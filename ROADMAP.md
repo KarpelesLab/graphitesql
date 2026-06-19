@@ -308,10 +308,14 @@ coverage rather than having a single "done".
   - **`%!.15g` real formatting** matching SQLite's double-to-text exactly;
   - **foreign-key enforcement** behind `PRAGMA foreign_keys` — child-side
     existence checks plus parent-side referential actions (NO ACTION/RESTRICT,
-    CASCADE, SET NULL, SET DEFAULT) on DELETE/UPDATE (`tests/foreign_keys.rs`).
-- **Deliverable (remaining):** triggers; subqueries/views in
-  joins; explicit window frame clauses (`ROWS`/`RANGE BETWEEN`); real `VACUUM`
-  compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
+    CASCADE, SET NULL, SET DEFAULT) on DELETE/UPDATE (`tests/foreign_keys.rs`);
+  - **row triggers** — `CREATE TRIGGER`/`DROP TRIGGER` for
+    `BEFORE`/`AFTER` `INSERT`/`UPDATE`/`DELETE`, with `OLD`/`NEW` references and a
+    `WHEN` guard, fired non-recursively (`tests/triggers.rs`).
+- **Deliverable (remaining):** subqueries/views in
+  joins; explicit window frame clauses (`ROWS`/`RANGE BETWEEN`); recursive
+  triggers & `INSTEAD OF` (view) triggers; `BEFORE`-trigger `NEW` mutation; real
+  `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.

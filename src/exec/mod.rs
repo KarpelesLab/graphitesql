@@ -84,6 +84,9 @@ pub struct Connection {
     /// Whether foreign-key constraints are enforced (`PRAGMA foreign_keys`).
     /// Off by default, matching SQLite.
     foreign_keys: bool,
+    /// Re-entrancy depth of trigger firing. Triggers fire only at depth 0
+    /// (non-recursive, matching `recursive_triggers = OFF`).
+    trigger_depth: core::cell::Cell<usize>,
 }
 
 /// A materialized common table expression: a named, in-memory relation.
@@ -100,6 +103,14 @@ struct OuterFrame {
     rowid: Option<i64>,
 }
 
+/// The kind of data-change event, for trigger matching.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrigEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
 impl Connection {
     fn from_pager(db: WritePager) -> Result<Connection> {
         let backend = Backend::Write(db);
@@ -111,6 +122,7 @@ impl Connection {
             cte_env: core::cell::RefCell::new(Vec::new()),
             outer_scope: core::cell::RefCell::new(Vec::new()),
             foreign_keys: false,
+            trigger_depth: core::cell::Cell::new(0),
         })
     }
 
@@ -124,6 +136,7 @@ impl Connection {
             cte_env: core::cell::RefCell::new(Vec::new()),
             outer_scope: core::cell::RefCell::new(Vec::new()),
             foreign_keys: false,
+            trigger_depth: core::cell::Cell::new(0),
         })
     }
 
@@ -363,6 +376,10 @@ impl Connection {
             }
             Statement::CreateView(cv) => {
                 self.exec_create_view(&cv, sql.trim())?;
+                0
+            }
+            Statement::CreateTrigger(ct) => {
+                self.exec_create_trigger(&ct, sql.trim())?;
                 0
             }
             Statement::Drop(d) => {
@@ -772,6 +789,160 @@ impl Connection {
         }
     }
 
+    /// Store a `CREATE TRIGGER` in `sqlite_schema` (type `trigger`, no b-tree).
+    fn exec_create_trigger(&mut self, ct: &CreateTrigger, sql_text: &str) -> Result<()> {
+        if self
+            .schema
+            .objects()
+            .iter()
+            .any(|o| o.name.eq_ignore_ascii_case(&ct.name))
+        {
+            if ct.if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::Error(format!("trigger {} already exists", ct.name)));
+        }
+        if self.schema.table(&ct.table).is_none() {
+            return Err(Error::Error(format!("no such table: {}", ct.table)));
+        }
+        let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
+        let row = encode_record(&[
+            Value::Text("trigger".into()),
+            Value::Text(ct.name.clone()),
+            Value::Text(ct.table.clone()),
+            Value::Integer(0),
+            Value::Text(sql_text.into()),
+        ]);
+        insert_table(
+            self.backend.writer()?,
+            crate::schema::SCHEMA_ROOT_PAGE,
+            next,
+            &row,
+        )?;
+        let cookie = self
+            .backend
+            .writer()?
+            .header()
+            .schema_cookie
+            .wrapping_add(1);
+        self.backend.writer()?.header_mut().schema_cookie = cookie;
+        self.schema = Schema::read(self.backend.source())?;
+        Ok(())
+    }
+
+    /// Triggers on `table` matching `kind`/`timing`, parsed from their schema SQL.
+    fn triggers_for(
+        &self,
+        table: &str,
+        kind: TrigEvent,
+        timing: TriggerTiming,
+    ) -> Result<Vec<CreateTrigger>> {
+        let mut out = Vec::new();
+        for obj in self.schema.objects() {
+            if obj.obj_type != crate::schema::ObjectType::Trigger
+                || !obj.tbl_name.eq_ignore_ascii_case(table)
+            {
+                continue;
+            }
+            let Some(sql) = &obj.sql else { continue };
+            let Ok(Statement::CreateTrigger(ct)) = sql::parse_one(sql) else {
+                continue;
+            };
+            let event_ok = matches!(
+                (&ct.event, kind),
+                (TriggerEvent::Insert, TrigEvent::Insert)
+                    | (TriggerEvent::Delete, TrigEvent::Delete)
+                    | (TriggerEvent::Update(_), TrigEvent::Update)
+            );
+            if ct.timing == timing && event_ok {
+                out.push(ct);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fire row triggers for one row change. `old`/`new` carry the affected row's
+    /// values and rowid before/after the change. Non-recursive: triggers fire
+    /// only at the top level (matching `recursive_triggers = OFF`).
+    #[allow(clippy::too_many_arguments)]
+    fn fire_triggers(
+        &mut self,
+        table: &str,
+        kind: TrigEvent,
+        timing: TriggerTiming,
+        meta: &TableMeta,
+        old: Option<(&[Value], i64)>,
+        new: Option<(&[Value], i64)>,
+        params: &Params,
+    ) -> Result<()> {
+        if self.trigger_depth.get() > 0 {
+            return Ok(());
+        }
+        let trigs = self.triggers_for(table, kind, timing)?;
+        if trigs.is_empty() {
+            return Ok(());
+        }
+        self.trigger_depth.set(1);
+        let base = self.outer_scope.borrow().len();
+        if let Some((vals, rid)) = old {
+            self.push_row_frame("old", meta, vals, rid);
+        }
+        if let Some((vals, rid)) = new {
+            self.push_row_frame("new", meta, vals, rid);
+        }
+        let result = self.run_trigger_bodies(&trigs, params);
+        self.outer_scope.borrow_mut().truncate(base);
+        self.trigger_depth.set(0);
+        result
+    }
+
+    fn push_row_frame(&self, label: &str, meta: &TableMeta, values: &[Value], rowid: i64) {
+        let columns = meta
+            .columns
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name.clone(),
+                table: String::from(label),
+                affinity: c.affinity,
+            })
+            .collect();
+        self.outer_scope.borrow_mut().push(OuterFrame {
+            columns,
+            row: values.to_vec(),
+            rowid: Some(rowid),
+        });
+    }
+
+    fn run_trigger_bodies(&mut self, trigs: &[CreateTrigger], params: &Params) -> Result<()> {
+        for trig in trigs {
+            if let Some(when) = &trig.when {
+                let fires = {
+                    let ctx = EvalCtx::rowless(params).with_subqueries(self);
+                    eval::truth(&eval::eval(when, &ctx)?) == Some(true)
+                };
+                if !fires {
+                    continue;
+                }
+            }
+            for stmt in &trig.body {
+                match stmt {
+                    Statement::Insert(ins) => {
+                        self.exec_insert(ins, params)?;
+                    }
+                    Statement::Update(u) => {
+                        self.exec_update(u, params)?;
+                    }
+                    Statement::Delete(d) => {
+                        self.exec_delete(d, params)?;
+                    }
+                    Statement::Select(_) => {} // side-effect free in our engine
+                    _ => return Err(Error::Unsupported("statement type in trigger body")),
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn exec_insert(&mut self, ins: &Insert, params: &Params) -> Result<usize> {
         let rows = match &ins.source {
             InsertSource::Values(rows) => rows.clone(),
@@ -806,7 +977,9 @@ impl Connection {
                 return Err(Error::Error("INSERT column/value count mismatch".into()));
             }
             // Start every column at its DEFAULT (or NULL), then apply provided.
-            let ctx = EvalCtx::rowless(params);
+            // Subqueries are attached so INSERT … VALUES can use scalar subqueries
+            // and trigger bodies can read NEW/OLD via the outer scope.
+            let ctx = EvalCtx::rowless(params).with_subqueries(self);
             let mut values: Vec<Value> = meta
                 .defaults
                 .iter()
@@ -860,6 +1033,15 @@ impl Connection {
             }
 
             let index_values = values.clone();
+            self.fire_triggers(
+                &ins.table,
+                TrigEvent::Insert,
+                TriggerTiming::Before,
+                &meta,
+                None,
+                Some((&index_values, rowid)),
+                params,
+            )?;
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Null;
             }
@@ -869,6 +1051,15 @@ impl Connection {
                 let key = index_key(&idx.cols, &index_values, rowid);
                 insert_index(self.backend.writer()?, idx.root, &key)?;
             }
+            self.fire_triggers(
+                &ins.table,
+                TrigEvent::Insert,
+                TriggerTiming::After,
+                &meta,
+                None,
+                Some((&index_values, rowid)),
+                params,
+            )?;
             affected += 1;
         }
         // REPLACE removed rows whose index entries were maintained incrementally;
@@ -919,13 +1110,36 @@ impl Connection {
         let indexes = self.indexes_of(&del.table)?;
         let victims = self.matching_rowids(&meta, del.where_clause.as_ref(), params)?;
         for rowid in &victims {
-            // Enforce referential actions on dependent child tables first.
+            let old = self.read_row(&meta, *rowid)?;
+            if let Some(old) = &old {
+                self.fire_triggers(
+                    &del.table,
+                    TrigEvent::Delete,
+                    TriggerTiming::Before,
+                    &meta,
+                    Some((old, *rowid)),
+                    None,
+                    params,
+                )?;
+            }
+            // Enforce referential actions on dependent child tables.
             if self.foreign_keys {
-                if let Some(old) = self.read_row(&meta, *rowid)? {
-                    self.enforce_parent_change(&del.table, &old, None, params)?;
+                if let Some(old) = &old {
+                    self.enforce_parent_change(&del.table, old, None, params)?;
                 }
             }
             delete_table(self.backend.writer()?, meta.root, *rowid)?;
+            if let Some(old) = &old {
+                self.fire_triggers(
+                    &del.table,
+                    TrigEvent::Delete,
+                    TriggerTiming::After,
+                    &meta,
+                    Some((old, *rowid)),
+                    None,
+                    params,
+                )?;
+            }
         }
         if !victims.is_empty() {
             self.rebuild_indexes(&meta, &indexes)?;
@@ -988,6 +1202,15 @@ impl Connection {
                 Some(ipk) => eval::to_i64(&values[ipk]),
                 None => rowid,
             };
+            self.fire_triggers(
+                &upd.table,
+                TrigEvent::Update,
+                TriggerTiming::Before,
+                &meta,
+                Some((&old_row, rowid)),
+                Some((&values, new_rowid)),
+                params,
+            )?;
             // UNIQUE/PK conflict against any other row.
             if !self
                 .find_conflicts(&meta, new_rowid, &values, Some(rowid))?
@@ -995,12 +1218,22 @@ impl Connection {
             {
                 return Err(Error::Constraint("UNIQUE constraint failed".into()));
             }
+            let new_full = values.clone();
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Null;
             }
             let record = encode_record(&values);
             delete_table(self.backend.writer()?, meta.root, rowid)?;
             insert_table(self.backend.writer()?, meta.root, new_rowid, &record)?;
+            self.fire_triggers(
+                &upd.table,
+                TrigEvent::Update,
+                TriggerTiming::After,
+                &meta,
+                Some((&old_row, rowid)),
+                Some((&new_full, new_rowid)),
+                params,
+            )?;
             affected += 1;
         }
         if affected > 0 {

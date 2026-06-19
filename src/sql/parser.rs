@@ -589,7 +589,73 @@ impl Parser {
         if self.eat_kw("view") {
             return Ok(Statement::CreateView(self.create_view()?));
         }
-        Err(self.err("expected TABLE, INDEX, or VIEW after CREATE"))
+        if self.eat_kw("temp") || self.eat_kw("temporary") {
+            // accept TEMP/TEMPORARY before TRIGGER/TABLE (treated as ordinary)
+        }
+        if self.eat_kw("trigger") {
+            return Ok(Statement::CreateTrigger(self.create_trigger()?));
+        }
+        Err(self.err("expected TABLE, INDEX, VIEW, or TRIGGER after CREATE"))
+    }
+
+    fn create_trigger(&mut self) -> Result<CreateTrigger> {
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.ident()?;
+        let timing = if self.eat_kw("before") {
+            TriggerTiming::Before
+        } else if self.eat_kw("after") {
+            TriggerTiming::After
+        } else if self.eat_kw("instead") {
+            self.expect_kw("of")?;
+            TriggerTiming::InsteadOf
+        } else {
+            TriggerTiming::Before // SQLite's default
+        };
+        let event = if self.eat_kw("insert") {
+            TriggerEvent::Insert
+        } else if self.eat_kw("delete") {
+            TriggerEvent::Delete
+        } else if self.eat_kw("update") {
+            let mut cols = Vec::new();
+            if self.eat_kw("of") {
+                cols.push(self.ident()?);
+                while self.eat(&Token::Comma) {
+                    cols.push(self.ident()?);
+                }
+            }
+            TriggerEvent::Update(cols)
+        } else {
+            return Err(self.err("expected INSERT, UPDATE, or DELETE in CREATE TRIGGER"));
+        };
+        self.expect_kw("on")?;
+        let table = self.ident()?;
+        if self.eat_kw("for") {
+            self.expect_kw("each")?;
+            self.expect_kw("row")?;
+        }
+        let when = if self.eat_kw("when") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        self.expect_kw("begin")?;
+        let mut body = Vec::new();
+        while !self.check_kw("end") && !self.at_end() {
+            let stmt = self.statement()?;
+            body.push(stmt);
+            // Each body statement is terminated by a semicolon.
+            let _ = self.eat(&Token::Semicolon);
+        }
+        self.expect_kw("end")?;
+        Ok(CreateTrigger {
+            if_not_exists,
+            name,
+            timing,
+            event,
+            table,
+            when,
+            body,
+        })
     }
 
     fn create_view(&mut self) -> Result<CreateView> {

@@ -30,6 +30,8 @@ pub enum Statement {
     CreateIndex(CreateIndex),
     /// A `CREATE VIEW` statement.
     CreateView(CreateView),
+    /// A `CREATE TRIGGER` statement.
+    CreateTrigger(CreateTrigger),
     /// A `DROP TABLE`/`DROP INDEX`/… statement.
     Drop(Drop),
     /// An `ALTER TABLE` statement.
@@ -357,6 +359,47 @@ pub struct CreateView {
     pub columns: Vec<String>,
     /// The view's `SELECT`.
     pub select: Box<Select>,
+}
+
+/// When a trigger fires relative to its event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    /// `BEFORE` the row change.
+    Before,
+    /// `AFTER` the row change.
+    After,
+    /// `INSTEAD OF` (views) — parsed but not executed.
+    InsteadOf,
+}
+
+/// The data-change event a trigger fires on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerEvent {
+    /// `INSERT`.
+    Insert,
+    /// `UPDATE [OF col, …]`.
+    Update(Vec<String>),
+    /// `DELETE`.
+    Delete,
+}
+
+/// A `CREATE TRIGGER` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTrigger {
+    /// `IF NOT EXISTS`?
+    pub if_not_exists: bool,
+    /// Trigger name.
+    pub name: String,
+    /// `BEFORE`/`AFTER`/`INSTEAD OF`.
+    pub timing: TriggerTiming,
+    /// The firing event.
+    pub event: TriggerEvent,
+    /// The table the trigger is attached to.
+    pub table: String,
+    /// `WHEN <expr>` guard, if any.
+    pub when: Option<Expr>,
+    /// The trigger body: statements between `BEGIN` and `END`.
+    pub body: Vec<Statement>,
 }
 
 /// What kind of object a `DROP` targets.
