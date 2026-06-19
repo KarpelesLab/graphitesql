@@ -20,7 +20,7 @@ mod window;
 
 use crate::btree::{
     clear_index, create_index_root, create_table_root, delete_table, free_tree, insert_index,
-    insert_table, TableCursor,
+    insert_table, IndexCursor, TableCursor,
 };
 use crate::error::{Error, Result};
 use crate::format::record::{decode_record, encode_record};
@@ -425,10 +425,25 @@ impl Connection {
             }
             return Err(Error::Error(format!("table {} already exists", ct.name)));
         }
-        if ct.without_rowid {
-            return Err(Error::Unsupported("WITHOUT ROWID tables"));
-        }
-        let root = create_table_root(self.backend.writer()?)?;
+        // A WITHOUT ROWID table is stored as a PK-clustered index b-tree; an
+        // ordinary table uses a rowid table b-tree.
+        let root = if ct.without_rowid {
+            // Validate the supported subset early (PK present, no extra UNIQUE).
+            let pk = primary_key_positions(ct);
+            if pk.is_empty() {
+                return Err(Error::Error(
+                    "WITHOUT ROWID table must have a PRIMARY KEY".into(),
+                ));
+            }
+            if collect_unique_sets(ct, None).len() > 1 {
+                return Err(Error::Unsupported(
+                    "WITHOUT ROWID with additional UNIQUE constraints",
+                ));
+            }
+            create_index_root(self.backend.writer()?)?
+        } else {
+            create_table_root(self.backend.writer()?)?
+        };
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
             Value::Text("table".into()),
@@ -447,8 +462,13 @@ impl Connection {
         // Create the automatic indexes SQLite implies for UNIQUE / non-rowid
         // PRIMARY KEY constraints, so the file is a valid SQLite database (it
         // otherwise reports "wrong # of entries in index sqlite_autoindex_*").
+        // A WITHOUT ROWID table's PK is the table itself, so it needs none.
         let ipk = find_integer_primary_key(ct);
-        let unique = collect_unique_sets(ct, ipk);
+        let unique = if ct.without_rowid {
+            Vec::new()
+        } else {
+            collect_unique_sets(ct, ipk)
+        };
         for (n, schema_rowid) in (next + 1..).enumerate().take(unique.len()) {
             let idx_root = create_index_root(self.backend.writer()?)?;
             let idx_row = encode_record(&[
@@ -993,6 +1013,9 @@ impl Connection {
             InsertSource::Select(_) => return Err(Error::Unsupported("INSERT ... SELECT")),
         };
         let meta = self.table_meta(&ins.table, None)?;
+        if meta.without_rowid {
+            return self.exec_insert_without_rowid(ins, &meta, &rows, params);
+        }
         let n_cols = meta.columns.len();
 
         // Map the provided column list (or all columns) to table positions.
@@ -1150,6 +1173,9 @@ impl Connection {
 
     fn exec_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
         let meta = self.table_meta(&del.table, None)?;
+        if meta.without_rowid {
+            return self.exec_delete_without_rowid(del, &meta, params);
+        }
         let indexes = self.indexes_of(&del.table)?;
         let victims = self.matching_rowids(&meta, del.where_clause.as_ref(), params)?;
         for rowid in &victims {
@@ -1192,6 +1218,9 @@ impl Connection {
 
     fn exec_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
         let meta = self.table_meta(&upd.table, None)?;
+        if meta.without_rowid {
+            return self.exec_update_without_rowid(upd, &meta, params);
+        }
         let indexes = self.indexes_of(&upd.table)?;
         // Collect (rowid, current values) for matching rows first.
         let mut targets: Vec<(i64, Vec<Value>)> = Vec::new();
@@ -2632,6 +2661,17 @@ impl Connection {
         // return a superset of matching rows.
         if from.joins.is_empty() {
             let first_meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
+            if first_meta.without_rowid {
+                let input_rows = self
+                    .scan_without_rowid(&first_meta)?
+                    .into_iter()
+                    .map(|values| InputRow {
+                        values,
+                        rowid: None,
+                    })
+                    .collect();
+                return Ok((first_meta.columns, input_rows));
+            }
             if let Some(rows) = self.try_index_lookup(&first_meta, &from.first.name, sel, params)? {
                 return Ok((first_meta.columns, rows));
             }
@@ -2738,12 +2778,221 @@ impl Connection {
             return Ok((cols, rows.into_iter().map(|r| r.values).collect()));
         }
         let meta = self.table_meta(&tref.name, tref.alias.as_deref())?;
-        let rows = self
-            .scan_table(&meta)?
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect();
+        let rows = if meta.without_rowid {
+            self.scan_without_rowid(&meta)?
+        } else {
+            self.scan_table(&meta)?
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect()
+        };
         Ok((meta.columns, rows))
+    }
+
+    /// Scan a `WITHOUT ROWID` table's clustered index b-tree, decoding each entry
+    /// (stored PK-first) back into declared column order.
+    fn scan_without_rowid(&self, meta: &TableMeta) -> Result<Vec<Vec<Value>>> {
+        let encoding = self.backend.source().header().text_encoding;
+        let mut cur = IndexCursor::new(self.backend.source(), meta.root);
+        let mut out = Vec::new();
+        while let Some(payload) = cur.next()? {
+            let storage = decode_record(&payload, encoding)?;
+            out.push(unpermute_row(meta, storage));
+        }
+        Ok(out)
+    }
+
+    /// Build a row (declared order) from an INSERT's column list + value exprs,
+    /// applying defaults and affinity. Shared by the WITHOUT ROWID insert path.
+    fn build_insert_row(
+        &self,
+        meta: &TableMeta,
+        target: &[usize],
+        row_exprs: &[Expr],
+        params: &Params,
+    ) -> Result<Vec<Value>> {
+        let ctx = EvalCtx::rowless(params).with_subqueries(self);
+        let mut values: Vec<Value> = meta
+            .defaults
+            .iter()
+            .map(|d| match d {
+                Some(e) => eval::eval(e, &ctx),
+                None => Ok(Value::Null),
+            })
+            .collect::<Result<_>>()?;
+        for (i, e) in row_exprs.iter().enumerate() {
+            values[target[i]] = eval::eval(e, &ctx)?;
+        }
+        apply_column_affinity(meta, &mut values);
+        Ok(values)
+    }
+
+    /// INSERT into a WITHOUT ROWID (PK-clustered) table.
+    fn exec_insert_without_rowid(
+        &mut self,
+        ins: &Insert,
+        meta: &TableMeta,
+        rows: &[Vec<Expr>],
+        params: &Params,
+    ) -> Result<usize> {
+        let n_cols = meta.columns.len();
+        let target: Vec<usize> = if ins.columns.is_empty() {
+            (0..n_cols).collect()
+        } else {
+            ins.columns
+                .iter()
+                .map(|name| {
+                    meta.columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| Error::Error(format!("no such column: {name}")))
+                })
+                .collect::<Result<_>>()?
+        };
+        let pk = &meta.storage_order[..meta.pk_len];
+        let mut affected = 0;
+        for row_exprs in rows {
+            if !ins.columns.is_empty() && row_exprs.len() != target.len() {
+                return Err(Error::Error("INSERT column/value count mismatch".into()));
+            }
+            let values = self.build_insert_row(meta, &target, row_exprs, params)?;
+            // PRIMARY KEY columns are implicitly NOT NULL in a WITHOUT ROWID table.
+            for &c in pk {
+                if matches!(values[c], Value::Null) {
+                    return Err(Error::Constraint("NOT NULL constraint failed".into()));
+                }
+            }
+            check_not_null(meta, &values)?;
+            self.check_constraints(meta, &values, None, params)?;
+
+            // Reject a duplicate primary key.
+            let existing = self.scan_without_rowid(meta)?;
+            let dup = existing
+                .iter()
+                .any(|r| pk.iter().all(|&c| eval::compare(&r[c], &values[c]).is_eq()));
+            if dup {
+                match ins.on_conflict {
+                    OnConflict::Abort => {
+                        return Err(Error::Constraint("UNIQUE constraint failed".into()))
+                    }
+                    OnConflict::Ignore => continue,
+                    OnConflict::Replace => {
+                        // Rebuild without the conflicting row, then insert.
+                        self.rewrite_without_rowid(
+                            meta,
+                            existing.into_iter().filter(|r| {
+                                !pk.iter().all(|&c| eval::compare(&r[c], &values[c]).is_eq())
+                            }),
+                        )?;
+                    }
+                }
+            }
+            let record = encode_record(&permute_row(meta, &values));
+            insert_index(self.backend.writer()?, meta.root, &record)?;
+            affected += 1;
+        }
+        Ok(affected)
+    }
+
+    /// DELETE from a WITHOUT ROWID table: keep non-matching rows, rebuild.
+    fn exec_delete_without_rowid(
+        &mut self,
+        del: &Delete,
+        meta: &TableMeta,
+        params: &Params,
+    ) -> Result<usize> {
+        let all = self.scan_without_rowid(meta)?;
+        let mut kept = Vec::new();
+        let mut deleted = 0;
+        for row in all {
+            let keep = match &del.where_clause {
+                Some(p) => {
+                    let ctx = row_ctx(&row, &meta.columns, None, params).with_subqueries(self);
+                    eval::truth(&eval::eval(p, &ctx)?) != Some(true)
+                }
+                None => false,
+            };
+            if keep {
+                kept.push(row);
+            } else {
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            self.rewrite_without_rowid(meta, kept.into_iter())?;
+        }
+        Ok(deleted)
+    }
+
+    /// UPDATE a WITHOUT ROWID table: recompute matching rows, rebuild.
+    fn exec_update_without_rowid(
+        &mut self,
+        upd: &Update,
+        meta: &TableMeta,
+        params: &Params,
+    ) -> Result<usize> {
+        let all = self.scan_without_rowid(meta)?;
+        let mut out = Vec::with_capacity(all.len());
+        let mut affected = 0;
+        for mut row in all {
+            let matches = match &upd.where_clause {
+                Some(p) => {
+                    let ctx = row_ctx(&row, &meta.columns, None, params).with_subqueries(self);
+                    eval::truth(&eval::eval(p, &ctx)?) == Some(true)
+                }
+                None => true,
+            };
+            if matches {
+                for (col, expr) in &upd.assignments {
+                    let pos = meta
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(col))
+                        .ok_or_else(|| Error::Error(format!("no such column: {col}")))?;
+                    let ctx = row_ctx(&row, &meta.columns, None, params).with_subqueries(self);
+                    row[pos] = eval::eval(expr, &ctx)?;
+                }
+                apply_column_affinity(meta, &mut row);
+                check_not_null(meta, &row)?;
+                self.check_constraints(meta, &row, None, params)?;
+                affected += 1;
+            }
+            out.push(row);
+        }
+        // Reject duplicate primary keys produced by the update.
+        let pk = &meta.storage_order[..meta.pk_len];
+        for i in 0..out.len() {
+            for j in (i + 1)..out.len() {
+                if pk
+                    .iter()
+                    .all(|&c| eval::compare(&out[i][c], &out[j][c]).is_eq())
+                {
+                    return Err(Error::Constraint("UNIQUE constraint failed".into()));
+                }
+            }
+        }
+        if affected > 0 {
+            self.rewrite_without_rowid(meta, out.into_iter())?;
+        }
+        Ok(affected)
+    }
+
+    /// Replace a WITHOUT ROWID table's entire contents with `rows` (declared
+    /// order), re-encoding each into PK-first storage order.
+    fn rewrite_without_rowid(
+        &mut self,
+        meta: &TableMeta,
+        rows: impl Iterator<Item = Vec<Value>>,
+    ) -> Result<()> {
+        let records: Vec<Vec<u8>> = rows
+            .map(|r| encode_record(&permute_row(meta, &r)))
+            .collect();
+        let w = self.backend.writer()?;
+        clear_index(w, meta.root)?;
+        for rec in &records {
+            insert_index(w, meta.root, rec)?;
+        }
+        Ok(())
     }
 
     /// Scan a whole table into `(rowid, column values)`.
@@ -3183,9 +3432,6 @@ impl Connection {
         let Statement::CreateTable(ct) = sql::parse_one(sql)? else {
             return Err(Error::Corrupt("schema sql is not CREATE TABLE".into()));
         };
-        if ct.without_rowid {
-            return Err(Error::Unsupported("WITHOUT ROWID tables"));
-        }
         let table_label = alias.unwrap_or(name).to_string();
         let columns: Vec<ColumnInfo> = ct
             .columns
@@ -3206,7 +3452,13 @@ impl Connection {
                 })
             })
             .collect();
-        let ipk = find_integer_primary_key(&ct);
+        // A WITHOUT ROWID table has no rowid, so `INTEGER PRIMARY KEY` is an
+        // ordinary column there (no rowid aliasing).
+        let ipk = if ct.without_rowid {
+            None
+        } else {
+            find_integer_primary_key(&ct)
+        };
         let not_null: Vec<bool> = ct
             .columns
             .iter()
@@ -3237,6 +3489,33 @@ impl Connection {
         // UNIQUE / PRIMARY KEY column sets that must be unique (the rowid IPK is
         // handled separately). Order matches SQLite's auto-index numbering.
         let unique = collect_unique_sets(&ct, ipk);
+
+        // WITHOUT ROWID: derive the PK-first storage order.
+        let (without_rowid, storage_order, pk_len) = if ct.without_rowid {
+            let pk = primary_key_positions(&ct);
+            if pk.is_empty() {
+                return Err(Error::Error(
+                    "WITHOUT ROWID table must have a PRIMARY KEY".into(),
+                ));
+            }
+            // Supported subset: the PRIMARY KEY is the only key (no extra UNIQUE).
+            if unique.len() > 1 {
+                return Err(Error::Unsupported(
+                    "WITHOUT ROWID with additional UNIQUE constraints",
+                ));
+            }
+            let mut order = pk.clone();
+            for i in 0..columns.len() {
+                if !pk.contains(&i) {
+                    order.push(i);
+                }
+            }
+            let pk_len = pk.len();
+            (true, order, pk_len)
+        } else {
+            (false, Vec::new(), 0)
+        };
+
         Ok(TableMeta {
             root: obj.rootpage,
             columns,
@@ -3245,6 +3524,9 @@ impl Connection {
             checks,
             unique,
             ipk,
+            without_rowid,
+            storage_order,
+            pk_len,
         })
     }
 
@@ -3280,6 +3562,14 @@ struct TableMeta {
     /// Column-index sets that must be UNIQUE (excludes the rowid IPK).
     unique: Vec<Vec<usize>>,
     ipk: Option<usize>,
+    /// `true` for a `WITHOUT ROWID` table (stored as a PK-clustered index b-tree
+    /// rather than a rowid table b-tree).
+    without_rowid: bool,
+    /// For a `WITHOUT ROWID` table, the on-disk column order: PRIMARY KEY columns
+    /// first (in key order), then the remaining columns in declared order. Empty
+    /// for ordinary rowid tables. `pk_len` is how many leading entries are PK.
+    storage_order: Vec<usize>,
+    pk_len: usize,
 }
 
 /// An index's b-tree root and the table column positions it covers.
@@ -3992,6 +4282,55 @@ fn collect_unique_sets(ct: &CreateTable, ipk: Option<usize>) -> Vec<Vec<usize>> 
         }
     }
     unique
+}
+
+/// Convert a `WITHOUT ROWID` row from declared column order to on-disk storage
+/// order (PK columns first, then the rest).
+fn permute_row(meta: &TableMeta, declared: &[Value]) -> Vec<Value> {
+    meta.storage_order
+        .iter()
+        .map(|&i| declared[i].clone())
+        .collect()
+}
+
+/// The inverse of [`permute_row`]: storage order back to declared column order.
+fn unpermute_row(meta: &TableMeta, storage: Vec<Value>) -> Vec<Value> {
+    let mut row = alloc::vec![Value::Null; meta.columns.len()];
+    for (k, &col) in meta.storage_order.iter().enumerate() {
+        if let Some(v) = storage.get(k) {
+            row[col] = v.clone();
+        }
+    }
+    row
+}
+
+/// The column positions of a table's PRIMARY KEY, in key order (column-level
+/// `PRIMARY KEY` or a table-level `PRIMARY KEY(...)`). Empty if none.
+fn primary_key_positions(ct: &CreateTable) -> Vec<usize> {
+    for (i, c) in ct.columns.iter().enumerate() {
+        if c.constraints
+            .iter()
+            .any(|k| matches!(k, ColumnConstraint::PrimaryKey { .. }))
+        {
+            return alloc::vec![i];
+        }
+    }
+    for tc in &ct.constraints {
+        if let TableConstraint::PrimaryKey(names) = tc {
+            let pos: Option<Vec<usize>> = names
+                .iter()
+                .map(|n| {
+                    ct.columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(n))
+                })
+                .collect();
+            if let Some(pos) = pos {
+                return pos;
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Parse the `<n>` from `sqlite_autoindex_<table>_<n>` (1-based), if `name` is an

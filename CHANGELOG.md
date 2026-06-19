@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: `WITHOUT ROWID` tables — stored as a PK-clustered index b-tree
+  (records held PK-first), with CRUD, composite primary keys, and
+  `INSERT OR REPLACE`. graphitesql-written WITHOUT ROWID databases pass real
+  `sqlite3 integrity_check`, and graphitesql reads sqlite-written ones
 - Phase 9: automatic indexes for `UNIQUE` / non-rowid `PRIMARY KEY` — graphitesql
   now writes the implicit `sqlite_autoindex_<table>_<n>` b-trees and maintains
   them across INSERT/UPDATE/DELETE. Fixes a file-format bug where real SQLite

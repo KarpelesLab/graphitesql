@@ -321,11 +321,16 @@ coverage rather than having a single "done".
     default (`tests/triggers.rs`);
   - **automatic indexes for `UNIQUE`/non-rowid `PRIMARY KEY`** — the implicit
     `sqlite_autoindex_*` b-trees are now written and maintained, so SQLite
-    accepts the files (`tests/indexes.rs`).
-- **Deliverable (remaining):** the storage-engine frontier — `WITHOUT ROWID`
-  tables; the WAL *write* path (frame append + `-shm` wal-index + checkpoint);
-  real `VACUUM` compaction; b-tree page merging/rebalance on delete; plus
-  `INSTEAD OF` (view) triggers and writable views.
+    accepts the files (`tests/indexes.rs`);
+  - **`WITHOUT ROWID` tables** — PK-clustered index-b-tree storage (records
+    held PK-first), CRUD + composite PKs + `INSERT OR REPLACE`; files pass real
+    `sqlite3 integrity_check` (`tests/without_rowid.rs`). *(Subset: the PRIMARY
+    KEY is the only key — additional `UNIQUE`/secondary indexes on a WITHOUT
+    ROWID table aren't supported yet.)*
+- **Deliverable (remaining):** the storage-engine frontier — the WAL *write*
+  path (frame append + `-shm` wal-index + checkpoint); real `VACUUM` compaction;
+  b-tree page merging/rebalance on delete; secondary indexes on `WITHOUT ROWID`
+  tables; plus `INSTEAD OF` (view) triggers and writable views.
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.
