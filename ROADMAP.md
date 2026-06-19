@@ -305,8 +305,11 @@ coverage rather than having a single "done".
   - **window functions** — `row_number`/`rank`/`dense_rank`/`ntile`,
     `lag`/`lead`/`first_value`/`last_value`/`nth_value`, and aggregate windows
     over `PARTITION BY`/`ORDER BY` with the default frame (`tests/window.rs`);
-  - **`%!.15g` real formatting** matching SQLite's double-to-text exactly.
-- **Deliverable (remaining):** foreign keys & triggers; subqueries/views in
+  - **`%!.15g` real formatting** matching SQLite's double-to-text exactly;
+  - **foreign-key enforcement** behind `PRAGMA foreign_keys` — child-side
+    existence checks plus parent-side referential actions (NO ACTION/RESTRICT,
+    CASCADE, SET NULL, SET DEFAULT) on DELETE/UPDATE (`tests/foreign_keys.rs`).
+- **Deliverable (remaining):** triggers; subqueries/views in
   joins; explicit window frame clauses (`ROWS`/`RANGE BETWEEN`); real `VACUUM`
   compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE

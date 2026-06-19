@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: foreign-key enforcement behind `PRAGMA foreign_keys = ON` (off by
+  default, as in SQLite) — child-side parent-existence checks on INSERT/UPDATE,
+  and referential actions on the parent (NO ACTION/RESTRICT, CASCADE, SET NULL,
+  SET DEFAULT) for DELETE and UPDATE; FK clauses are now modeled in the AST
 - Phase 9: window functions — `row_number`, `rank`, `dense_rank`, `ntile`,
   `lag`/`lead`, `first_value`/`last_value`/`nth_value`, and aggregate windows
   (`sum`/`avg`/`count`/`min`/`max`/`total`/`group_concat`) over

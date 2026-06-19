@@ -91,7 +91,39 @@ fn column_constraint(c: &ColumnConstraint) -> String {
         ColumnConstraint::Default(e) => format!("DEFAULT {}", expr(e)),
         ColumnConstraint::Collate(n) => format!("COLLATE {n}"),
         ColumnConstraint::Check(e) => format!("CHECK ({})", expr(e)),
+        ColumnConstraint::References(fk) => {
+            format!("REFERENCES {}", foreign_key_target(fk))
+        }
     }
+}
+
+/// Render a foreign key's `target(cols) [ON DELETE …] [ON UPDATE …]` tail.
+fn foreign_key_target(fk: &ForeignKey) -> String {
+    let mut s = ident(&fk.ref_table);
+    if !fk.ref_columns.is_empty() {
+        s.push_str(&format!(
+            "({})",
+            fk.ref_columns
+                .iter()
+                .map(|n| ident(n))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let action = |a: FkAction| match a {
+        FkAction::NoAction => "NO ACTION",
+        FkAction::Restrict => "RESTRICT",
+        FkAction::Cascade => "CASCADE",
+        FkAction::SetNull => "SET NULL",
+        FkAction::SetDefault => "SET DEFAULT",
+    };
+    if fk.on_delete != FkAction::NoAction {
+        s.push_str(&format!(" ON DELETE {}", action(fk.on_delete)));
+    }
+    if fk.on_update != FkAction::NoAction {
+        s.push_str(&format!(" ON UPDATE {}", action(fk.on_update)));
+    }
+    s
 }
 
 fn table_constraint(c: &TableConstraint) -> String {
@@ -106,6 +138,11 @@ fn table_constraint(c: &TableConstraint) -> String {
         TableConstraint::PrimaryKey(names) => format!("PRIMARY KEY({})", cols(names)),
         TableConstraint::Unique(names) => format!("UNIQUE({})", cols(names)),
         TableConstraint::Check(e) => format!("CHECK ({})", expr(e)),
+        TableConstraint::ForeignKey(fk) => format!(
+            "FOREIGN KEY({}) REFERENCES {}",
+            cols(&fk.columns),
+            foreign_key_target(fk)
+        ),
     }
 }
 

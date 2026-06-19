@@ -81,6 +81,9 @@ pub struct Connection {
     /// A stack of enclosing query rows, innermost last. A correlated subquery
     /// pushes its evaluation row here so its body can resolve outer columns.
     outer_scope: core::cell::RefCell<Vec<OuterFrame>>,
+    /// Whether foreign-key constraints are enforced (`PRAGMA foreign_keys`).
+    /// Off by default, matching SQLite.
+    foreign_keys: bool,
 }
 
 /// A materialized common table expression: a named, in-memory relation.
@@ -107,6 +110,7 @@ impl Connection {
             in_tx: false,
             cte_env: core::cell::RefCell::new(Vec::new()),
             outer_scope: core::cell::RefCell::new(Vec::new()),
+            foreign_keys: false,
         })
     }
 
@@ -119,6 +123,7 @@ impl Connection {
             in_tx: false,
             cte_env: core::cell::RefCell::new(Vec::new()),
             outer_scope: core::cell::RefCell::new(Vec::new()),
+            foreign_keys: false,
         })
     }
 
@@ -246,6 +251,10 @@ impl Connection {
                 ),
             )),
             "table_info" => self.pragma_table_info(p),
+            "foreign_keys" => Ok(single(
+                "foreign_keys",
+                Value::Integer(self.foreign_keys as i64),
+            )),
             _ => Err(Error::Unsupported("this PRAGMA")),
         }
     }
@@ -364,8 +373,11 @@ impl Connection {
                 self.exec_alter(&a)?;
                 0
             }
-            Statement::Pragma(_) => 0, // accepted, no-op for now
-            Statement::Vacuum => 0,    // accepted; compaction is a no-op here
+            Statement::Pragma(p) => {
+                self.exec_pragma(&p, params)?;
+                0
+            }
+            Statement::Vacuum => 0, // accepted; compaction is a no-op here
             Statement::Select(_) => return Err(Error::Unsupported("use query() for SELECT")),
             Statement::Explain { .. } => return Err(Error::Unsupported("use query() for EXPLAIN")),
             Statement::Begin | Statement::Commit | Statement::Rollback => unreachable!(),
@@ -416,6 +428,348 @@ impl Connection {
         // Make the new table visible to subsequent statements in this tx.
         self.schema = Schema::read(self.backend.source())?;
         Ok(())
+    }
+
+    /// Handle a settable `PRAGMA` (currently only `foreign_keys`). Unknown
+    /// pragmas are accepted as no-ops, matching SQLite's leniency.
+    fn exec_pragma(&mut self, p: &Pragma, params: &Params) -> Result<()> {
+        if p.name.eq_ignore_ascii_case("foreign_keys") {
+            if let Some(e) = &p.value {
+                self.foreign_keys = pragma_truth(e, params);
+            }
+        }
+        Ok(())
+    }
+
+    /// The foreign keys declared by `table`, with child columns resolved and
+    /// parent columns defaulted to the parent's primary key when omitted.
+    fn foreign_keys_of(&self, table: &str) -> Result<Vec<ForeignKey>> {
+        let Some(obj) = self.schema.table(table) else {
+            return Ok(Vec::new());
+        };
+        let Some(sql) = &obj.sql else {
+            return Ok(Vec::new());
+        };
+        let Statement::CreateTable(ct) = sql::parse_one(sql)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for col in &ct.columns {
+            for c in &col.constraints {
+                if let ColumnConstraint::References(fk) = c {
+                    out.push(self.resolve_fk(fk)?);
+                }
+            }
+        }
+        for c in &ct.constraints {
+            if let TableConstraint::ForeignKey(fk) = c {
+                out.push(self.resolve_fk(fk)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fill in a foreign key's parent columns from the parent's primary key when
+    /// the `REFERENCES` clause omitted them.
+    fn resolve_fk(&self, fk: &ForeignKey) -> Result<ForeignKey> {
+        let mut fk = fk.clone();
+        if fk.ref_columns.is_empty() {
+            fk.ref_columns = self.primary_key_columns(&fk.ref_table)?;
+        }
+        Ok(fk)
+    }
+
+    /// The primary-key column names of `table` (the INTEGER PRIMARY KEY, or a
+    /// declared PRIMARY KEY constraint).
+    fn primary_key_columns(&self, table: &str) -> Result<Vec<String>> {
+        let Some(obj) = self.schema.table(table) else {
+            return Err(Error::Error(format!("no such table: {table}")));
+        };
+        let sql = obj.sql.as_deref().unwrap_or("");
+        let Statement::CreateTable(ct) = sql::parse_one(sql)? else {
+            return Ok(Vec::new());
+        };
+        for col in &ct.columns {
+            if col
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
+            {
+                return Ok(alloc::vec![col.name.clone()]);
+            }
+        }
+        for c in &ct.constraints {
+            if let TableConstraint::PrimaryKey(cols) = c {
+                return Ok(cols.clone());
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Verify, for a row being inserted/updated into `table`, that every foreign
+    /// key it declares points at an existing parent row. NULL key columns are
+    /// skipped (MATCH SIMPLE).
+    fn check_fk_child(&self, table: &str, meta: &TableMeta, values: &[Value]) -> Result<()> {
+        if !self.foreign_keys {
+            return Ok(());
+        }
+        for fk in self.foreign_keys_of(table)? {
+            let key = match self.child_key_values(meta, &fk, values) {
+                Some(k) => k,
+                None => continue, // a NULL column => constraint satisfied
+            };
+            if !self.parent_has_key(&fk, &key)? {
+                return Err(Error::Constraint("FOREIGN KEY constraint failed".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The child key values for `fk` from a child row, or `None` if any is NULL.
+    fn child_key_values(
+        &self,
+        meta: &TableMeta,
+        fk: &ForeignKey,
+        values: &[Value],
+    ) -> Option<Vec<Value>> {
+        let mut key = Vec::with_capacity(fk.columns.len());
+        for cname in &fk.columns {
+            let pos = meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(cname))?;
+            let v = values.get(pos)?;
+            if matches!(v, Value::Null) {
+                return None;
+            }
+            key.push(v.clone());
+        }
+        Some(key)
+    }
+
+    /// Whether the parent table of `fk` has a row whose referenced columns equal
+    /// `key`.
+    fn parent_has_key(&self, fk: &ForeignKey, key: &[Value]) -> Result<bool> {
+        let pmeta = self.table_meta(&fk.ref_table, None)?;
+        let positions = self.column_positions(&pmeta, &fk.ref_columns)?;
+        for (_, row) in self.scan_table(&pmeta)? {
+            if positions
+                .iter()
+                .zip(key)
+                .all(|(&p, k)| eval::compare(&row[p], k) == core::cmp::Ordering::Equal)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Column positions in `meta` for the given names.
+    fn column_positions(&self, meta: &TableMeta, names: &[String]) -> Result<Vec<usize>> {
+        names
+            .iter()
+            .map(|n| {
+                meta.columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(n))
+                    .ok_or_else(|| Error::Error(format!("no such column: {n}")))
+            })
+            .collect()
+    }
+
+    /// Enforce referential actions when a parent row changes. `old_key` is the
+    /// parent row's referenced-column values before the change; `new_key` is the
+    /// values after (for `UPDATE`), or `None` for `DELETE`.
+    fn enforce_parent_change(
+        &mut self,
+        parent_table: &str,
+        old_vals: &[Value],
+        new_vals: Option<&[Value]>,
+        params: &Params,
+    ) -> Result<()> {
+        if !self.foreign_keys {
+            return Ok(());
+        }
+        // Find every (child table, fk) that references this parent.
+        let table_names: Vec<String> = self
+            .schema
+            .objects()
+            .iter()
+            .filter(|o| o.obj_type == crate::schema::ObjectType::Table)
+            .map(|o| o.name.clone())
+            .collect();
+        let mut referencing: Vec<(String, ForeignKey)> = Vec::new();
+        for name in table_names {
+            for fk in self.foreign_keys_of(&name)? {
+                if fk.ref_table.eq_ignore_ascii_case(parent_table) {
+                    referencing.push((name.clone(), fk));
+                }
+            }
+        }
+        if referencing.is_empty() {
+            return Ok(());
+        }
+        let pmeta = self.table_meta(parent_table, None)?;
+        for (child_table, fk) in referencing {
+            let ppos = self.column_positions(&pmeta, &fk.ref_columns)?;
+            let old_key: Vec<Value> = ppos.iter().map(|&p| old_vals[p].clone()).collect();
+            // A NULL parent key can't be referenced.
+            if old_key.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            let is_delete = new_vals.is_none();
+            let action = if is_delete {
+                fk.on_delete
+            } else {
+                fk.on_update
+            };
+            // If this is an UPDATE that didn't change the referenced key, skip.
+            if let Some(nv) = new_vals {
+                let new_key: Vec<Value> = ppos.iter().map(|&p| nv[p].clone()).collect();
+                if new_key
+                    .iter()
+                    .zip(&old_key)
+                    .all(|(a, b)| eval::compare(a, b) == core::cmp::Ordering::Equal)
+                {
+                    continue;
+                }
+            }
+            self.apply_fk_action(&child_table, &fk, &old_key, new_vals, &ppos, action, params)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_fk_action(
+        &mut self,
+        child_table: &str,
+        fk: &ForeignKey,
+        old_key: &[Value],
+        new_parent: Option<&[Value]>,
+        parent_pos: &[usize],
+        action: FkAction,
+        params: &Params,
+    ) -> Result<()> {
+        let cmeta = self.table_meta(child_table, None)?;
+        let cpos = self.column_positions(&cmeta, &fk.columns)?;
+        // Find child rowids whose key matches old_key.
+        let mut matches: Vec<i64> = Vec::new();
+        for (rowid, row) in self.scan_table(&cmeta)? {
+            if cpos
+                .iter()
+                .zip(old_key)
+                .all(|(&p, k)| eval::compare(&row[p], k) == core::cmp::Ordering::Equal)
+            {
+                matches.push(rowid);
+            }
+        }
+        if matches.is_empty() {
+            return Ok(());
+        }
+        match action {
+            FkAction::NoAction | FkAction::Restrict => {
+                Err(Error::Constraint("FOREIGN KEY constraint failed".into()))
+            }
+            FkAction::Cascade if new_parent.is_none() => {
+                // DELETE CASCADE: delete the matching child rows (recursively).
+                for rowid in matches {
+                    self.delete_row_cascade(child_table, &cmeta, rowid, params)?;
+                }
+                Ok(())
+            }
+            FkAction::Cascade => {
+                // UPDATE CASCADE: set child key columns to the new parent key.
+                let new_parent = new_parent.unwrap();
+                let new_key: Vec<Value> =
+                    parent_pos.iter().map(|&p| new_parent[p].clone()).collect();
+                for rowid in matches {
+                    self.update_child_key(&cmeta, child_table, rowid, &cpos, &new_key)?;
+                }
+                Ok(())
+            }
+            FkAction::SetNull => {
+                let nulls = alloc::vec![Value::Null; cpos.len()];
+                for rowid in matches {
+                    self.update_child_key(&cmeta, child_table, rowid, &cpos, &nulls)?;
+                }
+                Ok(())
+            }
+            FkAction::SetDefault => {
+                let defaults: Vec<Value> = cpos
+                    .iter()
+                    .map(|&p| match &cmeta.defaults[p] {
+                        Some(e) => eval::eval(e, &EvalCtx::rowless(params)).unwrap_or(Value::Null),
+                        None => Value::Null,
+                    })
+                    .collect();
+                for rowid in matches {
+                    self.update_child_key(&cmeta, child_table, rowid, &cpos, &defaults)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Delete one child row by rowid, first cascading to its own children.
+    fn delete_row_cascade(
+        &mut self,
+        table: &str,
+        meta: &TableMeta,
+        rowid: i64,
+        params: &Params,
+    ) -> Result<()> {
+        // Read the row so its own dependents can be enforced.
+        let old = self.read_row(meta, rowid)?;
+        if let Some(old) = old {
+            self.enforce_parent_change(table, &old, None, params)?;
+        }
+        delete_table(self.backend.writer()?, meta.root, rowid)?;
+        let indexes = self.indexes_of(table)?;
+        if !indexes.is_empty() {
+            self.rebuild_indexes(meta, &indexes)?;
+        }
+        Ok(())
+    }
+
+    /// Set specific columns of a child row (by position) to new values.
+    fn update_child_key(
+        &mut self,
+        meta: &TableMeta,
+        table: &str,
+        rowid: i64,
+        positions: &[usize],
+        new_vals: &[Value],
+    ) -> Result<()> {
+        let Some(mut row) = self.read_row(meta, rowid)? else {
+            return Ok(());
+        };
+        for (&p, v) in positions.iter().zip(new_vals) {
+            row[p] = v.clone();
+        }
+        // Re-encode and rewrite the row (rowid unchanged here).
+        let mut stored = row.clone();
+        if let Some(ipk) = meta.ipk {
+            stored[ipk] = Value::Null;
+        }
+        let record = encode_record(&stored);
+        insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
+        let indexes = self.indexes_of(table)?;
+        if !indexes.is_empty() {
+            self.rebuild_indexes(meta, &indexes)?;
+        }
+        Ok(())
+    }
+
+    /// Read a single row's full column values by rowid (IPK filled in), or None.
+    fn read_row(&self, meta: &TableMeta, rowid: i64) -> Result<Option<Vec<Value>>> {
+        let encoding = self.backend.source().header().text_encoding;
+        let mut cur = TableCursor::new(self.backend.source(), meta.root);
+        if cur.seek(rowid)? {
+            let values = self.decode_full_row(meta, rowid, &cur.payload()?, encoding)?;
+            Ok(Some(values))
+        } else {
+            Ok(None)
+        }
     }
 
     fn exec_insert(&mut self, ins: &Insert, params: &Params) -> Result<usize> {
@@ -486,6 +840,7 @@ impl Connection {
             }
             check_not_null(&meta, &values)?;
             self.check_constraints(&meta, &values, Some(rowid), params)?;
+            self.check_fk_child(&ins.table, &meta, &values)?;
 
             // Resolve UNIQUE / PRIMARY KEY (incl. rowid) conflicts.
             let conflicts = self.find_conflicts(&meta, rowid, &values, None)?;
@@ -564,6 +919,12 @@ impl Connection {
         let indexes = self.indexes_of(&del.table)?;
         let victims = self.matching_rowids(&meta, del.where_clause.as_ref(), params)?;
         for rowid in &victims {
+            // Enforce referential actions on dependent child tables first.
+            if self.foreign_keys {
+                if let Some(old) = self.read_row(&meta, *rowid)? {
+                    self.enforce_parent_change(&del.table, &old, None, params)?;
+                }
+            }
             delete_table(self.backend.writer()?, meta.root, *rowid)?;
         }
         if !victims.is_empty() {
@@ -601,6 +962,7 @@ impl Connection {
 
         let mut affected = 0;
         for (rowid, mut values) in targets {
+            let old_row = values.clone();
             // Apply SET assignments evaluated against the current row.
             for (col, expr) in &upd.assignments {
                 let pos = meta
@@ -615,6 +977,12 @@ impl Connection {
             apply_column_affinity(&meta, &mut values);
             check_not_null(&meta, &values)?;
             self.check_constraints(&meta, &values, Some(rowid), params)?;
+            // Foreign keys: this row as a child must still point at a parent, and
+            // as a parent it must propagate referenced-key changes to children.
+            self.check_fk_child(&upd.table, &meta, &values)?;
+            if self.foreign_keys {
+                self.enforce_parent_change(&upd.table, &old_row, Some(&values), params)?;
+            }
             // New rowid if the IPK column was changed, else unchanged.
             let new_rowid = match meta.ipk {
                 Some(ipk) => eval::to_i64(&values[ipk]),
@@ -2844,6 +3212,22 @@ fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
             true
         }
     });
+}
+
+/// Interpret a `PRAGMA name = value` argument as a boolean, accepting
+/// `1`/`0`, `on`/`off`, `yes`/`no`, `true`/`false`.
+fn pragma_truth(e: &Expr, params: &Params) -> bool {
+    match e {
+        Expr::Column { column, .. } => {
+            matches!(column.to_ascii_lowercase().as_str(), "on" | "yes" | "true")
+        }
+        Expr::Literal(Literal::Str(s)) => {
+            matches!(s.to_ascii_lowercase().as_str(), "on" | "yes" | "true" | "1")
+        }
+        _ => eval::eval(e, &EvalCtx::rowless(params))
+            .map(|v| eval::to_i64(&v) != 0)
+            .unwrap_or(false),
+    }
 }
 
 /// The EXPLAIN QUERY PLAN display label for a table reference: SQLite shows

@@ -263,6 +263,37 @@ pub struct ColumnDef {
     pub constraints: Vec<ColumnConstraint>,
 }
 
+/// A referential action for a foreign key (`ON DELETE`/`ON UPDATE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FkAction {
+    /// `NO ACTION` (the default) — reject if dependent rows remain at statement end.
+    #[default]
+    NoAction,
+    /// `RESTRICT` — reject immediately.
+    Restrict,
+    /// `CASCADE` — propagate the delete/update to child rows.
+    Cascade,
+    /// `SET NULL` — null the child's referencing columns.
+    SetNull,
+    /// `SET DEFAULT` — reset the child's referencing columns to their defaults.
+    SetDefault,
+}
+
+/// A foreign-key definition (column- or table-level).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKey {
+    /// Child columns that make up the key.
+    pub columns: Vec<String>,
+    /// Referenced (parent) table.
+    pub ref_table: String,
+    /// Referenced (parent) columns; empty means the parent's primary key.
+    pub ref_columns: Vec<String>,
+    /// `ON DELETE` action.
+    pub on_delete: FkAction,
+    /// `ON UPDATE` action.
+    pub on_update: FkAction,
+}
+
 /// A column-level constraint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnConstraint {
@@ -281,6 +312,8 @@ pub enum ColumnConstraint {
     Collate(String),
     /// `CHECK (<expr>)`.
     Check(Expr),
+    /// `REFERENCES parent(cols) …` — a column-level foreign key.
+    References(ForeignKey),
 }
 
 /// A table-level constraint.
@@ -292,6 +325,8 @@ pub enum TableConstraint {
     Unique(Vec<String>),
     /// `CHECK (<expr>)`.
     Check(Expr),
+    /// `FOREIGN KEY (cols) REFERENCES parent(cols) …`.
+    ForeignKey(ForeignKey),
 }
 
 /// A `CREATE INDEX` statement.

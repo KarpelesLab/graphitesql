@@ -219,15 +219,32 @@ impl Parser {
     fn pragma(&mut self) -> Result<Pragma> {
         let name = self.ident()?;
         let value = if self.eat(&Token::Eq) {
-            Some(self.expr()?)
+            Some(self.pragma_value()?)
         } else if self.eat(&Token::LParen) {
-            let v = self.expr()?;
+            let v = self.pragma_value()?;
             self.expect(&Token::RParen)?;
             Some(v)
         } else {
             None
         };
         Ok(Pragma { name, value })
+    }
+
+    /// A PRAGMA argument: a normal expression, but also a bare keyword like
+    /// `ON`/`OFF`/`FULL` that SQLite accepts as a literal here.
+    fn pragma_value(&mut self) -> Result<Expr> {
+        if let Some(Token::Word(w)) = self.peek() {
+            let w = w.clone();
+            // A bare word not followed by an operator/paren is a keyword literal.
+            if is_reserved_keyword(&w.to_ascii_lowercase()) {
+                self.pos += 1;
+                return Ok(Expr::Column {
+                    table: None,
+                    column: w,
+                });
+            }
+        }
+        self.expr()
     }
 
     fn select(&mut self) -> Result<Select> {
@@ -706,7 +723,8 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 constraints.push(ColumnConstraint::Check(e));
             } else if self.eat_kw("references") {
-                self.skip_fk_clause()?;
+                let fk = self.parse_fk_clause(alloc::vec![name.clone()])?;
+                constraints.push(ColumnConstraint::References(fk));
             } else if self.eat_kw("generated") {
                 let _ = self.eat_kw("always");
                 self.expect_kw("as")?;
@@ -758,10 +776,10 @@ impl Parser {
             Ok(Some(TableConstraint::Check(e)))
         } else if self.eat_kw("foreign") {
             self.expect_kw("key")?;
-            self.skip_balanced_parens()?; // the (columns)
+            let columns = self.paren_columns()?;
             self.expect_kw("references")?;
-            self.skip_fk_clause()?;
-            Ok(None)
+            let fk = self.parse_fk_clause(columns)?;
+            Ok(Some(TableConstraint::ForeignKey(fk)))
         } else {
             Err(self.err("expected a table constraint"))
         }
@@ -790,22 +808,45 @@ impl Parser {
         Ok(())
     }
 
-    /// Consume the tail of a `REFERENCES` clause (target, optional columns, and
-    /// any `ON …`/`MATCH …`/`DEFERRABLE …` actions). Not modeled, just skipped.
-    fn skip_fk_clause(&mut self) -> Result<()> {
-        let _ = self.ident()?; // referenced table
-        if self.check(&Token::LParen) {
-            self.skip_balanced_parens()?;
-        }
+    /// Parse the tail of a `REFERENCES` clause (target table, optional parent
+    /// columns, and `ON DELETE/UPDATE …` / `MATCH …` / `DEFERRABLE …` actions)
+    /// into a [`ForeignKey`], given the child `columns`.
+    fn parse_fk_clause(&mut self, columns: Vec<String>) -> Result<ForeignKey> {
+        let ref_table = self.ident()?;
+        let ref_columns = if self.check(&Token::LParen) {
+            self.paren_columns()?
+        } else {
+            Vec::new()
+        };
+        let mut on_delete = FkAction::default();
+        let mut on_update = FkAction::default();
         loop {
             if self.eat_kw("on") {
-                let _ = self.advance(); // DELETE / UPDATE
-                if self.eat_kw("set") {
-                    let _ = self.advance(); // NULL / DEFAULT
+                let is_delete = self.eat_kw("delete");
+                if !is_delete {
+                    let _ = self.eat_kw("update");
+                }
+                let action = if self.eat_kw("set") {
+                    if self.eat_kw("null") {
+                        FkAction::SetNull
+                    } else {
+                        let _ = self.eat_kw("default");
+                        FkAction::SetDefault
+                    }
+                } else if self.eat_kw("cascade") {
+                    FkAction::Cascade
+                } else if self.eat_kw("restrict") {
+                    FkAction::Restrict
                 } else if self.eat_kw("no") {
                     let _ = self.eat_kw("action");
+                    FkAction::NoAction
                 } else {
-                    let _ = self.advance(); // CASCADE / RESTRICT
+                    FkAction::NoAction
+                };
+                if is_delete {
+                    on_delete = action;
+                } else {
+                    on_update = action;
                 }
             } else if self.eat_kw("match") {
                 let _ = self.advance();
@@ -822,7 +863,13 @@ impl Parser {
                 break;
             }
         }
-        Ok(())
+        Ok(ForeignKey {
+            columns,
+            ref_table,
+            ref_columns,
+            on_delete,
+            on_update,
+        })
     }
 
     /// A parenthesized column list, tolerating per-column `COLLATE`/`ASC`/`DESC`.
@@ -1558,9 +1605,27 @@ mod tests {
             .constraints
             .iter()
             .any(|c| matches!(c, ColumnConstraint::NotNull)));
-        // Only the modeled UNIQUE table constraint is kept (FK is skipped).
-        assert_eq!(ct.constraints.len(), 1);
-        assert!(matches!(ct.constraints[0], TableConstraint::Unique(_)));
+        // The column-level REFERENCES on `pid` is captured with its action.
+        let pid_fk = ct.columns[1]
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                ColumnConstraint::References(fk) => Some(fk),
+                _ => None,
+            })
+            .expect("pid REFERENCES captured");
+        assert_eq!(pid_fk.ref_table, "parent");
+        assert_eq!(pid_fk.on_delete, FkAction::Cascade);
+        // Table constraints: the UNIQUE and the table-level FOREIGN KEY.
+        assert_eq!(ct.constraints.len(), 2);
+        assert!(ct
+            .constraints
+            .iter()
+            .any(|c| matches!(c, TableConstraint::Unique(_))));
+        assert!(ct
+            .constraints
+            .iter()
+            .any(|c| matches!(c, TableConstraint::ForeignKey(_))));
     }
 
     #[test]
