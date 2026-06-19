@@ -251,15 +251,27 @@ databases lands well before write support).
 This is the open-ended breadth phase — it grows continuously toward full SQLite
 coverage rather than having a single "done".
 
-- **Landed so far:** multi-table **`INNER`/`LEFT`/cross/comma joins**
-  (nested-loop, with `ON`, aliases, aggregation over joins) — `tests/joins.rs`.
+- **Landed so far:**
+  - multi-table **`INNER`/`LEFT`/cross/comma joins** (nested-loop, with `ON`,
+    aliases, aggregation over joins) — `tests/joins.rs`;
+  - **freelist reclamation** — `free_page`/`allocate_page` reuse pages;
+    overflow-row `DELETE` returns pages to the freelist (`tests/write_compat.rs`);
+  - **`CREATE INDEX` + index maintenance** — index b-trees (record keys, splits,
+    overflow); incremental insert on `INSERT`, in-place rebuild on
+    `DELETE`/`UPDATE`; verified by sqlite3 `integrity_check` — `tests/indexes.rs`;
+  - **`DROP TABLE`/`DROP INDEX`** (frees b-trees, removes schema rows, drops a
+    table's dependent indexes);
+  - **`ALTER TABLE`** `ADD COLUMN` (with `DEFAULT` applied to existing rows on
+    read) and `RENAME TO` (repointing dependent indexes) — `tests/alter.rs`;
+  - an AST→SQL printer (`sql::print`) used to regenerate stored `CREATE` text;
+  - queryable **`PRAGMA`s** (`table_info`, `page_size`, …) and the `graphitesql`
+    **CLI shell**.
 - **Deliverable (remaining):** foreign keys & triggers; views; `WITH`/CTEs &
   recursive queries; window functions; subqueries (scalar, `IN (SELECT)`);
-  `CREATE INDEX` write-path + index maintenance; index-driven query planning;
-  `ALTER`/`DROP`/`VACUUM`; freelist reclamation (unblocks overflow-row delete &
-  page merging); the rest of the built-in & `date/time`/`printf`/math functions;
-  `EXPLAIN`; the bulk of `PRAGMA`s; full type-affinity & collation edge cases;
-  WAL *write* path.
+  index-driven query planning; `ALTER … RENAME COLUMN`; `VACUUM`;
+  `WITHOUT ROWID`; constraint enforcement (`UNIQUE`/`CHECK`/`NOT NULL`); the rest
+  of the built-in & `date/time`/`printf`/math functions; `EXPLAIN`; full
+  type-affinity & collation edge cases; WAL *write* path; b-tree page merging.
 - **Goal:** pass a curated slice of SQLite's own test assertions and a large
   differential corpus.
 - **Reference:** `fkey.c`, `trigger.c`, `window.c`, `date.c`, `pragma.c`,

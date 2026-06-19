@@ -30,6 +30,8 @@ pub enum Statement {
     CreateIndex(CreateIndex),
     /// A `DROP TABLE`/`DROP INDEX`/… statement.
     Drop(Drop),
+    /// An `ALTER TABLE` statement.
+    Alter(Alter),
     /// `BEGIN [TRANSACTION]`.
     Begin,
     /// `COMMIT`/`END`.
@@ -260,6 +262,31 @@ pub struct Drop {
     pub if_exists: bool,
     /// Object name.
     pub name: String,
+}
+
+/// An `ALTER TABLE` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Alter {
+    /// The table being altered.
+    pub table: String,
+    /// What to do to it.
+    pub action: AlterAction,
+}
+
+/// The action of an `ALTER TABLE`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    /// `RENAME TO new_name`.
+    RenameTable(String),
+    /// `RENAME [COLUMN] old TO new`.
+    RenameColumn {
+        /// Existing column name.
+        old: String,
+        /// New column name.
+        new: String,
+    },
+    /// `ADD [COLUMN] <column-def>`.
+    AddColumn(ColumnDef),
 }
 
 /// A `PRAGMA` statement.

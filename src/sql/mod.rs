@@ -7,6 +7,7 @@
 
 pub mod ast;
 pub mod parser;
+pub mod print;
 pub mod token;
 
 pub use parser::{parse, parse_one};

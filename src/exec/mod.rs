@@ -321,6 +321,10 @@ impl Connection {
                 self.exec_drop(&d)?;
                 0
             }
+            Statement::Alter(a) => {
+                self.exec_alter(&a)?;
+                0
+            }
             Statement::Pragma(_) => 0, // accepted, no-op for now
             Statement::Select(_) => return Err(Error::Unsupported("use query() for SELECT")),
             Statement::Begin | Statement::Commit | Statement::Rollback => unreachable!(),
@@ -476,11 +480,7 @@ impl Connection {
             let mut ok = cur.first()?;
             while ok {
                 let rowid = cur.rowid()?;
-                let mut values = decode_record(&cur.payload()?, encoding)?;
-                values.resize(meta.columns.len(), Value::Null);
-                if let Some(ipk) = meta.ipk {
-                    values[ipk] = Value::Integer(rowid);
-                }
+                let values = self.decode_full_row(&meta, rowid, &cur.payload()?, encoding)?;
                 let matches = match &upd.where_clause {
                     Some(p) => {
                         let ctx = row_ctx(&values, &meta.columns, Some(rowid), params);
@@ -611,6 +611,114 @@ impl Connection {
         Ok(())
     }
 
+    fn exec_alter(&mut self, a: &Alter) -> Result<()> {
+        let obj = self
+            .schema
+            .table(&a.table)
+            .cloned()
+            .ok_or_else(|| Error::Error(format!("no such table: {}", a.table)))?;
+        let sql = obj
+            .sql
+            .as_deref()
+            .ok_or_else(|| Error::Corrupt("table has no CREATE statement".into()))?;
+        let Statement::CreateTable(mut ct) = sql::parse_one(sql)? else {
+            return Err(Error::Corrupt("schema sql is not CREATE TABLE".into()));
+        };
+
+        match &a.action {
+            AlterAction::AddColumn(cd) => {
+                if ct
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&cd.name))
+                {
+                    return Err(Error::Error(format!("duplicate column name: {}", cd.name)));
+                }
+                ct.columns.push(cd.clone());
+                let new_sql = sql::print::create_table(&ct);
+                let table = a.table.clone();
+                self.rewrite_schema_rows(|cols| {
+                    if is_text(&cols[0], "table") && is_text(&cols[1], &table) {
+                        cols[4] = Value::Text(new_sql.clone());
+                        true
+                    } else {
+                        false
+                    }
+                })?;
+            }
+            AlterAction::RenameTable(new_name) => {
+                if self.schema.table(new_name).is_some() {
+                    return Err(Error::Error(format!("table {new_name} already exists")));
+                }
+                ct.name = new_name.clone();
+                let new_table_sql = sql::print::create_table(&ct);
+                let old = a.table.clone();
+                let new_name = new_name.clone();
+                self.rewrite_schema_rows(|cols| {
+                    if is_text(&cols[0], "table") && is_text(&cols[1], &old) {
+                        cols[1] = Value::Text(new_name.clone());
+                        cols[2] = Value::Text(new_name.clone());
+                        cols[4] = Value::Text(new_table_sql.clone());
+                        true
+                    } else if is_text(&cols[2], &old) {
+                        // Dependent index/trigger/view: repoint, and rewrite an
+                        // index's CREATE text to reference the new table name.
+                        cols[2] = Value::Text(new_name.clone());
+                        if is_text(&cols[0], "index") {
+                            if let Some(Value::Text(isql)) = cols.get(4).cloned() {
+                                if let Ok(Statement::CreateIndex(mut ci)) = sql::parse_one(&isql) {
+                                    ci.table = new_name.clone();
+                                    cols[4] = Value::Text(sql::print::create_index(&ci));
+                                }
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                })?;
+            }
+            AlterAction::RenameColumn { .. } => {
+                return Err(Error::Unsupported("ALTER TABLE RENAME COLUMN"));
+            }
+        }
+
+        let cookie = self
+            .backend
+            .writer()?
+            .header()
+            .schema_cookie
+            .wrapping_add(1);
+        self.backend.writer()?.header_mut().schema_cookie = cookie;
+        self.schema = Schema::read(self.backend.source())?;
+        Ok(())
+    }
+
+    /// Scan `sqlite_schema`, let `f` mutate each decoded 5-column row in place,
+    /// and rewrite (delete + re-insert at the same rowid) the rows it changed.
+    fn rewrite_schema_rows(&mut self, mut f: impl FnMut(&mut Vec<Value>) -> bool) -> Result<()> {
+        let encoding = self.backend.source().header().text_encoding;
+        let mut changes: Vec<(i64, Vec<u8>)> = Vec::new();
+        {
+            let mut cur = TableCursor::new(self.backend.source(), crate::schema::SCHEMA_ROOT_PAGE);
+            let mut ok = cur.first()?;
+            while ok {
+                let mut cols = decode_record(&cur.payload()?, encoding)?;
+                cols.resize(5, Value::Null);
+                if f(&mut cols) {
+                    changes.push((cur.rowid()?, encode_record(&cols)));
+                }
+                ok = cur.next()?;
+            }
+        }
+        let w = self.backend.writer()?;
+        for (rid, rec) in changes {
+            delete_table(w, crate::schema::SCHEMA_ROOT_PAGE, rid)?;
+            insert_table(w, crate::schema::SCHEMA_ROOT_PAGE, rid, &rec)?;
+        }
+        Ok(())
+    }
+
     /// Resolve the `sqlite_schema` rowids of the objects named in `names`.
     fn schema_rowids_for(&self, names: &[String]) -> Result<Vec<i64>> {
         let encoding = self.backend.source().header().text_encoding;
@@ -696,11 +804,7 @@ impl Connection {
         let mut ok = cur.first()?;
         while ok {
             let rowid = cur.rowid()?;
-            let mut values = decode_record(&cur.payload()?, encoding)?;
-            values.resize(meta.columns.len(), Value::Null);
-            if let Some(ipk) = meta.ipk {
-                values[ipk] = Value::Integer(rowid);
-            }
+            let values = self.decode_full_row(meta, rowid, &cur.payload()?, encoding)?;
             let keep = match pred {
                 Some(p) => {
                     let ctx = row_ctx(&values, &meta.columns, Some(rowid), params);
@@ -889,8 +993,7 @@ impl Connection {
         Ok((columns, input_rows))
     }
 
-    /// Scan a whole table into `(rowid, column values)` with the INTEGER PRIMARY
-    /// KEY column filled in from the rowid and short records NULL-padded.
+    /// Scan a whole table into `(rowid, column values)`.
     fn scan_table(&self, meta: &TableMeta) -> Result<Vec<(i64, Vec<Value>)>> {
         let encoding = self.backend.source().header().text_encoding;
         let mut rows = Vec::new();
@@ -898,15 +1001,40 @@ impl Connection {
         let mut ok = cur.first()?;
         while ok {
             let rowid = cur.rowid()?;
-            let mut values = decode_record(&cur.payload()?, encoding)?;
-            values.resize(meta.columns.len(), Value::Null);
-            if let Some(ipk) = meta.ipk {
-                values[ipk] = Value::Integer(rowid);
-            }
+            let values = self.decode_full_row(meta, rowid, &cur.payload()?, encoding)?;
             rows.push((rowid, values));
             ok = cur.next()?;
         }
         Ok(rows)
+    }
+
+    /// Decode a stored row into full column values: pad missing trailing columns
+    /// with their `DEFAULT` (or NULL), and fill the INTEGER PRIMARY KEY column
+    /// from the rowid. This is how `ALTER TABLE ADD COLUMN` defaults show up for
+    /// rows written before the column existed.
+    fn decode_full_row(
+        &self,
+        meta: &TableMeta,
+        rowid: i64,
+        payload: &[u8],
+        encoding: crate::format::TextEncoding,
+    ) -> Result<Vec<Value>> {
+        let mut values = decode_record(payload, encoding)?;
+        let stored = values.len();
+        values.resize(meta.columns.len(), Value::Null);
+        if stored < meta.columns.len() {
+            let p = Params::default();
+            let ctx = EvalCtx::rowless(&p);
+            for (i, def) in meta.defaults.iter().enumerate().skip(stored) {
+                if let Some(e) = def {
+                    values[i] = eval::eval(e, &ctx)?;
+                }
+            }
+        }
+        if let Some(ipk) = meta.ipk {
+            values[ipk] = Value::Integer(rowid);
+        }
+        Ok(values)
     }
 
     /// Non-aggregated projection: one output row per input row.
@@ -1274,6 +1402,11 @@ struct TableMeta {
 struct IndexMeta {
     root: u32,
     cols: Vec<usize>,
+}
+
+/// Whether a value is the given text (used to match `sqlite_schema` columns).
+fn is_text(v: &Value, s: &str) -> bool {
+    matches!(v, Value::Text(t) if t == s)
 }
 
 /// Build an index key record: the indexed column values followed by the trailing

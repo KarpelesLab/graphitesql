@@ -166,6 +166,9 @@ impl Parser {
         if self.check_kw("drop") {
             return Ok(Statement::Drop(self.drop_stmt()?));
         }
+        if self.check_kw("alter") {
+            return Ok(Statement::Alter(self.alter()?));
+        }
         if self.eat_kw("begin") {
             let _ = self.eat_kw("transaction")
                 || self.eat_kw("deferred")
@@ -654,6 +657,29 @@ impl Parser {
             if_exists,
             name,
         })
+    }
+
+    fn alter(&mut self) -> Result<Alter> {
+        self.expect_kw("alter")?;
+        self.expect_kw("table")?;
+        let table = self.ident()?;
+        let action = if self.eat_kw("rename") {
+            if self.eat_kw("to") {
+                AlterAction::RenameTable(self.ident()?)
+            } else {
+                let _ = self.eat_kw("column");
+                let old = self.ident()?;
+                self.expect_kw("to")?;
+                let new = self.ident()?;
+                AlterAction::RenameColumn { old, new }
+            }
+        } else if self.eat_kw("add") {
+            let _ = self.eat_kw("column");
+            AlterAction::AddColumn(self.column_def()?)
+        } else {
+            return Err(self.err("expected RENAME or ADD after ALTER TABLE"));
+        };
+        Ok(Alter { table, action })
     }
 
     // ---- expressions (Pratt) ------------------------------------------------
