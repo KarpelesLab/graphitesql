@@ -70,6 +70,26 @@ fn update_and_delete() {
 }
 
 #[test]
+fn pragma_table_info_and_page_size() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT NOT NULL, n INT DEFAULT 7)")
+        .unwrap();
+    let info = c.query("PRAGMA table_info(t)").unwrap();
+    assert_eq!(info.columns[0], "cid");
+    assert_eq!(info.rows.len(), 3);
+    // id: pk=1, notnull=1 (INTEGER PRIMARY KEY)
+    assert_eq!(info.rows[0][1], Value::Text("id".into()));
+    assert_eq!(info.rows[0][5], Value::Integer(1)); // pk
+                                                    // name: notnull=1
+    assert_eq!(info.rows[1][3], Value::Integer(1));
+    // n: default '7'
+    assert_eq!(info.rows[2][4], Value::Text("7".into()));
+
+    let ps = c.query("PRAGMA page_size").unwrap();
+    assert_eq!(ps.rows[0][0], Value::Integer(4096));
+}
+
+#[test]
 fn defaults_applied() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, status TEXT DEFAULT 'new', n INT DEFAULT 0)")

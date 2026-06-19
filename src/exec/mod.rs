@@ -167,10 +167,110 @@ impl Connection {
     pub fn query_params(&self, sql: &str, params: &Params) -> Result<QueryResult> {
         match sql::parse_one(sql)? {
             Statement::Select(sel) => self.run_select(&sel, params),
+            Statement::Pragma(p) => self.run_pragma(&p),
             _ => Err(Error::Unsupported(
                 "use execute() for non-SELECT statements",
             )),
         }
+    }
+
+    /// Evaluate the read-only `PRAGMA`s that return a result set.
+    fn run_pragma(&self, p: &Pragma) -> Result<QueryResult> {
+        let name = p.name.to_ascii_lowercase();
+        let header = self.backend.source().header();
+        let single = |col: &str, v: Value| QueryResult {
+            columns: alloc::vec![String::from(col)],
+            rows: alloc::vec![alloc::vec![v]],
+        };
+        match name.as_str() {
+            "page_size" => Ok(single("page_size", Value::Integer(header.page_size as i64))),
+            "page_count" => Ok(single(
+                "page_count",
+                Value::Integer(self.backend.source().page_count() as i64),
+            )),
+            "user_version" => Ok(single(
+                "user_version",
+                Value::Integer(header.user_version as i64),
+            )),
+            "schema_version" => Ok(single(
+                "schema_version",
+                Value::Integer(header.schema_cookie as i64),
+            )),
+            "encoding" => Ok(single(
+                "encoding",
+                Value::Text(
+                    match header.text_encoding {
+                        crate::format::TextEncoding::Utf8 => "UTF-8",
+                        crate::format::TextEncoding::Utf16Le => "UTF-16le",
+                        crate::format::TextEncoding::Utf16Be => "UTF-16be",
+                    }
+                    .into(),
+                ),
+            )),
+            "table_info" => self.pragma_table_info(p),
+            _ => Err(Error::Unsupported("this PRAGMA")),
+        }
+    }
+
+    /// `PRAGMA table_info(name)` → one row per column
+    /// `(cid, name, type, notnull, dflt_value, pk)`.
+    fn pragma_table_info(&self, p: &Pragma) -> Result<QueryResult> {
+        let table = match &p.value {
+            Some(Expr::Column { column, .. }) => column.clone(),
+            Some(Expr::Literal(Literal::Str(s))) => s.clone(),
+            _ => {
+                return Err(Error::Error(
+                    "PRAGMA table_info requires a table name".into(),
+                ))
+            }
+        };
+        let obj = self
+            .schema
+            .table(&table)
+            .ok_or_else(|| Error::Error(format!("no such table: {table}")))?;
+        let sql = obj.sql.as_deref().unwrap_or("");
+        let Statement::CreateTable(ct) = sql::parse_one(sql)? else {
+            return Err(Error::Corrupt("schema sql is not CREATE TABLE".into()));
+        };
+        let ipk = find_integer_primary_key(&ct);
+
+        let mut rows = Vec::new();
+        for (i, col) in ct.columns.iter().enumerate() {
+            let notnull = col
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::NotNull))
+                || Some(i) == ipk;
+            let dflt = col.constraints.iter().find_map(|c| match c {
+                ColumnConstraint::Default(Expr::Literal(l)) => Some(literal_text(l)),
+                _ => None,
+            });
+            let pk = if Some(i) == ipk
+                || col
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
+            {
+                1
+            } else {
+                0
+            };
+            rows.push(alloc::vec![
+                Value::Integer(i as i64),
+                Value::Text(col.name.clone()),
+                Value::Text(col.type_name.clone().unwrap_or_default()),
+                Value::Integer(notnull as i64),
+                dflt.map(Value::Text).unwrap_or(Value::Null),
+                Value::Integer(pk),
+            ]);
+        }
+        Ok(QueryResult {
+            columns: ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+                .iter()
+                .map(|s| String::from(*s))
+                .collect(),
+            rows,
+        })
     }
 
     /// Execute a single non-`SELECT` statement, returning the number of rows
@@ -1143,6 +1243,18 @@ fn value_to_literal(v: Value) -> Literal {
         Value::Text(s) => Literal::Str(s),
         Value::Blob(b) => Literal::Blob(b),
     }
+}
+
+/// Render a literal as text (for `PRAGMA table_info`'s default-value column).
+fn literal_text(l: &Literal) -> String {
+    eval::to_text(&match l {
+        Literal::Null => Value::Null,
+        Literal::Integer(i) => Value::Integer(*i),
+        Literal::Real(r) => Value::Real(*r),
+        Literal::Str(s) => Value::Text(s.clone()),
+        Literal::Blob(b) => Value::Blob(b.clone()),
+        Literal::Boolean(b) => Value::Integer(*b as i64),
+    })
 }
 
 /// Best-effort label for an unaliased result expression.
