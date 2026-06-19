@@ -9,7 +9,7 @@
 //!   contents of every page about to be overwritten are written to a journal
 //!   file and synced *before* the database file is modified; the journal is
 //!   cleared only after the database is synced. A crash mid-commit leaves a
-//!   journal that [`recover`](WritePager::recover) replays on next open.
+//!   journal that the next [`open`](WritePager::open) replays via recovery.
 //!
 //! Reads consult the overlay first, so within a transaction the pager is
 //! read-your-writes consistent. It implements [`PageSource`], so the existing

@@ -55,3 +55,35 @@ jobs:
           key: docs
       - name: cargo doc --no-deps --all-features
         run: cargo doc --no-deps --all-features
+
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      # The cross-engine compatibility tests use the sqlite3 CLI when present
+      # (they skip gracefully otherwise); install it so CI exercises them.
+      - name: Install sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: cargo test --all-features
+        run: cargo test --all-features
+
+  no_std:
+    name: no_std build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: no_std
+      - name: cargo build --no-default-features
+        run: cargo build --no-default-features

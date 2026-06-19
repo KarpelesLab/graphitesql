@@ -4,7 +4,7 @@
 //! evaluates an [`Expr`] to a [`Value`], applying SQLite's comparison order,
 //! truthiness, numeric coercion, and a core set of built-in scalar functions.
 //! Aggregate functions are *not* handled here — they span rows and are computed
-//! by the executor ([`super::exec`]).
+//! by the executor (the [`super`] module).
 //!
 //! The rules implemented mirror SQLite's documented behavior
 //! (`lang_expr.html`, `datatype3.html`): `NULL` sorts first; values compare
