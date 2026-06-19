@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/graphitesql/compare/v0.0.3...v0.0.4) - 2026-06-19
+
+### Other
+
+- Phase 9: UNIQUE constraints on WITHOUT ROWID tables
+- Phase 9: real VACUUM compaction + empty-page cursor fix
+- Phase 8/9: WAL write path (PRAGMA journal_mode=WAL)
+- Phase 9: secondary indexes on WITHOUT ROWID tables
+- Phase 9: INSTEAD OF triggers (writable views)
+- Phase 9: WITHOUT ROWID tables
+- correct remaining-deliverables list
+- Phase 9: automatic indexes for UNIQUE / PRIMARY KEY
+- Phase 9: PRAGMA recursive_triggers
+- Phase 9: broaden differential corpus to 1658 (windows, subqueries, reals)
+- Phase 9: explicit window frame clauses
+- Phase 9: derived tables (FROM (SELECT ...) AS alias)
+- Phase 9: views and CTEs as join sources
+- refresh README status for expanded SQL surface
+- Phase 9: row triggers (CREATE TRIGGER)
+- Phase 9: foreign-key enforcement (PRAGMA foreign_keys)
+- Phase 9: window functions + %.15g real formatting
+- Phase 9: correlated subqueries + EXISTS
+- Phase 9: recursive CTEs (WITH RECURSIVE)
+- Phase 9: EXPLAIN QUERY PLAN + rowid equality fast-path
+- Phase 9: date/time functions + printf/format
+
 ### Other
 
 - Phase 9: `UNIQUE` constraints on `WITHOUT ROWID` tables — the implied
