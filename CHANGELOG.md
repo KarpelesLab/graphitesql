@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- Phase 9: b-tree page merging on delete — a delete that empties table leaf pages
+  now compacts the b-tree in place (root preserved), returning the slack to the
+  freelist for reuse so the file no longer grows unboundedly across delete/insert
+  cycles; verified valid across heavy/scattered/full deletes by `sqlite3`
+  `integrity_check`. This clears the last named Phase 9 deliverable.
+
 ## [0.0.4](https://github.com/KarpelesLab/graphitesql/compare/v0.0.3...v0.0.4) - 2026-06-19
 
 ### Other
@@ -32,77 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 9: recursive CTEs (WITH RECURSIVE)
 - Phase 9: EXPLAIN QUERY PLAN + rowid equality fast-path
 - Phase 9: date/time functions + printf/format
-
-### Other
-
-- Phase 9: `UNIQUE` constraints on `WITHOUT ROWID` tables — the implied
-  `sqlite_autoindex` (keyed by the unique cols + PK cols, numbered by SQLite's
-  declaration-position rule) is written and maintained, and the constraint is
-  enforced; verified by `sqlite3 integrity_check`
-- Phase 9: real `VACUUM` compaction — rebuilds the database into a fresh, gap-free
-  image (no free pages, defragmented b-trees), shrinking the file while
-  preserving rows, indexes, triggers, and `user_version`; the result passes real
-  `sqlite3 integrity_check`
-- Fix: b-tree cursors now skip empty leaf/interior pages left behind by heavy
-  deletes (previously a scan after deleting most rows errored with "cell index
-  out of range")
-- Phase 9: **WAL write path** — `PRAGMA journal_mode=WAL` switches the database
-  to write-ahead logging; commits append page frames (with SQLite's exact
-  checksums/salts) to the `-wal` file, `PRAGMA wal_checkpoint` writes them back
-  to the main file, and reopening loads an uncheckpointed `-wal`. Real `sqlite3`
-  reads graphitesql-written WAL databases (checkpointed or not) with
-  `integrity_check = ok`
-- Phase 9: secondary indexes on `WITHOUT ROWID` tables — `CREATE INDEX` on a
-  WITHOUT ROWID table builds and maintains a b-tree keyed by (indexed cols, PK
-  cols), as SQLite does; verified by `sqlite3 integrity_check`
-- Phase 9: `INSTEAD OF` triggers — INSERT/UPDATE/DELETE on a view fire its
-  `INSTEAD OF` triggers (with `OLD`/`NEW`), making views writable; without one,
-  modifying a view is rejected as in SQLite
-- Phase 9: `WITHOUT ROWID` tables — stored as a PK-clustered index b-tree
-  (records held PK-first), with CRUD, composite primary keys, and
-  `INSERT OR REPLACE`. graphitesql-written WITHOUT ROWID databases pass real
-  `sqlite3 integrity_check`, and graphitesql reads sqlite-written ones
-- Phase 9: automatic indexes for `UNIQUE` / non-rowid `PRIMARY KEY` — graphitesql
-  now writes the implicit `sqlite_autoindex_<table>_<n>` b-trees and maintains
-  them across INSERT/UPDATE/DELETE. Fixes a file-format bug where real SQLite
-  rejected such databases ("wrong # of entries in index sqlite_autoindex_*")
-- Phase 9: `PRAGMA recursive_triggers` — triggers may fire other triggers when
-  enabled (bounded to 1000 levels); off by default, matching SQLite
-- Phase 9: broaden the differential corpus to 1658 queries (window functions,
-  derived tables, correlated subqueries/`EXISTS`, real-valued expressions) and
-  render reals through the `%.15g`-compatible formatter
-- Phase 9: explicit window frame clauses — `ROWS`/`RANGE`/`GROUPS BETWEEN … AND …`
-  (and the bare-start form), with `UNBOUNDED`/`CURRENT ROW`/`N PRECEDING`/
-  `N FOLLOWING` bounds and an accepted-and-ignored `EXCLUDE` clause
-- Phase 9: derived tables — `FROM (SELECT …) [AS] alias` as a sole source or a
-  join operand
-- Phase 9: views (and CTEs) usable as a join source — a view or CTE may now
-  appear on either side of a `JOIN`, not just as the sole `FROM` source
-- Phase 9: row triggers — `CREATE TRIGGER … [BEFORE|AFTER] {INSERT|UPDATE|DELETE}
-  ON t [WHEN …] BEGIN … END` with `OLD`/`NEW` row references and `DROP TRIGGER`;
-  fired non-recursively (matching `recursive_triggers = OFF`)
-- Phase 9: foreign-key enforcement behind `PRAGMA foreign_keys = ON` (off by
-  default, as in SQLite) — child-side parent-existence checks on INSERT/UPDATE,
-  and referential actions on the parent (NO ACTION/RESTRICT, CASCADE, SET NULL,
-  SET DEFAULT) for DELETE and UPDATE; FK clauses are now modeled in the AST
-- Phase 9: window functions — `row_number`, `rank`, `dense_rank`, `ntile`,
-  `lag`/`lead`, `first_value`/`last_value`/`nth_value`, and aggregate windows
-  (`sum`/`avg`/`count`/`min`/`max`/`total`/`group_concat`) over
-  `PARTITION BY`/`ORDER BY` with SQLite's default frame; verified against `sqlite3`
-- Phase 9: real-number text formatting now matches SQLite's `%!.15g` exactly
-  (15 significant digits, scientific past the `[-4, 15)` exponent window)
-- Phase 9: correlated subqueries (scalar `(SELECT …)`, `IN (SELECT …)`) and
-  `[NOT] EXISTS (SELECT …)` — the subquery resolves columns from the enclosing
-  query's current row via an outer-scope frame stack
-- Phase 9: recursive `WITH RECURSIVE` CTEs (anchor + fixed-point recursive term,
-  `UNION`/`UNION ALL`), CTEs that reference earlier CTEs, and CTEs usable as a
-  join source — backed by a materialized CTE environment
-- Phase 9: `EXPLAIN QUERY PLAN` (SCAN/SEARCH plan rows in SQLite's format) and a
-  rowid (`INTEGER PRIMARY KEY`) equality fast-path that seeks the table b-tree
-  directly instead of scanning
-- Phase 9: date/time functions (`date`, `time`, `datetime`, `julianday`,
-  `unixepoch`, `strftime`) and `printf`/`format` — a dependency-free port of
-  SQLite's `date.c` Julian-day core, verified differentially against `sqlite3`
 
 ## [0.0.3](https://github.com/KarpelesLab/graphitesql/compare/v0.0.2...v0.0.3) - 2026-06-19
 

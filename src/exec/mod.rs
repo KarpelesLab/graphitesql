@@ -19,8 +19,8 @@ pub mod func;
 mod window;
 
 use crate::btree::{
-    clear_index, create_index_root, create_table_root, delete_table, free_tree, insert_index,
-    insert_table, IndexCursor, TableCursor,
+    clear_index, clear_table, create_index_root, create_table_root, delete_table, free_tree,
+    insert_index, insert_table, table_has_empty_leaf, IndexCursor, TableCursor,
 };
 use crate::error::{Error, Result};
 use crate::format::record::{decode_record, encode_record};
@@ -1503,9 +1503,37 @@ impl Connection {
             }
         }
         if !victims.is_empty() {
+            self.compact_table(&meta)?;
             self.rebuild_indexes(&meta, &indexes)?;
         }
         Ok(victims.len())
+    }
+
+    /// Reclaim empty/underfull table b-tree pages left by deletes: if the table
+    /// has any empty leaf page, rebuild the b-tree compactly in place (root page
+    /// number preserved), freeing the slack to the freelist. This is graphitesql's
+    /// page-merging-on-delete — using the well-tested insert path rather than
+    /// in-place sibling rebalancing — and keeps the tree balanced and compact.
+    fn compact_table(&mut self, meta: &TableMeta) -> Result<()> {
+        if !table_has_empty_leaf(self.backend.source(), meta.root)? {
+            return Ok(());
+        }
+        // Collect every surviving (rowid, raw payload) in key order.
+        let mut rows: Vec<(i64, Vec<u8>)> = Vec::new();
+        {
+            let mut cur = TableCursor::new(self.backend.source(), meta.root);
+            let mut ok = cur.first()?;
+            while ok {
+                rows.push((cur.rowid()?, cur.payload()?));
+                ok = cur.next()?;
+            }
+        }
+        let w = self.backend.writer()?;
+        clear_table(w, meta.root)?;
+        for (rowid, payload) in &rows {
+            insert_table(w, meta.root, *rowid, payload)?;
+        }
+        Ok(())
     }
 
     fn exec_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
@@ -1604,6 +1632,7 @@ impl Connection {
             affected += 1;
         }
         if affected > 0 {
+            self.compact_table(&meta)?;
             self.rebuild_indexes(&meta, &indexes)?;
         }
         Ok(affected)

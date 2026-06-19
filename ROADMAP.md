@@ -346,13 +346,19 @@ coverage rather than having a single "done".
     now also tolerate empty pages left by heavy deletes;
   - **`UNIQUE` constraints on `WITHOUT ROWID` tables** — the implied
     `sqlite_autoindex` (unique cols + PK cols, numbered by declaration position)
-    is written, maintained, and enforced (`tests/without_rowid.rs`).
-- **Deliverable (remaining):** eager b-tree page *merging* on delete — a pure
-  space-reclamation optimization. `VACUUM` already reclaims the space, cursors
-  traverse the empty pages correctly meanwhile, and SQLite itself only merges
-  opportunistically, so a non-merging delete is valid SQLite-compatible behavior.
-  This is the last open item, and it affects neither correctness nor file-format
-  compatibility.
+    is written, maintained, and enforced (`tests/without_rowid.rs`);
+  - **b-tree page merging on delete** — a delete that empties table leaf pages
+    compacts the b-tree in place (root preserved) and returns the slack to the
+    freelist for reuse, so the file no longer grows unboundedly across
+    delete/insert cycles; valid across heavy/scattered/full deletes per
+    `integrity_check` (`tests/page_merge.rs`).
+- **Deliverable (remaining):** the concrete Phase 9 backlog is **cleared** — the
+  full SQL surface, all constraints (incl. FKs), triggers (incl. `INSTEAD OF` /
+  recursive), `WITHOUT ROWID`, automatic + secondary + `UNIQUE` indexes, WAL
+  read **and** write, real `VACUUM`, and page merging are done, each verified
+  differentially against `sqlite3`. The track stays open for further SQLite
+  coverage (e.g. `ANALYZE`/query-planner statistics, generated columns, FTS5,
+  collation edge cases), now as additive breadth rather than named gaps.
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.

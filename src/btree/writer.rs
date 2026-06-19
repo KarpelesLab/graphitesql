@@ -103,6 +103,65 @@ pub fn delete_table(wp: &mut WritePager, root: u32, rowid: i64) -> Result<bool> 
     }
 }
 
+/// Empty a table b-tree while keeping its root page number stable: free every
+/// descendant page (and overflow chain) and reset the root to an empty leaf.
+/// Used to compact a table in place after deletes leave empty/underfull pages,
+/// without having to rewrite the table's `rootpage` in `sqlite_schema`.
+pub fn clear_table(wp: &mut WritePager, root: u32) -> Result<()> {
+    let usable = wp.usable_size();
+    let page_size = usable + wp.header().reserved_space as usize;
+    let bt = BtreePage::parse(wp.page(root)?)?;
+    let body = if root == 1 {
+        crate::format::header::HEADER_LEN
+    } else {
+        0
+    };
+    let prefix = page_one_prefix(root, &bt);
+    match bt.page_type() {
+        PageType::LeafTable => {
+            for i in 0..bt.num_cells() {
+                free_overflow_chain(wp, bt.table_leaf_cell(i, usable)?.payload.overflow)?;
+            }
+        }
+        PageType::InteriorTable => {
+            let n = bt.num_cells();
+            for i in 0..n {
+                super::free_tree(wp, bt.child_pointer(i)?)?;
+            }
+            super::free_tree(wp, bt.right_pointer())?;
+        }
+        _ => return Err(Error::Corrupt("clear of a non-table b-tree".into())),
+    }
+    let empty = serialize_leaf(page_size, body, &[], prefix.as_deref());
+    wp.write_page(root, empty)?;
+    Ok(())
+}
+
+/// Whether the table b-tree at `root` has any empty leaf page below an interior
+/// page (i.e. reclaimable waste from deletes). A single-leaf table never does.
+pub fn table_has_empty_leaf(wp: &dyn PageSource, root: u32) -> Result<bool> {
+    fn walk(wp: &dyn PageSource, page_no: u32) -> Result<bool> {
+        let bt = BtreePage::parse(wp.page(page_no)?)?;
+        match bt.page_type() {
+            PageType::LeafTable => Ok(bt.num_cells() == 0),
+            PageType::InteriorTable => {
+                for i in 0..bt.num_cells() {
+                    if walk(wp, bt.child_pointer(i)?)? {
+                        return Ok(true);
+                    }
+                }
+                walk(wp, bt.right_pointer())
+            }
+            _ => Ok(false),
+        }
+    }
+    let bt = BtreePage::parse(wp.page(root)?)?;
+    if bt.page_type() == PageType::LeafTable {
+        return Ok(false);
+    }
+    walk(wp, root)
+}
+
 /// Build the on-page cell bytes for a table-leaf row, allocating overflow pages
 /// for any payload that does not fit locally.
 fn build_leaf_cell(wp: &mut WritePager, rowid: i64, payload: &[u8]) -> Result<Vec<u8>> {
