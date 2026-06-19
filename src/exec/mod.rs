@@ -443,6 +443,29 @@ impl Connection {
             next,
             &row,
         )?;
+
+        // Create the automatic indexes SQLite implies for UNIQUE / non-rowid
+        // PRIMARY KEY constraints, so the file is a valid SQLite database (it
+        // otherwise reports "wrong # of entries in index sqlite_autoindex_*").
+        let ipk = find_integer_primary_key(ct);
+        let unique = collect_unique_sets(ct, ipk);
+        for (n, schema_rowid) in (next + 1..).enumerate().take(unique.len()) {
+            let idx_root = create_index_root(self.backend.writer()?)?;
+            let idx_row = encode_record(&[
+                Value::Text("index".into()),
+                Value::Text(alloc::format!("sqlite_autoindex_{}_{}", ct.name, n + 1)),
+                Value::Text(ct.name.clone()),
+                Value::Integer(idx_root as i64),
+                Value::Null, // automatic indexes carry no CREATE SQL
+            ]);
+            insert_table(
+                self.backend.writer()?,
+                crate::schema::SCHEMA_ROOT_PAGE,
+                schema_rowid,
+                &idx_row,
+            )?;
+        }
+
         let cookie = self
             .backend
             .writer()?
@@ -2056,15 +2079,29 @@ impl Connection {
         };
         let mut out = Vec::new();
         for obj in self.schema.indexes_on(table) {
-            let Some(sql) = &obj.sql else { continue }; // skip auto-indexes
-            let Statement::CreateIndex(ci) = sql::parse_one(sql)? else {
-                continue;
-            };
-            let cols = self.index_columns(&tmeta, &ci)?;
-            out.push(IndexMeta {
-                root: obj.rootpage,
-                cols,
-            });
+            match &obj.sql {
+                Some(sql) => {
+                    let Statement::CreateIndex(ci) = sql::parse_one(sql)? else {
+                        continue;
+                    };
+                    let cols = self.index_columns(&tmeta, &ci)?;
+                    out.push(IndexMeta {
+                        root: obj.rootpage,
+                        cols,
+                    });
+                }
+                // Automatic index: its columns are the n-th UNIQUE/PK set.
+                None => {
+                    if let Some(n) = autoindex_number(&obj.name, table) {
+                        if let Some(cols) = tmeta.unique.get(n - 1) {
+                            out.push(IndexMeta {
+                                root: obj.rootpage,
+                                cols: cols.clone(),
+                            });
+                        }
+                    }
+                }
+            }
         }
         Ok(out)
     }
@@ -3198,37 +3235,8 @@ impl Connection {
             }
         }
         // UNIQUE / PRIMARY KEY column sets that must be unique (the rowid IPK is
-        // handled separately).
-        let col_pos = |name: &str| {
-            ct.columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(name))
-        };
-        let mut unique: Vec<Vec<usize>> = Vec::new();
-        for (i, c) in ct.columns.iter().enumerate() {
-            for k in &c.constraints {
-                match k {
-                    ColumnConstraint::Unique => unique.push(alloc::vec![i]),
-                    ColumnConstraint::PrimaryKey { .. } if Some(i) != ipk => {
-                        unique.push(alloc::vec![i])
-                    }
-                    _ => {}
-                }
-            }
-        }
-        for tc in &ct.constraints {
-            let names = match tc {
-                TableConstraint::Unique(n) | TableConstraint::PrimaryKey(n) => n,
-                _ => continue,
-            };
-            let idxs: Option<Vec<usize>> = names.iter().map(|n| col_pos(n)).collect();
-            if let Some(set) = idxs {
-                // Skip a single-column PK that is the rowid alias.
-                if !(set.len() == 1 && Some(set[0]) == ipk) {
-                    unique.push(set);
-                }
-            }
-        }
+        // handled separately). Order matches SQLite's auto-index numbering.
+        let unique = collect_unique_sets(&ct, ipk);
         Ok(TableMeta {
             root: obj.rootpage,
             columns,
@@ -3948,6 +3956,51 @@ fn expr_label(expr: &Expr) -> String {
 
 /// Detect an `INTEGER PRIMARY KEY` rowid alias column (must be declared exactly
 /// `INTEGER`, per SQLite — `INT PRIMARY KEY` does not alias the rowid).
+/// The UNIQUE / non-rowid PRIMARY KEY column-index sets of a table, in
+/// declaration order (column-level constraints first, in column order, then
+/// table-level constraints). This is exactly the order SQLite numbers its
+/// `sqlite_autoindex_<table>_<n>` automatic indexes.
+fn collect_unique_sets(ct: &CreateTable, ipk: Option<usize>) -> Vec<Vec<usize>> {
+    let col_pos = |name: &str| {
+        ct.columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
+    };
+    let mut unique: Vec<Vec<usize>> = Vec::new();
+    for (i, c) in ct.columns.iter().enumerate() {
+        for k in &c.constraints {
+            match k {
+                ColumnConstraint::Unique => unique.push(alloc::vec![i]),
+                ColumnConstraint::PrimaryKey { .. } if Some(i) != ipk => {
+                    unique.push(alloc::vec![i])
+                }
+                _ => {}
+            }
+        }
+    }
+    for tc in &ct.constraints {
+        let names = match tc {
+            TableConstraint::Unique(n) | TableConstraint::PrimaryKey(n) => n,
+            _ => continue,
+        };
+        let idxs: Option<Vec<usize>> = names.iter().map(|n| col_pos(n)).collect();
+        if let Some(set) = idxs {
+            // Skip a single-column PK that is the rowid alias.
+            if !(set.len() == 1 && Some(set[0]) == ipk) {
+                unique.push(set);
+            }
+        }
+    }
+    unique
+}
+
+/// Parse the `<n>` from `sqlite_autoindex_<table>_<n>` (1-based), if `name` is an
+/// automatic index for `table`.
+fn autoindex_number(name: &str, table: &str) -> Option<usize> {
+    let prefix = alloc::format!("sqlite_autoindex_{table}_");
+    name.strip_prefix(&prefix)?.parse::<usize>().ok()
+}
+
 fn find_integer_primary_key(ct: &CreateTable) -> Option<usize> {
     for (i, c) in ct.columns.iter().enumerate() {
         let is_integer = c

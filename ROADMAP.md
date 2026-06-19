@@ -318,10 +318,13 @@ coverage rather than having a single "done".
   - **explicit window frames** — `ROWS`/`RANGE`/`GROUPS BETWEEN … AND …` with the
     full bound set (`tests/window.rs`);
   - **`PRAGMA recursive_triggers`** — recursive trigger firing (bounded), off by
-    default (`tests/triggers.rs`).
+    default (`tests/triggers.rs`);
+  - **automatic indexes for `UNIQUE`/non-rowid `PRIMARY KEY`** — the implicit
+    `sqlite_autoindex_*` b-trees are now written and maintained, so SQLite
+    accepts the files (`tests/indexes.rs`).
 - **Deliverable (remaining):**
   `INSTEAD OF` (view) triggers; `BEFORE`-trigger `NEW`
-  mutation; real `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`;
+  mutation; real `VACUUM` compaction; `WITHOUT ROWID`;
   WAL *write* path; b-tree page merging on delete
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree

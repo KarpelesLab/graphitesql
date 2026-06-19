@@ -182,3 +182,54 @@ fn drop_table_if_exists_is_noop() {
     c.execute("DROP TABLE IF EXISTS nope").unwrap();
     assert!(c.execute("DROP TABLE nope").is_err());
 }
+
+/// A graphitesql-written table with UNIQUE / non-rowid PRIMARY KEY constraints
+/// must carry the implicit `sqlite_autoindex_*` b-trees, or real SQLite rejects
+/// the file as malformed. Verify creation + maintenance across DML.
+#[test]
+fn autoindex_for_unique_passes_integrity() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = temp_path("autoindex");
+    cleanup(&path);
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute(
+            "CREATE TABLE x(id INTEGER PRIMARY KEY, e TEXT UNIQUE, a INT, b INT, UNIQUE(a,b))",
+        )
+        .unwrap();
+        for i in 1..=20i64 {
+            c.execute(&format!(
+                "INSERT INTO x(e,a,b) VALUES ('e{i}',{},{i})",
+                i % 7
+            ))
+            .unwrap();
+        }
+        // Exercise maintenance: delete some, update some.
+        c.execute("DELETE FROM x WHERE id % 5 = 0").unwrap();
+        c.execute("UPDATE x SET e = 'z' || e WHERE id % 3 = 0")
+            .unwrap();
+    }
+
+    // Two automatic indexes exist (for `e` and for `(a,b)`).
+    let idx = sqlite3_run(
+        &path,
+        "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name;",
+    );
+    assert_eq!(idx, "sqlite_autoindex_x_1\nsqlite_autoindex_x_2");
+    // The decisive gate.
+    assert_eq!(sqlite3_run(&path, "PRAGMA integrity_check;"), "ok");
+    // Real SQLite enforces the UNIQUE via the index we wrote.
+    let dup = Command::new("sqlite3")
+        .arg(&path)
+        .arg("INSERT INTO x(e,a,b) VALUES ('e1', 99, 99);")
+        .output()
+        .unwrap();
+    assert!(
+        !dup.status.success(),
+        "sqlite should reject the duplicate e='e1'"
+    );
+    cleanup(&path);
+}
