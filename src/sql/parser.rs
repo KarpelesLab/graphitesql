@@ -406,14 +406,22 @@ impl Parser {
     }
 
     fn insert(&mut self) -> Result<Insert> {
-        // INSERT [OR ...] INTO  /  REPLACE INTO
+        // INSERT [OR <action>] INTO  /  REPLACE INTO
+        let mut on_conflict = OnConflict::Abort;
         if self.eat_kw("insert") {
             if self.eat_kw("or") {
-                // conflict clause: ignore the specific action for now
-                let _ = self.advance();
+                on_conflict = if self.eat_kw("replace") {
+                    OnConflict::Replace
+                } else if self.eat_kw("ignore") {
+                    OnConflict::Ignore
+                } else {
+                    let _ = self.advance(); // ABORT / ROLLBACK / FAIL
+                    OnConflict::Abort
+                };
             }
         } else {
             self.expect_kw("replace")?;
+            on_conflict = OnConflict::Replace;
         }
         self.expect_kw("into")?;
         let table = self.ident()?;
@@ -444,6 +452,7 @@ impl Parser {
             table,
             columns,
             source,
+            on_conflict,
         })
     }
 

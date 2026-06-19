@@ -154,6 +154,19 @@ pub struct Insert {
     pub columns: Vec<String>,
     /// The data source.
     pub source: InsertSource,
+    /// Conflict resolution (`INSERT OR …` / `REPLACE`).
+    pub on_conflict: OnConflict,
+}
+
+/// Conflict resolution policy for `INSERT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnConflict {
+    /// Default: fail the statement on a constraint conflict.
+    Abort,
+    /// Skip the conflicting row.
+    Ignore,
+    /// Replace the conflicting row(s).
+    Replace,
 }
 
 /// Where an `INSERT` gets its rows.

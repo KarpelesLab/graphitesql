@@ -410,6 +410,7 @@ impl Connection {
         let indexes = self.indexes_of(&ins.table)?;
         let mut next_auto = self.next_rowid(meta.root)?;
         let mut affected = 0;
+        let mut replaced = false;
         for row_exprs in &rows {
             if !ins.columns.is_empty() && row_exprs.len() != target.len() {
                 return Err(Error::Error("INSERT column/value count mismatch".into()));
@@ -448,6 +449,24 @@ impl Connection {
             }
             check_not_null(&meta, &values)?;
             self.check_constraints(&meta, &values, Some(rowid), params)?;
+
+            // Resolve UNIQUE / PRIMARY KEY (incl. rowid) conflicts.
+            let conflicts = self.find_conflicts(&meta, rowid, &values, None)?;
+            if !conflicts.is_empty() {
+                match ins.on_conflict {
+                    OnConflict::Abort => {
+                        return Err(Error::Constraint("UNIQUE constraint failed".into()))
+                    }
+                    OnConflict::Ignore => continue, // skip this row
+                    OnConflict::Replace => {
+                        for cr in conflicts {
+                            delete_table(self.backend.writer()?, meta.root, cr)?;
+                        }
+                        replaced = true;
+                    }
+                }
+            }
+
             let index_values = values.clone();
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Null;
@@ -460,7 +479,47 @@ impl Connection {
             }
             affected += 1;
         }
+        // REPLACE removed rows whose index entries were maintained incrementally;
+        // rebuild from the final table state to be safe.
+        if replaced {
+            self.rebuild_indexes(&meta, &indexes)?;
+        }
         Ok(affected)
+    }
+
+    /// Rowids of existing rows that conflict with a candidate row on the rowid
+    /// or any UNIQUE/PRIMARY KEY column set (NULLs are considered distinct).
+    fn find_conflicts(
+        &self,
+        meta: &TableMeta,
+        rowid: i64,
+        values: &[Value],
+        exclude: Option<i64>,
+    ) -> Result<Vec<i64>> {
+        let mut out = Vec::new();
+        for (er, ev) in self.scan_table(meta)? {
+            if Some(er) == exclude {
+                continue;
+            }
+            if er == rowid {
+                out.push(er);
+                continue;
+            }
+            for set in &meta.unique {
+                let new_tuple: Vec<&Value> = set.iter().map(|&i| &values[i]).collect();
+                if new_tuple.iter().any(|v| matches!(v, Value::Null)) {
+                    continue; // a NULL makes the key distinct
+                }
+                let conflict = set.iter().zip(&new_tuple).all(|(&i, nv)| {
+                    crate::value::cmp_values(&ev[i], nv) == core::cmp::Ordering::Equal
+                });
+                if conflict {
+                    out.push(er);
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn exec_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
@@ -523,6 +582,13 @@ impl Connection {
                 Some(ipk) => eval::to_i64(&values[ipk]),
                 None => rowid,
             };
+            // UNIQUE/PK conflict against any other row.
+            if !self
+                .find_conflicts(&meta, new_rowid, &values, Some(rowid))?
+                .is_empty()
+            {
+                return Err(Error::Constraint("UNIQUE constraint failed".into()));
+            }
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Null;
             }
@@ -1562,12 +1628,45 @@ impl Connection {
                 checks.push(e.clone());
             }
         }
+        // UNIQUE / PRIMARY KEY column sets that must be unique (the rowid IPK is
+        // handled separately).
+        let col_pos = |name: &str| {
+            ct.columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+        };
+        let mut unique: Vec<Vec<usize>> = Vec::new();
+        for (i, c) in ct.columns.iter().enumerate() {
+            for k in &c.constraints {
+                match k {
+                    ColumnConstraint::Unique => unique.push(alloc::vec![i]),
+                    ColumnConstraint::PrimaryKey { .. } if Some(i) != ipk => {
+                        unique.push(alloc::vec![i])
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for tc in &ct.constraints {
+            let names = match tc {
+                TableConstraint::Unique(n) | TableConstraint::PrimaryKey(n) => n,
+                _ => continue,
+            };
+            let idxs: Option<Vec<usize>> = names.iter().map(|n| col_pos(n)).collect();
+            if let Some(set) = idxs {
+                // Skip a single-column PK that is the rowid alias.
+                if !(set.len() == 1 && Some(set[0]) == ipk) {
+                    unique.push(set);
+                }
+            }
+        }
         Ok(TableMeta {
             root: obj.rootpage,
             columns,
             defaults,
             not_null,
             checks,
+            unique,
             ipk,
         })
     }
@@ -1601,6 +1700,8 @@ struct TableMeta {
     not_null: Vec<bool>,
     /// CHECK constraint expressions (column-level and table-level).
     checks: Vec<Expr>,
+    /// Column-index sets that must be UNIQUE (excludes the rowid IPK).
+    unique: Vec<Vec<usize>>,
     ipk: Option<usize>,
 }
 

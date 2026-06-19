@@ -265,7 +265,9 @@ coverage rather than having a single "done".
     read) and `RENAME TO` (repointing dependent indexes) — `tests/alter.rs`;
   - **`CREATE VIEW` / `DROP VIEW`** and querying views (the view's `SELECT` runs
     as the source) — `tests/views.rs`;
-  - **`NOT NULL`** constraint enforcement on `INSERT`/`UPDATE`;
+  - **constraint enforcement** — `NOT NULL`, `CHECK` (column + table), and
+    `UNIQUE`/`PRIMARY KEY` on `INSERT`/`UPDATE`, with `INSERT OR IGNORE`/
+    `OR REPLACE` (and `REPLACE INTO`);
   - **subqueries** — scalar `(SELECT …)` and `expr [NOT] IN (SELECT …)`
     (uncorrelated) — `tests/subquery.rs`;
   - non-recursive **`WITH` / CTEs** used as a query source — `tests/cte.rs`;
@@ -280,7 +282,8 @@ coverage rather than having a single "done".
 - **Deliverable (remaining):** foreign keys & triggers; `WITH`/CTEs & recursive
   queries; window functions; *correlated* subqueries & subqueries/views in joins;
   index-driven query planning; `ALTER … RENAME COLUMN`; real `VACUUM` compaction;
-  `WITHOUT ROWID`; `UNIQUE`/`CHECK` enforcement; `date/time`/`printf` functions;
+  `WITHOUT ROWID`; auto-indexes for `UNIQUE` (we enforce by scan, not via an
+  index b-tree yet); `date/time`/`printf` functions;
   `EXPLAIN`; full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.
 - **Goal:** pass a curated slice of SQLite's own test assertions and a large

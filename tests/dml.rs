@@ -155,6 +155,45 @@ fn check_constraints_enforced() {
 }
 
 #[test]
+fn unique_constraint_and_conflict_clauses() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, email TEXT UNIQUE, n INT)")
+        .unwrap();
+    c.execute("INSERT INTO t(email, n) VALUES ('a', 1)")
+        .unwrap();
+    // Duplicate UNIQUE value is rejected by default (ABORT).
+    assert!(c
+        .execute("INSERT INTO t(email, n) VALUES ('a', 2)")
+        .is_err());
+    // OR IGNORE silently skips the conflicting row (0 rows affected).
+    assert_eq!(
+        c.execute("INSERT OR IGNORE INTO t(email, n) VALUES ('a', 3)")
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        c.query("SELECT n FROM t").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    // OR REPLACE replaces the conflicting row.
+    c.execute("INSERT OR REPLACE INTO t(email, n) VALUES ('a', 9)")
+        .unwrap();
+    let r = c.query("SELECT email, n FROM t").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0][1], Value::Integer(9));
+    // Duplicate explicit rowid (PRIMARY KEY) is rejected.
+    c.execute("INSERT INTO t(email, n) VALUES ('b', 1)")
+        .unwrap();
+    let some_id = match c.query("SELECT id FROM t WHERE email='b'").unwrap().rows[0][0] {
+        Value::Integer(v) => v,
+        _ => panic!(),
+    };
+    assert!(c
+        .execute(&format!("INSERT INTO t(id, email) VALUES ({some_id}, 'c')"))
+        .is_err());
+}
+
+#[test]
 fn defaults_applied() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, status TEXT DEFAULT 'new', n INT DEFAULT 0)")
