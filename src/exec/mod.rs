@@ -317,6 +317,10 @@ impl Connection {
                 self.exec_create_index(&ci, sql.trim())?;
                 0
             }
+            Statement::CreateView(cv) => {
+                self.exec_create_view(&cv, sql.trim())?;
+                0
+            }
             Statement::Drop(d) => {
                 self.exec_drop(&d)?;
                 0
@@ -560,6 +564,89 @@ impl Connection {
         w.header_mut().schema_cookie = cookie;
         self.schema = Schema::read(self.backend.source())?;
         Ok(())
+    }
+
+    fn exec_create_view(&mut self, cv: &CreateView, sql_text: &str) -> Result<()> {
+        let exists = self.schema.objects().iter().any(|o| o.name == cv.name);
+        if exists {
+            if cv.if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::Error(format!("table {} already exists", cv.name)));
+        }
+        let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
+        let row = encode_record(&[
+            Value::Text("view".into()),
+            Value::Text(cv.name.clone()),
+            Value::Text(cv.name.clone()),
+            Value::Integer(0), // views have no b-tree root
+            Value::Text(sql_text.into()),
+        ]);
+        insert_table(
+            self.backend.writer()?,
+            crate::schema::SCHEMA_ROOT_PAGE,
+            next,
+            &row,
+        )?;
+        let cookie = self
+            .backend
+            .writer()?
+            .header()
+            .schema_cookie
+            .wrapping_add(1);
+        self.backend.writer()?.header_mut().schema_cookie = cookie;
+        self.schema = Schema::read(self.backend.source())?;
+        Ok(())
+    }
+
+    /// If `name` is a view, run its `SELECT` and return its columns + rows.
+    fn try_view(
+        &self,
+        name: &str,
+        alias: Option<&str>,
+        params: &Params,
+    ) -> Result<Option<(Vec<ColumnInfo>, Vec<InputRow>)>> {
+        use crate::schema::ObjectType;
+        let obj = match self
+            .schema
+            .objects()
+            .iter()
+            .find(|o| o.obj_type == ObjectType::View && o.name.eq_ignore_ascii_case(name))
+        {
+            Some(o) => o.clone(),
+            None => return Ok(None),
+        };
+        let sql = obj
+            .sql
+            .as_deref()
+            .ok_or_else(|| Error::Corrupt("view has no CREATE statement".into()))?;
+        let Statement::CreateView(cv) = sql::parse_one(sql)? else {
+            return Err(Error::Corrupt("schema sql is not CREATE VIEW".into()));
+        };
+        let result = self.run_select(&cv.select, params)?;
+        let label = alias.unwrap_or(name).to_string();
+        // Column names: explicit view columns, else the SELECT's output labels.
+        let names = if cv.columns.is_empty() {
+            result.columns.clone()
+        } else {
+            cv.columns.clone()
+        };
+        let columns: Vec<ColumnInfo> = names
+            .into_iter()
+            .map(|n| ColumnInfo {
+                name: n,
+                table: label.clone(),
+            })
+            .collect();
+        let rows = result
+            .rows
+            .into_iter()
+            .map(|values| InputRow {
+                values,
+                rowid: None,
+            })
+            .collect();
+        Ok(Some((columns, rows)))
     }
 
     fn exec_drop(&mut self, d: &Drop) -> Result<()> {
@@ -923,6 +1010,17 @@ impl Connection {
                 }],
             ));
         };
+        // A view as the sole source: run its SELECT in place.
+        if from.joins.is_empty() {
+            if let Some((columns, rows)) =
+                self.try_view(&from.first.name, from.first.alias.as_deref(), params)?
+            {
+                return Ok((columns, rows));
+            }
+        } else if self.try_view(&from.first.name, None, params)?.is_some() {
+            return Err(Error::Unsupported("views in joins"));
+        }
+
         // Scan the first table.
         let first_meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
         let first_rows = self.scan_table(&first_meta)?;

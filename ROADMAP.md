@@ -263,15 +263,18 @@ coverage rather than having a single "done".
     table's dependent indexes);
   - **`ALTER TABLE`** `ADD COLUMN` (with `DEFAULT` applied to existing rows on
     read) and `RENAME TO` (repointing dependent indexes) — `tests/alter.rs`;
+  - **`CREATE VIEW` / `DROP VIEW`** and querying views (the view's `SELECT` runs
+    as the source) — `tests/views.rs`;
+  - **`NOT NULL`** constraint enforcement on `INSERT`/`UPDATE`;
   - an AST→SQL printer (`sql::print`) used to regenerate stored `CREATE` text;
   - queryable **`PRAGMA`s** (`table_info`, `page_size`, …) and the `graphitesql`
     **CLI shell**.
-- **Deliverable (remaining):** foreign keys & triggers; views; `WITH`/CTEs &
-  recursive queries; window functions; subqueries (scalar, `IN (SELECT)`);
+- **Deliverable (remaining):** foreign keys & triggers; `WITH`/CTEs & recursive
+  queries; window functions; subqueries (scalar, `IN (SELECT)`); views in joins;
   index-driven query planning; `ALTER … RENAME COLUMN`; `VACUUM`;
-  `WITHOUT ROWID`; constraint enforcement (`UNIQUE`/`CHECK`/`NOT NULL`); the rest
-  of the built-in & `date/time`/`printf`/math functions; `EXPLAIN`; full
-  type-affinity & collation edge cases; WAL *write* path; b-tree page merging.
+  `WITHOUT ROWID`; `UNIQUE`/`CHECK` enforcement; `date/time`/`printf` functions;
+  `EXPLAIN`; full type-affinity & collation edge cases; WAL *write* path; b-tree
+  page merging.
 - **Goal:** pass a curated slice of SQLite's own test assertions and a large
   differential corpus.
 - **Reference:** `fkey.c`, `trigger.c`, `window.c`, `date.c`, `pragma.c`,

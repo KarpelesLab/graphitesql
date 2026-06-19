@@ -28,6 +28,8 @@ pub enum Statement {
     CreateTable(CreateTable),
     /// A `CREATE INDEX` statement.
     CreateIndex(CreateIndex),
+    /// A `CREATE VIEW` statement.
+    CreateView(CreateView),
     /// A `DROP TABLE`/`DROP INDEX`/… statement.
     Drop(Drop),
     /// An `ALTER TABLE` statement.
@@ -238,6 +240,19 @@ pub struct CreateIndex {
     pub columns: Vec<OrderTerm>,
     /// Partial-index `WHERE`.
     pub where_clause: Option<Expr>,
+}
+
+/// A `CREATE VIEW` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateView {
+    /// `IF NOT EXISTS`?
+    pub if_not_exists: bool,
+    /// View name.
+    pub name: String,
+    /// Optional explicit column names.
+    pub columns: Vec<String>,
+    /// The view's `SELECT`.
+    pub select: Box<Select>,
 }
 
 /// What kind of object a `DROP` targets.

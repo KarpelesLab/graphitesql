@@ -476,7 +476,34 @@ impl Parser {
         if self.eat_kw("index") {
             return Ok(Statement::CreateIndex(self.create_index(unique)?));
         }
-        Err(self.err("expected TABLE or INDEX after CREATE"))
+        if unique {
+            return Err(self.err("expected INDEX after CREATE UNIQUE"));
+        }
+        if self.eat_kw("view") {
+            return Ok(Statement::CreateView(self.create_view()?));
+        }
+        Err(self.err("expected TABLE, INDEX, or VIEW after CREATE"))
+    }
+
+    fn create_view(&mut self) -> Result<CreateView> {
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.ident()?;
+        let mut columns = Vec::new();
+        if self.eat(&Token::LParen) {
+            columns.push(self.ident()?);
+            while self.eat(&Token::Comma) {
+                columns.push(self.ident()?);
+            }
+            self.expect(&Token::RParen)?;
+        }
+        self.expect_kw("as")?;
+        let select = Box::new(self.select()?);
+        Ok(CreateView {
+            if_not_exists,
+            name,
+            columns,
+            select,
+        })
     }
 
     fn if_not_exists(&mut self) -> Result<bool> {
