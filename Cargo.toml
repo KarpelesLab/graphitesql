@@ -2,7 +2,7 @@
 name = "graphitesql"
 version = "0.0.2"
 edition = "2021"
-rust-version = "1.95"
+rust-version = "1.88"
 description = "A pure, safe, no_std Rust re-implementation of SQLite, compatible with the SQLite 3 file format."
 # Public domain, with the SQLite "blessing" in place of a legal notice.
 # "blessing" is the SPDX identifier for the SQLite Blessing. See LICENSE.

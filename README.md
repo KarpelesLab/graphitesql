@@ -5,7 +5,7 @@
 [![docs.rs](https://img.shields.io/docsrs/graphitesql)](https://docs.rs/graphitesql)
 [![License: blessing](https://img.shields.io/badge/license-blessing%20(public%20domain)-blue.svg)](LICENSE)
 ![no_std](https://img.shields.io/badge/no__std-yes-success.svg)
-![MSRV](https://img.shields.io/badge/rustc-1.95+-blue.svg)
+![MSRV](https://img.shields.io/badge/rustc-1.88+-blue.svg)
 
 A pure, safe, `no_std`-capable Rust re-implementation of **SQLite**, as a single
 crate, aiming for **byte-for-byte compatibility with the SQLite 3 database file

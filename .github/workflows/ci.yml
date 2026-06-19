@@ -87,3 +87,19 @@ jobs:
           key: no_std
       - name: cargo build --no-default-features
         run: cargo build --no-default-features
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: cargo build (default + no_std) on MSRV
+        run: |
+          cargo build --all-features
+          cargo build --no-default-features

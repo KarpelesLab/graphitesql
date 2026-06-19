@@ -262,7 +262,11 @@ coverage rather than having a single "done".
   - **`DROP TABLE`/`DROP INDEX`** (frees b-trees, removes schema rows, drops a
     table's dependent indexes);
   - **`ALTER TABLE`** `ADD COLUMN` (with `DEFAULT` applied to existing rows on
-    read) and `RENAME TO` (repointing dependent indexes) — `tests/alter.rs`;
+    read), `RENAME TO` (repointing dependent indexes), and `RENAME COLUMN`
+    (updating dependent index definitions) — `tests/alter.rs`;
+  - a **differential test harness** (`tests/differential.rs`) that runs 1500+
+    generated `SELECT`s through both graphitesql and the real `sqlite3` and
+    asserts identical output — currently 1513/1513 match;
   - **`CREATE VIEW` / `DROP VIEW`** and querying views (the view's `SELECT` runs
     as the source) — `tests/views.rs`;
   - **constraint enforcement** — `NOT NULL`, `CHECK` (column + table), and

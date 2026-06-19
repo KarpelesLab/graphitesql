@@ -11,7 +11,7 @@ use crate::value::Value;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Names that the executor must treat as aggregates rather than scalars.
+/// Names that *can* be aggregates (used for catalog/name checks).
 pub fn is_aggregate(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -19,10 +19,20 @@ pub fn is_aggregate(name: &str) -> bool {
     )
 }
 
+/// Whether a *specific call* is an aggregate. `min`/`max` are scalar with 2+
+/// arguments and aggregate with exactly one (or `*`), matching SQLite.
+pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
+    match name.to_ascii_lowercase().as_str() {
+        "count" | "sum" | "total" | "avg" | "group_concat" => true,
+        "min" | "max" => star || nargs == 1,
+        _ => false,
+    }
+}
+
 /// Evaluate a scalar function call.
 pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Result<Value> {
     let lname = name.to_ascii_lowercase();
-    if is_aggregate(&lname) {
+    if is_aggregate_call(&lname, args.len(), star) {
         return Err(Error::Error(alloc::format!(
             "aggregate function {name} used outside an aggregate context"
         )));

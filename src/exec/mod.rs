@@ -1439,7 +1439,7 @@ impl Connection {
                 distinct,
                 args,
                 star,
-            } if func::is_aggregate(name) => {
+            } if func::is_aggregate_call(name, args.len(), *star) => {
                 let v = self.compute_aggregate(
                     name, *distinct, args, *star, columns, rows, group, params,
                 )?;
@@ -1911,8 +1911,10 @@ fn resolve_order_index(expr: &Expr, labels: &[String], ncols: usize) -> Option<u
 
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
-        Expr::Function { name, args, .. } => {
-            func::is_aggregate(name) || args.iter().any(contains_aggregate)
+        Expr::Function {
+            name, args, star, ..
+        } => {
+            func::is_aggregate_call(name, args.len(), *star) || args.iter().any(contains_aggregate)
         }
         Expr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
         Expr::Unary { expr, .. } | Expr::Paren(expr) => contains_aggregate(expr),
