@@ -533,8 +533,10 @@ impl Parser {
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
         loop {
-            if self.check_kw("primary") || self.check_kw("unique") {
-                constraints.push(self.table_constraint()?);
+            if self.starts_table_constraint() {
+                if let Some(tc) = self.table_constraint()? {
+                    constraints.push(tc);
+                }
             } else {
                 columns.push(self.column_def()?);
             }
@@ -584,7 +586,9 @@ impl Parser {
         }
         let mut constraints = Vec::new();
         loop {
-            if self.eat_kw("primary") {
+            if self.eat_kw("constraint") {
+                let _ = self.ident()?; // named constraint; the constraint follows
+            } else if self.eat_kw("primary") {
                 self.expect_kw("key")?;
                 let descending = if self.eat_kw("desc") {
                     true
@@ -592,15 +596,21 @@ impl Parser {
                     let _ = self.eat_kw("asc");
                     false
                 };
+                self.eat_conflict_clause();
                 let _ = self.eat_kw("autoincrement");
                 constraints.push(ColumnConstraint::PrimaryKey { descending });
             } else if self.eat_kw("not") {
                 self.expect_kw("null")?;
+                self.eat_conflict_clause();
                 constraints.push(ColumnConstraint::NotNull);
+            } else if self.eat_kw("null") {
+                // A bare NULL (explicitly nullable): no constraint to record.
             } else if self.eat_kw("unique") {
+                self.eat_conflict_clause();
                 constraints.push(ColumnConstraint::Unique);
             } else if self.eat_kw("default") {
-                let e = if self.eat(&Token::LParen) {
+                let e = if self.check(&Token::LParen) {
+                    self.expect(&Token::LParen)?;
                     let e = self.expr()?;
                     self.expect(&Token::RParen)?;
                     e
@@ -610,6 +620,19 @@ impl Parser {
                 constraints.push(ColumnConstraint::Default(e));
             } else if self.eat_kw("collate") {
                 constraints.push(ColumnConstraint::Collate(self.ident()?));
+            } else if self.eat_kw("check") {
+                // Not yet modeled/enforced; consume `(expr)`.
+                self.skip_balanced_parens()?;
+            } else if self.eat_kw("references") {
+                self.skip_fk_clause()?;
+            } else if self.eat_kw("generated") {
+                let _ = self.eat_kw("always");
+                self.expect_kw("as")?;
+                self.skip_balanced_parens()?;
+                let _ = self.eat_kw("stored") || self.eat_kw("virtual");
+            } else if self.eat_kw("as") {
+                self.skip_balanced_parens()?;
+                let _ = self.eat_kw("stored") || self.eat_kw("virtual");
             } else {
                 break;
             }
@@ -621,22 +644,116 @@ impl Parser {
         })
     }
 
-    fn table_constraint(&mut self) -> Result<TableConstraint> {
+    /// Whether the next item in a `CREATE TABLE` body is a table constraint
+    /// (rather than a column definition).
+    fn starts_table_constraint(&self) -> bool {
+        self.check_kw("constraint")
+            || self.check_kw("primary")
+            || self.check_kw("unique")
+            || self.check_kw("check")
+            || self.check_kw("foreign")
+    }
+
+    /// Parse one table constraint, returning `None` for kinds we accept but do
+    /// not yet model (`CHECK`, `FOREIGN KEY`).
+    fn table_constraint(&mut self) -> Result<Option<TableConstraint>> {
+        if self.eat_kw("constraint") {
+            let _ = self.ident()?; // named constraint
+        }
         if self.eat_kw("primary") {
             self.expect_kw("key")?;
-            Ok(TableConstraint::PrimaryKey(self.paren_ident_list()?))
+            let cols = self.paren_columns()?;
+            self.eat_conflict_clause();
+            Ok(Some(TableConstraint::PrimaryKey(cols)))
+        } else if self.eat_kw("unique") {
+            let cols = self.paren_columns()?;
+            self.eat_conflict_clause();
+            Ok(Some(TableConstraint::Unique(cols)))
+        } else if self.eat_kw("check") {
+            self.skip_balanced_parens()?;
+            Ok(None)
+        } else if self.eat_kw("foreign") {
+            self.expect_kw("key")?;
+            self.skip_balanced_parens()?; // the (columns)
+            self.expect_kw("references")?;
+            self.skip_fk_clause()?;
+            Ok(None)
         } else {
-            self.expect_kw("unique")?;
-            Ok(TableConstraint::Unique(self.paren_ident_list()?))
+            Err(self.err("expected a table constraint"))
         }
     }
 
-    fn paren_ident_list(&mut self) -> Result<Vec<String>> {
+    /// Consume an `ON CONFLICT <action>` clause if present.
+    fn eat_conflict_clause(&mut self) {
+        if self.eat_kw("on") {
+            let _ = self.eat_kw("conflict");
+            let _ = self.advance(); // the action keyword
+        }
+    }
+
+    /// Consume a balanced parenthesized group starting at the current `(`.
+    fn skip_balanced_parens(&mut self) -> Result<()> {
+        self.expect(&Token::LParen)?;
+        let mut depth = 1;
+        while depth > 0 {
+            match self.advance() {
+                None => return Err(self.err("unbalanced parentheses")),
+                Some(Token::LParen) => depth += 1,
+                Some(Token::RParen) => depth -= 1,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume the tail of a `REFERENCES` clause (target, optional columns, and
+    /// any `ON …`/`MATCH …`/`DEFERRABLE …` actions). Not modeled, just skipped.
+    fn skip_fk_clause(&mut self) -> Result<()> {
+        let _ = self.ident()?; // referenced table
+        if self.check(&Token::LParen) {
+            self.skip_balanced_parens()?;
+        }
+        loop {
+            if self.eat_kw("on") {
+                let _ = self.advance(); // DELETE / UPDATE
+                if self.eat_kw("set") {
+                    let _ = self.advance(); // NULL / DEFAULT
+                } else if self.eat_kw("no") {
+                    let _ = self.eat_kw("action");
+                } else {
+                    let _ = self.advance(); // CASCADE / RESTRICT
+                }
+            } else if self.eat_kw("match") {
+                let _ = self.advance();
+            } else if self.eat_kw("not") {
+                let _ = self.eat_kw("deferrable");
+                if self.eat_kw("initially") {
+                    let _ = self.advance();
+                }
+            } else if self.eat_kw("deferrable") {
+                if self.eat_kw("initially") {
+                    let _ = self.advance();
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// A parenthesized column list, tolerating per-column `COLLATE`/`ASC`/`DESC`.
+    fn paren_columns(&mut self) -> Result<Vec<String>> {
         self.expect(&Token::LParen)?;
         let mut names = Vec::new();
-        names.push(self.ident()?);
-        while self.eat(&Token::Comma) {
+        loop {
             names.push(self.ident()?);
+            if self.eat_kw("collate") {
+                let _ = self.ident()?;
+            }
+            let _ = self.eat_kw("asc") || self.eat_kw("desc");
+            if !self.eat(&Token::Comma) {
+                break;
+            }
         }
         self.expect(&Token::RParen)?;
         Ok(names)
@@ -1273,6 +1390,31 @@ mod tests {
         };
         assert_eq!(ct.columns.len(), 2);
         assert_eq!(ct.constraints.len(), 1);
+    }
+
+    #[test]
+    fn create_table_full_constraint_grammar() {
+        // Real-world constraints (CHECK, REFERENCES, FOREIGN KEY, named
+        // CONSTRAINT, conflict clauses) must parse so stored schemas load.
+        let Statement::CreateTable(ct) = one("CREATE TABLE child(\
+               id INTEGER PRIMARY KEY AUTOINCREMENT, \
+               pid INT REFERENCES parent(id) ON DELETE CASCADE, \
+               qty INT NOT NULL CHECK(qty > 0) DEFAULT 1, \
+               name TEXT COLLATE NOCASE UNIQUE ON CONFLICT IGNORE, \
+               CONSTRAINT uq UNIQUE(pid, qty), \
+               FOREIGN KEY(pid) REFERENCES parent(id))")
+        else {
+            panic!()
+        };
+        assert_eq!(ct.columns.len(), 4); // id, pid, qty, name
+        assert_eq!(ct.columns[0].name, "id");
+        assert!(ct.columns[2]
+            .constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::NotNull)));
+        // Only the modeled UNIQUE table constraint is kept (FK is skipped).
+        assert_eq!(ct.constraints.len(), 1);
+        assert!(matches!(ct.constraints[0], TableConstraint::Unique(_)));
     }
 
     #[test]
