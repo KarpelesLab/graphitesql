@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/KarpelesLab/graphitesql/compare/v0.0.2...v0.0.3) - 2026-06-19
+
+### Other
+
+- Phase 9: index-driven query planning (closes the rest of issue #4)
+- Phase 9: compound queries (UNION / UNION ALL / INTERSECT / EXCEPT)
+- Phase 9: broaden differential corpus to 1633 (joins, group_concat, GLOB)
+- Phase 9: fix substr() window semantics; differential at 1618/1618
+- Phase 9: type affinity (comparison + storage)
+- Phase 9: expand differential corpus + fix CAST/aggregate bugs
+- Phase 9: differential test harness (1513/1513 vs sqlite3); MSRV 1.88
+
 ## [0.0.2](https://github.com/KarpelesLab/graphitesql/compare/v0.0.1...v0.0.2) - 2026-06-19
 
 ### Other
