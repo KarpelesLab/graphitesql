@@ -11,12 +11,17 @@ A pure, safe, `no_std`-capable Rust re-implementation of **SQLite**, as a single
 crate, aiming for **byte-for-byte compatibility with the SQLite 3 database file
 format**.
 
-> **Status: read + write working.** graphitesql opens real SQLite files, runs
-> `SELECT` queries, and **creates databases and runs `CREATE TABLE`/`INSERT`/
-> `UPDATE`/`DELETE` with transactions** — and the databases it writes are opened
-> by the real `sqlite3` CLI with `PRAGMA integrity_check = ok`. Still to come:
-> indexes on the write path, WAL mode, and broader SQL (see the roadmap). The
-> full build plan and status is in **[ROADMAP.md](ROADMAP.md)**.
+> **Status: read + write working, with broad SQL.** graphitesql opens real
+> SQLite files (incl. WAL-mode reads), **creates databases and runs
+> `CREATE TABLE`/`INSERT`/`UPDATE`/`DELETE` with transactions and secondary
+> indexes** — and the databases it writes are opened by the real `sqlite3` CLI
+> with `PRAGMA integrity_check = ok`. The SQL surface now covers joins,
+> aggregates, `GROUP BY`/`HAVING`, compound queries, (recursive) CTEs,
+> correlated subqueries & `EXISTS`, **window functions**, **date/time &
+> `printf`**, **`EXPLAIN QUERY PLAN`**, **foreign keys** (`PRAGMA foreign_keys`),
+> and **triggers** — all verified differentially against `sqlite3`. Still to
+> come: WAL writes, `WITHOUT ROWID`, and more (see the roadmap). The full build
+> plan and status is in **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why
 
