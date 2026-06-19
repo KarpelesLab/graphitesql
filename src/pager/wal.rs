@@ -191,7 +191,7 @@ fn be32(b: &[u8], at: usize) -> u32 {
 
 /// The WAL running checksum. Consumes `data` (length a multiple of 8) as pairs of
 /// 32-bit words in the selected byte order, updating the (s0, s1) accumulators.
-fn checksum(big_endian: bool, mut s0: u32, mut s1: u32, data: &[u8]) -> (u32, u32) {
+pub(crate) fn checksum(big_endian: bool, mut s0: u32, mut s1: u32, data: &[u8]) -> (u32, u32) {
     let read = |at: usize| -> u32 {
         if big_endian {
             u32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])

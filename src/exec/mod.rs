@@ -65,6 +65,9 @@ impl Backend {
             Backend::Read(_) => Err(Error::Error("database is read-only".into())),
         }
     }
+    fn wal_mode(&self) -> bool {
+        matches!(self, Backend::Write(w) if w.wal_mode())
+    }
 }
 
 /// A database connection. Supports reading (`query`) and writing (`execute`),
@@ -149,7 +152,8 @@ impl Connection {
     pub fn open_vfs(vfs: &dyn Vfs, path: &str) -> Result<Connection> {
         let main = vfs.open(path, OpenFlags::READ_WRITE)?;
         let journal = vfs.open(&journal_path(path), OpenFlags::READ_WRITE_CREATE)?;
-        Connection::from_pager(WritePager::open(main, Some(journal))?)
+        let wal = vfs.open(&wal_path(path), OpenFlags::READ_WRITE_CREATE)?;
+        Connection::from_pager(WritePager::open_wal(main, Some(journal), Some(wal))?)
     }
 
     /// Open an existing database read-only through `vfs`. If a `<path>-wal` file
@@ -170,7 +174,8 @@ impl Connection {
     pub fn create_vfs(vfs: &dyn Vfs, path: &str, page_size: u32) -> Result<Connection> {
         let main = vfs.open(path, OpenFlags::READ_WRITE_CREATE)?;
         let journal = vfs.open(&journal_path(path), OpenFlags::READ_WRITE_CREATE)?;
-        let mut db = WritePager::create(main, Some(journal), page_size)?;
+        let wal = vfs.open(&wal_path(path), OpenFlags::READ_WRITE_CREATE)?;
+        let mut db = WritePager::create_wal(main, Some(journal), Some(wal), page_size)?;
         db.commit()?;
         Connection::from_pager(db)
     }
@@ -276,6 +281,14 @@ impl Connection {
                 "recursive_triggers",
                 Value::Integer(self.recursive_triggers as i64),
             )),
+            "journal_mode" => {
+                let mode = if self.backend.wal_mode() {
+                    "wal"
+                } else {
+                    "delete"
+                };
+                Ok(single("journal_mode", Value::Text(mode.into())))
+            }
             _ => Err(Error::Unsupported("this PRAGMA")),
         }
     }
@@ -509,6 +522,16 @@ impl Connection {
             if let Some(e) = &p.value {
                 self.recursive_triggers = pragma_truth(e, params);
             }
+        } else if p.name.eq_ignore_ascii_case("journal_mode") {
+            if let Some(e) = &p.value {
+                if pragma_text(e).eq_ignore_ascii_case("wal") {
+                    self.backend.writer()?.set_wal_mode()?;
+                }
+                // Other modes (delete/truncate/persist/memory/off) keep the
+                // rollback-journal path; switching back out of WAL is a no-op.
+            }
+        } else if p.name.eq_ignore_ascii_case("wal_checkpoint") {
+            self.backend.writer()?.checkpoint()?;
         }
         Ok(())
     }
@@ -4099,6 +4122,16 @@ fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
             true
         }
     });
+}
+
+/// A `PRAGMA name = value` argument as text (a bare keyword like `WAL` or a
+/// quoted string).
+fn pragma_text(e: &Expr) -> String {
+    match e {
+        Expr::Column { column, .. } => column.clone(),
+        Expr::Literal(Literal::Str(s)) => s.clone(),
+        _ => String::new(),
+    }
 }
 
 /// Interpret a `PRAGMA name = value` argument as a boolean, accepting

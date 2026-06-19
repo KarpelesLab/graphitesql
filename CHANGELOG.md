@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: **WAL write path** — `PRAGMA journal_mode=WAL` switches the database
+  to write-ahead logging; commits append page frames (with SQLite's exact
+  checksums/salts) to the `-wal` file, `PRAGMA wal_checkpoint` writes them back
+  to the main file, and reopening loads an uncheckpointed `-wal`. Real `sqlite3`
+  reads graphitesql-written WAL databases (checkpointed or not) with
+  `integrity_check = ok`
 - Phase 9: secondary indexes on `WITHOUT ROWID` tables — `CREATE INDEX` on a
   WITHOUT ROWID table builds and maintains a b-tree keyed by (indexed cols, PK
   cols), as SQLite does; verified by `sqlite3 integrity_check`

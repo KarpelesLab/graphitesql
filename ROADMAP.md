@@ -230,7 +230,7 @@ databases lands well before write support).
   `INSERT … SELECT`, and freelist-backed reclamation for overflow-row delete.
 - **Reference:** `build.c`, `insert.c`, `update.c`, `delete.c`, `alter.c`.
 
-### Phase 8 — WAL mode ✅ *(read done)*
+### Phase 8 — WAL mode ✅ *(read + write done)*
 
 - **Deliverable:** parse and overlay the `-wal` file so WAL-mode databases read
   correctly, with full frame validation.
@@ -241,9 +241,16 @@ databases lands well before write support).
   Verified by reading a real WAL-mode database whose table and rows exist
   **only** in an uncheckpointed `-wal` produced by SQLite (`tests/wal.rs`,
   `tests/fixtures/wal.db{,-wal}`).
-- **Files:** `src/pager/wal.rs`; `Connection` backend enum in `src/exec/mod.rs`.
-- **Carried to Phase 9:** *writing* WAL (appending frames + `-shm` wal-index),
-  checkpointing, the WAL locking protocol, and `PRAGMA journal_mode=wal`.
+- **Write side (done in Phase 9):** `PRAGMA journal_mode=WAL` switches modes;
+  commits append frames (exact SQLite checksums/salts) to `-wal` via
+  `WritePager`'s WAL runtime; `PRAGMA wal_checkpoint` writes frames back to the
+  main file; reopening loads an uncheckpointed `-wal`. Real `sqlite3` reads
+  graphitesql-written WAL databases with `integrity_check = ok`
+  (`tests/wal_write.rs`). The single-writer model means the `-shm` wal-index and
+  the multi-process WAL locking protocol are not needed (SQLite rebuilds `-shm`
+  from the `-wal`).
+- **Files:** `src/pager/wal.rs` (reader), `src/pager/write.rs` (writer);
+  `Connection` backend enum in `src/exec/mod.rs`.
 - **Reference:** `wal.c`, `fileformat2.html` (the WAL format).
 
 ### Phase 9 — Compatibility hardening & breadth 🔄 *(ongoing track)*
@@ -331,11 +338,13 @@ coverage rather than having a single "done".
     `INSTEAD OF` triggers with `OLD`/`NEW` (`tests/triggers.rs`);
   - **secondary indexes on `WITHOUT ROWID` tables** — `CREATE INDEX` builds a
     b-tree keyed by (indexed cols, PK cols), maintained across DML
-    (`tests/without_rowid.rs`).
-- **Deliverable (remaining):** the storage-engine frontier — the WAL *write*
-  path (frame append + `-shm` wal-index + checkpoint); real `VACUUM` compaction;
-  b-tree page merging/rebalance on delete; and `UNIQUE` (auto-index) constraints
-  on `WITHOUT ROWID` tables.
+    (`tests/without_rowid.rs`);
+  - **WAL write path** — `PRAGMA journal_mode=WAL`, frame-appending commits,
+    `wal_checkpoint`, and reopen-from-`-wal` (`tests/wal_write.rs`; see Phase 8).
+- **Deliverable (remaining):** real `VACUUM` compaction (the no-op is valid
+  SQLite behavior); b-tree page merging/rebalance on delete (space reclamation;
+  correct without it); and `UNIQUE` (auto-index) constraints on `WITHOUT ROWID`
+  tables.
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.

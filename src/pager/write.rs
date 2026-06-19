@@ -39,12 +39,45 @@ pub struct WritePager {
     /// Logical page count including not-yet-flushed allocations.
     page_count: u32,
     overlay: BTreeMap<u32, Vec<u8>>,
+    /// The `-wal` file handle, when one was supplied (file-backed databases).
+    wal_file: Option<Box<dyn File>>,
+    /// WAL runtime state; `Some` when the database is in WAL mode.
+    wal: Option<WalRuntime>,
 }
+
+/// Live WAL state: the committed frames overlaid on the main file plus the
+/// append cursor, running checksum, salts, and last-commit page count.
+struct WalRuntime {
+    /// Committed frame contents (page number → page bytes).
+    frames: BTreeMap<u32, Vec<u8>>,
+    /// Byte offset in the `-wal` file at which the next frame is appended.
+    offset: u64,
+    /// Running checksum after the last appended frame (or the WAL header).
+    cksum: (u32, u32),
+    /// The two 4-byte salts written into the WAL header and every frame.
+    salt: [u8; 8],
+    /// Database size in pages recorded by the last commit frame.
+    db_size: u32,
+}
+
+const WAL_MAGIC_LE: u32 = 0x377f_0682; // little-endian checksum variant
+const WAL_HDR_LEN: usize = 32;
+const WAL_FRAME_HDR_LEN: usize = 24;
 
 impl WritePager {
     /// Open an existing database file for writing. Replays the journal first if a
     /// previous commit was interrupted.
-    pub fn open(mut file: Box<dyn File>, mut journal: Option<Box<dyn File>>) -> Result<WritePager> {
+    pub fn open(file: Box<dyn File>, journal: Option<Box<dyn File>>) -> Result<WritePager> {
+        Self::open_wal(file, journal, None)
+    }
+
+    /// Like [`open`](Self::open), but also given the `-wal` companion file so the
+    /// database can be opened (and reopened) in WAL mode.
+    pub fn open_wal(
+        mut file: Box<dyn File>,
+        mut journal: Option<Box<dyn File>>,
+        mut wal_file: Option<Box<dyn File>>,
+    ) -> Result<WritePager> {
         if let Some(j) = journal.as_mut() {
             Self::recover(file.as_mut(), j.as_mut())?;
         }
@@ -62,14 +95,27 @@ impl WritePager {
             ));
         }
         let pages = (file_size / page_size as u64) as u32;
+        // If the database is in WAL mode and the -wal file carries committed
+        // frames, load them so reads see the latest data after a reopen.
+        let wal = if header.read_version == 2 {
+            match wal_file.as_mut() {
+                Some(w) => Self::load_wal(w.as_mut(), page_size)?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let page_count = wal.as_ref().map(|w| w.db_size).unwrap_or(pages);
         Ok(WritePager {
             file,
             journal,
             header,
             page_size,
             disk_pages: pages,
-            page_count: pages,
+            page_count,
             overlay: BTreeMap::new(),
+            wal_file,
+            wal,
         })
     }
 
@@ -77,6 +123,16 @@ impl WritePager {
     pub fn create(
         file: Box<dyn File>,
         journal: Option<Box<dyn File>>,
+        page_size: u32,
+    ) -> Result<WritePager> {
+        Self::create_wal(file, journal, None, page_size)
+    }
+
+    /// Like [`create`](Self::create), with the `-wal` companion file available.
+    pub fn create_wal(
+        file: Box<dyn File>,
+        journal: Option<Box<dyn File>>,
+        wal_file: Option<Box<dyn File>>,
         page_size: u32,
     ) -> Result<WritePager> {
         if page_size < 512 || !page_size.is_power_of_two() {
@@ -110,6 +166,8 @@ impl WritePager {
             disk_pages: 0,
             page_count: 1,
             overlay: BTreeMap::new(),
+            wal_file,
+            wal: None,
         };
         // Page 1: db header (0..100) + an empty table-leaf b-tree at offset 100.
         let mut page1 = vec![0u8; page_size as usize];
@@ -128,6 +186,12 @@ impl WritePager {
     pub fn read_page(&self, number: u32) -> Result<Vec<u8>> {
         if let Some(bytes) = self.overlay.get(&number) {
             return Ok(bytes.clone());
+        }
+        // In WAL mode, the newest version of a page may live in the WAL.
+        if let Some(w) = &self.wal {
+            if let Some(bytes) = w.frames.get(&number) {
+                return Ok(bytes.clone());
+            }
         }
         if number == 0 || number > self.disk_pages {
             return Err(Error::Corrupt(format!("page {number} out of range")));
@@ -216,13 +280,22 @@ impl WritePager {
     /// Discard all staged changes (ROLLBACK).
     pub fn rollback(&mut self) {
         self.overlay.clear();
-        self.page_count = self.disk_pages;
+        // The durable page count is the last WAL commit's in WAL mode, else the
+        // main file's.
+        self.page_count = match &self.wal {
+            Some(w) => w.db_size,
+            None => self.disk_pages,
+        };
     }
 
     /// Atomically flush all staged changes to the database file.
     pub fn commit(&mut self) -> Result<()> {
         if self.overlay.is_empty() {
             return Ok(());
+        }
+        // In WAL mode, append the dirty pages as WAL frames instead.
+        if self.wal.is_some() {
+            return self.commit_wal();
         }
         // Refresh header bookkeeping and re-stamp page 1.
         self.header.change_counter = self.header.change_counter.wrapping_add(1);
@@ -256,6 +329,227 @@ impl WritePager {
         self.disk_pages = self.page_count;
         self.overlay.clear();
         Ok(())
+    }
+
+    /// Whether the database is in WAL mode.
+    pub fn wal_mode(&self) -> bool {
+        self.wal.is_some()
+    }
+
+    /// Switch the database into WAL mode (`PRAGMA journal_mode = WAL`). Stamps the
+    /// file header's read/write version = 2 via a normal journaled commit, then
+    /// initializes empty WAL state. A no-op if already in WAL mode or if no
+    /// `-wal` file was supplied (e.g. a bare in-memory database).
+    pub fn set_wal_mode(&mut self) -> Result<bool> {
+        if self.wal.is_some() {
+            return Ok(true);
+        }
+        if self.wal_file.is_none() {
+            return Ok(false);
+        }
+        // Persist the WAL version bytes in the main header first.
+        if self.header.read_version != 2 || self.header.write_version != 2 {
+            self.header.read_version = 2;
+            self.header.write_version = 2;
+            let mut page1 = self.overlay.get(&1).cloned().unwrap_or(self.read_page(1)?);
+            self.header.write_to(&mut page1)?;
+            self.overlay.insert(1, page1);
+            self.commit()?; // journaled commit of the header change
+        }
+        // Fresh WAL: truncate any stale -wal and start with new salts.
+        if let Some(w) = self.wal_file.as_mut() {
+            w.truncate(0)?;
+            w.sync()?;
+        }
+        let salt = (self.header.change_counter as u64)
+            .wrapping_mul(0x9E37_79B9)
+            .to_be_bytes();
+        self.wal = Some(WalRuntime {
+            frames: BTreeMap::new(),
+            offset: 0,
+            cksum: (0, 0),
+            salt,
+            db_size: self.page_count,
+        });
+        Ok(true)
+    }
+
+    /// Commit the overlay as WAL frames appended to the `-wal` file.
+    fn commit_wal(&mut self) -> Result<()> {
+        self.header.change_counter = self.header.change_counter.wrapping_add(1);
+        self.header.size_in_pages = self.page_count;
+        self.header.version_valid_for = self.header.change_counter;
+        let mut page1 = self.overlay.get(&1).cloned().unwrap_or(self.read_page(1)?);
+        self.header.write_to(&mut page1)?;
+        self.overlay.insert(1, page1);
+
+        let page_size = self.page_size;
+        let pages: Vec<(u32, Vec<u8>)> =
+            self.overlay.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let wal = self.wal.as_mut().expect("wal mode");
+        let salt = wal.salt;
+        let file = self.wal_file.as_mut().expect("wal file");
+
+        // Write the 32-byte WAL header if this is the first frame after a reset.
+        if wal.offset == 0 {
+            let mut hdr = [0u8; WAL_HDR_LEN];
+            hdr[0..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
+            hdr[4..8].copy_from_slice(&3_007_000u32.to_be_bytes()); // format version
+            hdr[8..12].copy_from_slice(&(page_size as u32).to_be_bytes());
+            hdr[12..16].copy_from_slice(&0u32.to_be_bytes()); // checkpoint sequence
+            hdr[16..24].copy_from_slice(&salt);
+            let (h0, h1) = super::wal::checksum(false, 0, 0, &hdr[0..24]);
+            hdr[24..28].copy_from_slice(&h0.to_be_bytes());
+            hdr[28..32].copy_from_slice(&h1.to_be_bytes());
+            file.write_all_at(&hdr, 0)?;
+            wal.offset = WAL_HDR_LEN as u64;
+            wal.cksum = (h0, h1);
+        }
+
+        let (mut s0, mut s1) = wal.cksum;
+        let n = pages.len();
+        let frame_len = WAL_FRAME_HDR_LEN + page_size;
+        for (i, (page_no, data)) in pages.iter().enumerate() {
+            // The last frame of the commit carries the post-commit db size.
+            let db_size = if i + 1 == n { self.page_count } else { 0 };
+            let mut fhdr = [0u8; WAL_FRAME_HDR_LEN];
+            fhdr[0..4].copy_from_slice(&page_no.to_be_bytes());
+            fhdr[4..8].copy_from_slice(&db_size.to_be_bytes());
+            fhdr[8..16].copy_from_slice(&salt);
+            let (c0, c1) = super::wal::checksum(false, s0, s1, &fhdr[0..8]);
+            let (c0, c1) = super::wal::checksum(false, c0, c1, data);
+            fhdr[16..20].copy_from_slice(&c0.to_be_bytes());
+            fhdr[20..24].copy_from_slice(&c1.to_be_bytes());
+            let mut frame = Vec::with_capacity(frame_len);
+            frame.extend_from_slice(&fhdr);
+            frame.extend_from_slice(data);
+            file.write_all_at(&frame, wal.offset)?;
+            wal.offset += frame_len as u64;
+            s0 = c0;
+            s1 = c1;
+        }
+        file.sync()?;
+        wal.cksum = (s0, s1);
+        wal.db_size = self.page_count;
+        for (page_no, data) in pages {
+            wal.frames.insert(page_no, data);
+        }
+        self.overlay.clear();
+        Ok(())
+    }
+
+    /// Checkpoint: write all WAL frames back into the main database file, reset
+    /// the `-wal` file, and keep WAL mode active with fresh salts.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        let Some(wal) = self.wal.as_mut() else {
+            return Ok(());
+        };
+        let page_size = self.page_size as u64;
+        let frames: Vec<(u32, Vec<u8>)> = wal.frames.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let db_size = wal.db_size;
+        for (page_no, data) in &frames {
+            self.file
+                .write_all_at(data, (*page_no as u64 - 1) * page_size)?;
+        }
+        self.file.truncate(db_size as u64 * page_size)?;
+        self.file.sync()?;
+        self.disk_pages = db_size;
+        // Reset the WAL: empty it and restart with a new salt.
+        if let Some(w) = self.wal_file.as_mut() {
+            w.truncate(0)?;
+            w.sync()?;
+        }
+        let new_salt = {
+            let mut s = wal.salt;
+            let v = u32::from_be_bytes([s[0], s[1], s[2], s[3]]).wrapping_add(1);
+            s[0..4].copy_from_slice(&v.to_be_bytes());
+            s
+        };
+        self.wal = Some(WalRuntime {
+            frames: BTreeMap::new(),
+            offset: 0,
+            cksum: (0, 0),
+            salt: new_salt,
+            db_size,
+        });
+        Ok(())
+    }
+
+    /// Load committed frames from an existing `-wal` file (used on open). Returns
+    /// the runtime state positioned to append after the last valid frame, or
+    /// `None` if the WAL is empty/invalid.
+    fn load_wal(wal: &mut dyn File, page_size: usize) -> Result<Option<WalRuntime>> {
+        let size = wal.size()?;
+        if size < WAL_HDR_LEN as u64 {
+            return Ok(None);
+        }
+        let mut hdr = [0u8; WAL_HDR_LEN];
+        wal.read_exact_at(&mut hdr, 0)?;
+        let magic = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        if magic & 0xFFFF_FFFE != WAL_MAGIC_LE {
+            return Ok(None);
+        }
+        let big_endian = (magic & 1) == 1;
+        let wal_ps = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+        if wal_ps != page_size {
+            return Ok(None);
+        }
+        let mut salt = [0u8; 8];
+        salt.copy_from_slice(&hdr[16..24]);
+        let (h0, h1) = super::wal::checksum(big_endian, 0, 0, &hdr[0..24]);
+        if h0 != u32::from_be_bytes([hdr[24], hdr[25], hdr[26], hdr[27]])
+            || h1 != u32::from_be_bytes([hdr[28], hdr[29], hdr[30], hdr[31]])
+        {
+            return Ok(None);
+        }
+        let frame_len = WAL_FRAME_HDR_LEN + page_size;
+        let (mut s0, mut s1) = (h0, h1);
+        let mut off = WAL_HDR_LEN as u64;
+        let mut frames: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        let mut pending: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut db_size = 0u32;
+        let mut committed_off = WAL_HDR_LEN as u64;
+        let mut committed_cksum = (h0, h1);
+        while off + frame_len as u64 <= size {
+            let mut fhdr = [0u8; WAL_FRAME_HDR_LEN];
+            wal.read_exact_at(&mut fhdr, off)?;
+            let mut page = vec![0u8; page_size];
+            wal.read_exact_at(&mut page, off + WAL_FRAME_HDR_LEN as u64)?;
+            if fhdr[8..16] != salt {
+                break;
+            }
+            let (c0, c1) = super::wal::checksum(big_endian, s0, s1, &fhdr[0..8]);
+            let (c0, c1) = super::wal::checksum(big_endian, c0, c1, &page);
+            if c0 != u32::from_be_bytes([fhdr[16], fhdr[17], fhdr[18], fhdr[19]])
+                || c1 != u32::from_be_bytes([fhdr[20], fhdr[21], fhdr[22], fhdr[23]])
+            {
+                break;
+            }
+            s0 = c0;
+            s1 = c1;
+            let page_no = u32::from_be_bytes([fhdr[0], fhdr[1], fhdr[2], fhdr[3]]);
+            let commit = u32::from_be_bytes([fhdr[4], fhdr[5], fhdr[6], fhdr[7]]);
+            pending.push((page_no, page));
+            off += frame_len as u64;
+            if commit != 0 {
+                for (p, d) in pending.drain(..) {
+                    frames.insert(p, d);
+                }
+                db_size = commit;
+                committed_off = off;
+                committed_cksum = (s0, s1);
+            }
+        }
+        if frames.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(WalRuntime {
+            frames,
+            offset: committed_off,
+            cksum: committed_cksum,
+            salt,
+            db_size,
+        }))
     }
 
     fn write_journal(&mut self) -> Result<()> {
