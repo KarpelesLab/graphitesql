@@ -212,6 +212,31 @@ fn corpus() -> Vec<String> {
     // 12) CTE.
     q.push("WITH hi AS (SELECT id FROM t WHERE a > 40) SELECT count(*) FROM hi;".into());
 
+    // 13) NULL-aware aggregates and edge cases.
+    q.push("SELECT count(b), count(*), count(s) FROM t;".into());
+    q.push("SELECT sum(b), min(b), max(b) FROM t;".into()); // b has NULLs
+    q.push("SELECT g, count(b), count(s) FROM t GROUP BY g ORDER BY g;".into());
+    q.push("SELECT id, a || '-' || s FROM t ORDER BY id;".into()); // NULL s -> NULL
+    q.push("SELECT id, b % 3 FROM t WHERE b IS NOT NULL ORDER BY id;".into());
+    q.push("SELECT id, -b FROM t WHERE b IS NOT NULL ORDER BY id;".into());
+    // 14) CAST.
+    q.push("SELECT id, CAST(s AS INTEGER) FROM t ORDER BY id;".into());
+    q.push("SELECT CAST(avg(a) AS INTEGER) FROM t;".into());
+    q.push("SELECT id, CAST(b AS TEXT) FROM t WHERE b IS NOT NULL ORDER BY id;".into());
+    // 15) Multi-column GROUP BY / DISTINCT / HAVING-on-aggregate.
+    q.push("SELECT g, a%2, count(*) FROM t GROUP BY g, a%2 ORDER BY g, a%2;".into());
+    q.push("SELECT DISTINCT g, a%2 FROM t ORDER BY g, a%2;".into());
+    q.push("SELECT g, sum(a) FROM t GROUP BY g HAVING sum(a) > 300 ORDER BY g;".into());
+    // 16) Nested functions and predicates.
+    q.push("SELECT id, upper(substr(s,1,3)) FROM t WHERE s IS NOT NULL ORDER BY id;".into());
+    q.push("SELECT id FROM t WHERE s IS NULL OR s LIKE 'str_' ORDER BY id;".into());
+    q.push("SELECT id, length(s), abs(b) FROM t ORDER BY id;".into());
+    q.push("SELECT id FROM t WHERE NOT (a > 30) ORDER BY id;".into());
+    q.push("SELECT id FROM t WHERE (g = 1 OR g = 2) AND a < 30 ORDER BY id;".into());
+    // 17) ORDER BY expression / by output position.
+    q.push("SELECT id, a%5 FROM t ORDER BY 2, 1 LIMIT 15;".into());
+    q.push("SELECT id FROM t ORDER BY a%7, id;".into());
+
     q
 }
 

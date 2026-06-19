@@ -502,6 +502,10 @@ fn shift_right(a: i64, b: i64) -> i64 {
 
 /// Cast `v` to the affinity implied by a SQL type name.
 pub fn cast(v: Value, type_name: &str) -> Value {
+    // CAST(NULL AS anything) is NULL.
+    if matches!(v, Value::Null) {
+        return Value::Null;
+    }
     let aff = type_name.to_ascii_uppercase();
     if aff.contains("INT") {
         Value::Integer(to_i64(&v))

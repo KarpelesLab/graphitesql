@@ -1474,6 +1474,72 @@ impl Connection {
             Expr::Paren(e) => Expr::Paren(Box::new(
                 self.substitute_aggregates(e, columns, rows, group, params)?,
             )),
+            Expr::Cast { expr, type_name } => Expr::Cast {
+                expr: Box::new(self.substitute_aggregates(expr, columns, rows, group, params)?),
+                type_name: type_name.clone(),
+            },
+            Expr::IsNull { expr, negated } => Expr::IsNull {
+                expr: Box::new(self.substitute_aggregates(expr, columns, rows, group, params)?),
+                negated: *negated,
+            },
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(self.substitute_aggregates(expr, columns, rows, group, params)?),
+                low: Box::new(self.substitute_aggregates(low, columns, rows, group, params)?),
+                high: Box::new(self.substitute_aggregates(high, columns, rows, group, params)?),
+                negated: *negated,
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let mut new_list = Vec::with_capacity(list.len());
+                for e in list {
+                    new_list.push(self.substitute_aggregates(e, columns, rows, group, params)?);
+                }
+                Expr::InList {
+                    expr: Box::new(self.substitute_aggregates(expr, columns, rows, group, params)?),
+                    list: new_list,
+                    negated: *negated,
+                }
+            }
+            Expr::Case {
+                operand,
+                when_then,
+                else_result,
+            } => {
+                let operand = match operand {
+                    Some(o) => Some(Box::new(
+                        self.substitute_aggregates(o, columns, rows, group, params)?,
+                    )),
+                    None => None,
+                };
+                let mut new_wt = Vec::with_capacity(when_then.len());
+                for (w, t) in when_then {
+                    new_wt.push((
+                        self.substitute_aggregates(w, columns, rows, group, params)?,
+                        self.substitute_aggregates(t, columns, rows, group, params)?,
+                    ));
+                }
+                let else_result = match else_result {
+                    Some(e) => Some(Box::new(
+                        self.substitute_aggregates(e, columns, rows, group, params)?,
+                    )),
+                    None => None,
+                };
+                Expr::Case {
+                    operand,
+                    when_then: new_wt,
+                    else_result,
+                }
+            }
+            // Literals, columns, parameters, and subqueries are left as-is
+            // (a subquery's own aggregates belong to that subquery).
             other => other.clone(),
         })
     }
