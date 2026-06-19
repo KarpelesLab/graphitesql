@@ -8,9 +8,11 @@
 #![cfg(feature = "std")]
 
 use graphitesql::btree::{IndexCursor, TableCursor};
-use graphitesql::format::TextEncoding;
+use graphitesql::format::{decode_record, TextEncoding};
 use graphitesql::pager::Pager;
+use graphitesql::schema::{ObjectType, Schema};
 use graphitesql::vfs::{std_file::StdVfs, OpenFlags, Vfs};
+use graphitesql::Value;
 
 fn fixture(name: &str) -> String {
     format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
@@ -127,6 +129,61 @@ fn index_scan_basic_idx_b() {
         count += 1;
     }
     assert_eq!(count, 3);
+}
+
+#[test]
+fn reads_schema_catalog() {
+    let pager = open_pager("basic.db");
+    let schema = Schema::read(&pager).unwrap();
+
+    let t = schema.table("t").expect("table t in catalog");
+    assert_eq!(t.obj_type, ObjectType::Table);
+    assert_eq!(t.rootpage, 2); // matches SELECT rootpage FROM sqlite_schema
+    assert!(t.sql.as_deref().unwrap().contains("CREATE TABLE"));
+
+    let idx = schema.index("idx_b").expect("index idx_b in catalog");
+    assert_eq!(idx.obj_type, ObjectType::Index);
+    assert_eq!(idx.tbl_name, "t");
+    assert_eq!(idx.rootpage, 3);
+
+    // Exactly one index attached to `t`.
+    assert_eq!(schema.indexes_on("t").count(), 1);
+}
+
+#[test]
+fn schema_drives_table_scan_end_to_end() {
+    // Resolve a table name through the catalog, then decode its rows — the full
+    // read path from a name to typed values.
+    let pager = open_pager("basic.db");
+    let schema = Schema::read(&pager).unwrap();
+    let root = schema.table("t").unwrap().rootpage;
+
+    let mut cur = TableCursor::new(&pager, root);
+    let mut decoded_rows = Vec::new();
+    let mut ok = cur.first().unwrap();
+    while ok {
+        let rowid = cur.rowid().unwrap();
+        let cols = decode_record(&cur.payload().unwrap(), TextEncoding::Utf8).unwrap();
+        decoded_rows.push((rowid, cols));
+        ok = cur.next().unwrap();
+    }
+
+    assert_eq!(decoded_rows.len(), 3);
+    // Row 1: (1,'hello',3.14, x'01020304'). Column `a` is INTEGER PRIMARY KEY,
+    // so it is stored as NULL in the record and aliases the rowid.
+    let (rowid, cols) = &decoded_rows[0];
+    assert_eq!(*rowid, 1);
+    assert_eq!(cols[0], Value::Null); // IPK alias -> stored NULL
+    assert_eq!(cols[1], Value::Text("hello".into()));
+    #[allow(clippy::approx_constant)] // 3.14 is fixture data, not π
+    let pi_ish = 3.14;
+    assert_eq!(cols[2], Value::Real(pi_ish));
+    assert_eq!(cols[3], Value::Blob(vec![1, 2, 3, 4]));
+    // Row 3 has NULLs for b and c.
+    let (_, cols3) = &decoded_rows[2];
+    assert_eq!(cols3[1], Value::Null);
+    assert_eq!(cols3[2], Value::Null);
+    assert_eq!(cols3[3], Value::Blob(vec![0xff]));
 }
 
 #[test]

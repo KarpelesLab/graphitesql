@@ -14,5 +14,7 @@
 //! * freelist & pointer maps. *(planned)*
 
 pub mod header;
+pub mod record;
 
 pub use header::{DatabaseHeader, TextEncoding};
+pub use record::decode_record;

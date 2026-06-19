@@ -139,13 +139,16 @@ databases lands well before write support).
 - **Reference:** `btree.c`, `btreeInt.h`; `fileformat2.html` (B-tree pages,
   cell format, overflow).
 
-### Phase 3 — Record decoding & the schema catalog
+### Phase 3 — Record decoding & the schema catalog ✅ *(done)*
 
 - **Deliverable:** decode records (header of serial types + bodies) into
   `Value`s; read and parse `sqlite_schema` (table 1) into an in-memory catalog
   of tables/indexes with their root pages and SQL.
-- **Done:** `SELECT`-style enumeration of `sqlite_schema`; resolve a table name
-  to its root page; decode every row of `gtest.db` to typed values.
+- **Done:** full record decode incl. all integer widths (sign-extended),
+  REAL, TEXT (UTF-8/16), BLOB; `Schema::read` enumerates `sqlite_schema`,
+  resolves a table name → root page; end-to-end test decodes every row of
+  `basic.db` to typed values (incl. INTEGER-PRIMARY-KEY → NULL aliasing).
+- **Files:** `src/format/record.rs`, `src/schema/mod.rs`.
 - **Reference:** `fileformat2.html` (record format, schema table), `build.c`.
 
 ### Phase 4 — SQL front end (tokenizer + parser + AST)

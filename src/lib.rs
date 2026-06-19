@@ -56,6 +56,7 @@ pub use value::{SerialType, Value, ValueRef};
 pub mod btree;
 pub mod format;
 pub mod pager;
+pub mod schema;
 pub mod vfs;
 
 pub use error::{Error, Result};
