@@ -1,0 +1,10 @@
+/target
+Cargo.lock
+*.swp
+
+# Vendored SQLite reference material is large and reproducible via
+# `reference/fetch.sh` (hash-verified). Do not commit it.
+/reference/sqlite-src.zip
+/reference/sqlite-src-*/
+/reference/sqlite-fileformat2.html
+/reference/sqlite-doc-*/

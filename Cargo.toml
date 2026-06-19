@@ -1,0 +1,33 @@
+[package]
+name = "graphitesql"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.95"
+description = "A pure, safe, no_std Rust re-implementation of SQLite, compatible with the SQLite 3 file format."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/KarpelesLab/graphitesql"
+readme = "README.md"
+keywords = ["sqlite", "database", "sql", "no_std", "wasm"]
+categories = ["database-implementations", "no-std", "wasm"]
+# Keep the published crate small: the reference/ tree is dev-only and git-ignored.
+exclude = ["/reference", "/.github"]
+
+[features]
+# `std` is on by default and brings the std-backed VFS (real files) plus
+# std::error::Error impls. Turn it off for no_std targets (wasm, embedded);
+# graphitesql then runs entirely in-memory unless you supply your own Vfs.
+default = ["std"]
+std = []
+
+[dependencies]
+# Intentionally none. graphitesql is pure Rust over `core` + `alloc` only.
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+
+[lints.rust]
+# The whole point of the project: no `unsafe` anywhere in the crate.
+unsafe_code = "forbid"
+missing_docs = "warn"

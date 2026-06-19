@@ -1,0 +1,30 @@
+graphitesql
+===========
+
+graphitesql is an independent, clean-room-spirited re-implementation of the
+SQLite database engine in pure, safe Rust. It is not affiliated with, endorsed
+by, or derived from the source code of the SQLite project. It aims for byte-for-
+byte compatibility with the SQLite version 3 on-disk file format and broad
+compatibility with SQLite's SQL dialect and public behavior.
+
+
+Acknowledgement of SQLite
+-------------------------
+
+This project would not exist without SQLite, created by D. Richard Hipp and the
+SQLite developers. SQLite is in the public domain. The authors have placed the
+following blessing in lieu of a copyright notice, which we reproduce here with
+gratitude:
+
+    May you do good and not evil.
+    May you find forgiveness for yourself and forgive others.
+    May you share freely, never taking more than you give.
+
+graphitesql uses the published SQLite source code and documentation purely as a
+*specification reference* (see reference/fetch.sh and ATTRIBUTION.md). The
+on-disk file format that graphitesql reads and writes is the SQLite format,
+documented at https://www.sqlite.org/fileformat2.html.
+
+The names "SQLite" and "SQLite3" are used here only to describe compatibility.
+They are trademarks/identifiers of their respective owners and graphitesql
+claims no rights to them.
