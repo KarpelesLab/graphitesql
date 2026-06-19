@@ -90,6 +90,7 @@ fn column_constraint(c: &ColumnConstraint) -> String {
         ColumnConstraint::Unique => "UNIQUE".to_string(),
         ColumnConstraint::Default(e) => format!("DEFAULT {}", expr(e)),
         ColumnConstraint::Collate(n) => format!("COLLATE {n}"),
+        ColumnConstraint::Check(e) => format!("CHECK ({})", expr(e)),
     }
 }
 
@@ -104,6 +105,7 @@ fn table_constraint(c: &TableConstraint) -> String {
     match c {
         TableConstraint::PrimaryKey(names) => format!("PRIMARY KEY({})", cols(names)),
         TableConstraint::Unique(names) => format!("UNIQUE({})", cols(names)),
+        TableConstraint::Check(e) => format!("CHECK ({})", expr(e)),
     }
 }
 

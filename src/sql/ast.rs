@@ -229,6 +229,8 @@ pub enum ColumnConstraint {
     Default(Expr),
     /// `COLLATE <name>`.
     Collate(String),
+    /// `CHECK (<expr>)`.
+    Check(Expr),
 }
 
 /// A table-level constraint.
@@ -238,6 +240,8 @@ pub enum TableConstraint {
     PrimaryKey(Vec<String>),
     /// `UNIQUE (cols…)`.
     Unique(Vec<String>),
+    /// `CHECK (<expr>)`.
+    Check(Expr),
 }
 
 /// A `CREATE INDEX` statement.

@@ -646,8 +646,10 @@ impl Parser {
             } else if self.eat_kw("collate") {
                 constraints.push(ColumnConstraint::Collate(self.ident()?));
             } else if self.eat_kw("check") {
-                // Not yet modeled/enforced; consume `(expr)`.
-                self.skip_balanced_parens()?;
+                self.expect(&Token::LParen)?;
+                let e = self.expr()?;
+                self.expect(&Token::RParen)?;
+                constraints.push(ColumnConstraint::Check(e));
             } else if self.eat_kw("references") {
                 self.skip_fk_clause()?;
             } else if self.eat_kw("generated") {
@@ -695,8 +697,10 @@ impl Parser {
             self.eat_conflict_clause();
             Ok(Some(TableConstraint::Unique(cols)))
         } else if self.eat_kw("check") {
-            self.skip_balanced_parens()?;
-            Ok(None)
+            self.expect(&Token::LParen)?;
+            let e = self.expr()?;
+            self.expect(&Token::RParen)?;
+            Ok(Some(TableConstraint::Check(e)))
         } else if self.eat_kw("foreign") {
             self.expect_kw("key")?;
             self.skip_balanced_parens()?; // the (columns)

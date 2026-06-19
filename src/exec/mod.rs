@@ -447,6 +447,7 @@ impl Connection {
                 values[ipk] = Value::Integer(rowid);
             }
             check_not_null(&meta, &values)?;
+            self.check_constraints(&meta, &values, Some(rowid), params)?;
             let index_values = values.clone();
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Null;
@@ -516,6 +517,7 @@ impl Connection {
                 values[pos] = eval::eval(expr, &ctx)?;
             }
             check_not_null(&meta, &values)?;
+            self.check_constraints(&meta, &values, Some(rowid), params)?;
             // New rowid if the IPK column was changed, else unchanged.
             let new_rowid = match meta.ipk {
                 Some(ipk) => eval::to_i64(&values[ipk]),
@@ -1545,13 +1547,48 @@ impl Connection {
                         .any(|k| matches!(k, ColumnConstraint::NotNull))
             })
             .collect();
+        // CHECK constraints (column-level + table-level); each is evaluated
+        // against the full row on INSERT/UPDATE.
+        let mut checks: Vec<Expr> = Vec::new();
+        for col in &ct.columns {
+            for k in &col.constraints {
+                if let ColumnConstraint::Check(e) = k {
+                    checks.push(e.clone());
+                }
+            }
+        }
+        for tc in &ct.constraints {
+            if let TableConstraint::Check(e) = tc {
+                checks.push(e.clone());
+            }
+        }
         Ok(TableMeta {
             root: obj.rootpage,
             columns,
             defaults,
             not_null,
+            checks,
             ipk,
         })
+    }
+
+    /// Evaluate CHECK constraints against a fully-built row (with the IPK column
+    /// holding the rowid). A constraint fails only when it evaluates to false;
+    /// NULL (unknown) passes, matching SQLite.
+    fn check_constraints(
+        &self,
+        meta: &TableMeta,
+        values: &[Value],
+        rowid: Option<i64>,
+        params: &Params,
+    ) -> Result<()> {
+        for expr in &meta.checks {
+            let ctx = row_ctx(values, &meta.columns, rowid, params).with_subqueries(self);
+            if eval::truth(&eval::eval(expr, &ctx)?) == Some(false) {
+                return Err(Error::Constraint("CHECK constraint failed".into()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1562,6 +1599,8 @@ struct TableMeta {
     defaults: Vec<Option<Expr>>,
     /// Per-column `NOT NULL` flag (aligned with `columns`).
     not_null: Vec<bool>,
+    /// CHECK constraint expressions (column-level and table-level).
+    checks: Vec<Expr>,
     ipk: Option<usize>,
 }
 

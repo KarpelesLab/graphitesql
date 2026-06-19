@@ -129,6 +129,32 @@ fn additional_scalar_functions() {
 }
 
 #[test]
+fn check_constraints_enforced() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, qty INT CHECK(qty > 0), \
+         kind TEXT, CHECK(kind <> 'bad'))",
+    )
+    .unwrap();
+    c.execute("INSERT INTO t(qty, kind) VALUES (5, 'ok')")
+        .unwrap();
+    // Column-level CHECK violation.
+    assert!(c
+        .execute("INSERT INTO t(qty, kind) VALUES (0, 'ok')")
+        .is_err());
+    // Table-level CHECK violation.
+    assert!(c
+        .execute("INSERT INTO t(qty, kind) VALUES (5, 'bad')")
+        .is_err());
+    // UPDATE into a violating state is rejected.
+    assert!(c.execute("UPDATE t SET qty = -2 WHERE id = 1").is_err());
+    assert_eq!(
+        c.query("SELECT count(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+}
+
+#[test]
 fn defaults_applied() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, status TEXT DEFAULT 'new', n INT DEFAULT 0)")
