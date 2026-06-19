@@ -14,6 +14,11 @@ categories = ["database-implementations", "no-std", "wasm"]
 # Keep the published crate small: the reference/ tree is dev-only and git-ignored.
 exclude = ["/reference", "/.github"]
 
+[[bin]]
+name = "graphitesql"
+path = "src/bin/graphitesql.rs"
+required-features = ["std"]
+
 [features]
 # `std` is on by default and brings the std-backed VFS (real files) plus
 # std::error::Error impls. Turn it off for no_std targets (wasm, embedded);

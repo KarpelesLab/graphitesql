@@ -72,6 +72,20 @@ Open an existing `sqlite3`-written file with `Connection::open("file.db")` (or
 `open_readonly`). Low-level format primitives are public too
 (`graphitesql::format::DatabaseHeader`, `graphitesql::btree`, …).
 
+## Command-line shell
+
+The crate ships a `graphitesql` binary modeled on the `sqlite3` CLI:
+
+```sh
+cargo run --bin graphitesql                 # in-memory, interactive
+cargo run --bin graphitesql -- app.db       # open/create app.db, interactive
+cargo run --bin graphitesql -- app.db "SELECT * FROM users;"   # one-shot
+```
+
+It accepts `;`-terminated SQL (multi-line) and dot-commands: `.tables`,
+`.schema [table]`, `.headers on|off`, `.help`, `.quit`. Results print in
+SQLite's default `|`-separated list mode.
+
 ## Feature flags
 
 | feature | default | effect |
