@@ -61,6 +61,31 @@ fn view_with_explicit_columns_and_drop() {
 }
 
 #[test]
+fn view_in_join() {
+    let mut c = setup();
+    c.execute("CREATE TABLE k(kind TEXT, label TEXT)").unwrap();
+    c.execute("INSERT INTO k VALUES ('a','Apple'),('b','Banana')")
+        .unwrap();
+    c.execute("CREATE VIEW a_only AS SELECT id, kind, amount FROM t WHERE kind = 'a'")
+        .unwrap();
+    // Join a view against a base table (the previously-unsupported case).
+    let r = c
+        .query(
+            "SELECT a_only.amount, k.label FROM a_only \
+             JOIN k ON a_only.kind = k.kind ORDER BY a_only.amount",
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 3);
+    assert_eq!(r.rows[0][0], Value::Integer(10));
+    assert_eq!(r.rows[0][1], Value::Text("Apple".into()));
+    // And a view as the joined (right) side.
+    let r = c
+        .query("SELECT count(*) FROM k JOIN a_only ON k.kind = a_only.kind")
+        .unwrap();
+    assert_eq!(r.rows[0][0], Value::Integer(3));
+}
+
+#[test]
 fn create_view_if_not_exists() {
     let mut c = setup();
     c.execute("CREATE VIEW v AS SELECT id FROM t").unwrap();

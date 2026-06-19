@@ -2531,8 +2531,6 @@ impl Connection {
             {
                 return Ok((columns, rows));
             }
-        } else if self.try_view(&from.first.name, None, params)?.is_some() {
-            return Err(Error::Unsupported("views in joins"));
         }
 
         // Single-table fast path. Try an index-driven equality lookup first; the
@@ -2554,13 +2552,14 @@ impl Connection {
             return Ok((first_meta.columns, input_rows));
         }
 
-        // Join case: resolve the first source (CTE or table), then fold in joins.
-        let (mut columns, mut rows) = self.resolve_join_source(&from.first)?;
+        // Join case: resolve the first source (CTE, view, or table), then fold
+        // in joins.
+        let (mut columns, mut rows) = self.resolve_join_source(&from.first, params)?;
 
         // Fold each join in with a nested-loop, evaluating its ON predicate
         // against the columns accumulated so far plus the joined table's.
         for join in &from.joins {
-            let (jcols, jrows) = self.resolve_join_source(&join.table)?;
+            let (jcols, jrows) = self.resolve_join_source(&join.table, params)?;
 
             let mut new_columns = columns.clone();
             new_columns.extend(jcols.iter().cloned());
@@ -2608,8 +2607,15 @@ impl Connection {
     /// Resolve one table reference in a join to its columns + row values,
     /// consulting the CTE environment before the schema (so a CTE — including a
     /// recursive one — can appear as a join source).
-    fn resolve_join_source(&self, tref: &TableRef) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+    fn resolve_join_source(
+        &self,
+        tref: &TableRef,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         if let Some((cols, rows)) = self.lookup_cte(&tref.name, tref.alias.as_deref()) {
+            return Ok((cols, rows.into_iter().map(|r| r.values).collect()));
+        }
+        if let Some((cols, rows)) = self.try_view(&tref.name, tref.alias.as_deref(), params)? {
             return Ok((cols, rows.into_iter().map(|r| r.values).collect()));
         }
         let meta = self.table_meta(&tref.name, tref.alias.as_deref())?;

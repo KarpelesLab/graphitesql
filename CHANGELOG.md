@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: views (and CTEs) usable as a join source — a view or CTE may now
+  appear on either side of a `JOIN`, not just as the sole `FROM` source
 - Phase 9: row triggers — `CREATE TRIGGER … [BEFORE|AFTER] {INSERT|UPDATE|DELETE}
   ON t [WHEN …] BEGIN … END` with `OLD`/`NEW` row references and `DROP TRIGGER`;
   fired non-recursively (matching `recursive_triggers = OFF`)

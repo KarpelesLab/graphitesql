@@ -311,9 +311,10 @@ coverage rather than having a single "done".
     CASCADE, SET NULL, SET DEFAULT) on DELETE/UPDATE (`tests/foreign_keys.rs`);
   - **row triggers** — `CREATE TRIGGER`/`DROP TRIGGER` for
     `BEFORE`/`AFTER` `INSERT`/`UPDATE`/`DELETE`, with `OLD`/`NEW` references and a
-    `WHEN` guard, fired non-recursively (`tests/triggers.rs`).
-- **Deliverable (remaining):** subqueries/views in
-  joins; explicit window frame clauses (`ROWS`/`RANGE BETWEEN`); recursive
+    `WHEN` guard, fired non-recursively (`tests/triggers.rs`);
+  - **views & CTEs as join sources** — either side of a `JOIN` (`tests/views.rs`).
+- **Deliverable (remaining):** subqueries in `FROM` (`FROM (SELECT …)`);
+  explicit window frame clauses (`ROWS`/`RANGE BETWEEN`); recursive
   triggers & `INSTEAD OF` (view) triggers; `BEFORE`-trigger `NEW` mutation; real
   `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
