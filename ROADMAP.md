@@ -340,11 +340,13 @@ coverage rather than having a single "done".
     b-tree keyed by (indexed cols, PK cols), maintained across DML
     (`tests/without_rowid.rs`);
   - **WAL write path** — `PRAGMA journal_mode=WAL`, frame-appending commits,
-    `wal_checkpoint`, and reopen-from-`-wal` (`tests/wal_write.rs`; see Phase 8).
-- **Deliverable (remaining):** real `VACUUM` compaction (the no-op is valid
-  SQLite behavior); b-tree page merging/rebalance on delete (space reclamation;
-  correct without it); and `UNIQUE` (auto-index) constraints on `WITHOUT ROWID`
-  tables.
+    `wal_checkpoint`, and reopen-from-`-wal` (`tests/wal_write.rs`; see Phase 8);
+  - **real `VACUUM` compaction** — rebuilds into a fresh, gap-free image,
+    shrinking the file and preserving content (`tests/vacuum.rs`); b-tree cursors
+    now also tolerate empty pages left by heavy deletes.
+- **Deliverable (remaining):** b-tree page *merging* on delete (eager space
+  reclamation — `VACUUM` already reclaims it, and cursors handle the empty pages
+  meanwhile); and `UNIQUE` (auto-index) constraints on `WITHOUT ROWID` tables.
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.

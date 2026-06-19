@@ -105,12 +105,43 @@ impl<'p> TableCursor<'p> {
         self.stack.clear();
         self.exhausted = false;
         self.descend_left(self.root)?;
-        // An empty table's root is a leaf with no cells.
-        if self.leaf_empty() {
-            self.exhausted = true;
-            return Ok(false);
+        // The leftmost leaf may be empty (e.g. after deletes); settle onto the
+        // first real cell, skipping empty leaves in tree order.
+        self.settle()
+    }
+
+    /// Ensure the cursor's top frame is a leaf positioned at a valid cell,
+    /// advancing in tree order past any exhausted or empty leaves. Returns
+    /// `false` (and marks the cursor exhausted) if no more rows remain.
+    fn settle(&mut self) -> Result<bool> {
+        loop {
+            if let Some(top) = self.stack.last() {
+                if top.idx < top.page.num_cells() {
+                    return Ok(true);
+                }
+            } else {
+                self.exhausted = true;
+                return Ok(false);
+            }
+            // No valid cell at the current leaf: pop and walk up to the next
+            // child, then descend to its leftmost leaf and re-check.
+            self.stack.pop();
+            let mut descended = false;
+            while let Some(top) = self.stack.last_mut() {
+                top.idx += 1;
+                if top.idx <= top.page.num_cells() {
+                    let child = top.page.child_pointer(top.idx)?;
+                    self.descend_left(child)?;
+                    descended = true;
+                    break;
+                }
+                self.stack.pop();
+            }
+            if !descended {
+                self.exhausted = true;
+                return Ok(false);
+            }
         }
-        Ok(true)
     }
 
     /// Whether the cursor currently points at a valid row.
@@ -143,27 +174,13 @@ impl<'p> TableCursor<'p> {
         if self.exhausted {
             return Ok(false);
         }
-        // Advance within the current leaf if possible.
-        {
-            let top = self.stack.last_mut().expect("positioned cursor has frames");
-            top.idx += 1;
-            if top.idx < top.page.num_cells() {
-                return Ok(true);
-            }
-        }
-        // Leaf exhausted: pop and walk up to the next unexplored child.
-        self.stack.pop();
-        while let Some(top) = self.stack.last_mut() {
-            top.idx += 1;
-            if top.idx <= top.page.num_cells() {
-                let child = top.page.child_pointer(top.idx)?;
-                self.descend_left(child)?;
-                return Ok(true);
-            }
-            self.stack.pop();
-        }
-        self.exhausted = true;
-        Ok(false)
+        // Advance within the current leaf, then settle onto the next real cell
+        // (which may require skipping exhausted or empty leaves in tree order).
+        self.stack
+            .last_mut()
+            .expect("positioned cursor has frames")
+            .idx += 1;
+        self.settle()
     }
 
     /// Seek to `target` rowid, positioning at the smallest rowid `>= target`.
@@ -236,13 +253,6 @@ impl<'p> TableCursor<'p> {
         self.stack
             .last()
             .ok_or_else(|| Error::Error("cursor has no current frame".into()))
-    }
-
-    fn leaf_empty(&self) -> bool {
-        self.stack
-            .last()
-            .map(|f| f.page.num_cells() == 0)
-            .unwrap_or(true)
     }
 }
 

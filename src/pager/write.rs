@@ -475,6 +475,44 @@ impl WritePager {
         Ok(())
     }
 
+    /// Replace the entire database file with a freshly-built, compact `image`
+    /// (page 1 first, carrying the new header). Used by `VACUUM`. Bypasses the
+    /// rollback journal — the rebuild is all-or-nothing on success. In WAL mode
+    /// the image is written to the main file and the WAL is reset empty.
+    pub fn replace_image(&mut self, image: Vec<Vec<u8>>) -> Result<()> {
+        if image.is_empty() || image[0].len() != self.page_size {
+            return Err(Error::Error("invalid VACUUM image".into()));
+        }
+        let ps = self.page_size as u64;
+        for (i, bytes) in image.iter().enumerate() {
+            self.file.write_all_at(bytes, i as u64 * ps)?;
+        }
+        self.file.truncate(image.len() as u64 * ps)?;
+        self.file.sync()?;
+        let count = image.len() as u32;
+        self.header = DatabaseHeader::parse(&image[0])?;
+        self.disk_pages = count;
+        self.page_count = count;
+        self.overlay.clear();
+        // Reset any WAL: its frames now refer to the pre-VACUUM image.
+        if self.wal.is_some() {
+            if let Some(w) = self.wal_file.as_mut() {
+                w.truncate(0)?;
+                w.sync()?;
+            }
+            self.header.read_version = 2;
+            self.header.write_version = 2;
+            self.wal = Some(WalRuntime {
+                frames: BTreeMap::new(),
+                offset: 0,
+                cksum: (0, 0),
+                salt: (count as u64).wrapping_mul(0x9E37_79B9).to_be_bytes(),
+                db_size: count,
+            });
+        }
+        Ok(())
+    }
+
     /// Load committed frames from an existing `-wal` file (used on open). Returns
     /// the runtime state positioned to append after the last valid frame, or
     /// `None` if the WAL is empty/invalid.

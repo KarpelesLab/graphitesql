@@ -415,7 +415,10 @@ impl Connection {
                 self.exec_pragma(&p, params)?;
                 0
             }
-            Statement::Vacuum => 0, // accepted; compaction is a no-op here
+            Statement::Vacuum => {
+                self.exec_vacuum()?;
+                0
+            }
             Statement::Select(_) => return Err(Error::Unsupported("use query() for SELECT")),
             Statement::Explain { .. } => return Err(Error::Unsupported("use query() for EXPLAIN")),
             Statement::Begin | Statement::Commit | Statement::Rollback => unreachable!(),
@@ -427,6 +430,110 @@ impl Connection {
             self.schema = Schema::read(self.backend.source())?;
         }
         Ok(affected)
+    }
+
+    /// `VACUUM`: rebuild the database into a fresh, compact image (no free pages,
+    /// defragmented b-trees) and replace the file. Implemented by replaying the
+    /// stored `CREATE` statements and re-inserting all rows into a throwaway
+    /// in-memory database, then copying its pages over. A no-op for read-only
+    /// backends.
+    fn exec_vacuum(&mut self) -> Result<()> {
+        use crate::schema::ObjectType;
+        if !matches!(self.backend, Backend::Write(_)) {
+            return Ok(());
+        }
+        // Flush any WAL frames into the main image first.
+        if self.backend.wal_mode() {
+            self.backend.writer()?.checkpoint()?;
+        }
+        let user_version = self.backend.source().header().user_version;
+
+        // Snapshot the catalog: (type, name, sql), preserving creation order.
+        let objs: Vec<(ObjectType, String, Option<String>)> = self
+            .schema
+            .objects()
+            .iter()
+            .map(|o| (o.obj_type, o.name.clone(), o.sql.clone()))
+            .collect();
+
+        let quote = |n: &str| alloc::format!("\"{}\"", n.replace('"', "\"\""));
+
+        // Build a compact copy in a throwaway in-memory database.
+        let mut tmp = Connection::open_memory()?;
+        // 1. Tables (this also recreates their automatic indexes).
+        for (ty, _, sql) in &objs {
+            if *ty == ObjectType::Table {
+                if let Some(s) = sql {
+                    tmp.execute(s)?;
+                }
+            }
+        }
+        // 2. Explicit secondary indexes (auto-indexes have no SQL).
+        for (ty, _, sql) in &objs {
+            if *ty == ObjectType::Index {
+                if let Some(s) = sql {
+                    tmp.execute(s)?;
+                }
+            }
+        }
+        // 3. Re-insert every table's rows (before triggers exist, so none fire).
+        for (ty, name, _) in &objs {
+            if *ty != ObjectType::Table {
+                continue;
+            }
+            let result = self.query(&alloc::format!("SELECT * FROM {}", quote(name)))?;
+            let ncols = result.columns.len();
+            if ncols == 0 {
+                continue;
+            }
+            let placeholders = (1..=ncols)
+                .map(|i| alloc::format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let stmt = alloc::format!("INSERT INTO {} VALUES ({placeholders})", quote(name));
+            for row in result.rows {
+                let params = Params {
+                    positional: row,
+                    named: Vec::new(),
+                };
+                tmp.execute_params(&stmt, &params)?;
+            }
+        }
+        // 4. Views, then 5. triggers (last, so loading data didn't fire them).
+        for (ty, _, sql) in &objs {
+            if *ty == ObjectType::View {
+                if let Some(s) = sql {
+                    tmp.execute(s)?;
+                }
+            }
+        }
+        for (ty, _, sql) in &objs {
+            if *ty == ObjectType::Trigger {
+                if let Some(s) = sql {
+                    tmp.execute(s)?;
+                }
+            }
+        }
+
+        // Copy the compact image's pages over the current database file.
+        let count = tmp.backend.source().page_count();
+        let mut image = Vec::with_capacity(count as usize);
+        for n in 1..=count {
+            image.push(tmp.backend.source().page(n)?.data().to_vec());
+        }
+        self.backend.writer()?.replace_image(image)?;
+
+        // Preserve user_version across the rebuild.
+        if user_version != 0 {
+            self.backend.writer()?.header_mut().user_version = user_version;
+            // Re-stamp page 1 via a commit.
+            let mut page1 = self.backend.writer()?.read_page(1)?;
+            self.backend.writer()?.header().write_to(&mut page1)?;
+            self.backend.writer()?.write_page(1, page1)?;
+            self.backend.writer()?.commit()?;
+        }
+        self.schema = Schema::read(self.backend.source())?;
+        Ok(())
     }
 
     // ---- DDL / DML ----------------------------------------------------------

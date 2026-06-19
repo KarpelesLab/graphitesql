@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: real `VACUUM` compaction — rebuilds the database into a fresh, gap-free
+  image (no free pages, defragmented b-trees), shrinking the file while
+  preserving rows, indexes, triggers, and `user_version`; the result passes real
+  `sqlite3 integrity_check`
+- Fix: b-tree cursors now skip empty leaf/interior pages left behind by heavy
+  deletes (previously a scan after deleting most rows errored with "cell index
+  out of range")
 - Phase 9: **WAL write path** — `PRAGMA journal_mode=WAL` switches the database
   to write-ahead logging; commits append page frames (with SQLite's exact
   checksums/salts) to the `-wal` file, `PRAGMA wal_checkpoint` writes them back
