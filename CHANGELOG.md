@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: broaden the differential corpus to 1658 queries (window functions,
+  derived tables, correlated subqueries/`EXISTS`, real-valued expressions) and
+  render reals through the `%.15g`-compatible formatter
 - Phase 9: explicit window frame clauses — `ROWS`/`RANGE`/`GROUPS BETWEEN … AND …`
   (and the bare-start form), with `UNBOUNDED`/`CURRENT ROW`/`N PRECEDING`/
   `N FOLLOWING` bounds and an accepted-and-ignored `EXCLUDE` clause

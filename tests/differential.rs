@@ -68,7 +68,8 @@ fn render(result: &graphitesql::QueryResult) -> String {
                 Value::Null => String::new(),
                 Value::Integer(i) => i.to_string(),
                 Value::Text(s) => s.clone(),
-                Value::Real(r) => format!("{r}"),
+                // graphitesql's canonical real formatting (matches sqlite's %.15g).
+                Value::Real(r) => graphitesql::exec::eval::format_real(*r),
                 Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
             })
             .collect();
@@ -338,6 +339,43 @@ fn corpus() -> Vec<String> {
         "SELECT g, count(*) FROM t GROUP BY g UNION ALL SELECT 99, sum(a) FROM t ORDER BY 1;"
             .into(),
     );
+
+    // 24) Window functions over the dataset (rank/aggregates/offset + frames).
+    q.push("SELECT id, row_number() OVER (ORDER BY a, id) FROM t ORDER BY id;".into());
+    q.push("SELECT id, rank() OVER (PARTITION BY g ORDER BY b) FROM t ORDER BY id;".into());
+    q.push("SELECT id, dense_rank() OVER (PARTITION BY g ORDER BY b) FROM t ORDER BY id;".into());
+    q.push("SELECT id, sum(a) OVER (PARTITION BY g ORDER BY id) FROM t ORDER BY id;".into());
+    q.push("SELECT id, avg(a) OVER (PARTITION BY g) FROM t ORDER BY id;".into());
+    q.push("SELECT id, count(*) OVER (PARTITION BY g) FROM t ORDER BY id;".into());
+    q.push("SELECT id, lag(a) OVER (ORDER BY id) FROM t ORDER BY id;".into());
+    q.push("SELECT id, lead(a, 2, -1) OVER (ORDER BY id) FROM t ORDER BY id;".into());
+    q.push(
+        "SELECT id, sum(a) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id;"
+            .into(),
+    );
+    q.push("SELECT id, ntile(4) OVER (ORDER BY id) FROM t ORDER BY id;".into());
+
+    // 25) Derived tables and correlated subqueries / EXISTS over the dataset.
+    q.push("SELECT count(*) FROM (SELECT a FROM t WHERE a > 20);".into());
+    q.push(
+        "SELECT sub.g, sub.c FROM (SELECT g, count(*) AS c FROM t GROUP BY g) AS sub ORDER BY sub.g;"
+            .into(),
+    );
+    q.push(
+        "SELECT t.id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id) ORDER BY t.id;"
+            .into(),
+    );
+    q.push(
+        "SELECT t.id, (SELECT count(*) FROM u WHERE u.t_id = t.id) FROM t ORDER BY t.id;".into(),
+    );
+    q.push(
+        "SELECT id FROM t WHERE a > (SELECT avg(w) FROM u WHERE u.t_id = t.id) ORDER BY id;".into(),
+    );
+
+    // 26) Real-valued expressions (now that formatting matches sqlite's %.15g).
+    q.push("SELECT id, a * 1.0 / 3 FROM t WHERE id <= 6 ORDER BY id;".into());
+    q.push("SELECT avg(a), avg(b) FROM t;".into());
+    q.push("SELECT g, avg(a) FROM t GROUP BY g ORDER BY g;".into());
 
     q
 }
