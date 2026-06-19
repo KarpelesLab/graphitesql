@@ -197,6 +197,14 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 },
             }
         }
+        // Date/time functions (see `super::datetime`).
+        "date" => super::datetime::date(&v),
+        "time" => super::datetime::time(&v),
+        "datetime" => super::datetime::datetime(&v),
+        "julianday" => super::datetime::julianday(&v),
+        "unixepoch" => super::datetime::unixepoch(&v),
+        "strftime" => super::datetime::strftime(&v),
+        "printf" | "format" => super::datetime::printf(&v),
         _ => return Err(Error::Unsupported("unknown scalar function")),
     })
 }

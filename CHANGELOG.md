@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- Phase 9: date/time functions (`date`, `time`, `datetime`, `julianday`,
+  `unixepoch`, `strftime`) and `printf`/`format` — a dependency-free port of
+  SQLite's `date.c` Julian-day core, verified differentially against `sqlite3`
+
 ## [0.0.3](https://github.com/KarpelesLab/graphitesql/compare/v0.0.2...v0.0.3) - 2026-06-19
 
 ### Other

@@ -13,6 +13,7 @@
 //! writable pager, an in-memory database, or — read-only — a WAL-mode database
 //! (the `-wal` overlay is detected automatically).
 
+pub mod datetime;
 pub mod eval;
 pub mod func;
 
