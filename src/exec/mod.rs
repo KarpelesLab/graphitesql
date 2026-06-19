@@ -441,6 +441,7 @@ impl Connection {
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Integer(rowid);
             }
+            check_not_null(&meta, &values)?;
             let index_values = values.clone();
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Null;
@@ -507,6 +508,7 @@ impl Connection {
                 let ctx = row_ctx(&values, &meta.columns, Some(rowid), params);
                 values[pos] = eval::eval(expr, &ctx)?;
             }
+            check_not_null(&meta, &values)?;
             // New rowid if the IPK column was changed, else unchanged.
             let new_rowid = match meta.ipk {
                 Some(ipk) => eval::to_i64(&values[ipk]),
@@ -1381,10 +1383,23 @@ impl Connection {
             })
             .collect();
         let ipk = find_integer_primary_key(&ct);
+        let not_null: Vec<bool> = ct
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                // The INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
+                Some(i) == ipk
+                    || c.constraints
+                        .iter()
+                        .any(|k| matches!(k, ColumnConstraint::NotNull))
+            })
+            .collect();
         Ok(TableMeta {
             root: obj.rootpage,
             columns,
             defaults,
+            not_null,
             ipk,
         })
     }
@@ -1395,6 +1410,8 @@ struct TableMeta {
     columns: Vec<ColumnInfo>,
     /// Per-column `DEFAULT` expression, if declared (aligned with `columns`).
     defaults: Vec<Option<Expr>>,
+    /// Per-column `NOT NULL` flag (aligned with `columns`).
+    not_null: Vec<bool>,
     ipk: Option<usize>,
 }
 
@@ -1407,6 +1424,19 @@ struct IndexMeta {
 /// Whether a value is the given text (used to match `sqlite_schema` columns).
 fn is_text(v: &Value, s: &str) -> bool {
     matches!(v, Value::Text(t) if t == s)
+}
+
+/// Enforce declared `NOT NULL` column constraints over a fully-built row.
+fn check_not_null(meta: &TableMeta, values: &[Value]) -> Result<()> {
+    for (i, v) in values.iter().enumerate() {
+        if meta.not_null[i] && matches!(v, Value::Null) {
+            return Err(Error::Constraint(format!(
+                "NOT NULL constraint failed: {}.{}",
+                meta.columns[i].table, meta.columns[i].name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Build an index key record: the indexed column values followed by the trailing

@@ -90,6 +90,24 @@ fn pragma_table_info_and_page_size() {
 }
 
 #[test]
+fn not_null_constraint_enforced() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT)")
+        .unwrap();
+    // A NULL into a NOT NULL column is rejected.
+    assert!(c.execute("INSERT INTO t(name) VALUES (NULL)").is_err());
+    assert!(c.execute("INSERT INTO t(note) VALUES ('x')").is_err()); // name omitted -> NULL
+                                                                     // A valid row is accepted; nullable columns may be NULL.
+    c.execute("INSERT INTO t(name) VALUES ('ok')").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    // UPDATE that would violate NOT NULL is rejected.
+    assert!(c.execute("UPDATE t SET name = NULL WHERE id = 1").is_err());
+}
+
+#[test]
 fn defaults_applied() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, status TEXT DEFAULT 'new', n INT DEFAULT 0)")
