@@ -475,27 +475,10 @@ pub fn cast(v: Value, type_name: &str) -> Value {
 
 // ---- value semantics --------------------------------------------------------
 
-/// SQLite's total comparison order across storage classes.
+/// SQLite's total comparison order across storage classes (see
+/// [`crate::value::cmp_values`]).
 pub fn compare(a: &Value, b: &Value) -> Ordering {
-    fn class(v: &Value) -> u8 {
-        match v {
-            Value::Null => 0,
-            Value::Integer(_) | Value::Real(_) => 1,
-            Value::Text(_) => 2,
-            Value::Blob(_) => 3,
-        }
-    }
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Integer(_) | Value::Real(_), Value::Integer(_) | Value::Real(_)) => {
-            let x = number_as_f64(a);
-            let y = number_as_f64(b);
-            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
-        }
-        (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
-        (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
-        _ => class(a).cmp(&class(b)),
-    }
+    crate::value::cmp_values(a, b)
 }
 
 /// Three-valued truthiness: `None` is SQL `NULL`.

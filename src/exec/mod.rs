@@ -16,7 +16,10 @@
 pub mod eval;
 pub mod func;
 
-use crate::btree::{create_table_root, delete_table, insert_table, TableCursor};
+use crate::btree::{
+    clear_index, create_index_root, create_table_root, delete_table, free_tree, insert_index,
+    insert_table, TableCursor,
+};
 use crate::error::{Error, Result};
 use crate::format::record::{decode_record, encode_record};
 use crate::pager::{PageSource, WritePager};
@@ -310,11 +313,16 @@ impl Connection {
             Statement::Insert(ins) => self.exec_insert(&ins, params)?,
             Statement::Delete(del) => self.exec_delete(&del, params)?,
             Statement::Update(upd) => self.exec_update(&upd, params)?,
+            Statement::CreateIndex(ci) => {
+                self.exec_create_index(&ci, sql.trim())?;
+                0
+            }
+            Statement::Drop(d) => {
+                self.exec_drop(&d)?;
+                0
+            }
             Statement::Pragma(_) => 0, // accepted, no-op for now
             Statement::Select(_) => return Err(Error::Unsupported("use query() for SELECT")),
-            Statement::CreateIndex(_) | Statement::Drop(_) => {
-                return Err(Error::Unsupported("CREATE INDEX / DROP (Phase 7/9)"))
-            }
             Statement::Begin | Statement::Commit | Statement::Rollback => unreachable!(),
         };
 
@@ -390,6 +398,7 @@ impl Connection {
             t
         };
 
+        let indexes = self.indexes_of(&ins.table)?;
         let mut next_auto = self.next_rowid(meta.root)?;
         let mut affected = 0;
         for row_exprs in &rows {
@@ -423,12 +432,21 @@ impl Connection {
                     r
                 }
             };
-            // The IPK column is stored as NULL in the record (it aliases rowid).
+            // Capture column values (with the IPK = rowid) for index keys, then
+            // NULL the IPK column in the stored record (it aliases the rowid).
+            if let Some(ipk) = meta.ipk {
+                values[ipk] = Value::Integer(rowid);
+            }
+            let index_values = values.clone();
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Null;
             }
             let record = encode_record(&values);
             insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
+            for idx in &indexes {
+                let key = index_key(&idx.cols, &index_values, rowid);
+                insert_index(self.backend.writer()?, idx.root, &key)?;
+            }
             affected += 1;
         }
         Ok(affected)
@@ -436,15 +454,20 @@ impl Connection {
 
     fn exec_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
         let meta = self.table_meta(&del.table, None)?;
+        let indexes = self.indexes_of(&del.table)?;
         let victims = self.matching_rowids(&meta, del.where_clause.as_ref(), params)?;
         for rowid in &victims {
             delete_table(self.backend.writer()?, meta.root, *rowid)?;
+        }
+        if !victims.is_empty() {
+            self.rebuild_indexes(&meta, &indexes)?;
         }
         Ok(victims.len())
     }
 
     fn exec_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
         let meta = self.table_meta(&upd.table, None)?;
+        let indexes = self.indexes_of(&upd.table)?;
         // Collect (rowid, current values) for matching rows first.
         let mut targets: Vec<(i64, Vec<Value>)> = Vec::new();
         {
@@ -497,7 +520,167 @@ impl Connection {
             insert_table(self.backend.writer()?, meta.root, new_rowid, &record)?;
             affected += 1;
         }
+        if affected > 0 {
+            self.rebuild_indexes(&meta, &indexes)?;
+        }
         Ok(affected)
+    }
+
+    // ---- index DDL & maintenance --------------------------------------------
+
+    fn exec_create_index(&mut self, ci: &CreateIndex, sql_text: &str) -> Result<()> {
+        if self.schema.index(&ci.name).is_some() {
+            if ci.if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::Error(format!("index {} already exists", ci.name)));
+        }
+        let tmeta = self.table_meta(&ci.table, None)?;
+        let cols = self.index_columns(&tmeta, ci)?;
+        let schema_next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
+        let rows = self.scan_table(&tmeta)?;
+
+        let w = self.backend.writer()?;
+        let root = create_index_root(w)?;
+        for (rowid, values) in &rows {
+            let key = index_key(&cols, values, *rowid);
+            insert_index(w, root, &key)?;
+        }
+        let schema_row = encode_record(&[
+            Value::Text("index".into()),
+            Value::Text(ci.name.clone()),
+            Value::Text(ci.table.clone()),
+            Value::Integer(root as i64),
+            Value::Text(sql_text.into()),
+        ]);
+        insert_table(w, crate::schema::SCHEMA_ROOT_PAGE, schema_next, &schema_row)?;
+        let cookie = w.header().schema_cookie.wrapping_add(1);
+        w.header_mut().schema_cookie = cookie;
+        self.schema = Schema::read(self.backend.source())?;
+        Ok(())
+    }
+
+    fn exec_drop(&mut self, d: &Drop) -> Result<()> {
+        use crate::schema::ObjectType;
+        let want = match d.kind {
+            DropKind::Table => ObjectType::Table,
+            DropKind::Index => ObjectType::Index,
+            DropKind::View => ObjectType::View,
+            DropKind::Trigger => ObjectType::Trigger,
+        };
+        // Find the object (and, for a table, its dependent indexes) to remove.
+        let target = self
+            .schema
+            .objects()
+            .iter()
+            .find(|o| o.obj_type == want && o.name == d.name)
+            .cloned();
+        let Some(obj) = target else {
+            if d.if_exists {
+                return Ok(());
+            }
+            return Err(Error::Error(format!("no such {:?}: {}", d.kind, d.name)));
+        };
+
+        // Collect the schema rows (by rowid) and b-tree roots to drop.
+        let mut roots_to_free = Vec::new();
+        let mut names_to_remove = Vec::new();
+        roots_to_free.push(obj.rootpage);
+        names_to_remove.push(obj.name.clone());
+        if want == ObjectType::Table {
+            for idx in self.schema.indexes_on(&obj.name) {
+                roots_to_free.push(idx.rootpage);
+                names_to_remove.push(idx.name.clone());
+            }
+        }
+        // Map names -> sqlite_schema rowids (scan page 1).
+        let victim_rowids = self.schema_rowids_for(&names_to_remove)?;
+
+        let w = self.backend.writer()?;
+        for root in roots_to_free {
+            if root != 0 {
+                free_tree(w, root)?;
+            }
+        }
+        for rid in victim_rowids {
+            delete_table(w, crate::schema::SCHEMA_ROOT_PAGE, rid)?;
+        }
+        let cookie = w.header().schema_cookie.wrapping_add(1);
+        w.header_mut().schema_cookie = cookie;
+        self.schema = Schema::read(self.backend.source())?;
+        Ok(())
+    }
+
+    /// Resolve the `sqlite_schema` rowids of the objects named in `names`.
+    fn schema_rowids_for(&self, names: &[String]) -> Result<Vec<i64>> {
+        let encoding = self.backend.source().header().text_encoding;
+        let mut out = Vec::new();
+        let mut cur = TableCursor::new(self.backend.source(), crate::schema::SCHEMA_ROOT_PAGE);
+        let mut ok = cur.first()?;
+        while ok {
+            let cols = decode_record(&cur.payload()?, encoding)?;
+            if let Some(Value::Text(name)) = cols.get(1) {
+                if names.iter().any(|n| n == name) {
+                    out.push(cur.rowid()?);
+                }
+            }
+            ok = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// The index metadata (root + indexed column positions) for `table`.
+    fn indexes_of(&self, table: &str) -> Result<Vec<IndexMeta>> {
+        let tmeta = match self.schema.table(table) {
+            Some(_) => self.table_meta(table, None)?,
+            None => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        for obj in self.schema.indexes_on(table) {
+            let Some(sql) = &obj.sql else { continue }; // skip auto-indexes
+            let Statement::CreateIndex(ci) = sql::parse_one(sql)? else {
+                continue;
+            };
+            let cols = self.index_columns(&tmeta, &ci)?;
+            out.push(IndexMeta {
+                root: obj.rootpage,
+                cols,
+            });
+        }
+        Ok(out)
+    }
+
+    fn index_columns(&self, tmeta: &TableMeta, ci: &CreateIndex) -> Result<Vec<usize>> {
+        let mut cols = Vec::new();
+        for term in &ci.columns {
+            let Expr::Column { column, .. } = &term.expr else {
+                return Err(Error::Unsupported("expression indexes"));
+            };
+            let pos = tmeta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(column))
+                .ok_or_else(|| Error::Error(format!("no such column: {column}")))?;
+            cols.push(pos);
+        }
+        Ok(cols)
+    }
+
+    /// Rebuild every index of a table in place (used after DELETE/UPDATE).
+    fn rebuild_indexes(&mut self, tmeta: &TableMeta, indexes: &[IndexMeta]) -> Result<()> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let rows = self.scan_table(tmeta)?;
+        let w = self.backend.writer()?;
+        for idx in indexes {
+            clear_index(w, idx.root)?;
+            for (rowid, values) in &rows {
+                let key = index_key(&idx.cols, values, *rowid);
+                insert_index(w, idx.root, &key)?;
+            }
+        }
+        Ok(())
     }
 
     /// Rowids of rows in `meta` satisfying `pred` (all rows if `None`).
@@ -1085,6 +1268,20 @@ struct TableMeta {
     /// Per-column `DEFAULT` expression, if declared (aligned with `columns`).
     defaults: Vec<Option<Expr>>,
     ipk: Option<usize>,
+}
+
+/// An index's b-tree root and the table column positions it covers.
+struct IndexMeta {
+    root: u32,
+    cols: Vec<usize>,
+}
+
+/// Build an index key record: the indexed column values followed by the trailing
+/// rowid (which makes every index key unique and supports lookups).
+fn index_key(cols: &[usize], values: &[Value], rowid: i64) -> Vec<u8> {
+    let mut key: Vec<Value> = cols.iter().map(|&p| values[p].clone()).collect();
+    key.push(Value::Integer(rowid));
+    encode_record(&key)
 }
 
 struct InputRow {

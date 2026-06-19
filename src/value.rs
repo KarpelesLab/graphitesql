@@ -11,6 +11,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 /// A value's storage class, owning its data.
 ///
@@ -57,6 +58,37 @@ impl ValueRef<'_> {
             ValueRef::Text(s) => Value::Text(String::from(s)),
             ValueRef::Blob(b) => Value::Blob(Vec::from(b)),
         }
+    }
+}
+
+/// Compare two values in SQLite's total ordering: `NULL` < numbers < text <
+/// blobs; numbers compared numerically, text by byte (the `BINARY` collation),
+/// blobs by `memcmp`. This is the order used for index keys, `ORDER BY`, and
+/// comparisons (collation refinements are layered on top elsewhere).
+pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
+    fn class(v: &Value) -> u8 {
+        match v {
+            Value::Null => 0,
+            Value::Integer(_) | Value::Real(_) => 1,
+            Value::Text(_) => 2,
+            Value::Blob(_) => 3,
+        }
+    }
+    fn as_f64(v: &Value) -> f64 {
+        match v {
+            Value::Integer(i) => *i as f64,
+            Value::Real(r) => *r,
+            _ => 0.0,
+        }
+    }
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Integer(_) | Value::Real(_), Value::Integer(_) | Value::Real(_)) => {
+            as_f64(a).partial_cmp(&as_f64(b)).unwrap_or(Ordering::Equal)
+        }
+        (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
+        (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
+        _ => class(a).cmp(&class(b)),
     }
 }
 

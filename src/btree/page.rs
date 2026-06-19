@@ -239,6 +239,28 @@ impl BtreePage {
         Ok(&data[off..off + len])
     }
 
+    /// The raw "record cell" bytes of index cell `i`: the `varint(len)` + local
+    /// payload (+ overflow pointer), i.e. everything after the optional 4-byte
+    /// left-child pointer. Used by the writer to move index entries between pages.
+    pub fn raw_index_record_cell(&self, i: usize, usable: usize) -> Result<&[u8]> {
+        debug_assert!(!self.page_type.is_table());
+        let off = self.cell_offset(i)?;
+        let data = self.data();
+        let key_off = if self.page_type == PageType::InteriorIndex {
+            off + 4
+        } else {
+            off
+        };
+        let (plen, n1) = varint::decode(&data[key_off..])
+            .ok_or_else(|| Error::Corrupt("truncated index payload length".into()))?;
+        let (local_len, has_overflow) = payload_split(self.page_type, usable, plen as usize);
+        let len = n1 + local_len + if has_overflow { 4 } else { 0 };
+        if key_off + len > data.len() {
+            return Err(Error::Corrupt("index cell extends past page".into()));
+        }
+        Ok(&data[key_off..key_off + len])
+    }
+
     /// Parse index cell `i` (works for both leaf and interior index pages).
     pub fn index_cell(&self, i: usize, usable: usize) -> Result<IndexCell> {
         debug_assert!(!self.page_type.is_table());

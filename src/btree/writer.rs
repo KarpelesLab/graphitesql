@@ -136,7 +136,7 @@ fn free_overflow_chain(wp: &mut WritePager, mut first: u32) -> Result<()> {
 }
 
 /// Write `data` across a chain of overflow pages, returning the first page.
-fn write_overflow_chain(wp: &mut WritePager, data: &[u8]) -> Result<u32> {
+pub(crate) fn write_overflow_chain(wp: &mut WritePager, data: &[u8]) -> Result<u32> {
     let cap = wp.usable_size() - 4; // bytes of payload per overflow page
                                     // Allocate all pages first so we know each page's successor.
     let n_pages = data.len().div_ceil(cap);
@@ -336,7 +336,7 @@ fn read_leaf_cells(bt: &BtreePage, usable: usize) -> Result<Vec<LeafCell>> {
 
 /// For page 1, return its first 100 bytes so a rewrite preserves the database
 /// header region (commit later re-stamps it). For other pages, `None`.
-fn page_one_prefix(page_no: u32, bt: &BtreePage) -> Option<Vec<u8>> {
+pub(crate) fn page_one_prefix(page_no: u32, bt: &BtreePage) -> Option<Vec<u8>> {
     if page_no == 1 {
         Some(bt.data()[..crate::format::header::HEADER_LEN].to_vec())
     } else {
