@@ -22,7 +22,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+pub mod wal;
 pub mod write;
+pub use wal::WalReader;
 pub use write::WritePager;
 
 /// A single database page: its number and its raw bytes.

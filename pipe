@@ -1,0 +1,5 @@
+PRAGMA journal_mode=wal;
+PRAGMA wal_autocheckpoint=0;
+CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c REAL);
+INSERT INTO t VALUES(1,'one',1.5),(2,'two',2.5),(3,'three',3.5);
+SELECT count(*) FROM t;

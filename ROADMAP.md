@@ -230,12 +230,20 @@ databases lands well before write support).
   `INSERT … SELECT`, and freelist-backed reclamation for overflow-row delete.
 - **Reference:** `build.c`, `insert.c`, `update.c`, `delete.c`, `alter.c`.
 
-### Phase 8 — WAL mode
+### Phase 8 — WAL mode ✅ *(read done)*
 
-- **Deliverable:** write-ahead log read & write; `-wal` and `-shm` handling;
-  checkpointing; the WAL locking protocol; `PRAGMA journal_mode=wal`.
-- **Done:** a WAL-mode database is interoperable with `sqlite3` in both
-  directions, including reading a database another writer left mid-WAL.
+- **Deliverable:** parse and overlay the `-wal` file so WAL-mode databases read
+  correctly, with full frame validation.
+- **Done:** `WalReader` parses the WAL header and frames, validates the
+  **exact SQLite checksum** (Fibonacci-style, endianness from the magic's LSB)
+  and salts, honors frames up to the last valid commit, and overlays them on the
+  main file as a `PageSource`. `Connection::open_readonly` auto-detects `-wal`.
+  Verified by reading a real WAL-mode database whose table and rows exist
+  **only** in an uncheckpointed `-wal` produced by SQLite (`tests/wal.rs`,
+  `tests/fixtures/wal.db{,-wal}`).
+- **Files:** `src/pager/wal.rs`; `Connection` backend enum in `src/exec/mod.rs`.
+- **Carried to Phase 9:** *writing* WAL (appending frames + `-shm` wal-index),
+  checkpointing, the WAL locking protocol, and `PRAGMA journal_mode=wal`.
 - **Reference:** `wal.c`, `fileformat2.html` (the WAL format).
 
 ### Phase 9 — Compatibility hardening & breadth

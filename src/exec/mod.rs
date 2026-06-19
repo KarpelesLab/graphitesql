@@ -9,8 +9,9 @@
 //! VDBE bytecode. The observable semantics (row order, type coercion, NULL
 //! handling) follow SQLite; the bytecode representation the roadmap describes is
 //! an internal-representation refactor we can layer in later without changing
-//! results. This phase is read-only — `SELECT` works against real databases;
-//! writes arrive in Phase 6/7.
+//! results. The [`Connection`] reads (`query`) and writes (`execute`) over a
+//! writable pager, an in-memory database, or — read-only — a WAL-mode database
+//! (the `-wal` overlay is detected automatically).
 
 pub mod eval;
 pub mod func;
@@ -39,10 +40,32 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
 }
 
+/// The storage backing a connection: a writable pager, or a read-only page
+/// source (e.g. a WAL-mode database opened read-only).
+enum Backend {
+    Write(WritePager),
+    Read(Box<dyn PageSource>),
+}
+
+impl Backend {
+    fn source(&self) -> &dyn PageSource {
+        match self {
+            Backend::Write(w) => w,
+            Backend::Read(r) => r.as_ref(),
+        }
+    }
+    fn writer(&mut self) -> Result<&mut WritePager> {
+        match self {
+            Backend::Write(w) => Ok(w),
+            Backend::Read(_) => Err(Error::Error("database is read-only".into())),
+        }
+    }
+}
+
 /// A database connection. Supports reading (`query`) and writing (`execute`),
 /// over a file or in memory.
 pub struct Connection {
-    db: WritePager,
+    backend: Backend,
     schema: Schema,
     /// True between `BEGIN` and `COMMIT`/`ROLLBACK`; suppresses autocommit.
     in_tx: bool,
@@ -50,9 +73,20 @@ pub struct Connection {
 
 impl Connection {
     fn from_pager(db: WritePager) -> Result<Connection> {
-        let schema = Schema::read(&db)?;
+        let backend = Backend::Write(db);
+        let schema = Schema::read(backend.source())?;
         Ok(Connection {
-            db,
+            backend,
+            schema,
+            in_tx: false,
+        })
+    }
+
+    fn from_read_backend(backend: Box<dyn PageSource>) -> Result<Connection> {
+        let backend = Backend::Read(backend);
+        let schema = Schema::read(backend.source())?;
+        Ok(Connection {
+            backend,
             schema,
             in_tx: false,
         })
@@ -66,10 +100,18 @@ impl Connection {
         Connection::from_pager(WritePager::open(main, Some(journal))?)
     }
 
-    /// Open an existing database read-only through `vfs` (no journal file).
+    /// Open an existing database read-only through `vfs`. If a `<path>-wal` file
+    /// is present, its committed frames are overlaid so WAL-mode databases read
+    /// correctly.
     pub fn open_readonly_vfs(vfs: &dyn Vfs, path: &str) -> Result<Connection> {
         let main = vfs.open(path, OpenFlags::READ_ONLY)?;
-        Connection::from_pager(WritePager::open(main, None)?)
+        let wal_path = wal_path(path);
+        if vfs.exists(&wal_path)? {
+            let mut wal = vfs.open(&wal_path, OpenFlags::READ_ONLY)?;
+            let reader = crate::pager::WalReader::open(main, wal.as_mut())?;
+            return Connection::from_read_backend(Box::new(reader));
+        }
+        Connection::from_read_backend(Box::new(WritePager::open(main, None)?))
     }
 
     /// Create a new, empty database through `vfs`.
@@ -147,14 +189,14 @@ impl Connection {
                 return Ok(0);
             }
             Statement::Commit => {
-                self.db.commit()?;
+                self.backend.writer()?.commit()?;
                 self.in_tx = false;
                 return Ok(0);
             }
             Statement::Rollback => {
-                self.db.rollback();
+                self.backend.writer()?.rollback();
                 self.in_tx = false;
-                self.schema = Schema::read(&self.db)?;
+                self.schema = Schema::read(self.backend.source())?;
                 return Ok(0);
             }
             _ => {}
@@ -177,9 +219,9 @@ impl Connection {
         };
 
         if !self.in_tx {
-            self.db.commit()?;
+            self.backend.writer()?.commit()?;
             // Refresh the catalog from the committed image.
-            self.schema = Schema::read(&self.db)?;
+            self.schema = Schema::read(self.backend.source())?;
         }
         Ok(affected)
     }
@@ -196,7 +238,7 @@ impl Connection {
         if ct.without_rowid {
             return Err(Error::Unsupported("WITHOUT ROWID tables"));
         }
-        let root = create_table_root(&mut self.db)?;
+        let root = create_table_root(self.backend.writer()?)?;
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
             Value::Text("table".into()),
@@ -205,10 +247,21 @@ impl Connection {
             Value::Integer(root as i64),
             Value::Text(sql_text.into()),
         ]);
-        insert_table(&mut self.db, crate::schema::SCHEMA_ROOT_PAGE, next, &row)?;
-        self.db.header_mut().schema_cookie = self.db.header().schema_cookie.wrapping_add(1);
+        insert_table(
+            self.backend.writer()?,
+            crate::schema::SCHEMA_ROOT_PAGE,
+            next,
+            &row,
+        )?;
+        let cookie = self
+            .backend
+            .writer()?
+            .header()
+            .schema_cookie
+            .wrapping_add(1);
+        self.backend.writer()?.header_mut().schema_cookie = cookie;
         // Make the new table visible to subsequent statements in this tx.
-        self.schema = Schema::read(&self.db)?;
+        self.schema = Schema::read(self.backend.source())?;
         Ok(())
     }
 
@@ -275,7 +328,7 @@ impl Connection {
                 values[ipk] = Value::Null;
             }
             let record = encode_record(&values);
-            insert_table(&mut self.db, meta.root, rowid, &record)?;
+            insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
             affected += 1;
         }
         Ok(affected)
@@ -285,7 +338,7 @@ impl Connection {
         let meta = self.table_meta(&del.table, None)?;
         let victims = self.matching_rowids(&meta, del.where_clause.as_ref(), params)?;
         for rowid in &victims {
-            delete_table(&mut self.db, meta.root, *rowid)?;
+            delete_table(self.backend.writer()?, meta.root, *rowid)?;
         }
         Ok(victims.len())
     }
@@ -295,8 +348,8 @@ impl Connection {
         // Collect (rowid, current values) for matching rows first.
         let mut targets: Vec<(i64, Vec<Value>)> = Vec::new();
         {
-            let mut cur = TableCursor::new(&self.db, meta.root);
-            let encoding = self.db.header().text_encoding;
+            let mut cur = TableCursor::new(self.backend.source(), meta.root);
+            let encoding = self.backend.source().header().text_encoding;
             let mut ok = cur.first()?;
             while ok {
                 let rowid = cur.rowid()?;
@@ -340,8 +393,8 @@ impl Connection {
                 values[ipk] = Value::Null;
             }
             let record = encode_record(&values);
-            delete_table(&mut self.db, meta.root, rowid)?;
-            insert_table(&mut self.db, meta.root, new_rowid, &record)?;
+            delete_table(self.backend.writer()?, meta.root, rowid)?;
+            insert_table(self.backend.writer()?, meta.root, new_rowid, &record)?;
             affected += 1;
         }
         Ok(affected)
@@ -355,8 +408,8 @@ impl Connection {
         params: &Params,
     ) -> Result<Vec<i64>> {
         let mut out = Vec::new();
-        let mut cur = TableCursor::new(&self.db, meta.root);
-        let encoding = self.db.header().text_encoding;
+        let mut cur = TableCursor::new(self.backend.source(), meta.root);
+        let encoding = self.backend.source().header().text_encoding;
         let mut ok = cur.first()?;
         while ok {
             let rowid = cur.rowid()?;
@@ -382,7 +435,7 @@ impl Connection {
 
     /// The next rowid to assign for the table b-tree at `root` (max + 1, or 1).
     fn next_rowid(&self, root: u32) -> Result<i64> {
-        let mut cur = TableCursor::new(&self.db, root);
+        let mut cur = TableCursor::new(self.backend.source(), root);
         if cur.last()? {
             Ok(cur.rowid()? + 1)
         } else {
@@ -482,9 +535,9 @@ impl Connection {
         }
 
         let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
-        let encoding = self.db.header().text_encoding;
+        let encoding = self.backend.source().header().text_encoding;
         let mut rows = Vec::new();
-        let mut cur = TableCursor::new(&self.db, meta.root);
+        let mut cur = TableCursor::new(self.backend.source(), meta.root);
         let mut ok = cur.first()?;
         while ok {
             let rowid = cur.rowid()?;
@@ -902,6 +955,13 @@ fn row_ctx<'a>(
 fn journal_path(path: &str) -> String {
     let mut p = String::from(path);
     p.push_str("-journal");
+    p
+}
+
+/// The conventional `<path>-wal` companion file name.
+fn wal_path(path: &str) -> String {
+    let mut p = String::from(path);
+    p.push_str("-wal");
     p
 }
 
