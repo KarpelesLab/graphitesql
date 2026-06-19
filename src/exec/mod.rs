@@ -446,7 +446,7 @@ impl Connection {
     // ---- SELECT execution ---------------------------------------------------
 
     fn run_select(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
-        let (columns, input_rows) = self.scan_source(sel)?;
+        let (columns, input_rows) = self.scan_source(sel, params)?;
 
         // Apply WHERE.
         let mut rows: Vec<InputRow> = Vec::new();
@@ -519,7 +519,11 @@ impl Connection {
     }
 
     /// Scan the `FROM` source into column metadata and decoded input rows.
-    fn scan_source(&self, sel: &Select) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
+    fn scan_source(
+        &self,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
         let Some(from) = &sel.from else {
             // No FROM: a single empty row (e.g. `SELECT 1+1`).
             return Ok((
@@ -530,11 +534,81 @@ impl Connection {
                 }],
             ));
         };
-        if !from.joins.is_empty() {
-            return Err(Error::Unsupported("joins"));
+        // Scan the first table.
+        let first_meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
+        let first_rows = self.scan_table(&first_meta)?;
+
+        // Single-table fast path: preserve the rowid for `rowid` references.
+        if from.joins.is_empty() {
+            let input_rows = first_rows
+                .into_iter()
+                .map(|(rowid, values)| InputRow {
+                    values,
+                    rowid: Some(rowid),
+                })
+                .collect();
+            return Ok((first_meta.columns, input_rows));
         }
 
-        let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
+        let mut columns = first_meta.columns.clone();
+        let mut rows: Vec<Vec<Value>> = first_rows.into_iter().map(|(_, v)| v).collect();
+
+        // Fold each join in with a nested-loop, evaluating its ON predicate
+        // against the columns accumulated so far plus the joined table's.
+        for join in &from.joins {
+            let jmeta = self.table_meta(&join.table.name, join.table.alias.as_deref())?;
+            let jrows: Vec<Vec<Value>> = self
+                .scan_table(&jmeta)?
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect();
+
+            let mut new_columns = columns.clone();
+            new_columns.extend(jmeta.columns.iter().cloned());
+            let n_jcols = jmeta.columns.len();
+
+            let mut joined: Vec<Vec<Value>> = Vec::new();
+            for left in &rows {
+                let mut matched = false;
+                for right in &jrows {
+                    let mut combined = left.clone();
+                    combined.extend(right.iter().cloned());
+                    let keep = match &join.on {
+                        Some(on) => {
+                            let ctx = row_ctx(&combined, &new_columns, None, params);
+                            eval::truth(&eval::eval(on, &ctx)?) == Some(true)
+                        }
+                        None => true, // CROSS / comma join
+                    };
+                    if keep {
+                        joined.push(combined);
+                        matched = true;
+                    }
+                }
+                // LEFT JOIN: emit the left row with NULLs when nothing matched.
+                if !matched && join.kind == JoinKind::Left {
+                    let mut combined = left.clone();
+                    combined.extend(core::iter::repeat_n(Value::Null, n_jcols));
+                    joined.push(combined);
+                }
+            }
+            columns = new_columns;
+            rows = joined;
+        }
+
+        let input_rows = rows
+            .into_iter()
+            .map(|values| InputRow {
+                values,
+                rowid: None, // ambiguous across joined tables
+            })
+            .collect();
+        Ok((columns, input_rows))
+    }
+
+    /// Scan a whole table into `(rowid, column values)` with the INTEGER PRIMARY
+    /// KEY column filled in from the rowid and short records NULL-padded.
+    fn scan_table(&self, meta: &TableMeta) -> Result<Vec<(i64, Vec<Value>)>> {
         let encoding = self.backend.source().header().text_encoding;
         let mut rows = Vec::new();
         let mut cur = TableCursor::new(self.backend.source(), meta.root);
@@ -542,19 +616,14 @@ impl Connection {
         while ok {
             let rowid = cur.rowid()?;
             let mut values = decode_record(&cur.payload()?, encoding)?;
-            // Normalize column count to the schema (short records read as NULL).
             values.resize(meta.columns.len(), Value::Null);
-            // Substitute the rowid for an INTEGER PRIMARY KEY column.
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Integer(rowid);
             }
-            rows.push(InputRow {
-                values,
-                rowid: Some(rowid),
-            });
+            rows.push((rowid, values));
             ok = cur.next()?;
         }
-        Ok((meta.columns, rows))
+        Ok(rows)
     }
 
     /// Non-aggregated projection: one output row per input row.

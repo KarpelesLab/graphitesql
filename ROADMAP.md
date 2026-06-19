@@ -246,16 +246,24 @@ databases lands well before write support).
   checkpointing, the WAL locking protocol, and `PRAGMA journal_mode=wal`.
 - **Reference:** `wal.c`, `fileformat2.html` (the WAL format).
 
-### Phase 9 — Compatibility hardening & breadth
+### Phase 9 — Compatibility hardening & breadth 🔄 *(ongoing track)*
 
-- **Deliverable:** foreign keys & triggers; views; `WITH`/CTEs & recursive
-  queries; window functions; the rest of the built-in functions (`date/time`,
-  `printf`, math); `EXPLAIN`; the bulk of `PRAGMA`s; `VACUUM`; collation &
-  encoding edge cases; the SQLite type-affinity rules in full.
-- **Done:** pass a curated slice of SQLite's own test assertions and a large
+This is the open-ended breadth phase — it grows continuously toward full SQLite
+coverage rather than having a single "done".
+
+- **Landed so far:** multi-table **`INNER`/`LEFT`/cross/comma joins**
+  (nested-loop, with `ON`, aliases, aggregation over joins) — `tests/joins.rs`.
+- **Deliverable (remaining):** foreign keys & triggers; views; `WITH`/CTEs &
+  recursive queries; window functions; subqueries (scalar, `IN (SELECT)`);
+  `CREATE INDEX` write-path + index maintenance; index-driven query planning;
+  `ALTER`/`DROP`/`VACUUM`; freelist reclamation (unblocks overflow-row delete &
+  page merging); the rest of the built-in & `date/time`/`printf`/math functions;
+  `EXPLAIN`; the bulk of `PRAGMA`s; full type-affinity & collation edge cases;
+  WAL *write* path.
+- **Goal:** pass a curated slice of SQLite's own test assertions and a large
   differential corpus.
 - **Reference:** `fkey.c`, `trigger.c`, `window.c`, `date.c`, `pragma.c`,
-  `vacuum.c`, plus SQLite's `test/` TCL suite as an oracle.
+  `vacuum.c`, `where.c`, plus SQLite's `test/` TCL suite as an oracle.
 
 ### Phase 10 — Ecosystem & extensions *(post-1.0, behind features)*
 

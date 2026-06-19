@@ -60,7 +60,9 @@ for row in &result.rows {
     }
 }
 
-// Aggregates, GROUP BY, expressions, scalar functions, transactions all work.
+// Aggregates, GROUP BY, joins, expressions, scalar functions, transactions:
+db.query("SELECT u.name, sum(o.amount) FROM users u JOIN orders o \
+          ON u.id = o.user_id GROUP BY u.name")?;
 db.execute("BEGIN")?;
 db.execute("DELETE FROM users WHERE id = 2")?;
 db.execute("COMMIT")?;

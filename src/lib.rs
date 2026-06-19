@@ -9,11 +9,12 @@
 //!
 //! ## Status
 //!
-//! Early scaffolding. The architecture and the build plan live in
-//! `ROADMAP.md`. Today the crate provides the foundational, fully-specified
-//! primitives that everything else is built on (variable-length integers, the
-//! database header, value/serial-type model). See the roadmap for what lands
-//! next.
+//! graphitesql opens real SQLite databases, runs SQL (`SELECT` with joins,
+//! aggregates, `GROUP BY`/`ORDER BY`/`LIMIT`; `CREATE TABLE`, `INSERT`,
+//! `UPDATE`, `DELETE`; transactions), and **writes databases the real
+//! `sqlite3` opens with `PRAGMA integrity_check = ok`**. It reads WAL-mode
+//! databases (overlaying the `-wal`). The architecture and remaining breadth
+//! work (indexes on write, more SQL) live in `ROADMAP.md`.
 //!
 //! ## Design goals
 //!
