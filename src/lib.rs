@@ -54,6 +54,8 @@ mod value;
 pub use value::{SerialType, Value, ValueRef};
 
 pub mod format;
+pub mod pager;
+pub mod vfs;
 
 pub use error::{Error, Result};
 

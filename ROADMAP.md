@@ -113,13 +113,16 @@ databases lands well before write support).
 - **Files:** `src/util/varint.rs`, `src/value.rs`, `src/format/header.rs`,
   `src/error.rs`.
 
-### Phase 1 — VFS & raw paging *(read side)*
+### Phase 1 — VFS & raw paging *(read side)* ✅ *(done)*
 
 - **Deliverable:** `Vfs`/`File` traits; in-memory VFS; std-file VFS (feature
   `std`); a read-only pager that maps page numbers → byte slices and validates
   page size against the header.
-- **Done:** can open `gtest.db`, read page 1, and re-derive the header through
-  the pager. Page 1's 100-byte header offset is handled correctly.
+- **Done:** opens the committed real-SQLite fixtures (`tests/fixtures/*.db`)
+  through the std VFS + pager, re-derives the header, and reads every page;
+  page 1's 100-byte header offset is handled via `Page::body_offset`.
+- **Files:** `src/vfs/{mod,memory,std_file}.rs`, `src/pager/mod.rs`,
+  `tests/read_fixtures.rs`.
 - **Reference:** `os_unix.c` (the VFS contract), `pager.c` (page lifecycle).
 
 ### Phase 2 — B-tree reader
