@@ -259,6 +259,10 @@ coverage rather than having a single "done".
   - **`CREATE INDEX` + index maintenance** — index b-trees (record keys, splits,
     overflow); incremental insert on `INSERT`, in-place rebuild on
     `DELETE`/`UPDATE`; verified by sqlite3 `integrity_check` — `tests/indexes.rs`;
+  - **index-driven query planning** — single-table `WHERE col = const` (and
+    composite leftmost prefixes) use an index prefix-seek + rowid fetch instead
+    of a full scan; the differential suite runs with indexes present so the path
+    is exercised across the whole corpus (issue #4);
   - **`DROP TABLE`/`DROP INDEX`** (frees b-trees, removes schema rows, drops a
     table's dependent indexes);
   - **`ALTER TABLE`** `ADD COLUMN` (with `DEFAULT` applied to existing rows on

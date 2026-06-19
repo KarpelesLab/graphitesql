@@ -23,7 +23,7 @@ use crate::format::record::decode_record;
 use crate::format::TextEncoding;
 use crate::pager::{PageSource, WritePager};
 use crate::util::varint;
-use crate::value::cmp_values;
+use crate::value::{cmp_values, Value};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -35,6 +35,87 @@ struct IdxSplit {
     full: Vec<u8>,
     rcell: Vec<u8>,
     right_page: u32,
+}
+
+/// Find the rowids of all index entries whose leading columns equal `key`
+/// (an equality-prefix lookup), descending the index b-tree in `O(height)` plus
+/// the number of matches. The index record is `(indexed cols…, rowid)`, so the
+/// trailing rowid is returned for each match. This is what lets the planner use
+/// an index instead of a full table scan.
+pub fn index_seek_rowids(src: &dyn PageSource, root: u32, key: &[Value]) -> Result<Vec<i64>> {
+    let enc = src.header().text_encoding;
+    let usable = src.usable_size();
+    let mut out = Vec::new();
+    seek_prefix(src, root, key, enc, usable, &mut out)?;
+    Ok(out)
+}
+
+fn seek_prefix(
+    src: &dyn PageSource,
+    page_no: u32,
+    key: &[Value],
+    enc: TextEncoding,
+    usable: usize,
+    out: &mut Vec<i64>,
+) -> Result<()> {
+    let page = src.page(page_no)?;
+    let bt = BtreePage::parse(page)?;
+    let record = |i: usize| -> Result<Vec<Value>> {
+        let cell = bt.index_cell(i, usable)?;
+        let full = read_payload(src, bt.data(), &cell.payload)?;
+        decode_record(&full, enc)
+    };
+    match bt.page_type() {
+        PageType::LeafIndex => {
+            for i in 0..bt.num_cells() {
+                let rec = record(i)?;
+                match prefix_cmp(key, &rec) {
+                    Ordering::Greater => continue,
+                    Ordering::Equal => out.push(rowid_of(&rec)),
+                    Ordering::Less => break, // sorted: no further matches on this leaf
+                }
+            }
+            Ok(())
+        }
+        PageType::InteriorIndex => {
+            let n = bt.num_cells();
+            let mut i = 0;
+            // Skip cells strictly less than the key.
+            while i < n && prefix_cmp(key, &record(i)?) == Ordering::Greater {
+                i += 1;
+            }
+            // Matches < cell[i] live in its left child.
+            seek_prefix(src, bt.child_pointer(i)?, key, enc, usable, out)?;
+            // Equal interior cells are themselves matches; descend the child to
+            // their right for further matches.
+            while i < n && prefix_cmp(key, &record(i)?) == Ordering::Equal {
+                out.push(rowid_of(&record(i)?));
+                seek_prefix(src, bt.child_pointer(i + 1)?, key, enc, usable, out)?;
+                i += 1;
+            }
+            Ok(())
+        }
+        _ => Err(Error::Corrupt("index seek on a non-index b-tree".into())),
+    }
+}
+
+/// Compare a key against the leading columns of an index record.
+fn prefix_cmp(key: &[Value], rec: &[Value]) -> Ordering {
+    for (k, r) in key.iter().zip(rec.iter()) {
+        let o = cmp_values(k, r);
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    Ordering::Equal
+}
+
+/// The trailing rowid of an index record.
+fn rowid_of(rec: &[Value]) -> i64 {
+    match rec.last() {
+        Some(Value::Integer(i)) => *i,
+        _ => 0,
+    }
 }
 
 /// Allocate an empty index b-tree (a single leaf page) and return its root.

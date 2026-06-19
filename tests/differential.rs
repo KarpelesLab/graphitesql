@@ -17,6 +17,11 @@ use std::process::Command;
 const SETUP: &str = "
 CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT, g INT, s TEXT);
 CREATE TABLE u(id INTEGER PRIMARY KEY, t_id INT, w INT);
+CREATE INDEX it_a ON t(a);
+CREATE INDEX it_g ON t(g);
+CREATE INDEX it_gb ON t(g, b);
+CREATE INDEX it_s ON t(s);
+CREATE INDEX iu_tid ON u(t_id);
 ";
 
 fn dataset_inserts() -> Vec<String> {

@@ -15,6 +15,8 @@ pub mod page;
 pub mod writer;
 
 pub use cursor::{IndexCursor, TableCursor};
-pub use index_writer::{clear_index, create_index_root, free_tree, insert_index};
+pub use index_writer::{
+    clear_index, create_index_root, free_tree, index_seek_rowids, insert_index,
+};
 pub use page::{BtreePage, IndexCell, PageType, Payload, TableLeafCell};
 pub use writer::{create_table_root, delete_table, insert_table};

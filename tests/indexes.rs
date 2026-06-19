@@ -129,6 +129,54 @@ fn drop_index_and_table() {
 }
 
 #[test]
+fn index_equality_lookup_results() {
+    // Verify index-driven equality lookups return correct rows (single and
+    // composite leftmost-prefix), matching a full scan.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, g INT, s TEXT)")
+        .unwrap();
+    for i in 1..=300 {
+        c.execute(&format!(
+            "INSERT INTO t(a, g, s) VALUES ({}, {}, 'v{}')",
+            i,
+            i % 7,
+            i % 4
+        ))
+        .unwrap();
+    }
+    c.execute("CREATE INDEX ia ON t(a)").unwrap();
+    c.execute("CREATE INDEX igs ON t(g, s)").unwrap();
+
+    // Single-column index equality.
+    let r = c.query("SELECT id FROM t WHERE a = 150").unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Integer(150)]]);
+
+    // Index + an extra predicate the index doesn't cover (still correct).
+    let r = c.query("SELECT count(*) FROM t WHERE g = 3").unwrap();
+    let expected_g3 = (1..=300).filter(|i| i % 7 == 3).count() as i64;
+    assert_eq!(r.rows[0][0], Value::Integer(expected_g3));
+
+    // Composite index leftmost prefix (g) + full key (g, s).
+    let r = c
+        .query("SELECT count(*) FROM t WHERE g = 2 AND s = 'v1'")
+        .unwrap();
+    let expected = (1..=300).filter(|i| i % 7 == 2 && i % 4 == 1).count() as i64;
+    assert_eq!(r.rows[0][0], Value::Integer(expected));
+
+    // Affinity: querying an INT column with a text literal still hits the index.
+    let r = c.query("SELECT id FROM t WHERE a = '42'").unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Integer(42)]]);
+
+    // After deleting the row, the index lookup no longer finds it.
+    c.execute("DELETE FROM t WHERE a = 150").unwrap();
+    assert!(c
+        .query("SELECT id FROM t WHERE a = 150")
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+#[test]
 fn drop_table_if_exists_is_noop() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("DROP TABLE IF EXISTS nope").unwrap();

@@ -988,6 +988,64 @@ impl Connection {
     }
 
     /// The index metadata (root + indexed column positions) for `table`.
+    /// Try to satisfy a single-table query with an index equality lookup instead
+    /// of a full scan: pick the index whose longest leftmost column prefix is
+    /// covered by `col = const` predicates in the `WHERE`, seek it, and fetch the
+    /// matching rows by rowid. Returns `None` (→ full scan) if no index applies.
+    fn try_index_lookup(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let Some(where_expr) = &sel.where_clause else {
+            return Ok(None);
+        };
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        if eqs.is_empty() || eqs.iter().any(|(_, v)| matches!(v, Value::Null)) {
+            return Ok(None); // `col = NULL` is never true; let the scan handle it
+        }
+
+        // Choose the index covering the longest leftmost prefix of equalities.
+        let indexes = self.indexes_of(table_name)?;
+        let mut best: Option<(u32, Vec<Value>)> = None;
+        for idx in &indexes {
+            let mut key = Vec::new();
+            for &c in &idx.cols {
+                match eqs.iter().find(|(col, _)| *col == c) {
+                    Some((_, v)) => key.push(meta.columns[c].affinity.coerce(v.clone())),
+                    None => break,
+                }
+            }
+            if key.len() > best.as_ref().map_or(0, |(_, k)| k.len()) {
+                best = Some((idx.root, key));
+            }
+        }
+        let Some((root, key)) = best else {
+            return Ok(None);
+        };
+        if key.is_empty() {
+            return Ok(None);
+        }
+
+        let rowids = crate::btree::index_seek_rowids(self.backend.source(), root, &key)?;
+        let encoding = self.backend.source().header().text_encoding;
+        let mut cur = TableCursor::new(self.backend.source(), meta.root);
+        let mut out = Vec::new();
+        for rid in rowids {
+            if cur.seek(rid)? {
+                let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                out.push(InputRow {
+                    values,
+                    rowid: Some(rid),
+                });
+            }
+        }
+        Ok(Some(out))
+    }
+
     fn indexes_of(&self, table: &str) -> Result<Vec<IndexMeta>> {
         let tmeta = match self.schema.table(table) {
             Some(_) => self.table_meta(table, None)?,
@@ -1261,11 +1319,16 @@ impl Connection {
 
         // Scan the first table.
         let first_meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
-        let first_rows = self.scan_table(&first_meta)?;
 
-        // Single-table fast path: preserve the rowid for `rowid` references.
+        // Single-table fast path. Try an index-driven equality lookup first; the
+        // full WHERE is still applied by run_core, so the index only needs to
+        // return a superset of matching rows.
         if from.joins.is_empty() {
-            let input_rows = first_rows
+            if let Some(rows) = self.try_index_lookup(&first_meta, &from.first.name, sel, params)? {
+                return Ok((first_meta.columns, rows));
+            }
+            let input_rows = self
+                .scan_table(&first_meta)?
                 .into_iter()
                 .map(|(rowid, values)| InputRow {
                     values,
@@ -1274,6 +1337,8 @@ impl Connection {
                 .collect();
             return Ok((first_meta.columns, input_rows));
         }
+
+        let first_rows = self.scan_table(&first_meta)?;
 
         let mut columns = first_meta.columns.clone();
         let mut rows: Vec<Vec<Value>> = first_rows.into_iter().map(|(_, v)| v).collect();
@@ -1927,6 +1992,63 @@ impl eval::Subqueries for Connection {
 /// Whether a value is the given text (used to match `sqlite_schema` columns).
 fn is_text(v: &Value, s: &str) -> bool {
     matches!(v, Value::Text(t) if t == s)
+}
+
+/// Collect `column = constant` equalities from the top-level `AND` conjuncts of a
+/// `WHERE` clause, as `(column index, constant value)` pairs. Used to drive
+/// index selection; non-equality and non-constant terms are ignored (the full
+/// `WHERE` is still applied afterward).
+fn collect_eq_constraints(
+    e: &Expr,
+    columns: &[ColumnInfo],
+    params: &Params,
+    out: &mut Vec<(usize, Value)>,
+) {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            collect_eq_constraints(left, columns, params, out);
+            collect_eq_constraints(right, columns, params, out);
+        }
+        Expr::Paren(inner) => collect_eq_constraints(inner, columns, params, out),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            if let (Some(ci), Some(v)) = (col_index(left, columns), const_value(right, params)) {
+                out.push((ci, v));
+            } else if let (Some(ci), Some(v)) =
+                (col_index(right, columns), const_value(left, params))
+            {
+                out.push((ci, v));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The column index a bare/qualified column expression resolves to, if any.
+fn col_index(e: &Expr, columns: &[ColumnInfo]) -> Option<usize> {
+    if let Expr::Column { table, column } = e {
+        columns.iter().position(|c| {
+            c.name.eq_ignore_ascii_case(column)
+                && table
+                    .as_deref()
+                    .is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+        })
+    } else {
+        None
+    }
+}
+
+/// Evaluate `e` as a constant (no column references), or `None` if it depends on
+/// a row.
+fn const_value(e: &Expr, params: &Params) -> Option<Value> {
+    eval::eval(e, &EvalCtx::rowless(params)).ok()
 }
 
 /// Coerce each value to its column's type affinity (SQLite storage affinity).
