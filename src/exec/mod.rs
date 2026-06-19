@@ -875,8 +875,57 @@ impl Connection {
                     }
                 })?;
             }
-            AlterAction::RenameColumn { .. } => {
-                return Err(Error::Unsupported("ALTER TABLE RENAME COLUMN"));
+            AlterAction::RenameColumn { old, new } => {
+                let pos = ct
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(old))
+                    .ok_or_else(|| Error::Error(format!("no such column: {old}")))?;
+                ct.columns[pos].name = new.clone();
+                // Update table-level PK/UNIQUE column lists that name the column.
+                for tc in &mut ct.constraints {
+                    let names = match tc {
+                        TableConstraint::PrimaryKey(n) | TableConstraint::Unique(n) => n,
+                        _ => continue,
+                    };
+                    for nm in names {
+                        if nm.eq_ignore_ascii_case(old) {
+                            *nm = new.clone();
+                        }
+                    }
+                }
+                let new_table_sql = sql::print::create_table(&ct);
+                let table = a.table.clone();
+                let old = old.clone();
+                let new = new.clone();
+                self.rewrite_schema_rows(|cols| {
+                    if is_text(&cols[0], "table") && is_text(&cols[1], &table) {
+                        cols[4] = Value::Text(new_table_sql.clone());
+                        true
+                    } else if is_text(&cols[0], "index") && is_text(&cols[2], &table) {
+                        // Rewrite an index over this table if it names the column.
+                        if let Some(Value::Text(isql)) = cols.get(4).cloned() {
+                            if let Ok(Statement::CreateIndex(mut ci)) = sql::parse_one(&isql) {
+                                let mut changed = false;
+                                for term in &mut ci.columns {
+                                    if let Expr::Column { column, .. } = &mut term.expr {
+                                        if column.eq_ignore_ascii_case(&old) {
+                                            *column = new.clone();
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                                if changed {
+                                    cols[4] = Value::Text(sql::print::create_index(&ci));
+                                    return true;
+                                }
+                            }
+                        }
+                        false
+                    } else {
+                        false
+                    }
+                })?;
             }
         }
 

@@ -37,6 +37,43 @@ fn add_column_applies_default_to_existing_rows() {
 }
 
 #[test]
+fn rename_column_updates_table_and_index() {
+    let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    let path = temp_path("renamecol.db");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, old_name TEXT)")
+            .unwrap();
+        c.execute("CREATE INDEX i ON t(old_name)").unwrap();
+        c.execute("INSERT INTO t(old_name) VALUES ('x'),('y')")
+            .unwrap();
+
+        c.execute("ALTER TABLE t RENAME COLUMN old_name TO new_name")
+            .unwrap();
+
+        // Old name is gone; data is intact under the new name.
+        assert!(c.query("SELECT old_name FROM t").is_err());
+        let r = c.query("SELECT new_name FROM t ORDER BY new_name").unwrap();
+        assert_eq!(r.rows[0][0], Value::Text("x".into()));
+        assert_eq!(r.rows[1][0], Value::Text("y".into()));
+    }
+    if sqlite {
+        let out = Command::new("sqlite3")
+            .arg(&path)
+            .arg("PRAGMA integrity_check; SELECT new_name FROM t ORDER BY new_name;")
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("ok"), "integrity: {s}");
+        assert!(s.contains('x') && s.contains('y'));
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+}
+
+#[test]
 fn rename_table_updates_catalog_and_indexes() {
     let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
     let path = temp_path("rename.db");
