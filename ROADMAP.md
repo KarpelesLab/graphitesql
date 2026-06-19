@@ -316,10 +316,13 @@ coverage rather than having a single "done".
   - **derived tables** — `FROM (SELECT …) [AS] alias` as a sole source or join
     operand (`tests/subquery.rs`);
   - **explicit window frames** — `ROWS`/`RANGE`/`GROUPS BETWEEN … AND …` with the
-    full bound set (`tests/window.rs`).
+    full bound set (`tests/window.rs`);
+  - **`PRAGMA recursive_triggers`** — recursive trigger firing (bounded), off by
+    default (`tests/triggers.rs`).
 - **Deliverable (remaining):**
-  recursive triggers & `INSTEAD OF` (view) triggers; `BEFORE`-trigger `NEW`
-  mutation; real `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
+  `INSTEAD OF` (view) triggers; `BEFORE`-trigger `NEW`
+  mutation; real `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`;
+  WAL *write* path; b-tree page merging on delete
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.

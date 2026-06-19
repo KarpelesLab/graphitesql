@@ -134,6 +134,58 @@ fn drop_trigger_stops_firing() {
 }
 
 #[test]
+fn non_recursive_by_default() {
+    // With recursive_triggers OFF (the default), a trigger that writes the same
+    // table does not re-fire itself.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
+    c.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
+    c.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+            INSERT INTO log(v) VALUES (NEW.v); \
+            INSERT INTO t(v) VALUES (NEW.v + 1); \
+         END",
+    )
+    .unwrap();
+    // Inserting one row logs exactly one row (the nested INSERT does not re-fire).
+    c.execute("INSERT INTO t(v) VALUES (1)").unwrap();
+    assert_eq!(ints(&c, "SELECT count(*) FROM log"), vec![1]);
+    // Both the original and the trigger's inserted row exist in t.
+    assert_eq!(ints(&c, "SELECT count(*) FROM t"), vec![2]);
+}
+
+#[test]
+fn recursive_triggers_pragma() {
+    let mut c = Connection::open_memory().unwrap();
+    assert_eq!(
+        c.query("PRAGMA recursive_triggers").unwrap().rows[0][0],
+        Value::Integer(0)
+    );
+    c.execute("PRAGMA recursive_triggers = ON").unwrap();
+    assert_eq!(
+        c.query("PRAGMA recursive_triggers").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
+    c.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
+    // Recurse until v reaches a bound, logging each level.
+    c.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON t WHEN NEW.v < 5 BEGIN \
+            INSERT INTO log(v) VALUES (NEW.v); \
+            INSERT INTO t(v) VALUES (NEW.v + 1); \
+         END",
+    )
+    .unwrap();
+    c.execute("INSERT INTO t(v) VALUES (1)").unwrap();
+    // Levels v=1,2,3,4 each log (v=5 fails the WHEN guard).
+    assert_eq!(ints(&c, "SELECT v FROM log ORDER BY v"), vec![1, 2, 3, 4]);
+}
+
+#[test]
 fn triggers_against_sqlite3() {
     use std::process::Command;
     if Command::new("sqlite3").arg("--version").output().is_err() {

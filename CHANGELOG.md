@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: `PRAGMA recursive_triggers` — triggers may fire other triggers when
+  enabled (bounded to 1000 levels); off by default, matching SQLite
 - Phase 9: broaden the differential corpus to 1658 queries (window functions,
   derived tables, correlated subqueries/`EXISTS`, real-valued expressions) and
   render reals through the `%.15g`-compatible formatter

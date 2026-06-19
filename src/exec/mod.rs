@@ -84,9 +84,11 @@ pub struct Connection {
     /// Whether foreign-key constraints are enforced (`PRAGMA foreign_keys`).
     /// Off by default, matching SQLite.
     foreign_keys: bool,
-    /// Re-entrancy depth of trigger firing. Triggers fire only at depth 0
-    /// (non-recursive, matching `recursive_triggers = OFF`).
+    /// Re-entrancy depth of trigger firing.
     trigger_depth: core::cell::Cell<usize>,
+    /// Whether triggers may fire other triggers (`PRAGMA recursive_triggers`).
+    /// Off by default, matching SQLite: triggers then fire only at the top level.
+    recursive_triggers: bool,
 }
 
 /// A materialized common table expression: a named, in-memory relation.
@@ -123,6 +125,7 @@ impl Connection {
             outer_scope: core::cell::RefCell::new(Vec::new()),
             foreign_keys: false,
             trigger_depth: core::cell::Cell::new(0),
+            recursive_triggers: false,
         })
     }
 
@@ -137,6 +140,7 @@ impl Connection {
             outer_scope: core::cell::RefCell::new(Vec::new()),
             foreign_keys: false,
             trigger_depth: core::cell::Cell::new(0),
+            recursive_triggers: false,
         })
     }
 
@@ -267,6 +271,10 @@ impl Connection {
             "foreign_keys" => Ok(single(
                 "foreign_keys",
                 Value::Integer(self.foreign_keys as i64),
+            )),
+            "recursive_triggers" => Ok(single(
+                "recursive_triggers",
+                Value::Integer(self.recursive_triggers as i64),
             )),
             _ => Err(Error::Unsupported("this PRAGMA")),
         }
@@ -453,6 +461,10 @@ impl Connection {
         if p.name.eq_ignore_ascii_case("foreign_keys") {
             if let Some(e) = &p.value {
                 self.foreign_keys = pragma_truth(e, params);
+            }
+        } else if p.name.eq_ignore_ascii_case("recursive_triggers") {
+            if let Some(e) = &p.value {
+                self.recursive_triggers = pragma_truth(e, params);
             }
         }
         Ok(())
@@ -875,14 +887,22 @@ impl Connection {
         new: Option<(&[Value], i64)>,
         params: &Params,
     ) -> Result<()> {
-        if self.trigger_depth.get() > 0 {
-            return Ok(());
+        // Non-recursive by default; with PRAGMA recursive_triggers a trigger may
+        // fire others, bounded to avoid runaway recursion (SQLite caps at 1000).
+        let depth = self.trigger_depth.get();
+        let limit = if self.recursive_triggers { 1000 } else { 1 };
+        if depth >= limit {
+            return if self.recursive_triggers {
+                Err(Error::Error("too many levels of trigger recursion".into()))
+            } else {
+                Ok(())
+            };
         }
         let trigs = self.triggers_for(table, kind, timing)?;
         if trigs.is_empty() {
             return Ok(());
         }
-        self.trigger_depth.set(1);
+        self.trigger_depth.set(depth + 1);
         let base = self.outer_scope.borrow().len();
         if let Some((vals, rid)) = old {
             self.push_row_frame("old", meta, vals, rid);
@@ -892,7 +912,7 @@ impl Connection {
         }
         let result = self.run_trigger_bodies(&trigs, params);
         self.outer_scope.borrow_mut().truncate(base);
-        self.trigger_depth.set(0);
+        self.trigger_depth.set(depth);
         result
     }
 
