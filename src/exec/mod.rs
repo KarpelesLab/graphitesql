@@ -73,6 +73,17 @@ pub struct Connection {
     schema: Schema,
     /// True between `BEGIN` and `COMMIT`/`ROLLBACK`; suppresses autocommit.
     in_tx: bool,
+    /// A stack of materialized `WITH` common table expressions in scope, innermost
+    /// last. Resolved by name during `FROM` scanning before the schema is
+    /// consulted; this is also how a recursive CTE sees its own working table.
+    cte_env: core::cell::RefCell<Vec<CteBinding>>,
+}
+
+/// A materialized common table expression: a named, in-memory relation.
+struct CteBinding {
+    name: String,
+    columns: Vec<ColumnInfo>,
+    rows: Vec<InputRow>,
 }
 
 impl Connection {
@@ -83,6 +94,7 @@ impl Connection {
             backend,
             schema,
             in_tx: false,
+            cte_env: core::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -93,6 +105,7 @@ impl Connection {
             backend,
             schema,
             in_tx: false,
+            cte_env: core::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -341,9 +354,7 @@ impl Connection {
             Statement::Pragma(_) => 0, // accepted, no-op for now
             Statement::Vacuum => 0,    // accepted; compaction is a no-op here
             Statement::Select(_) => return Err(Error::Unsupported("use query() for SELECT")),
-            Statement::Explain { .. } => {
-                return Err(Error::Unsupported("use query() for EXPLAIN"))
-            }
+            Statement::Explain { .. } => return Err(Error::Unsupported("use query() for EXPLAIN")),
             Statement::Begin | Statement::Commit | Statement::Rollback => unreachable!(),
         };
 
@@ -684,33 +695,68 @@ impl Connection {
         Ok(())
     }
 
-    /// If `name` is a CTE declared on `sel`'s `WITH` clause, run it and return
-    /// its columns + rows. (Non-recursive; the CTE's own body is run on its own.)
-    fn try_cte(
+    /// Materialize each `WITH` CTE of `sel` into the environment, in declaration
+    /// order (so a later CTE may reference an earlier one). Recursive CTEs are
+    /// evaluated with the fixed-point loop.
+    fn push_ctes(&self, sel: &Select, params: &Params) -> Result<()> {
+        for cte in &sel.ctes {
+            let binding = if references_name(&cte.select, &cte.name) {
+                self.eval_recursive_cte(cte, params)?
+            } else {
+                self.materialize_plain_cte(cte, params)?
+            };
+            self.cte_env.borrow_mut().push(binding);
+        }
+        Ok(())
+    }
+
+    /// Look up a CTE by name in the current environment (innermost first),
+    /// returning a copy of its columns + rows relabeled to `alias` if given.
+    fn lookup_cte(
         &self,
-        sel: &Select,
         name: &str,
         alias: Option<&str>,
-        params: &Params,
-    ) -> Result<Option<(Vec<ColumnInfo>, Vec<InputRow>)>> {
-        let Some(cte) = sel.ctes.iter().find(|c| c.name.eq_ignore_ascii_case(name)) else {
-            return Ok(None);
-        };
-        let result = self.run_select(&cte.select, params)?;
-        let label = alias.unwrap_or(name).to_string();
+    ) -> Option<(Vec<ColumnInfo>, Vec<InputRow>)> {
+        let env = self.cte_env.borrow();
+        let b = env
+            .iter()
+            .rev()
+            .find(|b| b.name.eq_ignore_ascii_case(name))?;
+        let label = alias.unwrap_or(&b.name);
+        let columns = b
+            .columns
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name.clone(),
+                table: label.to_string(),
+                affinity: c.affinity,
+            })
+            .collect();
+        Some((columns, b.rows.clone()))
+    }
+
+    /// Build the column metadata for a CTE from its body's output labels (or its
+    /// explicit `(col, …)` list), labeled with the CTE name.
+    fn cte_columns(&self, cte: &Cte, body_cols: &[String]) -> Vec<ColumnInfo> {
         let names = if cte.columns.is_empty() {
-            result.columns.clone()
+            body_cols.to_vec()
         } else {
             cte.columns.clone()
         };
-        let columns = names
+        names
             .into_iter()
             .map(|n| ColumnInfo {
                 name: n,
-                table: label.clone(),
+                table: cte.name.clone(),
                 affinity: eval::Affinity::Blob,
             })
-            .collect();
+            .collect()
+    }
+
+    /// A non-recursive CTE: run its body once.
+    fn materialize_plain_cte(&self, cte: &Cte, params: &Params) -> Result<CteBinding> {
+        let result = self.run_select(&cte.select, params)?;
+        let columns = self.cte_columns(cte, &result.columns);
         let rows = result
             .rows
             .into_iter()
@@ -719,7 +765,136 @@ impl Connection {
                 rowid: None,
             })
             .collect();
-        Ok(Some((columns, rows)))
+        Ok(CteBinding {
+            name: cte.name.clone(),
+            columns,
+            rows,
+        })
+    }
+
+    /// A recursive CTE: `anchor [UNION [ALL] recursive]`. Evaluate the anchor,
+    /// then repeatedly evaluate the recursive term against the rows produced by
+    /// the previous step (bound to the CTE's name) until no new rows appear.
+    fn eval_recursive_cte(&self, cte: &Cte, params: &Params) -> Result<CteBinding> {
+        // Flatten the body into arms: (op-before-this-arm, select). The first
+        // arm has no preceding op.
+        let mut arms: Vec<(Option<CompoundOp>, Select)> = Vec::new();
+        let mut base = (*cte.select).clone();
+        let compound = core::mem::take(&mut base.compound);
+        base.order_by.clear();
+        base.limit = None;
+        base.offset = None;
+        arms.push((None, base));
+        for (op, mut s) in compound {
+            s.order_by.clear();
+            s.limit = None;
+            s.offset = None;
+            arms.push((Some(op), s));
+        }
+
+        // Partition into leading anchor arms and trailing recursive arms.
+        let mut anchor: Vec<Select> = Vec::new();
+        let mut recursive: Vec<Select> = Vec::new();
+        let mut rec_distinct = false;
+        let mut in_rec = false;
+        for (op, s) in arms {
+            if !in_rec && references_name_select(&s, &cte.name) {
+                in_rec = true;
+                rec_distinct = matches!(op, Some(CompoundOp::Union));
+            }
+            if in_rec {
+                recursive.push(s);
+            } else {
+                anchor.push(s);
+            }
+        }
+        if anchor.is_empty() || recursive.is_empty() {
+            return Err(Error::Unsupported(
+                "recursive CTE must have a non-recursive anchor and a recursive term",
+            ));
+        }
+
+        // Evaluate the anchor (a compound of the anchor arms).
+        let mut anchor_rows: Vec<Vec<Value>> = Vec::new();
+        for a in &anchor {
+            let r = self.run_select(a, params)?;
+            anchor_rows.extend(r.rows);
+        }
+        let body_cols = self.run_select(&anchor[0], params)?.columns;
+        let columns = self.cte_columns(cte, &body_cols);
+
+        if rec_distinct {
+            dedup_rows(&mut anchor_rows);
+        }
+        let mut all_rows = anchor_rows.clone();
+        let mut working = anchor_rows;
+
+        // Push a working binding the recursive term resolves against; update it
+        // each iteration. Guard against runaway recursion.
+        let slot = self.cte_env.borrow().len();
+        self.cte_env.borrow_mut().push(CteBinding {
+            name: cte.name.clone(),
+            columns: columns.clone(),
+            rows: Vec::new(),
+        });
+        let mut guard = 0usize;
+        let result = loop {
+            guard += 1;
+            if guard > 1_000_000 {
+                self.cte_env.borrow_mut().truncate(slot);
+                return Err(Error::Error("recursive CTE did not terminate".into()));
+            }
+            // Bind the working set.
+            self.cte_env.borrow_mut()[slot].rows = working
+                .iter()
+                .cloned()
+                .map(|values| InputRow {
+                    values,
+                    rowid: None,
+                })
+                .collect();
+
+            let mut produced: Vec<Vec<Value>> = Vec::new();
+            for r in &recursive {
+                match self.run_select(r, params) {
+                    Ok(res) => produced.extend(res.rows),
+                    Err(e) => {
+                        self.cte_env.borrow_mut().truncate(slot);
+                        return Err(e);
+                    }
+                }
+            }
+            // Keep only genuinely new rows (for UNION; UNION ALL keeps all but
+            // still must terminate — SQLite requires the recursive query to
+            // eventually produce nothing).
+            let mut fresh: Vec<Vec<Value>> = Vec::new();
+            for row in produced {
+                if rec_distinct && all_rows.iter().any(|s| rows_equal(s, &row)) {
+                    continue;
+                }
+                fresh.push(row);
+            }
+            if fresh.is_empty() {
+                break Ok(());
+            }
+            all_rows.extend(fresh.iter().cloned());
+            working = fresh;
+        };
+        self.cte_env.borrow_mut().truncate(slot);
+        result?;
+
+        let rows = all_rows
+            .into_iter()
+            .map(|values| InputRow {
+                values,
+                rowid: None,
+            })
+            .collect();
+        Ok(CteBinding {
+            name: cte.name.clone(),
+            columns,
+            rows,
+        })
     }
 
     /// If `name` is a view, run its `SELECT` and return its columns + rows.
@@ -1146,7 +1321,13 @@ impl Connection {
         let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
         let label = eqp_label(&from.first);
         let detail = if from.joins.is_empty() {
-            self.eqp_access(&label, &from.first.name, &meta, sel.where_clause.as_ref(), params)?
+            self.eqp_access(
+                &label,
+                &from.first.name,
+                &meta,
+                sel.where_clause.as_ref(),
+                params,
+            )?
         } else {
             // Joins run in FROM order as nested-loop scans (no reordering).
             alloc::format!("SCAN {label}")
@@ -1157,7 +1338,11 @@ impl Connection {
         for join in &from.joins {
             let id = *next_id;
             *next_id += 1;
-            out.push((id, parent, alloc::format!("SCAN {}", eqp_label(&join.table))));
+            out.push((
+                id,
+                parent,
+                alloc::format!("SCAN {}", eqp_label(&join.table)),
+            ));
         }
         // ORDER BY / GROUP BY that we satisfy with an in-memory sort.
         if !sel.order_by.is_empty() {
@@ -1222,7 +1407,9 @@ impl Connection {
                     .map(|&c| alloc::format!("{}=?", meta.columns[c].name))
                     .collect::<Vec<_>>()
                     .join(" AND ");
-                return Ok(alloc::format!("SEARCH {label} USING INDEX {idx_name} ({cond})"));
+                return Ok(alloc::format!(
+                    "SEARCH {label} USING INDEX {idx_name} ({cond})"
+                ));
             }
         }
         Ok(alloc::format!("SCAN {label}"))
@@ -1324,6 +1511,16 @@ impl Connection {
     // ---- SELECT execution ---------------------------------------------------
 
     fn run_select(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
+        // Materialize this query's `WITH` CTEs into the environment for the
+        // duration of the query, then restore the previous scope.
+        let base = self.cte_env.borrow().len();
+        let pushed = self.push_ctes(sel, params);
+        let result = pushed.and_then(|()| self.run_select_compound(sel, params));
+        self.cte_env.borrow_mut().truncate(base);
+        result
+    }
+
+    fn run_select_compound(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
         if sel.compound.is_empty() {
             return self.run_core(sel, params);
         }
@@ -1483,7 +1680,7 @@ impl Connection {
         // A `WITH` common table expression used as the sole source.
         if from.joins.is_empty() {
             if let Some((columns, rows)) =
-                self.try_cte(sel, &from.first.name, from.first.alias.as_deref(), params)?
+                self.lookup_cte(&from.first.name, from.first.alias.as_deref())
             {
                 return Ok((columns, rows));
             }
@@ -1499,13 +1696,11 @@ impl Connection {
             return Err(Error::Unsupported("views in joins"));
         }
 
-        // Scan the first table.
-        let first_meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
-
         // Single-table fast path. Try an index-driven equality lookup first; the
         // full WHERE is still applied by run_core, so the index only needs to
         // return a superset of matching rows.
         if from.joins.is_empty() {
+            let first_meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
             if let Some(rows) = self.try_index_lookup(&first_meta, &from.first.name, sel, params)? {
                 return Ok((first_meta.columns, rows));
             }
@@ -1520,24 +1715,17 @@ impl Connection {
             return Ok((first_meta.columns, input_rows));
         }
 
-        let first_rows = self.scan_table(&first_meta)?;
-
-        let mut columns = first_meta.columns.clone();
-        let mut rows: Vec<Vec<Value>> = first_rows.into_iter().map(|(_, v)| v).collect();
+        // Join case: resolve the first source (CTE or table), then fold in joins.
+        let (mut columns, mut rows) = self.resolve_join_source(&from.first)?;
 
         // Fold each join in with a nested-loop, evaluating its ON predicate
         // against the columns accumulated so far plus the joined table's.
         for join in &from.joins {
-            let jmeta = self.table_meta(&join.table.name, join.table.alias.as_deref())?;
-            let jrows: Vec<Vec<Value>> = self
-                .scan_table(&jmeta)?
-                .into_iter()
-                .map(|(_, v)| v)
-                .collect();
+            let (jcols, jrows) = self.resolve_join_source(&join.table)?;
 
             let mut new_columns = columns.clone();
-            new_columns.extend(jmeta.columns.iter().cloned());
-            let n_jcols = jmeta.columns.len();
+            new_columns.extend(jcols.iter().cloned());
+            let n_jcols = jcols.len();
 
             let mut joined: Vec<Vec<Value>> = Vec::new();
             for left in &rows {
@@ -1576,6 +1764,22 @@ impl Connection {
             })
             .collect();
         Ok((columns, input_rows))
+    }
+
+    /// Resolve one table reference in a join to its columns + row values,
+    /// consulting the CTE environment before the schema (so a CTE — including a
+    /// recursive one — can appear as a join source).
+    fn resolve_join_source(&self, tref: &TableRef) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        if let Some((cols, rows)) = self.lookup_cte(&tref.name, tref.alias.as_deref()) {
+            return Ok((cols, rows.into_iter().map(|r| r.values).collect()));
+        }
+        let meta = self.table_meta(&tref.name, tref.alias.as_deref())?;
+        let rows = self
+            .scan_table(&meta)?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        Ok((meta.columns, rows))
     }
 
     /// Scan a whole table into `(rowid, column values)`.
@@ -2180,6 +2384,44 @@ fn is_text(v: &Value, s: &str) -> bool {
 /// `WHERE` clause, as `(column index, constant value)` pairs. Used to drive
 /// index selection; non-equality and non-constant terms are ignored (the full
 /// `WHERE` is still applied afterward).
+/// Does `select` (across all its compound arms) read from a source named `name`?
+fn references_name(select: &Select, name: &str) -> bool {
+    if references_name_select(select, name) {
+        return true;
+    }
+    select
+        .compound
+        .iter()
+        .any(|(_, s)| references_name_select(s, name))
+}
+
+/// Does this single `SELECT` arm read from a source named `name` (first table or
+/// any joined table)?
+fn references_name_select(select: &Select, name: &str) -> bool {
+    let Some(from) = &select.from else {
+        return false;
+    };
+    if from.first.name.eq_ignore_ascii_case(name) {
+        return true;
+    }
+    from.joins
+        .iter()
+        .any(|j| j.table.name.eq_ignore_ascii_case(name))
+}
+
+/// Dedupe rows in place, preserving first-occurrence order.
+fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
+    let mut seen: Vec<Vec<Value>> = Vec::new();
+    rows.retain(|row| {
+        if seen.iter().any(|s| rows_equal(s, row)) {
+            false
+        } else {
+            seen.push(row.clone());
+            true
+        }
+    });
+}
+
 /// The EXPLAIN QUERY PLAN display label for a table reference: SQLite shows
 /// `name AS alias` when an alias is present, else just the name.
 fn eqp_label(t: &TableRef) -> String {
@@ -2271,6 +2513,7 @@ fn index_key(cols: &[usize], values: &[Value], rowid: i64) -> Vec<u8> {
     encode_record(&key)
 }
 
+#[derive(Clone)]
 struct InputRow {
     values: Vec<Value>,
     rowid: Option<i64>,

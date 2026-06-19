@@ -23,14 +23,14 @@ use alloc::vec::Vec;
 /// A parsed date/time, mirroring SQLite's `DateTime` struct.
 #[derive(Clone, Copy, Default)]
 struct DateTime {
-    ijd: i64,  // Julian day number * 86_400_000 (ms)
-    y: i32,    // year
-    m: i32,    // month (1-12)
-    d: i32,    // day (1-31)
-    h: i32,    // hour (0-23)
-    min: i32,  // minute (0-59)
-    s: f64,    // seconds, including fractional part
-    tz: i32,   // timezone offset in minutes
+    ijd: i64, // Julian day number * 86_400_000 (ms)
+    y: i32,   // year
+    m: i32,   // month (1-12)
+    d: i32,   // day (1-31)
+    h: i32,   // hour (0-23)
+    min: i32, // minute (0-59)
+    s: f64,   // seconds, including fractional part
+    tz: i32,  // timezone offset in minutes
     valid_jd: bool,
     valid_ymd: bool,
     valid_hms: bool,
@@ -438,7 +438,12 @@ fn apply_modifier(p: &mut DateTime, m: &str) -> bool {
 /// Handle `±N units`, `weekday N`, and `±HH:MM[:SS]` modifiers.
 fn apply_numeric_modifier(p: &mut DateTime, orig: &str, lower: &str) -> bool {
     if let Some(rest) = lower.strip_prefix("weekday ") {
-        if let Some(n) = rest.trim().parse::<i64>().ok().filter(|n| (0..=6).contains(n)) {
+        if let Some(n) = rest
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|n| (0..=6).contains(n))
+        {
             p.compute_ymd_hms();
             p.compute_jd();
             let cur = (p.ijd + 129_600_000) / 86_400_000 % 7; // 0 = Sunday
@@ -499,7 +504,11 @@ fn apply_numeric_modifier(p: &mut DateTime, orig: &str, lower: &str) -> bool {
         "month" | "months" => {
             p.compute_ymd_hms();
             p.m += r as i32;
-            let x = if p.m > 0 { (p.m - 1) / 12 } else { (p.m - 12) / 12 };
+            let x = if p.m > 0 {
+                (p.m - 1) / 12
+            } else {
+                (p.m - 12) / 12
+            };
             p.y += x;
             p.m -= x * 12;
             p.valid_jd = false;
@@ -693,9 +702,7 @@ fn render_strftime(fmt: &str, p: &mut DateTime) -> String {
                 out.push_str(&alloc::format!("{}", secs));
             }
             Some('S') => out.push_str(&alloc::format!("{:02}", p.s as i32)),
-            Some('T') => {
-                out.push_str(&alloc::format!("{:02}:{:02}:{:02}", p.h, p.min, p.s as i32))
-            }
+            Some('T') => out.push_str(&alloc::format!("{:02}:{:02}:{:02}", p.h, p.min, p.s as i32)),
             Some('u') => {
                 let mut wd = ((p.ijd + 129_600_000) / 86_400_000 % 7) as i32; // 0=Sun
                 if wd == 0 {
@@ -980,32 +987,29 @@ mod tests {
             datetime(&[Value::Integer(0), t("unixepoch")]),
             t("1970-01-01 00:00:00")
         );
-        assert_eq!(
-            unixepoch(&[t("1970-01-01 00:00:00")]),
-            Value::Integer(0)
-        );
+        assert_eq!(unixepoch(&[t("1970-01-01 00:00:00")]), Value::Integer(0));
     }
 
     #[test]
     fn strftime_codes() {
+        assert_eq!(strftime(&[t("%Y/%m/%d"), t("2000-01-02")]), t("2000/01/02"));
         assert_eq!(
-            strftime(&[t("%Y/%m/%d"), t("2000-01-02")]),
-            t("2000/01/02")
+            strftime(&[t("%H:%M:%S"), t("2000-01-02 03:04:05")]),
+            t("03:04:05")
         );
-        assert_eq!(strftime(&[t("%H:%M:%S"), t("2000-01-02 03:04:05")]), t("03:04:05"));
     }
 
     #[test]
     fn printf_basic() {
-        assert_eq!(printf(&[t("%d-%d"), Value::Integer(1), Value::Integer(2)]), t("1-2"));
+        assert_eq!(
+            printf(&[t("%d-%d"), Value::Integer(1), Value::Integer(2)]),
+            t("1-2")
+        );
         assert_eq!(printf(&[t("%05d"), Value::Integer(42)]), t("00042"));
         assert_eq!(printf(&[t("%.2f"), Value::Real(3.567)]), t("3.57"));
         assert_eq!(printf(&[t("%-5d|"), Value::Integer(7)]), t("7    |"));
         assert_eq!(printf(&[t("%x"), Value::Integer(255)]), t("ff"));
-        assert_eq!(
-            printf(&[t("%s and %s"), t("a"), t("b")]),
-            t("a and b")
-        );
+        assert_eq!(printf(&[t("%s and %s"), t("a"), t("b")]), t("a and b"));
     }
 
     #[cfg(feature = "std")]

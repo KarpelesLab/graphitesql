@@ -137,7 +137,9 @@ fn datetime_against_sqlite3() {
                 if got == want {
                     passed += 1;
                 } else {
-                    failures.push(format!("  {e}\n    sqlite:   {want:?}\n    graphite: {got:?}"));
+                    failures.push(format!(
+                        "  {e}\n    sqlite:   {want:?}\n    graphite: {got:?}"
+                    ));
                 }
             }
             Err(err) => failures.push(format!("  {e}\n    graphite error: {err}")),

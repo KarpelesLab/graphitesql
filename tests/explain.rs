@@ -67,7 +67,10 @@ fn search_by_index() {
 fn search_by_composite_index() {
     let c = setup();
     assert_eq!(
-        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 2 AND b = 1"),
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 2 AND b = 1"
+        ),
         ["SEARCH t USING INDEX it_ab (a=? AND b=?)"]
     );
 }

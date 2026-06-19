@@ -295,9 +295,12 @@ coverage rather than having a single "done".
     of `date.c`'s Julian-day engine, verified differentially (`tests/datetime.rs`);
   - **`EXPLAIN QUERY PLAN`** (SCAN/SEARCH plan rows in SQLite's detail format)
     plus a **rowid equality fast-path** that seeks the table b-tree directly
-    (`tests/explain.rs`).
-- **Deliverable (remaining):** foreign keys & triggers; recursive
-  `WITH` queries; window functions; *correlated* subqueries & subqueries/views in
+    (`tests/explain.rs`);
+  - **recursive `WITH RECURSIVE` CTEs** (anchor + fixed-point recursive term,
+    `UNION`/`UNION ALL`), CTEs referencing earlier CTEs, and CTEs as a join
+    source, via a materialized CTE environment (`tests/cte.rs`).
+- **Deliverable (remaining):** foreign keys & triggers;
+  window functions; *correlated* subqueries & subqueries/views in
   joins; real `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
