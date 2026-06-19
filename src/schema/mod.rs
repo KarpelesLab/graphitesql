@@ -47,7 +47,11 @@ impl ObjectType {
             "index" => ObjectType::Index,
             "view" => ObjectType::View,
             "trigger" => ObjectType::Trigger,
-            other => return Err(Error::Corrupt(format!("unknown schema object type {other:?}"))),
+            other => {
+                return Err(Error::Corrupt(format!(
+                    "unknown schema object type {other:?}"
+                )))
+            }
         })
     }
 }
@@ -137,7 +141,11 @@ fn parse_schema_row(cols: &[Value]) -> Result<SchemaObject> {
     let rootpage = match &cols[3] {
         Value::Integer(i) => *i as u32,
         Value::Null => 0,
-        _ => return Err(Error::Corrupt("sqlite_schema rootpage not an integer".into())),
+        _ => {
+            return Err(Error::Corrupt(
+                "sqlite_schema rootpage not an integer".into(),
+            ))
+        }
     };
     let sql = match &cols[4] {
         Value::Text(s) => Some(s.clone()),

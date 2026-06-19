@@ -1,0 +1,1240 @@
+//! A hand-written recursive-descent parser with a Pratt expression core.
+//!
+//! It turns a token stream into [`Statement`]s. The grammar source of truth is
+//! SQLite's `parse.y`; this implements the commonly-used core and grows toward
+//! it. Precedence follows SQLite's operator table (`lang_expr.html`): from
+//! loosest to tightest — `OR`, `AND`, `NOT`, comparison/`IS`/`IN`/`LIKE`/
+//! `BETWEEN`, relational, bitwise, additive, multiplicative, `||`, then unary.
+
+use crate::error::{Error, Result};
+use crate::sql::ast::*;
+use crate::sql::token::{tokenize, Spanned, Token};
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+// Binding powers (higher binds tighter).
+const BP_OR: u8 = 10;
+const BP_AND: u8 = 20;
+const BP_NOT_PREFIX: u8 = 35;
+const BP_EQ: u8 = 40; // = != IS IN LIKE GLOB BETWEEN
+const BP_REL: u8 = 50; // < <= > >=
+const BP_BIT: u8 = 60; // & | << >>
+const BP_ADD: u8 = 70;
+const BP_MUL: u8 = 80;
+const BP_CONCAT: u8 = 90;
+const BP_UNARY: u8 = 100;
+
+/// Parse a SQL string into a list of statements (split on `;`).
+pub fn parse(sql: &str) -> Result<Vec<Statement>> {
+    let tokens = tokenize(sql)?;
+    let mut parser = Parser::new(tokens);
+    let mut statements = Vec::new();
+    loop {
+        while parser.eat(&Token::Semicolon) {}
+        if parser.at_end() {
+            break;
+        }
+        statements.push(parser.statement()?);
+        if !parser.at_end() && !parser.check(&Token::Semicolon) {
+            return Err(parser.err("expected ';' or end of input after statement"));
+        }
+    }
+    Ok(statements)
+}
+
+/// Parse exactly one statement, erroring if there is trailing input.
+pub fn parse_one(sql: &str) -> Result<Statement> {
+    let mut stmts = parse(sql)?;
+    match stmts.len() {
+        1 => Ok(stmts.pop().unwrap()),
+        0 => Err(Error::Parse("empty statement".into())),
+        _ => Err(Error::Parse("expected a single statement".into())),
+    }
+}
+
+struct Parser {
+    tokens: Vec<Spanned>,
+    pos: usize,
+}
+
+impl Parser {
+    fn new(tokens: Vec<Spanned>) -> Parser {
+        Parser { tokens, pos: 0 }
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.tokens.len()
+    }
+
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos).map(|s| &s.token)
+    }
+
+    fn advance(&mut self) -> Option<Token> {
+        let t = self.tokens.get(self.pos).map(|s| s.token.clone());
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn check(&self, t: &Token) -> bool {
+        self.peek() == Some(t)
+    }
+
+    fn eat(&mut self, t: &Token) -> bool {
+        if self.check(t) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, t: &Token) -> Result<()> {
+        if self.eat(t) {
+            Ok(())
+        } else {
+            Err(self.err(&format!("expected {t:?}")))
+        }
+    }
+
+    fn err(&self, msg: &str) -> Error {
+        match self.tokens.get(self.pos) {
+            Some(s) => Error::Parse(format!(
+                "{msg} (near byte {}, found {:?})",
+                s.start, s.token
+            )),
+            None => Error::Parse(format!("{msg} (at end of input)")),
+        }
+    }
+
+    /// Is the current token the keyword `kw` (case-insensitive bare word)?
+    fn check_kw(&self, kw: &str) -> bool {
+        matches!(self.peek(), Some(Token::Word(w)) if w.eq_ignore_ascii_case(kw))
+    }
+
+    /// Consume the keyword `kw` if present.
+    fn eat_kw(&mut self, kw: &str) -> bool {
+        if self.check_kw(kw) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_kw(&mut self, kw: &str) -> Result<()> {
+        if self.eat_kw(kw) {
+            Ok(())
+        } else {
+            Err(self.err(&format!("expected keyword {kw}")))
+        }
+    }
+
+    /// Parse an identifier (a bare word or a quoted identifier).
+    fn ident(&mut self) -> Result<String> {
+        match self.advance() {
+            Some(Token::Word(w)) => Ok(w),
+            Some(Token::Ident(i)) => Ok(i),
+            other => Err(Error::Parse(format!(
+                "expected identifier, found {other:?}"
+            ))),
+        }
+    }
+
+    // ---- statements ---------------------------------------------------------
+
+    fn statement(&mut self) -> Result<Statement> {
+        if self.check_kw("select") || self.check_kw("with") {
+            return Ok(Statement::Select(self.select()?));
+        }
+        if self.check_kw("insert") || self.check_kw("replace") {
+            return Ok(Statement::Insert(self.insert()?));
+        }
+        if self.check_kw("update") {
+            return Ok(Statement::Update(self.update()?));
+        }
+        if self.check_kw("delete") {
+            return Ok(Statement::Delete(self.delete()?));
+        }
+        if self.check_kw("create") {
+            return self.create();
+        }
+        if self.check_kw("drop") {
+            return Ok(Statement::Drop(self.drop_stmt()?));
+        }
+        if self.eat_kw("begin") {
+            let _ = self.eat_kw("transaction")
+                || self.eat_kw("deferred")
+                || self.eat_kw("immediate")
+                || self.eat_kw("exclusive");
+            let _ = self.eat_kw("transaction");
+            return Ok(Statement::Begin);
+        }
+        if self.eat_kw("commit") || self.eat_kw("end") {
+            let _ = self.eat_kw("transaction");
+            return Ok(Statement::Commit);
+        }
+        if self.eat_kw("rollback") {
+            let _ = self.eat_kw("transaction");
+            return Ok(Statement::Rollback);
+        }
+        if self.eat_kw("pragma") {
+            return Ok(Statement::Pragma(self.pragma()?));
+        }
+        Err(self.err("unrecognized statement"))
+    }
+
+    fn pragma(&mut self) -> Result<Pragma> {
+        let name = self.ident()?;
+        let value = if self.eat(&Token::Eq) {
+            Some(self.expr()?)
+        } else if self.eat(&Token::LParen) {
+            let v = self.expr()?;
+            self.expect(&Token::RParen)?;
+            Some(v)
+        } else {
+            None
+        };
+        Ok(Pragma { name, value })
+    }
+
+    fn select(&mut self) -> Result<Select> {
+        // (CTE/`WITH` is accepted as a keyword but not yet modeled.)
+        if self.eat_kw("with") {
+            return Err(Error::Unsupported("WITH / common table expressions"));
+        }
+        self.expect_kw("select")?;
+        let distinct = if self.eat_kw("distinct") {
+            true
+        } else {
+            let _ = self.eat_kw("all");
+            false
+        };
+
+        let mut columns = Vec::new();
+        columns.push(self.result_column()?);
+        while self.eat(&Token::Comma) {
+            columns.push(self.result_column()?);
+        }
+
+        let from = if self.eat_kw("from") {
+            Some(self.tables_clause()?)
+        } else {
+            None
+        };
+        let where_clause = if self.eat_kw("where") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        let mut group_by = Vec::new();
+        let mut having = None;
+        if self.eat_kw("group") {
+            self.expect_kw("by")?;
+            group_by.push(self.expr()?);
+            while self.eat(&Token::Comma) {
+                group_by.push(self.expr()?);
+            }
+            if self.eat_kw("having") {
+                having = Some(self.expr()?);
+            }
+        }
+        let mut order_by = Vec::new();
+        if self.eat_kw("order") {
+            self.expect_kw("by")?;
+            order_by.push(self.order_term()?);
+            while self.eat(&Token::Comma) {
+                order_by.push(self.order_term()?);
+            }
+        }
+        let mut limit = None;
+        let mut offset = None;
+        if self.eat_kw("limit") {
+            limit = Some(self.expr()?);
+            if self.eat_kw("offset") {
+                offset = Some(self.expr()?);
+            } else if self.eat(&Token::Comma) {
+                // `LIMIT offset, count` form.
+                offset = limit.take();
+                limit = Some(self.expr()?);
+            }
+        }
+
+        Ok(Select {
+            distinct,
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
+    fn result_column(&mut self) -> Result<ResultColumn> {
+        if self.eat(&Token::Star) {
+            return Ok(ResultColumn::Wildcard);
+        }
+        // `table.*` ?
+        if let Some(Token::Word(_)) | Some(Token::Ident(_)) = self.peek() {
+            let save = self.pos;
+            let name = self.ident()?;
+            if self.eat(&Token::Dot) {
+                if self.eat(&Token::Star) {
+                    return Ok(ResultColumn::TableWildcard(name));
+                }
+                self.pos = save; // not a table.* ; reparse as expression
+            } else {
+                self.pos = save;
+            }
+        }
+        let expr = self.expr()?;
+        let alias = self.opt_alias()?;
+        Ok(ResultColumn::Expr { expr, alias })
+    }
+
+    fn opt_alias(&mut self) -> Result<Option<String>> {
+        if self.eat_kw("as") {
+            return Ok(Some(self.ident()?));
+        }
+        // A bare word that isn't a clause keyword can be an implicit alias.
+        if let Some(Token::Word(w)) = self.peek() {
+            if !is_reserved_after_expr(w) {
+                return Ok(Some(self.ident()?));
+            }
+        } else if let Some(Token::Ident(_)) = self.peek() {
+            return Ok(Some(self.ident()?));
+        }
+        Ok(None)
+    }
+
+    fn tables_clause(&mut self) -> Result<FromClause> {
+        let first = self.table_ref()?;
+        let mut joins = Vec::new();
+        loop {
+            if self.eat(&Token::Comma) {
+                let table = self.table_ref()?;
+                joins.push(Join {
+                    kind: JoinKind::Inner,
+                    table,
+                    on: None,
+                });
+                continue;
+            }
+            let kind = if self.eat_kw("left") {
+                let _ = self.eat_kw("outer");
+                self.expect_kw("join")?;
+                JoinKind::Left
+            } else if self.eat_kw("inner") || self.eat_kw("cross") {
+                self.expect_kw("join")?;
+                JoinKind::Inner
+            } else if self.eat_kw("join") {
+                JoinKind::Inner
+            } else {
+                break;
+            };
+            let table = self.table_ref()?;
+            let on = if self.eat_kw("on") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            joins.push(Join { kind, table, on });
+        }
+        Ok(FromClause { first, joins })
+    }
+
+    fn table_ref(&mut self) -> Result<TableRef> {
+        let name = self.ident()?;
+        let alias = self.opt_alias()?;
+        Ok(TableRef { name, alias })
+    }
+
+    fn order_term(&mut self) -> Result<OrderTerm> {
+        let expr = self.expr()?;
+        let descending = if self.eat_kw("desc") {
+            true
+        } else {
+            let _ = self.eat_kw("asc");
+            false
+        };
+        Ok(OrderTerm { expr, descending })
+    }
+
+    fn insert(&mut self) -> Result<Insert> {
+        // INSERT [OR ...] INTO  /  REPLACE INTO
+        if self.eat_kw("insert") {
+            if self.eat_kw("or") {
+                // conflict clause: ignore the specific action for now
+                let _ = self.advance();
+            }
+        } else {
+            self.expect_kw("replace")?;
+        }
+        self.expect_kw("into")?;
+        let table = self.ident()?;
+        let mut columns = Vec::new();
+        if self.eat(&Token::LParen) {
+            columns.push(self.ident()?);
+            while self.eat(&Token::Comma) {
+                columns.push(self.ident()?);
+            }
+            self.expect(&Token::RParen)?;
+        }
+
+        let source = if self.eat_kw("default") {
+            self.expect_kw("values")?;
+            InsertSource::DefaultValues
+        } else if self.check_kw("select") || self.check_kw("with") {
+            InsertSource::Select(Box::new(self.select()?))
+        } else {
+            self.expect_kw("values")?;
+            let mut rows = Vec::new();
+            rows.push(self.value_row()?);
+            while self.eat(&Token::Comma) {
+                rows.push(self.value_row()?);
+            }
+            InsertSource::Values(rows)
+        };
+        Ok(Insert {
+            table,
+            columns,
+            source,
+        })
+    }
+
+    fn value_row(&mut self) -> Result<Vec<Expr>> {
+        self.expect(&Token::LParen)?;
+        let mut row = Vec::new();
+        row.push(self.expr()?);
+        while self.eat(&Token::Comma) {
+            row.push(self.expr()?);
+        }
+        self.expect(&Token::RParen)?;
+        Ok(row)
+    }
+
+    fn update(&mut self) -> Result<Update> {
+        self.expect_kw("update")?;
+        let table = self.ident()?;
+        self.expect_kw("set")?;
+        let mut assignments = Vec::new();
+        loop {
+            let col = self.ident()?;
+            self.expect(&Token::Eq)?;
+            let value = self.expr()?;
+            assignments.push((col, value));
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        let where_clause = if self.eat_kw("where") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(Update {
+            table,
+            assignments,
+            where_clause,
+        })
+    }
+
+    fn delete(&mut self) -> Result<Delete> {
+        self.expect_kw("delete")?;
+        self.expect_kw("from")?;
+        let table = self.ident()?;
+        let where_clause = if self.eat_kw("where") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(Delete {
+            table,
+            where_clause,
+        })
+    }
+
+    fn create(&mut self) -> Result<Statement> {
+        self.expect_kw("create")?;
+        let unique = self.eat_kw("unique");
+        if self.eat_kw("table") {
+            if unique {
+                return Err(self.err("UNIQUE is not valid for CREATE TABLE"));
+            }
+            return Ok(Statement::CreateTable(self.create_table()?));
+        }
+        if self.eat_kw("index") {
+            return Ok(Statement::CreateIndex(self.create_index(unique)?));
+        }
+        Err(self.err("expected TABLE or INDEX after CREATE"))
+    }
+
+    fn if_not_exists(&mut self) -> Result<bool> {
+        if self.eat_kw("if") {
+            self.expect_kw("not")?;
+            self.expect_kw("exists")?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn create_table(&mut self) -> Result<CreateTable> {
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.ident()?;
+        self.expect(&Token::LParen)?;
+        let mut columns = Vec::new();
+        let mut constraints = Vec::new();
+        loop {
+            if self.check_kw("primary") || self.check_kw("unique") {
+                constraints.push(self.table_constraint()?);
+            } else {
+                columns.push(self.column_def()?);
+            }
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        let without_rowid = if self.eat_kw("without") {
+            self.expect_kw("rowid")?;
+            true
+        } else {
+            false
+        };
+        Ok(CreateTable {
+            if_not_exists,
+            name,
+            columns,
+            constraints,
+            without_rowid,
+        })
+    }
+
+    fn column_def(&mut self) -> Result<ColumnDef> {
+        let name = self.ident()?;
+        // Optional type name: one or more bare words, optionally with (n[,m]).
+        let mut type_name = None;
+        if let Some(Token::Word(_)) = self.peek() {
+            if !is_column_constraint_kw(self.peek()) {
+                let mut t = self.ident()?;
+                while let Some(Token::Word(_)) = self.peek() {
+                    if is_column_constraint_kw(self.peek()) {
+                        break;
+                    }
+                    t.push(' ');
+                    t.push_str(&self.ident()?);
+                }
+                if self.eat(&Token::LParen) {
+                    // length/precision args; consume to matching paren
+                    while !self.check(&Token::RParen) && !self.at_end() {
+                        self.advance();
+                    }
+                    self.expect(&Token::RParen)?;
+                }
+                type_name = Some(t);
+            }
+        }
+        let mut constraints = Vec::new();
+        loop {
+            if self.eat_kw("primary") {
+                self.expect_kw("key")?;
+                let descending = if self.eat_kw("desc") {
+                    true
+                } else {
+                    let _ = self.eat_kw("asc");
+                    false
+                };
+                let _ = self.eat_kw("autoincrement");
+                constraints.push(ColumnConstraint::PrimaryKey { descending });
+            } else if self.eat_kw("not") {
+                self.expect_kw("null")?;
+                constraints.push(ColumnConstraint::NotNull);
+            } else if self.eat_kw("unique") {
+                constraints.push(ColumnConstraint::Unique);
+            } else if self.eat_kw("default") {
+                let e = if self.eat(&Token::LParen) {
+                    let e = self.expr()?;
+                    self.expect(&Token::RParen)?;
+                    e
+                } else {
+                    self.expr()?
+                };
+                constraints.push(ColumnConstraint::Default(e));
+            } else if self.eat_kw("collate") {
+                constraints.push(ColumnConstraint::Collate(self.ident()?));
+            } else {
+                break;
+            }
+        }
+        Ok(ColumnDef {
+            name,
+            type_name,
+            constraints,
+        })
+    }
+
+    fn table_constraint(&mut self) -> Result<TableConstraint> {
+        if self.eat_kw("primary") {
+            self.expect_kw("key")?;
+            Ok(TableConstraint::PrimaryKey(self.paren_ident_list()?))
+        } else {
+            self.expect_kw("unique")?;
+            Ok(TableConstraint::Unique(self.paren_ident_list()?))
+        }
+    }
+
+    fn paren_ident_list(&mut self) -> Result<Vec<String>> {
+        self.expect(&Token::LParen)?;
+        let mut names = Vec::new();
+        names.push(self.ident()?);
+        while self.eat(&Token::Comma) {
+            names.push(self.ident()?);
+        }
+        self.expect(&Token::RParen)?;
+        Ok(names)
+    }
+
+    fn create_index(&mut self, unique: bool) -> Result<CreateIndex> {
+        let if_not_exists = self.if_not_exists()?;
+        let name = self.ident()?;
+        self.expect_kw("on")?;
+        let table = self.ident()?;
+        self.expect(&Token::LParen)?;
+        let mut columns = Vec::new();
+        columns.push(self.order_term()?);
+        while self.eat(&Token::Comma) {
+            columns.push(self.order_term()?);
+        }
+        self.expect(&Token::RParen)?;
+        let where_clause = if self.eat_kw("where") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(CreateIndex {
+            unique,
+            if_not_exists,
+            name,
+            table,
+            columns,
+            where_clause,
+        })
+    }
+
+    fn drop_stmt(&mut self) -> Result<Drop> {
+        self.expect_kw("drop")?;
+        let kind = if self.eat_kw("table") {
+            DropKind::Table
+        } else if self.eat_kw("index") {
+            DropKind::Index
+        } else if self.eat_kw("view") {
+            DropKind::View
+        } else if self.eat_kw("trigger") {
+            DropKind::Trigger
+        } else {
+            return Err(self.err("expected TABLE/INDEX/VIEW/TRIGGER after DROP"));
+        };
+        let if_exists = if self.eat_kw("if") {
+            self.expect_kw("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident()?;
+        Ok(Drop {
+            kind,
+            if_exists,
+            name,
+        })
+    }
+
+    // ---- expressions (Pratt) ------------------------------------------------
+
+    fn expr(&mut self) -> Result<Expr> {
+        self.expr_bp(0)
+    }
+
+    fn expr_bp(&mut self, min_bp: u8) -> Result<Expr> {
+        let mut left = self.prefix()?;
+        while let Some((op, bp)) = self.peek_infix() {
+            if bp < min_bp {
+                break;
+            }
+            left = self.infix(left, op, bp)?;
+        }
+        Ok(left)
+    }
+
+    fn prefix(&mut self) -> Result<Expr> {
+        match self.peek() {
+            Some(Token::Minus) => {
+                self.pos += 1;
+                Ok(Expr::Unary {
+                    op: UnaryOp::Negate,
+                    expr: Box::new(self.expr_bp(BP_UNARY)?),
+                })
+            }
+            Some(Token::Plus) => {
+                self.pos += 1;
+                Ok(Expr::Unary {
+                    op: UnaryOp::Identity,
+                    expr: Box::new(self.expr_bp(BP_UNARY)?),
+                })
+            }
+            Some(Token::BitNot) => {
+                self.pos += 1;
+                Ok(Expr::Unary {
+                    op: UnaryOp::BitNot,
+                    expr: Box::new(self.expr_bp(BP_UNARY)?),
+                })
+            }
+            Some(Token::Word(w)) if w.eq_ignore_ascii_case("not") => {
+                self.pos += 1;
+                Ok(Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(self.expr_bp(BP_NOT_PREFIX)?),
+                })
+            }
+            _ => self.primary(),
+        }
+    }
+
+    fn primary(&mut self) -> Result<Expr> {
+        match self.advance() {
+            Some(Token::Integer(i)) => Ok(Expr::Literal(Literal::Integer(i))),
+            Some(Token::Float(f)) => Ok(Expr::Literal(Literal::Real(f))),
+            Some(Token::Str(s)) => Ok(Expr::Literal(Literal::Str(s))),
+            Some(Token::Blob(b)) => Ok(Expr::Literal(Literal::Blob(b))),
+            Some(Token::Param(p)) => Ok(Expr::Parameter(p)),
+            Some(Token::LParen) => {
+                let e = self.expr()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::Paren(Box::new(e)))
+            }
+            Some(Token::Ident(name)) => self.after_name(name, true),
+            Some(Token::Word(w)) => {
+                let lw = w.to_ascii_lowercase();
+                match lw.as_str() {
+                    "null" => Ok(Expr::Literal(Literal::Null)),
+                    "true" => Ok(Expr::Literal(Literal::Boolean(true))),
+                    "false" => Ok(Expr::Literal(Literal::Boolean(false))),
+                    "case" => self.case_expr(),
+                    "cast" => self.cast_expr(),
+                    _ if is_reserved_keyword(&lw) => Err(Error::Parse(format!(
+                        "unexpected keyword {w:?} in expression"
+                    ))),
+                    _ => self.after_name(w, false),
+                }
+            }
+            other => Err(Error::Parse(format!(
+                "expected an expression, found {other:?}"
+            ))),
+        }
+    }
+
+    /// Continue parsing after a name: `name`, `tbl.col`, or `func(args)`.
+    fn after_name(&mut self, name: String, quoted: bool) -> Result<Expr> {
+        if !quoted && self.eat(&Token::LParen) {
+            return self.function_call(name);
+        }
+        if self.eat(&Token::Dot) {
+            let column = self.ident()?;
+            return Ok(Expr::Column {
+                table: Some(name),
+                column,
+            });
+        }
+        Ok(Expr::Column {
+            table: None,
+            column: name,
+        })
+    }
+
+    fn function_call(&mut self, name: String) -> Result<Expr> {
+        if self.eat(&Token::Star) {
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::Function {
+                name,
+                distinct: false,
+                args: Vec::new(),
+                star: true,
+            });
+        }
+        let distinct = self.eat_kw("distinct");
+        let mut args = Vec::new();
+        if !self.check(&Token::RParen) {
+            args.push(self.expr()?);
+            while self.eat(&Token::Comma) {
+                args.push(self.expr()?);
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Expr::Function {
+            name,
+            distinct,
+            args,
+            star: false,
+        })
+    }
+
+    fn case_expr(&mut self) -> Result<Expr> {
+        let operand = if !self.check_kw("when") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        let mut when_then = Vec::new();
+        while self.eat_kw("when") {
+            let cond = self.expr()?;
+            self.expect_kw("then")?;
+            let result = self.expr()?;
+            when_then.push((cond, result));
+        }
+        if when_then.is_empty() {
+            return Err(self.err("CASE requires at least one WHEN"));
+        }
+        let else_result = if self.eat_kw("else") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        self.expect_kw("end")?;
+        Ok(Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        })
+    }
+
+    fn cast_expr(&mut self) -> Result<Expr> {
+        self.expect(&Token::LParen)?;
+        let expr = Box::new(self.expr()?);
+        self.expect_kw("as")?;
+        let type_name = self.ident()?;
+        self.expect(&Token::RParen)?;
+        Ok(Expr::Cast { expr, type_name })
+    }
+
+    /// Peek at the current infix operator and its binding power, if any.
+    fn peek_infix(&self) -> Option<(InfixOp, u8)> {
+        let tok = self.peek()?;
+        let op = match tok {
+            Token::Concat => (InfixOp::Binary(BinaryOp::Concat), BP_CONCAT),
+            Token::Star => (InfixOp::Binary(BinaryOp::Mul), BP_MUL),
+            Token::Slash => (InfixOp::Binary(BinaryOp::Div), BP_MUL),
+            Token::Percent => (InfixOp::Binary(BinaryOp::Mod), BP_MUL),
+            Token::Plus => (InfixOp::Binary(BinaryOp::Add), BP_ADD),
+            Token::Minus => (InfixOp::Binary(BinaryOp::Sub), BP_ADD),
+            Token::BitAnd => (InfixOp::Binary(BinaryOp::BitAnd), BP_BIT),
+            Token::BitOr => (InfixOp::Binary(BinaryOp::BitOr), BP_BIT),
+            Token::LShift => (InfixOp::Binary(BinaryOp::LShift), BP_BIT),
+            Token::RShift => (InfixOp::Binary(BinaryOp::RShift), BP_BIT),
+            Token::Lt => (InfixOp::Binary(BinaryOp::Lt), BP_REL),
+            Token::LtEq => (InfixOp::Binary(BinaryOp::LtEq), BP_REL),
+            Token::Gt => (InfixOp::Binary(BinaryOp::Gt), BP_REL),
+            Token::GtEq => (InfixOp::Binary(BinaryOp::GtEq), BP_REL),
+            Token::Eq => (InfixOp::Binary(BinaryOp::Eq), BP_EQ),
+            Token::NotEq => (InfixOp::Binary(BinaryOp::NotEq), BP_EQ),
+            Token::Word(w) => {
+                let lw = w.to_ascii_lowercase();
+                match lw.as_str() {
+                    "or" => (InfixOp::Binary(BinaryOp::Or), BP_OR),
+                    "and" => (InfixOp::Binary(BinaryOp::And), BP_AND),
+                    "is" => (InfixOp::Is, BP_EQ),
+                    "in" => (InfixOp::In { negated: false }, BP_EQ),
+                    "like" => (InfixOp::Binary(BinaryOp::Like), BP_EQ),
+                    "glob" => (InfixOp::Binary(BinaryOp::Glob), BP_EQ),
+                    "between" => (InfixOp::Between { negated: false }, BP_EQ),
+                    "not" => (InfixOp::NotPrefixed, BP_EQ),
+                    "isnull" => (InfixOp::IsNullKw { negated: false }, BP_EQ),
+                    "notnull" => (InfixOp::IsNullKw { negated: true }, BP_EQ),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        Some(op)
+    }
+
+    fn infix(&mut self, left: Expr, op: InfixOp, bp: u8) -> Result<Expr> {
+        match op {
+            InfixOp::Binary(b) => {
+                self.pos += 1;
+                // Left-associative: right side binds at bp+1.
+                let right = self.expr_bp(bp + 1)?;
+                Ok(Expr::Binary {
+                    op: b,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+            InfixOp::Is => {
+                self.pos += 1; // IS
+                let negated = self.eat_kw("not");
+                if self.eat_kw("null") {
+                    return Ok(Expr::IsNull {
+                        expr: Box::new(left),
+                        negated,
+                    });
+                }
+                let right = self.expr_bp(bp + 1)?;
+                Ok(Expr::Binary {
+                    op: if negated {
+                        BinaryOp::IsNot
+                    } else {
+                        BinaryOp::Is
+                    },
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+            InfixOp::IsNullKw { negated } => {
+                self.pos += 1;
+                Ok(Expr::IsNull {
+                    expr: Box::new(left),
+                    negated,
+                })
+            }
+            InfixOp::In { negated } => {
+                self.pos += 1; // IN
+                self.parse_in(left, negated)
+            }
+            InfixOp::Between { negated } => {
+                self.pos += 1; // BETWEEN
+                self.parse_between(left, negated)
+            }
+            InfixOp::NotPrefixed => {
+                // NOT IN / NOT LIKE / NOT GLOB / NOT BETWEEN
+                self.pos += 1; // NOT
+                if self.eat_kw("in") {
+                    self.parse_in(left, true)
+                } else if self.eat_kw("between") {
+                    self.parse_between(left, true)
+                } else if self.eat_kw("like") {
+                    let right = self.expr_bp(bp + 1)?;
+                    Ok(Expr::Unary {
+                        op: UnaryOp::Not,
+                        expr: Box::new(Expr::Binary {
+                            op: BinaryOp::Like,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        }),
+                    })
+                } else if self.eat_kw("glob") {
+                    let right = self.expr_bp(bp + 1)?;
+                    Ok(Expr::Unary {
+                        op: UnaryOp::Not,
+                        expr: Box::new(Expr::Binary {
+                            op: BinaryOp::Glob,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        }),
+                    })
+                } else {
+                    Err(self.err("expected IN/LIKE/GLOB/BETWEEN after NOT"))
+                }
+            }
+        }
+    }
+
+    fn parse_in(&mut self, left: Expr, negated: bool) -> Result<Expr> {
+        self.expect(&Token::LParen)?;
+        let mut list = Vec::new();
+        if !self.check(&Token::RParen) {
+            list.push(self.expr()?);
+            while self.eat(&Token::Comma) {
+                list.push(self.expr()?);
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Expr::InList {
+            expr: Box::new(left),
+            list,
+            negated,
+        })
+    }
+
+    fn parse_between(&mut self, left: Expr, negated: bool) -> Result<Expr> {
+        // Operands bind tighter than AND so BETWEEN's AND is not the boolean one.
+        let low = self.expr_bp(BP_BIT)?;
+        self.expect_kw("and")?;
+        let high = self.expr_bp(BP_BIT)?;
+        Ok(Expr::Between {
+            expr: Box::new(left),
+            low: Box::new(low),
+            high: Box::new(high),
+            negated,
+        })
+    }
+}
+
+/// Classification of an infix position for the Pratt loop.
+#[derive(Debug, Clone, Copy)]
+enum InfixOp {
+    Binary(BinaryOp),
+    Is,
+    IsNullKw { negated: bool },
+    In { negated: bool },
+    Between { negated: bool },
+    NotPrefixed,
+}
+
+/// Keywords that end an expression in a result-column/table context, so a bare
+/// word here is a clause keyword rather than an implicit alias.
+fn is_reserved_after_expr(w: &str) -> bool {
+    matches!(
+        w.to_ascii_lowercase().as_str(),
+        "from"
+            | "where"
+            | "group"
+            | "having"
+            | "order"
+            | "limit"
+            | "offset"
+            | "join"
+            | "inner"
+            | "left"
+            | "right"
+            | "cross"
+            | "on"
+            | "using"
+            | "and"
+            | "or"
+            | "as"
+            | "when"
+            | "then"
+            | "else"
+            | "end"
+    )
+}
+
+/// Keywords that cannot appear where an expression primary is expected. These
+/// are the SQLite reserved words that are never usable as bare identifiers in
+/// expression position (so `SELECT FROM` is a syntax error, not a column named
+/// `FROM`). The list is intentionally conservative — words SQLite allows as
+/// identifiers (e.g. `key`, `default` in some contexts) are not included.
+fn is_reserved_keyword(lower: &str) -> bool {
+    matches!(
+        lower,
+        "select"
+            | "from"
+            | "where"
+            | "group"
+            | "having"
+            | "order"
+            | "limit"
+            | "offset"
+            | "join"
+            | "inner"
+            | "left"
+            | "right"
+            | "cross"
+            | "on"
+            | "using"
+            | "as"
+            | "when"
+            | "then"
+            | "else"
+            | "end"
+            | "into"
+            | "values"
+            | "set"
+            | "by"
+            | "and"
+            | "or"
+            | "insert"
+            | "update"
+            | "delete"
+            | "create"
+            | "drop"
+            | "table"
+            | "union"
+            | "intersect"
+            | "except"
+    )
+}
+
+fn is_column_constraint_kw(tok: Option<&Token>) -> bool {
+    matches!(tok, Some(Token::Word(w)) if matches!(
+        w.to_ascii_lowercase().as_str(),
+        "primary" | "not" | "null" | "unique" | "default" | "collate" | "check" | "references"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn one(sql: &str) -> Statement {
+        parse_one(sql).unwrap()
+    }
+
+    #[test]
+    fn simple_select() {
+        let s = one("SELECT a, b AS bee, t.* FROM t WHERE a > 1 ORDER BY b DESC LIMIT 10");
+        let Statement::Select(sel) = s else { panic!() };
+        assert_eq!(sel.columns.len(), 3);
+        assert!(sel.where_clause.is_some());
+        assert_eq!(sel.order_by.len(), 1);
+        assert!(sel.order_by[0].descending);
+        assert!(sel.limit.is_some());
+    }
+
+    #[test]
+    fn select_star() {
+        let Statement::Select(sel) = one("select * from t") else {
+            panic!()
+        };
+        assert_eq!(sel.columns, vec![ResultColumn::Wildcard]);
+        assert_eq!(sel.from.unwrap().first.name, "t");
+    }
+
+    #[test]
+    fn expression_precedence() {
+        // 1 + 2 * 3 = 7, and AND binds looser than comparison.
+        let Statement::Select(sel) = one("SELECT 1 + 2 * 3 WHERE a = 1 AND b = 2") else {
+            panic!()
+        };
+        let ResultColumn::Expr { expr, .. } = &sel.columns[0] else {
+            panic!()
+        };
+        // Top of the projected expr must be Add, with Mul on the right.
+        let Expr::Binary {
+            op: BinaryOp::Add,
+            right,
+            ..
+        } = expr
+        else {
+            panic!("expected Add at top, got {expr:?}")
+        };
+        assert!(matches!(
+            **right,
+            Expr::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
+        // WHERE must be (a=1) AND (b=2).
+        let Some(Expr::Binary {
+            op: BinaryOp::And, ..
+        }) = sel.where_clause
+        else {
+            panic!("expected AND at top of WHERE")
+        };
+    }
+
+    #[test]
+    fn in_between_is_null_like() {
+        one("SELECT * FROM t WHERE a IN (1,2,3)");
+        one("SELECT * FROM t WHERE a NOT IN (1,2)");
+        one("SELECT * FROM t WHERE a BETWEEN 1 AND 10");
+        one("SELECT * FROM t WHERE a NOT BETWEEN 1 AND 10");
+        one("SELECT * FROM t WHERE a IS NULL");
+        one("SELECT * FROM t WHERE a IS NOT NULL");
+        one("SELECT * FROM t WHERE name LIKE 'a%'");
+    }
+
+    #[test]
+    fn functions_and_case_and_cast() {
+        one("SELECT count(*), max(a), substr(b,1,2) FROM t");
+        one("SELECT count(DISTINCT a) FROM t");
+        one("SELECT CASE WHEN a > 0 THEN 'p' WHEN a < 0 THEN 'n' ELSE 'z' END FROM t");
+        one("SELECT CAST(a AS TEXT) FROM t");
+    }
+
+    #[test]
+    fn insert_forms() {
+        let Statement::Insert(ins) = one("INSERT INTO t(a,b) VALUES (1,'x'),(2,'y')") else {
+            panic!()
+        };
+        assert_eq!(ins.columns, vec!["a", "b"]);
+        match ins.source {
+            InsertSource::Values(rows) => assert_eq!(rows.len(), 2),
+            _ => panic!(),
+        }
+        one("INSERT INTO t DEFAULT VALUES");
+        one("INSERT INTO t SELECT * FROM u");
+        one("INSERT OR REPLACE INTO t VALUES (1)");
+    }
+
+    #[test]
+    fn update_delete() {
+        let Statement::Update(u) = one("UPDATE t SET a = 1, b = a + 1 WHERE id = 5") else {
+            panic!()
+        };
+        assert_eq!(u.assignments.len(), 2);
+        assert!(u.where_clause.is_some());
+
+        let Statement::Delete(d) = one("DELETE FROM t WHERE a < 0") else {
+            panic!()
+        };
+        assert_eq!(d.table, "t");
+    }
+
+    #[test]
+    fn create_table_and_index() {
+        let Statement::CreateTable(ct) =
+            one("CREATE TABLE IF NOT EXISTS t(a INTEGER PRIMARY KEY, b TEXT NOT NULL, c REAL DEFAULT 0)")
+        else {
+            panic!()
+        };
+        assert!(ct.if_not_exists);
+        assert_eq!(ct.columns.len(), 3);
+        assert_eq!(ct.columns[0].type_name.as_deref(), Some("INTEGER"));
+        assert!(ct.columns[0]
+            .constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. })));
+
+        let Statement::CreateIndex(ci) = one("CREATE UNIQUE INDEX idx ON t(b, c DESC)") else {
+            panic!()
+        };
+        assert!(ci.unique);
+        assert_eq!(ci.columns.len(), 2);
+        assert!(ci.columns[1].descending);
+    }
+
+    #[test]
+    fn create_table_with_table_constraint() {
+        let Statement::CreateTable(ct) = one("CREATE TABLE t(a, b, PRIMARY KEY(a, b))") else {
+            panic!()
+        };
+        assert_eq!(ct.columns.len(), 2);
+        assert_eq!(ct.constraints.len(), 1);
+    }
+
+    #[test]
+    fn drop_and_tx_and_pragma() {
+        assert!(matches!(one("DROP TABLE IF EXISTS t"), Statement::Drop(_)));
+        assert!(matches!(one("BEGIN"), Statement::Begin));
+        assert!(matches!(one("COMMIT"), Statement::Commit));
+        assert!(matches!(one("ROLLBACK"), Statement::Rollback));
+        let Statement::Pragma(p) = one("PRAGMA page_size = 4096") else {
+            panic!()
+        };
+        assert_eq!(p.name, "page_size");
+        assert!(p.value.is_some());
+    }
+
+    #[test]
+    fn multiple_statements() {
+        let stmts = parse("CREATE TABLE t(a); INSERT INTO t VALUES (1); SELECT * FROM t;").unwrap();
+        assert_eq!(stmts.len(), 3);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse("SELECT FROM").is_err());
+        assert!(parse("INSERT INTO").is_err());
+        assert!(parse("!!!").is_err());
+    }
+}

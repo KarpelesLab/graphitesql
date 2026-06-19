@@ -151,14 +151,18 @@ databases lands well before write support).
 - **Files:** `src/format/record.rs`, `src/schema/mod.rs`.
 - **Reference:** `fileformat2.html` (record format, schema table), `build.c`.
 
-### Phase 4 — SQL front end (tokenizer + parser + AST)
+### Phase 4 — SQL front end (tokenizer + parser + AST) ✅ *(done)*
 
 - **Deliverable:** tokenizer matching SQLite's lexical rules and keyword set; a
   recursive-descent parser producing an AST for the core grammar: `SELECT`
-  (with `WHERE`/`ORDER BY`/`LIMIT`/joins/subqueries), `INSERT`, `UPDATE`,
-  `DELETE`, `CREATE TABLE/INDEX`, `DROP`, transactions, and `PRAGMA`.
-- **Done:** parses a corpus of statements; AST round-trips through a pretty
-  printer; error positions match SQLite for a sample of bad inputs.
+  (with `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/joins), `INSERT`,
+  `UPDATE`, `DELETE`, `CREATE TABLE/INDEX`, `DROP`, transactions, and `PRAGMA`.
+- **Done:** tokenizer covers strings/blobs/quoted-idents/comments/params/numbers
+  (UTF-8 safe); Pratt expression parser with SQLite precedence incl.
+  `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE`/`GLOB`, `CASE`, `CAST`; reserved-word
+  checks reject `SELECT FROM`; ~20 parser/tokenizer tests. *(Subqueries & CTEs
+  deferred to Phase 9.)*
+- **Files:** `src/sql/{mod,token,ast,parser}.rs`.
 - **Reference:** `tokenize.c`, `parse.y`, `expr.c`. (We hand-write the parser
   rather than port the Lemon grammar, but `parse.y` is the source of truth for
   precedence and accepted forms.)

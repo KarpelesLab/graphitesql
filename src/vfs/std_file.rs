@@ -66,7 +66,10 @@ pub struct StdFile {
 
 impl StdFile {
     fn with<R>(&self, f: impl FnOnce(&mut fs::File) -> std::io::Result<R>) -> Result<R> {
-        let mut guard = self.inner.lock().map_err(|_| Error::Io("poisoned file lock".into()))?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Io("poisoned file lock".into()))?;
         f(&mut guard).map_err(io_err)
     }
 }

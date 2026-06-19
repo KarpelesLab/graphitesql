@@ -50,7 +50,7 @@ impl Error {
             Error::Error(_) | Error::Parse(_) | Error::Unsupported(_) => 1, // SQLITE_ERROR
             Error::Corrupt(_) => 11,                                        // SQLITE_CORRUPT
             Error::Io(_) => 10,                                             // SQLITE_IOERR
-            Error::Busy => 5,                                              // SQLITE_BUSY
+            Error::Busy => 5,                                               // SQLITE_BUSY
             Error::CantOpen(_) => 14,                                       // SQLITE_CANTOPEN
             Error::Constraint(_) => 19,                                     // SQLITE_CONSTRAINT
         }

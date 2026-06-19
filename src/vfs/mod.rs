@@ -39,11 +39,20 @@ pub struct OpenFlags {
 
 impl OpenFlags {
     /// Open an existing file for reading only.
-    pub const READ_ONLY: OpenFlags = OpenFlags { write: false, create: false };
+    pub const READ_ONLY: OpenFlags = OpenFlags {
+        write: false,
+        create: false,
+    };
     /// Open an existing file for reading and writing.
-    pub const READ_WRITE: OpenFlags = OpenFlags { write: true, create: false };
+    pub const READ_WRITE: OpenFlags = OpenFlags {
+        write: true,
+        create: false,
+    };
     /// Open for reading and writing, creating the file if absent.
-    pub const READ_WRITE_CREATE: OpenFlags = OpenFlags { write: true, create: true };
+    pub const READ_WRITE_CREATE: OpenFlags = OpenFlags {
+        write: true,
+        create: true,
+    };
 }
 
 /// File lock levels, matching SQLite's locking model.

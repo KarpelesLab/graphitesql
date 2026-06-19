@@ -57,6 +57,7 @@ pub mod btree;
 pub mod format;
 pub mod pager;
 pub mod schema;
+pub mod sql;
 pub mod vfs;
 
 pub use error::{Error, Result};

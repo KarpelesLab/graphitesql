@@ -1,0 +1,439 @@
+//! The abstract syntax tree produced by the parser.
+//!
+//! These types model the subset of SQLite's grammar graphitesql currently
+//! parses. They are deliberately close to SQLite's own parse structures so the
+//! code generator (Phase 5/7) can map them onto VDBE programs directly. The
+//! grammar source of truth is `parse.y`.
+
+use crate::sql::token::Param;
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+/// A complete parsed statement.
+// Variants differ in size (Select is the largest); boxing every variant would
+// hurt ergonomics more than the size gap costs, and statements are short-lived.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Statement {
+    /// A `SELECT` query.
+    Select(Select),
+    /// An `INSERT` statement.
+    Insert(Insert),
+    /// An `UPDATE` statement.
+    Update(Update),
+    /// A `DELETE` statement.
+    Delete(Delete),
+    /// A `CREATE TABLE` statement.
+    CreateTable(CreateTable),
+    /// A `CREATE INDEX` statement.
+    CreateIndex(CreateIndex),
+    /// A `DROP TABLE`/`DROP INDEX`/… statement.
+    Drop(Drop),
+    /// `BEGIN [TRANSACTION]`.
+    Begin,
+    /// `COMMIT`/`END`.
+    Commit,
+    /// `ROLLBACK`.
+    Rollback,
+    /// A `PRAGMA` statement.
+    Pragma(Pragma),
+}
+
+/// A `SELECT` query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Select {
+    /// `SELECT DISTINCT`?
+    pub distinct: bool,
+    /// The projected result columns.
+    pub columns: Vec<ResultColumn>,
+    /// The `FROM` clause, if any.
+    pub from: Option<FromClause>,
+    /// The `WHERE` predicate, if any.
+    pub where_clause: Option<Expr>,
+    /// `GROUP BY` expressions.
+    pub group_by: Vec<Expr>,
+    /// `HAVING` predicate.
+    pub having: Option<Expr>,
+    /// `ORDER BY` terms.
+    pub order_by: Vec<OrderTerm>,
+    /// `LIMIT` expression.
+    pub limit: Option<Expr>,
+    /// `OFFSET` expression.
+    pub offset: Option<Expr>,
+}
+
+/// A single result column in a `SELECT`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResultColumn {
+    /// `*`
+    Wildcard,
+    /// `table.*`
+    TableWildcard(String),
+    /// An expression with an optional alias.
+    Expr {
+        /// The projected expression.
+        expr: Expr,
+        /// `AS alias`, if present.
+        alias: Option<String>,
+    },
+}
+
+/// A `FROM` clause: a left table joined with zero or more others.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FromClause {
+    /// The first table source.
+    pub first: TableRef,
+    /// Subsequent joins.
+    pub joins: Vec<Join>,
+}
+
+/// A reference to a table in a `FROM` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableRef {
+    /// The table name.
+    pub name: String,
+    /// An optional alias (`AS x` or bare `x`).
+    pub alias: Option<String>,
+}
+
+/// The kind of join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// `,` or `CROSS JOIN` or `INNER JOIN`.
+    Inner,
+    /// `LEFT [OUTER] JOIN`.
+    Left,
+}
+
+/// A join onto a table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    /// The kind of join.
+    pub kind: JoinKind,
+    /// The joined table.
+    pub table: TableRef,
+    /// An `ON` predicate, if present.
+    pub on: Option<Expr>,
+}
+
+/// One `ORDER BY` term.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderTerm {
+    /// The ordering expression.
+    pub expr: Expr,
+    /// `DESC`?
+    pub descending: bool,
+}
+
+/// An `INSERT` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Insert {
+    /// Target table.
+    pub table: String,
+    /// Explicit column list, if given.
+    pub columns: Vec<String>,
+    /// The data source.
+    pub source: InsertSource,
+}
+
+/// Where an `INSERT` gets its rows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    /// `VALUES (…), (…)`.
+    Values(Vec<Vec<Expr>>),
+    /// `INSERT … SELECT …`.
+    Select(Box<Select>),
+    /// `DEFAULT VALUES`.
+    DefaultValues,
+}
+
+/// An `UPDATE` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Update {
+    /// Target table.
+    pub table: String,
+    /// `SET col = expr` assignments.
+    pub assignments: Vec<(String, Expr)>,
+    /// `WHERE` predicate.
+    pub where_clause: Option<Expr>,
+}
+
+/// A `DELETE` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delete {
+    /// Target table.
+    pub table: String,
+    /// `WHERE` predicate.
+    pub where_clause: Option<Expr>,
+}
+
+/// A `CREATE TABLE` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTable {
+    /// `IF NOT EXISTS`?
+    pub if_not_exists: bool,
+    /// Table name.
+    pub name: String,
+    /// Column definitions.
+    pub columns: Vec<ColumnDef>,
+    /// Table-level constraints (raw, for now).
+    pub constraints: Vec<TableConstraint>,
+    /// `WITHOUT ROWID`?
+    pub without_rowid: bool,
+}
+
+/// A column definition in `CREATE TABLE`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnDef {
+    /// Column name.
+    pub name: String,
+    /// Declared type name (e.g. `INTEGER`), if any.
+    pub type_name: Option<String>,
+    /// Column constraints.
+    pub constraints: Vec<ColumnConstraint>,
+}
+
+/// A column-level constraint.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnConstraint {
+    /// `PRIMARY KEY [ASC|DESC]`.
+    PrimaryKey {
+        /// Descending primary key?
+        descending: bool,
+    },
+    /// `NOT NULL`.
+    NotNull,
+    /// `UNIQUE`.
+    Unique,
+    /// `DEFAULT <expr>`.
+    Default(Expr),
+    /// `COLLATE <name>`.
+    Collate(String),
+}
+
+/// A table-level constraint.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableConstraint {
+    /// `PRIMARY KEY (cols…)`.
+    PrimaryKey(Vec<String>),
+    /// `UNIQUE (cols…)`.
+    Unique(Vec<String>),
+}
+
+/// A `CREATE INDEX` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndex {
+    /// `UNIQUE`?
+    pub unique: bool,
+    /// `IF NOT EXISTS`?
+    pub if_not_exists: bool,
+    /// Index name.
+    pub name: String,
+    /// Indexed table.
+    pub table: String,
+    /// Indexed columns, with direction.
+    pub columns: Vec<OrderTerm>,
+    /// Partial-index `WHERE`.
+    pub where_clause: Option<Expr>,
+}
+
+/// What kind of object a `DROP` targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropKind {
+    /// `DROP TABLE`.
+    Table,
+    /// `DROP INDEX`.
+    Index,
+    /// `DROP VIEW`.
+    View,
+    /// `DROP TRIGGER`.
+    Trigger,
+}
+
+/// A `DROP` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Drop {
+    /// What is being dropped.
+    pub kind: DropKind,
+    /// `IF EXISTS`?
+    pub if_exists: bool,
+    /// Object name.
+    pub name: String,
+}
+
+/// A `PRAGMA` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pragma {
+    /// Pragma name.
+    pub name: String,
+    /// `PRAGMA name = value` or `PRAGMA name(value)`.
+    pub value: Option<Expr>,
+}
+
+/// A scalar expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    /// A literal value.
+    Literal(Literal),
+    /// A bound parameter.
+    Parameter(Param),
+    /// A column reference, optionally table-qualified.
+    Column {
+        /// `table.` qualifier, if any.
+        table: Option<String>,
+        /// Column name.
+        column: String,
+    },
+    /// A unary operation.
+    Unary {
+        /// The operator.
+        op: UnaryOp,
+        /// The operand.
+        expr: Box<Expr>,
+    },
+    /// A binary operation.
+    Binary {
+        /// The operator.
+        op: BinaryOp,
+        /// Left operand.
+        left: Box<Expr>,
+        /// Right operand.
+        right: Box<Expr>,
+    },
+    /// A function call.
+    Function {
+        /// Function name.
+        name: String,
+        /// `COUNT(DISTINCT …)` etc.
+        distinct: bool,
+        /// Arguments (`COUNT(*)` has an empty list with `star = true`).
+        args: Vec<Expr>,
+        /// Whether the argument was `*`.
+        star: bool,
+    },
+    /// `expr IS [NOT] NULL`.
+    IsNull {
+        /// The tested expression.
+        expr: Box<Expr>,
+        /// `IS NOT NULL`?
+        negated: bool,
+    },
+    /// `expr [NOT] IN (list)`.
+    InList {
+        /// The tested expression.
+        expr: Box<Expr>,
+        /// Candidate list.
+        list: Vec<Expr>,
+        /// `NOT IN`?
+        negated: bool,
+    },
+    /// `expr [NOT] BETWEEN low AND high`.
+    Between {
+        /// The tested expression.
+        expr: Box<Expr>,
+        /// Lower bound.
+        low: Box<Expr>,
+        /// Upper bound.
+        high: Box<Expr>,
+        /// `NOT BETWEEN`?
+        negated: bool,
+    },
+    /// A `CASE` expression.
+    Case {
+        /// Optional base operand (`CASE x WHEN …`).
+        operand: Option<Box<Expr>>,
+        /// `(when, then)` pairs.
+        when_then: Vec<(Expr, Expr)>,
+        /// `ELSE` result.
+        else_result: Option<Box<Expr>>,
+    },
+    /// `CAST(expr AS type)`.
+    Cast {
+        /// The cast operand.
+        expr: Box<Expr>,
+        /// The target type name.
+        type_name: String,
+    },
+    /// A parenthesized expression (kept for fidelity; semantically transparent).
+    Paren(Box<Expr>),
+}
+
+/// A literal value in an expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    /// `NULL`.
+    Null,
+    /// An integer.
+    Integer(i64),
+    /// A real.
+    Real(f64),
+    /// A text string.
+    Str(String),
+    /// A blob.
+    Blob(Vec<u8>),
+    /// `TRUE` / `FALSE` (stored as 1/0 in SQLite, kept distinct for clarity).
+    Boolean(bool),
+}
+
+/// Unary operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// `-x`
+    Negate,
+    /// `+x`
+    Identity,
+    /// `NOT x`
+    Not,
+    /// `~x`
+    BitNot,
+}
+
+/// Binary operators, grouped roughly by precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    /// `OR`
+    Or,
+    /// `AND`
+    And,
+    /// `=`
+    Eq,
+    /// `<>` / `!=`
+    NotEq,
+    /// `<`
+    Lt,
+    /// `<=`
+    LtEq,
+    /// `>`
+    Gt,
+    /// `>=`
+    GtEq,
+    /// `IS`
+    Is,
+    /// `IS NOT`
+    IsNot,
+    /// `LIKE`
+    Like,
+    /// `GLOB`
+    Glob,
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `/`
+    Div,
+    /// `%`
+    Mod,
+    /// `||`
+    Concat,
+    /// `&`
+    BitAnd,
+    /// `|`
+    BitOr,
+    /// `<<`
+    LShift,
+    /// `>>`
+    RShift,
+}

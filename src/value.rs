@@ -165,7 +165,10 @@ mod tests {
         assert_eq!(SerialType::for_value(&Value::Integer(127)), SerialType(1));
         assert_eq!(SerialType::for_value(&Value::Integer(128)), SerialType(2));
         assert_eq!(SerialType::for_value(&Value::Integer(-1)), SerialType(1));
-        assert_eq!(SerialType::for_value(&Value::Integer(i64::MAX)), SerialType(6));
+        assert_eq!(
+            SerialType::for_value(&Value::Integer(i64::MAX)),
+            SerialType(6)
+        );
         assert_eq!(SerialType::for_value(&Value::Real(1.5)), SerialType(7));
         assert_eq!(
             SerialType::for_value(&Value::Text("abc".to_string())),

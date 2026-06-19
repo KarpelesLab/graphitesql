@@ -18,7 +18,9 @@ use alloc::vec::Vec;
 /// `usable - 4` payload bytes.
 pub fn read_payload(pager: &Pager, page_bytes: &[u8], payload: &Payload) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(payload.total_len);
-    out.extend_from_slice(&page_bytes[payload.local_offset..payload.local_offset + payload.local_len]);
+    out.extend_from_slice(
+        &page_bytes[payload.local_offset..payload.local_offset + payload.local_len],
+    );
 
     let usable = pager.usable_size();
     let mut next = payload.overflow;
@@ -99,7 +101,9 @@ impl<'p> TableCursor<'p> {
     /// The full row record (payload) at the cursor.
     pub fn payload(&self) -> Result<Vec<u8>> {
         let frame = self.leaf_frame()?;
-        let cell = frame.page.table_leaf_cell(frame.idx, self.pager.usable_size())?;
+        let cell = frame
+            .page
+            .table_leaf_cell(frame.idx, self.pager.usable_size())?;
         read_payload(self.pager, frame.page.data(), &cell.payload)
     }
 
@@ -249,7 +253,10 @@ impl<'p> IndexCursor<'p> {
         if !self.started {
             self.started = true;
             let root = BtreePage::parse(self.pager.page(self.root)?)?;
-            self.stack.push(IndexFrame { page: root, step: 0 });
+            self.stack.push(IndexFrame {
+                page: root,
+                step: 0,
+            });
         }
 
         let usable = self.pager.usable_size();

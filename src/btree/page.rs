@@ -41,9 +41,7 @@ impl PageType {
             5 => PageType::InteriorTable,
             10 => PageType::LeafIndex,
             13 => PageType::LeafTable,
-            other => {
-                return Err(Error::Corrupt(format!("invalid b-tree page type {other}")))
-            }
+            other => return Err(Error::Corrupt(format!("invalid b-tree page type {other}"))),
         })
     }
 
@@ -235,7 +233,10 @@ impl BtreePage {
         let (plen, n1) = varint::decode(&data[key_off..])
             .ok_or_else(|| Error::Corrupt("truncated index payload length".into()))?;
         let payload = self.payload_at(key_off + n1, plen as usize, usable)?;
-        Ok(IndexCell { left_child, payload })
+        Ok(IndexCell {
+            left_child,
+            payload,
+        })
     }
 
     /// Compute the [`Payload`] descriptor for a payload of `total` bytes whose

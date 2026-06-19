@@ -49,7 +49,9 @@ pub fn decode_record(bytes: &[u8], encoding: TextEncoding) -> Result<Vec<Value>>
             .content_len()
             .ok_or_else(|| Error::Corrupt(format!("reserved serial type {raw}")))?;
         if body + len > bytes.len() {
-            return Err(Error::Corrupt("record body shorter than header implies".into()));
+            return Err(Error::Corrupt(
+                "record body shorter than header implies".into(),
+            ));
         }
         let value = decode_value(serial, &bytes[body..body + len], encoding)?;
         body += len;
@@ -95,9 +97,8 @@ fn sign_extend(body: &[u8], nbytes: usize) -> i64 {
 
 fn decode_text(body: &[u8], encoding: TextEncoding) -> Result<String> {
     match encoding {
-        TextEncoding::Utf8 => {
-            String::from_utf8(Vec::from(body)).map_err(|_| Error::Corrupt("invalid UTF-8 text".into()))
-        }
+        TextEncoding::Utf8 => String::from_utf8(Vec::from(body))
+            .map_err(|_| Error::Corrupt("invalid UTF-8 text".into())),
         TextEncoding::Utf16Le | TextEncoding::Utf16Be => {
             if !body.len().is_multiple_of(2) {
                 return Err(Error::Corrupt("odd-length UTF-16 text".into()));
