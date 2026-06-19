@@ -489,7 +489,8 @@ impl Connection {
                 let values = self.decode_full_row(&meta, rowid, &cur.payload()?, encoding)?;
                 let matches = match &upd.where_clause {
                     Some(p) => {
-                        let ctx = row_ctx(&values, &meta.columns, Some(rowid), params);
+                        let ctx = row_ctx(&values, &meta.columns, Some(rowid), params)
+                            .with_subqueries(self);
                         eval::truth(&eval::eval(p, &ctx)?) == Some(true)
                     }
                     None => true,
@@ -510,7 +511,8 @@ impl Connection {
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col))
                     .ok_or_else(|| Error::Error(format!("no such column: {col}")))?;
-                let ctx = row_ctx(&values, &meta.columns, Some(rowid), params);
+                let ctx =
+                    row_ctx(&values, &meta.columns, Some(rowid), params).with_subqueries(self);
                 values[pos] = eval::eval(expr, &ctx)?;
             }
             check_not_null(&meta, &values)?;
@@ -897,7 +899,8 @@ impl Connection {
             let values = self.decode_full_row(meta, rowid, &cur.payload()?, encoding)?;
             let keep = match pred {
                 Some(p) => {
-                    let ctx = row_ctx(&values, &meta.columns, Some(rowid), params);
+                    let ctx =
+                        row_ctx(&values, &meta.columns, Some(rowid), params).with_subqueries(self);
                     eval::truth(&eval::eval(p, &ctx)?) == Some(true)
                 }
                 None => true,
@@ -929,7 +932,7 @@ impl Connection {
         let mut rows: Vec<InputRow> = Vec::new();
         for r in input_rows {
             if let Some(pred) = &sel.where_clause {
-                let ctx = r.ctx(&columns, params);
+                let ctx = r.ctx(&columns, params).with_subqueries(self);
                 if eval::truth(&eval::eval(pred, &ctx)?) != Some(true) {
                     continue;
                 }
@@ -1149,7 +1152,7 @@ impl Connection {
         let labels = self.output_labels(sel, columns);
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
-            let ctx = r.ctx(columns, params);
+            let ctx = r.ctx(columns, params).with_subqueries(self);
             let mut values = Vec::new();
             for col in &sel.columns {
                 project_column(col, columns, &ctx, &mut values)?;
@@ -1190,7 +1193,7 @@ impl Connection {
         let mut group_keys: Vec<Vec<Value>> = Vec::new();
         let mut groups: Vec<Vec<usize>> = Vec::new();
         for (i, r) in rows.iter().enumerate() {
-            let ctx = r.ctx(columns, params);
+            let ctx = r.ctx(columns, params).with_subqueries(self);
             let mut key = Vec::new();
             for g in &sel.group_by {
                 key.push(eval::eval(g, &ctx)?);
@@ -1218,7 +1221,10 @@ impl Connection {
                 values: alloc::vec![Value::Null; columns.len()],
                 rowid: None,
             };
-            let repr_ctx = repr.unwrap_or(&empty).ctx(columns, params);
+            let repr_ctx = repr
+                .unwrap_or(&empty)
+                .ctx(columns, params)
+                .with_subqueries(self);
 
             // Compute the output row, substituting aggregate calls with values.
             let mut values = Vec::new();
@@ -1332,7 +1338,7 @@ impl Connection {
             if star {
                 continue;
             }
-            let ctx = rows[i].ctx(columns, params);
+            let ctx = rows[i].ctx(columns, params).with_subqueries(self);
             let v = eval::eval(&args[0], &ctx)?;
             if !matches!(v, Value::Null) {
                 vals.push(v);
@@ -1520,6 +1526,31 @@ struct IndexMeta {
     cols: Vec<usize>,
 }
 
+impl eval::Subqueries for Connection {
+    fn scalar(&self, select: &Select) -> Result<Value> {
+        let r = self.run_select(select, &Params::default())?;
+        Ok(r.rows
+            .first()
+            .and_then(|row| row.first())
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    fn column(&self, select: &Select) -> Result<Vec<Value>> {
+        let r = self.run_select(select, &Params::default())?;
+        Ok(r.rows
+            .into_iter()
+            .map(|mut row| {
+                if row.is_empty() {
+                    Value::Null
+                } else {
+                    row.swap_remove(0)
+                }
+            })
+            .collect())
+    }
+}
+
 /// Whether a value is the given text (used to match `sqlite_schema` columns).
 fn is_text(v: &Value, s: &str) -> bool {
     matches!(v, Value::Text(t) if t == s)
@@ -1559,6 +1590,7 @@ impl InputRow {
             rowid: self.rowid,
             params,
             anon_counter: core::cell::Cell::new(0),
+            subqueries: None,
         }
     }
 }
@@ -1576,6 +1608,7 @@ fn row_ctx<'a>(
         rowid,
         params,
         anon_counter: core::cell::Cell::new(0),
+        subqueries: None,
     }
 }
 

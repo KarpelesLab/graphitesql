@@ -895,9 +895,15 @@ impl Parser {
             Some(Token::Blob(b)) => Ok(Expr::Literal(Literal::Blob(b))),
             Some(Token::Param(p)) => Ok(Expr::Parameter(p)),
             Some(Token::LParen) => {
-                let e = self.expr()?;
-                self.expect(&Token::RParen)?;
-                Ok(Expr::Paren(Box::new(e)))
+                if self.check_kw("select") || self.check_kw("with") {
+                    let sel = self.select()?;
+                    self.expect(&Token::RParen)?;
+                    Ok(Expr::Subquery(Box::new(sel)))
+                } else {
+                    let e = self.expr()?;
+                    self.expect(&Token::RParen)?;
+                    Ok(Expr::Paren(Box::new(e)))
+                }
             }
             Some(Token::Ident(name)) => self.after_name(name, true),
             Some(Token::Word(w)) => {
@@ -1127,6 +1133,16 @@ impl Parser {
 
     fn parse_in(&mut self, left: Expr, negated: bool) -> Result<Expr> {
         self.expect(&Token::LParen)?;
+        // `IN (SELECT …)` vs `IN (v1, v2, …)`.
+        if self.check_kw("select") || self.check_kw("with") {
+            let sel = self.select()?;
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::InSelect {
+                expr: Box::new(left),
+                select: Box::new(sel),
+                negated,
+            });
+        }
         let mut list = Vec::new();
         if !self.check(&Token::RParen) {
             list.push(self.expr()?);

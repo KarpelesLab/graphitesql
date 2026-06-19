@@ -266,12 +266,19 @@ coverage rather than having a single "done".
   - **`CREATE VIEW` / `DROP VIEW`** and querying views (the view's `SELECT` runs
     as the source) — `tests/views.rs`;
   - **`NOT NULL`** constraint enforcement on `INSERT`/`UPDATE`;
+  - **subqueries** — scalar `(SELECT …)` and `expr [NOT] IN (SELECT …)`
+    (uncorrelated) — `tests/subquery.rs`;
+  - the full **`CREATE TABLE` constraint grammar** parses (`CHECK`,
+    `REFERENCES`, `FOREIGN KEY`, named `CONSTRAINT`, conflict clauses) so
+    real-world schemas load — `tests/realworld.rs`;
+  - `VACUUM` accepted; more scalar functions (`concat`, `sign`, `zeroblob`,
+    `quote`, `unhex`, …);
   - an AST→SQL printer (`sql::print`) used to regenerate stored `CREATE` text;
   - queryable **`PRAGMA`s** (`table_info`, `page_size`, …) and the `graphitesql`
     **CLI shell**.
 - **Deliverable (remaining):** foreign keys & triggers; `WITH`/CTEs & recursive
-  queries; window functions; subqueries (scalar, `IN (SELECT)`); views in joins;
-  index-driven query planning; `ALTER … RENAME COLUMN`; `VACUUM`;
+  queries; window functions; *correlated* subqueries & subqueries/views in joins;
+  index-driven query planning; `ALTER … RENAME COLUMN`; real `VACUUM` compaction;
   `WITHOUT ROWID`; `UNIQUE`/`CHECK` enforcement; `date/time`/`printf` functions;
   `EXPLAIN`; full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.

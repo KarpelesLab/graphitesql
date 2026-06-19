@@ -198,6 +198,18 @@ pub fn expr(e: &Expr) -> String {
             }
         }
         Expr::Paren(inner) => format!("({})", expr(inner)),
+        // Subqueries are not expected in the schema text we regenerate; render a
+        // placeholder so the printer stays total.
+        Expr::Subquery(_) => "(SELECT ...)".to_string(),
+        Expr::InSelect {
+            expr: inner,
+            negated,
+            ..
+        } => format!(
+            "{}{} IN (SELECT ...)",
+            expr(inner),
+            if *negated { " NOT" } else { "" }
+        ),
     }
 }
 

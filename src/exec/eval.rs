@@ -13,12 +13,22 @@
 //! driven conversion is refined in Phase 9.
 
 use crate::error::{Error, Result};
-use crate::sql::ast::{BinaryOp, Expr, Literal, UnaryOp};
+use crate::sql::ast::{BinaryOp, Expr, Literal, Select, UnaryOp};
 use crate::sql::token::Param;
 use crate::value::Value;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
+
+/// Runs subqueries on behalf of expression evaluation. Implemented by the
+/// executor; lets `eval` resolve `(SELECT …)` and `IN (SELECT …)` without
+/// depending on the executor's concrete types.
+pub trait Subqueries {
+    /// First column of the first row (NULL if no rows) — a scalar subquery.
+    fn scalar(&self, select: &Select) -> Result<Value>;
+    /// First column of every row — the candidate set for `IN (SELECT …)`.
+    fn column(&self, select: &Select) -> Result<Vec<Value>>;
+}
 
 /// Describes a column available to expression evaluation.
 #[derive(Debug, Clone)]
@@ -77,6 +87,8 @@ pub struct EvalCtx<'a> {
     pub params: &'a Params,
     /// Running counter of anonymous `?` parameters seen so far.
     pub anon_counter: core::cell::Cell<usize>,
+    /// Subquery runner, if the executor supplied one.
+    pub subqueries: Option<&'a dyn Subqueries>,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -88,7 +100,14 @@ impl<'a> EvalCtx<'a> {
             rowid: None,
             params,
             anon_counter: core::cell::Cell::new(0),
+            subqueries: None,
         }
+    }
+
+    /// Attach a subquery runner (builder style).
+    pub fn with_subqueries(mut self, s: &'a dyn Subqueries) -> EvalCtx<'a> {
+        self.subqueries = Some(s);
+        self
     }
 
     fn resolve_column(&self, table: Option<&str>, name: &str) -> Result<Value> {
@@ -174,6 +193,37 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::Function {
             name, args, star, ..
         } => super::func::eval_scalar(name, args, *star, ctx),
+        Expr::Subquery(select) => match ctx.subqueries {
+            Some(s) => s.scalar(select),
+            None => Err(Error::Unsupported("subquery in this context")),
+        },
+        Expr::InSelect {
+            expr,
+            select,
+            negated,
+        } => {
+            let v = eval(expr, ctx)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let set = match ctx.subqueries {
+                Some(s) => s.column(select)?,
+                None => return Err(Error::Unsupported("IN (SELECT …) in this context")),
+            };
+            let mut saw_null = false;
+            for iv in &set {
+                if matches!(iv, Value::Null) {
+                    saw_null = true;
+                } else if compare(&v, iv) == Ordering::Equal {
+                    return Ok(bool_value(!negated));
+                }
+            }
+            if saw_null {
+                Ok(Value::Null)
+            } else {
+                Ok(bool_value(*negated))
+            }
+        }
     }
 }
 

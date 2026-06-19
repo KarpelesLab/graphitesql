@@ -401,6 +401,17 @@ pub enum Expr {
     },
     /// A parenthesized expression (kept for fidelity; semantically transparent).
     Paren(Box<Expr>),
+    /// A scalar subquery `(SELECT …)` — yields its first row's first column.
+    Subquery(Box<Select>),
+    /// `expr [NOT] IN (SELECT …)`.
+    InSelect {
+        /// The tested expression.
+        expr: Box<Expr>,
+        /// The subquery whose first column is the candidate set.
+        select: Box<Select>,
+        /// `NOT IN`?
+        negated: bool,
+    },
 }
 
 /// A literal value in an expression.
