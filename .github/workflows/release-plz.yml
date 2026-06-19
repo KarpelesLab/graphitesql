@@ -1,0 +1,64 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  # Open/update the release PR and create GitHub Releases.
+  contents: write
+  pull-requests: write
+
+# Don't run two release-plz jobs in parallel.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # release-plz pushes the version-bump commit / tag (and the release PR
+          # branch) via git, so the PAT must be persisted on the checkout — a tag
+          # pushed with the default GITHUB_TOKEN cannot trigger other workflows.
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # release-plz pushes the version-bump commit / tag (and the release PR
+          # branch) via git, so the PAT must be persisted on the checkout — a tag
+          # pushed with the default GITHUB_TOKEN cannot trigger other workflows.
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

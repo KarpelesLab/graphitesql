@@ -54,6 +54,7 @@ mod value;
 pub use value::{SerialType, Value, ValueRef};
 
 pub mod btree;
+pub mod exec;
 pub mod format;
 pub mod pager;
 pub mod schema;
@@ -61,6 +62,7 @@ pub mod sql;
 pub mod vfs;
 
 pub use error::{Error, Result};
+pub use exec::{Connection, QueryResult};
 
 /// The version of the SQLite file format graphitesql targets.
 ///

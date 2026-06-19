@@ -4,9 +4,11 @@ A pure, safe, `no_std`-capable Rust re-implementation of **SQLite**, as a single
 crate, aiming for **byte-for-byte compatibility with the SQLite 3 database file
 format**.
 
-> **Status: early scaffolding.** The on-disk-format foundations (varints,
-> database header, value/serial-type model) are implemented and tested against
-> real SQLite output. The full build plan is in **[ROADMAP.md](ROADMAP.md)**.
+> **Status: read engine working.** graphitesql opens real SQLite files and runs
+> `SELECT` queries — table/index b-trees, overflow pages, the schema catalog, a
+> SQL parser, and an expression/aggregate executor are implemented and tested
+> against databases produced by `sqlite3`. Writing (the b-tree writer, journal,
+> WAL) is next. The full build plan and status is in **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why
 
@@ -40,33 +42,27 @@ the same file format and SQL dialect to places where a **safe, dependency-free,
 
 ## Usage
 
-The public API is still taking shape. Today you can use the format primitives:
-
-```rust
-use graphitesql::format::DatabaseHeader;
-
-let bytes = std::fs::read("some.db")?;
-let header = DatabaseHeader::parse(&bytes)?;
-println!("page size = {}", header.page_size);
-println!("pages     = {}", header.size_in_pages);
-# Ok::<(), graphitesql::Error>(())
-```
-
-The target end-state API (subject to change) looks like:
+Today you can open a real SQLite database and query it (read-only):
 
 ```rust,ignore
-use graphitesql::Connection;
+use graphitesql::{Connection, Value};
 
-let mut db = Connection::open(":memory:")?;
-db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)")?;
-db.execute("INSERT INTO users(name) VALUES ('ada'), ('grace')")?;
+let db = Connection::open("app.db")?; // a file written by sqlite3
+let result = db.query("SELECT id, name FROM users WHERE id > 1 ORDER BY name")?;
 
-let mut stmt = db.prepare("SELECT id, name FROM users WHERE id > ?")?;
-for row in stmt.query([0])? {
-    let (id, name): (i64, String) = row?;
-    println!("{id}: {name}");
+for row in &result.rows {
+    if let (Value::Integer(id), Value::Text(name)) = (&row[0], &row[1]) {
+        println!("{id}: {name}");
+    }
 }
+
+// Aggregates, GROUP BY, expressions, scalar functions all work:
+let r = db.query("SELECT count(*), max(id) FROM users")?;
 ```
+
+The write path (`CREATE`/`INSERT`/`UPDATE`/`DELETE`, `:memory:` creation) is
+under construction — see the roadmap. Low-level format primitives are also
+public (`graphitesql::format::DatabaseHeader`, `graphitesql::btree`, …).
 
 ## Feature flags
 

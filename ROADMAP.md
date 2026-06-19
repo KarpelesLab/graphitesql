@@ -167,15 +167,27 @@ databases lands well before write support).
   rather than port the Lemon grammar, but `parse.y` is the source of truth for
   precedence and accepted forms.)
 
-### Phase 5 — VDBE + codegen for read queries
+### Phase 5 — Read-query execution engine ✅ *(done)*
 
-- **Deliverable:** the register virtual machine with the opcode subset needed
-  for queries (cursors, comparisons, arithmetic, `NULL` logic, aggregation,
-  sorting); codegen from AST to that bytecode; type affinity and the `BINARY`/
-  `NOCASE`/`RTRIM` collations; the built-in scalar/aggregate functions.
-- **Done:** `Connection::open` + `prepare` + `query` returns correct results for
-  a query suite run differentially against `sqlite3` on read-only databases.
-- **Reference:** `vdbe.c`, `opcodes.h`, `select.c`, `where.c`, `func.c`.
+- **Deliverable:** a `Connection` that parses, resolves names against the schema,
+  scans b-trees, decodes records, and evaluates expressions to produce result
+  rows; `NULL` three-valued logic, SQLite comparison order & numeric coercion,
+  `LIKE`/`GLOB`, `CASE`/`CAST`, a core of scalar functions, and the aggregates
+  `count`/`sum`/`avg`/`min`/`max`/`total`/`group_concat` with `GROUP BY`/`HAVING`,
+  plus `WHERE`, `ORDER BY` (by position/alias/expr), `LIMIT`/`OFFSET`, `DISTINCT`.
+- **Done:** `Connection::open(path).query(sql)` returns correct rows on the real
+  fixtures, verified differentially against `sqlite3` (e.g. `GROUP BY id%3`
+  counts 666/667/667). INTEGER-PRIMARY-KEY rowid aliasing handled.
+- **Files:** `src/exec/{mod,eval,func}.rs`, `src/util/float.rs`,
+  `tests/query.rs`.
+- **Implementation note — executor vs. bytecode:** the roadmap originally
+  specified a VDBE bytecode VM. graphitesql instead ships an **operational,
+  iterator-style executor** with the *same observable semantics*. This was the
+  pragmatic path to a correct, testable read engine; adopting a VDBE bytecode IR
+  is now an internal refactor (it changes how queries are represented, not their
+  results) and is tracked for a later pass. *(Single-table only; joins/subqueries
+  in Phase 9.)*
+- **Reference:** `vdbe.c`, `select.c`, `where.c`, `func.c`.
 
 ### Phase 6 — B-tree writer + pager transactions *(write side)*
 
