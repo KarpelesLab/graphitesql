@@ -189,16 +189,27 @@ databases lands well before write support).
   in Phase 9.)*
 - **Reference:** `vdbe.c`, `select.c`, `where.c`, `func.c`.
 
-### Phase 6 — B-tree writer + pager transactions *(write side)*
+### Phase 6 — B-tree writer + pager transactions *(write side)* ✅ *(core done)*
 
-- **Deliverable:** insert/delete/update cells with page splitting and balancing;
-  freelist management; the **rollback journal** with correct fsync ordering and
-  crash-safe atomic commit; locking state machine; `BEGIN`/`COMMIT`/`ROLLBACK`.
-- **Done:** create a database from scratch and `INSERT`/`UPDATE`/`DELETE`; the
-  resulting file opens in `sqlite3` and `PRAGMA integrity_check` passes; a
-  simulated crash mid-commit recovers to a consistent state.
-- **Reference:** `btree.c` (balance), `pager.c` (journal, commit), `fileformat2.html`
-  (freelist, the rollback journal format).
+- **Deliverable:** insert cells with page splitting; the rollback journal with
+  correct fsync ordering and crash-safe atomic commit; create-from-scratch.
+- **Done:** `WritePager` buffers all mutations in an overlay and commits
+  atomically through a hash-verified rollback journal (originals → sync → write
+  → sync → clear); journal **recovery on open** replays an interrupted commit;
+  `ROLLBACK` = drop overlay. The b-tree writer inserts rows (with overflow-page
+  allocation) and splits leaves/interiors bottom-up, growing a new root in place.
+  **Cross-engine gate met:** a database built by graphitesql (incl. 200- and
+  1500-row tables) is opened by the real `sqlite3` CLI and
+  `PRAGMA integrity_check` returns `ok`; values round-trip through SQLite's
+  decoder (`tests/write_compat.rs`).
+- **Files:** `src/pager/write.rs`, `src/btree/writer.rs`, `src/format/record.rs`
+  (`encode_record`), `tests/write_compat.rs`.
+- **Carried to Phase 7/9:** `DELETE`/`UPDATE` at the b-tree level (need freelist
+  page reclamation to keep `integrity_check` happy), freelist management, page
+  merging/rebalancing on delete, and the SQLite-format journal (ours is a
+  private, recoverable format). Locking is single-connection (no-op).
+- **Reference:** `btree.c` (balance), `pager.c` (journal, commit),
+  `fileformat2.html` (freelist, rollback journal format).
 
 ### Phase 7 — DDL & DML codegen
 

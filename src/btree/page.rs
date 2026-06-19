@@ -220,6 +220,25 @@ impl BtreePage {
         Ok(TableLeafCell { rowid, payload })
     }
 
+    /// The raw bytes of table-leaf cell `i`, including any 4-byte overflow
+    /// pointer. Used by the writer to move cells between pages while preserving
+    /// their overflow chains.
+    pub fn raw_table_leaf_cell(&self, i: usize, usable: usize) -> Result<&[u8]> {
+        debug_assert_eq!(self.page_type, PageType::LeafTable);
+        let off = self.cell_offset(i)?;
+        let data = self.data();
+        let (plen, n1) = varint::decode(&data[off..])
+            .ok_or_else(|| Error::Corrupt("truncated leaf payload length".into()))?;
+        let (_, n2) = varint::decode_i64(&data[off + n1..])
+            .ok_or_else(|| Error::Corrupt("truncated leaf rowid".into()))?;
+        let (local_len, has_overflow) = payload_split(self.page_type, usable, plen as usize);
+        let len = n1 + n2 + local_len + if has_overflow { 4 } else { 0 };
+        if off + len > data.len() {
+            return Err(Error::Corrupt("leaf cell extends past page".into()));
+        }
+        Ok(&data[off..off + len])
+    }
+
     /// Parse index cell `i` (works for both leaf and interior index pages).
     pub fn index_cell(&self, i: usize, usable: usize) -> Result<IndexCell> {
         debug_assert!(!self.page_type.is_table());
@@ -265,7 +284,7 @@ impl BtreePage {
 /// How many payload bytes are stored on the page itself, and whether any spill
 /// onto overflow pages. Implements the spill algorithm from the file-format
 /// spec ("the initial portion of the payload that does not spill to overflow").
-fn payload_split(page_type: PageType, usable: usize, p: usize) -> (usize, bool) {
+pub(crate) fn payload_split(page_type: PageType, usable: usize, p: usize) -> (usize, bool) {
     // Maximum bytes of payload kept locally before overflow is used.
     let max_local = match page_type {
         PageType::LeafTable => usable - 35,

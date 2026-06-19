@@ -17,4 +17,4 @@ pub mod header;
 pub mod record;
 
 pub use header::{DatabaseHeader, TextEncoding};
-pub use record::decode_record;
+pub use record::{decode_record, encode_record};

@@ -22,6 +22,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+pub mod write;
+pub use write::WritePager;
+
 /// A single database page: its number and its raw bytes.
 ///
 /// The bytes are reference-counted so handing out a page is cheap and the cache
@@ -33,6 +36,14 @@ pub struct Page {
 }
 
 impl Page {
+    /// Build a page from raw bytes (used by writers and synthetic sources).
+    pub fn from_bytes(number: u32, data: Vec<u8>) -> Page {
+        Page {
+            number,
+            data: Rc::new(data),
+        }
+    }
+
     /// This page's 1-based number.
     pub fn number(&self) -> u32 {
         self.number
@@ -51,6 +62,37 @@ impl Page {
         } else {
             0
         }
+    }
+}
+
+/// A source of database pages.
+///
+/// Abstracts "where pages come from" so the b-tree cursors and the schema
+/// reader work identically over a read-only [`Pager`] and the write-side pager
+/// (which serves dirty in-transaction pages from its overlay).
+pub trait PageSource {
+    /// Fetch page `number` (1-based).
+    fn page(&self, number: u32) -> Result<Page>;
+    /// The database header.
+    fn header(&self) -> &DatabaseHeader;
+    /// Usable bytes per page (page size minus reserved space).
+    fn usable_size(&self) -> usize;
+    /// Total number of pages.
+    fn page_count(&self) -> u32;
+}
+
+impl PageSource for Pager {
+    fn page(&self, number: u32) -> Result<Page> {
+        Pager::page(self, number)
+    }
+    fn header(&self) -> &DatabaseHeader {
+        Pager::header(self)
+    }
+    fn usable_size(&self) -> usize {
+        Pager::usable_size(self)
+    }
+    fn page_count(&self) -> u32 {
+        Pager::page_count(self)
     }
 }
 

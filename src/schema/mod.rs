@@ -18,7 +18,7 @@
 use crate::btree::TableCursor;
 use crate::error::{Error, Result};
 use crate::format::record::decode_record;
-use crate::pager::Pager;
+use crate::pager::PageSource;
 use crate::value::Value;
 use alloc::format;
 use alloc::string::String;
@@ -79,7 +79,7 @@ pub struct Schema {
 
 impl Schema {
     /// Read and parse the entire `sqlite_schema` table from the database.
-    pub fn read(pager: &Pager) -> Result<Schema> {
+    pub fn read(pager: &dyn PageSource) -> Result<Schema> {
         let encoding = pager.header().text_encoding;
         let mut objects = Vec::new();
         let mut cur = TableCursor::new(pager, SCHEMA_ROOT_PAGE);

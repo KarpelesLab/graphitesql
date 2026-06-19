@@ -25,6 +25,51 @@ use alloc::vec::Vec;
 
 /// Decode a complete record into its column values.
 ///
+/// Serialize column `values` into a record (header of serial types + bodies),
+/// exactly as SQLite lays out a row or index key. Integers use the narrowest
+/// lossless serial type; this is the inverse of [`decode_record`].
+pub fn encode_record(values: &[Value]) -> Vec<u8> {
+    let serials: Vec<SerialType> = values.iter().map(SerialType::for_value).collect();
+
+    // Body of the header: the serial-type varints.
+    let mut serial_bytes = Vec::new();
+    let mut buf = [0u8; varint::MAX_LEN];
+    for s in &serials {
+        let n = varint::encode(s.0, &mut buf);
+        serial_bytes.extend_from_slice(&buf[..n]);
+    }
+    // The header length varint includes itself; iterate to a fixed point because
+    // changing the length can change the varint's own width.
+    let mut header_len = serial_bytes.len() + 1;
+    loop {
+        let n = varint::len(header_len as u64);
+        if n + serial_bytes.len() == header_len {
+            break;
+        }
+        header_len = n + serial_bytes.len();
+    }
+
+    let mut out = Vec::new();
+    let n = varint::encode(header_len as u64, &mut buf);
+    out.extend_from_slice(&buf[..n]);
+    out.extend_from_slice(&serial_bytes);
+
+    for (v, s) in values.iter().zip(&serials) {
+        match v {
+            Value::Null | Value::Integer(0) | Value::Integer(1) => {}
+            Value::Integer(i) => {
+                let len = s.content_len().unwrap_or(0);
+                let be = i.to_be_bytes();
+                out.extend_from_slice(&be[8 - len..]);
+            }
+            Value::Real(r) => out.extend_from_slice(&r.to_be_bytes()),
+            Value::Text(t) => out.extend_from_slice(t.as_bytes()),
+            Value::Blob(b) => out.extend_from_slice(b),
+        }
+    }
+    out
+}
+
 /// `encoding` selects how TEXT bodies are interpreted (UTF-8 or UTF-16).
 pub fn decode_record(bytes: &[u8], encoding: TextEncoding) -> Result<Vec<Value>> {
     let (header_len, n) = varint::decode(bytes)
@@ -118,50 +163,6 @@ fn decode_text(body: &[u8], encoding: TextEncoding) -> Result<String> {
 mod tests {
     use super::*;
     use alloc::vec;
-
-    /// Build a record from values the way SQLite would, for round-trip testing.
-    fn encode_record(values: &[Value]) -> Vec<u8> {
-        let serials: Vec<SerialType> = values.iter().map(SerialType::for_value).collect();
-        // Header = varint(header_len) + serial varints; header_len includes itself.
-        let mut serial_bytes = Vec::new();
-        let mut buf = [0u8; varint::MAX_LEN];
-        for s in &serials {
-            let n = varint::encode(s.0, &mut buf);
-            serial_bytes.extend_from_slice(&buf[..n]);
-        }
-        // Find header_len fixed point (length varint may change its own size).
-        let mut header_len = serial_bytes.len() + 1;
-        loop {
-            let n = varint::len(header_len as u64);
-            if n + serial_bytes.len() == header_len {
-                break;
-            }
-            header_len = n + serial_bytes.len();
-        }
-        let mut out = Vec::new();
-        let n = varint::encode(header_len as u64, &mut buf);
-        out.extend_from_slice(&buf[..n]);
-        out.extend_from_slice(&serial_bytes);
-        // Bodies.
-        for v in values {
-            match v {
-                Value::Null => {}
-                Value::Integer(0) | Value::Integer(1) => {}
-                Value::Integer(_) => {
-                    let s = SerialType::for_value(v).0;
-                    let nbytes = SerialType(s).content_len().unwrap();
-                    if let Value::Integer(i) = v {
-                        let be = i.to_be_bytes();
-                        out.extend_from_slice(&be[8 - nbytes..]);
-                    }
-                }
-                Value::Real(r) => out.extend_from_slice(&r.to_be_bytes()),
-                Value::Text(t) => out.extend_from_slice(t.as_bytes()),
-                Value::Blob(b) => out.extend_from_slice(b),
-            }
-        }
-        out
-    }
 
     #[test]
     fn round_trip_mixed_values() {

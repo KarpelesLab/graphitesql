@@ -9,14 +9,18 @@
 
 use super::page::{BtreePage, Payload};
 use crate::error::{Error, Result};
-use crate::pager::Pager;
+use crate::pager::PageSource;
 use alloc::vec::Vec;
 
 /// Reassemble a full payload, following the overflow-page chain if needed.
 ///
 /// Overflow pages are a 4-byte "next page" pointer followed by up to
 /// `usable - 4` payload bytes.
-pub fn read_payload(pager: &Pager, page_bytes: &[u8], payload: &Payload) -> Result<Vec<u8>> {
+pub fn read_payload(
+    pager: &dyn PageSource,
+    page_bytes: &[u8],
+    payload: &Payload,
+) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(payload.total_len);
     out.extend_from_slice(
         &page_bytes[payload.local_offset..payload.local_offset + payload.local_len],
@@ -52,7 +56,7 @@ struct Frame {
 
 /// A cursor over a table b-tree, iterating rows in ascending rowid order.
 pub struct TableCursor<'p> {
-    pager: &'p Pager,
+    pager: &'p dyn PageSource,
     root: u32,
     stack: Vec<Frame>,
     exhausted: bool,
@@ -61,7 +65,7 @@ pub struct TableCursor<'p> {
 impl<'p> TableCursor<'p> {
     /// Create a cursor over the table b-tree rooted at page `root`. The cursor
     /// is unpositioned until [`first`](Self::first) or [`seek`](Self::seek).
-    pub fn new(pager: &'p Pager, root: u32) -> TableCursor<'p> {
+    pub fn new(pager: &'p dyn PageSource, root: u32) -> TableCursor<'p> {
         TableCursor {
             pager,
             root,
@@ -225,7 +229,7 @@ impl<'p> TableCursor<'p> {
 /// We encode position with a per-frame step counter: even steps descend a
 /// child, odd steps yield a cell.
 pub struct IndexCursor<'p> {
-    pager: &'p Pager,
+    pager: &'p dyn PageSource,
     root: u32,
     stack: Vec<IndexFrame>,
     started: bool,
@@ -238,7 +242,7 @@ struct IndexFrame {
 
 impl<'p> IndexCursor<'p> {
     /// Create a cursor over the index b-tree rooted at page `root`.
-    pub fn new(pager: &'p Pager, root: u32) -> IndexCursor<'p> {
+    pub fn new(pager: &'p dyn PageSource, root: u32) -> IndexCursor<'p> {
         IndexCursor {
             pager,
             root,
