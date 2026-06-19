@@ -53,6 +53,7 @@ pub mod util;
 mod value;
 pub use value::{SerialType, Value, ValueRef};
 
+pub mod btree;
 pub mod format;
 pub mod pager;
 pub mod vfs;

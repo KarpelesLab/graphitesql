@@ -7,6 +7,7 @@
 
 #![cfg(feature = "std")]
 
+use graphitesql::btree::{IndexCursor, TableCursor};
 use graphitesql::format::TextEncoding;
 use graphitesql::pager::Pager;
 use graphitesql::vfs::{std_file::StdVfs, OpenFlags, Vfs};
@@ -51,6 +52,81 @@ fn reads_big_db_with_many_pages() {
     // Reading the last page must succeed; reading past it must fail.
     assert!(pager.page(15).is_ok());
     assert!(pager.page(16).is_err());
+}
+
+#[test]
+fn table_scan_basic_t() {
+    // basic.db: table `t` root page 2, rows with rowid 1,2,3.
+    let pager = open_pager("basic.db");
+    let mut cur = TableCursor::new(&pager, 2);
+    let mut rowids = Vec::new();
+    let mut ok = cur.first().unwrap();
+    while ok {
+        rowids.push(cur.rowid().unwrap());
+        assert!(!cur.payload().unwrap().is_empty());
+        ok = cur.next().unwrap();
+    }
+    assert_eq!(rowids, vec![1, 2, 3]);
+}
+
+#[test]
+fn table_seek_basic_t() {
+    let pager = open_pager("basic.db");
+    let mut cur = TableCursor::new(&pager, 2);
+    assert!(cur.seek(2).unwrap()); // exact hit
+    assert_eq!(cur.rowid().unwrap(), 2);
+    assert!(!cur.seek(99).unwrap()); // past the end
+    assert!(!cur.is_valid());
+    assert!(!cur.seek(0).unwrap()); // before the first -> lands on rowid 1
+    assert_eq!(cur.rowid().unwrap(), 1);
+}
+
+#[test]
+fn table_scan_big_nums_interior_pages() {
+    // big.db: table `nums` root page 2, 2000 rows -> requires interior pages.
+    let pager = open_pager("big.db");
+    let mut cur = TableCursor::new(&pager, 2);
+    let mut count = 0i64;
+    let mut sum = 0i64;
+    let mut prev = 0i64;
+    let mut ok = cur.first().unwrap();
+    while ok {
+        let rid = cur.rowid().unwrap();
+        assert!(rid > prev, "rowids must be strictly ascending");
+        prev = rid;
+        sum += rid;
+        count += 1;
+        ok = cur.next().unwrap();
+    }
+    assert_eq!(count, 2000);
+    assert_eq!(sum, 2_001_000); // confirmed via SELECT sum(id)
+}
+
+#[test]
+fn table_scan_big_blob_overflow() {
+    // big.db: table `big` root page 11, one row with a 20000-byte blob payload
+    // that must span overflow pages.
+    let pager = open_pager("big.db");
+    let mut cur = TableCursor::new(&pager, 11);
+    assert!(cur.first().unwrap());
+    let payload = cur.payload().unwrap();
+    // Record = header + a 20000-byte blob body, so reassembled payload must be
+    // well beyond a single 4096-byte page: proves overflow reassembly works.
+    assert!(payload.len() > 20000, "got {} bytes", payload.len());
+    assert!(!cur.next().unwrap());
+}
+
+#[test]
+fn index_scan_basic_idx_b() {
+    // basic.db: index `idx_b` root page 3, one entry per row in `t` (3 rows).
+    let pager = open_pager("basic.db");
+    let mut cur = IndexCursor::new(&pager, 3);
+    let mut count = 0;
+    while let Some(payload) = cur.next().unwrap() {
+        assert!(!payload.is_empty());
+        count += 1;
+    }
+    assert_eq!(count, 3);
 }
 
 #[test]

@@ -125,13 +125,17 @@ databases lands well before write support).
   `tests/read_fixtures.rs`.
 - **Reference:** `os_unix.c` (the VFS contract), `pager.c` (page lifecycle).
 
-### Phase 2 — B-tree reader
+### Phase 2 — B-tree reader ✅ *(done)*
 
 - **Deliverable:** parse table & index, interior & leaf b-tree pages; cell
   parsing including overflow-page chains; a forward/seek cursor over a table
   b-tree keyed by rowid, and over an index b-tree keyed by record.
-- **Done:** full-table scan of `gtest.db` returns both rows with correct rowids;
-  cursor handles a table large enough to require interior pages and overflow.
+- **Done:** table scan of `nums` (2000 rows, interior pages) sums correctly;
+  20 KB blob row reassembles across overflow pages; rowid `seek` (exact / past-
+  end / before-first) works; index scan yields every entry. All verified
+  against real fixtures. *(Index seek-by-key awaits record comparison in
+  Phase 3.)*
+- **Files:** `src/btree/{mod,page,cursor}.rs`; tests in `tests/read_fixtures.rs`.
 - **Reference:** `btree.c`, `btreeInt.h`; `fileformat2.html` (B-tree pages,
   cell format, overflow).
 
