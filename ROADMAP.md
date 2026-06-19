@@ -268,6 +268,7 @@ coverage rather than having a single "done".
   - **`NOT NULL`** constraint enforcement on `INSERT`/`UPDATE`;
   - **subqueries** — scalar `(SELECT …)` and `expr [NOT] IN (SELECT …)`
     (uncorrelated) — `tests/subquery.rs`;
+  - non-recursive **`WITH` / CTEs** used as a query source — `tests/cte.rs`;
   - the full **`CREATE TABLE` constraint grammar** parses (`CHECK`,
     `REFERENCES`, `FOREIGN KEY`, named `CONSTRAINT`, conflict clauses) so
     real-world schemas load — `tests/realworld.rs`;

@@ -46,9 +46,22 @@ pub enum Statement {
     Vacuum,
 }
 
+/// A common table expression (`WITH name AS (select)`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    /// The CTE's name.
+    pub name: String,
+    /// Optional explicit column names.
+    pub columns: Vec<String>,
+    /// The CTE's query.
+    pub select: Box<Select>,
+}
+
 /// A `SELECT` query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    /// `WITH` common table expressions, in declaration order.
+    pub ctes: Vec<Cte>,
     /// `SELECT DISTINCT`?
     pub distinct: bool,
     /// The projected result columns.

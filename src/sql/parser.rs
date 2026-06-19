@@ -216,9 +216,33 @@ impl Parser {
     }
 
     fn select(&mut self) -> Result<Select> {
-        // (CTE/`WITH` is accepted as a keyword but not yet modeled.)
+        let mut ctes = Vec::new();
         if self.eat_kw("with") {
-            return Err(Error::Unsupported("WITH / common table expressions"));
+            // `RECURSIVE` is accepted as a keyword but recursion is not yet run.
+            let _ = self.eat_kw("recursive");
+            loop {
+                let name = self.ident()?;
+                let mut columns = Vec::new();
+                if self.eat(&Token::LParen) {
+                    columns.push(self.ident()?);
+                    while self.eat(&Token::Comma) {
+                        columns.push(self.ident()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                }
+                self.expect_kw("as")?;
+                self.expect(&Token::LParen)?;
+                let select = Box::new(self.select()?);
+                self.expect(&Token::RParen)?;
+                ctes.push(Cte {
+                    name,
+                    columns,
+                    select,
+                });
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
         }
         self.expect_kw("select")?;
         let distinct = if self.eat_kw("distinct") {
@@ -278,6 +302,7 @@ impl Parser {
         }
 
         Ok(Select {
+            ctes,
             distinct,
             columns,
             from,

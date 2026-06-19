@@ -602,6 +602,43 @@ impl Connection {
         Ok(())
     }
 
+    /// If `name` is a CTE declared on `sel`'s `WITH` clause, run it and return
+    /// its columns + rows. (Non-recursive; the CTE's own body is run on its own.)
+    fn try_cte(
+        &self,
+        sel: &Select,
+        name: &str,
+        alias: Option<&str>,
+        params: &Params,
+    ) -> Result<Option<(Vec<ColumnInfo>, Vec<InputRow>)>> {
+        let Some(cte) = sel.ctes.iter().find(|c| c.name.eq_ignore_ascii_case(name)) else {
+            return Ok(None);
+        };
+        let result = self.run_select(&cte.select, params)?;
+        let label = alias.unwrap_or(name).to_string();
+        let names = if cte.columns.is_empty() {
+            result.columns.clone()
+        } else {
+            cte.columns.clone()
+        };
+        let columns = names
+            .into_iter()
+            .map(|n| ColumnInfo {
+                name: n,
+                table: label.clone(),
+            })
+            .collect();
+        let rows = result
+            .rows
+            .into_iter()
+            .map(|values| InputRow {
+                values,
+                rowid: None,
+            })
+            .collect();
+        Ok(Some((columns, rows)))
+    }
+
     /// If `name` is a view, run its `SELECT` and return its columns + rows.
     fn try_view(
         &self,
@@ -1014,6 +1051,14 @@ impl Connection {
                 }],
             ));
         };
+        // A `WITH` common table expression used as the sole source.
+        if from.joins.is_empty() {
+            if let Some((columns, rows)) =
+                self.try_cte(sel, &from.first.name, from.first.alias.as_deref(), params)?
+            {
+                return Ok((columns, rows));
+            }
+        }
         // A view as the sole source: run its SELECT in place.
         if from.joins.is_empty() {
             if let Some((columns, rows)) =
