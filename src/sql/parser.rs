@@ -809,11 +809,9 @@ impl Parser {
             } else if self.eat_kw("generated") {
                 let _ = self.eat_kw("always");
                 self.expect_kw("as")?;
-                self.skip_balanced_parens()?;
-                let _ = self.eat_kw("stored") || self.eat_kw("virtual");
+                constraints.push(self.generated_column()?);
             } else if self.eat_kw("as") {
-                self.skip_balanced_parens()?;
-                let _ = self.eat_kw("stored") || self.eat_kw("virtual");
+                constraints.push(self.generated_column()?);
             } else {
                 break;
             }
@@ -823,6 +821,21 @@ impl Parser {
             type_name,
             constraints,
         })
+    }
+
+    /// Parse the tail of a generated-column clause, after `AS`:
+    /// `(expr) [STORED|VIRTUAL]`.
+    fn generated_column(&mut self) -> Result<ColumnConstraint> {
+        self.expect(&Token::LParen)?;
+        let expr = self.expr()?;
+        self.expect(&Token::RParen)?;
+        let stored = if self.eat_kw("stored") {
+            true
+        } else {
+            let _ = self.eat_kw("virtual");
+            false
+        };
+        Ok(ColumnConstraint::Generated { expr, stored })
     }
 
     /// Whether the next item in a `CREATE TABLE` body is a table constraint
@@ -872,21 +885,6 @@ impl Parser {
             let _ = self.eat_kw("conflict");
             let _ = self.advance(); // the action keyword
         }
-    }
-
-    /// Consume a balanced parenthesized group starting at the current `(`.
-    fn skip_balanced_parens(&mut self) -> Result<()> {
-        self.expect(&Token::LParen)?;
-        let mut depth = 1;
-        while depth > 0 {
-            match self.advance() {
-                None => return Err(self.err("unbalanced parentheses")),
-                Some(Token::LParen) => depth += 1,
-                Some(Token::RParen) => depth -= 1,
-                _ => {}
-            }
-        }
-        Ok(())
     }
 
     /// Parse the tail of a `REFERENCES` clause (target table, optional parent
@@ -1574,7 +1572,8 @@ fn is_reserved_keyword(lower: &str) -> bool {
 fn is_column_constraint_kw(tok: Option<&Token>) -> bool {
     matches!(tok, Some(Token::Word(w)) if matches!(
         w.to_ascii_lowercase().as_str(),
-        "primary" | "not" | "null" | "unique" | "default" | "collate" | "check" | "references"
+        "primary" | "not" | "null" | "unique" | "default" | "collate" | "check"
+            | "references" | "generated" | "as"
     ))
 }
 

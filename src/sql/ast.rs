@@ -357,6 +357,14 @@ pub enum ColumnConstraint {
     Check(Expr),
     /// `REFERENCES parent(cols) …` — a column-level foreign key.
     References(ForeignKey),
+    /// `[GENERATED ALWAYS] AS (expr) [STORED|VIRTUAL]` — a generated column.
+    Generated {
+        /// The generation expression.
+        expr: Expr,
+        /// `STORED` (true) materializes the value on disk; `VIRTUAL` (false, the
+        /// default) computes it on read and is not stored.
+        stored: bool,
+    },
 }
 
 /// A table-level constraint.

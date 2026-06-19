@@ -94,6 +94,13 @@ fn column_constraint(c: &ColumnConstraint) -> String {
         ColumnConstraint::References(fk) => {
             format!("REFERENCES {}", foreign_key_target(fk))
         }
+        ColumnConstraint::Generated { expr: e, stored } => {
+            format!(
+                "AS ({}) {}",
+                expr(e),
+                if *stored { "STORED" } else { "VIRTUAL" }
+            )
+        }
     }
 }
 

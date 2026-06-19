@@ -317,6 +317,14 @@ impl Connection {
 
         let mut rows = Vec::new();
         for (i, col) in ct.columns.iter().enumerate() {
+            // `table_info` hides generated columns (they appear in `table_xinfo`).
+            if col
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::Generated { .. }))
+            {
+                continue;
+            }
             let notnull = col
                 .constraints
                 .iter()
@@ -1344,9 +1352,16 @@ impl Connection {
                 })
                 .collect::<Result<_>>()?;
             for (i, e) in row_exprs.iter().enumerate() {
+                if meta.is_generated(target[i]) {
+                    return Err(Error::Error(format!(
+                        "cannot INSERT into generated column \"{}\"",
+                        meta.columns[target[i]].name
+                    )));
+                }
                 values[target[i]] = eval::eval(e, &ctx)?;
             }
             apply_column_affinity(&meta, &mut values);
+            self.materialize_generated(&meta, &mut values, params)?;
 
             // Determine the rowid (explicit INTEGER PRIMARY KEY value or auto).
             let rowid = match meta.ipk {
@@ -1397,10 +1412,7 @@ impl Connection {
                 Some((&index_values, rowid)),
                 params,
             )?;
-            if let Some(ipk) = meta.ipk {
-                values[ipk] = Value::Null;
-            }
-            let record = encode_record(&values);
+            let record = self.encode_table_record(&meta, &index_values);
             insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
             for idx in &indexes {
                 let key = index_key(&idx.cols, &index_values, rowid);
@@ -1579,11 +1591,17 @@ impl Connection {
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col))
                     .ok_or_else(|| Error::Error(format!("no such column: {col}")))?;
+                if meta.is_generated(pos) {
+                    return Err(Error::Error(format!(
+                        "cannot UPDATE generated column \"{col}\""
+                    )));
+                }
                 let ctx =
                     row_ctx(&values, &meta.columns, Some(rowid), params).with_subqueries(self);
                 values[pos] = eval::eval(expr, &ctx)?;
             }
             apply_column_affinity(&meta, &mut values);
+            self.materialize_generated(&meta, &mut values, params)?;
             check_not_null(&meta, &values)?;
             self.check_constraints(&meta, &values, Some(rowid), params)?;
             // Foreign keys: this row as a child must still point at a parent, and
@@ -1614,10 +1632,7 @@ impl Connection {
                 return Err(Error::Constraint("UNIQUE constraint failed".into()));
             }
             let new_full = values.clone();
-            if let Some(ipk) = meta.ipk {
-                values[ipk] = Value::Null;
-            }
-            let record = encode_record(&values);
+            let record = self.encode_table_record(&meta, &new_full);
             delete_table(self.backend.writer()?, meta.root, rowid)?;
             insert_table(self.backend.writer()?, meta.root, new_rowid, &record)?;
             self.fire_triggers(
@@ -3132,10 +3147,13 @@ impl Connection {
     fn scan_without_rowid(&self, meta: &TableMeta) -> Result<Vec<Vec<Value>>> {
         let encoding = self.backend.source().header().text_encoding;
         let mut cur = IndexCursor::new(self.backend.source(), meta.root);
+        let params = Params::default();
         let mut out = Vec::new();
         while let Some(payload) = cur.next()? {
             let storage = decode_record(&payload, encoding)?;
-            out.push(unpermute_row(meta, storage));
+            let mut row = unpermute_row(meta, storage);
+            self.compute_generated(meta, &mut row, &params)?;
+            out.push(row);
         }
         Ok(out)
     }
@@ -3159,9 +3177,16 @@ impl Connection {
             })
             .collect::<Result<_>>()?;
         for (i, e) in row_exprs.iter().enumerate() {
+            if meta.is_generated(target[i]) {
+                return Err(Error::Error(format!(
+                    "cannot INSERT into generated column \"{}\"",
+                    meta.columns[target[i]].name
+                )));
+            }
             values[target[i]] = eval::eval(e, &ctx)?;
         }
         apply_column_affinity(meta, &mut values);
+        self.materialize_generated(meta, &mut values, params)?;
         Ok(values)
     }
 
@@ -3291,10 +3316,16 @@ impl Connection {
                         .iter()
                         .position(|c| c.name.eq_ignore_ascii_case(col))
                         .ok_or_else(|| Error::Error(format!("no such column: {col}")))?;
+                    if meta.is_generated(pos) {
+                        return Err(Error::Error(format!(
+                            "cannot UPDATE generated column \"{col}\""
+                        )));
+                    }
                     let ctx = row_ctx(&row, &meta.columns, None, params).with_subqueries(self);
                     row[pos] = eval::eval(expr, &ctx)?;
                 }
                 apply_column_affinity(meta, &mut row);
+                self.materialize_generated(meta, &mut row, params)?;
                 check_not_null(meta, &row)?;
                 self.check_constraints(meta, &row, None, params)?;
                 affected += 1;
@@ -3379,22 +3410,90 @@ impl Connection {
         payload: &[u8],
         encoding: crate::format::TextEncoding,
     ) -> Result<Vec<Value>> {
-        let mut values = decode_record(payload, encoding)?;
-        let stored = values.len();
-        values.resize(meta.columns.len(), Value::Null);
-        if stored < meta.columns.len() {
-            let p = Params::default();
-            let ctx = EvalCtx::rowless(&p);
-            for (i, def) in meta.defaults.iter().enumerate().skip(stored) {
-                if let Some(e) = def {
-                    values[i] = eval::eval(e, &ctx)?;
-                }
+        let record = decode_record(payload, encoding)?;
+        let n = meta.columns.len();
+        let mut values = alloc::vec![Value::Null; n];
+        let p = Params::default();
+        // Map stored record values onto declared columns, skipping VIRTUAL
+        // generated columns (which occupy no record slot). A record shorter than
+        // the stored-column count means columns added by ALTER use their default.
+        let mut ri = 0usize;
+        for (i, def) in meta.defaults.iter().enumerate() {
+            if meta.is_virtual(i) {
+                continue;
             }
+            if ri < record.len() {
+                values[i] = record[ri].clone();
+            } else if let Some(e) = def {
+                values[i] = eval::eval(e, &EvalCtx::rowless(&p))?;
+            }
+            ri += 1;
         }
         if let Some(ipk) = meta.ipk {
             values[ipk] = Value::Integer(rowid);
         }
+        self.compute_generated(meta, &mut values, &p)?;
         Ok(values)
+    }
+
+    /// Fill in the VIRTUAL generated columns of `values` (computed on read).
+    /// STORED generated columns are read back from the record, not recomputed.
+    fn compute_generated(
+        &self,
+        meta: &TableMeta,
+        values: &mut [Value],
+        params: &Params,
+    ) -> Result<()> {
+        if meta.generated.iter().all(|g| g.is_none()) {
+            return Ok(());
+        }
+        for i in 0..meta.columns.len() {
+            if let Some((expr, stored)) = &meta.generated[i] {
+                if !stored {
+                    let ctx = row_ctx(values, &meta.columns, None, params).with_subqueries(self);
+                    let v = eval::eval(expr, &ctx)?;
+                    values[i] = meta.columns[i].affinity.coerce(v);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialize all generated columns (STORED and VIRTUAL) into `values`,
+    /// applied on the write path so CHECK/UNIQUE/indexes see their values.
+    fn materialize_generated(
+        &self,
+        meta: &TableMeta,
+        values: &mut [Value],
+        params: &Params,
+    ) -> Result<()> {
+        if meta.generated.iter().all(|g| g.is_none()) {
+            return Ok(());
+        }
+        for i in 0..meta.columns.len() {
+            if let Some((expr, _)) = &meta.generated[i] {
+                let ctx = row_ctx(values, &meta.columns, None, params).with_subqueries(self);
+                let v = eval::eval(expr, &ctx)?;
+                values[i] = meta.columns[i].affinity.coerce(v);
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode a table record from `values`, omitting VIRTUAL generated columns
+    /// (not stored) and nulling the rowid-aliased `INTEGER PRIMARY KEY`.
+    fn encode_table_record(&self, meta: &TableMeta, values: &[Value]) -> Vec<u8> {
+        let stored: Vec<Value> = (0..meta.columns.len())
+            .filter(|&i| !meta.is_virtual(i))
+            .map(|i| {
+                if Some(i) == meta.ipk {
+                    Value::Null
+                } else {
+                    values[i].clone()
+                }
+            })
+            .collect();
+        encode_record(&stored)
     }
 
     /// Non-aggregated projection: one output row per input row.
@@ -3829,6 +3928,17 @@ impl Connection {
                         .any(|k| matches!(k, ColumnConstraint::NotNull))
             })
             .collect();
+        // Generated columns: `… AS (expr) [STORED|VIRTUAL]`.
+        let generated: Vec<Option<(Expr, bool)>> = ct
+            .columns
+            .iter()
+            .map(|c| {
+                c.constraints.iter().find_map(|k| match k {
+                    ColumnConstraint::Generated { expr, stored } => Some((expr.clone(), *stored)),
+                    _ => None,
+                })
+            })
+            .collect();
         // CHECK constraints (column-level + table-level); each is evaluated
         // against the full row on INSERT/UPDATE.
         let mut checks: Vec<Expr> = Vec::new();
@@ -3856,9 +3966,12 @@ impl Connection {
                     "WITHOUT ROWID table must have a PRIMARY KEY".into(),
                 ));
             }
+            // Storage order: PK columns first, then the remaining *stored*
+            // columns (VIRTUAL generated columns are never written).
             let mut order = pk.clone();
-            for i in 0..columns.len() {
-                if !pk.contains(&i) {
+            for (i, gen) in generated.iter().enumerate() {
+                let is_virtual = matches!(gen, Some((_, false)));
+                if !pk.contains(&i) && !is_virtual {
                     order.push(i);
                 }
             }
@@ -3876,6 +3989,7 @@ impl Connection {
             checks,
             unique,
             ipk,
+            generated,
             without_rowid,
             storage_order,
             pk_len,
@@ -3914,6 +4028,10 @@ struct TableMeta {
     /// Column-index sets that must be UNIQUE (excludes the rowid IPK).
     unique: Vec<Vec<usize>>,
     ipk: Option<usize>,
+    /// Per-column generated-column spec `(expr, stored)`, if the column is
+    /// `… AS (expr) [STORED|VIRTUAL]`. `VIRTUAL` (stored = false) columns are not
+    /// written to disk; `STORED` ones are. Aligned with `columns`.
+    generated: Vec<Option<(Expr, bool)>>,
     /// `true` for a `WITHOUT ROWID` table (stored as a PK-clustered index b-tree
     /// rather than a rowid table b-tree).
     without_rowid: bool,
@@ -3922,6 +4040,18 @@ struct TableMeta {
     /// for ordinary rowid tables. `pk_len` is how many leading entries are PK.
     storage_order: Vec<usize>,
     pk_len: usize,
+}
+
+impl TableMeta {
+    /// Whether column `i` is a VIRTUAL generated column (computed, never stored).
+    fn is_virtual(&self, i: usize) -> bool {
+        matches!(self.generated[i], Some((_, false)))
+    }
+
+    /// Whether column `i` is generated (STORED or VIRTUAL).
+    fn is_generated(&self, i: usize) -> bool {
+        self.generated[i].is_some()
+    }
 }
 
 /// An index's b-tree root and the table column positions it covers.

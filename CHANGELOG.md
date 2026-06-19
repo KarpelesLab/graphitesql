@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: generated columns — `… AS (expr) [STORED|VIRTUAL]`. VIRTUAL columns
+  are computed on read and not stored; STORED ones are materialized on write;
+  writes to a generated column are rejected; indexes over generated columns work;
+  `table_info` hides them. Verified against `sqlite3` incl. `integrity_check`.
 - Phase 9: b-tree page merging on delete — a delete that empties table leaf pages
   now compacts the b-tree in place (root preserved), returning the slack to the
   freelist for reuse so the file no longer grows unboundedly across delete/insert
