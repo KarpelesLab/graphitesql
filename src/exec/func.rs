@@ -306,26 +306,32 @@ fn substr(v: &[Value]) -> Result<Value> {
     }
     let s: Vec<char> = eval::to_text(&v[0]).chars().collect();
     let len = s.len() as i64;
+    // 1-based start; a negative start counts from the end. Unlike a naive clamp,
+    // SQLite keeps the requested window and only the positions in 1..=len are
+    // returned, so `substr('hello',0,3)` yields "he" (positions 0,1,2 → 1,2).
     let mut start = eval::to_i64(&v[1]);
-    // SQLite: 1-based; negative counts from the end.
     if start < 0 {
         start += len + 1;
     }
-    if start < 1 {
-        start = 1;
+    let (wstart, wend) = if v.len() == 3 {
+        let z = eval::to_i64(&v[2]);
+        if z < 0 {
+            (start + z, start)
+        } else {
+            (start, start + z)
+        }
+    } else {
+        (start, len + 1)
+    };
+    let b = wstart.max(1);
+    let e = wend.min(len + 1);
+    if b >= e {
+        Ok(Value::Text(String::new()))
+    } else {
+        Ok(Value::Text(
+            s[(b - 1) as usize..(e - 1) as usize].iter().collect(),
+        ))
     }
-    let count = if v.len() == 3 {
-        eval::to_i64(&v[2])
-    } else {
-        len
-    };
-    let begin = (start - 1).clamp(0, len) as usize;
-    let end = if count < 0 {
-        begin
-    } else {
-        ((start - 1 + count).clamp(0, len)) as usize
-    };
-    Ok(Value::Text(s[begin..end.max(begin)].iter().collect()))
 }
 
 fn instr(v: &[Value]) -> Result<Value> {

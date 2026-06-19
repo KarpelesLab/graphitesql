@@ -254,6 +254,54 @@ fn corpus() -> Vec<String> {
         }
     }
 
+    // 19) Scalar edge cases (integer division/modulo signs, substr bounds,
+    // NULL-propagating functions, concat coercion, constant WHERE, nested CASE).
+    for e in [
+        "7/2",
+        "-7/2",
+        "7/-2",
+        "-7/-2",
+        "7%3",
+        "-7%3",
+        "7%-3",
+        "substr('hello',2)",
+        "substr('hello',2,2)",
+        "substr('hello',-2)",
+        "substr('hello',-2,1)",
+        "substr('hello',0,3)",
+        "substr('hello',10)",
+        "length('')",
+        "length('abc')",
+        "abs(-5)",
+        "abs(5)",
+        "1 || 2",
+        "'x' || 3",
+        "min(3,1,2)",
+        "max(3,1,2)",
+        "coalesce(NULL, NULL, 3)",
+        "nullif(5,5)",
+        "nullif(5,6)",
+        "CASE 2 WHEN 1 THEN 'a' WHEN 2 THEN 'b' END",
+        "CASE WHEN 0 THEN 'a' END",
+        "5 IN (1,2,5)",
+        "5 NOT IN (1,2)",
+        "NULL IN (1,2)",
+        "2 BETWEEN 1 AND 3",
+        "4 BETWEEN 1 AND 3",
+    ] {
+        q.push(format!("SELECT {e};"));
+    }
+    for w in ["1", "0", "NULL", "1=1", "1=0", "'a'='a'"] {
+        q.push(format!("SELECT count(*) FROM t WHERE {w};"));
+    }
+    // 20) NULL-propagating functions over a column with NULLs.
+    for f in ["length(s)", "upper(s)", "substr(s,2)", "abs(b)", "s || '!'"] {
+        q.push(format!("SELECT id, {f} FROM t ORDER BY id;"));
+    }
+    // 21) Aggregates over empty/filtered sets.
+    q.push("SELECT count(*), sum(a), min(a), max(a) FROM t WHERE a > 1000;".into());
+    q.push("SELECT g, count(*) FROM t WHERE a > 1000 GROUP BY g;".into());
+
     q
 }
 
