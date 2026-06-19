@@ -101,6 +101,6 @@ Deep gratitude to D. Richard Hipp and the SQLite developers. See
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at
-your option. (SQLite itself is public domain; see `ROADMAP.md` for the open
-question of whether to mirror that with a public-domain dedication.)
+**Public domain**, mirroring SQLite. In place of a legal notice, graphitesql
+carries a blessing — see [`LICENSE`](LICENSE). The SPDX identifier is
+`blessing` (the SQLite Blessing).

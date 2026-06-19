@@ -40,8 +40,6 @@ git-ignored.
 
 ## graphitesql's own license
 
-graphitesql's original Rust code is licensed under your choice of **MIT** or
-**Apache-2.0** (see `LICENSE-MIT` and `LICENSE-APACHE`), the Rust ecosystem
-default. Because the work it mirrors is public domain, contributors who prefer a
-public-domain dedication for their contributions are welcome to say so; this is
-tracked as an open decision in `ROADMAP.md`.
+graphitesql is **public domain**, mirroring SQLite. In place of a legal notice
+it carries the SQLite blessing (see `LICENSE`). The SPDX identifier is
+`blessing`. Contributions are accepted on the same public-domain terms.

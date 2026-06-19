@@ -251,9 +251,8 @@ contents*, not that bytes are identical for independently-built databases.
 These are deliberately unresolved; we'll settle them with input rather than by
 default. Tracked here so they don't get lost.
 
-1. **License.** Currently dual MIT/Apache-2.0 (Rust norm). Because SQLite is
-   public domain, a public-domain dedication (e.g. CC0/Unlicense, or
-   MIT-0) is on the table. → *Decision needed.*
+1. ~~**License.**~~ *Resolved:* **public domain**, mirroring SQLite, with the
+   SQLite blessing in place of a legal notice (SPDX `blessing`). See `LICENSE`.
 2. **Parser: hand-written vs. generated.** Plan is a hand-written
    recursive-descent parser (no build-time codegen, friendlier errors). The
    alternative is porting the Lemon grammar. → *Leaning hand-written.*
