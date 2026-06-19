@@ -188,6 +188,16 @@ impl Parser {
         if self.eat_kw("pragma") {
             return Ok(Statement::Pragma(self.pragma()?));
         }
+        if self.eat_kw("vacuum") {
+            // Accept `VACUUM [schema] [INTO 'file']`; the clauses don't affect us.
+            if !self.check(&Token::Semicolon) && !self.at_end() && !self.eat_kw("into") {
+                let _ = self.advance(); // optional schema name
+            }
+            if self.eat_kw("into") {
+                let _ = self.expr()?;
+            }
+            return Ok(Statement::Vacuum);
+        }
         Err(self.err("unrecognized statement"))
     }
 

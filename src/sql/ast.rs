@@ -42,6 +42,8 @@ pub enum Statement {
     Rollback,
     /// A `PRAGMA` statement.
     Pragma(Pragma),
+    /// A `VACUUM` statement (accepted; a no-op compaction in this build).
+    Vacuum,
 }
 
 /// A `SELECT` query.

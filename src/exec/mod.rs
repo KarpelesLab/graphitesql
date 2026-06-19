@@ -330,6 +330,7 @@ impl Connection {
                 0
             }
             Statement::Pragma(_) => 0, // accepted, no-op for now
+            Statement::Vacuum => 0,    // accepted; compaction is a no-op here
             Statement::Select(_) => return Err(Error::Unsupported("use query() for SELECT")),
             Statement::Begin | Statement::Commit | Statement::Rollback => unreachable!(),
         };
