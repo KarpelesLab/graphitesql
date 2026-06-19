@@ -302,6 +302,24 @@ fn corpus() -> Vec<String> {
     q.push("SELECT count(*), sum(a), min(a), max(a) FROM t WHERE a > 1000;".into());
     q.push("SELECT g, count(*) FROM t WHERE a > 1000 GROUP BY g;".into());
 
+    // 22) group_concat (row order = scan order), GLOB (case-sensitive),
+    // self/3-way joins, DISTINCT on expressions, deeper nesting.
+    q.push("SELECT g, group_concat(id) FROM t GROUP BY g ORDER BY g;".into());
+    q.push(
+        "SELECT g, group_concat(s, ',') FROM t WHERE s IS NOT NULL GROUP BY g ORDER BY g;".into(),
+    );
+    for pat in ["'str*'", "'*2'", "'str?'", "'STR1'", "'str[12]'"] {
+        q.push(format!("SELECT id FROM t WHERE s GLOB {pat} ORDER BY id;"));
+    }
+    q.push("SELECT DISTINCT a%3, g FROM t ORDER BY 1, 2;".into());
+    q.push("SELECT x.id, y.id FROM t x JOIN t y ON x.g = y.g AND x.id < y.id WHERE x.id < 5 ORDER BY x.id, y.id;".into());
+    q.push("SELECT t.id, u.w FROM t JOIN u ON t.id = u.t_id JOIN t t2 ON t2.id = u.w ORDER BY t.id, u.w;".into());
+    q.push("SELECT id, upper(substr(replace(s,'str','q'),1,2)) FROM t WHERE s IS NOT NULL ORDER BY id;".into());
+    q.push("SELECT id FROM t WHERE (a+b) > 20 AND b IS NOT NULL ORDER BY id;".into());
+    q.push("SELECT id FROM t WHERE abs(b) = 6 ORDER BY id;".into());
+    q.push("SELECT count(*) FROM t WHERE s LIKE 'STR%';".into());
+    q.push("SELECT id, coalesce(b, -100) FROM t ORDER BY coalesce(b,-100), id;".into());
+
     q
 }
 
