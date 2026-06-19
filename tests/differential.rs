@@ -237,6 +237,23 @@ fn corpus() -> Vec<String> {
     q.push("SELECT id, a%5 FROM t ORDER BY 2, 1 LIMIT 15;".into());
     q.push("SELECT id FROM t ORDER BY a%7, id;".into());
 
+    // 18) Type affinity in comparisons (column type vs literal type).
+    for (col, lit) in [
+        ("a", "'5'"),
+        ("a", "'10'"),
+        ("g", "'1'"),
+        ("id", "'30'"),
+        ("s", "1"),
+        ("s", "'str3'"),
+        ("b", "'0'"),
+    ] {
+        for op in ops {
+            q.push(format!(
+                "SELECT id FROM t WHERE {col} {op} {lit} ORDER BY id;"
+            ));
+        }
+    }
+
     q
 }
 

@@ -30,6 +30,108 @@ pub trait Subqueries {
     fn column(&self, select: &Select) -> Result<Vec<Value>>;
 }
 
+/// A column's type affinity (SQLite, `datatype3.html` §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Affinity {
+    /// No conversion (BLOB / untyped).
+    Blob,
+    /// Prefer text.
+    Text,
+    /// Prefer a number, falling back to the original value.
+    Numeric,
+    /// Like Numeric, also turning integral reals into integers.
+    Integer,
+    /// Prefer a real.
+    Real,
+}
+
+impl Affinity {
+    /// Determine a column's affinity from its declared type name (the rules in
+    /// `datatype3.html`: the first matching substring wins).
+    pub fn from_type(type_name: Option<&str>) -> Affinity {
+        let Some(t) = type_name else {
+            return Affinity::Blob; // no datatype => BLOB (NONE) affinity
+        };
+        let t = t.to_ascii_uppercase();
+        if t.contains("INT") {
+            Affinity::Integer
+        } else if t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT") {
+            Affinity::Text
+        } else if t.contains("BLOB") {
+            Affinity::Blob
+        } else if t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB") {
+            Affinity::Real
+        } else {
+            Affinity::Numeric
+        }
+    }
+
+    /// Apply this affinity to a value for *storage* (SQLite coerces values to the
+    /// column's affinity on insert/update).
+    pub fn coerce(self, v: Value) -> Value {
+        match self {
+            Affinity::Blob => v,
+            Affinity::Text => match v {
+                Value::Integer(_) | Value::Real(_) => Value::Text(to_text(&v)),
+                other => other,
+            },
+            Affinity::Real => match v {
+                Value::Null | Value::Blob(_) => v,
+                _ => match to_number_strict(&v) {
+                    Some(n) => Value::Real(number_as_f64(&n)),
+                    None => v,
+                },
+            },
+            Affinity::Integer | Affinity::Numeric => match v {
+                Value::Null | Value::Blob(_) => v,
+                Value::Real(r) => {
+                    // Reduce an integral real to an integer.
+                    if r == crate::util::float::trunc(r)
+                        && r.is_finite()
+                        && self == Affinity::Integer
+                    {
+                        Value::Integer(r as i64)
+                    } else {
+                        Value::Real(r)
+                    }
+                }
+                Value::Integer(_) => v,
+                Value::Text(_) => match to_number_strict(&v) {
+                    Some(Value::Real(r))
+                        if r == crate::util::float::trunc(r)
+                            && r.is_finite()
+                            && self == Affinity::Integer =>
+                    {
+                        Value::Integer(r as i64)
+                    }
+                    Some(n) => n,
+                    None => v,
+                },
+            },
+        }
+    }
+}
+
+/// Parse a value as a number only if it is *entirely* a valid numeric literal
+/// (no trailing junk), else `None`. Used for affinity coercion, where SQLite
+/// only converts text that fully looks like a number.
+fn to_number_strict(v: &Value) -> Option<Value> {
+    match v {
+        Value::Integer(_) | Value::Real(_) => Some(v.clone()),
+        Value::Text(s) => {
+            let t = s.trim();
+            if let Ok(i) = t.parse::<i64>() {
+                Some(Value::Integer(i))
+            } else if let Ok(f) = t.parse::<f64>() {
+                Some(Value::Real(f))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Describes a column available to expression evaluation.
 #[derive(Debug, Clone)]
 pub struct ColumnInfo {
@@ -37,6 +139,8 @@ pub struct ColumnInfo {
     pub name: String,
     /// The table (or alias) the column belongs to.
     pub table: String,
+    /// The column's type affinity (Blob/NONE when unknown).
+    pub affinity: Affinity,
 }
 
 /// Bound parameter values, by position (1-based) and by name.
@@ -128,6 +232,46 @@ impl<'a> EvalCtx<'a> {
     }
 }
 
+/// The affinity of an expression for comparison purposes: a column's declared
+/// affinity, a CAST's target affinity, transparent through parentheses, else
+/// none (BLOB).
+fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Affinity {
+    match expr {
+        Expr::Column { table, column } => {
+            for col in ctx.columns {
+                let name_ok = col.name.eq_ignore_ascii_case(column);
+                let table_ok = table
+                    .as_deref()
+                    .is_none_or(|t| col.table.eq_ignore_ascii_case(t));
+                if name_ok && table_ok {
+                    return col.affinity;
+                }
+            }
+            Affinity::Blob
+        }
+        Expr::Cast { type_name, .. } => Affinity::from_type(Some(type_name)),
+        Expr::Paren(e) => expr_affinity(e, ctx),
+        _ => Affinity::Blob,
+    }
+}
+
+/// Apply SQLite comparison affinity to a pair of operands before comparing.
+fn apply_comparison_affinity(l: Value, la: Affinity, r: Value, ra: Affinity) -> (Value, Value) {
+    let numeric = |a: Affinity| matches!(a, Affinity::Integer | Affinity::Real | Affinity::Numeric);
+    let texty = |a: Affinity| matches!(a, Affinity::Text | Affinity::Blob);
+    if numeric(la) && texty(ra) {
+        (l, Affinity::Numeric.coerce(r))
+    } else if numeric(ra) && texty(la) {
+        (Affinity::Numeric.coerce(l), r)
+    } else if la == Affinity::Text && ra == Affinity::Blob {
+        (l, Affinity::Text.coerce(r))
+    } else if ra == Affinity::Text && la == Affinity::Blob {
+        (Affinity::Text.coerce(l), r)
+    } else {
+        (l, r)
+    }
+}
+
 fn is_rowid_alias(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
         || name.eq_ignore_ascii_case("_rowid_")
@@ -149,13 +293,25 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::Paren(e) => eval(e, ctx),
         Expr::Unary { op, expr } => eval_unary(*op, eval(expr, ctx)?),
         Expr::Binary { op, left, right } => {
-            // Short-circuit AND/OR per SQLite's three-valued logic.
+            use BinaryOp::*;
             match op {
-                BinaryOp::And => return eval_and(left, right, ctx),
-                BinaryOp::Or => return eval_or(left, right, ctx),
-                _ => {}
+                // Short-circuit AND/OR per SQLite's three-valued logic.
+                And => eval_and(left, right, ctx),
+                Or => eval_or(left, right, ctx),
+                // Comparisons apply operand affinity before comparing.
+                Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+                    let l = eval(left, ctx)?;
+                    let r = eval(right, ctx)?;
+                    let (l, r) = apply_comparison_affinity(
+                        l,
+                        expr_affinity(left, ctx),
+                        r,
+                        expr_affinity(right, ctx),
+                    );
+                    eval_binary(*op, l, r)
+                }
+                _ => eval_binary(*op, eval(left, ctx)?, eval(right, ctx)?),
             }
-            eval_binary(*op, eval(left, ctx)?, eval(right, ctx)?)
         }
         Expr::IsNull { expr, negated } => {
             let v = eval(expr, ctx)?;

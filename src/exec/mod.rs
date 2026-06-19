@@ -428,6 +428,7 @@ impl Connection {
             for (i, e) in row_exprs.iter().enumerate() {
                 values[target[i]] = eval::eval(e, &ctx)?;
             }
+            apply_column_affinity(&meta, &mut values);
 
             // Determine the rowid (explicit INTEGER PRIMARY KEY value or auto).
             let rowid = match meta.ipk {
@@ -575,6 +576,7 @@ impl Connection {
                     row_ctx(&values, &meta.columns, Some(rowid), params).with_subqueries(self);
                 values[pos] = eval::eval(expr, &ctx)?;
             }
+            apply_column_affinity(&meta, &mut values);
             check_not_null(&meta, &values)?;
             self.check_constraints(&meta, &values, Some(rowid), params)?;
             // New rowid if the IPK column was changed, else unchanged.
@@ -694,6 +696,7 @@ impl Connection {
             .map(|n| ColumnInfo {
                 name: n,
                 table: label.clone(),
+                affinity: eval::Affinity::Blob,
             })
             .collect();
         let rows = result
@@ -744,6 +747,7 @@ impl Connection {
             .map(|n| ColumnInfo {
                 name: n,
                 table: label.clone(),
+                affinity: eval::Affinity::Blob,
             })
             .collect();
         let rows = result
@@ -1703,6 +1707,7 @@ impl Connection {
             .map(|c| ColumnInfo {
                 name: c.name.clone(),
                 table: table_label.clone(),
+                affinity: eval::Affinity::from_type(c.type_name.as_deref()),
             })
             .collect();
         let defaults: Vec<Option<Expr>> = ct
@@ -1854,6 +1859,14 @@ impl eval::Subqueries for Connection {
 /// Whether a value is the given text (used to match `sqlite_schema` columns).
 fn is_text(v: &Value, s: &str) -> bool {
     matches!(v, Value::Text(t) if t == s)
+}
+
+/// Coerce each value to its column's type affinity (SQLite storage affinity).
+fn apply_column_affinity(meta: &TableMeta, values: &mut [Value]) {
+    for (i, v) in values.iter_mut().enumerate() {
+        let taken = core::mem::replace(v, Value::Null);
+        *v = meta.columns[i].affinity.coerce(taken);
+    }
 }
 
 /// Enforce declared `NOT NULL` column constraints over a fully-built row.
