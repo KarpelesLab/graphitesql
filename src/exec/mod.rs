@@ -1084,6 +1084,74 @@ impl Connection {
     // ---- SELECT execution ---------------------------------------------------
 
     fn run_select(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
+        if sel.compound.is_empty() {
+            return self.run_core(sel, params);
+        }
+        // Compound query: run the first core (without the trailing ORDER BY/LIMIT
+        // and compound tail), then fold in each operand, then order/limit the whole.
+        let mut first = sel.clone();
+        first.compound = Vec::new();
+        first.order_by = Vec::new();
+        first.limit = None;
+        first.offset = None;
+        let mut result = self.run_core(&first, params)?;
+        for (op, operand) in &sel.compound {
+            let r = self.run_core(operand, params)?;
+            result.rows = apply_compound(*op, result.rows, r.rows);
+        }
+        self.compound_order_limit(&mut result, sel, params)?;
+        Ok(result)
+    }
+
+    /// Apply a compound query's overall `ORDER BY` / `LIMIT` / `OFFSET` to the
+    /// already-combined rows (terms must reference output columns by position or
+    /// name).
+    fn compound_order_limit(
+        &self,
+        result: &mut QueryResult,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<()> {
+        if !sel.order_by.is_empty() {
+            let mut keys = Vec::new();
+            for term in &sel.order_by {
+                let idx = resolve_order_index(&term.expr, &result.columns, result.columns.len())
+                    .ok_or(Error::Unsupported(
+                        "ORDER BY term must be an output column in a compound query",
+                    ))?;
+                keys.push((idx, term.descending));
+            }
+            result.rows.sort_by(|a, b| {
+                for (idx, desc) in &keys {
+                    let ord = eval::compare(&a[*idx], &b[*idx]);
+                    let ord = if *desc { ord.reverse() } else { ord };
+                    if ord != core::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+        }
+        let offset = match &sel.offset {
+            Some(e) => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize,
+            None => 0,
+        };
+        let limit = match &sel.limit {
+            Some(e) => {
+                Some(eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize)
+            }
+            None => None,
+        };
+        if offset > 0 {
+            result.rows.drain(0..offset.min(result.rows.len()));
+        }
+        if let Some(n) = limit {
+            result.rows.truncate(n);
+        }
+        Ok(())
+    }
+
+    fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
         let (columns, input_rows) = self.scan_source(sel, params)?;
 
         // Apply WHERE.
@@ -2017,6 +2085,45 @@ fn contains_aggregate(expr: &Expr) -> bool {
         }
         Expr::Cast { expr, .. } => contains_aggregate(expr),
         _ => false,
+    }
+}
+
+/// Combine two compound-query operand row sets per the operator.
+fn apply_compound(
+    op: CompoundOp,
+    left: Vec<Vec<Value>>,
+    right: Vec<Vec<Value>>,
+) -> Vec<Vec<Value>> {
+    let dedup = |rows: Vec<Vec<Value>>| -> Vec<Vec<Value>> {
+        let mut seen: Vec<Vec<Value>> = Vec::new();
+        for r in rows {
+            if !seen.iter().any(|s| rows_equal(s, &r)) {
+                seen.push(r);
+            }
+        }
+        seen
+    };
+    match op {
+        CompoundOp::UnionAll => {
+            let mut out = left;
+            out.extend(right);
+            out
+        }
+        CompoundOp::Union => {
+            let mut out = left;
+            out.extend(right);
+            dedup(out)
+        }
+        CompoundOp::Intersect => dedup(
+            left.into_iter()
+                .filter(|l| right.iter().any(|r| rows_equal(l, r)))
+                .collect(),
+        ),
+        CompoundOp::Except => dedup(
+            left.into_iter()
+                .filter(|l| !right.iter().any(|r| rows_equal(l, r)))
+                .collect(),
+        ),
     }
 }
 

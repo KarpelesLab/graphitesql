@@ -244,6 +244,56 @@ impl Parser {
                 }
             }
         }
+        // First query core, then any compound continuations (left-associative).
+        let mut outer = self.select_core()?;
+        outer.ctes = ctes;
+        while let Some(op) = self.compound_op() {
+            let right = self.select_core()?;
+            outer.compound.push((op, right));
+        }
+
+        // Trailing ORDER BY / LIMIT / OFFSET apply to the whole (compound) query.
+        if self.eat_kw("order") {
+            self.expect_kw("by")?;
+            outer.order_by.push(self.order_term()?);
+            while self.eat(&Token::Comma) {
+                outer.order_by.push(self.order_term()?);
+            }
+        }
+        if self.eat_kw("limit") {
+            outer.limit = Some(self.expr()?);
+            if self.eat_kw("offset") {
+                outer.offset = Some(self.expr()?);
+            } else if self.eat(&Token::Comma) {
+                // `LIMIT offset, count` form.
+                outer.offset = outer.limit.take();
+                outer.limit = Some(self.expr()?);
+            }
+        }
+        Ok(outer)
+    }
+
+    /// A `UNION [ALL]` / `INTERSECT` / `EXCEPT` operator, if present.
+    fn compound_op(&mut self) -> Option<CompoundOp> {
+        if self.eat_kw("union") {
+            if self.eat_kw("all") {
+                Some(CompoundOp::UnionAll)
+            } else {
+                Some(CompoundOp::Union)
+            }
+        } else if self.eat_kw("intersect") {
+            Some(CompoundOp::Intersect)
+        } else if self.eat_kw("except") {
+            Some(CompoundOp::Except)
+        } else {
+            None
+        }
+    }
+
+    /// Parse a single query core: `SELECT … FROM … WHERE … GROUP BY … HAVING …`
+    /// (no `WITH`, compound, `ORDER BY`, or `LIMIT` — those are handled by the
+    /// enclosing [`select`](Self::select)).
+    fn select_core(&mut self) -> Result<Select> {
         self.expect_kw("select")?;
         let distinct = if self.eat_kw("distinct") {
             true
@@ -280,38 +330,19 @@ impl Parser {
                 having = Some(self.expr()?);
             }
         }
-        let mut order_by = Vec::new();
-        if self.eat_kw("order") {
-            self.expect_kw("by")?;
-            order_by.push(self.order_term()?);
-            while self.eat(&Token::Comma) {
-                order_by.push(self.order_term()?);
-            }
-        }
-        let mut limit = None;
-        let mut offset = None;
-        if self.eat_kw("limit") {
-            limit = Some(self.expr()?);
-            if self.eat_kw("offset") {
-                offset = Some(self.expr()?);
-            } else if self.eat(&Token::Comma) {
-                // `LIMIT offset, count` form.
-                offset = limit.take();
-                limit = Some(self.expr()?);
-            }
-        }
 
         Ok(Select {
-            ctes,
+            ctes: Vec::new(),
+            compound: Vec::new(),
             distinct,
             columns,
             from,
             where_clause,
             group_by,
             having,
-            order_by,
-            limit,
-            offset,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
         })
     }
 
@@ -1247,6 +1278,9 @@ fn is_reserved_after_expr(w: &str) -> bool {
             | "then"
             | "else"
             | "end"
+            | "union"
+            | "intersect"
+            | "except"
     )
 }
 

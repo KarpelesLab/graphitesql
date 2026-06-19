@@ -266,7 +266,7 @@ coverage rather than having a single "done".
     (updating dependent index definitions) — `tests/alter.rs`;
   - a **differential test harness** (`tests/differential.rs`) that runs 1500+
     generated `SELECT`s through both graphitesql and the real `sqlite3` and
-    asserts identical output — currently 1513/1513 match;
+    asserts identical output — currently 1640/1640 match;
   - **`CREATE VIEW` / `DROP VIEW`** and querying views (the view's `SELECT` runs
     as the source) — `tests/views.rs`;
   - **constraint enforcement** — `NOT NULL`, `CHECK` (column + table), and
@@ -275,6 +275,9 @@ coverage rather than having a single "done".
   - **subqueries** — scalar `(SELECT …)` and `expr [NOT] IN (SELECT …)`
     (uncorrelated) — `tests/subquery.rs`;
   - non-recursive **`WITH` / CTEs** used as a query source — `tests/cte.rs`;
+  - **compound queries** `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` with an
+    overall `ORDER BY`/`LIMIT`;
+  - **type affinity** (comparison + storage) and `substr()` window semantics;
   - the full **`CREATE TABLE` constraint grammar** parses (`CHECK`,
     `REFERENCES`, `FOREIGN KEY`, named `CONSTRAINT`, conflict clauses) so
     real-world schemas load — `tests/realworld.rs`;

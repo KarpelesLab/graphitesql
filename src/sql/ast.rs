@@ -57,11 +57,27 @@ pub struct Cte {
     pub select: Box<Select>,
 }
 
+/// A compound-query operator joining two `SELECT`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompoundOp {
+    /// `UNION` (distinct).
+    Union,
+    /// `UNION ALL`.
+    UnionAll,
+    /// `INTERSECT`.
+    Intersect,
+    /// `EXCEPT`.
+    Except,
+}
+
 /// A `SELECT` query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     /// `WITH` common table expressions, in declaration order.
     pub ctes: Vec<Cte>,
+    /// Compound continuations (`UNION`/`INTERSECT`/`EXCEPT` …), left-associative.
+    /// The outer `order_by`/`limit`/`offset` apply to the whole compound.
+    pub compound: Vec<(CompoundOp, Select)>,
     /// `SELECT DISTINCT`?
     pub distinct: bool,
     /// The projected result columns.

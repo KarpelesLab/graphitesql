@@ -320,6 +320,20 @@ fn corpus() -> Vec<String> {
     q.push("SELECT count(*) FROM t WHERE s LIKE 'STR%';".into());
     q.push("SELECT id, coalesce(b, -100) FROM t ORDER BY coalesce(b,-100), id;".into());
 
+    // 23) Compound queries: UNION / UNION ALL / INTERSECT / EXCEPT.
+    q.push("SELECT g FROM t WHERE a < 20 UNION SELECT g FROM t WHERE a > 40 ORDER BY g;".into());
+    q.push("SELECT a FROM t WHERE g = 1 UNION ALL SELECT a FROM t WHERE g = 2 ORDER BY a;".into());
+    q.push(
+        "SELECT g FROM t WHERE a < 30 INTERSECT SELECT g FROM t WHERE a > 10 ORDER BY g;".into(),
+    );
+    q.push("SELECT g FROM t EXCEPT SELECT g FROM t WHERE a < 30 ORDER BY g;".into());
+    q.push("SELECT id FROM t WHERE g = 0 UNION SELECT id FROM t WHERE g = 1 UNION SELECT id FROM t WHERE g = 2 ORDER BY id;".into());
+    q.push("SELECT a FROM t UNION SELECT t_id FROM u ORDER BY a LIMIT 10;".into());
+    q.push(
+        "SELECT g, count(*) FROM t GROUP BY g UNION ALL SELECT 99, sum(a) FROM t ORDER BY 1;"
+            .into(),
+    );
+
     q
 }
 
