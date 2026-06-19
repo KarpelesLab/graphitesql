@@ -314,11 +314,12 @@ coverage rather than having a single "done".
     `WHEN` guard, fired non-recursively (`tests/triggers.rs`);
   - **views & CTEs as join sources** — either side of a `JOIN` (`tests/views.rs`);
   - **derived tables** — `FROM (SELECT …) [AS] alias` as a sole source or join
-    operand (`tests/subquery.rs`).
+    operand (`tests/subquery.rs`);
+  - **explicit window frames** — `ROWS`/`RANGE`/`GROUPS BETWEEN … AND …` with the
+    full bound set (`tests/window.rs`).
 - **Deliverable (remaining):**
-  explicit window frame clauses (`ROWS`/`RANGE BETWEEN`); recursive
-  triggers & `INSTEAD OF` (view) triggers; `BEFORE`-trigger `NEW` mutation; real
-  `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
+  recursive triggers & `INSTEAD OF` (view) triggers; `BEFORE`-trigger `NEW`
+  mutation; real `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.

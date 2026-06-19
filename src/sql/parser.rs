@@ -1217,13 +1217,68 @@ impl Parser {
                 spec.order_by.push(self.order_term()?);
             }
         }
-        // Frame clauses (ROWS/RANGE …) are accepted-but-ignored for now: the
-        // default frame is applied by the executor.
-        while !self.check(&Token::RParen) && !self.at_end() {
-            self.advance();
-        }
+        spec.frame = self.window_frame()?;
         self.expect(&Token::RParen)?;
         Ok(Some(spec))
+    }
+
+    /// Parse an optional frame clause: `(ROWS|RANGE|GROUPS) (BETWEEN a AND b | a)`.
+    fn window_frame(&mut self) -> Result<Option<WindowFrame>> {
+        let mode = if self.eat_kw("rows") {
+            FrameMode::Rows
+        } else if self.eat_kw("range") {
+            FrameMode::Range
+        } else if self.eat_kw("groups") {
+            FrameMode::Groups
+        } else {
+            return Ok(None);
+        };
+        let (start, end) = if self.eat_kw("between") {
+            let s = self.frame_bound()?;
+            self.expect_kw("and")?;
+            let e = self.frame_bound()?;
+            (s, e)
+        } else {
+            // A bare start bound; the end defaults to CURRENT ROW.
+            (self.frame_bound()?, FrameBound::CurrentRow)
+        };
+        // Accept and ignore an EXCLUDE clause.
+        if self.eat_kw("exclude") {
+            if self.eat_kw("no") {
+                let _ = self.eat_kw("others");
+            } else if self.eat_kw("current") {
+                let _ = self.eat_kw("row");
+            } else {
+                let _ = self.eat_kw("group") || self.eat_kw("ties");
+            }
+        }
+        Ok(Some(WindowFrame { mode, start, end }))
+    }
+
+    fn frame_bound(&mut self) -> Result<FrameBound> {
+        if self.eat_kw("unbounded") {
+            if self.eat_kw("preceding") {
+                return Ok(FrameBound::UnboundedPreceding);
+            }
+            self.expect_kw("following")?;
+            return Ok(FrameBound::UnboundedFollowing);
+        }
+        if self.eat_kw("current") {
+            self.expect_kw("row")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        // `<n> PRECEDING|FOLLOWING`
+        let n = match self.expr()? {
+            Expr::Literal(Literal::Integer(i)) => i,
+            _ => return Err(self.err("expected an integer frame offset")),
+        };
+        if self.eat_kw("preceding") {
+            Ok(FrameBound::Preceding(n))
+        } else if self.eat_kw("following") {
+            Ok(FrameBound::Following(n))
+        } else {
+            Err(self.err("expected PRECEDING or FOLLOWING"))
+        }
     }
 
     fn case_expr(&mut self) -> Result<Expr> {

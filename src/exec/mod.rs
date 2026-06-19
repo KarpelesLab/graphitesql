@@ -2312,7 +2312,7 @@ impl Connection {
                 &ordered,
                 &ord_keys,
                 &arg_vals,
-                &spec.order_by.is_empty(),
+                spec,
                 &mut result,
             )?;
         }
@@ -2320,8 +2320,7 @@ impl Connection {
     }
 
     /// Fill `result` for one ordered partition `ordered` (indices into the row
-    /// arrays). `no_order` indicates the window has no `ORDER BY` (whole-partition
-    /// frame).
+    /// arrays), honoring `spec`'s frame (or the default frame).
     #[allow(clippy::too_many_arguments)]
     fn fill_window_partition(
         &self,
@@ -2330,13 +2329,22 @@ impl Connection {
         ordered: &[usize],
         ord_keys: &[Vec<Value>],
         arg_vals: &[Vec<Value>],
-        no_order: &bool,
+        spec: &WindowSpec,
         result: &mut [Value],
     ) -> Result<()> {
         let m = ordered.len();
+        // Peer-group id per ordered position (for RANGE/GROUPS frames).
+        let mut gid = alloc::vec![0usize; m];
+        for q in 1..m {
+            gid[q] = gid[q - 1]
+                + usize::from(
+                    !cmp_keys(&ord_keys[ordered[q - 1]], &ord_keys[ordered[q]], &[]).is_eq(),
+                );
+        }
         // Ranking values per ordered position.
         for p in 0..m {
             let idx = ordered[p];
+            let (fstart, fend) = frame_bounds(p, m, &gid, spec);
             let val = match lname {
                 "row_number" => Value::Integer(p as i64 + 1),
                 "rank" => {
@@ -2379,19 +2387,9 @@ impl Connection {
                         default
                     }
                 }
-                "first_value" => arg_vals[ordered[0]].first().cloned().unwrap_or(Value::Null),
-                "last_value" => {
-                    let end = frame_end(p, ordered, ord_keys, *no_order);
-                    arg_vals[ordered[end - 1]]
-                        .first()
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                }
-                "nth_value" => {
-                    let nth = arg_vals[idx].get(1).map(eval::to_i64).unwrap_or(1);
-                    let end = frame_end(p, ordered, ord_keys, *no_order);
-                    if nth >= 1 && (nth as usize) <= end {
-                        arg_vals[ordered[nth as usize - 1]]
+                "first_value" => {
+                    if fstart < fend {
+                        arg_vals[ordered[fstart]]
                             .first()
                             .cloned()
                             .unwrap_or(Value::Null)
@@ -2399,11 +2397,35 @@ impl Connection {
                         Value::Null
                     }
                 }
-                // Aggregate windows over the default frame.
+                "last_value" => {
+                    if fstart < fend {
+                        arg_vals[ordered[fend - 1]]
+                            .first()
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }
+                "nth_value" => {
+                    let nth = arg_vals[idx].get(1).map(eval::to_i64).unwrap_or(1);
+                    // nth row within the frame (1-based).
+                    let target = fstart + (nth.max(1) as usize) - 1;
+                    if nth >= 1 && target < fend {
+                        arg_vals[ordered[target]]
+                            .first()
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }
+                // Aggregate windows over the frame.
                 _ => {
-                    let end = frame_end(p, ordered, ord_keys, *no_order);
-                    let frame: Vec<&Vec<Value>> =
-                        ordered[..end].iter().map(|&i| &arg_vals[i]).collect();
+                    let frame: Vec<&Vec<Value>> = ordered[fstart..fend]
+                        .iter()
+                        .map(|&i| &arg_vals[i])
+                        .collect();
                     window_aggregate(lname, star, &frame)?
                 }
             };
@@ -3362,19 +3384,90 @@ fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> core::cmp::Ordering {
     Ordering::Equal
 }
 
-/// Exclusive end index of the default window frame for ordered position `p`:
-/// the whole partition when there is no `ORDER BY`, else through the last peer
-/// (rows sharing `p`'s order key) — SQLite's RANGE UNBOUNDED PRECEDING / CURRENT
-/// ROW default.
-fn frame_end(p: usize, ordered: &[usize], ord_keys: &[Vec<Value>], no_order: bool) -> usize {
-    if no_order {
-        return ordered.len();
+/// The `[start, end)` frame indices (into the ordered partition) for position
+/// `p`, given peer-group ids `gid` and the window `spec`.
+///
+/// With no explicit frame: the whole partition when there is no `ORDER BY`, else
+/// `UNBOUNDED PRECEDING` through the current row's last peer — SQLite's default.
+/// `ROWS` frames use physical offsets; `RANGE`/`GROUPS` use peer-group offsets.
+fn frame_bounds(p: usize, m: usize, gid: &[usize], spec: &WindowSpec) -> (usize, usize) {
+    let Some(frame) = &spec.frame else {
+        if spec.order_by.is_empty() {
+            return (0, m);
+        }
+        // Default: UNBOUNDED PRECEDING .. CURRENT ROW (peers included).
+        let mut e = p + 1;
+        while e < m && gid[e] == gid[p] {
+            e += 1;
+        }
+        return (0, e);
+    };
+    let (start, end) = match frame.mode {
+        FrameMode::Rows => (
+            row_bound(&frame.start, p, m, true),
+            row_bound(&frame.end, p, m, false),
+        ),
+        FrameMode::Range | FrameMode::Groups => (
+            group_bound(&frame.start, p, m, gid, true),
+            group_bound(&frame.end, p, m, gid, false),
+        ),
+    };
+    let start = start.min(m);
+    (start, end.min(m).max(start))
+}
+
+/// A `ROWS` frame bound as an index; `is_start` selects inclusive-start vs
+/// exclusive-end semantics.
+fn row_bound(b: &FrameBound, p: usize, m: usize, is_start: bool) -> usize {
+    match (b, is_start) {
+        (FrameBound::UnboundedPreceding, _) => 0,
+        (FrameBound::UnboundedFollowing, _) => m,
+        (FrameBound::CurrentRow, true) => p,
+        (FrameBound::CurrentRow, false) => p + 1,
+        (FrameBound::Preceding(n), true) => p.saturating_sub(*n as usize),
+        (FrameBound::Preceding(n), false) => (p + 1).saturating_sub(*n as usize),
+        (FrameBound::Following(n), true) => (p + *n as usize).min(m),
+        (FrameBound::Following(n), false) => (p + 1 + *n as usize).min(m),
     }
-    let mut e = p + 1;
-    while e < ordered.len() && cmp_keys(&ord_keys[ordered[e]], &ord_keys[ordered[p]], &[]).is_eq() {
-        e += 1;
+}
+
+/// A `RANGE`/`GROUPS` frame bound, measured in peer groups.
+fn group_bound(b: &FrameBound, p: usize, m: usize, gid: &[usize], is_start: bool) -> usize {
+    let maxg = if m == 0 { 0 } else { gid[m - 1] as i64 };
+    let target = |g: i64| -> i64 { gid[p] as i64 + g };
+    // First ordered index of peer-group `g` (clamped: below 0 -> 0, above max -> m).
+    let first_of = |g: i64| -> usize {
+        if g < 0 {
+            0
+        } else if g > maxg {
+            m
+        } else {
+            (0..m).find(|&i| gid[i] as i64 == g).unwrap_or(m)
+        }
+    };
+    // One past the last ordered index of peer-group `g` (same clamping).
+    let after_last_of = |g: i64| -> usize {
+        if g < 0 {
+            0
+        } else if g > maxg {
+            m
+        } else {
+            (0..m)
+                .rev()
+                .find(|&i| gid[i] as i64 == g)
+                .map_or(0, |i| i + 1)
+        }
+    };
+    match (b, is_start) {
+        (FrameBound::UnboundedPreceding, _) => 0,
+        (FrameBound::UnboundedFollowing, _) => m,
+        (FrameBound::CurrentRow, true) => first_of(target(0)),
+        (FrameBound::CurrentRow, false) => after_last_of(target(0)),
+        (FrameBound::Preceding(n), true) => first_of(target(-(*n))),
+        (FrameBound::Preceding(n), false) => after_last_of(target(-(*n))),
+        (FrameBound::Following(n), true) => first_of(target(*n)),
+        (FrameBound::Following(n), false) => after_last_of(target(*n)),
     }
-    e
 }
 
 /// The 1-based `ntile` bucket for ordered position `p` of `m` rows split into

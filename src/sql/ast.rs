@@ -78,6 +78,45 @@ pub struct WindowSpec {
     pub partition_by: Vec<Expr>,
     /// `ORDER BY` terms within each partition.
     pub order_by: Vec<OrderTerm>,
+    /// An explicit frame clause, if given (else the default frame applies).
+    pub frame: Option<WindowFrame>,
+}
+
+/// A window frame: a mode (`ROWS`/`RANGE`/`GROUPS`) and start/end bounds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFrame {
+    /// `ROWS`, `RANGE`, or `GROUPS`.
+    pub mode: FrameMode,
+    /// The frame's starting bound.
+    pub start: FrameBound,
+    /// The frame's ending bound (`CURRENT ROW` when no `BETWEEN` is given).
+    pub end: FrameBound,
+}
+
+/// The unit a window frame is measured in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameMode {
+    /// `ROWS` — physical row offsets.
+    Rows,
+    /// `RANGE` — logical (peer) ranges.
+    Range,
+    /// `GROUPS` — peer-group offsets.
+    Groups,
+}
+
+/// One bound of a window frame.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrameBound {
+    /// `UNBOUNDED PRECEDING`.
+    UnboundedPreceding,
+    /// `<n> PRECEDING`.
+    Preceding(i64),
+    /// `CURRENT ROW`.
+    CurrentRow,
+    /// `<n> FOLLOWING`.
+    Following(i64),
+    /// `UNBOUNDED FOLLOWING`.
+    UnboundedFollowing,
 }
 
 /// A compound-query operator joining two `SELECT`s.

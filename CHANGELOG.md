@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: explicit window frame clauses — `ROWS`/`RANGE`/`GROUPS BETWEEN … AND …`
+  (and the bare-start form), with `UNBOUNDED`/`CURRENT ROW`/`N PRECEDING`/
+  `N FOLLOWING` bounds and an accepted-and-ignored `EXCLUDE` clause
 - Phase 9: derived tables — `FROM (SELECT …) [AS] alias` as a sole source or a
   join operand
 - Phase 9: views (and CTEs) usable as a join source — a view or CTE may now

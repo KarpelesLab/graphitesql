@@ -137,6 +137,18 @@ fn window_against_sqlite3() {
         "SELECT id, row_number() OVER (ORDER BY v DESC, id) FROM t ORDER BY id",
         "SELECT id, sum(v) OVER (ORDER BY v, id) + 100 FROM t ORDER BY id",
         "SELECT g, v, rank() OVER (PARTITION BY g ORDER BY v) FROM t ORDER BY g, v, id",
+        // Explicit ROWS frames.
+        "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id",
+        "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+        "SELECT id, avg(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+        "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id",
+        "SELECT id, last_value(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t ORDER BY id",
+        "SELECT id, first_value(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+        "SELECT id, max(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY id",
+        "SELECT id, count(*) OVER (ORDER BY id ROWS 2 PRECEDING) FROM t ORDER BY id",
+        // RANGE / GROUPS over the ordering key (peer-based).
+        "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+        "SELECT id, sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id",
     ];
 
     let mut failures = Vec::new();
