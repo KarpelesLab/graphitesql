@@ -60,7 +60,7 @@ fn graphitesql_reads_back_its_own_writes() {
     let path = temp_path("roundtrip.db");
     build_db(&path, 50);
 
-    let c = Connection::open(&path).unwrap();
+    let c = Connection::open_readonly(&path).unwrap();
     let r = c.query("SELECT a, b, c FROM t ORDER BY a").unwrap();
     assert_eq!(r.rows.len(), 50);
     assert_eq!(r.rows[0][0], Value::Integer(1));
@@ -78,7 +78,7 @@ fn graphitesql_reads_back_its_own_writes() {
 fn many_rows_with_splits_read_back() {
     let path = temp_path("splits.db");
     build_db(&path, 1500); // forces leaf + interior splits
-    let c = Connection::open(&path).unwrap();
+    let c = Connection::open_readonly(&path).unwrap();
     let r = c.query("SELECT count(*), min(a), max(a) FROM t").unwrap();
     assert_eq!(
         r.rows[0],

@@ -74,6 +74,31 @@ impl<'p> TableCursor<'p> {
         }
     }
 
+    /// Position at the last (highest-rowid) row. Returns `false` if empty. Useful
+    /// for finding the next auto-assigned rowid in `O(height)`.
+    pub fn last(&mut self) -> Result<bool> {
+        self.stack.clear();
+        self.exhausted = false;
+        let mut page_no = self.root;
+        loop {
+            let page = BtreePage::parse(self.pager.page(page_no)?)?;
+            if page.page_type().is_leaf() {
+                let n = page.num_cells();
+                if n == 0 {
+                    self.stack.push(Frame { page, idx: 0 });
+                    self.exhausted = true;
+                    return Ok(false);
+                }
+                self.stack.push(Frame { page, idx: n - 1 });
+                return Ok(true);
+            }
+            let nc = page.num_cells();
+            let child = page.child_pointer(nc)?; // right-most pointer
+            self.stack.push(Frame { page, idx: nc });
+            page_no = child;
+        }
+    }
+
     /// Position at the first (lowest-rowid) row. Returns `false` if the table is
     /// empty.
     pub fn first(&mut self) -> Result<bool> {

@@ -50,6 +50,61 @@ pub fn insert_table(wp: &mut WritePager, root: u32, rowid: i64, payload: &[u8]) 
     Ok(())
 }
 
+/// Delete the row with `rowid` from the table b-tree at `root`, if present.
+/// Returns whether a row was removed.
+///
+/// This rewrites the containing leaf without the cell. It does **not** yet
+/// reclaim freed pages, so to keep `integrity_check` happy it refuses to delete
+/// a row whose payload spills onto overflow pages (those would otherwise leak).
+/// Full freelist management is tracked for Phase 9.
+pub fn delete_table(wp: &mut WritePager, root: u32, rowid: i64) -> Result<bool> {
+    // Locate the leaf containing rowid by descending the tree.
+    let mut page_no = root;
+    loop {
+        let page = wp.page(page_no)?;
+        let body = page.body_offset();
+        let bt = BtreePage::parse(page)?;
+        let usable = wp.usable_size();
+        let page_size = usable + wp.header().reserved_space as usize;
+        match bt.page_type() {
+            PageType::LeafTable => {
+                let mut cells = read_leaf_cells(&bt, usable)?;
+                let Some(pos) = cells.iter().position(|(r, _)| *r == rowid) else {
+                    return Ok(false);
+                };
+                // Refuse overflow rows (their overflow pages would leak).
+                let n = bt.num_cells();
+                for i in 0..n {
+                    if bt.table_leaf_cell(i, usable)?.rowid == rowid
+                        && bt.table_leaf_cell(i, usable)?.payload.overflow != 0
+                    {
+                        return Err(Error::Unsupported(
+                            "DELETE/UPDATE of a row with overflow payload (freelist pending)",
+                        ));
+                    }
+                }
+                cells.remove(pos);
+                let header_prefix = page_one_prefix(page_no, &bt);
+                let buf = serialize_leaf(page_size, body, &cells, header_prefix.as_deref());
+                wp.write_page(page_no, buf)?;
+                return Ok(true);
+            }
+            PageType::InteriorTable => {
+                let n = bt.num_cells();
+                let mut next = bt.right_pointer();
+                for i in 0..n {
+                    if rowid <= bt.table_interior_key(i)? {
+                        next = bt.child_pointer(i)?;
+                        break;
+                    }
+                }
+                page_no = next;
+            }
+            _ => return Err(Error::Corrupt("delete from a non-table b-tree".into())),
+        }
+    }
+}
+
 /// Build the on-page cell bytes for a table-leaf row, allocating overflow pages
 /// for any payload that does not fit locally.
 fn build_leaf_cell(wp: &mut WritePager, rowid: i64, payload: &[u8]) -> Result<Vec<u8>> {

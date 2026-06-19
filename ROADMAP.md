@@ -211,15 +211,23 @@ databases lands well before write support).
 - **Reference:** `btree.c` (balance), `pager.c` (journal, commit),
   `fileformat2.html` (freelist, rollback journal format).
 
-### Phase 7 — DDL & DML codegen
+### Phase 7 — DDL & DML through the `Connection` API ✅ *(core done)*
 
-- **Deliverable:** codegen for `CREATE TABLE/INDEX`, `INSERT`, `UPDATE`,
-  `DELETE`, `ALTER TABLE`, `DROP`; schema mutation writes a correct
-  `sqlite_schema` and bumps the schema cookie; `ROWID`/`INTEGER PRIMARY KEY`
-  and `WITHOUT ROWID` tables; `UNIQUE`/`NOT NULL`/`CHECK`/`DEFAULT` constraints.
-- **Done:** the full `gtest.db` creation script run through graphitesql produces
-  a file byte-comparable (modulo documented nondeterminism) to `sqlite3`'s, and
-  the reverse opens cleanly.
+- **Deliverable:** a writable `Connection` (`execute`/`query`, file & `:memory:`)
+  running `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE`, and `BEGIN`/`COMMIT`/
+  `ROLLBACK`; schema mutation writes `sqlite_schema` and bumps the schema cookie;
+  `INTEGER PRIMARY KEY` rowid aliasing; `DEFAULT` values; autocommit + explicit
+  transactions with read-your-writes.
+- **Done:** in-memory and on-disk CREATE/INSERT/UPDATE/DELETE round-trip;
+  data persists across reopen; a database built entirely through graphitesql SQL
+  (`CREATE TABLE` + 300 parameterized `INSERT`s) is opened by real `sqlite3` with
+  `PRAGMA integrity_check = ok` (`tests/dml.rs`).
+- **Files:** `src/exec/mod.rs` (`Connection::{open,open_readonly,create,
+  open_memory,execute,execute_params}`), `src/btree/writer.rs` (`delete_table`),
+  `src/btree/cursor.rs` (`TableCursor::last`).
+- **Carried to Phase 9:** `CREATE INDEX` + index maintenance on write, `ALTER`,
+  `DROP`, `WITHOUT ROWID`, `UNIQUE`/`CHECK`/`NOT NULL` enforcement,
+  `INSERT … SELECT`, and freelist-backed reclamation for overflow-row delete.
 - **Reference:** `build.c`, `insert.c`, `update.c`, `delete.c`, `alter.c`.
 
 ### Phase 8 — WAL mode

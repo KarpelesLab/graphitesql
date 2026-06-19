@@ -4,11 +4,12 @@ A pure, safe, `no_std`-capable Rust re-implementation of **SQLite**, as a single
 crate, aiming for **byte-for-byte compatibility with the SQLite 3 database file
 format**.
 
-> **Status: read engine working.** graphitesql opens real SQLite files and runs
-> `SELECT` queries — table/index b-trees, overflow pages, the schema catalog, a
-> SQL parser, and an expression/aggregate executor are implemented and tested
-> against databases produced by `sqlite3`. Writing (the b-tree writer, journal,
-> WAL) is next. The full build plan and status is in **[ROADMAP.md](ROADMAP.md)**.
+> **Status: read + write working.** graphitesql opens real SQLite files, runs
+> `SELECT` queries, and **creates databases and runs `CREATE TABLE`/`INSERT`/
+> `UPDATE`/`DELETE` with transactions** — and the databases it writes are opened
+> by the real `sqlite3` CLI with `PRAGMA integrity_check = ok`. Still to come:
+> indexes on the write path, WAL mode, and broader SQL (see the roadmap). The
+> full build plan and status is in **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why
 
@@ -42,27 +43,32 @@ the same file format and SQL dialect to places where a **safe, dependency-free,
 
 ## Usage
 
-Today you can open a real SQLite database and query it (read-only):
+Create a database, write to it, and read it back — and `sqlite3` can open it too:
 
 ```rust,ignore
 use graphitesql::{Connection, Value};
 
-let db = Connection::open("app.db")?; // a file written by sqlite3
-let result = db.query("SELECT id, name FROM users WHERE id > 1 ORDER BY name")?;
+let mut db = Connection::open_memory()?;            // or Connection::create("app.db")?
+db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)")?;
+db.execute("INSERT INTO users(name) VALUES ('ada'), ('grace')")?;
+db.execute("UPDATE users SET name = 'Ada Lovelace' WHERE id = 1")?;
 
+let result = db.query("SELECT id, name FROM users ORDER BY name")?;
 for row in &result.rows {
     if let (Value::Integer(id), Value::Text(name)) = (&row[0], &row[1]) {
         println!("{id}: {name}");
     }
 }
 
-// Aggregates, GROUP BY, expressions, scalar functions all work:
-let r = db.query("SELECT count(*), max(id) FROM users")?;
+// Aggregates, GROUP BY, expressions, scalar functions, transactions all work.
+db.execute("BEGIN")?;
+db.execute("DELETE FROM users WHERE id = 2")?;
+db.execute("COMMIT")?;
 ```
 
-The write path (`CREATE`/`INSERT`/`UPDATE`/`DELETE`, `:memory:` creation) is
-under construction — see the roadmap. Low-level format primitives are also
-public (`graphitesql::format::DatabaseHeader`, `graphitesql::btree`, …).
+Open an existing `sqlite3`-written file with `Connection::open("file.db")` (or
+`open_readonly`). Low-level format primitives are public too
+(`graphitesql::format::DatabaseHeader`, `graphitesql::btree`, …).
 
 ## Feature flags
 

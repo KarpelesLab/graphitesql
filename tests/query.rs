@@ -10,7 +10,7 @@ fn fixture(name: &str) -> String {
 }
 
 fn conn(name: &str) -> Connection {
-    Connection::open(&fixture(name)).expect("open connection")
+    Connection::open_readonly(&fixture(name)).expect("open connection")
 }
 
 fn ints(col: &[Vec<Value>], i: usize) -> Vec<i64> {
