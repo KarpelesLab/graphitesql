@@ -1485,14 +1485,28 @@ impl Connection {
         let tmeta = self.table_meta(&ci.table, None)?;
         let cols = self.index_columns(&tmeta, ci)?;
         let schema_next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
-        let rows = self.scan_table(&tmeta)?;
 
+        // WITHOUT ROWID secondary indexes are keyed by (indexed cols, PK cols)
+        // instead of (indexed cols, rowid).
+        let root = if tmeta.without_rowid {
+            let rows = self.scan_without_rowid(&tmeta)?;
+            let pk_cols = tmeta.storage_order[..tmeta.pk_len].to_vec();
+            let w = self.backend.writer()?;
+            let root = create_index_root(w)?;
+            for row in &rows {
+                insert_index(w, root, &wr_index_key(&cols, &pk_cols, row))?;
+            }
+            root
+        } else {
+            let rows = self.scan_table(&tmeta)?;
+            let w = self.backend.writer()?;
+            let root = create_index_root(w)?;
+            for (rowid, values) in &rows {
+                insert_index(w, root, &index_key(&cols, values, *rowid))?;
+            }
+            root
+        };
         let w = self.backend.writer()?;
-        let root = create_index_root(w)?;
-        for (rowid, values) in &rows {
-            let key = index_key(&cols, values, *rowid);
-            insert_index(w, root, &key)?;
-        }
         let schema_row = encode_record(&[
             Value::Text("index".into()),
             Value::Text(ci.name.clone()),
@@ -3050,6 +3064,9 @@ impl Connection {
             insert_index(self.backend.writer()?, meta.root, &record)?;
             affected += 1;
         }
+        if affected > 0 {
+            self.rebuild_wr_indexes(meta, &ins.table)?;
+        }
         Ok(affected)
     }
 
@@ -3079,6 +3096,7 @@ impl Connection {
         }
         if deleted > 0 {
             self.rewrite_without_rowid(meta, kept.into_iter())?;
+            self.rebuild_wr_indexes(meta, &del.table)?;
         }
         Ok(deleted)
     }
@@ -3132,6 +3150,7 @@ impl Connection {
         }
         if affected > 0 {
             self.rewrite_without_rowid(meta, out.into_iter())?;
+            self.rebuild_wr_indexes(meta, &upd.table)?;
         }
         Ok(affected)
     }
@@ -3150,6 +3169,25 @@ impl Connection {
         clear_index(w, meta.root)?;
         for rec in &records {
             insert_index(w, meta.root, rec)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild every secondary index of a `WITHOUT ROWID` table from its current
+    /// rows, keying entries by (indexed cols, PK cols).
+    fn rebuild_wr_indexes(&mut self, meta: &TableMeta, table: &str) -> Result<()> {
+        let indexes = self.indexes_of(table)?;
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let rows = self.scan_without_rowid(meta)?;
+        let pk_cols = meta.storage_order[..meta.pk_len].to_vec();
+        let w = self.backend.writer()?;
+        for idx in &indexes {
+            clear_index(w, idx.root)?;
+            for row in &rows {
+                insert_index(w, idx.root, &wr_index_key(&idx.cols, &pk_cols, row))?;
+            }
         }
         Ok(())
     }
@@ -4167,6 +4205,14 @@ fn check_not_null(meta: &TableMeta, values: &[Value]) -> Result<()> {
 fn index_key(cols: &[usize], values: &[Value], rowid: i64) -> Vec<u8> {
     let mut key: Vec<Value> = cols.iter().map(|&p| values[p].clone()).collect();
     key.push(Value::Integer(rowid));
+    encode_record(&key)
+}
+
+/// An index record for a `WITHOUT ROWID` table: the indexed columns followed by
+/// the table's PRIMARY KEY columns (which make the entry unique), as SQLite does.
+fn wr_index_key(cols: &[usize], pk_cols: &[usize], values: &[Value]) -> Vec<u8> {
+    let mut key: Vec<Value> = cols.iter().map(|&p| values[p].clone()).collect();
+    key.extend(pk_cols.iter().map(|&p| values[p].clone()));
     encode_record(&key)
 }
 

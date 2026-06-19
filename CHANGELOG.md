@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: secondary indexes on `WITHOUT ROWID` tables — `CREATE INDEX` on a
+  WITHOUT ROWID table builds and maintains a b-tree keyed by (indexed cols, PK
+  cols), as SQLite does; verified by `sqlite3 integrity_check`
 - Phase 9: `INSTEAD OF` triggers — INSERT/UPDATE/DELETE on a view fire its
   `INSTEAD OF` triggers (with `OLD`/`NEW`), making views writable; without one,
   modifying a view is rejected as in SQLite

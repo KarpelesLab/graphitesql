@@ -160,6 +160,47 @@ fn integrity_and_roundtrip_vs_sqlite3() {
     cleanup(&path);
 }
 
+#[test]
+fn secondary_index_integrity() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = temp_path("wr-idx.db");
+    cleanup(&path);
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v INT) WITHOUT ROWID")
+            .unwrap();
+        c.execute("CREATE INDEX iv ON t(v)").unwrap();
+        for i in 1..=30i64 {
+            c.execute(&format!(
+                "INSERT INTO t VALUES ('k{:02}', {})",
+                30 - i,
+                i % 6
+            ))
+            .unwrap();
+        }
+        c.execute("DELETE FROM t WHERE v = 0").unwrap();
+        c.execute("UPDATE t SET v = v + 100 WHERE k = 'k05'")
+            .unwrap();
+    }
+    // The secondary index b-tree on a WITHOUT ROWID table (keyed by (v, k))
+    // must be consistent with the table per real sqlite3.
+    assert_eq!(sqlite3_run(&path, "PRAGMA integrity_check;"), "ok");
+    // And it's used by sqlite to answer a lookup correctly.
+    let want = sqlite3_run(&path, "SELECT count(*) FROM t WHERE v = 3;");
+    let got = {
+        let c = Connection::open_readonly(&path).unwrap();
+        match c.query("SELECT count(*) FROM t WHERE v = 3").unwrap().rows[0][0] {
+            Value::Integer(n) => n.to_string(),
+            _ => panic!(),
+        }
+    };
+    assert_eq!(got, want);
+    cleanup(&path);
+}
+
 /// graphitesql must also read a WITHOUT ROWID database written by real sqlite3.
 #[test]
 fn reads_sqlite_written_without_rowid() {

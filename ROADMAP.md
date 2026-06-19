@@ -325,14 +325,17 @@ coverage rather than having a single "done".
   - **`WITHOUT ROWID` tables** — PK-clustered index-b-tree storage (records
     held PK-first), CRUD + composite PKs + `INSERT OR REPLACE`; files pass real
     `sqlite3 integrity_check` (`tests/without_rowid.rs`). *(Subset: the PRIMARY
-    KEY is the only key — additional `UNIQUE`/secondary indexes on a WITHOUT
-    ROWID table aren't supported yet.)*;
+    KEY is the only key; additional `UNIQUE` constraints on a WITHOUT ROWID
+    table aren't supported yet, but explicit secondary `CREATE INDEX` is.)*;
   - **`INSTEAD OF` triggers / writable views** — DML on a view fires its
-    `INSTEAD OF` triggers with `OLD`/`NEW` (`tests/triggers.rs`).
+    `INSTEAD OF` triggers with `OLD`/`NEW` (`tests/triggers.rs`);
+  - **secondary indexes on `WITHOUT ROWID` tables** — `CREATE INDEX` builds a
+    b-tree keyed by (indexed cols, PK cols), maintained across DML
+    (`tests/without_rowid.rs`).
 - **Deliverable (remaining):** the storage-engine frontier — the WAL *write*
   path (frame append + `-shm` wal-index + checkpoint); real `VACUUM` compaction;
-  b-tree page merging/rebalance on delete; and secondary indexes on `WITHOUT
-  ROWID` tables.
+  b-tree page merging/rebalance on delete; and `UNIQUE` (auto-index) constraints
+  on `WITHOUT ROWID` tables.
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.
