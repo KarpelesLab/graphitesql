@@ -343,10 +343,16 @@ coverage rather than having a single "done".
     `wal_checkpoint`, and reopen-from-`-wal` (`tests/wal_write.rs`; see Phase 8);
   - **real `VACUUM` compaction** — rebuilds into a fresh, gap-free image,
     shrinking the file and preserving content (`tests/vacuum.rs`); b-tree cursors
-    now also tolerate empty pages left by heavy deletes.
-- **Deliverable (remaining):** b-tree page *merging* on delete (eager space
-  reclamation — `VACUUM` already reclaims it, and cursors handle the empty pages
-  meanwhile); and `UNIQUE` (auto-index) constraints on `WITHOUT ROWID` tables.
+    now also tolerate empty pages left by heavy deletes;
+  - **`UNIQUE` constraints on `WITHOUT ROWID` tables** — the implied
+    `sqlite_autoindex` (unique cols + PK cols, numbered by declaration position)
+    is written, maintained, and enforced (`tests/without_rowid.rs`).
+- **Deliverable (remaining):** eager b-tree page *merging* on delete — a pure
+  space-reclamation optimization. `VACUUM` already reclaims the space, cursors
+  traverse the empty pages correctly meanwhile, and SQLite itself only merges
+  opportunistically, so a non-merging delete is valid SQLite-compatible behavior.
+  This is the last open item, and it affects neither correctness nor file-format
+  compatibility.
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.

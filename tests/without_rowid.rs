@@ -201,6 +201,48 @@ fn secondary_index_integrity() {
     cleanup(&path);
 }
 
+#[test]
+fn unique_constraint_on_wr() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = temp_path("wr-uniq.db");
+    cleanup(&path);
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE TABLE t(k TEXT PRIMARY KEY, email TEXT UNIQUE, n INT) WITHOUT ROWID")
+            .unwrap();
+        c.execute("INSERT INTO t VALUES ('a','a@x',1),('b','b@x',2)")
+            .unwrap();
+        // Duplicate UNIQUE email is rejected.
+        assert!(c.execute("INSERT INTO t VALUES ('c','a@x',3)").is_err());
+        // NULL email is allowed and distinct.
+        c.execute("INSERT INTO t VALUES ('d',NULL,4),('e',NULL,5)")
+            .unwrap();
+        // Update into a conflicting email is rejected.
+        assert!(c.execute("UPDATE t SET email='b@x' WHERE k='a'").is_err());
+    }
+    // The implied sqlite_autoindex for the UNIQUE column must be consistent.
+    assert_eq!(sqlite3_run(&path, "PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        sqlite3_run(
+            &path,
+            "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name;"
+        ),
+        "sqlite_autoindex_t_2"
+    );
+    // sqlite enforces the UNIQUE via the index we wrote.
+    assert!(!Command::new("sqlite3")
+        .arg(&path)
+        .arg("INSERT INTO t VALUES ('z','a@x',9);")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    cleanup(&path);
+}
+
 /// graphitesql must also read a WITHOUT ROWID database written by real sqlite3.
 #[test]
 fn reads_sqlite_written_without_rowid() {

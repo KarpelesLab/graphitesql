@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: `UNIQUE` constraints on `WITHOUT ROWID` tables — the implied
+  `sqlite_autoindex` (keyed by the unique cols + PK cols, numbered by SQLite's
+  declaration-position rule) is written and maintained, and the constraint is
+  enforced; verified by `sqlite3 integrity_check`
 - Phase 9: real `VACUUM` compaction — rebuilds the database into a fresh, gap-free
   image (no free pages, defragmented b-trees), shrinking the file while
   preserving rows, indexes, triggers, and `user_version`; the result passes real

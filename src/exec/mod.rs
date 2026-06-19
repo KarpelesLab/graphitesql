@@ -548,16 +548,10 @@ impl Connection {
         // A WITHOUT ROWID table is stored as a PK-clustered index b-tree; an
         // ordinary table uses a rowid table b-tree.
         let root = if ct.without_rowid {
-            // Validate the supported subset early (PK present, no extra UNIQUE).
-            let pk = primary_key_positions(ct);
-            if pk.is_empty() {
+            // A WITHOUT ROWID table must have a PRIMARY KEY (it is the b-tree key).
+            if primary_key_positions(ct).is_empty() {
                 return Err(Error::Error(
                     "WITHOUT ROWID table must have a PRIMARY KEY".into(),
-                ));
-            }
-            if collect_unique_sets(ct, None).len() > 1 {
-                return Err(Error::Unsupported(
-                    "WITHOUT ROWID with additional UNIQUE constraints",
                 ));
             }
             create_index_root(self.backend.writer()?)?
@@ -582,14 +576,25 @@ impl Connection {
         // Create the automatic indexes SQLite implies for UNIQUE / non-rowid
         // PRIMARY KEY constraints, so the file is a valid SQLite database (it
         // otherwise reports "wrong # of entries in index sqlite_autoindex_*").
-        // A WITHOUT ROWID table's PK is the table itself, so it needs none.
-        let ipk = find_integer_primary_key(ct);
-        let unique = if ct.without_rowid {
-            Vec::new()
+        // For a WITHOUT ROWID table the PRIMARY KEY *is* the table (no separate
+        // b-tree), but it still consumes its `sqlite_autoindex_<t>_<n>` slot.
+        let ipk = if ct.without_rowid {
+            None
         } else {
-            collect_unique_sets(ct, ipk)
+            find_integer_primary_key(ct)
         };
-        for (n, schema_rowid) in (next + 1..).enumerate().take(unique.len()) {
+        let unique = collect_unique_sets(ct, ipk);
+        let pk = if ct.without_rowid {
+            primary_key_positions(ct)
+        } else {
+            Vec::new()
+        };
+        let mut schema_rowid = next + 1;
+        for (n, set) in unique.iter().enumerate() {
+            // The clustered PRIMARY KEY of a WITHOUT ROWID table gets no b-tree.
+            if ct.without_rowid && *set == pk {
+                continue;
+            }
             let idx_root = create_index_root(self.backend.writer()?)?;
             let idx_row = encode_record(&[
                 Value::Text("index".into()),
@@ -604,6 +609,7 @@ impl Connection {
                 schema_rowid,
                 &idx_row,
             )?;
+            schema_rowid += 1;
         }
 
         let cookie = self
@@ -3168,11 +3174,11 @@ impl Connection {
             check_not_null(meta, &values)?;
             self.check_constraints(meta, &values, None, params)?;
 
-            // Reject a duplicate primary key.
+            // Reject a duplicate primary key or any other UNIQUE constraint.
             let existing = self.scan_without_rowid(meta)?;
             let dup = existing
                 .iter()
-                .any(|r| pk.iter().all(|&c| eval::compare(&r[c], &values[c]).is_eq()));
+                .any(|r| unique_match(&meta.unique, r, &values));
             if dup {
                 match ins.on_conflict {
                     OnConflict::Abort => {
@@ -3180,12 +3186,12 @@ impl Connection {
                     }
                     OnConflict::Ignore => continue,
                     OnConflict::Replace => {
-                        // Rebuild without the conflicting row, then insert.
+                        // Rebuild without the conflicting row(s), then insert.
                         self.rewrite_without_rowid(
                             meta,
-                            existing.into_iter().filter(|r| {
-                                !pk.iter().all(|&c| eval::compare(&r[c], &values[c]).is_eq())
-                            }),
+                            existing
+                                .into_iter()
+                                .filter(|r| !unique_match(&meta.unique, r, &values)),
                         )?;
                     }
                 }
@@ -3266,14 +3272,10 @@ impl Connection {
             }
             out.push(row);
         }
-        // Reject duplicate primary keys produced by the update.
-        let pk = &meta.storage_order[..meta.pk_len];
+        // Reject duplicate primary keys or UNIQUE values produced by the update.
         for i in 0..out.len() {
             for j in (i + 1)..out.len() {
-                if pk
-                    .iter()
-                    .all(|&c| eval::compare(&out[i][c], &out[j][c]).is_eq())
-                {
+                if unique_match(&meta.unique, &out[i], &out[j]) {
                     return Err(Error::Constraint("UNIQUE constraint failed".into()));
                 }
             }
@@ -3825,12 +3827,6 @@ impl Connection {
                     "WITHOUT ROWID table must have a PRIMARY KEY".into(),
                 ));
             }
-            // Supported subset: the PRIMARY KEY is the only key (no extra UNIQUE).
-            if unique.len() > 1 {
-                return Err(Error::Unsupported(
-                    "WITHOUT ROWID with additional UNIQUE constraints",
-                ));
-            }
             let mut order = pk.clone();
             for i in 0..columns.len() {
                 if !pk.contains(&i) {
@@ -4346,6 +4342,18 @@ fn index_key(cols: &[usize], values: &[Value], rowid: i64) -> Vec<u8> {
     let mut key: Vec<Value> = cols.iter().map(|&p| values[p].clone()).collect();
     key.push(Value::Integer(rowid));
     encode_record(&key)
+}
+
+/// Whether rows `a` and `b` collide on any UNIQUE/PRIMARY KEY column set (all
+/// columns of the set equal and none NULL — NULLs are distinct, as in SQLite).
+fn unique_match(sets: &[Vec<usize>], a: &[Value], b: &[Value]) -> bool {
+    sets.iter().any(|set| {
+        set.iter().all(|&c| {
+            !matches!(a[c], Value::Null)
+                && !matches!(b[c], Value::Null)
+                && eval::compare(&a[c], &b[c]).is_eq()
+        })
+    })
 }
 
 /// An index record for a `WITHOUT ROWID` table: the indexed columns followed by
