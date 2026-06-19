@@ -326,11 +326,13 @@ coverage rather than having a single "done".
     held PK-first), CRUD + composite PKs + `INSERT OR REPLACE`; files pass real
     `sqlite3 integrity_check` (`tests/without_rowid.rs`). *(Subset: the PRIMARY
     KEY is the only key — additional `UNIQUE`/secondary indexes on a WITHOUT
-    ROWID table aren't supported yet.)*
+    ROWID table aren't supported yet.)*;
+  - **`INSTEAD OF` triggers / writable views** — DML on a view fires its
+    `INSTEAD OF` triggers with `OLD`/`NEW` (`tests/triggers.rs`).
 - **Deliverable (remaining):** the storage-engine frontier — the WAL *write*
   path (frame append + `-shm` wal-index + checkpoint); real `VACUUM` compaction;
-  b-tree page merging/rebalance on delete; secondary indexes on `WITHOUT ROWID`
-  tables; plus `INSTEAD OF` (view) triggers and writable views.
+  b-tree page merging/rebalance on delete; and secondary indexes on `WITHOUT
+  ROWID` tables.
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.

@@ -186,6 +186,51 @@ fn recursive_triggers_pragma() {
 }
 
 #[test]
+fn instead_of_makes_view_writable() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE base(id INTEGER PRIMARY KEY, v INT, hidden INT)")
+        .unwrap();
+    c.execute("INSERT INTO base(id,v,hidden) VALUES (1,10,100),(2,20,200)")
+        .unwrap();
+    c.execute("CREATE VIEW vw AS SELECT id, v FROM base")
+        .unwrap();
+
+    // Without an INSTEAD OF trigger, the view is not writable.
+    assert!(c.execute("INSERT INTO vw(id,v) VALUES (3,30)").is_err());
+
+    c.execute(
+        "CREATE TRIGGER vi INSTEAD OF INSERT ON vw BEGIN \
+            INSERT INTO base(id,v,hidden) VALUES (NEW.id, NEW.v, NEW.v * 10); \
+         END",
+    )
+    .unwrap();
+    c.execute(
+        "CREATE TRIGGER vu INSTEAD OF UPDATE ON vw BEGIN \
+            UPDATE base SET v = NEW.v WHERE id = OLD.id; \
+         END",
+    )
+    .unwrap();
+    c.execute(
+        "CREATE TRIGGER vd INSTEAD OF DELETE ON vw BEGIN \
+            DELETE FROM base WHERE id = OLD.id; \
+         END",
+    )
+    .unwrap();
+
+    // INSERT through the view.
+    c.execute("INSERT INTO vw(id,v) VALUES (3,30)").unwrap();
+    assert_eq!(ints(&c, "SELECT hidden FROM base WHERE id = 3"), vec![300]);
+
+    // UPDATE through the view.
+    c.execute("UPDATE vw SET v = 99 WHERE id = 1").unwrap();
+    assert_eq!(ints(&c, "SELECT v FROM base WHERE id = 1"), vec![99]);
+
+    // DELETE through the view.
+    c.execute("DELETE FROM vw WHERE id = 2").unwrap();
+    assert_eq!(ints(&c, "SELECT count(*) FROM base WHERE id = 2"), vec![0]);
+}
+
+#[test]
 fn triggers_against_sqlite3() {
     use std::process::Command;
     if Command::new("sqlite3").arg("--version").output().is_err() {

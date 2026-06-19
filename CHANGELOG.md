@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: `INSTEAD OF` triggers — INSERT/UPDATE/DELETE on a view fire its
+  `INSTEAD OF` triggers (with `OLD`/`NEW`), making views writable; without one,
+  modifying a view is rejected as in SQLite
 - Phase 9: `WITHOUT ROWID` tables — stored as a PK-clustered index b-tree
   (records held PK-first), with CRUD, composite primary keys, and
   `INSERT OR REPLACE`. graphitesql-written WITHOUT ROWID databases pass real

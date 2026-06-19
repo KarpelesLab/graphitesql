@@ -857,7 +857,8 @@ impl Connection {
             }
             return Err(Error::Error(format!("trigger {} already exists", ct.name)));
         }
-        if self.schema.table(&ct.table).is_none() {
+        // The target may be a table or (for INSTEAD OF triggers) a view.
+        if self.schema.table(&ct.table).is_none() && !self.is_view(&ct.table) {
             return Err(Error::Error(format!("no such table: {}", ct.table)));
         }
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
@@ -925,11 +926,11 @@ impl Connection {
         table: &str,
         kind: TrigEvent,
         timing: TriggerTiming,
-        meta: &TableMeta,
+        columns: &[ColumnInfo],
         old: Option<(&[Value], i64)>,
         new: Option<(&[Value], i64)>,
         params: &Params,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Non-recursive by default; with PRAGMA recursive_triggers a trigger may
         // fire others, bounded to avoid runaway recursion (SQLite caps at 1000).
         let depth = self.trigger_depth.get();
@@ -938,30 +939,29 @@ impl Connection {
             return if self.recursive_triggers {
                 Err(Error::Error("too many levels of trigger recursion".into()))
             } else {
-                Ok(())
+                Ok(false)
             };
         }
         let trigs = self.triggers_for(table, kind, timing)?;
         if trigs.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         self.trigger_depth.set(depth + 1);
         let base = self.outer_scope.borrow().len();
         if let Some((vals, rid)) = old {
-            self.push_row_frame("old", meta, vals, rid);
+            self.push_row_frame("old", columns, vals, rid);
         }
         if let Some((vals, rid)) = new {
-            self.push_row_frame("new", meta, vals, rid);
+            self.push_row_frame("new", columns, vals, rid);
         }
         let result = self.run_trigger_bodies(&trigs, params);
         self.outer_scope.borrow_mut().truncate(base);
         self.trigger_depth.set(depth);
-        result
+        result.map(|()| true)
     }
 
-    fn push_row_frame(&self, label: &str, meta: &TableMeta, values: &[Value], rowid: i64) {
-        let columns = meta
-            .columns
+    fn push_row_frame(&self, label: &str, columns: &[ColumnInfo], values: &[Value], rowid: i64) {
+        let columns = columns
             .iter()
             .map(|c| ColumnInfo {
                 name: c.name.clone(),
@@ -974,6 +974,156 @@ impl Connection {
             row: values.to_vec(),
             rowid: Some(rowid),
         });
+    }
+
+    /// Whether `name` is a view.
+    fn is_view(&self, name: &str) -> bool {
+        self.schema.objects().iter().any(|o| {
+            o.obj_type == crate::schema::ObjectType::View && o.name.eq_ignore_ascii_case(name)
+        })
+    }
+
+    /// The output columns of a view (labeled with the view name).
+    fn view_columns(&self, name: &str, params: &Params) -> Result<Vec<ColumnInfo>> {
+        match self.try_view(name, None, params)? {
+            Some((cols, _)) => Ok(cols),
+            None => Err(Error::Error(format!("no such view: {name}"))),
+        }
+    }
+
+    /// `INSERT` into a view: fire its `INSTEAD OF INSERT` triggers (per row), or
+    /// error if none exist.
+    fn exec_view_insert(
+        &mut self,
+        ins: &Insert,
+        rows: &[Vec<Expr>],
+        params: &Params,
+    ) -> Result<usize> {
+        let cols = self.view_columns(&ins.table, params)?;
+        if self
+            .triggers_for(&ins.table, TrigEvent::Insert, TriggerTiming::InsteadOf)?
+            .is_empty()
+        {
+            return Err(Error::Error(format!(
+                "cannot modify {} — it is a view",
+                ins.table
+            )));
+        }
+        let target: Vec<usize> = if ins.columns.is_empty() {
+            (0..cols.len()).collect()
+        } else {
+            ins.columns
+                .iter()
+                .map(|name| {
+                    cols.iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| Error::Error(format!("no such column: {name}")))
+                })
+                .collect::<Result<_>>()?
+        };
+        let mut affected = 0;
+        for row_exprs in rows {
+            let ctx = EvalCtx::rowless(params).with_subqueries(self);
+            let mut new = alloc::vec![Value::Null; cols.len()];
+            for (i, e) in row_exprs.iter().enumerate() {
+                new[target[i]] = eval::eval(e, &ctx)?;
+            }
+            self.fire_triggers(
+                &ins.table,
+                TrigEvent::Insert,
+                TriggerTiming::InsteadOf,
+                &cols,
+                None,
+                Some((&new, 0)),
+                params,
+            )?;
+            affected += 1;
+        }
+        Ok(affected)
+    }
+
+    /// `DELETE` from a view: fire `INSTEAD OF DELETE` triggers for each row that
+    /// the view yields and the `WHERE` selects.
+    fn exec_view_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
+        let (cols, rows) = self
+            .try_view(&del.table, None, params)?
+            .ok_or_else(|| Error::Error(format!("no such view: {}", del.table)))?;
+        if self
+            .triggers_for(&del.table, TrigEvent::Delete, TriggerTiming::InsteadOf)?
+            .is_empty()
+        {
+            return Err(Error::Error(format!(
+                "cannot modify {} — it is a view",
+                del.table
+            )));
+        }
+        let mut affected = 0;
+        for row in rows {
+            if let Some(p) = &del.where_clause {
+                let ctx = row_ctx(&row.values, &cols, None, params).with_subqueries(self);
+                if eval::truth(&eval::eval(p, &ctx)?) != Some(true) {
+                    continue;
+                }
+            }
+            self.fire_triggers(
+                &del.table,
+                TrigEvent::Delete,
+                TriggerTiming::InsteadOf,
+                &cols,
+                Some((&row.values, 0)),
+                None,
+                params,
+            )?;
+            affected += 1;
+        }
+        Ok(affected)
+    }
+
+    /// `UPDATE` a view: fire `INSTEAD OF UPDATE` triggers with OLD/NEW for each
+    /// selected row.
+    fn exec_view_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
+        let (cols, rows) = self
+            .try_view(&upd.table, None, params)?
+            .ok_or_else(|| Error::Error(format!("no such view: {}", upd.table)))?;
+        if self
+            .triggers_for(&upd.table, TrigEvent::Update, TriggerTiming::InsteadOf)?
+            .is_empty()
+        {
+            return Err(Error::Error(format!(
+                "cannot modify {} — it is a view",
+                upd.table
+            )));
+        }
+        let mut affected = 0;
+        for row in rows {
+            let old = row.values.clone();
+            if let Some(p) = &upd.where_clause {
+                let ctx = row_ctx(&old, &cols, None, params).with_subqueries(self);
+                if eval::truth(&eval::eval(p, &ctx)?) != Some(true) {
+                    continue;
+                }
+            }
+            let mut new = old.clone();
+            for (col, expr) in &upd.assignments {
+                let pos = cols
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col))
+                    .ok_or_else(|| Error::Error(format!("no such column: {col}")))?;
+                let ctx = row_ctx(&new, &cols, None, params).with_subqueries(self);
+                new[pos] = eval::eval(expr, &ctx)?;
+            }
+            self.fire_triggers(
+                &upd.table,
+                TrigEvent::Update,
+                TriggerTiming::InsteadOf,
+                &cols,
+                Some((&old, 0)),
+                Some((&new, 0)),
+                params,
+            )?;
+            affected += 1;
+        }
+        Ok(affected)
     }
 
     fn run_trigger_bodies(&mut self, trigs: &[CreateTrigger], params: &Params) -> Result<()> {
@@ -1012,6 +1162,9 @@ impl Connection {
             InsertSource::DefaultValues => alloc::vec![Vec::new()],
             InsertSource::Select(_) => return Err(Error::Unsupported("INSERT ... SELECT")),
         };
+        if self.is_view(&ins.table) {
+            return self.exec_view_insert(ins, &rows, params);
+        }
         let meta = self.table_meta(&ins.table, None)?;
         if meta.without_rowid {
             return self.exec_insert_without_rowid(ins, &meta, &rows, params);
@@ -1103,7 +1256,7 @@ impl Connection {
                 &ins.table,
                 TrigEvent::Insert,
                 TriggerTiming::Before,
-                &meta,
+                &meta.columns,
                 None,
                 Some((&index_values, rowid)),
                 params,
@@ -1121,7 +1274,7 @@ impl Connection {
                 &ins.table,
                 TrigEvent::Insert,
                 TriggerTiming::After,
-                &meta,
+                &meta.columns,
                 None,
                 Some((&index_values, rowid)),
                 params,
@@ -1172,6 +1325,9 @@ impl Connection {
     }
 
     fn exec_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
+        if self.is_view(&del.table) {
+            return self.exec_view_delete(del, params);
+        }
         let meta = self.table_meta(&del.table, None)?;
         if meta.without_rowid {
             return self.exec_delete_without_rowid(del, &meta, params);
@@ -1185,7 +1341,7 @@ impl Connection {
                     &del.table,
                     TrigEvent::Delete,
                     TriggerTiming::Before,
-                    &meta,
+                    &meta.columns,
                     Some((old, *rowid)),
                     None,
                     params,
@@ -1203,7 +1359,7 @@ impl Connection {
                     &del.table,
                     TrigEvent::Delete,
                     TriggerTiming::After,
-                    &meta,
+                    &meta.columns,
                     Some((old, *rowid)),
                     None,
                     params,
@@ -1217,6 +1373,9 @@ impl Connection {
     }
 
     fn exec_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
+        if self.is_view(&upd.table) {
+            return self.exec_view_update(upd, params);
+        }
         let meta = self.table_meta(&upd.table, None)?;
         if meta.without_rowid {
             return self.exec_update_without_rowid(upd, &meta, params);
@@ -1278,7 +1437,7 @@ impl Connection {
                 &upd.table,
                 TrigEvent::Update,
                 TriggerTiming::Before,
-                &meta,
+                &meta.columns,
                 Some((&old_row, rowid)),
                 Some((&values, new_rowid)),
                 params,
@@ -1301,7 +1460,7 @@ impl Connection {
                 &upd.table,
                 TrigEvent::Update,
                 TriggerTiming::After,
-                &meta,
+                &meta.columns,
                 Some((&old_row, rowid)),
                 Some((&new_full, new_rowid)),
                 params,
