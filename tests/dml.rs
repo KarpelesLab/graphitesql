@@ -108,6 +108,27 @@ fn not_null_constraint_enforced() {
 }
 
 #[test]
+fn additional_scalar_functions() {
+    let c = Connection::open_memory().unwrap();
+    let r = c
+        .query("SELECT sign(-5), sign(0), sign(9), concat('a', NULL, 'b'), concat_ws('-', 1, 2, 3)")
+        .unwrap();
+    let row = &r.rows[0];
+    assert_eq!(row[0], Value::Integer(-1));
+    assert_eq!(row[1], Value::Integer(0));
+    assert_eq!(row[2], Value::Integer(1));
+    assert_eq!(row[3], Value::Text("ab".into()));
+    assert_eq!(row[4], Value::Text("1-2-3".into()));
+
+    let r = c
+        .query("SELECT zeroblob(3), unhex('41FF'), quote('a''b')")
+        .unwrap();
+    assert_eq!(r.rows[0][0], Value::Blob(vec![0, 0, 0]));
+    assert_eq!(r.rows[0][1], Value::Blob(vec![0x41, 0xff]));
+    assert_eq!(r.rows[0][2], Value::Text("'a''b'".into()));
+}
+
+#[test]
 fn defaults_applied() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, status TEXT DEFAULT 'new', n INT DEFAULT 0)")

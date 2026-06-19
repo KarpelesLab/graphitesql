@@ -123,8 +123,113 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 v[2].clone()
             }
         }
+        "zeroblob" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => {
+                    let n = eval::to_i64(other).max(0) as usize;
+                    Value::Blob(alloc::vec![0u8; n])
+                }
+            }
+        }
+        "quote" => {
+            arity(&lname, args, 1)?;
+            Value::Text(quote_value(&v[0]))
+        }
+        "sign" => {
+            arity(&lname, args, 1)?;
+            match eval::to_number(&v[0]) {
+                Value::Integer(i) => Value::Integer(i.signum()),
+                Value::Real(r) => Value::Integer(if r > 0.0 {
+                    1
+                } else if r < 0.0 {
+                    -1
+                } else {
+                    0
+                }),
+                _ => Value::Null,
+            }
+        }
+        "concat" => {
+            // SQLite 3.44+: concatenate all args, treating NULL as empty.
+            let mut s = String::new();
+            for x in &v {
+                if !matches!(x, Value::Null) {
+                    s.push_str(&eval::to_text(x));
+                }
+            }
+            Value::Text(s)
+        }
+        "concat_ws" => {
+            if v.is_empty() {
+                return Err(Error::Error("concat_ws() needs a separator".into()));
+            }
+            if matches!(v[0], Value::Null) {
+                Value::Null
+            } else {
+                let sep = eval::to_text(&v[0]);
+                let parts: alloc::vec::Vec<String> = v[1..]
+                    .iter()
+                    .filter(|x| !matches!(x, Value::Null))
+                    .map(eval::to_text)
+                    .collect();
+                Value::Text(parts.join(&sep))
+            }
+        }
+        "unhex" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => match unhex(&eval::to_text(other)) {
+                    Some(b) => Value::Blob(b),
+                    None => Value::Null,
+                },
+            }
+        }
         _ => return Err(Error::Unsupported("unknown scalar function")),
     })
+}
+
+/// Render a value as a SQL literal, like SQLite's `quote()`.
+fn quote_value(v: &Value) -> String {
+    match v {
+        Value::Null => String::from("NULL"),
+        Value::Integer(i) => alloc::format!("{i}"),
+        Value::Real(r) => eval::format_real(*r),
+        Value::Text(s) => alloc::format!("'{}'", s.replace('\'', "''")),
+        Value::Blob(b) => {
+            let mut s = String::from("x'");
+            for byte in b {
+                s.push_str(&alloc::format!("{byte:02x}"));
+            }
+            s.push('\'');
+            s
+        }
+    }
+}
+
+/// Decode a hex string to bytes (even length, all hex digits), else `None`.
+fn unhex(s: &str) -> Option<alloc::vec::Vec<u8>> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let hexval = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = alloc::vec::Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        out.push((hexval(bytes[i])? << 4) | hexval(bytes[i + 1])?);
+        i += 2;
+    }
+    Some(out)
 }
 
 fn arity(name: &str, args: &[Expr], n: usize) -> Result<()> {
