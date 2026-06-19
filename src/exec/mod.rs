@@ -77,6 +77,9 @@ pub struct Connection {
     /// last. Resolved by name during `FROM` scanning before the schema is
     /// consulted; this is also how a recursive CTE sees its own working table.
     cte_env: core::cell::RefCell<Vec<CteBinding>>,
+    /// A stack of enclosing query rows, innermost last. A correlated subquery
+    /// pushes its evaluation row here so its body can resolve outer columns.
+    outer_scope: core::cell::RefCell<Vec<OuterFrame>>,
 }
 
 /// A materialized common table expression: a named, in-memory relation.
@@ -84,6 +87,13 @@ struct CteBinding {
     name: String,
     columns: Vec<ColumnInfo>,
     rows: Vec<InputRow>,
+}
+
+/// A snapshot of an enclosing query's current row, for correlated subqueries.
+struct OuterFrame {
+    columns: Vec<ColumnInfo>,
+    row: Vec<Value>,
+    rowid: Option<i64>,
 }
 
 impl Connection {
@@ -95,6 +105,7 @@ impl Connection {
             schema,
             in_tx: false,
             cte_env: core::cell::RefCell::new(Vec::new()),
+            outer_scope: core::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -106,6 +117,7 @@ impl Connection {
             schema,
             in_tx: false,
             cte_env: core::cell::RefCell::new(Vec::new()),
+            outer_scope: core::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -2350,28 +2362,77 @@ struct IndexMeta {
     cols: Vec<usize>,
 }
 
+impl Connection {
+    /// Run `body` with `outer`'s row pushed as a correlation frame, then pop it
+    /// (even on error). The subquery runs with the outer query's parameters.
+    fn with_outer_frame<T>(
+        &self,
+        outer: &EvalCtx,
+        body: impl FnOnce(&Params) -> Result<T>,
+    ) -> Result<T> {
+        self.outer_scope.borrow_mut().push(OuterFrame {
+            columns: outer.columns.to_vec(),
+            row: outer.row.to_vec(),
+            rowid: outer.rowid,
+        });
+        let params_ptr = outer.params;
+        let out = body(params_ptr);
+        self.outer_scope.borrow_mut().pop();
+        out
+    }
+}
+
 impl eval::Subqueries for Connection {
-    fn scalar(&self, select: &Select) -> Result<Value> {
-        let r = self.run_select(select, &Params::default())?;
-        Ok(r.rows
-            .first()
-            .and_then(|row| row.first())
-            .cloned()
-            .unwrap_or(Value::Null))
+    fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value> {
+        self.with_outer_frame(outer, |params| {
+            let r = self.run_select(select, params)?;
+            Ok(r.rows
+                .first()
+                .and_then(|row| row.first())
+                .cloned()
+                .unwrap_or(Value::Null))
+        })
     }
 
-    fn column(&self, select: &Select) -> Result<Vec<Value>> {
-        let r = self.run_select(select, &Params::default())?;
-        Ok(r.rows
-            .into_iter()
-            .map(|mut row| {
-                if row.is_empty() {
-                    Value::Null
-                } else {
-                    row.swap_remove(0)
+    fn column(&self, select: &Select, outer: &EvalCtx) -> Result<Vec<Value>> {
+        self.with_outer_frame(outer, |params| {
+            let r = self.run_select(select, params)?;
+            Ok(r.rows
+                .into_iter()
+                .map(|mut row| {
+                    if row.is_empty() {
+                        Value::Null
+                    } else {
+                        row.swap_remove(0)
+                    }
+                })
+                .collect())
+        })
+    }
+
+    fn exists(&self, select: &Select, outer: &EvalCtx) -> Result<bool> {
+        self.with_outer_frame(outer, |params| {
+            Ok(!self.run_select(select, params)?.rows.is_empty())
+        })
+    }
+
+    fn resolve_outer(&self, table: Option<&str>, name: &str) -> Option<Value> {
+        let scope = self.outer_scope.borrow();
+        for frame in scope.iter().rev() {
+            if table.is_none() && eval::is_rowid_alias(name) {
+                if let Some(r) = frame.rowid {
+                    return Some(Value::Integer(r));
                 }
-            })
-            .collect())
+            }
+            for (i, col) in frame.columns.iter().enumerate() {
+                let name_ok = col.name.eq_ignore_ascii_case(name);
+                let table_ok = table.is_none_or(|t| col.table.eq_ignore_ascii_case(t));
+                if name_ok && table_ok {
+                    return Some(frame.row[i].clone());
+                }
+            }
+        }
+        None
     }
 }
 

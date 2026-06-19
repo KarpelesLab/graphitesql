@@ -203,6 +203,9 @@ pub fn expr(e: &Expr) -> String {
         // Subqueries are not expected in the schema text we regenerate; render a
         // placeholder so the printer stays total.
         Expr::Subquery(_) => "(SELECT ...)".to_string(),
+        Expr::Exists { negated, .. } => {
+            format!("{}EXISTS (SELECT ...)", if *negated { "NOT " } else { "" })
+        }
         Expr::InSelect {
             expr: inner,
             negated,

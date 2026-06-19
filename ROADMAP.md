@@ -298,9 +298,12 @@ coverage rather than having a single "done".
     (`tests/explain.rs`);
   - **recursive `WITH RECURSIVE` CTEs** (anchor + fixed-point recursive term,
     `UNION`/`UNION ALL`), CTEs referencing earlier CTEs, and CTEs as a join
-    source, via a materialized CTE environment (`tests/cte.rs`).
+    source, via a materialized CTE environment (`tests/cte.rs`);
+  - **correlated subqueries** (scalar, `IN (SELECT …)`) and `[NOT] EXISTS` — the
+    subquery resolves outer columns through an outer-scope frame stack
+    (`tests/subquery.rs`).
 - **Deliverable (remaining):** foreign keys & triggers;
-  window functions; *correlated* subqueries & subqueries/views in
+  window functions; subqueries/views in
   joins; real `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree

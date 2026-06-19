@@ -998,6 +998,15 @@ impl Parser {
                     "false" => Ok(Expr::Literal(Literal::Boolean(false))),
                     "case" => self.case_expr(),
                     "cast" => self.cast_expr(),
+                    "exists" => {
+                        self.expect(&Token::LParen)?;
+                        let sel = self.select()?;
+                        self.expect(&Token::RParen)?;
+                        Ok(Expr::Exists {
+                            select: Box::new(sel),
+                            negated: false,
+                        })
+                    }
                     _ if is_reserved_keyword(&lw) => Err(Error::Parse(format!(
                         "unexpected keyword {w:?} in expression"
                     ))),

@@ -24,10 +24,17 @@ use core::cmp::Ordering;
 /// executor; lets `eval` resolve `(SELECT …)` and `IN (SELECT …)` without
 /// depending on the executor's concrete types.
 pub trait Subqueries {
-    /// First column of the first row (NULL if no rows) — a scalar subquery.
-    fn scalar(&self, select: &Select) -> Result<Value>;
+    /// First column of the first row (NULL if no rows) — a scalar subquery. The
+    /// enclosing row context `outer` is made available so correlated subqueries
+    /// can resolve outer columns.
+    fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value>;
     /// First column of every row — the candidate set for `IN (SELECT …)`.
-    fn column(&self, select: &Select) -> Result<Vec<Value>>;
+    fn column(&self, select: &Select, outer: &EvalCtx) -> Result<Vec<Value>>;
+    /// Whether the subquery returns at least one row — for `EXISTS`.
+    fn exists(&self, select: &Select, outer: &EvalCtx) -> Result<bool>;
+    /// Resolve a column against the enclosing (outer) query rows, if any are in
+    /// scope. Returns `None` when there is no such outer column.
+    fn resolve_outer(&self, table: Option<&str>, name: &str) -> Option<Value>;
 }
 
 /// A column's type affinity (SQLite, `datatype3.html` §3).
@@ -228,6 +235,12 @@ impl<'a> EvalCtx<'a> {
                 return Ok(self.row[i].clone());
             }
         }
+        // Fall back to an enclosing query's row (a correlated reference).
+        if let Some(s) = self.subqueries {
+            if let Some(v) = s.resolve_outer(table, name) {
+                return Ok(v);
+            }
+        }
         Err(Error::Error(alloc::format!("no such column: {name}")))
     }
 }
@@ -272,7 +285,7 @@ fn apply_comparison_affinity(l: Value, la: Affinity, r: Value, ra: Affinity) -> 
     }
 }
 
-fn is_rowid_alias(name: &str) -> bool {
+pub(crate) fn is_rowid_alias(name: &str) -> bool {
     name.eq_ignore_ascii_case("rowid")
         || name.eq_ignore_ascii_case("_rowid_")
         || name.eq_ignore_ascii_case("oid")
@@ -350,8 +363,12 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             name, args, star, ..
         } => super::func::eval_scalar(name, args, *star, ctx),
         Expr::Subquery(select) => match ctx.subqueries {
-            Some(s) => s.scalar(select),
+            Some(s) => s.scalar(select, ctx),
             None => Err(Error::Unsupported("subquery in this context")),
+        },
+        Expr::Exists { select, negated } => match ctx.subqueries {
+            Some(s) => Ok(bool_value(s.exists(select, ctx)? != *negated)),
+            None => Err(Error::Unsupported("EXISTS in this context")),
         },
         Expr::InSelect {
             expr,
@@ -363,7 +380,7 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 return Ok(Value::Null);
             }
             let set = match ctx.subqueries {
-                Some(s) => s.column(select)?,
+                Some(s) => s.column(select, ctx)?,
                 None => return Err(Error::Unsupported("IN (SELECT …) in this context")),
             };
             let mut saw_null = false;

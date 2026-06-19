@@ -457,6 +457,13 @@ pub enum Expr {
     Paren(Box<Expr>),
     /// A scalar subquery `(SELECT …)` — yields its first row's first column.
     Subquery(Box<Select>),
+    /// `[NOT] EXISTS (SELECT …)`.
+    Exists {
+        /// The subquery to test for any rows.
+        select: Box<Select>,
+        /// `NOT EXISTS`?
+        negated: bool,
+    },
     /// `expr [NOT] IN (SELECT …)`.
     InSelect {
         /// The tested expression.

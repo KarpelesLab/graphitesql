@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: correlated subqueries (scalar `(SELECT …)`, `IN (SELECT …)`) and
+  `[NOT] EXISTS (SELECT …)` — the subquery resolves columns from the enclosing
+  query's current row via an outer-scope frame stack
 - Phase 9: recursive `WITH RECURSIVE` CTEs (anchor + fixed-point recursive term,
   `UNION`/`UNION ALL`), CTEs that reference earlier CTEs, and CTEs usable as a
   join source — backed by a materialized CTE environment
