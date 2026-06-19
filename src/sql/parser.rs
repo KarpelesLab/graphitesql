@@ -1040,11 +1040,13 @@ impl Parser {
     fn function_call(&mut self, name: String) -> Result<Expr> {
         if self.eat(&Token::Star) {
             self.expect(&Token::RParen)?;
+            let over = self.window_over()?;
             return Ok(Expr::Function {
                 name,
                 distinct: false,
                 args: Vec::new(),
                 star: true,
+                over,
             });
         }
         let distinct = self.eat_kw("distinct");
@@ -1056,12 +1058,44 @@ impl Parser {
             }
         }
         self.expect(&Token::RParen)?;
+        let over = self.window_over()?;
         Ok(Expr::Function {
             name,
             distinct,
             args,
             star: false,
+            over,
         })
+    }
+
+    /// Parse an optional `OVER ( [PARTITION BY …] [ORDER BY …] )` clause.
+    fn window_over(&mut self) -> Result<Option<WindowSpec>> {
+        if !self.eat_kw("over") {
+            return Ok(None);
+        }
+        self.expect(&Token::LParen)?;
+        let mut spec = WindowSpec::default();
+        if self.eat_kw("partition") {
+            self.expect_kw("by")?;
+            spec.partition_by.push(self.expr()?);
+            while self.eat(&Token::Comma) {
+                spec.partition_by.push(self.expr()?);
+            }
+        }
+        if self.eat_kw("order") {
+            self.expect_kw("by")?;
+            spec.order_by.push(self.order_term()?);
+            while self.eat(&Token::Comma) {
+                spec.order_by.push(self.order_term()?);
+            }
+        }
+        // Frame clauses (ROWS/RANGE …) are accepted-but-ignored for now: the
+        // default frame is applied by the executor.
+        while !self.check(&Token::RParen) && !self.at_end() {
+            self.advance();
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Some(spec))
     }
 
     fn case_expr(&mut self) -> Result<Expr> {

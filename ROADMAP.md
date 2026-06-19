@@ -301,10 +301,14 @@ coverage rather than having a single "done".
     source, via a materialized CTE environment (`tests/cte.rs`);
   - **correlated subqueries** (scalar, `IN (SELECT …)`) and `[NOT] EXISTS` — the
     subquery resolves outer columns through an outer-scope frame stack
-    (`tests/subquery.rs`).
-- **Deliverable (remaining):** foreign keys & triggers;
-  window functions; subqueries/views in
-  joins; real `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
+    (`tests/subquery.rs`);
+  - **window functions** — `row_number`/`rank`/`dense_rank`/`ntile`,
+    `lag`/`lead`/`first_value`/`last_value`/`nth_value`, and aggregate windows
+    over `PARTITION BY`/`ORDER BY` with the default frame (`tests/window.rs`);
+  - **`%!.15g` real formatting** matching SQLite's double-to-text exactly.
+- **Deliverable (remaining):** foreign keys & triggers; subqueries/views in
+  joins; explicit window frame clauses (`ROWS`/`RANGE BETWEEN`); real `VACUUM`
+  compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
   (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
   bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.

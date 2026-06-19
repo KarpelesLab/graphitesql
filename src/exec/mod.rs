@@ -16,6 +16,7 @@
 pub mod datetime;
 pub mod eval;
 pub mod func;
+mod window;
 
 use crate::btree::{
     clear_index, create_index_root, create_table_root, delete_table, free_tree, insert_index,
@@ -1600,8 +1601,218 @@ impl Connection {
         Ok(())
     }
 
+    /// Compute every window function in `sel` over `rows`, append each result as
+    /// a synthetic column on `columns`/`rows`, and return a rewritten `SELECT`
+    /// whose projection/ORDER BY reference those columns.
+    fn apply_windows(
+        &self,
+        sel: &Select,
+        columns: &mut Vec<ColumnInfo>,
+        rows: &mut [InputRow],
+        params: &Params,
+    ) -> Result<Select> {
+        let wins = window::collect_window_exprs(sel);
+        let mut new_sel = sel.clone();
+        for (k, wexpr) in wins.iter().enumerate() {
+            let values = self.compute_window(wexpr, columns, rows, params)?;
+            let col_name = alloc::format!("__win{k}");
+            columns.push(ColumnInfo {
+                name: col_name.clone(),
+                table: String::new(),
+                affinity: eval::Affinity::Blob,
+            });
+            for (row, v) in rows.iter_mut().zip(values) {
+                row.values.push(v);
+            }
+            let repl = Expr::Column {
+                table: None,
+                column: col_name,
+            };
+            window::replace_window_expr(&mut new_sel, wexpr, &repl);
+        }
+        Ok(new_sel)
+    }
+
+    /// Compute one window function across all `rows`, returning a value per row
+    /// (aligned with `rows`).
+    fn compute_window(
+        &self,
+        wexpr: &Expr,
+        columns: &[ColumnInfo],
+        rows: &[InputRow],
+        params: &Params,
+    ) -> Result<Vec<Value>> {
+        let Expr::Function {
+            name,
+            args,
+            star,
+            over: Some(spec),
+            ..
+        } = wexpr
+        else {
+            return Err(Error::Error("not a window function".into()));
+        };
+        let lname = name.to_ascii_lowercase();
+        let n = rows.len();
+
+        // Per-row partition keys, order keys, and argument values.
+        let mut part_keys: Vec<Vec<Value>> = Vec::with_capacity(n);
+        let mut ord_keys: Vec<Vec<Value>> = Vec::with_capacity(n);
+        let mut arg_vals: Vec<Vec<Value>> = Vec::with_capacity(n);
+        for r in rows {
+            let ctx = r.ctx(columns, params).with_subqueries(self);
+            part_keys.push(
+                spec.partition_by
+                    .iter()
+                    .map(|e| eval::eval(e, &ctx))
+                    .collect::<Result<_>>()?,
+            );
+            ord_keys.push(
+                spec.order_by
+                    .iter()
+                    .map(|t| eval::eval(&t.expr, &ctx))
+                    .collect::<Result<_>>()?,
+            );
+            arg_vals.push(
+                args.iter()
+                    .map(|e| eval::eval(e, &ctx))
+                    .collect::<Result<_>>()?,
+            );
+        }
+        let descending: Vec<bool> = spec.order_by.iter().map(|t| t.descending).collect();
+
+        // Partition rows by partition key, preserving first-seen order.
+        let mut partitions: Vec<Vec<usize>> = Vec::new();
+        let mut part_of: Vec<usize> = Vec::new();
+        for i in 0..n {
+            let p = partitions
+                .iter()
+                .position(|members| rows_equal(&part_keys[members[0]], &part_keys[i]));
+            match p {
+                Some(idx) => {
+                    partitions[idx].push(i);
+                    part_of.push(idx);
+                }
+                None => {
+                    part_of.push(partitions.len());
+                    partitions.push(alloc::vec![i]);
+                }
+            }
+        }
+
+        let mut result = alloc::vec![Value::Null; n];
+        for members in &partitions {
+            // Order the partition's rows (stable).
+            let mut ordered = members.clone();
+            ordered.sort_by(|&a, &b| cmp_keys(&ord_keys[a], &ord_keys[b], &descending));
+            self.fill_window_partition(
+                &lname,
+                *star,
+                &ordered,
+                &ord_keys,
+                &arg_vals,
+                &spec.order_by.is_empty(),
+                &mut result,
+            )?;
+        }
+        Ok(result)
+    }
+
+    /// Fill `result` for one ordered partition `ordered` (indices into the row
+    /// arrays). `no_order` indicates the window has no `ORDER BY` (whole-partition
+    /// frame).
+    #[allow(clippy::too_many_arguments)]
+    fn fill_window_partition(
+        &self,
+        lname: &str,
+        star: bool,
+        ordered: &[usize],
+        ord_keys: &[Vec<Value>],
+        arg_vals: &[Vec<Value>],
+        no_order: &bool,
+        result: &mut [Value],
+    ) -> Result<()> {
+        let m = ordered.len();
+        // Ranking values per ordered position.
+        for p in 0..m {
+            let idx = ordered[p];
+            let val = match lname {
+                "row_number" => Value::Integer(p as i64 + 1),
+                "rank" => {
+                    // 1 + number of strictly-preceding rows by order key.
+                    let mut r = p;
+                    while r > 0 && cmp_keys(&ord_keys[ordered[r - 1]], &ord_keys[idx], &[]).is_eq()
+                    {
+                        r -= 1;
+                    }
+                    Value::Integer(r as i64 + 1)
+                }
+                "dense_rank" => {
+                    let mut dr = 1i64;
+                    for q in 1..=p {
+                        if !cmp_keys(&ord_keys[ordered[q - 1]], &ord_keys[ordered[q]], &[]).is_eq()
+                        {
+                            dr += 1;
+                        }
+                    }
+                    Value::Integer(dr)
+                }
+                "ntile" => {
+                    let buckets = arg_vals[idx].first().map(eval::to_i64).unwrap_or(1).max(1);
+                    Value::Integer(ntile_bucket(p, m, buckets))
+                }
+                "lag" | "lead" => {
+                    let offset = arg_vals[idx].get(1).map(eval::to_i64).unwrap_or(1);
+                    let default = arg_vals[idx].get(2).cloned().unwrap_or(Value::Null);
+                    let target = if lname == "lag" {
+                        p as i64 - offset
+                    } else {
+                        p as i64 + offset
+                    };
+                    if target >= 0 && (target as usize) < m {
+                        arg_vals[ordered[target as usize]]
+                            .first()
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    } else {
+                        default
+                    }
+                }
+                "first_value" => arg_vals[ordered[0]].first().cloned().unwrap_or(Value::Null),
+                "last_value" => {
+                    let end = frame_end(p, ordered, ord_keys, *no_order);
+                    arg_vals[ordered[end - 1]]
+                        .first()
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                }
+                "nth_value" => {
+                    let nth = arg_vals[idx].get(1).map(eval::to_i64).unwrap_or(1);
+                    let end = frame_end(p, ordered, ord_keys, *no_order);
+                    if nth >= 1 && (nth as usize) <= end {
+                        arg_vals[ordered[nth as usize - 1]]
+                            .first()
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }
+                // Aggregate windows over the default frame.
+                _ => {
+                    let end = frame_end(p, ordered, ord_keys, *no_order);
+                    let frame: Vec<&Vec<Value>> =
+                        ordered[..end].iter().map(|&i| &arg_vals[i]).collect();
+                    window_aggregate(lname, star, &frame)?
+                }
+            };
+            result[idx] = val;
+        }
+        Ok(())
+    }
+
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
-        let (columns, input_rows) = self.scan_source(sel, params)?;
+        let (mut columns, input_rows) = self.scan_source(sel, params)?;
 
         // Apply WHERE.
         let mut rows: Vec<InputRow> = Vec::new();
@@ -1614,6 +1825,21 @@ impl Connection {
             }
             rows.push(r);
         }
+
+        // Window functions: compute over the post-WHERE rows, append the results
+        // as synthetic columns, and rewrite the projection to reference them.
+        let rewritten;
+        let sel = if window::has_window(sel) {
+            if !sel.group_by.is_empty() || self.has_aggregate(sel) {
+                return Err(Error::Unsupported(
+                    "window functions combined with GROUP BY / aggregates",
+                ));
+            }
+            rewritten = self.apply_windows(sel, &mut columns, &mut rows, params)?;
+            &rewritten
+        } else {
+            sel
+        };
 
         let aggregated = !sel.group_by.is_empty() || self.has_aggregate(sel);
         let (out_labels, mut out) = if aggregated {
@@ -1974,6 +2200,7 @@ impl Connection {
                 distinct,
                 args,
                 star,
+                over: None,
             } if func::is_aggregate_call(name, args.len(), *star) => {
                 let v = self.compute_aggregate(
                     name, *distinct, args, *star, columns, rows, group, params,
@@ -1985,6 +2212,7 @@ impl Connection {
                 distinct,
                 args,
                 star,
+                over,
             } => {
                 let mut new_args = Vec::with_capacity(args.len());
                 for a in args {
@@ -1995,6 +2223,7 @@ impl Connection {
                     distinct: *distinct,
                     args: new_args,
                     star: *star,
+                    over: over.clone(),
                 }
             }
             Expr::Binary { op, left, right } => Expr::Binary {
@@ -2470,6 +2699,140 @@ fn references_name_select(select: &Select, name: &str) -> bool {
         .any(|j| j.table.name.eq_ignore_ascii_case(name))
 }
 
+/// Compare two ordering-key vectors with per-position `descending` flags
+/// (missing flags default to ascending).
+fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        let mut o = eval::compare(x, y);
+        if desc.get(i).copied().unwrap_or(false) {
+            o = o.reverse();
+        }
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Exclusive end index of the default window frame for ordered position `p`:
+/// the whole partition when there is no `ORDER BY`, else through the last peer
+/// (rows sharing `p`'s order key) — SQLite's RANGE UNBOUNDED PRECEDING / CURRENT
+/// ROW default.
+fn frame_end(p: usize, ordered: &[usize], ord_keys: &[Vec<Value>], no_order: bool) -> usize {
+    if no_order {
+        return ordered.len();
+    }
+    let mut e = p + 1;
+    while e < ordered.len() && cmp_keys(&ord_keys[ordered[e]], &ord_keys[ordered[p]], &[]).is_eq() {
+        e += 1;
+    }
+    e
+}
+
+/// The 1-based `ntile` bucket for ordered position `p` of `m` rows split into
+/// `buckets` groups (earlier groups absorb the remainder).
+fn ntile_bucket(p: usize, m: usize, buckets: i64) -> i64 {
+    let buckets = (buckets.max(1) as usize).min(m.max(1));
+    let size = m / buckets;
+    let rem = m % buckets;
+    let big = rem * (size + 1);
+    if p < big {
+        (p / (size + 1)) as i64 + 1
+    } else {
+        (rem + (p - big) / size.max(1)) as i64 + 1
+    }
+}
+
+/// Evaluate an aggregate window function over a frame of per-row argument
+/// values, matching `compute_aggregate`'s numeric semantics.
+fn window_aggregate(lname: &str, star: bool, frame: &[&Vec<Value>]) -> Result<Value> {
+    let mut vals: Vec<Value> = Vec::new();
+    for row in frame {
+        if star {
+            continue;
+        }
+        if let Some(v) = row.first() {
+            if !matches!(v, Value::Null) {
+                vals.push(v.clone());
+            }
+        }
+    }
+    Ok(match lname {
+        "count" => {
+            if star {
+                Value::Integer(frame.len() as i64)
+            } else {
+                Value::Integer(vals.len() as i64)
+            }
+        }
+        "sum" => {
+            if vals.is_empty() {
+                Value::Null
+            } else if vals.iter().all(|v| matches!(v, Value::Integer(_))) {
+                let mut acc: i64 = 0;
+                let mut overflow = false;
+                for v in &vals {
+                    if let Value::Integer(i) = v {
+                        match acc.checked_add(*i) {
+                            Some(s) => acc = s,
+                            None => {
+                                overflow = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if overflow {
+                    Value::Real(vals.iter().map(eval::to_f64).sum())
+                } else {
+                    Value::Integer(acc)
+                }
+            } else {
+                Value::Real(vals.iter().map(eval::to_f64).sum())
+            }
+        }
+        "total" => Value::Real(vals.iter().map(eval::to_f64).sum()),
+        "avg" => {
+            if vals.is_empty() {
+                Value::Null
+            } else {
+                let sum: f64 = vals.iter().map(eval::to_f64).sum();
+                Value::Real(sum / vals.len() as f64)
+            }
+        }
+        "min" => vals
+            .into_iter()
+            .reduce(|a, b| {
+                if eval::compare(&b, &a) == core::cmp::Ordering::Less {
+                    b
+                } else {
+                    a
+                }
+            })
+            .unwrap_or(Value::Null),
+        "max" => vals
+            .into_iter()
+            .reduce(|a, b| {
+                if eval::compare(&b, &a) == core::cmp::Ordering::Greater {
+                    b
+                } else {
+                    a
+                }
+            })
+            .unwrap_or(Value::Null),
+        "group_concat" => {
+            if vals.is_empty() {
+                Value::Null
+            } else {
+                let parts: Vec<String> = vals.iter().map(eval::to_text).collect();
+                Value::Text(parts.join(","))
+            }
+        }
+        _ => return Err(Error::Unsupported("window function")),
+    })
+}
+
 /// Dedupe rows in place, preserving first-occurrence order.
 fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
     let mut seen: Vec<Vec<Value>> = Vec::new();
@@ -2675,6 +3038,13 @@ fn resolve_order_index(expr: &Expr, labels: &[String], ncols: usize) -> Option<u
 
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
+        // A window function (`f(…) OVER (…)`) is not a plain aggregate, even when
+        // `f` is an aggregate name; only its arguments might contain aggregates.
+        Expr::Function {
+            over: Some(_),
+            args,
+            ..
+        } => args.iter().any(contains_aggregate),
         Expr::Function {
             name, args, star, ..
         } => {

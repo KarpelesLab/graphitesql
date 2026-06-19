@@ -804,18 +804,69 @@ pub fn to_text(v: &Value) -> String {
     }
 }
 
-/// Format a real the way SQLite renders doubles in text contexts.
+/// Format a real the way SQLite renders doubles in text contexts: the C
+/// `%!.15g` style — 15 significant digits, scientific notation when the decimal
+/// exponent is `< -4` or `>= 15`, trailing zeros trimmed, always with a decimal
+/// point (`N.0`) and a two-digit signed exponent (`1.0e+20`).
 pub fn format_real(r: f64) -> String {
-    use crate::util::float;
-    if r == float::trunc(r) && r.is_finite() && float::abs(r) < 1e15 {
-        // Whole-valued doubles print as `N.0`.
-        alloc::format!("{:.1}", r)
-    } else {
-        let mut s = alloc::format!("{r}");
-        if !s.contains('.') && !s.contains('e') && !s.contains("inf") && !s.contains("nan") {
-            s.push_str(".0");
+    if r.is_nan() {
+        return String::new();
+    }
+    if !r.is_finite() {
+        return if r < 0.0 {
+            String::from("-Inf")
+        } else {
+            String::from("Inf")
+        };
+    }
+    if r == 0.0 {
+        return String::from("0.0");
+    }
+    let neg = r < 0.0;
+    let a = crate::util::float::abs(r);
+
+    // 15 significant digits in scientific form: "D.DDDDDDDDDDDDDDe<exp>".
+    let sci = alloc::format!("{:.14e}", a);
+    let (mant, exp_str) = sci.split_once('e').expect("scientific format has 'e'");
+    let exp: i32 = exp_str.parse().expect("valid exponent");
+    let digits: String = mant.chars().filter(|c| *c != '.').collect(); // 15 digits
+
+    let body = if !(-4..15).contains(&exp) {
+        // Scientific.
+        let frac = digits[1..].trim_end_matches('0');
+        let mantissa = if frac.is_empty() {
+            alloc::format!("{}.0", &digits[0..1])
+        } else {
+            alloc::format!("{}.{}", &digits[0..1], frac)
+        };
+        let sign = if exp < 0 { '-' } else { '+' };
+        alloc::format!("{mantissa}e{sign}{:02}", exp.abs())
+    } else if exp >= 0 {
+        // Fixed, value >= 1: (exp+1) integer digits.
+        let int_len = (exp + 1) as usize;
+        let int_part = &digits[..int_len];
+        let frac = digits[int_len..].trim_end_matches('0');
+        if frac.is_empty() {
+            alloc::format!("{int_part}.0")
+        } else {
+            alloc::format!("{int_part}.{frac}")
         }
-        s
+    } else {
+        // Fixed, value < 1: leading zeros then the digits.
+        let lead = (-(exp + 1)) as usize;
+        let mut frac = String::new();
+        for _ in 0..lead {
+            frac.push('0');
+        }
+        frac.push_str(&digits);
+        let frac = frac.trim_end_matches('0');
+        alloc::format!("0.{frac}")
+    };
+
+    if neg {
+        alloc::format!("-{body}")
+    } else {
+        body
     }
 }
 
@@ -948,5 +999,18 @@ mod tests {
     fn real_formatting() {
         assert_eq!(format_real(3.0), "3.0");
         assert_eq!(format_real(2.5), "2.5");
+        // %.15g compatibility with sqlite.
+        assert_eq!(format_real(35.0 / 3.0), "11.6666666666667");
+        assert_eq!(format_real(1.0 / 3.0), "0.333333333333333");
+        assert_eq!(format_real(0.1), "0.1");
+        assert_eq!(format_real(0.1 + 0.2), "0.3");
+        assert_eq!(format_real(1e20), "1.0e+20");
+        assert_eq!(format_real(1e-10), "1.0e-10");
+        assert_eq!(format_real(1e15), "1.0e+15");
+        assert_eq!(format_real(1e14), "100000000000000.0");
+        assert_eq!(format_real(0.0001), "0.0001");
+        assert_eq!(format_real(0.00001), "1.0e-05");
+        assert_eq!(format_real(-2.5), "-2.5");
+        assert_eq!(format_real(0.0), "0.0");
     }
 }

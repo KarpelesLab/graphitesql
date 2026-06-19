@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: window functions — `row_number`, `rank`, `dense_rank`, `ntile`,
+  `lag`/`lead`, `first_value`/`last_value`/`nth_value`, and aggregate windows
+  (`sum`/`avg`/`count`/`min`/`max`/`total`/`group_concat`) over
+  `PARTITION BY`/`ORDER BY` with SQLite's default frame; verified against `sqlite3`
+- Phase 9: real-number text formatting now matches SQLite's `%!.15g` exactly
+  (15 significant digits, scientific past the `[-4, 15)` exponent window)
 - Phase 9: correlated subqueries (scalar `(SELECT …)`, `IN (SELECT …)`) and
   `[NOT] EXISTS (SELECT …)` — the subquery resolves columns from the enclosing
   query's current row via an outer-scope frame stack

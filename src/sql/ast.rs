@@ -65,6 +65,19 @@ pub struct Cte {
     pub select: Box<Select>,
 }
 
+/// A window-function `OVER (…)` specification.
+///
+/// Explicit frame clauses (`ROWS`/`RANGE BETWEEN …`) are not yet modeled; the
+/// executor applies SQLite's default frame (RANGE UNBOUNDED PRECEDING to CURRENT
+/// ROW when `ORDER BY` is present, the whole partition otherwise).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WindowSpec {
+    /// `PARTITION BY` expressions.
+    pub partition_by: Vec<Expr>,
+    /// `ORDER BY` terms within each partition.
+    pub order_by: Vec<OrderTerm>,
+}
+
 /// A compound-query operator joining two `SELECT`s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompoundOp {
@@ -409,6 +422,8 @@ pub enum Expr {
         args: Vec<Expr>,
         /// Whether the argument was `*`.
         star: bool,
+        /// `OVER (…)` window specification, making this a window-function call.
+        over: Option<WindowSpec>,
     },
     /// `expr IS [NOT] NULL`.
     IsNull {
