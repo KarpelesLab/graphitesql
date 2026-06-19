@@ -44,6 +44,14 @@ pub enum Statement {
     Pragma(Pragma),
     /// A `VACUUM` statement (accepted; a no-op compaction in this build).
     Vacuum,
+    /// `EXPLAIN [QUERY PLAN] <stmt>`.
+    Explain {
+        /// `EXPLAIN QUERY PLAN` (true) vs plain `EXPLAIN` (false, VDBE bytecode,
+        /// which this engine does not produce).
+        query_plan: bool,
+        /// The statement being explained.
+        stmt: Box<Statement>,
+    },
 }
 
 /// A common table expression (`WITH name AS (select)`).

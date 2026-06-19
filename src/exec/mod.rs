@@ -172,6 +172,14 @@ impl Connection {
         match sql::parse_one(sql)? {
             Statement::Select(sel) => self.run_select(&sel, params),
             Statement::Pragma(p) => self.run_pragma(&p),
+            Statement::Explain { query_plan, stmt } => {
+                if !query_plan {
+                    return Err(Error::Unsupported(
+                        "plain EXPLAIN (VDBE bytecode); use EXPLAIN QUERY PLAN",
+                    ));
+                }
+                self.explain_query_plan(&stmt, params)
+            }
             _ => Err(Error::Unsupported(
                 "use execute() for non-SELECT statements",
             )),
@@ -333,6 +341,9 @@ impl Connection {
             Statement::Pragma(_) => 0, // accepted, no-op for now
             Statement::Vacuum => 0,    // accepted; compaction is a no-op here
             Statement::Select(_) => return Err(Error::Unsupported("use query() for SELECT")),
+            Statement::Explain { .. } => {
+                return Err(Error::Unsupported("use query() for EXPLAIN"))
+            }
             Statement::Begin | Statement::Commit | Statement::Rollback => unreachable!(),
         };
 
@@ -1009,6 +1020,27 @@ impl Connection {
             return Ok(None); // `col = NULL` is never true; let the scan handle it
         }
 
+        // Rowid (INTEGER PRIMARY KEY) equality: seek the table b-tree directly
+        // by rowid. run_core re-applies the full WHERE, so returning the single
+        // candidate row is a valid superset even when the literal isn't an exact
+        // integer (e.g. `id = 5.5` seeks rowid 5, then gets filtered out).
+        if let Some(ipk) = meta.ipk {
+            if let Some((_, v)) = eqs.iter().find(|(c, _)| *c == ipk) {
+                let rid = eval::to_i64(v);
+                let encoding = self.backend.source().header().text_encoding;
+                let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                let mut out = Vec::new();
+                if cur.seek(rid)? {
+                    let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                    out.push(InputRow {
+                        values,
+                        rowid: Some(rid),
+                    });
+                }
+                return Ok(Some(out));
+            }
+        }
+
         // Choose the index covering the longest leftmost prefix of equalities.
         let indexes = self.indexes_of(table_name)?;
         let mut best: Option<(u32, Vec<Value>)> = None;
@@ -1045,6 +1077,155 @@ impl Connection {
             }
         }
         Ok(Some(out))
+    }
+
+    /// `EXPLAIN QUERY PLAN <stmt>` -> the `(id, parent, notused, detail)` rows
+    /// that SQLite's API returns. The detail strings describe graphitesql's
+    /// *actual* execution plan (it does not reorder joins), matching SQLite's
+    /// format for the single-table SCAN/SEARCH cases.
+    fn explain_query_plan(&self, stmt: &Statement, params: &Params) -> Result<QueryResult> {
+        let mut details: Vec<(i64, i64, String)> = Vec::new();
+        let mut next_id = 1i64;
+        match stmt {
+            Statement::Select(sel) => {
+                self.eqp_select(sel, 0, &mut next_id, &mut details, params)?
+            }
+            Statement::Delete(d) => {
+                let meta = self.table_meta(&d.table, None)?;
+                let detail =
+                    self.eqp_access(&d.table, &d.table, &meta, d.where_clause.as_ref(), params)?;
+                details.push((next_id, 0, detail));
+            }
+            Statement::Update(u) => {
+                let meta = self.table_meta(&u.table, None)?;
+                let detail =
+                    self.eqp_access(&u.table, &u.table, &meta, u.where_clause.as_ref(), params)?;
+                details.push((next_id, 0, detail));
+            }
+            Statement::Insert(ins) => {
+                if let InsertSource::Select(sel) = &ins.source {
+                    self.eqp_select(sel, 0, &mut next_id, &mut details, params)?;
+                }
+            }
+            _ => return Err(Error::Unsupported("EXPLAIN QUERY PLAN for this statement")),
+        }
+        Ok(QueryResult {
+            columns: alloc::vec![
+                String::from("id"),
+                String::from("parent"),
+                String::from("notused"),
+                String::from("detail"),
+            ],
+            rows: details
+                .into_iter()
+                .map(|(id, parent, detail)| {
+                    alloc::vec![
+                        Value::Integer(id),
+                        Value::Integer(parent),
+                        Value::Integer(0),
+                        Value::Text(detail),
+                    ]
+                })
+                .collect(),
+        })
+    }
+
+    /// Emit query-plan nodes for one SELECT under `parent`.
+    fn eqp_select(
+        &self,
+        sel: &Select,
+        parent: i64,
+        next_id: &mut i64,
+        out: &mut Vec<(i64, i64, String)>,
+        params: &Params,
+    ) -> Result<()> {
+        let Some(from) = &sel.from else {
+            return Ok(()); // SELECT with no FROM => no scan node
+        };
+        // First source.
+        let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
+        let label = eqp_label(&from.first);
+        let detail = if from.joins.is_empty() {
+            self.eqp_access(&label, &from.first.name, &meta, sel.where_clause.as_ref(), params)?
+        } else {
+            // Joins run in FROM order as nested-loop scans (no reordering).
+            alloc::format!("SCAN {label}")
+        };
+        let id = *next_id;
+        *next_id += 1;
+        out.push((id, parent, detail));
+        for join in &from.joins {
+            let id = *next_id;
+            *next_id += 1;
+            out.push((id, parent, alloc::format!("SCAN {}", eqp_label(&join.table))));
+        }
+        // ORDER BY / GROUP BY that we satisfy with an in-memory sort.
+        if !sel.order_by.is_empty() {
+            let id = *next_id;
+            *next_id += 1;
+            out.push((id, parent, String::from("USE TEMP B-TREE FOR ORDER BY")));
+        }
+        Ok(())
+    }
+
+    /// The SCAN/SEARCH detail string for accessing one table given its WHERE.
+    /// `label` is the display name (alias if any); `table` is the real table
+    /// name used to look up its indexes.
+    fn eqp_access(
+        &self,
+        label: &str,
+        table: &str,
+        meta: &TableMeta,
+        where_clause: Option<&Expr>,
+        params: &Params,
+    ) -> Result<String> {
+        let Some(where_expr) = where_clause else {
+            return Ok(alloc::format!("SCAN {label}"));
+        };
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        // Rowid equality wins, as in try_index_lookup.
+        if let Some(ipk) = meta.ipk {
+            if eqs.iter().any(|(c, _)| *c == ipk) {
+                return Ok(alloc::format!(
+                    "SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"
+                ));
+            }
+        }
+        // Index covering the longest leftmost prefix of equalities.
+        let mut best: Option<(String, Vec<usize>)> = None;
+        for obj in self.schema.indexes_on(table) {
+            let Some(sql) = &obj.sql else { continue };
+            let Ok(Statement::CreateIndex(ci)) = sql::parse_one(sql) else {
+                continue;
+            };
+            let Ok(cols) = self.index_columns(meta, &ci) else {
+                continue;
+            };
+            let mut matched = Vec::new();
+            for &c in &cols {
+                if eqs.iter().any(|(col, _)| *col == c) {
+                    matched.push(c);
+                } else {
+                    break;
+                }
+            }
+            if matched.len() > best.as_ref().map_or(0, |(_, m)| m.len()) {
+                best = Some((obj.name.clone(), matched));
+            }
+        }
+        if let Some((idx_name, matched)) = best {
+            if !matched.is_empty() {
+                let cond = matched
+                    .iter()
+                    .map(|&c| alloc::format!("{}=?", meta.columns[c].name))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                return Ok(alloc::format!("SEARCH {label} USING INDEX {idx_name} ({cond})"));
+            }
+        }
+        Ok(alloc::format!("SCAN {label}"))
     }
 
     fn indexes_of(&self, table: &str) -> Result<Vec<IndexMeta>> {
@@ -1999,6 +2180,15 @@ fn is_text(v: &Value, s: &str) -> bool {
 /// `WHERE` clause, as `(column index, constant value)` pairs. Used to drive
 /// index selection; non-equality and non-constant terms are ignored (the full
 /// `WHERE` is still applied afterward).
+/// The EXPLAIN QUERY PLAN display label for a table reference: SQLite shows
+/// `name AS alias` when an alias is present, else just the name.
+fn eqp_label(t: &TableRef) -> String {
+    match &t.alias {
+        Some(a) => alloc::format!("{} AS {}", t.name, a),
+        None => t.name.clone(),
+    }
+}
+
 fn collect_eq_constraints(
     e: &Expr,
     columns: &[ColumnInfo],

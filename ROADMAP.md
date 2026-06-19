@@ -290,12 +290,17 @@ coverage rather than having a single "done".
   - an AST→SQL printer (`sql::print`) used to regenerate stored `CREATE` text;
   - queryable **`PRAGMA`s** (`table_info`, `page_size`, …) and the `graphitesql`
     **CLI shell**.
-- **Deliverable (remaining):** foreign keys & triggers; `WITH`/CTEs & recursive
-  queries; window functions; *correlated* subqueries & subqueries/views in joins;
-  index-driven query planning; `ALTER … RENAME COLUMN`; real `VACUUM` compaction;
-  `WITHOUT ROWID`; auto-indexes for `UNIQUE` (we enforce by scan, not via an
-  index b-tree yet); `date/time`/`printf` functions;
-  `EXPLAIN`; full type-affinity & collation edge cases; WAL *write* path; b-tree
+  - **date/time functions** (`date`, `time`, `datetime`, `julianday`,
+    `unixepoch`, `strftime`) and **`printf`/`format`** — a dependency-free port
+    of `date.c`'s Julian-day engine, verified differentially (`tests/datetime.rs`);
+  - **`EXPLAIN QUERY PLAN`** (SCAN/SEARCH plan rows in SQLite's detail format)
+    plus a **rowid equality fast-path** that seeks the table b-tree directly
+    (`tests/explain.rs`).
+- **Deliverable (remaining):** foreign keys & triggers; recursive
+  `WITH` queries; window functions; *correlated* subqueries & subqueries/views in
+  joins; real `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`
+  (we enforce by scan, not via an index b-tree yet); plain `EXPLAIN` (VDBE
+  bytecode); full type-affinity & collation edge cases; WAL *write* path; b-tree
   page merging.
 - **Goal:** pass a curated slice of SQLite's own test assertions and a large
   differential corpus.

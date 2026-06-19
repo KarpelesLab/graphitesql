@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Phase 9: `EXPLAIN QUERY PLAN` (SCAN/SEARCH plan rows in SQLite's format) and a
+  rowid (`INTEGER PRIMARY KEY`) equality fast-path that seeks the table b-tree
+  directly instead of scanning
 - Phase 9: date/time functions (`date`, `time`, `datetime`, `julianday`,
   `unixepoch`, `strftime`) and `printf`/`format` — a dependency-free port of
   SQLite's `date.c` Julian-day core, verified differentially against `sqlite3`

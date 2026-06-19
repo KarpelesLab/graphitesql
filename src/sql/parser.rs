@@ -148,6 +148,21 @@ impl Parser {
     // ---- statements ---------------------------------------------------------
 
     fn statement(&mut self) -> Result<Statement> {
+        if self.eat_kw("explain") {
+            let query_plan = if self.eat_kw("query") {
+                if !self.eat_kw("plan") {
+                    return Err(self.err("expected PLAN after EXPLAIN QUERY"));
+                }
+                true
+            } else {
+                false
+            };
+            let stmt = self.statement()?;
+            return Ok(Statement::Explain {
+                query_plan,
+                stmt: alloc::boxed::Box::new(stmt),
+            });
+        }
         if self.check_kw("select") || self.check_kw("with") {
             return Ok(Statement::Select(self.select()?));
         }
