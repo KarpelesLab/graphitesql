@@ -141,6 +141,32 @@ fn correlated_in_where_predicate() {
 }
 
 #[test]
+fn subquery_in_from() {
+    let c = setup();
+    // Derived table as the sole source.
+    let got = ints(
+        &c,
+        "SELECT x FROM (SELECT a AS x FROM t WHERE a > 15) ORDER BY x",
+    );
+    assert_eq!(got, vec![20, 30, 40]);
+
+    // Aggregate over a derived table.
+    let r = c
+        .query("SELECT count(*), sum(x) FROM (SELECT a AS x FROM t WHERE a > 15)")
+        .unwrap();
+    assert_eq!(r.rows[0][0], Value::Integer(3));
+    assert_eq!(r.rows[0][1], Value::Integer(90));
+
+    // Derived table joined against a base table.
+    let got = ints(
+        &c,
+        "SELECT sub.a FROM (SELECT a FROM t WHERE a >= 20) AS sub \
+         JOIN u ON sub.a = u.a ORDER BY sub.a",
+    );
+    assert_eq!(got, vec![20, 40]);
+}
+
+#[test]
 fn correlated_against_sqlite3() {
     use std::process::Command;
     if Command::new("sqlite3").arg("--version").output().is_err() {

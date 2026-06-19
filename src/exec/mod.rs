@@ -2516,6 +2516,21 @@ impl Connection {
                 }],
             ));
         };
+        // A derived-table subquery used as the sole source.
+        if from.joins.is_empty() {
+            if let Some(sub) = &from.first.subquery {
+                let (columns, rows) =
+                    self.run_subquery_source(sub, from.first.alias.as_deref(), params)?;
+                let input = rows
+                    .into_iter()
+                    .map(|values| InputRow {
+                        values,
+                        rowid: None,
+                    })
+                    .collect();
+                return Ok((columns, input));
+            }
+        }
         // A `WITH` common table expression used as the sole source.
         if from.joins.is_empty() {
             if let Some((columns, rows)) =
@@ -2607,11 +2622,36 @@ impl Connection {
     /// Resolve one table reference in a join to its columns + row values,
     /// consulting the CTE environment before the schema (so a CTE — including a
     /// recursive one — can appear as a join source).
+    /// Run a derived-table subquery (`FROM (SELECT …) AS alias`) into column
+    /// metadata (labeled with the alias) and row values.
+    fn run_subquery_source(
+        &self,
+        select: &Select,
+        alias: Option<&str>,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        let result = self.run_select(select, params)?;
+        let label = alias.unwrap_or("").to_string();
+        let columns = result
+            .columns
+            .iter()
+            .map(|n| ColumnInfo {
+                name: n.clone(),
+                table: label.clone(),
+                affinity: eval::Affinity::Blob,
+            })
+            .collect();
+        Ok((columns, result.rows))
+    }
+
     fn resolve_join_source(
         &self,
         tref: &TableRef,
         params: &Params,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        if let Some(sub) = &tref.subquery {
+            return self.run_subquery_source(sub, tref.alias.as_deref(), params);
+        }
         if let Some((cols, rows)) = self.lookup_cte(&tref.name, tref.alias.as_deref()) {
             return Ok((cols, rows.into_iter().map(|r| r.values).collect()));
         }

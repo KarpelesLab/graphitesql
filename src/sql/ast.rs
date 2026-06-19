@@ -149,10 +149,12 @@ pub struct FromClause {
 /// A reference to a table in a `FROM` clause.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
-    /// The table name.
+    /// The table name (empty when this source is a subquery).
     pub name: String,
     /// An optional alias (`AS x` or bare `x`).
     pub alias: Option<String>,
+    /// A derived-table subquery (`FROM (SELECT …) [AS] alias`), if any.
+    pub subquery: Option<Box<Select>>,
 }
 
 /// The kind of join.

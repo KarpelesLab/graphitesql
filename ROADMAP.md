@@ -312,8 +312,10 @@ coverage rather than having a single "done".
   - **row triggers** — `CREATE TRIGGER`/`DROP TRIGGER` for
     `BEFORE`/`AFTER` `INSERT`/`UPDATE`/`DELETE`, with `OLD`/`NEW` references and a
     `WHEN` guard, fired non-recursively (`tests/triggers.rs`);
-  - **views & CTEs as join sources** — either side of a `JOIN` (`tests/views.rs`).
-- **Deliverable (remaining):** subqueries in `FROM` (`FROM (SELECT …)`);
+  - **views & CTEs as join sources** — either side of a `JOIN` (`tests/views.rs`);
+  - **derived tables** — `FROM (SELECT …) [AS] alias` as a sole source or join
+    operand (`tests/subquery.rs`).
+- **Deliverable (remaining):**
   explicit window frame clauses (`ROWS`/`RANGE BETWEEN`); recursive
   triggers & `INSTEAD OF` (view) triggers; `BEFORE`-trigger `NEW` mutation; real
   `VACUUM` compaction; `WITHOUT ROWID`; auto-indexes for `UNIQUE`

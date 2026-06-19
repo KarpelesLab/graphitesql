@@ -452,9 +452,24 @@ impl Parser {
     }
 
     fn table_ref(&mut self) -> Result<TableRef> {
+        // A derived table: `(SELECT …) [AS] alias`.
+        if self.eat(&Token::LParen) {
+            let select = self.select()?;
+            self.expect(&Token::RParen)?;
+            let alias = self.opt_alias()?;
+            return Ok(TableRef {
+                name: String::new(),
+                alias,
+                subquery: Some(Box::new(select)),
+            });
+        }
         let name = self.ident()?;
         let alias = self.opt_alias()?;
-        Ok(TableRef { name, alias })
+        Ok(TableRef {
+            name,
+            alias,
+            subquery: None,
+        })
     }
 
     fn order_term(&mut self) -> Result<OrderTerm> {
