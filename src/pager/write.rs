@@ -147,13 +147,70 @@ impl WritePager {
         Ok(())
     }
 
-    /// Allocate a fresh page at the end of the file, returning its number and a
-    /// zeroed image staged in the overlay.
+    /// Allocate a page, reusing one from the freelist if available, otherwise
+    /// extending the file. The returned page is staged zeroed in the overlay.
     pub fn allocate_page(&mut self) -> Result<u32> {
+        if self.header.freelist_count > 0 && self.header.freelist_trunk != 0 {
+            return self.alloc_from_freelist();
+        }
         self.page_count += 1;
         let n = self.page_count;
         self.overlay.insert(n, vec![0u8; self.page_size]);
         Ok(n)
+    }
+
+    /// Pop a page off the freelist (file-format spec, "The Freelist"). The
+    /// freelist is trunk pages, each holding a next-trunk pointer, a leaf count,
+    /// and that many free-page numbers.
+    fn alloc_from_freelist(&mut self) -> Result<u32> {
+        let trunk = self.header.freelist_trunk;
+        let mut tbytes = self.read_page(trunk)?;
+        let leaf_count = be32(&tbytes, 4);
+        if leaf_count > 0 {
+            // Reuse the last leaf; the trunk stays on the list.
+            let idx = 8 + 4 * (leaf_count as usize - 1);
+            let leaf = be32(&tbytes, idx);
+            put32(&mut tbytes, 4, leaf_count - 1);
+            self.write_page(trunk, tbytes)?;
+            self.header.freelist_count -= 1;
+            self.overlay.insert(leaf, vec![0u8; self.page_size]);
+            Ok(leaf)
+        } else {
+            // No leaves: consume the trunk page itself; its successor heads the list.
+            let next = be32(&tbytes, 0);
+            self.header.freelist_trunk = next;
+            self.header.freelist_count -= 1;
+            self.overlay.insert(trunk, vec![0u8; self.page_size]);
+            Ok(trunk)
+        }
+    }
+
+    /// Return `page` to the freelist (appending it as a leaf of the first trunk
+    /// if there is room, else making it a new trunk page).
+    pub fn free_page(&mut self, page: u32) -> Result<()> {
+        let trunk = self.header.freelist_trunk;
+        // SQLite caps trunk leaves at usable/4 - 2 (integrity_check enforces it).
+        let max_leaves = (self.usable_size() / 4).saturating_sub(2) as u32;
+        if trunk != 0 {
+            let mut tbytes = self.read_page(trunk)?;
+            let leaf_count = be32(&tbytes, 4);
+            if leaf_count < max_leaves {
+                let idx = 8 + 4 * leaf_count as usize;
+                put32(&mut tbytes, idx, page);
+                put32(&mut tbytes, 4, leaf_count + 1);
+                self.write_page(trunk, tbytes)?;
+                self.header.freelist_count += 1;
+                return Ok(());
+            }
+        }
+        // Make `page` a new trunk pointing at the previous head.
+        let mut nb = vec![0u8; self.page_size];
+        put32(&mut nb, 0, trunk); // next trunk
+        put32(&mut nb, 4, 0); // leaf count
+        self.write_page(page, nb)?;
+        self.header.freelist_trunk = page;
+        self.header.freelist_count += 1;
+        Ok(())
     }
 
     /// Discard all staged changes (ROLLBACK).
@@ -171,8 +228,6 @@ impl WritePager {
         self.header.change_counter = self.header.change_counter.wrapping_add(1);
         self.header.size_in_pages = self.page_count;
         self.header.version_valid_for = self.header.change_counter;
-        self.header.freelist_trunk = 0;
-        self.header.freelist_count = 0;
         let mut page1 = self.overlay.get(&1).cloned().unwrap_or(self.read_page(1)?);
         self.header.write_to(&mut page1)?;
         self.overlay.insert(1, page1);
@@ -279,6 +334,16 @@ impl PageSource for WritePager {
     fn page_count(&self) -> u32 {
         self.page_count
     }
+}
+
+#[inline]
+fn be32(b: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+#[inline]
+fn put32(b: &mut [u8], at: usize, v: u32) {
+    b[at..at + 4].copy_from_slice(&v.to_be_bytes());
 }
 
 /// Write an empty table-leaf b-tree header at `offset` within `page`.

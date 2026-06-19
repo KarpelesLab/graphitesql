@@ -53,10 +53,9 @@ pub fn insert_table(wp: &mut WritePager, root: u32, rowid: i64, payload: &[u8]) 
 /// Delete the row with `rowid` from the table b-tree at `root`, if present.
 /// Returns whether a row was removed.
 ///
-/// This rewrites the containing leaf without the cell. It does **not** yet
-/// reclaim freed pages, so to keep `integrity_check` happy it refuses to delete
-/// a row whose payload spills onto overflow pages (those would otherwise leak).
-/// Full freelist management is tracked for Phase 9.
+/// Rewrites the containing leaf without the cell and returns any overflow pages
+/// the row used to the freelist. (Leaf/interior pages are not merged on delete,
+/// so an emptied leaf is left in place — valid, just not maximally compact.)
 pub fn delete_table(wp: &mut WritePager, root: u32, rowid: i64) -> Result<bool> {
     // Locate the leaf containing rowid by descending the tree.
     let mut page_no = root;
@@ -72,21 +71,20 @@ pub fn delete_table(wp: &mut WritePager, root: u32, rowid: i64) -> Result<bool> 
                 let Some(pos) = cells.iter().position(|(r, _)| *r == rowid) else {
                     return Ok(false);
                 };
-                // Refuse overflow rows (their overflow pages would leak).
-                let n = bt.num_cells();
-                for i in 0..n {
-                    if bt.table_leaf_cell(i, usable)?.rowid == rowid
-                        && bt.table_leaf_cell(i, usable)?.payload.overflow != 0
-                    {
-                        return Err(Error::Unsupported(
-                            "DELETE/UPDATE of a row with overflow payload (freelist pending)",
-                        ));
+                // Collect this row's overflow chain so we can reclaim it.
+                let mut overflow = 0u32;
+                for i in 0..bt.num_cells() {
+                    let cell = bt.table_leaf_cell(i, usable)?;
+                    if cell.rowid == rowid {
+                        overflow = cell.payload.overflow;
+                        break;
                     }
                 }
                 cells.remove(pos);
                 let header_prefix = page_one_prefix(page_no, &bt);
                 let buf = serialize_leaf(page_size, body, &cells, header_prefix.as_deref());
                 wp.write_page(page_no, buf)?;
+                free_overflow_chain(wp, overflow)?;
                 return Ok(true);
             }
             PageType::InteriorTable => {
@@ -124,6 +122,17 @@ fn build_leaf_cell(wp: &mut WritePager, rowid: i64, payload: &[u8]) -> Result<Ve
         cell.extend_from_slice(&first.to_be_bytes());
     }
     Ok(cell)
+}
+
+/// Return an overflow-page chain (starting at `first`, 0 = none) to the freelist.
+fn free_overflow_chain(wp: &mut WritePager, mut first: u32) -> Result<()> {
+    while first != 0 {
+        let page = wp.read_page(first)?;
+        let next = u32::from_be_bytes([page[0], page[1], page[2], page[3]]);
+        wp.free_page(first)?;
+        first = next;
+    }
+    Ok(())
 }
 
 /// Write `data` across a chain of overflow pages, returning the first page.

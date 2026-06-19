@@ -92,6 +92,56 @@ fn many_rows_with_splits_read_back() {
 }
 
 #[test]
+fn overflow_delete_reclaims_pages_and_stays_valid() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    use graphitesql::exec::eval::Params;
+    let path = temp_path("freelist.db");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+
+    let big = vec![0xCDu8; 30_000]; // spills across several overflow pages
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB)")
+            .unwrap();
+        let p = Params {
+            positional: vec![Value::Blob(big.clone())],
+            named: vec![],
+        };
+        c.execute_params("INSERT INTO t(data) VALUES (?1)", &p)
+            .unwrap();
+        // Deleting the overflow row must free its overflow pages onto the freelist.
+        assert_eq!(c.execute("DELETE FROM t WHERE id = 1").unwrap(), 1);
+        // Reinsert; the freed pages should be reused.
+        c.execute_params("INSERT INTO t(data) VALUES (?1)", &p)
+            .unwrap();
+    }
+
+    let run = |sql: &str| {
+        let out = Command::new("sqlite3")
+            .arg(&path)
+            .arg(sql)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(run("PRAGMA integrity_check;"), "ok");
+    assert_eq!(run("SELECT count(*) FROM t;"), "1");
+    assert_eq!(run("SELECT length(data) FROM t;"), "30000");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+}
+
+#[test]
 fn sqlite3_cli_opens_graphitesql_database() {
     // Skip cleanly if the sqlite3 CLI is unavailable.
     if Command::new("sqlite3").arg("--version").output().is_err() {
