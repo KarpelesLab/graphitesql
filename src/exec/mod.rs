@@ -1194,6 +1194,18 @@ impl Connection {
                 }
             }
         }
+        // A table must have at least one non-generated (real) column, as in SQLite.
+        if !ct.columns.is_empty()
+            && ct.columns.iter().all(|c| {
+                c.constraints
+                    .iter()
+                    .any(|k| matches!(k, ColumnConstraint::Generated { .. }))
+            })
+        {
+            return Err(Error::Error(
+                "must have at least one non-generated column".into(),
+            ));
+        }
         // A WITHOUT ROWID table is stored as a PK-clustered index b-tree; an
         // ordinary table uses a rowid table b-tree.
         let root = if ct.without_rowid {

@@ -134,3 +134,17 @@ fn generated_against_sqlite3() {
     let got = render_rows(&g.query(query).unwrap());
     assert_eq!(got, want);
 }
+
+#[test]
+fn table_must_have_a_non_generated_column() {
+    // SQLite rejects a table whose every column is generated.
+    let mut c = Connection::open_memory().unwrap();
+    assert!(c
+        .execute("CREATE TABLE t(x INT GENERATED ALWAYS AS (1) VIRTUAL)")
+        .is_err());
+    assert!(c
+        .execute("CREATE TABLE t(a AS (1) STORED, b AS (2) STORED)")
+        .is_err());
+    // A single real column alongside generated ones is fine.
+    assert!(c.execute("CREATE TABLE t(a, b AS (a + 1))").is_ok());
+}
