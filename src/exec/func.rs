@@ -387,6 +387,26 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 }
             }
         }
+        // `json_pretty(X [, indent])` — reformat with indentation (default 4
+        // spaces). Empty arrays/objects and scalars stay compact, like SQLite.
+        "json_pretty" => {
+            if v.is_empty() || v.len() > 2 {
+                return Err(Error::Error("json_pretty() takes 1 or 2 arguments".into()));
+            }
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => {
+                    let indent = match v.get(1) {
+                        Some(Value::Null) | None => alloc::string::String::from("    "),
+                        Some(iv) => eval::to_text(iv),
+                    };
+                    match super::json::parse(&eval::to_text(other)) {
+                        Some(j) => Value::Text(j.pretty(&indent)),
+                        None => return Err(Error::Error("malformed JSON".into())),
+                    }
+                }
+            }
+        }
         "json_quote" => {
             arity(&lname, args, 1)?;
             Value::Text(super::json::value_to_json(&v[0]).serialize())

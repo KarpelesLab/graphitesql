@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **`json_pretty(X [, indent])`** -- reformats JSON with indentation (default 4
+  spaces; empty arrays/objects and scalars stay compact), byte-compatible with
+  sqlite3.
 - **`CURRENT_DATE` / `CURRENT_TIME` / `CURRENT_TIMESTAMP`** keywords now evaluate
   (UTC), equivalent to `date`/`time`/`datetime('now')` -- in expressions and as
   column `DEFAULT`s. A quoted `"current_date"` stays an identifier.

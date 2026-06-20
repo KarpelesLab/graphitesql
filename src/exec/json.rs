@@ -64,6 +64,57 @@ impl Json {
         s
     }
 
+    /// Serialize to pretty-printed JSON using `indent` as the per-level unit
+    /// (SQLite's `json_pretty`). Empty arrays/objects stay on one line; scalars
+    /// render compactly.
+    pub fn pretty(&self, indent: &str) -> String {
+        let mut s = String::new();
+        self.write_pretty(&mut s, indent, 0);
+        s
+    }
+
+    fn write_pretty(&self, out: &mut String, indent: &str, depth: usize) {
+        let pad = |out: &mut String, n: usize| {
+            for _ in 0..n {
+                out.push_str(indent);
+            }
+        };
+        match self {
+            Json::Array(items) if !items.is_empty() => {
+                out.push('[');
+                for (i, it) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                    pad(out, depth + 1);
+                    it.write_pretty(out, indent, depth + 1);
+                }
+                out.push('\n');
+                pad(out, depth);
+                out.push(']');
+            }
+            Json::Object(members) if !members.is_empty() => {
+                out.push('{');
+                for (i, (k, v)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                    pad(out, depth + 1);
+                    write_json_string(k, out);
+                    out.push_str(": ");
+                    v.write_pretty(out, indent, depth + 1);
+                }
+                out.push('\n');
+                pad(out, depth);
+                out.push('}');
+            }
+            // Scalars and empty containers render the same as the compact form.
+            _ => self.write(out),
+        }
+    }
+
     fn write(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),
