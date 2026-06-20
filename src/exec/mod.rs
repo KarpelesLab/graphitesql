@@ -4679,6 +4679,10 @@ impl eval::Subqueries for Connection {
         })
     }
 
+    fn rows(&self, select: &Select, outer: &EvalCtx) -> Result<Vec<Vec<Value>>> {
+        self.with_outer_frame(outer, |params| Ok(self.run_select(select, params)?.rows))
+    }
+
     fn exists(&self, select: &Select, outer: &EvalCtx) -> Result<bool> {
         self.with_outer_frame(outer, |params| {
             Ok(!self.run_select(select, params)?.rows.is_empty())

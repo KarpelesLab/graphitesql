@@ -30,6 +30,8 @@ pub trait Subqueries {
     fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value>;
     /// First column of every row — the candidate set for `IN (SELECT …)`.
     fn column(&self, select: &Select, outer: &EvalCtx) -> Result<Vec<Value>>;
+    /// Every row in full — the candidate set for a row-value `(a,b) IN (SELECT …)`.
+    fn rows(&self, select: &Select, outer: &EvalCtx) -> Result<Vec<Vec<Value>>>;
     /// Whether the subquery returns at least one row — for `EXISTS`.
     fn exists(&self, select: &Select, outer: &EvalCtx) -> Result<bool>;
     /// Resolve a column against the enclosing (outer) query rows, if any are in
@@ -456,6 +458,9 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             select,
             negated,
         } => {
+            if let Some(ls) = as_row_value(expr) {
+                return eval_row_in_select(ls, select, *negated, ctx);
+            }
             let v = eval(expr, ctx)?;
             if matches!(v, Value::Null) {
                 return Ok(Value::Null);
@@ -567,6 +572,51 @@ fn fold_row_comparison(op: BinaryOp, cmps: &[Option<Ordering>]) -> Value {
             bool_value(matches!(op, LtEq | GtEq))
         }
         _ => Value::Null,
+    }
+}
+
+/// `(a, b, …) [NOT] IN (SELECT …)` — row value membership against a subquery.
+fn eval_row_in_select(
+    lefts: &[Expr],
+    select: &Select,
+    negated: bool,
+    ctx: &EvalCtx,
+) -> Result<Value> {
+    let lvals: Vec<Value> = lefts.iter().map(|e| eval(e, ctx)).collect::<Result<_>>()?;
+    let rows = match ctx.subqueries {
+        Some(s) => s.rows(select, ctx)?,
+        None => return Err(Error::Unsupported("IN (SELECT …) in this context")),
+    };
+    let mut saw_null = false;
+    for row in &rows {
+        if row.len() != lvals.len() {
+            return Err(Error::Error(alloc::format!(
+                "sub-select returns {} columns - expected {}",
+                row.len(),
+                lvals.len()
+            )));
+        }
+        let cmps: Vec<Option<Ordering>> = lvals
+            .iter()
+            .zip(row)
+            .map(|(l, r)| {
+                if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                    None
+                } else {
+                    Some(compare(l, r))
+                }
+            })
+            .collect();
+        match fold_row_comparison(BinaryOp::Eq, &cmps) {
+            Value::Integer(1) => return Ok(bool_value(!negated)),
+            Value::Null => saw_null = true,
+            _ => {}
+        }
+    }
+    if saw_null {
+        Ok(Value::Null)
+    } else {
+        Ok(bool_value(negated))
     }
 }
 

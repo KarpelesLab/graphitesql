@@ -70,6 +70,30 @@ fn in_list() {
 }
 
 #[test]
+fn in_select() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a,b)").unwrap();
+    c.execute("INSERT INTO t VALUES (1,1),(1,2),(2,2)").unwrap();
+    c.execute("CREATE TABLE u(x,y)").unwrap();
+    c.execute("INSERT INTO u VALUES (1,2),(2,2),(9,9)").unwrap();
+    assert_eq!(
+        rows_str(
+            &c,
+            "SELECT a,b FROM t WHERE (a,b) IN (SELECT x,y FROM u) ORDER BY a,b"
+        ),
+        "1|2\n2|2"
+    );
+    assert_eq!(
+        one(&c, "SELECT (1,2) IN (SELECT x,y FROM u)"),
+        Value::Integer(1)
+    );
+    assert_eq!(
+        one(&c, "SELECT (5,5) IN (SELECT x,y FROM u)"),
+        Value::Integer(0)
+    );
+}
+
+#[test]
 fn against_sqlite3() {
     if !sqlite3_available() {
         eprintln!("sqlite3 not found; skipping");
