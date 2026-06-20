@@ -1624,6 +1624,9 @@ impl Connection {
             let record = self.encode_table_record(&meta, &index_values);
             insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
             for idx in &indexes {
+                if !self.row_in_index(idx, &meta, &index_values, Some(rowid), params)? {
+                    continue; // partial index excludes this row
+                }
                 let key = index_key(&idx.cols, &index_values, rowid);
                 insert_index(self.backend.writer()?, idx.root, &key, &idx.collations)?;
             }
@@ -2046,25 +2049,51 @@ impl Connection {
         let (cols, colls) = self.index_columns_coll(&tmeta, ci)?;
         let schema_next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
 
+        // A partial index (`CREATE INDEX … WHERE p`) only stores rows for which
+        // the predicate holds; evaluate it up front (before the writer borrow).
+        let no_params = Params::default();
+        let keep_row = |values: &[Value], rowid: Option<i64>| -> Result<bool> {
+            match &ci.where_clause {
+                None => Ok(true),
+                Some(p) => {
+                    let ctx =
+                        row_ctx(values, &tmeta.columns, rowid, &no_params).with_subqueries(self);
+                    Ok(eval::truth(&eval::eval(p, &ctx)?) == Some(true))
+                }
+            }
+        };
+
         // WITHOUT ROWID secondary indexes are keyed by (indexed cols, PK cols)
         // instead of (indexed cols, rowid).
         let root = if tmeta.without_rowid {
             let rows = self.scan_without_rowid(&tmeta)?;
+            let keep: Vec<bool> = rows
+                .iter()
+                .map(|row| keep_row(row, None))
+                .collect::<Result<_>>()?;
             let pk_cols = tmeta.storage_order[..tmeta.pk_len].to_vec();
             let mut key_colls = colls.clone();
             key_colls.extend(self.col_collations(&tmeta, &pk_cols));
             let w = self.backend.writer()?;
             let root = create_index_root(w)?;
-            for row in &rows {
-                insert_index(w, root, &wr_index_key(&cols, &pk_cols, row), &key_colls)?;
+            for (row, &k) in rows.iter().zip(&keep) {
+                if k {
+                    insert_index(w, root, &wr_index_key(&cols, &pk_cols, row), &key_colls)?;
+                }
             }
             root
         } else {
             let rows = self.scan_table(&tmeta)?;
+            let keep: Vec<bool> = rows
+                .iter()
+                .map(|(rowid, values)| keep_row(values, Some(*rowid)))
+                .collect::<Result<_>>()?;
             let w = self.backend.writer()?;
             let root = create_index_root(w)?;
-            for (rowid, values) in &rows {
-                insert_index(w, root, &index_key(&cols, values, *rowid), &colls)?;
+            for ((rowid, values), &k) in rows.iter().zip(&keep) {
+                if k {
+                    insert_index(w, root, &index_key(&cols, values, *rowid), &colls)?;
+                }
             }
             root
         };
@@ -2648,6 +2677,11 @@ impl Connection {
         let stats = self.stat1_map();
         let mut best: Option<(u32, Vec<Value>, Vec<crate::value::Collation>, u64)> = None;
         for idx in &indexes {
+            // A partial index covers only some rows; using it for a general
+            // equality seek could miss rows, so leave those to the table scan.
+            if idx.partial.is_some() {
+                continue;
+            }
             let mut key = Vec::new();
             let mut colls = Vec::new();
             for (pos, &c) in idx.cols.iter().enumerate() {
@@ -2834,6 +2868,9 @@ impl Connection {
             let Ok(Statement::CreateIndex(ci)) = sql::parse_one(sql) else {
                 continue;
             };
+            if ci.where_clause.is_some() {
+                continue; // partial indexes are not used for seeks (see try_index_lookup)
+            }
             let Ok(cols) = self.index_columns(meta, &ci) else {
                 continue;
             };
@@ -2893,6 +2930,7 @@ impl Connection {
                         root: obj.rootpage,
                         cols,
                         collations,
+                        partial: ci.where_clause.clone(),
                     });
                 }
                 // Automatic index: its columns are the n-th UNIQUE/PK set.
@@ -2905,6 +2943,7 @@ impl Connection {
                                 root: obj.rootpage,
                                 cols: cols.clone(),
                                 collations,
+                                partial: None,
                             });
                         }
                     }
@@ -2955,16 +2994,48 @@ impl Connection {
         cols.iter().map(|&c| tmeta.columns[c].collation).collect()
     }
 
+    /// Whether a row belongs in `idx`: always for a full index, else whether the
+    /// partial-index predicate holds for the row.
+    fn row_in_index(
+        &self,
+        idx: &IndexMeta,
+        tmeta: &TableMeta,
+        values: &[Value],
+        rowid: Option<i64>,
+        params: &Params,
+    ) -> Result<bool> {
+        match &idx.partial {
+            None => Ok(true),
+            Some(pred) => {
+                let ctx = row_ctx(values, &tmeta.columns, rowid, params).with_subqueries(self);
+                Ok(eval::truth(&eval::eval(pred, &ctx)?) == Some(true))
+            }
+        }
+    }
+
     /// Rebuild every index of a table in place (used after DELETE/UPDATE).
     fn rebuild_indexes(&mut self, tmeta: &TableMeta, indexes: &[IndexMeta]) -> Result<()> {
         if indexes.is_empty() {
             return Ok(());
         }
         let rows = self.scan_table(tmeta)?;
-        let w = self.backend.writer()?;
+        // Precompute, per index, which rows it includes (partial predicate) before
+        // taking the writer borrow.
+        let mut keep: Vec<Vec<usize>> = Vec::with_capacity(indexes.len());
         for idx in indexes {
+            let mut ks = Vec::new();
+            for (i, (rowid, values)) in rows.iter().enumerate() {
+                if self.row_in_index(idx, tmeta, values, Some(*rowid), &Params::default())? {
+                    ks.push(i);
+                }
+            }
+            keep.push(ks);
+        }
+        let w = self.backend.writer()?;
+        for (idx, ks) in indexes.iter().zip(&keep) {
             clear_index(w, idx.root)?;
-            for (rowid, values) in &rows {
+            for &i in ks {
+                let (rowid, values) = &rows[i];
                 let key = index_key(&idx.cols, values, *rowid);
                 insert_index(w, idx.root, &key, &idx.collations)?;
             }
@@ -3884,16 +3955,27 @@ impl Connection {
         let pk_cols = meta.storage_order[..meta.pk_len].to_vec();
         let pk_colls: Vec<crate::value::Collation> =
             pk_cols.iter().map(|&c| meta.columns[c].collation).collect();
-        let w = self.backend.writer()?;
+        // Precompute partial-index membership before the writer borrow.
+        let mut keep: Vec<Vec<usize>> = Vec::with_capacity(indexes.len());
         for idx in &indexes {
+            let mut ks = Vec::new();
+            for (i, row) in rows.iter().enumerate() {
+                if self.row_in_index(idx, meta, row, None, &Params::default())? {
+                    ks.push(i);
+                }
+            }
+            keep.push(ks);
+        }
+        let w = self.backend.writer()?;
+        for (idx, ks) in indexes.iter().zip(&keep) {
             let mut key_colls = idx.collations.clone();
             key_colls.extend(pk_colls.iter().copied());
             clear_index(w, idx.root)?;
-            for row in &rows {
+            for &i in ks {
                 insert_index(
                     w,
                     idx.root,
-                    &wr_index_key(&idx.cols, &pk_cols, row),
+                    &wr_index_key(&idx.cols, &pk_cols, &rows[i]),
                     &key_colls,
                 )?;
             }
@@ -4629,6 +4711,9 @@ struct IndexMeta {
     cols: Vec<usize>,
     /// Collating sequence for each indexed column (aligned with `cols`).
     collations: Vec<crate::value::Collation>,
+    /// `CREATE INDEX … WHERE <predicate>` — a partial index only stores rows for
+    /// which the predicate is true. `None` for a full index.
+    partial: Option<Expr>,
 }
 
 impl Connection {

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: partial indexes — `CREATE INDEX … WHERE <predicate>`. The index stores
+  only rows satisfying the predicate; entries are added/removed as rows cross the
+  boundary on insert/update/delete, so `sqlite3 integrity_check` passes. The
+  planner conservatively scans rather than seeking a partial index (always
+  correct). Verified against `sqlite3`.
 - Track A: `VALUES` as a query — standalone (`VALUES (1,2),(3,4)`) and as a table
   source (`SELECT … FROM (VALUES …)`). Desugared to a `UNION ALL` of single-row
   selects with SQLite's `column1`/`column2`/… naming. Verified against `sqlite3`.
