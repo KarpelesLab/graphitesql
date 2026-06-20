@@ -72,6 +72,42 @@ fn against_sqlite3() {
     }
 
     let mut failures = Vec::new();
+    // foreign_key_check needs its own fixture with dangling references.
+    {
+        let fkc = "CREATE TABLE pp(id INTEGER PRIMARY KEY);\
+                   CREATE TABLE cc(x, y, FOREIGN KEY(x) REFERENCES pp(id));\
+                   INSERT INTO pp VALUES (1);\
+                   INSERT INTO cc VALUES (1,'a'),(2,'b'),(9,'c')";
+        let fpath = std::env::temp_dir().join(format!("gsql-fkc-{}.db", std::process::id()));
+        let fpath = fpath.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&fpath);
+        Command::new("sqlite3")
+            .arg(&fpath)
+            .arg(fkc)
+            .output()
+            .unwrap();
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(&fpath)
+                .arg("PRAGMA foreign_key_check")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let _ = std::fs::remove_file(&fpath);
+        let mut gc = Connection::open_memory().unwrap();
+        for s in fkc.split(';') {
+            if !s.trim().is_empty() {
+                gc.execute(s).unwrap();
+            }
+        }
+        let got = rows_str(&gc, "PRAGMA foreign_key_check");
+        if got != want {
+            failures.push(format!(
+                "  foreign_key_check\n    sqlite:   {want:?}\n    graphite: {got:?}"
+            ));
+        }
+    }
     for q in queries {
         let want = {
             let o = Command::new("sqlite3").arg(&path).arg(q).output().unwrap();

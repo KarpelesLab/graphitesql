@@ -298,6 +298,7 @@ impl Connection {
             "index_list" => self.pragma_index_list(p),
             "index_info" => self.pragma_index_info(p),
             "foreign_key_list" => self.pragma_foreign_key_list(p),
+            "foreign_key_check" => self.pragma_foreign_key_check(p),
             "foreign_keys" => Ok(single(
                 "foreign_keys",
                 Value::Integer(self.foreign_keys as i64),
@@ -537,6 +538,57 @@ impl Connection {
             .iter()
             .map(|s| String::from(*s))
             .collect(),
+            rows,
+        })
+    }
+
+    /// `PRAGMA foreign_key_check[(table)]` → one `(table, rowid, parent, fkid)`
+    /// row per child row that references a missing parent key. `fkid` matches the
+    /// `id` reported by `foreign_key_list`.
+    fn pragma_foreign_key_check(&self, p: &Pragma) -> Result<QueryResult> {
+        use crate::schema::ObjectType;
+        let tables: Vec<String> = match &p.value {
+            Some(_) => alloc::vec![Self::pragma_arg_name(p)?],
+            None => self
+                .schema
+                .objects()
+                .iter()
+                .filter(|o| o.obj_type == ObjectType::Table && !o.name.starts_with("sqlite_"))
+                .map(|o| o.name.clone())
+                .collect(),
+        };
+        let mut rows = Vec::new();
+        for table in &tables {
+            let meta = self.table_meta(table, None)?;
+            if meta.without_rowid {
+                continue; // rowid-less FK reporting not modeled yet
+            }
+            let fks = self.foreign_keys_of(table)?;
+            if fks.is_empty() {
+                continue;
+            }
+            let n = fks.len();
+            for (rowid, values) in self.scan_table(&meta)? {
+                for (i, fk) in fks.iter().enumerate() {
+                    let Some(key) = self.child_key_values(&meta, fk, &values) else {
+                        continue; // a NULL key column => satisfied
+                    };
+                    if !self.parent_has_key(fk, &key)? {
+                        rows.push(alloc::vec![
+                            Value::Text(table.clone()),
+                            Value::Integer(rowid),
+                            Value::Text(fk.ref_table.clone()),
+                            Value::Integer((n - 1 - i) as i64),
+                        ]);
+                    }
+                }
+            }
+        }
+        Ok(QueryResult {
+            columns: ["table", "rowid", "parent", "fkid"]
+                .iter()
+                .map(|s| String::from(*s))
+                .collect(),
             rows,
         })
     }

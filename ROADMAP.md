@@ -199,9 +199,10 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
   (ours is a private, recoverable format today) so a crashed graphitesql write is
   recoverable by `sqlite3` too.
 - ✅ introspection PRAGMAs: `index_list`, `index_info`, `foreign_key_list`,
-  `freelist_count`, `application_id`, `data_version` (plus existing `table_info`,
-  …). *Remaining:* `foreign_key_check`, `quick_check`/`integrity_check` (in-engine,
-  currently delegated to `sqlite3`), and the `pragma_*` table-valued functions.
+  `foreign_key_check`, `freelist_count`, `application_id`, `data_version` (plus
+  existing `table_info`, …). *Remaining:* `quick_check`/`integrity_check`
+  (in-engine, currently delegated to `sqlite3`), and the `pragma_*` table-valued
+  functions.
 
 ### Track D — Phase 10: ecosystem & extensions *(post-1.0, behind features)*
 
