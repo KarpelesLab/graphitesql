@@ -102,6 +102,12 @@ pub struct Connection {
     /// Count of open savepoints. Like `in_tx`, a non-zero count suppresses
     /// autocommit so changes accumulate until the outermost savepoint is released.
     open_savepoints: usize,
+    /// The rowid of the most recently inserted row (`last_insert_rowid()`).
+    last_insert_rowid: core::cell::Cell<i64>,
+    /// Rows modified by the most recent INSERT/UPDATE/DELETE (`changes()`).
+    changes: core::cell::Cell<i64>,
+    /// Rows modified since the connection opened (`total_changes()`).
+    total_changes: core::cell::Cell<i64>,
 }
 
 /// A materialized common table expression: a named, in-memory relation.
@@ -141,6 +147,9 @@ impl Connection {
             recursive_triggers: false,
             returning_rows: core::cell::RefCell::new(Vec::new()),
             open_savepoints: 0,
+            last_insert_rowid: core::cell::Cell::new(0),
+            changes: core::cell::Cell::new(0),
+            total_changes: core::cell::Cell::new(0),
         })
     }
 
@@ -158,6 +167,9 @@ impl Connection {
             recursive_triggers: false,
             returning_rows: core::cell::RefCell::new(Vec::new()),
             open_savepoints: 0,
+            last_insert_rowid: core::cell::Cell::new(0),
+            changes: core::cell::Cell::new(0),
+            total_changes: core::cell::Cell::new(0),
         })
     }
 
@@ -817,6 +829,11 @@ impl Connection {
             _ => {}
         }
 
+        // `changes()`/`total_changes()` track only INSERT/UPDATE/DELETE.
+        let is_dml = matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        );
         let affected = match stmt {
             Statement::CreateTable(ct) => {
                 self.exec_create_table(&ct, sql.trim())?;
@@ -869,6 +886,11 @@ impl Connection {
             | Statement::RollbackTo(_) => unreachable!(),
         };
 
+        if is_dml {
+            self.changes.set(affected as i64);
+            self.total_changes
+                .set(self.total_changes.get() + affected as i64);
+        }
         if !self.in_tx && self.open_savepoints == 0 {
             self.backend.writer()?.commit()?;
             // Refresh the catalog from the committed image.
@@ -2066,6 +2088,9 @@ impl Connection {
             )?;
             let record = self.encode_table_record(&meta, &index_values);
             insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
+            // `last_insert_rowid()` tracks the most recent insert (a later insert
+            // from an AFTER trigger overwrites this, matching SQLite).
+            self.last_insert_rowid.set(rowid);
             for idx in &indexes {
                 if !self.row_in_index(idx, &meta, &index_values, Some(rowid), params)? {
                     continue; // partial index excludes this row
@@ -6440,6 +6465,15 @@ impl Connection {
 }
 
 impl eval::Subqueries for Connection {
+    fn last_insert_rowid(&self) -> i64 {
+        self.last_insert_rowid.get()
+    }
+    fn changes(&self) -> i64 {
+        self.changes.get()
+    }
+    fn total_changes(&self) -> i64 {
+        self.total_changes.get()
+    }
     fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value> {
         self.with_outer_frame(outer, |params| {
             let r = self.run_select(select, params)?;

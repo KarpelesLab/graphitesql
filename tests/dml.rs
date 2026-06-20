@@ -346,3 +346,27 @@ fn delete_update_with_order_by_limit() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}-journal"));
 }
+
+#[test]
+fn change_counters_match_sqlite_semantics() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+        .unwrap();
+    c.execute("INSERT INTO t(v) VALUES (1),(2),(3)").unwrap();
+    let i = |c: &Connection, q: &str| match &c.query(q).unwrap().rows[0][0] {
+        Value::Integer(n) => *n,
+        other => panic!("not int: {other:?}"),
+    };
+    assert_eq!(i(&c, "SELECT last_insert_rowid()"), 3);
+    assert_eq!(i(&c, "SELECT changes()"), 3);
+    assert_eq!(i(&c, "SELECT total_changes()"), 3);
+    c.execute("UPDATE t SET v = v + 1").unwrap();
+    assert_eq!(i(&c, "SELECT changes()"), 3);
+    assert_eq!(i(&c, "SELECT total_changes()"), 6);
+    c.execute("DELETE FROM t WHERE id > 1").unwrap();
+    assert_eq!(i(&c, "SELECT changes()"), 2);
+    assert_eq!(i(&c, "SELECT total_changes()"), 8);
+    // A SELECT does not change the counters.
+    let _ = c.query("SELECT count(*) FROM t").unwrap();
+    assert_eq!(i(&c, "SELECT changes()"), 2);
+}

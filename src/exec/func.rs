@@ -43,6 +43,20 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         )));
     }
 
+    // Connection-state functions: read counters off the subquery handler.
+    match lname.as_str() {
+        "last_insert_rowid" | "changes" | "total_changes" => {
+            arity(&lname, args, 0)?;
+            let n = ctx.subqueries.map_or(0, |s| match lname.as_str() {
+                "last_insert_rowid" => s.last_insert_rowid(),
+                "changes" => s.changes(),
+                _ => s.total_changes(),
+            });
+            return Ok(Value::Integer(n));
+        }
+        _ => {}
+    }
+
     // Functions whose NULL-handling is special are done before arg evaluation.
     match lname.as_str() {
         "coalesce" => {

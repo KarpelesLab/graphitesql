@@ -37,6 +37,18 @@ pub trait Subqueries {
     /// Resolve a column against the enclosing (outer) query rows, if any are in
     /// scope. Returns `None` when there is no such outer column.
     fn resolve_outer(&self, table: Option<&str>, name: &str) -> Option<Value>;
+    /// `last_insert_rowid()` — rowid of the most recently inserted row.
+    fn last_insert_rowid(&self) -> i64 {
+        0
+    }
+    /// `changes()` — rows modified by the most recent INSERT/UPDATE/DELETE.
+    fn changes(&self) -> i64 {
+        0
+    }
+    /// `total_changes()` — rows modified since the connection opened.
+    fn total_changes(&self) -> i64 {
+        0
+    }
 }
 
 /// A column's type affinity (SQLite, `datatype3.html` §3).
