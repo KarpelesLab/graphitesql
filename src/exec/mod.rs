@@ -77,6 +77,13 @@ impl Backend {
 pub struct Connection {
     backend: Backend,
     schema: Schema,
+    /// The `main` database's file path (empty for an in-memory database), as
+    /// reported by `PRAGMA database_list`.
+    main_file: String,
+    /// Attached databases (`ATTACH … AS name`), in attachment order, each with
+    /// its own backend and schema. The `main` database is the fields above; this
+    /// list holds everything attached after it. *(Populated from C2 onward.)*
+    attached: Vec<AttachedDb>,
     /// True between `BEGIN` and `COMMIT`/`ROLLBACK`; suppresses autocommit.
     in_tx: bool,
     /// A stack of materialized `WITH` common table expressions in scope, innermost
@@ -110,6 +117,19 @@ pub struct Connection {
     total_changes: core::cell::Cell<i64>,
 }
 
+/// An attached database (`ATTACH 'file' AS name`): its own storage and catalog.
+struct AttachedDb {
+    /// The schema name given in `ATTACH … AS name`.
+    name: String,
+    /// The file path it was attached from (empty for an in-memory attachment).
+    file: String,
+    // Read once the executor becomes database-aware (C2/C3).
+    #[allow(dead_code)]
+    backend: Backend,
+    #[allow(dead_code)]
+    schema: Schema,
+}
+
 /// A materialized common table expression: a named, in-memory relation.
 struct CteBinding {
     name: String,
@@ -139,6 +159,8 @@ impl Connection {
         Ok(Connection {
             backend,
             schema,
+            main_file: String::new(),
+            attached: Vec::new(),
             in_tx: false,
             cte_env: core::cell::RefCell::new(Vec::new()),
             outer_scope: core::cell::RefCell::new(Vec::new()),
@@ -159,6 +181,8 @@ impl Connection {
         Ok(Connection {
             backend,
             schema,
+            main_file: String::new(),
+            attached: Vec::new(),
             in_tx: false,
             cte_env: core::cell::RefCell::new(Vec::new()),
             outer_scope: core::cell::RefCell::new(Vec::new()),
@@ -179,7 +203,9 @@ impl Connection {
         let main = vfs.open(path, OpenFlags::READ_WRITE)?;
         let journal = vfs.open(&journal_path(path), OpenFlags::READ_WRITE_CREATE)?;
         let wal = vfs.open(&wal_path(path), OpenFlags::READ_WRITE_CREATE)?;
-        Connection::from_pager(WritePager::open_wal(main, Some(journal), Some(wal))?)
+        let mut c = Connection::from_pager(WritePager::open_wal(main, Some(journal), Some(wal))?)?;
+        c.main_file = path.to_string();
+        Ok(c)
     }
 
     /// Open an existing database read-only through `vfs`. If a `<path>-wal` file
@@ -191,9 +217,13 @@ impl Connection {
         if vfs.exists(&wal_path)? {
             let mut wal = vfs.open(&wal_path, OpenFlags::READ_ONLY)?;
             let reader = crate::pager::WalReader::open(main, wal.as_mut())?;
-            return Connection::from_read_backend(Box::new(reader));
+            let mut c = Connection::from_read_backend(Box::new(reader))?;
+            c.main_file = path.to_string();
+            return Ok(c);
         }
-        Connection::from_read_backend(Box::new(WritePager::open(main, None)?))
+        let mut c = Connection::from_read_backend(Box::new(WritePager::open(main, None)?))?;
+        c.main_file = path.to_string();
+        Ok(c)
     }
 
     /// Create a new, empty database through `vfs`.
@@ -203,7 +233,9 @@ impl Connection {
         let wal = vfs.open(&wal_path(path), OpenFlags::READ_WRITE_CREATE)?;
         let mut db = WritePager::create_wal(main, Some(journal), Some(wal), page_size)?;
         db.commit()?;
-        Connection::from_pager(db)
+        let mut c = Connection::from_pager(db)?;
+        c.main_file = path.to_string();
+        Ok(c)
     }
 
     /// Open an existing database file for reading and writing (requires `std`).
@@ -354,6 +386,7 @@ impl Connection {
             "index_list" => self.pragma_index_list(p),
             "index_info" => self.pragma_index_info(p, false),
             "index_xinfo" => self.pragma_index_info(p, true),
+            "database_list" => Ok(self.pragma_database_list()),
             "foreign_key_list" => self.pragma_foreign_key_list(p),
             "foreign_key_check" => self.pragma_foreign_key_check(p),
             "integrity_check" | "quick_check" => self.pragma_integrity_check(),
@@ -374,6 +407,28 @@ impl Connection {
                 Ok(single("journal_mode", Value::Text(mode.into())))
             }
             _ => Err(Error::Unsupported("this PRAGMA")),
+        }
+    }
+
+    /// `PRAGMA database_list` → `(seq, name, file)` for `main`, then each
+    /// attached database in attachment order. In-memory databases report an
+    /// empty file path, as in SQLite.
+    fn pragma_database_list(&self) -> QueryResult {
+        let mut rows = alloc::vec![alloc::vec![
+            Value::Integer(0),
+            Value::Text("main".into()),
+            Value::Text(self.main_file.clone()),
+        ]];
+        for (i, db) in self.attached.iter().enumerate() {
+            rows.push(alloc::vec![
+                Value::Integer((i + 1) as i64),
+                Value::Text(db.name.clone()),
+                Value::Text(db.file.clone()),
+            ]);
+        }
+        QueryResult {
+            columns: alloc::vec!["seq".into(), "name".into(), "file".into()],
+            rows,
         }
     }
 
