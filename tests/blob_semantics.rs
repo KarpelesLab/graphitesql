@@ -63,6 +63,10 @@ fn blob_semantics_match_sqlite3() {
         "SELECT length(x'010203'), hex(x'abcd'), quote(x'00ff')",
         "SELECT typeof(x'00'), typeof(cast('AB' as blob))",
         "SELECT hex(x'41' || x'42')",
+        // substr on a blob slices bytes and returns a blob.
+        "SELECT quote(substr(x'41424344', 2, 2))",
+        "SELECT quote(substr(x'0102030405', -2))",
+        "SELECT typeof(substr(x'4142', 1, 1))",
         "SELECT quote(min(v)), quote(max(v)) FROM x",
         "SELECT count(*) FROM x WHERE v IS NOT NULL",
     ];

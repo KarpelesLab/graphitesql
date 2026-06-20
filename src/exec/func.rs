@@ -669,8 +669,18 @@ fn substr(v: &[Value]) -> Result<Value> {
     if matches!(v[0], Value::Null) {
         return Ok(Value::Null);
     }
-    let s: Vec<char> = eval::to_text(&v[0]).chars().collect();
-    let len = s.len() as i64;
+    // `substr` of a blob slices bytes and returns a blob; otherwise it slices
+    // characters of the text form and returns text.
+    let blob = matches!(v[0], Value::Blob(_));
+    let units: alloc::vec::Vec<char> = if blob {
+        match &v[0] {
+            Value::Blob(b) => b.iter().map(|&x| x as char).collect(),
+            _ => unreachable!(),
+        }
+    } else {
+        eval::to_text(&v[0]).chars().collect()
+    };
+    let len = units.len() as i64;
     // 1-based start; a negative start counts from the end. Unlike a naive clamp,
     // SQLite keeps the requested window and only the positions in 1..=len are
     // returned, so `substr('hello',0,3)` yields "he" (positions 0,1,2 → 1,2).
@@ -690,12 +700,15 @@ fn substr(v: &[Value]) -> Result<Value> {
     };
     let b = wstart.max(1);
     let e = wend.min(len + 1);
-    if b >= e {
-        Ok(Value::Text(String::new()))
+    let slice = if b >= e {
+        &[][..]
     } else {
-        Ok(Value::Text(
-            s[(b - 1) as usize..(e - 1) as usize].iter().collect(),
-        ))
+        &units[(b - 1) as usize..(e - 1) as usize]
+    };
+    if blob {
+        Ok(Value::Blob(slice.iter().map(|&c| c as u8).collect()))
+    } else {
+        Ok(Value::Text(slice.iter().collect()))
     }
 }
 
