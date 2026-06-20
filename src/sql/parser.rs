@@ -561,9 +561,13 @@ impl Parser {
                     kind: JoinKind::Inner,
                     table,
                     on: None,
+                    natural: false,
+                    using: Vec::new(),
                 });
                 continue;
             }
+            // An optional `NATURAL` prefixes the join type.
+            let natural = self.eat_kw("natural");
             let kind = if self.eat_kw("left") {
                 let _ = self.eat_kw("outer");
                 self.expect_kw("join")?;
@@ -581,16 +585,39 @@ impl Parser {
                 JoinKind::Inner
             } else if self.eat_kw("join") {
                 JoinKind::Inner
+            } else if natural {
+                return Err(self.err("expected JOIN after NATURAL"));
             } else {
                 break;
             };
             let table = self.table_ref()?;
-            let on = if self.eat_kw("on") {
-                Some(self.expr()?)
-            } else {
-                None
-            };
-            joins.push(Join { kind, table, on });
+            // `ON <expr>` or `USING (col, …)` — at most one, and neither with
+            // NATURAL.
+            let mut on = None;
+            let mut using = Vec::new();
+            if self.eat_kw("on") {
+                if natural {
+                    return Err(self.err("NATURAL join may not have an ON clause"));
+                }
+                on = Some(self.expr()?);
+            } else if self.eat_kw("using") {
+                if natural {
+                    return Err(self.err("NATURAL join may not have a USING clause"));
+                }
+                self.expect(&Token::LParen)?;
+                using.push(self.ident()?);
+                while self.eat(&Token::Comma) {
+                    using.push(self.ident()?);
+                }
+                self.expect(&Token::RParen)?;
+            }
+            joins.push(Join {
+                kind,
+                table,
+                on,
+                natural,
+                using,
+            });
         }
         Ok(FromClause { first, joins })
     }
@@ -2020,6 +2047,7 @@ fn is_reserved_after_expr(w: &str) -> bool {
             | "full"
             | "outer"
             | "cross"
+            | "natural"
             | "on"
             | "using"
             | "and"

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Fix: **`NATURAL JOIN` and `JOIN … USING (…)`** now work. `NATURAL` was parsed
+  as a table alias (`FROM t AS natural JOIN …`), silently turning a natural join
+  into a cross join with wrong results; both forms now join on equality of the
+  common / named columns and coalesce each into a single output column
+  (`COALESCE(left, right)` for outer joins), keeping it in its left position and
+  referenceable unqualified — matching sqlite. A `NATURAL` join with no common
+  column degrades to a cross join, and a `USING` column absent from either side
+  is an error, both as in sqlite.
 - **Planner (B0): index-driven `ORDER BY`.** A single-table full scan whose sole
   `ORDER BY` term is satisfied by a scan order now skips the sort: the rowid /
   INTEGER PRIMARY KEY case uses the table b-tree (`SCAN t`), and a column that is

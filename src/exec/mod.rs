@@ -6481,11 +6481,46 @@ impl Connection {
         for join in &from.joins {
             let (jcols, jrows) = self.resolve_join_source(&join.table, params)?;
 
+            let left_width = columns.len();
+            // `NATURAL` / `USING` join columns, as `(left index, right local
+            // index)` pairs: the join matches on equality of these and coalesces
+            // each into the single left-side output column. `NATURAL` pairs every
+            // commonly-named column; with no common column it degrades to a cross
+            // join (empty `pairs`), matching SQLite.
+            let pairs: Vec<(usize, usize)> = if join.natural {
+                jcols
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(rl, rc)| {
+                        columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(&rc.name))
+                            .map(|li| (li, rl))
+                    })
+                    .collect()
+            } else if !join.using.is_empty() {
+                let mut v = Vec::with_capacity(join.using.len());
+                for name in &join.using {
+                    let li = columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(name));
+                    let rl = jcols.iter().position(|c| c.name.eq_ignore_ascii_case(name));
+                    match (li, rl) {
+                        (Some(li), Some(rl)) => v.push((li, rl)),
+                        _ => return Err(Error::Error(format!(
+                            "cannot join using column {name} - column not present in both tables"
+                        ))),
+                    }
+                }
+                v
+            } else {
+                Vec::new()
+            };
+
             let mut new_columns = columns.clone();
             new_columns.extend(jcols.iter().cloned());
             let n_jcols = jcols.len();
 
-            let left_width = columns.len();
             let mut joined: Vec<Vec<Value>> = Vec::new();
             let mut right_matched = alloc::vec![false; jrows.len()];
 
@@ -6493,10 +6528,15 @@ impl Connection {
             // equi-join `left.col = right.col`, turning the O(n*m) nested loop into
             // a probe. The full ON is still evaluated on each candidate (the hash
             // only narrows which right rows to test), so semantics are unchanged.
-            let equi = join
-                .on
-                .as_ref()
-                .and_then(|on| join_equi_cols(on, &new_columns, left_width));
+            // `NATURAL`/`USING` joins evaluate their equality directly (below) and
+            // use the nested loop.
+            let equi = if pairs.is_empty() {
+                join.on
+                    .as_ref()
+                    .and_then(|on| join_equi_cols(on, &new_columns, left_width))
+            } else {
+                None
+            };
             let hash: Option<(usize, alloc::collections::BTreeMap<JoinKey, Vec<usize>>)> = equi
                 .map(|(li, ri_local)| {
                     let mut map: alloc::collections::BTreeMap<JoinKey, Vec<usize>> =
@@ -6531,12 +6571,27 @@ impl Connection {
                     let right = &jrows[ri];
                     let mut combined = left.clone();
                     combined.extend(right.iter().cloned());
-                    let keep = match &join.on {
-                        Some(on) => {
-                            let ctx = row_ctx(&combined, &new_columns, None, params);
-                            eval::truth(&eval::eval(on, &ctx)?) == Some(true)
+                    let keep = if !pairs.is_empty() {
+                        // NATURAL / USING: all join columns must be `=` equal (a
+                        // NULL on either side is not a match), each under the left
+                        // column's collation.
+                        pairs.iter().all(|&(li, rl)| {
+                            let coll = new_columns[li].collation;
+                            eval::truth(&eval::compare_op(
+                                BinaryOp::Eq,
+                                &combined[li],
+                                &combined[left_width + rl],
+                                coll,
+                            )) == Some(true)
+                        })
+                    } else {
+                        match &join.on {
+                            Some(on) => {
+                                let ctx = row_ctx(&combined, &new_columns, None, params);
+                                eval::truth(&eval::eval(on, &ctx)?) == Some(true)
+                            }
+                            None => true, // CROSS / comma join
                         }
-                        None => true, // CROSS / comma join
                     };
                     if keep {
                         joined.push(combined);
@@ -6561,6 +6616,30 @@ impl Connection {
                     }
                 }
             }
+
+            // NATURAL / USING: coalesce each join column into its left output
+            // position (`COALESCE(left, right)` — the left value, or the right's
+            // when the left side is NULL from an outer join), then drop the right
+            // duplicate columns so each join column appears once.
+            if !pairs.is_empty() {
+                let mut drop: Vec<usize> = pairs.iter().map(|&(_, rl)| left_width + rl).collect();
+                drop.sort_unstable();
+                drop.dedup();
+                for row in &mut joined {
+                    for &(li, rl) in &pairs {
+                        if matches!(row[li], Value::Null) {
+                            row[li] = row[left_width + rl].clone();
+                        }
+                    }
+                    for &d in drop.iter().rev() {
+                        row.remove(d);
+                    }
+                }
+                for &d in drop.iter().rev() {
+                    new_columns.remove(d);
+                }
+            }
+
             columns = new_columns;
             rows = joined;
         }

@@ -279,6 +279,12 @@ pub struct Join {
     pub table: TableRef,
     /// An `ON` predicate, if present.
     pub on: Option<Expr>,
+    /// `NATURAL` join: join on equality of all columns common to both sides
+    /// (mutually exclusive with `on`/`using`).
+    pub natural: bool,
+    /// `USING (col, …)`: join on equality of the named columns, which are then
+    /// coalesced into a single output column each (mutually exclusive with `on`).
+    pub using: Vec<String>,
 }
 
 /// One `ORDER BY` term.
