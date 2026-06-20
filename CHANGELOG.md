@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **`printf`/`format` `,` thousands-grouping flag and `l`/`ll` length
+  modifiers** (`printf('%,d', 1234567)` → `1,234,567`; `%ld`/`%lld` accepted).
 - Fix: **`UPDATE OF <columns>` triggers** fire only when one of the named
   columns is in the UPDATE's SET list (previously fired on any update).
 - Fix: **`NEW.rowid` / `OLD.rowid`** (and qualified rowid in correlated
