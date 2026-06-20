@@ -300,3 +300,53 @@ fn triggers_against_sqlite3() {
         .join("\n");
     assert_eq!(got, want);
 }
+
+#[test]
+fn update_of_columns_restricts_firing() {
+    // `UPDATE OF a` fires only when column a is in the SET list.
+    let mut c = Connection::open_memory().unwrap();
+    for s in [
+        "CREATE TABLE t(a, b, c)",
+        "CREATE TABLE log(m)",
+        "CREATE TRIGGER tr AFTER UPDATE OF a ON t BEGIN INSERT INTO log VALUES(1); END",
+        "INSERT INTO t VALUES(1, 2, 3)",
+    ] {
+        c.execute(s).unwrap();
+    }
+    // Updating b only: trigger must NOT fire.
+    c.execute("UPDATE t SET b = 9 WHERE a = 1").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM log").unwrap().rows[0][0],
+        Value::Integer(0)
+    );
+    // Updating a: trigger fires.
+    c.execute("UPDATE t SET a = 7 WHERE c = 3").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM log").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+}
+
+#[test]
+fn update_of_multiple_columns_and_plain_update() {
+    let mut c = Connection::open_memory().unwrap();
+    for s in [
+        "CREATE TABLE t(a, b, c)",
+        "CREATE TABLE log(m)",
+        "CREATE TRIGGER tof AFTER UPDATE OF a, c ON t BEGIN INSERT INTO log VALUES('of'); END",
+        "CREATE TRIGGER tany AFTER UPDATE ON t BEGIN INSERT INTO log VALUES('any'); END",
+        "INSERT INTO t VALUES(1, 2, 3)",
+    ] {
+        c.execute(s).unwrap();
+    }
+    // Update b only: the plain trigger fires, the OF(a,c) trigger does not.
+    c.execute("UPDATE t SET b = 9").unwrap();
+    let rows = c.query("SELECT m FROM log").unwrap();
+    assert_eq!(rows.rows, vec![vec![Value::Text("any".into())]]);
+    // Update c: both fire.
+    c.execute("UPDATE t SET c = 8").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM log").unwrap().rows[0][0],
+        Value::Integer(3)
+    );
+}

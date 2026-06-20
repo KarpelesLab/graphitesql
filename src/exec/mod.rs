@@ -1775,6 +1775,7 @@ impl Connection {
         old: Option<(&[Value], i64)>,
         new: Option<(&[Value], i64)>,
         params: &Params,
+        changed_cols: Option<&[String]>,
     ) -> Result<bool> {
         // Non-recursive by default; with PRAGMA recursive_triggers a trigger may
         // fire others, bounded to avoid runaway recursion (SQLite caps at 1000).
@@ -1787,7 +1788,17 @@ impl Connection {
                 Ok(false)
             };
         }
-        let trigs = self.triggers_for(table, kind, timing)?;
+        let mut trigs = self.triggers_for(table, kind, timing)?;
+        // An `UPDATE OF col, …` trigger fires only when one of its named columns
+        // appears in the UPDATE's SET list (SQLite semantics).
+        if let Some(changed) = changed_cols {
+            trigs.retain(|t| match &t.event {
+                TriggerEvent::Update(cols) if !cols.is_empty() => cols
+                    .iter()
+                    .any(|c| changed.iter().any(|ch| ch.eq_ignore_ascii_case(c))),
+                _ => true,
+            });
+        }
         if trigs.is_empty() {
             return Ok(false);
         }
@@ -1882,6 +1893,7 @@ impl Connection {
                 None,
                 Some((&new, 0)),
                 params,
+                None,
             )?;
             affected += 1;
         }
@@ -1919,6 +1931,7 @@ impl Connection {
                 Some((&row.values, 0)),
                 None,
                 params,
+                None,
             )?;
             affected += 1;
         }
@@ -1940,6 +1953,7 @@ impl Connection {
                 upd.table
             )));
         }
+        let changed: Vec<String> = upd.assignments.iter().map(|(c, _)| c.clone()).collect();
         let mut affected = 0;
         for row in rows {
             let old = row.values.clone();
@@ -1966,6 +1980,7 @@ impl Connection {
                 Some((&old, 0)),
                 Some((&new, 0)),
                 params,
+                Some(&changed),
             )?;
             affected += 1;
         }
@@ -2159,6 +2174,7 @@ impl Connection {
                 None,
                 Some((&index_values, rowid)),
                 params,
+                None,
             )?;
             let record = self.encode_table_record(&meta, &index_values);
             insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
@@ -2180,6 +2196,7 @@ impl Connection {
                 None,
                 Some((&index_values, rowid)),
                 params,
+                None,
             )?;
             if !ins.returning.is_empty() {
                 self.collect_returning(&ins.returning, &meta, &index_values, Some(rowid), params)?;
@@ -2213,6 +2230,7 @@ impl Connection {
         let Some(old_row) = self.read_row(meta, existing_rowid)? else {
             return Ok(false);
         };
+        let changed: Vec<String> = assignments.iter().map(|(c, _)| c.clone()).collect();
         // Column scope for the SET/WHERE expressions: the target table's columns,
         // then the same columns again under the `excluded` table label.
         let mut cols: Vec<ColumnInfo> = meta.columns.clone();
@@ -2277,6 +2295,7 @@ impl Connection {
             Some((&old_row, existing_rowid)),
             Some((&values, new_rowid)),
             params,
+            Some(&changed),
         )?;
         if !self
             .find_conflicts(
@@ -2303,6 +2322,7 @@ impl Connection {
             Some((&old_row, existing_rowid)),
             Some((&new_full, new_rowid)),
             params,
+            Some(&changed),
         )?;
         if !returning.is_empty() {
             self.collect_returning(returning, meta, &new_full, Some(new_rowid), params)?;
@@ -2542,6 +2562,7 @@ impl Connection {
                     Some((old, *rowid)),
                     None,
                     params,
+                    None,
                 )?;
             }
             // Enforce referential actions on dependent child tables.
@@ -2560,6 +2581,7 @@ impl Connection {
                     Some((old, *rowid)),
                     None,
                     params,
+                    None,
                 )?;
             }
         }
@@ -2613,6 +2635,8 @@ impl Connection {
             return self.exec_update_without_rowid(upd, &meta, params);
         }
         let indexes = self.indexes_of(&upd.table)?;
+        // Columns named in the SET list — drives `UPDATE OF col,…` trigger firing.
+        let changed: Vec<String> = upd.assignments.iter().map(|(c, _)| c.clone()).collect();
         // UPDATE … FROM: materialize the extra tables once. Each target row is
         // joined to the first FROM-row combination satisfying WHERE, and that
         // row's columns are visible to SET/WHERE. Without FROM, `from_rows` is
@@ -2772,6 +2796,7 @@ impl Connection {
                 Some((&old_row, rowid)),
                 Some((&values, new_rowid)),
                 params,
+                Some(&changed),
             )?;
             // UNIQUE/PK conflict against any other row.
             if !self
@@ -2792,6 +2817,7 @@ impl Connection {
                 Some((&old_row, rowid)),
                 Some((&new_full, new_rowid)),
                 params,
+                Some(&changed),
             )?;
             if !upd.returning.is_empty() {
                 self.collect_returning(&upd.returning, &meta, &new_full, Some(new_rowid), params)?;
