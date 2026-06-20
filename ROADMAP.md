@@ -165,11 +165,10 @@ validation.
   column/subquery (`'x' = nocase_col`, `'x' IN (SELECT nocase_col)`) should adopt
   the *right* side's collation when the left has none; also window-frame
   `min`/`max` collation. *Ref:* `resolve.c` collation-of rules.
-- **A5 — `timediff(A,B)`.** Returns the calendar delta `±YYYY-MM-DD HH:MM:SS.SSS`.
-  Needs SQLite's iterative breakdown: add Y years to B, back off if it overshoots
-  A, then months, then take the residual via Julian-day difference for
-  `D HH:MM:SS.SSS`. *Ref:* `date.c` `timediffFunc`. Acceptance: byte-match
-  sqlite3 across sign, leap years, and month-length boundaries.
+- ✅ **A5 — `timediff(A,B)`.** Done — faithful port of `date.c` `timediffFunc`
+  (two mirror branches snapping `d2`'s year/month toward `d1`, residual span via
+  the Julian-day difference biased by `0000-01-01`). Byte-identical to sqlite3
+  across 2000+ randomized pairs + edge cases.
 - ✅ **A6 — `json_error_position(X)`.** Done: `parse_with_error_position` threads
   the failing byte offset out; the function maps `Ok`→0, `Err(off)`→`off+1`,
   NULL→NULL. Matches sqlite3 on well-formed JSON + common structural errors.
@@ -265,13 +264,14 @@ them (rather than corrupt the ptrmap it can't yet maintain).
 
 *Multi-schema leftovers (small):*
 
-- **C-ms1 — `CREATE TEMP VIEW/TRIGGER` catalog placement.** `CREATE TEMP INDEX`
-  already lands in the `temp` catalog (it follows its temp table). `CREATE TEMP
-  VIEW`/`TRIGGER` still land in `main`'s `sqlite_master` (they function, but
-  belong in `sqlite_temp_master`). Route them to `temp`, and extend unqualified
-  view/trigger resolution to consult the `temp` catalog so reads/firing still
-  work. Acceptance: a temp view/trigger appears in `sqlite_temp_master` (not
-  `sqlite_master`) and still resolves.
+- ✅ **C-ms1 — `CREATE TEMP VIEW/TRIGGER` catalog placement.** Done — the parser
+  tags an unqualified TEMP view/trigger with `schema="temp"`; `target_db` routes
+  it to the temp catalog (stored bare-named). `try_view`/`is_view` consult the
+  temp catalog first (shadowing main) and run a temp view via
+  `scan_db_view(Temp)`; `triggers_for` scans the active + temp catalogs so a temp
+  trigger fires on writes to its table (incl. a `main` table). Now appears in
+  `sqlite_temp_master`, not `sqlite_master`. **The multi-schema track is fully
+  complete — no leftovers.**
 
 *Storage — `auto_vacuum` write path (C6b), split so each lands testable:*
 

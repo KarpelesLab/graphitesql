@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **`timediff(A, B)`** scalar function — the calendar delta from B to A as
+  `(+|-)YYYY-MM-DD HH:MM:SS.SSS`, a faithful port of SQLite's `date.c`
+  algorithm (byte-identical across 2000+ randomized pairs incl. leap days,
+  month boundaries, and sub-second; NULL/invalid → NULL).
+- **`CREATE TEMP VIEW` / `CREATE TEMP TRIGGER`** now live in the `temp` catalog
+  (`sqlite_temp_master`), not `main`'s `sqlite_master`, matching sqlite — a temp
+  view resolves via the temp catalog (shadowing main) and a temp trigger fires on
+  writes to its table (including a `main` table). `CREATE TEMP INDEX` already did.
 - **`json_error_position(X)`** scalar function — the 1-based byte position of the
   first JSON syntax error (0 if valid, NULL for NULL). Matches sqlite3 on
   well-formed JSON and the common structural-error shapes; JSON5 inputs sqlite
