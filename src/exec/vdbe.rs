@@ -7,9 +7,11 @@
 //! cursors, filters, joins) while the existing engine keeps serving queries.
 //!
 //! The design mirrors SQLite's VDBE shape (`vdbe.c`): a flat instruction array
-//! over a register file, where each op reads/writes registers by index and a
-//! `ResultRow` op emits a span of registers as an output row. graphitesql's ops
-//! are a small, safe-Rust subset — no jumps yet beyond `Halt`.
+//! over a register file driven by a program counter, where each op reads/writes
+//! registers by index, `Goto`/`IfFalse` branch, and a `ResultRow` op emits a span
+//! of registers as an output row. graphitesql's ops are a small, safe-Rust subset
+//! covering constant `SELECT` projections (literals, arithmetic, concat,
+//! comparison, three-valued boolean logic, `IS NULL`, `CASE`, `CAST`).
 
 use crate::error::{Error, Result};
 use crate::sql::ast::{BinaryOp, Expr, Literal, ResultColumn, Select};
@@ -60,6 +62,12 @@ pub enum Op {
     },
     /// Copy `src` into `dest`.
     Copy { src: usize, dest: usize },
+    /// `dest = CAST(reg AS type_name)`.
+    Cast {
+        reg: usize,
+        type_name: String,
+        dest: usize,
+    },
     /// Unconditional jump to instruction index `target`.
     Goto { target: usize },
     /// Jump to `target` when `reg` is false or NULL (i.e. not true).
@@ -249,6 +257,18 @@ impl Compiler {
                     _ => Err(Error::Unsupported("VDBE spike: this operator")),
                 }
             }
+            Expr::Cast {
+                expr: inner,
+                type_name,
+            } => {
+                let r = self.compile_expr(inner)?;
+                self.ops.push(Op::Cast {
+                    reg: r,
+                    type_name: type_name.clone(),
+                    dest,
+                });
+                Ok(())
+            }
             Expr::Case {
                 operand,
                 when_then,
@@ -341,6 +361,13 @@ pub fn run(program: &Program) -> Result<Vec<Vec<Value>>> {
                 }
             }
             Op::Copy { src, dest } => regs[*dest] = regs[*src].clone(),
+            Op::Cast {
+                reg,
+                type_name,
+                dest,
+            } => {
+                regs[*dest] = crate::exec::eval::cast(regs[*reg].clone(), type_name);
+            }
             Op::Integer { value, dest } => regs[*dest] = Value::Integer(*value),
             Op::Real { value, dest } => regs[*dest] = Value::Real(*value),
             Op::Str { value, dest } => regs[*dest] = Value::Text(value.clone()),

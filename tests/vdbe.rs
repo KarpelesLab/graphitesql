@@ -44,6 +44,8 @@ fn vdbe_matches_tree_walker() {
         "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 3 > 2 THEN 'b' ELSE 'c' END",
         "SELECT CASE 5 WHEN 1 THEN 'one' WHEN 5 THEN 'five' ELSE '?' END",
         "SELECT CASE WHEN 0 THEN 1 END, CASE WHEN 1 THEN 2 ELSE 3 END",
+        "SELECT CAST(3.9 AS INTEGER), CAST('42' AS INTEGER), CAST(5 AS TEXT)",
+        "SELECT CAST('3.14' AS REAL), CAST(7 AS REAL)",
     ];
     for q in queries {
         let walker = c.query(q).unwrap().rows;
