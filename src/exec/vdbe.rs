@@ -140,6 +140,22 @@ pub enum Op {
         outputs: Vec<GroupOut>,
         agg_kinds: Vec<AggKind>,
     },
+    /// Finalize the accumulated groups (computing each slot's value per group)
+    /// into an emit list, then position the group cursor at the first group;
+    /// jump to `target` (the emit-loop exit) when there are no groups. Used by
+    /// the `HAVING`/`ORDER BY` grouped path, where each group's keys and
+    /// aggregates are loaded into registers so arbitrary predicates / sort keys
+    /// can be computed by ordinary ops.
+    GroupFinalize {
+        agg_kinds: Vec<AggKind>,
+        target: usize,
+    },
+    /// Load group-key value at index `key` of the current group into `dest`.
+    GroupKey { key: usize, dest: usize },
+    /// Load the finalized aggregate at `slot` of the current group into `dest`.
+    GroupAgg { slot: usize, dest: usize },
+    /// Advance the group cursor; jump back to `target` if a group remains.
+    GroupNext { target: usize },
     /// Stop execution.
     Halt,
 }
@@ -231,6 +247,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         ops: Vec::new(),
         next_reg: count,
         columns: Vec::new(),
+        bindings: Vec::new(),
     };
     let mut columns = Vec::new();
     for (i, rc) in sel.columns.iter().enumerate() {
@@ -322,6 +339,7 @@ fn compile_aggregate_select(
         ops: Vec::new(),
         next_reg: count,
         columns: columns.to_vec(),
+        bindings: Vec::new(),
     };
     let rewind = c.ops.len();
     c.ops.push(Op::Rewind { target: 0 });
@@ -377,25 +395,70 @@ fn compile_aggregate_select(
     })
 }
 
+/// Collect every top-level aggregate call in `expr` into `out` (deduplicated by
+/// structural equality), so each distinct aggregate folds into one slot. Does not
+/// recurse into a nested aggregate's arguments (aggregates can't nest).
+fn collect_aggregates(expr: &Expr, out: &mut Vec<Expr>) {
+    if is_aggregate_expr(expr) {
+        if !out.iter().any(|e| e == expr) {
+            out.push(expr.clone());
+        }
+        return;
+    }
+    match expr {
+        Expr::Paren(inner)
+        | Expr::Unary { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => collect_aggregates(inner, out),
+        Expr::Binary { left, right, .. } => {
+            collect_aggregates(left, out);
+            collect_aggregates(right, out);
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_aggregates(a, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_aggregates(o, out);
+            }
+            for (w, t) in when_then {
+                collect_aggregates(w, out);
+                collect_aggregates(t, out);
+            }
+            if let Some(e) = else_result {
+                collect_aggregates(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Compile `SELECT <group cols / aggregates> FROM <table> [WHERE …] GROUP BY
-/// <cols>`: each grouping key must be a bare column, and every output column must
-/// be either one of those grouping columns or an aggregate call. The scan folds
-/// per-group aggregates (first-seen group order), then `GroupEmit` produces one
-/// row per group. `HAVING`/`ORDER BY`/`DISTINCT`/`LIMIT`/`OFFSET` fall back.
+/// <cols> [HAVING …] [ORDER BY …] [LIMIT/OFFSET]`. Each grouping key must be a
+/// bare column. Output columns, the `HAVING` predicate, and `ORDER BY` keys may
+/// reference grouping columns and aggregate calls (in arbitrary scalar
+/// expressions, via the compiler's binding table). The scan folds per-group
+/// aggregates (first-seen group order); a second pass then walks the groups,
+/// applies `HAVING`, projects, and (optionally) feeds a sorter for `ORDER BY`.
+/// `DISTINCT` and non-grouped output columns still fall back.
 fn compile_group_select(
     sel: &Select,
     columns: &[String],
     projections: &[(Expr, String)],
 ) -> Result<Program> {
-    if sel.having.is_some()
-        || !sel.order_by.is_empty()
-        || sel.distinct
-        || sel.limit.is_some()
-        || sel.offset.is_some()
-    {
-        return Err(Error::Unsupported("VDBE: plain GROUP BY only"));
+    if sel.distinct {
+        return Err(Error::Unsupported("VDBE: GROUP BY + DISTINCT"));
     }
-    // Resolve each grouping key to a table column index.
+    let has_having = sel.having.is_some();
+    let has_order = !sel.order_by.is_empty();
+    let has_limit = sel.limit.is_some() || sel.offset.is_some();
+    // Resolve each grouping key to a table column index (bare columns only).
     let col_index = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
     let mut group_cols: Vec<usize> = Vec::new();
     for g in &sel.group_by {
@@ -407,6 +470,367 @@ fn compile_group_select(
             _ => return Err(Error::Unsupported("VDBE: GROUP BY column refs only")),
         }
     }
+
+    // The plain path (no HAVING / ORDER BY / LIMIT) keeps its compact `GroupEmit`.
+    if !has_having && !has_order && !has_limit {
+        return compile_group_emit(sel, columns, projections, &group_cols);
+    }
+
+    // General path: gather every distinct aggregate referenced by the projection,
+    // HAVING, and ORDER BY into slots; the rest of each expression is compiled
+    // against per-group registers holding the grouping keys and aggregate finals.
+    let mut agg_exprs: Vec<Expr> = Vec::new();
+    for (e, _) in projections {
+        collect_aggregates(e, &mut agg_exprs);
+    }
+    if let Some(h) = &sel.having {
+        collect_aggregates(h, &mut agg_exprs);
+    }
+    for term in &sel.order_by {
+        collect_aggregates(&term.expr, &mut agg_exprs);
+    }
+    // Each aggregate must be a shape the VDBE can fold.
+    let mut agg_specs: Vec<(AggKind, Option<Expr>)> = Vec::new();
+    for e in &agg_exprs {
+        match agg_kind(e) {
+            Some(spec) => agg_specs.push(spec),
+            None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
+        }
+    }
+
+    let mut c = Compiler {
+        ops: Vec::new(),
+        next_reg: 0,
+        columns: columns.to_vec(),
+        bindings: Vec::new(),
+    };
+    // Contiguous key registers, loaded per row from the grouping columns.
+    let key_start = c.next_reg;
+    for _ in &group_cols {
+        c.alloc();
+    }
+    let rewind = c.ops.len();
+    c.ops.push(Op::Rewind { target: 0 });
+    let body = c.ops.len();
+    let skip = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    for (k, &ci) in group_cols.iter().enumerate() {
+        c.ops.push(Op::Column {
+            col: ci,
+            dest: key_start + k,
+        });
+    }
+    // Evaluate each aggregate argument into a register for this row.
+    let mut aggs: Vec<AggSpec> = Vec::new();
+    for (kind, arg) in &agg_specs {
+        let arg_reg = match arg {
+            Some(expr) => Some(c.compile_expr(expr)?),
+            None => None,
+        };
+        aggs.push(AggSpec {
+            kind: *kind,
+            arg: arg_reg,
+        });
+    }
+    c.ops.push(Op::GroupStep {
+        key_start,
+        key_count: group_cols.len(),
+        aggs,
+    });
+    let next = c.ops.len();
+    c.ops.push(Op::Next { target: body });
+    if let Some(at) = skip {
+        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = next;
+        }
+    }
+    let end = c.ops.len();
+    if let Op::Rewind { target } = &mut c.ops[rewind] {
+        *target = end;
+    }
+
+    // Per-group registers: one for each grouping key value, one for each
+    // aggregate final. These feed the bindings so HAVING/projection/ORDER-BY
+    // expressions resolve grouping-column refs and aggregate calls to registers.
+    let gkey_start = c.next_reg;
+    for _ in &group_cols {
+        c.alloc();
+    }
+    let gagg_start = c.next_reg;
+    for _ in &agg_specs {
+        c.alloc();
+    }
+    // Grouping-column reference (by table-column index) → its key register.
+    for (k, &ci) in group_cols.iter().enumerate() {
+        let bind_expr = Expr::Column {
+            table: None,
+            column: columns[ci].clone(),
+        };
+        c.bindings.push((bind_expr, gkey_start + k));
+    }
+    // Each aggregate call → its final register.
+    for (j, e) in agg_exprs.iter().enumerate() {
+        c.bindings.push((e.clone(), gagg_start + j));
+    }
+
+    // Output registers for the projected row (a contiguous block).
+    let count = projections.len();
+    let out_start = c.next_reg;
+    for _ in 0..count {
+        c.alloc();
+    }
+
+    // Optional LIMIT/OFFSET counters (constant integers only).
+    let limit_reg = match &sel.limit {
+        None => None,
+        Some(Expr::Literal(Literal::Integer(n))) => {
+            let r = c.alloc();
+            c.ops.push(Op::Integer { value: *n, dest: r });
+            Some(r)
+        }
+        Some(_) => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
+    };
+    let offset_reg = match &sel.offset {
+        None => None,
+        Some(Expr::Literal(Literal::Integer(n))) => {
+            let r = c.alloc();
+            c.ops.push(Op::Integer { value: *n, dest: r });
+            Some(r)
+        }
+        Some(_) => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
+    };
+
+    // Resolve each ORDER BY term to an output-column expression where it is a
+    // bare ordinal or output alias (mirroring the scan path / tree-walker).
+    let mut key_specs: Vec<(Expr, SortKey)> = Vec::new();
+    for term in &sel.order_by {
+        let expr = match &term.expr {
+            Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count => {
+                projections[*k as usize - 1].0.clone()
+            }
+            Expr::Column {
+                table: None,
+                column,
+            } if !columns.iter().any(|c| c.eq_ignore_ascii_case(column))
+                && projections
+                    .iter()
+                    .any(|(_, l)| l.eq_ignore_ascii_case(column)) =>
+            {
+                projections
+                    .iter()
+                    .find(|(_, l)| l.eq_ignore_ascii_case(column))
+                    .map(|(e, _)| e.clone())
+                    .unwrap()
+            }
+            other => other.clone(),
+        };
+        key_specs.push((
+            expr,
+            SortKey {
+                descending: term.descending,
+                nulls_first: term.nulls_first,
+            },
+        ));
+    }
+    let key_start2 = c.next_reg;
+    for _ in &key_specs {
+        c.alloc();
+    }
+
+    // `LIMIT 0` emits nothing: skip the whole emit phase when the counter starts
+    // at zero (target backpatched to the emit-loop exit).
+    let limit_skip = limit_reg.map(|r| {
+        let at = c.ops.len();
+        c.ops.push(Op::IfFalse { reg: r, target: 0 });
+        at
+    });
+
+    // Finalize groups and position the group cursor; the emit loop body follows.
+    let gfin = c.ops.len();
+    c.ops.push(Op::GroupFinalize {
+        agg_kinds: agg_specs.iter().map(|(k, _)| *k).collect(),
+        target: 0,
+    });
+    let gbody = c.ops.len();
+    // Load this group's keys and aggregate finals into their registers.
+    for k in 0..group_cols.len() {
+        c.ops.push(Op::GroupKey {
+            key: k,
+            dest: gkey_start + k,
+        });
+    }
+    for j in 0..agg_specs.len() {
+        c.ops.push(Op::GroupAgg {
+            slot: j,
+            dest: gagg_start + j,
+        });
+    }
+    // Project the output row into the contiguous output block first, so HAVING
+    // (and ORDER BY) can reference output aliases — matching the tree-walker,
+    // where a HAVING/ORDER-BY name that isn't a table column resolves to the
+    // SELECT-list label. Table columns still take precedence (those bindings are
+    // searched first).
+    for (i, (expr, _)) in projections.iter().enumerate() {
+        c.compile_expr_into(expr, out_start + i)?;
+    }
+    for (i, (expr, label)) in projections.iter().enumerate() {
+        // Only non-(table-column) aliases participate, and never shadow a real
+        // column name. A bare-column projection already resolves directly.
+        let is_bare_col = matches!(expr, Expr::Column { .. });
+        if !is_bare_col && !columns.iter().any(|c| c.eq_ignore_ascii_case(label)) {
+            c.bindings.push((
+                Expr::Column {
+                    table: None,
+                    column: label.clone(),
+                },
+                out_start + i,
+            ));
+        }
+    }
+    // HAVING: skip the group (advance) when the predicate is not true.
+    let having_skip = match &sel.having {
+        Some(h) => {
+            let preg = c.compile_expr(h)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    let mut limit_done = None;
+    let mut offset_skip = None;
+    if has_order {
+        for (j, (expr, _)) in key_specs.iter().enumerate() {
+            c.compile_expr_into(expr, key_start2 + j)?;
+        }
+        c.ops.push(Op::SorterInsert {
+            row_start: out_start,
+            row_count: count,
+            key_start: key_start2,
+            key_count: key_specs.len(),
+        });
+    } else {
+        // No ORDER BY: apply OFFSET then LIMIT directly to the group stream.
+        offset_skip = offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        });
+        c.ops.push(Op::ResultRow {
+            start: out_start,
+            count,
+        });
+        if let Some(r) = limit_reg {
+            limit_done = Some(c.ops.len());
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+        }
+    }
+    let gnext = c.ops.len();
+    c.ops.push(Op::GroupNext { target: gbody });
+    if let Some(at) = having_skip {
+        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = gnext;
+        }
+    }
+    if let Some(at) = offset_skip {
+        // A skipped (offset) group advances to the next without emitting.
+        if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
+            *target = gnext;
+        }
+    }
+    let gend = c.ops.len();
+    if let Op::GroupFinalize { target, .. } = &mut c.ops[gfin] {
+        *target = gend;
+    }
+    if let Some(at) = limit_done {
+        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
+            *target = gend;
+        }
+    }
+
+    // Sorted emit loop for ORDER BY.
+    if has_order {
+        c.ops.push(Op::SorterSort {
+            keys: key_specs.iter().map(|(_, k)| k.clone()).collect(),
+        });
+        let srewind = c.ops.len();
+        c.ops.push(Op::SorterRewind { target: 0 });
+        let ebody = c.ops.len();
+        let eoffset = offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        });
+        c.ops.push(Op::SorterRow {
+            start: out_start,
+            count,
+        });
+        c.ops.push(Op::ResultRow {
+            start: out_start,
+            count,
+        });
+        let elimit = limit_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+            at
+        });
+        let snext = c.ops.len();
+        c.ops.push(Op::SorterNext { target: ebody });
+        let eend = c.ops.len();
+        if let Op::SorterRewind { target } = &mut c.ops[srewind] {
+            *target = eend;
+        }
+        if let Some(at) = eoffset {
+            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
+                *target = snext;
+            }
+        }
+        if let Some(at) = elimit {
+            if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
+                *target = eend;
+            }
+        }
+    }
+
+    // `LIMIT 0` jumps past the whole emit phase (here, just before Halt).
+    let final_end = c.ops.len();
+    if let Some(at) = limit_skip {
+        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = final_end;
+        }
+    }
+
+    c.ops.push(Op::Halt);
+    Ok(Program {
+        ops: c.ops,
+        n_registers: c.next_reg,
+        columns: projections.iter().map(|(_, l)| l.clone()).collect(),
+    })
+}
+
+/// The compact plain-GROUP-BY path: every output column is a grouping key or a
+/// bare aggregate, with no HAVING/ORDER BY/LIMIT. Folds the scan and emits one
+/// row per group via [`Op::GroupEmit`].
+fn compile_group_emit(
+    sel: &Select,
+    columns: &[String],
+    projections: &[(Expr, String)],
+    group_cols: &[usize],
+) -> Result<Program> {
+    let col_index = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
     // Classify each output column as a grouping-key reference or an aggregate.
     let mut outputs: Vec<GroupOut> = Vec::new();
     let mut agg_specs: Vec<(AggKind, Option<Expr>)> = Vec::new();
@@ -436,10 +860,11 @@ fn compile_group_select(
         ops: Vec::new(),
         next_reg: 0,
         columns: columns.to_vec(),
+        bindings: Vec::new(),
     };
     // Contiguous key registers, loaded per row from the grouping columns.
     let key_start = c.next_reg;
-    for _ in &group_cols {
+    for _ in group_cols {
         c.alloc();
     }
     let rewind = c.ops.len();
@@ -554,6 +979,7 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
         ops: Vec::new(),
         next_reg: count,
         columns: columns.to_vec(),
+        bindings: Vec::new(),
     };
     // Optional LIMIT (constant integer only): a counter register decremented
     // after each emitted row, halting the loop at zero.
@@ -781,6 +1207,11 @@ struct Compiler {
     next_reg: usize,
     /// Table column names, for resolving `Expr::Column` to a `Column` op.
     columns: Vec<String>,
+    /// Expression → register overrides consulted before normal compilation.
+    /// Used by the grouped `HAVING`/`ORDER BY` path to resolve aggregate calls
+    /// and grouping-column references to per-group registers (so an arbitrary
+    /// predicate / sort-key expression over them compiles to ordinary ops).
+    bindings: Vec<(Expr, usize)>,
 }
 
 impl Compiler {
@@ -799,6 +1230,14 @@ impl Compiler {
 
     /// Compile `expr` so its value lands in register `dest`.
     fn compile_expr_into(&mut self, expr: &Expr, dest: usize) -> Result<()> {
+        // A bound sub-expression (a grouping-column ref or aggregate call in the
+        // grouped HAVING/ORDER BY path) is already materialized in a register.
+        if let Some(&(_, src)) = self.bindings.iter().find(|(e, _)| e == expr) {
+            if src != dest {
+                self.ops.push(Op::Copy { src, dest });
+            }
+            return Ok(());
+        }
         match expr {
             Expr::Literal(l) => {
                 let op = match l {
@@ -1018,6 +1457,10 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
     // GROUP BY state: each group is `(key values, per-aggregate accumulators)`,
     // kept in first-seen order.
     let mut groups: Vec<Group> = Vec::new();
+    // Finalized groups for the HAVING/ORDER BY emit loop: `(key values, aggregate
+    // finals)` per group, walked by `GroupFinalize`/`GroupNext`.
+    let mut emit_groups: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
+    let mut gcursor: usize = 0;
     let mut pc = 0usize;
     while pc < program.ops.len() {
         let op = &program.ops[pc];
@@ -1251,6 +1694,43 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                         })
                         .collect();
                     out.push(row);
+                }
+            }
+            Op::GroupFinalize { agg_kinds, target } => {
+                // Finalize each group's aggregates once, into `emit_groups`, in
+                // first-seen order; position the group cursor at the first.
+                emit_groups.clear();
+                for (key, accs) in groups.drain(..) {
+                    let finals: Vec<Value> = agg_kinds
+                        .iter()
+                        .zip(accs)
+                        .map(|(k, (vals, star))| finalize_agg(*k, vals, star))
+                        .collect::<Result<_>>()?;
+                    emit_groups.push((key, finals));
+                }
+                gcursor = 0;
+                if emit_groups.is_empty() {
+                    pc = *target;
+                }
+            }
+            Op::GroupKey { key, dest } => {
+                regs[*dest] = emit_groups
+                    .get(gcursor)
+                    .and_then(|(k, _)| k.get(*key))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            Op::GroupAgg { slot, dest } => {
+                regs[*dest] = emit_groups
+                    .get(gcursor)
+                    .and_then(|(_, a)| a.get(*slot))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            Op::GroupNext { target } => {
+                gcursor += 1;
+                if gcursor < emit_groups.len() {
+                    pc = *target;
                 }
             }
             Op::Halt => break,
