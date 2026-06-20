@@ -329,11 +329,13 @@ Done: a table-valued-function mechanism (`generate_series`, `json_each`,
 
 **Remaining pieces:**
 
-- **D1a — `sqlite3_module` analog: the trait + registry.** A safe Rust trait for
-  virtual-table modules (`connect`/`best_index`/`filter`/`next`/`column`/`rowid`)
-  and a connection-scoped module registry to register implementations under a
-  name. No SQL surface yet — unit-tested against an in-crate example module.
-  *Ref:* `vtab.c`.
+- ✅ **D1a — `sqlite3_module` analog: the trait + registry.** Done in
+  `src/vtab.rs`: the `VTabModule` trait (`connect`→`VTabSchema`, `best_index`→
+  `IndexPlan` with a no-pushdown default, `open`→cursor), an iterator-shaped
+  `VTabCursor` (`next`→`Result<Option<Row>>`, per-row `column`/`rowid`),
+  object-safe `Dyn*` erasure so a `VTabRegistry` holds heterogeneous modules by
+  name, a `SeriesModule` example, and 14 unit tests. `no_std`+alloc, no unsafe.
+  Constraint pushdown / writes are stubbed for D1b.
 - **D1b — `CREATE VIRTUAL TABLE` + executor integration.** Parse
   `CREATE VIRTUAL TABLE … USING module(args)`, persist it in `sqlite_schema`
   (type `table`, with the `USING` form), instantiate the module's table on
