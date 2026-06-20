@@ -214,10 +214,10 @@ VDBE (Track B) and virtual tables.
 - **C-API shim** — a `libsqlite3`-compatible surface (`sqlite3_open`/`prepare`/
   `step`/`column_*`/`bind_*`/…) as a separate crate, so existing C/FFI consumers
   link against graphitesql. *Ref:* `main.c`, `legacy.c`, `vdbeapi.c`.
-- **Virtual tables & table-valued functions** — the `sqlite3_module` analog
-  (`xBestIndex`/`xFilter`/…), `CREATE VIRTUAL TABLE`, and TVFs like
-  `generate_series`/`json_each`. Foundation for FTS5/R-Tree/JSON-tree.
-  *Ref:* `vtab.c`, `vdbevtab.c`.
+- **Virtual tables & table-valued functions** — ✅ a first TVF mechanism with
+  `generate_series` as a `FROM` source. *Remaining:* `json_each`/`json_tree`, the
+  `sqlite3_module` analog (`xBestIndex`/`xFilter`/…) and `CREATE VIRTUAL TABLE`.
+  Foundation for FTS5/R-Tree. *Ref:* `vtab.c`, `vdbevtab.c`.
 - **FTS5** full-text search; **R-Tree** spatial index. *Ref:* `fts5*.c`, `rtree.c`.
 - **User-defined functions from Rust** — register scalar/aggregate/window funcs
   and custom collations through a safe API.

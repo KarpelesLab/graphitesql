@@ -546,9 +546,24 @@ impl Parser {
                 alias,
                 subquery: Some(Box::new(select)),
                 index_hint: None,
+                tvf_args: None,
             });
         }
         let name = self.ident()?;
+        // A table-valued function: `name(args)` as a FROM source.
+        let tvf_args = if self.eat(&Token::LParen) {
+            let mut args = Vec::new();
+            if !self.check(&Token::RParen) {
+                args.push(self.expr()?);
+                while self.eat(&Token::Comma) {
+                    args.push(self.expr()?);
+                }
+            }
+            self.expect(&Token::RParen)?;
+            Some(args)
+        } else {
+            None
+        };
         let alias = self.opt_alias()?;
         let index_hint = self.index_hint()?;
         Ok(TableRef {
@@ -556,6 +571,7 @@ impl Parser {
             alias,
             subquery: None,
             index_hint,
+            tvf_args,
         })
     }
 

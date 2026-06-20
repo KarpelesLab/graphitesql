@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track D: table-valued functions — `generate_series(start, stop[, step])` as a
+  `FROM` source (sole source or joined), with the `value` column. Establishes the
+  TVF mechanism (`TableRef.tvf_args`). Verified against `sqlite3`.
 - Track A: `CREATE TABLE … AS SELECT …` (CTAS). The new table's columns are the
   query's output labels (untyped), populated with the query's rows via the normal
   insert path. Verified against `sqlite3`.

@@ -211,6 +211,9 @@ pub struct TableRef {
     pub subquery: Option<Box<Select>>,
     /// `INDEXED BY name` / `NOT INDEXED` query-planner hint, if given.
     pub index_hint: Option<IndexHint>,
+    /// Table-valued-function arguments (`FROM generate_series(1, 10)`), if this
+    /// source is a TVF call rather than a table.
+    pub tvf_args: Option<Vec<Expr>>,
 }
 
 /// A `FROM` table's index hint.

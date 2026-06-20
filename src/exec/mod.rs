@@ -3967,6 +3967,18 @@ impl Connection {
                 }],
             ));
         };
+        // A table-valued function used as the sole source.
+        if from.joins.is_empty() && from.first.tvf_args.is_some() {
+            let (columns, rows) = self.tvf_rows(&from.first, params)?;
+            let input = rows
+                .into_iter()
+                .map(|values| InputRow {
+                    values,
+                    rowid: None,
+                })
+                .collect();
+            return Ok((columns, input));
+        }
         // A derived-table subquery used as the sole source.
         if from.joins.is_empty() {
             if let Some(sub) = &from.first.subquery {
@@ -4086,6 +4098,59 @@ impl Connection {
     /// recursive one — can appear as a join source).
     /// Run a derived-table subquery (`FROM (SELECT …) AS alias`) into column
     /// metadata (labeled with the alias) and row values.
+    /// Produce the rows of a table-valued function (`generate_series`, `json_each`,
+    /// `json_tree`) used as a `FROM` source.
+    fn tvf_rows(
+        &self,
+        tref: &TableRef,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        let args = tref.tvf_args.as_deref().unwrap_or(&[]);
+        let lname = tref.name.to_ascii_lowercase();
+        let label = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+        let ctx = EvalCtx::rowless(params).with_subqueries(self);
+        let col = |name: &str, affinity| ColumnInfo {
+            name: String::from(name),
+            table: label.clone(),
+            affinity,
+            collation: crate::value::Collation::default(),
+        };
+        match lname.as_str() {
+            "generate_series" => {
+                if args.is_empty() {
+                    return Err(Error::Error("generate_series() requires arguments".into()));
+                }
+                let nums: Vec<i64> = args
+                    .iter()
+                    .map(|a| eval::eval(a, &ctx).map(|v| eval::to_i64(&v)))
+                    .collect::<Result<_>>()?;
+                let start = nums[0];
+                let stop = nums.get(1).copied().unwrap_or(start);
+                let step = nums.get(2).copied().unwrap_or(1);
+                let mut rows = Vec::new();
+                if step != 0 {
+                    let mut v = start;
+                    loop {
+                        let in_range = if step > 0 { v <= stop } else { v >= stop };
+                        if !in_range {
+                            break;
+                        }
+                        rows.push(alloc::vec![Value::Integer(v)]);
+                        match v.checked_add(step) {
+                            Some(n) => v = n,
+                            None => break, // i64 overflow ends the series
+                        }
+                    }
+                }
+                Ok((alloc::vec![col("value", eval::Affinity::Integer)], rows))
+            }
+            _ => Err(Error::Error(format!(
+                "no such table-valued function: {}",
+                tref.name
+            ))),
+        }
+    }
+
     fn run_subquery_source(
         &self,
         select: &Select,
@@ -4112,6 +4177,9 @@ impl Connection {
         tref: &TableRef,
         params: &Params,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        if tref.tvf_args.is_some() {
+            return self.tvf_rows(tref, params);
+        }
         if let Some(sub) = &tref.subquery {
             return self.run_subquery_source(sub, tref.alias.as_deref(), params);
         }
