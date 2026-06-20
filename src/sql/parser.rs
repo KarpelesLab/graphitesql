@@ -396,6 +396,12 @@ impl Parser {
                     self.expect(&Token::RParen)?;
                 }
                 self.expect_kw("as")?;
+                // An optional `MATERIALIZED` / `NOT MATERIALIZED` hint follows
+                // `AS` (an optimizer directive; accepted and ignored). A lone
+                // `NOT` here must be part of `NOT MATERIALIZED`.
+                if !self.eat_kw("materialized") && self.eat_kw("not") {
+                    self.expect_kw("materialized")?;
+                }
                 self.expect(&Token::LParen)?;
                 let select = Box::new(self.select()?);
                 self.expect(&Token::RParen)?;
