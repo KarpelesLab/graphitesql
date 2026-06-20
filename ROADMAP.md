@@ -117,8 +117,9 @@ formatting; collation (`BINARY`/`NOCASE`/`RTRIM`) honored across comparisons,
 an index-driven planner (equality/range/`IN`/OR-union seeks, **index-driven
 `ORDER BY`** with **covering-index reads**, stats-driven choice via
 `ANALYZE`/`sqlite_stat1`); constraint enforcement (`NOT NULL`, `CHECK`,
-`UNIQUE`/`PK`, **foreign keys** with all actions, standalone/partial/expression
-UNIQUE indexes); **triggers** (`BEFORE`/`AFTER`/`INSTEAD OF`, `UPDATE OF`,
+`UNIQUE`/`PK`, standalone/partial/expression UNIQUE indexes; **foreign-key
+runtime enforcement is in progress — see Track E**, FK definitions/actions parse
+and store today); **triggers** (`BEFORE`/`AFTER`/`INSTEAD OF`, `UPDATE OF`,
 `WHEN`, recursive, `NEW`/`OLD` incl. rowid); `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`;
 **`ATTACH`/`DETACH`/`TEMP`** multi-schema (cross-database reads, writes, joins,
 qualified DDL, view reads, transactions & savepoints); DDL with full CREATE-time
@@ -463,15 +464,21 @@ the `subsec`/`subsecond` datetime modifier, end-relative `$[#]` JSON paths +
 strict json1 error/blob semantics), the full multi-schema track, the planner's
 index-driven `ORDER BY`/covering reads (B0/B2/B2b) and inner-join seeks
 (B1a/B1a²), partial/expression-index use (A3), the virtual-table interface with
-`best_index` pushdown (D1a/D1b/D1b²), the full `auto_vacuum` read+write storage
-track (C6a/C6b-1/C6b-2), VDBE grouped `HAVING`/aggregate `ORDER BY` (B6), and the
-corruption-robustness fuzz harness. Recent differential hardening: shell real
-rendering + numeric CAST prefixes, and explicit `COLLATE` inside IN/CASE/BETWEEN.
-Suggested next order:
+`best_index` pushdown (D1a/D1b/D1b²), the **complete `auto_vacuum` track**
+(C6a/C6b-1..4: read, write, FULL auto-truncate, INCREMENTAL reclaim), VDBE
+grouped `HAVING`/aggregate `ORDER BY` (B6), and the corruption-robustness fuzz
+harness. Recent differential hardening: shell real rendering + numeric CAST
+prefixes, explicit `COLLATE` in IN/CASE/BETWEEN, strftime NULL-on-unknown + `%U`
++ year bound, **printf/format** full surface, raw-byte blob `||`, GLOB `]`,
+i64-overflow promotions, CTE `MATERIALIZED`, postfix `NOT NULL`, windowed
+`group_concat` separator, and an aggregate-arity panic guard. Suggested next order:
 
-1. **C6b-4 — `PRAGMA incremental_vacuum(N)`** — the on-demand shrink for
-   `auto_vacuum=INCREMENTAL`, reusing C6b-3's page relocator. (C6b-3 FULL
-   commit-time truncation is now done.)
+1. **Track E — FOREIGN KEY runtime enforcement** *(in progress)* — gated on
+   `PRAGMA foreign_keys=ON` (default OFF, byte-identical): child INSERT/UPDATE
+   parent-exists checks, and parent DELETE/UPDATE actions (NO ACTION/RESTRICT →
+   error, CASCADE/SET NULL/SET DEFAULT). Definitions already parse+store; this is
+   enforcement in the DML paths. *(Deferred: DEFERRABLE/INITIALLY DEFERRED
+   check-at-commit.)*
 2. **D2 — FTS5** full-text search — the next big module on the vtab trait (now
    that `best_index` pushdown exists).
 3. **Planner leftovers** — **B0b** (`GROUP BY`/multi-term `ORDER BY` via index),
