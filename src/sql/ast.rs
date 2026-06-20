@@ -299,6 +299,8 @@ pub struct OrderTerm {
 pub struct Insert {
     /// Target table.
     pub table: String,
+    /// A `schema.` qualifier (`INSERT INTO aux.t`), if any.
+    pub schema: Option<String>,
     /// Explicit column list, if given.
     pub columns: Vec<String>,
     /// The data source.
@@ -369,6 +371,8 @@ pub enum InsertSource {
 pub struct Update {
     /// Target table.
     pub table: String,
+    /// A `schema.` qualifier (`UPDATE aux.t`), if any.
+    pub schema: Option<String>,
     /// `SET col = expr` assignments.
     pub assignments: Vec<(String, Expr)>,
     /// `UPDATE … SET … FROM <sources>` — extra tables joined to the target so
@@ -391,6 +395,8 @@ pub struct Update {
 pub struct Delete {
     /// Target table.
     pub table: String,
+    /// A `schema.` qualifier (`DELETE FROM aux.t`), if any.
+    pub schema: Option<String>,
     /// `WHERE` predicate.
     pub where_clause: Option<Expr>,
     /// `ORDER BY` for a `LIMIT`ed delete (empty when absent).
@@ -410,6 +416,8 @@ pub struct CreateTable {
     pub if_not_exists: bool,
     /// Table name.
     pub name: String,
+    /// A `schema.` qualifier (`CREATE TABLE aux.t`), if any.
+    pub schema: Option<String>,
     /// Column definitions.
     pub columns: Vec<ColumnDef>,
     /// Table-level constraints (raw, for now).
@@ -605,6 +613,8 @@ pub struct Drop {
     pub if_exists: bool,
     /// Object name.
     pub name: String,
+    /// A `schema.` qualifier (`DROP TABLE aux.t`), if any.
+    pub schema: Option<String>,
 }
 
 /// An `ALTER TABLE` statement.

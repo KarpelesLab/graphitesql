@@ -88,11 +88,48 @@ fn schema_qualified_read_main() {
     assert_eq!(r.rows[0][1], Value::Text("x".into()));
     // A table-qualified alias works too.
     assert_eq!(
-        c.query("SELECT m.b FROM main.t AS m WHERE m.a = 2").unwrap().rows[0][0],
+        c.query("SELECT m.b FROM main.t AS m WHERE m.a = 2")
+            .unwrap()
+            .rows[0][0],
         Value::Text("y".into())
     );
     // Unknown database / cross-database join are clear errors (not silent).
     c.execute("ATTACH ':memory:' AS aux").unwrap();
     assert!(c.query("SELECT * FROM zzz.t").is_err());
     assert!(c.query("SELECT * FROM t, aux.t").is_err());
+}
+
+#[test]
+fn cross_database_create_read_write() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("INSERT INTO t VALUES(99)").unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+
+    // CREATE / INSERT into the attached database, then read it back.
+    c.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    assert_eq!(
+        c.execute("INSERT INTO aux.t VALUES(1,'alice'),(2,'bob')").unwrap(),
+        2
+    );
+    let r = c.query("SELECT id, name FROM aux.t ORDER BY id").unwrap();
+    assert_eq!(r.rows[0][1], Value::Text("alice".into()));
+    assert_eq!(r.rows[1][1], Value::Text("bob".into()));
+
+    // The two databases are isolated: main.t still has its own single row, and
+    // each catalog lists only its own table.
+    assert_eq!(c.query("SELECT a FROM t").unwrap().rows[0][0], Value::Integer(99));
+    assert_eq!(c.query("SELECT count(*) FROM main.t").unwrap().rows[0][0], Value::Integer(1));
+    assert_eq!(c.query("SELECT count(*) FROM aux.sqlite_master").unwrap().rows[0][0], Value::Integer(1));
+
+    // UPDATE / DELETE / DROP against the attached database.
+    c.execute("UPDATE aux.t SET name='ALICE' WHERE id=1").unwrap();
+    c.execute("DELETE FROM aux.t WHERE id=2").unwrap();
+    let r = c.query("SELECT id, name FROM aux.t").unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Integer(1), Value::Text("ALICE".into())]]);
+    c.execute("DROP TABLE aux.t").unwrap();
+    assert_eq!(c.query("SELECT count(*) FROM aux.sqlite_master").unwrap().rows[0][0], Value::Integer(0));
+    // main.t is untouched by the DROP in aux.
+    assert_eq!(c.query("SELECT count(*) FROM main.sqlite_master").unwrap().rows[0][0], Value::Integer(1));
 }

@@ -681,6 +681,16 @@ impl Parser {
         })
     }
 
+    /// Parse `[schema .] name`, returning the optional schema qualifier and name.
+    fn qualified_name(&mut self) -> Result<(Option<String>, String)> {
+        let first = self.ident()?;
+        if self.eat(&Token::Dot) {
+            Ok((Some(first), self.ident()?))
+        } else {
+            Ok((None, first))
+        }
+    }
+
     fn insert(&mut self) -> Result<Insert> {
         // INSERT [OR <action>] INTO  /  REPLACE INTO
         let mut on_conflict = OnConflict::Abort;
@@ -700,7 +710,7 @@ impl Parser {
             on_conflict = OnConflict::Replace;
         }
         self.expect_kw("into")?;
-        let table = self.ident()?;
+        let (schema, table) = self.qualified_name()?;
         let mut columns = Vec::new();
         if self.eat(&Token::LParen) {
             columns.push(self.ident()?);
@@ -728,6 +738,7 @@ impl Parser {
         let returning = self.returning_clause()?;
         Ok(Insert {
             table,
+            schema,
             columns,
             source,
             on_conflict,
@@ -813,7 +824,7 @@ impl Parser {
 
     fn update(&mut self) -> Result<Update> {
         self.expect_kw("update")?;
-        let table = self.ident()?;
+        let (schema, table) = self.qualified_name()?;
         self.expect_kw("set")?;
         let mut assignments = Vec::new();
         loop {
@@ -842,6 +853,7 @@ impl Parser {
         let (order_by, limit, offset) = self.order_limit_offset()?;
         Ok(Update {
             table,
+            schema,
             assignments,
             from,
             where_clause,
@@ -855,7 +867,7 @@ impl Parser {
     fn delete(&mut self) -> Result<Delete> {
         self.expect_kw("delete")?;
         self.expect_kw("from")?;
-        let table = self.ident()?;
+        let (schema, table) = self.qualified_name()?;
         let where_clause = if self.eat_kw("where") {
             Some(self.expr()?)
         } else {
@@ -865,6 +877,7 @@ impl Parser {
         let (order_by, limit, offset) = self.order_limit_offset()?;
         Ok(Delete {
             table,
+            schema,
             where_clause,
             order_by,
             limit,
@@ -993,13 +1006,14 @@ impl Parser {
 
     fn create_table(&mut self) -> Result<CreateTable> {
         let if_not_exists = self.if_not_exists()?;
-        let name = self.ident()?;
+        let (schema, name) = self.qualified_name()?;
         // `CREATE TABLE name AS SELECT …`.
         if self.eat_kw("as") {
             let select = self.select()?;
             return Ok(CreateTable {
                 if_not_exists,
                 name,
+                schema,
                 columns: Vec::new(),
                 constraints: Vec::new(),
                 without_rowid: false,
@@ -1043,6 +1057,7 @@ impl Parser {
         Ok(CreateTable {
             if_not_exists,
             name,
+            schema,
             columns,
             constraints,
             without_rowid,
@@ -1331,11 +1346,12 @@ impl Parser {
         } else {
             false
         };
-        let name = self.ident()?;
+        let (schema, name) = self.qualified_name()?;
         Ok(Drop {
             kind,
             if_exists,
             name,
+            schema,
         })
     }
 

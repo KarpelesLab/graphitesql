@@ -902,6 +902,44 @@ impl Connection {
             _ => {}
         }
 
+        // A schema-qualified DDL/DML statement (`… aux.t`) runs against that
+        // database: a single write touches exactly one database, so we make it
+        // the active `main` for the duration (swapping back afterwards, even on
+        // error). Cross-database *joins* are handled separately in the read path.
+        match self.target_db(&stmt)? {
+            None => self.exec_parsed(stmt, sql, params),
+            Some(i) => {
+                self.swap_db(i);
+                let r = self.exec_parsed(stmt, sql, params);
+                self.swap_db(i);
+                r
+            }
+        }
+    }
+
+    /// The attached-database index a schema-qualified DDL/DML statement targets
+    /// (`None` for the main database / an unqualified statement).
+    fn target_db(&self, stmt: &Statement) -> Result<Option<usize>> {
+        let schema = match stmt {
+            Statement::CreateTable(s) => s.schema.as_deref(),
+            Statement::Insert(s) => s.schema.as_deref(),
+            Statement::Update(s) => s.schema.as_deref(),
+            Statement::Delete(s) => s.schema.as_deref(),
+            Statement::Drop(s) => s.schema.as_deref(),
+            _ => None,
+        };
+        self.resolve_db(schema)
+    }
+
+    /// Make attached database `i` the active `main` (or swap it back) by
+    /// exchanging the backend and schema. Used around a qualified write.
+    fn swap_db(&mut self, i: usize) {
+        core::mem::swap(&mut self.backend, &mut self.attached[i].backend);
+        core::mem::swap(&mut self.schema, &mut self.attached[i].schema);
+    }
+
+    /// Execute a parsed non-transaction-control statement on the active database.
+    fn exec_parsed(&mut self, stmt: Statement, sql: &str, params: &Params) -> Result<usize> {
         // `changes()`/`total_changes()` track only INSERT/UPDATE/DELETE.
         let is_dml = matches!(
             stmt,
@@ -1526,6 +1564,7 @@ impl Connection {
                 .collect();
             let ins = Insert {
                 table: ct.name.clone(),
+                schema: None,
                 columns: Vec::new(),
                 source: InsertSource::Values(value_rows),
                 on_conflict: OnConflict::Abort,
