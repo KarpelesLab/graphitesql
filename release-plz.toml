@@ -1,0 +1,33 @@
+# release-plz configuration.
+#
+# IMPORTANT: CHANGELOG.md is generated automatically by release-plz from
+# conventional-commit messages. DO NOT edit CHANGELOG.md by hand — the
+# `## [Unreleased]` section is an empty placeholder that release-plz fills on
+# release. See CLAUDE.md.
+#
+# This [changelog] block customizes how commit *types* map to changelog
+# sections (first match wins). Use conventional commits:
+#   feat:      -> Added
+#   fix:       -> Fixed
+#   perf:      -> Performance
+#   refactor:  -> Refactor
+#   docs:      -> Documentation
+#   test:      -> Testing
+#   ci/build/chore/style/revert, and merge commits -> skipped (no changelog noise)
+#   anything else -> Other
+[changelog]
+commit_parsers = [
+    { message = "^[Mm]erge ", skip = true },
+    { message = "^feat", group = "Added" },
+    { message = "^fix", group = "Fixed" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Refactor" },
+    { message = "^docs?", group = "Documentation" },
+    { message = "^test", group = "Testing" },
+    { message = "^ci", skip = true },
+    { message = "^build", skip = true },
+    { message = "^chore", skip = true },
+    { message = "^style", skip = true },
+    { message = "^revert", skip = true },
+    { message = ".*", group = "Other" },
+]
