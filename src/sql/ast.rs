@@ -362,6 +362,9 @@ pub struct CreateTable {
     pub constraints: Vec<TableConstraint>,
     /// `WITHOUT ROWID`?
     pub without_rowid: bool,
+    /// `CREATE TABLE … AS SELECT …` — the table's columns and rows come from the
+    /// query. When present, `columns`/`constraints` are empty until materialized.
+    pub as_select: Option<Box<Select>>,
 }
 
 /// A column definition in `CREATE TABLE`.

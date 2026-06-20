@@ -893,6 +893,18 @@ impl Parser {
     fn create_table(&mut self) -> Result<CreateTable> {
         let if_not_exists = self.if_not_exists()?;
         let name = self.ident()?;
+        // `CREATE TABLE name AS SELECT …`.
+        if self.eat_kw("as") {
+            let select = self.select()?;
+            return Ok(CreateTable {
+                if_not_exists,
+                name,
+                columns: Vec::new(),
+                constraints: Vec::new(),
+                without_rowid: false,
+                as_select: Some(Box::new(select)),
+            });
+        }
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
@@ -921,6 +933,7 @@ impl Parser {
             columns,
             constraints,
             without_rowid,
+            as_select: None,
         })
     }
 

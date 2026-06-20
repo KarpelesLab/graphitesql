@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: `CREATE TABLE … AS SELECT …` (CTAS). The new table's columns are the
+  query's output labels (untyped), populated with the query's rows via the normal
+  insert path. Verified against `sqlite3`.
 - Track A: `INDEXED BY name` / `NOT INDEXED` query hints. `NOT INDEXED` forces a
   table scan; `INDEXED BY` restricts the planner to the named index (and errors if
   it does not exist). Results are identical to the unhinted query. Verified.

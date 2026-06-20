@@ -121,6 +121,8 @@ Order within a track is roughly by value/effort; tracks can progress in parallel
 
 Make the dialect complete. Each item lands with a differential corpus addition.
 
+- ✅ **`CREATE TABLE … AS SELECT`** — columns from the query's labels, populated
+  with its rows.
 - ✅ **Generated columns** — `… AS (expr) [STORED|VIRTUAL]`: modeled in the AST,
   `VIRTUAL` computed on read, `STORED` materialized on write, writes rejected,
   indexable. *Ref:* `build.c`, expression eval.

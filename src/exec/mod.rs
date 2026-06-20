@@ -943,6 +943,9 @@ impl Connection {
     // ---- DDL / DML ----------------------------------------------------------
 
     fn exec_create_table(&mut self, ct: &CreateTable, sql_text: &str) -> Result<()> {
+        if let Some(select) = &ct.as_select {
+            return self.exec_create_table_as_select(ct, select);
+        }
         if self.schema.table(&ct.name).is_some() {
             if ct.if_not_exists {
                 return Ok(());
@@ -1025,6 +1028,56 @@ impl Connection {
         self.backend.writer()?.header_mut().schema_cookie = cookie;
         // Make the new table visible to subsequent statements in this tx.
         self.schema = Schema::read(self.backend.source())?;
+        Ok(())
+    }
+
+    /// `CREATE TABLE name AS SELECT …`: create a table whose columns are the
+    /// query's output labels (no declared types/constraints), then populate it
+    /// with the query's rows.
+    fn exec_create_table_as_select(&mut self, ct: &CreateTable, select: &Select) -> Result<()> {
+        if self.schema.table(&ct.name).is_some() {
+            if ct.if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::Error(format!("table {} already exists", ct.name)));
+        }
+        let result = self.run_select(select, &Params::default())?;
+        // Build and create the resolved table `name(col1, col2, …)`.
+        let cols = result
+            .columns
+            .iter()
+            .map(|c| crate::sql::print::ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let create_sql = format!(
+            "CREATE TABLE {}({cols})",
+            crate::sql::print::ident(&ct.name)
+        );
+        let Statement::CreateTable(syn) = sql::parse_one(&create_sql)? else {
+            return Err(Error::Corrupt("generated CTAS schema is invalid".into()));
+        };
+        self.exec_create_table(&syn, &create_sql)?;
+        // Populate it with the query's rows via the normal insert path.
+        if !result.rows.is_empty() {
+            let value_rows: Vec<Vec<Expr>> = result
+                .rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| Expr::Literal(value_to_literal(v)))
+                        .collect()
+                })
+                .collect();
+            let ins = Insert {
+                table: ct.name.clone(),
+                columns: Vec::new(),
+                source: InsertSource::Values(value_rows),
+                on_conflict: OnConflict::Abort,
+                upsert: None,
+                returning: Vec::new(),
+            };
+            self.exec_insert(&ins, &Params::default())?;
+        }
         Ok(())
     }
 

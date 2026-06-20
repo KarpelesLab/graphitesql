@@ -1,0 +1,108 @@
+//! Track A: `CREATE TABLE … AS SELECT …`. Verified against the `sqlite3` CLI.
+
+#![cfg(feature = "std")]
+
+use graphitesql::{Connection, Value};
+use std::process::Command;
+
+fn sqlite3_available() -> bool {
+    Command::new("sqlite3").arg("--version").output().is_ok()
+}
+
+fn render(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Integer(i) => i.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Real(r) => graphitesql::exec::eval::format_real(*r),
+        Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+    }
+}
+
+fn rows_str(c: &Connection, sql: &str) -> String {
+    c.query(sql)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|row| row.iter().map(render).collect::<Vec<_>>().join("|"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn basic_ctas() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE src(a, b)").unwrap();
+    c.execute("INSERT INTO src VALUES (1,'x'),(2,'y'),(3,'z')")
+        .unwrap();
+    c.execute("CREATE TABLE dst AS SELECT a, b FROM src WHERE a >= 2")
+        .unwrap();
+    assert_eq!(rows_str(&c, "SELECT a, b FROM dst ORDER BY a"), "2|y\n3|z");
+    // Column names come from the SELECT.
+    let r = c.query("SELECT * FROM dst LIMIT 0").unwrap();
+    assert_eq!(r.columns, vec!["a", "b"]);
+    // Aliased/expression columns.
+    c.execute("CREATE TABLE agg AS SELECT count(*) AS n, sum(a) AS s FROM src")
+        .unwrap();
+    assert_eq!(rows_str(&c, "SELECT n, s FROM agg"), "3|6");
+}
+
+#[test]
+fn against_sqlite3() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let setup = "CREATE TABLE src(a INT, b TEXT, c REAL);\
+                 INSERT INTO src VALUES (1,'aa',1.5),(2,'bb',2.5),(3,'cc',3.5);\
+                 CREATE TABLE t1 AS SELECT a, b FROM src WHERE a > 1;\
+                 CREATE TABLE t2 AS SELECT a*10 AS x, upper(b) AS y FROM src;\
+                 CREATE TABLE t3 AS SELECT b, count(*) AS n FROM src GROUP BY (a > 1)";
+    let queries = [
+        "SELECT a, b FROM t1 ORDER BY a",
+        "SELECT x, y FROM t2 ORDER BY x",
+        "SELECT count(*) FROM t3",
+    ];
+
+    let path = std::env::temp_dir().join(format!("gsql-ctas-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let out = Command::new("sqlite3")
+        .arg(&path)
+        .arg(setup)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+
+    let mut failures = Vec::new();
+    for q in queries {
+        let want = {
+            let o = Command::new("sqlite3").arg(&path).arg(q).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = rows_str(&g, q);
+        if got != want {
+            failures.push(format!(
+                "  {q}\n    sqlite:   {want:?}\n    graphite: {got:?}"
+            ));
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        failures.is_empty(),
+        "{} CTAS queries diverged:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
