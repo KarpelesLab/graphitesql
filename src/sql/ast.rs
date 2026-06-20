@@ -53,6 +53,9 @@ pub enum Statement {
     Pragma(Pragma),
     /// A `VACUUM` statement (accepted; a no-op compaction in this build).
     Vacuum,
+    /// `REINDEX [name]` — accepted as a no-op: graphitesql rebuilds an index
+    /// whenever the underlying rows change, so indexes are always current.
+    Reindex,
     /// `ANALYZE [name]`: gather statistics into `sqlite_stat1`. `None` analyzes
     /// the whole database; `Some(name)` a single table or index.
     Analyze(Option<String>),

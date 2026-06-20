@@ -224,6 +224,16 @@ impl Parser {
             }
             return Ok(Statement::Vacuum);
         }
+        if self.eat_kw("reindex") {
+            // `REINDEX` / `REINDEX name` / `REINDEX schema.name` (a no-op here).
+            if !self.check(&Token::Semicolon) && !self.at_end() {
+                let _ = self.ident()?;
+                if self.eat(&Token::Dot) {
+                    let _ = self.ident()?;
+                }
+            }
+            return Ok(Statement::Reindex);
+        }
         if self.eat_kw("analyze") {
             // `ANALYZE` / `ANALYZE name` / `ANALYZE schema.name`.
             let target = if self.check(&Token::Semicolon) || self.at_end() {

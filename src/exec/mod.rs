@@ -788,6 +788,8 @@ impl Connection {
                 self.exec_vacuum()?;
                 0
             }
+            // Indexes are kept current on every write, so REINDEX is a no-op.
+            Statement::Reindex => 0,
             Statement::Analyze(target) => {
                 self.exec_analyze(target.as_deref())?;
                 0
