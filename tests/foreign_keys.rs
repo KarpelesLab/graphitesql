@@ -125,6 +125,60 @@ fn update_cascade() {
     assert_eq!(r.rows[0][0], graphitesql::Value::Integer(5));
 }
 
+#[test]
+fn composite_key() {
+    // A multi-column FK: orphan rejected, valid accepted, ON DELETE CASCADE
+    // removes only the rows matching the full (a,b) key.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute("CREATE TABLE p(a INT, b INT, PRIMARY KEY(a,b))")
+        .unwrap();
+    c.execute(
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, a INT, b INT, \
+         FOREIGN KEY(a,b) REFERENCES p(a,b) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    c.execute("INSERT INTO p VALUES (1,1),(1,2),(2,2)").unwrap();
+    c.execute("INSERT INTO c VALUES (10,1,1),(11,1,2),(12,2,2)")
+        .unwrap();
+    // No parent (9,9): rejected.
+    let err = c.execute("INSERT INTO c VALUES (13,9,9)");
+    assert!(matches!(err, Err(Error::Constraint(_))), "got {err:?}");
+    // Deleting (1,1) cascades only to child 10.
+    c.execute("DELETE FROM p WHERE a = 1 AND b = 1").unwrap();
+    let r = c.query("SELECT id FROM c ORDER BY id").unwrap();
+    let ids: Vec<_> = r.rows.iter().map(|row| row[0].clone()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            graphitesql::Value::Integer(11),
+            graphitesql::Value::Integer(12)
+        ]
+    );
+}
+
+#[test]
+fn self_referential_cascade() {
+    // A self-referential FK with recursive ON DELETE CASCADE: deleting the
+    // root must cascade through the whole tree and terminate.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute(
+        "CREATE TABLE node(id INTEGER PRIMARY KEY, \
+         parent INT REFERENCES node(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    c.execute("INSERT INTO node VALUES (1,NULL),(2,1),(3,2),(4,1)")
+        .unwrap();
+    // A self-referential orphan is still rejected.
+    let err = c.execute("INSERT INTO node VALUES (5,99)");
+    assert!(matches!(err, Err(Error::Constraint(_))), "got {err:?}");
+    // Deleting 1 cascades to 2 and 4, then 2 cascades to 3 — table empties.
+    c.execute("DELETE FROM node WHERE id = 1").unwrap();
+    let r = c.query("SELECT id FROM node ORDER BY id").unwrap();
+    assert!(r.rows.is_empty(), "expected empty, got {:?}", r.rows);
+}
+
 /// Differential battery against sqlite3 with foreign_keys ON.
 #[test]
 fn foreign_keys_against_sqlite3() {
