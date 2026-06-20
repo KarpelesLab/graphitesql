@@ -368,8 +368,17 @@ Done: a table-valued-function mechanism (`generate_series`, `json_each`,
   a vtab is a `FROM` source (single + join side) via the trait
   (connect→open→cursor, WHERE re-applied by `run_core`); `DROP` works;
   INSERT/UPDATE/DELETE are rejected (read-only). File round-trip verified.
-  *Remaining:* `best_index` constraint pushdown (full scan today); a public
-  module-registration API (overlaps D4). Foundation for D2–D3.
+  *Remaining:* a public module-registration API (overlaps D4). Foundation for D2–D3.
+- ✅ **D1b² — `best_index` constraint pushdown.** Done — vtab scans push usable
+  WHERE constraints into the module via an xBestIndex/xFilter-style interface:
+  `IndexConstraint{column,op}` → `best_index` → `IndexPlan` (per-constraint
+  `argv_index`, `omit`, `order_by_consumed`, cost); `filter(cursor, plan, argv)`
+  seeds the cursor. `series` consumes `=`/`>=`/`>`/`<=`/`<` (+ `BETWEEN`),
+  narrowing generation for ascending/descending series. Correctness: `omit` is
+  never set so `run_core` re-applies the full WHERE (pushed bounds only shrink to
+  a superset; the narrowed start stays grid-aligned). Joins keep the full-scan
+  path. Proven by an instrumented generation counter + instant completion over a
+  billion-row series. *(Match/Like/Glob recognized but not yet consumed.)*
 - **D2 — FTS5** full-text search (a module on D1). *Ref:* `fts5*.c`.
 - **D3 — R-Tree** spatial index (a module on D1). *Ref:* `rtree.c`.
 - **D4 — User-defined functions from Rust.** Register scalar/aggregate/window
@@ -436,24 +445,30 @@ on contents**, not byte-identical independently-built databases.
 
 ## 7. Immediate next steps
 
-Done so far: Track A breadth (incl. `timediff`, `json_error_position`, JSON5),
-the full multi-schema track, the planner's index-driven `ORDER BY`/covering
-reads (B0/B2/B2b) and inner-join seeks (B1a/B1a²), partial/expression-index use
-(A3), the virtual-table interface (D1a/D1b), the `auto_vacuum` empty-db header
-(C6b-1), and the corruption-robustness fuzz harness. Suggested next order:
+Done so far: Track A breadth (incl. `timediff`, `json_error_position`, JSON5,
+the `subsec`/`subsecond` datetime modifier, end-relative `$[#]` JSON paths +
+strict json1 error/blob semantics), the full multi-schema track, the planner's
+index-driven `ORDER BY`/covering reads (B0/B2/B2b) and inner-join seeks
+(B1a/B1a²), partial/expression-index use (A3), the virtual-table interface with
+`best_index` pushdown (D1a/D1b/D1b²), the full `auto_vacuum` read+write storage
+track (C6a/C6b-1/C6b-2), VDBE grouped `HAVING`/aggregate `ORDER BY` (B6), and the
+corruption-robustness fuzz harness. Recent differential hardening: shell real
+rendering + numeric CAST prefixes, and explicit `COLLATE` inside IN/CASE/BETWEEN.
+Suggested next order:
 
-1. **C6b-2 — `auto_vacuum` ptrmap write maintenance** — the big storage piece,
-   on the verified `ptrmap.rs` + C6b-1 header. Maintain ptrmap entries on every
-   alloc/free/balance, then lift the C6a write-refusal; acceptance is sqlite3
-   reading a graphite-written auto_vacuum file with `integrity_check = ok`. Then
-   C6b-3 (FULL truncate) and C6b-4 (`incremental_vacuum`).
-2. **D2 — FTS5**, or **D1b `best_index` pushdown** — build on the vtab trait.
+1. **C6b-3 / C6b-4 — `auto_vacuum` space reclaim** — FULL commit-time truncation
+   (page relocation: move trailing pages into freelist gaps, fix parent pointers
+   + ptrmap) and `PRAGMA incremental_vacuum`. Files are already sound without it
+   (freed pages keep correct FREEPAGE entries); this is compaction only.
+2. **D2 — FTS5** full-text search — the next big module on the vtab trait (now
+   that `best_index` pushdown exists).
 3. **Planner leftovers** — **B0b** (`GROUP BY`/multi-term `ORDER BY` via index),
    **B1b** (join reordering, now that inner tables can be seeked), **B3**
-   (auto-index EQP), **A2** (DESC seek direction), **A4** (literal-left
-   collation), **B4** (`sqlite_stat4`). Perf-only, EQP-gated.
+   (auto-index EQP), **A2** (DESC seek direction), **B4** (`sqlite_stat4`).
+   Perf-only, EQP-gated. *(A4 literal-left collation: the IN/CASE/BETWEEN
+   `COLLATE` cases are now done; NULLIF collation in `func.rs` remains.)*
 4. **A7 — `execute_batch`** and the smaller API/ergonomics gaps.
-5. **B5–B8 — the executor→VDBE migration** — the largest internal refactor;
+5. **B5/B7/B8 — the executor→VDBE migration** — the largest internal refactor;
    unblocks real `EXPLAIN`.
 
 Deferred: **A1** (`random*` — needs an RNG), **C7/C9** (SQLite-format journal,
