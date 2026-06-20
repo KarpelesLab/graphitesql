@@ -9,9 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
-- Track D: table-valued functions — `generate_series(start, stop[, step])` as a
-  `FROM` source (sole source or joined), with the `value` column. Establishes the
-  TVF mechanism (`TableRef.tvf_args`). Verified against `sqlite3`.
+- Track D: table-valued functions — `generate_series(start, stop[, step])`,
+  `json_each`, and `json_tree` as `FROM` sources (sole source or joined).
+  `json_each` yields the direct children, `json_tree` the full depth-first tree,
+  each with the `key`/`value`/`type`/`atom`/`id`/`parent`/`fullkey`/`path` columns
+  (the `id`/`parent` numbering is graphitesql's own; the rest match SQLite).
+  Establishes the TVF mechanism (`TableRef.tvf_args`). Verified against `sqlite3`.
 - Track A: `CREATE TABLE … AS SELECT …` (CTAS). The new table's columns are the
   query's output labels (untyped), populated with the query's rows via the normal
   insert path. Verified against `sqlite3`.

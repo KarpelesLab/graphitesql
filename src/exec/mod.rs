@@ -4144,6 +4144,36 @@ impl Connection {
                 }
                 Ok((alloc::vec![col("value", eval::Affinity::Integer)], rows))
             }
+            "json_each" | "json_tree" => {
+                let columns = alloc::vec![
+                    col("key", eval::Affinity::Blob),
+                    col("value", eval::Affinity::Blob),
+                    col("type", eval::Affinity::Text),
+                    col("atom", eval::Affinity::Blob),
+                    col("id", eval::Affinity::Integer),
+                    col("parent", eval::Affinity::Integer),
+                    col("fullkey", eval::Affinity::Text),
+                    col("path", eval::Affinity::Text),
+                ];
+                let Some(doc_arg) = args.first() else {
+                    return Err(Error::Error(format!("{lname}() requires a JSON argument")));
+                };
+                let doc = eval::eval(doc_arg, &ctx)?;
+                if matches!(doc, Value::Null) {
+                    return Ok((columns, Vec::new()));
+                }
+                let Some(root) = crate::exec::json::parse(&eval::to_text(&doc)) else {
+                    return Err(Error::Error("malformed JSON".into()));
+                };
+                let mut rows = Vec::new();
+                let mut next_id = 0i64;
+                if lname == "json_tree" {
+                    json_tree_walk(&root, None, "$", "$", None, &mut next_id, &mut rows);
+                } else {
+                    json_each_children(&root, &mut next_id, &mut rows);
+                }
+                Ok((columns, rows))
+            }
             _ => Err(Error::Error(format!(
                 "no such table-valued function: {}",
                 tref.name
@@ -5464,6 +5494,129 @@ fn resolve_window_ref(wexpr: &Expr, defs: &[(String, WindowSpec)]) -> Result<Exp
         order_by: order_by.clone(),
         over: Some(effective),
     })
+}
+
+/// Emit one `json_each`/`json_tree` row for `node` and return its assigned id.
+/// `key` is the member name / array index (None for a top-level scalar or the
+/// `json_tree` root); `fullkey`/`path` are the element's path and its parent's.
+fn json_emit_node(
+    node: &crate::exec::json::Json,
+    key: Option<Value>,
+    fullkey: &str,
+    path: &str,
+    parent: Option<i64>,
+    next_id: &mut i64,
+    rows: &mut Vec<Vec<Value>>,
+) -> i64 {
+    use crate::exec::json::Json;
+    let id = *next_id;
+    *next_id += 1;
+    let is_container = matches!(node, Json::Object(_) | Json::Array(_));
+    let value = node.to_sql();
+    let atom = if is_container {
+        Value::Null
+    } else {
+        value.clone()
+    };
+    rows.push(alloc::vec![
+        key.unwrap_or(Value::Null),
+        value,
+        Value::Text(String::from(node.type_name())),
+        atom,
+        Value::Integer(id),
+        parent.map(Value::Integer).unwrap_or(Value::Null),
+        Value::Text(String::from(fullkey)),
+        Value::Text(String::from(path)),
+    ]);
+    id
+}
+
+/// `json_each`: emit a row for each *direct* child of `root` (or a single row for
+/// a scalar root).
+fn json_each_children(
+    root: &crate::exec::json::Json,
+    next_id: &mut i64,
+    rows: &mut Vec<Vec<Value>>,
+) {
+    use crate::exec::json::Json;
+    match root {
+        Json::Object(members) => {
+            for (k, v) in members {
+                let fullkey = alloc::format!("$.{k}");
+                json_emit_node(
+                    v,
+                    Some(Value::Text(k.clone())),
+                    &fullkey,
+                    "$",
+                    None,
+                    next_id,
+                    rows,
+                );
+            }
+        }
+        Json::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                let fullkey = alloc::format!("$[{i}]");
+                json_emit_node(
+                    v,
+                    Some(Value::Integer(i as i64)),
+                    &fullkey,
+                    "$",
+                    None,
+                    next_id,
+                    rows,
+                );
+            }
+        }
+        scalar => {
+            json_emit_node(scalar, None, "$", "$", None, next_id, rows);
+        }
+    }
+}
+
+/// `json_tree`: emit `node` then recurse depth-first into its children.
+fn json_tree_walk(
+    node: &crate::exec::json::Json,
+    key: Option<Value>,
+    fullkey: &str,
+    path: &str,
+    parent: Option<i64>,
+    next_id: &mut i64,
+    rows: &mut Vec<Vec<Value>>,
+) {
+    use crate::exec::json::Json;
+    let id = json_emit_node(node, key, fullkey, path, parent, next_id, rows);
+    match node {
+        Json::Object(members) => {
+            for (k, v) in members {
+                let child = alloc::format!("{fullkey}.{k}");
+                json_tree_walk(
+                    v,
+                    Some(Value::Text(k.clone())),
+                    &child,
+                    fullkey,
+                    Some(id),
+                    next_id,
+                    rows,
+                );
+            }
+        }
+        Json::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                let child = alloc::format!("{fullkey}[{i}]");
+                json_tree_walk(
+                    v,
+                    Some(Value::Integer(i as i64)),
+                    &child,
+                    fullkey,
+                    Some(id),
+                    next_id,
+                    rows,
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 fn frame_bounds(p: usize, m: usize, gid: &[usize], spec: &WindowSpec) -> (usize, usize) {

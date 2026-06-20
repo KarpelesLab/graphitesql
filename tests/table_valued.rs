@@ -73,6 +73,46 @@ fn join_with_series() {
 }
 
 #[test]
+fn json_each_and_tree() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let c = Connection::open_memory().unwrap();
+    // Stable columns only — `id`/`parent` are SQLite-internal node offsets.
+    let queries = [
+        r#"SELECT key,value,type,atom,fullkey,path FROM json_each('{"a":1,"b":[7,8],"c":"x"}')"#,
+        r#"SELECT key,value,type,fullkey,path FROM json_each('[10,20,30]')"#,
+        r#"SELECT key,value,type,fullkey,path FROM json_tree('{"a":1,"b":[7,8]}')"#,
+        r#"SELECT value FROM json_each('[1,2,3,4]') WHERE value > 2"#,
+        r#"SELECT count(*), sum(value) FROM json_each('[5,10,15]')"#,
+    ];
+    let mut failures = Vec::new();
+    for q in queries {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(q)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = rows_str(&c, q);
+        if got != want {
+            failures.push(format!(
+                "  {q}\n    sqlite:   {want:?}\n    graphite: {got:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} json_each/json_tree queries diverged:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn against_sqlite3() {
     if !sqlite3_available() {
         eprintln!("sqlite3 not found; skipping");

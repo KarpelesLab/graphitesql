@@ -143,9 +143,9 @@ Make the dialect complete. Each item lands with a differential corpus addition.
   `ln`/`log`, trig, …, pure-`core`, no libm) and ✅ **JSON** functions (`json`,
   `json_extract`, `json_array`/`json_object`, `json_type`, `json_array_length`,
   `json_valid`, `json_quote`, the `->`/`->>` operators, and the
-  `json_set`/`json_insert`/`json_replace`/`json_remove`/`json_patch` mutators).
-  *Remaining:* `json_each`/`json_tree` (table-valued — depends on Track D) and
-  remaining string/blob built-ins. *Ref:* `func.c`, `math.c`, `json.c`.
+  `json_set`/`json_insert`/`json_replace`/`json_remove`/`json_patch` mutators,
+  and the `json_each`/`json_tree` table-valued functions). *Remaining:* a few
+  string/blob built-ins. *Ref:* `func.c`, `math.c`, `json.c`.
 - **Indexing breadth** — ✅ partial indexes (`CREATE INDEX … WHERE`), ✅
   expression indexes (`CREATE INDEX … (lower(x))`), ✅ `INDEXED BY` / `NOT INDEXED`
   hints. *Remaining:* `DESC` index columns honored in seeks, partial/expression-
@@ -214,10 +214,10 @@ VDBE (Track B) and virtual tables.
 - **C-API shim** — a `libsqlite3`-compatible surface (`sqlite3_open`/`prepare`/
   `step`/`column_*`/`bind_*`/…) as a separate crate, so existing C/FFI consumers
   link against graphitesql. *Ref:* `main.c`, `legacy.c`, `vdbeapi.c`.
-- **Virtual tables & table-valued functions** — ✅ a first TVF mechanism with
-  `generate_series` as a `FROM` source. *Remaining:* `json_each`/`json_tree`, the
-  `sqlite3_module` analog (`xBestIndex`/`xFilter`/…) and `CREATE VIRTUAL TABLE`.
-  Foundation for FTS5/R-Tree. *Ref:* `vtab.c`, `vdbevtab.c`.
+- **Virtual tables & table-valued functions** — ✅ a TVF mechanism with
+  `generate_series`, `json_each`, and `json_tree` as `FROM` sources. *Remaining:*
+  the `sqlite3_module` analog (`xBestIndex`/`xFilter`/…) and `CREATE VIRTUAL
+  TABLE`. Foundation for FTS5/R-Tree. *Ref:* `vtab.c`, `vdbevtab.c`.
 - **FTS5** full-text search; **R-Tree** spatial index. *Ref:* `fts5*.c`, `rtree.c`.
 - **User-defined functions from Rust** — register scalar/aggregate/window funcs
   and custom collations through a safe API.
