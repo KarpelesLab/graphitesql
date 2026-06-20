@@ -1301,12 +1301,14 @@ impl Parser {
     fn function_call(&mut self, name: String) -> Result<Expr> {
         if self.eat(&Token::Star) {
             self.expect(&Token::RParen)?;
+            let filter = self.filter_clause()?;
             let over = self.window_over()?;
             return Ok(Expr::Function {
                 name,
                 distinct: false,
                 args: Vec::new(),
                 star: true,
+                filter,
                 over,
             });
         }
@@ -1319,14 +1321,28 @@ impl Parser {
             }
         }
         self.expect(&Token::RParen)?;
+        let filter = self.filter_clause()?;
         let over = self.window_over()?;
         Ok(Expr::Function {
             name,
             distinct,
             args,
             star: false,
+            filter,
             over,
         })
+    }
+
+    /// Parse an optional `FILTER (WHERE <expr>)` aggregate/window filter.
+    fn filter_clause(&mut self) -> Result<Option<Box<Expr>>> {
+        if !self.eat_kw("filter") {
+            return Ok(None);
+        }
+        self.expect(&Token::LParen)?;
+        self.expect_kw("where")?;
+        let e = self.expr()?;
+        self.expect(&Token::RParen)?;
+        Ok(Some(Box::new(e)))
     }
 
     /// Parse an optional `OVER ( [PARTITION BY …] [ORDER BY …] )` clause.

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: aggregate `FILTER (WHERE …)`. `count`/`sum`/`avg`/`total`/
+  `group_concat`/… accept a `FILTER (WHERE predicate)` that restricts which rows
+  of the group they consume, grouped or ungrouped. Verified against `sqlite3`.
 - Track C: `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` nested transactions. The write
   pager snapshots its staged state on `SAVEPOINT`; `ROLLBACK TO` restores it
   (keeping the savepoint open and repeatable), `RELEASE` discards it keeping the

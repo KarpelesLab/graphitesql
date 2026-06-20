@@ -598,6 +598,9 @@ pub enum Expr {
         args: Vec<Expr>,
         /// Whether the argument was `*`.
         star: bool,
+        /// `FILTER (WHERE …)` — restricts which rows an aggregate/window function
+        /// consumes.
+        filter: Option<Box<Expr>>,
         /// `OVER (…)` window specification, making this a window-function call.
         over: Option<WindowSpec>,
     },

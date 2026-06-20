@@ -4160,8 +4160,18 @@ impl Connection {
                 distinct,
                 args,
                 star,
+                filter,
                 over: None,
             } if func::is_aggregate_call(name, args.len(), *star) => {
+                // `FILTER (WHERE …)` narrows the group's rows before aggregating.
+                let filtered;
+                let group = match filter {
+                    Some(pred) => {
+                        filtered = self.filter_group(pred, columns, rows, group, params)?;
+                        &filtered[..]
+                    }
+                    None => group,
+                };
                 let v = self.compute_aggregate(
                     name, *distinct, args, *star, columns, rows, group, params,
                 )?;
@@ -4172,6 +4182,7 @@ impl Connection {
                 distinct,
                 args,
                 star,
+                filter,
                 over,
             } => {
                 let mut new_args = Vec::with_capacity(args.len());
@@ -4183,6 +4194,7 @@ impl Connection {
                     distinct: *distinct,
                     args: new_args,
                     star: *star,
+                    filter: filter.clone(),
                     over: over.clone(),
                 }
             }
@@ -4266,6 +4278,26 @@ impl Connection {
             // (a subquery's own aggregates belong to that subquery).
             other => other.clone(),
         })
+    }
+
+    /// The subset of `group`'s row indices for which `pred` (an aggregate
+    /// `FILTER (WHERE …)`) evaluates true.
+    fn filter_group(
+        &self,
+        pred: &Expr,
+        columns: &[ColumnInfo],
+        rows: &[InputRow],
+        group: &[usize],
+        params: &Params,
+    ) -> Result<Vec<usize>> {
+        let mut out = Vec::new();
+        for &i in group {
+            let ctx = rows[i].ctx(columns, params).with_subqueries(self);
+            if eval::truth(&eval::eval(pred, &ctx)?) == Some(true) {
+                out.push(i);
+            }
+        }
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
