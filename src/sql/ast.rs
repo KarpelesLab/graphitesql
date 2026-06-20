@@ -95,7 +95,8 @@ pub struct WindowSpec {
     pub base_name: Option<String>,
 }
 
-/// A window frame: a mode (`ROWS`/`RANGE`/`GROUPS`) and start/end bounds.
+/// A window frame: a mode (`ROWS`/`RANGE`/`GROUPS`), start/end bounds, and an
+/// optional `EXCLUDE` clause.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowFrame {
     /// `ROWS`, `RANGE`, or `GROUPS`.
@@ -104,6 +105,22 @@ pub struct WindowFrame {
     pub start: FrameBound,
     /// The frame's ending bound (`CURRENT ROW` when no `BETWEEN` is given).
     pub end: FrameBound,
+    /// The `EXCLUDE` clause (default `NO OTHERS`).
+    pub exclude: FrameExclude,
+}
+
+/// A window frame's `EXCLUDE` clause: which rows of the computed frame to drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameExclude {
+    /// `EXCLUDE NO OTHERS` (the default): keep the whole frame.
+    #[default]
+    NoOthers,
+    /// `EXCLUDE CURRENT ROW`: drop the current row.
+    CurrentRow,
+    /// `EXCLUDE GROUP`: drop the current row's entire peer group.
+    Group,
+    /// `EXCLUDE TIES`: drop the current row's peers but keep the current row.
+    Ties,
 }
 
 /// The unit a window frame is measured in.

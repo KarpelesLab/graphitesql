@@ -4423,10 +4423,25 @@ impl Connection {
             Vec::new()
         };
         let desc = spec.order_by.first().map(|t| t.descending).unwrap_or(false);
+        // The frame's EXCLUDE clause (default NO OTHERS).
+        let exclude = spec
+            .frame
+            .as_ref()
+            .map(|f| f.exclude)
+            .unwrap_or(FrameExclude::NoOthers);
         // Ranking values per ordered position.
         for p in 0..m {
             let idx = ordered[p];
             let (fstart, fend) = frame_bounds(p, m, &gid, spec, &ovals, desc);
+            // Positions of the frame after applying EXCLUDE.
+            let fpos: Vec<usize> = (fstart..fend)
+                .filter(|&k| match exclude {
+                    FrameExclude::NoOthers => true,
+                    FrameExclude::CurrentRow => k != p,
+                    FrameExclude::Group => gid[k] != gid[p],
+                    FrameExclude::Ties => gid[k] != gid[p] || k == p,
+                })
+                .collect();
             let val = match lname {
                 "row_number" => Value::Integer(p as i64 + 1),
                 "rank" => {
@@ -4492,34 +4507,20 @@ impl Connection {
                         default
                     }
                 }
-                "first_value" => {
-                    if fstart < fend {
-                        arg_vals[ordered[fstart]]
-                            .first()
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
-                    }
-                }
-                "last_value" => {
-                    if fstart < fend {
-                        arg_vals[ordered[fend - 1]]
-                            .first()
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
-                    }
-                }
+                "first_value" => fpos
+                    .first()
+                    .and_then(|&k| arg_vals[ordered[k]].first().cloned())
+                    .unwrap_or(Value::Null),
+                "last_value" => fpos
+                    .last()
+                    .and_then(|&k| arg_vals[ordered[k]].first().cloned())
+                    .unwrap_or(Value::Null),
                 "nth_value" => {
                     let nth = arg_vals[idx].get(1).map(eval::to_i64).unwrap_or(1);
-                    // nth row within the frame (1-based).
-                    let target = fstart + (nth.max(1) as usize) - 1;
-                    if nth >= 1 && target < fend {
-                        arg_vals[ordered[target]]
-                            .first()
-                            .cloned()
+                    // nth row within the (post-EXCLUDE) frame (1-based).
+                    if nth >= 1 {
+                        fpos.get((nth - 1) as usize)
+                            .and_then(|&k| arg_vals[ordered[k]].first().cloned())
                             .unwrap_or(Value::Null)
                     } else {
                         Value::Null
@@ -4527,10 +4528,8 @@ impl Connection {
                 }
                 // Aggregate windows over the frame.
                 _ => {
-                    let frame: Vec<&Vec<Value>> = ordered[fstart..fend]
-                        .iter()
-                        .map(|&i| &arg_vals[i])
-                        .collect();
+                    let frame: Vec<&Vec<Value>> =
+                        fpos.iter().map(|&k| &arg_vals[ordered[k]]).collect();
                     window_aggregate(lname, star, &frame)?
                 }
             };

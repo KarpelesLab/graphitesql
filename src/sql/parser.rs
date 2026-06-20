@@ -1539,17 +1539,29 @@ impl Parser {
             // A bare start bound; the end defaults to CURRENT ROW.
             (self.frame_bound()?, FrameBound::CurrentRow)
         };
-        // Accept and ignore an EXCLUDE clause.
-        if self.eat_kw("exclude") {
+        // Optional EXCLUDE clause.
+        let exclude = if self.eat_kw("exclude") {
             if self.eat_kw("no") {
-                let _ = self.eat_kw("others");
+                self.expect_kw("others")?;
+                FrameExclude::NoOthers
             } else if self.eat_kw("current") {
-                let _ = self.eat_kw("row");
+                self.expect_kw("row")?;
+                FrameExclude::CurrentRow
+            } else if self.eat_kw("group") {
+                FrameExclude::Group
             } else {
-                let _ = self.eat_kw("group") || self.eat_kw("ties");
+                self.expect_kw("ties")?;
+                FrameExclude::Ties
             }
-        }
-        Ok(Some(WindowFrame { mode, start, end }))
+        } else {
+            FrameExclude::NoOthers
+        };
+        Ok(Some(WindowFrame {
+            mode,
+            start,
+            end,
+            exclude,
+        }))
     }
 
     fn frame_bound(&mut self) -> Result<FrameBound> {

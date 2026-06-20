@@ -63,6 +63,12 @@ fn range_value_frames_match_sqlite3() {
     queries.push("SELECT id, sum(v) OVER (ORDER BY v DESC RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t ORDER BY id".into());
     queries.push("SELECT id, count(*) OVER (PARTITION BY g ORDER BY v RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t ORDER BY id".into());
     queries.push("SELECT id, avg(v) OVER (ORDER BY v RANGE BETWEEN 20 PRECEDING AND 20 FOLLOWING) FROM t ORDER BY id".into());
+    // EXCLUDE clauses (CURRENT ROW / GROUP / TIES) over aggregates and first_value.
+    queries.push("SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t ORDER BY id".into());
+    queries.push("SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM t ORDER BY id".into());
+    queries.push("SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM t ORDER BY id".into());
+    queries.push("SELECT id, count(*) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE GROUP) FROM t ORDER BY id".into());
+    queries.push("SELECT id, first_value(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM t ORDER BY id".into());
     for qq in &queries {
         let want = {
             let o = Command::new("sqlite3")
