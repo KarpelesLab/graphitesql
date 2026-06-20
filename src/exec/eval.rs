@@ -1119,31 +1119,46 @@ pub fn format_real(r: f64) -> String {
 /// SQLite `LIKE`: `%` matches any run, `_` any single char; case-insensitive for
 /// ASCII (SQLite's default).
 fn like_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    like_rec(&p, &t)
+    like_match_escape(pattern, text, None)
 }
 
-fn like_rec(p: &[char], t: &[char]) -> bool {
+/// `LIKE` with an optional `ESCAPE` character: a wildcard (`%`/`_`) or the escape
+/// character itself, when preceded by the escape character, matches literally.
+pub fn like_match_escape(pattern: &str, text: &str, escape: Option<char>) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    like_rec(&p, &t, escape)
+}
+
+fn like_rec(p: &[char], t: &[char], esc: Option<char>) -> bool {
     if p.is_empty() {
         return t.is_empty();
+    }
+    // An escaped character matches literally.
+    if let Some(e) = esc {
+        if p[0] == e && p.len() >= 2 {
+            let lit = p[1];
+            return !t.is_empty()
+                && lit.eq_ignore_ascii_case(&t[0])
+                && like_rec(&p[2..], &t[1..], esc);
+        }
     }
     match p[0] {
         '%' => {
             // Collapse consecutive %.
             let rest = &p[1..];
-            if like_rec(rest, t) {
+            if like_rec(rest, t, esc) {
                 return true;
             }
             for i in 0..t.len() {
-                if like_rec(rest, &t[i + 1..]) {
+                if like_rec(rest, &t[i + 1..], esc) {
                     return true;
                 }
             }
             false
         }
-        '_' => !t.is_empty() && like_rec(&p[1..], &t[1..]),
-        pc => !t.is_empty() && pc.eq_ignore_ascii_case(&t[0]) && like_rec(&p[1..], &t[1..]),
+        '_' => !t.is_empty() && like_rec(&p[1..], &t[1..], esc),
+        pc => !t.is_empty() && pc.eq_ignore_ascii_case(&t[0]) && like_rec(&p[1..], &t[1..], esc),
     }
 }
 

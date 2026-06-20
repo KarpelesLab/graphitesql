@@ -144,8 +144,9 @@ Make the dialect complete. Each item lands with a differential corpus addition.
   `json_extract`, `json_array`/`json_object`, `json_type`, `json_array_length`,
   `json_valid`, `json_quote`, the `->`/`->>` operators, and the
   `json_set`/`json_insert`/`json_replace`/`json_remove`/`json_patch` mutators,
-  and the `json_each`/`json_tree` table-valued functions). *Remaining:* a few
-  string/blob built-ins. *Ref:* `func.c`, `math.c`, `json.c`.
+  and the `json_each`/`json_tree` table-valued functions), plus `LIKE … ESCAPE`,
+  the `like()` function form, and `likely`/`unlikely`/`likelihood`. *Remaining:* a
+  few string/blob built-ins. *Ref:* `func.c`, `math.c`, `json.c`.
 - **Indexing breadth** — ✅ partial indexes (`CREATE INDEX … WHERE`), ✅
   expression indexes (`CREATE INDEX … (lower(x))`), ✅ `INDEXED BY` / `NOT INDEXED`
   hints. *Remaining:* `DESC` index columns honored in seeks, partial/expression-

@@ -187,6 +187,30 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 Value::Text(parts.join(&sep))
             }
         }
+        "like" => {
+            // like(pattern, text[, escape]) — the function form of `text LIKE
+            // pattern`. NULL operand → NULL.
+            if v.len() < 2 || v.len() > 3 {
+                return Err(Error::Error("like() takes 2 or 3 arguments".into()));
+            }
+            if v.iter().take(2).any(|x| matches!(x, Value::Null)) {
+                Value::Null
+            } else {
+                let escape = v.get(2).map(eval::to_text).and_then(|s| s.chars().next());
+                let m =
+                    eval::like_match_escape(&eval::to_text(&v[0]), &eval::to_text(&v[1]), escape);
+                Value::Integer(m as i64)
+            }
+        }
+        // Optimizer hints that are no-ops at the value level (return the operand).
+        "likely" | "unlikely" => {
+            arity(&lname, args, 1)?;
+            v[0].clone()
+        }
+        "likelihood" => {
+            arity(&lname, args, 2)?;
+            v[0].clone()
+        }
         "unhex" => {
             arity(&lname, args, 1)?;
             match &v[0] {

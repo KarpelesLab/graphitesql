@@ -1637,7 +1637,7 @@ impl Parser {
                     "and" => (InfixOp::Binary(BinaryOp::And), BP_AND),
                     "is" => (InfixOp::Is, BP_EQ),
                     "in" => (InfixOp::In { negated: false }, BP_EQ),
-                    "like" => (InfixOp::Binary(BinaryOp::Like), BP_EQ),
+                    "like" => (InfixOp::Like { negated: false }, BP_EQ),
                     "glob" => (InfixOp::Binary(BinaryOp::Glob), BP_EQ),
                     "between" => (InfixOp::Between { negated: false }, BP_EQ),
                     "not" => (InfixOp::NotPrefixed, BP_EQ),
@@ -1705,6 +1705,10 @@ impl Parser {
                 self.pos += 1; // BETWEEN
                 self.parse_between(left, negated)
             }
+            InfixOp::Like { negated } => {
+                self.pos += 1; // LIKE
+                self.parse_like(left, negated)
+            }
             InfixOp::NotPrefixed => {
                 // NOT IN / NOT LIKE / NOT GLOB / NOT BETWEEN
                 self.pos += 1; // NOT
@@ -1713,15 +1717,7 @@ impl Parser {
                 } else if self.eat_kw("between") {
                     self.parse_between(left, true)
                 } else if self.eat_kw("like") {
-                    let right = self.expr_bp(bp + 1)?;
-                    Ok(Expr::Unary {
-                        op: UnaryOp::Not,
-                        expr: Box::new(Expr::Binary {
-                            op: BinaryOp::Like,
-                            left: Box::new(left),
-                            right: Box::new(right),
-                        }),
-                    })
+                    self.parse_like(left, true)
                 } else if self.eat_kw("glob") {
                     let right = self.expr_bp(bp + 1)?;
                     Ok(Expr::Unary {
@@ -1736,6 +1732,42 @@ impl Parser {
                     Err(self.err("expected IN/LIKE/GLOB/BETWEEN after NOT"))
                 }
             }
+        }
+    }
+
+    /// Parse the right-hand side of `text LIKE pattern [ESCAPE c]`. Without
+    /// `ESCAPE` this is `BinaryOp::Like`; with it, the SQLite 3-argument
+    /// `like(pattern, text, escape)` function form. `NOT LIKE` wraps in `NOT`.
+    fn parse_like(&mut self, left: Expr, negated: bool) -> Result<Expr> {
+        let pattern = self.expr_bp(BP_EQ + 1)?;
+        let escape = if self.eat_kw("escape") {
+            Some(self.expr_bp(BP_EQ + 1)?)
+        } else {
+            None
+        };
+        let core = match escape {
+            None => Expr::Binary {
+                op: BinaryOp::Like,
+                left: Box::new(left),
+                right: Box::new(pattern),
+            },
+            Some(esc) => Expr::Function {
+                name: String::from("like"),
+                distinct: false,
+                args: alloc::vec![pattern, left, esc], // like(pattern, text, escape)
+                star: false,
+                filter: None,
+                order_by: Vec::new(),
+                over: None,
+            },
+        };
+        if negated {
+            Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(core),
+            })
+        } else {
+            Ok(core)
         }
     }
 
@@ -1788,6 +1820,7 @@ enum InfixOp {
     IsNullKw { negated: bool },
     In { negated: bool },
     Between { negated: bool },
+    Like { negated: bool },
     NotPrefixed,
 }
 

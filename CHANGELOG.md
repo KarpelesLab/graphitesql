@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each with the `key`/`value`/`type`/`atom`/`id`/`parent`/`fullkey`/`path` columns
   (the `id`/`parent` numbering is graphitesql's own; the rest match SQLite).
   Establishes the TVF mechanism (`TableRef.tvf_args`). Verified against `sqlite3`.
+- Track A: `LIKE … ESCAPE`, the `like(pattern, text[, escape])` function form, and
+  the `likely`/`unlikely`/`likelihood` optimizer-hint functions (identity at the
+  value level). Verified against `sqlite3`.
 - Track A: `CREATE TABLE … AS SELECT …` (CTAS). The new table's columns are the
   query's output labels (untyped), populated with the query's rows via the normal
   insert path. Verified against `sqlite3`.
