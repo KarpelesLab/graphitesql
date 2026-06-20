@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **SELECT-list aliases in WHERE/GROUP BY/HAVING** are now resolved (a real
+  column of the same name still takes precedence), matching SQLite — e.g.
+  `SELECT a+b AS s FROM t WHERE s>3` and `… GROUP BY m`/`HAVING c>1`.
+- Fix: **CTE explicit column list** must match the body column count
+  (`table t has N values for M columns`), like SQLite.
 - Fix: a **multi-row `VALUES` on the right of a compound operator** (e.g.
   `… UNION VALUES(2),(3)`) now contributes all its rows, not just the first.
 - Track A: **`UPDATE … SET … FROM <sources>`** (SQLite's UPDATE-FROM extension)

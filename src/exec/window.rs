@@ -156,6 +156,12 @@ pub fn has_window(sel: &Select) -> bool {
     found
 }
 
+/// Replace every occurrence of `target` within `e` with `repl` (pre-order; a
+/// replaced node is not descended into). Does not descend into nested `SELECT`s.
+pub fn replace_expr(e: &mut Expr, target: &Expr, repl: &Expr) {
+    replace_in(e, target, repl)
+}
+
 /// Replace every occurrence of `target` in `sel`'s projection and `ORDER BY`
 /// with `repl`.
 pub fn replace_window_expr(sel: &mut Select, target: &Expr, repl: &Expr) {

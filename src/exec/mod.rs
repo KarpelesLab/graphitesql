@@ -5256,6 +5256,18 @@ impl Connection {
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
         let (mut columns, input_rows) = self.scan_source(sel, params)?;
 
+        // SQLite lets WHERE/GROUP BY/HAVING reference a SELECT-list alias, with a
+        // real column of the same name taking precedence. Rewrite those clauses
+        // by substituting each unshadowed alias with its defining expression.
+        let alias_rewritten;
+        let sel = match alias_substituted(sel, &columns) {
+            Some(s) => {
+                alias_rewritten = s;
+                &alias_rewritten
+            }
+            None => sel,
+        };
+
         // Apply WHERE.
         let mut rows: Vec<InputRow> = Vec::new();
         for r in input_rows {
@@ -6921,6 +6933,76 @@ fn expand_agg_wildcards(sel: &Select, columns: &[ColumnInfo]) -> Select {
     let mut s = sel.clone();
     s.columns = new_cols;
     s
+}
+
+/// If `sel`'s WHERE/GROUP BY/HAVING reference any SELECT-list alias that is not
+/// shadowed by a real input column, return a copy of `sel` with those alias
+/// references replaced by their defining expressions (SQLite resolves aliases in
+/// these clauses, with real columns winning). Returns `None` when no rewrite is
+/// needed, so the common path clones nothing.
+fn alias_substituted(sel: &Select, columns: &[ColumnInfo]) -> Option<Select> {
+    // Explicit `AS` aliases that don't collide with a real input column name.
+    let mut aliases: Vec<(String, Expr)> = Vec::new();
+    for c in &sel.columns {
+        if let ResultColumn::Expr {
+            expr,
+            alias: Some(name),
+        } = c
+        {
+            if !columns
+                .iter()
+                .any(|col| col.name.eq_ignore_ascii_case(name))
+                && !aliases.iter().any(|(a, _)| a.eq_ignore_ascii_case(name))
+            {
+                aliases.push((name.clone(), expr.clone()));
+            }
+        }
+    }
+    if aliases.is_empty() {
+        return None;
+    }
+    // Only rewrite if a clause actually references one of those aliases.
+    let mentions = |e: &Expr| -> bool {
+        let mut found = false;
+        window::visit(e, &mut |n| {
+            if let Expr::Column {
+                table: None,
+                column,
+            } = n
+            {
+                if aliases.iter().any(|(a, _)| a.eq_ignore_ascii_case(column)) {
+                    found = true;
+                }
+            }
+        });
+        found
+    };
+    let used = sel.where_clause.as_ref().is_some_and(&mentions)
+        || sel.group_by.iter().any(&mentions)
+        || sel.having.as_ref().is_some_and(&mentions);
+    if !used {
+        return None;
+    }
+    let mut out = sel.clone();
+    let apply = |e: &mut Expr| {
+        for (name, repl) in &aliases {
+            let target = Expr::Column {
+                table: None,
+                column: name.clone(),
+            };
+            window::replace_expr(e, &target, repl);
+        }
+    };
+    if let Some(w) = &mut out.where_clause {
+        apply(w);
+    }
+    for g in &mut out.group_by {
+        apply(g);
+    }
+    if let Some(h) = &mut out.having {
+        apply(h);
+    }
+    Some(out)
 }
 
 /// Wrap a runtime [`Value`] as a literal [`Expr`], so rows produced by an
