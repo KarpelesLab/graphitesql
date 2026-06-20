@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Fix: **collation is now honored** in `IN (list)`, `IN (SELECT …)`, `BETWEEN`,
+  `CASE x WHEN y`, `min()`/`max()`, and compound set ops (UNION/INTERSECT/EXCEPT
+  dedup + their ORDER BY) — these used plain BINARY before, so NOCASE columns
+  diverged from SQLite. (Literal-left `IN`/comparison falling back to the
+  subquery/right column's collation, and window-frame min/max, remain edges.)
 - **`printf`/`format` `,` thousands-grouping flag and `l`/`ll` length
   modifiers** (`printf('%,d', 1234567)` → `1,234,567`; `%ld`/`%lld` accepted).
 - Fix: **`UPDATE OF <columns>` triggers** fire only when one of the named
