@@ -113,8 +113,35 @@ pub enum Op {
     SorterRow { start: usize, count: usize },
     /// Advance the sorter cursor; jump back to `target` if a row remains.
     SorterNext { target: usize },
+    /// Fold the current row into aggregate `slot`: for `CountStar` bump the row
+    /// counter, otherwise collect `arg` (when non-NULL).
+    AggStep {
+        slot: usize,
+        kind: AggKind,
+        arg: Option<usize>,
+    },
+    /// Finalize aggregate `slot` into `dest`.
+    AggFinal {
+        slot: usize,
+        kind: AggKind,
+        dest: usize,
+    },
     /// Stop execution.
     Halt,
+}
+
+/// The aggregate functions the VDBE can fold over a single-table scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum AggKind {
+    CountStar,
+    Count,
+    Sum,
+    Total,
+    Avg,
+    Min,
+    Max,
+    GroupConcat,
 }
 
 /// One `ORDER BY` key for [`Op::SorterSort`]: direction and NULL placement
@@ -186,6 +213,130 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
     })
 }
 
+/// Is `expr` a (top-level) aggregate function call the VDBE can fold?
+fn is_aggregate_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Function { name, args, star, .. }
+            if crate::exec::func::is_aggregate_call(name, args.len(), *star)
+    )
+}
+
+/// Map a 1-arg-or-star aggregate call to its [`AggKind`] (binding the argument
+/// register expression). Returns `None` for unsupported call shapes.
+fn agg_kind(expr: &Expr) -> Option<(AggKind, Option<Expr>)> {
+    let Expr::Function {
+        name,
+        distinct,
+        args,
+        star,
+        filter,
+        order_by,
+        over,
+    } = expr
+    else {
+        return None;
+    };
+    // Plain aggregates only: no DISTINCT/FILTER/ORDER BY/OVER in the VDBE path.
+    if *distinct || filter.is_some() || !order_by.is_empty() || over.is_some() {
+        return None;
+    }
+    let arg = args.first().cloned();
+    let kind = match name.to_ascii_lowercase().as_str() {
+        "count" if *star => return Some((AggKind::CountStar, None)),
+        "count" if args.len() == 1 => AggKind::Count,
+        "sum" if args.len() == 1 => AggKind::Sum,
+        "total" if args.len() == 1 => AggKind::Total,
+        "avg" if args.len() == 1 => AggKind::Avg,
+        "min" if args.len() == 1 => AggKind::Min,
+        "max" if args.len() == 1 => AggKind::Max,
+        "group_concat" if args.len() == 1 => AggKind::GroupConcat,
+        _ => return None,
+    };
+    Some((kind, arg))
+}
+
+/// Compile `SELECT <aggregates> FROM <table> [WHERE …]` (no GROUP BY): the scan
+/// folds every aggregate slot, then a single `ResultRow` emits the finalized
+/// values. Returns `Unsupported` for shapes outside this grammar (so the caller
+/// falls back); `ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT` on an aggregate query are
+/// left to the tree-walker.
+fn compile_aggregate_select(
+    sel: &Select,
+    columns: &[String],
+    projections: &[(Expr, String)],
+) -> Result<Program> {
+    if !sel.order_by.is_empty() || sel.limit.is_some() || sel.offset.is_some() || sel.distinct {
+        return Err(Error::Unsupported("VDBE: bare aggregate only"));
+    }
+    // Every projection must be exactly one supported aggregate call.
+    let mut slots: Vec<(AggKind, Option<Expr>)> = Vec::new();
+    for (e, _) in projections {
+        match agg_kind(e) {
+            Some(spec) => slots.push(spec),
+            None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
+        }
+    }
+    let count = projections.len();
+    let mut c = Compiler {
+        ops: Vec::new(),
+        next_reg: count,
+        columns: columns.to_vec(),
+    };
+    let rewind = c.ops.len();
+    c.ops.push(Op::Rewind { target: 0 });
+    let body = c.ops.len();
+    let skip = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    for (slot, (kind, arg)) in slots.iter().enumerate() {
+        let arg_reg = match arg {
+            Some(expr) => Some(c.compile_expr(expr)?),
+            None => None,
+        };
+        c.ops.push(Op::AggStep {
+            slot,
+            kind: *kind,
+            arg: arg_reg,
+        });
+    }
+    let next = c.ops.len();
+    c.ops.push(Op::Next { target: body });
+    if let Some(at) = skip {
+        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = next;
+        }
+    }
+    let end = c.ops.len();
+    if let Op::Rewind { target } = &mut c.ops[rewind] {
+        *target = end;
+    }
+    // Finalize each slot into its output register, then emit the single row.
+    for (slot, (kind, _)) in slots.iter().enumerate() {
+        c.ops.push(Op::AggFinal {
+            slot,
+            kind: *kind,
+            dest: slot,
+        });
+    }
+    c.ops.push(Op::ResultRow { start: 0, count });
+    c.ops.push(Op::Halt);
+    Ok(Program {
+        ops: c.ops,
+        n_registers: c.next_reg,
+        columns: projections.iter().map(|(_, l)| l.clone()).collect(),
+    })
+}
+
 /// Compile `SELECT <projection> FROM <single table>` (no `WHERE`/joins/aggregates/
 /// `ORDER BY`) into a program that scans the table via cursor ops. `columns` are
 /// the table's column names, used to resolve column references to indices.
@@ -223,6 +374,10 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
     }
     if projections.is_empty() {
         return Err(Error::Unsupported("VDBE: empty projection"));
+    }
+    // An all-aggregate projection (no GROUP BY) folds the scan into one row.
+    if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
+        return compile_aggregate_select(sel, columns, &projections);
     }
     let count = projections.len();
     let mut c = Compiler {
@@ -687,6 +842,9 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
     let mut scursor: usize = 0;
     // Rows already emitted under DISTINCT (NULLs compare equal here).
     let mut seen: Vec<Vec<Value>> = Vec::new();
+    // Aggregate accumulators, one per slot: `(collected non-NULL values, row
+    // count for count(*))`.
+    let mut agg: Vec<(Vec<Value>, i64)> = Vec::new();
     let mut pc = 0usize;
     while pc < program.ops.len() {
         let op = &program.ops[pc];
@@ -859,10 +1017,107 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                     pc = *target;
                 }
             }
+            Op::AggStep { slot, kind, arg } => {
+                if *slot >= agg.len() {
+                    agg.resize(*slot + 1, (Vec::new(), 0));
+                }
+                if *kind == AggKind::CountStar {
+                    agg[*slot].1 += 1;
+                } else if let Some(r) = arg {
+                    if !matches!(regs[*r], Value::Null) {
+                        let v = regs[*r].clone();
+                        agg[*slot].0.push(v);
+                    }
+                }
+            }
+            Op::AggFinal { slot, kind, dest } => {
+                let (vals, star) = match agg.get_mut(*slot) {
+                    Some(e) => core::mem::take(e),
+                    None => (Vec::new(), 0),
+                };
+                regs[*dest] = finalize_agg(*kind, vals, star);
+            }
             Op::Halt => break,
         }
     }
     Ok(out)
+}
+
+/// Finalize an aggregate slot, matching the tree-walker's semantics exactly:
+/// `count` is 0/`n`, `sum` stays integer until it overflows then promotes to
+/// real (NULL over no rows), `total` is always real, `avg` is real (NULL over no
+/// rows), `min`/`max` reduce by value comparison (NULL over no rows), and
+/// `group_concat` joins with `,` (NULL over no rows).
+fn finalize_agg(kind: AggKind, vals: Vec<Value>, star: i64) -> Value {
+    use crate::exec::eval;
+    use core::cmp::Ordering;
+    match kind {
+        AggKind::CountStar => Value::Integer(star),
+        AggKind::Count => Value::Integer(vals.len() as i64),
+        AggKind::Sum => {
+            if vals.is_empty() {
+                Value::Null
+            } else if vals.iter().all(|v| matches!(v, Value::Integer(_))) {
+                let mut acc: i64 = 0;
+                let mut overflow = false;
+                for v in &vals {
+                    if let Value::Integer(i) = v {
+                        match acc.checked_add(*i) {
+                            Some(s) => acc = s,
+                            None => {
+                                overflow = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if overflow {
+                    Value::Real(vals.iter().map(eval::to_f64).sum())
+                } else {
+                    Value::Integer(acc)
+                }
+            } else {
+                Value::Real(vals.iter().map(eval::to_f64).sum())
+            }
+        }
+        AggKind::Total => Value::Real(vals.iter().map(eval::to_f64).sum()),
+        AggKind::Avg => {
+            if vals.is_empty() {
+                Value::Null
+            } else {
+                let sum: f64 = vals.iter().map(eval::to_f64).sum();
+                Value::Real(sum / vals.len() as f64)
+            }
+        }
+        AggKind::Min => vals
+            .into_iter()
+            .reduce(|a, b| {
+                if eval::compare(&b, &a) == Ordering::Less {
+                    b
+                } else {
+                    a
+                }
+            })
+            .unwrap_or(Value::Null),
+        AggKind::Max => vals
+            .into_iter()
+            .reduce(|a, b| {
+                if eval::compare(&b, &a) == Ordering::Greater {
+                    b
+                } else {
+                    a
+                }
+            })
+            .unwrap_or(Value::Null),
+        AggKind::GroupConcat => {
+            if vals.is_empty() {
+                Value::Null
+            } else {
+                let parts: Vec<String> = vals.iter().map(eval::to_text).collect();
+                Value::Text(parts.join(","))
+            }
+        }
+    }
 }
 
 /// Equality used by `DISTINCT`: two NULLs are equal (unlike `=`), otherwise the

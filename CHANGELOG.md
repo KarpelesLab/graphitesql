@@ -114,7 +114,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ORDER BY 2`) and aliases (`ORDER BY d`) resolve to their projection.
   `SELECT DISTINCT` compiles to a `DistinctCheck` gate (NULLs compare equal) that
   drops duplicate output rows before `OFFSET`/`LIMIT`, composing with `ORDER BY`
-  (dedup, then sort).
+  (dedup, then sort). Whole-table aggregates (`count`/`sum`/`total`/`avg`/`min`/
+  `max`/`group_concat`, no `GROUP BY`) compile to `AggStep`/`AggFinal`: the scan
+  folds each slot (counting rows for `count(*)`, collecting non-NULL arguments
+  otherwise) and a single `ResultRow` emits the finalized values, reproducing the
+  tree-walker's exact semantics (integer-`sum` overflow promotes to real, empty
+  group yields 0/NULL per function).
 - Track B: `ANALYZE` and cost-based index selection. `ANALYZE [name]` gathers
   index selectivity into a `sqlite_stat1(tbl,idx,stat)` table, byte-compatible
   with SQLite's `nRow avgEq1 avgEq2 …` format (`avgEqK = (nRow + dK/2)/dK`);

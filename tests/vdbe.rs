@@ -124,6 +124,14 @@ fn table_scan_matches_tree_walker() {
         "SELECT DISTINCT b FROM t ORDER BY b",
         "SELECT DISTINCT a FROM t WHERE a >= 1 LIMIT 2",
         "SELECT DISTINCT a FROM t ORDER BY a DESC LIMIT 1 OFFSET 1",
+        "SELECT count(*) FROM t",
+        "SELECT count(*), count(a), sum(a), avg(a) FROM t",
+        "SELECT min(a), max(a), min(b), max(b) FROM t",
+        "SELECT total(a), sum(a) FROM t WHERE a > 100",
+        "SELECT count(*) FROM t WHERE a > 1",
+        "SELECT sum(a * 2), avg(a + 1) FROM t",
+        "SELECT group_concat(b) FROM t",
+        "SELECT count(*), min(a) FROM t WHERE b = 'nope'",
     ] {
         assert_eq!(
             c.query_vdbe(q).unwrap().rows,
@@ -170,6 +178,8 @@ fn table_scan_matches_sqlite3() {
         "SELECT a, b FROM t ORDER BY b DESC",
         "SELECT a FROM t ORDER BY a DESC LIMIT 2 OFFSET 1",
         "SELECT DISTINCT a FROM t ORDER BY a",
+        "SELECT count(*), sum(a), avg(a), min(a), max(b) FROM t",
+        "SELECT count(*) FROM t WHERE a > 1",
     ];
     for q in queries {
         let want = {
