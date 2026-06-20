@@ -1154,11 +1154,12 @@ pub fn format_real(r: f64) -> String {
         return String::new();
     }
     if !r.is_finite() {
-        // SQLite prints infinities as `±9.0e+999` (a value past any real double).
+        // SQLite's text rendering of an infinity is `Inf`/`-Inf` (its `quote()`
+        // instead uses `±9.0e+999` — see `quote_value`).
         return if r < 0.0 {
-            String::from("-9.0e+999")
+            String::from("-Inf")
         } else {
-            String::from("9.0e+999")
+            String::from("Inf")
         };
     }
     if r == 0.0 {

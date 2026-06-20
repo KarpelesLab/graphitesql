@@ -512,6 +512,11 @@ fn quote_value(v: &Value) -> String {
     match v {
         Value::Null => String::from("NULL"),
         Value::Integer(i) => alloc::format!("{i}"),
+        // `quote()` renders an infinity as `±9.0e+999` (unlike plain text output,
+        // which prints `Inf`).
+        Value::Real(r) if !r.is_finite() => {
+            String::from(if *r < 0.0 { "-9.0e+999" } else { "9.0e+999" })
+        }
         Value::Real(r) => eval::format_real(*r),
         Value::Text(s) => alloc::format!("'{}'", s.replace('\'', "''")),
         Value::Blob(b) => {
