@@ -361,6 +361,12 @@ pub struct Update {
     pub assignments: Vec<(String, Expr)>,
     /// `WHERE` predicate.
     pub where_clause: Option<Expr>,
+    /// `ORDER BY` for a `LIMIT`ed update (empty when absent).
+    pub order_by: Vec<OrderTerm>,
+    /// `LIMIT` row cap (with the SQLite update/delete-limit extension).
+    pub limit: Option<Expr>,
+    /// `OFFSET` skip count.
+    pub offset: Option<Expr>,
     /// `RETURNING` projection, empty when absent.
     pub returning: Vec<ResultColumn>,
 }
@@ -372,6 +378,12 @@ pub struct Delete {
     pub table: String,
     /// `WHERE` predicate.
     pub where_clause: Option<Expr>,
+    /// `ORDER BY` for a `LIMIT`ed delete (empty when absent).
+    pub order_by: Vec<OrderTerm>,
+    /// `LIMIT` row cap (with the SQLite update/delete-limit extension).
+    pub limit: Option<Expr>,
+    /// `OFFSET` skip count.
+    pub offset: Option<Expr>,
     /// `RETURNING` projection, empty when absent.
     pub returning: Vec<ResultColumn>,
 }

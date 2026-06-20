@@ -339,6 +339,32 @@ impl Parser {
         Ok(outer)
     }
 
+    /// Parse a trailing `[ORDER BY …] [LIMIT … [OFFSET …| , …]]`, returning the
+    /// terms, limit, and offset. Shared by `SELECT` and the `UPDATE`/`DELETE`
+    /// row-limit extension.
+    fn order_limit_offset(&mut self) -> Result<(Vec<OrderTerm>, Option<Expr>, Option<Expr>)> {
+        let mut order_by = Vec::new();
+        if self.eat_kw("order") {
+            self.expect_kw("by")?;
+            order_by.push(self.order_term()?);
+            while self.eat(&Token::Comma) {
+                order_by.push(self.order_term()?);
+            }
+        }
+        let mut limit = None;
+        let mut offset = None;
+        if self.eat_kw("limit") {
+            limit = Some(self.expr()?);
+            if self.eat_kw("offset") {
+                offset = Some(self.expr()?);
+            } else if self.eat(&Token::Comma) {
+                offset = limit.take();
+                limit = Some(self.expr()?);
+            }
+        }
+        Ok((order_by, limit, offset))
+    }
+
     /// A `UNION [ALL]` / `INTERSECT` / `EXCEPT` operator, if present.
     fn compound_op(&mut self) -> Option<CompoundOp> {
         if self.eat_kw("union") {
@@ -780,11 +806,16 @@ impl Parser {
         } else {
             None
         };
+        // RETURNING comes before any ORDER BY/LIMIT extension.
         let returning = self.returning_clause()?;
+        let (order_by, limit, offset) = self.order_limit_offset()?;
         Ok(Update {
             table,
             assignments,
             where_clause,
+            order_by,
+            limit,
+            offset,
             returning,
         })
     }
@@ -799,9 +830,13 @@ impl Parser {
             None
         };
         let returning = self.returning_clause()?;
+        let (order_by, limit, offset) = self.order_limit_offset()?;
         Ok(Delete {
             table,
             where_clause,
+            order_by,
+            limit,
+            offset,
             returning,
         })
     }

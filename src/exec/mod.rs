@@ -2298,7 +2298,17 @@ impl Connection {
             return self.exec_delete_without_rowid(del, &meta, params);
         }
         let indexes = self.indexes_of(&del.table)?;
-        let victims = self.matching_rowids(&meta, del.where_clause.as_ref(), params)?;
+        let mut victims = self.matching_rowids(&meta, del.where_clause.as_ref(), params)?;
+        if !del.order_by.is_empty() || del.limit.is_some() || del.offset.is_some() {
+            victims = self.order_limit_rowids(
+                &meta,
+                victims,
+                &del.order_by,
+                del.limit.as_ref(),
+                del.offset.as_ref(),
+                params,
+            )?;
+        }
         for rowid in &victims {
             let old = self.read_row(&meta, *rowid)?;
             if let Some(old) = &old {
@@ -2402,6 +2412,25 @@ impl Connection {
                 }
                 ok = cur.next()?;
             }
+        }
+        // `ORDER BY … LIMIT …` selects which matching rows to update.
+        if !upd.order_by.is_empty() || upd.limit.is_some() || upd.offset.is_some() {
+            let rowids: Vec<i64> = targets.iter().map(|(r, _)| *r).collect();
+            let kept = self.order_limit_rowids(
+                &meta,
+                rowids,
+                &upd.order_by,
+                upd.limit.as_ref(),
+                upd.offset.as_ref(),
+                params,
+            )?;
+            // Reorder/filter `targets` to the kept rowids, preserving kept order.
+            let mut by_id: alloc::collections::BTreeMap<i64, Vec<Value>> =
+                targets.into_iter().collect();
+            targets = kept
+                .into_iter()
+                .filter_map(|r| by_id.remove(&r).map(|v| (r, v)))
+                .collect();
         }
 
         let mut affected = 0;
@@ -4326,6 +4355,64 @@ impl Connection {
     }
 
     /// Rowids of rows in `meta` satisfying `pred` (all rows if `None`).
+    /// Reduce candidate rowids by an `UPDATE`/`DELETE` `ORDER BY … LIMIT …`
+    /// clause (the SQLite update/delete-limit extension): order the rows by the
+    /// terms, then apply `OFFSET`/`LIMIT` (a negative limit means no limit). With
+    /// no `ORDER BY`, the candidates keep their scan (rowid) order.
+    fn order_limit_rowids(
+        &self,
+        meta: &TableMeta,
+        rowids: Vec<i64>,
+        order_by: &[OrderTerm],
+        limit: Option<&Expr>,
+        offset: Option<&Expr>,
+        params: &Params,
+    ) -> Result<Vec<i64>> {
+        let mut rowids = rowids;
+        if !order_by.is_empty() {
+            let mut keyed: Vec<(i64, Vec<Value>)> = Vec::with_capacity(rowids.len());
+            for rid in rowids {
+                let row = self.read_row(meta, rid)?.unwrap_or_default();
+                let ctx = row_ctx(&row, &meta.columns, Some(rid), params).with_subqueries(self);
+                let keys = order_by
+                    .iter()
+                    .map(|t| eval::eval(&t.expr, &ctx))
+                    .collect::<Result<Vec<_>>>()?;
+                keyed.push((rid, keys));
+            }
+            keyed.sort_by(|a, b| {
+                for (i, t) in order_by.iter().enumerate() {
+                    let o = cmp_order(
+                        &a.1[i],
+                        &b.1[i],
+                        t.descending,
+                        t.nulls_first,
+                        crate::value::Collation::Binary,
+                    );
+                    if o != core::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            rowids = keyed.into_iter().map(|(r, _)| r).collect();
+        }
+        let off = match offset {
+            Some(e) => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize,
+            None => 0,
+        };
+        if off > 0 {
+            rowids.drain(0..off.min(rowids.len()));
+        }
+        if let Some(e) = limit {
+            let n = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+            if n >= 0 {
+                rowids.truncate(n as usize);
+            }
+        }
+        Ok(rowids)
+    }
+
     fn matching_rowids(
         &self,
         meta: &TableMeta,

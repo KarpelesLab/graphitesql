@@ -302,3 +302,47 @@ fn params(i: i64) -> graphitesql::exec::eval::Params {
         named: vec![],
     }
 }
+
+#[test]
+fn delete_update_with_order_by_limit() {
+    let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    let path = temp_path("dml_limit.db");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INT)")
+            .unwrap();
+        c.execute("CREATE INDEX iv ON t(v)").unwrap();
+        c.execute("INSERT INTO t(v) VALUES (5),(3),(8),(1),(9),(2),(7)")
+            .unwrap();
+
+        // UPDATE the two largest to 0.
+        c.execute("UPDATE t SET v = 0 ORDER BY v DESC LIMIT 2")
+            .unwrap();
+        let r = c.query("SELECT count(*) FROM t WHERE v = 0").unwrap();
+        assert_eq!(r.rows[0][0], Value::Integer(2));
+
+        // DELETE the two smallest non-zero rows.
+        c.execute("DELETE FROM t WHERE v > 0 ORDER BY v LIMIT 2")
+            .unwrap();
+        // Started with 7 rows; 0 deleted by update, 2 deleted now -> 5 left.
+        let r = c.query("SELECT count(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Value::Integer(5));
+
+        // OFFSET form.
+        c.execute("DELETE FROM t ORDER BY id LIMIT 1 OFFSET 2")
+            .unwrap();
+        let r = c.query("SELECT count(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Value::Integer(4));
+    }
+    if sqlite {
+        let out = Command::new("sqlite3")
+            .arg(&path)
+            .arg("PRAGMA integrity_check;")
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("ok"));
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+}
