@@ -63,3 +63,61 @@ fn comparison_affinity_matches_sqlite3() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+/// Storage affinity: values are coerced to each column's affinity on INSERT
+/// (e.g. text '123' into an INTEGER column becomes the integer 123). Checked
+/// against sqlite3 via both `typeof` and the stored value.
+#[test]
+fn storage_affinity_matches_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-storeaff-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let setup =
+        "CREATE TABLE x(id INTEGER PRIMARY KEY, i INTEGER, r REAL, n NUMERIC, t TEXT, b BLOB);\
+        INSERT INTO x(i,r,n,t,b) VALUES ('123','4.5','6',7,8.5);\
+        INSERT INTO x(i,r,n,t,b) VALUES (9.0,9,'10.0',11.5,'12');\
+        INSERT INTO x(i,r,n,t,b) VALUES ('x','y','3.14','z','w');\
+        INSERT INTO x(i,r,n,t,b) VALUES (NULL,NULL,'2.0e2',NULL,NULL);";
+    sqlite3(&path, setup);
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+    for q in [
+        "SELECT id, typeof(i), typeof(r), typeof(n), typeof(t), typeof(b) FROM x ORDER BY id",
+        "SELECT id, i, r, n, t, b FROM x ORDER BY id",
+        "SELECT id FROM x WHERE n = 6 ORDER BY id",
+        "SELECT id FROM x WHERE i = 123 ORDER BY id",
+    ] {
+        let want = sqlite3(&path, &format!("{q};"));
+        let got = render_rows(&g.query(q).unwrap());
+        assert_eq!(got, want, "storage affinity diverged: {q}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+fn render_rows(result: &graphitesql::QueryResult) -> String {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| match v {
+                    graphitesql::Value::Null => String::new(),
+                    graphitesql::Value::Integer(i) => i.to_string(),
+                    graphitesql::Value::Text(s) => s.clone(),
+                    graphitesql::Value::Real(r) => graphitesql::exec::eval::format_real(*r),
+                    graphitesql::Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}

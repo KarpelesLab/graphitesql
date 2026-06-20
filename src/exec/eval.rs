@@ -91,33 +91,37 @@ impl Affinity {
                     None => v,
                 },
             },
+            // INTEGER and NUMERIC affinity behave identically for storage: a
+            // value (or fully-numeric text) is converted to INTEGER when it is an
+            // integer that fits in i64, else REAL. So `'10.0'`, `'2e2'`, and the
+            // real `10.0` all store as integers, while `10.5` and an out-of-range
+            // integral real stay REAL — matching SQLite.
             Affinity::Integer | Affinity::Numeric => match v {
                 Value::Null | Value::Blob(_) => v,
-                Value::Real(r) => {
-                    // Reduce an integral real to an integer.
-                    if r == crate::util::float::trunc(r)
-                        && r.is_finite()
-                        && self == Affinity::Integer
-                    {
-                        Value::Integer(r as i64)
-                    } else {
-                        Value::Real(r)
-                    }
-                }
+                Value::Real(r) => integral_real_to_int(r).unwrap_or(Value::Real(r)),
                 Value::Integer(_) => v,
                 Value::Text(_) => match to_number_strict(&v) {
-                    Some(Value::Real(r))
-                        if r == crate::util::float::trunc(r)
-                            && r.is_finite()
-                            && self == Affinity::Integer =>
-                    {
-                        Value::Integer(r as i64)
-                    }
+                    Some(Value::Real(r)) => integral_real_to_int(r).unwrap_or(Value::Real(r)),
                     Some(n) => n,
                     None => v,
                 },
             },
         }
+    }
+}
+
+/// `Some(Integer)` when `r` is a finite integral real that fits exactly in an
+/// `i64` (`[-2^63, 2^63)`), else `None`. This is the NUMERIC/INTEGER storage rule:
+/// integral reals reduce to integers, but an out-of-range one stays REAL.
+fn integral_real_to_int(r: f64) -> Option<Value> {
+    if r.is_finite()
+        && r == crate::util::float::trunc(r)
+        && r >= i64::MIN as f64
+        && r < 9_223_372_036_854_775_808.0
+    {
+        Some(Value::Integer(r as i64))
+    } else {
+        None
     }
 }
 
