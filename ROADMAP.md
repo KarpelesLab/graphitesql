@@ -195,25 +195,26 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
 
 **Remaining pieces:**
 
-*Multi-schema (`ATTACH`/`DETACH`/`TEMP`) — the next track to land, in order:*
+*Multi-schema (`ATTACH`/`DETACH`/`TEMP`):*
 
-- **C1 — Multi-database registry.** Refactor `Connection` to hold an ordered
-  list of databases (`main` first; later `temp`, then attached) each with its own
-  `Backend` + `Schema`, behind accessors that keep all current single-db code
-  working unchanged. Add `PRAGMA database_list`. *Pure structural step; no
-  behavior change, full suite stays green.*
-- **C2 — `ATTACH ':memory:' AS x` / `DETACH x`.** Parse the statements; create
-  an in-memory attached database; `database_list` shows it; `DETACH` removes it
-  (rejecting `main`/`temp` and an in-use db).
-- **C3 — Schema-qualified names `x.table`.** Parser accepts `schema.table` in
-  `FROM`/`INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER`; name resolution
-  searches `temp`→`main`→attached for an unqualified name and the named db for a
-  qualified one. Enables cross-database queries.
-- **C4 — `TEMP` tables/indexes/triggers.** `CREATE TEMP …` targets the `temp`
-  database (created lazily); `sqlite_temp_schema`/`sqlite_temp_master` queryable;
-  temp objects invisible to other connections and dropped on close.
+- ✅ **C1 — Multi-database registry + `PRAGMA database_list`.** `Connection`
+  holds `main` (the existing fields) plus an attached-database list; each
+  attached db has its own `Backend` + `Schema`.
+- ✅ **C2 — `ATTACH ':memory:' AS x` / `DETACH x`.** In-memory attachments;
+  SQLite-exact name validation; `database_list` shows them at seq 2+ (seq 1
+  reserved for temp).
+- ✅ **C3 — Schema-qualified names `x.table`.** Reads materialize a qualified
+  single table through its own backend; writes (`CREATE`/`INSERT`/`UPDATE`/
+  `DELETE`/`DROP … aux.t`) temporarily swap the attached db in as the active
+  `main` (a single write touches one database). Databases are isolated, matching
+  sqlite3. *Remaining within C3: cross-database **joins** (need two backends at
+  once — guarded as `Unsupported` today), qualified `ALTER`, and `WITHOUT ROWID`
+  cross-db reads.*
+- **C4 — `TEMP` tables/indexes/triggers.** A lazily-created `temp` database (seq
+  1); `CREATE TEMP …` targets it; `sqlite_temp_schema`/`sqlite_temp_master`;
+  unqualified-name resolution searches `temp`→`main`.
 - **C5 — `ATTACH 'file.db' AS x`.** Open a real file as an attached database
-  (read/write), reusing the existing pager; transactions span attached dbs.
+  (`std`), reusing the pager; cross-database transaction semantics.
 
 *Storage:*
 
