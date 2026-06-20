@@ -150,8 +150,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
 /// the table's column names, used to resolve column references to indices.
 /// Returns `Unsupported` outside this grammar so the caller can fall back.
 pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program> {
-    if sel.where_clause.is_some()
-        || !sel.group_by.is_empty()
+    if !sel.group_by.is_empty()
         || !sel.compound.is_empty()
         || !sel.order_by.is_empty()
         || sel.distinct
@@ -198,11 +197,30 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
     let rewind = c.ops.len();
     c.ops.push(Op::Rewind { target: 0 });
     let body = c.ops.len();
+    // Optional WHERE: skip the row (jump to Next) when the predicate is not true.
+    let skip = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
     }
     c.ops.push(Op::ResultRow { start: 0, count });
+    let next = c.ops.len();
     c.ops.push(Op::Next { target: body });
+    if let Some(at) = skip {
+        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = next; // a filtered-out row advances to the next
+        }
+    }
     let end = c.ops.len();
     if let Op::Rewind { target } = &mut c.ops[rewind] {
         *target = end;

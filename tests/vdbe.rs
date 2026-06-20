@@ -91,14 +91,17 @@ fn table_scan_matches_tree_walker() {
         .unwrap();
     c.execute("INSERT INTO t(a,b) VALUES (3,'x'),(1,'y'),(2,'z')")
         .unwrap();
-    // Plain projections and expressions over columns run through the VDBE and
-    // match the tree-walker; a WHERE clause cleanly falls back to Unsupported.
-    assert!(c.query_vdbe("SELECT a FROM t WHERE a > 1").is_err());
+    // Plain projections, expressions over columns, and WHERE filters all run
+    // through the VDBE and match the tree-walker.
     for q in [
         "SELECT a, b FROM t",
         "SELECT a * 2, b || '!' FROM t",
         "SELECT *, a + id FROM t",
         "SELECT CASE WHEN a > 1 THEN 'big' ELSE 'small' END FROM t",
+        "SELECT a, b FROM t WHERE a > 1",
+        "SELECT id FROM t WHERE b = 'y'",
+        "SELECT a FROM t WHERE a >= 2 AND b <> 'z'",
+        "SELECT a FROM t WHERE 0",
     ] {
         assert_eq!(
             c.query_vdbe(q).unwrap().rows,
