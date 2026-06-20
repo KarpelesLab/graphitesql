@@ -74,6 +74,17 @@ fn be_u32(buf: &[u8], at: usize) -> u32 {
     u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
 }
 
+/// Read a big-endian `u32` at `at`, returning [`Error::Corrupt`] (rather than
+/// panicking) when the four bytes would run past the end of `buf`. Used for
+/// reads at attacker-controlled cell offsets.
+#[inline]
+fn be_u32_checked(buf: &[u8], at: usize) -> Result<u32> {
+    let bytes = buf
+        .get(at..at + 4)
+        .ok_or_else(|| Error::Corrupt("4-byte read past end of page".into()))?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 /// How a cell's payload is split between this page and overflow pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Payload {
@@ -187,27 +198,44 @@ impl BtreePage {
     /// for `i < num_cells`, or the right-most pointer for `i == num_cells`.
     /// Interior pages only.
     pub fn child_pointer(&self, i: usize) -> Result<u32> {
-        debug_assert!(!self.page_type.is_leaf());
+        if self.page_type.is_leaf() {
+            return Err(Error::Corrupt(
+                "child pointer requested on a leaf page".into(),
+            ));
+        }
         if i >= self.num_cells {
             return Ok(self.right_pointer);
         }
         let off = self.cell_offset(i)?;
-        Ok(be_u32(self.data(), off))
+        be_u32_checked(self.data(), off)
     }
 
     /// The rowid separator key of interior-table cell `i`.
     pub fn table_interior_key(&self, i: usize) -> Result<i64> {
-        debug_assert_eq!(self.page_type, PageType::InteriorTable);
+        if self.page_type != PageType::InteriorTable {
+            return Err(Error::Corrupt(
+                "interior-table key on non-interior page".into(),
+            ));
+        }
         let off = self.cell_offset(i)?;
         // Layout: 4-byte left child, then varint rowid.
-        let (rowid, _) = varint::decode_i64(&self.data()[off + 4..])
+        let data = self.data();
+        let key_off = off
+            .checked_add(4)
+            .filter(|&e| e <= data.len())
+            .ok_or_else(|| Error::Corrupt("interior cell past end of page".into()))?;
+        let (rowid, _) = varint::decode_i64(&data[key_off..])
             .ok_or_else(|| Error::Corrupt("truncated interior cell rowid".into()))?;
         Ok(rowid)
     }
 
     /// Parse table-leaf cell `i`, given the database's usable page size.
     pub fn table_leaf_cell(&self, i: usize, usable: usize) -> Result<TableLeafCell> {
-        debug_assert_eq!(self.page_type, PageType::LeafTable);
+        if self.page_type != PageType::LeafTable {
+            return Err(Error::Corrupt(
+                "table-leaf cell on non-table-leaf page".into(),
+            ));
+        }
         let off = self.cell_offset(i)?;
         let data = self.data();
         // Layout: varint payload length, varint rowid, then payload.
@@ -224,7 +252,11 @@ impl BtreePage {
     /// pointer. Used by the writer to move cells between pages while preserving
     /// their overflow chains.
     pub fn raw_table_leaf_cell(&self, i: usize, usable: usize) -> Result<&[u8]> {
-        debug_assert_eq!(self.page_type, PageType::LeafTable);
+        if self.page_type != PageType::LeafTable {
+            return Err(Error::Corrupt(
+                "raw table-leaf cell on non-table-leaf page".into(),
+            ));
+        }
         let off = self.cell_offset(i)?;
         let data = self.data();
         let (plen, n1) = varint::decode(&data[off..])
@@ -243,7 +275,9 @@ impl BtreePage {
     /// payload (+ overflow pointer), i.e. everything after the optional 4-byte
     /// left-child pointer. Used by the writer to move index entries between pages.
     pub fn raw_index_record_cell(&self, i: usize, usable: usize) -> Result<&[u8]> {
-        debug_assert!(!self.page_type.is_table());
+        if self.page_type.is_table() {
+            return Err(Error::Corrupt("index record cell on a table page".into()));
+        }
         let off = self.cell_offset(i)?;
         let data = self.data();
         let key_off = if self.page_type == PageType::InteriorIndex {
@@ -251,7 +285,10 @@ impl BtreePage {
         } else {
             off
         };
-        let (plen, n1) = varint::decode(&data[key_off..])
+        let key_bytes = data
+            .get(key_off..)
+            .ok_or_else(|| Error::Corrupt("index cell key past end of page".into()))?;
+        let (plen, n1) = varint::decode(key_bytes)
             .ok_or_else(|| Error::Corrupt("truncated index payload length".into()))?;
         let (local_len, has_overflow) = payload_split(self.page_type, usable, plen as usize);
         let len = n1 + local_len + if has_overflow { 4 } else { 0 };
@@ -263,15 +300,20 @@ impl BtreePage {
 
     /// Parse index cell `i` (works for both leaf and interior index pages).
     pub fn index_cell(&self, i: usize, usable: usize) -> Result<IndexCell> {
-        debug_assert!(!self.page_type.is_table());
+        if self.page_type.is_table() {
+            return Err(Error::Corrupt("index cell on a table page".into()));
+        }
         let off = self.cell_offset(i)?;
         let data = self.data();
         let (left_child, key_off) = if self.page_type == PageType::InteriorIndex {
-            (be_u32(data, off), off + 4)
+            (be_u32_checked(data, off)?, off + 4)
         } else {
             (0, off)
         };
-        let (plen, n1) = varint::decode(&data[key_off..])
+        let key_bytes = data
+            .get(key_off..)
+            .ok_or_else(|| Error::Corrupt("index cell key past end of page".into()))?;
+        let (plen, n1) = varint::decode(key_bytes)
             .ok_or_else(|| Error::Corrupt("truncated index payload length".into()))?;
         let payload = self.payload_at(key_off + n1, plen as usize, usable)?;
         Ok(IndexCell {
@@ -307,18 +349,28 @@ impl BtreePage {
 /// onto overflow pages. Implements the spill algorithm from the file-format
 /// spec ("the initial portion of the payload that does not spill to overflow").
 pub(crate) fn payload_split(page_type: PageType, usable: usize, p: usize) -> (usize, bool) {
+    // Saturating arithmetic throughout: on a *valid* database `usable` is always
+    // at least 480 (page size >= 512), so every subtraction below is identical to
+    // plain `-`. On a *corrupt* header `usable` can be tiny, which would otherwise
+    // underflow these `usize` subtractions and panic; saturating keeps the reader
+    // returning an `Err` from the surrounding bounds checks instead of crashing.
     // Maximum bytes of payload kept locally before overflow is used.
     let max_local = match page_type {
-        PageType::LeafTable => usable - 35,
-        PageType::LeafIndex | PageType::InteriorIndex => (usable - 12) * 64 / 255 - 23,
+        PageType::LeafTable => usable.saturating_sub(35),
+        PageType::LeafIndex | PageType::InteriorIndex => {
+            (usable.saturating_sub(12) * 64 / 255).saturating_sub(23)
+        }
         // Interior table cells carry no payload; never called.
         PageType::InteriorTable => return (0, false),
     };
     if p <= max_local {
         return (p, false);
     }
-    let min_local = (usable - 12) * 32 / 255 - 23;
-    let k = min_local + (p - min_local) % (usable - 4);
+    let min_local = (usable.saturating_sub(12) * 32 / 255).saturating_sub(23);
+    // `usable - 4` is the overflow-page payload capacity; guard the modulus so a
+    // corrupt `usable <= 4` cannot divide by zero.
+    let span = usable.saturating_sub(4).max(1);
+    let k = min_local + p.saturating_sub(min_local) % span;
     let local = if k <= max_local { k } else { min_local };
     (local, true)
 }

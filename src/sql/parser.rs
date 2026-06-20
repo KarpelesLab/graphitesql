@@ -86,14 +86,66 @@ fn is_wordish_start(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Maximum recursion depth for nested expressions and sub-selects.
+///
+/// The parser is recursive descent, so an attacker-supplied string with very
+/// deep nesting (e.g. hundreds of `(`, `NOT`, or `CASE`) would otherwise
+/// overflow the native stack and abort the process. SQLite caps the same way
+/// via `SQLITE_MAX_EXPR_DEPTH` (default 1000), but its parse frames are tiny C
+/// frames; ours carry large `Expr`/`Select` values by value, so each level
+/// costs far more stack. We therefore cap well below the point where parsing
+/// would overflow even a small (2 MiB) thread stack, while still admitting far
+/// more nesting than any realistic query needs. Past the limit, parsing fails
+/// cleanly with [`Error::Parse`] instead of crashing the process.
+///
+/// The cap also protects the downstream binder/planner/evaluator, which recurse
+/// over the parsed AST and (for nested sub-selects especially) use even more
+/// stack per level than the parser does.
+const MAX_PARSE_DEPTH: usize = 30;
+
 struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
+    /// Current recursive-descent nesting depth (guarded by [`MAX_PARSE_DEPTH`]).
+    ///
+    /// Shared via [`Rc`] so a [`DepthGuard`] can decrement it on drop without
+    /// borrowing the parser, which stays mutably borrowed during recursion.
+    depth: alloc::rc::Rc<core::cell::Cell<usize>>,
+}
+
+/// Decrements the parser's depth counter when dropped, so recursion accounting
+/// stays balanced across every exit path (including the `?` operator).
+struct DepthGuard {
+    depth: alloc::rc::Rc<core::cell::Cell<usize>>,
+}
+
+impl core::ops::Drop for DepthGuard {
+    fn drop(&mut self) {
+        self.depth.set(self.depth.get() - 1);
+    }
 }
 
 impl Parser {
     fn new(tokens: Vec<Spanned>) -> Parser {
-        Parser { tokens, pos: 0 }
+        Parser {
+            tokens,
+            pos: 0,
+            depth: alloc::rc::Rc::new(core::cell::Cell::new(0)),
+        }
+    }
+
+    /// Enter one level of recursion, erroring if the nesting limit is exceeded.
+    /// The returned guard decrements the counter when dropped, so every exit
+    /// path (including `?`) is balanced.
+    fn enter(&self) -> Result<DepthGuard> {
+        let d = self.depth.get();
+        if d >= MAX_PARSE_DEPTH {
+            return Err(Error::Parse("expression or query nesting too deep".into()));
+        }
+        self.depth.set(d + 1);
+        Ok(DepthGuard {
+            depth: alloc::rc::Rc::clone(&self.depth),
+        })
     }
 
     fn at_end(&self) -> bool {
@@ -328,6 +380,7 @@ impl Parser {
     }
 
     fn select(&mut self) -> Result<Select> {
+        let _guard = self.enter()?;
         let mut ctes = Vec::new();
         if self.eat_kw("with") {
             // `RECURSIVE` is accepted as a keyword but recursion is not yet run.
@@ -1559,6 +1612,7 @@ impl Parser {
     }
 
     fn expr_bp(&mut self, min_bp: u8) -> Result<Expr> {
+        let _guard = self.enter()?;
         let mut left = self.prefix()?;
         while let Some((op, bp)) = self.peek_infix() {
             if bp < min_bp {
