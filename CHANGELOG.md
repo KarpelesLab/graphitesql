@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: SQLite math functions — `pi`, `sqrt`, `exp`, `ln`, `log`/`log10`/
+  `log2`, `pow`/`power`, `mod`, `ceil`/`ceiling`, `floor`, `trunc`, `sin`/`cos`/
+  `tan`, `asin`/`acos`/`atan`/`atan2`, `sinh`/`cosh`/`tanh`,
+  `asinh`/`acosh`/`atanh`, `degrees`, `radians`. Implemented in pure `core`
+  arithmetic (no libm dependency): `sqrt` is correctly rounded; the transcendentals
+  are accurate to ~1 ULP. NULL/domain errors return NULL. Verified against `sqlite3`.
 - Track A: UPSERT and `RETURNING`. `INSERT … ON CONFLICT [(target)] DO NOTHING`
   skips the conflicting row; `DO UPDATE SET … [WHERE …]` updates the existing
   row, exposing the would-be-inserted values via the `excluded` pseudo-table and

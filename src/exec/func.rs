@@ -197,6 +197,71 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 },
             }
         }
+        // Math functions (SQLite's `-DSQLITE_ENABLE_MATH_FUNCTIONS` set; the CLI
+        // ships with these enabled). Each coerces its argument(s) to a real and
+        // returns NULL when an argument is NULL or the result is not finite,
+        // matching SQLite.
+        "pi" => {
+            arity(&lname, args, 0)?;
+            Value::Real(crate::util::float::PI)
+        }
+        "ceil" | "ceiling" => math1(&lname, &v, crate::util::float::ceil)?,
+        "floor" => math1(&lname, &v, crate::util::float::floor)?,
+        "trunc" => math1(&lname, &v, crate::util::float::trunc)?,
+        "sqrt" => math1(&lname, &v, crate::util::float::sqrt)?,
+        "exp" => math1(&lname, &v, crate::util::float::exp)?,
+        "ln" => math1(&lname, &v, crate::util::float::ln)?,
+        "log2" => math1(&lname, &v, crate::util::float::log2)?,
+        "sin" => math1(&lname, &v, crate::util::float::sin)?,
+        "cos" => math1(&lname, &v, crate::util::float::cos)?,
+        "tan" => math1(&lname, &v, crate::util::float::tan)?,
+        "asin" => math1(&lname, &v, crate::util::float::asin)?,
+        "acos" => math1(&lname, &v, crate::util::float::acos)?,
+        "atan" => math1(&lname, &v, crate::util::float::atan)?,
+        "sinh" => math1(&lname, &v, crate::util::float::sinh)?,
+        "cosh" => math1(&lname, &v, crate::util::float::cosh)?,
+        "tanh" => math1(&lname, &v, crate::util::float::tanh)?,
+        "asinh" => math1(&lname, &v, crate::util::float::asinh)?,
+        "acosh" => math1(&lname, &v, crate::util::float::acosh)?,
+        "atanh" => math1(&lname, &v, crate::util::float::atanh)?,
+        "degrees" => math1(&lname, &v, crate::util::float::degrees)?,
+        "radians" => math1(&lname, &v, crate::util::float::radians)?,
+        // `log(X)` is base-10; `log(B, X)` is base B. `log10` is base-10.
+        "log10" => math1(&lname, &v, crate::util::float::log10)?,
+        "log" => {
+            if v.len() == 1 {
+                math_finite(real_arg(&v[0]).map(crate::util::float::log10))
+            } else {
+                arity(&lname, args, 2)?;
+                match (real_arg(&v[0]), real_arg(&v[1])) {
+                    (Some(b), Some(x)) => {
+                        math_finite(Some(crate::util::float::ln(x) / crate::util::float::ln(b)))
+                    }
+                    _ => Value::Null,
+                }
+            }
+        }
+        "pow" | "power" => {
+            arity(&lname, args, 2)?;
+            match (real_arg(&v[0]), real_arg(&v[1])) {
+                (Some(b), Some(e)) => math_finite(Some(crate::util::float::pow(b, e))),
+                _ => Value::Null,
+            }
+        }
+        "atan2" => {
+            arity(&lname, args, 2)?;
+            match (real_arg(&v[0]), real_arg(&v[1])) {
+                (Some(y), Some(x)) => math_finite(Some(crate::util::float::atan2(y, x))),
+                _ => Value::Null,
+            }
+        }
+        "mod" => {
+            arity(&lname, args, 2)?;
+            match (real_arg(&v[0]), real_arg(&v[1])) {
+                (Some(x), Some(y)) => math_finite(Some(crate::util::float::fmod(x, y))),
+                _ => Value::Null,
+            }
+        }
         // Date/time functions (see `super::datetime`).
         "date" => super::datetime::date(&v),
         "time" => super::datetime::time(&v),
@@ -266,6 +331,35 @@ fn str_map(v: &Value, f: impl Fn(&str) -> String) -> Value {
         Value::Null => Value::Null,
         other => Value::Text(f(&eval::to_text(other))),
     }
+}
+
+/// A numeric argument to a math function: `None` for SQL `NULL`, else the value
+/// coerced to `f64` (SQLite applies REAL affinity to math-function arguments).
+fn real_arg(v: &Value) -> Option<f64> {
+    match v {
+        Value::Null => None,
+        other => Some(eval::to_f64(other)),
+    }
+}
+
+/// Wrap a computed math result: `NULL` for a missing argument or a non-finite
+/// result (domain error), else a `REAL`. Matches SQLite, where e.g. `ln(0)` and
+/// `sqrt(-1)` yield `NULL`.
+fn math_finite(r: Option<f64>) -> Value {
+    match r {
+        Some(x) if x.is_finite() => Value::Real(x),
+        _ => Value::Null,
+    }
+}
+
+/// A one-argument math function: arity-check, coerce, apply, finiteness-guard.
+fn math1(name: &str, v: &[Value], f: impl Fn(f64) -> f64) -> Result<Value> {
+    if v.len() != 1 {
+        return Err(Error::Error(alloc::format!(
+            "wrong number of arguments to function {name}()"
+        )));
+    }
+    Ok(math_finite(real_arg(&v[0]).map(f)))
 }
 
 fn type_name(v: &Value) -> &'static str {
