@@ -6541,11 +6541,25 @@ impl Connection {
     ) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
         let (schema, backend) = self.db_parts(db);
         let meta = self.table_meta_in(schema, name, alias)?;
-        if meta.without_rowid {
-            return Err(Error::Unsupported("cross-database WITHOUT ROWID table"));
-        }
         let source = backend.source();
         let encoding = source.header().text_encoding;
+        // WITHOUT ROWID: walk the clustered index b-tree (records stored
+        // PK-first) and decode each entry back into declared column order.
+        if meta.without_rowid {
+            let params = Params::default();
+            let mut rows = Vec::new();
+            let mut cur = IndexCursor::new(source, meta.root);
+            while let Some(payload) = cur.next()? {
+                let storage = decode_record(&payload, encoding)?;
+                let mut values = unpermute_row(&meta, storage);
+                self.compute_generated(&meta, &mut values, &params)?;
+                rows.push(InputRow {
+                    values,
+                    rowid: None,
+                });
+            }
+            return Ok((meta.columns, rows));
+        }
         let mut rows = Vec::new();
         let mut cur = TableCursor::new(source, meta.root);
         let mut ok = cur.first()?;

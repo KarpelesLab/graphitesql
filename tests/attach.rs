@@ -161,6 +161,48 @@ fn cross_database_join() {
 }
 
 #[test]
+fn cross_database_without_rowid_read() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE aux.k(a TEXT, b INT, PRIMARY KEY(a)) WITHOUT ROWID")
+        .unwrap();
+    c.execute("INSERT INTO aux.k VALUES('x',1),('a',2),('m',3)")
+        .unwrap();
+    // Sole-source read walks the clustered index in PK order.
+    let r = c.query("SELECT a, b FROM aux.k ORDER BY a").unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Text("a".into()), Value::Integer(2)],
+            vec![Value::Text("m".into()), Value::Integer(3)],
+            vec![Value::Text("x".into()), Value::Integer(1)],
+        ]
+    );
+    // A WITHOUT ROWID attached table as a join source.
+    c.execute("CREATE TABLE main.t(a TEXT, n INT)").unwrap();
+    c.execute("INSERT INTO main.t VALUES('a',10),('x',20)")
+        .unwrap();
+    let r = c
+        .query("SELECT t.a, aux.k.b, t.n FROM t JOIN aux.k ON t.a=aux.k.a ORDER BY t.a")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![
+                Value::Text("a".into()),
+                Value::Integer(2),
+                Value::Integer(10)
+            ],
+            vec![
+                Value::Text("x".into()),
+                Value::Integer(1),
+                Value::Integer(20)
+            ],
+        ]
+    );
+}
+
+#[test]
 fn cross_database_create_read_write() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a)").unwrap();
