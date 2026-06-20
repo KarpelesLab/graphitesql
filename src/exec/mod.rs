@@ -4565,7 +4565,11 @@ impl Connection {
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
         if eqs.is_empty() || eqs.iter().any(|(_, v)| matches!(v, Value::Null)) {
-            return Ok(None); // `col = NULL` is never true; let the scan handle it
+            // No usable column equality (`col = NULL` is never true). A plain or
+            // partial *column* index can't seek, but an *expression* index might
+            // (e.g. `lower(x) = 'b'` leaves no column eq behind). Try that, then
+            // let the scan handle the rest.
+            return self.partial_expr_lookup(meta, table_name, sel, where_expr, params);
         }
 
         // Rowid (INTEGER PRIMARY KEY) equality: seek the table b-tree directly
@@ -4654,8 +4658,15 @@ impl Connection {
                 best = Some((idx.root, key, colls, idx.cols.clone(), est));
             }
         }
-        let Some((root, key, seek_colls, idx_cols, _)) = best else {
-            return Ok(None);
+        // Plain column indexes take priority. If none applied, try a partial or
+        // expression index whose eligibility we can prove from the `WHERE`
+        // structure (see `partial_expr_seek`). This keeps plain-index behavior
+        // byte-identical while extending seeks to the new index kinds.
+        let (root, key, seek_colls, idx_cols) = match best {
+            Some((root, key, colls, idx_cols, _)) => (root, key, colls, idx_cols),
+            None => {
+                return self.partial_expr_lookup(meta, table_name, sel, where_expr, params);
+            }
         };
         if key.is_empty() {
             return Ok(None);
@@ -4670,8 +4681,20 @@ impl Connection {
             return Ok(Some(self.covering_seek_rows(meta, root, &idx_cols)?));
         }
 
-        let rowids =
-            crate::btree::index_seek_rowids(self.backend.source(), root, &key, &seek_colls)?;
+        self.index_seek_fetch(meta, root, &key, &seek_colls)
+    }
+
+    /// Fetch table rows for an equality index seek: collect the matching rowids
+    /// from the index, then read each row from the table b-tree. Returns a
+    /// superset (`run_core` re-applies the full `WHERE`).
+    fn index_seek_fetch(
+        &self,
+        meta: &TableMeta,
+        root: u32,
+        key: &[Value],
+        colls: &[crate::value::Collation],
+    ) -> Result<Option<Vec<InputRow>>> {
+        let rowids = crate::btree::index_seek_rowids(self.backend.source(), root, key, colls)?;
         let encoding = self.backend.source().header().text_encoding;
         let mut cur = TableCursor::new(self.backend.source(), meta.root);
         let mut out = Vec::new();
@@ -4685,6 +4708,137 @@ impl Connection {
             }
         }
         Ok(Some(out))
+    }
+
+    /// Equality-seek fallback for partial / expression indexes, used when no
+    /// plain column index applied. Picks the first index (honoring `INDEXED BY`)
+    /// for which [`partial_expr_seek`](Self::partial_expr_seek) proves a seek is
+    /// valid, fetches its rows, and returns the superset. Returns `None` (→ scan)
+    /// when none qualifies. `eqp_access` mirrors this exact choice.
+    fn partial_expr_lookup(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        sel: &Select,
+        where_expr: &Expr,
+        params: &Params,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
+        for idx in self.indexes_of(table_name)? {
+            if let Some(IndexHint::IndexedBy(n)) = hint {
+                if !idx.name.eq_ignore_ascii_case(n) {
+                    continue;
+                }
+            }
+            if let Some((key, colls)) = self.partial_expr_seek(&idx, where_expr, meta, params)? {
+                // Expression indexes don't map keys back to table columns, so they
+                // are never a covering seek here; fetch table rows by rowid (a
+                // superset re-filtered by `run_core`).
+                return self.index_seek_fetch(meta, idx.root, &key, &colls);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Decide whether a *partial* or *expression* index can serve an equality
+    /// seek for `where_expr`, and if so return the seek `(key, collations)`.
+    ///
+    /// The rules are deliberately conservative (no general implication):
+    ///
+    /// * **Partial index** (`CREATE INDEX … WHERE pred`): usable only when `pred`
+    ///   appears verbatim (modulo redundant parens) as a top-level `AND` conjunct
+    ///   of the query's `WHERE`, so every row the seek can return is one the index
+    ///   actually stores. A partial index over plain columns then seeks like an
+    ///   ordinary column index; a partial *expression* index must additionally
+    ///   satisfy the expression rule below.
+    /// * **Expression index** (`CREATE INDEX … (expr)`): usable when a top-level
+    ///   `AND` conjunct is `<indexed-expr> = <const>` (either operand order), with
+    ///   `<indexed-expr>` structurally equal to the index's single key expression.
+    ///   The seek key is the evaluated constant; the index stores that same value
+    ///   per row, so the seek finds a superset.
+    ///
+    /// Returns `None` for plain column indexes (handled by the caller's main
+    /// loop) and whenever the proof above fails. `eqp_access` calls this same
+    /// helper, keeping the plan string in lockstep with what executes.
+    fn partial_expr_seek(
+        &self,
+        idx: &IndexMeta,
+        where_expr: &Expr,
+        meta: &TableMeta,
+        params: &Params,
+    ) -> Result<Option<(Vec<Value>, Vec<crate::value::Collation>)>> {
+        // Plain column index: not our concern.
+        if idx.partial.is_none() && idx.key_exprs.is_none() {
+            return Ok(None);
+        }
+        let mut conjuncts = Vec::new();
+        and_conjuncts(where_expr, &mut conjuncts);
+
+        // A partial predicate must be guaranteed by a top-level conjunct.
+        if let Some(pred) = &idx.partial {
+            if !conjuncts.iter().any(|c| expr_eq_modulo_parens(c, pred)) {
+                return Ok(None);
+            }
+        }
+
+        match &idx.key_exprs {
+            // Partial index over plain columns: seek as an ordinary column index.
+            None => {
+                let mut key = Vec::new();
+                let mut colls = Vec::new();
+                let mut eqs: Vec<(usize, Value)> = Vec::new();
+                collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+                for (pos, &c) in idx.cols.iter().enumerate() {
+                    match eqs
+                        .iter()
+                        .find(|(col, v)| *col == c && !matches!(v, Value::Null))
+                    {
+                        Some((_, v)) => {
+                            key.push(meta.columns[c].affinity.coerce(v.clone()));
+                            colls.push(idx.collations[pos]);
+                        }
+                        None => break,
+                    }
+                }
+                if key.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some((key, colls)))
+            }
+            // Expression index: match a conjunct `<key_expr> = <const>`. Only a
+            // single-term key is supported (the common `lower(x)` shape).
+            Some(exprs) => {
+                let [key_expr] = exprs.as_slice() else {
+                    return Ok(None);
+                };
+                for c in &conjuncts {
+                    let Expr::Binary {
+                        op: BinaryOp::Eq,
+                        left,
+                        right,
+                    } = unparen(c)
+                    else {
+                        continue;
+                    };
+                    // `<key_expr> = <const>` or `<const> = <key_expr>`.
+                    let val = if expr_eq_modulo_parens(left, key_expr) {
+                        const_value(right, params)
+                    } else if expr_eq_modulo_parens(right, key_expr) {
+                        const_value(left, params)
+                    } else {
+                        None
+                    };
+                    if let Some(v) = val {
+                        if matches!(v, Value::Null) {
+                            continue; // `expr = NULL` is never true
+                        }
+                        let coll = idx.collations.first().copied().unwrap_or_default();
+                        return Ok(Some((alloc::vec![v], alloc::vec![coll])));
+                    }
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// Try to satisfy a single-table query with an index *range* scan: pick an
@@ -5500,6 +5654,33 @@ impl Connection {
                 let kw = index_kw(&idx_cols);
                 return Ok(alloc::format!(
                     "SEARCH {label} USING {kw} {idx_name} ({cond})"
+                ));
+            }
+        }
+
+        // Partial / expression equality seek — in lockstep with the same
+        // fallback in `try_index_lookup` (plain column indexes win first; this
+        // fires only when none applied). `partial_expr_seek` proves eligibility.
+        for idx in self.indexes_of(table)? {
+            if self
+                .partial_expr_seek(&idx, where_expr, meta, params)?
+                .is_some()
+            {
+                let cond = match &idx.key_exprs {
+                    // Partial column index: render the matched leading columns.
+                    None => idx
+                        .cols
+                        .iter()
+                        .take_while(|&&c| eqs.iter().any(|(col, _)| *col == c))
+                        .map(|&c| alloc::format!("{}=?", meta.columns[c].name))
+                        .collect::<Vec<_>>()
+                        .join(" AND "),
+                    // Expression index: the indexed expression compared to a value.
+                    Some(_) => "<expr>=?".into(),
+                };
+                return Ok(alloc::format!(
+                    "SEARCH {label} USING INDEX {} ({cond})",
+                    idx.name
                 ));
             }
         }
@@ -10142,6 +10323,40 @@ fn collect_eq_constraints(
             }
         }
         _ => {}
+    }
+}
+
+/// Strip redundant outer parentheses from an expression, so structural
+/// comparison ignores grouping (`(active = 1)` ≡ `active = 1`).
+fn unparen(e: &Expr) -> &Expr {
+    let mut cur = e;
+    while let Expr::Paren(inner) = cur {
+        cur = inner;
+    }
+    cur
+}
+
+/// Two expressions are equal modulo redundant parentheses. Used to match a
+/// partial-index predicate (or an expression-index key) against a query's
+/// `WHERE` structurally — this is the conservative rule (no general implication),
+/// so it only recurses through `Paren`; everything else uses derived `PartialEq`.
+fn expr_eq_modulo_parens(a: &Expr, b: &Expr) -> bool {
+    unparen(a) == unparen(b)
+}
+
+/// Collect the top-level `AND` conjuncts of `e` (descending through `Paren` and
+/// `AND` nodes), pushing each non-`AND` leaf as a borrowed reference.
+fn and_conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match unparen(e) {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            and_conjuncts(left, out);
+            and_conjuncts(right, out);
+        }
+        other => out.push(other),
     }
 }
 
