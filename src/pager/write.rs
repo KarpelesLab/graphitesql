@@ -454,11 +454,13 @@ impl WritePager {
     ///
     /// It also stamps `largest_root_page` = max root page number, which
     /// `integrity_check` requires to match exactly.
-    fn rebuild_ptrmap(&mut self) -> Result<()> {
-        let usable = self.usable_size() as u32;
-        // Desired (type, parent) for every tracked page.
+    /// Derive the desired pointer-map entries `(type, parent)` for every tracked
+    /// page from the current logical page contents, plus the largest root page
+    /// number. Shared by [`rebuild_ptrmap`](Self::rebuild_ptrmap) and the
+    /// FULL-mode commit-time relocator, which needs the same parent bookkeeping
+    /// to fix references to moved pages.
+    fn compute_want(&self) -> Result<(BTreeMap<u32, PtrmapEntry>, u32)> {
         let mut want: BTreeMap<u32, PtrmapEntry> = BTreeMap::new();
-
         // 1. Discover all b-tree roots: the schema tree (page 1) and every
         //    `rootpage` recorded in sqlite_schema. Roots get a RootPage entry
         //    (page 1 is never tracked). Then walk each tree for Btree/overflow.
@@ -477,14 +479,20 @@ impl WritePager {
         for root in roots {
             self.walk_btree_ptrmap(root, &mut want)?;
         }
-
         // 2. Freelist pages (trunk + leaves) are FreePage with parent 0.
         self.walk_freelist_ptrmap(&mut want)?;
+        Ok((want, max_root))
+    }
 
-        // 3. Keep the header's largest_root_page in sync.
+    fn rebuild_ptrmap(&mut self) -> Result<()> {
+        let usable = self.usable_size() as u32;
+        // Desired (type, parent) for every tracked page, plus the max root page.
+        let (want, max_root) = self.compute_want()?;
+
+        // Keep the header's largest_root_page in sync.
         self.header.largest_root_page = max_root;
 
-        // 4. Materialize the ptrmap pages: gather the entries that fall on each,
+        // Materialize the ptrmap pages: gather the entries that fall on each,
         //    and write them. Pages with no live entry keep their slot's previous
         //    bytes (integrity_check never reads an unreferenced slot).
         let mut by_map: BTreeMap<u32, Vec<(u32, PtrmapEntry)>> = BTreeMap::new();
@@ -504,6 +512,219 @@ impl WritePager {
                 page[off..off + ptrmap::ENTRY_SIZE].copy_from_slice(&enc);
             }
             self.overlay.insert(map_pg, page);
+        }
+        Ok(())
+    }
+
+    /// Run FULL-mode commit-time truncation, best-effort: only in FULL auto-vacuum
+    /// mode, and any error rolls back to the pre-relocation staged state so the
+    /// commit proceeds via the sound "leave freed pages in place" path. A
+    /// sound-but-not-maximally-compact file is always acceptable; a corrupt one
+    /// never is.
+    fn maybe_autovacuum_truncate(&mut self) {
+        if self.auto_vacuum() != AutoVacuum::Full {
+            return;
+        }
+        let saved_overlay = self.overlay.clone();
+        let saved_header = self.header.clone();
+        let saved_count = self.page_count;
+        if self.autovacuum_truncate().is_err() {
+            self.overlay = saved_overlay;
+            self.header = saved_header;
+            self.page_count = saved_count;
+        }
+    }
+
+    /// FULL `auto_vacuum` commit-time truncation (SQLite's `autoVacuumCommit`).
+    ///
+    /// Relocates pages from the end of the file into lower-numbered free slots and
+    /// shrinks `page_count`, so the file stays compact after deletes. Runs only in
+    /// FULL mode, just before [`rebuild_ptrmap`](Self::rebuild_ptrmap) regenerates
+    /// the pointer map and `largest_root_page` from the relocated structure.
+    ///
+    /// The relocation moves each trailing data page into the lowest free page,
+    /// then fixes the single pointer that referenced it (a parent's child pointer,
+    /// an overflow holder's link, or the previous overflow page's next-pointer),
+    /// looked up from the freshly-derived `want` map. B-tree **root** pages are
+    /// never relocated: their page number is cached in the executor's in-memory
+    /// schema, which this layer must not invalidate. When the lowest movable page
+    /// is a root (or no free slot remains, or a structural page blocks the way),
+    /// the loop stops and leaves the remaining pages in place — still sound, just
+    /// less compact. Freed pages that survive below the new size are rebuilt onto
+    /// the freelist; everything above it is simply truncated away.
+    ///
+    /// Any error leaves the staged state untouched-enough that the caller can fall
+    /// back to the in-place path; callers treat a relocation error as "skip
+    /// truncation" rather than failing the commit.
+    fn autovacuum_truncate(&mut self) -> Result<()> {
+        let usable = self.usable_size() as u32;
+        let (want, _max_root) = self.compute_want()?;
+
+        // The set of currently-free data pages (freelist trunk + leaves). We empty
+        // the freelist and rebuild it at the end from whatever stays free below the
+        // truncation point.
+        let mut free: alloc::collections::BTreeSet<u32> = alloc::collections::BTreeSet::new();
+        {
+            let mut probe: BTreeMap<u32, PtrmapEntry> = BTreeMap::new();
+            self.walk_freelist_ptrmap(&mut probe)?;
+            for (pg, (kind, _)) in probe {
+                if kind == PtrmapType::FreePage {
+                    free.insert(pg);
+                }
+            }
+        }
+        if free.is_empty() {
+            return Ok(()); // nothing to reclaim
+        }
+        // Detach the existing freelist; we rebuild it from `free` at the end.
+        self.header.freelist_trunk = 0;
+        self.header.freelist_count = 0;
+
+        // Translation from a moved page's old number to its new (lower) number,
+        // so a later fixup that names a since-relocated parent/holder/prev follows
+        // it to where its bytes now live.
+        let mut moved: BTreeMap<u32, u32> = BTreeMap::new();
+        let resolve = |moved: &BTreeMap<u32, u32>, p: u32| -> u32 { *moved.get(&p).unwrap_or(&p) };
+
+        let lock_page = (PENDING_BYTE / self.page_size as u64) as u32 + 1;
+        let is_lock = |p: u32| lock_page > 1 && p == lock_page;
+
+        let mut last = self.page_count;
+        while last > 1 {
+            // Trailing structural / free pages can be dropped without moving.
+            if ptrmap::is_ptrmap_page(usable, last) {
+                // A ptrmap page at the very end tracks only now-gone pages.
+                self.overlay.remove(&last);
+                last -= 1;
+                continue;
+            }
+            if is_lock(last) {
+                break; // never relocate across the lock-byte page
+            }
+            if free.remove(&last) {
+                // A free page at the tail: just drop it.
+                self.overlay.remove(&last);
+                last -= 1;
+                continue;
+            }
+            // `last` is a live data page. Find the lowest free slot below it that
+            // is itself usable (not a ptrmap/lock page).
+            let dest = free
+                .iter()
+                .copied()
+                .find(|&f| f < last && !ptrmap::is_ptrmap_page(usable, f) && !is_lock(f));
+            let Some(dest) = dest else {
+                break; // no free slot below: cannot compact further
+            };
+
+            let (kind, parent) = match want.get(&last) {
+                Some(&e) => e,
+                // A live page with no ptrmap entry would be a bug; bail to the
+                // safe in-place path rather than risk corruption.
+                None => return Err(Error::Corrupt("relocate: page not in ptrmap".into())),
+            };
+            if kind == PtrmapType::RootPage {
+                break; // do not relocate roots (in-memory schema caches them)
+            }
+
+            // Move the page contents into `dest`.
+            let contents = self.read_page(last)?;
+            self.overlay.insert(dest, contents);
+            self.overlay.remove(&last);
+            free.remove(&dest);
+            moved.insert(last, dest);
+
+            // Fix the one reference that pointed at `last`.
+            self.fix_reference(kind, resolve(&moved, parent), last, dest, usable)?;
+
+            last -= 1;
+        }
+
+        // Rebuild the freelist from the pages that remain free at or below the new
+        // size; free pages above it were truncated away.
+        let survivors: Vec<u32> = free.iter().copied().filter(|&pg| pg <= last).collect();
+        for pg in survivors {
+            self.free_page(pg)?;
+        }
+
+        // Apply the new page count and drop any overlay pages past the end.
+        self.page_count = last;
+        let stale: Vec<u32> = self.overlay.keys().copied().filter(|&p| p > last).collect();
+        for p in stale {
+            self.overlay.remove(&p);
+        }
+        Ok(())
+    }
+
+    /// Rewrite the single on-page pointer that referenced page `old` so it points
+    /// at `new`, given the moved page's ptrmap `kind` and its (already
+    /// move-resolved) `holder` page. Used by [`autovacuum_truncate`].
+    fn fix_reference(
+        &mut self,
+        kind: PtrmapType,
+        holder: u32,
+        old: u32,
+        new: u32,
+        usable: u32,
+    ) -> Result<()> {
+        match kind {
+            PtrmapType::Btree => {
+                // `holder` is the parent b-tree page; find the child pointer == old.
+                let mut bytes = self.read_page(holder)?;
+                let bt = BtreePage::parse(Page::from_bytes(holder, bytes.clone()))?;
+                let mut fixed = false;
+                for i in 0..=bt.num_cells() {
+                    if bt.child_pointer(i)? == old {
+                        let off = bt.child_pointer_offset(i)?;
+                        bytes[off..off + 4].copy_from_slice(&new.to_be_bytes());
+                        fixed = true;
+                        break;
+                    }
+                }
+                if !fixed {
+                    return Err(Error::Corrupt("relocate: child pointer not found".into()));
+                }
+                self.overlay.insert(holder, bytes);
+            }
+            PtrmapType::Overflow1 => {
+                // `holder` is a b-tree page; one of its cells owns the chain whose
+                // first page is `old`. Rewrite that cell's first-overflow pointer.
+                let mut bytes = self.read_page(holder)?;
+                let bt = BtreePage::parse(Page::from_bytes(holder, bytes.clone()))?;
+                let mut fixed = false;
+                for i in 0..bt.num_cells() {
+                    if let Some(off) = bt.cell_overflow_offset(i, usable as usize)? {
+                        if u32::from_be_bytes([
+                            bytes[off],
+                            bytes[off + 1],
+                            bytes[off + 2],
+                            bytes[off + 3],
+                        ]) == old
+                        {
+                            bytes[off..off + 4].copy_from_slice(&new.to_be_bytes());
+                            fixed = true;
+                            break;
+                        }
+                    }
+                }
+                if !fixed {
+                    return Err(Error::Corrupt("relocate: overflow holder not found".into()));
+                }
+                self.overlay.insert(holder, bytes);
+            }
+            PtrmapType::Overflow2 => {
+                // `holder` is the previous overflow page; its first 4 bytes are the
+                // next-pointer that named `old`.
+                let mut bytes = self.read_page(holder)?;
+                if u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != old {
+                    return Err(Error::Corrupt("relocate: overflow link mismatch".into()));
+                }
+                bytes[0..4].copy_from_slice(&new.to_be_bytes());
+                self.overlay.insert(holder, bytes);
+            }
+            PtrmapType::RootPage | PtrmapType::FreePage => {
+                return Err(Error::Corrupt("relocate: unexpected page kind".into()));
+            }
         }
         Ok(())
     }
@@ -734,11 +955,10 @@ impl WritePager {
         }
         // Take the EXCLUSIVE lock for the flush (no other writer or reader).
         self.acquire_exclusive()?;
-        // In auto-vacuum mode, bring the pointer-map pages up to date before
-        // flushing. (We keep any freed pages in place with a correct FREEPAGE
-        // ptrmap entry, which `integrity_check` accepts; FULL-mode commit-time
-        // truncation/relocation is a separate later piece, C6b-3.)
+        // In auto-vacuum mode, first relocate-and-truncate (FULL only), then bring
+        // the pointer-map pages up to date before flushing.
         if self.auto_vacuum_on() {
+            self.maybe_autovacuum_truncate();
             self.rebuild_ptrmap()?;
         }
         // Refresh header bookkeeping and re-stamp page 1.
@@ -869,6 +1089,7 @@ impl WritePager {
     /// Commit the overlay as WAL frames appended to the `-wal` file.
     fn commit_wal(&mut self) -> Result<()> {
         if self.auto_vacuum_on() {
+            self.maybe_autovacuum_truncate();
             self.rebuild_ptrmap()?;
         }
         self.header.change_counter = self.header.change_counter.wrapping_add(1);

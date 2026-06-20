@@ -322,6 +322,40 @@ impl BtreePage {
         })
     }
 
+    /// For an interior page: the byte offset within the page of the 4-byte child
+    /// pointer for child position `i` (`i < num_cells` → the cell's left child;
+    /// `i == num_cells` → the page header's right-most child pointer). Used by the
+    /// auto-vacuum relocator to rewrite a parent's pointer to a moved child page.
+    pub fn child_pointer_offset(&self, i: usize) -> Result<usize> {
+        if self.page_type.is_leaf() {
+            return Err(Error::Corrupt(
+                "child pointer offset requested on a leaf page".into(),
+            ));
+        }
+        if i >= self.num_cells {
+            // Right-most child pointer lives at body_offset + 8.
+            return Ok(self.body_offset + 8);
+        }
+        self.cell_offset(i)
+    }
+
+    /// For a cell that owns an overflow chain, the byte offset within the page of
+    /// the 4-byte "first overflow page" pointer at the tail of its local payload.
+    /// Returns `None` if the cell has no overflow chain. Used by the relocator to
+    /// rewrite an `Overflow1` holder's link to a moved overflow page.
+    pub fn cell_overflow_offset(&self, i: usize, usable: usize) -> Result<Option<usize>> {
+        let payload = match self.page_type {
+            PageType::LeafTable => self.table_leaf_cell(i, usable)?.payload,
+            PageType::LeafIndex | PageType::InteriorIndex => self.index_cell(i, usable)?.payload,
+            PageType::InteriorTable => return Ok(None),
+        };
+        if payload.overflow == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(payload.local_offset + payload.local_len))
+        }
+    }
+
     /// Compute the [`Payload`] descriptor for a payload of `total` bytes whose
     /// local portion begins at `payload_start` within the page.
     fn payload_at(&self, payload_start: usize, total: usize, usable: usize) -> Result<Payload> {
