@@ -2000,6 +2000,7 @@ impl Connection {
     }
 
     fn exec_insert(&mut self, ins: &Insert, params: &Params) -> Result<usize> {
+        reject_schema_write(&ins.table)?;
         let rows = match &ins.source {
             InsertSource::Values(rows) => rows.clone(),
             InsertSource::DefaultValues => alloc::vec![Vec::new()],
@@ -2487,6 +2488,7 @@ impl Connection {
     }
 
     fn exec_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
+        reject_schema_write(&del.table)?;
         if self.is_view(&del.table) {
             return self.exec_view_delete(del, params);
         }
@@ -2579,6 +2581,7 @@ impl Connection {
     }
 
     fn exec_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
+        reject_schema_write(&upd.table)?;
         if self.is_view(&upd.table) {
             return self.exec_view_update(upd, params);
         }
@@ -6460,6 +6463,11 @@ impl Connection {
     }
 
     fn table_meta(&self, name: &str, alias: Option<&str>) -> Result<TableMeta> {
+        // The schema catalog itself is queryable as `sqlite_schema` /
+        // `sqlite_master` (a 5-column rowid table rooted at page 1).
+        if is_main_schema_table(name) {
+            return Ok(schema_table_meta(alias.unwrap_or(name)));
+        }
         let obj = self
             .schema
             .table(name)
@@ -6687,6 +6695,57 @@ struct TableMeta {
     /// (aligned with `columns`); `None` for an ordinary table. Drives write-time
     /// type checking.
     strict_types: Option<Vec<(StrictType, String)>>,
+}
+
+/// Whether `name` refers to the main schema catalog table, which SQLite exposes
+/// under both the modern `sqlite_schema` and the historical `sqlite_master`.
+fn is_main_schema_table(name: &str) -> bool {
+    name.eq_ignore_ascii_case("sqlite_schema") || name.eq_ignore_ascii_case("sqlite_master")
+}
+
+/// Reject a direct DML write to the schema catalog, as SQLite does (the catalog
+/// is maintained by DDL, not by `INSERT`/`UPDATE`/`DELETE`).
+fn reject_schema_write(table: &str) -> Result<()> {
+    if is_main_schema_table(table) {
+        return Err(Error::Error(alloc::format!(
+            "table {table} may not be modified"
+        )));
+    }
+    Ok(())
+}
+
+/// A synthetic [`TableMeta`] for the schema catalog (`sqlite_schema`): the
+/// 5-column rowid table physically rooted at page 1. Read-only — writes are
+/// rejected before reaching here.
+fn schema_table_meta(label: &str) -> TableMeta {
+    let col = |n: &str, aff: eval::Affinity| ColumnInfo {
+        name: n.to_string(),
+        table: label.to_string(),
+        affinity: aff,
+        collation: crate::value::Collation::default(),
+    };
+    let columns = alloc::vec![
+        col("type", eval::Affinity::Text),
+        col("name", eval::Affinity::Text),
+        col("tbl_name", eval::Affinity::Text),
+        col("rootpage", eval::Affinity::Integer),
+        col("sql", eval::Affinity::Text),
+    ];
+    let n = columns.len();
+    TableMeta {
+        root: crate::schema::SCHEMA_ROOT_PAGE,
+        columns,
+        defaults: alloc::vec![None; n],
+        not_null: alloc::vec![false; n],
+        checks: Vec::new(),
+        unique: Vec::new(),
+        ipk: None,
+        generated: alloc::vec![None; n],
+        without_rowid: false,
+        storage_order: Vec::new(),
+        pk_len: 0,
+        strict_types: None,
+    }
 }
 
 /// Whether `e` contains a subquery (scalar `(SELECT …)`, `EXISTS`, or `IN
