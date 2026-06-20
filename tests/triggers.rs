@@ -350,3 +350,36 @@ fn update_of_multiple_columns_and_plain_update() {
         Value::Integer(3)
     );
 }
+
+#[test]
+fn new_and_old_rowid_in_trigger_bodies() {
+    // NEW.rowid is usable in an AFTER INSERT trigger body.
+    let mut c = Connection::open_memory().unwrap();
+    for s in [
+        "CREATE TABLE t(a)",
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET a = a * 2 WHERE rowid = NEW.rowid; END",
+        "INSERT INTO t VALUES(5)",
+    ] {
+        c.execute(s).unwrap();
+    }
+    assert_eq!(
+        c.query("SELECT a FROM t").unwrap().rows[0][0],
+        Value::Integer(10)
+    );
+
+    // OLD.rowid is usable in a BEFORE DELETE trigger body.
+    let mut c = Connection::open_memory().unwrap();
+    for s in [
+        "CREATE TABLE t(a)",
+        "CREATE TABLE log(r)",
+        "CREATE TRIGGER tr BEFORE DELETE ON t BEGIN INSERT INTO log VALUES(OLD.rowid); END",
+        "INSERT INTO t VALUES(10),(20)",
+        "DELETE FROM t WHERE a = 20",
+    ] {
+        c.execute(s).unwrap();
+    }
+    assert_eq!(
+        c.query("SELECT r FROM log").unwrap().rows[0][0],
+        Value::Integer(2)
+    );
+}

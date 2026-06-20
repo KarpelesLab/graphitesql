@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Fix: **`UPDATE OF <columns>` triggers** fire only when one of the named
+  columns is in the UPDATE's SET list (previously fired on any update).
+- Fix: **`NEW.rowid` / `OLD.rowid`** (and qualified rowid in correlated
+  subqueries) now resolve inside trigger bodies.
 - **SELECT-list aliases in WHERE/GROUP BY/HAVING** are now resolved (a real
   column of the same name still takes precedence), matching SQLite — e.g.
   `SELECT a+b AS s FROM t WHERE s>3` and `… GROUP BY m`/`HAVING c>1`.

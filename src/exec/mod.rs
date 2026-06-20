@@ -7243,9 +7243,25 @@ impl eval::Subqueries for Connection {
     fn resolve_outer(&self, table: Option<&str>, name: &str) -> Option<Value> {
         let scope = self.outer_scope.borrow();
         for frame in scope.iter().rev() {
-            if table.is_none() && eval::is_rowid_alias(name) {
-                if let Some(r) = frame.rowid {
-                    return Some(Value::Integer(r));
+            // A rowid alias, optionally qualified by the frame's label (e.g.
+            // `NEW.rowid`/`OLD.rowid` in a trigger, or `t.rowid` in a correlated
+            // subquery). A real column of that name in the frame wins.
+            if eval::is_rowid_alias(name) {
+                let qualifies = match table {
+                    None => true,
+                    Some(t) => frame
+                        .columns
+                        .iter()
+                        .any(|c| c.table.eq_ignore_ascii_case(t)),
+                };
+                let has_real = frame.columns.iter().any(|c| {
+                    c.name.eq_ignore_ascii_case(name)
+                        && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+                });
+                if qualifies && !has_real {
+                    if let Some(r) = frame.rowid {
+                        return Some(Value::Integer(r));
+                    }
                 }
             }
             for (i, col) in frame.columns.iter().enumerate() {
