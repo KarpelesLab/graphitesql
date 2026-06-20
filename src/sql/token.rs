@@ -79,6 +79,10 @@ pub enum Token {
     LShift,
     /// `>>`
     RShift,
+    /// `->` — JSON extract (as JSON).
+    Arrow,
+    /// `->>` — JSON extract (as text).
+    Arrow2,
 }
 
 /// A bound parameter.
@@ -191,7 +195,19 @@ impl<'a> Tokenizer<'a> {
             b',' => self.single(Token::Comma),
             b';' => self.single(Token::Semicolon),
             b'+' => self.single(Token::Plus),
-            b'-' => self.single(Token::Minus),
+            b'-' => {
+                self.pos += 1; // consume '-'
+                if self.peek() == Some(b'>') {
+                    self.pos += 1; // consume '>'
+                    if self.peek() == Some(b'>') {
+                        self.single(Token::Arrow2) // ->>
+                    } else {
+                        Ok(Token::Arrow) // ->
+                    }
+                } else {
+                    Ok(Token::Minus)
+                }
+            }
             b'%' => self.single(Token::Percent),
             b'~' => self.single(Token::BitNot),
             b'*' => self.single(Token::Star),

@@ -652,6 +652,8 @@ fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
                 bool_value(m)
             }
         }
+        JsonExtract => crate::exec::json::arrow(&l, &r, false),
+        JsonExtractText => crate::exec::json::arrow(&l, &r, true),
         And | Or => unreachable!("handled with short-circuiting"),
     })
 }

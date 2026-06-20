@@ -418,3 +418,193 @@ pub fn value_to_json(v: &Value) -> Json {
         Value::Blob(_) => Json::Str(String::new()),
     }
 }
+
+/// The `->` / `->>` operators. `doc` is the JSON document, `path_arg` the right
+/// operand (a JSON path, a bare object label, or an integer array index). With
+/// `as_text` (the `->>` form) the result is the SQL value at the path; otherwise
+/// (`->`) it is that node re-rendered as JSON text. NULL doc or a missing path
+/// yields SQL NULL.
+pub fn arrow(doc: &Value, path_arg: &Value, as_text: bool) -> Value {
+    if matches!(doc, Value::Null) {
+        return Value::Null;
+    }
+    let text = crate::exec::eval::to_text(doc);
+    let Some(root) = parse(&text) else {
+        return Value::Null;
+    };
+    let path = arrow_path(path_arg);
+    match navigate(&root, &path) {
+        None => Value::Null,
+        Some(node) => {
+            if as_text {
+                node.to_sql()
+            } else {
+                Value::Text(node.serialize())
+            }
+        }
+    }
+}
+
+/// Normalize an `->`/`->>` right operand into a JSON path: an integer is an array
+/// index `$[n]`, a string starting with `$` is used verbatim, any other string is
+/// an object label `$.label`.
+fn arrow_path(v: &Value) -> String {
+    match v {
+        Value::Integer(i) => alloc::format!("$[{i}]"),
+        Value::Text(s) if s.starts_with('$') => s.clone(),
+        Value::Text(s) => alloc::format!("$.{s}"),
+        other => alloc::format!("$.{}", crate::exec::eval::to_text(other)),
+    }
+}
+
+/// One step of a JSON path: an object key or an array index.
+enum Seg {
+    Key(String),
+    Index(usize),
+}
+
+/// Parse a `$`-rooted path into its segments (the subset used by the mutators:
+/// `.key`, `."key"`, `[n]`). Returns `None` on a malformed path.
+fn parse_path(path: &str) -> Option<Vec<Seg>> {
+    let bytes = path.as_bytes();
+    if bytes.first() != Some(&b'$') {
+        return None;
+    }
+    let mut segs = Vec::new();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' => {
+                let (key, next) = parse_key(bytes, i + 1)?;
+                segs.push(Seg::Key(key));
+                i = next;
+            }
+            b'[' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() && bytes[j] != b']' {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    return None;
+                }
+                let n: usize = core::str::from_utf8(&bytes[start..j])
+                    .ok()?
+                    .trim()
+                    .parse()
+                    .ok()?;
+                segs.push(Seg::Index(n));
+                i = j + 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(segs)
+}
+
+/// How a `json_set`/`json_insert`/`json_replace` write applies at the leaf.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SetMode {
+    /// `json_set`: create or overwrite.
+    Set,
+    /// `json_insert`: only create when absent.
+    Insert,
+    /// `json_replace`: only overwrite when present.
+    Replace,
+}
+
+/// Apply one `(path, value)` write to `root` under `mode`. Missing parent
+/// containers are left untouched (matching SQLite, which only writes the leaf).
+pub fn set_path(root: &mut Json, path: &str, value: Json, mode: SetMode) -> Option<()> {
+    let segs = parse_path(path)?;
+    if segs.is_empty() {
+        if mode != SetMode::Insert {
+            *root = value; // `$` targets the whole document
+        }
+        return Some(());
+    }
+    let mut cur = root;
+    for seg in &segs[..segs.len() - 1] {
+        cur = match (cur, seg) {
+            (Json::Object(m), Seg::Key(k)) => {
+                m.iter_mut().find(|(kk, _)| kk == k).map(|(_, v)| v)?
+            }
+            (Json::Array(a), Seg::Index(i)) => a.get_mut(*i)?,
+            _ => return None,
+        };
+    }
+    match (cur, segs.last()?) {
+        (Json::Object(m), Seg::Key(k)) => {
+            let slot = m.iter_mut().find(|(kk, _)| kk == k);
+            match (slot, mode) {
+                (Some(s), SetMode::Set) | (Some(s), SetMode::Replace) => s.1 = value,
+                (None, SetMode::Set) | (None, SetMode::Insert) => m.push((k.clone(), value)),
+                _ => {}
+            }
+        }
+        (Json::Array(a), Seg::Index(i)) => {
+            let exists = *i < a.len();
+            match mode {
+                SetMode::Set if exists => a[*i] = value,
+                SetMode::Replace if exists => a[*i] = value,
+                SetMode::Set | SetMode::Insert if !exists => a.push(value),
+                _ => {}
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Remove the element at `path` from `root` if present.
+pub fn remove_path(root: &mut Json, path: &str) -> Option<()> {
+    let segs = parse_path(path)?;
+    if segs.is_empty() {
+        return None; // `$` cannot be removed
+    }
+    let mut cur = root;
+    for seg in &segs[..segs.len() - 1] {
+        cur = match (cur, seg) {
+            (Json::Object(m), Seg::Key(k)) => {
+                m.iter_mut().find(|(kk, _)| kk == k).map(|(_, v)| v)?
+            }
+            (Json::Array(a), Seg::Index(i)) => a.get_mut(*i)?,
+            _ => return None,
+        };
+    }
+    match (cur, segs.last()?) {
+        (Json::Object(m), Seg::Key(k)) => m.retain(|(kk, _)| kk != k),
+        (Json::Array(a), Seg::Index(i)) if *i < a.len() => {
+            a.remove(*i);
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+/// Apply an RFC 7396 JSON merge patch: object members merge recursively, a member
+/// whose patch value is `null` is removed, and a non-object patch replaces the
+/// target outright.
+pub fn merge_patch(target: &mut Json, patch: &Json) {
+    let Json::Object(pm) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !matches!(target, Json::Object(_)) {
+        *target = Json::Object(Vec::new());
+    }
+    let Json::Object(tm) = target else {
+        return;
+    };
+    for (k, pv) in pm {
+        if matches!(pv, Json::Null) {
+            tm.retain(|(kk, _)| kk != k);
+        } else if let Some(slot) = tm.iter_mut().find(|(kk, _)| kk == k) {
+            merge_patch(&mut slot.1, pv);
+        } else {
+            tm.push((k.clone(), Json::Null));
+            let slot = tm.last_mut().unwrap();
+            merge_patch(&mut slot.1, pv);
+        }
+    }
+}

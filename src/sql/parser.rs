@@ -1444,6 +1444,8 @@ impl Parser {
             Token::BitOr => (InfixOp::Binary(BinaryOp::BitOr), BP_BIT),
             Token::LShift => (InfixOp::Binary(BinaryOp::LShift), BP_BIT),
             Token::RShift => (InfixOp::Binary(BinaryOp::RShift), BP_BIT),
+            Token::Arrow => (InfixOp::Binary(BinaryOp::JsonExtract), BP_CONCAT),
+            Token::Arrow2 => (InfixOp::Binary(BinaryOp::JsonExtractText), BP_CONCAT),
             Token::Lt => (InfixOp::Binary(BinaryOp::Lt), BP_REL),
             Token::LtEq => (InfixOp::Binary(BinaryOp::LtEq), BP_REL),
             Token::Gt => (InfixOp::Binary(BinaryOp::Gt), BP_REL),

@@ -137,12 +137,12 @@ Make the dialect complete. Each item lands with a differential corpus addition.
   clause and named-window reuse, frame `EXCLUDE`, `percent_rank`/`cume_dist`,
   `GROUP_CONCAT` ordering, `count(DISTINCT …)` over windows.
 - **Function library** — ✅ math functions (`sqrt`, `pow`, `ceil`, `floor`,
-  `ln`/`log`, trig, …, pure-`core`, no libm) and ✅ core **JSON** functions
-  (`json`, `json_extract`, `json_array`/`json_object`, `json_type`,
-  `json_array_length`, `json_valid`, `json_quote`). *Remaining:* JSON mutators
-  (`json_set`/`json_remove`/…), the `->`/`->>` operators, `json_each`/`json_tree`
-  (table-valued — depends on Track D), and remaining string/blob built-ins.
-  *Ref:* `func.c`, `math.c`, `json.c`.
+  `ln`/`log`, trig, …, pure-`core`, no libm) and ✅ **JSON** functions (`json`,
+  `json_extract`, `json_array`/`json_object`, `json_type`, `json_array_length`,
+  `json_valid`, `json_quote`, the `->`/`->>` operators, and the
+  `json_set`/`json_insert`/`json_replace`/`json_remove`/`json_patch` mutators).
+  *Remaining:* `json_each`/`json_tree` (table-valued — depends on Track D) and
+  remaining string/blob built-ins. *Ref:* `func.c`, `math.c`, `json.c`.
 - **Indexing breadth** — partial indexes (`CREATE INDEX … WHERE`), expression
   indexes (`CREATE INDEX … (lower(x))`), `DESC` index columns honored in seeks,
   and `INDEXED BY` / `NOT INDEXED` hints.

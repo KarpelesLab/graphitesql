@@ -364,6 +364,55 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             }
             Value::Text(super::json::Json::Object(members).serialize())
         }
+        "json_set" | "json_insert" | "json_replace" => {
+            if v.len() < 3 || v.len().is_multiple_of(2) {
+                return Err(Error::Error(alloc::format!(
+                    "{lname}() requires a document and (path, value) pairs"
+                )));
+            }
+            let mode = match lname.as_str() {
+                "json_set" => super::json::SetMode::Set,
+                "json_insert" => super::json::SetMode::Insert,
+                _ => super::json::SetMode::Replace,
+            };
+            match json_root(&v[0])? {
+                None => Value::Null,
+                Some(mut root) => {
+                    let mut i = 1;
+                    while i + 1 < v.len() {
+                        let path = eval::to_text(&v[i]);
+                        let val = arg_to_json(&v[i + 1], args.get(i + 1));
+                        super::json::set_path(&mut root, &path, val, mode);
+                        i += 2;
+                    }
+                    Value::Text(root.serialize())
+                }
+            }
+        }
+        "json_remove" => {
+            if v.is_empty() {
+                return Err(Error::Error("json_remove() requires a document".into()));
+            }
+            match json_root(&v[0])? {
+                None => Value::Null,
+                Some(mut root) => {
+                    for p in &v[1..] {
+                        super::json::remove_path(&mut root, &eval::to_text(p));
+                    }
+                    Value::Text(root.serialize())
+                }
+            }
+        }
+        "json_patch" => {
+            arity(&lname, args, 2)?;
+            match (json_root(&v[0])?, json_root(&v[1])?) {
+                (Some(mut root), Some(patch)) => {
+                    super::json::merge_patch(&mut root, &patch);
+                    Value::Text(root.serialize())
+                }
+                _ => Value::Null,
+            }
+        }
         // Date/time functions (see `super::datetime`).
         "date" => super::datetime::date(&v),
         "time" => super::datetime::time(&v),

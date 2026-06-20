@@ -743,4 +743,8 @@ pub enum BinaryOp {
     LShift,
     /// `>>`
     RShift,
+    /// `->` — JSON extract, returning the result as JSON.
+    JsonExtract,
+    /// `->>` — JSON extract, returning the result as a SQL text/value.
+    JsonExtractText,
 }

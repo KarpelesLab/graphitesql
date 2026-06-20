@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: JSON `->`/`->>` operators and mutators. `->` returns the extracted
+  node as JSON, `->>` as a SQL value; a bare-label or integer right operand is
+  normalized to `$.label`/`$[n]`. Added `json_set`, `json_insert`,
+  `json_replace`, `json_remove`, and RFC-7396 `json_patch`; nested
+  `json_array`/`json_object` arguments embed as JSON. Verified against `sqlite3`.
 - Track A: `ORDER BY … NULLS FIRST/LAST` and `IS [NOT] DISTINCT FROM`. NULL
   placement in sorts is now controllable (default stays SQLite's: NULLs first
   under `ASC`, last under `DESC`); `IS DISTINCT FROM`/`IS NOT DISTINCT FROM` are

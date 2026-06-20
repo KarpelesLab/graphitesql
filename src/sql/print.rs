@@ -292,6 +292,8 @@ fn binary_op(op: BinaryOp) -> &'static str {
         BinaryOp::BitOr => "|",
         BinaryOp::LShift => "<<",
         BinaryOp::RShift => ">>",
+        BinaryOp::JsonExtract => "->",
+        BinaryOp::JsonExtractText => "->>",
     }
 }
 
