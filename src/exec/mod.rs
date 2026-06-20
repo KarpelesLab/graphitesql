@@ -17,6 +17,7 @@ pub mod datetime;
 pub mod eval;
 pub mod func;
 pub mod json;
+pub mod vdbe;
 mod window;
 
 use crate::btree::{

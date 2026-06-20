@@ -92,6 +92,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit, rollback, and autocommit. (Reads buffer per-connection so they stay
   isolated from uncommitted writes; cross-process OS locks remain a host-VFS
   concern.)
+- Track B: VDBE bytecode IR spike. A new `exec::vdbe` module defines a
+  register-machine instruction set (`Op`), a `Program`, a compiler for constant
+  `SELECT` projections, and an interpreter — built *alongside* the tree-walking
+  executor (not replacing it) so the IR can grow incrementally toward cursors and
+  filters. The compiled+interpreted output matches both the tree-walker and
+  `sqlite3` for arithmetic/concat projections; unsupported queries cleanly report
+  `Unsupported` for fallback.
 - Track B: `ANALYZE` and cost-based index selection. `ANALYZE [name]` gathers
   index selectivity into a `sqlite_stat1(tbl,idx,stat)` table, byte-compatible
   with SQLite's `nRow avgEq1 avgEq2 …` format (`avgEqK = (nRow + dK/2)/dK`);

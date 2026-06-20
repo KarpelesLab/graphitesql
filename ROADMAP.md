@@ -167,11 +167,13 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
   (`<`/`>`/`BETWEEN`) and `IN`-list driven seeks; the **OR-by-union**
   optimization; covering-index detection; auto-indexes for unindexed joins;
   skip-scan. *Ref:* `where.c`, `wherecode.c`, `whereexpr.c`.
-- **VDBE bytecode IR** — compile the AST to register-machine bytecode and run it,
-  replacing the tree-walker incrementally (same results). This is the enabler for
-  **real `EXPLAIN`** (the `addr/opcode/p1…` listing) being byte-comparable to
-  SQLite's, and for query flattening / subquery co-routines. *Ref:* `vdbe.c`,
-  `vdbeaux.c`, `opcodes.h`.
+- **VDBE bytecode IR** — 🚧 *spike landed* (`exec::vdbe`): a register-machine
+  `Op`/`Program`, a compiler for constant `SELECT` projections, and an interpreter,
+  running alongside the tree-walker with matching results. *Remaining:* grow it to
+  table cursors, filters, joins and migrate the executor onto it; then **real
+  `EXPLAIN`** (the `addr/opcode/p1…` listing) byte-comparable to SQLite's, and
+  query flattening / subquery co-routines. *Ref:* `vdbe.c`, `vdbeaux.c`,
+  `opcodes.h`.
 - **`EXPLAIN` (bytecode)** — currently `Error::Unsupported`; lands with the VDBE.
 
 ### Track C — Storage engine, transactions & **concurrency**

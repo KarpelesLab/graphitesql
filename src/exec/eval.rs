@@ -828,6 +828,12 @@ fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
     })
 }
 
+/// Apply an arithmetic `BinaryOp` to two values (SQLite numeric semantics).
+/// Public wrapper used by the VDBE interpreter.
+pub fn arithmetic_values(op: BinaryOp, l: &Value, r: &Value) -> Value {
+    arithmetic(op, l.clone(), r.clone())
+}
+
 fn arithmetic(op: BinaryOp, l: Value, r: Value) -> Value {
     use BinaryOp::*;
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
