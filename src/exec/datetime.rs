@@ -652,6 +652,121 @@ pub fn unixepoch(args: &[Value]) -> Value {
     }
 }
 
+/// `timediff(A, B)` -> the calendar time difference from B to A, formatted as
+/// `(+|-)YYYY-MM-DD HH:MM:SS.SSS` (the amount of time to add to B to reach A).
+///
+/// Faithful port of SQLite's `timediffFunc`: parse both operands, choose the
+/// sign by ordering them, then carry the calendar breakdown month-by-month so
+/// that uneven month lengths and leap years come out exactly as upstream.
+pub fn timediff(a: &Value, b: &Value) -> Value {
+    // Both operands must parse as a single date/time value (no modifiers).
+    let Some(mut d1) = parse_value(a) else {
+        return Value::Null;
+    };
+    let Some(mut d2) = parse_value(b) else {
+        return Value::Null;
+    };
+    // Like `isDate`, finish both operands to a valid Julian day before reading.
+    d1.compute_jd();
+    d2.compute_jd();
+    d1.compute_ymd_hms();
+    d2.compute_ymd_hms();
+
+    // iJD of 0000-01-01 00:00:00, used to bias the residual so re-deriving Y/M/D
+    // yields the day count (+1) and the clock fields directly.
+    const BIAS: i64 = 148_699_540_800_000;
+    let (sign, mut y, mut m);
+    if d1.ijd >= d2.ijd {
+        // d1 >= d2: carry d2 up toward d1 by whole years then whole months.
+        sign = '+';
+        y = d1.y - d2.y;
+        if y != 0 {
+            d2.y = d1.y;
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        m = d1.m - d2.m;
+        if m < 0 {
+            y -= 1;
+            m += 12;
+        }
+        if m != 0 {
+            d2.m = d1.m;
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        // Back off a month at a time until d2 no longer overshoots d1.
+        while d1.ijd < d2.ijd {
+            m -= 1;
+            if m < 0 {
+                m = 11;
+                y -= 1;
+            }
+            d2.m -= 1;
+            if d2.m < 1 {
+                d2.m = 12;
+                d2.y -= 1;
+            }
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        d1.ijd -= d2.ijd;
+        d1.ijd += BIAS;
+    } else {
+        // d1 < d2: pull d2 down toward d1 by whole years then whole months.
+        sign = '-';
+        y = d2.y - d1.y;
+        if y != 0 {
+            d2.y = d1.y;
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        m = d2.m - d1.m;
+        if m < 0 {
+            y -= 1;
+            m += 12;
+        }
+        if m != 0 {
+            d2.m = d1.m;
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        // Step d2 forward a month at a time until it no longer undershoots d1.
+        while d1.ijd > d2.ijd {
+            m -= 1;
+            if m < 0 {
+                m = 11;
+                y -= 1;
+            }
+            d2.m += 1;
+            if d2.m > 12 {
+                d2.m = 1;
+                d2.y += 1;
+            }
+            d2.valid_jd = false;
+            d2.compute_jd();
+        }
+        d1.ijd = d2.ijd - d1.ijd;
+        d1.ijd += BIAS;
+    }
+
+    d1.valid_ymd = false;
+    d1.valid_hms = false;
+    d1.valid_tz = false;
+    d1.compute_ymd_hms();
+
+    Value::Text(alloc::format!(
+        "{}{:04}-{:02}-{:02} {:02}:{:02}:{:06.3}",
+        sign,
+        y,
+        m,
+        d1.d - 1,
+        d1.h,
+        d1.min,
+        d1.s
+    ))
+}
+
 /// `strftime(format, timevalue, modifier, ...)`.
 pub fn strftime(args: &[Value]) -> Value {
     if args.len() < 2 {
@@ -1172,6 +1287,56 @@ mod tests {
             t("1970-01-01 00:00:00")
         );
         assert_eq!(unixepoch(&[t("1970-01-01 00:00:00")]), Value::Integer(0));
+    }
+
+    #[test]
+    fn timediff_basic() {
+        let td = |a: &str, b: &str| timediff(&t(a), &t(b));
+        // amount to add to B to reach A
+        assert_eq!(
+            td("2020-01-02 00:00:00", "2020-01-01 00:00:00"),
+            t("+0000-00-01 00:00:00.000")
+        );
+        assert_eq!(
+            td("2024-03-01", "2024-02-01"),
+            t("+0000-01-00 00:00:00.000")
+        );
+        // negative sign when A < B
+        assert_eq!(
+            td("2020-01-01", "2020-03-01"),
+            t("-0000-02-00 00:00:00.000")
+        );
+        assert_eq!(
+            td("2025-06-15", "2020-01-01"),
+            t("+0005-05-14 00:00:00.000")
+        );
+        // sub-second
+        assert_eq!(
+            td("2020-01-01 12:30:45.5", "2020-01-01 12:00:00"),
+            t("+0000-00-00 00:30:45.500")
+        );
+        // equal inputs
+        assert_eq!(
+            td("2020-01-01", "2020-01-01"),
+            t("+0000-00-00 00:00:00.000")
+        );
+        // leap-day month boundary (the back-off loop)
+        assert_eq!(
+            td("2024-03-31", "2024-02-29"),
+            t("+0000-01-02 00:00:00.000")
+        );
+        // forward/backward asymmetry around uneven months
+        assert_eq!(
+            td("2159-10-07", "2156-03-17"),
+            t("+0003-06-20 00:00:00.000")
+        );
+        assert_eq!(
+            td("2156-03-17", "2159-10-07"),
+            t("-0003-06-21 00:00:00.000")
+        );
+        // invalid / NULL operands -> NULL
+        assert_eq!(timediff(&t("not a date"), &t("2020-01-01")), Value::Null);
+        assert_eq!(timediff(&Value::Null, &t("2020-01-01")), Value::Null);
     }
 
     #[test]

@@ -557,6 +557,10 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "julianday" => super::datetime::julianday(&v),
         "unixepoch" => super::datetime::unixepoch(&v),
         "strftime" => super::datetime::strftime(&v),
+        "timediff" => {
+            arity(&lname, args, 2)?;
+            super::datetime::timediff(&v[0], &v[1])
+        }
         "printf" | "format" => super::datetime::printf(&v),
         _ => return Err(Error::Unsupported("unknown scalar function")),
     })
