@@ -4774,9 +4774,47 @@ impl Connection {
             let left_width = columns.len();
             let mut joined: Vec<Vec<Value>> = Vec::new();
             let mut right_matched = alloc::vec![false; jrows.len()];
+
+            // Build a hash index on the joined table when the ON predicate has an
+            // equi-join `left.col = right.col`, turning the O(n*m) nested loop into
+            // a probe. The full ON is still evaluated on each candidate (the hash
+            // only narrows which right rows to test), so semantics are unchanged.
+            let equi = join
+                .on
+                .as_ref()
+                .and_then(|on| join_equi_cols(on, &new_columns, left_width));
+            let hash: Option<(usize, alloc::collections::BTreeMap<JoinKey, Vec<usize>>)> = equi
+                .map(|(li, ri_local)| {
+                    let mut map: alloc::collections::BTreeMap<JoinKey, Vec<usize>> =
+                        alloc::collections::BTreeMap::new();
+                    for (ri, right) in jrows.iter().enumerate() {
+                        for k in join_keys_of(&right[ri_local]) {
+                            map.entry(k).or_default().push(ri);
+                        }
+                    }
+                    (li, map)
+                });
+
             for left in &rows {
                 let mut matched = false;
-                for (ri, right) in jrows.iter().enumerate() {
+                // Right rows to test: the hash candidates (sorted, deduped, so the
+                // output order matches the nested loop) or every right row.
+                let candidates: Vec<usize> = match &hash {
+                    Some((li, map)) => {
+                        let mut c: Vec<usize> = Vec::new();
+                        for k in join_keys_of(&left[*li]) {
+                            if let Some(idxs) = map.get(&k) {
+                                c.extend_from_slice(idxs);
+                            }
+                        }
+                        c.sort_unstable();
+                        c.dedup();
+                        c
+                    }
+                    None => (0..jrows.len()).collect(),
+                };
+                for ri in candidates {
+                    let right = &jrows[ri];
                     let mut combined = left.clone();
                     combined.extend(right.iter().cloned());
                     let keep = match &join.on {
@@ -6610,6 +6648,95 @@ fn collect_eq_constraints(
             }
         }
         _ => {}
+    }
+}
+
+/// A hash-join bucket key. Over-keying (one value yielding several keys) is safe:
+/// the join's full `ON` predicate is re-evaluated on every candidate, so extra
+/// keys only cost comparisons — they never drop a real match.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum JoinKey {
+    /// Numeric value, keyed by canonical `f64` bits (so `5` and `5.0` collide).
+    Num(u64),
+    /// Text value (exact bytes).
+    Text(String),
+    /// Blob value.
+    Blob(Vec<u8>),
+}
+
+/// Canonical bits for a number, normalizing `-0.0` to `0.0` so the two compare
+/// equal (as they do in SQL).
+fn num_bits(f: f64) -> u64 {
+    (if f == 0.0 { 0.0 } else { f }).to_bits()
+}
+
+/// The set of hash-join keys a value participates in. A numeric value keys by its
+/// number *and* its text form; text that parses as a number keys by both too — so
+/// affinity-driven cross-type equality (`5 = '5'`) never misses (the `ON` re-eval
+/// rejects the spurious ones). `NULL` keys nothing (it never equi-joins).
+fn join_keys_of(v: &Value) -> Vec<JoinKey> {
+    match v {
+        Value::Null => Vec::new(),
+        Value::Integer(i) => alloc::vec![
+            JoinKey::Num(num_bits(*i as f64)),
+            JoinKey::Text(i.to_string())
+        ],
+        Value::Real(r) => {
+            alloc::vec![
+                JoinKey::Num(num_bits(*r)),
+                JoinKey::Text(eval::format_real(*r))
+            ]
+        }
+        Value::Text(s) => {
+            let mut keys = alloc::vec![JoinKey::Text(s.clone())];
+            match eval::to_number(&Value::Text(s.clone())) {
+                Value::Integer(i) => keys.push(JoinKey::Num(num_bits(i as f64))),
+                Value::Real(r) => keys.push(JoinKey::Num(num_bits(r))),
+                _ => {}
+            }
+            keys
+        }
+        Value::Blob(b) => alloc::vec![JoinKey::Blob(b.clone())],
+    }
+}
+
+/// Extract a single equi-join `left.col = right.col` from the top-level `AND`
+/// conjuncts of an `ON` predicate, returning `(left column index, right column
+/// index within the joined table)`. Both columns must use `BINARY` collation
+/// (otherwise text equality is collation-sensitive and a hash on exact bytes
+/// could miss a match — fall back to the nested loop). `cols` is the combined
+/// left+right column list; `left_width` is the number of left columns.
+fn join_equi_cols(on: &Expr, cols: &[ColumnInfo], left_width: usize) -> Option<(usize, usize)> {
+    match on {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => join_equi_cols(left, cols, left_width)
+            .or_else(|| join_equi_cols(right, cols, left_width)),
+        Expr::Paren(inner) => join_equi_cols(inner, cols, left_width),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            let a = col_index(left, cols)?;
+            let b = col_index(right, cols)?;
+            let binary = |i: usize| cols[i].collation == crate::value::Collation::Binary;
+            let (l, r) = if a < left_width && b >= left_width {
+                (a, b)
+            } else if b < left_width && a >= left_width {
+                (b, a)
+            } else {
+                return None;
+            };
+            if binary(l) && binary(r) {
+                Some((l, r - left_width))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

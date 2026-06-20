@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track B: **hash join**. A two-table join with an equi-join `left.col = right.col`
+  in its `ON` now builds a hash index on the joined table and probes it per left
+  row (the full `ON` is still re-evaluated on each candidate, so semantics are
+  unchanged), turning the O(n·m) nested loop into a probe. Numeric keys collide
+  across `INTEGER`/`REAL` (`5` and `5.0`) and across affinity (`5`/`'5'`) via
+  multi-keying; non-`BINARY` collations fall back to the nested loop. Verified
+  against `sqlite3` (numeric/text/NOCASE/duplicate-key/NULL/outer/self joins).
+- Fix: pre-comparison type affinity no longer text-coerces a typeless (BLOB/NONE)
+  column against a TEXT column — `none_col = text_col` now matches SQLite (e.g.
+  integer `1` vs `'1'` is false). `expr_affinity` distinguishes a literal's
+  absence of affinity from a column's BLOB affinity.
+
 - Track B: **`IN`-list index seeks**. A single-table query with `column IN (c1,
   c2, …)` now seeks each constant through an index on that column (or the rowid
   b-tree for an `INTEGER PRIMARY KEY`), unions the rowids, and fetches the rows,

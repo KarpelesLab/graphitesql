@@ -166,8 +166,10 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
 - **Cost-based planning** — ✅ statistics now drive index *choice*, ✅ range scans
   (`<`/`>`/`BETWEEN` seek an index between bounds via `index_range_rowids`), ✅
   `IN`-list driven seeks (per-value index/rowid seeks, unioned), ✅ the
-  **OR-by-union** optimization (each disjunct seeks, rowids unioned);
-  *remaining:* **join order** (today joins run in `FROM` order as nested loops);
+  **OR-by-union** optimization (each disjunct seeks, rowids unioned), ✅ a
+  **hash join** for equi-join `ON` conditions (builds a hash on the joined table,
+  probes per left row; falls back to the nested loop for non-equi/non-binary
+  cases); *remaining:* **join order** (joins still run in `FROM` order);
   covering-index detection; auto-indexes for unindexed joins; skip-scan.
   *Ref:* `where.c`, `wherecode.c`, `whereexpr.c`.
 - **VDBE bytecode IR** — 🚧 *spike landed* (`exec::vdbe`): a register-machine

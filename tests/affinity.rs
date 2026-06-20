@@ -33,16 +33,16 @@ fn comparison_affinity_matches_sqlite3() {
 
     // Column-vs-column (affinity pairs) and column-vs-literal cases.
     let exprs = [
-        "none_col = t",  // BLOB vs TEXT: no coercion -> 1 = '1' false
-        "t = none_col",  // symmetric
-        "i = t",         // INTEGER vs TEXT: numeric applied -> true
-        "none_col = i",  // BLOB vs INTEGER: numeric applied -> true
-        "r = t",         // REAL vs TEXT: numeric applied -> true
+        "none_col = t",   // BLOB vs TEXT: no coercion -> 1 = '1' false
+        "t = none_col",   // symmetric
+        "i = t",          // INTEGER vs TEXT: numeric applied -> true
+        "none_col = i",   // BLOB vs INTEGER: numeric applied -> true
+        "r = t",          // REAL vs TEXT: numeric applied -> true
         "none_col = '1'", // BLOB col vs text literal: no coercion (col holds int)
-        "none_col = 1",  // BLOB col vs int literal: int vs int -> true
-        "t = 1",         // TEXT col vs int literal: text-coerce literal -> true
-        "t = '1'",       // TEXT vs text literal -> true
-        "i = '5'",       // INTEGER col vs text literal -> numeric -> true
+        "none_col = 1",   // BLOB col vs int literal: int vs int -> true
+        "t = 1",          // TEXT col vs int literal: text-coerce literal -> true
+        "t = '1'",        // TEXT vs text literal -> true
+        "i = '5'",        // INTEGER col vs text literal -> numeric -> true
     ];
     for e in exprs {
         let q = format!("SELECT {e} FROM x ORDER BY rowid");

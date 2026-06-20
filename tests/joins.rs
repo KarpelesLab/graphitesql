@@ -97,3 +97,84 @@ fn aliased_join() {
     assert_eq!(r.rows.len(), 1);
     assert_eq!(r.rows[0][0], Value::Text("grace".into()));
 }
+
+/// Hash-join correctness across the tricky cases the equi-join hash must handle:
+/// integer/real numeric equality, affinity-driven cross-type (`int = text`),
+/// NOCASE collation (must fall back to the nested loop and still be correct),
+/// duplicate keys, NULLs, and all outer-join kinds. Compared byte-for-byte with
+/// real sqlite3.
+#[test]
+fn hash_join_matches_sqlite3() {
+    use std::process::Command;
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-hashjoin-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let setup = "\
+        CREATE TABLE l(id INTEGER PRIMARY KEY, k, t TEXT, c TEXT COLLATE NOCASE);\
+        CREATE TABLE r(id INTEGER PRIMARY KEY, k, t TEXT, c TEXT COLLATE NOCASE);\
+        INSERT INTO l(k,t,c) VALUES (1,'1','A'),(2,'2','b'),(2,'2','B'),(3,'x','c'),(5,'5','d'),(NULL,'n','e'),(5.0,'5.0','f');\
+        INSERT INTO r(k,t,c) VALUES (1,'1','a'),(2,'2','B'),(5,'5','D'),(5,'x','d'),(NULL,'m','g'),(2.0,'2','h');";
+    Command::new("sqlite3")
+        .arg(&path)
+        .arg(setup)
+        .output()
+        .unwrap();
+
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+
+    let queries = [
+        // Numeric equi-join (int and real keys collide: 5 vs 5.0, 2 vs 2.0).
+        "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k ORDER BY l.id, r.id",
+        // Affinity cross-type: numeric column = text column.
+        "SELECT l.id, r.id FROM l JOIN r ON l.k = r.t ORDER BY l.id, r.id",
+        "SELECT l.id, r.id FROM l JOIN r ON l.t = r.k ORDER BY l.id, r.id",
+        // Pure text equi-join.
+        "SELECT l.id, r.id FROM l JOIN r ON l.t = r.t ORDER BY l.id, r.id",
+        // NOCASE collation join (must fall back; 'A'='a' etc.).
+        "SELECT l.id, r.id FROM l JOIN r ON l.c = r.c ORDER BY l.id, r.id",
+        // Extra non-equi condition alongside the equi key.
+        "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k AND l.id < r.id ORDER BY l.id, r.id",
+        // Outer joins exercise the matched-tracking under the hash.
+        "SELECT l.id, r.id FROM l LEFT JOIN r ON l.k = r.k ORDER BY l.id, r.id",
+        "SELECT l.id, r.id FROM l LEFT JOIN r ON l.k = r.k WHERE r.id IS NULL ORDER BY l.id",
+        "SELECT count(*) FROM l JOIN r ON l.k = r.k",
+        // Self-join.
+        "SELECT a.id, b.id FROM l a JOIN l b ON a.k = b.k AND a.id < b.id ORDER BY a.id, b.id",
+    ];
+    let render = |v: &Value| match v {
+        Value::Null => String::new(),
+        Value::Integer(i) => i.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Real(r) => format!("{r}"),
+        Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+    };
+    for q in queries {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(&path)
+                .arg(format!("{q};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = g
+            .query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.iter().map(render).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(got, want, "hash-join diverged on {q}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
