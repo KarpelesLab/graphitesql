@@ -147,10 +147,8 @@ fn to_number_strict(v: &Value) -> Option<Value> {
             let t = s.trim();
             if let Ok(i) = t.parse::<i64>() {
                 Some(Value::Integer(i))
-            } else if let Ok(f) = t.parse::<f64>() {
-                Some(Value::Real(f))
             } else {
-                None
+                parse_decimal_f64(t).map(Value::Real)
             }
         }
         _ => None,
@@ -1073,12 +1071,27 @@ pub fn to_number(v: &Value) -> Value {
     }
 }
 
+/// Parse `t` as an f64 the way SQLite's text→number conversion does: like
+/// `f64::from_str` but rejecting the word forms (`inf`, `infinity`, `nan`) that
+/// Rust accepts and SQLite does not. A numeric *overflow* such as `1e400` is
+/// still a valid number and yields ±Inf.
+pub(crate) fn parse_decimal_f64(t: &str) -> Option<f64> {
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    match body.as_bytes().first() {
+        // A SQLite numeric literal begins with a digit or a decimal point;
+        // anything else ("inf", "nan", "0x…" — Rust rejects hex anyway) is not a
+        // number to SQLite.
+        Some(c) if c.is_ascii_digit() || *c == b'.' => t.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
 fn parse_number(s: &str) -> Value {
     let t = s.trim();
     if let Ok(i) = t.parse::<i64>() {
         return Value::Integer(i);
     }
-    if let Ok(f) = t.parse::<f64>() {
+    if let Some(f) = parse_decimal_f64(t) {
         return Value::Real(f);
     }
     // SQLite uses the longest valid numeric prefix; approximate that.

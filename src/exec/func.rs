@@ -194,7 +194,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             let num = match &v[0] {
                 Value::Integer(i) => Some(*i as f64),
                 Value::Real(r) => Some(*r),
-                Value::Text(s) => s.trim().parse::<f64>().ok(),
+                Value::Text(s) => eval::parse_decimal_f64(s.trim()),
                 _ => None,
             };
             match num {
