@@ -421,9 +421,11 @@ impl Parser {
             while self.eat(&Token::Comma) {
                 group_by.push(self.expr()?);
             }
-            if self.eat_kw("having") {
-                having = Some(self.expr()?);
-            }
+        }
+        // HAVING may appear without GROUP BY (the whole result is one group),
+        // matching SQLite.
+        if self.eat_kw("having") {
+            having = Some(self.expr()?);
         }
 
         // `WINDOW name AS (spec), …` named-window definitions.

@@ -5163,6 +5163,13 @@ impl Connection {
         };
 
         let aggregated = !sel.group_by.is_empty() || self.has_aggregate(sel);
+        // A HAVING clause requires an aggregate context (a GROUP BY or any
+        // aggregate function); SQLite rejects it on a plain query.
+        if sel.having.is_some() && !aggregated {
+            return Err(Error::Error(
+                "HAVING clause on a non-aggregate query".into(),
+            ));
+        }
         let (out_labels, mut out) = if aggregated {
             self.eval_aggregated(sel, &columns, rows, params)?
         } else {
