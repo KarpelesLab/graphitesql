@@ -416,6 +416,116 @@ fn corpus() -> Vec<String> {
         q.push(format!("SELECT id FROM t WHERE {p} ORDER BY id;"));
     }
 
+    // 26) Scalar-expression edge cases (mixed-type arithmetic and coercion,
+    // string-function bounds, rounding, CAST corners) evaluated as constants.
+    for e in [
+        // Mixed-type arithmetic: text operands coerce to numbers (or 0).
+        "3 + '4'",
+        "'10' - 2",
+        "'3.5' * 2",
+        "'abc' + 1",
+        "2 + '5xyz'",
+        "10 / 4",
+        "10 / 4.0",
+        "10 % 3",
+        "-10 % 3",
+        "10 % -3",
+        "5 / 0",
+        "5 % 0",
+        "5.0 / 0",
+        // Comparison coercions between literals.
+        "'2' < '10'",
+        "2 < 10",
+        "'2' < 10",
+        "'a' < 'b'",
+        "1 = 1.0",
+        "'1' = 1",
+        // round / abs / sign edge cases.
+        "round(2.5)",
+        "round(3.5)",
+        "round(-2.5)",
+        "round(2.345, 2)",
+        "round(2.345, -1)",
+        "abs(-9223372036854775807)",
+        "sign(-3.2)",
+        "sign(0)",
+        // substr bounds.
+        "substr('hello', 0)",
+        "substr('hello', -3, 2)",
+        "substr('hello', 2, -1)",
+        "substr('hello', 3, 100)",
+        "substr('', 1, 1)",
+        // instr / replace / trim / upper-lower corners.
+        "instr('hello', '')",
+        "instr('', 'x')",
+        "instr('banana', 'na')",
+        "replace('aaa', 'a', 'bb')",
+        "replace('abc', '', 'x')",
+        "trim('  x  ')",
+        "trim('xxhixx', 'x')",
+        "ltrim('--y', '-')",
+        "rtrim('z--', '-')",
+        // hex / quote / typeof / char / unicode.
+        "hex('AB')",
+        "hex(255)",
+        "quote('a''b')",
+        "quote(NULL)",
+        "quote(3.5)",
+        "typeof(1)",
+        "typeof(1.0)",
+        "typeof('x')",
+        "typeof(NULL)",
+        "typeof(x'00')",
+        "char(72, 105)",
+        "unicode('A')",
+        // CAST corners.
+        "CAST('12abc' AS INTEGER)",
+        "CAST('3.9' AS INTEGER)",
+        "CAST(3.9 AS INTEGER)",
+        "CAST('  42  ' AS INTEGER)",
+        "CAST('xyz' AS REAL)",
+        "CAST(65 AS TEXT)",
+        "CAST(x'4142' AS TEXT)",
+        "CAST('1e3' AS REAL)",
+        // coalesce / nullif / iif / boolean-ish.
+        "coalesce(NULL, 2.0, 3)",
+        "nullif('a', 'a')",
+        "iif(1 < 2, 'y', 'n')",
+        "1 AND 2",
+        "0 OR '3'",
+        "NOT 'abc'",
+        "NOT ''",
+        // printf / format.
+        "printf('%d-%s', 5, 'x')",
+        "printf('%.2f', 3.14159)",
+        "printf('%5d', 42)",
+        "format('%x', 255)",
+    ] {
+        q.push(format!("SELECT {e};"));
+    }
+
+    // 27) Date/time functions with fixed (deterministic) inputs.
+    for e in [
+        "date('2024-02-29')",
+        "date('2024-01-31', '+1 month')",
+        "date('2024-03-31', '-1 month')",
+        "date('2024-02-29', '+1 year')",
+        "time('2024-01-01 13:45:30')",
+        "datetime('2024-06-15 08:30:00', '+90 minutes')",
+        "datetime('2024-06-15', '+1 day', '-2 hours')",
+        "strftime('%Y-%m-%d %H:%M', '2024-06-15 08:30:00')",
+        "strftime('%j', '2024-12-31')",
+        "strftime('%w', '2024-06-16')",
+        "julianday('2000-01-01')",
+        "date('2024-06-15', 'start of month')",
+        "date('2024-06-15', 'weekday 0')",
+        "strftime('%s', '1970-01-02 00:00:00')",
+        "datetime(0, 'unixepoch')",
+        "datetime(86400, 'unixepoch')",
+    ] {
+        q.push(format!("SELECT {e};"));
+    }
+
     q
 }
 
