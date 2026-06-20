@@ -1120,23 +1120,49 @@ impl Connection {
                 "database {name} is already in use"
             )));
         }
-        if !(path.is_empty() || path.eq_ignore_ascii_case(":memory:")) {
-            return Err(Error::Unsupported("ATTACH of a file database"));
-        }
-        // A fresh in-memory database (same pattern as `open_memory`).
-        let vfs = crate::vfs::memory::MemoryVfs::new();
-        let f = vfs.open(name, OpenFlags::READ_WRITE_CREATE)?;
-        let mut db = WritePager::create(f, None, 4096)?;
-        db.commit()?;
-        let backend = Backend::Write(Box::new(db));
+        let (backend, file) = if path.is_empty() || path.eq_ignore_ascii_case(":memory:") {
+            // A fresh in-memory database (same pattern as `open_memory`).
+            let vfs = crate::vfs::memory::MemoryVfs::new();
+            let f = vfs.open(name, OpenFlags::READ_WRITE_CREATE)?;
+            let mut db = WritePager::create(f, None, 4096)?;
+            db.commit()?;
+            (Backend::Write(Box::new(db)), String::new())
+        } else {
+            (self.open_attached_file(&path)?, path)
+        };
         let schema = Schema::read(backend.source())?;
         self.attached.push(AttachedDb {
             name: name.to_string(),
-            file: String::new(),
+            file,
             backend,
             schema,
         });
         Ok(())
+    }
+
+    /// Open (or create, if absent/empty) a real file as an attached database's
+    /// backend. Requires the `std` file VFS.
+    #[cfg(feature = "std")]
+    fn open_attached_file(&self, path: &str) -> Result<Backend> {
+        let vfs = crate::vfs::std_file::StdVfs::new();
+        let main = vfs.open(path, OpenFlags::READ_WRITE_CREATE)?;
+        let journal = vfs.open(&journal_path(path), OpenFlags::READ_WRITE_CREATE)?;
+        // Rollback-journal (non-WAL) mode: commits land directly in the main
+        // file, so the attached database is immediately readable by sqlite3
+        // without needing a WAL checkpoint when the connection closes.
+        let db = if main.size()? == 0 {
+            let mut db = WritePager::create(main, Some(journal), 4096)?;
+            db.commit()?;
+            db
+        } else {
+            WritePager::open(main, Some(journal))?
+        };
+        Ok(Backend::Write(Box::new(db)))
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn open_attached_file(&self, _path: &str) -> Result<Backend> {
+        Err(Error::Unsupported("ATTACH of a file database requires std"))
     }
 
     /// `DETACH <name>`: close an attached database. `main`/`temp` cannot be
@@ -1363,6 +1389,17 @@ impl Connection {
         if let Some(select) = &ct.as_select {
             return self.exec_create_table_as_select(ct, select);
         }
+        // The schema-qualified form (`CREATE TABLE aux.t …`) must be stored in the
+        // target database's catalog WITHOUT the `schema.` prefix — otherwise the
+        // stored SQL is invalid in that database's own namespace (and unreadable
+        // by sqlite3). Reprint the bare-name form when a qualifier was present.
+        let reprinted;
+        let sql_text = if ct.schema.is_some() {
+            reprinted = sql::print::create_table(ct);
+            reprinted.as_str()
+        } else {
+            sql_text
+        };
         if self.schema.table(&ct.name).is_some() {
             if ct.if_not_exists {
                 return Ok(());

@@ -248,3 +248,56 @@ fn temp_tables_do_not_persist_to_a_file() {
     assert_eq!(names, vec![Value::Text("persist".into())]);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn attach_file_database_cross_engine() {
+    let sqlite = std::process::Command::new("sqlite3").arg("--version").output().is_ok();
+
+    let mut p = std::env::temp_dir();
+    p.push(format!("graphitesql-attach-file-{}.db", std::process::id()));
+    let path = p.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+
+    // Create + populate a brand-new file via ATTACH, then check sqlite3 reads it.
+    {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(&format!("ATTACH '{path}' AS d")).unwrap();
+        c.execute("CREATE TABLE d.t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        c.execute("INSERT INTO d.t VALUES(1,'hello'),(2,'world')").unwrap();
+        // database_list reports the file path for the attachment.
+        let r = c.query("PRAGMA database_list").unwrap();
+        assert_eq!(r.rows[1][1], Value::Text("d".into()));
+        assert_eq!(r.rows[1][2], Value::Text(path.clone()));
+    }
+    if sqlite {
+        let out = std::process::Command::new("sqlite3")
+            .arg(&path)
+            .arg("PRAGMA integrity_check; SELECT id||':'||v FROM t ORDER BY id;")
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("ok"), "integrity: {s}");
+        assert!(s.contains("1:hello") && s.contains("2:world"), "rows: {s}");
+    }
+
+    // Re-attach the existing file and read it back; a further write round-trips.
+    {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(&format!("ATTACH '{path}' AS d")).unwrap();
+        assert_eq!(
+            c.query("SELECT v FROM d.t WHERE id=1").unwrap().rows[0][0],
+            Value::Text("hello".into())
+        );
+        c.execute("INSERT INTO d.t VALUES(3,'again')").unwrap();
+    }
+    if sqlite {
+        let out = std::process::Command::new("sqlite3")
+            .arg(&path)
+            .arg("SELECT count(*) FROM t;")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+}

@@ -210,17 +210,16 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
   sqlite3. *Remaining within C3: cross-database **joins** (need two backends at
   once — guarded as `Unsupported` today), qualified `ALTER`, and `WITHOUT ROWID`
   cross-db reads.*
-- **C4 — `TEMP` tables/indexes/triggers.** A lazily-created `temp` database (seq
-  1); `CREATE TEMP …` targets it; `sqlite_temp_schema`/`sqlite_temp_master`;
-  unqualified-name resolution searches `temp`→`main`. *Design:* map `TEMP` to a
-  `schema = "temp"` qualifier (reusing C3's swap path for the write) and store
-  the temp db in a dedicated slot; generalize `resolve_db`/`swap_db`/`scan_db`
-  to a `DbRef { Main, Temp, Attached(i) }`. The substantive part is making
-  **unqualified** name resolution check temp before main (the query hot path) —
-  do it behind one resolver so the change is localized and the full differential
-  suite stays green.
+- ✅ **C4 — `TEMP` tables.** A lazily-created in-memory `temp` database (seq 1);
+  `CREATE TEMP TABLE` targets it (modeled as a `schema = "temp"` qualifier);
+  unqualified names resolve `temp`→`main` (a temp table shadows main);
+  `sqlite_temp_master`/`sqlite_temp_schema`/`temp.sqlite_master` read the temp
+  catalog; TEMP no longer persists to a file database. *Remaining: `CREATE TEMP
+  INDEX/VIEW/TRIGGER` still target main.*
 - **C5 — `ATTACH 'file.db' AS x`.** Open a real file as an attached database
-  (`std`), reusing the pager; cross-database transaction semantics.
+  (`std` only — needs a file VFS), reusing the pager; cross-database transaction
+  semantics. The registry, qualified read/write, and isolation are already in
+  place (C1–C4); C5 is opening a file backend instead of an in-memory one.
 
 *Storage:*
 
