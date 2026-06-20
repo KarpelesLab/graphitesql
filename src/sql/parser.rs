@@ -889,14 +889,18 @@ impl Parser {
     fn create(&mut self) -> Result<Statement> {
         self.expect_kw("create")?;
         let unique = self.eat_kw("unique");
-        // Accept TEMP/TEMPORARY before TABLE/VIEW/TRIGGER. graphitesql has a single
-        // schema, so a temporary object is created like an ordinary one.
-        let _temp = self.eat_kw("temp") || self.eat_kw("temporary");
+        // `TEMP`/`TEMPORARY` before TABLE/VIEW/TRIGGER routes the object to the
+        // `temp` database (modeled as a `schema = "temp"` qualifier).
+        let temp = self.eat_kw("temp") || self.eat_kw("temporary");
         if self.eat_kw("table") {
             if unique {
                 return Err(self.err("UNIQUE is not valid for CREATE TABLE"));
             }
-            return Ok(Statement::CreateTable(self.create_table()?));
+            let mut ct = self.create_table()?;
+            if temp && ct.schema.is_none() {
+                ct.schema = Some("temp".into());
+            }
+            return Ok(Statement::CreateTable(ct));
         }
         if self.eat_kw("index") {
             return Ok(Statement::CreateIndex(self.create_index(unique)?));

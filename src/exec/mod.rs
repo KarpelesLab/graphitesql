@@ -82,8 +82,11 @@ pub struct Connection {
     main_file: String,
     /// Attached databases (`ATTACH … AS name`), in attachment order, each with
     /// its own backend and schema. The `main` database is the fields above; this
-    /// list holds everything attached after it. *(Populated from C2 onward.)*
+    /// list holds everything attached after it.
     attached: Vec<AttachedDb>,
+    /// The `temp` database (`CREATE TEMP …`), created lazily on first use and
+    /// invisible to other connections. Reported at seq 1 by `database_list`.
+    temp_db: Option<AttachedDb>,
     /// True between `BEGIN` and `COMMIT`/`ROLLBACK`; suppresses autocommit.
     in_tx: bool,
     /// A stack of materialized `WITH` common table expressions in scope, innermost
@@ -115,6 +118,15 @@ pub struct Connection {
     changes: core::cell::Cell<i64>,
     /// Rows modified since the connection opened (`total_changes()`).
     total_changes: core::cell::Cell<i64>,
+}
+
+/// Which database an operation targets: `main`, the lazily-created `temp`
+/// database, or an attached database by index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DbRef {
+    Main,
+    Temp,
+    Attached(usize),
 }
 
 /// An attached database (`ATTACH 'file' AS name`): its own storage and catalog.
@@ -158,6 +170,7 @@ impl Connection {
             schema,
             main_file: String::new(),
             attached: Vec::new(),
+            temp_db: None,
             in_tx: false,
             cte_env: core::cell::RefCell::new(Vec::new()),
             outer_scope: core::cell::RefCell::new(Vec::new()),
@@ -180,6 +193,7 @@ impl Connection {
             schema,
             main_file: String::new(),
             attached: Vec::new(),
+            temp_db: None,
             in_tx: false,
             cte_env: core::cell::RefCell::new(Vec::new()),
             outer_scope: core::cell::RefCell::new(Vec::new()),
@@ -416,8 +430,14 @@ impl Connection {
             Value::Text("main".into()),
             Value::Text(self.main_file.clone()),
         ]];
-        // SQLite reserves seq 1 for `temp` (shown only when it exists — C4), so
-        // attached databases begin at seq 2.
+        // `temp` occupies seq 1 once it exists; attached databases begin at seq 2.
+        if self.temp_db.is_some() {
+            rows.push(alloc::vec![
+                Value::Integer(1),
+                Value::Text("temp".into()),
+                Value::Text(String::new()),
+            ]);
+        }
         for (i, db) in self.attached.iter().enumerate() {
             rows.push(alloc::vec![
                 Value::Integer((i + 2) as i64),
@@ -902,38 +922,63 @@ impl Connection {
             _ => {}
         }
 
-        // A schema-qualified DDL/DML statement (`… aux.t`) runs against that
-        // database: a single write touches exactly one database, so we make it
-        // the active `main` for the duration (swapping back afterwards, even on
-        // error). Cross-database *joins* are handled separately in the read path.
-        match self.target_db(&stmt)? {
-            None => self.exec_parsed(stmt, sql, params),
-            Some(i) => {
-                self.swap_db(i);
+        // A DDL/DML statement targeting a non-main database (`… aux.t`,
+        // `CREATE TEMP …`, or an unqualified name that a temp table shadows) runs
+        // against that database: a single write touches exactly one database, so
+        // we make it the active `main` for the duration (swapping back
+        // afterwards, even on error). Cross-database *joins* are handled
+        // separately in the read path.
+        let target = self.target_db(&stmt)?;
+        if target == DbRef::Temp {
+            self.ensure_temp()?;
+        }
+        match target {
+            DbRef::Main => self.exec_parsed(stmt, sql, params),
+            other => {
+                self.swap_db(other);
                 let r = self.exec_parsed(stmt, sql, params);
-                self.swap_db(i);
+                self.swap_db(other);
                 r
             }
         }
     }
 
-    /// The attached-database index a schema-qualified DDL/DML statement targets
-    /// (`None` for the main database / an unqualified statement).
-    fn target_db(&self, stmt: &Statement) -> Result<Option<usize>> {
-        let schema = match stmt {
-            Statement::CreateTable(s) => s.schema.as_deref(),
-            Statement::Insert(s) => s.schema.as_deref(),
-            Statement::Update(s) => s.schema.as_deref(),
-            Statement::Delete(s) => s.schema.as_deref(),
-            Statement::Drop(s) => s.schema.as_deref(),
-            _ => None,
+    /// The database a DDL/DML statement targets: an explicit `schema.` qualifier
+    /// (including `CREATE TEMP …` → `Temp`), else — for DML/`DROP` — the temp
+    /// database when it shadows the unqualified name, else `main`.
+    fn target_db(&self, stmt: &Statement) -> Result<DbRef> {
+        let resolved = |s: Option<&str>, name: &str| -> Result<DbRef> {
+            match s {
+                Some(_) => self.resolve_db(s),
+                None => Ok(self.unqualified_db(name)),
+            }
         };
-        self.resolve_db(schema)
+        match stmt {
+            // CREATE never temp-shadows: a bare `CREATE TABLE t` goes to main.
+            Statement::CreateTable(s) => self.resolve_db(s.schema.as_deref()),
+            Statement::Insert(s) => resolved(s.schema.as_deref(), &s.table),
+            Statement::Update(s) => resolved(s.schema.as_deref(), &s.table),
+            Statement::Delete(s) => resolved(s.schema.as_deref(), &s.table),
+            Statement::Drop(s) => resolved(s.schema.as_deref(), &s.name),
+            _ => Ok(DbRef::Main),
+        }
     }
 
-    /// Make attached database `i` the active `main` (or swap it back) by
-    /// exchanging the backend and schema. Used around a qualified write.
-    fn swap_db(&mut self, i: usize) {
+    /// Make `db` the active `main` (or swap it back) by exchanging the backend
+    /// and schema. Used around a write to a non-main database.
+    fn swap_db(&mut self, db: DbRef) {
+        match db {
+            DbRef::Main => {}
+            DbRef::Temp => {
+                let t = self.temp_db.as_mut().expect("temp db exists");
+                core::mem::swap(&mut self.backend, &mut t.backend);
+                core::mem::swap(&mut self.schema, &mut t.schema);
+            }
+            DbRef::Attached(i) => self.swap_attached(i),
+        }
+    }
+
+    fn swap_attached(&mut self, i: usize) {
         core::mem::swap(&mut self.backend, &mut self.attached[i].backend);
         core::mem::swap(&mut self.schema, &mut self.attached[i].schema);
     }
@@ -5724,8 +5769,33 @@ impl Connection {
             return Err(Error::Unsupported("cross-database join"));
         }
         if from.joins.is_empty() && from.first.subquery.is_none() && from.first.tvf_args.is_none() {
-            if let Some(idx) = self.resolve_db(from.first.schema.as_deref())? {
-                return self.scan_db_table(idx, &from.first.name, from.first.alias.as_deref());
+            // An explicit qualifier picks the database; an unqualified name may be
+            // shadowed by a temp table. A non-main database is read by
+            // materializing the table through its own backend.
+            // `sqlite_temp_master`/`sqlite_temp_schema` read the temp catalog
+            // (empty when no temp database exists).
+            if from.first.schema.is_none() && is_temp_schema_table(&from.first.name) {
+                let alias = from.first.alias.as_deref();
+                return match &self.temp_db {
+                    Some(_) => self.scan_db_table(DbRef::Temp, "sqlite_master", alias),
+                    None => Ok((
+                        schema_table_meta(alias.unwrap_or(&from.first.name)).columns,
+                        Vec::new(),
+                    )),
+                };
+            }
+            let db = match from.first.schema.as_deref() {
+                Some(_) => self.resolve_db(from.first.schema.as_deref())?,
+                // Don't let a temp table shadow a CTE or view of the same name.
+                None if self.lookup_cte(&from.first.name, None).is_none()
+                    && !self.is_view(&from.first.name) =>
+                {
+                    self.unqualified_db(&from.first.name)
+                }
+                None => DbRef::Main,
+            };
+            if db != DbRef::Main {
+                return self.scan_db_table(db, &from.first.name, from.first.alias.as_deref());
             }
         }
         // A table-valued function used as the sole source.
@@ -6356,38 +6426,85 @@ impl Connection {
         }
     }
 
-    /// Resolve a `schema.` qualifier to a database: `None`/`main` → the main
-    /// database (`Ok(None)`); an attached name → `Ok(Some(index))`; `temp` is not
-    /// yet implemented (C4); an unknown name is an error.
-    fn resolve_db(&self, schema: Option<&str>) -> Result<Option<usize>> {
+    /// Resolve a `schema.` qualifier to a database: `None`/`main` → `Main`;
+    /// `temp`/`temporary` → `Temp`; an attached name → `Attached(index)`; an
+    /// unknown name is an error.
+    fn resolve_db(&self, schema: Option<&str>) -> Result<DbRef> {
         match schema {
-            None => Ok(None),
-            Some(s) if s.eq_ignore_ascii_case("main") => Ok(None),
-            Some(s) if s.eq_ignore_ascii_case("temp") => Err(Error::Unsupported("temp database")),
+            None => Ok(DbRef::Main),
+            Some(s) if s.eq_ignore_ascii_case("main") => Ok(DbRef::Main),
+            Some(s) if s.eq_ignore_ascii_case("temp") || s.eq_ignore_ascii_case("temporary") => {
+                Ok(DbRef::Temp)
+            }
             Some(s) => self
                 .attached
                 .iter()
                 .position(|d| d.name.eq_ignore_ascii_case(s))
-                .map(Some)
+                .map(DbRef::Attached)
                 .ok_or_else(|| Error::Error(alloc::format!("unknown database {s}"))),
         }
     }
 
-    /// Materialize a rowid table from attached database `db_idx` into
-    /// `(columns, rows)` — the cross-database read path (C3). Reads through the
-    /// attached database's own backend, so its page numbers resolve correctly.
+    /// The schema catalog and backend for a resolved database. `Temp` requires
+    /// the temp database to exist (created by [`ensure_temp`](Self::ensure_temp)).
+    fn db_parts(&self, db: DbRef) -> (&Schema, &Backend) {
+        match db {
+            DbRef::Main => (&self.schema, &self.backend),
+            DbRef::Temp => {
+                let t = self.temp_db.as_ref().expect("temp db exists");
+                (&t.schema, &t.backend)
+            }
+            DbRef::Attached(i) => (&self.attached[i].schema, &self.attached[i].backend),
+        }
+    }
+
+    /// The database an *unqualified* table name resolves to: the `temp` database
+    /// when it holds the table (temp shadows main), else `main`.
+    fn unqualified_db(&self, name: &str) -> DbRef {
+        if let Some(t) = &self.temp_db {
+            if t.schema.table(name).is_some() {
+                return DbRef::Temp;
+            }
+        }
+        DbRef::Main
+    }
+
+    /// Create the `temp` database if it does not yet exist (a fresh in-memory
+    /// database, like an attachment).
+    fn ensure_temp(&mut self) -> Result<()> {
+        if self.temp_db.is_some() {
+            return Ok(());
+        }
+        let vfs = crate::vfs::memory::MemoryVfs::new();
+        let f = vfs.open("temp", OpenFlags::READ_WRITE_CREATE)?;
+        let mut db = WritePager::create(f, None, 4096)?;
+        db.commit()?;
+        let backend = Backend::Write(Box::new(db));
+        let schema = Schema::read(backend.source())?;
+        self.temp_db = Some(AttachedDb {
+            name: "temp".into(),
+            file: String::new(),
+            backend,
+            schema,
+        });
+        Ok(())
+    }
+
+    /// Materialize a rowid table from a non-main database into `(columns, rows)`
+    /// — the cross-database read path (C3/C4). Reads through that database's own
+    /// backend, so its page numbers resolve correctly.
     fn scan_db_table(
         &self,
-        db_idx: usize,
+        db: DbRef,
         name: &str,
         alias: Option<&str>,
     ) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
-        let db = &self.attached[db_idx];
-        let meta = self.table_meta_in(&db.schema, name, alias)?;
+        let (schema, backend) = self.db_parts(db);
+        let meta = self.table_meta_in(schema, name, alias)?;
         if meta.without_rowid {
             return Err(Error::Unsupported("cross-database WITHOUT ROWID table"));
         }
-        let source = db.backend.source();
+        let source = backend.source();
         let encoding = source.header().text_encoding;
         let mut rows = Vec::new();
         let mut cur = TableCursor::new(source, meta.root);
@@ -7448,6 +7565,13 @@ fn value_to_literal_expr(v: Value) -> Expr {
 /// under both the modern `sqlite_schema` and the historical `sqlite_master`.
 fn is_main_schema_table(name: &str) -> bool {
     name.eq_ignore_ascii_case("sqlite_schema") || name.eq_ignore_ascii_case("sqlite_master")
+}
+
+/// Whether `name` is the temp-database catalog (`sqlite_temp_schema` /
+/// `sqlite_temp_master`), which reads the `temp` database's `sqlite_master`.
+fn is_temp_schema_table(name: &str) -> bool {
+    name.eq_ignore_ascii_case("sqlite_temp_schema")
+        || name.eq_ignore_ascii_case("sqlite_temp_master")
 }
 
 /// Reject a direct DML write to the schema catalog, as SQLite does (the catalog
