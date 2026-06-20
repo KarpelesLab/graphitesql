@@ -4441,7 +4441,14 @@ impl Connection {
             }
         }
         let stats = self.stat1_map();
-        let mut best: Option<(u32, Vec<Value>, Vec<crate::value::Collation>, u64)> = None;
+        #[allow(clippy::type_complexity)]
+        let mut best: Option<(
+            u32,
+            Vec<Value>,
+            Vec<crate::value::Collation>,
+            Vec<usize>,
+            u64,
+        )> = None;
         for idx in &indexes {
             // Honor `INDEXED BY`: consider only the named index.
             if let Some(IndexHint::IndexedBy(n)) = hint {
@@ -4477,17 +4484,26 @@ impl Connection {
                 .unwrap_or(u64::MAX - key.len() as u64);
             let better = match &best {
                 None => true,
-                Some((_, bk, _, be)) => est < *be || (est == *be && key.len() > bk.len()),
+                Some((_, bk, _, _, be)) => est < *be || (est == *be && key.len() > bk.len()),
             };
             if better {
-                best = Some((idx.root, key, colls, est));
+                best = Some((idx.root, key, colls, idx.cols.clone(), est));
             }
         }
-        let Some((root, key, seek_colls, _)) = best else {
+        let Some((root, key, seek_colls, idx_cols, _)) = best else {
             return Ok(None);
         };
         if key.is_empty() {
             return Ok(None);
+        }
+
+        // Covering seek: when the chosen index holds every referenced column (the
+        // result columns, the `WHERE` columns, and any `ORDER BY`), read straight
+        // from the index — `eqp_access` reports `USING COVERING INDEX` for the
+        // same decision. Stays in lockstep with the table-fetch path below
+        // (`run_core` re-applies the full `WHERE` to the superset of index rows).
+        if self.seek_index_covers(sel, meta, &idx_cols, where_expr) {
+            return Ok(Some(self.covering_seek_rows(meta, root, &idx_cols)?));
         }
 
         let rowids =
@@ -4594,7 +4610,7 @@ impl Connection {
                 return Err(Error::Error(alloc::format!("no such index: {n}")));
             }
         }
-        let mut chosen: Option<(u32, RangeBound, crate::value::Collation)> = None;
+        let mut chosen: Option<(u32, RangeBound, crate::value::Collation, Vec<usize>)> = None;
         for idx in &indexes {
             if let Some(IndexHint::IndexedBy(n)) = hint {
                 if !idx.name.eq_ignore_ascii_case(n) {
@@ -4614,13 +4630,19 @@ impl Connection {
                     lower: b.lower.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i)),
                     upper: b.upper.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i)),
                 };
-                chosen = Some((idx.root, b, coll));
+                chosen = Some((idx.root, b, coll, idx.cols.clone()));
                 break;
             }
         }
-        let Some((root, bound, coll)) = chosen else {
+        let Some((root, bound, coll, idx_cols)) = chosen else {
             return Ok(None);
         };
+
+        // Covering range seek: read from the index when it holds every referenced
+        // column (kept in lockstep with `eqp_access`'s `USING COVERING INDEX`).
+        if self.seek_index_covers(sel, meta, &idx_cols, where_expr) {
+            return Ok(Some(self.covering_seek_rows(meta, root, &idx_cols)?));
+        }
 
         let colls = [coll];
         let lower_key = bound.lower.as_ref().map(|(v, _)| core::slice::from_ref(v));
@@ -4707,7 +4729,7 @@ impl Connection {
                 return Err(Error::Error(alloc::format!("no such index: {n}")));
             }
         }
-        let mut chosen: Option<(u32, crate::value::Collation)> = None;
+        let mut chosen: Option<(u32, crate::value::Collation, Vec<usize>)> = None;
         for idx in &indexes {
             if let Some(IndexHint::IndexedBy(n)) = hint {
                 if !idx.name.eq_ignore_ascii_case(n) {
@@ -4721,13 +4743,21 @@ impl Connection {
                 chosen = Some((
                     idx.root,
                     idx.collations.first().copied().unwrap_or_default(),
+                    idx.cols.clone(),
                 ));
                 break;
             }
         }
-        let Some((root, coll)) = chosen else {
+        let Some((root, coll, idx_cols)) = chosen else {
             return Ok(None);
         };
+
+        // Covering IN seek: read from the index when it holds every referenced
+        // column (kept in lockstep with `eqp_access`'s `USING COVERING INDEX`).
+        if self.seek_index_covers(sel, meta, &idx_cols, where_expr) {
+            return Ok(Some(self.covering_seek_rows(meta, root, &idx_cols)?));
+        }
+
         let aff = meta.columns[col].affinity;
         let colls = [coll];
         let mut rowids: Vec<i64> = Vec::new();
@@ -4980,14 +5010,26 @@ impl Connection {
             }
             Statement::Delete(d) => {
                 let meta = self.table_meta(&d.table, None)?;
-                let detail =
-                    self.eqp_access(&d.table, &d.table, &meta, d.where_clause.as_ref(), params)?;
+                let detail = self.eqp_access(
+                    &d.table,
+                    &d.table,
+                    &meta,
+                    d.where_clause.as_ref(),
+                    None,
+                    params,
+                )?;
                 details.push((next_id, 0, detail));
             }
             Statement::Update(u) => {
                 let meta = self.table_meta(&u.table, None)?;
-                let detail =
-                    self.eqp_access(&u.table, &u.table, &meta, u.where_clause.as_ref(), params)?;
+                let detail = self.eqp_access(
+                    &u.table,
+                    &u.table,
+                    &meta,
+                    u.where_clause.as_ref(),
+                    None,
+                    params,
+                )?;
                 details.push((next_id, 0, detail));
             }
             Statement::Insert(ins) => {
@@ -5071,6 +5113,7 @@ impl Connection {
                         &from.first.name,
                         &meta,
                         sel.where_clause.as_ref(),
+                        Some(sel),
                         params,
                     )?
                 }
@@ -5129,7 +5172,7 @@ impl Connection {
         // Each disjunct must seek (its eqp_access is a SEARCH, not a SCAN).
         let mut details = Vec::with_capacity(disjuncts.len());
         for d in &disjuncts {
-            let detail = self.eqp_access(label, table, meta, Some(d), params)?;
+            let detail = self.eqp_access(label, table, meta, Some(d), None, params)?;
             if !detail.starts_with("SEARCH") {
                 return Ok(false);
             }
@@ -5151,17 +5194,32 @@ impl Connection {
 
     /// The SCAN/SEARCH detail string for accessing one table given its WHERE.
     /// `label` is the display name (alias if any); `table` is the real table
-    /// name used to look up its indexes.
+    /// name used to look up its indexes. `sel`, when present, is the enclosing
+    /// `SELECT`: a seek whose index covers every referenced column reads as
+    /// `USING COVERING INDEX` (B2b), kept in lockstep with the executor's
+    /// [`seek_index_covers`](Self::seek_index_covers) decision. `None` (DELETE /
+    /// UPDATE / OR-plan disjuncts, which all touch the table) never covers.
     fn eqp_access(
         &self,
         label: &str,
         table: &str,
         meta: &TableMeta,
         where_clause: Option<&Expr>,
+        sel: Option<&Select>,
         params: &Params,
     ) -> Result<String> {
         let Some(where_expr) = where_clause else {
             return Ok(alloc::format!("SCAN {label}"));
+        };
+        // `INDEX` vs `COVERING INDEX` for a seek through `idx_cols`: the same
+        // decision the executor's seek paths make via `seek_index_covers`.
+        let index_kw = |idx_cols: &[usize]| -> &'static str {
+            match sel {
+                Some(s) if self.seek_index_covers(s, meta, idx_cols, where_expr) => {
+                    "COVERING INDEX"
+                }
+                _ => "INDEX",
+            }
         };
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
@@ -5178,7 +5236,8 @@ impl Connection {
         // the most selective one when `ANALYZE` statistics are available (kept in
         // step with the cost-based chooser in try_index_lookup).
         let stats = self.stat1_map();
-        let mut best: Option<(String, Vec<usize>, u64)> = None;
+        #[allow(clippy::type_complexity)]
+        let mut best: Option<(String, Vec<usize>, Vec<usize>, u64)> = None;
         for obj in self.schema.indexes_on(table) {
             let Some(sql) = &obj.sql else { continue };
             let Ok(Statement::CreateIndex(ci)) = sql::parse_one(sql) else {
@@ -5207,21 +5266,22 @@ impl Connection {
                 .unwrap_or(u64::MAX - matched.len() as u64);
             let better = match &best {
                 None => true,
-                Some((_, bm, be)) => est < *be || (est == *be && matched.len() > bm.len()),
+                Some((_, bm, _, be)) => est < *be || (est == *be && matched.len() > bm.len()),
             };
             if better {
-                best = Some((obj.name.clone(), matched, est));
+                best = Some((obj.name.clone(), matched, cols, est));
             }
         }
-        if let Some((idx_name, matched, _)) = best {
+        if let Some((idx_name, matched, idx_cols, _)) = best {
             if !matched.is_empty() {
                 let cond = matched
                     .iter()
                     .map(|&c| alloc::format!("{}=?", meta.columns[c].name))
                     .collect::<Vec<_>>()
                     .join(" AND ");
+                let kw = index_kw(&idx_cols);
                 return Ok(alloc::format!(
-                    "SEARCH {label} USING INDEX {idx_name} ({cond})"
+                    "SEARCH {label} USING {kw} {idx_name} ({cond})"
                 ));
             }
         }
@@ -5273,7 +5333,7 @@ impl Connection {
             }
         }
         for (&col, bound) in &ranges {
-            if let Some((idx_name, _)) = leading_index(col) {
+            if let Some((idx_name, idx_cols)) = leading_index(col) {
                 let name = &meta.columns[col].name;
                 // SQLite's EQP renders bounds as `>`/`<` regardless of inclusivity.
                 let cond = match (&bound.lower, &bound.upper) {
@@ -5282,8 +5342,9 @@ impl Connection {
                     (None, Some(_)) => alloc::format!("{name}<?"),
                     (None, None) => continue,
                 };
+                let kw = index_kw(&idx_cols);
                 return Ok(alloc::format!(
-                    "SEARCH {label} USING INDEX {idx_name} ({cond})"
+                    "SEARCH {label} USING {kw} {idx_name} ({cond})"
                 ));
             }
         }
@@ -5295,10 +5356,11 @@ impl Connection {
                     "SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"
                 ));
             }
-            if let Some((idx_name, _)) = leading_index(col) {
+            if let Some((idx_name, idx_cols)) = leading_index(col) {
                 let name = &meta.columns[col].name;
+                let kw = index_kw(&idx_cols);
                 return Ok(alloc::format!(
-                    "SEARCH {label} USING INDEX {idx_name} ({name}=?)"
+                    "SEARCH {label} USING {kw} {idx_name} ({name}=?)"
                 ));
             }
         }
@@ -6169,6 +6231,66 @@ impl Connection {
             }
         }
         None
+    }
+
+    /// Covering check for a WHERE-driven *seek* (B2b, seek case): on top of
+    /// [`index_covers_query`](Self::index_covers_query) (result columns + `ORDER
+    /// BY`), every column the `WHERE` clause references must also be covered by
+    /// `idx_cols` or be the rowid. The seek's own index column is covered by
+    /// construction, but a residual predicate on some *other* column (e.g.
+    /// `WHERE c=5 AND b>0`) would still need the table unless that column is in
+    /// the index too. Conservative: any construct whose referenced columns can't
+    /// be enumerated (a subquery/`EXISTS`/`IN (SELECT …)`) makes this `false`, so
+    /// the caller falls back to the always-correct table-fetch path.
+    fn seek_index_covers(
+        &self,
+        sel: &Select,
+        meta: &TableMeta,
+        idx_cols: &[usize],
+        where_expr: &Expr,
+    ) -> bool {
+        if !self.index_covers_query(sel, meta, idx_cols) {
+            return false;
+        }
+        where_cols_covered(where_expr, meta, idx_cols)
+    }
+
+    /// Build the input rows of a covering seek by walking the chosen index and
+    /// keeping every record (a superset — `run_core` re-applies the full `WHERE`,
+    /// so the seek's own predicate filters out non-matching keys). Each record is
+    /// `(indexed col values…, rowid)`; indexed columns are mapped onto their table
+    /// positions and the rowid fills the `INTEGER PRIMARY KEY` column, exactly as
+    /// the ordered covering scan does. Reads only the index b-tree — never the
+    /// table.
+    fn covering_seek_rows(
+        &self,
+        meta: &TableMeta,
+        root: u32,
+        idx_cols: &[usize],
+    ) -> Result<Vec<InputRow>> {
+        let src = self.backend.source();
+        let encoding = src.header().text_encoding;
+        let mut icur = IndexCursor::new(src, root);
+        let mut out = Vec::new();
+        while let Some(payload) = icur.next()? {
+            let rec = decode_record(&payload, encoding)?;
+            let rowid = match rec.get(idx_cols.len()) {
+                Some(Value::Integer(r)) => *r,
+                _ => return Err(Error::Corrupt("index record missing rowid".into())),
+            };
+            let mut values = alloc::vec![Value::Null; meta.columns.len()];
+            for (i, &mc) in idx_cols.iter().enumerate() {
+                values[mc] = rec[i].clone();
+            }
+            if let Some(ipk) = meta.ipk {
+                values[ipk] = Value::Integer(rowid);
+            }
+            out.push(InputRow {
+                values,
+                rowid: Some(rowid),
+            });
+        }
+        Ok(out)
     }
 
     /// Conservative covering check (B2): every column the query references
@@ -9360,6 +9482,76 @@ fn eqp_label(t: &TableRef) -> String {
     match &t.alias {
         Some(a) => alloc::format!("{} AS {}", t.name, a),
         None => t.name.clone(),
+    }
+}
+
+/// Whether every column the `WHERE` expression references is covered by the
+/// index (`idx_cols`) or is the rowid — the seek-covering precondition. Walks the
+/// expression tree and returns `false` the moment it finds an uncovered column,
+/// an unknown column name that is not a rowid alias, or a construct whose columns
+/// can't be enumerated locally (a scalar subquery / `EXISTS` / `IN (SELECT …)`),
+/// so the caller conservatively falls back to the table-fetch path.
+fn where_cols_covered(e: &Expr, meta: &TableMeta, idx_cols: &[usize]) -> bool {
+    let covered = |ci: usize| idx_cols.contains(&ci) || meta.ipk == Some(ci);
+    match e {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Column { column, .. } => match meta
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(column))
+        {
+            Some(ci) => covered(ci),
+            None => matches!(
+                column.to_ascii_lowercase().as_str(),
+                "rowid" | "_rowid_" | "oid"
+            ),
+        },
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::Paren(expr) => where_cols_covered(expr, meta, idx_cols),
+        Expr::Binary { left, right, .. } => {
+            where_cols_covered(left, meta, idx_cols) && where_cols_covered(right, meta, idx_cols)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            where_cols_covered(expr, meta, idx_cols)
+                && where_cols_covered(low, meta, idx_cols)
+                && where_cols_covered(high, meta, idx_cols)
+        }
+        Expr::InList { expr, list, .. } => {
+            where_cols_covered(expr, meta, idx_cols)
+                && list.iter().all(|x| where_cols_covered(x, meta, idx_cols))
+        }
+        Expr::RowValue(items) => items.iter().all(|x| where_cols_covered(x, meta, idx_cols)),
+        Expr::Function {
+            args, filter, over, ..
+        } => {
+            over.is_none()
+                && filter.is_none()
+                && args.iter().all(|x| where_cols_covered(x, meta, idx_cols))
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            operand
+                .as_deref()
+                .map(|o| where_cols_covered(o, meta, idx_cols))
+                .unwrap_or(true)
+                && when_then.iter().all(|(w, t)| {
+                    where_cols_covered(w, meta, idx_cols) && where_cols_covered(t, meta, idx_cols)
+                })
+                && else_result
+                    .as_deref()
+                    .map(|x| where_cols_covered(x, meta, idx_cols))
+                    .unwrap_or(true)
+        }
+        // A subquery may read other tables/columns we can't enumerate here; bail.
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. } => false,
     }
 }
 
