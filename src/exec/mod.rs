@@ -3240,6 +3240,114 @@ impl Connection {
         Ok(Some(out))
     }
 
+    /// Try to satisfy a single-table query with per-value index seeks for a
+    /// `column IN (const, …)` predicate: seek each list value through an index on
+    /// that column (or the rowid b-tree for an `INTEGER PRIMARY KEY`), union the
+    /// rowids, and fetch the rows. Returns a superset (`run_core` re-applies the
+    /// full `WHERE`), or `None` (→ scan) when no index applies.
+    fn try_index_in(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let Some(where_expr) = &sel.where_clause else {
+            return Ok(None);
+        };
+        let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
+        if matches!(hint, Some(IndexHint::NotIndexed)) {
+            return Ok(None);
+        }
+        let Some((col, values)) = find_in_constraint(where_expr, &meta.columns, params) else {
+            return Ok(None);
+        };
+        // Skip if any list value is NULL (`x IN (NULL)` is never true/usable here).
+        if values.iter().any(|v| matches!(v, Value::Null)) {
+            return Ok(None);
+        }
+        let encoding = self.backend.source().header().text_encoding;
+
+        // Rowid IN-list: seek the table b-tree directly for each value.
+        if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
+            if let Some(ipk) = meta.ipk {
+                if col == ipk {
+                    let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                    let mut out = Vec::new();
+                    let mut seen: Vec<i64> = Vec::new();
+                    for v in &values {
+                        let rid = eval::to_i64(v);
+                        if seen.contains(&rid) {
+                            continue;
+                        }
+                        seen.push(rid);
+                        if cur.seek(rid)? {
+                            let values =
+                                self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                            out.push(InputRow {
+                                values,
+                                rowid: Some(rid),
+                            });
+                        }
+                    }
+                    return Ok(Some(out));
+                }
+            }
+        }
+
+        // Otherwise pick a plain index whose leading column is the IN column.
+        let indexes = self.indexes_of(table_name)?;
+        if let Some(IndexHint::IndexedBy(n)) = hint {
+            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
+                return Err(Error::Error(alloc::format!("no such index: {n}")));
+            }
+        }
+        let mut chosen: Option<(u32, crate::value::Collation)> = None;
+        for idx in &indexes {
+            if let Some(IndexHint::IndexedBy(n)) = hint {
+                if !idx.name.eq_ignore_ascii_case(n) {
+                    continue;
+                }
+            }
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
+                continue;
+            }
+            if idx.cols.first() == Some(&col) {
+                chosen = Some((
+                    idx.root,
+                    idx.collations.first().copied().unwrap_or_default(),
+                ));
+                break;
+            }
+        }
+        let Some((root, coll)) = chosen else {
+            return Ok(None);
+        };
+        let aff = meta.columns[col].affinity;
+        let colls = [coll];
+        let mut rowids: Vec<i64> = Vec::new();
+        for v in &values {
+            let key = [aff.coerce(v.clone())];
+            for rid in crate::btree::index_seek_rowids(self.backend.source(), root, &key, &colls)? {
+                if !rowids.contains(&rid) {
+                    rowids.push(rid);
+                }
+            }
+        }
+        let mut cur = TableCursor::new(self.backend.source(), meta.root);
+        let mut out = Vec::new();
+        for rid in rowids {
+            if cur.seek(rid)? {
+                let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                out.push(InputRow {
+                    values,
+                    rowid: Some(rid),
+                });
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// `EXPLAIN QUERY PLAN <stmt>` -> the `(id, parent, notused, detail)` rows
     /// that SQLite's API returns. The detail strings describe graphitesql's
     /// *actual* execution plan (it does not reorder joins), matching SQLite's
@@ -4222,6 +4330,9 @@ impl Connection {
                 return Ok((first_meta.columns, rows));
             }
             if let Some(rows) = self.try_index_range(&first_meta, &from.first.name, sel, params)? {
+                return Ok((first_meta.columns, rows));
+            }
+            if let Some(rows) = self.try_index_in(&first_meta, &from.first.name, sel, params)? {
                 return Ok((first_meta.columns, rows));
             }
             let input_rows = self
@@ -6087,6 +6198,41 @@ fn collect_eq_constraints(
             }
         }
         _ => {}
+    }
+}
+
+/// Find a top-level `column IN (const, const, …)` conjunct (not `NOT IN`, all
+/// list entries constant), returning the column index and the constant values.
+/// Used to drive per-value index seeks; only the first such term is returned.
+fn find_in_constraint(
+    e: &Expr,
+    columns: &[ColumnInfo],
+    params: &Params,
+) -> Option<(usize, Vec<Value>)> {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => find_in_constraint(left, columns, params)
+            .or_else(|| find_in_constraint(right, columns, params)),
+        Expr::Paren(inner) => find_in_constraint(inner, columns, params),
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            let ci = col_index(expr, columns)?;
+            if list.is_empty() {
+                return None;
+            }
+            let mut vals = Vec::with_capacity(list.len());
+            for item in list {
+                vals.push(const_value(item, params)?);
+            }
+            Some((ci, vals))
+        }
+        _ => None,
     }
 }
 

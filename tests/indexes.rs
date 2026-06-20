@@ -275,6 +275,13 @@ fn index_range_scans_match_sqlite3() {
         "SELECT id FROM t WHERE b <= 'c' ORDER BY id",
         "SELECT a FROM t WHERE a > 3 ORDER BY a",
         "SELECT count(*) FROM t WHERE a >= 5",
+        // IN-list seeks (indexed column, rowid, text index, dups, mixed).
+        "SELECT id FROM t WHERE a IN (1, 4, 9) ORDER BY id",
+        "SELECT id FROM t WHERE a IN (100, 200) ORDER BY id",
+        "SELECT id FROM t WHERE id IN (2, 4, 6) ORDER BY id",
+        "SELECT id FROM t WHERE b IN ('a', 'n', 'zzz') ORDER BY id",
+        "SELECT id FROM t WHERE a IN (1, 1, 5) ORDER BY id",
+        "SELECT id FROM t WHERE a IN (3) AND b > 'a' ORDER BY id",
     ];
     for q in queries {
         let want = sqlite3_run(&path, &format!("{q};"));
@@ -297,7 +304,7 @@ fn index_range_scans_match_sqlite3() {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(got, want, "range query diverged: {q}");
+        assert_eq!(got, want, "range/IN query diverged: {q}");
     }
     cleanup(&path);
 }

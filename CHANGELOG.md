@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track B: **`IN`-list index seeks**. A single-table query with `column IN (c1,
+  c2, …)` now seeks each constant through an index on that column (or the rowid
+  b-tree for an `INTEGER PRIMARY KEY`), unions the rowids, and fetches the rows,
+  instead of scanning. Returns a superset (full `WHERE` re-applied). Verified
+  against `sqlite3`.
 - Track B: index **range scans**. A single-table query whose `WHERE` constrains an
   indexed column by `<`/`<=`/`>`/`>=`/`BETWEEN` now seeks the index between those
   bounds (`btree::index_range_rowids`, an in-order traversal that stops once the
