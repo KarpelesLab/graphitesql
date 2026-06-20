@@ -3181,6 +3181,58 @@ impl Connection {
             return Ok(None);
         }
 
+        // Rowid (INTEGER PRIMARY KEY) range: walk the table b-tree between integer
+        // bounds. `INDEXED BY` forbids this (the rowid is not a named index). Only
+        // integer bounds are taken (a non-integer literal falls to the scan); the
+        // returned span is a superset, so the boundary rows are filtered by the
+        // re-applied WHERE.
+        if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
+            if let Some(ipk) = meta.ipk {
+                if let Some(b) = ranges.get(&ipk) {
+                    let int_bound = |o: &Option<(Value, bool)>| match o {
+                        Some((Value::Integer(i), _)) => Some(*i),
+                        None => None,
+                        _ => Some(i64::MAX), // sentinel: a non-integer bound disables it
+                    };
+                    let lo = int_bound(&b.lower);
+                    let hi = int_bound(&b.upper);
+                    // Disable when a present bound is non-integer (sentinel hit on
+                    // the wrong side).
+                    let lo_ok =
+                        b.lower.is_none() || matches!(b.lower, Some((Value::Integer(_), _)));
+                    let hi_ok =
+                        b.upper.is_none() || matches!(b.upper, Some((Value::Integer(_), _)));
+                    if lo_ok && hi_ok {
+                        let start = lo.unwrap_or(i64::MIN);
+                        let stop = hi.unwrap_or(i64::MAX);
+                        let encoding = self.backend.source().header().text_encoding;
+                        let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                        let mut out = Vec::new();
+                        let mut ok = if start == i64::MIN {
+                            cur.first()?
+                        } else {
+                            cur.seek(start)?;
+                            cur.is_valid()
+                        };
+                        while ok {
+                            let rid = cur.rowid()?;
+                            if rid > stop {
+                                break;
+                            }
+                            let values =
+                                self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                            out.push(InputRow {
+                                values,
+                                rowid: Some(rid),
+                            });
+                            ok = cur.next()?;
+                        }
+                        return Ok(Some(out));
+                    }
+                }
+            }
+        }
+
         // Pick the first plain (non-partial, non-expression) index whose leading
         // column has a range bound, honoring `INDEXED BY`.
         let indexes = self.indexes_of(table_name)?;
@@ -3546,10 +3598,30 @@ impl Connection {
             None
         };
 
-        // Range scan on an indexed leading column (rowid ranges still scan).
+        // Range scan: rowid (integer bounds) walks the table b-tree; an indexed
+        // leading column seeks its index.
         let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
             alloc::collections::BTreeMap::new();
         collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+        if let Some(ipk) = meta.ipk {
+            if let Some(b) = ranges.get(&ipk) {
+                let lo_int = b.lower.is_none() || matches!(b.lower, Some((Value::Integer(_), _)));
+                let hi_int = b.upper.is_none() || matches!(b.upper, Some((Value::Integer(_), _)));
+                if lo_int && hi_int {
+                    let cond = match (&b.lower, &b.upper) {
+                        (Some(_), Some(_)) => "rowid>? AND rowid<?",
+                        (Some(_), None) => "rowid>?",
+                        (None, Some(_)) => "rowid<?",
+                        (None, None) => "",
+                    };
+                    if !cond.is_empty() {
+                        return Ok(alloc::format!(
+                            "SEARCH {label} USING INTEGER PRIMARY KEY ({cond})"
+                        ));
+                    }
+                }
+            }
+        }
         for (&col, bound) in &ranges {
             if let Some((idx_name, _)) = leading_index(col) {
                 let name = &meta.columns[col].name;

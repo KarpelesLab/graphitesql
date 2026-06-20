@@ -119,10 +119,21 @@ fn search_by_range_and_in() {
         detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM r WHERE id IN (1,2,3)"),
         ["SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"]
     );
-    // A rowid range still scans (graphitesql does not range-seek the rowid yet).
+    // Rowid ranges walk the table b-tree between integer bounds.
     assert_eq!(
         detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM r WHERE id > 5"),
-        ["SCAN r"]
+        ["SEARCH r USING INTEGER PRIMARY KEY (rowid>?)"]
+    );
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM r WHERE id >= 5 AND id < 9"
+        ),
+        ["SEARCH r USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)"]
+    );
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM r WHERE id < 9"),
+        ["SEARCH r USING INTEGER PRIMARY KEY (rowid<?)"]
     );
 }
 

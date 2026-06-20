@@ -23,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounds (`btree::index_range_rowids`, an in-order traversal that stops once the
   upper bound is passed) instead of scanning the whole table, then re-applies the
   full `WHERE`. The lookup returns a superset, so correctness is preserved
-  regardless of bound edge cases. Verified against `sqlite3`.
+  regardless of bound edge cases. A range on the `INTEGER PRIMARY KEY` rowid walks
+  the table b-tree directly between integer bounds (seeking the lower bound, then
+  iterating until the upper). Both verified against `sqlite3`, and reported by
+  `EXPLAIN QUERY PLAN` as `SEARCH … (rowid>? AND rowid<?)` etc.
 - Track A: `octet_length(X)` (byte length of a value's encoding — blob bytes, else
   the UTF-8 length of its text form) and the `glob(pattern, text)` function form of
   the `GLOB` operator. Both verified against `sqlite3` in the differential corpus.

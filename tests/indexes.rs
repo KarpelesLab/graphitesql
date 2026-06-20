@@ -282,6 +282,13 @@ fn index_range_scans_match_sqlite3() {
         "SELECT id FROM t WHERE b IN ('a', 'n', 'zzz') ORDER BY id",
         "SELECT id FROM t WHERE a IN (1, 1, 5) ORDER BY id",
         "SELECT id FROM t WHERE a IN (3) AND b > 'a' ORDER BY id",
+        // Rowid range scans over the table b-tree.
+        "SELECT id FROM t WHERE id > 5 ORDER BY id",
+        "SELECT id FROM t WHERE id >= 5 AND id < 9 ORDER BY id",
+        "SELECT id FROM t WHERE id < 4 ORDER BY id",
+        "SELECT id FROM t WHERE id BETWEEN 3 AND 7 ORDER BY id",
+        "SELECT id FROM t WHERE id <= 2 OR id > 8 ORDER BY id",
+        "SELECT count(*) FROM t WHERE id > 100",
     ];
     for q in queries {
         let want = sqlite3_run(&path, &format!("{q};"));
