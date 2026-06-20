@@ -43,6 +43,11 @@ pub struct WritePager {
     wal_file: Option<Box<dyn File>>,
     /// WAL runtime state; `Some` when the database is in WAL mode.
     wal: Option<WalRuntime>,
+    /// The write lock currently held on the main file. A write transaction takes
+    /// `Reserved` on its first staged page and upgrades to `Exclusive` while
+    /// flushing at commit, so a second writer to the same file gets
+    /// [`Error::Busy`](crate::Error::Busy). Released on commit/rollback.
+    held: crate::vfs::LockLevel,
 }
 
 /// Live WAL state: the committed frames overlaid on the main file plus the
@@ -116,6 +121,7 @@ impl WritePager {
             overlay: BTreeMap::new(),
             wal_file,
             wal,
+            held: crate::vfs::LockLevel::Unlocked,
         })
     }
 
@@ -168,6 +174,7 @@ impl WritePager {
             overlay: BTreeMap::new(),
             wal_file,
             wal: None,
+            held: crate::vfs::LockLevel::Unlocked,
         };
         // Page 1: db header (0..100) + an empty table-leaf b-tree at offset 100.
         let mut page1 = vec![0u8; page_size as usize];
@@ -207,8 +214,53 @@ impl WritePager {
         if bytes.len() != self.page_size {
             return Err(Error::Error("page image has wrong size".into()));
         }
+        self.acquire_write_intent()?;
         self.overlay.insert(number, bytes);
         Ok(())
+    }
+
+    /// Take the write-intent (`RESERVED`) lock on the main file before staging
+    /// changes, so a concurrent writer to the same file is rejected with
+    /// [`Error::Busy`] rather than corrupting it. Idempotent within a transaction.
+    fn acquire_write_intent(&mut self) -> Result<()> {
+        use crate::vfs::LockLevel;
+        let entry = self.held;
+        if self.held < LockLevel::Shared {
+            self.file.lock(LockLevel::Shared)?;
+            self.held = LockLevel::Shared;
+        }
+        if self.held < LockLevel::Reserved {
+            if let Err(e) = self.file.lock(LockLevel::Reserved) {
+                // A rejected first write must not keep the SHARED lock it just
+                // took, or it would block the current writer from committing.
+                if entry == LockLevel::Unlocked {
+                    self.release_locks();
+                }
+                return Err(e);
+            }
+            self.held = LockLevel::Reserved;
+        }
+        Ok(())
+    }
+
+    /// Upgrade to the `EXCLUSIVE` lock for the flush phase of a commit.
+    fn acquire_exclusive(&mut self) -> Result<()> {
+        use crate::vfs::LockLevel;
+        self.acquire_write_intent()?;
+        if self.held < LockLevel::Exclusive {
+            self.file.lock(LockLevel::Exclusive)?;
+            self.held = LockLevel::Exclusive;
+        }
+        Ok(())
+    }
+
+    /// Drop all write locks at the end of a transaction.
+    fn release_locks(&mut self) {
+        use crate::vfs::LockLevel;
+        if self.held != LockLevel::Unlocked {
+            let _ = self.file.unlock(LockLevel::Unlocked);
+            self.held = LockLevel::Unlocked;
+        }
     }
 
     /// Allocate a page, reusing one from the freelist if available, otherwise
@@ -286,17 +338,21 @@ impl WritePager {
             Some(w) => w.db_size,
             None => self.disk_pages,
         };
+        self.release_locks();
     }
 
     /// Atomically flush all staged changes to the database file.
     pub fn commit(&mut self) -> Result<()> {
         if self.overlay.is_empty() {
+            self.release_locks();
             return Ok(());
         }
         // In WAL mode, append the dirty pages as WAL frames instead.
         if self.wal.is_some() {
             return self.commit_wal();
         }
+        // Take the EXCLUSIVE lock for the flush (no other writer or reader).
+        self.acquire_exclusive()?;
         // Refresh header bookkeeping and re-stamp page 1.
         self.header.change_counter = self.header.change_counter.wrapping_add(1);
         self.header.size_in_pages = self.page_count;
@@ -328,6 +384,7 @@ impl WritePager {
 
         self.disk_pages = self.page_count;
         self.overlay.clear();
+        self.release_locks();
         Ok(())
     }
 
@@ -435,6 +492,9 @@ impl WritePager {
             wal.frames.insert(page_no, data);
         }
         self.overlay.clear();
+        // WAL writers serialize via the write-intent lock taken in write_page;
+        // readers stay concurrent. Release it now that the frames are durable.
+        self.release_locks();
         Ok(())
     }
 

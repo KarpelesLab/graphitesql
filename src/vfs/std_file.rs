@@ -4,13 +4,31 @@
 //! `Mutex`, so reads can take `&self` while remaining correct across platforms
 //! and without any `unsafe` or platform-specific `FileExt`.
 
-use super::{File, OpenFlags, Vfs};
+use super::{File, LockLevel, LockState, OpenFlags, Vfs};
 use crate::error::{Error, Result};
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Process-global registry of per-path lock states. `StdVfs` locking is advisory
+/// and **process-local**: two `Connection`s in the same process serialize
+/// correctly, but cross-process locking would require OS file locks (which need
+/// `unsafe`/`std::fs::File::lock`, above this crate's MSRV and no-`unsafe`
+/// policy). A host that needs multi-process access can supply its own `Vfs`
+/// whose `lock`/`unlock` call the platform primitives.
+fn lock_registry() -> &'static Mutex<HashMap<String, Arc<Mutex<LockState>>>> {
+    static REG: OnceLock<Mutex<HashMap<String, Arc<Mutex<LockState>>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The shared lock state for `path`, creating it on first use.
+fn locks_for(path: &str) -> Arc<Mutex<LockState>> {
+    let mut reg = lock_registry().lock().expect("lock registry poisoned");
+    reg.entry(path.to_string()).or_default().clone()
+}
 
 /// A virtual file system over the real local file system.
 #[derive(Debug, Default, Clone, Copy)]
@@ -43,6 +61,8 @@ impl Vfs for StdVfs {
         })?;
         Ok(Box::new(StdFile {
             inner: Mutex::new(file),
+            locks: locks_for(path),
+            level: LockLevel::Unlocked,
         }))
     }
 
@@ -62,6 +82,10 @@ impl Vfs for StdVfs {
 /// A handle to one real file.
 pub struct StdFile {
     inner: Mutex<fs::File>,
+    /// The process-shared lock state for this file's path.
+    locks: Arc<Mutex<LockState>>,
+    /// The lock level this handle currently holds.
+    level: LockLevel,
 }
 
 impl StdFile {
@@ -71,6 +95,14 @@ impl StdFile {
             .lock()
             .map_err(|_| Error::Io("poisoned file lock".into()))?;
         f(&mut guard).map_err(io_err)
+    }
+}
+
+impl Drop for StdFile {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.locks.lock() {
+            s.release(self.level, LockLevel::Unlocked);
+        }
     }
 }
 
@@ -99,6 +131,32 @@ impl File for StdFile {
 
     fn size(&self) -> Result<u64> {
         self.with(|f| Ok(f.metadata()?.len()))
+    }
+
+    fn lock(&mut self, level: LockLevel) -> Result<()> {
+        let mut s = self
+            .locks
+            .lock()
+            .map_err(|_| Error::Io("lock state poisoned".into()))?;
+        s.acquire(self.level, level)?;
+        drop(s);
+        if level > self.level {
+            self.level = level;
+        }
+        Ok(())
+    }
+
+    fn unlock(&mut self, level: LockLevel) -> Result<()> {
+        let mut s = self
+            .locks
+            .lock()
+            .map_err(|_| Error::Io("lock state poisoned".into()))?;
+        s.release(self.level, level);
+        drop(s);
+        if level < self.level {
+            self.level = level;
+        }
+        Ok(())
     }
 }
 

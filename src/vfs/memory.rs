@@ -8,7 +8,7 @@
 //! threads is out of scope until the concurrency model is settled (see
 //! `ROADMAP.md`).
 
-use super::{File, OpenFlags, Vfs};
+use super::{File, LockLevel, LockState, OpenFlags, Vfs};
 use crate::error::{Error, Result};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -21,10 +21,20 @@ use core::cell::RefCell;
 /// is how the VFS and any open handles see each other's writes.
 type SharedBytes = Rc<RefCell<Vec<u8>>>;
 
+/// Shared lock state for one path, coordinating all open handles to it.
+type SharedLocks = Rc<RefCell<LockState>>;
+
+/// A named file in the VFS: its bytes and the lock state shared by its handles.
+#[derive(Clone)]
+struct FileEntry {
+    bytes: SharedBytes,
+    locks: SharedLocks,
+}
+
 /// An in-memory virtual file system.
 #[derive(Default, Clone)]
 pub struct MemoryVfs {
-    files: Rc<RefCell<BTreeMap<String, SharedBytes>>>,
+    files: Rc<RefCell<BTreeMap<String, FileEntry>>>,
 }
 
 impl MemoryVfs {
@@ -37,18 +47,25 @@ impl MemoryVfs {
 impl Vfs for MemoryVfs {
     fn open(&self, path: &str, flags: OpenFlags) -> Result<Box<dyn File>> {
         let mut files = self.files.borrow_mut();
-        let bytes = match files.get(path) {
-            Some(b) => Rc::clone(b),
+        let entry = match files.get(path) {
+            Some(e) => e.clone(),
             None => {
                 if !flags.create {
                     return Err(Error::CantOpen(String::from(path)));
                 }
-                let b: SharedBytes = Rc::new(RefCell::new(Vec::new()));
-                files.insert(String::from(path), Rc::clone(&b));
-                b
+                let e = FileEntry {
+                    bytes: Rc::new(RefCell::new(Vec::new())),
+                    locks: Rc::new(RefCell::new(LockState::default())),
+                };
+                files.insert(String::from(path), e.clone());
+                e
             }
         };
-        Ok(Box::new(MemoryFile { bytes }))
+        Ok(Box::new(MemoryFile {
+            bytes: entry.bytes,
+            locks: entry.locks,
+            level: LockLevel::Unlocked,
+        }))
     }
 
     fn delete(&self, path: &str) -> Result<()> {
@@ -64,6 +81,20 @@ impl Vfs for MemoryVfs {
 /// A handle to one in-memory file.
 pub struct MemoryFile {
     bytes: SharedBytes,
+    /// Lock state shared with every other handle to the same path.
+    locks: SharedLocks,
+    /// The lock level this handle currently holds.
+    level: LockLevel,
+}
+
+impl Drop for MemoryFile {
+    fn drop(&mut self) {
+        // Release any locks this handle still holds so closing a connection
+        // frees the file for others.
+        self.locks
+            .borrow_mut()
+            .release(self.level, LockLevel::Unlocked);
+    }
 }
 
 impl File for MemoryFile {
@@ -104,6 +135,22 @@ impl File for MemoryFile {
 
     fn size(&self) -> Result<u64> {
         Ok(self.bytes.borrow().len() as u64)
+    }
+
+    fn lock(&mut self, level: LockLevel) -> Result<()> {
+        self.locks.borrow_mut().acquire(self.level, level)?;
+        if level > self.level {
+            self.level = level;
+        }
+        Ok(())
+    }
+
+    fn unlock(&mut self, level: LockLevel) -> Result<()> {
+        self.locks.borrow_mut().release(self.level, level);
+        if level < self.level {
+            self.level = level;
+        }
+        Ok(())
     }
 }
 

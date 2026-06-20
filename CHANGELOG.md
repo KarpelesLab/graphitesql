@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track C: VFS advisory-locking contract and writer serialization. A new
+  `LockState` encodes SQLite's `SHARED`/`RESERVED`/`PENDING`/`EXCLUSIVE`
+  compatibility rules; `MemoryVfs` and `StdVfs` now share one lock state per path
+  across all open handles (process-local). The write pager takes the write-intent
+  lock when staging a transaction and upgrades to exclusive while flushing, so a
+  second connection writing the same database is rejected with `Error::Busy`
+  while another holds an open write transaction — and the lock is released on
+  commit, rollback, and autocommit. (Reads buffer per-connection so they stay
+  isolated from uncommitted writes; cross-process OS locks remain a host-VFS
+  concern.)
 - Track B: `ANALYZE` and cost-based index selection. `ANALYZE [name]` gathers
   index selectivity into a `sqlite_stat1(tbl,idx,stat)` table, byte-compatible
   with SQLite's `nRow avgEq1 avgEq2 …` format (`avgEqK = (nRow + dK/2)/dK`);

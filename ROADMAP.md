@@ -169,17 +169,20 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
 
 ### Track C — Storage engine, transactions & **concurrency**
 
-- **Concurrency model** *(committed — we will support it).* Today the engine is
-  single-connection with no-op locking. Build out:
-  - the **`Vfs` locking contract** (`SHARED`/`RESERVED`/`PENDING`/`EXCLUSIVE`)
-    and an OS-file lock implementation behind `std`;
-  - **rollback-journal concurrency** — multiple readers or one writer, per
-    SQLite's lock ladder;
-  - the **WAL `-shm` wal-index** (shared-memory hash index) and the WAL locking
-    protocol so multiple connections (and other processes / the `sqlite3` CLI)
-    can read a WAL database concurrently with a writer, and checkpoint safely;
-  - a **thread-safe `Connection`/shared-pager** design that maps cleanly onto the
-    `Vfs` traits, with a documented threading model (serialized vs. multi-thread).
+- **Concurrency model** *(committed — we will support it).* Progress:
+  - ✅ the **`Vfs` locking contract** (`SHARED`/`RESERVED`/`PENDING`/`EXCLUSIVE`)
+    as a `LockState` machine, shared per-path across handles in `MemoryVfs`/
+    `StdVfs` (process-local), with the write pager taking write-intent → exclusive
+    and a second writer getting `Error::Busy`;
+  - ✅ **rollback-journal writer serialization** — one writer at a time, readers
+    isolated via per-connection buffering;
+  - *remaining:* **reader `SHARED`-lock enforcement on the read path**; an
+    **OS-file lock** implementation (needs `std::fs::File::lock`, MSRV ≥ 1.89, or
+    a host VFS) for true cross-process locking;
+  - *remaining:* the **WAL `-shm` wal-index** (shared-memory hash index) and WAL
+    locking protocol for multi-reader-with-writer concurrency and safe checkpoint;
+  - *remaining:* a **thread-safe `Connection`/shared-pager** with a documented
+    threading model.
   *Ref:* `wal.c` (`walIndex*`), `os_unix.c` (locking), `pager.c`.
 - **`auto_vacuum`** (full + incremental) — pointer-map (ptrmap) pages so the file
   can shrink on commit; `PRAGMA incremental_vacuum`. *Ref:* `btree.c` (ptrmap).
