@@ -5468,10 +5468,19 @@ impl Connection {
         }
 
         let labels = self.output_labels(sel, columns);
+        // SQLite's bare-column rule: with exactly one min()/max(), bare columns
+        // come from the row achieving that extreme (else the group's first row).
+        let minmax = single_minmax_arg(sel);
         let mut out = Vec::new();
         for group in &groups {
             // Representative row context for bare column references.
-            let repr = group.first().map(|&i| &rows[i]);
+            let repr_idx = match &minmax {
+                Some((is_max, arg)) => {
+                    self.argextreme_row(group, columns, &rows, arg, *is_max, params)?
+                }
+                None => group.first().copied(),
+            };
+            let repr = repr_idx.map(|i| &rows[i]);
             let empty = InputRow {
                 values: alloc::vec![Value::Null; columns.len()],
                 rowid: None,
@@ -5514,6 +5523,43 @@ impl Connection {
             out.push(OutRow { values, sort_keys });
         }
         Ok((labels, out))
+    }
+
+    /// The index (into `rows`) of the group member achieving the maximum (or
+    /// minimum) value of `arg`, ignoring NULLs; falls back to the group's first
+    /// row when every value is NULL. Implements SQLite's bare-column min/max rule.
+    fn argextreme_row(
+        &self,
+        group: &[usize],
+        columns: &[ColumnInfo],
+        rows: &[InputRow],
+        arg: &Expr,
+        is_max: bool,
+        params: &Params,
+    ) -> Result<Option<usize>> {
+        let mut best: Option<(usize, Value)> = None;
+        for &i in group {
+            let ctx = rows[i].ctx(columns, params).with_subqueries(self);
+            let v = eval::eval(arg, &ctx)?;
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            let take = match &best {
+                None => true,
+                Some((_, bv)) => {
+                    let ord = eval::compare(&v, bv);
+                    if is_max {
+                        ord == core::cmp::Ordering::Greater
+                    } else {
+                        ord == core::cmp::Ordering::Less
+                    }
+                }
+            };
+            if take {
+                best = Some((i, v));
+            }
+        }
+        Ok(best.map(|(i, _)| i).or_else(|| group.first().copied()))
     }
 
     /// Replace aggregate function calls in `expr` with their computed values for
@@ -7130,6 +7176,109 @@ fn resolve_order_index(expr: &Expr, labels: &[String], ncols: usize) -> Option<u
             column,
         } => labels.iter().position(|l| l.eq_ignore_ascii_case(column)),
         _ => None,
+    }
+}
+
+/// Invoke `f(is_max, arg)` for each plain (non-window) single-argument `min()` /
+/// `max()` aggregate call in `expr`. Used to detect SQLite's bare-column rule:
+/// a query with exactly one `min`/`max` takes bare columns from the extreme row.
+fn for_each_minmax(expr: &Expr, f: &mut dyn FnMut(bool, &Expr)) {
+    match expr {
+        Expr::Function {
+            over: Some(_),
+            args,
+            ..
+        } => {
+            for a in args {
+                for_each_minmax(a, f);
+            }
+        }
+        Expr::Function {
+            name,
+            args,
+            star: false,
+            ..
+        } => {
+            if args.len() == 1 {
+                let l = name.to_ascii_lowercase();
+                if l == "min" || l == "max" {
+                    f(l == "max", &args[0]);
+                }
+            }
+            for a in args {
+                for_each_minmax(a, f);
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                for_each_minmax(a, f);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            for_each_minmax(left, f);
+            for_each_minmax(right, f);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => for_each_minmax(expr, f),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            for_each_minmax(expr, f);
+            for_each_minmax(low, f);
+            for_each_minmax(high, f);
+        }
+        Expr::InList { expr, list, .. } => {
+            for_each_minmax(expr, f);
+            for l in list {
+                for_each_minmax(l, f);
+            }
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                for_each_minmax(o, f);
+            }
+            for (w, t) in when_then {
+                for_each_minmax(w, f);
+                for_each_minmax(t, f);
+            }
+            if let Some(e) = else_result {
+                for_each_minmax(e, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// If a grouped query references exactly one `min()`/`max()` aggregate (anywhere
+/// in its result columns, `HAVING`, or `ORDER BY`), return `(is_max, arg)`: bare
+/// columns then take their values from the row achieving that extreme, per
+/// SQLite. `min(a,b)`/`max(a,b)` (scalar, 2-arg) and window forms don't qualify.
+fn single_minmax_arg(sel: &Select) -> Option<(bool, Expr)> {
+    let mut hits: Vec<(bool, Expr)> = Vec::new();
+    let mut collect =
+        |e: &Expr| for_each_minmax(e, &mut |is_max, arg| hits.push((is_max, arg.clone())));
+    for col in &sel.columns {
+        if let ResultColumn::Expr { expr, .. } = col {
+            collect(expr);
+        }
+    }
+    if let Some(h) = &sel.having {
+        collect(h);
+    }
+    for term in &sel.order_by {
+        collect(&term.expr);
+    }
+    if hits.len() == 1 {
+        hits.pop()
+    } else {
+        None
     }
 }
 
