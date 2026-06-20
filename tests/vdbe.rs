@@ -89,7 +89,7 @@ fn table_scan_matches_tree_walker() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT)")
         .unwrap();
-    c.execute("INSERT INTO t(a,b) VALUES (3,'x'),(1,'y'),(2,'z')")
+    c.execute("INSERT INTO t(a,b) VALUES (3,'x'),(1,'y'),(2,'z'),(1,'y'),(2,'x')")
         .unwrap();
     // Plain projections, expressions over columns, and WHERE filters all run
     // through the VDBE and match the tree-walker.
@@ -119,6 +119,11 @@ fn table_scan_matches_tree_walker() {
         "SELECT a * 2 AS d FROM t ORDER BY d",
         "SELECT a, b FROM t ORDER BY 1 DESC",
         "SELECT a FROM t ORDER BY b DESC, a",
+        "SELECT DISTINCT a FROM t",
+        "SELECT DISTINCT a > 1 FROM t",
+        "SELECT DISTINCT b FROM t ORDER BY b",
+        "SELECT DISTINCT a FROM t WHERE a >= 1 LIMIT 2",
+        "SELECT DISTINCT a FROM t ORDER BY a DESC LIMIT 1 OFFSET 1",
     ] {
         assert_eq!(
             c.query_vdbe(q).unwrap().rows,
@@ -141,7 +146,7 @@ fn table_scan_matches_sqlite3() {
     let path = path.to_string_lossy().into_owned();
     let _ = std::fs::remove_file(&path);
     let setup = "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT);\
-                 INSERT INTO t(a,b) VALUES (3,'x'),(1,'y'),(2,'z')";
+                 INSERT INTO t(a,b) VALUES (3,'x'),(1,'y'),(2,'z'),(1,'y'),(2,'x')";
     Command::new("sqlite3")
         .arg(&path)
         .arg(setup)
@@ -164,6 +169,7 @@ fn table_scan_matches_sqlite3() {
         "SELECT a, b FROM t ORDER BY a",
         "SELECT a, b FROM t ORDER BY b DESC",
         "SELECT a FROM t ORDER BY a DESC LIMIT 2 OFFSET 1",
+        "SELECT DISTINCT a FROM t ORDER BY a",
     ];
     for q in queries {
         let want = {

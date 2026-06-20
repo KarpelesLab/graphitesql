@@ -172,10 +172,11 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
   `SELECT` projections covering arithmetic, concat, comparison, three-valued
   boolean logic, `IS NULL`, `CASE` (via `Goto`/`IfFalse` control flow), and `CAST`,
   plus a single-table scan with `WHERE` filtering, `ORDER BY` (a
-  `SorterInsert`/`SorterSort`/`SorterRewind` sorter), and `LIMIT`/`OFFSET`
-  (`Rewind`/`Column`/`Next` + `IfFalse` + `DecrJumpZero` + `IfPosDecr`) wired into
-  the engine via `Connection::query_vdbe` — all running alongside the tree-walker
-  with matching results. *Remaining:* joins and aggregates on the VDBE,
+  `SorterInsert`/`SorterSort`/`SorterRewind` sorter), `DISTINCT` (a
+  `DistinctCheck` gate), and `LIMIT`/`OFFSET` (`Rewind`/`Column`/`Next` +
+  `IfFalse` + `DecrJumpZero` + `IfPosDecr`) wired into the engine via
+  `Connection::query_vdbe` — all running alongside the tree-walker with matching
+  results. *Remaining:* joins and aggregates on the VDBE,
   then migrate the executor onto it; then **real `EXPLAIN`** (the `addr/opcode/p1…`
   listing) byte-comparable to SQLite's, and query flattening / subquery
   co-routines. *Ref:* `vdbe.c`, `vdbeaux.c`, `opcodes.h`.

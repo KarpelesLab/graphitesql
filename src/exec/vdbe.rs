@@ -88,6 +88,13 @@ pub enum Op {
     Negate { reg: usize, dest: usize },
     /// Emit registers `[start, start+count)` as one output row.
     ResultRow { start: usize, count: usize },
+    /// `DISTINCT` gate: if the row in `[start, start+count)` was already seen,
+    /// jump to `target` (skip it); otherwise record it and fall through.
+    DistinctCheck {
+        start: usize,
+        count: usize,
+        target: usize,
+    },
     /// Append a row to the sorter: the output values in `[row_start, row_start+
     /// row_count)` keyed by `[key_start, key_start+key_count)`.
     SorterInsert {
@@ -184,7 +191,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
 /// the table's column names, used to resolve column references to indices.
 /// Returns `Unsupported` outside this grammar so the caller can fall back.
 pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program> {
-    if !sel.group_by.is_empty() || !sel.compound.is_empty() || sel.distinct {
+    if !sel.group_by.is_empty() || !sel.compound.is_empty() {
         return Err(Error::Unsupported("VDBE: only plain table projections"));
     }
     // Expand the projection list to concrete expressions/labels (supporting `*`).
@@ -319,6 +326,23 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
         }
         None => None,
     };
+    // Compute the projected row first: `DISTINCT` and (non-ordering) `OFFSET` both
+    // gate on it, and `DISTINCT` must run before `OFFSET`/`LIMIT`.
+    for (i, (expr, _)) in projections.iter().enumerate() {
+        c.compile_expr_into(expr, i)?;
+    }
+    // Optional DISTINCT: skip the row (jump to Next) when an equal one was emitted.
+    let distinct_skip = if sel.distinct {
+        let at = c.ops.len();
+        c.ops.push(Op::DistinctCheck {
+            start: 0,
+            count,
+            target: 0,
+        });
+        Some(at)
+    } else {
+        None
+    };
     // Scan-loop OFFSET skip (only when not ordering; otherwise OFFSET is applied
     // to the sorted output).
     let offset_skip = if ordering {
@@ -330,9 +354,6 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
             at
         })
     };
-    for (i, (expr, _)) in projections.iter().enumerate() {
-        c.compile_expr_into(expr, i)?;
-    }
     let mut limit_done = None;
     if ordering {
         // Stage the projected row and its keys into the sorter; emission happens
@@ -364,6 +385,11 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
     if let Some(at) = offset_skip {
         if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
             *target = next; // a skipped (offset) row advances to the next
+        }
+    }
+    if let Some(at) = distinct_skip {
+        if let Op::DistinctCheck { target, .. } = &mut c.ops[at] {
+            *target = next; // a duplicate row advances to the next
         }
     }
     let end = c.ops.len();
@@ -659,6 +685,8 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                                // place by `SorterSort`, then walked by `SorterRewind`/`SorterNext`.
     let mut sorter: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     let mut scursor: usize = 0;
+    // Rows already emitted under DISTINCT (NULLs compare equal here).
+    let mut seen: Vec<Vec<Value>> = Vec::new();
     let mut pc = 0usize;
     while pc < program.ops.len() {
         let op = &program.ops[pc];
@@ -770,6 +798,21 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
             Op::ResultRow { start, count } => {
                 out.push(regs[*start..*start + *count].to_vec());
             }
+            Op::DistinctCheck {
+                start,
+                count,
+                target,
+            } => {
+                let row = &regs[*start..*start + *count];
+                let dup = seen.iter().any(|prev| {
+                    prev.len() == row.len() && prev.iter().zip(row).all(|(a, b)| distinct_eq(a, b))
+                });
+                if dup {
+                    pc = *target;
+                } else {
+                    seen.push(row.to_vec());
+                }
+            }
             Op::SorterInsert {
                 row_start,
                 row_count,
@@ -820,6 +863,19 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
         }
     }
     Ok(out)
+}
+
+/// Equality used by `DISTINCT`: two NULLs are equal (unlike `=`), otherwise the
+/// usual binary-collation value comparison decides.
+fn distinct_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        _ => {
+            crate::value::cmp_values_coll(a, b, crate::value::Collation::Binary)
+                == core::cmp::Ordering::Equal
+        }
+    }
 }
 
 /// `a AND b` under SQLite three-valued logic: false dominates, else NULL if

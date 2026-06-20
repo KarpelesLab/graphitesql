@@ -112,6 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second cursor loop (`SorterRewind`/`SorterRow`/`SorterNext`) emits them with
   `OFFSET`/`LIMIT` applied to the sorted output. Output-column ordinals
   (`ORDER BY 2`) and aliases (`ORDER BY d`) resolve to their projection.
+  `SELECT DISTINCT` compiles to a `DistinctCheck` gate (NULLs compare equal) that
+  drops duplicate output rows before `OFFSET`/`LIMIT`, composing with `ORDER BY`
+  (dedup, then sort).
 - Track B: `ANALYZE` and cost-based index selection. `ANALYZE [name]` gathers
   index selectivity into a `sqlite_stat1(tbl,idx,stat)` table, byte-compatible
   with SQLite's `nRow avgEq1 avgEq2 …` format (`avgEqK = (nRow + dK/2)/dK`);
