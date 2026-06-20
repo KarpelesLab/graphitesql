@@ -527,6 +527,8 @@ pub struct CreateIndex {
     pub unique: bool,
     /// `IF NOT EXISTS`?
     pub if_not_exists: bool,
+    /// Optional `schema.` (database) qualifier on the index name.
+    pub schema: Option<String>,
     /// Index name.
     pub name: String,
     /// Indexed table.

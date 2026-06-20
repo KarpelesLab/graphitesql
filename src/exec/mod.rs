@@ -961,6 +961,9 @@ impl Connection {
             Statement::Delete(s) => resolved(s.schema.as_deref(), &s.table),
             Statement::Drop(s) => resolved(s.schema.as_deref(), &s.name),
             Statement::Alter(a) => resolved(a.schema.as_deref(), &a.table),
+            // The index lives in the schema named on the index (or, unqualified,
+            // wherever its table lives — so a temp table's index goes to temp).
+            Statement::CreateIndex(ci) => resolved(ci.schema.as_deref(), &ci.table),
             _ => Ok(DbRef::Main),
         }
     }
@@ -3170,6 +3173,15 @@ impl Connection {
     // ---- index DDL & maintenance --------------------------------------------
 
     fn exec_create_index(&mut self, ci: &CreateIndex, sql_text: &str) -> Result<()> {
+        // A schema-qualified `CREATE INDEX aux.idx …` stores its SQL bare-named
+        // in the target catalog (the `aux.` prefix is invalid there). Reprint.
+        let reprinted;
+        let sql_text = if ci.schema.is_some() {
+            reprinted = sql::print::create_index(ci);
+            reprinted.as_str()
+        } else {
+            sql_text
+        };
         if self.schema.index(&ci.name).is_some() {
             if ci.if_not_exists {
                 return Ok(());

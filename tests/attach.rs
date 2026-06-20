@@ -203,6 +203,78 @@ fn cross_database_without_rowid_read() {
 }
 
 #[test]
+fn cross_database_create_index() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE aux.t(a INT, b TEXT)").unwrap();
+    c.execute("INSERT INTO aux.t VALUES(1,'x'),(2,'y'),(1,'z')")
+        .unwrap();
+    c.execute("CREATE INDEX aux.idx_a ON t(a)").unwrap();
+    c.execute("CREATE UNIQUE INDEX aux.idx_b ON t(b)").unwrap();
+
+    // The index serves an equality seek and its UNIQUE constraint is enforced.
+    let r = c.query("SELECT b FROM aux.t WHERE a=1 ORDER BY b").unwrap();
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Text("x".into())], vec![Value::Text("z".into())]]
+    );
+    assert!(c.execute("INSERT INTO aux.t VALUES(9,'x')").is_err());
+
+    // The indexes live in aux's catalog, none leak into main.
+    let names: Vec<_> = c
+        .query("SELECT name FROM aux.sqlite_master WHERE type='index' ORDER BY name")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec![Value::Text("idx_a".into()), Value::Text("idx_b".into())]
+    );
+    assert_eq!(
+        c.query("SELECT count(*) FROM main.sqlite_master WHERE type='index'")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(0)
+    );
+}
+
+#[test]
+fn cross_database_create_index_file_cross_engine() {
+    let sqlite = std::process::Command::new("sqlite3")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !sqlite {
+        return;
+    }
+    let mut p = std::env::temp_dir();
+    p.push(format!("graphitesql-attach-idx-{}.db", std::process::id()));
+    let path = p.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(&format!("ATTACH '{path}' AS d")).unwrap();
+        c.execute("CREATE TABLE d.t(a INT, b TEXT)").unwrap();
+        c.execute("INSERT INTO d.t VALUES(1,'x'),(2,'y')").unwrap();
+        c.execute("CREATE INDEX d.idx_a ON t(a)").unwrap();
+    }
+    // sqlite3 reads the file: integrity ok (index pages valid) and the index is
+    // stored bare-named so sqlite can use it.
+    let out = std::process::Command::new("sqlite3")
+        .arg(&path)
+        .arg("PRAGMA integrity_check; SELECT b FROM t WHERE a=2;")
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("ok"), "integrity: {s}");
+    assert!(s.contains('y'), "seek: {s}");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+}
+
+#[test]
 fn cross_database_alter() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("ATTACH ':memory:' AS aux").unwrap();

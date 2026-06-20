@@ -903,7 +903,11 @@ impl Parser {
             return Ok(Statement::CreateTable(ct));
         }
         if self.eat_kw("index") {
-            return Ok(Statement::CreateIndex(self.create_index(unique)?));
+            let mut ci = self.create_index(unique)?;
+            if temp && ci.schema.is_none() {
+                ci.schema = Some("temp".into());
+            }
+            return Ok(Statement::CreateIndex(ci));
         }
         if unique {
             return Err(self.err("expected INDEX after CREATE UNIQUE"));
@@ -1306,7 +1310,7 @@ impl Parser {
 
     fn create_index(&mut self, unique: bool) -> Result<CreateIndex> {
         let if_not_exists = self.if_not_exists()?;
-        let name = self.ident()?;
+        let (schema, name) = self.qualified_name()?;
         self.expect_kw("on")?;
         let table = self.ident()?;
         self.expect(&Token::LParen)?;
@@ -1324,6 +1328,7 @@ impl Parser {
         Ok(CreateIndex {
             unique,
             if_not_exists,
+            schema,
             name,
             table,
             columns,
