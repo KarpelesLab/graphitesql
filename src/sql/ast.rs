@@ -359,6 +359,9 @@ pub struct Update {
     pub table: String,
     /// `SET col = expr` assignments.
     pub assignments: Vec<(String, Expr)>,
+    /// `UPDATE … SET … FROM <sources>` — extra tables joined to the target so
+    /// the `SET`/`WHERE` expressions can read their columns (SQLite extension).
+    pub from: Option<FromClause>,
     /// `WHERE` predicate.
     pub where_clause: Option<Expr>,
     /// `ORDER BY` for a `LIMIT`ed update (empty when absent).

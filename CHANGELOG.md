@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: **`UPDATE … SET … FROM <sources>`** (SQLite's UPDATE-FROM extension)
+  — the target table is joined to the FROM tables (incl. multi-table and
+  derived-table sources); each matched target row is updated using the joined
+  row's columns, firing triggers and enforcing constraints as usual.
 - Fix: **LIMIT/OFFSET on a recursive CTE** is honored — it bounds the produced
   rows and terminates the recursion (was stripped, causing "did not terminate").
 - Fix: **HAVING without GROUP BY** parses and runs (whole result = one group);

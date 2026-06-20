@@ -803,6 +803,13 @@ impl Parser {
                 break;
             }
         }
+        // `FROM <sources>` (SQLite's UPDATE-FROM extension) sits between SET and
+        // WHERE.
+        let from = if self.eat_kw("from") {
+            Some(self.tables_clause()?)
+        } else {
+            None
+        };
         let where_clause = if self.eat_kw("where") {
             Some(self.expr()?)
         } else {
@@ -814,6 +821,7 @@ impl Parser {
         Ok(Update {
             table,
             assignments,
+            from,
             where_clause,
             order_by,
             limit,

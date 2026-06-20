@@ -2610,8 +2610,40 @@ impl Connection {
             return self.exec_update_without_rowid(upd, &meta, params);
         }
         let indexes = self.indexes_of(&upd.table)?;
-        // Collect (rowid, current values) for matching rows first.
-        let mut targets: Vec<(i64, Vec<Value>)> = Vec::new();
+        // UPDATE … FROM: materialize the extra tables once. Each target row is
+        // joined to the first FROM-row combination satisfying WHERE, and that
+        // row's columns are visible to SET/WHERE. Without FROM, `from_rows` is
+        // empty and the target is matched against WHERE directly.
+        let from_data = match &upd.from {
+            Some(fc) => {
+                // A from-only synthetic SELECT to reuse the join scanner. Its WHERE
+                // stays empty (the UPDATE's WHERE references the target too and is
+                // applied per target row below), so the scan is a plain superset.
+                let synth = Select {
+                    ctes: Vec::new(),
+                    compound: Vec::new(),
+                    distinct: false,
+                    columns: Vec::new(),
+                    from: Some(fc.clone()),
+                    where_clause: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    window_defs: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                };
+                let (cols, rows) = self.scan_source(&synth, params)?;
+                Some((cols, rows.into_iter().map(|r| r.values).collect::<Vec<_>>()))
+            }
+            None => None,
+        };
+        let combined_columns: Vec<ColumnInfo> = match &from_data {
+            Some((cols, _)) => meta.columns.iter().chain(cols).cloned().collect(),
+            None => Vec::new(),
+        };
+        // Collect (rowid, current values, matched FROM row) for matching rows.
+        let mut targets: Vec<(i64, Vec<Value>, Option<Vec<Value>>)> = Vec::new();
         {
             let mut cur = TableCursor::new(self.backend.source(), meta.root);
             let encoding = self.backend.source().header().text_encoding;
@@ -2619,23 +2651,51 @@ impl Connection {
             while ok {
                 let rowid = cur.rowid()?;
                 let values = self.decode_full_row(&meta, rowid, &cur.payload()?, encoding)?;
-                let matches = match &upd.where_clause {
-                    Some(p) => {
-                        let ctx = row_ctx(&values, &meta.columns, Some(rowid), params)
-                            .with_subqueries(self);
-                        eval::truth(&eval::eval(p, &ctx)?) == Some(true)
+                match &from_data {
+                    // UPDATE … FROM: find the first joined row passing WHERE.
+                    Some((_, from_rows)) => {
+                        let mut matched = None;
+                        for fr in from_rows {
+                            let mut combined = values.clone();
+                            combined.extend_from_slice(fr);
+                            let ok = match &upd.where_clause {
+                                Some(p) => {
+                                    let ctx =
+                                        row_ctx(&combined, &combined_columns, Some(rowid), params)
+                                            .with_subqueries(self);
+                                    eval::truth(&eval::eval(p, &ctx)?) == Some(true)
+                                }
+                                None => true,
+                            };
+                            if ok {
+                                matched = Some(fr.clone());
+                                break;
+                            }
+                        }
+                        if let Some(fr) = matched {
+                            targets.push((rowid, values, Some(fr)));
+                        }
                     }
-                    None => true,
-                };
-                if matches {
-                    targets.push((rowid, values));
+                    None => {
+                        let matches = match &upd.where_clause {
+                            Some(p) => {
+                                let ctx = row_ctx(&values, &meta.columns, Some(rowid), params)
+                                    .with_subqueries(self);
+                                eval::truth(&eval::eval(p, &ctx)?) == Some(true)
+                            }
+                            None => true,
+                        };
+                        if matches {
+                            targets.push((rowid, values, None));
+                        }
+                    }
                 }
                 ok = cur.next()?;
             }
         }
         // `ORDER BY … LIMIT …` selects which matching rows to update.
         if !upd.order_by.is_empty() || upd.limit.is_some() || upd.offset.is_some() {
-            let rowids: Vec<i64> = targets.iter().map(|(r, _)| *r).collect();
+            let rowids: Vec<i64> = targets.iter().map(|(r, _, _)| *r).collect();
             let kept = self.order_limit_rowids(
                 &meta,
                 rowids,
@@ -2645,18 +2705,19 @@ impl Connection {
                 params,
             )?;
             // Reorder/filter `targets` to the kept rowids, preserving kept order.
-            let mut by_id: alloc::collections::BTreeMap<i64, Vec<Value>> =
-                targets.into_iter().collect();
+            let mut by_id: alloc::collections::BTreeMap<i64, (Vec<Value>, Option<Vec<Value>>)> =
+                targets.into_iter().map(|(r, v, f)| (r, (v, f))).collect();
             targets = kept
                 .into_iter()
-                .filter_map(|r| by_id.remove(&r).map(|v| (r, v)))
+                .filter_map(|r| by_id.remove(&r).map(|(v, f)| (r, v, f)))
                 .collect();
         }
 
         let mut affected = 0;
-        for (rowid, mut values) in targets {
+        for (rowid, mut values, matched_from) in targets {
             let old_row = values.clone();
-            // Apply SET assignments evaluated against the current row.
+            // Apply SET assignments evaluated against the current row (joined to
+            // the matched FROM row, for UPDATE … FROM).
             for (col, expr) in &upd.assignments {
                 let pos = meta
                     .columns
@@ -2668,9 +2729,21 @@ impl Connection {
                         "cannot UPDATE generated column \"{col}\""
                     )));
                 }
-                let ctx =
-                    row_ctx(&values, &meta.columns, Some(rowid), params).with_subqueries(self);
-                values[pos] = eval::eval(expr, &ctx)?;
+                let new = match &matched_from {
+                    Some(fr) => {
+                        let mut combined = values.clone();
+                        combined.extend_from_slice(fr);
+                        let ctx = row_ctx(&combined, &combined_columns, Some(rowid), params)
+                            .with_subqueries(self);
+                        eval::eval(expr, &ctx)?
+                    }
+                    None => {
+                        let ctx = row_ctx(&values, &meta.columns, Some(rowid), params)
+                            .with_subqueries(self);
+                        eval::eval(expr, &ctx)?
+                    }
+                };
+                values[pos] = new;
             }
             apply_column_affinity(&meta, &mut values);
             self.materialize_generated(&meta, &mut values, params)?;
