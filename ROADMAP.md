@@ -117,9 +117,11 @@ formatting; collation (`BINARY`/`NOCASE`/`RTRIM`) honored across comparisons,
 an index-driven planner (equality/range/`IN`/OR-union seeks, **index-driven
 `ORDER BY`** with **covering-index reads**, stats-driven choice via
 `ANALYZE`/`sqlite_stat1`); constraint enforcement (`NOT NULL`, `CHECK`,
-`UNIQUE`/`PK`, standalone/partial/expression UNIQUE indexes; **foreign-key
-runtime enforcement is in progress — see Track E**, FK definitions/actions parse
-and store today); **triggers** (`BEFORE`/`AFTER`/`INSTEAD OF`, `UPDATE OF`,
+`UNIQUE`/`PK`, standalone/partial/expression UNIQUE indexes; **foreign keys**
+enforced at runtime under `PRAGMA foreign_keys=ON` — child INSERT/UPDATE parent
+checks and parent DELETE/UPDATE actions NO ACTION/RESTRICT/CASCADE/SET NULL/SET
+DEFAULT, composite + self-referential; *deferred:* DEFERRABLE/INITIALLY DEFERRED);
+**triggers** (`BEFORE`/`AFTER`/`INSTEAD OF`, `UPDATE OF`,
 `WHEN`, recursive, `NEW`/`OLD` incl. rowid); `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`;
 **`ATTACH`/`DETACH`/`TEMP`** multi-schema (cross-database reads, writes, joins,
 qualified DDL, view reads, transactions & savepoints); DDL with full CREATE-time
@@ -473,14 +475,9 @@ prefixes, explicit `COLLATE` in IN/CASE/BETWEEN, strftime NULL-on-unknown + `%U`
 i64-overflow promotions, CTE `MATERIALIZED`, postfix `NOT NULL`, windowed
 `group_concat` separator, and an aggregate-arity panic guard. Suggested next order:
 
-1. **Track E — FOREIGN KEY runtime enforcement** *(in progress)* — gated on
-   `PRAGMA foreign_keys=ON` (default OFF, byte-identical): child INSERT/UPDATE
-   parent-exists checks, and parent DELETE/UPDATE actions (NO ACTION/RESTRICT →
-   error, CASCADE/SET NULL/SET DEFAULT). Definitions already parse+store; this is
-   enforcement in the DML paths. *(Deferred: DEFERRABLE/INITIALLY DEFERRED
-   check-at-commit.)*
-2. **D2 — FTS5** full-text search — the next big module on the vtab trait (now
-   that `best_index` pushdown exists).
+1. **D2 — FTS5** full-text search — the next big module on the vtab trait (now
+   that `best_index` pushdown exists). *(FOREIGN KEY runtime enforcement turned
+   out to be already done — only DEFERRABLE/INITIALLY DEFERRED remains there.)*
 3. **Planner leftovers** — **B0b** (`GROUP BY`/multi-term `ORDER BY` via index),
    **B1b** (join reordering, now that inner tables can be seeked), **B3**
    (auto-index EQP), **A2** (DESC seek direction), **B4** (`sqlite_stat4`).
