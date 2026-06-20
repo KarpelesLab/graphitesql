@@ -202,7 +202,7 @@ Open EQP divergences (verified against sqlite3):
 | query | graphite today | sqlite3 (target) | piece |
 |-------|----------------|------------------|-------|
 | `… FROM t JOIN u ON t.c=u.x` (`x` = `u` PK) | ✅ now `SCAN t` + `SEARCH u USING INTEGER PRIMARY KEY (rowid=?)` | (same) | **B1a** ✅ |
-| `… FROM t JOIN u ON t.c=u.k` (`k` indexed) | `SCAN t` + `SCAN u` | `SCAN t` + `SEARCH u USING INDEX …` | **B1a²/B3** |
+| `… FROM t JOIN u ON t.c=u.k` (`k` indexed) | ✅ now `SCAN t` + `SEARCH u USING INDEX …` | (same) | **B1a²** ✅ |
 | `SELECT count(*) FROM t` (one full index `ic`) | ✅ now `SCAN t USING COVERING INDEX ic` | `SCAN t USING COVERING INDEX ic` | **B2b** ✅ |
 
 - **B0b — Index-driven `ORDER BY`/`GROUP BY`, remaining cases.** Extend the
@@ -214,8 +214,10 @@ Open EQP divergences (verified against sqlite3):
   INNER/LEFT join whose `ON` is `outer.col = u.rowid` seeks `u` by rowid per
   outer row (`rowid_join_seek` + `exec_rowid_join_seek`), reporting `SEARCH u
   USING INTEGER PRIMARY KEY (rowid=?)` in lockstep with execution; the full `ON`
-  is re-checked so results are identical. *Remaining (B1a²):* the same for a
-  non-PK **indexed** inner column (`SEARCH … USING INDEX …`), and RIGHT/FULL.
+  is re-checked so results are identical. ✅ **B1a²** also done — the same seek
+  for a non-PK **indexed** inner column (`index_join_seek`/`exec_index_join_seek`,
+  `SEARCH … USING INDEX …`), with non-unique-key fan-out and collation-superset
+  re-eval. *Remaining:* RIGHT/FULL joins (still materialized).
 - **B1b — Join order.** Reorder `FROM` tables by a simple cost model (smallest
   estimated cardinality / most-selective indexed table first) rather than textual
   order; results identical, order verified via EQP. *Ref:* `where.c`.
