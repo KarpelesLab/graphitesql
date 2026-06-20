@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   b-tree for an `INTEGER PRIMARY KEY`), unions the rowids, and fetches the rows,
   instead of scanning. Returns a superset (full `WHERE` re-applied). Verified
   against `sqlite3`.
+- Track B: `EXPLAIN QUERY PLAN` now reports the index range and `IN`-list seeks as
+  `SEARCH … USING INDEX … (a>? AND a<?)` / `(a=?)` (and rowid `IN` as
+  `… INTEGER PRIMARY KEY (rowid=?)`), matching SQLite's format and reflecting what
+  the executor actually does.
 - Track B: index **range scans**. A single-table query whose `WHERE` constrains an
   indexed column by `<`/`<=`/`>`/`>=`/`BETWEEN` now seeks the index between those
   bounds (`btree::index_range_rowids`, an in-order traversal that stops once the

@@ -76,6 +76,57 @@ fn search_by_composite_index() {
 }
 
 #[test]
+fn search_by_range_and_in() {
+    // A dedicated table with a single index per column, so the chosen index is
+    // unambiguous (and matches what the executor seeks).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE r(id INTEGER PRIMARY KEY, a INT, b TEXT)")
+        .unwrap();
+    c.execute("CREATE INDEX r_a ON r(a)").unwrap();
+    for i in 1..=20 {
+        c.execute(&format!("INSERT INTO r(a,b) VALUES ({}, 'x{i}')", i % 7))
+            .unwrap();
+    }
+    // Range bounds render as `>`/`<` regardless of inclusivity, like SQLite.
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM r WHERE a > 3"),
+        ["SEARCH r USING INDEX r_a (a>?)"]
+    );
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM r WHERE a <= 3"),
+        ["SEARCH r USING INDEX r_a (a<?)"]
+    );
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM r WHERE a >= 2 AND a < 5"
+        ),
+        ["SEARCH r USING INDEX r_a (a>? AND a<?)"]
+    );
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM r WHERE a BETWEEN 2 AND 5"
+        ),
+        ["SEARCH r USING INDEX r_a (a>? AND a<?)"]
+    );
+    // IN-list renders like equality.
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM r WHERE a IN (1,2,3)"),
+        ["SEARCH r USING INDEX r_a (a=?)"]
+    );
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM r WHERE id IN (1,2,3)"),
+        ["SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"]
+    );
+    // A rowid range still scans (graphitesql does not range-seek the rowid yet).
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM r WHERE id > 5"),
+        ["SCAN r"]
+    );
+}
+
+#[test]
 fn order_by_adds_temp_btree() {
     let c = setup();
     let d = detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY s");

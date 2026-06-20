@@ -3523,6 +3523,64 @@ impl Connection {
                 ));
             }
         }
+
+        // No equality index applied. Mirror run_core's remaining fast paths
+        // (range, then IN) so the plan reflects what actually executes. Find the
+        // name/columns of a plain index by its leading column.
+        let leading_index = |target: usize| -> Option<(String, Vec<usize>)> {
+            for obj in self.schema.indexes_on(table) {
+                let sql = obj.sql.as_ref()?;
+                let Ok(Statement::CreateIndex(ci)) = sql::parse_one(sql) else {
+                    continue;
+                };
+                if ci.where_clause.is_some() {
+                    continue;
+                }
+                let Ok(cols) = self.index_columns(meta, &ci) else {
+                    continue;
+                };
+                if cols.first() == Some(&target) {
+                    return Some((obj.name.clone(), cols));
+                }
+            }
+            None
+        };
+
+        // Range scan on an indexed leading column (rowid ranges still scan).
+        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+            alloc::collections::BTreeMap::new();
+        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+        for (&col, bound) in &ranges {
+            if let Some((idx_name, _)) = leading_index(col) {
+                let name = &meta.columns[col].name;
+                // SQLite's EQP renders bounds as `>`/`<` regardless of inclusivity.
+                let cond = match (&bound.lower, &bound.upper) {
+                    (Some(_), Some(_)) => alloc::format!("{name}>? AND {name}<?"),
+                    (Some(_), None) => alloc::format!("{name}>?"),
+                    (None, Some(_)) => alloc::format!("{name}<?"),
+                    (None, None) => continue,
+                };
+                return Ok(alloc::format!(
+                    "SEARCH {label} USING INDEX {idx_name} ({cond})"
+                ));
+            }
+        }
+
+        // IN-list seek: rowid b-tree, or an index on the IN column.
+        if let Some((col, _)) = find_in_constraint(where_expr, &meta.columns, params) {
+            if meta.ipk == Some(col) {
+                return Ok(alloc::format!(
+                    "SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"
+                ));
+            }
+            if let Some((idx_name, _)) = leading_index(col) {
+                let name = &meta.columns[col].name;
+                return Ok(alloc::format!(
+                    "SEARCH {label} USING INDEX {idx_name} ({name}=?)"
+                ));
+            }
+        }
+
         Ok(alloc::format!("SCAN {label}"))
     }
 
