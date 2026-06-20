@@ -1369,6 +1369,7 @@ impl Parser {
                 args: Vec::new(),
                 star: true,
                 filter,
+                order_by: Vec::new(),
                 over,
             });
         }
@@ -1380,6 +1381,15 @@ impl Parser {
                 args.push(self.expr()?);
             }
         }
+        // `ORDER BY …` inside an aggregate call (e.g. `group_concat(x ORDER BY y)`).
+        let mut order_by = Vec::new();
+        if self.eat_kw("order") {
+            self.expect_kw("by")?;
+            order_by.push(self.order_term()?);
+            while self.eat(&Token::Comma) {
+                order_by.push(self.order_term()?);
+            }
+        }
         self.expect(&Token::RParen)?;
         let filter = self.filter_clause()?;
         let over = self.window_over()?;
@@ -1389,6 +1399,7 @@ impl Parser {
             args,
             star: false,
             filter,
+            order_by,
             over,
         })
     }

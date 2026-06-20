@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: ordered aggregates — `group_concat(x ORDER BY y [DESC])` (and any
+  aggregate with an inner `ORDER BY`) sorts the group's rows before folding,
+  honoring `DESC`/`NULLS` and collation. Verified against `sqlite3`.
 - Track A: `percent_rank()` and `cume_dist()` window functions. Verified against
   `sqlite3`.
 - Track A: named windows — `WINDOW w AS (…)` definitions with `OVER w` references

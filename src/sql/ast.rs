@@ -274,6 +274,10 @@ pub struct Upsert {
 
 /// The action of an `ON CONFLICT … DO …` clause.
 #[derive(Debug, Clone, PartialEq)]
+// `DO UPDATE` carries assignments + an optional predicate; boxing them would hurt
+// ergonomics more than the size gap costs (see the module note), and upsert
+// statements are short-lived.
+#[allow(clippy::large_enum_variant)]
 pub enum UpsertAction {
     /// `DO NOTHING`: silently skip the conflicting row.
     Nothing,
@@ -606,6 +610,8 @@ pub enum Expr {
         /// `FILTER (WHERE …)` — restricts which rows an aggregate/window function
         /// consumes.
         filter: Option<Box<Expr>>,
+        /// `ORDER BY …` inside an aggregate call (`group_concat(x ORDER BY y)`).
+        order_by: Vec<OrderTerm>,
         /// `OVER (…)` window specification, making this a window-function call.
         over: Option<WindowSpec>,
     },

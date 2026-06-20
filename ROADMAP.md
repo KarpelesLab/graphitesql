@@ -135,8 +135,8 @@ Make the dialect complete. Each item lands with a differential corpus addition.
 - ✅ **`ORDER BY` modifiers** — `NULLS FIRST`/`NULLS LAST`; `IS [NOT] DISTINCT FROM`.
 - **Aggregate/window extras** — ✅ `FILTER (WHERE …)` on aggregates, ✅ the
   `WINDOW name AS (…)` clause with named-window reuse, ✅ `percent_rank`/
-  `cume_dist`. *Remaining:* frame `EXCLUDE`, `GROUP_CONCAT` ordering, `FILTER` on
-  window functions, `count(DISTINCT …)` over windows.
+  `cume_dist`, ✅ ordered aggregates (`group_concat(x ORDER BY y)`). *Remaining:*
+  frame `EXCLUDE`, `FILTER` on window functions, `count(DISTINCT …)` over windows.
 - **Function library** — ✅ math functions (`sqrt`, `pow`, `ceil`, `floor`,
   `ln`/`log`, trig, …, pure-`core`, no libm) and ✅ **JSON** functions (`json`,
   `json_extract`, `json_array`/`json_object`, `json_type`, `json_array_length`,

@@ -4580,6 +4580,7 @@ impl Connection {
                 args,
                 star,
                 filter,
+                order_by,
                 over: None,
             } if func::is_aggregate_call(name, args.len(), *star) => {
                 // `FILTER (WHERE …)` narrows the group's rows before aggregating.
@@ -4592,7 +4593,7 @@ impl Connection {
                     None => group,
                 };
                 let v = self.compute_aggregate(
-                    name, *distinct, args, *star, columns, rows, group, params,
+                    name, *distinct, args, *star, order_by, columns, rows, group, params,
                 )?;
                 Expr::Literal(value_to_literal(v))
             }
@@ -4602,6 +4603,7 @@ impl Connection {
                 args,
                 star,
                 filter,
+                order_by,
                 over,
             } => {
                 let mut new_args = Vec::with_capacity(args.len());
@@ -4614,6 +4616,7 @@ impl Connection {
                     args: new_args,
                     star: *star,
                     filter: filter.clone(),
+                    order_by: order_by.clone(),
                     over: over.clone(),
                 }
             }
@@ -4720,18 +4723,55 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn compute_aggregate(
         &self,
         name: &str,
         distinct: bool,
         args: &[Expr],
         star: bool,
+        order_by: &[OrderTerm],
         columns: &[ColumnInfo],
         rows: &[InputRow],
         group: &[usize],
         params: &Params,
     ) -> Result<Value> {
         let lname = name.to_ascii_lowercase();
+
+        // An `ORDER BY` inside the aggregate (`group_concat(x ORDER BY y)`) sorts
+        // the group's rows before the values are gathered.
+        let ordered_group;
+        let group = if order_by.is_empty() {
+            group
+        } else {
+            let mut g = group.to_vec();
+            let mut err = None;
+            g.sort_by(|&a, &b| {
+                for term in order_by {
+                    let ca = rows[a].ctx(columns, params).with_subqueries(self);
+                    let cb = rows[b].ctx(columns, params).with_subqueries(self);
+                    let (va, vb) = match (eval::eval(&term.expr, &ca), eval::eval(&term.expr, &cb))
+                    {
+                        (Ok(x), Ok(y)) => (x, y),
+                        (Err(e), _) | (_, Err(e)) => {
+                            err.get_or_insert(e);
+                            return core::cmp::Ordering::Equal;
+                        }
+                    };
+                    let coll = eval::key_collation(&term.expr, &ca);
+                    let ord = cmp_order(&va, &vb, term.descending, term.nulls_first, coll);
+                    if ord != core::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
+            ordered_group = g;
+            &ordered_group[..]
+        };
 
         // Gather the (non-NULL for most) argument values across the group.
         let mut vals: Vec<Value> = Vec::new();
@@ -5246,6 +5286,7 @@ fn resolve_window_ref(wexpr: &Expr, defs: &[(String, WindowSpec)]) -> Result<Exp
         args,
         star,
         filter,
+        order_by,
         over: Some(spec),
     } = wexpr
     else {
@@ -5277,6 +5318,7 @@ fn resolve_window_ref(wexpr: &Expr, defs: &[(String, WindowSpec)]) -> Result<Exp
         args: args.clone(),
         star: *star,
         filter: filter.clone(),
+        order_by: order_by.clone(),
         over: Some(effective),
     })
 }
