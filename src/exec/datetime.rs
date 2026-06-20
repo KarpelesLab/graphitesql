@@ -954,6 +954,11 @@ fn iso_week_date(p: &DateTime) -> (i32, i32) {
 
 // ---- printf / format --------------------------------------------------------
 
+/// SQLite's total-output ceiling (`SQLITE_MAX_LENGTH`, default 1e9). A field
+/// whose width or precision would push the result to or past this returns the
+/// empty string, exactly as SQLite's `sqlite3_str` does on `SQLITE_TOOBIG`.
+const PRINTF_LIMIT: usize = 1_000_000_000;
+
 /// Insert `,` thousands separators into the integer part of a formatted number,
 /// preserving a leading sign (`+`/`-`/space) and any fractional `.xxx` tail.
 fn group_thousands(s: &str) -> String {
@@ -974,9 +979,33 @@ fn group_thousands(s: &str) -> String {
     alloc::format!("{sign}{grouped}{frac}")
 }
 
-/// SQLite's `printf`/`format`: a subset of C `printf` conversions sufficient for
-/// the common cases (`%d %i %u %s %c %x %X %o %f %e %g %% %q %Q %w`), with width,
-/// left-justify, zero-pad, `+`, space, `,` thousands-grouping, and precision flags.
+/// SQLite's alt-form-2 (`!`) float rendering: strip trailing zeros from the
+/// fraction but always keep at least one digit after the decimal point (so
+/// `1.000000` becomes `1.0`, not `1`). Applies to `%f`/`%e`/`%g`.
+fn strip_zeros_keep_one(s: &str) -> String {
+    // Split off an exponent (`e+02`) so we only trim the mantissa.
+    let (mant, exp) = match s.find(['e', 'E']) {
+        Some(pos) => s.split_at(pos),
+        None => (s, ""),
+    };
+    let mant = if mant.contains('.') {
+        let t = mant.trim_end_matches('0');
+        if t.ends_with('.') {
+            alloc::format!("{t}0")
+        } else {
+            String::from(t)
+        }
+    } else {
+        alloc::format!("{mant}.0")
+    };
+    alloc::format!("{mant}{exp}")
+}
+
+/// SQLite's `printf`/`format`, mirroring `sqlite3_str_vappendf`: the C
+/// conversions `%d %i %u %f %e %E %g %G %x %X %o %s %c %%` plus SQLite's
+/// extensions `%q %Q %w %z`, the flags `- + space 0 # ,` and `!`, numeric or
+/// `*` width and precision (including integer minimum-digit precision and the
+/// `#` alternate form).
 pub fn printf(args: &[Value]) -> Value {
     if args.is_empty() {
         return Value::Null;
@@ -988,6 +1017,8 @@ pub fn printf(args: &[Value]) -> Value {
     let mut arg_idx = 1usize;
     let bytes: Vec<char> = fmt.chars().collect();
     let mut i = 0;
+    // Set on any width/precision overflow; SQLite returns the empty string.
+    let mut too_big = false;
     while i < bytes.len() {
         let c = bytes[i];
         if c != '%' {
@@ -1011,6 +1042,7 @@ pub fn printf(args: &[Value]) -> Value {
         let mut space = false;
         let mut alt = false;
         let mut comma = false;
+        let mut bang = false;
         loop {
             match bytes.get(i) {
                 Some('-') => left = true,
@@ -1019,15 +1051,15 @@ pub fn printf(args: &[Value]) -> Value {
                 Some(' ') => space = true,
                 Some('#') => alt = true,
                 Some(',') => comma = true, // thousands grouping (SQLite extension)
-                Some('!') => {}            // accepted, ignored
+                Some('!') => bang = true,  // alt-form-2: trim trailing zeros
                 _ => break,
             }
             i += 1;
         }
         // width — a `*` takes it from the next argument (a negative value means
-        // left-justify).
+        // left-justify). A `,` here (after width) is not a flag and makes the
+        // whole conversion fail in SQLite; we honour that below.
         let mut width = 0usize;
-        let mut has_width = false;
         if bytes.get(i) == Some(&'*') {
             i += 1;
             let wv = eval::to_i64(&args.get(arg_idx).cloned().unwrap_or(Value::Null));
@@ -1038,13 +1070,20 @@ pub fn printf(args: &[Value]) -> Value {
             } else {
                 width = wv as usize;
             }
-            has_width = true;
         } else {
             while let Some(d) = bytes.get(i).filter(|c| c.is_ascii_digit()) {
-                width = width * 10 + (*d as u8 - b'0') as usize;
-                has_width = true;
+                width = width
+                    .saturating_mul(10)
+                    .saturating_add((*d as u8 - b'0') as usize);
                 i += 1;
             }
+        }
+        // A comma following the width (e.g. `%12,d`) is rejected by SQLite — the
+        // comma is only valid in the flags position, never after the width — so
+        // the whole result becomes the empty string.
+        if bytes.get(i) == Some(&',') {
+            too_big = true; // reuse the "fail -> empty string" path
+            break;
         }
         // precision — likewise `.*` takes it from the next argument.
         let mut prec: Option<usize> = None;
@@ -1058,7 +1097,9 @@ pub fn printf(args: &[Value]) -> Value {
             } else {
                 let mut p = 0usize;
                 while let Some(d) = bytes.get(i).filter(|c| c.is_ascii_digit()) {
-                    p = p * 10 + (*d as u8 - b'0') as usize;
+                    p = p
+                        .saturating_mul(10)
+                        .saturating_add((*d as u8 - b'0') as usize);
                     i += 1;
                 }
                 prec = Some(p);
@@ -1072,66 +1113,111 @@ pub fn printf(args: &[Value]) -> Value {
         }
         let Some(&conv) = bytes.get(i) else { break };
         i += 1;
-        let _ = has_width;
         let next = |idx: &mut usize| -> Value {
             let v = args.get(*idx).cloned().unwrap_or(Value::Null);
             *idx += 1;
             v
         };
+        // Bound the field: width/precision past SQLITE_MAX_LENGTH yield "".
+        if width >= PRINTF_LIMIT || prec.is_some_and(|p| p >= PRINTF_LIMIT) {
+            too_big = true;
+            break;
+        }
+        // Whether this conversion zero-pads on the left of the numeric digits.
+        let numeric = matches!(
+            conv,
+            'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'e' | 'E' | 'g' | 'G'
+        );
         let body = match conv {
-            'd' | 'i' => {
-                let n = eval::to_i64(&next(&mut arg_idx));
-                let mut s = if n < 0 {
-                    alloc::format!("{}", n.unsigned_abs())
-                } else {
-                    alloc::format!("{n}")
-                };
-                if n >= 0 {
-                    if plus {
-                        s.insert(0, '+');
-                    } else if space {
-                        s.insert(0, ' ');
-                    }
-                } else {
-                    s.insert(0, '-');
-                }
-                s
-            }
-            'u' => alloc::format!("{}", eval::to_i64(&next(&mut arg_idx)) as u64),
-            'x' => alloc::format!("{:x}", eval::to_i64(&next(&mut arg_idx)) as u64),
-            'X' => alloc::format!("{:X}", eval::to_i64(&next(&mut arg_idx)) as u64),
-            'o' => alloc::format!("{:o}", eval::to_i64(&next(&mut arg_idx)) as u64),
+            'd' | 'i' => int_body(eval::to_i64(&next(&mut arg_idx)), prec, plus, space),
+            'u' => int_unsigned(
+                eval::to_i64(&next(&mut arg_idx)) as u64,
+                10,
+                false,
+                prec,
+                alt,
+            ),
+            'x' => int_unsigned(
+                eval::to_i64(&next(&mut arg_idx)) as u64,
+                16,
+                false,
+                prec,
+                alt,
+            ),
+            'X' => int_unsigned(
+                eval::to_i64(&next(&mut arg_idx)) as u64,
+                16,
+                true,
+                prec,
+                alt,
+            ),
+            'o' => int_unsigned(
+                eval::to_i64(&next(&mut arg_idx)) as u64,
+                8,
+                false,
+                prec,
+                alt,
+            ),
             'c' => {
                 // SQLite's %c emits the first character of the argument's text
-                // (e.g. 104 -> "104" -> '1'), not the code point.
+                // (e.g. 104 -> "104" -> '1'), not the code point. A NULL argument
+                // yields a single NUL byte (matching SQLite's `et_charx`).
                 let v = next(&mut arg_idx);
-                eval::to_text(&v)
-                    .chars()
-                    .next()
-                    .map(String::from)
-                    .unwrap_or_default()
+                if matches!(v, Value::Null) {
+                    String::from('\0')
+                } else {
+                    eval::to_text(&v)
+                        .chars()
+                        .next()
+                        .map(String::from)
+                        .unwrap_or_default()
+                }
             }
             'f' => {
                 let f = eval::to_f64(&next(&mut arg_idx));
-                let p = prec.unwrap_or(6);
-                // SQLite's printf rounds half away from zero (its own formatter,
-                // not the C library's round-half-to-even).
-                let r = crate::exec::func::round_half_away(f, p as u32);
-                with_sign(alloc::format!("{r:.p$}"), plus, space)
+                // SQLite renders a negative zero as positive (`%f` of -0.0 is
+                // `0.000000`, not `-0.000000`).
+                let f = if f == 0.0 { 0.0 } else { f };
+                if !f.is_finite() {
+                    nonfinite(f, plus, space)
+                } else {
+                    let p = prec.unwrap_or(6);
+                    let mut s = fixed(f, p);
+                    if alt && p == 0 && !s.contains('.') {
+                        s.push('.');
+                    }
+                    if bang {
+                        s = strip_zeros_keep_one(&s);
+                    }
+                    with_sign(s, plus, space)
+                }
             }
-            'e' => {
+            'e' | 'E' => {
                 let f = eval::to_f64(&next(&mut arg_idx));
-                with_sign(fmt_exp(f, prec.unwrap_or(6), false), plus, space)
-            }
-            'E' => {
-                let f = eval::to_f64(&next(&mut arg_idx));
-                with_sign(fmt_exp(f, prec.unwrap_or(6), true), plus, space)
+                let f = if f == 0.0 { 0.0 } else { f };
+                if !f.is_finite() {
+                    nonfinite(f, plus, space)
+                } else {
+                    let mut s = fmt_exp(f, prec.unwrap_or(6), conv == 'E');
+                    if bang {
+                        s = strip_zeros_keep_one(&s);
+                    }
+                    with_sign(s, plus, space)
+                }
             }
             'g' | 'G' => {
                 let f = eval::to_f64(&next(&mut arg_idx));
-                with_sign(fmt_general(f, prec.unwrap_or(6), conv == 'G'), plus, space)
+                if !f.is_finite() {
+                    nonfinite(f, plus, space)
+                } else {
+                    with_sign(
+                        fmt_general(f, prec.unwrap_or(6), conv == 'G', alt, bang),
+                        plus,
+                        space,
+                    )
+                }
             }
-            's' => {
+            's' | 'z' => {
                 let v = next(&mut arg_idx);
                 let mut s = eval::to_text(&v);
                 if let Some(pr) = prec {
@@ -1141,53 +1227,118 @@ pub fn printf(args: &[Value]) -> Value {
             }
             'q' => {
                 let v = next(&mut arg_idx);
-                eval::to_text(&v).replace('\'', "''")
+                let mut s = match v {
+                    Value::Null => String::from("(NULL)"),
+                    other => eval::to_text(&other).replace('\'', "''"),
+                };
+                if let Some(pr) = prec {
+                    s = s.chars().take(pr).collect();
+                }
+                s
             }
             'Q' => {
                 let v = next(&mut arg_idx);
-                match v {
+                let mut s = match v {
                     Value::Null => String::from("NULL"),
                     other => alloc::format!("'{}'", eval::to_text(&other).replace('\'', "''")),
+                };
+                if let Some(pr) = prec {
+                    s = s.chars().take(pr).collect();
                 }
+                s
             }
             'w' => {
                 let v = next(&mut arg_idx);
-                eval::to_text(&v).replace('"', "\"\"")
+                let mut s = match v {
+                    Value::Null => String::from("(NULL)"),
+                    other => eval::to_text(&other).replace('"', "\"\""),
+                };
+                if let Some(pr) = prec {
+                    s = s.chars().take(pr).collect();
+                }
+                s
             }
             _ => {
-                // Unknown conversion: emit verbatim.
-                out.push('%');
-                out.push(conv);
-                continue;
+                // Unknown conversion (e.g. `%y`): SQLite discards the directive
+                // and stops formatting the rest of the string.
+                break;
             }
         };
-        let _ = alt;
-        // The `,` flag groups the integer part of a decimal/float in threes.
-        let body = if comma && matches!(conv, 'd' | 'i' | 'f') {
+        // SQLite still honours the `0` flag for integers when a precision is
+        // given (unlike C): `%05.3d` of 7 is `00007` — precision sets the minimum
+        // digit count and the `0` flag then zero-pads to the field width.
+        let zero_pad = zero && numeric;
+        let grouped = comma && matches!(conv, 'd' | 'i' | 'f');
+        // The `,` flag groups the integer part in threes. With zero-padding the
+        // grouping is applied *after* the zero-fill to the field width (so the
+        // commas fall between the pad zeros and the result may exceed `width`);
+        // otherwise it groups first and then space-pads.
+        let body = if grouped && zero_pad && width > body.chars().count() {
+            // Zero-pad the magnitude (after any sign) up to the field width,
+            // then group the whole run.
+            let (sign, mag) = match body.strip_prefix(['+', '-', ' ']) {
+                Some(r) => (&body[..1], r),
+                None => ("", body.as_str()),
+            };
+            let pad = width - body.chars().count();
+            let padded = alloc::format!("{sign}{}{mag}", "0".repeat(pad));
+            group_thousands(&padded)
+        } else if grouped {
             group_thousands(&body)
         } else {
             body
         };
+        // Once comma-grouping has consumed the zero-padding above, fall back to
+        // ordinary (space) justification for any residual width.
+        let zero_pad = zero_pad && !grouped;
+        // For integer conversions SQLite lets the `0` flag override `-` (so
+        // `%-010d` of 7 is `0000000007`); for floats/strings, `-` wins. So an
+        // integer zero-pad takes priority over left-justification.
+        let is_int = matches!(conv, 'd' | 'i' | 'u' | 'x' | 'X' | 'o');
+        let zero_wins = zero_pad && (is_int || !left);
+        // For `#` zero-padding, the alternate-form prefix (`0x`/`0X`, or a
+        // leading octal `0`) is emitted before the zero-fill and is *not* counted
+        // toward the field width (matching C/SQLite).
+        let alt_prefix_len = if alt && zero_pad {
+            match conv {
+                'x' | 'X' if body.starts_with("0x") || body.starts_with("0X") => 2,
+                'o' if body.starts_with('0') => 1,
+                _ => 0,
+            }
+        } else {
+            0
+        };
         // apply width/justification
         let len = body.chars().count();
-        if width > len {
-            let pad = width - len;
-            if left {
-                out.push_str(&body);
-                for _ in 0..pad {
-                    out.push(' ');
-                }
-            } else if zero && matches!(conv, 'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'e' | 'E') {
-                // zero-pad after any sign.
-                let (sign, rest) = match body.strip_prefix(['-', '+', ' ']) {
-                    Some(r) => (&body[..1], r),
-                    None => ("", body.as_str()),
+        // Zero-pad reaches `width` digits *after* the alt prefix; space-pad
+        // counts the whole body.
+        let effective = if zero_wins { len - alt_prefix_len } else { len };
+        if width > effective {
+            if (out.len() + width + alt_prefix_len) >= PRINTF_LIMIT {
+                too_big = true;
+                break;
+            }
+            let pad = width - effective;
+            if zero_wins {
+                // zero-pad after any sign and the alternate-form prefix.
+                let rest = body.as_str();
+                let (sign, rest) = if let Some(r) = rest.strip_prefix(['-', '+', ' ']) {
+                    (&body[..1], r)
+                } else {
+                    ("", rest)
                 };
+                let (prefix, rest) = rest.split_at(alt_prefix_len.min(rest.len()));
                 out.push_str(sign);
+                out.push_str(prefix);
                 for _ in 0..pad {
                     out.push('0');
                 }
                 out.push_str(rest);
+            } else if left {
+                out.push_str(&body);
+                for _ in 0..pad {
+                    out.push(' ');
+                }
             } else {
                 for _ in 0..pad {
                     out.push(' ');
@@ -1197,8 +1348,101 @@ pub fn printf(args: &[Value]) -> Value {
         } else {
             out.push_str(&body);
         }
+        if out.len() >= PRINTF_LIMIT {
+            too_big = true;
+            break;
+        }
+    }
+    if too_big {
+        return Value::Text(String::new());
     }
     Value::Text(out)
+}
+
+/// Fixed-point (`%f`) rendering of a finite `f` with `p` fractional digits,
+/// rounded half away from zero like SQLite. Rust's formatter takes the precision
+/// as a `u16`, so a precision beyond what an `f64` can represent exactly is
+/// rendered at a safe cap and the (necessarily-zero) tail is appended.
+fn fixed(f: f64, p: usize) -> String {
+    // An f64's smallest denormal contributes at most ~1074 nonzero fractional
+    // digits; anything past that is exact zeros.
+    const CAP: usize = 1100;
+    if p <= CAP {
+        let r = crate::exec::func::round_half_away(f, p as u32);
+        return alloc::format!("{r:.p$}");
+    }
+    let r = crate::exec::func::round_half_away(f, CAP as u32);
+    let head = alloc::format!("{r:.CAP$}");
+    let mut s = String::with_capacity(head.len() + (p - CAP));
+    s.push_str(&head);
+    for _ in 0..(p - CAP) {
+        s.push('0');
+    }
+    s
+}
+
+/// Render a non-finite float for `%f`/`%e`/`%g`: `Inf`/`-Inf` (NaN -> `NaN`),
+/// with the `+`/space sign flag applied to the positive infinity.
+fn nonfinite(f: f64, plus: bool, space: bool) -> String {
+    if f.is_nan() {
+        return String::from("NaN");
+    }
+    if f < 0.0 {
+        String::from("-Inf")
+    } else {
+        with_sign(String::from("Inf"), plus, space)
+    }
+}
+
+/// Format a signed integer for `%d`/`%i`: apply a minimum-digit precision
+/// (zero-padding the magnitude) and the sign flags.
+fn int_body(n: i64, prec: Option<usize>, plus: bool, space: bool) -> String {
+    let mag = n.unsigned_abs();
+    let mut digits = alloc::format!("{mag}");
+    // Precision 0 with value 0 still prints "0" in SQLite (unlike C, which emits
+    // nothing); otherwise precision is the minimum number of digits.
+    if let Some(p) = prec {
+        while digits.len() < p {
+            digits.insert(0, '0');
+        }
+    }
+    let mut s = digits;
+    if n < 0 {
+        s.insert(0, '-');
+    } else if plus {
+        s.insert(0, '+');
+    } else if space {
+        s.insert(0, ' ');
+    }
+    s
+}
+
+/// Format an unsigned integer for `%u`/`%x`/`%X`/`%o`: minimum-digit precision
+/// and, with `#`, the alternate-form prefix (`0x`/`0X` for hex, leading `0` for
+/// octal — never on a zero value).
+fn int_unsigned(n: u64, base: u32, upper: bool, prec: Option<usize>, alt: bool) -> String {
+    let mut digits = match base {
+        16 if upper => alloc::format!("{n:X}"),
+        16 => alloc::format!("{n:x}"),
+        8 => alloc::format!("{n:o}"),
+        _ => alloc::format!("{n}"),
+    };
+    if let Some(p) = prec {
+        while digits.len() < p {
+            digits.insert(0, '0');
+        }
+    }
+    if alt && n != 0 {
+        match base {
+            16 if upper => digits.insert_str(0, "0X"),
+            16 => digits.insert_str(0, "0x"),
+            // SQLite's octal `#` always prepends a single `0` (e.g. `%#.5o` of 8
+            // is `000010`), regardless of any precision zero-padding.
+            8 => digits.insert(0, '0'),
+            _ => {}
+        }
+    }
+    digits
 }
 
 /// Prepend the `+`/space sign flag to a formatted non-negative number (a leading
@@ -1216,11 +1460,30 @@ fn with_sign(mut s: String, plus: bool, space: bool) -> String {
 
 /// Format `%g`/`%G`: `prec` significant digits, choosing fixed or exponential
 /// notation (exponent < -4 or >= prec uses exponential), then stripping trailing
-/// zeros — matching C/SQLite `%g`.
-fn fmt_general(f: f64, prec: usize, upper: bool) -> String {
+/// zeros — matching C/SQLite `%g`. With `alt` (`#`) the trailing zeros and the
+/// decimal point are kept; with `bang` (`!`) zeros are trimmed but at least one
+/// fractional digit (`.0`) is retained.
+fn fmt_general(f: f64, prec: usize, upper: bool, alt: bool, bang: bool) -> String {
     let p = prec.max(1);
+    // How a fully-formatted mantissa string is reduced to its final shape.
+    let shape = |s: &str| -> String {
+        if alt {
+            // `#g` keeps all trailing zeros and always shows the decimal point
+            // (so `%#.3g` of 100 is `100.`).
+            if s.contains('.') {
+                String::from(s)
+            } else {
+                alloc::format!("{s}.")
+            }
+        } else if bang {
+            strip_zeros_keep_one(s)
+        } else {
+            strip_trailing_zeros(s)
+        }
+    };
     if f == 0.0 {
-        return String::from("0");
+        // `0` with p-1 fractional zeros under `#`, `0.0` under `!`, else `0`.
+        return shape(&alloc::format!("{:.*}", p - 1, 0.0));
     }
     // Decimal exponent of the value rounded to p significant digits: format in
     // exponential first to read the exponent after rounding.
@@ -1237,14 +1500,11 @@ fn fmt_general(f: f64, prec: usize, upper: bool) -> String {
             Some(pos) => upper_e.split_at(pos),
             None => return upper_e,
         };
-        let mant = strip_trailing_zeros(mant);
-        alloc::format!("{mant}{e}")
+        alloc::format!("{}{e}", shape(mant))
     } else {
         // Fixed form with prec-1-exp fraction digits, trailing zeros stripped.
         let frac = (p as i32 - 1 - exp).max(0) as usize;
-        let r = crate::exec::func::round_half_away(f, frac as u32);
-        let s = alloc::format!("{r:.frac$}");
-        strip_trailing_zeros(&s)
+        shape(&fixed(f, frac))
     }
 }
 
@@ -1260,7 +1520,22 @@ fn strip_trailing_zeros(s: &str) -> String {
 
 /// Format `%e` style: `d.dddde±dd`.
 fn fmt_exp(f: f64, prec: usize, upper: bool) -> String {
-    let s = alloc::format!("{:.*e}", prec, f);
+    // Rust's `{:.*e}` takes the precision as a `u16`; beyond what the f64
+    // mantissa can carry the extra fraction digits are zeros, so render at a safe
+    // cap and splice the zero tail into the mantissa before the exponent.
+    const CAP: usize = 1100;
+    let s = if prec <= CAP {
+        alloc::format!("{:.*e}", prec, f)
+    } else {
+        let head = alloc::format!("{:.*e}", CAP, f);
+        match head.find(['e', 'E']) {
+            Some(pos) => {
+                let (mant, exp) = head.split_at(pos);
+                alloc::format!("{mant}{}{exp}", "0".repeat(prec - CAP))
+            }
+            None => head,
+        }
+    };
     // Rust prints `1.5e2`; C/SQLite prints `1.5e+02`. Normalize the exponent.
     if let Some(pos) = s.find(['e', 'E']) {
         let (mantissa, exp) = s.split_at(pos);
