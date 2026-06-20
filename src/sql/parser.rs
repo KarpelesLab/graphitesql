@@ -1549,6 +1549,11 @@ impl Parser {
                     "null" => Ok(Expr::Literal(Literal::Null)),
                     "true" => Ok(Expr::Literal(Literal::Boolean(true))),
                     "false" => Ok(Expr::Literal(Literal::Boolean(false))),
+                    // SQL date/time keywords (UTC), equivalent to the
+                    // `date`/`time`/`datetime` functions on `'now'`.
+                    "current_date" => Ok(now_datetime_fn("date")),
+                    "current_time" => Ok(now_datetime_fn("time")),
+                    "current_timestamp" => Ok(now_datetime_fn("datetime")),
                     "case" => self.case_expr(),
                     "cast" => self.cast_expr(),
                     "exists" => {
@@ -2042,6 +2047,20 @@ enum InfixOp {
     Between { negated: bool },
     Like { negated: bool },
     NotPrefixed,
+}
+
+/// Build the function expression a `CURRENT_DATE`/`CURRENT_TIME`/
+/// `CURRENT_TIMESTAMP` keyword desugars to: `<fn>('now')`.
+fn now_datetime_fn(func: &str) -> Expr {
+    Expr::Function {
+        name: String::from(func),
+        distinct: false,
+        args: alloc::vec![Expr::Literal(Literal::Str(String::from("now")))],
+        star: false,
+        filter: None,
+        order_by: alloc::vec![],
+        over: None,
+    }
 }
 
 /// Keywords that end an expression in a result-column/table context, so a bare
