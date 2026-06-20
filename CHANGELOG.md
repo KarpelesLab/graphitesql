@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **`PRAGMA collation_list`** lists the three built-in collating sequences (BINARY/NOCASE/RTRIM).
 - **`PRAGMA table_list [(name)]`**: one row per table/view across main + temp +
   attached databases — `(schema, name, type, ncol, wr, strict)` — plus each
   database's synthetic schema table (`temp` always listed, matching sqlite).

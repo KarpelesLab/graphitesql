@@ -413,6 +413,16 @@ impl Connection {
             "index_xinfo" => self.pragma_index_info(p, true),
             "database_list" => Ok(self.pragma_database_list()),
             "table_list" => self.pragma_table_list(p),
+            // The collating sequences graphite implements (built-ins only; it
+            // registers no custom collations).
+            "collation_list" => Ok(QueryResult {
+                columns: alloc::vec!["seq".into(), "name".into()],
+                rows: ["RTRIM", "NOCASE", "BINARY"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| alloc::vec![Value::Integer(i as i64), Value::Text((*n).into())])
+                    .collect(),
+            }),
             "foreign_key_list" => self.pragma_foreign_key_list(p),
             "foreign_key_check" => self.pragma_foreign_key_check(p),
             "integrity_check" | "quick_check" => self.pragma_integrity_check(),

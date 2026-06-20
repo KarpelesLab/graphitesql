@@ -87,6 +87,25 @@ fn table_list_matches_sqlite() {
 }
 
 #[test]
+fn collation_list_reports_builtins() {
+    let c = Connection::open_memory().unwrap();
+    let names: Vec<String> = c
+        .query("PRAGMA collation_list")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| match &r[1] {
+            Value::Text(s) => s.clone(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    // graphite implements exactly the three built-in collating sequences.
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["BINARY", "NOCASE", "RTRIM"]);
+}
+
+#[test]
 fn table_list_filtered_by_name() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a,b)").unwrap();
