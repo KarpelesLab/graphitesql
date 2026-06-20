@@ -165,11 +165,11 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
   `sqlite_stat4` histograms. *Ref:* `analyze.c`.
 - **Cost-based planning** — ✅ statistics now drive index *choice*, ✅ range scans
   (`<`/`>`/`BETWEEN` seek an index between bounds via `index_range_rowids`), ✅
-  `IN`-list driven seeks (per-value index/rowid seeks, unioned);
+  `IN`-list driven seeks (per-value index/rowid seeks, unioned), ✅ the
+  **OR-by-union** optimization (each disjunct seeks, rowids unioned);
   *remaining:* **join order** (today joins run in `FROM` order as nested loops);
-  the **OR-by-union**
-  optimization; covering-index detection; auto-indexes for unindexed joins;
-  skip-scan. *Ref:* `where.c`, `wherecode.c`, `whereexpr.c`.
+  covering-index detection; auto-indexes for unindexed joins; skip-scan.
+  *Ref:* `where.c`, `wherecode.c`, `whereexpr.c`.
 - **VDBE bytecode IR** — 🚧 *spike landed* (`exec::vdbe`): a register-machine
   `Op`/`Program` with a program-counter interpreter, a compiler for constant
   `SELECT` projections covering arithmetic, concat, comparison, three-valued

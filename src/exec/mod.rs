@@ -3400,6 +3400,220 @@ impl Connection {
         Ok(Some(out))
     }
 
+    /// Find a plain (non-partial, non-expression) index whose leading column is
+    /// `col`, returning its root page and leading collation. Honors `INDEXED BY`.
+    fn leading_index_for(
+        &self,
+        table_name: &str,
+        col: usize,
+        hint: Option<&IndexHint>,
+    ) -> Result<Option<(u32, crate::value::Collation)>> {
+        for idx in &self.indexes_of(table_name)? {
+            if let Some(IndexHint::IndexedBy(n)) = hint {
+                if !idx.name.eq_ignore_ascii_case(n) {
+                    continue;
+                }
+            }
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
+                continue;
+            }
+            if idx.cols.first() == Some(&col) {
+                return Ok(Some((
+                    idx.root,
+                    idx.collations.first().copied().unwrap_or_default(),
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Rowids matching `col IN values` (or `col = v` with a one-element slice) via
+    /// the rowid b-tree or an index, or `None` when neither applies.
+    fn seek_col_values(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        hint: Option<&IndexHint>,
+        col: usize,
+        values: &[Value],
+    ) -> Result<Option<Vec<i64>>> {
+        let mut rowids: Vec<i64> = Vec::new();
+        // Rowid column: each value is itself a candidate rowid.
+        if !matches!(hint, Some(IndexHint::IndexedBy(_))) && meta.ipk == Some(col) {
+            for v in values {
+                let rid = eval::to_i64(v);
+                if !rowids.contains(&rid) {
+                    rowids.push(rid);
+                }
+            }
+            return Ok(Some(rowids));
+        }
+        let Some((root, coll)) = self.leading_index_for(table_name, col, hint)? else {
+            return Ok(None);
+        };
+        let aff = meta.columns[col].affinity;
+        let colls = [coll];
+        for v in values {
+            let key = [aff.coerce(v.clone())];
+            for rid in crate::btree::index_seek_rowids(self.backend.source(), root, &key, &colls)? {
+                if !rowids.contains(&rid) {
+                    rowids.push(rid);
+                }
+            }
+        }
+        Ok(Some(rowids))
+    }
+
+    /// Rowids matching a range `bound` on `col` via the rowid b-tree (integer
+    /// bounds) or an index, or `None` when neither applies.
+    fn seek_col_range(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        hint: Option<&IndexHint>,
+        col: usize,
+        bound: &RangeBound,
+    ) -> Result<Option<Vec<i64>>> {
+        // Rowid integer range: walk the table b-tree between bounds.
+        if !matches!(hint, Some(IndexHint::IndexedBy(_))) && meta.ipk == Some(col) {
+            let lo_int =
+                bound.lower.is_none() || matches!(bound.lower, Some((Value::Integer(_), _)));
+            let hi_int =
+                bound.upper.is_none() || matches!(bound.upper, Some((Value::Integer(_), _)));
+            if !(lo_int && hi_int) {
+                return Ok(None);
+            }
+            let start = match &bound.lower {
+                Some((Value::Integer(i), _)) => *i,
+                _ => i64::MIN,
+            };
+            let stop = match &bound.upper {
+                Some((Value::Integer(i), _)) => *i,
+                _ => i64::MAX,
+            };
+            let mut cur = TableCursor::new(self.backend.source(), meta.root);
+            let mut rowids = Vec::new();
+            let mut ok = if start == i64::MIN {
+                cur.first()?
+            } else {
+                cur.seek(start)?;
+                cur.is_valid()
+            };
+            while ok {
+                let rid = cur.rowid()?;
+                if rid > stop {
+                    break;
+                }
+                rowids.push(rid);
+                ok = cur.next()?;
+            }
+            return Ok(Some(rowids));
+        }
+        let Some((root, coll)) = self.leading_index_for(table_name, col, hint)? else {
+            return Ok(None);
+        };
+        let aff = meta.columns[col].affinity;
+        let lo = bound
+            .lower
+            .as_ref()
+            .map(|(v, i)| (aff.coerce(v.clone()), *i));
+        let hi = bound
+            .upper
+            .as_ref()
+            .map(|(v, i)| (aff.coerce(v.clone()), *i));
+        let colls = [coll];
+        let lower = lo.as_ref().map(|(v, i)| (core::slice::from_ref(v), *i));
+        let upper = hi.as_ref().map(|(v, i)| (core::slice::from_ref(v), *i));
+        let rowids =
+            crate::btree::index_range_rowids(self.backend.source(), root, lower, upper, &colls)?;
+        Ok(Some(rowids))
+    }
+
+    /// Rowids for one seekable predicate atom (`col = c`, `col IN (…)`, or a range
+    /// on `col`), or `None` if it is not index/rowid-seekable. Superset semantics:
+    /// the caller re-applies the full `WHERE`.
+    fn predicate_rowids(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        hint: Option<&IndexHint>,
+        pred: &Expr,
+        params: &Params,
+    ) -> Result<Option<Vec<i64>>> {
+        if let Some((col, vals)) = find_in_constraint(pred, &meta.columns, params) {
+            if vals.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(None);
+            }
+            return self.seek_col_values(meta, table_name, hint, col, &vals);
+        }
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(pred, &meta.columns, params, &mut eqs);
+        eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        if let Some((col, v)) = eqs.into_iter().next() {
+            return self.seek_col_values(meta, table_name, hint, col, &[v]);
+        }
+        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+            alloc::collections::BTreeMap::new();
+        collect_range_constraints(pred, &meta.columns, params, &mut ranges);
+        if let Some((&col, bound)) = ranges.iter().next() {
+            return self.seek_col_range(meta, table_name, hint, col, bound);
+        }
+        Ok(None)
+    }
+
+    /// Try to satisfy a single-table query whose `WHERE` is a top-level `OR` of
+    /// individually-seekable predicates: seek each disjunct, union the rowids, and
+    /// fetch the rows once. Returns `None` (→ scan) unless *every* disjunct is
+    /// seekable. Superset semantics — `run_core` re-applies the full `WHERE`.
+    fn try_index_or(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let Some(where_expr) = &sel.where_clause else {
+            return Ok(None);
+        };
+        let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
+        if matches!(hint, Some(IndexHint::NotIndexed)) {
+            return Ok(None);
+        }
+        // Flatten the top-level OR chain; require at least two disjuncts.
+        let mut disjuncts: Vec<&Expr> = Vec::new();
+        flatten_or(where_expr, &mut disjuncts);
+        if disjuncts.len() < 2 {
+            return Ok(None);
+        }
+        // Every disjunct must be seekable, else a scan is needed regardless.
+        let mut rowids: Vec<i64> = Vec::new();
+        for d in disjuncts {
+            match self.predicate_rowids(meta, table_name, hint, d, params)? {
+                Some(rs) => {
+                    for r in rs {
+                        if !rowids.contains(&r) {
+                            rowids.push(r);
+                        }
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+        let encoding = self.backend.source().header().text_encoding;
+        let mut cur = TableCursor::new(self.backend.source(), meta.root);
+        let mut out = Vec::new();
+        for rid in rowids {
+            if cur.seek(rid)? {
+                let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                out.push(InputRow {
+                    values,
+                    rowid: Some(rid),
+                });
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// `EXPLAIN QUERY PLAN <stmt>` -> the `(id, parent, notused, detail)` rows
     /// that SQLite's API returns. The detail strings describe graphitesql's
     /// *actual* execution plan (it does not reorder joins), matching SQLite's
@@ -4463,6 +4677,9 @@ impl Connection {
                 return Ok((first_meta.columns, rows));
             }
             if let Some(rows) = self.try_index_in(&first_meta, &from.first.name, sel, params)? {
+                return Ok((first_meta.columns, rows));
+            }
+            if let Some(rows) = self.try_index_or(&first_meta, &from.first.name, sel, params)? {
                 return Ok((first_meta.columns, rows));
             }
             let input_rows = self
@@ -6328,6 +6545,23 @@ fn collect_eq_constraints(
             }
         }
         _ => {}
+    }
+}
+
+/// Flatten a top-level `OR` chain into its disjuncts (unwrapping parentheses),
+/// e.g. `a OR (b OR c)` → `[a, b, c]`. A non-`OR` expression yields itself.
+fn flatten_or<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            flatten_or(left, out);
+            flatten_or(right, out);
+        }
+        Expr::Paren(inner) => flatten_or(inner, out),
+        other => out.push(other),
     }
 }
 

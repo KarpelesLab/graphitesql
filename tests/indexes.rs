@@ -289,6 +289,15 @@ fn index_range_scans_match_sqlite3() {
         "SELECT id FROM t WHERE id BETWEEN 3 AND 7 ORDER BY id",
         "SELECT id FROM t WHERE id <= 2 OR id > 8 ORDER BY id",
         "SELECT count(*) FROM t WHERE id > 100",
+        // OR-by-union: every disjunct individually seekable.
+        "SELECT id FROM t WHERE a = 1 OR a = 9 ORDER BY id",
+        "SELECT id FROM t WHERE a = 1 OR b = 'z' ORDER BY id",
+        "SELECT id FROM t WHERE a < 2 OR a > 8 ORDER BY id",
+        "SELECT id FROM t WHERE a IN (1, 2) OR b = 'z' ORDER BY id",
+        "SELECT id FROM t WHERE id = 3 OR a = 9 ORDER BY id",
+        "SELECT id FROM t WHERE a = 1 OR a = 1 ORDER BY id",
+        "SELECT id FROM t WHERE (a = 1 AND b = 'a') OR a = 9 ORDER BY id",
+        "SELECT id FROM t WHERE a = 99 OR b = 'nope' ORDER BY id",
     ];
     for q in queries {
         let want = sqlite3_run(&path, &format!("{q};"));
