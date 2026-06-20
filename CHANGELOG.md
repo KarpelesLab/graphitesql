@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Fix: **`sum()`/`abs()` integer overflow is an error** (not a silent real
+  promotion), matching SQLite — the `+`/`*` operators still fall back to real.
+- Fix: **`-9223372036854775808` parses as `Integer(i64::MIN)`** (the literal
+  `2^63` folds under a leading minus) instead of a real; `typeof` and `abs()`
+  now agree with SQLite.
+- Fix: **text→number ignores `inf`/`infinity`/`nan`** (value 0 / NULL like
+  SQLite); numeric overflow such as `1e400` still yields ±Inf.
 - Track A: **`STRICT` tables**. `CREATE TABLE … STRICT` (alone or with `WITHOUT
   ROWID`, in either order) restricts column types to `INT`/`INTEGER`/`REAL`/
   `TEXT`/`BLOB`/`ANY` — any other or missing type is rejected at `CREATE` — and
