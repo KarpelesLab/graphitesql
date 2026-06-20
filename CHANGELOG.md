@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **CREATE TABLE validations** matching SQLite: duplicate column name, more than
+  one PRIMARY KEY, a PRIMARY KEY/UNIQUE list naming a missing column,
+  AUTOINCREMENT only on an INTEGER PRIMARY KEY (and not on WITHOUT ROWID), and a
+  table with no non-generated column.
+- Fix: the **`%` operator** truncates both operands to integers (`10.5 % 3` → 1.0,
+  divisor truncating to 0 → NULL), like SQLite; the `mod()` function stays floating.
+- **`string_agg`** added as the standard-SQL alias for `group_concat`.
 - **`json_group_array` / `json_group_object` aggregates** — build a JSON array
   or object from a group (NULL-inclusive, `ORDER BY` inside the aggregate, JSON
   subtype propagation for `json(...)` arguments), like SQLite.
