@@ -201,8 +201,8 @@ Open EQP divergences (verified against sqlite3):
 
 | query | graphite today | sqlite3 (target) | piece |
 |-------|----------------|------------------|-------|
-| `… FROM t JOIN u ON t.c=u.x` (`x` = `u` PK) | `SCAN t` + `SCAN u` | `SCAN t` + `SEARCH u USING INTEGER PRIMARY KEY (rowid=?)` | **B1a** |
-| `… FROM t JOIN u ON t.c=u.k` (`k` indexed) | `SCAN t` + `SCAN u` | `SCAN t` + `SEARCH u USING INDEX …` | **B1a/B3** |
+| `… FROM t JOIN u ON t.c=u.x` (`x` = `u` PK) | ✅ now `SCAN t` + `SEARCH u USING INTEGER PRIMARY KEY (rowid=?)` | (same) | **B1a** ✅ |
+| `… FROM t JOIN u ON t.c=u.k` (`k` indexed) | `SCAN t` + `SCAN u` | `SCAN t` + `SEARCH u USING INDEX …` | **B1a²/B3** |
 | `SELECT count(*) FROM t` (one full index `ic`) | ✅ now `SCAN t USING COVERING INDEX ic` | `SCAN t USING COVERING INDEX ic` | **B2b** ✅ |
 
 - **B0b — Index-driven `ORDER BY`/`GROUP BY`, remaining cases.** Extend the
@@ -210,11 +210,12 @@ Open EQP divergences (verified against sqlite3):
   prefix of a multi-column index; (b) `GROUP BY` over an indexed prefix (consume
   groups in index order, no hash); (c) `ORDER BY` satisfied by the index a
   `WHERE` seek already chose (today B0 only fires with no `WHERE`).
-- **B1a — Seek the inner table of a join.** In a nested-loop join, when the inner
-  table's join column is its rowid/IPK or a usable index, seek it per outer row
-  instead of scanning (today every joined table is materialized + hashed). Report
-  `SEARCH … USING INTEGER PRIMARY KEY`/`USING INDEX`. The highest-value planner
-  win; foundation for B1b.
+- ✅ **B1a — Seek the inner table of a join (rowid/IPK case).** Done — an
+  INNER/LEFT join whose `ON` is `outer.col = u.rowid` seeks `u` by rowid per
+  outer row (`rowid_join_seek` + `exec_rowid_join_seek`), reporting `SEARCH u
+  USING INTEGER PRIMARY KEY (rowid=?)` in lockstep with execution; the full `ON`
+  is re-checked so results are identical. *Remaining (B1a²):* the same for a
+  non-PK **indexed** inner column (`SEARCH … USING INDEX …`), and RIGHT/FULL.
 - **B1b — Join order.** Reorder `FROM` tables by a simple cost model (smallest
   estimated cardinality / most-selective indexed table first) rather than textual
   order; results identical, order verified via EQP. *Ref:* `where.c`.
