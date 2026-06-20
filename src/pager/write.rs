@@ -16,6 +16,8 @@
 //! b-tree cursors and schema reader work over it unchanged.
 
 use super::{Page, PageSource};
+use crate::btree::page::{BtreePage, PageType};
+use crate::btree::ptrmap::{self, PtrmapType};
 use crate::error::{Error, Result};
 use crate::format::header::HEADER_LEN;
 use crate::format::{DatabaseHeader, TextEncoding};
@@ -28,6 +30,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 const JOURNAL_MAGIC: &[u8; 8] = b"GSQLJRN1";
+
+/// Fixed file offset of the SQLite "lock byte". The page that contains this byte
+/// is never used to store data; on databases larger than 1 GiB it falls on a
+/// page after page 1 that the allocator skips.
+const PENDING_BYTE: u64 = 0x4000_0000;
+
+/// A pointer-map entry: the page's type and its parent page number.
+type PtrmapEntry = (PtrmapType, u32);
 
 /// Auto-vacuum mode of a database, as recorded in the file header.
 ///
@@ -334,14 +344,48 @@ impl WritePager {
 
     /// Allocate a page, reusing one from the freelist if available, otherwise
     /// extending the file. The returned page is staged zeroed in the overlay.
+    ///
+    /// In auto-vacuum mode the file is interleaved with pointer-map pages; when
+    /// extending the file we must never hand out a ptrmap page number. If the
+    /// next page would be a ptrmap page (or the lock-byte page), we allocate and
+    /// zero it in place and advance to the following page.
     pub fn allocate_page(&mut self) -> Result<u32> {
         if self.header.freelist_count > 0 && self.header.freelist_trunk != 0 {
             return self.alloc_from_freelist();
         }
-        self.page_count += 1;
-        let n = self.page_count;
-        self.overlay.insert(n, vec![0u8; self.page_size]);
-        Ok(n)
+        let auto_vacuum = self.auto_vacuum_on();
+        let usable = self.usable_size() as u32;
+        loop {
+            self.page_count += 1;
+            let n = self.page_count;
+            if auto_vacuum && self.is_reserved_layout_page(n, usable) {
+                // Materialize the ptrmap (or lock-byte) page zeroed and keep
+                // going; its contents are filled in by `rebuild_ptrmap` at commit.
+                self.overlay.insert(n, vec![0u8; self.page_size]);
+                continue;
+            }
+            self.overlay.insert(n, vec![0u8; self.page_size]);
+            return Ok(n);
+        }
+    }
+
+    /// Whether the database is in any auto-vacuum mode (FULL or INCREMENTAL).
+    fn auto_vacuum_on(&self) -> bool {
+        self.header.largest_root_page != 0
+    }
+
+    /// Whether `pgno` is a structural page that must not be handed out as data:
+    /// a pointer-map page, or the page that contains the lock byte (only when the
+    /// page size makes that byte fall on a page other than page 1).
+    fn is_reserved_layout_page(&self, pgno: u32, usable: u32) -> bool {
+        if ptrmap::is_ptrmap_page(usable, pgno) {
+            return true;
+        }
+        // The lock byte lives at fixed file offset 2^30. The page holding it is
+        // skipped by the allocator. For page sizes ≤ 1 GiB on small databases
+        // this never triggers, but we stay correct for large files.
+        let lock_page = (PENDING_BYTE / self.page_size as u64) as u32 + 1;
+        lock_page > 1 && pgno == lock_page
     }
 
     /// Pop a page off the freelist (file-format spec, "The Freelist"). The
@@ -395,6 +439,222 @@ impl WritePager {
         self.write_page(page, nb)?;
         self.header.freelist_trunk = page;
         self.header.freelist_count += 1;
+        Ok(())
+    }
+
+    /// Rebuild every pointer-map page from the current logical page contents.
+    ///
+    /// Only called in auto-vacuum mode, just before a commit flushes pages. It
+    /// derives the (type, parent) of every tracked page by walking the b-tree
+    /// forest (roots from `sqlite_schema`, plus page 1's own schema tree) and the
+    /// freelist, then re-stages the affected ptrmap pages into the overlay so the
+    /// flush writes them. This whole-map rebuild keeps the ptrmap correct across
+    /// arbitrary structural changes (splits, merges, overflow chains, frees)
+    /// without threading parent bookkeeping through every b-tree writer.
+    ///
+    /// It also stamps `largest_root_page` = max root page number, which
+    /// `integrity_check` requires to match exactly.
+    fn rebuild_ptrmap(&mut self) -> Result<()> {
+        let usable = self.usable_size() as u32;
+        // Desired (type, parent) for every tracked page.
+        let mut want: BTreeMap<u32, PtrmapEntry> = BTreeMap::new();
+
+        // 1. Discover all b-tree roots: the schema tree (page 1) and every
+        //    `rootpage` recorded in sqlite_schema. Roots get a RootPage entry
+        //    (page 1 is never tracked). Then walk each tree for Btree/overflow.
+        let mut roots: Vec<u32> = Vec::new();
+        roots.push(1);
+        let mut max_root = 1u32;
+        for root in self.schema_roots()? {
+            if root >= 2 {
+                want.insert(root, (PtrmapType::RootPage, 0));
+            }
+            if root > max_root {
+                max_root = root;
+            }
+            roots.push(root);
+        }
+        for root in roots {
+            self.walk_btree_ptrmap(root, &mut want)?;
+        }
+
+        // 2. Freelist pages (trunk + leaves) are FreePage with parent 0.
+        self.walk_freelist_ptrmap(&mut want)?;
+
+        // 3. Keep the header's largest_root_page in sync.
+        self.header.largest_root_page = max_root;
+
+        // 4. Materialize the ptrmap pages: gather the entries that fall on each,
+        //    and write them. Pages with no live entry keep their slot's previous
+        //    bytes (integrity_check never reads an unreferenced slot).
+        let mut by_map: BTreeMap<u32, Vec<(u32, PtrmapEntry)>> = BTreeMap::new();
+        for (&pgno, &ent) in &want {
+            let map = ptrmap::ptrmap_pageno(usable, pgno);
+            by_map.entry(map).or_default().push((pgno, ent));
+        }
+        for (map_pg, entries) in by_map {
+            let mut page = if self.has_page(map_pg) {
+                self.read_page(map_pg)?
+            } else {
+                vec![0u8; self.page_size]
+            };
+            for (pgno, (kind, parent)) in entries {
+                let off = ptrmap::ptrmap_entry_offset(usable, pgno);
+                let enc = ptrmap::encode_entry(kind, parent);
+                page[off..off + ptrmap::ENTRY_SIZE].copy_from_slice(&enc);
+            }
+            self.overlay.insert(map_pg, page);
+        }
+        Ok(())
+    }
+
+    /// Whether page `n` currently exists (in the overlay, WAL, or on disk).
+    fn has_page(&self, n: u32) -> bool {
+        if self.overlay.contains_key(&n) {
+            return true;
+        }
+        if let Some(w) = &self.wal {
+            if w.frames.contains_key(&n) {
+                return true;
+            }
+        }
+        n >= 1 && n <= self.disk_pages
+    }
+
+    /// Read the `rootpage` of every object in `sqlite_schema` (the table b-tree
+    /// rooted at page 1), returning `(rootpage, _)` pairs. Rows with a null/zero
+    /// root (views, triggers) are skipped.
+    fn schema_roots(&self) -> Result<Vec<u32>> {
+        let enc = self.header.text_encoding;
+        let mut out = Vec::new();
+        let mut stack = alloc::vec![1u32];
+        while let Some(pg) = stack.pop() {
+            let bt = BtreePage::parse(Page::from_bytes(pg, self.read_page(pg)?))?;
+            match bt.page_type() {
+                PageType::LeafTable => {
+                    let usable = self.usable_size();
+                    for i in 0..bt.num_cells() {
+                        let cell = bt.table_leaf_cell(i, usable)?;
+                        let full =
+                            crate::btree::cursor::read_payload(self, bt.data(), &cell.payload)?;
+                        let cols = crate::format::record::decode_record(&full, enc)?;
+                        // sqlite_schema column 3 is `rootpage`.
+                        if let Some(crate::value::Value::Integer(r)) = cols.get(3) {
+                            if *r > 0 {
+                                out.push(*r as u32);
+                            }
+                        }
+                    }
+                }
+                PageType::InteriorTable => {
+                    for i in 0..bt.num_cells() {
+                        stack.push(bt.child_pointer(i)?);
+                    }
+                    stack.push(bt.right_pointer());
+                }
+                _ => return Err(Error::Corrupt("sqlite_schema is not a table b-tree".into())),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Walk the b-tree rooted at `root`, recording the ptrmap entry of every
+    /// non-root page below it: child pages get `Btree(parent)`, and each cell's
+    /// overflow chain gets `Overflow1(holding page)` then `Overflow2(prev)`.
+    fn walk_btree_ptrmap(&self, root: u32, want: &mut BTreeMap<u32, PtrmapEntry>) -> Result<()> {
+        let usable = self.usable_size();
+        // Iterative DFS over (page, is_root) so we don't record the root as Btree.
+        let mut stack = alloc::vec![root];
+        while let Some(pg) = stack.pop() {
+            let bt = BtreePage::parse(Page::from_bytes(pg, self.read_page(pg)?))?;
+            match bt.page_type() {
+                PageType::LeafTable => {
+                    for i in 0..bt.num_cells() {
+                        let ov = bt.table_leaf_cell(i, usable)?.payload.overflow;
+                        self.record_overflow_chain(ov, pg, want)?;
+                    }
+                }
+                PageType::LeafIndex => {
+                    for i in 0..bt.num_cells() {
+                        let ov = bt.index_cell(i, usable)?.payload.overflow;
+                        self.record_overflow_chain(ov, pg, want)?;
+                    }
+                }
+                PageType::InteriorTable => {
+                    for i in 0..bt.num_cells() {
+                        let child = bt.child_pointer(i)?;
+                        want.insert(child, (PtrmapType::Btree, pg));
+                        stack.push(child);
+                    }
+                    let r = bt.right_pointer();
+                    want.insert(r, (PtrmapType::Btree, pg));
+                    stack.push(r);
+                }
+                PageType::InteriorIndex => {
+                    for i in 0..bt.num_cells() {
+                        let ov = bt.index_cell(i, usable)?.payload.overflow;
+                        self.record_overflow_chain(ov, pg, want)?;
+                        let child = bt.child_pointer(i)?;
+                        want.insert(child, (PtrmapType::Btree, pg));
+                        stack.push(child);
+                    }
+                    let r = bt.right_pointer();
+                    want.insert(r, (PtrmapType::Btree, pg));
+                    stack.push(r);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the ptrmap entries for an overflow chain whose owning cell lives on
+    /// `holder`: first page `Overflow1(holder)`, the rest `Overflow2(prev)`.
+    fn record_overflow_chain(
+        &self,
+        first: u32,
+        holder: u32,
+        want: &mut BTreeMap<u32, PtrmapEntry>,
+    ) -> Result<()> {
+        if first == 0 {
+            return Ok(());
+        }
+        want.insert(first, (PtrmapType::Overflow1, holder));
+        let mut prev = first;
+        let mut cur = {
+            let pg = self.read_page(first)?;
+            u32::from_be_bytes([pg[0], pg[1], pg[2], pg[3]])
+        };
+        while cur != 0 {
+            want.insert(cur, (PtrmapType::Overflow2, prev));
+            let pg = self.read_page(cur)?;
+            prev = cur;
+            cur = u32::from_be_bytes([pg[0], pg[1], pg[2], pg[3]]);
+        }
+        Ok(())
+    }
+
+    /// Record `FreePage(0)` for every page on the freelist (trunk pages and the
+    /// leaf pages they list).
+    fn walk_freelist_ptrmap(&self, want: &mut BTreeMap<u32, PtrmapEntry>) -> Result<()> {
+        let mut trunk = self.header.freelist_trunk;
+        let mut guard = 0u32;
+        let cap = self.header.freelist_count + 8;
+        while trunk != 0 {
+            guard += 1;
+            if guard > cap {
+                return Err(Error::Corrupt("freelist trunk cycle".into()));
+            }
+            want.insert(trunk, (PtrmapType::FreePage, 0));
+            let tb = self.read_page(trunk)?;
+            let next = u32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]);
+            let leaf_count = u32::from_be_bytes([tb[4], tb[5], tb[6], tb[7]]);
+            for i in 0..leaf_count as usize {
+                let idx = 8 + 4 * i;
+                let leaf = u32::from_be_bytes([tb[idx], tb[idx + 1], tb[idx + 2], tb[idx + 3]]);
+                want.insert(leaf, (PtrmapType::FreePage, 0));
+            }
+            trunk = next;
+        }
         Ok(())
     }
 
@@ -474,6 +734,13 @@ impl WritePager {
         }
         // Take the EXCLUSIVE lock for the flush (no other writer or reader).
         self.acquire_exclusive()?;
+        // In auto-vacuum mode, bring the pointer-map pages up to date before
+        // flushing. (We keep any freed pages in place with a correct FREEPAGE
+        // ptrmap entry, which `integrity_check` accepts; FULL-mode commit-time
+        // truncation/relocation is a separate later piece, C6b-3.)
+        if self.auto_vacuum_on() {
+            self.rebuild_ptrmap()?;
+        }
         // Refresh header bookkeeping and re-stamp page 1.
         self.header.change_counter = self.header.change_counter.wrapping_add(1);
         self.header.size_in_pages = self.page_count;
@@ -530,6 +797,37 @@ impl WritePager {
         }
     }
 
+    /// Switch an *empty* database (page 1 only, no user tables) into the given
+    /// auto-vacuum `mode` by stamping the header fields, mirroring how SQLite
+    /// honours `PRAGMA auto_vacuum=FULL|INCREMENTAL` only before any table is
+    /// created. Returns `Ok(true)` if the mode was applied, `Ok(false)` if the
+    /// database already contains data (in which case SQLite makes the pragma a
+    /// no-op until the next `VACUUM`, which we mirror).
+    pub fn set_auto_vacuum_if_empty(&mut self, mode: AutoVacuum) -> Result<bool> {
+        // "Empty" means a single page whose schema b-tree has no rows.
+        if self.page_count != 1 {
+            return Ok(false);
+        }
+        let p1 = self.read_page(1)?;
+        let bt = BtreePage::parse(Page::from_bytes(1, p1))?;
+        let non_empty = match bt.page_type() {
+            PageType::LeafTable => bt.num_cells() != 0,
+            _ => true,
+        };
+        if non_empty {
+            return Ok(false);
+        }
+        let (largest_root_page, incremental_vacuum) = match mode {
+            AutoVacuum::None => (0, 0),
+            AutoVacuum::Full => (1, 0),
+            AutoVacuum::Incremental => (1, 1),
+        };
+        let h = self.header_mut();
+        h.largest_root_page = largest_root_page;
+        h.incremental_vacuum = incremental_vacuum;
+        Ok(true)
+    }
+
     /// Switch the database into WAL mode (`PRAGMA journal_mode = WAL`). Stamps the
     /// file header's read/write version = 2 via a normal journaled commit, then
     /// initializes empty WAL state. A no-op if already in WAL mode or if no
@@ -570,6 +868,9 @@ impl WritePager {
 
     /// Commit the overlay as WAL frames appended to the `-wal` file.
     fn commit_wal(&mut self) -> Result<()> {
+        if self.auto_vacuum_on() {
+            self.rebuild_ptrmap()?;
+        }
         self.header.change_counter = self.header.change_counter.wrapping_add(1);
         self.header.size_in_pages = self.page_count;
         self.header.version_valid_for = self.header.change_counter;

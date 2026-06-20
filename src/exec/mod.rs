@@ -26,7 +26,7 @@ use crate::btree::{
 };
 use crate::error::{Error, Result};
 use crate::format::record::{decode_record, encode_record};
-use crate::pager::{PageSource, WritePager};
+use crate::pager::{AutoVacuum, PageSource, WritePager};
 use crate::schema::Schema;
 use crate::sql::ast::*;
 use crate::sql::{self};
@@ -1230,30 +1230,11 @@ impl Connection {
             stmt,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
-        // graphite does not yet maintain pointer-map pages, so writing a page to
-        // an `auto_vacuum` database (one sqlite3 created with that mode) would
-        // corrupt its ptrmap. Refuse such writes rather than silently corrupt the
-        // file; reads, and writes to ordinary (auto_vacuum=NONE) databases, are
-        // unaffected. The active backend here is already the statement's target
-        // (a non-main write swaps its database in as `main` beforehand).
-        let mutates_pages = matches!(
-            stmt,
-            Statement::CreateTable(_)
-                | Statement::Insert(_)
-                | Statement::Update(_)
-                | Statement::Delete(_)
-                | Statement::CreateIndex(_)
-                | Statement::CreateView(_)
-                | Statement::CreateTrigger(_)
-                | Statement::CreateVirtualTable(_)
-                | Statement::Drop(_)
-                | Statement::Alter(_)
-        );
-        if mutates_pages && auto_vacuum_mode(self.backend.source().header()) != 0 {
-            return Err(Error::Unsupported(
-                "writing an auto_vacuum database (pointer-map maintenance not yet implemented)",
-            ));
-        }
+        // Writes to an `auto_vacuum` database are now supported: the write-side
+        // pager maintains the pointer-map pages on commit (see
+        // `WritePager::rebuild_ptrmap`), so the C6a guard that used to refuse
+        // such writes has been lifted. auto_vacuum=NONE databases take the
+        // unchanged plain write path.
         let affected = match stmt {
             Statement::CreateTable(ct) => {
                 self.exec_create_table(&ct, sql.trim())?;
@@ -1966,14 +1947,19 @@ impl Connection {
                     "incremental" => 2,
                     _ => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?),
                 };
-                // graphite creates only `auto_vacuum=NONE` databases and cannot
-                // maintain pointer-map pages, so accept NONE (the status quo) and
-                // reject FULL/INCREMENTAL rather than claim a mode it can't honor.
-                if mode != 0 {
-                    return Err(Error::Unsupported(
-                        "PRAGMA auto_vacuum = FULL/INCREMENTAL (pointer-map maintenance not yet implemented)",
-                    ));
-                }
+                // SQLite only honours a change of auto-vacuum mode on an *empty*
+                // database (before any table is created); afterwards it is a
+                // no-op until the next VACUUM. graphite mirrors that: on an empty
+                // database we stamp the header into the requested mode and the
+                // pager maintains pointer-map pages from then on; on a non-empty
+                // database the pragma is silently ignored.
+                let target = match mode {
+                    0 => AutoVacuum::None,
+                    1 => AutoVacuum::Full,
+                    2 => AutoVacuum::Incremental,
+                    _ => return Err(Error::Error(format!("invalid auto_vacuum mode {mode}"))),
+                };
+                self.backend.writer()?.set_auto_vacuum_if_empty(target)?;
             }
         }
         Ok(())
