@@ -250,10 +250,23 @@ impl<'a> EvalCtx<'a> {
     }
 
     fn resolve_column(&self, table: Option<&str>, name: &str) -> Result<Value> {
-        // Special rowid aliases.
-        if table.is_none() && is_rowid_alias(name) {
-            if let Some(r) = self.rowid {
-                return Ok(Value::Integer(r));
+        // Special rowid aliases (`rowid`/`_rowid_`/`oid`), optionally qualified
+        // by a table name in scope (`t.rowid`). A real column always wins, so
+        // only fall back to the rowid when no column matches.
+        if is_rowid_alias(name)
+            && !self.columns.iter().any(|col| {
+                col.name.eq_ignore_ascii_case(name)
+                    && table.is_none_or(|t| col.table.eq_ignore_ascii_case(t))
+            })
+        {
+            let qualifies = match table {
+                None => true,
+                Some(t) => self.columns.iter().any(|c| c.table.eq_ignore_ascii_case(t)),
+            };
+            if qualifies {
+                if let Some(r) = self.rowid {
+                    return Ok(Value::Integer(r));
+                }
             }
         }
         for (i, col) in self.columns.iter().enumerate() {
