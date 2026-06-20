@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **Transaction & DDL state checks**: nested `BEGIN`, and `COMMIT`/`ROLLBACK`
+  with no active transaction, are now rejected; `DROP` of a missing object
+  reports lowercase "no such <kind>" with a table↔view hint; `ALTER … RENAME
+  COLUMN` onto an existing name and `RENAME TABLE` onto an existing table/index
+  are rejected with SQLite's messages.
 - **CREATE TABLE validations** matching SQLite: duplicate column name, more than
   one PRIMARY KEY, a PRIMARY KEY/UNIQUE list naming a missing column,
   AUTOINCREMENT only on an INTEGER PRIMARY KEY (and not on WITHOUT ROWID), and a
