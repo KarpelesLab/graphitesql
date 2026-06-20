@@ -412,6 +412,7 @@ impl Connection {
             "index_info" => self.pragma_index_info(p, false),
             "index_xinfo" => self.pragma_index_info(p, true),
             "database_list" => Ok(self.pragma_database_list()),
+            "table_list" => self.pragma_table_list(p),
             "foreign_key_list" => self.pragma_foreign_key_list(p),
             "foreign_key_check" => self.pragma_foreign_key_check(p),
             "integrity_check" | "quick_check" => self.pragma_integrity_check(),
@@ -438,6 +439,120 @@ impl Connection {
     /// `PRAGMA database_list` → `(seq, name, file)` for `main`, then each
     /// attached database in attachment order. In-memory databases report an
     /// empty file path, as in SQLite.
+    /// `PRAGMA table_list [(name)]`: one row per table/view across every
+    /// database — `(schema, name, type, ncol, wr, strict)` — plus each
+    /// database's synthetic schema table. Row order is unspecified in sqlite
+    /// (hash order); we emit database order, then catalog order within each.
+    fn pragma_table_list(&self, p: &Pragma) -> Result<QueryResult> {
+        use crate::schema::ObjectType;
+        let filter = match &p.value {
+            Some(Expr::Column { column, .. }) => Some(column.clone()),
+            Some(Expr::Literal(Literal::Str(s))) => Some(s.clone()),
+            _ => None,
+        };
+        let params = Params::default();
+        // (display name, which database, that database's schema-table name).
+        // `temp` is always listed here (matching sqlite) even before it exists —
+        // unlike `database_list`, which omits it until first use.
+        let mut dbs: Vec<(String, DbRef, &str)> = alloc::vec![
+            ("main".into(), DbRef::Main, "sqlite_schema"),
+            ("temp".into(), DbRef::Temp, "sqlite_temp_schema"),
+        ];
+        for (i, d) in self.attached.iter().enumerate() {
+            dbs.push((d.name.clone(), DbRef::Attached(i), "sqlite_schema"));
+        }
+        let matches = |n: &str| filter.as_deref().is_none_or(|f| f.eq_ignore_ascii_case(n));
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for (db_name, db, schema_tab) in &dbs {
+            // `temp` may be listed before it has been created (no user objects).
+            let objects: &[crate::schema::SchemaObject] =
+                if matches!(db, DbRef::Temp) && self.temp_db.is_none() {
+                    &[]
+                } else {
+                    self.db_parts(*db).0.objects()
+                };
+            for obj in objects {
+                let typ = match obj.obj_type {
+                    ObjectType::Table => "table",
+                    ObjectType::View => "view",
+                    _ => continue,
+                };
+                if !matches(&obj.name) {
+                    continue;
+                }
+                let (ncol, wr, strict) = self.table_list_dims(*db, obj, &params);
+                rows.push(alloc::vec![
+                    Value::Text(db_name.clone()),
+                    Value::Text(obj.name.clone()),
+                    Value::Text(typ.into()),
+                    Value::Integer(ncol),
+                    Value::Integer(wr),
+                    Value::Integer(strict),
+                ]);
+            }
+            // The database's own schema table (also matchable as `sqlite_master`).
+            if matches(schema_tab)
+                || filter
+                    .as_deref()
+                    .is_some_and(|f| f.eq_ignore_ascii_case("sqlite_master"))
+            {
+                rows.push(alloc::vec![
+                    Value::Text(db_name.clone()),
+                    Value::Text((*schema_tab).into()),
+                    Value::Text("table".into()),
+                    Value::Integer(5),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                ]);
+            }
+        }
+        Ok(QueryResult {
+            columns: alloc::vec![
+                "schema".into(),
+                "name".into(),
+                "type".into(),
+                "ncol".into(),
+                "wr".into(),
+                "strict".into(),
+            ],
+            rows,
+        })
+    }
+
+    /// `(ncol, wr, strict)` for one `table_list` row: a table's column count,
+    /// WITHOUT ROWID flag, and STRICT flag; a view's output-column count (its
+    /// `wr`/`strict` are always 0). Best-effort — an unreadable object yields 0s.
+    fn table_list_dims(
+        &self,
+        db: DbRef,
+        obj: &crate::schema::SchemaObject,
+        params: &Params,
+    ) -> (i64, i64, i64) {
+        use crate::schema::ObjectType;
+        match obj.obj_type {
+            ObjectType::Table => {
+                let (schema, _) = self.db_parts(db);
+                match self.table_meta_in(schema, &obj.name, None) {
+                    Ok(m) => (
+                        m.columns.len() as i64,
+                        m.without_rowid as i64,
+                        m.strict_types.is_some() as i64,
+                    ),
+                    Err(_) => (0, 0, 0),
+                }
+            }
+            ObjectType::View => {
+                let ncol = self
+                    .scan_db_view(db, &obj.name, None, params)
+                    .ok()
+                    .flatten()
+                    .map_or(0, |(c, _)| c.len() as i64);
+                (ncol, 0, 0)
+            }
+            _ => (0, 0, 0),
+        }
+    }
+
     fn pragma_database_list(&self) -> QueryResult {
         let mut rows = alloc::vec![alloc::vec![
             Value::Integer(0),

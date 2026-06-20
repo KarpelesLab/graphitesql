@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **`PRAGMA table_list [(name)]`**: one row per table/view across main + temp +
+  attached databases — `(schema, name, type, ncol, wr, strict)` — plus each
+  database's synthetic schema table (`temp` always listed, matching sqlite).
+  View `ncol` is the output-column count; `wr`/`strict` flag WITHOUT ROWID /
+  STRICT tables. Row set verified equal to the sqlite3 CLI.
 - Track C6a: **`auto_vacuum` awareness.** `PRAGMA auto_vacuum` now reports the
   database's mode (0 = NONE, 1 = FULL, 2 = INCREMENTAL). graphite reads
   `auto_vacuum` databases created by sqlite3 (pointer-map pages are skipped
