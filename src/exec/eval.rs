@@ -497,14 +497,15 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             if matches!(v, Value::Null) {
                 return Ok(Value::Null);
             }
-            // Both bounds compare under the left operand's collation, as in SQLite.
-            let coll = key_collation(expr, ctx);
+            // `x BETWEEN lo AND hi` is `x >= lo AND x <= hi`; each comparison
+            // resolves its own collation (left operand's, else an explicit
+            // `COLLATE` on that bound), as in SQLite.
             let ge = matches!(
-                crate::value::cmp_values_coll(&v, &lo, coll),
+                crate::value::cmp_values_coll(&v, &lo, resolve_collation(expr, low, ctx)),
                 Ordering::Greater | Ordering::Equal
             );
             let le = matches!(
-                crate::value::cmp_values_coll(&v, &hi, coll),
+                crate::value::cmp_values_coll(&v, &hi, resolve_collation(expr, high, ctx)),
                 Ordering::Less | Ordering::Equal
             );
             let within = ge && le;
@@ -789,9 +790,16 @@ fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<V
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
-    // The membership test uses the left operand's collation (an explicit
-    // COLLATE or the column's declared collation), matching SQLite.
-    let coll = key_collation(expr, ctx);
+    // SQLite rewrites a single-element `x IN (y)` to `x = y`, so an explicit
+    // `COLLATE` on that one element applies (`'a' IN ('A' COLLATE NOCASE)` is
+    // true). A multi-element list instead uses the left operand's collation only
+    // — per-element `COLLATE` is ignored there (`'a' IN ('x','A' COLLATE NOCASE)`
+    // is false).
+    let coll = if list.len() == 1 {
+        resolve_collation(expr, &list[0], ctx)
+    } else {
+        key_collation(expr, ctx)
+    };
     let mut saw_null = false;
     for item in list {
         let iv = eval(item, ctx)?;
@@ -821,19 +829,20 @@ fn eval_case(
         Some(e) => Some(eval(e, ctx)?),
         None => None,
     };
-    // `CASE x WHEN y …` compares under x's collation (e.g. a NOCASE column).
-    let base_coll = operand.map(|e| key_collation(e, ctx)).unwrap_or_default();
     for (when, then) in when_then {
-        let matched = match &base {
-            // `CASE x WHEN y` matches when x = y.
-            Some(b) => {
+        let matched = match (&base, operand) {
+            // `CASE x WHEN y` matches when `x = y`, resolving collation per-WHEN
+            // like a binary comparison: x's explicit/column collation, else an
+            // explicit `COLLATE` on the WHEN expression.
+            (Some(b), Some(op_expr)) => {
                 let w = eval(when, ctx)?;
+                let coll = resolve_collation(op_expr, when, ctx);
                 !matches!(b, Value::Null)
                     && !matches!(w, Value::Null)
-                    && crate::value::cmp_values_coll(b, &w, base_coll) == Ordering::Equal
+                    && crate::value::cmp_values_coll(b, &w, coll) == Ordering::Equal
             }
-            // `CASE WHEN cond` matches when cond is true.
-            None => truth(&eval(when, ctx)?) == Some(true),
+            // `CASE WHEN cond` (no base operand) matches when cond is true.
+            _ => truth(&eval(when, ctx)?) == Some(true),
         };
         if matched {
             return eval(then, ctx);
