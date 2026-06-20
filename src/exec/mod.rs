@@ -435,6 +435,10 @@ impl Connection {
                 self.exec_vacuum()?;
                 0
             }
+            Statement::Analyze(target) => {
+                self.exec_analyze(target.as_deref())?;
+                0
+            }
             Statement::Select(_) => return Err(Error::Unsupported("use query() for SELECT")),
             Statement::Explain { .. } => return Err(Error::Unsupported("use query() for EXPLAIN")),
             Statement::Begin | Statement::Commit | Statement::Rollback => unreachable!(),
@@ -585,6 +589,99 @@ impl Connection {
             self.backend.writer()?.header().write_to(&mut page1)?;
             self.backend.writer()?.write_page(1, page1)?;
             self.backend.writer()?.commit()?;
+        }
+        self.schema = Schema::read(self.backend.source())?;
+        Ok(())
+    }
+
+    /// `ANALYZE`: gather index selectivity statistics into the `sqlite_stat1`
+    /// table. The `stat` string for an index is `nRow avgEq1 avgEq2 …`, where
+    /// `avgEqK = (nRow + dK/2) / dK` and `dK` is the number of distinct values of
+    /// the index's leftmost `K` columns — the same integers SQLite records. A
+    /// table with no index gets a single `(tbl, NULL, nRow)` row.
+    fn exec_analyze(&mut self, target: Option<&str>) -> Result<()> {
+        use crate::schema::ObjectType;
+        // Which user tables to (re)analyze.
+        let analyze: Vec<String> = match target {
+            None => self
+                .schema
+                .objects()
+                .iter()
+                .filter(|o| o.obj_type == ObjectType::Table && !o.name.starts_with("sqlite_"))
+                .map(|o| o.name.clone())
+                .collect(),
+            Some(name) => {
+                if let Some(t) = self.schema.table(name) {
+                    alloc::vec![t.name.clone()]
+                } else if let Some(ix) = self.schema.index(name) {
+                    alloc::vec![ix.tbl_name.clone()]
+                } else {
+                    return Ok(()); // unknown object: no-op, like SQLite
+                }
+            }
+        };
+
+        // Compute the new stat rows up front (read-only phase).
+        let mut new_rows: Vec<(String, Option<String>, String)> = Vec::new();
+        for tname in &analyze {
+            let meta = self.table_meta(tname, None)?;
+            let rows: Vec<Vec<Value>> = if meta.without_rowid {
+                self.scan_without_rowid(&meta)?
+            } else {
+                self.scan_table(&meta)?
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect()
+            };
+            let n = rows.len();
+            let indexes = self.indexes_of(tname)?;
+            if indexes.is_empty() {
+                if n > 0 {
+                    new_rows.push((tname.clone(), None, alloc::format!("{n}")));
+                }
+            } else {
+                for idx in &indexes {
+                    if n == 0 {
+                        continue; // SQLite records nothing for an empty index
+                    }
+                    let stat = index_stat_string(&idx.cols, &idx.collations, &rows);
+                    new_rows.push((tname.clone(), Some(idx.name.clone()), stat));
+                }
+            }
+        }
+
+        // Ensure the sqlite_stat1 catalog table exists.
+        if self.schema.table("sqlite_stat1").is_none() {
+            const STAT1_SQL: &str = "CREATE TABLE sqlite_stat1(tbl,idx,stat)";
+            let Statement::CreateTable(ct) = sql::parse_one(STAT1_SQL)? else {
+                unreachable!()
+            };
+            self.exec_create_table(&ct, STAT1_SQL)?;
+        }
+        let stat_root = self.schema.table("sqlite_stat1").unwrap().rootpage;
+
+        // Replace existing rows for the analyzed tables.
+        let stat_meta = self.table_meta("sqlite_stat1", None)?;
+        let victims: Vec<i64> = self
+            .scan_table(&stat_meta)?
+            .into_iter()
+            .filter(
+                |(_, vals)| matches!(&vals[0], Value::Text(t) if analyze.iter().any(|a| a == t)),
+            )
+            .map(|(rid, _)| rid)
+            .collect();
+        for rid in victims {
+            delete_table(self.backend.writer()?, stat_root, rid)?;
+        }
+
+        let base = self.next_rowid(stat_root)?;
+        for (i, (tbl, idx, stat)) in new_rows.into_iter().enumerate() {
+            let rec = encode_record(&[
+                Value::Text(tbl),
+                idx.map_or(Value::Null, Value::Text),
+                Value::Text(stat),
+            ]);
+            insert_table(self.backend.writer()?, stat_root, base + i as i64, &rec)?;
         }
         self.schema = Schema::read(self.backend.source())?;
         Ok(())
@@ -1644,6 +1741,34 @@ impl Connection {
         Ok(())
     }
 
+    /// Load `ANALYZE` statistics, mapping each index name to its parsed `stat`
+    /// integers (`[nRow, avgEq1, avgEq2, …]`). Empty when the database has not
+    /// been analyzed. Used by the cost-based index chooser.
+    fn stat1_map(&self) -> alloc::collections::BTreeMap<String, Vec<u64>> {
+        let mut map = alloc::collections::BTreeMap::new();
+        if self.schema.table("sqlite_stat1").is_none() {
+            return map;
+        }
+        let Ok(meta) = self.table_meta("sqlite_stat1", None) else {
+            return map;
+        };
+        let Ok(rows) = self.scan_table(&meta) else {
+            return map;
+        };
+        for (_, vals) in rows {
+            if let (Some(Value::Text(idx)), Some(Value::Text(stat))) = (vals.get(1), vals.get(2)) {
+                let nums: Vec<u64> = stat
+                    .split_whitespace()
+                    .filter_map(|t| t.parse().ok())
+                    .collect();
+                if !nums.is_empty() {
+                    map.insert(idx.clone(), nums);
+                }
+            }
+        }
+        map
+    }
+
     /// Rowids of existing rows that conflict with a candidate row on the rowid
     /// or any UNIQUE/PRIMARY KEY column set (NULLs are considered distinct).
     fn find_conflicts(
@@ -2480,9 +2605,13 @@ impl Connection {
             }
         }
 
-        // Choose the index covering the longest leftmost prefix of equalities.
+        // Choose the index to seek. Each candidate covers the longest leftmost
+        // prefix of the index's columns that the WHERE constrains by equality.
+        // With `ANALYZE` statistics we pick the most selective (fewest estimated
+        // rows); absent stats we fall back to the longest matched prefix.
         let indexes = self.indexes_of(table_name)?;
-        let mut best: Option<(u32, Vec<Value>, Vec<crate::value::Collation>)> = None;
+        let stats = self.stat1_map();
+        let mut best: Option<(u32, Vec<Value>, Vec<crate::value::Collation>, u64)> = None;
         for idx in &indexes {
             let mut key = Vec::new();
             let mut colls = Vec::new();
@@ -2495,11 +2624,24 @@ impl Connection {
                     None => break,
                 }
             }
-            if key.len() > best.as_ref().map_or(0, |(_, k, _)| k.len()) {
-                best = Some((idx.root, key, colls));
+            if key.is_empty() {
+                continue;
+            }
+            // Estimated rows returned: the stat's avgEq at the matched prefix
+            // length when available, else a sentinel that prefers longer prefixes.
+            let est = stats
+                .get(&idx.name)
+                .and_then(|s| s.get(key.len()).copied())
+                .unwrap_or(u64::MAX - key.len() as u64);
+            let better = match &best {
+                None => true,
+                Some((_, bk, _, be)) => est < *be || (est == *be && key.len() > bk.len()),
+            };
+            if better {
+                best = Some((idx.root, key, colls, est));
             }
         }
-        let Some((root, key, seek_colls)) = best else {
+        let Some((root, key, seek_colls, _)) = best else {
             return Ok(None);
         };
         if key.is_empty() {
@@ -2647,8 +2789,11 @@ impl Connection {
                 ));
             }
         }
-        // Index covering the longest leftmost prefix of equalities.
-        let mut best: Option<(String, Vec<usize>)> = None;
+        // Index covering the longest leftmost prefix of equalities, preferring
+        // the most selective one when `ANALYZE` statistics are available (kept in
+        // step with the cost-based chooser in try_index_lookup).
+        let stats = self.stat1_map();
+        let mut best: Option<(String, Vec<usize>, u64)> = None;
         for obj in self.schema.indexes_on(table) {
             let Some(sql) = &obj.sql else { continue };
             let Ok(Statement::CreateIndex(ci)) = sql::parse_one(sql) else {
@@ -2665,11 +2810,22 @@ impl Connection {
                     break;
                 }
             }
-            if matched.len() > best.as_ref().map_or(0, |(_, m)| m.len()) {
-                best = Some((obj.name.clone(), matched));
+            if matched.is_empty() {
+                continue;
+            }
+            let est = stats
+                .get(&obj.name)
+                .and_then(|s| s.get(matched.len()).copied())
+                .unwrap_or(u64::MAX - matched.len() as u64);
+            let better = match &best {
+                None => true,
+                Some((_, bm, be)) => est < *be || (est == *be && matched.len() > bm.len()),
+            };
+            if better {
+                best = Some((obj.name.clone(), matched, est));
             }
         }
-        if let Some((idx_name, matched)) = best {
+        if let Some((idx_name, matched, _)) = best {
             if !matched.is_empty() {
                 let cond = matched
                     .iter()
@@ -2698,6 +2854,7 @@ impl Connection {
                     };
                     let (cols, collations) = self.index_columns_coll(&tmeta, &ci)?;
                     out.push(IndexMeta {
+                        name: obj.name.clone(),
                         root: obj.rootpage,
                         cols,
                         collations,
@@ -2709,6 +2866,7 @@ impl Connection {
                         if let Some(cols) = tmeta.unique.get(n - 1) {
                             let collations = self.col_collations(&tmeta, cols);
                             out.push(IndexMeta {
+                                name: obj.name.clone(),
                                 root: obj.rootpage,
                                 cols: cols.clone(),
                                 collations,
@@ -4389,6 +4547,8 @@ impl TableMeta {
 
 /// An index's b-tree root and the table column positions it covers.
 struct IndexMeta {
+    /// The index name (as in `sqlite_schema`), used by `ANALYZE`.
+    name: String,
     root: u32,
     cols: Vec<usize>,
     /// Collating sequence for each indexed column (aligned with `cols`).
@@ -4840,6 +5000,53 @@ fn index_key(cols: &[usize], values: &[Value], rowid: i64) -> Vec<u8> {
 
 /// Whether rows `a` and `b` collide on any UNIQUE/PRIMARY KEY column set (all
 /// columns of the set equal and none NULL — NULLs are distinct, as in SQLite).
+/// Build the `sqlite_stat1` `stat` string for an index over `rows`: `nRow`
+/// followed by, for each leftmost prefix length `K`, `(nRow + dK/2) / dK` where
+/// `dK` is the number of distinct prefixes of length `K` (collation-aware).
+fn index_stat_string(
+    cols: &[usize],
+    colls: &[crate::value::Collation],
+    rows: &[Vec<Value>],
+) -> String {
+    let n = rows.len();
+    let mut tuples: Vec<Vec<Value>> = rows
+        .iter()
+        .map(|r| cols.iter().map(|&c| r[c].clone()).collect())
+        .collect();
+    tuples.sort_by(|a, b| stat_prefix_cmp(a, b, colls, cols.len()));
+    let mut s = alloc::format!("{n}");
+    for k in 1..=cols.len() {
+        let mut distinct = 1usize; // n > 0 guaranteed by the caller
+        for w in tuples.windows(2) {
+            if stat_prefix_cmp(&w[0], &w[1], colls, k) != core::cmp::Ordering::Equal {
+                distinct += 1;
+            }
+        }
+        let avg = (n + distinct / 2) / distinct;
+        s.push(' ');
+        s.push_str(&avg.to_string());
+    }
+    s
+}
+
+/// Compare the leftmost `len` columns of two index tuples under per-column
+/// collations (used to count distinct prefixes for `ANALYZE`).
+fn stat_prefix_cmp(
+    a: &[Value],
+    b: &[Value],
+    colls: &[crate::value::Collation],
+    len: usize,
+) -> core::cmp::Ordering {
+    for i in 0..len {
+        let coll = colls.get(i).copied().unwrap_or_default();
+        let ord = crate::value::cmp_values_coll(&a[i], &b[i], coll);
+        if ord != core::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    core::cmp::Ordering::Equal
+}
+
 fn unique_match(meta: &TableMeta, a: &[Value], b: &[Value]) -> bool {
     meta.unique.iter().any(|set| {
         set.iter().all(|&c| {

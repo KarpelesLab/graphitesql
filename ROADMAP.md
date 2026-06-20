@@ -121,29 +121,28 @@ Order within a track is roughly by value/effort; tracks can progress in parallel
 
 Make the dialect complete. Each item lands with a differential corpus addition.
 
-- **Generated columns** — `GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]`. Today
-  the clause is parsed-and-ignored; model it in the AST, evaluate `VIRTUAL` on
-  read and materialize `STORED` on write, and reject writes to them.
-  *Ref:* `build.c`, expression eval.
-- **Collations** — honor `COLLATE NOCASE`/`RTRIM`/`BINARY` (and column/index
-  `COLLATE`) in comparisons, `ORDER BY`, `GROUP BY`, `DISTINCT`, and index key
-  ordering. Today `COLLATE` parses but comparisons are always `BINARY`.
-  *Ref:* `vdbeaux.c` (`sqlite3MemCompare`), `callback.c`.
-- **UPSERT** — `INSERT … ON CONFLICT (cols) DO UPDATE SET … [WHERE …]` and
-  `DO NOTHING` (we already have `INSERT OR IGNORE/REPLACE`).
-- **`RETURNING`** — for `INSERT`/`UPDATE`/`DELETE`.
+- ✅ **Generated columns** — `… AS (expr) [STORED|VIRTUAL]`: modeled in the AST,
+  `VIRTUAL` computed on read, `STORED` materialized on write, writes rejected,
+  indexable. *Ref:* `build.c`, expression eval.
+- ✅ **Collations** — `COLLATE NOCASE`/`RTRIM`/`BINARY` (and column/index
+  `COLLATE`) honored in comparisons, `ORDER BY`, `GROUP BY`, `DISTINCT`, `UNIQUE`
+  enforcement, and index key ordering/seek. *Ref:* `vdbeaux.c`, `callback.c`.
+- ✅ **UPSERT** — `INSERT … ON CONFLICT [(cols)] DO UPDATE SET … [WHERE …]` and
+  `DO NOTHING`, with the `excluded` pseudo-table.
+- ✅ **`RETURNING`** — for `INSERT`/`UPDATE`/`DELETE` (`Connection::execute_returning`).
 - **Row values** — `(a, b) IN (…)`, `(a, b) = (c, d)`, `(a,b) < (c,d)`, and
   `VALUES` as a standalone statement / table source.
 - **`ORDER BY` modifiers** — `NULLS FIRST`/`NULLS LAST`; `IS [NOT] DISTINCT FROM`.
 - **Aggregate/window extras** — `FILTER (WHERE …)`, the `WINDOW name AS (…)`
   clause and named-window reuse, frame `EXCLUDE`, `percent_rank`/`cume_dist`,
   `GROUP_CONCAT` ordering, `count(DISTINCT …)` over windows.
-- **Function library** — the math functions (`sqrt`, `pow`, `ceil`, `floor`,
-  `ln`/`log`, trig, …, behind SQLite's `-DSQLITE_ENABLE_MATH_FUNCTIONS`),
-  remaining string/blob built-ins, and the **JSON** functions (`json`,
-  `json_extract`, `->`/`->>`, `json_array`/`json_object`, `json_each`/`json_tree`
-  as table-valued — depends on Track D virtual tables). *Ref:* `func.c`,
-  `math.c`, `json.c`.
+- **Function library** — ✅ math functions (`sqrt`, `pow`, `ceil`, `floor`,
+  `ln`/`log`, trig, …, pure-`core`, no libm) and ✅ core **JSON** functions
+  (`json`, `json_extract`, `json_array`/`json_object`, `json_type`,
+  `json_array_length`, `json_valid`, `json_quote`). *Remaining:* JSON mutators
+  (`json_set`/`json_remove`/…), the `->`/`->>` operators, `json_each`/`json_tree`
+  (table-valued — depends on Track D), and remaining string/blob built-ins.
+  *Ref:* `func.c`, `math.c`, `json.c`.
 - **Indexing breadth** — partial indexes (`CREATE INDEX … WHERE`), expression
   indexes (`CREATE INDEX … (lower(x))`), `DESC` index columns honored in seeks,
   and `INDEXED BY` / `NOT INDEXED` hints.
@@ -153,13 +152,14 @@ Make the dialect complete. Each item lands with a differential corpus addition.
 Move from "iterator executor + equality index seek" to a cost-based planner, and
 introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
 
-- **`ANALYZE` + `sqlite_stat1`/`sqlite_stat4`** — gather and store row/selectivity
-  statistics, read them back on open. *Ref:* `analyze.c`.
-- **Cost-based planning** — use statistics to choose indexes and **join order**
-  (today joins run in `FROM` order as nested loops); range scans (`<`/`>`/
-  `BETWEEN`) and `IN`-list driven seeks; the **OR-by-union** optimization;
-  covering-index detection; auto-indexes for unindexed joins; skip-scan.
-  *Ref:* `where.c`, `wherecode.c`, `whereexpr.c`.
+- ✅ **`ANALYZE` + `sqlite_stat1`** — gather and store row/selectivity statistics
+  (`nRow avgEqK` format, byte-compatible), read back when planning. *Remaining:*
+  `sqlite_stat4` histograms. *Ref:* `analyze.c`.
+- **Cost-based planning** — ✅ statistics now drive index *choice*; *remaining:*
+  **join order** (today joins run in `FROM` order as nested loops); range scans
+  (`<`/`>`/`BETWEEN`) and `IN`-list driven seeks; the **OR-by-union**
+  optimization; covering-index detection; auto-indexes for unindexed joins;
+  skip-scan. *Ref:* `where.c`, `wherecode.c`, `whereexpr.c`.
 - **VDBE bytecode IR** — compile the AST to register-machine bytecode and run it,
   replacing the tree-walker incrementally (same results). This is the enabler for
   **real `EXPLAIN`** (the `addr/opcode/p1…` listing) being byte-comparable to
@@ -261,16 +261,16 @@ on contents**, not byte-identical independently-built databases.
 
 ## 7. Immediate next steps
 
-A suggested order to start chipping at the gap:
+Done so far: ✅ generated columns, ✅ collations, ✅ UPSERT + `RETURNING`,
+✅ math + core JSON functions, ✅ `ANALYZE`/`sqlite_stat1` + stats-driven index
+choice. A suggested order for what remains:
 
-1. **Generated columns** (Track A) — small, self-contained, high real-world value;
-   good warm-up that touches the AST, write path, and read path.
-2. **Collations** (Track A) — threads a collation through comparison/ordering;
-   prerequisite for correct text indexes and `ORDER BY … COLLATE`.
-3. **`ANALYZE` + `sqlite_stat1`** (Track B) — write/read the stats tables; sets up
-   the cost-based planner that follows.
-4. **The `Vfs` locking contract + rollback-journal concurrency** (Track C) — the
+1. **The `Vfs` locking contract + rollback-journal concurrency** (Track C) — the
    first concrete step of the committed concurrency model, before the WAL `-shm`.
-5. **VDBE IR spike** (Track B) — prototype compiling a simple `SELECT` to bytecode
+2. **VDBE IR spike** (Track B) — prototype compiling a simple `SELECT` to bytecode
    and running it, to de-risk the executor→VDBE migration and unlock real
    `EXPLAIN`.
+3. **Range/`IN` driven index seeks + join order** (Track B) — extend the new
+   cost-based chooser beyond equality prefixes.
+4. **Row values & `ORDER BY` modifiers** (Track A) — `(a,b) IN (…)`,
+   `NULLS FIRST/LAST`, `IS [NOT] DISTINCT FROM`.

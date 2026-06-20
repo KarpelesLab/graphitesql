@@ -46,6 +46,9 @@ pub enum Statement {
     Pragma(Pragma),
     /// A `VACUUM` statement (accepted; a no-op compaction in this build).
     Vacuum,
+    /// `ANALYZE [name]`: gather statistics into `sqlite_stat1`. `None` analyzes
+    /// the whole database; `Some(name)` a single table or index.
+    Analyze(Option<String>),
     /// `EXPLAIN [QUERY PLAN] <stmt>`.
     Explain {
         /// `EXPLAIN QUERY PLAN` (true) vs plain `EXPLAIN` (false, VDBE bytecode,

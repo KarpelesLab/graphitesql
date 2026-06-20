@@ -213,6 +213,19 @@ impl Parser {
             }
             return Ok(Statement::Vacuum);
         }
+        if self.eat_kw("analyze") {
+            // `ANALYZE` / `ANALYZE name` / `ANALYZE schema.name`.
+            let target = if self.check(&Token::Semicolon) || self.at_end() {
+                None
+            } else {
+                let mut name = self.ident()?;
+                if self.eat(&Token::Dot) {
+                    name = self.ident()?; // schema-qualified: keep the object name
+                }
+                Some(name)
+            };
+            return Ok(Statement::Analyze(target));
+        }
         Err(self.err("unrecognized statement"))
     }
 

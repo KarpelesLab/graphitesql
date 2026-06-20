@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track B: `ANALYZE` and cost-based index selection. `ANALYZE [name]` gathers
+  index selectivity into a `sqlite_stat1(tbl,idx,stat)` table, byte-compatible
+  with SQLite's `nRow avgEq1 avgEq2 …` format (`avgEqK = (nRow + dK/2)/dK`);
+  no-index tables get a `(tbl, NULL, nRow)` row, empty indexes are skipped, and
+  re-analyzing replaces a table's rows. The planner (both execution and
+  `EXPLAIN QUERY PLAN`) now prefers the most selective usable index per those
+  statistics, falling back to the longest-prefix heuristic when unanalyzed.
+  Verified against `sqlite3` incl. `integrity_check`.
 - Track A: SQLite JSON functions — `json`, `json_valid`, `json_quote`,
   `json_type`, `json_array_length`, `json_extract`, `json_array`, `json_object`.
   Includes a pure-`core` RFC-8259 parser/serializer and `$`/`.key`/`[n]` path
