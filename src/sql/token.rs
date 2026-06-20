@@ -382,25 +382,21 @@ impl<'a> Tokenizer<'a> {
         if self.peek() == Some(b'0') && matches!(self.peek_at(1), Some(b'x') | Some(b'X')) {
             self.pos += 2;
             let hstart = self.pos;
-            while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
-                self.pos += 1;
-            }
-            let digits = &self.src[hstart..self.pos];
-            let v = u64::from_str_radix(digits, 16)
+            self.consume_digit_run(|c| c.is_ascii_hexdigit());
+            // SQLite allows `_` digit separators between digits (3.46+); strip
+            // them before parsing.
+            let digits = self.src[hstart..self.pos].replace('_', "");
+            let v = u64::from_str_radix(&digits, 16)
                 .map_err(|_| self.err("invalid hexadecimal integer"))?;
             return Ok(Token::Integer(v as i64));
         }
 
         let mut is_float = false;
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-            self.pos += 1;
-        }
+        self.consume_digit_run(|c| c.is_ascii_digit());
         if self.peek() == Some(b'.') {
             is_float = true;
             self.pos += 1;
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                self.pos += 1;
-            }
+            self.consume_digit_run(|c| c.is_ascii_digit());
         }
         if matches!(self.peek(), Some(b'e') | Some(b'E')) {
             is_float = true;
@@ -408,11 +404,9 @@ impl<'a> Tokenizer<'a> {
             if matches!(self.peek(), Some(b'+') | Some(b'-')) {
                 self.pos += 1;
             }
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                self.pos += 1;
-            }
+            self.consume_digit_run(|c| c.is_ascii_digit());
         }
-        let text = &self.src[start..self.pos];
+        let text = self.src[start..self.pos].replace('_', "");
         if is_float {
             text.parse::<f64>()
                 .map(Token::Float)
@@ -425,6 +419,27 @@ impl<'a> Tokenizer<'a> {
                     .parse::<f64>()
                     .map(Token::Float)
                     .map_err(|_| self.err("invalid integer literal")),
+            }
+        }
+    }
+
+    /// Advance over a run of digits accepted by `is_digit`, allowing single `_`
+    /// separators that sit between two such digits (SQLite 3.46+).
+    fn consume_digit_run(&mut self, is_digit: impl Fn(u8) -> bool) {
+        while let Some(c) = self.peek() {
+            // A digit, or a `_` separator sitting between two digits.
+            let sep_ok = c == b'_'
+                && matches!(self.peek_at(1), Some(n) if is_digit(n))
+                && self.pos > 0
+                && self
+                    .src
+                    .as_bytes()
+                    .get(self.pos - 1)
+                    .is_some_and(|&p| is_digit(p));
+            if is_digit(c) || sep_ok {
+                self.pos += 1;
+            } else {
+                break;
             }
         }
     }

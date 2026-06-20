@@ -546,6 +546,20 @@ fn corpus() -> Vec<String> {
     ] {
         q.push(format!("SELECT {e};"));
     }
+    // 29) Numeric-literal digit separators (SQLite 3.46+) and hex literals.
+    for e in [
+        "1_000",
+        "1_000_000",
+        "0xFF_FF",
+        "1_000.0",
+        "1_0e3",
+        "0x1F",
+        "0xABCDEF",
+        "1_000 + 2_000",
+        "1_2.3_4",
+    ] {
+        q.push(format!("SELECT {e};"));
+    }
 
     q
 }
