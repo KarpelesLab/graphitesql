@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: `octet_length(X)` (byte length of a value's encoding — blob bytes, else
+  the UTF-8 length of its text form) and the `glob(pattern, text)` function form of
+  the `GLOB` operator. Both verified against `sqlite3` in the differential corpus.
 - Track D: table-valued functions — `generate_series(start, stop[, step])`,
   `json_each`, and `json_tree` as `FROM` sources (sole source or joined).
   `json_each` yields the direct children, `json_tree` the full depth-first tree,

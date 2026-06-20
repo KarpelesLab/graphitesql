@@ -88,6 +88,26 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 other => Value::Integer(eval::to_text(other).chars().count() as i64),
             }
         }
+        "octet_length" => {
+            arity(&lname, args, 1)?;
+            // Number of bytes in the value's encoding: blobs as-is, everything
+            // else as the UTF-8 length of its text representation.
+            match &v[0] {
+                Value::Null => Value::Null,
+                Value::Blob(b) => Value::Integer(b.len() as i64),
+                other => Value::Integer(eval::to_text(other).len() as i64),
+            }
+        }
+        "glob" => {
+            // glob(pattern, text) is the function form of `text GLOB pattern`.
+            arity(&lname, args, 2)?;
+            if v.iter().take(2).any(|x| matches!(x, Value::Null)) {
+                Value::Null
+            } else {
+                let m = eval::glob_match(&eval::to_text(&v[0]), &eval::to_text(&v[1]));
+                Value::Integer(m as i64)
+            }
+        }
         "lower" => {
             arity(&lname, args, 1)?;
             str_map(&v[0], |s| s.to_lowercase())

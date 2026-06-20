@@ -1169,7 +1169,8 @@ fn like_rec(p: &[char], t: &[char], esc: Option<char>) -> bool {
 }
 
 /// SQLite `GLOB`: `*`/`?`/`[set]`, case-sensitive.
-fn glob_match(pattern: &str, text: &str) -> bool {
+/// SQLite `GLOB` matching: case-sensitive `*`/`?`/`[…]` wildcards.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     glob_rec(&p, &t)

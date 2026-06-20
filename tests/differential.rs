@@ -182,12 +182,20 @@ fn corpus() -> Vec<String> {
         "min(a,b)",
         "nullif(g,0)",
         "ifnull(s,'?')",
+        "octet_length(s)",
+        "octet_length(a)",
+        "glob('str*', s)",
+        "glob('STR*', s)",
+        "glob('str?', s)",
     ] {
         q.push(format!("SELECT id, {f} FROM t ORDER BY id;"));
     }
     // 7) LIKE / GLOB.
     for pat in ["'str%'", "'%2'", "'str_'", "'STR1'"] {
         q.push(format!("SELECT id FROM t WHERE s LIKE {pat} ORDER BY id;"));
+    }
+    for pat in ["'str*'", "'*1'", "'str?'", "'[s]tr*'"] {
+        q.push(format!("SELECT id FROM t WHERE s GLOB {pat} ORDER BY id;"));
     }
     // 8) ORDER BY / LIMIT / OFFSET / DISTINCT.
     q.push("SELECT id FROM t ORDER BY b, id;".into());
