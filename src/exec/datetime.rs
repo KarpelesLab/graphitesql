@@ -20,6 +20,11 @@ use crate::value::Value;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// The largest Julian-day value (in ms) SQLite will represent: the end of year
+/// 9999. A computation that pushes `ijd` past this (or below 0) yields SQL NULL,
+/// mirroring SQLite's `validJulianDay`.
+const JD_MAX: i64 = 464_269_060_799_999;
+
 /// A parsed date/time, mirroring SQLite's `DateTime` struct.
 #[derive(Clone, Copy, Default)]
 struct DateTime {
@@ -37,6 +42,7 @@ struct DateTime {
     valid_tz: bool,
     raw_s: bool,  // the value came in as a bare number (for `unixepoch`)
     subsec: bool, // a `subsec`/`subsecond` modifier was applied (render ms)
+    n_floor: i32, // days the day-of-month overflowed (for the `floor` modifier)
 }
 
 impl DateTime {
@@ -56,15 +62,29 @@ impl DateTime {
         } else {
             (2000, 1, 1)
         };
+        // SQLite (`computeJD`) flags an out-of-range year as an error, which
+        // ultimately makes the value NULL; we mark `ijd` out of bounds so the
+        // `validJulianDay` check in `is_date` rejects it. This also keeps the
+        // intermediate products below from overflowing.
+        if !(-4713..=9999).contains(&year) || self.raw_s {
+            self.ijd = i64::MIN;
+            self.valid_jd = true;
+            return;
+        }
         if month <= 2 {
             year -= 1;
             month += 12;
         }
+        // Widen to i64: the products stay well within range for the bounded year
+        // above, but a transient pre-check year (before the modifier renormalizes
+        // it) could otherwise overflow i32.
+        let year = year as i64;
+        let month = month as i64;
         let a = year / 100;
         let b = 2 - a + a / 4;
         let x1 = 36525 * (year + 4716) / 100;
         let x2 = 306001 * (month + 1) / 10000;
-        self.ijd = (((x1 + x2 + day + b) as f64 - 1524.5) * 86_400_000.0) as i64;
+        self.ijd = (((x1 + x2 + day as i64 + b) as f64 - 1524.5) * 86_400_000.0) as i64;
         self.valid_jd = true;
         if self.valid_hms {
             self.ijd += self.h as i64 * 3_600_000
@@ -77,6 +97,26 @@ impl DateTime {
                 self.valid_tz = false;
             }
         }
+    }
+
+    /// Port of `computeFloor`: from the current Y/M/D, count how many days the
+    /// day-of-month overflows the month's length. Stored in `n_floor` so the
+    /// `floor` modifier can roll the date back to the end of the month.
+    fn compute_floor(&mut self) {
+        let m = self.m;
+        let d = self.d;
+        self.n_floor = if d <= 28 {
+            0
+        } else if (1 << m) & 0x15aa != 0 {
+            // Months with 31 days (and the low bits SQLite masks): no overflow.
+            0
+        } else if m != 2 {
+            i32::from(d == 31)
+        } else if self.y % 4 != 0 || (self.y % 100 == 0 && self.y % 400 != 0) {
+            d - 28
+        } else {
+            d - 29
+        };
     }
 
     /// Port of `computeYMD`.
@@ -148,22 +188,22 @@ fn parse_yyyy_mm_dd(z: &str, p: &mut DateTime) -> bool {
     } else {
         false
     };
-    // year: up to 4 digits
-    let (year, ni) = read_int(bytes, i, 4);
+    // year: exactly 4 digits (SQLite `40f`); month/day exactly 2.
+    let (year, ni) = read_exact(bytes, i, 4);
     let Some(year) = year else { return false };
     i = ni;
     if bytes.get(i) != Some(&b'-') {
         return false;
     }
     i += 1;
-    let (month, ni) = read_int(bytes, i, 2);
+    let (month, ni) = read_exact(bytes, i, 2);
     let Some(month) = month else { return false };
     i = ni;
     if bytes.get(i) != Some(&b'-') {
         return false;
     }
     i += 1;
-    let (day, ni) = read_int(bytes, i, 2);
+    let (day, ni) = read_exact(bytes, i, 2);
     let Some(day) = day else { return false };
     i = ni;
     // SQLite validates the month (1-12) and day (1-31); a day that overflows the
@@ -189,6 +229,7 @@ fn parse_yyyy_mm_dd(z: &str, p: &mut DateTime) -> bool {
     p.y = if neg { -year } else { year };
     p.m = month;
     p.d = day;
+    p.compute_floor();
     true
 }
 
@@ -196,20 +237,22 @@ fn parse_yyyy_mm_dd(z: &str, p: &mut DateTime) -> bool {
 fn parse_hh_mm_ss(z: &str, p: &mut DateTime) -> bool {
     let bytes = z.as_bytes();
     let mut i = 0;
-    let (h, ni) = read_int(bytes, i, 2);
+    // SQLite `20c:20e`: hour 2 digits (0-24), minute 2 digits (0-59).
+    let (h, ni) = read_exact(bytes, i, 2);
     let Some(h) = h else { return false };
     i = ni;
     if bytes.get(i) != Some(&b':') {
         return false;
     }
     i += 1;
-    let (min, ni) = read_int(bytes, i, 2);
+    let (min, ni) = read_exact(bytes, i, 2);
     let Some(min) = min else { return false };
     i = ni;
     let mut sec = 0.0;
     if bytes.get(i) == Some(&b':') {
         i += 1;
-        let (s, ni) = read_int(bytes, i, 2);
+        // `20e`: seconds 2 digits (0-59); the fractional `.FFF` is separate.
+        let (s, ni) = read_exact(bytes, i, 2);
         let Some(s) = s else { return false };
         i = ni;
         sec = s as f64;
@@ -265,37 +308,39 @@ fn parse_timezone(z: &str, mut i: usize, p: &mut DateTime) -> bool {
         _ => return false,
     };
     i += 1;
-    let (th, ni) = read_int(bytes, i, 2);
-    let Some(th) = th else { return false };
+    // SQLite `20b:20e`: tz hour 2 digits (0-14), tz minute 2 digits (0-59).
+    let (th, ni) = read_exact(bytes, i, 2);
+    let Some(th) = th.filter(|h| (0..=14).contains(h)) else {
+        return false;
+    };
     i = ni;
     if bytes.get(i) != Some(&b':') {
         return false;
     }
     i += 1;
-    let (tm, ni) = read_int(bytes, i, 2);
-    let Some(tm) = tm else { return false };
+    let (tm, ni) = read_exact(bytes, i, 2);
+    let Some(tm) = tm.filter(|m| (0..=59).contains(m)) else {
+        return false;
+    };
     i = ni;
     p.tz = sign * (th * 60 + tm);
     p.valid_tz = true;
     i == bytes.len()
 }
 
-/// Read up to `maxlen` ASCII digits as an int. Returns the value and the new
-/// index; `None` if no digit was present.
-fn read_int(bytes: &[u8], start: usize, maxlen: usize) -> (Option<i32>, usize) {
-    let mut i = start;
+/// Read **exactly** `len` ASCII digits as an int (port of SQLite's `getDigits`,
+/// whose `40f`/`21a`/… specs read a fixed digit count). Returns the value and the
+/// new index, or `None` if fewer than `len` digits are present. The `min`/`max`
+/// bounds are checked by the caller.
+fn read_exact(bytes: &[u8], start: usize, len: usize) -> (Option<i32>, usize) {
     let mut val: i32 = 0;
-    let mut seen = false;
-    while i < bytes.len() && i < start + maxlen && bytes[i].is_ascii_digit() {
-        val = val * 10 + (bytes[i] - b'0') as i32;
-        seen = true;
-        i += 1;
+    for k in 0..len {
+        match bytes.get(start + k) {
+            Some(b) if b.is_ascii_digit() => val = val * 10 + (b - b'0') as i32,
+            _ => return (None, start),
+        }
     }
-    if seen {
-        (Some(val), i)
-    } else {
-        (None, start)
-    }
+    (Some(val), start + len)
 }
 
 /// Parse a `Value` into a `DateTime` (port of `parseDateOrTime`). Returns `None`
@@ -313,7 +358,10 @@ fn parse_value(v: &Value) -> Option<DateTime> {
             Some(p)
         }
         Value::Text(s) => {
-            let z = s.trim();
+            // SQLite passes the raw text to the parsers (no trim): a date/time
+            // shape with leading whitespace is rejected, while the numeric
+            // fallback (`parse_float`) tolerates surrounding whitespace itself.
+            let z = s.as_str();
             if parse_yyyy_mm_dd(z, &mut p) || parse_hh_mm_ss(z, &mut p) {
                 Some(p)
             } else if z.eq_ignore_ascii_case("now") {
@@ -368,40 +416,57 @@ fn parse_float(s: &str) -> Option<f64> {
 }
 
 /// Apply one modifier string (port of the common cases of `parseModifier`).
-/// Returns `false` if the modifier is unrecognized/invalid.
-fn apply_modifier(p: &mut DateTime, m: &str) -> bool {
-    let m = m.trim();
+/// `idx` is the 1-based position of the modifier in the argument list (the first
+/// modifier is 1), used by SQLite to forbid `auto`/`julianday`/`unixepoch`
+/// anywhere but the very first modifier. Returns `false` if the modifier is
+/// unrecognized/invalid.
+fn apply_modifier(p: &mut DateTime, m: &str, idx: usize) -> bool {
+    // SQLite does NOT trim modifiers: it switches on the first byte and matches
+    // the keyword exactly (`sqlite3_stricmp`), so any leading or trailing
+    // whitespace makes the whole modifier — and the date — invalid. Only the
+    // numeric `±N unit` and `weekday N` forms tolerate *internal* whitespace, and
+    // they handle it themselves below.
     let lower = m.to_ascii_lowercase();
     match lower.as_str() {
         // Timezone modifiers: no tz database => treat as UTC no-ops.
         "utc" | "localtime" => true,
         "unixepoch" => {
-            if p.raw_s {
-                let r = p.s * 1000.0 + 210_866_760_000_000.0;
-                if (0.0..464_269_060_800_000.0).contains(&r) {
-                    p.clear_ymd_hms_tz();
-                    p.ijd = (r + 0.5) as i64;
-                    p.valid_jd = true;
-                    p.raw_s = false;
-                    return true;
-                }
+            // Only valid as the first modifier, and only on a raw number.
+            if idx > 1 || !p.raw_s {
+                return false;
+            }
+            let r = p.s * 1000.0 + 210_866_760_000_000.0;
+            if (0.0..464_269_060_800_000.0).contains(&r) {
+                p.clear_ymd_hms_tz();
+                p.ijd = (r + 0.5) as i64;
+                p.valid_jd = true;
+                p.raw_s = false;
+                return true;
             }
             false
         }
         "julianday" => {
-            // Force the raw number to be interpreted as a Julian day (default).
+            // Force the raw number to be interpreted as a Julian day (default);
+            // only valid as the first modifier.
+            if idx > 1 {
+                return false;
+            }
             if p.raw_s {
                 p.raw_s = false;
             }
             true
         }
         "auto" => {
+            // Only valid as the first modifier.
+            if idx > 1 {
+                return false;
+            }
             if p.raw_s {
                 // < 5373484.5 days => already a JD; otherwise a unix timestamp.
                 if p.s >= 0.0 && p.s < 5_373_484.5 {
                     p.raw_s = false;
                 } else {
-                    return apply_modifier(p, "unixepoch");
+                    return apply_modifier(p, "unixepoch", idx);
                 }
             }
             true
@@ -442,6 +507,22 @@ fn apply_modifier(p: &mut DateTime, m: &str) -> bool {
             p.compute_jd();
             true
         }
+        "ceiling" => {
+            // Day-of-month overflow rolls forward (the default); a near no-op
+            // that just finalizes the JD and clears the floor counter.
+            p.compute_jd();
+            p.clear_ymd_hms_tz();
+            p.n_floor = 0;
+            true
+        }
+        "floor" => {
+            // Day-of-month overflow rolls *back* to the end of the month: undo
+            // the `n_floor` days that the most recent parse / month-add overflowed.
+            p.compute_jd();
+            p.ijd -= p.n_floor as i64 * 86_400_000;
+            p.clear_ymd_hms_tz();
+            true
+        }
         "subsec" | "subsecond" => {
             // Make `datetime()`/`time()` render milliseconds; a no-op for `date()`.
             p.subsec = true;
@@ -453,34 +534,45 @@ fn apply_modifier(p: &mut DateTime, m: &str) -> bool {
 
 /// Handle `±N units`, `weekday N`, and `±HH:MM[:SS]` modifiers.
 fn apply_numeric_modifier(p: &mut DateTime, orig: &str, lower: &str) -> bool {
+    // `weekday N`: exactly the prefix `"weekday "` (one space), then a number in
+    // [0,7) that is integer-valued. SQLite's `sqlite3AtoF` tolerates a leading
+    // `+`/whitespace and trailing whitespace, and accepts `3.0` (== 3) but not
+    // `3.5`.
     if let Some(rest) = lower.strip_prefix("weekday ") {
-        if let Some(n) = rest
-            .trim()
-            .parse::<i64>()
-            .ok()
-            .filter(|n| (0..=6).contains(n))
-        {
-            p.compute_ymd_hms();
-            p.compute_jd();
-            let cur = (p.ijd + 129_600_000) / 86_400_000 % 7; // 0 = Sunday
-            let mut delta = n - cur;
-            if delta < 0 {
-                delta += 7;
-            }
-            p.ijd += delta * 86_400_000;
-            p.clear_ymd_hms_tz();
-            return true;
+        let Some(r) = parse_float(rest) else {
+            return false;
+        };
+        if !(0.0..7.0).contains(&r) || r != float::trunc(r) {
+            return false;
         }
-        return false;
+        let n = r as i64;
+        p.compute_ymd_hms();
+        p.valid_jd = false;
+        p.compute_jd();
+        let mut z = (p.ijd + 129_600_000) / 86_400_000 % 7; // 0 = Sunday
+        if z > n {
+            z -= 7;
+        }
+        p.ijd += (n - z) * 86_400_000;
+        p.clear_ymd_hms_tz();
+        return true;
     }
 
-    // Parse a leading signed number.
+    // The `(+|-)YYYY-MM-DD[ HH:MM]` calendar-offset form. Only attempted when the
+    // text starts with a sign and has the right shape; falls through to the
+    // `±N unit` / `±HH:MM` forms otherwise.
+    if (orig.starts_with('+') || orig.starts_with('-')) && apply_ymd_offset(p, orig) {
+        return true;
+    }
+
+    // Parse a leading signed number, stopping at the first space or colon (so an
+    // embedded space — `+1 day` — splits number from unit, while `+1day` does
+    // not and is rejected as a malformed unit).
     let bytes = orig.as_bytes();
     let mut i = 0;
     if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
         i += 1;
     }
-    let num_start = 0;
     while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
         i += 1;
     }
@@ -491,11 +583,36 @@ fn apply_numeric_modifier(p: &mut DateTime, orig: &str, lower: &str) -> bool {
     if bytes.get(i) == Some(&b':') {
         return apply_time_shift(p, orig);
     }
-    let Some(r) = parse_float(&orig[num_start..i]) else {
+    let Some(r) = parse_float(&orig[..i]) else {
         return false;
     };
-    let unit = orig[i..].trim().to_ascii_lowercase();
+    // The unit name follows after optional internal spaces; SQLite skips the
+    // whitespace, then requires the *rest* to be exactly the unit name (no
+    // trailing whitespace) of length 3..=10 with an optional plural `s`.
+    let unit_field = &orig[i..];
+    let unit_trimmed = unit_field.trim_start();
+    if unit_trimmed.len() == unit_field.len() && !unit_field.is_empty() {
+        // No separating space at all (`+1day`): SQLite rejects this.
+        return false;
+    }
+    let unit = unit_trimmed.to_ascii_lowercase();
     let rounder = if r < 0.0 { -0.5 } else { 0.5 };
+    // SQLite rejects an out-of-range magnitude (`r > -rLimit && r < rLimit`)
+    // before applying the transform, so e.g. `+1e10 days` is NULL rather than an
+    // overflow. The limits mirror `aXformType[].rLimit` in `date.c`.
+    let limit = match unit.as_str() {
+        "second" | "seconds" => 4.6427e14_f64,
+        "minute" | "minutes" => 7.7379e12,
+        "hour" | "hours" => 1.2897e11,
+        "day" | "days" => 5_373_485.0,
+        "month" | "months" => 176_546.0,
+        "year" | "years" => 14713.0,
+        _ => return false,
+    };
+    if !(-limit < r && r < limit) {
+        return false;
+    }
+    p.n_floor = 0;
     match unit.as_str() {
         "day" | "days" => {
             p.compute_jd();
@@ -527,6 +644,7 @@ fn apply_numeric_modifier(p: &mut DateTime, orig: &str, lower: &str) -> bool {
             };
             p.y += x;
             p.m -= x * 12;
+            p.compute_floor();
             p.valid_jd = false;
             p.compute_jd();
             let frac = r - float::trunc(r);
@@ -539,6 +657,7 @@ fn apply_numeric_modifier(p: &mut DateTime, orig: &str, lower: &str) -> bool {
         "year" | "years" => {
             p.compute_ymd_hms();
             p.y += r as i32;
+            p.compute_floor();
             p.valid_jd = false;
             p.compute_jd();
             let frac = r - float::trunc(r);
@@ -549,6 +668,99 @@ fn apply_numeric_modifier(p: &mut DateTime, orig: &str, lower: &str) -> bool {
         }
         _ => return false,
     }
+    true
+}
+
+/// Apply the `(+|-)YYYY-MM-DD[ HH:MM]` calendar-offset modifier (port of the
+/// `z[n]=='-'` branch of SQLite's numeric `parseModifier`). Adds (or subtracts)
+/// whole years, months (0-11) and days (0-30), with the optional ` HH:MM` tail
+/// adding a time-of-day shift. Returns `false` if `orig` is not this shape.
+fn apply_ymd_offset(p: &mut DateTime, orig: &str) -> bool {
+    let bytes = orig.as_bytes();
+    let sign = bytes[0];
+    // Find the extent of the leading number, stopping at `:` or whitespace, and
+    // detecting the embedded `-` separators that mark the YMD form.
+    let mut n = 1;
+    let mut dash_at = None;
+    while n < bytes.len() {
+        let c = bytes[n];
+        if c == b':' || c == b' ' {
+            break;
+        }
+        if c == b'-' {
+            // `40f-21a-21d`: a `-` after a 4- or 5-digit year marks the YMD form.
+            if (n == 5 || n == 6) && dash_at.is_none() {
+                dash_at = Some(n);
+            }
+        }
+        n += 1;
+    }
+    // Width of the year field: 4 (`+YYYY-`) or 5 (`+YYYYY-`); anything else is
+    // not the calendar-offset form.
+    let Some(dash) = dash_at else { return false };
+    let year_w = dash - 1;
+    if year_w != 4 && year_w != 5 {
+        return false;
+    }
+    // Parse `YYYY-MM-DD` (each of MM/DD exactly two digits).
+    let head = &orig[1..n];
+    let parts: Vec<&str> = head.split('-').collect();
+    if parts.len() != 3 || parts[1].len() != 2 || parts[2].len() != 2 {
+        return false;
+    }
+    let (Ok(yy), Ok(mm), Ok(dd)) = (
+        parts[0].parse::<i32>(),
+        parts[1].parse::<i32>(),
+        parts[2].parse::<i32>(),
+    ) else {
+        return false;
+    };
+    if mm >= 12 || dd >= 31 {
+        return false;
+    }
+    p.compute_ymd_hms();
+    p.valid_jd = false;
+    let d_shift = if sign == b'-' {
+        p.y -= yy;
+        p.m -= mm;
+        -dd
+    } else {
+        p.y += yy;
+        p.m += mm;
+        dd
+    };
+    let x = if p.m > 0 {
+        (p.m - 1) / 12
+    } else {
+        (p.m - 12) / 12
+    };
+    p.y += x;
+    p.m -= x * 12;
+    p.compute_floor();
+    p.compute_jd();
+    p.valid_hms = false;
+    p.valid_ymd = false;
+    p.ijd += d_shift as i64 * 86_400_000;
+    // Optional ` HH:MM` time-of-day tail.
+    if n >= bytes.len() {
+        return true;
+    }
+    if bytes[n] != b' ' {
+        return false;
+    }
+    let mut tx = DateTime::default();
+    if !parse_hh_mm_ss(&orig[n + 1..], &mut tx) {
+        return false;
+    }
+    // Reuse the `±HH:MM` shift, with the sign of the whole modifier.
+    let ms = tx.h as i64 * 3_600_000 + tx.min as i64 * 60_000 + (tx.s * 1000.0 + 0.5) as i64;
+    p.compute_jd();
+    if sign == b'-' {
+        p.ijd -= ms;
+    } else {
+        p.ijd += ms;
+    }
+    p.clear_ymd_hms_tz();
     true
 }
 
@@ -586,24 +798,34 @@ fn is_date(args: &[Value]) -> Option<DateTime> {
         }
     };
     let rest = if args.is_empty() { &[][..] } else { &args[1..] };
-    for m in rest {
+    for (idx, m) in rest.iter().enumerate() {
         let Value::Text(ms) = m else { return None };
-        if !apply_modifier(&mut p, ms) {
+        // `idx + 1` is the 1-based modifier position, matching SQLite's argv index
+        // (the first modifier is 1), which `auto`/`julianday`/`unixepoch` require.
+        if !apply_modifier(&mut p, ms, idx + 1) {
             return None;
         }
     }
     p.compute_jd();
-    // Re-derive Y/M/D from the Julian day so a day that overflows its month is
-    // normalized (e.g. `2024-02-30` -> `2024-03-01`), matching SQLite. The
-    // round-trip is the identity for in-range dates. The clock fields are kept as
-    // parsed so `time('24:00:00')` stays `24:00:00` (SQLite does not roll it over).
-    p.valid_ymd = false;
-    p.compute_ymd();
-    // SQLite's date functions return NULL once a computation runs past the end of
-    // year 9999 (`date('9999-12-31','+1 day')` is NULL, not `+10000-01-01`).
-    if p.y > 9999 {
+    // SQLite's date functions return NULL once a computation runs outside the
+    // representable Julian-day window (year 0..=9999). This is a check on the
+    // Julian day itself, not on Y/M/D: `datetime('9999-12-31 24:00:00')` is NULL
+    // even though its stored day is 31, because the +24h pushes the JD past the
+    // ceiling. Mirrors `validJulianDay` in SQLite's `date.c`.
+    if !(0..=JD_MAX).contains(&p.ijd) {
         return None;
     }
+    // SQLite only re-derives Y/M/D from the Julian day in the no-modifier case
+    // when the parsed day overflows its month (`D > 28`), e.g.
+    // `date('2024-02-30')` -> `2024-03-01`. A modifier path leaves YMD invalid
+    // (the modifier clears it), so `compute_ymd` rebuilds it from the JD then.
+    // Crucially, a valid in-range day that merely carries a `24:00:00` clock
+    // (`datetime('2000-01-01 24:00:00')`) is *not* rolled into the next day — the
+    // Y/M/D and the clock fields are both printed exactly as parsed.
+    if args.len() == 1 && p.valid_ymd && p.d > 28 {
+        p.valid_ymd = false;
+    }
+    p.compute_ymd();
     Some(p)
 }
 
