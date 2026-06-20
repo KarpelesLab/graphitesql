@@ -382,6 +382,10 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 Or => eval_or(left, right, ctx),
                 // Comparisons apply operand affinity, then the resolved collation.
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+                    // Row-value comparison `(a,b) OP (c,d)` is lexicographic.
+                    if let (Some(ls), Some(rs)) = (as_row_value(left), as_row_value(right)) {
+                        return compare_row_values(*op, ls, rs, ctx);
+                    }
                     let l = eval(left, ctx)?;
                     let r = eval(right, ctx)?;
                     let (l, r) = apply_comparison_affinity(
@@ -405,7 +409,12 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             expr,
             list,
             negated,
-        } => eval_in(expr, list, *negated, ctx),
+        } => {
+            if let Some(ls) = as_row_value(expr) {
+                return eval_row_in(ls, list, *negated, ctx);
+            }
+            eval_in(expr, list, *negated, ctx)
+        }
         Expr::Between {
             expr,
             low,
@@ -469,6 +478,117 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 Ok(bool_value(*negated))
             }
         }
+        Expr::RowValue(_) => Err(Error::Error(
+            "row value used where a single value is expected".into(),
+        )),
+    }
+}
+
+/// View an expression as a row value's element list, if it is one (transparently
+/// through a redundant parenthesization).
+fn as_row_value(e: &Expr) -> Option<&[Expr]> {
+    match e {
+        Expr::RowValue(items) => Some(items),
+        Expr::Paren(inner) => as_row_value(inner),
+        _ => None,
+    }
+}
+
+/// Per-element comparison of two row values: `Some(Ordering)` when both sides are
+/// non-NULL, `None` when either is NULL (an undecidable element).
+fn row_element_cmps(
+    lefts: &[Expr],
+    rights: &[Expr],
+    ctx: &EvalCtx,
+) -> Result<Vec<Option<Ordering>>> {
+    if lefts.len() != rights.len() {
+        return Err(Error::Error(alloc::format!(
+            "row values have a different number of columns ({} vs {})",
+            lefts.len(),
+            rights.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(lefts.len());
+    for (le, re) in lefts.iter().zip(rights) {
+        let l = eval(le, ctx)?;
+        let r = eval(re, ctx)?;
+        if matches!(l, Value::Null) || matches!(r, Value::Null) {
+            out.push(None);
+            continue;
+        }
+        let (l, r) =
+            apply_comparison_affinity(l, expr_affinity(le, ctx), r, expr_affinity(re, ctx));
+        let coll = resolve_collation(le, re, ctx);
+        out.push(Some(crate::value::cmp_values_coll(&l, &r, coll)));
+    }
+    Ok(out)
+}
+
+/// Lexicographic comparison of two row values under SQLite's three-valued logic.
+fn compare_row_values(
+    op: BinaryOp,
+    lefts: &[Expr],
+    rights: &[Expr],
+    ctx: &EvalCtx,
+) -> Result<Value> {
+    let cmps = row_element_cmps(lefts, rights, ctx)?;
+    Ok(fold_row_comparison(op, &cmps))
+}
+
+/// Combine per-element comparisons into the result of a row comparison `op`.
+fn fold_row_comparison(op: BinaryOp, cmps: &[Option<Ordering>]) -> Value {
+    use BinaryOp::*;
+    match op {
+        Eq | NotEq => {
+            let mut unknown = false;
+            for c in cmps {
+                match c {
+                    None => unknown = true,
+                    Some(Ordering::Equal) => {}
+                    Some(_) => return bool_value(matches!(op, NotEq)), // a definite difference
+                }
+            }
+            if unknown {
+                Value::Null
+            } else {
+                bool_value(matches!(op, Eq)) // all elements equal
+            }
+        }
+        Lt | LtEq | Gt | GtEq => {
+            for c in cmps {
+                match c {
+                    None => return Value::Null, // undecidable at this position
+                    Some(Ordering::Equal) => continue,
+                    Some(Ordering::Less) => return bool_value(matches!(op, Lt | LtEq)),
+                    Some(Ordering::Greater) => return bool_value(matches!(op, Gt | GtEq)),
+                }
+            }
+            // All elements equal: `<=`/`>=` hold, strict `<`/`>` do not.
+            bool_value(matches!(op, LtEq | GtEq))
+        }
+        _ => Value::Null,
+    }
+}
+
+/// `(a, b, …) [NOT] IN ((…), (…))` — row value membership.
+fn eval_row_in(lefts: &[Expr], list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<Value> {
+    let mut saw_null = false;
+    for item in list {
+        let Some(rights) = as_row_value(item) else {
+            return Err(Error::Error(
+                "row value IN list must contain row values".into(),
+            ));
+        };
+        match fold_row_comparison(BinaryOp::Eq, &row_element_cmps(lefts, rights, ctx)?) {
+            Value::Integer(1) => return Ok(bool_value(!negated)),
+            Value::Null => saw_null = true,
+            _ => {}
+        }
+    }
+    if saw_null {
+        Ok(Value::Null)
+    } else {
+        Ok(bool_value(negated))
     }
 }
 

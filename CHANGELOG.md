@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: row-value expressions — `(a,b) = (c,d)`, lexicographic ordering
+  (`<`/`<=`/`>`/`>=`), and `(a,b) IN ((…),(…))`, with SQLite's three-valued NULL
+  semantics (an undecided element yields NULL; a decisive earlier element still
+  resolves). Verified against `sqlite3`.
 - Track A: JSON `->`/`->>` operators and mutators. `->` returns the extracted
   node as JSON, `->>` as a SQL value; a bare-label or integer right operand is
   normalized to `$.label`/`$[n]`. Added `json_set`, `json_insert`,

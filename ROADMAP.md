@@ -130,9 +130,10 @@ Make the dialect complete. Each item lands with a differential corpus addition.
 - ✅ **UPSERT** — `INSERT … ON CONFLICT [(cols)] DO UPDATE SET … [WHERE …]` and
   `DO NOTHING`, with the `excluded` pseudo-table.
 - ✅ **`RETURNING`** — for `INSERT`/`UPDATE`/`DELETE` (`Connection::execute_returning`).
-- **Row values** — `(a, b) IN (…)`, `(a, b) = (c, d)`, `(a,b) < (c,d)`, and
-  `VALUES` as a standalone statement / table source.
-- **`ORDER BY` modifiers** — `NULLS FIRST`/`NULLS LAST`; `IS [NOT] DISTINCT FROM`.
+- **Row values** — ✅ `(a, b) = (c, d)`, `(a,b) < (c,d)`, `(a, b) IN ((…),(…))`.
+  *Remaining:* `(a,b) IN (SELECT …)` and `VALUES` as a standalone statement /
+  table source.
+- ✅ **`ORDER BY` modifiers** — `NULLS FIRST`/`NULLS LAST`; `IS [NOT] DISTINCT FROM`.
 - **Aggregate/window extras** — `FILTER (WHERE …)`, the `WINDOW name AS (…)`
   clause and named-window reuse, frame `EXCLUDE`, `percent_rank`/`cume_dist`,
   `GROUP_CONCAT` ordering, `count(DISTINCT …)` over windows.

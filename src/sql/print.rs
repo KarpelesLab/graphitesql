@@ -250,6 +250,10 @@ pub fn expr(e: &Expr) -> String {
             }
         }
         Expr::Paren(inner) => format!("({})", expr(inner)),
+        Expr::RowValue(items) => {
+            let parts: Vec<String> = items.iter().map(expr).collect();
+            format!("({})", parts.join(", "))
+        }
         // Subqueries are not expected in the schema text we regenerate; render a
         // placeholder so the printer stays total.
         Expr::Subquery(_) => "(SELECT ...)".to_string(),

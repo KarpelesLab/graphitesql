@@ -639,6 +639,9 @@ pub enum Expr {
     },
     /// A parenthesized expression (kept for fidelity; semantically transparent).
     Paren(Box<Expr>),
+    /// A row value `(a, b, …)` with two or more elements — used in comparisons
+    /// (`(a,b) < (c,d)`) and `IN` lists (`(a,b) IN ((1,2),(3,4))`).
+    RowValue(Vec<Expr>),
     /// `expr COLLATE name` — assigns a collating sequence for comparison.
     Collate {
         /// The operand.

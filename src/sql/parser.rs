@@ -1223,9 +1223,20 @@ impl Parser {
                     self.expect(&Token::RParen)?;
                     Ok(Expr::Subquery(Box::new(sel)))
                 } else {
-                    let e = self.expr()?;
-                    self.expect(&Token::RParen)?;
-                    Ok(Expr::Paren(Box::new(e)))
+                    let first = self.expr()?;
+                    if self.eat(&Token::Comma) {
+                        // A row value `(a, b, …)`.
+                        let mut items = alloc::vec![first];
+                        items.push(self.expr()?);
+                        while self.eat(&Token::Comma) {
+                            items.push(self.expr()?);
+                        }
+                        self.expect(&Token::RParen)?;
+                        Ok(Expr::RowValue(items))
+                    } else {
+                        self.expect(&Token::RParen)?;
+                        Ok(Expr::Paren(Box::new(first)))
+                    }
                 }
             }
             Some(Token::Ident(name)) => self.after_name(name, true),
