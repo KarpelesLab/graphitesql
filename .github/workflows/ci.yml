@@ -67,10 +67,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: test
-      # The cross-engine compatibility tests use the sqlite3 CLI when present
-      # (they skip gracefully otherwise); install it so CI exercises them.
-      - name: Install sqlite3
-        run: sudo apt-get update && sudo apt-get install -y sqlite3
+      # The differential / cross-engine tests use the sqlite3 CLI as the oracle.
+      # The distro's apt sqlite3 is too old for some features graphitesql tracks
+      # (ISO-week strftime %G/%V/%u, `_` numeric separators, %f rounding), which
+      # would make correct graphitesql output look "divergent". Pin a known
+      # recent sqlite3 — the version local development validates against — so the
+      # oracle matches graphitesql's target behavior.
+      - name: Install sqlite3 (pinned)
+        run: |
+          set -euo pipefail
+          ver=3500400  # 3.50.4
+          curl -fsSL "https://www.sqlite.org/2025/sqlite-tools-linux-x64-${ver}.zip" -o /tmp/sqlite-tools.zip
+          unzip -o -j /tmp/sqlite-tools.zip sqlite3 -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/sqlite3"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Show sqlite3 version
+        run: sqlite3 --version
       - name: cargo test --all-features
         run: cargo test --all-features
 
