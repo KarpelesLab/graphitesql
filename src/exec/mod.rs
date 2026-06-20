@@ -7538,7 +7538,11 @@ impl Connection {
                     .collect::<Result<_>>()?;
                 let start = nums[0];
                 let stop = nums.get(1).copied().unwrap_or(start);
-                let step = nums.get(2).copied().unwrap_or(1);
+                // SQLite's generate_series treats a step of 0 as 1.
+                let step = match nums.get(2).copied().unwrap_or(1) {
+                    0 => 1,
+                    s => s,
+                };
                 let mut rows = Vec::new();
                 if step != 0 {
                     let mut v = start;
@@ -8604,11 +8608,32 @@ impl Connection {
             sel
         };
 
+        // Resolve a positional `GROUP BY N` (an integer literal) to the N-th
+        // output column's expression, matching sqlite — `GROUP BY 1` groups by
+        // the first result column, not by the constant 1. (Range was already
+        // validated upstream by `check_positional_terms`.)
+        let group_by: Vec<Expr> = sel
+            .group_by
+            .iter()
+            .map(|g| {
+                if let Expr::Literal(Literal::Integer(n)) = g {
+                    if *n >= 1 {
+                        if let Some(ResultColumn::Expr { expr, .. }) =
+                            sel.columns.get((*n - 1) as usize)
+                        {
+                            return expr.clone();
+                        }
+                    }
+                }
+                g.clone()
+            })
+            .collect();
+
         // Partition rows into groups (first-seen order), comparing each grouping
         // key under its column collation.
         let group_colls: Vec<crate::value::Collation> = {
             let cctx = row_ctx(&[], columns, None, params);
-            sel.group_by
+            group_by
                 .iter()
                 .map(|g| eval::key_collation(g, &cctx))
                 .collect()
@@ -8618,7 +8643,7 @@ impl Connection {
         for (i, r) in rows.iter().enumerate() {
             let ctx = r.ctx(columns, params).with_subqueries(self);
             let mut key = Vec::new();
-            for g in &sel.group_by {
+            for g in &group_by {
                 key.push(eval::eval(g, &ctx)?);
             }
             match group_keys
