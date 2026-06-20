@@ -4878,14 +4878,20 @@ impl Connection {
         first.limit = None;
         first.offset = None;
         let mut result = self.run_core(&first, params)?;
+        // Compound set operations (UNION/INTERSECT/EXCEPT) compare rows under the
+        // left SELECT's per-column collations.
+        let colls = {
+            let (cols, _) = self.scan_source(&first, params)?;
+            self.output_collations(&first, &cols, params)
+        };
         for (op, operand) in &sel.compound {
             // Run the operand fully: a `VALUES (…),(…)` operand desugars to a
             // SELECT carrying its extra rows in its *own* compound tail, so it
             // must be expanded (not just its first core) or those rows are lost.
             let r = self.run_select_compound(operand, params)?;
-            result.rows = apply_compound(*op, result.rows, r.rows);
+            result.rows = apply_compound(*op, result.rows, r.rows, &colls);
         }
-        self.compound_order_limit(&mut result, sel, params)?;
+        self.compound_order_limit(&mut result, sel, params, &colls)?;
         Ok(result)
     }
 
@@ -4897,6 +4903,7 @@ impl Connection {
         result: &mut QueryResult,
         sel: &Select,
         params: &Params,
+        colls: &[crate::value::Collation],
     ) -> Result<()> {
         if !sel.order_by.is_empty() {
             let mut keys = Vec::new();
@@ -4905,17 +4912,13 @@ impl Connection {
                     .ok_or(Error::Unsupported(
                         "ORDER BY term must be an output column in a compound query",
                     ))?;
-                keys.push((idx, term.descending, term.nulls_first));
+                // The output column's collation (from the left SELECT) applies.
+                let coll = colls.get(idx).copied().unwrap_or_default();
+                keys.push((idx, term.descending, term.nulls_first, coll));
             }
             result.rows.sort_by(|a, b| {
-                for (idx, desc, nf) in &keys {
-                    let ord = cmp_order(
-                        &a[*idx],
-                        &b[*idx],
-                        *desc,
-                        *nf,
-                        crate::value::Collation::Binary,
-                    );
+                for (idx, desc, nf, coll) in &keys {
+                    let ord = cmp_order(&a[*idx], &b[*idx], *desc, *nf, *coll);
                     if ord != core::cmp::Ordering::Equal {
                         return ord;
                     }
@@ -8540,14 +8543,17 @@ fn apply_compound(
     op: CompoundOp,
     left: Vec<Vec<Value>>,
     right: Vec<Vec<Value>>,
+    colls: &[crate::value::Collation],
 ) -> Vec<Vec<Value>> {
+    // Set comparison uses the left SELECT's per-column collations (SQLite).
+    let eq = |a: &[Value], b: &[Value]| rows_equal_coll(a, b, colls);
     // Deduplicate, keeping the *last* occurrence's representation: when two rows
     // are equal but differ in type (e.g. `1` vs `1.0`), SQLite's compound dedup
     // keeps the later one (`SELECT 1 UNION SELECT 1.0` yields `1.0`).
     let dedup = |rows: Vec<Vec<Value>>| -> Vec<Vec<Value>> {
         let mut seen: Vec<Vec<Value>> = Vec::new();
         for r in rows {
-            match seen.iter().position(|s| rows_equal(s, &r)) {
+            match seen.iter().position(|s| eq(s, &r)) {
                 Some(i) => seen[i] = r,
                 None => seen.push(r),
             }
@@ -8567,12 +8573,12 @@ fn apply_compound(
         }
         CompoundOp::Intersect => dedup(
             left.into_iter()
-                .filter(|l| right.iter().any(|r| rows_equal(l, r)))
+                .filter(|l| right.iter().any(|r| eq(l, r)))
                 .collect(),
         ),
         CompoundOp::Except => dedup(
             left.into_iter()
-                .filter(|l| !right.iter().any(|r| rows_equal(l, r)))
+                .filter(|l| !right.iter().any(|r| eq(l, r)))
                 .collect(),
         ),
     }

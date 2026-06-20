@@ -279,11 +279,40 @@ fn in_subquery_uses_left_collation() {
     }
     // `a IN (SELECT b …)` tests membership under a's NOCASE collation.
     assert_eq!(
-        rows_str(&c, "SELECT a FROM t WHERE a IN (SELECT b FROM u) ORDER BY a"),
+        rows_str(
+            &c,
+            "SELECT a FROM t WHERE a IN (SELECT b FROM u) ORDER BY a"
+        ),
         "X"
     );
     assert_eq!(
-        rows_str(&c, "SELECT a FROM t WHERE a NOT IN (SELECT b FROM u) ORDER BY a"),
+        rows_str(
+            &c,
+            "SELECT a FROM t WHERE a NOT IN (SELECT b FROM u) ORDER BY a"
+        ),
         "y"
     );
+}
+
+#[test]
+fn compound_set_ops_use_collation() {
+    let mut c = Connection::open_memory().unwrap();
+    for s in [
+        "CREATE TABLE t(a TEXT COLLATE NOCASE)",
+        "INSERT INTO t VALUES('X'),('y')",
+        "CREATE TABLE u(b TEXT COLLATE NOCASE)",
+        "INSERT INTO u VALUES('x'),('Z')",
+    ] {
+        c.execute(s).unwrap();
+    }
+    // INTERSECT/EXCEPT compare under the left SELECT's column collation.
+    assert_eq!(rows_str(&c, "SELECT a FROM t INTERSECT SELECT b FROM u"), "X");
+    assert_eq!(rows_str(&c, "SELECT a FROM t EXCEPT SELECT b FROM u"), "y");
+    // UNION dedups X/x and the trailing ORDER BY also sorts case-insensitively.
+    assert_eq!(
+        rows_str(&c, "SELECT a FROM t UNION SELECT b FROM u ORDER BY a"),
+        "x\ny\nZ"
+    );
+    // A BINARY compound is unaffected (A sorts before b).
+    assert_eq!(rows_str(&c, "SELECT 'b' UNION SELECT 'A' ORDER BY 1"), "A\nb");
 }
