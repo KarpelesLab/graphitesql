@@ -92,6 +92,11 @@ pub struct Connection {
     /// Whether triggers may fire other triggers (`PRAGMA recursive_triggers`).
     /// Off by default, matching SQLite: triggers then fire only at the top level.
     recursive_triggers: bool,
+    /// Rows projected by the most recent `RETURNING` clause, drained by
+    /// [`execute_returning`](Self::execute_returning). Populated as a side effect
+    /// of `INSERT`/`UPDATE`/`DELETE` execution when the statement has a
+    /// `RETURNING` list.
+    returning_rows: core::cell::RefCell<Vec<Vec<Value>>>,
 }
 
 /// A materialized common table expression: a named, in-memory relation.
@@ -129,6 +134,7 @@ impl Connection {
             foreign_keys: false,
             trigger_depth: core::cell::Cell::new(0),
             recursive_triggers: false,
+            returning_rows: core::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -144,6 +150,7 @@ impl Connection {
             foreign_keys: false,
             trigger_depth: core::cell::Cell::new(0),
             recursive_triggers: false,
+            returning_rows: core::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -438,6 +445,44 @@ impl Connection {
             self.schema = Schema::read(self.backend.source())?;
         }
         Ok(affected)
+    }
+
+    /// Execute an `INSERT`/`UPDATE`/`DELETE` with a `RETURNING` clause, returning
+    /// the projected rows as a [`QueryResult`]. Without a `RETURNING` list the
+    /// result has no columns and no rows (the statement still runs for its
+    /// effects). Errors on `SELECT`/DDL — use [`query`](Self::query) or
+    /// [`execute`](Self::execute) for those.
+    pub fn execute_returning(&mut self, sql: &str, params: &Params) -> Result<QueryResult> {
+        let stmt = sql::parse_one(sql)?;
+        let returning: &[ResultColumn] = match &stmt {
+            Statement::Insert(i) => &i.returning,
+            Statement::Update(u) => &u.returning,
+            Statement::Delete(d) => &d.returning,
+            _ => {
+                return Err(Error::Unsupported(
+                    "execute_returning expects INSERT/UPDATE/DELETE",
+                ))
+            }
+        };
+        if returning.is_empty() {
+            self.execute_params(sql, params)?;
+            return Ok(QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+            });
+        }
+        let table = match &stmt {
+            Statement::Insert(i) => &i.table,
+            Statement::Update(u) => &u.table,
+            Statement::Delete(d) => &d.table,
+            _ => unreachable!(),
+        };
+        let meta = self.table_meta(table, None)?;
+        let columns = returning_labels(returning, &meta.columns);
+        self.returning_rows.borrow_mut().clear();
+        self.execute_params(sql, params)?;
+        let rows = core::mem::take(&mut *self.returning_rows.borrow_mut());
+        Ok(QueryResult { columns, rows })
     }
 
     /// `VACUUM`: rebuild the database into a fresh, compact image (no free pages,
@@ -1312,6 +1357,11 @@ impl Connection {
         }
         let meta = self.table_meta(&ins.table, None)?;
         if meta.without_rowid {
+            if ins.upsert.is_some() || !ins.returning.is_empty() {
+                return Err(Error::Unsupported(
+                    "UPSERT / RETURNING on WITHOUT ROWID tables",
+                ));
+            }
             return self.exec_insert_without_rowid(ins, &meta, &rows, params);
         }
         let n_cols = meta.columns.len();
@@ -1389,6 +1439,31 @@ impl Connection {
             // Resolve UNIQUE / PRIMARY KEY (incl. rowid) conflicts.
             let conflicts = self.find_conflicts(&meta, rowid, &values, None)?;
             if !conflicts.is_empty() {
+                // An `ON CONFLICT … DO …` upsert clause intercepts the conflict.
+                if let Some(up) = &ins.upsert {
+                    match &up.action {
+                        UpsertAction::Nothing => continue, // skip the conflicting row
+                        UpsertAction::Update {
+                            assignments,
+                            where_clause,
+                        } => {
+                            if self.upsert_do_update(
+                                &ins.table,
+                                &meta,
+                                conflicts[0],
+                                &values,
+                                assignments,
+                                where_clause.as_ref(),
+                                &ins.returning,
+                                params,
+                            )? {
+                                affected += 1;
+                                replaced = true; // index entries changed; rebuild
+                            }
+                            continue;
+                        }
+                    }
+                }
                 match ins.on_conflict {
                     OnConflict::Abort => {
                         return Err(Error::Constraint("UNIQUE constraint failed".into()))
@@ -1428,6 +1503,9 @@ impl Connection {
                 Some((&index_values, rowid)),
                 params,
             )?;
+            if !ins.returning.is_empty() {
+                self.collect_returning(&ins.returning, &meta, &index_values, Some(rowid), params)?;
+            }
             affected += 1;
         }
         // REPLACE removed rows whose index entries were maintained incrementally;
@@ -1436,6 +1514,133 @@ impl Connection {
             self.rebuild_indexes(&meta, &indexes)?;
         }
         Ok(affected)
+    }
+
+    /// Apply an `ON CONFLICT … DO UPDATE` action to the existing conflicting
+    /// row `existing_rowid`. `proposed` is the row the `INSERT` would have added,
+    /// exposed to the `SET`/`WHERE` expressions as the `excluded` pseudo-table.
+    /// Returns whether a row was actually updated (the optional `WHERE` can veto).
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_do_update(
+        &mut self,
+        table: &str,
+        meta: &TableMeta,
+        existing_rowid: i64,
+        proposed: &[Value],
+        assignments: &[(String, Expr)],
+        where_clause: Option<&Expr>,
+        returning: &[ResultColumn],
+        params: &Params,
+    ) -> Result<bool> {
+        let Some(old_row) = self.read_row(meta, existing_rowid)? else {
+            return Ok(false);
+        };
+        // Column scope for the SET/WHERE expressions: the target table's columns,
+        // then the same columns again under the `excluded` table label.
+        let mut cols: Vec<ColumnInfo> = meta.columns.clone();
+        cols.extend(meta.columns.iter().map(|c| ColumnInfo {
+            name: c.name.clone(),
+            table: String::from("excluded"),
+            affinity: c.affinity,
+            collation: c.collation,
+        }));
+        // Evaluate the DO UPDATE WHERE and SET right-hand sides against the
+        // combined (existing row + excluded) scope, then drop the borrow.
+        let mut values = old_row.clone();
+        {
+            let mut combined = old_row.clone();
+            combined.extend_from_slice(proposed);
+            let ctx = EvalCtx {
+                row: &combined,
+                columns: &cols,
+                rowid: Some(existing_rowid),
+                params,
+                anon_counter: core::cell::Cell::new(0),
+                subqueries: None,
+            }
+            .with_subqueries(self);
+            if let Some(w) = where_clause {
+                if eval::truth(&eval::eval(w, &ctx)?) != Some(true) {
+                    return Ok(false);
+                }
+            }
+            for (col, e) in assignments {
+                let pos = meta
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col))
+                    .ok_or_else(|| Error::Error(format!("no such column: {col}")))?;
+                if meta.is_generated(pos) {
+                    return Err(Error::Error(format!(
+                        "cannot UPDATE generated column \"{col}\""
+                    )));
+                }
+                values[pos] = eval::eval(e, &ctx)?;
+            }
+        }
+        apply_column_affinity(meta, &mut values);
+        self.materialize_generated(meta, &mut values, params)?;
+        check_not_null(meta, &values)?;
+        self.check_constraints(meta, &values, Some(existing_rowid), params)?;
+        self.check_fk_child(table, meta, &values)?;
+        if self.foreign_keys {
+            self.enforce_parent_change(table, &old_row, Some(&values), params)?;
+        }
+        let new_rowid = match meta.ipk {
+            Some(ipk) => eval::to_i64(&values[ipk]),
+            None => existing_rowid,
+        };
+        self.fire_triggers(
+            table,
+            TrigEvent::Update,
+            TriggerTiming::Before,
+            &meta.columns,
+            Some((&old_row, existing_rowid)),
+            Some((&values, new_rowid)),
+            params,
+        )?;
+        if !self
+            .find_conflicts(meta, new_rowid, &values, Some(existing_rowid))?
+            .is_empty()
+        {
+            return Err(Error::Constraint("UNIQUE constraint failed".into()));
+        }
+        let new_full = values.clone();
+        let record = self.encode_table_record(meta, &new_full);
+        delete_table(self.backend.writer()?, meta.root, existing_rowid)?;
+        insert_table(self.backend.writer()?, meta.root, new_rowid, &record)?;
+        self.fire_triggers(
+            table,
+            TrigEvent::Update,
+            TriggerTiming::After,
+            &meta.columns,
+            Some((&old_row, existing_rowid)),
+            Some((&new_full, new_rowid)),
+            params,
+        )?;
+        if !returning.is_empty() {
+            self.collect_returning(returning, meta, &new_full, Some(new_rowid), params)?;
+        }
+        Ok(true)
+    }
+
+    /// Project a `RETURNING` row from `values` (a full table row) and stash it in
+    /// [`returning_rows`](Self::returning_rows) for `execute_returning` to drain.
+    fn collect_returning(
+        &self,
+        returning: &[ResultColumn],
+        meta: &TableMeta,
+        values: &[Value],
+        rowid: Option<i64>,
+        params: &Params,
+    ) -> Result<()> {
+        let ctx = row_ctx(values, &meta.columns, rowid, params).with_subqueries(self);
+        let mut out = Vec::new();
+        for col in returning {
+            project_column(col, &meta.columns, &ctx, &mut out)?;
+        }
+        self.returning_rows.borrow_mut().push(out);
+        Ok(())
     }
 
     /// Rowids of existing rows that conflict with a candidate row on the rowid
@@ -1480,6 +1685,9 @@ impl Connection {
         }
         let meta = self.table_meta(&del.table, None)?;
         if meta.without_rowid {
+            if !del.returning.is_empty() {
+                return Err(Error::Unsupported("RETURNING on WITHOUT ROWID tables"));
+            }
             return self.exec_delete_without_rowid(del, &meta, params);
         }
         let indexes = self.indexes_of(&del.table)?;
@@ -1487,6 +1695,9 @@ impl Connection {
         for rowid in &victims {
             let old = self.read_row(&meta, *rowid)?;
             if let Some(old) = &old {
+                if !del.returning.is_empty() {
+                    self.collect_returning(&del.returning, &meta, old, Some(*rowid), params)?;
+                }
                 self.fire_triggers(
                     &del.table,
                     TrigEvent::Delete,
@@ -1556,6 +1767,9 @@ impl Connection {
         }
         let meta = self.table_meta(&upd.table, None)?;
         if meta.without_rowid {
+            if !upd.returning.is_empty() {
+                return Err(Error::Unsupported("RETURNING on WITHOUT ROWID tables"));
+            }
             return self.exec_update_without_rowid(upd, &meta, params);
         }
         let indexes = self.indexes_of(&upd.table)?;
@@ -1646,6 +1860,9 @@ impl Connection {
                 Some((&new_full, new_rowid)),
                 params,
             )?;
+            if !upd.returning.is_empty() {
+                self.collect_returning(&upd.returning, &meta, &new_full, Some(new_rowid), params)?;
+            }
             affected += 1;
         }
         if affected > 0 {
@@ -4693,6 +4910,33 @@ fn wal_path(path: &str) -> String {
 struct OutRow {
     values: Vec<Value>,
     sort_keys: Vec<Value>,
+}
+
+/// Output column labels for a `RETURNING` projection (mirrors a `SELECT` list:
+/// `*`/`tbl.*` expand to table column names, expressions use their alias or a
+/// derived label).
+fn returning_labels(returning: &[ResultColumn], columns: &[ColumnInfo]) -> Vec<String> {
+    let mut labels = Vec::new();
+    for col in returning {
+        match col {
+            ResultColumn::Wildcard => {
+                for c in columns {
+                    labels.push(c.name.clone());
+                }
+            }
+            ResultColumn::TableWildcard(t) => {
+                for c in columns {
+                    if c.table.eq_ignore_ascii_case(t) {
+                        labels.push(c.name.clone());
+                    }
+                }
+            }
+            ResultColumn::Expr { expr, alias } => {
+                labels.push(alias.clone().unwrap_or_else(|| expr_label(expr)));
+            }
+        }
+    }
+    labels
 }
 
 fn project_column(

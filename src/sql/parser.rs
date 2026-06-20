@@ -526,12 +526,80 @@ impl Parser {
             }
             InsertSource::Values(rows)
         };
+        let upsert = self.upsert_clause()?;
+        let returning = self.returning_clause()?;
         Ok(Insert {
             table,
             columns,
             source,
             on_conflict,
+            upsert,
+            returning,
         })
+    }
+
+    /// Parse an optional `ON CONFLICT [(target) [WHERE …]] DO {NOTHING | UPDATE …}`.
+    fn upsert_clause(&mut self) -> Result<Option<Upsert>> {
+        if !self.eat_kw("on") {
+            return Ok(None);
+        }
+        self.expect_kw("conflict")?;
+        let mut target = Vec::new();
+        let mut target_where = None;
+        if self.eat(&Token::LParen) {
+            target.push(self.ident()?);
+            while self.eat(&Token::Comma) {
+                target.push(self.ident()?);
+            }
+            self.expect(&Token::RParen)?;
+            if self.eat_kw("where") {
+                target_where = Some(self.expr()?);
+            }
+        }
+        self.expect_kw("do")?;
+        let action = if self.eat_kw("nothing") {
+            UpsertAction::Nothing
+        } else {
+            self.expect_kw("update")?;
+            self.expect_kw("set")?;
+            let mut assignments = Vec::new();
+            loop {
+                let col = self.ident()?;
+                self.expect(&Token::Eq)?;
+                let value = self.expr()?;
+                assignments.push((col, value));
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            let where_clause = if self.eat_kw("where") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            UpsertAction::Update {
+                assignments,
+                where_clause,
+            }
+        };
+        Ok(Some(Upsert {
+            target,
+            target_where,
+            action,
+        }))
+    }
+
+    /// Parse an optional `RETURNING <result columns>`; empty when absent.
+    fn returning_clause(&mut self) -> Result<Vec<ResultColumn>> {
+        if !self.eat_kw("returning") {
+            return Ok(Vec::new());
+        }
+        let mut cols = Vec::new();
+        cols.push(self.result_column()?);
+        while self.eat(&Token::Comma) {
+            cols.push(self.result_column()?);
+        }
+        Ok(cols)
     }
 
     fn value_row(&mut self) -> Result<Vec<Expr>> {
@@ -564,10 +632,12 @@ impl Parser {
         } else {
             None
         };
+        let returning = self.returning_clause()?;
         Ok(Update {
             table,
             assignments,
             where_clause,
+            returning,
         })
     }
 
@@ -580,9 +650,11 @@ impl Parser {
         } else {
             None
         };
+        let returning = self.returning_clause()?;
         Ok(Delete {
             table,
             where_clause,
+            returning,
         })
     }
 

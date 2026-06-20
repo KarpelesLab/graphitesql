@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: UPSERT and `RETURNING`. `INSERT … ON CONFLICT [(target)] DO NOTHING`
+  skips the conflicting row; `DO UPDATE SET … [WHERE …]` updates the existing
+  row, exposing the would-be-inserted values via the `excluded` pseudo-table and
+  honoring a vetoing `WHERE`. `INSERT`/`UPDATE`/`DELETE … RETURNING <cols|*>`
+  projects the affected rows; drained via the new `Connection::execute_returning`.
+  Verified against `sqlite3`. (WITHOUT ROWID upsert/returning not yet supported.)
 - Track A: collating sequences — `BINARY`/`NOCASE`/`RTRIM` honored in comparisons,
   `ORDER BY`, `GROUP BY`, `DISTINCT`, `count(DISTINCT …)`, `UNIQUE` enforcement, and
   index b-tree ordering/seek. Resolution follows SQLite: explicit `COLLATE` (left

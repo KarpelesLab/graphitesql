@@ -236,6 +236,37 @@ pub struct Insert {
     pub source: InsertSource,
     /// Conflict resolution (`INSERT OR …` / `REPLACE`).
     pub on_conflict: OnConflict,
+    /// `ON CONFLICT … DO …` upsert clause, if present.
+    pub upsert: Option<Upsert>,
+    /// `RETURNING` projection, empty when absent.
+    pub returning: Vec<ResultColumn>,
+}
+
+/// An `ON CONFLICT [(target)] DO …` upsert clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Upsert {
+    /// Conflict-target column names (empty for a bare `ON CONFLICT`).
+    pub target: Vec<String>,
+    /// Optional `WHERE` on the conflict target (partial-index match).
+    pub target_where: Option<Expr>,
+    /// What to do on conflict.
+    pub action: UpsertAction,
+}
+
+/// The action of an `ON CONFLICT … DO …` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpsertAction {
+    /// `DO NOTHING`: silently skip the conflicting row.
+    Nothing,
+    /// `DO UPDATE SET … [WHERE …]`: update the conflicting row. The assignments
+    /// and predicate may reference the existing row by column name and the
+    /// would-be-inserted row via the `excluded` pseudo-table.
+    Update {
+        /// `SET col = expr` assignments.
+        assignments: Vec<(String, Expr)>,
+        /// Optional `WHERE` filtering which conflicts get updated.
+        where_clause: Option<Expr>,
+    },
 }
 
 /// Conflict resolution policy for `INSERT`.
@@ -269,6 +300,8 @@ pub struct Update {
     pub assignments: Vec<(String, Expr)>,
     /// `WHERE` predicate.
     pub where_clause: Option<Expr>,
+    /// `RETURNING` projection, empty when absent.
+    pub returning: Vec<ResultColumn>,
 }
 
 /// A `DELETE` statement.
@@ -278,6 +311,8 @@ pub struct Delete {
     pub table: String,
     /// `WHERE` predicate.
     pub where_clause: Option<Expr>,
+    /// `RETURNING` projection, empty when absent.
+    pub returning: Vec<ResultColumn>,
 }
 
 /// A `CREATE TABLE` statement.
