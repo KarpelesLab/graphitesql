@@ -390,8 +390,12 @@ This is the project's whole reason to exist, so it gets first-class testing.
   rejection-based behavior, boundary values, `Error::Unsupported` gaps, and
   introspection/error-message detail; these are covered by targeted suites driven
   by probing each semantic dimension against the `sqlite3` CLI.
-- **Fuzzing** *(planned, expand)* — fuzz the readers with malformed pages (must
-  return `Error::Corrupt`, never panic) and fuzz SQL parsing.
+- **Fuzzing** — a deterministic corruption-robustness harness
+  (`tests/fuzz_corruption.rs`, ~50k malformed-file variants;
+  `tests/fuzz_sql.rs`, ~3.3k malformed/deeply-nested SQL) asserts the readers
+  return an error and never panic. It already caught real reader panics
+  (`btree/page.rs` assert/bounds/arithmetic, `sql/parser.rs` recursion depth),
+  now fixed. *(Expand toward a coverage-guided fuzzer when a no-dep path exists.)*
 - **Crash-recovery** *(planned, pairs with C7)* — a fault-injecting `Vfs` that
   truncates / fails at chosen fsync points, asserting recovery to a consistent
   state.
