@@ -7,6 +7,187 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/graphitesql/compare/v0.0.4...v0.0.5) - 2026-06-20
+
+### Added
+
+- implement timediff(A, B) scalar function (roadmap A5)
+
+### Fixed
+
+- *(test)* make connection mutable in having_no_group test
+
+### Other
+
+- changelog + roadmap for timediff (A5) and CREATE TEMP VIEW/TRIGGER (C-ms1)
+- mkdir the sqlite3 install dir before unzip
+- pin sqlite3 to 3.50.4 as the differential oracle
+- Merge A5: timediff(A,B)
+- changelog + roadmap for json_error_position (A6) and count(*) covering (B2b)
+- Merge A6: json_error_position(X)
+- Phase A6: implement json_error_position(X) scalar function
+- prune completed roadmap items, split/sharpen pending ones
+- Add json_pretty(X [, indent])
+- Add CURRENT_DATE / CURRENT_TIME / CURRENT_TIMESTAMP keywords
+- Support bare pragma_<name> table-valued functions (no parens)
+- Add sqlite_version() scalar function
+- Add UPDATE OR IGNORE/REPLACE/ABORT conflict clauses
+- Add if() as an alias for iif(), and the 2-arg form
+- Fix NATURAL JOIN / JOIN USING (silent cross-join bug)
+- B2 (planner): covering-index reads for the ordered index scan
+- B0 (planner): satisfy ORDER BY from a secondary index
+- B0 (planner): skip the sort for ORDER BY rowid / INTEGER PRIMARY KEY
+- make Track-B planner gaps concrete + testable
+- Add PRAGMA collation_list
+- Add PRAGMA table_list
+- auto_vacuum awareness — read, report, and refuse-to-corrupt
+- Track C: cross-database savepoints
+- Track C: cross-database transactions (completes the multi-schema track)
+- Track C: cross-database view reads + qualified CREATE VIEW
+- Track C: qualified CREATE TRIGGER (aux.tr) + bare-SQL strip helper
+- Track C: qualified CREATE INDEX (aux.idx / temp.idx)
+- Track C: qualified ALTER TABLE (aux.t / temp.t)
+- Track C: WITHOUT ROWID cross-database reads
+- Track C: cross-database joins + 3-part column names
+- mark C5 done — ATTACH multi-schema track (C1-C5) complete
+- ATTACH 'file.db' AS x (cross-engine file databases)
+- TEMP tables (separate temp database with unqualified shadowing)
+- note C4 (TEMP) design approach in roadmap
+- mark C1-C3 (ATTACH multi-schema) done in roadmap + changelog
+- C3 (write path): cross-database CREATE/INSERT/UPDATE/DELETE/DROP
+- C3 (read path): schema-qualified table reads via materialization
+- ATTACH ':memory:' AS x / DETACH x
+- multi-database registry + PRAGMA database_list
+- restructure ROADMAP — condense done work, expand tracks into shippable pieces
+- changelog for transaction/DDL state checks
+- Reject RENAME COLUMN onto existing name; broaden RENAME TABLE collision check
+- Validate transaction state; fix DROP error messages
+- changelog for CREATE validations, % operator, string_agg
+- Add CREATE TABLE validations (dup column, multi-PK, bad PK/UNIQUE col, AUTOINCREMENT)
+- Reject a table with no non-generated column
+- Fix % operator to truncate operands to integers (SQLite semantics)
+- Add string_agg as an alias for group_concat
+- Add json_group_array / json_group_object aggregates
+- changelog for collation propagation fixes
+- Apply collation to compound set ops (UNION/INTERSECT/EXCEPT) and their ORDER BY
+- Apply left-operand collation to IN (SELECT …)
+- Apply collation to BETWEEN and CASE x WHEN y
+- Apply collation to IN membership and min()/max()
+- changelog for printf comma flag + length modifiers
+- support the ',' thousands-grouping flag and l/ll length modifiers
+- Resolve NEW.rowid / OLD.rowid in trigger bodies
+- Honor UPDATE OF <columns> in trigger firing
+- Resolve SELECT-list aliases in WHERE/GROUP BY/HAVING
+- Reject CTE explicit column list with mismatched count
+- changelog for VALUES compound-operand fix
+- Fix multi-row VALUES as a compound-query operand
+- Guard UPDATE … FROM on WITHOUT ROWID tables; roadmap note
+- Support UPDATE … SET … FROM <sources>
+- changelog for recursive-CTE LIMIT, HAVING, dflt_value fixes
+- Honor LIMIT/OFFSET on a recursive CTE
+- PRAGMA table_info: dflt_value is the default expression's SQL text
+- Allow HAVING without GROUP BY
+- changelog for qualified rowid and star-with-aggregation
+- Resolve table-qualified rowid aliases (t.rowid / t._rowid_ / t.oid)
+- Support '*' / table.* mixed with aggregates
+- Support INSERT … SELECT
+- changelog for schema catalog, ADD COLUMN, CHECK-subquery fixes
+- Enforce SQLite's ALTER TABLE ADD COLUMN restrictions
+- Make the schema catalog queryable as sqlite_schema / sqlite_master
+- Reject subqueries in CHECK constraints and generated columns
+- changelog entries for overflow/literal/inf-nan fixes
+- Reject inf/nan words in text→number coercion (match SQLite)
+- Fold -9223372036854775808 literal to Integer(i64::MIN)
+- Match SQLite: sum()/abs() integer overflow is an error
+- Add STRICT tables (CREATE TABLE … STRICT)
+- Enforce UNIQUE on standalone indexes (plain/partial/expression)
+- Support PRAGMA table-valued functions in FROM
+- Inf prints as Inf in text output, 9.0e+999 only in quote()
+- Print infinities as ±9.0e+999 and map NaN arithmetic to NULL
+- Persist writable PRAGMA user_version / application_id
+- Add last_insert_rowid(), changes(), and total_changes()
+- Add printf '*' width/precision, unhex(x,ignore), and sign() NULL semantics
+- Support ORDER BY / LIMIT on DELETE and UPDATE
+- Fix table_info notnull for rowid; add table_xinfo and index_xinfo
+- Parse REINDEX as a no-op
+- Add CREATE TEMP TABLE and ALTER TABLE DROP COLUMN
+- Fix `IS TRUE`/`IS FALSE` truthiness and abs() of text
+- Fix compound dedup to keep the last occurrence's representation
+- Apply FILTER on window aggregates; reject DISTINCT windows
+- mark frame EXCLUDE and RANGE value-offset done in ROADMAP
+- Implement window frame EXCLUDE clause
+- Implement RANGE window frames with value offsets
+- Fix strftime %j off-by-one; add ISO week-date %G/%V/%g
+- Allow HAVING to reference SELECT-output aliases
+- Implement SQLite's bare-column min/max rule
+- Parse sized / multi-word type names in CAST
+- Fix printf %g notation, %f half-away rounding, and float sign flags
+- Fix negative LIMIT to mean "no limit"
+- Support `_` digit separators in numeric literals
+- Validate and normalize date/time components
+- Fix round() to round the true decimal value (half away from zero)
+- Add correlated-subquery / EXISTS differential test
+- Add distinct-aggregate and window-function differential test
+- Fix substr() on blobs to slice bytes and return a blob
+- Fix CAST: blob reinterpretation and NUMERIC text reduction
+- Fix quote() blob format and CAST AS BLOB
+- Add REAL formatting differential test
+- Add mixed-affinity differential test
+- Fix NUMERIC storage affinity: reduce integral reals to integers
+- Phase 9: broaden differential corpus with scalar/date edge cases
+- Phase 9: hash join for equi-join ON conditions
+- Fix pre-comparison affinity: NONE column vs TEXT column
+- Phase 9: EXPLAIN QUERY PLAN emits MULTI-INDEX OR
+- Phase 9: broaden differential corpus over planner seek paths
+- Phase 9: OR-by-union index optimization
+- Phase 9: rowid range scans over the table b-tree
+- Phase 9: EXPLAIN QUERY PLAN reports range/IN index seeks
+- Phase 9: IN-list driven index seeks
+- Phase 9: index range scans (< <= > >= BETWEEN)
+- Phase 9: add octet_length() and glob() scalar functions
+- Phase 9: VDBE single-table GROUP BY
+- Phase 9: VDBE whole-table aggregates
+- Phase 9: VDBE SELECT DISTINCT
+- Phase 9: VDBE ORDER BY via a sorter
+- Phase 9: VDBE OFFSET on single-table scans
+- Track B: VDBE LIMIT
+- Track B: VDBE WHERE filtering
+- Track B: VDBE table scans + Connection::query_vdbe
+- Track B: VDBE CAST op; refresh module overview
+- Track B: VDBE control flow (Goto/IfFalse) and CASE compilation
+- Track B: extend VDBE IR with comparison and boolean ops
+- Track B: VDBE bytecode IR spike (exec::vdbe)
+- Track A: RIGHT and FULL OUTER JOIN
+- Track A: LIKE ... ESCAPE, like() function form, likely/unlikely/likelihood
+- Track C: in-engine PRAGMA integrity_check / quick_check
+- Track D: json_each / json_tree table-valued functions
+- Track D: table-valued functions — generate_series
+- Track A: CREATE TABLE ... AS SELECT (CTAS)
+- Track A: INDEXED BY / NOT INDEXED query hints
+- Track A: ordered aggregates (group_concat(x ORDER BY y))
+- Track A: percent_rank() and cume_dist() window functions
+- Track A: expression indexes (CREATE INDEX ... (expr))
+- Track A: named windows (WINDOW w AS ... / OVER w)
+- Track C: PRAGMA foreign_key_check
+- Track C: introspection PRAGMAs (index_list/info, foreign_key_list, ...)
+- Track A: partial indexes (CREATE INDEX ... WHERE)
+- Track A: VALUES as a statement and table source
+- Track A: row-value IN (SELECT ...)
+- Track A: aggregate FILTER (WHERE ...) clause
+- Track C: SAVEPOINT / RELEASE / ROLLBACK TO nested transactions
+- Track A: row-value expressions (=, ordering, IN)
+- Track A: JSON ->/->> operators and json_set/insert/replace/remove/patch
+- Track A: ORDER BY NULLS FIRST/LAST and IS [NOT] DISTINCT FROM
+- Track C: VFS advisory-locking contract + writer serialization
+- Track B: ANALYZE + sqlite_stat1 + cost-based index selection
+- Track A: SQLite JSON functions (pure-core parser/serializer)
+- Track A: SQLite math functions (pure-core, no libm)
+- Track A: UPSERT (ON CONFLICT DO UPDATE/NOTHING) and RETURNING
+- Track A: collating sequences (BINARY/NOCASE/RTRIM)
+- Track A: generated columns (STORED / VIRTUAL)
+- re-plan ROADMAP toward full SQLite parity
+- Phase 9: b-tree page merging on delete (last roadmap item)
+
 ### Other
 
 - **`timediff(A, B)`** scalar function — the calendar delta from B to A as
