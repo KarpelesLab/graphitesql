@@ -88,8 +88,36 @@ pub enum Op {
     Negate { reg: usize, dest: usize },
     /// Emit registers `[start, start+count)` as one output row.
     ResultRow { start: usize, count: usize },
+    /// Append a row to the sorter: the output values in `[row_start, row_start+
+    /// row_count)` keyed by `[key_start, key_start+key_count)`.
+    SorterInsert {
+        row_start: usize,
+        row_count: usize,
+        key_start: usize,
+        key_count: usize,
+    },
+    /// Sort the accumulated sorter rows by their keys (per `keys`, in order).
+    SorterSort { keys: Vec<SortKey> },
+    /// Position the sorter cursor at the first sorted row; jump to `target` (the
+    /// emit-loop exit) when the sorter is empty.
+    SorterRewind { target: usize },
+    /// Load the current sorter row's stored output values into `[start, start+
+    /// count)`.
+    SorterRow { start: usize, count: usize },
+    /// Advance the sorter cursor; jump back to `target` if a row remains.
+    SorterNext { target: usize },
     /// Stop execution.
     Halt,
+}
+
+/// One `ORDER BY` key for [`Op::SorterSort`]: direction and NULL placement
+/// (collation is binary in the VDBE scan path).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortKey {
+    /// `DESC` when true.
+    pub descending: bool,
+    /// Explicit `NULLS FIRST`/`LAST`; `None` uses SQLite's default.
+    pub nulls_first: Option<bool>,
 }
 
 /// A compiled VDBE program: the instruction stream and the register-file size.
@@ -156,11 +184,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
 /// the table's column names, used to resolve column references to indices.
 /// Returns `Unsupported` outside this grammar so the caller can fall back.
 pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program> {
-    if !sel.group_by.is_empty()
-        || !sel.compound.is_empty()
-        || !sel.order_by.is_empty()
-        || sel.distinct
-    {
+    if !sel.group_by.is_empty() || !sel.compound.is_empty() || sel.distinct {
         return Err(Error::Unsupported("VDBE: only plain table projections"));
     }
     // Expand the projection list to concrete expressions/labels (supporting `*`).
@@ -221,15 +245,66 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
         }
         Some(_) => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
     };
+    // With `ORDER BY`, the scan feeds a sorter and `LIMIT`/`OFFSET` apply to the
+    // sorted emit loop instead of to the scan itself.
+    let ordering = !sel.order_by.is_empty();
+    // Reserve contiguous sort-key registers (one per `ORDER BY` term). A bare
+    // positive integer term is an output-column ordinal (1-based).
+    let mut key_specs: Vec<(Expr, SortKey)> = Vec::new();
+    if ordering {
+        for term in &sel.order_by {
+            let expr = match &term.expr {
+                // A bare positive integer is a 1-based output-column ordinal.
+                Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count => {
+                    projections[*k as usize - 1].0.clone()
+                }
+                // A bare name that is an output alias (and not a table column)
+                // refers to that projection.
+                Expr::Column {
+                    table: None,
+                    column,
+                } if !columns.iter().any(|c| c.eq_ignore_ascii_case(column))
+                    && projections
+                        .iter()
+                        .any(|(_, l)| l.eq_ignore_ascii_case(column)) =>
+                {
+                    projections
+                        .iter()
+                        .find(|(_, l)| l.eq_ignore_ascii_case(column))
+                        .map(|(e, _)| e.clone())
+                        .unwrap()
+                }
+                other => other.clone(),
+            };
+            key_specs.push((
+                expr,
+                SortKey {
+                    descending: term.descending,
+                    nulls_first: term.nulls_first,
+                },
+            ));
+        }
+    }
+    let key_start = c.next_reg;
+    for _ in &key_specs {
+        c.alloc();
+    }
+
     // Rewind (target backpatched to the loop exit), then the loop body.
     let rewind = c.ops.len();
     c.ops.push(Op::Rewind { target: 0 });
-    // `LIMIT 0` emits nothing: skip the whole loop when the counter starts at 0.
-    let limit_skip = limit_reg.map(|r| {
-        let at = c.ops.len();
-        c.ops.push(Op::IfFalse { reg: r, target: 0 });
-        at
-    });
+    // `LIMIT 0` (no ordering) emits nothing: skip the whole scan loop when the
+    // counter starts at 0. (With ordering the counter is consumed in the emit
+    // loop, so the scan must still run to populate the sorter.)
+    let limit_skip = if ordering {
+        None
+    } else {
+        limit_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse { reg: r, target: 0 });
+            at
+        })
+    };
     let body = c.ops.len();
     // Optional WHERE: skip the row (jump to Next) when the predicate is not true.
     let skip = match &sel.where_clause {
@@ -244,22 +319,40 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
         }
         None => None,
     };
-    // Optional OFFSET: skip this qualifying row (jump to Next) while the counter
-    // is still positive.
-    let offset_skip = offset_reg.map(|r| {
-        let at = c.ops.len();
-        c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
-        at
-    });
+    // Scan-loop OFFSET skip (only when not ordering; otherwise OFFSET is applied
+    // to the sorted output).
+    let offset_skip = if ordering {
+        None
+    } else {
+        offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        })
+    };
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
     }
-    c.ops.push(Op::ResultRow { start: 0, count });
-    // After emitting a row, decrement the LIMIT counter and stop at zero.
     let mut limit_done = None;
-    if let Some(r) = limit_reg {
-        limit_done = Some(c.ops.len());
-        c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+    if ordering {
+        // Stage the projected row and its keys into the sorter; emission happens
+        // after the scan completes.
+        for (j, (expr, _)) in key_specs.iter().enumerate() {
+            c.compile_expr_into(expr, key_start + j)?;
+        }
+        c.ops.push(Op::SorterInsert {
+            row_start: 0,
+            row_count: count,
+            key_start,
+            key_count: key_specs.len(),
+        });
+    } else {
+        c.ops.push(Op::ResultRow { start: 0, count });
+        // After emitting a row, decrement the LIMIT counter and stop at zero.
+        if let Some(r) = limit_reg {
+            limit_done = Some(c.ops.len());
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+        }
     }
     let next = c.ops.len();
     c.ops.push(Op::Next { target: body });
@@ -285,6 +378,43 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
     if let Some(at) = limit_done {
         if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
             *target = end;
+        }
+    }
+    // Sorted emit loop: sort, then walk the sorter applying OFFSET then LIMIT.
+    if ordering {
+        c.ops.push(Op::SorterSort {
+            keys: key_specs.iter().map(|(_, k)| k.clone()).collect(),
+        });
+        let srewind = c.ops.len();
+        c.ops.push(Op::SorterRewind { target: 0 });
+        let ebody = c.ops.len();
+        let eoffset = offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        });
+        c.ops.push(Op::SorterRow { start: 0, count });
+        c.ops.push(Op::ResultRow { start: 0, count });
+        let elimit = limit_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+            at
+        });
+        let snext = c.ops.len();
+        c.ops.push(Op::SorterNext { target: ebody });
+        let eend = c.ops.len();
+        if let Op::SorterRewind { target } = &mut c.ops[srewind] {
+            *target = eend;
+        }
+        if let Some(at) = eoffset {
+            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
+                *target = snext; // a skipped (offset) row advances to the next
+            }
+        }
+        if let Some(at) = elimit {
+            if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
+                *target = eend;
+            }
         }
     }
     c.ops.push(Op::Halt);
@@ -525,6 +655,10 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
     let mut regs: Vec<Value> = alloc::vec![Value::Null; program.n_registers];
     let mut out = Vec::new();
     let mut cursor: usize = 0; // index of the current row
+                               // The sorter holds `(keys, row)` pairs staged by `SorterInsert`, sorted in
+                               // place by `SorterSort`, then walked by `SorterRewind`/`SorterNext`.
+    let mut sorter: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
+    let mut scursor: usize = 0;
     let mut pc = 0usize;
     while pc < program.ops.len() {
         let op = &program.ops[pc];
@@ -635,6 +769,52 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
             }
             Op::ResultRow { start, count } => {
                 out.push(regs[*start..*start + *count].to_vec());
+            }
+            Op::SorterInsert {
+                row_start,
+                row_count,
+                key_start,
+                key_count,
+            } => {
+                let row = regs[*row_start..*row_start + *row_count].to_vec();
+                let keys = regs[*key_start..*key_start + *key_count].to_vec();
+                sorter.push((keys, row));
+            }
+            Op::SorterSort { keys } => {
+                sorter.sort_by(|a, b| {
+                    for (i, k) in keys.iter().enumerate() {
+                        let ord = crate::exec::cmp_order(
+                            &a.0[i],
+                            &b.0[i],
+                            k.descending,
+                            k.nulls_first,
+                            crate::value::Collation::Binary,
+                        );
+                        if ord != core::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    core::cmp::Ordering::Equal
+                });
+            }
+            Op::SorterRewind { target } => {
+                scursor = 0;
+                if sorter.is_empty() {
+                    pc = *target;
+                }
+            }
+            Op::SorterRow { start, count } => {
+                if let Some((_, row)) = sorter.get(scursor) {
+                    for (i, v) in row.iter().take(*count).enumerate() {
+                        regs[*start + i] = v.clone();
+                    }
+                }
+            }
+            Op::SorterNext { target } => {
+                scursor += 1;
+                if scursor < sorter.len() {
+                    pc = *target;
+                }
             }
             Op::Halt => break,
         }

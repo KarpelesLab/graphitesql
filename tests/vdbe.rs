@@ -110,6 +110,15 @@ fn table_scan_matches_tree_walker() {
         "SELECT a FROM t LIMIT 2 OFFSET 1",
         "SELECT a FROM t LIMIT 5 OFFSET 2",
         "SELECT id FROM t WHERE a >= 1 LIMIT 1 OFFSET 1",
+        "SELECT a FROM t ORDER BY a",
+        "SELECT a, b FROM t ORDER BY a DESC",
+        "SELECT a, b FROM t ORDER BY b",
+        "SELECT a FROM t ORDER BY a DESC LIMIT 2",
+        "SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 1",
+        "SELECT a, b FROM t WHERE a >= 1 ORDER BY a DESC",
+        "SELECT a * 2 AS d FROM t ORDER BY d",
+        "SELECT a, b FROM t ORDER BY 1 DESC",
+        "SELECT a FROM t ORDER BY b DESC, a",
     ] {
         assert_eq!(
             c.query_vdbe(q).unwrap().rows,
@@ -152,6 +161,9 @@ fn table_scan_matches_sqlite3() {
         "SELECT a FROM t",
         "SELECT a, b FROM t",
         "SELECT a + 1, b || b FROM t",
+        "SELECT a, b FROM t ORDER BY a",
+        "SELECT a, b FROM t ORDER BY b DESC",
+        "SELECT a FROM t ORDER BY a DESC LIMIT 2 OFFSET 1",
     ];
     for q in queries {
         let want = {

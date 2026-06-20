@@ -104,9 +104,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table with an optional `WHERE` filter (`Rewind`/`Column`/`Next` cursor ops with
   an `IfFalse` row skip), wired into the engine via the new
   `Connection::query_vdbe`, matching the tree-walker and `sqlite3` for
-  `SELECT <exprs> FROM <table> [WHERE …] [LIMIT n [OFFSET m]]` (a `DecrJumpZero`
-  counter caps the row count; an `IfPosDecr` counter skips the leading `OFFSET`
-  rows that pass the filter).
+  `SELECT <exprs> FROM <table> [WHERE …] [ORDER BY …] [LIMIT n [OFFSET m]]` (a
+  `DecrJumpZero` counter caps the row count; an `IfPosDecr` counter skips the
+  leading `OFFSET` rows). `ORDER BY` compiles to a sorter: the scan stages each
+  projected row plus its key columns (`SorterInsert`), then after the scan the
+  rows are sorted (`SorterSort`, honoring `DESC`/`NULLS FIRST`/`LAST`) and a
+  second cursor loop (`SorterRewind`/`SorterRow`/`SorterNext`) emits them with
+  `OFFSET`/`LIMIT` applied to the sorted output. Output-column ordinals
+  (`ORDER BY 2`) and aliases (`ORDER BY d`) resolve to their projection.
 - Track B: `ANALYZE` and cost-based index selection. `ANALYZE [name]` gathers
   index selectivity into a `sqlite_stat1(tbl,idx,stat)` table, byte-compatible
   with SQLite's `nRow avgEq1 avgEq2 …` format (`avgEqK = (nRow + dK/2)/dK`);

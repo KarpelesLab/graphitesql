@@ -5523,7 +5523,7 @@ fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> core::cmp::Ordering {
 /// ordering follows the explicit `NULLS FIRST`/`LAST` when given, else SQLite's
 /// default (NULLs first under `ASC`, last under `DESC`); the non-NULL comparison
 /// uses the column collation and is reversed by `DESC`.
-fn cmp_order(
+pub(crate) fn cmp_order(
     a: &Value,
     b: &Value,
     descending: bool,
