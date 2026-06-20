@@ -222,6 +222,179 @@ pub fn parse_with_error_position(text: &str) -> Result<Json, usize> {
     }
 }
 
+/// Validate that `text` is well-formed *strict* RFC-8259 JSON (no JSON5
+/// extensions). `json_valid(X)` (the 1-argument form) is restricted to strict
+/// JSON in sqlite, whereas the JSON *functions* (`json`, `json_extract`, …)
+/// accept the JSON5 superset via [`parse`]. Kept as a separate, self-contained
+/// validator so the lenient JSON5 parser is unaffected.
+pub fn is_strict_json(text: &str) -> bool {
+    let mut p = StrictParser {
+        b: text.as_bytes(),
+        i: 0,
+    };
+    p.ws();
+    p.value() && {
+        p.ws();
+        p.i == p.b.len()
+    }
+}
+
+struct StrictParser<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl StrictParser<'_> {
+    fn ws(&mut self) {
+        while matches!(self.b.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.i += 1;
+        }
+    }
+    fn lit(&mut self, w: &str) -> bool {
+        if self.b[self.i..].starts_with(w.as_bytes()) {
+            self.i += w.len();
+            true
+        } else {
+            false
+        }
+    }
+    fn value(&mut self) -> bool {
+        self.ws();
+        match self.b.get(self.i) {
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(b'"') => self.string(),
+            Some(b't') => self.lit("true"),
+            Some(b'f') => self.lit("false"),
+            Some(b'n') => self.lit("null"),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            _ => false,
+        }
+    }
+    fn object(&mut self) -> bool {
+        self.i += 1; // '{'
+        self.ws();
+        if self.b.get(self.i) == Some(&b'}') {
+            self.i += 1;
+            return true;
+        }
+        loop {
+            self.ws();
+            // Strict: keys are double-quoted strings only (no trailing comma).
+            if self.b.get(self.i) != Some(&b'"') || !self.string() {
+                return false;
+            }
+            self.ws();
+            if self.b.get(self.i) != Some(&b':') {
+                return false;
+            }
+            self.i += 1;
+            if !self.value() {
+                return false;
+            }
+            self.ws();
+            match self.b.get(self.i) {
+                Some(b',') => self.i += 1, // must be followed by another member
+                Some(b'}') => {
+                    self.i += 1;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+    }
+    fn array(&mut self) -> bool {
+        self.i += 1; // '['
+        self.ws();
+        if self.b.get(self.i) == Some(&b']') {
+            self.i += 1;
+            return true;
+        }
+        loop {
+            if !self.value() {
+                return false;
+            }
+            self.ws();
+            match self.b.get(self.i) {
+                Some(b',') => self.i += 1, // must be followed by another element
+                Some(b']') => {
+                    self.i += 1;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+    }
+    fn string(&mut self) -> bool {
+        self.i += 1; // opening '"'
+        loop {
+            match self.b.get(self.i) {
+                None => return false,
+                Some(b'"') => {
+                    self.i += 1;
+                    return true;
+                }
+                Some(b'\\') => {
+                    self.i += 1;
+                    match self.b.get(self.i) {
+                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => self.i += 1,
+                        Some(b'u') => {
+                            self.i += 1;
+                            for _ in 0..4 {
+                                match self.b.get(self.i) {
+                                    Some(c) if c.is_ascii_hexdigit() => self.i += 1,
+                                    _ => return false,
+                                }
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                // Unescaped control characters are not allowed in strict JSON.
+                Some(&c) if c < 0x20 => return false,
+                Some(_) => self.i += 1,
+            }
+        }
+    }
+    fn number(&mut self) -> bool {
+        let start = self.i;
+        if self.b.get(self.i) == Some(&b'-') {
+            self.i += 1;
+        }
+        match self.b.get(self.i) {
+            Some(b'0') => self.i += 1, // a leading zero allows no more int digits
+            Some(b'1'..=b'9') => {
+                while matches!(self.b.get(self.i), Some(b'0'..=b'9')) {
+                    self.i += 1;
+                }
+            }
+            _ => return false,
+        }
+        if self.b.get(self.i) == Some(&b'.') {
+            self.i += 1;
+            if !matches!(self.b.get(self.i), Some(b'0'..=b'9')) {
+                return false;
+            }
+            while matches!(self.b.get(self.i), Some(b'0'..=b'9')) {
+                self.i += 1;
+            }
+        }
+        if matches!(self.b.get(self.i), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.b.get(self.i), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            if !matches!(self.b.get(self.i), Some(b'0'..=b'9')) {
+                return false;
+            }
+            while matches!(self.b.get(self.i), Some(b'0'..=b'9')) {
+                self.i += 1;
+            }
+        }
+        self.i > start
+    }
+}
+
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,

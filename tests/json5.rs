@@ -151,22 +151,23 @@ fn string_escapes() {
 }
 
 #[test]
-fn json_valid_accepts_json5() {
+fn json_valid_is_strict_rfc8259() {
     let c = Connection::open_memory().unwrap();
-    // KNOWN DIVERGENCE: graphite's single-argument `json_valid` shares the JSON5
-    // parser used by `json()`, so it reports 1 for JSON5 input. The `sqlite3`
-    // CLI's 1-arg `json_valid` defaults to strict RFC-8259 and returns 0 for
-    // these (its JSON5 acceptance lives behind the 2-arg flag form, which
-    // graphite does not implement). The shared dispatch is fixed, so this is the
-    // single unavoidable mismatch from the JSON5 work.
-    assert_eq!(int(&c, "SELECT json_valid('{a:1}')"), 1);
-    assert_eq!(int(&c, "SELECT json_valid('{a:1,}')"), 1);
-    assert_eq!(int(&c, "SELECT json_valid('[1,]')"), 1);
-    // Strict JSON is valid in both, and genuine garbage is invalid in both.
+    // The 1-argument `json_valid` is restricted to strict RFC-8259 JSON, matching
+    // sqlite (its JSON5 acceptance is behind the 2-arg flag form). So although
+    // `json()`/`json_extract()` accept JSON5, `json_valid` rejects JSON5-only
+    // forms — verified byte-for-byte against the sqlite3 CLI.
+    assert_eq!(int(&c, "SELECT json_valid('{a:1}')"), 0); // unquoted key
+    assert_eq!(int(&c, r#"SELECT json_valid('{"a":1,}')"#), 0); // trailing comma
+    assert_eq!(int(&c, "SELECT json_valid('[1,2,]')"), 0); // trailing comma
+    assert_eq!(int(&c, "SELECT json_valid('\"x\"')"), 1); // strict scalar
+                                                          // Strict JSON is valid; genuine garbage is invalid.
     assert_eq!(int(&c, r#"SELECT json_valid('{"a":1}')"#), 1);
     assert_eq!(int(&c, "SELECT json_valid('[1,2]')"), 1);
+    assert_eq!(int(&c, "SELECT json_valid('5')"), 1);
+    assert_eq!(int(&c, "SELECT json_valid('1.5e3')"), 1);
     assert_eq!(int(&c, "SELECT json_valid('{bad}')"), 0);
-    assert_eq!(int(&c, "SELECT json_valid('not json')"), 0);
+    assert_eq!(int(&c, "SELECT json_valid('nul')"), 0);
 }
 
 #[test]

@@ -381,8 +381,11 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 1)?;
             match &v[0] {
                 Value::Null => Value::Null,
+                // The 1-argument form is restricted to strict RFC-8259 JSON
+                // (sqlite reserves JSON5 acceptance for the 2-argument flag form),
+                // unlike `json()`/`json_extract()` which accept the JSON5 superset.
                 other => {
-                    let ok = super::json::parse(&eval::to_text(other)).is_some();
+                    let ok = super::json::is_strict_json(&eval::to_text(other));
                     Value::Integer(ok as i64)
                 }
             }
