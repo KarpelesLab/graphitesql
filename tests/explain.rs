@@ -177,6 +177,63 @@ fn order_by_adds_temp_btree() {
 }
 
 #[test]
+fn order_by_rowid_skips_temp_btree() {
+    // ORDER BY the rowid / INTEGER PRIMARY KEY is already satisfied by the table
+    // scan, so no temp b-tree is used (matching sqlite's plain SCAN) — for both
+    // ASC and DESC, and via the `rowid` alias.
+    let c = setup();
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY id"),
+        ["SCAN t"]
+    );
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY id DESC"),
+        ["SCAN t"]
+    );
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY rowid"),
+        ["SCAN t"]
+    );
+    // The optimisation must not fire when anything reshapes the rows: a WHERE
+    // could pick a different access path, and a non-rowid key still needs a sort.
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a=1 ORDER BY id"),
+        ["SEARCH t USING INDEX it_a (a=?)", "USE TEMP B-TREE FOR ORDER BY"]
+    );
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY a"),
+        ["SCAN t", "USE TEMP B-TREE FOR ORDER BY"]
+    );
+}
+
+#[test]
+fn order_by_rowid_returns_correct_order() {
+    // The skipped sort must still yield rowid order (incl. negative rowids and
+    // DESC via reverse).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES(3,'c'),(1,'a'),(2,'b'),(-5,'neg')")
+        .unwrap();
+    let col = |sql: &str| -> Vec<i64> {
+        c.query(sql)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                graphitesql::Value::Integer(n) => n,
+                _ => panic!("not int"),
+            })
+            .collect()
+    };
+    assert_eq!(col("SELECT a FROM t ORDER BY a"), [-5, 1, 2, 3]);
+    assert_eq!(col("SELECT a FROM t ORDER BY a DESC"), [3, 2, 1, -5]);
+    assert_eq!(col("SELECT a FROM t ORDER BY rowid"), [-5, 1, 2, 3]);
+    assert_eq!(col("SELECT a FROM t ORDER BY a LIMIT 2"), [-5, 1]);
+    assert_eq!(col("SELECT a FROM t ORDER BY a DESC LIMIT 2"), [3, 2]);
+}
+
+#[test]
 fn aliased_table() {
     let c = setup();
     assert_eq!(

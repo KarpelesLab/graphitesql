@@ -168,17 +168,23 @@ piece beside it):
 
 | query | graphite today | sqlite3 (target) | piece |
 |-------|----------------|------------------|-------|
-| `… FROM t ORDER BY c` (index on `c`) | `SCAN t` + `USE TEMP B-TREE FOR ORDER BY` | `SCAN t USING INDEX ic` | **B0** |
+| `… FROM t ORDER BY a` (`a` = rowid/IPK) | ✅ now `SCAN t` (no sort) | `SCAN t` | **B0** ✅ |
+| `… FROM t ORDER BY c` (secondary index on `c`) | `SCAN t` + `USE TEMP B-TREE FOR ORDER BY` | `SCAN t USING INDEX ic` | **B0** (secondary) |
 | `… FROM t JOIN u ON t.c=u.x` (`x` = `u` PK) | `SCAN t` + `SCAN u` | `SCAN t` + `SEARCH u USING INTEGER PRIMARY KEY (rowid=?)` | **B1/B3** |
 | `SELECT count(*) FROM t` (any index `ic`) | `SCAN t` | `SCAN t USING COVERING INDEX ic` | **B2** |
 
-- **B0 — Index-driven `ORDER BY`/`GROUP BY`.** When a single-table query's
-  `ORDER BY` is a prefix of an available index (matching column order, direction,
-  and collation, with NULLs ordered as the index stores them), scan that index
-  in key order and *skip* the post-sort. Requires a shared planner decision
-  across `scan_source` (scan via the index), `run_core` (suppress the
-  `out.sort_by`), and `eqp_access` (report `USING INDEX` instead of
-  `USE TEMP B-TREE`) — they must agree on the exact row order or results break.
+- **B0 — Index-driven `ORDER BY`/`GROUP BY`.**
+  - ✅ *rowid/IPK case.* A single-table full scan whose sole `ORDER BY` term is
+    the rowid / INTEGER PRIMARY KEY (ASC or DESC) now skips the sort — the table
+    b-tree is already in rowid order — reversing for `DESC`. `rowid_ordered_scan`
+    is shared by `run_core` (suppress `out.sort_by`) and `eqp_access` (no
+    `USE TEMP B-TREE`), so execution and `EXPLAIN QUERY PLAN` stay in lockstep.
+    Conservative: bails on `WHERE`/`GROUP`/aggregate/window/`DISTINCT`, multiple
+    terms, `COLLATE`, WITHOUT ROWID, or a shadowing real column.
+  - *remaining: secondary-index case.* When `ORDER BY` is a prefix of a
+    secondary index (matching direction/collation, NULLs as the index stores
+    them), scan that index in key order and skip the sort, reporting
+    `USING INDEX`. Needs a new ordered index-scan fetch path in `scan_source`.
 - **B1 — Join order.** Reorder `FROM` tables by a simple cost model (smallest
   estimated cardinality / most-selective indexed table first) instead of textual
   order; keep results identical, verify the chosen order via `EXPLAIN QUERY

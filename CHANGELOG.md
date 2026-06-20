@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **Planner (B0): index-free `ORDER BY rowid`.** A single-table full scan whose
+  sole `ORDER BY` term is the rowid / INTEGER PRIMARY KEY (ASC or DESC) now skips
+  the sort — the table b-tree is already in rowid order (reversed for `DESC`) —
+  and `EXPLAIN QUERY PLAN` reports a plain `SCAN t` with no `USE TEMP B-TREE`,
+  matching sqlite. Conservative: any `WHERE`/grouping/aggregate/window/`DISTINCT`,
+  `COLLATE`, extra ORDER BY terms, or a shadowing column falls back to the sort.
 - **`PRAGMA collation_list`** lists the three built-in collating sequences (BINARY/NOCASE/RTRIM).
 - **`PRAGMA table_list [(name)]`**: one row per table/view across main + temp +
   attached databases — `(schema, name, type, ncol, wr, strict)` — plus each

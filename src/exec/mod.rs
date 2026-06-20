@@ -5018,8 +5018,9 @@ impl Connection {
                 alloc::format!("SCAN {}", eqp_label(&join.table)),
             ));
         }
-        // ORDER BY / GROUP BY that we satisfy with an in-memory sort.
-        if !sel.order_by.is_empty() {
+        // ORDER BY that we satisfy with an in-memory sort — unless the rowid scan
+        // already yields the requested order (no temp b-tree then, like sqlite).
+        if !sel.order_by.is_empty() && self.rowid_ordered_scan(sel).is_none() {
             let id = *next_id;
             *next_id += 1;
             out.push((id, parent, String::from("USE TEMP B-TREE FOR ORDER BY")));
@@ -5962,6 +5963,69 @@ impl Connection {
         out
     }
 
+    /// When a query's sole `ORDER BY` term is the rowid / INTEGER PRIMARY KEY of
+    /// a single plain table that is scanned in full (no `WHERE`, no grouping,
+    /// aggregate, window, or `DISTINCT`), the table b-tree already yields rows in
+    /// rowid order — so the sort is redundant. Returns `Some(descending)` in that
+    /// case (the caller reverses for `DESC`), else `None` (sort normally). Shared
+    /// by `run_core` and `eqp_access` so execution and `EXPLAIN QUERY PLAN` agree.
+    fn rowid_ordered_scan(&self, sel: &Select) -> Option<bool> {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let t = &from.first;
+        if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
+            return None;
+        }
+        if sel.where_clause.is_some()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || sel.order_by.len() != 1
+        {
+            return None;
+        }
+        if self.has_aggregate(sel) || window::has_window(sel) {
+            return None;
+        }
+        // The single ORDER BY term must be a plain (un-COLLATE'd) reference to the
+        // rowid or the INTEGER PRIMARY KEY column of this table.
+        let term = &sel.order_by[0];
+        let (tbl, col) = match &term.expr {
+            Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+            _ => return None,
+        };
+        // A CTE/view of the same name is not a rowid table scan.
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
+            return None;
+        }
+        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+        if meta.without_rowid {
+            return None;
+        }
+        let shadowed = meta
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(col));
+        let is_rowid_alias = matches!(
+            col.to_ascii_lowercase().as_str(),
+            "rowid" | "_rowid_" | "oid"
+        ) && !shadowed;
+        let is_ipk = meta
+            .ipk
+            .is_some_and(|i| meta.columns[i].name.eq_ignore_ascii_case(col));
+        if is_rowid_alias || is_ipk {
+            Some(term.descending)
+        } else {
+            None
+        }
+    }
+
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
         let (mut columns, input_rows) = self.scan_source(sel, params)?;
 
@@ -6033,25 +6097,34 @@ impl Connection {
             });
         }
 
-        // ORDER BY.
+        // ORDER BY. A query already produced in rowid order by the table scan
+        // (sole ORDER BY term = rowid / INTEGER PRIMARY KEY) skips the sort —
+        // just reversing for DESC — matching sqlite's plain SCAN with no temp
+        // b-tree.
         if !sel.order_by.is_empty() {
-            let colls = self.order_collations(sel, &columns, params);
-            // Stable sort by the precomputed sort keys, each under its collation.
-            out.sort_by(|a, b| {
-                for (i, term) in sel.order_by.iter().enumerate() {
-                    let ord = cmp_order(
-                        &a.sort_keys[i],
-                        &b.sort_keys[i],
-                        term.descending,
-                        term.nulls_first,
-                        colls[i],
-                    );
-                    if ord != core::cmp::Ordering::Equal {
-                        return ord;
-                    }
+            match self.rowid_ordered_scan(sel) {
+                Some(true) => out.reverse(),
+                Some(false) => {}
+                None => {
+                    let colls = self.order_collations(sel, &columns, params);
+                    // Stable sort by the precomputed sort keys, each under its collation.
+                    out.sort_by(|a, b| {
+                        for (i, term) in sel.order_by.iter().enumerate() {
+                            let ord = cmp_order(
+                                &a.sort_keys[i],
+                                &b.sort_keys[i],
+                                term.descending,
+                                term.nulls_first,
+                                colls[i],
+                            );
+                            if ord != core::cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        core::cmp::Ordering::Equal
+                    });
                 }
-                core::cmp::Ordering::Equal
-            });
+            }
         }
 
         // OFFSET / LIMIT.
