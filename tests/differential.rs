@@ -575,12 +575,37 @@ fn corpus() -> Vec<String> {
     );
     // 31) printf/format specifiers: %g notation, half-away %f rounding, sign flags.
     for e in [
-        "printf('%g',1000000)", "printf('%g',100000)", "printf('%g',0.0001)",
-        "printf('%g',0.00001)", "printf('%.3g',3.14159)", "printf('%g',1234.5)",
-        "printf('%G',123456789)", "printf('%.0f',2.5)", "printf('%.0f',0.5)",
-        "printf('%+.2f',3.5)", "printf('% d',5)", "printf('%+d',5)",
-        "printf('%.2f',2.675)", "printf('%08.3f',3.14)", "printf('%5.2f',3.14159)",
-        "printf('%e',12345.678)", "printf('%g',0.1)",
+        "printf('%g',1000000)",
+        "printf('%g',100000)",
+        "printf('%g',0.0001)",
+        "printf('%g',0.00001)",
+        "printf('%.3g',3.14159)",
+        "printf('%g',1234.5)",
+        "printf('%G',123456789)",
+        "printf('%.0f',2.5)",
+        "printf('%.0f',0.5)",
+        "printf('%+.2f',3.5)",
+        "printf('% d',5)",
+        "printf('%+d',5)",
+        "printf('%.2f',2.675)",
+        "printf('%08.3f',3.14)",
+        "printf('%5.2f',3.14159)",
+        "printf('%e',12345.678)",
+        "printf('%g',0.1)",
+    ] {
+        q.push(format!("SELECT {e};"));
+    }
+    // 32) CAST to sized / multi-word type names (the size is ignored; affinity
+    // comes from the type keyword).
+    for e in [
+        "CAST(3.7 AS VARCHAR(10))",
+        "CAST(3.7 AS DECIMAL(10,2))",
+        "CAST('5' AS INT8)",
+        "CAST(123 AS CHARACTER(5))",
+        "CAST(5 AS UNSIGNED BIG INT)",
+        "CAST('3.0' AS DECIMAL(10,2))",
+        "typeof(CAST(5.5 AS DECIMAL(4,1)))",
+        "typeof(CAST('7' AS NUMERIC(3)))",
     ] {
         q.push(format!("SELECT {e};"));
     }

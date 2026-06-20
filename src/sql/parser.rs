@@ -1611,7 +1611,20 @@ impl Parser {
         self.expect(&Token::LParen)?;
         let expr = Box::new(self.expr()?);
         self.expect_kw("as")?;
-        let type_name = self.ident()?;
+        // A type name is one or more bare words, optionally followed by a size
+        // suffix `(n[,m])` (e.g. `VARCHAR(10)`, `DECIMAL(10,2)`). Only the words
+        // matter for affinity; the size is parsed and ignored.
+        let mut type_name = self.ident()?;
+        while let Some(Token::Word(_)) = self.peek() {
+            type_name.push(' ');
+            type_name.push_str(&self.ident()?);
+        }
+        if self.eat(&Token::LParen) {
+            while !self.check(&Token::RParen) && !self.at_end() {
+                self.advance();
+            }
+            self.expect(&Token::RParen)?;
+        }
         self.expect(&Token::RParen)?;
         Ok(Expr::Cast { expr, type_name })
     }
