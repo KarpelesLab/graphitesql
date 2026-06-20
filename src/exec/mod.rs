@@ -3154,6 +3154,92 @@ impl Connection {
         Ok(Some(out))
     }
 
+    /// Try to satisfy a single-table query with an index *range* scan: pick an
+    /// index whose leading column is constrained by a `<`/`<=`/`>`/`>=`/`BETWEEN`
+    /// predicate, walk the index between those bounds, and fetch the rows by
+    /// rowid. Like [`try_index_lookup`](Self::try_index_lookup) this returns a
+    /// superset — `run_core` re-applies the full `WHERE`. Returns `None` (→ scan)
+    /// when no index applies.
+    fn try_index_range(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let Some(where_expr) = &sel.where_clause else {
+            return Ok(None);
+        };
+        let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
+        if matches!(hint, Some(IndexHint::NotIndexed)) {
+            return Ok(None);
+        }
+        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+            alloc::collections::BTreeMap::new();
+        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+
+        // Pick the first plain (non-partial, non-expression) index whose leading
+        // column has a range bound, honoring `INDEXED BY`.
+        let indexes = self.indexes_of(table_name)?;
+        if let Some(IndexHint::IndexedBy(n)) = hint {
+            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
+                return Err(Error::Error(alloc::format!("no such index: {n}")));
+            }
+        }
+        let mut chosen: Option<(u32, RangeBound, crate::value::Collation)> = None;
+        for idx in &indexes {
+            if let Some(IndexHint::IndexedBy(n)) = hint {
+                if !idx.name.eq_ignore_ascii_case(n) {
+                    continue;
+                }
+            }
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
+                continue;
+            }
+            let Some(&lead) = idx.cols.first() else {
+                continue;
+            };
+            if let Some(b) = ranges.get(&lead) {
+                let coll = idx.collations.first().copied().unwrap_or_default();
+                let aff = meta.columns[lead].affinity;
+                let b = RangeBound {
+                    lower: b.lower.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i)),
+                    upper: b.upper.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i)),
+                };
+                chosen = Some((idx.root, b, coll));
+                break;
+            }
+        }
+        let Some((root, bound, coll)) = chosen else {
+            return Ok(None);
+        };
+
+        let colls = [coll];
+        let lower_key = bound.lower.as_ref().map(|(v, _)| core::slice::from_ref(v));
+        let upper_key = bound.upper.as_ref().map(|(v, _)| core::slice::from_ref(v));
+        let lower = lower_key.map(|k| (k, bound.lower.as_ref().unwrap().1));
+        let upper = upper_key.map(|k| (k, bound.upper.as_ref().unwrap().1));
+        let rowids =
+            crate::btree::index_range_rowids(self.backend.source(), root, lower, upper, &colls)?;
+
+        let encoding = self.backend.source().header().text_encoding;
+        let mut cur = TableCursor::new(self.backend.source(), meta.root);
+        let mut out = Vec::new();
+        for rid in rowids {
+            if cur.seek(rid)? {
+                let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                out.push(InputRow {
+                    values,
+                    rowid: Some(rid),
+                });
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// `EXPLAIN QUERY PLAN <stmt>` -> the `(id, parent, notused, detail)` rows
     /// that SQLite's API returns. The detail strings describe graphitesql's
     /// *actual* execution plan (it does not reorder joins), matching SQLite's
@@ -4133,6 +4219,9 @@ impl Connection {
                 return Ok((first_meta.columns, input_rows));
             }
             if let Some(rows) = self.try_index_lookup(&first_meta, &from.first.name, sel, params)? {
+                return Ok((first_meta.columns, rows));
+            }
+            if let Some(rows) = self.try_index_range(&first_meta, &from.first.name, sel, params)? {
                 return Ok((first_meta.columns, rows));
             }
             let input_rows = self
@@ -5995,6 +6084,93 @@ fn collect_eq_constraints(
                 (col_index(right, columns), const_value(left, params))
             {
                 out.push((ci, v));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A per-column range constraint gathered from `WHERE`: optional lower and upper
+/// bounds, each `(value, inclusive)`.
+#[derive(Default, Clone)]
+struct RangeBound {
+    lower: Option<(Value, bool)>,
+    upper: Option<(Value, bool)>,
+}
+
+/// Fold one comparison `column <op> value` into a [`RangeBound`]. Overwriting an
+/// existing bound is safe: the index range scan only needs to return a superset
+/// (the full `WHERE` is re-applied), and either of two bounds on the same side
+/// yields a valid superset.
+fn apply_bound(b: &mut RangeBound, op: BinaryOp, v: Value) {
+    match op {
+        BinaryOp::Gt => b.lower = Some((v, false)),
+        BinaryOp::GtEq => b.lower = Some((v, true)),
+        BinaryOp::Lt => b.upper = Some((v, false)),
+        BinaryOp::LtEq => b.upper = Some((v, true)),
+        _ => {}
+    }
+}
+
+/// The comparison with its operands swapped (`a < b` ⇔ `b > a`).
+fn flip_cmp(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
+}
+
+/// Collect per-column range bounds (`<`/`<=`/`>`/`>=`/`BETWEEN`) from the
+/// top-level `AND` conjuncts of `WHERE`, keyed by column index. Drives an index
+/// range scan; non-range and non-constant terms are ignored (the full `WHERE` is
+/// re-applied afterward).
+fn collect_range_constraints(
+    e: &Expr,
+    columns: &[ColumnInfo],
+    params: &Params,
+    out: &mut alloc::collections::BTreeMap<usize, RangeBound>,
+) {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            collect_range_constraints(left, columns, params, out);
+            collect_range_constraints(right, columns, params, out);
+        }
+        Expr::Paren(inner) => collect_range_constraints(inner, columns, params, out),
+        Expr::Binary { op, left, right }
+            if matches!(
+                op,
+                BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+            ) =>
+        {
+            if let (Some(ci), Some(v)) = (col_index(left, columns), const_value(right, params)) {
+                apply_bound(out.entry(ci).or_default(), *op, v);
+            } else if let (Some(ci), Some(v)) =
+                (col_index(right, columns), const_value(left, params))
+            {
+                apply_bound(out.entry(ci).or_default(), flip_cmp(*op), v);
+            }
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+        } => {
+            if let Some(ci) = col_index(expr, columns) {
+                let b = out.entry(ci).or_default();
+                if let Some(v) = const_value(low, params) {
+                    apply_bound(b, BinaryOp::GtEq, v);
+                }
+                if let Some(v) = const_value(high, params) {
+                    apply_bound(b, BinaryOp::LtEq, v);
+                }
             }
         }
         _ => {}

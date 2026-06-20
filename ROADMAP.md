@@ -163,9 +163,10 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
 - ✅ **`ANALYZE` + `sqlite_stat1`** — gather and store row/selectivity statistics
   (`nRow avgEqK` format, byte-compatible), read back when planning. *Remaining:*
   `sqlite_stat4` histograms. *Ref:* `analyze.c`.
-- **Cost-based planning** — ✅ statistics now drive index *choice*; *remaining:*
-  **join order** (today joins run in `FROM` order as nested loops); range scans
-  (`<`/`>`/`BETWEEN`) and `IN`-list driven seeks; the **OR-by-union**
+- **Cost-based planning** — ✅ statistics now drive index *choice*, ✅ range scans
+  (`<`/`>`/`BETWEEN` seek an index between bounds via `index_range_rowids`);
+  *remaining:* **join order** (today joins run in `FROM` order as nested loops);
+  `IN`-list driven seeks; the **OR-by-union**
   optimization; covering-index detection; auto-indexes for unindexed joins;
   skip-scan. *Ref:* `where.c`, `wherecode.c`, `whereexpr.c`.
 - **VDBE bytecode IR** — 🚧 *spike landed* (`exec::vdbe`): a register-machine

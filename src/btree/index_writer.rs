@@ -55,6 +55,126 @@ pub fn index_seek_rowids(
     Ok(out)
 }
 
+/// Range variant of [`index_seek_rowids`]: return the rowids of every index
+/// entry whose leading column(s) fall within the given bounds, in index order.
+/// `lower`/`upper` are optional `(key_prefix, inclusive)` constraints compared
+/// against the leading columns. The result may be a *superset* of the rows the
+/// caller wants (callers re-apply the full `WHERE`), but never drops a matching
+/// row; the in-order traversal stops as soon as the upper bound is passed.
+pub fn index_range_rowids(
+    src: &dyn PageSource,
+    root: u32,
+    lower: Option<(&[Value], bool)>,
+    upper: Option<(&[Value], bool)>,
+    colls: &[Collation],
+) -> Result<Vec<i64>> {
+    let enc = src.header().text_encoding;
+    let usable = src.usable_size();
+    let mut out = Vec::new();
+    range_scan(src, root, lower, upper, enc, usable, colls, &mut out)?;
+    Ok(out)
+}
+
+/// Does `rec` satisfy the optional lower bound `(key, inclusive)`?
+fn passes_lower(lower: Option<(&[Value], bool)>, rec: &[Value], colls: &[Collation]) -> bool {
+    match lower {
+        None => true,
+        Some((lk, inc)) => match prefix_cmp(lk, rec, colls) {
+            Ordering::Greater => false, // lower > rec ⇒ rec < lower
+            Ordering::Equal => inc,     // rec == lower
+            Ordering::Less => true,     // rec > lower
+        },
+    }
+}
+
+/// Is `rec` past the optional upper bound `(key, inclusive)`? In ascending index
+/// order, the first `true` ends the scan.
+fn beyond_upper(upper: Option<(&[Value], bool)>, rec: &[Value], colls: &[Collation]) -> bool {
+    match upper {
+        None => false,
+        Some((uk, inc)) => match prefix_cmp(uk, rec, colls) {
+            Ordering::Less => true,     // upper < rec ⇒ rec > upper
+            Ordering::Equal => !inc,    // rec == upper: past it only when exclusive
+            Ordering::Greater => false, // rec < upper
+        },
+    }
+}
+
+/// In-order range traversal. Returns `Ok(false)` once the upper bound is passed
+/// (so the caller stops descending further-right subtrees), else `Ok(true)`.
+#[allow(clippy::too_many_arguments)]
+fn range_scan(
+    src: &dyn PageSource,
+    page_no: u32,
+    lower: Option<(&[Value], bool)>,
+    upper: Option<(&[Value], bool)>,
+    enc: TextEncoding,
+    usable: usize,
+    colls: &[Collation],
+    out: &mut Vec<i64>,
+) -> Result<bool> {
+    let page = src.page(page_no)?;
+    let bt = BtreePage::parse(page)?;
+    let record = |i: usize| -> Result<Vec<Value>> {
+        let cell = bt.index_cell(i, usable)?;
+        let full = read_payload(src, bt.data(), &cell.payload)?;
+        decode_record(&full, enc)
+    };
+    match bt.page_type() {
+        PageType::LeafIndex => {
+            for i in 0..bt.num_cells() {
+                let rec = record(i)?;
+                if beyond_upper(upper, &rec, colls) {
+                    return Ok(false);
+                }
+                if passes_lower(lower, &rec, colls) {
+                    out.push(rowid_of(&rec));
+                }
+            }
+            Ok(true)
+        }
+        PageType::InteriorIndex => {
+            let n = bt.num_cells();
+            for k in 0..n {
+                // Left child of cell k, then the interior cell (itself an entry).
+                if !range_scan(
+                    src,
+                    bt.child_pointer(k)?,
+                    lower,
+                    upper,
+                    enc,
+                    usable,
+                    colls,
+                    out,
+                )? {
+                    return Ok(false);
+                }
+                let rec = record(k)?;
+                if beyond_upper(upper, &rec, colls) {
+                    return Ok(false);
+                }
+                if passes_lower(lower, &rec, colls) {
+                    out.push(rowid_of(&rec));
+                }
+            }
+            // Right-most child.
+            range_scan(
+                src,
+                bt.child_pointer(n)?,
+                lower,
+                upper,
+                enc,
+                usable,
+                colls,
+                out,
+            )
+        }
+        _ => Err(Error::Corrupt(
+            "index range scan on a non-index b-tree".into(),
+        )),
+    }
+}
+
 fn seek_prefix(
     src: &dyn PageSource,
     page_no: u32,

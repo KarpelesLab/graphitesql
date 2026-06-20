@@ -233,3 +233,71 @@ fn autoindex_for_unique_passes_integrity() {
     );
     cleanup(&path);
 }
+
+/// Index range scans (`<`/`<=`/`>`/`>=`/`BETWEEN` on an indexed column) must
+/// return exactly the same rows as `sqlite3` — the planner walks the index
+/// between bounds and re-applies the full `WHERE`.
+#[test]
+fn index_range_scans_match_sqlite3() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let path = temp_path("range.db");
+    cleanup(&path);
+
+    let setup = "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT);\
+                 CREATE INDEX ta ON t(a);\
+                 CREATE INDEX tb ON t(b);\
+                 INSERT INTO t(a,b) VALUES \
+                   (5,'m'),(1,'a'),(9,'z'),(3,'c'),(7,'q'),(1,'a'),(4,'k'),(8,'y'),(2,'b'),(6,'n');";
+    sqlite3_run(&path, setup);
+
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+
+    let queries = [
+        "SELECT id FROM t WHERE a > 4 ORDER BY id",
+        "SELECT id FROM t WHERE a >= 4 ORDER BY id",
+        "SELECT id FROM t WHERE a < 4 ORDER BY id",
+        "SELECT id FROM t WHERE a <= 4 ORDER BY id",
+        "SELECT id FROM t WHERE a BETWEEN 3 AND 7 ORDER BY id",
+        "SELECT id FROM t WHERE a > 2 AND a < 8 ORDER BY id",
+        "SELECT id FROM t WHERE a >= 1 AND a <= 1 ORDER BY id",
+        "SELECT id FROM t WHERE a > 100 ORDER BY id",
+        "SELECT id FROM t WHERE a < -5 ORDER BY id",
+        "SELECT id FROM t WHERE b > 'k' ORDER BY id",
+        "SELECT id FROM t WHERE b BETWEEN 'b' AND 'n' ORDER BY id",
+        "SELECT id FROM t WHERE b <= 'c' ORDER BY id",
+        "SELECT a FROM t WHERE a > 3 ORDER BY a",
+        "SELECT count(*) FROM t WHERE a >= 5",
+    ];
+    for q in queries {
+        let want = sqlite3_run(&path, &format!("{q};"));
+        let got = g
+            .query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| match v {
+                        Value::Null => String::new(),
+                        Value::Integer(i) => i.to_string(),
+                        Value::Text(s) => s.clone(),
+                        Value::Real(r) => format!("{r}"),
+                        Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(got, want, "range query diverged: {q}");
+    }
+    cleanup(&path);
+}

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track B: index **range scans**. A single-table query whose `WHERE` constrains an
+  indexed column by `<`/`<=`/`>`/`>=`/`BETWEEN` now seeks the index between those
+  bounds (`btree::index_range_rowids`, an in-order traversal that stops once the
+  upper bound is passed) instead of scanning the whole table, then re-applies the
+  full `WHERE`. The lookup returns a superset, so correctness is preserved
+  regardless of bound edge cases. Verified against `sqlite3`.
 - Track A: `octet_length(X)` (byte length of a value's encoding — blob bytes, else
   the UTF-8 length of its text form) and the `glob(pattern, text)` function form of
   the `GLOB` operator. Both verified against `sqlite3` in the differential corpus.
