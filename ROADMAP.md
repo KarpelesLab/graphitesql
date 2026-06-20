@@ -121,6 +121,9 @@ Order within a track is roughly by value/effort; tracks can progress in parallel
 
 Make the dialect complete. Each item lands with a differential corpus addition.
 
+- ✅ **`UPDATE … SET … FROM <sources>`** — join the target to extra tables
+  (multi-table and derived-table sources) so `SET`/`WHERE` can read their
+  columns; rowid tables only.
 - ✅ **`INSERT … SELECT`** — populate a table from a query (incl. compound
   `SELECT` sources and a target column list); the query is snapshotted first so
   `INSERT INTO t SELECT … FROM t` terminates, then rows flow through the normal

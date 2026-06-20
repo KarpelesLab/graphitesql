@@ -2607,6 +2607,9 @@ impl Connection {
             if !upd.returning.is_empty() {
                 return Err(Error::Unsupported("RETURNING on WITHOUT ROWID tables"));
             }
+            if upd.from.is_some() {
+                return Err(Error::Unsupported("UPDATE … FROM on WITHOUT ROWID tables"));
+            }
             return self.exec_update_without_rowid(upd, &meta, params);
         }
         let indexes = self.indexes_of(&upd.table)?;
