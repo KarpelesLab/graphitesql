@@ -8832,6 +8832,21 @@ impl Connection {
     ) -> Result<Value> {
         let lname = name.to_ascii_lowercase();
 
+        // Arity guards: every aggregate but `count(*)` needs at least one
+        // argument, and `json_group_object` needs two. SQLite rejects a short
+        // call ("wrong number of arguments"); without this we would index
+        // `args[…]` out of bounds and panic (e.g. `group_concat()`).
+        if !star && args.is_empty() {
+            return Err(Error::Error(format!(
+                "wrong number of arguments to function {lname}()"
+            )));
+        }
+        if lname == "json_group_object" && args.len() < 2 {
+            return Err(Error::Error(format!(
+                "wrong number of arguments to function {lname}()"
+            )));
+        }
+
         // An `ORDER BY` inside the aggregate (`group_concat(x ORDER BY y)`) sorts
         // the group's rows before the values are gathered.
         let ordered_group;
