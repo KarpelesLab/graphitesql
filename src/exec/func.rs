@@ -90,7 +90,11 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 1)?;
             match &v[0] {
                 Value::Null => Value::Null,
-                Value::Integer(i) => Value::Integer(i.wrapping_abs()),
+                // `abs(-9223372036854775808)` has no i64 result — SQLite errors.
+                Value::Integer(i) => match i.checked_abs() {
+                    Some(a) => Value::Integer(a),
+                    None => return Err(Error::Error("integer overflow".into())),
+                },
                 Value::Real(r) => Value::Real(crate::util::float::abs(*r)),
                 // A text/blob argument is coerced to a real (SQLite gives
                 // `abs('5')` = 5.0, not 5).

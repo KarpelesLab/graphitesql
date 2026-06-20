@@ -1208,7 +1208,7 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                     Some(e) => core::mem::take(e),
                     None => (Vec::new(), 0),
                 };
-                regs[*dest] = finalize_agg(*kind, vals, star);
+                regs[*dest] = finalize_agg(*kind, vals, star)?;
             }
             Op::GroupStep {
                 key_start,
@@ -1242,7 +1242,7 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                         .iter()
                         .zip(accs)
                         .map(|(k, (vals, star))| finalize_agg(*k, vals, star))
-                        .collect();
+                        .collect::<Result<_>>()?;
                     let row: Vec<Value> = outputs
                         .iter()
                         .map(|o| match o {
@@ -1264,10 +1264,10 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
 /// real (NULL over no rows), `total` is always real, `avg` is real (NULL over no
 /// rows), `min`/`max` reduce by value comparison (NULL over no rows), and
 /// `group_concat` joins with `,` (NULL over no rows).
-fn finalize_agg(kind: AggKind, vals: Vec<Value>, star: i64) -> Value {
+fn finalize_agg(kind: AggKind, vals: Vec<Value>, star: i64) -> Result<Value> {
     use crate::exec::eval;
     use core::cmp::Ordering;
-    match kind {
+    Ok(match kind {
         AggKind::CountStar => Value::Integer(star),
         AggKind::Count => Value::Integer(vals.len() as i64),
         AggKind::Sum => {
@@ -1288,7 +1288,8 @@ fn finalize_agg(kind: AggKind, vals: Vec<Value>, star: i64) -> Value {
                     }
                 }
                 if overflow {
-                    Value::Real(vals.iter().map(eval::to_f64).sum())
+                    // Match SQLite: integer `sum()` overflow is an error.
+                    return Err(Error::Error("integer overflow".into()));
                 } else {
                     Value::Integer(acc)
                 }
@@ -1333,7 +1334,7 @@ fn finalize_agg(kind: AggKind, vals: Vec<Value>, star: i64) -> Value {
                 Value::Text(parts.join(","))
             }
         }
-    }
+    })
 }
 
 /// Equality used by `DISTINCT`: two NULLs are equal (unlike `=`), otherwise the

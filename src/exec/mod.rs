@@ -6351,7 +6351,9 @@ impl Connection {
                         }
                     }
                     if overflow {
-                        Value::Real(vals.iter().map(eval::to_f64).sum())
+                        // Like SQLite: an integer `sum()` that overflows i64 is an
+                        // error (use `total()` for a non-failing real sum).
+                        return Err(Error::Error("integer overflow".into()));
                     } else {
                         Value::Integer(acc)
                     }
