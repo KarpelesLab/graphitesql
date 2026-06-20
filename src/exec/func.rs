@@ -172,16 +172,18 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "sign" => {
             arity(&lname, args, 1)?;
-            match eval::to_number(&v[0]) {
-                Value::Integer(i) => Value::Integer(i.signum()),
-                Value::Real(r) => Value::Integer(if r > 0.0 {
-                    1
-                } else if r < 0.0 {
-                    -1
-                } else {
-                    0
-                }),
-                _ => Value::Null,
+            // Numeric (or losslessly-numeric text) only; otherwise NULL.
+            let num = match &v[0] {
+                Value::Integer(i) => Some(*i as f64),
+                Value::Real(r) => Some(*r),
+                Value::Text(s) => s.trim().parse::<f64>().ok(),
+                _ => None,
+            };
+            match num {
+                Some(r) if r > 0.0 => Value::Integer(1),
+                Some(r) if r < 0.0 => Value::Integer(-1),
+                Some(_) => Value::Integer(0),
+                None => Value::Null,
             }
         }
         "concat" => {
@@ -235,13 +237,32 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             v[0].clone()
         }
         "unhex" => {
-            arity(&lname, args, 1)?;
+            if v.is_empty() || v.len() > 2 {
+                return Err(Error::Error("unhex() takes 1 or 2 arguments".into()));
+            }
+            // `unhex(X, Y)` first removes any characters of Y from X.
+            let cleaned = match v.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(ignore) => {
+                    let set: alloc::vec::Vec<char> = eval::to_text(ignore).chars().collect();
+                    Some(
+                        eval::to_text(&v[0])
+                            .chars()
+                            .filter(|c| !set.contains(c))
+                            .collect::<String>(),
+                    )
+                }
+                None => None,
+            };
             match &v[0] {
                 Value::Null => Value::Null,
-                other => match unhex(&eval::to_text(other)) {
-                    Some(b) => Value::Blob(b),
-                    None => Value::Null,
-                },
+                other => {
+                    let text = cleaned.unwrap_or_else(|| eval::to_text(other));
+                    match unhex(&text) {
+                        Some(b) => Value::Blob(b),
+                        None => Value::Null,
+                    }
+                }
             }
         }
         // Math functions (SQLite's `-DSQLITE_ENABLE_MATH_FUNCTIONS` set; the CLI

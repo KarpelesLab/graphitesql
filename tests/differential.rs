@@ -368,6 +368,15 @@ fn corpus() -> Vec<String> {
         "abs(-5)",
         "abs('-3.2abc')",
         "abs(5.5)",
+        "printf('%*d', 5, 3)",
+        "printf('%.*f', 2, 3.14159)",
+        "printf('%-*d|', 4, 7)",
+        "printf('%*d', -5, 3)",
+        "sign('abc')",
+        "sign('5')",
+        "sign('-3.2')",
+        "quote(unhex('48-49', '-'))",
+        "quote(unhex('48 49', ' '))",
     ] {
         q.push(format!("SELECT {e};"));
     }

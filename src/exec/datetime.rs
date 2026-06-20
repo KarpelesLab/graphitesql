@@ -860,24 +860,45 @@ pub fn printf(args: &[Value]) -> Value {
             }
             i += 1;
         }
-        // width
+        // width — a `*` takes it from the next argument (a negative value means
+        // left-justify).
         let mut width = 0usize;
         let mut has_width = false;
-        while let Some(d) = bytes.get(i).filter(|c| c.is_ascii_digit()) {
-            width = width * 10 + (*d as u8 - b'0') as usize;
-            has_width = true;
+        if bytes.get(i) == Some(&'*') {
             i += 1;
+            let wv = eval::to_i64(&args.get(arg_idx).cloned().unwrap_or(Value::Null));
+            arg_idx += 1;
+            if wv < 0 {
+                left = true;
+                width = wv.unsigned_abs() as usize;
+            } else {
+                width = wv as usize;
+            }
+            has_width = true;
+        } else {
+            while let Some(d) = bytes.get(i).filter(|c| c.is_ascii_digit()) {
+                width = width * 10 + (*d as u8 - b'0') as usize;
+                has_width = true;
+                i += 1;
+            }
         }
-        // precision
+        // precision — likewise `.*` takes it from the next argument.
         let mut prec: Option<usize> = None;
         if bytes.get(i) == Some(&'.') {
             i += 1;
-            let mut p = 0usize;
-            while let Some(d) = bytes.get(i).filter(|c| c.is_ascii_digit()) {
-                p = p * 10 + (*d as u8 - b'0') as usize;
+            if bytes.get(i) == Some(&'*') {
                 i += 1;
+                let pv = eval::to_i64(&args.get(arg_idx).cloned().unwrap_or(Value::Null));
+                arg_idx += 1;
+                prec = Some(pv.max(0) as usize);
+            } else {
+                let mut p = 0usize;
+                while let Some(d) = bytes.get(i).filter(|c| c.is_ascii_digit()) {
+                    p = p * 10 + (*d as u8 - b'0') as usize;
+                    i += 1;
+                }
+                prec = Some(p);
             }
-            prec = Some(p);
         }
         let Some(&conv) = bytes.get(i) else { break };
         i += 1;
