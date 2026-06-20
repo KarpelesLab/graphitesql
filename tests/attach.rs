@@ -275,6 +275,88 @@ fn cross_database_create_index_file_cross_engine() {
 }
 
 #[test]
+fn cross_database_transaction() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE m(a)").unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE aux.t(a)").unwrap();
+
+    // A transaction spanning both databases commits atomically.
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO m VALUES(1)").unwrap();
+    c.execute("INSERT INTO aux.t VALUES(10)").unwrap();
+    c.execute("COMMIT").unwrap();
+    assert_eq!(
+        c.query("SELECT a FROM m").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    assert_eq!(
+        c.query("SELECT a FROM aux.t").unwrap().rows[0][0],
+        Value::Integer(10)
+    );
+
+    // ROLLBACK discards the attached database's changes too (not just main's).
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO m VALUES(2)").unwrap();
+    c.execute("INSERT INTO aux.t VALUES(20)").unwrap();
+    c.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM m").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    assert_eq!(
+        c.query("SELECT count(*) FROM aux.t").unwrap().rows[0][0],
+        Value::Integer(1) // only the committed 10 remains
+    );
+
+    // DDL in the attached database is rolled back as well.
+    c.execute("BEGIN").unwrap();
+    c.execute("CREATE TABLE aux.tmp2(x)").unwrap();
+    c.execute("ROLLBACK").unwrap();
+    let names: Vec<_> = c
+        .query("SELECT name FROM aux.sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect();
+    assert_eq!(names, vec![Value::Text("t".into())]);
+}
+
+#[test]
+fn cross_database_transaction_file_durability() {
+    let mut p = std::env::temp_dir();
+    p.push(format!("graphitesql-attach-tx-{}.db", std::process::id()));
+    let path = p.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+
+    // A committed cross-database transaction lands durably in the attached file.
+    {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(&format!("ATTACH '{path}' AS d")).unwrap();
+        c.execute("CREATE TABLE d.t(a)").unwrap();
+        c.execute("BEGIN").unwrap();
+        c.execute("INSERT INTO d.t VALUES(1),(2)").unwrap();
+        c.execute("COMMIT").unwrap();
+        // A subsequent rolled-back transaction leaves no trace.
+        c.execute("BEGIN").unwrap();
+        c.execute("INSERT INTO d.t VALUES(3)").unwrap();
+        c.execute("ROLLBACK").unwrap();
+    }
+    // Reopen the file: exactly the committed rows are present.
+    {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(&format!("ATTACH '{path}' AS d")).unwrap();
+        assert_eq!(
+            c.query("SELECT count(*) FROM d.t").unwrap().rows[0][0],
+            Value::Integer(2)
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+}
+
+#[test]
 fn cross_database_view() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("ATTACH ':memory:' AS aux").unwrap();

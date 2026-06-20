@@ -25,8 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CREATE VIEW aux.v AS …` target the attached database (stored bare-named,
   cross-engine verified; trigger bodies' `NEW.col` left intact). Cross-database
   **view reads** resolve the view body's unqualified tables (joins, subqueries,
-  nested views) in the view's own database. (Cross-database transactions are
-  upcoming.)
+  nested views) in the view's own database. **Cross-database transactions**:
+  `BEGIN … COMMIT/ROLLBACK` spanning main + temp + attached databases
+  commits/rolls back them together (data and DDL); file attachments persist on
+  commit and leave no trace on rollback. The multi-schema track is complete.
 - **Transaction & DDL state checks**: nested `BEGIN`, and `COMMIT`/`ROLLBACK`
   with no active transaction, are now rejected; `DROP` of a missing object
   reports lowercase "no such <kind>" with a table↔view hint; `ALTER … RENAME

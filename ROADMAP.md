@@ -228,13 +228,17 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
   file (rollback-journal mode so commits are immediately sqlite3-readable).
   Cross-engine verified both directions. Also fixed: a qualified `CREATE TABLE
   aux.t` now stores its CREATE bare-named in the target catalog (the `aux.`
-  prefix is invalid in that database's namespace). *Remaining: cross-database
-  transactions spanning attached files (each commits independently today).*
+  prefix is invalid in that database's namespace).
+- ✅ **Cross-database transactions.** `BEGIN … COMMIT/ROLLBACK` spanning main +
+  temp + attached databases commits/rolls back them together: `COMMIT` flushes
+  every database's staged pages (a clean pager commit is a no-op), `ROLLBACK`
+  discards each one's overlay (data *and* DDL) and reloads its catalog. File
+  attachments persist durably on commit and leave no trace on rollback.
 
-**The ATTACH/DETACH/TEMP multi-schema track (C1–C5) is complete** for in-memory
-and file databases, including cross-database joins. Remaining multi-schema
-refinements: cross-database transactions (each attached file commits
-independently today).
+**The ATTACH/DETACH/TEMP multi-schema track is complete** for in-memory and
+file databases — including cross-database joins, qualified DDL
+(`ALTER`/`CREATE INDEX|TRIGGER|VIEW`), cross-database view reads, and
+cross-database transactions. No multi-schema refinements remain outstanding.
 
 *Storage:*
 

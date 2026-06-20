@@ -887,6 +887,9 @@ impl Connection {
                     ));
                 }
                 self.backend.writer()?.commit()?;
+                // Cross-database transaction: commit the temp + attached
+                // databases alongside main (a clean pager commit is a no-op).
+                self.commit_attached()?;
                 self.in_tx = false;
                 self.open_savepoints = 0;
                 return Ok(0);
@@ -903,6 +906,7 @@ impl Connection {
                 // finalizes it.
                 if self.open_savepoints == 0 && !self.in_tx {
                     self.backend.writer()?.commit()?;
+                    self.commit_attached()?;
                     self.schema = Schema::read(self.backend.source())?;
                 }
                 return Ok(0);
@@ -921,6 +925,9 @@ impl Connection {
                     ));
                 }
                 self.backend.writer()?.rollback();
+                // Cross-database transaction: roll back the temp + attached
+                // databases too, discarding their staged changes.
+                self.rollback_attached()?;
                 self.in_tx = false;
                 self.open_savepoints = 0;
                 self.schema = Schema::read(self.backend.source())?;
@@ -982,6 +989,35 @@ impl Connection {
             Statement::CreateTrigger(ct) => resolved(ct.schema.as_deref(), &ct.table),
             _ => Ok(DbRef::Main),
         }
+    }
+
+    /// Commit pending changes in the temp + attached databases, refreshing each
+    /// catalog from its committed image. Part of a cross-database transaction
+    /// commit; a clean pager commit is a no-op.
+    fn commit_attached(&mut self) -> Result<()> {
+        if let Some(t) = &mut self.temp_db {
+            t.backend.writer()?.commit()?;
+            t.schema = Schema::read(t.backend.source())?;
+        }
+        for d in &mut self.attached {
+            d.backend.writer()?.commit()?;
+            d.schema = Schema::read(d.backend.source())?;
+        }
+        Ok(())
+    }
+
+    /// Roll back staged changes in the temp + attached databases and reload each
+    /// catalog. Part of a cross-database transaction rollback.
+    fn rollback_attached(&mut self) -> Result<()> {
+        if let Some(t) = &mut self.temp_db {
+            t.backend.writer()?.rollback();
+            t.schema = Schema::read(t.backend.source())?;
+        }
+        for d in &mut self.attached {
+            d.backend.writer()?.rollback();
+            d.schema = Schema::read(d.backend.source())?;
+        }
+        Ok(())
     }
 
     /// Make `db` the active `main` (or swap it back) by exchanging the backend
