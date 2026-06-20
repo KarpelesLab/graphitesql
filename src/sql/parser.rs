@@ -984,7 +984,7 @@ impl Parser {
 
     fn create_view(&mut self) -> Result<CreateView> {
         let if_not_exists = self.if_not_exists()?;
-        let name = self.ident()?;
+        let (schema, name) = self.qualified_name()?;
         let mut columns = Vec::new();
         if self.eat(&Token::LParen) {
             columns.push(self.ident()?);
@@ -997,6 +997,7 @@ impl Parser {
         let select = Box::new(self.select()?);
         Ok(CreateView {
             if_not_exists,
+            schema,
             name,
             columns,
             select,

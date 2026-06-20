@@ -118,6 +118,11 @@ pub struct Connection {
     changes: core::cell::Cell<i64>,
     /// Rows modified since the connection opened (`total_changes()`).
     total_changes: core::cell::Cell<i64>,
+    /// During a cross-database view read, the database whose catalog unqualified
+    /// table names resolve against (so a view's body reads its own database's
+    /// tables). `Main` at all other times; nested subqueries inherit it. Set and
+    /// restored around [`scan_db_view`](Self::scan_db_view).
+    read_default: core::cell::Cell<DbRef>,
 }
 
 /// Which database an operation targets: `main`, the lazily-created `temp`
@@ -182,6 +187,7 @@ impl Connection {
             last_insert_rowid: core::cell::Cell::new(0),
             changes: core::cell::Cell::new(0),
             total_changes: core::cell::Cell::new(0),
+            read_default: core::cell::Cell::new(DbRef::Main),
         })
     }
 
@@ -205,6 +211,7 @@ impl Connection {
             last_insert_rowid: core::cell::Cell::new(0),
             changes: core::cell::Cell::new(0),
             total_changes: core::cell::Cell::new(0),
+            read_default: core::cell::Cell::new(DbRef::Main),
         })
     }
 
@@ -964,6 +971,12 @@ impl Connection {
             // The index lives in the schema named on the index (or, unqualified,
             // wherever its table lives — so a temp table's index goes to temp).
             Statement::CreateIndex(ci) => resolved(ci.schema.as_deref(), &ci.table),
+            // An explicitly-qualified view lives in the named schema; an
+            // unqualified `CREATE VIEW` (incl. `CREATE TEMP VIEW`) stays in main.
+            Statement::CreateView(cv) => match cv.schema.as_deref() {
+                Some(_) => self.resolve_db(cv.schema.as_deref()),
+                None => Ok(DbRef::Main),
+            },
             // A trigger lives in the schema named on it (or, unqualified,
             // wherever the table it fires on lives).
             Statement::CreateTrigger(ct) => resolved(ct.schema.as_deref(), &ct.table),
@@ -3289,6 +3302,15 @@ impl Connection {
     }
 
     fn exec_create_view(&mut self, cv: &CreateView, sql_text: &str) -> Result<()> {
+        // A schema-qualified `CREATE VIEW aux.v …` stores its SQL bare-named.
+        let stripped;
+        let sql_text = match cv.schema.as_deref() {
+            Some(s) => {
+                stripped = strip_schema_qualifier(sql_text, s)?;
+                stripped.as_str()
+            }
+            None => sql_text,
+        };
         let exists = self.schema.objects().iter().any(|o| o.name == cv.name);
         if exists {
             if cv.if_not_exists {
@@ -5849,7 +5871,11 @@ impl Connection {
                 None => DbRef::Main,
             };
             if db != DbRef::Main {
-                return self.scan_db_table(db, &from.first.name, from.first.alias.as_deref());
+                let alias = from.first.alias.as_deref();
+                if let Some(r) = self.scan_db_view(db, &from.first.name, alias, params)? {
+                    return Ok(r);
+                }
+                return self.scan_db_table(db, &from.first.name, alias);
             }
         }
         // A table-valued function used as the sole source.
@@ -6187,6 +6213,11 @@ impl Connection {
             None => self.unqualified_db(&tref.name),
         };
         if db != DbRef::Main {
+            if let Some((cols, input)) =
+                self.scan_db_view(db, &tref.name, tref.alias.as_deref(), params)?
+            {
+                return Ok((cols, input.into_iter().map(|r| r.values).collect()));
+            }
             let (cols, input) = self.scan_db_table(db, &tref.name, tref.alias.as_deref())?;
             return Ok((cols, input.into_iter().map(|r| r.values).collect()));
         }
@@ -6531,6 +6562,16 @@ impl Connection {
                 return DbRef::Temp;
             }
         }
+        // Inside a cross-database view read, unqualified names resolve in the
+        // view's own database (when it has the table) before falling back to
+        // main; nested subqueries inherit this via the shared cell.
+        let def = self.read_default.get();
+        if def != DbRef::Main {
+            let (schema, _) = self.db_parts(def);
+            if schema.table(name).is_some() {
+                return def;
+            }
+        }
         DbRef::Main
     }
 
@@ -6598,6 +6639,67 @@ impl Connection {
             ok = cur.next()?;
         }
         Ok((meta.columns, rows))
+    }
+
+    /// Read a view from a non-main database: run its body with unqualified
+    /// table names resolving in that database (via `read_default`, restored
+    /// afterwards). Returns `None` when `name` is not a view in `db`, so the
+    /// caller can fall back to reading it as a table.
+    fn scan_db_view(
+        &self,
+        db: DbRef,
+        name: &str,
+        alias: Option<&str>,
+        params: &Params,
+    ) -> Result<Option<(Vec<ColumnInfo>, Vec<InputRow>)>> {
+        use crate::schema::ObjectType;
+        let (schema, _) = self.db_parts(db);
+        let obj = match schema
+            .objects()
+            .iter()
+            .find(|o| o.obj_type == ObjectType::View && o.name.eq_ignore_ascii_case(name))
+        {
+            Some(o) => o.clone(),
+            None => return Ok(None),
+        };
+        let sql = obj
+            .sql
+            .as_deref()
+            .ok_or_else(|| Error::Corrupt("view has no CREATE statement".into()))?;
+        let Statement::CreateView(cv) = sql::parse_one(sql)? else {
+            return Err(Error::Corrupt("schema sql is not CREATE VIEW".into()));
+        };
+        // Resolve the view body's unqualified names in `db`; restore on the way
+        // out (even on error) so an outer query's resolution is unaffected.
+        let prev = self.read_default.get();
+        self.read_default.set(db);
+        let run = self.run_select(&cv.select, params);
+        self.read_default.set(prev);
+        let result = run?;
+        let label = alias.unwrap_or(name).to_string();
+        let names = if cv.columns.is_empty() {
+            result.columns.clone()
+        } else {
+            cv.columns.clone()
+        };
+        let columns: Vec<ColumnInfo> = names
+            .into_iter()
+            .map(|n| ColumnInfo {
+                name: n,
+                table: label.clone(),
+                affinity: eval::Affinity::Blob,
+                collation: crate::value::Collation::default(),
+            })
+            .collect();
+        let rows = result
+            .rows
+            .into_iter()
+            .map(|values| InputRow {
+                values,
+                rowid: None,
+            })
+            .collect();
+        Ok(Some((columns, rows)))
     }
 
     fn scan_table(&self, meta: &TableMeta) -> Result<Vec<(i64, Vec<Value>)>> {

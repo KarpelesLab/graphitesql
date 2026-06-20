@@ -211,9 +211,12 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
   materialized through its own backend, and 3-part column names
   (`aux.tbl.col`) parse. `WITHOUT ROWID` tables read cross-db too (sole
   source and join source). Qualified `ALTER TABLE aux.t …` (ADD / RENAME
-  COLUMN / RENAME TABLE), `CREATE INDEX aux.idx ON t(…)`, and
-  `CREATE TRIGGER aux.tr … ON t …` target the attached database, cross-engine
-  verified (stored bare-named; trigger bodies' `NEW.col` left intact).
+  COLUMN / RENAME TABLE), `CREATE INDEX aux.idx ON t(…)`,
+  `CREATE TRIGGER aux.tr … ON t …`, and `CREATE VIEW aux.v AS …` target the
+  attached database, cross-engine verified (stored bare-named; trigger bodies'
+  `NEW.col` left intact). Cross-database **view reads** work: a view's body
+  (joins, subqueries, nested views) resolves its unqualified tables in the
+  view's own database via a `read_default` context cell.
 - ✅ **C4 — `TEMP` tables.** A lazily-created in-memory `temp` database (seq 1);
   `CREATE TEMP TABLE` targets it (modeled as a `schema = "temp"` qualifier);
   unqualified names resolve `temp`→`main` (a temp table shadows main);
@@ -230,10 +233,8 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
 
 **The ATTACH/DETACH/TEMP multi-schema track (C1–C5) is complete** for in-memory
 and file databases, including cross-database joins. Remaining multi-schema
-refinements: cross-database **view reads** (`SELECT … FROM aux.someview` — the
-view body must resolve its tables in `aux`, which needs a read-path
-default-database context; qualified `CREATE VIEW` waits on this), and
-cross-database transactions.
+refinements: cross-database transactions (each attached file commits
+independently today).
 
 *Storage:*
 

@@ -21,10 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each source materialized through its own backend, with 3-part column names
   (`aux.tbl.col`) parsed; `WITHOUT ROWID` tables read cross-db too. Qualified
   `ALTER TABLE aux.t …` (ADD / RENAME COLUMN / RENAME TABLE),
-  `CREATE INDEX aux.idx ON t(…)`, and `CREATE TRIGGER aux.tr … ON t …` target
-  the attached database (stored bare-named, cross-engine verified; trigger
-  bodies' `NEW.col` left intact). (Cross-database view reads and transactions
-  are upcoming.)
+  `CREATE INDEX aux.idx ON t(…)`, `CREATE TRIGGER aux.tr … ON t …`, and
+  `CREATE VIEW aux.v AS …` target the attached database (stored bare-named,
+  cross-engine verified; trigger bodies' `NEW.col` left intact). Cross-database
+  **view reads** resolve the view body's unqualified tables (joins, subqueries,
+  nested views) in the view's own database. (Cross-database transactions are
+  upcoming.)
 - **Transaction & DDL state checks**: nested `BEGIN`, and `COMMIT`/`ROLLBACK`
   with no active transaction, are now rejected; `DROP` of a missing object
   reports lowercase "no such <kind>" with a table↔view hint; `ALTER … RENAME

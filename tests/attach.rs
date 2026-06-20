@@ -275,6 +275,118 @@ fn cross_database_create_index_file_cross_engine() {
 }
 
 #[test]
+fn cross_database_view() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE aux.t(a INT, b TEXT)").unwrap();
+    c.execute("INSERT INTO aux.t VALUES(1,'x'),(2,'y'),(3,'z')")
+        .unwrap();
+    c.execute("CREATE TABLE aux.u(a INT, n INT)").unwrap();
+    c.execute("INSERT INTO aux.u VALUES(2,20),(3,30)").unwrap();
+
+    // A view whose body resolves its (unqualified) tables in the attached db.
+    c.execute("CREATE VIEW aux.v AS SELECT a, b FROM t WHERE a > 1")
+        .unwrap();
+    assert_eq!(
+        c.query("SELECT * FROM aux.v ORDER BY a").unwrap().rows,
+        vec![
+            vec![Value::Integer(2), Value::Text("y".into())],
+            vec![Value::Integer(3), Value::Text("z".into())],
+        ]
+    );
+    // Stored bare-named.
+    assert_eq!(
+        c.query("SELECT sql FROM aux.sqlite_master WHERE name='v'")
+            .unwrap()
+            .rows[0][0],
+        Value::Text("CREATE VIEW v AS SELECT a, b FROM t WHERE a > 1".into())
+    );
+
+    // A view body containing a join (both tables in the attached db).
+    c.execute("CREATE VIEW aux.j AS SELECT t.b, u.n FROM t JOIN u ON t.a=u.a")
+        .unwrap();
+    assert_eq!(
+        c.query("SELECT * FROM aux.j ORDER BY n").unwrap().rows,
+        vec![
+            vec![Value::Text("y".into()), Value::Integer(20)],
+            vec![Value::Text("z".into()), Value::Integer(30)],
+        ]
+    );
+
+    // A subquery in the view body also resolves in the attached db.
+    c.execute("CREATE VIEW aux.s AS SELECT b FROM t WHERE a IN (SELECT a FROM u)")
+        .unwrap();
+    assert_eq!(
+        c.query("SELECT * FROM aux.s ORDER BY b").unwrap().rows,
+        vec![vec![Value::Text("y".into())], vec![Value::Text("z".into())]]
+    );
+
+    // The cross-db view used as a join source from a main table.
+    c.execute("CREATE TABLE main.m(a INT, tag TEXT)").unwrap();
+    c.execute("INSERT INTO main.m VALUES(2,'two'),(3,'three')")
+        .unwrap();
+    assert_eq!(
+        c.query("SELECT m.tag, aux.v.b FROM m JOIN aux.v ON m.a=aux.v.a ORDER BY m.a")
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Text("two".into()), Value::Text("y".into())],
+            vec![Value::Text("three".into()), Value::Text("z".into())],
+        ]
+    );
+
+    // A plain/TEMP view (unqualified) still lives in main and reads fine.
+    c.execute("CREATE TEMP VIEW tv AS SELECT 42").unwrap();
+    assert_eq!(
+        c.query("SELECT * FROM tv").unwrap().rows[0][0],
+        Value::Integer(42)
+    );
+}
+
+#[test]
+fn cross_database_view_file_cross_engine() {
+    let sqlite = std::process::Command::new("sqlite3")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !sqlite {
+        return;
+    }
+    let mut p = std::env::temp_dir();
+    p.push(format!("graphitesql-attach-view-{}.db", std::process::id()));
+    let path = p.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(&format!("ATTACH '{path}' AS d")).unwrap();
+        c.execute("CREATE TABLE d.t(a INT, b TEXT)").unwrap();
+        c.execute("INSERT INTO d.t VALUES(1,'x'),(2,'y')").unwrap();
+        c.execute("CREATE VIEW d.v AS SELECT b FROM t WHERE a=2")
+            .unwrap();
+    }
+    // graphite re-reads the view from the file...
+    {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(&format!("ATTACH '{path}' AS d")).unwrap();
+        assert_eq!(
+            c.query("SELECT * FROM d.v").unwrap().rows[0][0],
+            Value::Text("y".into())
+        );
+    }
+    // ...and so does sqlite3 (bare-named view SQL, integrity ok).
+    let out = std::process::Command::new("sqlite3")
+        .arg(&path)
+        .arg("PRAGMA integrity_check; SELECT b FROM v;")
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("ok"), "integrity: {s}");
+    assert!(s.contains('y'), "view under sqlite3: {s}");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+}
+
+#[test]
 fn cross_database_create_trigger() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("ATTACH ':memory:' AS aux").unwrap();

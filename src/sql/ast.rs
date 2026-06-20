@@ -544,6 +544,8 @@ pub struct CreateIndex {
 pub struct CreateView {
     /// `IF NOT EXISTS`?
     pub if_not_exists: bool,
+    /// Optional `schema.` (database) qualifier.
+    pub schema: Option<String>,
     /// View name.
     pub name: String,
     /// Optional explicit column names.
