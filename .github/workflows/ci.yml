@@ -77,6 +77,7 @@ jobs:
         run: |
           set -euo pipefail
           ver=3500400  # 3.50.4
+          mkdir -p "$HOME/.local/bin"
           curl -fsSL "https://www.sqlite.org/2025/sqlite-tools-linux-x64-${ver}.zip" -o /tmp/sqlite-tools.zip
           unzip -o -j /tmp/sqlite-tools.zip sqlite3 -d "$HOME/.local/bin"
           chmod +x "$HOME/.local/bin/sqlite3"
