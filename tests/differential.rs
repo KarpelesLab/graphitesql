@@ -385,6 +385,37 @@ fn corpus() -> Vec<String> {
     q.push("SELECT avg(a), avg(b) FROM t;".into());
     q.push("SELECT g, avg(a) FROM t GROUP BY g ORDER BY g;".into());
 
+    // 25) Planner seek paths over indexed columns (a, g, s) and the rowid:
+    // OR-of-seekables (same/different index), IN, multi-range, AND-in-OR. Each is
+    // also checked for `count(*)` to exercise the aggregate path over the seek.
+    let or_preds = [
+        "a = 10 OR a = 20",
+        "a = 10 OR g = 1",
+        "a < 5 OR a > 55",
+        "a IN (3, 7, 11) OR g = 2",
+        "id = 4 OR a = 30",
+        "g = 0 OR g = 2 OR a > 50",
+        "(a = 10 AND g = 0) OR a = 40",
+        "s = 'str1' OR s = 'str3'",
+        "id < 5 OR id > 25",
+        "a BETWEEN 10 AND 20 OR a BETWEEN 40 AND 50",
+    ];
+    for p in or_preds {
+        q.push(format!("SELECT id FROM t WHERE {p} ORDER BY id;"));
+        q.push(format!("SELECT count(*) FROM t WHERE {p};"));
+    }
+    // Range + IN seeks over the rowid and indexed columns, with extra predicates
+    // that must survive the superset re-filtering.
+    for p in [
+        "a >= 20 AND a <= 40 AND b IS NOT NULL",
+        "id IN (1, 5, 9, 13) AND g = 0",
+        "g IN (0, 1) AND a > 25",
+        "a > 30 AND s LIKE 'str%'",
+        "id BETWEEN 5 AND 15 AND a % 2 = 0",
+    ] {
+        q.push(format!("SELECT id FROM t WHERE {p} ORDER BY id;"));
+    }
+
     q
 }
 
