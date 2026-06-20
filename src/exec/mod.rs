@@ -5013,9 +5013,15 @@ impl Connection {
             // rows already emitted
         } else {
             let detail = if from.joins.is_empty() {
+                // `SELECT count(*)` answered by counting a full secondary index
+                // (B2b) reads as `USING COVERING INDEX`. Kept in lockstep with
+                // `run_core` via the shared `count_covering_index` helper.
+                if let Some((name, _)) = self.count_covering_index(sel) {
+                    alloc::format!("SCAN {label} USING COVERING INDEX {name}")
+                }
                 // A full index scanned to satisfy ORDER BY reads as `USING INDEX`,
                 // or `USING COVERING INDEX` when it holds every referenced column.
-                if let Some(s) = self.order_index_scan(sel) {
+                else if let Some(s) = self.order_index_scan(sel) {
                     let kind = if s.covering {
                         "COVERING INDEX"
                     } else {
@@ -6171,6 +6177,80 @@ impl Connection {
         sel.order_by.iter().all(|t| col_ok(&t.expr))
     }
 
+    /// `SELECT count(*) FROM <single rowid table>` can be answered by counting a
+    /// full secondary index's entries instead of scanning the table — a full,
+    /// non-partial index has exactly one entry per table row, and its b-tree is
+    /// usually smaller (B2b). This returns `Some((index name, root))` only in the
+    /// unambiguous case so execution and `EXPLAIN QUERY PLAN` agree:
+    ///
+    /// * the query is exactly one bare `count(*)` projection — no `WHERE`,
+    ///   `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY`, joins, subquery, or TVF;
+    /// * the source is an ordinary rowid table (not `WITHOUT ROWID`, view, or CTE);
+    /// * the table has **exactly one** full (non-partial, non-expression)
+    ///   secondary index, so the chosen name is unambiguous and matches sqlite.
+    ///
+    /// Zero or multiple such indexes → `None` (fall back to the plain `SCAN t`),
+    /// never guessing. Shared by `run_core` and `eqp_select`.
+    fn count_covering_index(&self, sel: &Select) -> Option<(String, u32)> {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let t = &from.first;
+        if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
+            return None;
+        }
+        if sel.where_clause.is_some()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || !sel.order_by.is_empty()
+        {
+            return None;
+        }
+        if window::has_window(sel) {
+            return None;
+        }
+        // The projection must be exactly a single bare `count(*)`.
+        if sel.columns.len() != 1 {
+            return None;
+        }
+        let ResultColumn::Expr { expr, .. } = &sel.columns[0] else {
+            return None;
+        };
+        match expr {
+            Expr::Function {
+                name,
+                distinct: false,
+                star: true,
+                filter: None,
+                over: None,
+                ..
+            } if name.eq_ignore_ascii_case("count") => {}
+            _ => return None,
+        }
+        // The source must be an ordinary rowid table (not a view or CTE).
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+        if meta.without_rowid {
+            return None;
+        }
+        // Exactly one full (non-partial, non-expression) secondary index.
+        let mut chosen: Option<(String, u32)> = None;
+        for idx in self.indexes_of(&t.name).ok()? {
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
+                continue;
+            }
+            if chosen.is_some() {
+                return None; // ambiguous: more than one candidate
+            }
+            chosen = Some((idx.name, idx.root));
+        }
+        chosen
+    }
+
     /// Whether a single-table scan already yields rows in the query's `ORDER BY`
     /// order (so `run_core` can skip the sort, reversing for `DESC`). Combines the
     /// rowid/IPK and secondary-index cases; shared with `eqp_access`.
@@ -6182,6 +6262,23 @@ impl Connection {
     }
 
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
+        // `SELECT count(*) FROM t` over a single rowid table with exactly one full
+        // secondary index counts that index's entries instead of scanning the
+        // table (B2b). Kept in lockstep with `eqp_select` via the shared
+        // `count_covering_index` helper so EQP reports `USING COVERING INDEX`.
+        if let Some((_, root)) = self.count_covering_index(sel) {
+            let mut cur = IndexCursor::new(self.backend.source(), root);
+            let mut n = 0i64;
+            while cur.next()?.is_some() {
+                n += 1;
+            }
+            let label = self.output_labels(sel, &[]).pop().unwrap_or_default();
+            return Ok(QueryResult {
+                columns: alloc::vec![label],
+                rows: alloc::vec![alloc::vec![Value::Integer(n)]],
+            });
+        }
+
         let (mut columns, input_rows) = self.scan_source(sel, params)?;
 
         // SQLite lets WHERE/GROUP BY/HAVING reference a SELECT-list alias, with a
