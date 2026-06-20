@@ -812,9 +812,29 @@ fn iso_week_date(p: &DateTime) -> (i32, i32) {
 
 // ---- printf / format --------------------------------------------------------
 
+/// Insert `,` thousands separators into the integer part of a formatted number,
+/// preserving a leading sign (`+`/`-`/space) and any fractional `.xxx` tail.
+fn group_thousands(s: &str) -> String {
+    let (sign, rest) = match s.strip_prefix(['+', '-', ' ']) {
+        Some(r) => (&s[..1], r),
+        None => ("", s),
+    };
+    let dot = rest.find('.').unwrap_or(rest.len());
+    let (int_part, frac) = rest.split_at(dot);
+    let n = int_part.len();
+    let mut grouped = String::with_capacity(n + n / 3);
+    for (idx, ch) in int_part.chars().enumerate() {
+        if idx > 0 && (n - idx) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    alloc::format!("{sign}{grouped}{frac}")
+}
+
 /// SQLite's `printf`/`format`: a subset of C `printf` conversions sufficient for
 /// the common cases (`%d %i %u %s %c %x %X %o %f %e %g %% %q %Q %w`), with width,
-/// left-justify, zero-pad, `+`, space, and precision flags.
+/// left-justify, zero-pad, `+`, space, `,` thousands-grouping, and precision flags.
 pub fn printf(args: &[Value]) -> Value {
     if args.is_empty() {
         return Value::Null;
@@ -848,6 +868,7 @@ pub fn printf(args: &[Value]) -> Value {
         let mut plus = false;
         let mut space = false;
         let mut alt = false;
+        let mut comma = false;
         loop {
             match bytes.get(i) {
                 Some('-') => left = true,
@@ -855,7 +876,8 @@ pub fn printf(args: &[Value]) -> Value {
                 Some('+') => plus = true,
                 Some(' ') => space = true,
                 Some('#') => alt = true,
-                Some(',') | Some('!') => {} // accepted, ignored
+                Some(',') => comma = true, // thousands grouping (SQLite extension)
+                Some('!') => {}            // accepted, ignored
                 _ => break,
             }
             i += 1;
@@ -899,6 +921,12 @@ pub fn printf(args: &[Value]) -> Value {
                 }
                 prec = Some(p);
             }
+        }
+        // The `l`/`ll` length modifiers are accepted and ignored (graphite
+        // formats integers as i64 regardless), matching SQLite, which supports
+        // `%ld`/`%lld` but not `%hd`.
+        while bytes.get(i) == Some(&'l') {
+            i += 1;
         }
         let Some(&conv) = bytes.get(i) else { break };
         i += 1;
@@ -992,6 +1020,12 @@ pub fn printf(args: &[Value]) -> Value {
             }
         };
         let _ = alt;
+        // The `,` flag groups the integer part of a decimal/float in threes.
+        let body = if comma && matches!(conv, 'd' | 'i' | 'f') {
+            group_thousands(&body)
+        } else {
+            body
+        };
         // apply width/justification
         let len = body.chars().count();
         if width > len {
