@@ -177,17 +177,35 @@ fn write_json_string(s: &str, out: &mut String) {
 /// Parse JSON text into a [`Json`], or `None` if it is not valid JSON (trailing
 /// non-whitespace also fails).
 pub fn parse(text: &str) -> Option<Json> {
+    parse_with_error_position(text).ok()
+}
+
+/// Parse JSON text, returning the value on success or, on failure, the 0-based
+/// byte offset of the first syntax error.
+///
+/// The offset is chosen to track the position the `sqlite3` CLI reports from
+/// `json_error_position(X)` (which is the 1-based form, i.e. this value + 1)
+/// for the common malformed-JSON shapes: truncated objects/arrays, missing
+/// separators, bad tokens in value position, and unterminated strings.
+pub fn parse_with_error_position(text: &str) -> Result<Json, usize> {
     let mut p = Parser {
         bytes: text.as_bytes(),
         pos: 0,
     };
     p.skip_ws();
+    // An empty or whitespace-only document has no value at all; sqlite3 reports
+    // position 1 (offset 0) here rather than the post-whitespace offset.
+    if p.peek().is_none() {
+        return Err(0);
+    }
     let v = p.value()?;
     p.skip_ws();
     if p.pos == p.bytes.len() {
-        Some(v)
+        Ok(v)
     } else {
-        None
+        // Trailing non-whitespace: report the start of the document, matching
+        // sqlite3's reporting for the common trailing-junk case.
+        Err(0)
     }
 }
 
@@ -201,6 +219,11 @@ impl Parser<'_> {
         self.bytes.get(self.pos).copied()
     }
 
+    /// The current position as a parse error.
+    fn err<T>(&self) -> Result<T, usize> {
+        Err(self.pos)
+    }
+
     fn skip_ws(&mut self) {
         while let Some(c) = self.peek() {
             if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
@@ -211,95 +234,115 @@ impl Parser<'_> {
         }
     }
 
-    fn value(&mut self) -> Option<Json> {
+    fn value(&mut self) -> Result<Json, usize> {
         self.skip_ws();
-        match self.peek()? {
-            b'{' => self.object(),
-            b'[' => self.array(),
-            b'"' => self.string().map(Json::Str),
-            b't' => self.literal("true", Json::Bool(true)),
-            b'f' => self.literal("false", Json::Bool(false)),
-            b'n' => self.literal("null", Json::Null),
-            b'-' | b'0'..=b'9' => self.number(),
-            _ => None,
+        match self.peek() {
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(b'"') => self.string().map(Json::Str),
+            Some(b't') => self.literal("true", Json::Bool(true)),
+            Some(b'f') => self.literal("false", Json::Bool(false)),
+            Some(b'n') => self.literal("null", Json::Null),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            _ => self.err(),
         }
     }
 
-    fn literal(&mut self, word: &str, val: Json) -> Option<Json> {
+    fn literal(&mut self, word: &str, val: Json) -> Result<Json, usize> {
         if self.bytes[self.pos..].starts_with(word.as_bytes()) {
             self.pos += word.len();
-            Some(val)
+            Ok(val)
         } else {
-            None
+            self.err()
         }
     }
 
-    fn object(&mut self) -> Option<Json> {
+    fn object(&mut self) -> Result<Json, usize> {
         self.pos += 1; // '{'
         let mut members = Vec::new();
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
-            return Some(Json::Object(members));
+            return Ok(Json::Object(members));
         }
         loop {
             self.skip_ws();
             if self.peek() != Some(b'"') {
-                return None;
+                // sqlite3 tolerates JSON5-style bare identifier keys, scanning
+                // the run of identifier bytes before failing; mirror its error
+                // position by skipping that run so we report its end.
+                self.skip_bare_key();
+                return self.err();
             }
             let key = self.string()?;
             self.skip_ws();
             if self.peek() != Some(b':') {
-                return None;
+                return self.err();
             }
             self.pos += 1;
             let val = self.value()?;
             members.push((key, val));
             self.skip_ws();
-            match self.peek()? {
-                b',' => self.pos += 1,
-                b'}' => {
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
                     self.pos += 1;
-                    return Some(Json::Object(members));
+                    return Ok(Json::Object(members));
                 }
-                _ => return None,
+                _ => return self.err(),
             }
         }
     }
 
-    fn array(&mut self) -> Option<Json> {
+    /// Advance over a run of bare-key identifier bytes (`A-Za-z0-9_$`), used only
+    /// to align the reported error position with sqlite3 when a key is missing.
+    fn skip_bare_key(&mut self) {
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn array(&mut self) -> Result<Json, usize> {
         self.pos += 1; // '['
         let mut items = Vec::new();
         self.skip_ws();
         if self.peek() == Some(b']') {
             self.pos += 1;
-            return Some(Json::Array(items));
+            return Ok(Json::Array(items));
         }
         loop {
             let val = self.value()?;
             items.push(val);
             self.skip_ws();
-            match self.peek()? {
-                b',' => self.pos += 1,
-                b']' => {
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
                     self.pos += 1;
-                    return Some(Json::Array(items));
+                    return Ok(Json::Array(items));
                 }
-                _ => return None,
+                _ => return self.err(),
             }
         }
     }
 
-    fn string(&mut self) -> Option<String> {
+    fn string(&mut self) -> Result<String, usize> {
         self.pos += 1; // opening quote
         let mut s = String::new();
         loop {
-            let c = self.peek()?;
+            let Some(c) = self.peek() else {
+                return self.err();
+            };
             self.pos += 1;
             match c {
-                b'"' => return Some(s),
+                b'"' => return Ok(s),
                 b'\\' => {
-                    let esc = self.peek()?;
+                    let Some(esc) = self.peek() else {
+                        return self.err();
+                    };
                     self.pos += 1;
                     match esc {
                         b'"' => s.push('"'),
@@ -320,18 +363,24 @@ impl Parser<'_> {
                                         self.pos += 1;
                                         let lo = self.hex4()?;
                                         let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                        s.push(char::from_u32(c)?);
+                                        match char::from_u32(c) {
+                                            Some(ch) => s.push(ch),
+                                            None => return self.err(),
+                                        }
                                     } else {
-                                        return None;
+                                        return self.err();
                                     }
                                 } else {
-                                    return None;
+                                    return self.err();
                                 }
                             } else {
-                                s.push(char::from_u32(cp)?);
+                                match char::from_u32(cp) {
+                                    Some(ch) => s.push(ch),
+                                    None => return self.err(),
+                                }
                             }
                         }
-                        _ => return None,
+                        _ => return self.err(),
                     }
                 }
                 // A raw multi-byte UTF-8 sequence: copy the bytes through.
@@ -340,25 +389,32 @@ impl Parser<'_> {
                     while self.peek().is_some_and(|b| b >= 0x80) {
                         self.pos += 1;
                     }
-                    s.push_str(core::str::from_utf8(&self.bytes[start..self.pos]).ok()?);
+                    match core::str::from_utf8(&self.bytes[start..self.pos]) {
+                        Ok(chunk) => s.push_str(chunk),
+                        Err(_) => return self.err(),
+                    }
                 }
                 c => s.push(c as char),
             }
         }
     }
 
-    fn hex4(&mut self) -> Option<u32> {
+    fn hex4(&mut self) -> Result<u32, usize> {
         let mut v = 0u32;
         for _ in 0..4 {
-            let c = self.peek()?;
-            let d = (c as char).to_digit(16)?;
+            let Some(c) = self.peek() else {
+                return self.err();
+            };
+            let Some(d) = (c as char).to_digit(16) else {
+                return self.err();
+            };
             v = v * 16 + d;
             self.pos += 1;
         }
-        Some(v)
+        Ok(v)
     }
 
-    fn number(&mut self) -> Option<Json> {
+    fn number(&mut self) -> Result<Json, usize> {
         let start = self.pos;
         if self.peek() == Some(b'-') {
             self.pos += 1;
@@ -374,13 +430,18 @@ impl Parser<'_> {
                 _ => break,
             }
         }
-        let tok = core::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
+        let Ok(tok) = core::str::from_utf8(&self.bytes[start..self.pos]) else {
+            return Err(start);
+        };
         if !is_real {
             if let Ok(i) = tok.parse::<i64>() {
-                return Some(Json::Int(i));
+                return Ok(Json::Int(i));
             }
         }
-        tok.parse::<f64>().ok().map(Json::Real)
+        match tok.parse::<f64>() {
+            Ok(r) => Ok(Json::Real(r)),
+            Err(_) => Err(start),
+        }
     }
 }
 
