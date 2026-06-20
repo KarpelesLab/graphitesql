@@ -61,6 +61,7 @@ pub mod pager;
 pub mod schema;
 pub mod sql;
 pub mod vfs;
+pub mod vtab;
 
 pub use error::{Error, Result};
 pub use exec::{Connection, QueryResult};
