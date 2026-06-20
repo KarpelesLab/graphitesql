@@ -90,6 +90,9 @@ pub struct WindowSpec {
     pub order_by: Vec<OrderTerm>,
     /// An explicit frame clause, if given (else the default frame applies).
     pub frame: Option<WindowFrame>,
+    /// For `OVER window_name`, the referenced named window (resolved against the
+    /// query's `WINDOW name AS (…)` definitions before computation).
+    pub base_name: Option<String>,
 }
 
 /// A window frame: a mode (`ROWS`/`RANGE`/`GROUPS`) and start/end bounds.
@@ -162,6 +165,8 @@ pub struct Select {
     pub group_by: Vec<Expr>,
     /// `HAVING` predicate.
     pub having: Option<Expr>,
+    /// `WINDOW name AS (spec)` named-window definitions.
+    pub window_defs: Vec<(String, WindowSpec)>,
     /// `ORDER BY` terms.
     pub order_by: Vec<OrderTerm>,
     /// `LIMIT` expression.

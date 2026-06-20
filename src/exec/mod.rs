@@ -3399,7 +3399,10 @@ impl Connection {
         let wins = window::collect_window_exprs(sel);
         let mut new_sel = sel.clone();
         for (k, wexpr) in wins.iter().enumerate() {
-            let values = self.compute_window(wexpr, columns, rows, params)?;
+            // Resolve `OVER name` against the query's WINDOW definitions, then
+            // compute with the resolved spec (but replace the original node).
+            let resolved = resolve_window_ref(wexpr, &sel.window_defs)?;
+            let values = self.compute_window(&resolved, columns, rows, params)?;
             let col_name = alloc::format!("__win{k}");
             columns.push(ColumnInfo {
                 name: col_name.clone(),
@@ -5113,6 +5116,51 @@ fn cmp_order(
 /// With no explicit frame: the whole partition when there is no `ORDER BY`, else
 /// `UNBOUNDED PRECEDING` through the current row's last peer — SQLite's default.
 /// `ROWS` frames use physical offsets; `RANGE`/`GROUPS` use peer-group offsets.
+/// Resolve a window function's `OVER name` (or `OVER (name …)`) reference against
+/// the query's `WINDOW name AS (…)` definitions, returning a clone of `wexpr`
+/// whose spec is the effective one. A spec with no `base_name` is returned as-is.
+fn resolve_window_ref(wexpr: &Expr, defs: &[(String, WindowSpec)]) -> Result<Expr> {
+    let Expr::Function {
+        name,
+        distinct,
+        args,
+        star,
+        filter,
+        over: Some(spec),
+    } = wexpr
+    else {
+        return Ok(wexpr.clone());
+    };
+    let Some(base) = &spec.base_name else {
+        return Ok(wexpr.clone());
+    };
+    let def = defs
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(base))
+        .map(|(_, s)| s)
+        .ok_or_else(|| Error::Error(alloc::format!("no such window: {base}")))?;
+    // The named window provides PARTITION BY; the referencing use may add ORDER BY
+    // and a frame when the base omits them.
+    let effective = WindowSpec {
+        partition_by: def.partition_by.clone(),
+        order_by: if spec.order_by.is_empty() {
+            def.order_by.clone()
+        } else {
+            spec.order_by.clone()
+        },
+        frame: spec.frame.clone().or_else(|| def.frame.clone()),
+        base_name: None,
+    };
+    Ok(Expr::Function {
+        name: name.clone(),
+        distinct: *distinct,
+        args: args.clone(),
+        star: *star,
+        filter: filter.clone(),
+        over: Some(effective),
+    })
+}
+
 fn frame_bounds(p: usize, m: usize, gid: &[usize], spec: &WindowSpec) -> (usize, usize) {
     let Some(frame) = &spec.frame else {
         if spec.order_by.is_empty() {

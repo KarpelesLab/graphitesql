@@ -390,6 +390,20 @@ impl Parser {
             }
         }
 
+        // `WINDOW name AS (spec), …` named-window definitions.
+        let mut window_defs = Vec::new();
+        if self.eat_kw("window") {
+            loop {
+                let name = self.ident()?;
+                self.expect_kw("as")?;
+                let spec = self.window_paren_spec()?;
+                window_defs.push((name, spec));
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+
         Ok(Select {
             ctes: Vec::new(),
             compound: Vec::new(),
@@ -399,6 +413,7 @@ impl Parser {
             where_clause,
             group_by,
             having,
+            window_defs,
             order_by: Vec::new(),
             limit: None,
             offset: None,
@@ -433,6 +448,7 @@ impl Parser {
                 where_clause: None,
                 group_by: Vec::new(),
                 having: None,
+                window_defs: Vec::new(),
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
@@ -1394,8 +1410,32 @@ impl Parser {
         if !self.eat_kw("over") {
             return Ok(None);
         }
+        // `OVER window_name` references a named window; `OVER (…)` is inline.
+        if !self.check(&Token::LParen) {
+            let name = self.ident()?;
+            return Ok(Some(WindowSpec {
+                base_name: Some(name),
+                ..WindowSpec::default()
+            }));
+        }
+        Ok(Some(self.window_paren_spec()?))
+    }
+
+    /// Parse a parenthesized window spec `( [name] [PARTITION BY …] [ORDER BY …]
+    /// [frame] )`. A leading bare name inherits a named window's spec.
+    fn window_paren_spec(&mut self) -> Result<WindowSpec> {
         self.expect(&Token::LParen)?;
         let mut spec = WindowSpec::default();
+        // An optional base window name (anything that isn't a clause keyword).
+        if let Some(Token::Word(w)) = self.peek() {
+            let lw = w.to_ascii_lowercase();
+            if !matches!(
+                lw.as_str(),
+                "partition" | "order" | "rows" | "range" | "groups"
+            ) {
+                spec.base_name = Some(self.ident()?);
+            }
+        }
         if self.eat_kw("partition") {
             self.expect_kw("by")?;
             spec.partition_by.push(self.expr()?);
@@ -1412,7 +1452,7 @@ impl Parser {
         }
         spec.frame = self.window_frame()?;
         self.expect(&Token::RParen)?;
-        Ok(Some(spec))
+        Ok(spec)
     }
 
     /// Parse an optional frame clause: `(ROWS|RANGE|GROUPS) (BETWEEN a AND b | a)`.
@@ -1724,6 +1764,7 @@ fn is_reserved_after_expr(w: &str) -> bool {
             | "union"
             | "intersect"
             | "except"
+            | "window"
     )
 }
 

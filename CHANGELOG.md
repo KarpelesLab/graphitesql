@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: named windows — `WINDOW w AS (…)` definitions with `OVER w` references
+  and `OVER (w ORDER BY …)` extension (a base window supplies `PARTITION BY`; the
+  use may add `ORDER BY`/frame). Verified against `sqlite3`.
 - Track C: introspection PRAGMAs — `index_list`, `index_info`,
   `foreign_key_list`, `foreign_key_check`, `freelist_count`, `application_id`,
   `data_version`. Output matches SQLite's column layout and ordering;

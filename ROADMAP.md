@@ -133,10 +133,10 @@ Make the dialect complete. Each item lands with a differential corpus addition.
 - ✅ **Row values** — `(a, b) = (c, d)`, `(a,b) < (c,d)`, `(a, b) IN ((…),(…))`,
   `(a,b) IN (SELECT …)`, and `VALUES` as a standalone statement / table source.
 - ✅ **`ORDER BY` modifiers** — `NULLS FIRST`/`NULLS LAST`; `IS [NOT] DISTINCT FROM`.
-- **Aggregate/window extras** — ✅ `FILTER (WHERE …)` on aggregates. *Remaining:*
-  the `WINDOW name AS (…)` clause and named-window reuse, frame `EXCLUDE`,
-  `percent_rank`/`cume_dist`, `GROUP_CONCAT` ordering, `FILTER` on window
-  functions, `count(DISTINCT …)` over windows.
+- **Aggregate/window extras** — ✅ `FILTER (WHERE …)` on aggregates and ✅ the
+  `WINDOW name AS (…)` clause with named-window reuse. *Remaining:* frame
+  `EXCLUDE`, `percent_rank`/`cume_dist`, `GROUP_CONCAT` ordering, `FILTER` on
+  window functions, `count(DISTINCT …)` over windows.
 - **Function library** — ✅ math functions (`sqrt`, `pow`, `ceil`, `floor`,
   `ln`/`log`, trig, …, pure-`core`, no libm) and ✅ **JSON** functions (`json`,
   `json_extract`, `json_array`/`json_object`, `json_type`, `json_array_length`,
