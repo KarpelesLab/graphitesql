@@ -156,11 +156,13 @@ validation.
   (`try_index_lookup`/`try_index_range`, `index_range_rowids`) to walk a `DESC`
   b-tree in the right direction. *Perf-only; acceptance: `EXPLAIN QUERY PLAN`
   shows the seek and results are unchanged.*
-- **A3 — partial/expression index use in the planner.** The planner scans for
-  these today; let the index chooser (`try_index_*` + `eqp_access` in lockstep)
-  use a *partial* index when the query's `WHERE` implies its predicate, and an
-  *expression* index when a `WHERE`/`ORDER BY` term matches the indexed
-  expression. Acceptance: `USING INDEX` in EQP + unchanged results.
+- ✅ **A3 — partial/expression index use in the planner (equality seeks).** Done
+  via a shared `partial_expr_seek` consulted by `try_index_lookup` + `eqp_access`
+  in lockstep: a *partial* index is used when its predicate is a top-level `AND`
+  conjunct of the `WHERE` (conjunct membership, not general implication); an
+  *expression* index when a conjunct is `<key_expr> = <const>` matching the
+  indexed expression. `SEARCH … USING INDEX` in EQP, results unchanged (superset
+  re-filtered). *Remaining:* range/IN seeks still skip these indexes.
 - **A4 — literal-left collation fallback.** A literal compared to a collated
   column/subquery (`'x' = nocase_col`, `'x' IN (SELECT nocase_col)`) should adopt
   the *right* side's collation when the left has none; also window-frame
