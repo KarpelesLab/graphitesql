@@ -123,10 +123,7 @@ struct AttachedDb {
     name: String,
     /// The file path it was attached from (empty for an in-memory attachment).
     file: String,
-    // Read once the executor becomes database-aware (C2/C3).
-    #[allow(dead_code)]
     backend: Backend,
-    #[allow(dead_code)]
     schema: Schema,
 }
 
@@ -5679,6 +5676,19 @@ impl Connection {
                 }],
             ));
         };
+        // Schema-qualified sources (`aux.t`): C3 reads a single attached table as
+        // the sole source by materializing it; cross-database joins are not yet
+        // wired (guard against silently resolving against `main`).
+        let any_qualified =
+            from.first.schema.is_some() || from.joins.iter().any(|j| j.table.schema.is_some());
+        if any_qualified && !from.joins.is_empty() {
+            return Err(Error::Unsupported("cross-database join"));
+        }
+        if from.joins.is_empty() && from.first.subquery.is_none() && from.first.tvf_args.is_none() {
+            if let Some(idx) = self.resolve_db(from.first.schema.as_deref())? {
+                return self.scan_db_table(idx, &from.first.name, from.first.alias.as_deref());
+            }
+        }
         // A table-valued function used as the sole source.
         if from.joins.is_empty() && from.first.tvf_args.is_some() {
             let (columns, rows) = self.tvf_rows(&from.first, params)?;
@@ -6305,6 +6315,54 @@ impl Connection {
         } else {
             Ok(self.scan_table(&meta)?.is_empty())
         }
+    }
+
+    /// Resolve a `schema.` qualifier to a database: `None`/`main` → the main
+    /// database (`Ok(None)`); an attached name → `Ok(Some(index))`; `temp` is not
+    /// yet implemented (C4); an unknown name is an error.
+    fn resolve_db(&self, schema: Option<&str>) -> Result<Option<usize>> {
+        match schema {
+            None => Ok(None),
+            Some(s) if s.eq_ignore_ascii_case("main") => Ok(None),
+            Some(s) if s.eq_ignore_ascii_case("temp") => Err(Error::Unsupported("temp database")),
+            Some(s) => self
+                .attached
+                .iter()
+                .position(|d| d.name.eq_ignore_ascii_case(s))
+                .map(Some)
+                .ok_or_else(|| Error::Error(alloc::format!("unknown database {s}"))),
+        }
+    }
+
+    /// Materialize a rowid table from attached database `db_idx` into
+    /// `(columns, rows)` — the cross-database read path (C3). Reads through the
+    /// attached database's own backend, so its page numbers resolve correctly.
+    fn scan_db_table(
+        &self,
+        db_idx: usize,
+        name: &str,
+        alias: Option<&str>,
+    ) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
+        let db = &self.attached[db_idx];
+        let meta = self.table_meta_in(&db.schema, name, alias)?;
+        if meta.without_rowid {
+            return Err(Error::Unsupported("cross-database WITHOUT ROWID table"));
+        }
+        let source = db.backend.source();
+        let encoding = source.header().text_encoding;
+        let mut rows = Vec::new();
+        let mut cur = TableCursor::new(source, meta.root);
+        let mut ok = cur.first()?;
+        while ok {
+            let rowid = cur.rowid()?;
+            let values = self.decode_full_row(&meta, rowid, &cur.payload()?, encoding)?;
+            rows.push(InputRow {
+                values,
+                rowid: Some(rowid),
+            });
+            ok = cur.next()?;
+        }
+        Ok((meta.columns, rows))
     }
 
     fn scan_table(&self, meta: &TableMeta) -> Result<Vec<(i64, Vec<Value>)>> {
@@ -6996,13 +7054,18 @@ impl Connection {
     }
 
     fn table_meta(&self, name: &str, alias: Option<&str>) -> Result<TableMeta> {
+        self.table_meta_in(&self.schema, name, alias)
+    }
+
+    /// Like [`table_meta`](Self::table_meta) but resolving `name` in an explicit
+    /// schema catalog (the `main` schema or an attached database's).
+    fn table_meta_in(&self, schema: &Schema, name: &str, alias: Option<&str>) -> Result<TableMeta> {
         // The schema catalog itself is queryable as `sqlite_schema` /
         // `sqlite_master` (a 5-column rowid table rooted at page 1).
         if is_main_schema_table(name) {
             return Ok(schema_table_meta(alias.unwrap_or(name)));
         }
-        let obj = self
-            .schema
+        let obj = schema
             .table(name)
             .ok_or_else(|| Error::Error(alloc::format!("no such table: {name}")))?;
         let sql = obj

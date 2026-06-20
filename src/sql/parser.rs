@@ -603,13 +603,20 @@ impl Parser {
             let alias = self.opt_alias()?;
             return Ok(TableRef {
                 name: String::new(),
+                schema: None,
                 alias,
                 subquery: Some(Box::new(select)),
                 index_hint: None,
                 tvf_args: None,
             });
         }
-        let name = self.ident()?;
+        // `[schema .] name` — a `.` qualifier names the database to resolve in.
+        let mut name = self.ident()?;
+        let mut schema = None;
+        if self.eat(&Token::Dot) {
+            schema = Some(name);
+            name = self.ident()?;
+        }
         // A table-valued function: `name(args)` as a FROM source.
         let tvf_args = if self.eat(&Token::LParen) {
             let mut args = Vec::new();
@@ -628,6 +635,7 @@ impl Parser {
         let index_hint = self.index_hint()?;
         Ok(TableRef {
             name,
+            schema,
             alias,
             subquery: None,
             index_hint,

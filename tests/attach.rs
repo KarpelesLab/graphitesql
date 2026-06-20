@@ -45,9 +45,21 @@ fn attach_and_detach_in_memory() {
     assert_eq!(
         r.rows,
         vec![
-            vec![Value::Integer(0), Value::Text("main".into()), Value::Text("".into())],
-            vec![Value::Integer(2), Value::Text("aux".into()), Value::Text("".into())],
-            vec![Value::Integer(3), Value::Text("aux2".into()), Value::Text("".into())],
+            vec![
+                Value::Integer(0),
+                Value::Text("main".into()),
+                Value::Text("".into())
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Text("aux".into()),
+                Value::Text("".into())
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Text("aux2".into()),
+                Value::Text("".into())
+            ],
         ]
     );
 
@@ -63,4 +75,24 @@ fn attach_and_detach_in_memory() {
     let r = c.query("PRAGMA database_list").unwrap();
     assert_eq!(r.rows.len(), 2); // main + aux2
     assert_eq!(r.rows[1][1], Value::Text("aux2".into()));
+}
+
+#[test]
+fn schema_qualified_read_main() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("INSERT INTO t VALUES(1,'x'),(2,'y')").unwrap();
+    // `main.t` resolves to the main database.
+    let r = c.query("SELECT a, b FROM main.t ORDER BY a").unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows[0][1], Value::Text("x".into()));
+    // A table-qualified alias works too.
+    assert_eq!(
+        c.query("SELECT m.b FROM main.t AS m WHERE m.a = 2").unwrap().rows[0][0],
+        Value::Text("y".into())
+    );
+    // Unknown database / cross-database join are clear errors (not silent).
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    assert!(c.query("SELECT * FROM zzz.t").is_err());
+    assert!(c.query("SELECT * FROM t, aux.t").is_err());
 }

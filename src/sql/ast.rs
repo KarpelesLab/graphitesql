@@ -234,6 +234,9 @@ pub struct FromClause {
 pub struct TableRef {
     /// The table name (empty when this source is a subquery).
     pub name: String,
+    /// A `schema.` qualifier (`FROM aux.t`), if any — the database to resolve
+    /// `name` in (`main`/`temp`/an attached database).
+    pub schema: Option<String>,
     /// An optional alias (`AS x` or bare `x`).
     pub alias: Option<String>,
     /// A derived-table subquery (`FROM (SELECT …) [AS] alias`), if any.
