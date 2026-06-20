@@ -623,6 +623,12 @@ impl Parser {
 
     fn opt_alias(&mut self) -> Result<Option<String>> {
         if self.eat_kw("as") {
+            // After AS the alias may be an identifier or a string literal.
+            if let Some(Token::Str(_)) = self.peek() {
+                if let Some(Token::Str(s)) = self.advance() {
+                    return Ok(Some(s));
+                }
+            }
             return Ok(Some(self.ident()?));
         }
         // A bare word that isn't a clause keyword can be an implicit alias.
@@ -632,6 +638,12 @@ impl Parser {
             }
         } else if let Some(Token::Ident(_)) = self.peek() {
             return Ok(Some(self.ident()?));
+        } else if let Some(Token::Str(_)) = self.peek() {
+            // SQLite accepts a string literal as an implicit alias, for a result
+            // column (`SELECT x 'name'`) or a table (`FROM t 'm'`).
+            if let Some(Token::Str(s)) = self.advance() {
+                return Ok(Some(s));
+            }
         }
         Ok(None)
     }
@@ -1982,19 +1994,23 @@ impl Parser {
         self.expect(&Token::LParen)?;
         let expr = Box::new(self.expr()?);
         self.expect_kw("as")?;
-        // A type name is one or more bare words, optionally followed by a size
+        // A type name is zero or more bare words, optionally followed by a size
         // suffix `(n[,m])` (e.g. `VARCHAR(10)`, `DECIMAL(10,2)`). Only the words
-        // matter for affinity; the size is parsed and ignored.
-        let mut type_name = self.ident()?;
-        while let Some(Token::Word(_)) = self.peek() {
-            type_name.push(' ');
-            type_name.push_str(&self.ident()?);
-        }
-        if self.eat(&Token::LParen) {
-            while !self.check(&Token::RParen) && !self.at_end() {
-                self.advance();
+        // matter for affinity; the size is parsed and ignored. An empty type name
+        // is allowed (`CAST(x AS)` — SQLite leaves the value unchanged).
+        let mut type_name = String::new();
+        if let Some(Token::Word(_)) = self.peek() {
+            type_name = self.ident()?;
+            while let Some(Token::Word(_)) = self.peek() {
+                type_name.push(' ');
+                type_name.push_str(&self.ident()?);
             }
-            self.expect(&Token::RParen)?;
+            if self.eat(&Token::LParen) {
+                while !self.check(&Token::RParen) && !self.at_end() {
+                    self.advance();
+                }
+                self.expect(&Token::RParen)?;
+            }
         }
         self.expect(&Token::RParen)?;
         Ok(Expr::Cast { expr, type_name })
