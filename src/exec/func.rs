@@ -62,6 +62,13 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
     // Functions whose NULL-handling is special are done before arg evaluation.
     match lname.as_str() {
         "coalesce" => {
+            // SQLite requires at least two arguments.
+            if args.len() < 2 {
+                return Err(Error::Error(alloc::format!(
+                    "wrong number of arguments to function coalesce() (want at least 2, got {})",
+                    args.len()
+                )));
+            }
             for a in args {
                 let v = eval::eval(a, ctx)?;
                 if !matches!(v, Value::Null) {
@@ -97,10 +104,12 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     Some(a) => Value::Integer(a),
                     None => return Err(Error::Error("integer overflow".into())),
                 },
-                Value::Real(r) => Value::Real(crate::util::float::abs(*r)),
+                // `+ 0.0` normalises a negative-zero result to `0.0`, matching
+                // SQLite (`abs(-0.0)` is `0.0`, not `-0.0`).
+                Value::Real(r) => Value::Real(crate::util::float::abs(*r) + 0.0),
                 // A text/blob argument is coerced to a real (SQLite gives
                 // `abs('5')` = 5.0, not 5).
-                other => Value::Real(crate::util::float::abs(eval::to_f64(other))),
+                other => Value::Real(crate::util::float::abs(eval::to_f64(other)) + 0.0),
             }
         }
         "length" => {
@@ -145,7 +154,12 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "typeof" => Value::Text(String::from(type_name(&v[0]))),
         "nullif" => {
             arity(&lname, args, 2)?;
-            if eval::compare(&v[0], &v[1]) == core::cmp::Ordering::Equal {
+            // The comparison follows the standard binary-comparison collation
+            // rule: an explicit `COLLATE` on either operand wins (left-preferred),
+            // else a column's declared collation, else BINARY — so
+            // `NULLIF('a','A' COLLATE NOCASE)` is NULL.
+            let coll = eval::resolve_collation(&args[0], &args[1], ctx);
+            if crate::value::cmp_values_coll(&v[0], &v[1], coll) == core::cmp::Ordering::Equal {
                 Value::Null
             } else {
                 v[0].clone()
@@ -156,8 +170,8 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "instr" => instr(&v)?,
         "replace" => replace(&v)?,
         "round" => round(&v)?,
-        "min" => scalar_min_max(&v, true),
-        "max" => scalar_min_max(&v, false),
+        "min" => scalar_min_max(&v, true)?,
+        "max" => scalar_min_max(&v, false)?,
         "hex" => Value::Text(hex_encode(&v[0])),
         "char" => char_fn(&v),
         "unicode" => match &v[0] {
@@ -221,6 +235,13 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "concat" => {
             // SQLite 3.44+: concatenate all args, treating NULL as empty.
+            // At least one argument is required.
+            if v.is_empty() {
+                return Err(Error::Error(
+                    "wrong number of arguments to function concat() (want at least 1, got 0)"
+                        .into(),
+                ));
+            }
             let mut s = String::new();
             for x in &v {
                 if !matches!(x, Value::Null) {
@@ -230,8 +251,12 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             Value::Text(s)
         }
         "concat_ws" => {
-            if v.is_empty() {
-                return Err(Error::Error("concat_ws() needs a separator".into()));
+            // A separator plus at least one value argument are required.
+            if v.len() < 2 {
+                return Err(Error::Error(alloc::format!(
+                    "wrong number of arguments to function concat_ws() (want at least 2, got {})",
+                    v.len()
+                )));
             }
             if matches!(v[0], Value::Null) {
                 Value::Null
@@ -251,10 +276,28 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             if v.len() < 2 || v.len() > 3 {
                 return Err(Error::Error("like() takes 2 or 3 arguments".into()));
             }
-            if v.iter().take(2).any(|x| matches!(x, Value::Null)) {
+            // A NULL escape, like a NULL pattern/text, yields NULL.
+            if v.iter().any(|x| matches!(x, Value::Null)) {
                 Value::Null
             } else {
-                let escape = v.get(2).map(eval::to_text).and_then(|s| s.chars().next());
+                // An explicit ESCAPE must be exactly one character (SQLite
+                // raises "ESCAPE expression must be a single character" for
+                // empty or multi-character escapes).
+                let escape = match v.get(2) {
+                    Some(e) => {
+                        let s = eval::to_text(e);
+                        let mut it = s.chars();
+                        match (it.next(), it.next()) {
+                            (Some(c), None) => Some(c),
+                            _ => {
+                                return Err(Error::Error(
+                                    "ESCAPE expression must be a single character".into(),
+                                ));
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 let m =
                     eval::like_match_escape(&eval::to_text(&v[0]), &eval::to_text(&v[1]), escape);
                 Value::Integer(m as i64)
@@ -834,30 +877,51 @@ fn substr(v: &[Value]) -> Result<Value> {
         eval::to_text(&v[0]).chars().collect()
     };
     let len = units.len() as i64;
-    // 1-based start; a negative start counts from the end. Unlike a naive clamp,
-    // SQLite keeps the requested window and only the positions in 1..=len are
-    // returned, so `substr('hello',0,3)` yields "he" (positions 0,1,2 → 1,2).
-    let mut start = eval::to_i64(&v[1]);
-    if start < 0 {
-        start += len + 1;
-    }
-    let (wstart, wend) = if v.len() == 3 {
-        let z = eval::to_i64(&v[2]);
-        if z < 0 {
-            (start + z, start)
-        } else {
-            (start, start + z)
+    // Faithful port of SQLite's `substrFunc` (src/func.c): `p1` is a 1-based
+    // start (negative counts from the end), `p2` a signed length (negative
+    // means "the |p2| units ending at p1"). The default `p2` for the 2-arg form
+    // is the LENGTH limit (1e9), which we clamp to `len` below. All arithmetic
+    // saturates so pathological i64 inputs (e.g. i64::MIN) cannot overflow,
+    // matching SQLite's behaviour where the window collapses to empty or the
+    // whole string.
+    let mut p1 = eval::to_i64(&v[1]);
+    let mut p2 = if v.len() == 3 {
+        // `substr(x, p1, NULL)` returns NULL (the length argument is required
+        // to be non-NULL to produce a value).
+        if matches!(v[2], Value::Null) {
+            return Ok(Value::Null);
         }
+        eval::to_i64(&v[2])
     } else {
-        (start, len + 1)
+        1_000_000_000
     };
-    let b = wstart.max(1);
-    let e = wend.min(len + 1);
-    let slice = if b >= e {
-        &[][..]
-    } else {
-        &units[(b - 1) as usize..(e - 1) as usize]
-    };
+    if p1 < 0 {
+        p1 = p1.saturating_add(len);
+        if p1 < 0 {
+            if p2 < 0 {
+                p2 = 0;
+            } else {
+                p2 = p2.saturating_add(p1);
+            }
+            p1 = 0;
+        }
+    } else if p1 > 0 {
+        p1 -= 1;
+    } else if p2 > 0 {
+        p2 -= 1;
+    }
+    if p2 < 0 {
+        if p2 < -p1 {
+            p2 = p1;
+        } else {
+            p2 = -p2;
+        }
+        p1 = p1.saturating_sub(p2);
+    }
+    // `p1 >= 0 && p2 >= 0` now holds. Clamp the window to the available units.
+    let start = (p1.max(0) as usize).min(units.len());
+    let take = (p2.max(0) as usize).min(units.len() - start);
+    let slice = &units[start..start + take];
     if blob {
         Ok(Value::Blob(slice.iter().map(|&c| c as u8).collect()))
     } else {
@@ -904,7 +968,8 @@ fn round(v: &[Value]) -> Result<Value> {
     if v.is_empty() || v.len() > 2 {
         return Err(Error::Error("round() takes 1 or 2 arguments".into()));
     }
-    if matches!(v[0], Value::Null) {
+    // A NULL value or NULL precision both yield NULL.
+    if matches!(v[0], Value::Null) || matches!(v.get(1), Some(Value::Null)) {
         return Ok(Value::Null);
     }
     let x = eval::to_f64(&v[0]);
@@ -913,7 +978,10 @@ fn round(v: &[Value]) -> Result<Value> {
     } else {
         0
     };
-    Ok(Value::Real(round_half_away(x, digits)))
+    let r = round_half_away(x, digits);
+    // SQLite normalises a negative-zero result to positive zero
+    // (`round(-0.4)` is `0.0`, not `-0.0`).
+    Ok(Value::Real(if r == 0.0 { 0.0 } else { r }))
 }
 
 /// Round `x` to `n` decimal places, half away from zero, matching SQLite. Instead
@@ -983,24 +1051,38 @@ pub(crate) fn round_half_away(x: f64, n: u32) -> f64 {
     }
 }
 
-fn scalar_min_max(v: &[Value], want_min: bool) -> Value {
-    // Scalar min()/max() with 2+ args; NULL if any arg is NULL.
-    if v.iter().any(|x| matches!(x, Value::Null)) {
-        return Value::Null;
+fn scalar_min_max(v: &[Value], want_min: bool) -> Result<Value> {
+    // Scalar min()/max() take 2+ args (the 1-arg/`*` forms are aggregates,
+    // routed elsewhere); 0 args is an error in SQLite.
+    if v.is_empty() {
+        let name = if want_min { "min" } else { "max" };
+        return Err(Error::Error(alloc::format!(
+            "wrong number of arguments to function {name}()"
+        )));
     }
+    // NULL if any arg is NULL.
+    if v.iter().any(|x| matches!(x, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    // Mirror SQLite's `minmaxFunc`: scan left-to-right keeping the best so far.
+    // For `min`, replace whenever `best >= candidate` (so on a tie the *later*
+    // argument wins — `min(1.0,1)` is the integer `1`); for `max`, replace only
+    // when `best < candidate` (so on a tie the *earlier* argument wins —
+    // `max(1.0,1)` is the real `1.0`). This preserves the storage class of the
+    // exact argument SQLite would return.
     let mut best = v[0].clone();
     for x in &v[1..] {
-        let ord = eval::compare(x, &best);
+        let ord = eval::compare(&best, x);
         let take = if want_min {
-            ord == core::cmp::Ordering::Less
+            ord != core::cmp::Ordering::Less
         } else {
-            ord == core::cmp::Ordering::Greater
+            ord == core::cmp::Ordering::Less
         };
         if take {
             best = x.clone();
         }
     }
-    best
+    Ok(best)
 }
 
 fn hex_encode(v: &Value) -> String {

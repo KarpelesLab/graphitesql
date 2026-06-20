@@ -385,7 +385,7 @@ pub fn compare_op(op: BinaryOp, l: &Value, r: &Value, coll: Collation) -> Value 
 /// Resolve the collating sequence of a binary comparison: an explicit `COLLATE`
 /// on the left, else on the right, else the left column's declared collation,
 /// else the right column's, else `BINARY`. (Mirrors SQLite's rules.)
-fn resolve_collation(left: &Expr, right: &Expr, ctx: &EvalCtx) -> Collation {
+pub(crate) fn resolve_collation(left: &Expr, right: &Expr, ctx: &EvalCtx) -> Collation {
     explicit_collation(left)
         .or_else(|| explicit_collation(right))
         .or_else(|| column_collation_of(left, ctx))
