@@ -168,12 +168,19 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 .map(|c| Value::Integer(c as i64))
                 .unwrap_or(Value::Null),
         },
-        "iif" => {
-            arity(&lname, args, 3)?;
+        // `if` is SQLite's alias for `iif`. Both take 2 or 3 arguments: the
+        // 2-argument form yields NULL when the condition is not true.
+        "iif" | "if" => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err(Error::Error(alloc::format!(
+                    "wrong number of arguments to function {lname}() (want 2 or 3, got {})",
+                    args.len()
+                )));
+            }
             if eval::truth(&v[0]) == Some(true) {
                 v[1].clone()
             } else {
-                v[2].clone()
+                v.get(2).cloned().unwrap_or(Value::Null)
             }
         }
         "zeroblob" => {

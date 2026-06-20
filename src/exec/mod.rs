@@ -6507,9 +6507,11 @@ impl Connection {
                     let rl = jcols.iter().position(|c| c.name.eq_ignore_ascii_case(name));
                     match (li, rl) {
                         (Some(li), Some(rl)) => v.push((li, rl)),
-                        _ => return Err(Error::Error(format!(
+                        _ => {
+                            return Err(Error::Error(format!(
                             "cannot join using column {name} - column not present in both tables"
-                        ))),
+                        )))
+                        }
                     }
                 }
                 v

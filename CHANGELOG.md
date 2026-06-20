@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **`if(...)`** is now accepted as SQLite's alias for `iif(...)`, and both
+  accept the 2-argument form (`if(cond, x)` -> `x` or NULL).
 - Fix: **`NATURAL JOIN` and `JOIN … USING (…)`** now work. `NATURAL` was parsed
   as a table alias (`FROM t AS natural JOIN …`), silently turning a natural join
   into a cross join with wrong results; both forms now join on equality of the

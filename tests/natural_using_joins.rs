@@ -7,7 +7,8 @@ use graphitesql::{Connection, Value};
 
 fn setup() -> Connection {
     let mut c = Connection::open_memory().unwrap();
-    c.execute("CREATE TABLE e(id INT, name TEXT, dept INT)").unwrap();
+    c.execute("CREATE TABLE e(id INT, name TEXT, dept INT)")
+        .unwrap();
     c.execute("CREATE TABLE d(dept INT, dname TEXT)").unwrap();
     c.execute("INSERT INTO e VALUES(1,'a',10),(2,'b',20),(3,'c',99)")
         .unwrap();
@@ -90,7 +91,8 @@ fn natural_self_join_is_not_a_cross_join() {
     // cross join. A self natural join matches each row only with itself.
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a INT, b INT)").unwrap();
-    c.execute("INSERT INTO t VALUES(1,10),(2,20),(1,99)").unwrap();
+    c.execute("INSERT INTO t VALUES(1,10),(2,20),(1,99)")
+        .unwrap();
     assert_eq!(
         rows(&c, "SELECT count(*) FROM t NATURAL JOIN t")[0][0],
         Value::Integer(3)
