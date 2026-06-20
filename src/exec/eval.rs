@@ -744,7 +744,12 @@ fn eval_unary(op: UnaryOp, v: Value) -> Result<Value> {
     Ok(match op {
         UnaryOp::Identity => v,
         UnaryOp::Negate => match to_number(&v) {
-            Value::Integer(i) => Value::Integer(i.wrapping_neg()),
+            // Negating `i64::MIN` overflows; SQLite promotes it to a real
+            // (`-(-9223372036854775808)` -> 9.22e18), so fall back to f64.
+            Value::Integer(i) => i
+                .checked_neg()
+                .map(Value::Integer)
+                .unwrap_or(Value::Real(-(i as f64))),
             Value::Real(r) => Value::Real(-r),
             _ => Value::Null,
         },
@@ -888,9 +893,20 @@ fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 Value::Null
             } else {
-                let mut s = to_text(&l);
-                s.push_str(&to_text(&r));
-                Value::Text(s)
+                // SQLite's `||` concatenates the *raw bytes* of each operand's
+                // text representation (a blob contributes its bytes verbatim, a
+                // number its decimal text), yielding a value whose storage class
+                // is text. Because graphitesql models `Value::Text` as UTF-8, a
+                // result holding non-UTF-8 bytes (e.g. `x'00' || x'ff'` ->
+                // `00FF`) is returned as a `Value::Blob` so the exact bytes are
+                // preserved; a UTF-8-valid result stays text, matching SQLite's
+                // `typeof` in the common case.
+                let mut bytes = text_bytes(&l);
+                bytes.extend_from_slice(&text_bytes(&r));
+                match String::from_utf8(bytes) {
+                    Ok(s) => Value::Text(s),
+                    Err(e) => Value::Blob(e.into_bytes()),
+                }
             }
         }
         BitAnd | BitOr | LShift | RShift => {
@@ -962,13 +978,19 @@ fn arithmetic(op: BinaryOp, l: Value, r: Value) -> Value {
                 if b == 0 {
                     Value::Null
                 } else {
-                    Value::Integer(a.wrapping_div(b))
+                    // `i64::MIN / -1` overflows i64; SQLite promotes it to a
+                    // real (9.22e18). Every other quotient stays integer.
+                    a.checked_div(b)
+                        .map(Value::Integer)
+                        .unwrap_or(Value::Real(a as f64 / b as f64))
                 }
             }
             Mod => {
                 if b == 0 {
                     Value::Null
                 } else {
+                    // `i64::MIN % -1` overflows in plain `%`; the true remainder
+                    // is 0. `wrapping_rem` already yields 0 here.
                     Value::Integer(a.wrapping_rem(b))
                 }
             }
@@ -1024,7 +1046,11 @@ fn shift_left(a: i64, b: i64) -> i64 {
 }
 
 fn shift_right(a: i64, b: i64) -> i64 {
-    if b < 0 {
+    if b <= -64 {
+        // A right shift by a magnitude >= 64 is a left shift off the top: 0.
+        // (Guards against `-b` overflowing when `b == i64::MIN`.)
+        0
+    } else if b < 0 {
         shift_left(a, -b)
     } else if b >= 64 {
         if a < 0 {
@@ -1262,6 +1288,17 @@ pub fn to_f64(v: &Value) -> f64 {
     number_as_f64(&to_number(v))
 }
 
+/// The raw bytes of a value's text representation, used by `||`. A blob
+/// contributes its bytes verbatim (no UTF-8 coercion); every other class
+/// contributes the bytes of its [`to_text`] form. Unlike `to_text(..).into_bytes()`
+/// this never mangles a non-UTF-8 blob through lossy decoding.
+fn text_bytes(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Blob(b) => b.clone(),
+        other => to_text(other).into_bytes(),
+    }
+}
+
 /// Render a value as text (for `||`, CAST to TEXT, etc.).
 pub fn to_text(v: &Value) -> String {
     match v {
@@ -1427,6 +1464,15 @@ fn glob_rec(p: &[char], t: &[char]) -> bool {
                 i += 1;
             }
             let mut matched = false;
+            // A `]` as the very first class member (right after `[` or `[^`) is a
+            // literal `]`, not the terminator — matching SQLite/GLOB semantics:
+            // `'a]c' GLOB 'a[]]c'` is true, and `'x' GLOB '[^]]'` is true.
+            if i < p.len() && p[i] == ']' {
+                if t[0] == ']' {
+                    matched = true;
+                }
+                i += 1;
+            }
             while i < p.len() && p[i] != ']' {
                 if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
                     if t[0] >= p[i] && t[0] <= p[i + 2] {
@@ -1452,6 +1498,7 @@ fn glob_rec(p: &[char], t: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn comparison_class_order() {
@@ -1480,6 +1527,60 @@ mod tests {
         assert!(glob_match("a*", "apple"));
         assert!(glob_match("a[pq]ple", "apple"));
         assert!(!glob_match("A*", "apple")); // case-sensitive
+                                             // A `]` as the first class member is literal, not the terminator.
+        assert!(glob_match("a[]]c", "a]c"));
+        assert!(glob_match("[]]", "]"));
+        assert!(glob_match("[^]]", "x"));
+        assert!(!glob_match("[^]]", "]"));
+        assert!(glob_match("[]a]", "a"));
+        assert!(!glob_match("[^]a]", "a"));
+    }
+
+    #[test]
+    fn concat_preserves_blob_bytes() {
+        // `||` joins raw bytes; a non-UTF-8 result is returned as a blob so the
+        // exact bytes survive (sqlite stores it as text, same bytes).
+        assert_eq!(
+            eval_binary(
+                BinaryOp::Concat,
+                Value::Blob(vec![0x00]),
+                Value::Blob(vec![0xff])
+            )
+            .unwrap(),
+            Value::Blob(vec![0x00, 0xff])
+        );
+        // A UTF-8-valid result stays text.
+        assert_eq!(
+            eval_binary(
+                BinaryOp::Concat,
+                Value::Blob(vec![0x61]),
+                Value::Text("b".into())
+            )
+            .unwrap(),
+            Value::Text("ab".into())
+        );
+    }
+
+    #[test]
+    fn shift_and_negate_overflow_do_not_panic() {
+        // Extreme shift magnitudes saturate to 0 / sign-fill, never panic.
+        assert_eq!(shift_right(-1, i64::MIN), 0);
+        assert_eq!(shift_left(1, i64::MIN), 0);
+        assert_eq!(shift_right(1, i64::MIN), 0);
+        // -(i64::MIN) overflows i64 -> promotes to real.
+        assert_eq!(
+            eval_unary(UnaryOp::Negate, Value::Integer(i64::MIN)).unwrap(),
+            Value::Real(-(i64::MIN as f64))
+        );
+        // i64::MIN / -1 overflows -> real; remainder is 0.
+        assert_eq!(
+            arithmetic(BinaryOp::Div, Value::Integer(i64::MIN), Value::Integer(-1)),
+            Value::Real(i64::MIN as f64 / -1.0)
+        );
+        assert_eq!(
+            arithmetic(BinaryOp::Mod, Value::Integer(i64::MIN), Value::Integer(-1)),
+            Value::Integer(0)
+        );
     }
 
     #[test]
