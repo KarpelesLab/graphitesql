@@ -1164,6 +1164,33 @@ impl Connection {
                 }
             }
         }
+        // SQLite forbids subqueries in CHECK constraints and generated columns.
+        for c in &ct.columns {
+            for k in &c.constraints {
+                match k {
+                    ColumnConstraint::Check(e) if expr_has_subquery(e) => {
+                        return Err(Error::Error(
+                            "subqueries prohibited in CHECK constraints".into(),
+                        ));
+                    }
+                    ColumnConstraint::Generated { expr, .. } if expr_has_subquery(expr) => {
+                        return Err(Error::Error(
+                            "subqueries prohibited in generated columns".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for tc in &ct.constraints {
+            if let TableConstraint::Check(e) = tc {
+                if expr_has_subquery(e) {
+                    return Err(Error::Error(
+                        "subqueries prohibited in CHECK constraints".into(),
+                    ));
+                }
+            }
+        }
         // A WITHOUT ROWID table is stored as a PK-clustered index b-tree; an
         // ordinary table uses a rowid table b-tree.
         let root = if ct.without_rowid {
@@ -6660,6 +6687,22 @@ struct TableMeta {
     /// (aligned with `columns`); `None` for an ordinary table. Drives write-time
     /// type checking.
     strict_types: Option<Vec<(StrictType, String)>>,
+}
+
+/// Whether `e` contains a subquery (scalar `(SELECT …)`, `EXISTS`, or `IN
+/// (SELECT …)`) anywhere — SQLite forbids these in CHECK constraints and
+/// generated-column expressions.
+fn expr_has_subquery(e: &Expr) -> bool {
+    let mut found = false;
+    window::visit(e, &mut |n| {
+        if matches!(
+            n,
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. }
+        ) {
+            found = true;
+        }
+    });
+    found
 }
 
 /// The rigid column type of a `STRICT` table column.
