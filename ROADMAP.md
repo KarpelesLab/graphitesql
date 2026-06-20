@@ -144,10 +144,10 @@ Make the dialect complete. Each item lands with a differential corpus addition.
   `json_set`/`json_insert`/`json_replace`/`json_remove`/`json_patch` mutators).
   *Remaining:* `json_each`/`json_tree` (table-valued — depends on Track D) and
   remaining string/blob built-ins. *Ref:* `func.c`, `math.c`, `json.c`.
-- **Indexing breadth** — ✅ partial indexes (`CREATE INDEX … WHERE`) and ✅
-  expression indexes (`CREATE INDEX … (lower(x))`). *Remaining:* `DESC` index
-  columns honored in seeks, partial/expression-index use in the planner (currently
-  scan-only), UNIQUE expression indexes, and `INDEXED BY` / `NOT INDEXED` hints.
+- **Indexing breadth** — ✅ partial indexes (`CREATE INDEX … WHERE`), ✅
+  expression indexes (`CREATE INDEX … (lower(x))`), ✅ `INDEXED BY` / `NOT INDEXED`
+  hints. *Remaining:* `DESC` index columns honored in seeks, partial/expression-
+  index use in the planner (currently scan-only), UNIQUE expression indexes.
 
 ### Track B — Query planner, statistics & the VDBE
 

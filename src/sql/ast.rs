@@ -209,6 +209,17 @@ pub struct TableRef {
     pub alias: Option<String>,
     /// A derived-table subquery (`FROM (SELECT …) [AS] alias`), if any.
     pub subquery: Option<Box<Select>>,
+    /// `INDEXED BY name` / `NOT INDEXED` query-planner hint, if given.
+    pub index_hint: Option<IndexHint>,
+}
+
+/// A `FROM` table's index hint.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexHint {
+    /// `NOT INDEXED` — forbid using any index for this table (force a scan).
+    NotIndexed,
+    /// `INDEXED BY name` — require that the named index be used.
+    IndexedBy(String),
 }
 
 /// The kind of join.

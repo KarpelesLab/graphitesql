@@ -545,15 +545,31 @@ impl Parser {
                 name: String::new(),
                 alias,
                 subquery: Some(Box::new(select)),
+                index_hint: None,
             });
         }
         let name = self.ident()?;
         let alias = self.opt_alias()?;
+        let index_hint = self.index_hint()?;
         Ok(TableRef {
             name,
             alias,
             subquery: None,
+            index_hint,
         })
+    }
+
+    /// Parse an optional `INDEXED BY name` / `NOT INDEXED` hint after a table.
+    fn index_hint(&mut self) -> Result<Option<IndexHint>> {
+        if self.eat_kw("indexed") {
+            self.expect_kw("by")?;
+            return Ok(Some(IndexHint::IndexedBy(self.ident()?)));
+        }
+        if self.eat_kw("not") {
+            self.expect_kw("indexed")?;
+            return Ok(Some(IndexHint::NotIndexed));
+        }
+        Ok(None)
     }
 
     fn order_term(&mut self) -> Result<OrderTerm> {
@@ -1776,6 +1792,8 @@ fn is_reserved_after_expr(w: &str) -> bool {
             | "intersect"
             | "except"
             | "window"
+            | "indexed"
+            | "not"
     )
 }
 

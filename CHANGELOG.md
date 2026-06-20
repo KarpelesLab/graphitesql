@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: `INDEXED BY name` / `NOT INDEXED` query hints. `NOT INDEXED` forces a
+  table scan; `INDEXED BY` restricts the planner to the named index (and errors if
+  it does not exist). Results are identical to the unhinted query. Verified.
 - Track A: ordered aggregates — `group_concat(x ORDER BY y [DESC])` (and any
   aggregate with an inner `ORDER BY`) sorts the group's rows before folding,
   honoring `DESC`/`NULLS` and collation. Verified against `sqlite3`.

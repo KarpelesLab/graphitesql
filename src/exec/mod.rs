@@ -2881,6 +2881,12 @@ impl Connection {
         let Some(where_expr) = &sel.where_clause else {
             return Ok(None);
         };
+        // `NOT INDEXED` forbids any index for this table; `INDEXED BY name`
+        // restricts to one named index (validated below).
+        let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
+        if matches!(hint, Some(IndexHint::NotIndexed)) {
+            return Ok(None);
+        }
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
         if eqs.is_empty() || eqs.iter().any(|(_, v)| matches!(v, Value::Null)) {
@@ -2891,20 +2897,24 @@ impl Connection {
         // by rowid. run_core re-applies the full WHERE, so returning the single
         // candidate row is a valid superset even when the literal isn't an exact
         // integer (e.g. `id = 5.5` seeks rowid 5, then gets filtered out).
-        if let Some(ipk) = meta.ipk {
-            if let Some((_, v)) = eqs.iter().find(|(c, _)| *c == ipk) {
-                let rid = eval::to_i64(v);
-                let encoding = self.backend.source().header().text_encoding;
-                let mut cur = TableCursor::new(self.backend.source(), meta.root);
-                let mut out = Vec::new();
-                if cur.seek(rid)? {
-                    let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
-                    out.push(InputRow {
-                        values,
-                        rowid: Some(rid),
-                    });
+        // The rowid (INTEGER PRIMARY KEY) is not a named index, so `INDEXED BY`
+        // forbids this fast path.
+        if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
+            if let Some(ipk) = meta.ipk {
+                if let Some((_, v)) = eqs.iter().find(|(c, _)| *c == ipk) {
+                    let rid = eval::to_i64(v);
+                    let encoding = self.backend.source().header().text_encoding;
+                    let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                    let mut out = Vec::new();
+                    if cur.seek(rid)? {
+                        let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                        out.push(InputRow {
+                            values,
+                            rowid: Some(rid),
+                        });
+                    }
+                    return Ok(Some(out));
                 }
-                return Ok(Some(out));
             }
         }
 
@@ -2913,9 +2923,21 @@ impl Connection {
         // With `ANALYZE` statistics we pick the most selective (fewest estimated
         // rows); absent stats we fall back to the longest matched prefix.
         let indexes = self.indexes_of(table_name)?;
+        // `INDEXED BY name` must name a real index of this table.
+        if let Some(IndexHint::IndexedBy(n)) = hint {
+            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
+                return Err(Error::Error(alloc::format!("no such index: {n}")));
+            }
+        }
         let stats = self.stat1_map();
         let mut best: Option<(u32, Vec<Value>, Vec<crate::value::Collation>, u64)> = None;
         for idx in &indexes {
+            // Honor `INDEXED BY`: consider only the named index.
+            if let Some(IndexHint::IndexedBy(n)) = hint {
+                if !idx.name.eq_ignore_ascii_case(n) {
+                    continue;
+                }
+            }
             // A partial index covers only some rows; an expression index is keyed
             // by computed values, not columns. Neither is used for a plain
             // column-equality seek — leave those to the table scan.
