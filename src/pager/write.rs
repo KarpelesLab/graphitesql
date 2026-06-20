@@ -199,7 +199,15 @@ impl WritePager {
     }
 
     /// The database header (reflects in-transaction changes once committed).
+    /// Touching it marks page 1 dirty so a header-only change (e.g.
+    /// `PRAGMA user_version=…`) is still flushed by `commit`, which otherwise
+    /// short-circuits when no pages changed.
     pub fn header_mut(&mut self) -> &mut DatabaseHeader {
+        if !self.overlay.contains_key(&1) {
+            if let Ok(p) = self.read_page(1) {
+                self.overlay.insert(1, p);
+            }
+        }
         &mut self.header
     }
 

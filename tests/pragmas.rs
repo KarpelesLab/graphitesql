@@ -134,3 +134,40 @@ fn against_sqlite3() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn writable_user_version_and_application_id_persist() {
+    let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    let path = std::env::temp_dir().join(format!("gsql-uv-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE TABLE t(a)").unwrap();
+        c.execute("PRAGMA user_version = 42").unwrap();
+        c.execute("PRAGMA application_id = 0x1234").unwrap();
+        assert_eq!(
+            c.query("PRAGMA user_version").unwrap().rows[0][0],
+            Value::Integer(42)
+        );
+        c.execute("PRAGMA user_version = -5").unwrap();
+        assert_eq!(
+            c.query("PRAGMA user_version").unwrap().rows[0][0],
+            Value::Integer(-5) // reported signed
+        );
+        c.execute("PRAGMA user_version = 100").unwrap();
+    }
+    if sqlite {
+        // Re-read the graphite-written file with real sqlite3.
+        let out = Command::new("sqlite3")
+            .arg(&path)
+            .arg("PRAGMA user_version; PRAGMA application_id; PRAGMA integrity_check;")
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("100"), "user_version not persisted: {s}");
+        assert!(s.contains("4660"), "application_id not persisted: {s}"); // 0x1234
+        assert!(s.contains("ok"));
+    }
+    let _ = std::fs::remove_file(&path);
+}

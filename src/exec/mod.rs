@@ -321,8 +321,9 @@ impl Connection {
                 Value::Integer(self.backend.source().page_count() as i64),
             )),
             "user_version" => Ok(single(
+                // Stored as a 32-bit value; SQLite reports it signed.
                 "user_version",
-                Value::Integer(header.user_version as i64),
+                Value::Integer(header.user_version as i32 as i64),
             )),
             "schema_version" => Ok(single(
                 "schema_version",
@@ -345,7 +346,7 @@ impl Connection {
             )),
             "application_id" => Ok(single(
                 "application_id",
-                Value::Integer(header.application_id as i64),
+                Value::Integer(header.application_id as i32 as i64),
             )),
             "data_version" => Ok(single("data_version", Value::Integer(1))),
             "table_info" => self.pragma_table_info(p, false),
@@ -1296,6 +1297,16 @@ impl Connection {
             }
         } else if p.name.eq_ignore_ascii_case("wal_checkpoint") {
             self.backend.writer()?.checkpoint()?;
+        } else if p.name.eq_ignore_ascii_case("user_version") {
+            if let Some(e) = &p.value {
+                let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?) as u32;
+                self.backend.writer()?.header_mut().user_version = v;
+            }
+        } else if p.name.eq_ignore_ascii_case("application_id") {
+            if let Some(e) = &p.value {
+                let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?) as u32;
+                self.backend.writer()?.header_mut().application_id = v;
+            }
         }
         Ok(())
     }
