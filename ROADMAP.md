@@ -106,8 +106,10 @@ sources; **window functions** (`ROWS`/`RANGE`/`GROUPS`, `EXCLUDE`, `FILTER`,
 named windows); `INSERT … SELECT`, `UPDATE … FROM`, `UPDATE OR
 IGNORE/REPLACE/…`, UPSERT, `RETURNING`, row values, `STRICT` tables, generated
 columns; a broad scalar/aggregate function library incl. **date/time**
-(+ `CURRENT_DATE`/`TIME`/`TIMESTAMP`), `printf`/`format`, **JSON** (`json_*`,
-`json_group_array`/`object`, `json_pretty`, `json_each`/`json_tree`), `iif`/`if`,
+(+ `CURRENT_DATE`/`TIME`/`TIMESTAMP`, `timediff`), `printf`/`format`, **JSON**
+(`json_*`, `json_group_array`/`object`, `json_pretty`, `json_each`/`json_tree`,
+**JSON5 input** with strict `json_valid`), **virtual tables**
+(`CREATE VIRTUAL TABLE … USING module`), `iif`/`if`,
 `sqlite_version`, math (pure-`core`); **type affinity** and SQLite-exact real
 formatting; collation (`BINARY`/`NOCASE`/`RTRIM`) honored across comparisons,
 `IN`/`BETWEEN`/`CASE`, `min`/`max`, set ops,
@@ -173,10 +175,13 @@ validation.
   across 2000+ randomized pairs + edge cases.
 - ✅ **A6 — `json_error_position(X)`.** Done: `parse_with_error_position` threads
   the failing byte offset out; the function maps `Ok`→0, `Err(off)`→`off+1`,
-  NULL→NULL. Matches sqlite3 on well-formed JSON + common structural errors.
-  *Remaining edge:* JSON5 inputs sqlite accepts (unquoted keys, trailing commas)
-  diverge — graphite's JSON parser is strict RFC-8259 (a broader gap than this
-  function).
+  NULL→NULL. Matches sqlite3.
+- ✅ **JSON5 input.** The JSON functions now accept the JSON5 superset sqlite
+  takes (unquoted keys, single quotes, trailing commas, comments, hex/`Infinity`/
+  `NaN`, JSON5 escapes); canonical output stays strict minified JSON.
+  `json_valid(X)` validates strict RFC-8259 (via a separate `is_strict_json`),
+  matching sqlite's 1-arg behavior. *(Minor residual: a couple of JSON5-only
+  escapes re-serialize in a different style — values identical.)*
 - **A7 — multi-statement `execute_batch(sql)`.** A new API that runs a
   `;`-separated script (like `sqlite3_exec`). Needs a statement splitter aware
   that trigger bodies (`BEGIN … END`) and `CASE … END` contain inner `;` — track
@@ -417,24 +422,26 @@ on contents**, not byte-identical independently-built databases.
 
 ## 7. Immediate next steps
 
-Breadth (Track A) and the multi-schema track (C1–C5) are done. Suggested order,
-cheapest-and-highest-leverage first:
+Done so far: Track A breadth (incl. `timediff`, `json_error_position`, JSON5),
+the full multi-schema track, the planner's index-driven `ORDER BY`/covering
+reads (B0/B2/B2b) and inner-join seeks (B1a/B1a²), partial/expression-index use
+(A3), the virtual-table interface (D1a/D1b), the `auto_vacuum` empty-db header
+(C6b-1), and the corruption-robustness fuzz harness. Suggested next order:
 
-1. **Quick wins** — clear the small, self-contained gaps: **A5** (`timediff`),
-   **A6** (`json_error_position`), **A7** (`execute_batch`), **C-ms1**
-   (`CREATE TEMP INDEX/VIEW/TRIGGER`). Each is one function/clause with a direct
-   differential test.
-2. **B1a: seek the inner table of a join** — the highest-value planner win and
-   the next concrete EQP gap; then **B2b** (covering on seeks + `count(*)`),
-   **B0b** (remaining `ORDER BY`/`GROUP BY`), **B1b** (join reordering), **B3**
-   (auto-index). All perf-only, EQP-gated.
-3. **C6b-1…4: `auto_vacuum` write path** — self-contained in the btree/pager
-   layer; lands in four testable steps and lifts the C6a write-refusal.
-4. **D1a→D1b: the virtual-table interface** — the trait + registry, then
-   `CREATE VIRTUAL TABLE` + executor integration; unblocks FTS5/R-Tree.
-5. **B5–B8: the executor→VDBE migration** — the largest internal refactor;
-   unblocks real `EXPLAIN` and a cost-based planner.
+1. **C6b-2 — `auto_vacuum` ptrmap write maintenance** — the big storage piece,
+   on the verified `ptrmap.rs` + C6b-1 header. Maintain ptrmap entries on every
+   alloc/free/balance, then lift the C6a write-refusal; acceptance is sqlite3
+   reading a graphite-written auto_vacuum file with `integrity_check = ok`. Then
+   C6b-3 (FULL truncate) and C6b-4 (`incremental_vacuum`).
+2. **D2 — FTS5**, or **D1b `best_index` pushdown** — build on the vtab trait.
+3. **Planner leftovers** — **B0b** (`GROUP BY`/multi-term `ORDER BY` via index),
+   **B1b** (join reordering, now that inner tables can be seeked), **B3**
+   (auto-index EQP), **A2** (DESC seek direction), **A4** (literal-left
+   collation), **B4** (`sqlite_stat4`). Perf-only, EQP-gated.
+4. **A7 — `execute_batch`** and the smaller API/ergonomics gaps.
+5. **B5–B8 — the executor→VDBE migration** — the largest internal refactor;
+   unblocks real `EXPLAIN`.
 
-Deferred (documented above): **A1** (`random*` — needs an RNG), **C7/C9b**
-(SQLite-format journal & OS locks — durability/concurrency depth), **D7** (C-API
-— blocked by `#![forbid(unsafe_code)]`).
+Deferred: **A1** (`random*` — needs an RNG), **C7/C9** (SQLite-format journal,
+cross-process locks/concurrency — durability/concurrency depth), **D7** (C-API —
+blocked by `#![forbid(unsafe_code)]`).
