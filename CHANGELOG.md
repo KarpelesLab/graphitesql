@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **`UPDATE OR IGNORE/REPLACE/ABORT/ROLLBACK/FAIL`** conflict clauses are now
+  parsed and honored: `OR IGNORE` skips a row whose update would violate a
+  UNIQUE/NOT NULL/CHECK constraint, `OR REPLACE` deletes the conflicting rows
+  first, and `OR ABORT`/`ROLLBACK`/`FAIL` (and the default) fail the statement --
+  matching sqlite.
 - **`if(...)`** is now accepted as SQLite's alias for `iif(...)`, and both
   accept the 2-argument form (`if(cond, x)` -> `x` or NULL).
 - Fix: **`NATURAL JOIN` and `JOIN … USING (…)`** now work. `NATURAL` was parsed

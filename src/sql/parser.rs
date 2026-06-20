@@ -851,6 +851,21 @@ impl Parser {
 
     fn update(&mut self) -> Result<Update> {
         self.expect_kw("update")?;
+        // `UPDATE OR <action>` conflict clause (REPLACE/IGNORE keep their own
+        // resolution; ROLLBACK/ABORT/FAIL all abort the statement, like INSERT).
+        let on_conflict = if self.eat_kw("or") {
+            if self.eat_kw("replace") {
+                OnConflict::Replace
+            } else if self.eat_kw("ignore") {
+                OnConflict::Ignore
+            } else if self.eat_kw("rollback") || self.eat_kw("abort") || self.eat_kw("fail") {
+                OnConflict::Abort
+            } else {
+                return Err(self.err("expected REPLACE/IGNORE/ROLLBACK/ABORT/FAIL after UPDATE OR"));
+            }
+        } else {
+            OnConflict::Abort
+        };
         let (schema, table) = self.qualified_name()?;
         self.expect_kw("set")?;
         let mut assignments = Vec::new();
@@ -881,6 +896,7 @@ impl Parser {
         Ok(Update {
             table,
             schema,
+            on_conflict,
             assignments,
             from,
             where_clause,

@@ -3393,9 +3393,18 @@ impl Connection {
             }
             apply_column_affinity(&meta, &mut values);
             self.materialize_generated(&meta, &mut values, params)?;
-            check_not_null(&meta, &values)?;
-            self.check_strict_types(&meta, &values)?;
-            self.check_constraints(&meta, &values, Some(rowid), params)?;
+            // NOT NULL / CHECK / STRICT-type constraints. `UPDATE OR IGNORE` skips
+            // a row that violates one rather than failing the statement.
+            {
+                let r = check_not_null(&meta, &values)
+                    .and_then(|()| self.check_strict_types(&meta, &values))
+                    .and_then(|()| self.check_constraints(&meta, &values, Some(rowid), params));
+                match r {
+                    Ok(()) => {}
+                    Err(Error::Constraint(_)) if upd.on_conflict == OnConflict::Ignore => continue,
+                    Err(e) => return Err(e),
+                }
+            }
             // Foreign keys: this row as a child must still point at a parent, and
             // as a parent it must propagate referenced-key changes to children.
             self.check_fk_child(&upd.table, &meta, &values)?;
@@ -3417,12 +3426,22 @@ impl Connection {
                 params,
                 Some(&changed),
             )?;
-            // UNIQUE/PK conflict against any other row.
-            if !self
-                .find_conflicts(&upd.table, &meta, new_rowid, &values, Some(rowid), params)?
-                .is_empty()
-            {
-                return Err(Error::Constraint("UNIQUE constraint failed".into()));
+            // UNIQUE/PK conflict against any other row. `UPDATE OR IGNORE` skips
+            // this row; `UPDATE OR REPLACE` deletes the conflicting rows first.
+            let conflicts =
+                self.find_conflicts(&upd.table, &meta, new_rowid, &values, Some(rowid), params)?;
+            if !conflicts.is_empty() {
+                match upd.on_conflict {
+                    OnConflict::Ignore => continue,
+                    OnConflict::Replace => {
+                        for cr in conflicts {
+                            delete_table(self.backend.writer()?, meta.root, cr)?;
+                        }
+                    }
+                    OnConflict::Abort => {
+                        return Err(Error::Constraint("UNIQUE constraint failed".into()))
+                    }
+                }
             }
             let new_full = values.clone();
             let record = self.encode_table_record(&meta, &new_full);

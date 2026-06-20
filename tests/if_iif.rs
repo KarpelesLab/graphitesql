@@ -15,7 +15,10 @@ fn if_is_alias_for_iif() {
     assert_eq!(val(&c, "SELECT if(0, 2, 3)"), Value::Integer(3));
     // NULL condition is not true → the else branch.
     assert_eq!(val(&c, "SELECT if(NULL, 2, 3)"), Value::Integer(3));
-    assert_eq!(val(&c, "SELECT if('x', 'yes', 'no')"), Value::Text("no".into()));
+    assert_eq!(
+        val(&c, "SELECT if('x', 'yes', 'no')"),
+        Value::Text("no".into())
+    );
 }
 
 #[test]

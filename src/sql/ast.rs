@@ -379,6 +379,8 @@ pub struct Update {
     pub table: String,
     /// A `schema.` qualifier (`UPDATE aux.t`), if any.
     pub schema: Option<String>,
+    /// `UPDATE OR <action>` conflict resolution (default `Abort`).
+    pub on_conflict: OnConflict,
     /// `SET col = expr` assignments.
     pub assignments: Vec<(String, Expr)>,
     /// `UPDATE … SET … FROM <sources>` — extra tables joined to the target so
