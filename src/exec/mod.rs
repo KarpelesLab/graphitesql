@@ -4411,10 +4411,22 @@ impl Connection {
                     !cmp_keys(&ord_keys[ordered[q - 1]], &ord_keys[ordered[q]], &[]).is_eq(),
                 );
         }
+        // The single ORDER BY value per ordered position, for RANGE value
+        // offsets (`RANGE n PRECEDING/FOLLOWING`, which SQLite restricts to one
+        // ordering term), and its direction.
+        let ovals: Vec<Value> = if spec.order_by.len() == 1 {
+            ordered
+                .iter()
+                .map(|&i| ord_keys[i].first().cloned().unwrap_or(Value::Null))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let desc = spec.order_by.first().map(|t| t.descending).unwrap_or(false);
         // Ranking values per ordered position.
         for p in 0..m {
             let idx = ordered[p];
-            let (fstart, fend) = frame_bounds(p, m, &gid, spec);
+            let (fstart, fend) = frame_bounds(p, m, &gid, spec, &ovals, desc);
             let val = match lname {
                 "row_number" => Value::Integer(p as i64 + 1),
                 "rank" => {
@@ -6463,7 +6475,14 @@ fn json_tree_walk(
     }
 }
 
-fn frame_bounds(p: usize, m: usize, gid: &[usize], spec: &WindowSpec) -> (usize, usize) {
+fn frame_bounds(
+    p: usize,
+    m: usize,
+    gid: &[usize],
+    spec: &WindowSpec,
+    ovals: &[Value],
+    desc: bool,
+) -> (usize, usize) {
     let Some(frame) = &spec.frame else {
         if spec.order_by.is_empty() {
             return (0, m);
@@ -6480,6 +6499,23 @@ fn frame_bounds(p: usize, m: usize, gid: &[usize], spec: &WindowSpec) -> (usize,
             row_bound(&frame.start, p, m, true),
             row_bound(&frame.end, p, m, false),
         ),
+        // RANGE with a numeric offset bounds the frame by the ORDER BY *value*
+        // (within `value ± n`); CURRENT ROW / UNBOUNDED still use peer groups.
+        FrameMode::Range
+            if !ovals.is_empty()
+                && (matches!(
+                    frame.start,
+                    FrameBound::Preceding(_) | FrameBound::Following(_)
+                ) || matches!(
+                    frame.end,
+                    FrameBound::Preceding(_) | FrameBound::Following(_)
+                )) =>
+        {
+            (
+                range_value_bound(&frame.start, p, m, gid, ovals, desc, true),
+                range_value_bound(&frame.end, p, m, gid, ovals, desc, false),
+            )
+        }
         FrameMode::Range | FrameMode::Groups => (
             group_bound(&frame.start, p, m, gid, true),
             group_bound(&frame.end, p, m, gid, false),
@@ -6487,6 +6523,82 @@ fn frame_bounds(p: usize, m: usize, gid: &[usize], spec: &WindowSpec) -> (usize,
     };
     let start = start.min(m);
     (start, end.min(m).max(start))
+}
+
+/// A `RANGE` frame bound measured by the ORDER BY value: the frame includes rows
+/// whose value is within `[value - start_n, value + end_n]` (signs flipped for a
+/// `DESC` ordering). `CURRENT ROW` and `UNBOUNDED` fall back to peer-group edges.
+/// Falls back to peer-group edges if the current value is not numeric.
+fn range_value_bound(
+    b: &FrameBound,
+    p: usize,
+    m: usize,
+    gid: &[usize],
+    ovals: &[Value],
+    desc: bool,
+    is_start: bool,
+) -> usize {
+    // Non-numeric/NULL current value: fall back to peer-group edges.
+    if matches!(
+        b,
+        FrameBound::CurrentRow | FrameBound::Preceding(_) | FrameBound::Following(_)
+    ) && matches!(ovals[p], Value::Null)
+    {
+        return group_bound(b, p, m, gid, is_start);
+    }
+    let val = eval::to_f64(&ovals[p]);
+    // The frame edge as an ORDER BY value. Under ASC, PRECEDING subtracts and
+    // FOLLOWING adds; under DESC the sequence decreases so the signs flip.
+    let threshold = match b {
+        FrameBound::UnboundedPreceding => return 0,
+        FrameBound::UnboundedFollowing => return m,
+        FrameBound::CurrentRow => val,
+        FrameBound::Preceding(n) => {
+            if desc {
+                val + *n as f64
+            } else {
+                val - *n as f64
+            }
+        }
+        FrameBound::Following(n) => {
+            if desc {
+                val - *n as f64
+            } else {
+                val + *n as f64
+            }
+        }
+    };
+    // Values run ascending (ASC) or descending (DESC) across positions. The frame
+    // is the contiguous span of rows on the inclusive side of `threshold`.
+    let inside = |vk: f64, edge: f64| if desc { vk >= edge } else { vk <= edge };
+    if is_start {
+        // First row at/after the start edge.
+        (0..m)
+            .find(|&k| {
+                !matches!(ovals[k], Value::Null) && {
+                    let vk = eval::to_f64(&ovals[k]);
+                    if desc {
+                        vk <= threshold
+                    } else {
+                        vk >= threshold
+                    }
+                }
+            })
+            .unwrap_or(m)
+    } else {
+        // One past the last row at/before the end edge.
+        let mut e = m;
+        for (k, ov) in ovals.iter().enumerate().take(m) {
+            if matches!(ov, Value::Null) {
+                continue;
+            }
+            if !inside(eval::to_f64(ov), threshold) {
+                e = k;
+                break;
+            }
+        }
+        e
+    }
 }
 
 /// A `ROWS` frame bound as an index; `is_start` selects inclusive-start vs
