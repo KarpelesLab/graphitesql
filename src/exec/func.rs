@@ -24,6 +24,8 @@ pub fn is_aggregate(name: &str) -> bool {
 pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "count" | "sum" | "total" | "avg" | "group_concat" => true,
+        "json_group_array" => nargs == 1,
+        "json_group_object" => nargs == 2,
         "min" | "max" => star || nargs == 1,
         _ => false,
     }
@@ -642,7 +644,7 @@ fn json_extract(root: &super::json::Json, paths: &[Value]) -> Value {
 /// JSON-producing call (`json`, `json_array`, `json_object`), its text value is
 /// embedded as parsed JSON — mirroring SQLite's JSON subtype propagation — rather
 /// than quoted as a string.
-fn arg_to_json(val: &Value, expr: Option<&Expr>) -> super::json::Json {
+pub(crate) fn arg_to_json(val: &Value, expr: Option<&Expr>) -> super::json::Json {
     if let (Value::Text(s), Some(e)) = (val, expr) {
         if produces_json(e) {
             if let Some(j) = super::json::parse(s) {

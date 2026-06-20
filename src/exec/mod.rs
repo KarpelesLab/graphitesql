@@ -6568,6 +6568,29 @@ impl Connection {
             &ordered_group[..]
         };
 
+        // JSON aggregates build their result directly from the (NULL-inclusive,
+        // possibly multi-argument) per-row values, so they bypass the NULL-
+        // stripping single-value collection used by the other aggregates.
+        if lname == "json_group_array" {
+            let mut items = Vec::new();
+            for &i in group {
+                let ctx = rows[i].ctx(columns, params).with_subqueries(self);
+                let v = eval::eval(&args[0], &ctx)?;
+                items.push(func::arg_to_json(&v, args.first()));
+            }
+            return Ok(Value::Text(json::Json::Array(items).serialize()));
+        }
+        if lname == "json_group_object" {
+            let mut pairs = Vec::new();
+            for &i in group {
+                let ctx = rows[i].ctx(columns, params).with_subqueries(self);
+                let k = eval::eval(&args[0], &ctx)?;
+                let v = eval::eval(&args[1], &ctx)?;
+                pairs.push((eval::to_text(&k), func::arg_to_json(&v, args.get(1))));
+            }
+            return Ok(Value::Text(json::Json::Object(pairs).serialize()));
+        }
+
         // Gather the (non-NULL for most) argument values across the group.
         let mut vals: Vec<Value> = Vec::new();
         let mut count_rows = 0usize; // for count(*)

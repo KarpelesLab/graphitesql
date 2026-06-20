@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **`json_group_array` / `json_group_object` aggregates** — build a JSON array
+  or object from a group (NULL-inclusive, `ORDER BY` inside the aggregate, JSON
+  subtype propagation for `json(...)` arguments), like SQLite.
 - Fix: **collation is now honored** in `IN (list)`, `IN (SELECT …)`, `BETWEEN`,
   `CASE x WHEN y`, `min()`/`max()`, and compound set ops (UNION/INTERSECT/EXCEPT
   dedup + their ORDER BY) — these used plain BINARY before, so NOCASE columns

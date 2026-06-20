@@ -162,6 +162,7 @@ Make the dialect complete. Each item lands with a differential corpus addition.
   `json_extract`, `json_array`/`json_object`, `json_type`, `json_array_length`,
   `json_valid`, `json_quote`, the `->`/`->>` operators, and the
   `json_set`/`json_insert`/`json_replace`/`json_remove`/`json_patch` mutators,
+  the `json_group_array`/`json_group_object` aggregates,
   and the `json_each`/`json_tree` table-valued functions), plus `LIKE … ESCAPE`,
   the `like()` function form, `glob()`, `octet_length`, and `likely`/`unlikely`/
   `likelihood`. *Remaining:* a few more string/blob built-ins (`randomblob`,

@@ -306,7 +306,10 @@ fn compound_set_ops_use_collation() {
         c.execute(s).unwrap();
     }
     // INTERSECT/EXCEPT compare under the left SELECT's column collation.
-    assert_eq!(rows_str(&c, "SELECT a FROM t INTERSECT SELECT b FROM u"), "X");
+    assert_eq!(
+        rows_str(&c, "SELECT a FROM t INTERSECT SELECT b FROM u"),
+        "X"
+    );
     assert_eq!(rows_str(&c, "SELECT a FROM t EXCEPT SELECT b FROM u"), "y");
     // UNION dedups X/x and the trailing ORDER BY also sorts case-insensitively.
     assert_eq!(
@@ -314,5 +317,8 @@ fn compound_set_ops_use_collation() {
         "x\ny\nZ"
     );
     // A BINARY compound is unaffected (A sorts before b).
-    assert_eq!(rows_str(&c, "SELECT 'b' UNION SELECT 'A' ORDER BY 1"), "A\nb");
+    assert_eq!(
+        rows_str(&c, "SELECT 'b' UNION SELECT 'A' ORDER BY 1"),
+        "A\nb"
+    );
 }

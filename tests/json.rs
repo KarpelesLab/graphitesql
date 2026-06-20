@@ -131,3 +131,48 @@ fn against_sqlite3() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn json_group_array_and_object() {
+    let mut c = Connection::open_memory().unwrap();
+    for s in [
+        "CREATE TABLE t(g, v)",
+        "INSERT INTO t VALUES('a',3),('a',1),('b',2),('a',NULL),('b',5)",
+    ] {
+        c.execute(s).unwrap();
+    }
+    // json_group_array includes NULLs and preserves group order.
+    let r = c
+        .query("SELECT g, json_group_array(v) FROM t GROUP BY g ORDER BY g")
+        .unwrap();
+    assert_eq!(render(&r.rows[0][1]), "[3,1,null]");
+    assert_eq!(render(&r.rows[1][1]), "[2,5]");
+
+    // json_group_object builds an object (duplicate keys allowed, int key -> text).
+    assert_eq!(
+        one(&c, "SELECT json_group_object(g, v) FROM t WHERE g='a'"),
+        r#"{"a":3,"a":1,"a":null}"#
+    );
+    assert_eq!(one(&c, "SELECT json_group_object(5, 'x')"), r#"{"5":"x"}"#);
+
+    // Text values become JSON strings; an empty group yields '[]'.
+    assert_eq!(
+        one(
+            &c,
+            "SELECT json_group_array(x) FROM (SELECT 'a' x UNION ALL SELECT 'b')"
+        ),
+        r#"["a","b"]"#
+    );
+    assert_eq!(one(&c, "SELECT json_group_array(v) FROM t WHERE 0"), "[]");
+
+    // An ORDER BY inside the aggregate sorts the elements.
+    assert_eq!(
+        one(
+            &c,
+            "SELECT json_group_array(v ORDER BY v) FROM t WHERE g='a'"
+        ),
+        "[null,1,3]"
+    );
+    // A json() argument is embedded as JSON, not quoted (subtype propagation).
+    assert_eq!(one(&c, "SELECT json_group_array(json('[1,2]'))"), "[[1,2]]");
+}
