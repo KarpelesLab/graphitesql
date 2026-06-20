@@ -1961,6 +1961,19 @@ impl Connection {
                 };
                 self.backend.writer()?.set_auto_vacuum_if_empty(target)?;
             }
+        } else if p.name.eq_ignore_ascii_case("incremental_vacuum") {
+            // `PRAGMA incremental_vacuum` (or `= N` / `(N)`): reclaim up to N free
+            // pages off the end of an `auto_vacuum=INCREMENTAL` database. With no
+            // argument (or N <= 0) reclaim as many as possible. The pager makes it
+            // a no-op for NONE/FULL, mirroring SQLite. The reclamation is staged
+            // like any other write; the caller's normal commit (the implicit
+            // auto-commit when not in a transaction, or an explicit COMMIT) flushes
+            // the now-smaller file to disk.
+            let n = match &p.value {
+                Some(e) => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?),
+                None => 0,
+            };
+            self.backend.writer()?.incremental_vacuum(n)?;
         }
         Ok(())
     }

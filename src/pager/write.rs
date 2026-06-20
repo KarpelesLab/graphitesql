@@ -528,11 +528,46 @@ impl WritePager {
         let saved_overlay = self.overlay.clone();
         let saved_header = self.header.clone();
         let saved_count = self.page_count;
-        if self.autovacuum_truncate().is_err() {
+        // `limit == 0` ⇒ reclaim as much as possible (full compaction).
+        if self.autovacuum_truncate(0).is_err() {
             self.overlay = saved_overlay;
             self.header = saved_header;
             self.page_count = saved_count;
         }
+    }
+
+    /// `PRAGMA incremental_vacuum(n)`: reclaim up to `n` free pages off the end of
+    /// the file for an `auto_vacuum=INCREMENTAL` database, returning the number of
+    /// pages actually removed. When `n <= 0` it reclaims as many as possible (full
+    /// compaction). The reclaimed pages are dropped from the staged image; a
+    /// subsequent [`commit`](Self::commit) makes the smaller file durable.
+    ///
+    /// Outside INCREMENTAL mode this is a no-op that reclaims nothing, matching
+    /// SQLite (which does nothing for `auto_vacuum` NONE/FULL). Like the FULL-mode
+    /// commit-time truncation it reuses, it is best-effort: any internal relocation
+    /// error rolls the staged state back to its pre-reclamation form, so the worst
+    /// case is a sound-but-less-compact file, never a corrupt one.
+    pub fn incremental_vacuum(&mut self, n: i64) -> Result<u32> {
+        if self.auto_vacuum() != AutoVacuum::Incremental {
+            return Ok(0);
+        }
+        // `n <= 0` ⇒ unbounded (`limit == 0`); otherwise cap the pages truncated.
+        let limit = if n <= 0 {
+            0
+        } else {
+            n.min(u32::MAX as i64) as u32
+        };
+        let before = self.page_count;
+        let saved_overlay = self.overlay.clone();
+        let saved_header = self.header.clone();
+        let saved_count = self.page_count;
+        if self.autovacuum_truncate(limit).is_err() {
+            self.overlay = saved_overlay;
+            self.header = saved_header;
+            self.page_count = saved_count;
+            return Ok(0);
+        }
+        Ok(before - self.page_count)
     }
 
     /// FULL `auto_vacuum` commit-time truncation (SQLite's `autoVacuumCommit`).
@@ -556,7 +591,14 @@ impl WritePager {
     /// Any error leaves the staged state untouched-enough that the caller can fall
     /// back to the in-place path; callers treat a relocation error as "skip
     /// truncation" rather than failing the commit.
-    fn autovacuum_truncate(&mut self) -> Result<()> {
+    ///
+    /// `limit` bounds how many pages are truncated off the end: `0` means
+    /// unbounded (full compaction, the FULL-mode commit behavior), while a
+    /// non-zero `limit` stops once that many trailing pages have been removed —
+    /// the bound `PRAGMA incremental_vacuum(n)` relies on. The relocation,
+    /// reference-fixing, freelist-rebuild and root/lock-byte safety rules are
+    /// identical in both cases.
+    fn autovacuum_truncate(&mut self, limit: u32) -> Result<()> {
         let usable = self.usable_size() as u32;
         let (want, _max_root) = self.compute_want()?;
 
@@ -589,8 +631,17 @@ impl WritePager {
         let lock_page = (PENDING_BYTE / self.page_size as u64) as u32 + 1;
         let is_lock = |p: u32| lock_page > 1 && p == lock_page;
 
+        let start = self.page_count;
         let mut last = self.page_count;
         while last > 1 {
+            // Stop once `limit` trailing pages have been truncated (0 = unbounded).
+            // Counting pages removed from the *end* of the file, not relocations,
+            // matches `PRAGMA incremental_vacuum(n)`: each pass shrinks the file by
+            // one page, whether that tail page was free/structural (dropped) or a
+            // live page displaced by relocating it into a lower free slot.
+            if limit != 0 && start - last >= limit {
+                break;
+            }
             // Trailing structural / free pages can be dropped without moving.
             if ptrmap::is_ptrmap_page(usable, last) {
                 // A ptrmap page at the very end tracks only now-gone pages.
