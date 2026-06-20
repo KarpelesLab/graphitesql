@@ -275,9 +275,11 @@ both directions), schema-qualified reads/writes/`DROP`, cross-database joins
 (+ 3-part `aux.t.c` names, `WITHOUT ROWID` sources), qualified DDL
 (`ALTER`/`CREATE INDEX|TRIGGER|VIEW`, stored bare-named), cross-database view
 reads (via a `read_default` context cell), `TEMP` tables, and cross-database
-transactions + savepoints. **C6a** also done — graphite reads `auto_vacuum`
-files sqlite3 created and reports `PRAGMA auto_vacuum`, and *refuses* writes to
-them (rather than corrupt the ptrmap it can't yet maintain).
+transactions + savepoints. **`auto_vacuum`** is fully read/write now (C6a read +
+C6b-1 empty-db header + C6b-2 ptrmap maintenance): graphite reads and **writes**
+auto_vacuum databases that sqlite3 reads with `integrity_check = ok` (only the
+optional space-reclaim — FULL truncate C6b-3, `incremental_vacuum` C6b-4 —
+remains).
 
 **Remaining pieces.**
 
@@ -309,11 +311,16 @@ them (rather than corrupt the ptrmap it can't yet maintain).
   sqlite3). *Remaining for the write path:* reserving/using ptrmap pages as the
   db grows is C6b-2; the `PRAGMA auto_vacuum=…` SQL wiring (currently rejected by
   C6a) is still to be connected.
-- **C6b-2 — maintain ptrmap entries on alloc/free/balance.** Every page whose
-  parent/type changes (btree child moves on split, overflow-chain links, freelist
-  transitions) updates its 5-byte ptrmap entry. Acceptance: graphite writes rows
-  + indexes into an auto_vacuum file, sqlite3 reads it `integrity_check = ok`.
-  Lift the C6a write-refusal once this holds.
+- ✅ **C6b-2 — maintain ptrmap entries (write auto_vacuum DBs).** Done — graphite
+  writes auto_vacuum databases that sqlite3 reads with `integrity_check = ok`, and
+  the C6a write-refusal is **lifted**. Instead of per-writer parent bookkeeping,
+  the pager *rebuilds the whole pointer map at commit* (`rebuild_ptrmap`,
+  auto_vacuum mode only): discover roots from `sqlite_schema`, walk each b-tree
+  emitting `RootPage`/`Btree(parent)`/`Overflow1/2` entries, mark freelist pages
+  `FreePage`, stamp `largest_root_page`; the allocator skips/materializes ptrmap
+  pages. Verified on a ~2454-page FULL file crossing 3 ptrmap boundaries (overflow
+  + index + deletes). `auto_vacuum=NONE` byte-unaffected. *(`PRAGMA
+  auto_vacuum=FULL` on an empty db switches the mode.)*
 - **C6b-3 — `auto_vacuum=FULL` truncate on commit.** At commit, move trailing
   free pages onto freed slots and truncate the file (updating ptrmap + parent
   pointers for moved pages). *Ref:* `btree.c` `autoVacuumCommit`.
