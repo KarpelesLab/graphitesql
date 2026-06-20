@@ -4994,13 +4994,18 @@ impl Connection {
             // rows already emitted
         } else {
             let detail = if from.joins.is_empty() {
-                self.eqp_access(
-                    &label,
-                    &from.first.name,
-                    &meta,
-                    sel.where_clause.as_ref(),
-                    params,
-                )?
+                // A full index scanned to satisfy ORDER BY reads as `USING INDEX`.
+                if let Some((iname, _, _, _)) = self.order_index_scan(sel) {
+                    alloc::format!("SCAN {label} USING INDEX {iname}")
+                } else {
+                    self.eqp_access(
+                        &label,
+                        &from.first.name,
+                        &meta,
+                        sel.where_clause.as_ref(),
+                        params,
+                    )?
+                }
             } else {
                 // Joins run in FROM order as nested-loop scans (no reordering).
                 alloc::format!("SCAN {label}")
@@ -5020,7 +5025,7 @@ impl Connection {
         }
         // ORDER BY that we satisfy with an in-memory sort — unless the rowid scan
         // already yields the requested order (no temp b-tree then, like sqlite).
-        if !sel.order_by.is_empty() && self.rowid_ordered_scan(sel).is_none() {
+        if !sel.order_by.is_empty() && self.order_satisfied_by_scan(sel).is_none() {
             let id = *next_id;
             *next_id += 1;
             out.push((id, parent, String::from("USE TEMP B-TREE FOR ORDER BY")));
@@ -6026,6 +6031,83 @@ impl Connection {
         }
     }
 
+    /// The secondary-index analogue of [`rowid_ordered_scan`]: when the same
+    /// single-table full-scan shape has its sole `ORDER BY` term as a plain
+    /// column that is the leading column of a full (non-partial, non-expression)
+    /// index whose collation matches the column's, scanning that index in key
+    /// order yields rows in `ORDER BY` order. Returns `(index name, root,
+    /// collations, descending)`. NULLs sort first in the index (ascending),
+    /// matching `ORDER BY col ASC`; reversing for `DESC` puts them last, matching
+    /// `ORDER BY col DESC` — so both directions are exact.
+    fn order_index_scan(
+        &self,
+        sel: &Select,
+    ) -> Option<(String, u32, Vec<crate::value::Collation>, bool)> {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let t = &from.first;
+        if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
+            return None;
+        }
+        if sel.where_clause.is_some()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || sel.order_by.len() != 1
+        {
+            return None;
+        }
+        if self.has_aggregate(sel) || window::has_window(sel) {
+            return None;
+        }
+        let term = &sel.order_by[0];
+        let (tbl, col_name) = match &term.expr {
+            Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+            _ => return None,
+        };
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
+            return None;
+        }
+        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+        if meta.without_rowid {
+            return None;
+        }
+        let col = meta
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(col_name))?;
+        if meta.ipk == Some(col) {
+            return None; // the rowid/IPK case is handled by rowid_ordered_scan
+        }
+        let col_coll = meta.columns[col].collation;
+        // A full index whose leading column is `col` with the column's collation.
+        for idx in self.indexes_of(&t.name).ok()? {
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
+                continue;
+            }
+            if idx.cols.first() == Some(&col) && idx.collations.first() == Some(&col_coll) {
+                return Some((idx.name, idx.root, idx.collations, term.descending));
+            }
+        }
+        None
+    }
+
+    /// Whether a single-table scan already yields rows in the query's `ORDER BY`
+    /// order (so `run_core` can skip the sort, reversing for `DESC`). Combines the
+    /// rowid/IPK and secondary-index cases; shared with `eqp_access`.
+    fn order_satisfied_by_scan(&self, sel: &Select) -> Option<bool> {
+        if let Some(d) = self.rowid_ordered_scan(sel) {
+            return Some(d);
+        }
+        self.order_index_scan(sel).map(|(_, _, _, d)| d)
+    }
+
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
         let (mut columns, input_rows) = self.scan_source(sel, params)?;
 
@@ -6102,7 +6184,7 @@ impl Connection {
         // just reversing for DESC — matching sqlite's plain SCAN with no temp
         // b-tree.
         if !sel.order_by.is_empty() {
-            match self.rowid_ordered_scan(sel) {
+            match self.order_satisfied_by_scan(sel) {
                 Some(true) => out.reverse(),
                 Some(false) => {}
                 None => {
@@ -6277,6 +6359,27 @@ impl Connection {
             }
             if let Some(rows) = self.try_index_or(&first_meta, &from.first.name, sel, params)? {
                 return Ok((first_meta.columns, rows));
+            }
+            // ORDER BY satisfied by a full secondary index (B0): walk that index
+            // in key order and fetch rows, so `run_core` can skip the sort. Must
+            // stay in lockstep with `order_satisfied_by_scan`/`eqp_access`.
+            if let Some((_, root, colls, _)) = self.order_index_scan(sel) {
+                let src = self.backend.source();
+                let rowids = crate::btree::index_range_rowids(src, root, None, None, &colls)?;
+                let encoding = src.header().text_encoding;
+                let mut cur = TableCursor::new(src, first_meta.root);
+                let mut input_rows = Vec::with_capacity(rowids.len());
+                for rid in rowids {
+                    if cur.seek(rid)? {
+                        let values =
+                            self.decode_full_row(&first_meta, rid, &cur.payload()?, encoding)?;
+                        input_rows.push(InputRow {
+                            values,
+                            rowid: Some(rid),
+                        });
+                    }
+                }
+                return Ok((first_meta.columns, input_rows));
             }
             let input_rows = self
                 .scan_table(&first_meta)?

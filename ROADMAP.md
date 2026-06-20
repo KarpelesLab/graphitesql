@@ -169,7 +169,7 @@ piece beside it):
 | query | graphite today | sqlite3 (target) | piece |
 |-------|----------------|------------------|-------|
 | `… FROM t ORDER BY a` (`a` = rowid/IPK) | ✅ now `SCAN t` (no sort) | `SCAN t` | **B0** ✅ |
-| `… FROM t ORDER BY c` (secondary index on `c`) | `SCAN t` + `USE TEMP B-TREE FOR ORDER BY` | `SCAN t USING INDEX ic` | **B0** (secondary) |
+| `… FROM t ORDER BY c` (secondary index on `c`) | ✅ now `SCAN t USING INDEX ic` (no sort) | `SCAN t USING INDEX ic` | **B0** ✅ |
 | `… FROM t JOIN u ON t.c=u.x` (`x` = `u` PK) | `SCAN t` + `SCAN u` | `SCAN t` + `SEARCH u USING INTEGER PRIMARY KEY (rowid=?)` | **B1/B3** |
 | `SELECT count(*) FROM t` (any index `ic`) | `SCAN t` | `SCAN t USING COVERING INDEX ic` | **B2** |
 
@@ -181,10 +181,19 @@ piece beside it):
     `USE TEMP B-TREE`), so execution and `EXPLAIN QUERY PLAN` stay in lockstep.
     Conservative: bails on `WHERE`/`GROUP`/aggregate/window/`DISTINCT`, multiple
     terms, `COLLATE`, WITHOUT ROWID, or a shadowing real column.
-  - *remaining: secondary-index case.* When `ORDER BY` is a prefix of a
-    secondary index (matching direction/collation, NULLs as the index stores
-    them), scan that index in key order and skip the sort, reporting
-    `USING INDEX`. Needs a new ordered index-scan fetch path in `scan_source`.
+  - ✅ *secondary-index case.* When the sole `ORDER BY` term is the leading
+    column of a full (non-partial, non-expression) index whose collation matches
+    the column's, `scan_source` walks that index in key order
+    (`index_range_rowids`) and fetches the rows; `run_core` skips the sort
+    (reversing for `DESC` — index NULLs-first becomes NULLs-last, matching
+    `ORDER BY … DESC`); `eqp_access` reports `SCAN t USING INDEX <name>`. All
+    three gate on the shared `order_index_scan`, so they stay in lockstep.
+    Verified against sqlite incl. NULLs, ties (rowid order), `DESC`, `LIMIT`,
+    and a NOCASE index; the whole differential corpus stays green. (sqlite's
+    extra `COVERING` qualifier is the separate B2 piece.)
+  - *remaining:* multi-term `ORDER BY` against a multi-column index prefix;
+    using an index for `GROUP BY`; satisfying `ORDER BY` from the index chosen
+    by a `WHERE` seek (today the optimisation only fires with no `WHERE`).
 - **B1 — Join order.** Reorder `FROM` tables by a simple cost model (smallest
   estimated cardinality / most-selective indexed table first) instead of textual
   order; keep results identical, verify the chosen order via `EXPLAIN QUERY

@@ -197,13 +197,95 @@ fn order_by_rowid_skips_temp_btree() {
     // The optimisation must not fire when anything reshapes the rows: a WHERE
     // could pick a different access path, and a non-rowid key still needs a sort.
     assert_eq!(
-        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a=1 ORDER BY id"),
-        ["SEARCH t USING INDEX it_a (a=?)", "USE TEMP B-TREE FOR ORDER BY"]
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a=1 ORDER BY id"
+        ),
+        [
+            "SEARCH t USING INDEX it_a (a=?)",
+            "USE TEMP B-TREE FOR ORDER BY"
+        ]
     );
+    // A non-indexed column still needs a sort.
     assert_eq!(
-        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY a"),
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY s"),
         ["SCAN t", "USE TEMP B-TREE FOR ORDER BY"]
     );
+}
+
+#[test]
+fn order_by_secondary_index_uses_index() {
+    // ORDER BY a full-index column scans that index in key order instead of
+    // sorting; EQP reports `USING INDEX` and no temp b-tree (matching sqlite,
+    // modulo its separate COVERING-index detection).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c INT)")
+        .unwrap();
+    c.execute("CREATE INDEX ic ON t(c)").unwrap();
+    for (id, cv) in [(1, 30), (2, 10), (3, 20), (4, 10)] {
+        c.execute(&format!("INSERT INTO t VALUES({id},{cv})"))
+            .unwrap();
+    }
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY c"),
+        ["SCAN t USING INDEX ic"]
+    );
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY c DESC"),
+        ["SCAN t USING INDEX ic"]
+    );
+    // A partial index must NOT be used (it omits rows), so the sort stays.
+    c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, c INT)")
+        .unwrap();
+    c.execute("CREATE INDEX ip ON p(c) WHERE c > 0").unwrap();
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM p ORDER BY c"),
+        ["SCAN p", "USE TEMP B-TREE FOR ORDER BY"]
+    );
+}
+
+#[test]
+fn order_by_secondary_index_returns_correct_order() {
+    // Result order must exactly match a sort: NULLs first (ASC) / last (DESC),
+    // ties in rowid order, and NOCASE honored when the index collation matches.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, c INT)")
+        .unwrap();
+    c.execute("CREATE INDEX ic ON t(c)").unwrap();
+    c.execute("INSERT INTO t VALUES(1,30),(2,10),(3,NULL),(4,10),(5,20),(6,NULL)")
+        .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        c.query(sql)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(n) => n,
+                _ => panic!(),
+            })
+            .collect()
+    };
+    assert_eq!(ids("SELECT a FROM t ORDER BY c"), [3, 6, 2, 4, 5, 1]);
+    assert_eq!(ids("SELECT a FROM t ORDER BY c DESC"), [1, 5, 4, 2, 6, 3]);
+    assert_eq!(ids("SELECT a FROM t ORDER BY c LIMIT 3"), [3, 6, 2]);
+
+    let mut u = Connection::open_memory().unwrap();
+    u.execute("CREATE TABLE u(k INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)")
+        .unwrap();
+    u.execute("CREATE INDEX iu ON u(name)").unwrap();
+    u.execute("INSERT INTO u VALUES(1,'banana'),(2,'Apple'),(3,'cherry'),(4,'apple')")
+        .unwrap();
+    let names: Vec<String> = u
+        .query("SELECT name FROM u ORDER BY name")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            _ => panic!(),
+        })
+        .collect();
+    assert_eq!(names, ["Apple", "apple", "banana", "cherry"]);
 }
 
 #[test]
