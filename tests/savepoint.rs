@@ -103,3 +103,41 @@ fn release_unknown_savepoint_errors() {
     assert!(c.execute("RELEASE nope").is_err());
     assert!(c.execute("ROLLBACK TO nope").is_err());
 }
+
+#[test]
+fn transaction_state_errors() {
+    // BEGIN inside a transaction, and COMMIT/ROLLBACK with no active
+    // transaction, are rejected like SQLite.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("BEGIN").unwrap();
+    assert!(c.execute("BEGIN").is_err());
+    c.execute("COMMIT").unwrap();
+
+    let mut c = Connection::open_memory().unwrap();
+    assert!(c.execute("COMMIT").is_err());
+    assert!(c.execute("ROLLBACK").is_err());
+
+    // COMMIT is valid when only a savepoint (implicit transaction) is open.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("SAVEPOINT s").unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("COMMIT").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM sqlite_master").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+}
+
+#[test]
+fn drop_wrong_kind_messages() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("CREATE VIEW v AS SELECT 1").unwrap();
+    // Dropping a table that is really a view (and vice versa) gives a hint.
+    assert!(c.execute("DROP TABLE v").is_err());
+    assert!(c.execute("DROP VIEW t").is_err());
+    // Dropping a missing object: lowercase "no such <kind>".
+    let mut c = Connection::open_memory().unwrap();
+    assert!(c.execute("DROP TABLE nope").is_err());
+    assert!(c.execute("DROP TABLE IF EXISTS nope").is_ok());
+}

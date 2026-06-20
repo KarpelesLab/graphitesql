@@ -791,10 +791,20 @@ impl Connection {
         // Transaction control is handled directly (no autocommit around it).
         match &stmt {
             Statement::Begin => {
+                if self.in_tx {
+                    return Err(Error::Error(
+                        "cannot start a transaction within a transaction".into(),
+                    ));
+                }
                 self.in_tx = true;
                 return Ok(0);
             }
             Statement::Commit => {
+                if !self.in_tx && self.open_savepoints == 0 {
+                    return Err(Error::Error(
+                        "cannot commit - no transaction is active".into(),
+                    ));
+                }
                 self.backend.writer()?.commit()?;
                 self.in_tx = false;
                 self.open_savepoints = 0;
@@ -824,6 +834,11 @@ impl Connection {
                 return Ok(0);
             }
             Statement::Rollback => {
+                if !self.in_tx && self.open_savepoints == 0 {
+                    return Err(Error::Error(
+                        "cannot rollback - no transaction is active".into(),
+                    ));
+                }
                 self.backend.writer()?.rollback();
                 self.in_tx = false;
                 self.open_savepoints = 0;
@@ -3353,7 +3368,32 @@ impl Connection {
             if d.if_exists {
                 return Ok(());
             }
-            return Err(Error::Error(format!("no such {:?}: {}", d.kind, d.name)));
+            // SQLite's table↔view confusion hint when a same-named object of the
+            // other kind exists; otherwise a lowercase "no such <kind>".
+            if let Some(other) = self.schema.objects().iter().find(|o| o.name == d.name) {
+                match (d.kind, other.obj_type) {
+                    (DropKind::Table, ObjectType::View) => {
+                        return Err(Error::Error(format!(
+                            "use DROP VIEW to delete view {}",
+                            d.name
+                        )))
+                    }
+                    (DropKind::View, ObjectType::Table) => {
+                        return Err(Error::Error(format!(
+                            "use DROP TABLE to delete table {}",
+                            d.name
+                        )))
+                    }
+                    _ => {}
+                }
+            }
+            let kind = match d.kind {
+                DropKind::Table => "table",
+                DropKind::Index => "index",
+                DropKind::View => "view",
+                DropKind::Trigger => "trigger",
+            };
+            return Err(Error::Error(format!("no such {kind}: {}", d.name)));
         };
 
         // Collect the schema rows (by rowid) and b-tree roots to drop.
