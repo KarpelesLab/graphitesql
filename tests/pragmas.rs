@@ -50,6 +50,12 @@ fn against_sqlite3() {
         "PRAGMA foreign_key_list(ch)",
         "PRAGMA freelist_count",
         "PRAGMA application_id",
+        "PRAGMA table_info(t)",
+        "PRAGMA table_info(p)",
+        "PRAGMA table_xinfo(t)",
+        "PRAGMA table_xinfo(p)",
+        "PRAGMA index_xinfo(ix)",
+        "PRAGMA index_xinfo(ixp)",
     ];
 
     let path = std::env::temp_dir().join(format!("gsql-prag-{}.db", std::process::id()));

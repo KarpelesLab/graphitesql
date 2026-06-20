@@ -336,9 +336,11 @@ impl Connection {
                 Value::Integer(header.application_id as i64),
             )),
             "data_version" => Ok(single("data_version", Value::Integer(1))),
-            "table_info" => self.pragma_table_info(p),
+            "table_info" => self.pragma_table_info(p, false),
+            "table_xinfo" => self.pragma_table_info(p, true),
             "index_list" => self.pragma_index_list(p),
-            "index_info" => self.pragma_index_info(p),
+            "index_info" => self.pragma_index_info(p, false),
+            "index_xinfo" => self.pragma_index_info(p, true),
             "foreign_key_list" => self.pragma_foreign_key_list(p),
             "foreign_key_check" => self.pragma_foreign_key_check(p),
             "integrity_check" | "quick_check" => self.pragma_integrity_check(),
@@ -364,7 +366,7 @@ impl Connection {
 
     /// `PRAGMA table_info(name)` → one row per column
     /// `(cid, name, type, notnull, dflt_value, pk)`.
-    fn pragma_table_info(&self, p: &Pragma) -> Result<QueryResult> {
+    fn pragma_table_info(&self, p: &Pragma, extended: bool) -> Result<QueryResult> {
         let table = match &p.value {
             Some(Expr::Column { column, .. }) => column.clone(),
             Some(Expr::Literal(Literal::Str(s))) => s.clone(),
@@ -386,19 +388,27 @@ impl Connection {
 
         let mut rows = Vec::new();
         for (i, col) in ct.columns.iter().enumerate() {
-            // `table_info` hides generated columns (they appear in `table_xinfo`).
-            if col
-                .constraints
-                .iter()
-                .any(|c| matches!(c, ColumnConstraint::Generated { .. }))
-            {
+            // A generated column's storage kind (`Some(stored)`), or `None`.
+            let generated = col.constraints.iter().find_map(|c| match c {
+                ColumnConstraint::Generated { stored, .. } => Some(*stored),
+                _ => None,
+            });
+            // `table_info` hides generated columns; `table_xinfo` includes them
+            // with a `hidden` flag (2 = virtual, 3 = stored generated; 0 = normal).
+            if generated.is_some() && !extended {
                 continue;
             }
+            let hidden = match generated {
+                None => 0,
+                Some(false) => 2,
+                Some(true) => 3,
+            };
+            // SQLite reports `notnull` from an explicit `NOT NULL` only — an
+            // INTEGER PRIMARY KEY (the rowid) is shown as notnull=0.
             let notnull = col
                 .constraints
                 .iter()
-                .any(|c| matches!(c, ColumnConstraint::NotNull))
-                || Some(i) == ipk;
+                .any(|c| matches!(c, ColumnConstraint::NotNull));
             let dflt = col.constraints.iter().find_map(|c| match c {
                 ColumnConstraint::Default(Expr::Literal(l)) => Some(literal_text(l)),
                 _ => None,
@@ -413,22 +423,39 @@ impl Connection {
             } else {
                 0
             };
-            rows.push(alloc::vec![
+            let mut row = alloc::vec![
                 Value::Integer(i as i64),
                 Value::Text(col.name.clone()),
                 Value::Text(col.type_name.clone().unwrap_or_default()),
                 Value::Integer(notnull as i64),
                 dflt.map(Value::Text).unwrap_or(Value::Null),
                 Value::Integer(pk),
-            ]);
+            ];
+            if extended {
+                row.push(Value::Integer(hidden));
+            }
+            rows.push(row);
         }
-        Ok(QueryResult {
-            columns: ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        let columns: Vec<String> = if extended {
+            [
+                "cid",
+                "name",
+                "type",
+                "notnull",
+                "dflt_value",
+                "pk",
+                "hidden",
+            ]
+            .iter()
+            .map(|s| String::from(*s))
+            .collect()
+        } else {
+            ["cid", "name", "type", "notnull", "dflt_value", "pk"]
                 .iter()
                 .map(|s| String::from(*s))
-                .collect(),
-            rows,
-        })
+                .collect()
+        };
+        Ok(QueryResult { columns, rows })
     }
 
     /// The single name argument of a `PRAGMA foo(name)` / `PRAGMA foo = name`.
@@ -474,13 +501,21 @@ impl Connection {
     }
 
     /// `PRAGMA index_info(index)` → `(seqno, cid, name)` for each indexed column.
-    fn pragma_index_info(&self, p: &Pragma) -> Result<QueryResult> {
+    fn pragma_index_info(&self, p: &Pragma, extended: bool) -> Result<QueryResult> {
         let index = Self::pragma_arg_name(p)?;
         let obj = self
             .schema
             .index(&index)
             .ok_or_else(|| Error::Error(format!("no such index: {index}")))?;
         let tmeta = self.table_meta(&obj.tbl_name, None)?;
+        // Per-key-column descending flags (from the CREATE INDEX text).
+        let descs: Vec<bool> = match &obj.sql {
+            Some(sql) => match sql::parse_one(sql)? {
+                Statement::CreateIndex(ci) => ci.columns.iter().map(|c| c.descending).collect(),
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        };
         let cols: Vec<usize> = match &obj.sql {
             Some(sql) => match sql::parse_one(sql)? {
                 Statement::CreateIndex(ci) => self.index_columns(&tmeta, &ci)?,
@@ -490,24 +525,54 @@ impl Connection {
                 .and_then(|n| tmeta.unique.get(n - 1).cloned())
                 .unwrap_or_default(),
         };
-        let rows = cols
-            .iter()
-            .enumerate()
-            .map(|(seqno, &cid)| {
-                alloc::vec![
+        let mut rows = Vec::new();
+        for (seqno, &cid) in cols.iter().enumerate() {
+            if extended {
+                let coll = match tmeta.columns[cid].collation {
+                    crate::value::Collation::NoCase => "NOCASE",
+                    crate::value::Collation::RTrim => "RTRIM",
+                    crate::value::Collation::Binary => "BINARY",
+                };
+                rows.push(alloc::vec![
                     Value::Integer(seqno as i64),
                     Value::Integer(cid as i64),
                     Value::Text(tmeta.columns[cid].name.clone()),
-                ]
-            })
-            .collect();
-        Ok(QueryResult {
-            columns: ["seqno", "cid", "name"]
+                    Value::Integer(descs.get(seqno).copied().unwrap_or(false) as i64),
+                    Value::Text(coll.into()),
+                    Value::Integer(1), // key column
+                ]);
+            } else {
+                rows.push(alloc::vec![
+                    Value::Integer(seqno as i64),
+                    Value::Integer(cid as i64),
+                    Value::Text(tmeta.columns[cid].name.clone()),
+                ]);
+            }
+        }
+        // index_xinfo appends the implicit trailing rowid (an auxiliary, non-key
+        // column) for an ordinary rowid table.
+        if extended && !tmeta.without_rowid {
+            rows.push(alloc::vec![
+                Value::Integer(cols.len() as i64),
+                Value::Integer(-1),
+                Value::Null,
+                Value::Integer(0),
+                Value::Text("BINARY".into()),
+                Value::Integer(0),
+            ]);
+        }
+        let columns: Vec<String> = if extended {
+            ["seqno", "cid", "name", "desc", "coll", "key"]
                 .iter()
                 .map(|s| String::from(*s))
-                .collect(),
-            rows,
-        })
+                .collect()
+        } else {
+            ["seqno", "cid", "name"]
+                .iter()
+                .map(|s| String::from(*s))
+                .collect()
+        };
+        Ok(QueryResult { columns, rows })
     }
 
     /// `PRAGMA foreign_key_list(table)` →
