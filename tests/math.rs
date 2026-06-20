@@ -139,3 +139,24 @@ fn against_sqlite3() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn modulo_operator_truncates_to_integer() {
+    // The `%` operator truncates both operands to integers (unlike the mod()
+    // function, which is a floating modulo), with a real result when an operand
+    // is real, and NULL when the divisor truncates to zero — like SQLite.
+    let c = Connection::open_memory().unwrap();
+    let cell = |sql: &str| c.query(sql).unwrap().rows[0][0].clone();
+
+    assert_eq!(cell("SELECT 10 % 3"), Value::Integer(1));
+    assert_eq!(cell("SELECT 10.5 % 3"), Value::Real(1.0));
+    assert_eq!(cell("SELECT 10.9 % 3.9"), Value::Real(1.0));
+    assert_eq!(cell("SELECT -10.5 % 3"), Value::Real(-1.0));
+    assert_eq!(cell("SELECT 7 % 2.5"), Value::Real(1.0));
+    assert_eq!(cell("SELECT 5 % 1.5"), Value::Real(0.0));
+    assert_eq!(cell("SELECT 5 % 0"), Value::Null);
+    assert_eq!(cell("SELECT 5 % 0.5"), Value::Null); // divisor truncates to 0
+
+    // The mod() function remains a floating modulo.
+    assert_eq!(cell("SELECT mod(10.5, 3)"), Value::Real(1.5));
+}

@@ -989,10 +989,15 @@ fn arithmetic(op: BinaryOp, l: Value, r: Value) -> Value {
             }
         }
         Mod => {
-            if b == 0.0 {
+            // SQLite's `%` truncates both operands to integers, then takes the
+            // integer remainder; the result is real because an operand is real
+            // (e.g. `10.5 % 3` → `10 % 3` → `1.0`). A divisor that truncates to 0
+            // yields NULL.
+            let bi = b as i64;
+            if bi == 0 {
                 Value::Null
             } else {
-                real(crate::util::float::fmod(a, b))
+                Value::Real((a as i64).wrapping_rem(bi) as f64)
             }
         }
         _ => unreachable!(),
