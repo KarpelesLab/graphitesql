@@ -352,6 +352,25 @@ fn corpus() -> Vec<String> {
     q.push("SELECT 1.0 UNION SELECT 1;".into());
     q.push("SELECT 5 UNION SELECT 5.5 UNION SELECT 5.0 ORDER BY 1;".into());
     q.push("SELECT a FROM t WHERE a<3 UNION SELECT a*1.0 FROM t WHERE a<3 ORDER BY 1;".into());
+    // IS TRUE/FALSE truthiness and abs() of text (REAL result).
+    for e in [
+        "2 IS TRUE",
+        "0 IS TRUE",
+        "NULL IS TRUE",
+        "2 IS FALSE",
+        "0 IS FALSE",
+        "2 IS NOT TRUE",
+        "NULL IS NOT FALSE",
+        "-5 IS TRUE",
+        "'' IS TRUE",
+        "abs('5')",
+        "abs('5xy')",
+        "abs(-5)",
+        "abs('-3.2abc')",
+        "abs(5.5)",
+    ] {
+        q.push(format!("SELECT {e};"));
+    }
 
     // 24) Window functions over the dataset (rank/aggregates/offset + frames).
     q.push("SELECT id, row_number() OVER (ORDER BY a, id) FROM t ORDER BY id;".into());

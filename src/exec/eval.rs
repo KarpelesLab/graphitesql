@@ -431,6 +431,19 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     let coll = resolve_collation(left, right, ctx);
                     Ok(compare_op(*op, &l, &r, coll))
                 }
+                // `x IS TRUE`/`IS FALSE` (and their `IS NOT` forms) test
+                // truthiness, not value equality: `2 IS TRUE` is 1, and
+                // `NULL IS TRUE` is 0.
+                Is | IsNot if matches!(unparen(right), Expr::Literal(Literal::Boolean(_))) => {
+                    let want = matches!(unparen(right), Expr::Literal(Literal::Boolean(true)));
+                    let is_truthy = truth(&eval(left, ctx)?) == Some(want);
+                    let res = if matches!(op, IsNot) {
+                        !is_truthy
+                    } else {
+                        is_truthy
+                    };
+                    Ok(Value::Integer(res as i64))
+                }
                 _ => eval_binary(*op, eval(left, ctx)?, eval(right, ctx)?),
             }
         }
@@ -523,6 +536,14 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
 
 /// View an expression as a row value's element list, if it is one (transparently
 /// through a redundant parenthesization).
+/// Peel away `(…)` wrappers to reach the inner expression.
+fn unparen(e: &Expr) -> &Expr {
+    match e {
+        Expr::Paren(inner) => unparen(inner),
+        other => other,
+    }
+}
+
 fn as_row_value(e: &Expr) -> Option<&[Expr]> {
     match e {
         Expr::RowValue(items) => Some(items),

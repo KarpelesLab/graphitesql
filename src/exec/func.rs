@@ -74,10 +74,13 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
     Ok(match lname.as_str() {
         "abs" => {
             arity(&lname, args, 1)?;
-            match eval::to_number(&v[0]) {
+            match &v[0] {
+                Value::Null => Value::Null,
                 Value::Integer(i) => Value::Integer(i.wrapping_abs()),
-                Value::Real(r) => Value::Real(crate::util::float::abs(r)),
-                _ => Value::Null,
+                Value::Real(r) => Value::Real(crate::util::float::abs(*r)),
+                // A text/blob argument is coerced to a real (SQLite gives
+                // `abs('5')` = 5.0, not 5).
+                other => Value::Real(crate::util::float::abs(eval::to_f64(other))),
             }
         }
         "length" => {
