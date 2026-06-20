@@ -216,16 +216,17 @@ fn order_by_rowid_skips_temp_btree() {
 #[test]
 fn order_by_secondary_index_uses_index() {
     // ORDER BY a full-index column scans that index in key order instead of
-    // sorting; EQP reports `USING INDEX` and no temp b-tree (matching sqlite,
-    // modulo its separate COVERING-index detection).
+    // sorting. `USING INDEX` when the table is fetched, `USING COVERING INDEX`
+    // when the index holds every referenced column — matching sqlite.
     let mut c = Connection::open_memory().unwrap();
-    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c INT)")
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c INT, extra TEXT)")
         .unwrap();
     c.execute("CREATE INDEX ic ON t(c)").unwrap();
     for (id, cv) in [(1, 30), (2, 10), (3, 20), (4, 10)] {
-        c.execute(&format!("INSERT INTO t VALUES({id},{cv})"))
+        c.execute(&format!("INSERT INTO t VALUES({id},{cv},'x')"))
             .unwrap();
     }
+    // `extra` is not in the index, so SELECT * fetches the table: USING INDEX.
     assert_eq!(
         detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY c"),
         ["SCAN t USING INDEX ic"]
@@ -234,6 +235,15 @@ fn order_by_secondary_index_uses_index() {
         detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY c DESC"),
         ["SCAN t USING INDEX ic"]
     );
+    // Referencing only indexed/rowid columns is covered: USING COVERING INDEX.
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT c FROM t ORDER BY c"),
+        ["SCAN t USING COVERING INDEX ic"]
+    );
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT id, c FROM t ORDER BY c"),
+        ["SCAN t USING COVERING INDEX ic"]
+    );
     // A partial index must NOT be used (it omits rows), so the sort stays.
     c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, c INT)")
         .unwrap();
@@ -241,6 +251,33 @@ fn order_by_secondary_index_uses_index() {
     assert_eq!(
         detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM p ORDER BY c"),
         ["SCAN p", "USE TEMP B-TREE FOR ORDER BY"]
+    );
+}
+
+#[test]
+fn covering_index_scan_returns_correct_values() {
+    // The covering path builds rows from index records (indexed cols + rowid)
+    // without touching the table b-tree; values must be exact, incl. SELECT *
+    // when the table is only rowid + indexed columns.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE u(k INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    c.execute("CREATE INDEX iu ON u(name)").unwrap();
+    c.execute("INSERT INTO u VALUES(1,'banana'),(2,'apple'),(3,'cherry')")
+        .unwrap();
+    // SELECT * is covered (k = rowid, name = indexed); rows built from the index.
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM u ORDER BY name"),
+        ["SCAN u USING COVERING INDEX iu"]
+    );
+    let rows = c.query("SELECT k, name FROM u ORDER BY name").unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(2), Value::Text("apple".into())],
+            vec![Value::Integer(1), Value::Text("banana".into())],
+            vec![Value::Integer(3), Value::Text("cherry".into())],
+        ]
     );
 }
 

@@ -4994,9 +4994,15 @@ impl Connection {
             // rows already emitted
         } else {
             let detail = if from.joins.is_empty() {
-                // A full index scanned to satisfy ORDER BY reads as `USING INDEX`.
-                if let Some((iname, _, _, _)) = self.order_index_scan(sel) {
-                    alloc::format!("SCAN {label} USING INDEX {iname}")
+                // A full index scanned to satisfy ORDER BY reads as `USING INDEX`,
+                // or `USING COVERING INDEX` when it holds every referenced column.
+                if let Some(s) = self.order_index_scan(sel) {
+                    let kind = if s.covering {
+                        "COVERING INDEX"
+                    } else {
+                        "INDEX"
+                    };
+                    alloc::format!("SCAN {label} USING {kind} {}", s.name)
                 } else {
                     self.eqp_access(
                         &label,
@@ -6039,10 +6045,7 @@ impl Connection {
     /// collations, descending)`. NULLs sort first in the index (ascending),
     /// matching `ORDER BY col ASC`; reversing for `DESC` puts them last, matching
     /// `ORDER BY col DESC` — so both directions are exact.
-    fn order_index_scan(
-        &self,
-        sel: &Select,
-    ) -> Option<(String, u32, Vec<crate::value::Collation>, bool)> {
+    fn order_index_scan(&self, sel: &Select) -> Option<OrderIndexScan> {
         let from = sel.from.as_ref()?;
         if !from.joins.is_empty() {
             return None;
@@ -6092,10 +6095,61 @@ impl Connection {
                 continue;
             }
             if idx.cols.first() == Some(&col) && idx.collations.first() == Some(&col_coll) {
-                return Some((idx.name, idx.root, idx.collations, term.descending));
+                let covering = self.index_covers_query(sel, &meta, &idx.cols);
+                return Some(OrderIndexScan {
+                    name: idx.name,
+                    root: idx.root,
+                    colls: idx.collations,
+                    cols: idx.cols,
+                    descending: term.descending,
+                    covering,
+                });
             }
         }
         None
+    }
+
+    /// Conservative covering check (B2): every column the query references
+    /// (result columns + `ORDER BY`) is an indexed column or the rowid, which is
+    /// present in every index record. Returns `false` on anything it cannot prove
+    /// covered — an expression/function/subquery result column, a wildcard over a
+    /// non-covered column, or any generated column on the table.
+    fn index_covers_query(&self, sel: &Select, meta: &TableMeta, idx_cols: &[usize]) -> bool {
+        if meta.generated.iter().any(|g| g.is_some()) {
+            return false;
+        }
+        let covered = |ci: usize| idx_cols.contains(&ci) || meta.ipk == Some(ci);
+        let col_ok = |expr: &Expr| -> bool {
+            match expr {
+                Expr::Column { column, .. } => match meta
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(column))
+                {
+                    Some(ci) => covered(ci),
+                    None => matches!(
+                        column.to_ascii_lowercase().as_str(),
+                        "rowid" | "_rowid_" | "oid"
+                    ),
+                },
+                _ => false,
+            }
+        };
+        for rc in &sel.columns {
+            match rc {
+                ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => {
+                    if !(0..meta.columns.len()).all(covered) {
+                        return false;
+                    }
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    if !col_ok(expr) {
+                        return false;
+                    }
+                }
+            }
+        }
+        sel.order_by.iter().all(|t| col_ok(&t.expr))
     }
 
     /// Whether a single-table scan already yields rows in the query's `ORDER BY`
@@ -6105,7 +6159,7 @@ impl Connection {
         if let Some(d) = self.rowid_ordered_scan(sel) {
             return Some(d);
         }
-        self.order_index_scan(sel).map(|(_, _, _, d)| d)
+        self.order_index_scan(sel).map(|s| s.descending)
     }
 
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
@@ -6361,12 +6415,38 @@ impl Connection {
                 return Ok((first_meta.columns, rows));
             }
             // ORDER BY satisfied by a full secondary index (B0): walk that index
-            // in key order and fetch rows, so `run_core` can skip the sort. Must
-            // stay in lockstep with `order_satisfied_by_scan`/`eqp_access`.
-            if let Some((_, root, colls, _)) = self.order_index_scan(sel) {
+            // in key order, so `run_core` can skip the sort. Must stay in lockstep
+            // with `order_satisfied_by_scan`/`eqp_access`. When the index covers
+            // every referenced column (B2), build rows from the index records and
+            // skip the table b-tree entirely; otherwise fetch each row by rowid.
+            if let Some(s) = self.order_index_scan(sel) {
                 let src = self.backend.source();
-                let rowids = crate::btree::index_range_rowids(src, root, None, None, &colls)?;
                 let encoding = src.header().text_encoding;
+                if s.covering {
+                    let mut icur = IndexCursor::new(src, s.root);
+                    let mut input_rows = Vec::new();
+                    while let Some(payload) = icur.next()? {
+                        let rec = decode_record(&payload, encoding)?;
+                        // The record is `(indexed col values…, rowid)`.
+                        let rowid = match rec.get(s.cols.len()) {
+                            Some(Value::Integer(r)) => *r,
+                            _ => return Err(Error::Corrupt("index record missing rowid".into())),
+                        };
+                        let mut values = alloc::vec![Value::Null; first_meta.columns.len()];
+                        for (i, &mc) in s.cols.iter().enumerate() {
+                            values[mc] = rec[i].clone();
+                        }
+                        if let Some(ipk) = first_meta.ipk {
+                            values[ipk] = Value::Integer(rowid);
+                        }
+                        input_rows.push(InputRow {
+                            values,
+                            rowid: Some(rowid),
+                        });
+                    }
+                    return Ok((first_meta.columns, input_rows));
+                }
+                let rowids = crate::btree::index_range_rowids(src, s.root, None, None, &s.colls)?;
                 let mut cur = TableCursor::new(src, first_meta.root);
                 let mut input_rows = Vec::with_capacity(rowids.len());
                 for rid in rowids {
@@ -8290,6 +8370,24 @@ impl TableMeta {
 }
 
 /// An index's b-tree root and the table column positions it covers.
+/// A planner decision to satisfy `ORDER BY` by scanning a secondary index in key
+/// order (B0), shared by `scan_source`, `run_core`, and `eqp_access`.
+struct OrderIndexScan {
+    /// The index name (for `EXPLAIN QUERY PLAN`).
+    name: String,
+    /// Root page of the index b-tree.
+    root: u32,
+    /// Collations of the index's columns (for the b-tree walk).
+    colls: Vec<crate::value::Collation>,
+    /// Table-column index of each index column (record layout `cols…, rowid`).
+    cols: Vec<usize>,
+    /// `ORDER BY … DESC` (the ascending scan is reversed).
+    descending: bool,
+    /// The index holds every column the query references (B2): rows can be built
+    /// from index records without touching the table b-tree.
+    covering: bool,
+}
+
 struct IndexMeta {
     /// The index name (as in `sqlite_schema`), used by `ANALYZE`.
     name: String,

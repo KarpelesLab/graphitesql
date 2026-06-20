@@ -171,7 +171,8 @@ piece beside it):
 | `… FROM t ORDER BY a` (`a` = rowid/IPK) | ✅ now `SCAN t` (no sort) | `SCAN t` | **B0** ✅ |
 | `… FROM t ORDER BY c` (secondary index on `c`) | ✅ now `SCAN t USING INDEX ic` (no sort) | `SCAN t USING INDEX ic` | **B0** ✅ |
 | `… FROM t JOIN u ON t.c=u.x` (`x` = `u` PK) | `SCAN t` + `SCAN u` | `SCAN t` + `SEARCH u USING INTEGER PRIMARY KEY (rowid=?)` | **B1/B3** |
-| `SELECT count(*) FROM t` (any index `ic`) | `SCAN t` | `SCAN t USING COVERING INDEX ic` | **B2** |
+| `SELECT c FROM t ORDER BY c` (index on `c`) | ✅ now `SCAN t USING COVERING INDEX ic` | `SCAN t USING COVERING INDEX ic` | **B2** ✅ (ordered scan) |
+| `SELECT count(*) FROM t` (any index `ic`) | `SCAN t` | `SCAN t USING COVERING INDEX ic` | **B2** (aggregate) |
 
 - **B0 — Index-driven `ORDER BY`/`GROUP BY`.**
   - ✅ *rowid/IPK case.* A single-table full scan whose sole `ORDER BY` term is
@@ -189,8 +190,9 @@ piece beside it):
     `ORDER BY … DESC`); `eqp_access` reports `SCAN t USING INDEX <name>`. All
     three gate on the shared `order_index_scan`, so they stay in lockstep.
     Verified against sqlite incl. NULLs, ties (rowid order), `DESC`, `LIMIT`,
-    and a NOCASE index; the whole differential corpus stays green. (sqlite's
-    extra `COVERING` qualifier is the separate B2 piece.)
+    and a NOCASE index; the whole differential corpus stays green. Covering
+    (B2): when the index holds every referenced column, rows are built from the
+    index records (no table fetch) and EQP reports `USING COVERING INDEX`.
   - *remaining:* multi-term `ORDER BY` against a multi-column index prefix;
     using an index for `GROUP BY`; satisfying `ORDER BY` from the index chosen
     by a `WHERE` seek (today the optimisation only fires with no `WHERE`).
@@ -201,7 +203,10 @@ piece beside it):
   rather than scanning it — the second row of the table above.)
 - **B2 — Covering-index detection.** When all referenced columns of a table are
   in a chosen index, read from the index without touching the table b-tree; mark
-  it in `EXPLAIN QUERY PLAN` (`USING COVERING INDEX`).
+  it in `EXPLAIN QUERY PLAN` (`USING COVERING INDEX`). ✅ *Done for the B0 ordered
+  index scan* (`index_covers_query` + the covering read in `scan_source`).
+  *Remaining:* covering reads on `WHERE`-driven index seeks (range/IN/equality)
+  and the `count(*)`-via-index aggregate case.
 - **B3 — Automatic indexes for unindexed joins.** Build a transient hash/sorted
   index on a join's inner table when no usable index exists (the `auto-index`
   optimization), reported as `USING AUTOMATIC … INDEX`.

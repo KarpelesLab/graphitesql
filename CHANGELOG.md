@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NOCASE index. Conservative: any `WHERE`/grouping/aggregate/window/`DISTINCT`,
   `COLLATE`, extra ORDER BY terms, partial/expression index, or a shadowing
   column falls back to the in-memory sort.
+- **Planner (B2): covering-index reads.** When the index satisfying an ordered
+  scan also holds every column the query references (an indexed column or the
+  rowid), rows are built directly from the index records and the table b-tree is
+  not touched; `EXPLAIN QUERY PLAN` reports `USING COVERING INDEX` (else plain
+  `USING INDEX`), matching sqlite. Coverage detection is conservative — a
+  wildcard over a non-covered column, an expression/function/subquery result
+  column, or any generated column on the table disables it.
 - **`PRAGMA collation_list`** lists the three built-in collating sequences (BINARY/NOCASE/RTRIM).
 - **`PRAGMA table_list [(name)]`**: one row per table/view across main + temp +
   attached databases — `(schema, name, type, ncol, wr, strict)` — plus each
