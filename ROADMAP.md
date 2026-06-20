@@ -286,12 +286,13 @@ them (rather than corrupt the ptrmap it can't yet maintain).
 > `PENDING_BYTE`/lock-byte page and source `usable_size` from the live header
 > incl. `reserved_space`.)
 
-- **C6b-1 — header flag + ptrmap page layout at create.** Honor `PRAGMA
-  auto_vacuum=FULL|INCREMENTAL` on an empty database: set the header
-  largest-root-page / incremental-vacuum fields and reserve pointer-map pages at
-  the right page numbers (`PTRMAP_PAGENO` cadence = `usable/5` data pages per
-  ptrmap page). Acceptance: sqlite3 opens the empty db, `integrity_check = ok`,
-  `PRAGMA auto_vacuum` agrees.
+- ✅ **C6b-1 — empty-db header.** Done — `WritePager::create_auto_vacuum(.., mode)`
+  + `AutoVacuum` enum writes the header largest-root-page (1) and incremental
+  flag for FULL/INCREMENTAL on an empty db; sqlite3 opens the files with
+  `integrity_check = ok` and `PRAGMA auto_vacuum` = 1/2 (values confirmed against
+  sqlite3). *Remaining for the write path:* reserving/using ptrmap pages as the
+  db grows is C6b-2; the `PRAGMA auto_vacuum=…` SQL wiring (currently rejected by
+  C6a) is still to be connected.
 - **C6b-2 — maintain ptrmap entries on alloc/free/balance.** Every page whose
   parent/type changes (btree child moves on split, overflow-chain links, freelist
   transitions) updates its 5-byte ptrmap entry. Acceptance: graphite writes rows
