@@ -140,7 +140,12 @@ impl Shell {
     }
 
     fn run_one(&mut self, conn: &mut Connection, sql: &str) -> graphitesql::Result<()> {
-        if returns_rows(sql) {
+        // A `PRAGMA name = value` setter must go through `execute` (`&mut self`):
+        // `query` takes `&self` and cannot mutate connection state, so routing a
+        // setter through it would silently no-op (e.g. `PRAGMA foreign_keys=ON`).
+        // Getter pragmas (`PRAGMA foreign_keys`, `PRAGMA table_info(t)`) have no
+        // `=` and still return rows via `query`.
+        if returns_rows(sql) && !is_pragma_setter(sql) {
             let result = conn.query(sql)?;
             self.print_result(&result);
         } else {
@@ -236,6 +241,19 @@ fn returns_rows(sql: &str) -> bool {
         .unwrap_or("")
         .to_ascii_uppercase();
     matches!(word.as_str(), "SELECT" | "PRAGMA" | "WITH" | "VALUES")
+}
+
+/// Whether `sql` is a `PRAGMA name = value` setter (which mutates connection
+/// state and so must run through `execute`, not `query`). The `= value` form is
+/// the distinguishing mark; bare/`(arg)` getter pragmas have no `=`.
+fn is_pragma_setter(sql: &str) -> bool {
+    let word = sql
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    word == "PRAGMA" && sql.contains('=')
 }
 
 /// Split a batch into statements on `;`, respecting single-quoted strings so a
