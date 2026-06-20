@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **Bare `pragma_<name>` table-valued functions** (no parentheses) now work as
+  a FROM source (e.g. `SELECT name FROM pragma_database_list`), the zero-argument
+  form, matching sqlite; a real table/view/CTE of the same name still shadows it.
 - **`sqlite_version()`** scalar function -- returns the SQLite release graphitesql
   tracks and writes into new file headers (`3.53.2`).
 - **`UPDATE OR IGNORE/REPLACE/ABORT/ROLLBACK/FAIL`** conflict clauses are now

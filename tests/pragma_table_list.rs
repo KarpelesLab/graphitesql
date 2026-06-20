@@ -114,3 +114,28 @@ fn table_list_filtered_by_name() {
     let got = graphite_set(&c, "PRAGMA table_list('t')");
     assert_eq!(got, vec!["main|t|table|2|0|0".to_string()]);
 }
+
+#[test]
+fn pragma_table_valued_function_without_parens() {
+    // `FROM pragma_<name>` (no parentheses) is the 0-arg table-valued form.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    let names: Vec<_> = c
+        .query("SELECT name FROM pragma_database_list ORDER BY seq")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec![Value::Text("main".into()), Value::Text("aux".into())]
+    );
+    // A real table of the same name still wins (no shadowing).
+    c.execute("CREATE TABLE pragma_x(z)").unwrap();
+    c.execute("INSERT INTO pragma_x VALUES(7)").unwrap();
+    assert_eq!(
+        c.query("SELECT z FROM pragma_x").unwrap().rows[0][0],
+        Value::Integer(7)
+    );
+}

@@ -6362,7 +6362,9 @@ impl Connection {
             }
         }
         // A table-valued function used as the sole source.
-        if from.joins.is_empty() && from.first.tvf_args.is_some() {
+        if from.joins.is_empty()
+            && (from.first.tvf_args.is_some() || self.is_pragma_tvf(&from.first))
+        {
             let (columns, rows) = self.tvf_rows(&from.first, params)?;
             let input = rows
                 .into_iter()
@@ -6680,6 +6682,20 @@ impl Connection {
     /// recursive one — can appear as a join source).
     /// Run a derived-table subquery (`FROM (SELECT …) AS alias`) into column
     /// metadata (labeled with the alias) and row values.
+    /// A bare `pragma_<name>` (no parentheses) used as a `FROM` source is the
+    /// zero-argument table-valued form of that PRAGMA — unless a real table,
+    /// view, or CTE of the same name shadows it.
+    fn is_pragma_tvf(&self, tref: &TableRef) -> bool {
+        tref.tvf_args.is_none()
+            && tref.subquery.is_none()
+            && tref.schema.is_none()
+            && tref.name.to_ascii_lowercase().starts_with("pragma_")
+            && self.lookup_cte(&tref.name, None).is_none()
+            && !self.is_view(&tref.name)
+            && self.unqualified_db(&tref.name) == DbRef::Main
+            && self.schema.table(&tref.name).is_none()
+    }
+
     /// Produce the rows of a table-valued function (`generate_series`, `json_each`,
     /// `json_tree`) used as a `FROM` source.
     fn tvf_rows(
@@ -6804,7 +6820,7 @@ impl Connection {
         tref: &TableRef,
         params: &Params,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
-        if tref.tvf_args.is_some() {
+        if tref.tvf_args.is_some() || self.is_pragma_tvf(tref) {
             return self.tvf_rows(tref, params);
         }
         if let Some(sub) = &tref.subquery {
