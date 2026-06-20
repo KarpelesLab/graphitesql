@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TABLE` lives in a private in-memory `temp` database (seq 1) that shadows main
   for unqualified names and never persists to a file; `sqlite_temp_master` reads
   it. File attachments are sqlite3-readable/writable both directions.
-  (Cross-database joins and transactions are upcoming.)
+  **Cross-database joins** now work (`SELECT … FROM main.u JOIN aux.o ON …`),
+  each source materialized through its own backend, with 3-part column names
+  (`aux.tbl.col`) parsed. (Cross-database transactions are upcoming.)
 - **Transaction & DDL state checks**: nested `BEGIN`, and `COMMIT`/`ROLLBACK`
   with no active transaction, are now rejected; `DROP` of a missing object
   reports lowercase "no such <kind>" with a table↔view hint; `ALTER … RENAME

@@ -5797,14 +5797,6 @@ impl Connection {
                 }],
             ));
         };
-        // Schema-qualified sources (`aux.t`): C3 reads a single attached table as
-        // the sole source by materializing it; cross-database joins are not yet
-        // wired (guard against silently resolving against `main`).
-        let any_qualified =
-            from.first.schema.is_some() || from.joins.iter().any(|j| j.table.schema.is_some());
-        if any_qualified && !from.joins.is_empty() {
-            return Err(Error::Unsupported("cross-database join"));
-        }
         if from.joins.is_empty() && from.first.subquery.is_none() && from.first.tvf_args.is_none() {
             // An explicit qualifier picks the database; an unqualified name may be
             // shadowed by a temp table. A non-main database is read by
@@ -6161,6 +6153,17 @@ impl Connection {
         }
         if let Some((cols, rows)) = self.try_view(&tref.name, tref.alias.as_deref(), params)? {
             return Ok((cols, rows.into_iter().map(|r| r.values).collect()));
+        }
+        // Cross-database join source: an explicit qualifier (`aux.t`) picks the
+        // database; an unqualified name may be shadowed by a temp table. Either
+        // way a non-main source is materialized through its own backend.
+        let db = match tref.schema.as_deref() {
+            Some(_) => self.resolve_db(tref.schema.as_deref())?,
+            None => self.unqualified_db(&tref.name),
+        };
+        if db != DbRef::Main {
+            let (cols, input) = self.scan_db_table(db, &tref.name, tref.alias.as_deref())?;
+            return Ok((cols, input.into_iter().map(|r| r.values).collect()));
         }
         let meta = self.table_meta(&tref.name, tref.alias.as_deref())?;
         let rows = if meta.without_rowid {

@@ -93,10 +93,71 @@ fn schema_qualified_read_main() {
             .rows[0][0],
         Value::Text("y".into())
     );
-    // Unknown database / cross-database join are clear errors (not silent).
+    // An unknown database qualifier is a clear error (not silent).
     c.execute("ATTACH ':memory:' AS aux").unwrap();
     assert!(c.query("SELECT * FROM zzz.t").is_err());
-    assert!(c.query("SELECT * FROM t, aux.t").is_err());
+}
+
+#[test]
+fn cross_database_join() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    c.execute("INSERT INTO u VALUES(1,'alice'),(2,'bob'),(3,'carol')")
+        .unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE aux.o(oid INTEGER PRIMARY KEY, uid INT, amt INT)")
+        .unwrap();
+    c.execute("INSERT INTO aux.o VALUES(10,1,100),(11,1,200),(12,2,50)")
+        .unwrap();
+
+    // INNER join across databases, with 3-part column names (`aux.o.amt`).
+    let r = c
+        .query("SELECT u.name, aux.o.amt FROM u JOIN aux.o ON u.id = aux.o.uid ORDER BY aux.o.oid")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Text("alice".into()), Value::Integer(100)],
+            vec![Value::Text("alice".into()), Value::Integer(200)],
+            vec![Value::Text("bob".into()), Value::Integer(50)],
+        ]
+    );
+
+    // LEFT join: carol (id 3) has no orders, so a NULL-extended row.
+    let r = c
+        .query(
+            "SELECT u.name, o.amt FROM u LEFT JOIN aux.o AS o ON u.id = o.uid ORDER BY u.id, o.amt",
+        )
+        .unwrap();
+    assert_eq!(
+        r.rows.last().unwrap(),
+        &vec![Value::Text("carol".into()), Value::Null]
+    );
+
+    // Both sources qualified, with aliases.
+    assert_eq!(
+        c.query("SELECT count(*) FROM main.u AS u JOIN aux.o AS o ON u.id=o.uid")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(3)
+    );
+
+    // A temp table joins against a main table for unqualified names.
+    c.execute("CREATE TEMP TABLE labels(uid INT, tag TEXT)")
+        .unwrap();
+    c.execute("INSERT INTO labels VALUES(1,'vip'),(2,'std')")
+        .unwrap();
+    let r = c
+        .query("SELECT u.name, labels.tag FROM u JOIN labels ON u.id = labels.uid ORDER BY u.id")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Text("alice".into()), Value::Text("vip".into())],
+            vec![Value::Text("bob".into()), Value::Text("std".into())],
+        ]
+    );
 }
 
 #[test]
@@ -251,7 +312,10 @@ fn temp_tables_do_not_persist_to_a_file() {
 
 #[test]
 fn attach_file_database_cross_engine() {
-    let sqlite = std::process::Command::new("sqlite3").arg("--version").output().is_ok();
+    let sqlite = std::process::Command::new("sqlite3")
+        .arg("--version")
+        .output()
+        .is_ok();
 
     let mut p = std::env::temp_dir();
     p.push(format!("graphitesql-attach-file-{}.db", std::process::id()));
@@ -262,8 +326,10 @@ fn attach_file_database_cross_engine() {
     {
         let mut c = Connection::open_memory().unwrap();
         c.execute(&format!("ATTACH '{path}' AS d")).unwrap();
-        c.execute("CREATE TABLE d.t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
-        c.execute("INSERT INTO d.t VALUES(1,'hello'),(2,'world')").unwrap();
+        c.execute("CREATE TABLE d.t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        c.execute("INSERT INTO d.t VALUES(1,'hello'),(2,'world')")
+            .unwrap();
         // database_list reports the file path for the attachment.
         let r = c.query("PRAGMA database_list").unwrap();
         assert_eq!(r.rows[1][1], Value::Text("d".into()));

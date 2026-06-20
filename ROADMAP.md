@@ -207,9 +207,10 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
   single table through its own backend; writes (`CREATE`/`INSERT`/`UPDATE`/
   `DELETE`/`DROP … aux.t`) temporarily swap the attached db in as the active
   `main` (a single write touches one database). Databases are isolated, matching
-  sqlite3. *Remaining within C3: cross-database **joins** (need two backends at
-  once — guarded as `Unsupported` today), qualified `ALTER`, and `WITHOUT ROWID`
-  cross-db reads.*
+  sqlite3. Cross-database **joins** now work too — each join source is
+  materialized through its own backend, and 3-part column names
+  (`aux.tbl.col`) parse. *Remaining within C3: qualified `ALTER`, and
+  `WITHOUT ROWID` cross-db reads.*
 - ✅ **C4 — `TEMP` tables.** A lazily-created in-memory `temp` database (seq 1);
   `CREATE TEMP TABLE` targets it (modeled as a `schema = "temp"` qualifier);
   unqualified names resolve `temp`→`main` (a temp table shadows main);
@@ -225,9 +226,9 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
   transactions spanning attached files (each commits independently today).*
 
 **The ATTACH/DETACH/TEMP multi-schema track (C1–C5) is complete** for in-memory
-and file databases. Remaining multi-schema refinements: cross-database **joins**,
-qualified `ALTER`/`CREATE INDEX|VIEW|TRIGGER`, `WITHOUT ROWID` cross-db reads,
-and cross-database transactions.
+and file databases, including cross-database joins. Remaining multi-schema
+refinements: qualified `ALTER`/`CREATE INDEX|VIEW|TRIGGER`, `WITHOUT ROWID`
+cross-db reads, and cross-database transactions.
 
 *Storage:*
 

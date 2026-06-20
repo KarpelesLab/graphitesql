@@ -1524,9 +1524,17 @@ impl Parser {
             return self.function_call(name);
         }
         if self.eat(&Token::Dot) {
-            let column = self.ident()?;
+            let mut table = name;
+            let mut column = self.ident()?;
+            // A third dotted part means `schema.table.column`: the database
+            // qualifier is redundant for name resolution (a table/alias name is
+            // unique within a query's scope), so keep the table + column.
+            if self.eat(&Token::Dot) {
+                table = column;
+                column = self.ident()?;
+            }
             return Ok(Expr::Column {
-                table: Some(name),
+                table: Some(table),
                 column,
             });
         }
