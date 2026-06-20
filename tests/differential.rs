@@ -347,6 +347,11 @@ fn corpus() -> Vec<String> {
         "SELECT g, count(*) FROM t GROUP BY g UNION ALL SELECT 99, sum(a) FROM t ORDER BY 1;"
             .into(),
     );
+    // Compound dedup keeps the last occurrence's representation across types.
+    q.push("SELECT 1 UNION SELECT 1.0;".into());
+    q.push("SELECT 1.0 UNION SELECT 1;".into());
+    q.push("SELECT 5 UNION SELECT 5.5 UNION SELECT 5.0 ORDER BY 1;".into());
+    q.push("SELECT a FROM t WHERE a<3 UNION SELECT a*1.0 FROM t WHERE a<3 ORDER BY 1;".into());
 
     // 24) Window functions over the dataset (rank/aggregates/offset + frames).
     q.push("SELECT id, row_number() OVER (ORDER BY a, id) FROM t ORDER BY id;".into());

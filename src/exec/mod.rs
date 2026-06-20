@@ -7475,11 +7475,15 @@ fn apply_compound(
     left: Vec<Vec<Value>>,
     right: Vec<Vec<Value>>,
 ) -> Vec<Vec<Value>> {
+    // Deduplicate, keeping the *last* occurrence's representation: when two rows
+    // are equal but differ in type (e.g. `1` vs `1.0`), SQLite's compound dedup
+    // keeps the later one (`SELECT 1 UNION SELECT 1.0` yields `1.0`).
     let dedup = |rows: Vec<Vec<Value>>| -> Vec<Vec<Value>> {
         let mut seen: Vec<Vec<Value>> = Vec::new();
         for r in rows {
-            if !seen.iter().any(|s| rows_equal(s, &r)) {
-                seen.push(r);
+            match seen.iter().position(|s| rows_equal(s, &r)) {
+                Some(i) => seen[i] = r,
+                None => seen.push(r),
             }
         }
         seen
