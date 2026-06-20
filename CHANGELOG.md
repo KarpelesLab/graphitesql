@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Fix: **LIMIT/OFFSET on a recursive CTE** is honored — it bounds the produced
+  rows and terminates the recursion (was stripped, causing "did not terminate").
+- Fix: **HAVING without GROUP BY** parses and runs (whole result = one group);
+  a HAVING on a non-aggregate query is rejected like SQLite.
+- Fix: **`PRAGMA table_info.dflt_value`** is the default expression's SQL text
+  (string defaults keep their quotes, `DEFAULT NULL` shows `NULL`).
 - Fix: **table-qualified rowid aliases** (`t.rowid` / `t._rowid_` / `t.oid`) now
   resolve (bare forms already did); a real column of that name still wins.
 - Fix: **`*` / `table.*` mixed with aggregates** (`SELECT *, count(*) …`) now
