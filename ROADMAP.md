@@ -338,12 +338,15 @@ Done: a table-valued-function mechanism (`generate_series`, `json_each`,
   object-safe `Dyn*` erasure so a `VTabRegistry` holds heterogeneous modules by
   name, a `SeriesModule` example, and 14 unit tests. `no_std`+alloc, no unsafe.
   Constraint pushdown / writes are stubbed for D1b.
-- **D1b — `CREATE VIRTUAL TABLE` + executor integration.** Parse
-  `CREATE VIRTUAL TABLE … USING module(args)`, persist it in `sqlite_schema`
-  (type `table`, with the `USING` form), instantiate the module's table on
-  schema load, and treat a vtab as a `FROM` source via the trait
-  (`best_index`→`filter`→`next`→`column`). Acceptance: a built-in example vtab is
-  queryable. Foundation for D2–D3. *Ref:* `vdbevtab.c`.
+- ✅ **D1b — `CREATE VIRTUAL TABLE` + executor integration.** Done —
+  `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module[(args)]` parses and
+  persists a `sqlite_schema` row (type `table`, `rootpage=0`, the CREATE text);
+  `Connection` carries a `VTabRegistry` seeded with a built-in `series` module;
+  a vtab is a `FROM` source (single + join side) via the trait
+  (connect→open→cursor, WHERE re-applied by `run_core`); `DROP` works;
+  INSERT/UPDATE/DELETE are rejected (read-only). File round-trip verified.
+  *Remaining:* `best_index` constraint pushdown (full scan today); a public
+  module-registration API (overlaps D4). Foundation for D2–D3.
 - **D2 — FTS5** full-text search (a module on D1). *Ref:* `fts5*.c`.
 - **D3 — R-Tree** spatial index (a module on D1). *Ref:* `rtree.c`.
 - **D4 — User-defined functions from Rust.** Register scalar/aggregate/window
