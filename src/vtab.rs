@@ -38,22 +38,27 @@
 //! [`rowid`](VTabRow::rowid), folding `xColumn`/`xRowid` into the row value so
 //! implementors never juggle a separate "current row" pointer.
 //!
-//! # What is stubbed / deferred to D1b
+//! # Wired up in D1b; what is still stubbed
+//!
+//! `CREATE VIRTUAL TABLE … USING <name>(<args>)` is parsed and executed by
+//! `crate::exec`: it persists a `sqlite_schema` row (`type='table'`,
+//! `rootpage=0`) and, on a `FROM`-clause read, looks the module up in the
+//! connection's [`VTabRegistry`], calls [`connect`](VTabModule::connect) for the
+//! column schema, [`open`](VTabModule::open)s a cursor with the `USING`
+//! arguments, and drains it like any other source. The built-in
+//! [`SeriesModule`] is registered under `"series"` on every connection.
+//!
+//! Still stubbed:
 //!
 //! * **Constraint pushdown / `best_index`.** [`VTabModule::best_index`] has a
 //!   default implementation that returns an empty (no-pushdown) plan, and
 //!   [`VTabModule::open`] receives the chosen [`IndexPlan`] but an implementation
-//!   is free to ignore it and do a full scan. A real cost-based planner that
-//!   turns SQL `WHERE` constraints into [`IndexConstraint`]s and feeds the chosen
-//!   plan back into the scan is D1b.
-//! * **`CREATE VIRTUAL TABLE` + executor integration.** Parsing the DDL, calling
-//!   [`VTabModule::connect`] with the `USING` arguments, and surfacing the cursor
-//!   rows as a `FROM` source all belong to D1b. The shape of "a `FROM` source
-//!   that yields rows" mirrors the existing table-valued functions in
-//!   `crate::exec` (`generate_series`, `json_each`); this trait is the reusable,
-//!   registerable generalization of that idea.
+//!   is free to ignore it and do a full scan (the executor re-applies the SQL
+//!   `WHERE`). A real cost-based planner that turns SQL constraints into
+//!   [`IndexConstraint`]s and feeds the chosen plan back into the scan is later.
 //! * **Writes.** `xUpdate` (INSERT/UPDATE/DELETE through a virtual table) is not
-//!   modeled here; D1a is read/scan only.
+//!   modeled; virtual tables are read/scan only, and the executor rejects writes
+//!   to them.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -226,10 +231,12 @@ pub trait VTabModule {
 
     /// Open a scan over the table under the chosen `plan`, returning a cursor.
     ///
-    /// In D1a an implementation may ignore `plan` and perform a full scan; the
-    /// `plan` argument exists so the signature is stable when D1b adds real
-    /// constraint pushdown.
-    fn open(&self, plan: &IndexPlan) -> Result<Self::Cursor>;
+    /// `args` are the same `USING <name>(<args>)` arguments that were passed to
+    /// [`connect`](Self::connect); they configure the scan (e.g. a `series`'
+    /// `start`/`stop`/`step`). An implementation may ignore `plan` and perform a
+    /// full scan; the `plan` argument exists so the signature is stable when
+    /// constraint pushdown lands.
+    fn open(&self, args: &[&str], plan: &IndexPlan) -> Result<Self::Cursor>;
 }
 
 /// An object-safe erasure of [`VTabModule`] so heterogeneous modules can live in
@@ -249,7 +256,7 @@ pub trait DynVTabModule {
     /// See [`VTabModule::best_index`].
     fn dyn_best_index(&self, constraints: &[IndexConstraint]) -> Result<IndexPlan>;
     /// See [`VTabModule::open`]; returns a boxed, type-erased cursor.
-    fn dyn_open(&self, plan: &IndexPlan) -> Result<Box<dyn DynCursor>>;
+    fn dyn_open(&self, args: &[&str], plan: &IndexPlan) -> Result<Box<dyn DynCursor>>;
 }
 
 /// A type-erased [`VTabRow`] yielded by a [`DynCursor`].
@@ -295,8 +302,8 @@ where
     fn dyn_best_index(&self, constraints: &[IndexConstraint]) -> Result<IndexPlan> {
         VTabModule::best_index(self, constraints)
     }
-    fn dyn_open(&self, plan: &IndexPlan) -> Result<Box<dyn DynCursor>> {
-        Ok(Box::new(VTabModule::open(self, plan)?) as Box<dyn DynCursor>)
+    fn dyn_open(&self, args: &[&str], plan: &IndexPlan) -> Result<Box<dyn DynCursor>> {
+        Ok(Box::new(VTabModule::open(self, args, plan)?) as Box<dyn DynCursor>)
     }
 }
 
@@ -354,6 +361,19 @@ impl VTabRegistry {
     /// Whether no modules are registered.
     pub fn is_empty(&self) -> bool {
         self.modules.is_empty()
+    }
+}
+
+impl VTabRegistry {
+    /// Build a registry pre-populated with the engine's built-in virtual-table
+    /// modules. Currently just [`SeriesModule`] under the name `"series"`, so
+    /// `CREATE VIRTUAL TABLE … USING series(…)` works out of the box. A
+    /// user-facing registration API is roadmap D4.
+    pub fn with_builtins() -> VTabRegistry {
+        let mut reg = VTabRegistry::new();
+        reg.register("series", Box::new(SeriesModule))
+            .expect("fresh registry has no name collisions");
+        reg
     }
 }
 
@@ -462,17 +482,29 @@ impl VTabModule for SeriesModule {
         Ok(VTabSchema::new(["value"]))
     }
 
-    fn open(&self, plan: &IndexPlan) -> Result<SeriesCursor> {
-        // D1a ignores the plan and always full-scans; the argument is taken so
-        // the signature is stable for D1b constraint pushdown.
+    fn open(&self, args: &[&str], plan: &IndexPlan) -> Result<SeriesCursor> {
+        // The plan is ignored (a full scan); the argument is taken so the
+        // signature is stable for constraint pushdown.
         let _ = plan;
-        Ok(SeriesCursor {
-            next: 0,
-            stop: 0,
-            step: 1,
-            next_rowid: 1,
-            done: true,
-        })
+        // `series(start[, stop[, step]])`: stop defaults to start, step to 1.
+        let start = args
+            .first()
+            .map(|a| SeriesModule::parse_arg(a))
+            .transpose()?;
+        let Some(start) = start else {
+            return Err(Error::Error(
+                "series() requires at least a start argument".into(),
+            ));
+        };
+        let stop = match args.get(1) {
+            Some(a) => SeriesModule::parse_arg(a)?,
+            None => start,
+        };
+        let step = match args.get(2) {
+            Some(a) => SeriesModule::parse_arg(a)?,
+            None => 1,
+        };
+        SeriesModule::scan(start, stop, step)
     }
 }
 
@@ -623,12 +655,22 @@ mod tests {
         assert_eq!(schema.columns, vec![String::from("value")]);
 
         let plan = module.dyn_best_index(&[]).unwrap();
-        // The dyn `open` path goes through `SeriesModule::open`, which in D1a
-        // yields an empty scan; the configured scan is exercised via `scan`
-        // above. Here we assert the boxed cursor is produced and drainable.
-        let mut cur = module.dyn_open(&plan).unwrap();
-        // D1a's `open` is the empty full-scan stub, so it yields no rows.
-        assert!(cur.dyn_next().unwrap().is_none());
+        // The dyn `open` path goes through `SeriesModule::open`, configuring the
+        // scan from the same `USING` arguments passed to `connect`.
+        let mut cur = module.dyn_open(&["2", "8", "2"], &plan).unwrap();
+        let mut seen = Vec::new();
+        while let Some(row) = cur.dyn_next().unwrap() {
+            seen.push(row.dyn_column(0));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Value::Integer(2),
+                Value::Integer(4),
+                Value::Integer(6),
+                Value::Integer(8),
+            ]
+        );
     }
 
     /// Drive a boxed `dyn` cursor produced from a configured scan, exercising the

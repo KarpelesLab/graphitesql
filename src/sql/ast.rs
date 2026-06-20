@@ -30,6 +30,8 @@ pub enum Statement {
     CreateIndex(CreateIndex),
     /// A `CREATE VIEW` statement.
     CreateView(CreateView),
+    /// A `CREATE VIRTUAL TABLE … USING module(args)` statement.
+    CreateVirtualTable(CreateVirtualTable),
     /// A `CREATE TRIGGER` statement.
     CreateTrigger(CreateTrigger),
     /// A `DROP TABLE`/`DROP INDEX`/… statement.
@@ -560,6 +562,27 @@ pub struct CreateView {
     pub columns: Vec<String>,
     /// The view's `SELECT`.
     pub select: Box<Select>,
+}
+
+/// A `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module[(arg, …)]`
+/// statement.
+///
+/// The module name is an identifier; the arguments are captured verbatim as
+/// strings (SQLite passes them to the module untouched, never evaluating them as
+/// expressions).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateVirtualTable {
+    /// `IF NOT EXISTS`?
+    pub if_not_exists: bool,
+    /// Optional `schema.` (database) qualifier.
+    pub schema: Option<String>,
+    /// The virtual table's name.
+    pub name: String,
+    /// The module name following `USING`.
+    pub module: String,
+    /// The comma-separated module arguments, captured verbatim (empty when no
+    /// parenthesized argument list was given).
+    pub args: Vec<String>,
 }
 
 /// When a trigger fires relative to its event.

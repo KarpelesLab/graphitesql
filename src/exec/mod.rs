@@ -32,6 +32,7 @@ use crate::sql::ast::*;
 use crate::sql::{self};
 use crate::value::Value;
 use crate::vfs::{OpenFlags, Vfs};
+use crate::vtab::VTabRegistry;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -123,6 +124,10 @@ pub struct Connection {
     /// tables). `Main` at all other times; nested subqueries inherit it. Set and
     /// restored around [`scan_db_view`](Self::scan_db_view).
     read_default: core::cell::Cell<DbRef>,
+    /// Virtual-table modules registered on this connection, keyed by the name
+    /// that follows `USING` in `CREATE VIRTUAL TABLE`. Seeded with the built-in
+    /// `series` module; a public registration API is roadmap D4.
+    vtab_registry: VTabRegistry,
 }
 
 /// Which database an operation targets: `main`, the lazily-created `temp`
@@ -188,6 +193,7 @@ impl Connection {
             changes: core::cell::Cell::new(0),
             total_changes: core::cell::Cell::new(0),
             read_default: core::cell::Cell::new(DbRef::Main),
+            vtab_registry: VTabRegistry::with_builtins(),
         })
     }
 
@@ -212,6 +218,7 @@ impl Connection {
             changes: core::cell::Cell::new(0),
             total_changes: core::cell::Cell::new(0),
             read_default: core::cell::Cell::new(DbRef::Main),
+            vtab_registry: VTabRegistry::with_builtins(),
         })
     }
 
@@ -1119,6 +1126,8 @@ impl Connection {
             // A trigger lives in the schema named on it (or, unqualified,
             // wherever the table it fires on lives).
             Statement::CreateTrigger(ct) => resolved(ct.schema.as_deref(), &ct.table),
+            // A virtual table lives in the schema named on it; bare → main.
+            Statement::CreateVirtualTable(cvt) => self.resolve_db(cvt.schema.as_deref()),
             _ => Ok(DbRef::Main),
         }
     }
@@ -1236,6 +1245,7 @@ impl Connection {
                 | Statement::CreateIndex(_)
                 | Statement::CreateView(_)
                 | Statement::CreateTrigger(_)
+                | Statement::CreateVirtualTable(_)
                 | Statement::Drop(_)
                 | Statement::Alter(_)
         );
@@ -1262,6 +1272,10 @@ impl Connection {
             }
             Statement::CreateTrigger(ct) => {
                 self.exec_create_trigger(&ct, sql.trim())?;
+                0
+            }
+            Statement::CreateVirtualTable(cvt) => {
+                self.exec_create_virtual_table(&cvt, sql.trim())?;
                 0
             }
             Statement::Drop(d) => {
@@ -2670,6 +2684,7 @@ impl Connection {
 
     fn exec_insert(&mut self, ins: &Insert, params: &Params) -> Result<usize> {
         reject_schema_write(&ins.table)?;
+        self.reject_vtab_write(&ins.table)?;
         // `INSERT … SELECT` is evaluated to a snapshot of value rows first (so
         // `INSERT INTO t SELECT … FROM t` reads the pre-insert state), then each
         // row flows through the normal VALUES path as literal expressions.
@@ -3177,6 +3192,7 @@ impl Connection {
 
     fn exec_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
         reject_schema_write(&del.table)?;
+        self.reject_vtab_write(&del.table)?;
         if self.is_view(&del.table) {
             return self.exec_view_delete(del, params);
         }
@@ -3272,6 +3288,7 @@ impl Connection {
 
     fn exec_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
         reject_schema_write(&upd.table)?;
+        self.reject_vtab_write(&upd.table)?;
         if self.is_view(&upd.table) {
             return self.exec_view_update(upd, params);
         }
@@ -3647,6 +3664,153 @@ impl Connection {
         self.backend.writer()?.header_mut().schema_cookie = cookie;
         self.schema = Schema::read(self.backend.source())?;
         Ok(())
+    }
+
+    /// Execute `CREATE VIRTUAL TABLE … USING module(args)`: look the module up in
+    /// the registry, validate the arguments by connecting (so a bad CREATE fails
+    /// now, not at first query), and persist a `sqlite_schema` row with
+    /// `type='table'`, `rootpage=0`, and `sql` = the original CREATE text.
+    fn exec_create_virtual_table(
+        &mut self,
+        cvt: &CreateVirtualTable,
+        sql_text: &str,
+    ) -> Result<()> {
+        // A schema-qualified `CREATE VIRTUAL TABLE aux.v …` stores its SQL
+        // bare-named, like CREATE TABLE/VIEW.
+        let stripped;
+        let sql_text = match cvt.schema.as_deref() {
+            Some(s) => {
+                stripped = strip_schema_qualifier(sql_text, s)?;
+                stripped.as_str()
+            }
+            None => sql_text,
+        };
+        let exists = self.schema.objects().iter().any(|o| o.name == cvt.name);
+        if exists {
+            if cvt.if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::Error(format!("table {} already exists", cvt.name)));
+        }
+        // The module must be registered, and must accept these arguments.
+        let module = self
+            .vtab_registry
+            .get(&cvt.module)
+            .ok_or_else(|| Error::Error(format!("no such module: {}", cvt.module)))?;
+        let arg_refs: Vec<&str> = cvt.args.iter().map(String::as_str).collect();
+        module.dyn_connect(&arg_refs)?;
+
+        let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
+        let row = encode_record(&[
+            Value::Text("table".into()),
+            Value::Text(cvt.name.clone()),
+            Value::Text(cvt.name.clone()),
+            Value::Integer(0), // virtual tables have no b-tree root
+            Value::Text(sql_text.into()),
+        ]);
+        insert_table(
+            self.backend.writer()?,
+            crate::schema::SCHEMA_ROOT_PAGE,
+            next,
+            &row,
+        )?;
+        let cookie = self
+            .backend
+            .writer()?
+            .header()
+            .schema_cookie
+            .wrapping_add(1);
+        self.backend.writer()?.header_mut().schema_cookie = cookie;
+        self.schema = Schema::read(self.backend.source())?;
+        Ok(())
+    }
+
+    /// Whether the named object is a virtual table (a `type='table'` schema row
+    /// whose stored SQL is a `CREATE VIRTUAL TABLE`). Such a table has no b-tree
+    /// (`rootpage = 0`) and is scanned through its registered module instead.
+    fn is_virtual_table(&self, name: &str) -> bool {
+        self.schema
+            .objects()
+            .iter()
+            .filter(|o| {
+                o.obj_type == crate::schema::ObjectType::Table && o.name.eq_ignore_ascii_case(name)
+            })
+            .any(|o| {
+                matches!(
+                    o.sql.as_deref().map(sql::parse_one),
+                    Some(Ok(Statement::CreateVirtualTable(_)))
+                )
+            })
+    }
+
+    /// Reject an `INSERT`/`UPDATE`/`DELETE` targeting a virtual table. The
+    /// built-in modules are read-only; writes (SQLite's `xUpdate`) are not yet
+    /// modeled.
+    fn reject_vtab_write(&self, name: &str) -> Result<()> {
+        if self.is_virtual_table(name) {
+            return Err(Error::Error(format!(
+                "cannot modify {name} — it is a read-only virtual table"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Produce the columns and rows of a virtual table used as a `FROM` source:
+    /// reparse its stored `CREATE VIRTUAL TABLE`, look the module up in the
+    /// registry, `connect` for its column schema, then `open` a cursor and drain
+    /// it. Returns `Ok(None)` when `name` is not a virtual table.
+    fn try_virtual_table(
+        &self,
+        name: &str,
+        alias: Option<&str>,
+    ) -> Result<Option<(Vec<ColumnInfo>, Vec<InputRow>)>> {
+        use crate::schema::ObjectType;
+        let obj = match self
+            .schema
+            .objects()
+            .iter()
+            .find(|o| o.obj_type == ObjectType::Table && o.name.eq_ignore_ascii_case(name))
+        {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        let sql = match obj.sql.as_deref() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let cvt = match sql::parse_one(sql) {
+            Ok(Statement::CreateVirtualTable(cvt)) => cvt,
+            _ => return Ok(None),
+        };
+        let module = self
+            .vtab_registry
+            .get(&cvt.module)
+            .ok_or_else(|| Error::Error(format!("no such module: {}", cvt.module)))?;
+        let arg_refs: Vec<&str> = cvt.args.iter().map(String::as_str).collect();
+        let schema = module.dyn_connect(&arg_refs)?;
+        let plan = module.dyn_best_index(&[])?;
+        let mut cursor = module.dyn_open(&arg_refs, &plan)?;
+        let label = alias.unwrap_or(name).to_string();
+        let columns: Vec<ColumnInfo> = schema
+            .columns
+            .iter()
+            .map(|n| ColumnInfo {
+                name: n.clone(),
+                table: label.clone(),
+                affinity: eval::Affinity::Blob,
+                collation: crate::value::Collation::default(),
+            })
+            .collect();
+        let ncols = columns.len();
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.dyn_next()? {
+            let values = (0..ncols).map(|i| row.dyn_column(i)).collect();
+            rows.push(InputRow {
+                values,
+                rowid: Some(row.dyn_rowid()),
+            });
+        }
+        Ok(Some((columns, rows)))
     }
 
     /// Materialize each `WITH` CTE of `sel` into the environment, in declaration
@@ -6706,6 +6870,14 @@ impl Connection {
                 return Ok((columns, rows));
             }
         }
+        // A virtual table as the sole source: drain its module's cursor.
+        if from.joins.is_empty() && from.first.schema.is_none() {
+            if let Some((columns, rows)) =
+                self.try_virtual_table(&from.first.name, from.first.alias.as_deref())?
+            {
+                return Ok((columns, rows));
+            }
+        }
 
         // Single-table fast path. Try an index-driven equality lookup first; the
         // full WHERE is still applied by run_core, so the index only needs to
@@ -7286,6 +7458,11 @@ impl Connection {
         }
         if let Some((cols, rows)) = self.try_view(&tref.name, tref.alias.as_deref(), params)? {
             return Ok((cols, rows.into_iter().map(|r| r.values).collect()));
+        }
+        if tref.schema.is_none() {
+            if let Some((cols, rows)) = self.try_virtual_table(&tref.name, tref.alias.as_deref())? {
+                return Ok((cols, rows.into_iter().map(|r| r.values).collect()));
+            }
         }
         // Cross-database join source: an explicit qualifier (`aux.t`) picks the
         // database; an unqualified name may be shadowed by a temp table. Either

@@ -54,6 +54,38 @@ pub fn parse_one(sql: &str) -> Result<Statement> {
     }
 }
 
+/// Render one token of a `CREATE VIRTUAL TABLE … USING m(…)` argument back to
+/// the string a virtual-table module receives. Module arguments are not SQL
+/// expressions — SQLite hands them over verbatim — so this reproduces the
+/// literal's value (e.g. `Integer(5)` → `"5"`, `Str("a")` → `"a"`).
+fn token_arg_text(tok: &Token) -> String {
+    match tok {
+        Token::Word(w) => w.clone(),
+        Token::Ident(i) => i.clone(),
+        Token::Integer(n) => alloc::format!("{n}"),
+        Token::Int2Pow63 => String::from("9223372036854775808"),
+        Token::Float(f) => alloc::format!("{f}"),
+        Token::Str(s) => s.clone(),
+        Token::Minus => String::from("-"),
+        Token::Plus => String::from("+"),
+        Token::Dot => String::from("."),
+        Token::Star => String::from("*"),
+        Token::Eq => String::from("="),
+        other => alloc::format!("{other:?}"),
+    }
+}
+
+/// Whether `s` ends in an alphanumeric/underscore character (a word-like run
+/// that should be space-separated from a following word-like token).
+fn ends_wordish(s: &str) -> bool {
+    s.chars().next_back().is_some_and(is_wordish_start)
+}
+
+/// Whether `c` begins a word-like token (letter, digit, or underscore).
+fn is_wordish_start(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
@@ -969,7 +1001,15 @@ impl Parser {
             }
             return Ok(Statement::CreateTrigger(ct));
         }
-        Err(self.err("expected TABLE, INDEX, VIEW, or TRIGGER after CREATE"))
+        if self.eat_kw("virtual") {
+            self.expect_kw("table")?;
+            let mut cvt = self.create_virtual_table()?;
+            if temp && cvt.schema.is_none() {
+                cvt.schema = Some("temp".into());
+            }
+            return Ok(Statement::CreateVirtualTable(cvt));
+        }
+        Err(self.err("expected TABLE, INDEX, VIEW, TRIGGER, or VIRTUAL TABLE after CREATE"))
     }
 
     fn create_trigger(&mut self) -> Result<CreateTrigger> {
@@ -1053,6 +1093,71 @@ impl Parser {
             columns,
             select,
         })
+    }
+
+    fn create_virtual_table(&mut self) -> Result<CreateVirtualTable> {
+        let if_not_exists = self.if_not_exists()?;
+        let (schema, name) = self.qualified_name()?;
+        self.expect_kw("using")?;
+        let module = self.ident()?;
+        let mut args = Vec::new();
+        if self.eat(&Token::LParen) {
+            // SQLite passes the module arguments to the module verbatim; we don't
+            // evaluate them as expressions. Capture each comma-separated argument
+            // as a string, reassembling the raw token text. A bare comma at depth
+            // zero separates arguments; nested parentheses are kept within an arg.
+            if !self.check(&Token::RParen) {
+                loop {
+                    args.push(self.vtab_arg()?);
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Token::RParen)?;
+        }
+        Ok(CreateVirtualTable {
+            if_not_exists,
+            schema,
+            name,
+            module,
+            args,
+        })
+    }
+
+    /// Capture one module argument of a `CREATE VIRTUAL TABLE … USING m(…)` list
+    /// verbatim as a string, stopping at a top-level comma or the closing paren.
+    fn vtab_arg(&mut self) -> Result<String> {
+        let mut out = String::new();
+        let mut depth = 0usize;
+        loop {
+            match self.peek() {
+                None => return Err(self.err("unterminated virtual-table argument list")),
+                Some(Token::RParen) if depth == 0 => break,
+                Some(Token::Comma) if depth == 0 => break,
+                Some(_) => {}
+            }
+            let tok = self.advance().expect("peeked");
+            match &tok {
+                Token::LParen => depth += 1,
+                Token::RParen => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            let text = token_arg_text(&tok);
+            // Separate two word-like tokens with a space, but keep a sign or dot
+            // adjacent to its number (so `- 5` stays `-5`).
+            let needs_space = !out.is_empty()
+                && ends_wordish(&out)
+                && text.chars().next().is_some_and(is_wordish_start);
+            if needs_space {
+                out.push(' ');
+            }
+            out.push_str(&text);
+        }
+        if out.is_empty() {
+            return Err(self.err("empty virtual-table argument"));
+        }
+        Ok(out)
     }
 
     fn if_not_exists(&mut self) -> Result<bool> {
@@ -2170,6 +2275,36 @@ mod tests {
 
     fn one(sql: &str) -> Statement {
         parse_one(sql).unwrap()
+    }
+
+    #[test]
+    fn create_virtual_table() {
+        let Statement::CreateVirtualTable(cvt) = one("CREATE VIRTUAL TABLE v USING series(1, 5)")
+        else {
+            panic!()
+        };
+        assert!(!cvt.if_not_exists);
+        assert_eq!(cvt.name, "v");
+        assert_eq!(cvt.module, "series");
+        assert_eq!(cvt.args, vec![String::from("1"), String::from("5")]);
+
+        // IF NOT EXISTS, a negative argument, and no parens.
+        let Statement::CreateVirtualTable(cvt) =
+            one("CREATE VIRTUAL TABLE IF NOT EXISTS s USING series(-3, 3, 2)")
+        else {
+            panic!()
+        };
+        assert!(cvt.if_not_exists);
+        assert_eq!(
+            cvt.args,
+            vec![String::from("-3"), String::from("3"), String::from("2")]
+        );
+
+        let Statement::CreateVirtualTable(cvt) = one("CREATE VIRTUAL TABLE m USING mod") else {
+            panic!()
+        };
+        assert_eq!(cvt.module, "mod");
+        assert!(cvt.args.is_empty());
     }
 
     #[test]
