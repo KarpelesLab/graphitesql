@@ -756,12 +756,78 @@ fn round(v: &[Value]) -> Result<Value> {
     }
     let x = eval::to_f64(&v[0]);
     let digits = if v.len() == 2 {
-        eval::to_i64(&v[1]).max(0)
+        eval::to_i64(&v[1]).clamp(0, 30) as u32
     } else {
         0
     };
-    let factor = crate::util::float::powi(10.0, digits as i32);
-    Ok(Value::Real(crate::util::float::round(x * factor) / factor))
+    Ok(Value::Real(round_half_away(x, digits)))
+}
+
+/// Round `x` to `n` decimal places, half away from zero, matching SQLite. Instead
+/// of `round(x * 10^n) / 10^n` — which loses precision (e.g. `2.675 * 100` rounds
+/// *up* to exactly `267.5` in f64, giving 2.68 where SQLite gives 2.67) — this
+/// formats `x` to high fixed precision (exposing the true decimal digits) and
+/// rounds the digit string, so it sees that `2.675` is really `2.67499…`.
+fn round_half_away(x: f64, n: u32) -> f64 {
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    // Values at or beyond 2^52 have no fractional part in f64; return unchanged
+    // (this also bounds the formatted string length).
+    if crate::util::float::abs(x) >= 4_503_599_627_370_496.0 {
+        return x;
+    }
+    let neg = x < 0.0;
+    let ax = crate::util::float::abs(x);
+    let prec = n as usize + 25;
+    let s = alloc::format!("{ax:.prec$}");
+    let dot = s.find('.').unwrap_or(s.len());
+    let frac = if dot < s.len() { &s[dot + 1..] } else { "" };
+    // Round up when the first dropped digit (position `n`) is >= 5.
+    let round_up = frac.as_bytes().get(n as usize).is_some_and(|&d| d >= b'5');
+    // Kept digits: the integer part followed by the first `n` fractional digits.
+    let mut digits: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    digits.extend_from_slice(&s.as_bytes()[..dot]);
+    if n > 0 {
+        let take = (n as usize).min(frac.len());
+        digits.extend_from_slice(&frac.as_bytes()[..take]);
+        // Pad with zeros if the formatting produced fewer than n fraction digits.
+        digits.resize(dot + n as usize, b'0');
+    }
+    if round_up {
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                digits.insert(0, b'1');
+                break;
+            }
+            i -= 1;
+            if digits[i] == b'9' {
+                digits[i] = b'0';
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+    }
+    // Reassemble with the decimal point `n` digits from the right and parse back.
+    let nn = n as usize;
+    let s2 = if nn == 0 {
+        alloc::string::String::from_utf8(digits).unwrap_or_default()
+    } else {
+        let point = digits.len() - nn;
+        let mut out = alloc::string::String::new();
+        out.push_str(core::str::from_utf8(&digits[..point]).unwrap_or("0"));
+        out.push('.');
+        out.push_str(core::str::from_utf8(&digits[point..]).unwrap_or("0"));
+        out
+    };
+    let mag: f64 = s2.parse().unwrap_or(ax);
+    if neg {
+        -mag
+    } else {
+        mag
+    }
 }
 
 fn scalar_min_max(v: &[Value], want_min: bool) -> Value {
