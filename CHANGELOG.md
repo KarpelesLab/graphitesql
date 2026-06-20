@@ -97,7 +97,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SELECT` projections, and an interpreter — built *alongside* the tree-walking
   executor (not replacing it) so the IR can grow incrementally toward cursors and
   filters. The compiled+interpreted output matches both the tree-walker and
-  `sqlite3` for arithmetic/concat projections; unsupported queries cleanly report
+  `sqlite3` for arithmetic, concatenation, comparison, three-valued `AND`/`OR`/
+  `NOT`, and `IS [NOT] NULL` projections; unsupported queries cleanly report
   `Unsupported` for fallback.
 - Track B: `ANALYZE` and cost-based index selection. `ANALYZE [name]` gathers
   index selectivity into a `sqlite_stat1(tbl,idx,stat)` table, byte-compatible

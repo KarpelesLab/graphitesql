@@ -38,6 +38,26 @@ pub enum Op {
     },
     /// `dest = lhs || rhs` (text concatenation).
     Concat { lhs: usize, rhs: usize, dest: usize },
+    /// `dest = lhs <op> rhs` for a comparison `BinaryOp` (Eq/NotEq/Lt/…), with
+    /// SQLite's NULL-yields-NULL three-valued result (1/0/NULL).
+    Compare {
+        op: BinaryOp,
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    /// `dest = lhs AND rhs` (three-valued).
+    And { lhs: usize, rhs: usize, dest: usize },
+    /// `dest = lhs OR rhs` (three-valued).
+    Or { lhs: usize, rhs: usize, dest: usize },
+    /// `dest = NOT reg` (three-valued; NULL stays NULL).
+    Not { reg: usize, dest: usize },
+    /// `dest = reg IS [NOT] NULL` (1/0).
+    IsNull {
+        reg: usize,
+        negated: bool,
+        dest: usize,
+    },
     /// `dest = -reg` (numeric negation).
     Negate { reg: usize, dest: usize },
     /// Emit registers `[start, start+count)` as one output row.
@@ -153,15 +173,32 @@ impl Compiler {
                 self.ops.push(Op::Negate { reg: r, dest });
                 Ok(())
             }
+            Expr::Unary {
+                op: crate::sql::ast::UnaryOp::Not,
+                expr: inner,
+            } => {
+                let r = self.compile_expr(inner)?;
+                self.ops.push(Op::Not { reg: r, dest });
+                Ok(())
+            }
+            Expr::IsNull {
+                expr: inner,
+                negated,
+            } => {
+                let r = self.compile_expr(inner)?;
+                self.ops.push(Op::IsNull {
+                    reg: r,
+                    negated: *negated,
+                    dest,
+                });
+                Ok(())
+            }
             Expr::Binary { op, left, right } => {
                 let l = self.compile_expr(left)?;
                 let r = self.compile_expr(right)?;
+                use BinaryOp::*;
                 match op {
-                    BinaryOp::Add
-                    | BinaryOp::Sub
-                    | BinaryOp::Mul
-                    | BinaryOp::Div
-                    | BinaryOp::Mod => {
+                    Add | Sub | Mul | Div | Mod => {
                         self.ops.push(Op::Arith {
                             op: *op,
                             lhs: l,
@@ -170,8 +207,33 @@ impl Compiler {
                         });
                         Ok(())
                     }
-                    BinaryOp::Concat => {
+                    Concat => {
                         self.ops.push(Op::Concat {
+                            lhs: l,
+                            rhs: r,
+                            dest,
+                        });
+                        Ok(())
+                    }
+                    Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+                        self.ops.push(Op::Compare {
+                            op: *op,
+                            lhs: l,
+                            rhs: r,
+                            dest,
+                        });
+                        Ok(())
+                    }
+                    And => {
+                        self.ops.push(Op::And {
+                            lhs: l,
+                            rhs: r,
+                            dest,
+                        });
+                        Ok(())
+                    }
+                    Or => {
+                        self.ops.push(Op::Or {
                             lhs: l,
                             rhs: r,
                             dest,
@@ -216,6 +278,30 @@ pub fn run(program: &Program) -> Result<Vec<Vec<Value>>> {
                         Value::Text(s)
                     };
             }
+            Op::Compare { op, lhs, rhs, dest } => {
+                regs[*dest] = crate::exec::eval::compare_op(
+                    *op,
+                    &regs[*lhs],
+                    &regs[*rhs],
+                    crate::value::Collation::Binary,
+                );
+            }
+            Op::And { lhs, rhs, dest } => {
+                regs[*dest] = three_valued_and(&regs[*lhs], &regs[*rhs]);
+            }
+            Op::Or { lhs, rhs, dest } => {
+                regs[*dest] = three_valued_or(&regs[*lhs], &regs[*rhs]);
+            }
+            Op::Not { reg, dest } => {
+                regs[*dest] = match crate::exec::eval::truth(&regs[*reg]) {
+                    Some(b) => Value::Integer(!b as i64),
+                    None => Value::Null,
+                };
+            }
+            Op::IsNull { reg, negated, dest } => {
+                let is_null = matches!(regs[*reg], Value::Null);
+                regs[*dest] = Value::Integer((is_null != *negated) as i64);
+            }
             Op::ResultRow { start, count } => {
                 out.push(regs[*start..*start + *count].to_vec());
             }
@@ -223,6 +309,28 @@ pub fn run(program: &Program) -> Result<Vec<Vec<Value>>> {
         }
     }
     Ok(out)
+}
+
+/// `a AND b` under SQLite three-valued logic: false dominates, else NULL if
+/// either is NULL, else true.
+fn three_valued_and(a: &Value, b: &Value) -> Value {
+    use crate::exec::eval::truth;
+    match (truth(a), truth(b)) {
+        (Some(false), _) | (_, Some(false)) => Value::Integer(0),
+        (Some(true), Some(true)) => Value::Integer(1),
+        _ => Value::Null,
+    }
+}
+
+/// `a OR b` under SQLite three-valued logic: true dominates, else NULL if either
+/// is NULL, else false.
+fn three_valued_or(a: &Value, b: &Value) -> Value {
+    use crate::exec::eval::truth;
+    match (truth(a), truth(b)) {
+        (Some(true), _) | (_, Some(true)) => Value::Integer(1),
+        (Some(false), Some(false)) => Value::Integer(0),
+        _ => Value::Null,
+    }
 }
 
 #[cfg(test)]

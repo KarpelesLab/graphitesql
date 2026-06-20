@@ -37,6 +37,10 @@ fn vdbe_matches_tree_walker() {
         "SELECT -5, 3.5, 2 + 3.5",
         "SELECT (1 + 2) * (3 + 4)",
         "SELECT 100 / 7, 100.0 / 7",
+        "SELECT 1 < 2, 2 <= 2, 3 > 4, 5 = 5, 5 <> 6",
+        "SELECT 1 AND 1, 1 AND 0, 0 OR 1, 0 OR 0",
+        "SELECT NOT 0, NOT 1, NULL IS NULL, 1 IS NOT NULL",
+        "SELECT (1 < 2) AND (3 < 4), (1 > 2) OR (5 = 5)",
     ];
     for q in queries {
         let walker = c.query(q).unwrap().rows;
