@@ -620,6 +620,8 @@ pub struct Drop {
 /// An `ALTER TABLE` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Alter {
+    /// Optional `schema.` (database) qualifier.
+    pub schema: Option<String>,
     /// The table being altered.
     pub table: String,
     /// What to do to it.

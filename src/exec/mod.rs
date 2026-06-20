@@ -960,6 +960,7 @@ impl Connection {
             Statement::Update(s) => resolved(s.schema.as_deref(), &s.table),
             Statement::Delete(s) => resolved(s.schema.as_deref(), &s.table),
             Statement::Drop(s) => resolved(s.schema.as_deref(), &s.name),
+            Statement::Alter(a) => resolved(a.schema.as_deref(), &a.table),
             _ => Ok(DbRef::Main),
         }
     }

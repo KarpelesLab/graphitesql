@@ -1362,7 +1362,7 @@ impl Parser {
     fn alter(&mut self) -> Result<Alter> {
         self.expect_kw("alter")?;
         self.expect_kw("table")?;
-        let table = self.ident()?;
+        let (schema, table) = self.qualified_name()?;
         let action = if self.eat_kw("rename") {
             if self.eat_kw("to") {
                 AlterAction::RenameTable(self.ident()?)
@@ -1382,7 +1382,11 @@ impl Parser {
         } else {
             return Err(self.err("expected RENAME, ADD, or DROP after ALTER TABLE"));
         };
-        Ok(Alter { table, action })
+        Ok(Alter {
+            schema,
+            table,
+            action,
+        })
     }
 
     // ---- expressions (Pratt) ------------------------------------------------

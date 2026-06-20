@@ -203,6 +203,79 @@ fn cross_database_without_rowid_read() {
 }
 
 #[test]
+fn cross_database_alter() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE aux.t(a INT, b TEXT)").unwrap();
+    c.execute("INSERT INTO aux.t VALUES(1,'x')").unwrap();
+
+    // ADD / RENAME COLUMN / RENAME TABLE all target the attached database.
+    c.execute("ALTER TABLE aux.t ADD COLUMN c INT DEFAULT 7")
+        .unwrap();
+    c.execute("ALTER TABLE aux.t RENAME COLUMN b TO bb")
+        .unwrap();
+    c.execute("ALTER TABLE aux.t RENAME TO t2").unwrap();
+    let r = c.query("SELECT a, bb, c FROM aux.t2").unwrap();
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Value::Integer(1),
+            Value::Text("x".into()),
+            Value::Integer(7)
+        ]]
+    );
+
+    // A same-named main table is untouched by ALTERs against aux.
+    c.execute("CREATE TABLE main.t(z)").unwrap();
+    c.execute("ALTER TABLE main.t ADD COLUMN w").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM aux.sqlite_master WHERE name='t'")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(0)
+    );
+}
+
+#[test]
+fn cross_database_alter_file_cross_engine() {
+    let sqlite = std::process::Command::new("sqlite3")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !sqlite {
+        return;
+    }
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "graphitesql-attach-alter-{}.db",
+        std::process::id()
+    ));
+    let path = p.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(&format!("ATTACH '{path}' AS d")).unwrap();
+        c.execute("CREATE TABLE d.t(a INT, b TEXT)").unwrap();
+        c.execute("INSERT INTO d.t VALUES(1,'x')").unwrap();
+        c.execute("ALTER TABLE d.t ADD COLUMN c INT DEFAULT 9")
+            .unwrap();
+        c.execute("ALTER TABLE d.t RENAME COLUMN b TO bb").unwrap();
+    }
+    // sqlite3 reads the ALTERed file: integrity ok and the new schema is visible.
+    let out = std::process::Command::new("sqlite3")
+        .arg(&path)
+        .arg("PRAGMA integrity_check; SELECT a||'|'||bb||'|'||c FROM t;")
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("ok"), "integrity: {s}");
+    assert!(s.contains("1|x|9"), "row: {s}");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+}
+
+#[test]
 fn cross_database_create_read_write() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a)").unwrap();
