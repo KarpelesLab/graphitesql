@@ -12,6 +12,7 @@
 pub mod cursor;
 pub mod index_writer;
 pub mod page;
+pub mod ptrmap;
 pub mod writer;
 
 pub use cursor::{IndexCursor, TableCursor};
