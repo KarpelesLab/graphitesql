@@ -573,6 +573,17 @@ fn corpus() -> Vec<String> {
     q.push(
         "SELECT id FROM t WHERE g=1 UNION SELECT id FROM t WHERE g=2 ORDER BY id LIMIT -1;".into(),
     );
+    // 31) printf/format specifiers: %g notation, half-away %f rounding, sign flags.
+    for e in [
+        "printf('%g',1000000)", "printf('%g',100000)", "printf('%g',0.0001)",
+        "printf('%g',0.00001)", "printf('%.3g',3.14159)", "printf('%g',1234.5)",
+        "printf('%G',123456789)", "printf('%.0f',2.5)", "printf('%.0f',0.5)",
+        "printf('%+.2f',3.5)", "printf('% d',5)", "printf('%+d',5)",
+        "printf('%.2f',2.675)", "printf('%08.3f',3.14)", "printf('%5.2f',3.14159)",
+        "printf('%e',12345.678)", "printf('%g',0.1)",
+    ] {
+        q.push(format!("SELECT {e};"));
+    }
 
     q
 }

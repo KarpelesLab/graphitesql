@@ -870,19 +870,23 @@ pub fn printf(args: &[Value]) -> Value {
             }
             'f' => {
                 let f = eval::to_f64(&next(&mut arg_idx));
-                alloc::format!("{:.*}", prec.unwrap_or(6), f)
+                let p = prec.unwrap_or(6);
+                // SQLite's printf rounds half away from zero (its own formatter,
+                // not the C library's round-half-to-even).
+                let r = crate::exec::func::round_half_away(f, p as u32);
+                with_sign(alloc::format!("{r:.p$}"), plus, space)
             }
             'e' => {
                 let f = eval::to_f64(&next(&mut arg_idx));
-                fmt_exp(f, prec.unwrap_or(6), false)
+                with_sign(fmt_exp(f, prec.unwrap_or(6), false), plus, space)
             }
             'E' => {
                 let f = eval::to_f64(&next(&mut arg_idx));
-                fmt_exp(f, prec.unwrap_or(6), true)
+                with_sign(fmt_exp(f, prec.unwrap_or(6), true), plus, space)
             }
             'g' | 'G' => {
                 let f = eval::to_f64(&next(&mut arg_idx));
-                eval::format_real(f)
+                with_sign(fmt_general(f, prec.unwrap_or(6), conv == 'G'), plus, space)
             }
             's' => {
                 let v = next(&mut arg_idx);
@@ -946,6 +950,63 @@ pub fn printf(args: &[Value]) -> Value {
         }
     }
     Value::Text(out)
+}
+
+/// Prepend the `+`/space sign flag to a formatted non-negative number (a leading
+/// `-` is already present for negatives).
+fn with_sign(mut s: String, plus: bool, space: bool) -> String {
+    if !s.starts_with('-') {
+        if plus {
+            s.insert(0, '+');
+        } else if space {
+            s.insert(0, ' ');
+        }
+    }
+    s
+}
+
+/// Format `%g`/`%G`: `prec` significant digits, choosing fixed or exponential
+/// notation (exponent < -4 or >= prec uses exponential), then stripping trailing
+/// zeros — matching C/SQLite `%g`.
+fn fmt_general(f: f64, prec: usize, upper: bool) -> String {
+    let p = prec.max(1);
+    if f == 0.0 {
+        return String::from("0");
+    }
+    // Decimal exponent of the value rounded to p significant digits: format in
+    // exponential first to read the exponent after rounding.
+    let e_str = fmt_exp(f, p - 1, false);
+    let exp: i32 = e_str
+        .split(['e', 'E'])
+        .nth(1)
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(0);
+    if exp < -4 || exp >= p as i32 {
+        // Exponential form, mantissa trailing zeros stripped.
+        let upper_e = fmt_exp(f, p - 1, upper);
+        let (mant, e) = match upper_e.find(['e', 'E']) {
+            Some(pos) => upper_e.split_at(pos),
+            None => return upper_e,
+        };
+        let mant = strip_trailing_zeros(mant);
+        alloc::format!("{mant}{e}")
+    } else {
+        // Fixed form with prec-1-exp fraction digits, trailing zeros stripped.
+        let frac = (p as i32 - 1 - exp).max(0) as usize;
+        let r = crate::exec::func::round_half_away(f, frac as u32);
+        let s = alloc::format!("{r:.frac$}");
+        strip_trailing_zeros(&s)
+    }
+}
+
+/// Strip trailing zeros after a decimal point (and a trailing bare `.`).
+fn strip_trailing_zeros(s: &str) -> String {
+    if s.contains('.') {
+        let t = s.trim_end_matches('0');
+        String::from(t.trim_end_matches('.'))
+    } else {
+        String::from(s)
+    }
 }
 
 /// Format `%e` style: `d.dddde±dd`.

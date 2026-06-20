@@ -768,7 +768,7 @@ fn round(v: &[Value]) -> Result<Value> {
 /// *up* to exactly `267.5` in f64, giving 2.68 where SQLite gives 2.67) — this
 /// formats `x` to high fixed precision (exposing the true decimal digits) and
 /// rounds the digit string, so it sees that `2.675` is really `2.67499…`.
-fn round_half_away(x: f64, n: u32) -> f64 {
+pub(crate) fn round_half_away(x: f64, n: u32) -> f64 {
     if !x.is_finite() || x == 0.0 {
         return x;
     }
