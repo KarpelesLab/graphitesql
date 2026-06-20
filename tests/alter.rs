@@ -203,3 +203,22 @@ fn add_column_constraint_restrictions() {
         Value::Integer(0)
     );
 }
+
+#[test]
+fn rename_collisions_are_rejected() {
+    // RENAME COLUMN onto an existing column name is a duplicate.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    assert!(c.execute("ALTER TABLE t RENAME COLUMN a TO b").is_err());
+    assert!(c.execute("ALTER TABLE t RENAME COLUMN a TO c").is_ok());
+
+    // RENAME TABLE onto an existing table, index, or itself is rejected.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("CREATE TABLE u(b)").unwrap();
+    c.execute("CREATE INDEX ix ON t(a)").unwrap();
+    assert!(c.execute("ALTER TABLE t RENAME TO u").is_err());
+    assert!(c.execute("ALTER TABLE t RENAME TO ix").is_err());
+    assert!(c.execute("ALTER TABLE t RENAME TO t").is_err());
+    assert!(c.execute("ALTER TABLE t RENAME TO renamed").is_ok());
+}

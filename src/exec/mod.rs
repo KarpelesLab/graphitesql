@@ -3503,8 +3503,17 @@ impl Connection {
                 })?;
             }
             AlterAction::RenameTable(new_name) => {
-                if self.schema.table(new_name).is_some() {
-                    return Err(Error::Error(format!("table {new_name} already exists")));
+                // The new name must not collide with any existing table or index,
+                // including renaming a table to its own name, as in SQLite.
+                if self
+                    .schema
+                    .objects()
+                    .iter()
+                    .any(|o| o.name.eq_ignore_ascii_case(new_name))
+                {
+                    return Err(Error::Error(format!(
+                        "there is already another table or index with this name: {new_name}"
+                    )));
                 }
                 ct.name = new_name.clone();
                 let new_table_sql = sql::print::create_table(&ct);
@@ -3540,6 +3549,15 @@ impl Connection {
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(old))
                     .ok_or_else(|| Error::Error(format!("no such column: {old}")))?;
+                // Renaming onto an existing column name is rejected, like SQLite.
+                if ct
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .any(|(i, c)| i != pos && c.name.eq_ignore_ascii_case(new))
+                {
+                    return Err(Error::Error(format!("duplicate column name: {new}")));
+                }
                 ct.columns[pos].name = new.clone();
                 // Update table-level PK/UNIQUE column lists that name the column.
                 for tc in &mut ct.constraints {
