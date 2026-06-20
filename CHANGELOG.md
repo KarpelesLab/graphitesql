@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Fix: **table-qualified rowid aliases** (`t.rowid` / `t._rowid_` / `t.oid`) now
+  resolve (bare forms already did); a real column of that name still wins.
+- Fix: **`*` / `table.*` mixed with aggregates** (`SELECT *, count(*) …`) now
+  works — wildcards expand to columns following the representative-row rule.
 - Track A: **`INSERT … SELECT`** — populate a table from a query (compound
   sources and target column lists included). The query is snapshotted before any
   insert, so `INSERT INTO t SELECT … FROM t` terminates; rows then flow through
