@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AND` containing one) now seeks each disjunct, unions the rowids, and fetches the
   rows once, instead of scanning. If any disjunct is not seekable it falls back to
   a scan. Superset semantics keep it correct (full `WHERE` re-applied). Verified
-  against `sqlite3`, including ORs spanning two different indexes.
+  against `sqlite3`, including ORs spanning two different indexes. `EXPLAIN QUERY
+  PLAN` reports these as SQLite's nested `MULTI-INDEX OR` / `INDEX 1` / `SEARCH …`
+  structure.
 - Track B: `EXPLAIN QUERY PLAN` now reports the index range and `IN`-list seeks as
   `SEARCH … USING INDEX … (a>? AND a<?)` / `(a=?)` (and rowid `IN` as
   `… INTEGER PRIMARY KEY (rowid=?)`), matching SQLite's format and reflecting what

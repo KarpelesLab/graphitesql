@@ -138,6 +138,38 @@ fn search_by_range_and_in() {
 }
 
 #[test]
+fn multi_index_or() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT)")
+        .unwrap();
+    c.execute("CREATE INDEX ta ON t(a)").unwrap();
+    c.execute("CREATE INDEX tb ON t(b)").unwrap();
+    // Top-level OR of two seekable disjuncts on different indexes.
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 OR b = 2"
+        ),
+        [
+            "MULTI-INDEX OR",
+            "INDEX 1",
+            "SEARCH t USING INDEX ta (a=?)",
+            "INDEX 2",
+            "SEARCH t USING INDEX tb (b=?)",
+        ]
+    );
+    // A non-seekable disjunct (no index on the rowid range's... here b+1) makes
+    // the whole thing a plain scan.
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 OR b + 1 = 2"
+        ),
+        ["SCAN t"]
+    );
+}
+
+#[test]
 fn order_by_adds_temp_btree() {
     let c = setup();
     let d = detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY s");

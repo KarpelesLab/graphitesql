@@ -3680,21 +3680,38 @@ impl Connection {
         // First source.
         let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
         let label = eqp_label(&from.first);
-        let detail = if from.joins.is_empty() {
-            self.eqp_access(
+        // A top-level OR of seekable disjuncts is a MULTI-INDEX OR plan (multiple
+        // rows); otherwise a single SCAN/SEARCH node.
+        if from.joins.is_empty()
+            && self.eqp_or_plan(
                 &label,
                 &from.first.name,
                 &meta,
                 sel.where_clause.as_ref(),
+                parent,
+                next_id,
+                out,
                 params,
             )?
+        {
+            // rows already emitted
         } else {
-            // Joins run in FROM order as nested-loop scans (no reordering).
-            alloc::format!("SCAN {label}")
-        };
-        let id = *next_id;
-        *next_id += 1;
-        out.push((id, parent, detail));
+            let detail = if from.joins.is_empty() {
+                self.eqp_access(
+                    &label,
+                    &from.first.name,
+                    &meta,
+                    sel.where_clause.as_ref(),
+                    params,
+                )?
+            } else {
+                // Joins run in FROM order as nested-loop scans (no reordering).
+                alloc::format!("SCAN {label}")
+            };
+            let id = *next_id;
+            *next_id += 1;
+            out.push((id, parent, detail));
+        }
         for join in &from.joins {
             let id = *next_id;
             *next_id += 1;
@@ -3711,6 +3728,54 @@ impl Connection {
             out.push((id, parent, String::from("USE TEMP B-TREE FOR ORDER BY")));
         }
         Ok(())
+    }
+
+    /// Emit a SQLite-style `MULTI-INDEX OR` plan when `where_clause` is a
+    /// top-level `OR` whose every disjunct is index/rowid-seekable (i.e. each
+    /// disjunct's [`eqp_access`](Self::eqp_access) yields a `SEARCH`). Returns
+    /// `true` (rows pushed) when it applies, else `false` (caller emits the plain
+    /// node). Mirrors [`try_index_or`](Self::try_index_or)'s applicability.
+    #[allow(clippy::too_many_arguments)]
+    fn eqp_or_plan(
+        &self,
+        label: &str,
+        table: &str,
+        meta: &TableMeta,
+        where_clause: Option<&Expr>,
+        parent: i64,
+        next_id: &mut i64,
+        out: &mut Vec<(i64, i64, String)>,
+        params: &Params,
+    ) -> Result<bool> {
+        let Some(where_expr) = where_clause else {
+            return Ok(false);
+        };
+        let mut disjuncts: Vec<&Expr> = Vec::new();
+        flatten_or(where_expr, &mut disjuncts);
+        if disjuncts.len() < 2 {
+            return Ok(false);
+        }
+        // Each disjunct must seek (its eqp_access is a SEARCH, not a SCAN).
+        let mut details = Vec::with_capacity(disjuncts.len());
+        for d in &disjuncts {
+            let detail = self.eqp_access(label, table, meta, Some(d), params)?;
+            if !detail.starts_with("SEARCH") {
+                return Ok(false);
+            }
+            details.push(detail);
+        }
+        let or_id = *next_id;
+        *next_id += 1;
+        out.push((or_id, parent, String::from("MULTI-INDEX OR")));
+        for (i, detail) in details.into_iter().enumerate() {
+            let idx_id = *next_id;
+            *next_id += 1;
+            out.push((idx_id, or_id, alloc::format!("INDEX {}", i + 1)));
+            let search_id = *next_id;
+            *next_id += 1;
+            out.push((search_id, idx_id, detail));
+        }
+        Ok(true)
     }
 
     /// The SCAN/SEARCH detail string for accessing one table given its WHERE.
