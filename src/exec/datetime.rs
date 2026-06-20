@@ -35,7 +35,8 @@ struct DateTime {
     valid_ymd: bool,
     valid_hms: bool,
     valid_tz: bool,
-    raw_s: bool, // the value came in as a bare number (for `unixepoch`)
+    raw_s: bool,  // the value came in as a bare number (for `unixepoch`)
+    subsec: bool, // a `subsec`/`subsecond` modifier was applied (render ms)
 }
 
 impl DateTime {
@@ -441,7 +442,11 @@ fn apply_modifier(p: &mut DateTime, m: &str) -> bool {
             p.compute_jd();
             true
         }
-        "subsec" | "subsecond" => true,
+        "subsec" | "subsecond" => {
+            // Make `datetime()`/`time()` render milliseconds; a no-op for `date()`.
+            p.subsec = true;
+            true
+        }
         _ => apply_numeric_modifier(p, m, &lower),
     }
 }
@@ -609,7 +614,12 @@ fn fmt_date(p: &mut DateTime) -> String {
 
 fn fmt_time(p: &mut DateTime) -> String {
     p.compute_hms();
-    alloc::format!("{:02}:{:02}:{:02}", p.h, p.min, p.s as i32)
+    if p.subsec {
+        // `subsec`/`subsecond`: render seconds as `SS.SSS` (e.g. `45.000`).
+        alloc::format!("{:02}:{:02}:{:06.3}", p.h, p.min, p.s)
+    } else {
+        alloc::format!("{:02}:{:02}:{:02}", p.h, p.min, p.s as i32)
+    }
 }
 
 /// `date(...)` -> `YYYY-MM-DD`.
