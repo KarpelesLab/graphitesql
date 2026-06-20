@@ -688,20 +688,7 @@ fn render_strftime(fmt: &str, p: &mut DateTime) -> String {
                 let h12 = ((p.h + 11) % 12) + 1;
                 out.push_str(&alloc::format!("{:02}", h12));
             }
-            Some('j') => {
-                let mut y0 = *p;
-                y0.valid_jd = false;
-                y0.m = 1;
-                y0.d = 1;
-                y0.h = 0;
-                y0.min = 0;
-                y0.s = 0.0;
-                y0.valid_ymd = true;
-                y0.valid_hms = true;
-                y0.compute_jd();
-                let nday = ((p.ijd - y0.ijd + 43_200_000) / 86_400_000) + 1;
-                out.push_str(&alloc::format!("{:03}", nday));
-            }
+            Some('j') => out.push_str(&alloc::format!("{:03}", day_of_year(p))),
             Some('J') => out.push_str(&eval::format_real(p.ijd as f64 / 86_400_000.0)),
             Some('k') => out.push_str(&alloc::format!("{:2}", p.h)),
             Some('l') => {
@@ -747,6 +734,18 @@ fn render_strftime(fmt: &str, p: &mut DateTime) -> String {
                 out.push_str(&alloc::format!("{:02}", wn));
             }
             Some('Y') => out.push_str(&alloc::format!("{:04}", p.y)),
+            Some('G') => {
+                let (iy, _) = iso_week_date(p);
+                out.push_str(&alloc::format!("{iy:04}"));
+            }
+            Some('g') => {
+                let (iy, _) = iso_week_date(p);
+                out.push_str(&alloc::format!("{:02}", iy.rem_euclid(100)));
+            }
+            Some('V') => {
+                let (_, iw) = iso_week_date(p);
+                out.push_str(&alloc::format!("{iw:02}"));
+            }
             Some('%') => out.push('%'),
             Some(other) => {
                 out.push('%');
@@ -756,6 +755,59 @@ fn render_strftime(fmt: &str, p: &mut DateTime) -> String {
         }
     }
     out
+}
+
+/// Day of year (1-366) for `p`, normalizing to midnight.
+fn day_of_year(p: &DateTime) -> i64 {
+    let midnight = |m: i32, d: i32| {
+        let mut x = *p;
+        x.valid_jd = false;
+        x.m = m;
+        x.d = d;
+        x.h = 0;
+        x.min = 0;
+        x.s = 0.0;
+        x.valid_ymd = true;
+        x.valid_hms = true;
+        x.compute_jd();
+        x.ijd
+    };
+    ((midnight(p.m, p.d) - midnight(1, 1) + 43_200_000) / 86_400_000) + 1
+}
+
+/// ISO weekday of `p`: Monday = 1 … Sunday = 7.
+fn iso_weekday(p: &DateTime) -> i32 {
+    let wd = ((p.ijd + 129_600_000) / 86_400_000 % 7) as i32; // 0 = Sunday
+    if wd == 0 {
+        7
+    } else {
+        wd
+    }
+}
+
+/// ISO 8601 week-date `(year, week)` for `p`. Week 1 is the week (Mon–Sun)
+/// containing the year's first Thursday; days before it belong to the last week
+/// of the previous ISO year, and late-December days can belong to week 1 of the
+/// next ISO year.
+fn iso_week_date(p: &DateTime) -> (i32, i32) {
+    // Whether ISO year `y` has 53 weeks (the standard "long year" predicate).
+    let long_year = |y: i64| {
+        let f =
+            |y: i64| (y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400)).rem_euclid(7);
+        f(y) == 4 || f(y - 1) == 3
+    };
+    let doy = day_of_year(p);
+    let dow = iso_weekday(p) as i64;
+    let week = (doy - dow + 10) / 7;
+    let y = p.y as i64;
+    let (iy, iw) = if week < 1 {
+        (y - 1, if long_year(y - 1) { 53 } else { 52 })
+    } else if week > if long_year(y) { 53 } else { 52 } {
+        (y + 1, 1)
+    } else {
+        (y, week)
+    };
+    (iy as i32, iw as i32)
 }
 
 // ---- printf / format --------------------------------------------------------
