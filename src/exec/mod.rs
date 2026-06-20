@@ -32,7 +32,7 @@ use crate::sql::ast::*;
 use crate::sql::{self};
 use crate::value::Value;
 use crate::vfs::{OpenFlags, Vfs};
-use crate::vtab::VTabRegistry;
+use crate::vtab::{ConstraintOp, IndexConstraint, IndexPlan, VTabRegistry};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -3745,10 +3745,18 @@ impl Connection {
     /// reparse its stored `CREATE VIRTUAL TABLE`, look the module up in the
     /// registry, `connect` for its column schema, then `open` a cursor and drain
     /// it. Returns `Ok(None)` when `name` is not a virtual table.
+    ///
+    /// `pushdown`, when given as `Some((sel, params))`, lets the module restrict
+    /// what it produces from the query's `WHERE` (constraint pushdown via
+    /// [`best_index`](crate::vtab::VTabModule::best_index) /
+    /// [`filter`](crate::vtab::VTabModule::filter)). The plan is always a superset:
+    /// the caller's `run_core` re-applies the full `WHERE`, so even a partially
+    /// consumed or ignored constraint stays correct.
     fn try_virtual_table(
         &self,
         name: &str,
         alias: Option<&str>,
+        pushdown: Option<(&Select, &Params)>,
     ) -> Result<Option<(Vec<ColumnInfo>, Vec<InputRow>)>> {
         use crate::schema::ObjectType;
         let obj = match self
@@ -3774,8 +3782,6 @@ impl Connection {
             .ok_or_else(|| Error::Error(format!("no such module: {}", cvt.module)))?;
         let arg_refs: Vec<&str> = cvt.args.iter().map(String::as_str).collect();
         let schema = module.dyn_connect(&arg_refs)?;
-        let plan = module.dyn_best_index(&[])?;
-        let mut cursor = module.dyn_open(&arg_refs, &plan)?;
         let label = alias.unwrap_or(name).to_string();
         let columns: Vec<ColumnInfo> = schema
             .columns
@@ -3787,6 +3793,15 @@ impl Connection {
                 collation: crate::value::Collation::default(),
             })
             .collect();
+        // Constraint pushdown: offer the WHERE's usable comparisons to the module,
+        // let it choose a plan, then hand back the bound values it requested.
+        let (constraints, bound_values) = match pushdown {
+            Some((sel, params)) => collect_vtab_constraints(sel, &columns, params),
+            None => (Vec::new(), Vec::new()),
+        };
+        let plan = module.dyn_best_index(&constraints)?;
+        let argv = order_vtab_argv(&plan, &bound_values);
+        let mut cursor = module.dyn_open(&arg_refs, &plan, &argv)?;
         let ncols = columns.len();
         let mut rows = Vec::new();
         while let Some(row) = cursor.dyn_next()? {
@@ -7047,11 +7062,16 @@ impl Connection {
                 return Ok((columns, rows));
             }
         }
-        // A virtual table as the sole source: drain its module's cursor.
+        // A virtual table as the sole source: drain its module's cursor, pushing
+        // the query's WHERE constraints into the module (it may restrict what it
+        // produces; run_core still re-applies the full WHERE, so this is a
+        // superset — never wrong).
         if from.joins.is_empty() && from.first.schema.is_none() {
-            if let Some((columns, rows)) =
-                self.try_virtual_table(&from.first.name, from.first.alias.as_deref())?
-            {
+            if let Some((columns, rows)) = self.try_virtual_table(
+                &from.first.name,
+                from.first.alias.as_deref(),
+                Some((sel, params)),
+            )? {
                 return Ok((columns, rows));
             }
         }
@@ -7808,7 +7828,11 @@ impl Connection {
             return Ok((cols, rows.into_iter().map(|r| r.values).collect()));
         }
         if tref.schema.is_none() {
-            if let Some((cols, rows)) = self.try_virtual_table(&tref.name, tref.alias.as_deref())? {
+            // In a join, the WHERE may reference other tables, so no pushdown here
+            // (full scan + the join's re-applied WHERE keeps it correct).
+            if let Some((cols, rows)) =
+                self.try_virtual_table(&tref.name, tref.alias.as_deref(), None)?
+            {
                 return Ok((cols, rows.into_iter().map(|r| r.values).collect()));
             }
         }
@@ -10277,6 +10301,110 @@ fn where_cols_covered(e: &Expr, meta: &TableMeta, idx_cols: &[usize]) -> bool {
         // A subquery may read other tables/columns we can't enumerate here; bail.
         Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. } => false,
     }
+}
+
+/// Gather the virtual-table constraints to offer `best_index` from a query's
+/// `WHERE`, plus, in lockstep, each constraint's bound right-hand [`Value`].
+///
+/// Walks the top-level `AND` conjuncts looking for `col <op> const` comparisons
+/// (and `BETWEEN`, expanded to a `>=`/`<=` pair) where `col` is one of this
+/// table's `columns` and the other side is row-independent. The returned
+/// `(constraints, values)` vectors are parallel: `values[i]` is the evaluated
+/// bound of `constraints[i]`. Only the comparison *shape* goes to the module (as
+/// SQLite does); the values are held back and handed to `filter` per the plan's
+/// `argv_index`.
+fn collect_vtab_constraints(
+    sel: &Select,
+    columns: &[ColumnInfo],
+    params: &Params,
+) -> (Vec<IndexConstraint>, Vec<Value>) {
+    let mut constraints = Vec::new();
+    let mut values = Vec::new();
+    let Some(where_expr) = &sel.where_clause else {
+        return (constraints, values);
+    };
+    let mut conjuncts = Vec::new();
+    and_conjuncts(where_expr, &mut conjuncts);
+    let mut push = |col: usize, op: ConstraintOp, v: Value| {
+        constraints.push(IndexConstraint {
+            column: col,
+            op,
+            usable: true,
+        });
+        values.push(v);
+    };
+    for c in conjuncts {
+        match c {
+            Expr::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+                ) =>
+            {
+                if let (Some(ci), Some(v)) = (col_index(left, columns), const_value(right, params))
+                {
+                    if let Some(cop) = binop_to_constraint(*op) {
+                        push(ci, cop, v);
+                    }
+                } else if let (Some(ci), Some(v)) =
+                    (col_index(right, columns), const_value(left, params))
+                {
+                    if let Some(cop) = binop_to_constraint(flip_cmp(*op)) {
+                        push(ci, cop, v);
+                    }
+                }
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated: false,
+            } => {
+                if let Some(ci) = col_index(expr, columns) {
+                    if let Some(v) = const_value(low, params) {
+                        push(ci, ConstraintOp::Ge, v);
+                    }
+                    if let Some(v) = const_value(high, params) {
+                        push(ci, ConstraintOp::Le, v);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (constraints, values)
+}
+
+/// Map a comparison [`BinaryOp`] to a vtab [`ConstraintOp`], or `None` for a
+/// non-comparison operator.
+fn binop_to_constraint(op: BinaryOp) -> Option<ConstraintOp> {
+    Some(match op {
+        BinaryOp::Eq => ConstraintOp::Eq,
+        BinaryOp::Lt => ConstraintOp::Lt,
+        BinaryOp::LtEq => ConstraintOp::Le,
+        BinaryOp::Gt => ConstraintOp::Gt,
+        BinaryOp::GtEq => ConstraintOp::Ge,
+        _ => return None,
+    })
+}
+
+/// Order the bound constraint `values` by the plan's 1-based `argv_index`, the
+/// argument vector handed to [`crate::vtab::VTabModule::filter`].
+///
+/// `argv_index[i]` is the position (1-based) the module wants `values[i]` passed
+/// at, or `0` to drop it. A robust pass: collect `(pos, value)` for every nonzero
+/// entry, sort by `pos`, and emit the values. Gaps or duplicate positions are
+/// tolerated (the module decides what its own positions mean).
+fn order_vtab_argv(plan: &IndexPlan, values: &[Value]) -> Vec<Value> {
+    let mut slots: Vec<(u32, Value)> = plan
+        .argv_index
+        .iter()
+        .zip(values.iter())
+        .filter(|(pos, _)| **pos != 0)
+        .map(|(pos, v)| (*pos, v.clone()))
+        .collect();
+    slots.sort_by_key(|(pos, _)| *pos);
+    slots.into_iter().map(|(_, v)| v).collect()
 }
 
 fn collect_eq_constraints(
