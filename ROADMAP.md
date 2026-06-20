@@ -162,10 +162,28 @@ single-table `GROUP BY`, all matching the tree-walker via `query_vdbe`.
 
 **Remaining pieces:**
 
+*Concrete `EXPLAIN QUERY PLAN` gaps* (verified against sqlite3 — graphite gives
+correct results but a different/cheaper plan; each is an acceptance test for the
+piece beside it):
+
+| query | graphite today | sqlite3 (target) | piece |
+|-------|----------------|------------------|-------|
+| `… FROM t ORDER BY c` (index on `c`) | `SCAN t` + `USE TEMP B-TREE FOR ORDER BY` | `SCAN t USING INDEX ic` | **B0** |
+| `… FROM t JOIN u ON t.c=u.x` (`x` = `u` PK) | `SCAN t` + `SCAN u` | `SCAN t` + `SEARCH u USING INTEGER PRIMARY KEY (rowid=?)` | **B1/B3** |
+| `SELECT count(*) FROM t` (any index `ic`) | `SCAN t` | `SCAN t USING COVERING INDEX ic` | **B2** |
+
+- **B0 — Index-driven `ORDER BY`/`GROUP BY`.** When a single-table query's
+  `ORDER BY` is a prefix of an available index (matching column order, direction,
+  and collation, with NULLs ordered as the index stores them), scan that index
+  in key order and *skip* the post-sort. Requires a shared planner decision
+  across `scan_source` (scan via the index), `run_core` (suppress the
+  `out.sort_by`), and `eqp_access` (report `USING INDEX` instead of
+  `USE TEMP B-TREE`) — they must agree on the exact row order or results break.
 - **B1 — Join order.** Reorder `FROM` tables by a simple cost model (smallest
   estimated cardinality / most-selective indexed table first) instead of textual
   order; keep results identical, verify the chosen order via `EXPLAIN QUERY
-  PLAN`. *Ref:* `where.c`.
+  PLAN`. *Ref:* `where.c`. (Includes seeking an inner join table by its PK/index
+  rather than scanning it — the second row of the table above.)
 - **B2 — Covering-index detection.** When all referenced columns of a table are
   in a chosen index, read from the index without touching the table b-tree; mark
   it in `EXPLAIN QUERY PLAN` (`USING COVERING INDEX`).
