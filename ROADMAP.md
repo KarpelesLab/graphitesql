@@ -216,10 +216,18 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
   `sqlite_temp_master`/`sqlite_temp_schema`/`temp.sqlite_master` read the temp
   catalog; TEMP no longer persists to a file database. *Remaining: `CREATE TEMP
   INDEX/VIEW/TRIGGER` still target main.*
-- **C5 — `ATTACH 'file.db' AS x`.** Open a real file as an attached database
-  (`std` only — needs a file VFS), reusing the pager; cross-database transaction
-  semantics. The registry, qualified read/write, and isolation are already in
-  place (C1–C4); C5 is opening a file backend instead of an in-memory one.
+- ✅ **C5 — `ATTACH 'file.db' AS x`.** Opens a real file (std file VFS) as an
+  attached database — creating an empty one if absent, else opening the existing
+  file (rollback-journal mode so commits are immediately sqlite3-readable).
+  Cross-engine verified both directions. Also fixed: a qualified `CREATE TABLE
+  aux.t` now stores its CREATE bare-named in the target catalog (the `aux.`
+  prefix is invalid in that database's namespace). *Remaining: cross-database
+  transactions spanning attached files (each commits independently today).*
+
+**The ATTACH/DETACH/TEMP multi-schema track (C1–C5) is complete** for in-memory
+and file databases. Remaining multi-schema refinements: cross-database **joins**,
+qualified `ALTER`/`CREATE INDEX|VIEW|TRIGGER`, `WITHOUT ROWID` cross-db reads,
+and cross-database transactions.
 
 *Storage:*
 

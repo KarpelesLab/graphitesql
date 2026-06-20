@@ -9,12 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
-- Track C: **`ATTACH`/`DETACH` and cross-database queries** (C1–C3). `ATTACH
-  ':memory:' AS x`/`DETACH x` manage an attached-database registry; `PRAGMA
-  database_list` reports them. Schema-qualified names (`aux.t`) work for reads
-  (`SELECT … FROM aux.t`, `aux.sqlite_master`) and writes (`CREATE`/`INSERT`/
-  `UPDATE`/`DELETE`/`DROP … aux.t`), with the databases isolated, matching
-  sqlite3. (Cross-database joins, file attachments, and `TEMP` are upcoming.)
+- Track C: **`ATTACH`/`DETACH`, `TEMP`, and cross-database queries** (C1–C5).
+  `ATTACH ':memory:'/'file.db' AS x` and `DETACH x` manage an attached-database
+  registry (`PRAGMA database_list`). Schema-qualified names (`aux.t`) work for
+  reads and writes (`CREATE`/`INSERT`/`UPDATE`/`DELETE`/`DROP … aux.t`,
+  `aux.sqlite_master`), databases isolated, cross-engine verified. `CREATE TEMP
+  TABLE` lives in a private in-memory `temp` database (seq 1) that shadows main
+  for unqualified names and never persists to a file; `sqlite_temp_master` reads
+  it. File attachments are sqlite3-readable/writable both directions.
+  (Cross-database joins and transactions are upcoming.)
 - **Transaction & DDL state checks**: nested `BEGIN`, and `COMMIT`/`ROLLBACK`
   with no active transaction, are now rejected; `DROP` of a missing object
   reports lowercase "no such <kind>" with a table↔view hint; `ALTER … RENAME
