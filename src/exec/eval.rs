@@ -262,7 +262,12 @@ impl<'a> EvalCtx<'a> {
 /// The affinity of an expression for comparison purposes: a column's declared
 /// affinity, a CAST's target affinity, transparent through parentheses, else
 /// none (BLOB).
-fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Affinity {
+/// The affinity of an expression for comparison purposes, or `None` when the
+/// expression has *no* affinity. SQLite distinguishes a typeless column (which
+/// has BLOB/NONE affinity) from a literal or computed expression (which has no
+/// affinity at all): the difference decides whether text coercion applies (see
+/// [`apply_comparison_affinity`]).
+fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Option<Affinity> {
     match expr {
         Expr::Column { table, column } => {
             for col in ctx.columns {
@@ -271,28 +276,51 @@ fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Affinity {
                     .as_deref()
                     .is_none_or(|t| col.table.eq_ignore_ascii_case(t));
                 if name_ok && table_ok {
-                    return col.affinity;
+                    return Some(col.affinity);
                 }
             }
-            Affinity::Blob
+            // An unresolved column name has no affinity to contribute.
+            None
         }
-        Expr::Cast { type_name, .. } => Affinity::from_type(Some(type_name)),
+        Expr::Cast { type_name, .. } => Some(Affinity::from_type(Some(type_name))),
         Expr::Paren(e) => expr_affinity(e, ctx),
-        _ => Affinity::Blob,
+        // Literals and computed expressions carry no affinity.
+        _ => None,
     }
 }
 
 /// Apply SQLite comparison affinity to a pair of operands before comparing.
-fn apply_comparison_affinity(l: Value, la: Affinity, r: Value, ra: Affinity) -> (Value, Value) {
-    let numeric = |a: Affinity| matches!(a, Affinity::Integer | Affinity::Real | Affinity::Numeric);
-    let texty = |a: Affinity| matches!(a, Affinity::Text | Affinity::Blob);
-    if numeric(la) && texty(ra) {
+/// Apply SQLite's pre-comparison affinity rules to a pair of operands, given each
+/// operand's affinity (`None` = no affinity, e.g. a literal):
+///
+/// * if one side has numeric affinity and the other does not, NUMERIC affinity is
+///   applied to the other (text/blob/no-affinity → number where possible);
+/// * else if one side has TEXT affinity and the other has *no* affinity (a
+///   literal), TEXT affinity is applied to that literal;
+/// * otherwise the operands are compared as stored.
+///
+/// The second rule deliberately does **not** fire when the other side is a
+/// typeless column (BLOB/NONE affinity): SQLite compares `none_col = text_col`
+/// without coercion, so `1 = '1'` across such columns is false.
+fn apply_comparison_affinity(
+    l: Value,
+    la: Option<Affinity>,
+    r: Value,
+    ra: Option<Affinity>,
+) -> (Value, Value) {
+    let numeric = |a: Option<Affinity>| {
+        matches!(
+            a,
+            Some(Affinity::Integer | Affinity::Real | Affinity::Numeric)
+        )
+    };
+    if numeric(la) && !numeric(ra) {
         (l, Affinity::Numeric.coerce(r))
-    } else if numeric(ra) && texty(la) {
+    } else if numeric(ra) && !numeric(la) {
         (Affinity::Numeric.coerce(l), r)
-    } else if la == Affinity::Text && ra == Affinity::Blob {
+    } else if la == Some(Affinity::Text) && ra.is_none() {
         (l, Affinity::Text.coerce(r))
-    } else if ra == Affinity::Text && la == Affinity::Blob {
+    } else if ra == Some(Affinity::Text) && la.is_none() {
         (Affinity::Text.coerce(l), r)
     } else {
         (l, r)
