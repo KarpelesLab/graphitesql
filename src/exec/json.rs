@@ -72,6 +72,19 @@ impl Json {
         s
     }
 
+    /// Serialize as `json_quote(X)` does. Identical to [`serialize`](Self::serialize)
+    /// except that a non-finite REAL value renders as SQLite's quoted-literal form
+    /// `±9.0e+999` (whereas a JSON-literal `9e999` round-trips verbatim through
+    /// [`serialize`](Self::serialize)). `json_quote` only ever sees a scalar.
+    pub fn quote(&self) -> String {
+        if let Json::Real(r) = self {
+            if r.is_infinite() {
+                return String::from(if *r < 0.0 { "-9.0e+999" } else { "9.0e+999" });
+            }
+        }
+        self.serialize()
+    }
+
     /// Serialize to pretty-printed JSON using `indent` as the per-level unit
     /// (SQLite's `json_pretty`). Empty arrays/objects stay on one line; scalars
     /// render compactly.
@@ -778,77 +791,32 @@ fn parse_json5_real(tok: &str) -> Option<f64> {
     tok.parse::<f64>().ok()
 }
 
-/// Navigate a JSON value by a SQLite path expression (`$`, `.key`, `[index]`).
-/// Returns `None` if the path does not resolve. Only the common subset is
-/// supported: object keys via `.name` or `."name"`, array elements via `[n]`.
+/// Navigate a JSON value by a SQLite path expression to a node for reading, or
+/// `None` if the path is syntactically bad **or** does not resolve. Callers that
+/// must distinguish a bad path (an error) from a merely-missing one (SQL `NULL`)
+/// validate the path first with [`path_is_valid`].
+///
+/// Supports object keys (`.name`, `."name"`), array indices (`[n]`), and the
+/// SQLite end-relative forms `[#]` (one past the last element) and `[#-n]`
+/// (counting back from the end).
 pub fn navigate<'a>(root: &'a Json, path: &str) -> Option<&'a Json> {
-    let bytes = path.as_bytes();
-    if bytes.first() != Some(&b'$') {
-        return None;
-    }
+    let segs = parse_path(path)?;
     let mut cur = root;
-    let mut i = 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'.' => {
-                i += 1;
-                let (key, next) = parse_key(bytes, i)?;
-                i = next;
-                let Json::Object(members) = cur else {
-                    return None;
-                };
-                cur = members.iter().find(|(k, _)| *k == key).map(|(_, v)| v)?;
+    for seg in &segs {
+        match (cur, seg) {
+            (Json::Object(members), Seg::Key(k)) => {
+                cur = members.iter().find(|(kk, _)| kk == k).map(|(_, v)| v)?;
             }
-            b'[' => {
-                i += 1;
-                let start = i;
-                while i < bytes.len() && bytes[i] != b']' {
-                    i += 1;
-                }
-                if i >= bytes.len() {
-                    return None;
-                }
-                let idx_str = core::str::from_utf8(&bytes[start..i]).ok()?;
-                i += 1; // ']'
-                let Json::Array(items) = cur else {
-                    return None;
-                };
-                let n: usize = idx_str.trim().parse().ok()?;
+            (Json::Array(items), Seg::Index(idx)) => {
+                let n = idx.resolve_read(items.len())?;
                 cur = items.get(n)?;
             }
+            // A `.key` step into a non-object, or an `[i]` step into a
+            // non-array, simply does not resolve (NULL).
             _ => return None,
         }
     }
     Some(cur)
-}
-
-/// Parse an object-key path segment starting at `i`, returning `(key, next_i)`.
-/// Handles a bare identifier or a `"quoted"` key.
-fn parse_key(bytes: &[u8], i: usize) -> Option<(String, usize)> {
-    if bytes.get(i) == Some(&b'"') {
-        // Quoted key: read until the closing quote.
-        let mut j = i + 1;
-        let mut s = String::new();
-        while j < bytes.len() && bytes[j] != b'"' {
-            s.push(bytes[j] as char);
-            j += 1;
-        }
-        if j >= bytes.len() {
-            return None;
-        }
-        Some((s, j + 1))
-    } else {
-        let start = i;
-        let mut j = i;
-        while j < bytes.len() && bytes[j] != b'.' && bytes[j] != b'[' {
-            j += 1;
-        }
-        if j == start {
-            return None;
-        }
-        let key = core::str::from_utf8(&bytes[start..j]).ok()?.to_string();
-        Some((key, j))
-    }
 }
 
 /// Convert a SQL [`Value`] to a [`Json`] for `json_array`/`json_object`. A text
@@ -891,10 +859,12 @@ pub fn arrow(doc: &Value, path_arg: &Value, as_text: bool) -> Value {
 }
 
 /// Normalize an `->`/`->>` right operand into a JSON path: an integer is an array
-/// index `$[n]`, a string starting with `$` is used verbatim, any other string is
-/// an object label `$.label`.
+/// index (a non-negative integer is `$[n]`; a negative integer `-k` is the
+/// end-relative `$[#-k]`, matching SQLite), a string starting with `$` is used
+/// verbatim, any other string is an object label `$.label`.
 fn arrow_path(v: &Value) -> String {
     match v {
+        Value::Integer(i) if *i < 0 => alloc::format!("$[#-{}]", i.unsigned_abs()),
         Value::Integer(i) => alloc::format!("$[{i}]"),
         Value::Text(s) if s.starts_with('$') => s.clone(),
         Value::Text(s) => alloc::format!("$.{s}"),
@@ -902,14 +872,48 @@ fn arrow_path(v: &Value) -> String {
     }
 }
 
+/// An array-index path step. SQLite supports a plain index `[n]`, plus the
+/// end-relative forms `[#]` (one past the last element — the append slot) and
+/// `[#-k]` (the `k`-th element counting back from the end, `[#-1]` being the
+/// last). Negative *literal* indices (`[-1]`) are **not** valid paths.
+#[derive(Clone, Copy)]
+enum Idx {
+    /// A literal index `[n]`.
+    Abs(usize),
+    /// `[#-k]`; `[#]` is `FromEnd(0)`, i.e. the one-past-end append slot.
+    FromEnd(usize),
+}
+
+impl Idx {
+    /// Resolve to a concrete index for *reading* an array of length `len`, or
+    /// `None` if it falls outside `0..len` (`[#]` and `[#-k]` past the start both
+    /// miss).
+    fn resolve_read(self, len: usize) -> Option<usize> {
+        match self {
+            Idx::Abs(n) => Some(n),
+            // `[#]` (FromEnd(0)) is the append slot — never an existing element.
+            Idx::FromEnd(0) => None,
+            Idx::FromEnd(k) => len.checked_sub(k),
+        }
+    }
+}
+
 /// One step of a JSON path: an object key or an array index.
 enum Seg {
     Key(String),
-    Index(usize),
+    Index(Idx),
 }
 
-/// Parse a `$`-rooted path into its segments (the subset used by the mutators:
-/// `.key`, `."key"`, `[n]`). Returns `None` on a malformed path.
+/// Whether `path` is a syntactically valid SQLite JSON path (`$`-rooted, with
+/// `.key`/`[n]`/`[#]`/`[#-k]` steps). The JSON scalar functions raise
+/// `bad JSON path: '<path>'` when this is false.
+pub fn path_is_valid(path: &str) -> bool {
+    parse_path(path).is_some()
+}
+
+/// Parse a `$`-rooted path into its segments: `.key`, `."key"`, `[n]`, `[#]`,
+/// and `[#-k]`. Returns `None` on a malformed path (so the caller can surface
+/// SQLite's `bad JSON path` error).
 fn parse_path(path: &str) -> Option<Vec<Seg>> {
     let bytes = path.as_bytes();
     if bytes.first() != Some(&b'$') {
@@ -931,20 +935,64 @@ fn parse_path(path: &str) -> Option<Vec<Seg>> {
                     j += 1;
                 }
                 if j >= bytes.len() {
-                    return None;
+                    return None; // unterminated `[`
                 }
-                let n: usize = core::str::from_utf8(&bytes[start..j])
-                    .ok()?
-                    .trim()
-                    .parse()
-                    .ok()?;
-                segs.push(Seg::Index(n));
+                let inner = core::str::from_utf8(&bytes[start..j]).ok()?.trim();
+                segs.push(Seg::Index(parse_index(inner)?));
                 i = j + 1;
             }
             _ => return None,
         }
     }
     Some(segs)
+}
+
+/// Parse the contents between `[` and `]`: a non-negative integer, `#`, or
+/// `#-k` (with `k` a non-negative integer). Anything else — a negative literal,
+/// `#+k`, or junk — is a bad path.
+fn parse_index(inner: &str) -> Option<Idx> {
+    if let Some(rest) = inner.strip_prefix('#') {
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            return Some(Idx::FromEnd(0)); // `[#]`
+        }
+        let k = rest.strip_prefix('-')?.trim_start();
+        // Only `#-k` is valid; `#+k` and bare `#5` are not.
+        Some(Idx::FromEnd(k.parse::<usize>().ok()?))
+    } else {
+        // A plain literal index: digits only (no `-`).
+        Some(Idx::Abs(inner.parse::<usize>().ok()?))
+    }
+}
+
+/// Parse an object-key path segment starting at `i`, returning `(key, next_i)`.
+/// Handles a bare identifier or a `"quoted"` key. A bare key may not be empty
+/// (so `$.` is a bad path).
+fn parse_key(bytes: &[u8], i: usize) -> Option<(String, usize)> {
+    if bytes.get(i) == Some(&b'"') {
+        // Quoted key: read until the closing quote.
+        let mut j = i + 1;
+        let mut s = String::new();
+        while j < bytes.len() && bytes[j] != b'"' {
+            s.push(bytes[j] as char);
+            j += 1;
+        }
+        if j >= bytes.len() {
+            return None;
+        }
+        Some((s, j + 1))
+    } else {
+        let start = i;
+        let mut j = i;
+        while j < bytes.len() && bytes[j] != b'.' && bytes[j] != b'[' {
+            j += 1;
+        }
+        if j == start {
+            return None;
+        }
+        let key = core::str::from_utf8(&bytes[start..j]).ok()?.to_string();
+        Some((key, j))
+    }
 }
 
 /// How a `json_set`/`json_insert`/`json_replace` write applies at the leaf.
@@ -958,8 +1006,29 @@ pub enum SetMode {
     Replace,
 }
 
+/// Walk `cur` down the interior (non-final) segments of a path, returning a
+/// mutable reference to the parent container of the leaf, or `None` if a step
+/// does not resolve. The end-relative array forms resolve against the live
+/// length at each step.
+fn walk_to_parent<'a>(mut cur: &'a mut Json, segs: &[Seg]) -> Option<&'a mut Json> {
+    for seg in segs {
+        cur = match (cur, seg) {
+            (Json::Object(m), Seg::Key(k)) => {
+                m.iter_mut().find(|(kk, _)| kk == k).map(|(_, v)| v)?
+            }
+            (Json::Array(a), Seg::Index(idx)) => {
+                let n = idx.resolve_read(a.len())?;
+                a.get_mut(n)?
+            }
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
 /// Apply one `(path, value)` write to `root` under `mode`. Missing parent
 /// containers are left untouched (matching SQLite, which only writes the leaf).
+/// Returns `None` if the path is malformed (a `bad JSON path` for the caller).
 pub fn set_path(root: &mut Json, path: &str, value: Json, mode: SetMode) -> Option<()> {
     let segs = parse_path(path)?;
     if segs.is_empty() {
@@ -968,17 +1037,11 @@ pub fn set_path(root: &mut Json, path: &str, value: Json, mode: SetMode) -> Opti
         }
         return Some(());
     }
-    let mut cur = root;
-    for seg in &segs[..segs.len() - 1] {
-        cur = match (cur, seg) {
-            (Json::Object(m), Seg::Key(k)) => {
-                m.iter_mut().find(|(kk, _)| kk == k).map(|(_, v)| v)?
-            }
-            (Json::Array(a), Seg::Index(i)) => a.get_mut(*i)?,
-            _ => return None,
-        };
-    }
-    match (cur, segs.last()?) {
+    let (last, parents) = segs.split_last()?;
+    let Some(cur) = walk_to_parent(root, parents) else {
+        return Some(()); // an unresolved parent: nothing to write, not an error
+    };
+    match (cur, last) {
         (Json::Object(m), Seg::Key(k)) => {
             let slot = m.iter_mut().find(|(kk, _)| kk == k);
             match (slot, mode) {
@@ -987,40 +1050,47 @@ pub fn set_path(root: &mut Json, path: &str, value: Json, mode: SetMode) -> Opti
                 _ => {}
             }
         }
-        (Json::Array(a), Seg::Index(i)) => {
-            let exists = *i < a.len();
-            match mode {
-                SetMode::Set if exists => a[*i] = value,
-                SetMode::Replace if exists => a[*i] = value,
-                SetMode::Set | SetMode::Insert if !exists => a.push(value),
-                _ => {}
+        (Json::Array(a), Seg::Index(idx)) => {
+            // An in-range index overwrites; `[#]` (and any end-relative slot that
+            // resolves past the start) is the append slot. A literal index past
+            // the end is a no-op (SQLite does not grow the array for it).
+            match idx.resolve_read(a.len()) {
+                Some(n) if n < a.len() => match mode {
+                    SetMode::Set | SetMode::Replace => a[n] = value,
+                    SetMode::Insert => {}
+                },
+                _ => {
+                    // Only the append slot `[#]` (FromEnd(0)) grows the array;
+                    // `[#-k]` past the start and out-of-range literals are no-ops.
+                    if matches!(idx, Idx::FromEnd(0))
+                        && matches!(mode, SetMode::Set | SetMode::Insert)
+                    {
+                        a.push(value);
+                    }
+                }
             }
         }
-        _ => return None,
+        _ => return Some(()),
     }
     Some(())
 }
 
-/// Remove the element at `path` from `root` if present.
+/// Remove the element at `path` from `root` if present. Returns `None` if the
+/// path is malformed.
 pub fn remove_path(root: &mut Json, path: &str) -> Option<()> {
     let segs = parse_path(path)?;
-    if segs.is_empty() {
-        return None; // `$` cannot be removed
-    }
-    let mut cur = root;
-    for seg in &segs[..segs.len() - 1] {
-        cur = match (cur, seg) {
-            (Json::Object(m), Seg::Key(k)) => {
-                m.iter_mut().find(|(kk, _)| kk == k).map(|(_, v)| v)?
-            }
-            (Json::Array(a), Seg::Index(i)) => a.get_mut(*i)?,
-            _ => return None,
-        };
-    }
-    match (cur, segs.last()?) {
+    let (last, parents) = segs.split_last()?; // `$` (empty) cannot be removed
+    let Some(cur) = walk_to_parent(root, parents) else {
+        return Some(());
+    };
+    match (cur, last) {
         (Json::Object(m), Seg::Key(k)) => m.retain(|(kk, _)| kk != k),
-        (Json::Array(a), Seg::Index(i)) if *i < a.len() => {
-            a.remove(*i);
+        (Json::Array(a), Seg::Index(idx)) => {
+            if let Some(n) = idx.resolve_read(a.len()) {
+                if n < a.len() {
+                    a.remove(n);
+                }
+            }
         }
         _ => {}
     }

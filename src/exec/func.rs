@@ -428,7 +428,8 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "json_quote" => {
             arity(&lname, args, 1)?;
-            Value::Text(super::json::value_to_json(&v[0]).serialize())
+            reject_blob(&v[0])?;
+            Value::Text(super::json::value_to_json(&v[0]).quote())
         }
         "json_type" => {
             if v.is_empty() || v.len() > 2 {
@@ -438,6 +439,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 None => Value::Null,
                 Some(root) => {
                     let target = if v.len() == 2 {
+                        check_path(&v[1])?;
                         super::json::navigate(&root, &eval::to_text(&v[1]))
                     } else {
                         Some(&root)
@@ -459,6 +461,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 None => Value::Null,
                 Some(root) => {
                     let target = if v.len() == 2 {
+                        check_path(&v[1])?;
                         super::json::navigate(&root, &eval::to_text(&v[1]))
                     } else {
                         Some(&root)
@@ -479,12 +482,13 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             }
             match json_root(&v[0])? {
                 None => Value::Null,
-                Some(root) => json_extract(&root, &v[1..]),
+                Some(root) => json_extract(&root, &v[1..])?,
             }
         }
         "json_array" => {
             let mut items = Vec::with_capacity(v.len());
             for (i, val) in v.iter().enumerate() {
+                reject_blob(val)?;
                 items.push(arg_to_json(val, args.get(i)));
             }
             Value::Text(super::json::Json::Array(items).serialize())
@@ -498,9 +502,14 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             let mut members = Vec::with_capacity(v.len() / 2);
             for pair in v.chunks(2).enumerate() {
                 let (i, kv) = pair;
-                let key = eval::to_text(&kv[0]);
+                // SQLite requires object labels to be TEXT (a NULL, numeric, or
+                // BLOB key is an error), and rejects BLOB values.
+                let Value::Text(key) = &kv[0] else {
+                    return Err(Error::Error("json_object() labels must be TEXT".into()));
+                };
+                reject_blob(&kv[1])?;
                 let val = arg_to_json(&kv[1], args.get(2 * i + 1));
-                members.push((key, val));
+                members.push((key.clone(), val));
             }
             Value::Text(super::json::Json::Object(members).serialize())
         }
@@ -520,6 +529,8 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 Some(mut root) => {
                     let mut i = 1;
                     while i + 1 < v.len() {
+                        check_path(&v[i])?;
+                        reject_blob(&v[i + 1])?;
                         let path = eval::to_text(&v[i]);
                         let val = arg_to_json(&v[i + 1], args.get(i + 1));
                         super::json::set_path(&mut root, &path, val, mode);
@@ -536,10 +547,21 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             match json_root(&v[0])? {
                 None => Value::Null,
                 Some(mut root) => {
+                    let mut removed = Value::Text(String::new());
                     for p in &v[1..] {
+                        check_path(p)?;
+                        // Removing the whole document (`$`) yields SQL NULL.
+                        if matches!(p, Value::Text(s) if s == "$") {
+                            removed = Value::Null;
+                            continue;
+                        }
                         super::json::remove_path(&mut root, &eval::to_text(p));
                     }
-                    Value::Text(root.serialize())
+                    if matches!(removed, Value::Null) {
+                        Value::Null
+                    } else {
+                        Value::Text(root.serialize())
+                    }
                 }
             }
         }
@@ -676,15 +698,41 @@ fn json_root(v: &Value) -> Result<Option<super::json::Json>> {
     }
 }
 
+/// Validate a JSON path argument, raising SQLite's `bad JSON path: '<path>'`
+/// error if it is malformed. A `NULL` path is left for the caller to treat as a
+/// missing lookup (SQLite returns NULL rather than erroring on a NULL path).
+fn check_path(p: &Value) -> Result<()> {
+    if let Value::Text(s) = p {
+        if !super::json::path_is_valid(s) {
+            return Err(Error::Error(alloc::format!("bad JSON path: '{s}'")));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a BLOB argument to a JSON constructor/mutator: SQLite cannot store a
+/// BLOB in JSON and raises `JSON cannot hold BLOB values`.
+fn reject_blob(v: &Value) -> Result<()> {
+    if matches!(v, Value::Blob(_)) {
+        return Err(Error::Error("JSON cannot hold BLOB values".into()));
+    }
+    Ok(())
+}
+
 /// `json_extract`: one path returns the SQL value at that path (objects/arrays as
 /// minified JSON text); multiple paths return a JSON array of the extracted
 /// elements (missing paths become JSON `null`).
-fn json_extract(root: &super::json::Json, paths: &[Value]) -> Value {
+fn json_extract(root: &super::json::Json, paths: &[Value]) -> Result<Value> {
+    for p in paths {
+        check_path(p)?;
+    }
     if paths.len() == 1 {
-        return match super::json::navigate(root, &eval::to_text(&paths[0])) {
-            Some(j) => j.to_sql(),
-            None => Value::Null,
-        };
+        return Ok(
+            match super::json::navigate(root, &eval::to_text(&paths[0])) {
+                Some(j) => j.to_sql(),
+                None => Value::Null,
+            },
+        );
     }
     let items = paths
         .iter()
@@ -693,7 +741,7 @@ fn json_extract(root: &super::json::Json, paths: &[Value]) -> Value {
             None => super::json::Json::Null,
         })
         .collect();
-    Value::Text(super::json::Json::Array(items).serialize())
+    Ok(Value::Text(super::json::Json::Array(items).serialize()))
 }
 
 /// Convert a constructor argument to JSON. If the source expression is itself a
