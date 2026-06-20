@@ -43,7 +43,7 @@ fn having_on_non_aggregate_query_is_rejected() {
 
 #[test]
 fn group_by_having_still_works() {
-    let c = setup();
+    let mut c = setup();
     c.execute("INSERT INTO t VALUES(1)").unwrap();
     let r = c
         .query("SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1")
