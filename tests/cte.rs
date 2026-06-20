@@ -171,3 +171,39 @@ fn recursive_against_sqlite3() {
         assert_eq!(got, want, "query: {q}");
     }
 }
+
+#[test]
+fn recursive_cte_limit_terminates_and_bounds() {
+    let c = Connection::open_memory().unwrap();
+    // LIMIT on the CTE body bounds the rows it produces and terminates what
+    // would otherwise be an infinite recursion.
+    assert_eq!(
+        ints(
+            &c,
+            "WITH RECURSIVE cc(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cc LIMIT 5) SELECT x FROM cc"
+        ),
+        vec![1, 2, 3, 4, 5]
+    );
+    // LIMIT with OFFSET.
+    assert_eq!(
+        ints(
+            &c,
+            "WITH RECURSIVE cc(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cc LIMIT 3 OFFSET 2) SELECT x FROM cc"
+        ),
+        vec![3, 4, 5]
+    );
+    // LIMIT 0 yields nothing.
+    assert!(ints(
+        &c,
+        "WITH RECURSIVE cc(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cc LIMIT 0) SELECT x FROM cc"
+    )
+    .is_empty());
+    // A normally-terminating recursion is unaffected.
+    assert_eq!(
+        ints(
+            &c,
+            "WITH RECURSIVE cc(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cc WHERE x<4) SELECT x FROM cc"
+        ),
+        vec![1, 2, 3, 4]
+    );
+}

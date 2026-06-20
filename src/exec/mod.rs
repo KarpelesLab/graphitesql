@@ -2946,6 +2946,21 @@ impl Connection {
         // arm has no preceding op.
         let mut arms: Vec<(Option<CompoundOp>, Select)> = Vec::new();
         let mut base = (*cte.select).clone();
+        // A LIMIT/OFFSET on the CTE definition bounds the rows it produces — and
+        // crucially terminates an otherwise-infinite recursion. Capture them
+        // before stripping the per-arm clauses below. (A negative LIMIT means
+        // "no limit", as elsewhere in SQLite.)
+        let rec_limit = match &base.limit {
+            Some(e) => {
+                let n = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                (n >= 0).then_some(n as usize)
+            }
+            None => None,
+        };
+        let rec_offset = match &base.offset {
+            Some(e) => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize,
+            None => 0,
+        };
         let compound = core::mem::take(&mut base.compound);
         base.order_by.clear();
         base.limit = None;
@@ -3045,9 +3060,23 @@ impl Connection {
             }
             all_rows.extend(fresh.iter().cloned());
             working = fresh;
+            // Stop once the CTE's LIMIT (after OFFSET) is satisfied.
+            if let Some(lim) = rec_limit {
+                if all_rows.len() >= rec_offset.saturating_add(lim) {
+                    break Ok(());
+                }
+            }
         };
         self.cte_env.borrow_mut().truncate(slot);
         result?;
+
+        // Apply the CTE definition's OFFSET/LIMIT to the produced rows.
+        if rec_offset > 0 {
+            all_rows.drain(..rec_offset.min(all_rows.len()));
+        }
+        if let Some(lim) = rec_limit {
+            all_rows.truncate(lim);
+        }
 
         let rows = all_rows
             .into_iter()
