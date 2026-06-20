@@ -155,8 +155,12 @@ Make the dialect complete. Each item lands with a differential corpus addition.
   `char`-edge cases). *Ref:* `func.c`, `math.c`, `json.c`.
 - **Indexing breadth** — ✅ partial indexes (`CREATE INDEX … WHERE`), ✅
   expression indexes (`CREATE INDEX … (lower(x))`), ✅ `INDEXED BY` / `NOT INDEXED`
-  hints. *Remaining:* `DESC` index columns honored in seeks, partial/expression-
-  index use in the planner (currently scan-only), UNIQUE expression indexes.
+  hints, ✅ **UNIQUE-index enforcement** for standalone `CREATE UNIQUE INDEX`
+  (plain, partial, expression, multi-column, NOCASE/collation-aware, NULL-distinct)
+  on INSERT/UPDATE/UPSERT and WITHOUT ROWID tables — previously only inline
+  `CREATE TABLE` UNIQUE/PK constraints were checked. *Remaining:* `DESC` index
+  columns honored in seeks, partial/expression-index use in the planner
+  (currently scan-only).
 
 ### Track B — Query planner, statistics & the VDBE
 

@@ -2046,7 +2046,7 @@ impl Connection {
             self.check_fk_child(&ins.table, &meta, &values)?;
 
             // Resolve UNIQUE / PRIMARY KEY (incl. rowid) conflicts.
-            let conflicts = self.find_conflicts(&meta, rowid, &values, None)?;
+            let conflicts = self.find_conflicts(&ins.table, &meta, rowid, &values, None, params)?;
             if !conflicts.is_empty() {
                 // An `ON CONFLICT … DO …` upsert clause intercepts the conflict.
                 if let Some(up) = &ins.upsert {
@@ -2215,7 +2215,14 @@ impl Connection {
             params,
         )?;
         if !self
-            .find_conflicts(meta, new_rowid, &values, Some(existing_rowid))?
+            .find_conflicts(
+                table,
+                meta,
+                new_rowid,
+                &values,
+                Some(existing_rowid),
+                params,
+            )?
             .is_empty()
         {
             return Err(Error::Constraint("UNIQUE constraint failed".into()));
@@ -2290,11 +2297,40 @@ impl Connection {
     /// or any UNIQUE/PRIMARY KEY column set (NULLs are considered distinct).
     fn find_conflicts(
         &self,
+        table: &str,
         meta: &TableMeta,
         rowid: i64,
         values: &[Value],
         exclude: Option<i64>,
+        params: &Params,
     ) -> Result<Vec<i64>> {
+        // Unique standalone indexes (named `CREATE UNIQUE INDEX`, incl. partial
+        // and expression indexes) are not represented in `meta.unique` — those
+        // sets come only from inline CREATE TABLE constraints (whose automatic
+        // indexes we therefore skip here). Precompute each such index's key
+        // values for the new row; a NULL key term or an excluding partial
+        // predicate means the new row can't collide on that index.
+        let uniq_idx: Vec<(IndexMeta, Vec<Value>)> = self
+            .indexes_of(table)?
+            .into_iter()
+            .filter(|i| i.unique && autoindex_number(&i.name, table).is_none())
+            .filter_map(|i| {
+                if !self
+                    .row_in_index(&i, meta, values, Some(rowid), params)
+                    .unwrap_or(false)
+                {
+                    return None;
+                }
+                let key = self
+                    .index_key_values(&i, meta, values, rowid, params)
+                    .ok()?;
+                if key.iter().any(|v| matches!(v, Value::Null)) {
+                    return None; // a NULL makes the key distinct
+                }
+                Some((i, key))
+            })
+            .collect();
+
         let mut out = Vec::new();
         for (er, ev) in self.scan_table(meta)? {
             if Some(er) == exclude {
@@ -2304,6 +2340,7 @@ impl Connection {
                 out.push(er);
                 continue;
             }
+            let mut conflicted = false;
             for set in &meta.unique {
                 let new_tuple: Vec<&Value> = set.iter().map(|&i| &values[i]).collect();
                 if new_tuple.iter().any(|v| matches!(v, Value::Null)) {
@@ -2315,11 +2352,92 @@ impl Connection {
                 });
                 if conflict {
                     out.push(er);
+                    conflicted = true;
+                    break;
+                }
+            }
+            if conflicted {
+                continue;
+            }
+            // Then the unique standalone/partial/expression indexes.
+            for (idx, new_key) in &uniq_idx {
+                if !self.row_in_index(idx, meta, &ev, Some(er), params)? {
+                    continue; // existing row not in this partial index
+                }
+                let ex_key = self.index_key_values(idx, meta, &ev, er, params)?;
+                let conflict = ex_key.len() == new_key.len()
+                    && ex_key
+                        .iter()
+                        .zip(new_key)
+                        .zip(&idx.collations)
+                        .all(|((a, b), &coll)| {
+                            crate::value::cmp_values_coll(a, b, coll) == core::cmp::Ordering::Equal
+                        });
+                if conflict {
+                    out.push(er);
                     break;
                 }
             }
         }
         Ok(out)
+    }
+
+    /// The key values for a row under `idx` (excluding the trailing rowid): the
+    /// indexed column values, or the evaluated key expressions for an expression
+    /// index. Used for uniqueness comparison (collation applied by the caller).
+    fn index_key_values(
+        &self,
+        idx: &IndexMeta,
+        meta: &TableMeta,
+        values: &[Value],
+        rowid: i64,
+        params: &Params,
+    ) -> Result<Vec<Value>> {
+        match &idx.key_exprs {
+            None => Ok(idx.cols.iter().map(|&c| values[c].clone()).collect()),
+            Some(exprs) => {
+                let ctx = row_ctx(values, &meta.columns, Some(rowid), params).with_subqueries(self);
+                exprs.iter().map(|e| eval::eval(e, &ctx)).collect()
+            }
+        }
+    }
+
+    /// Whether rows `a` and `b` collide on any unique *standalone* index of
+    /// `table` (plain or partial — expression indexes are rejected on WITHOUT
+    /// ROWID tables). Complements [`unique_match`], which covers only the inline
+    /// PRIMARY KEY / UNIQUE constraints; used by the WITHOUT ROWID write paths.
+    fn wr_index_collision(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        a: &[Value],
+        b: &[Value],
+        params: &Params,
+    ) -> Result<bool> {
+        for idx in self
+            .indexes_of(table)?
+            .iter()
+            .filter(|i| i.unique && autoindex_number(&i.name, table).is_none())
+        {
+            if !self.row_in_index(idx, meta, a, None, params)?
+                || !self.row_in_index(idx, meta, b, None, params)?
+            {
+                continue;
+            }
+            let ka = self.index_key_values(idx, meta, a, 0, params)?;
+            if ka.iter().any(|v| matches!(v, Value::Null)) {
+                continue; // a NULL makes the key distinct
+            }
+            let kb = self.index_key_values(idx, meta, b, 0, params)?;
+            let eq = ka.len() == kb.len()
+                && ka.iter().zip(&kb).zip(&idx.collations).all(|((x, y), &c)| {
+                    crate::value::cmp_values_coll(x, y, c) == core::cmp::Ordering::Equal
+                });
+            if eq {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn exec_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
@@ -2514,7 +2632,7 @@ impl Connection {
             )?;
             // UNIQUE/PK conflict against any other row.
             if !self
-                .find_conflicts(&meta, new_rowid, &values, Some(rowid))?
+                .find_conflicts(&upd.table, &meta, new_rowid, &values, Some(rowid), params)?
                 .is_empty()
             {
                 return Err(Error::Constraint("UNIQUE constraint failed".into()));
@@ -4208,6 +4326,7 @@ impl Connection {
                         collations,
                         partial: ci.where_clause.clone(),
                         key_exprs,
+                        unique: ci.unique,
                     });
                 }
                 // Automatic index: its columns are the n-th UNIQUE/PK set.
@@ -4222,6 +4341,7 @@ impl Connection {
                                 collations,
                                 partial: None,
                                 key_exprs: None,
+                                unique: true,
                             });
                         }
                     }
@@ -5453,10 +5573,19 @@ impl Connection {
             check_not_null(meta, &values)?;
             self.check_constraints(meta, &values, None, params)?;
 
-            // Reject a duplicate primary key or any other UNIQUE constraint.
+            // Reject a duplicate primary key, an inline UNIQUE constraint, or a
+            // standalone UNIQUE index (incl. partial). Collect colliding rows so
+            // REPLACE can rebuild without them.
             let existing = self.scan_without_rowid(meta)?;
-            let dup = existing.iter().any(|r| unique_match(meta, r, &values));
-            if dup {
+            let mut collide = Vec::new();
+            for (i, r) in existing.iter().enumerate() {
+                if unique_match(meta, r, &values)
+                    || self.wr_index_collision(&ins.table, meta, r, &values, params)?
+                {
+                    collide.push(i);
+                }
+            }
+            if !collide.is_empty() {
                 match ins.on_conflict {
                     OnConflict::Abort => {
                         return Err(Error::Constraint("UNIQUE constraint failed".into()))
@@ -5464,12 +5593,13 @@ impl Connection {
                     OnConflict::Ignore => continue,
                     OnConflict::Replace => {
                         // Rebuild without the conflicting row(s), then insert.
-                        self.rewrite_without_rowid(
-                            meta,
-                            existing
-                                .into_iter()
-                                .filter(|r| !unique_match(meta, r, &values)),
-                        )?;
+                        let kept: Vec<Vec<Value>> = existing
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(i, _)| !collide.contains(i))
+                            .map(|(_, r)| r)
+                            .collect();
+                        self.rewrite_without_rowid(meta, kept.into_iter())?;
                     }
                 }
             }
@@ -5556,10 +5686,13 @@ impl Connection {
             }
             out.push(row);
         }
-        // Reject duplicate primary keys or UNIQUE values produced by the update.
+        // Reject duplicate primary keys or UNIQUE values produced by the update
+        // (inline constraints and standalone unique indexes alike).
         for i in 0..out.len() {
             for j in (i + 1)..out.len() {
-                if unique_match(meta, &out[i], &out[j]) {
+                if unique_match(meta, &out[i], &out[j])
+                    || self.wr_index_collision(&upd.table, meta, &out[i], &out[j], params)?
+                {
                     return Err(Error::Constraint("UNIQUE constraint failed".into()));
                 }
             }
@@ -6468,6 +6601,10 @@ struct IndexMeta {
     /// expressions evaluated against each row to form the key. `None` for an
     /// ordinary column index (which uses `cols`).
     key_exprs: Option<Vec<Expr>>,
+    /// `true` for a `UNIQUE` index (or an automatic UNIQUE/PK index). Drives
+    /// uniqueness enforcement for standalone/partial/expression indexes, which
+    /// the inline-constraint `TableMeta::unique` sets do not cover.
+    unique: bool,
 }
 
 impl Connection {
