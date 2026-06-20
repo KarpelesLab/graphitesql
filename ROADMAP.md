@@ -321,11 +321,19 @@ remains).
   pages. Verified on a ~2454-page FULL file crossing 3 ptrmap boundaries (overflow
   + index + deletes). `auto_vacuum=NONE` byte-unaffected. *(`PRAGMA
   auto_vacuum=FULL` on an empty db switches the mode.)*
-- **C6b-3 — `auto_vacuum=FULL` truncate on commit.** At commit, move trailing
-  free pages onto freed slots and truncate the file (updating ptrmap + parent
-  pointers for moved pages). *Ref:* `btree.c` `autoVacuumCommit`.
+- ✅ **C6b-3 — `auto_vacuum=FULL` truncate on commit.** Done —
+  `autovacuum_truncate` (FULL mode only) moves each live non-root data page from
+  the end of the file into the lowest free slot, fixing the one reference that
+  named it (parent child-pointer for b-tree pages; holder/prev links for overflow
+  pages), then `rebuild_ptrmap` regenerates the map and the freelist is rebuilt.
+  A FULL db deleting ~80% shrinks 2479→1217 pages (~51%) with sqlite3
+  `integrity_check = ok`. Best-effort + gated on `auto_vacuum()==Full`: b-tree
+  ROOT relocation is skipped (rootpages cached in the executor schema), the loop
+  stops at the lock-byte page, and any error rolls back to the sound in-place
+  path; NONE/INCREMENTAL writes byte-identical. *Ref:* `btree.c`
+  `autoVacuumCommit`.
 - **C6b-4 — `PRAGMA incremental_vacuum(N)`.** The on-demand shrink for
-  `auto_vacuum=INCREMENTAL`.
+  `auto_vacuum=INCREMENTAL`. *(C6b-3's relocator is directly reusable.)*
 
 *Storage / durability / concurrency (each independent):*
 
@@ -456,10 +464,9 @@ corruption-robustness fuzz harness. Recent differential hardening: shell real
 rendering + numeric CAST prefixes, and explicit `COLLATE` inside IN/CASE/BETWEEN.
 Suggested next order:
 
-1. **C6b-3 / C6b-4 — `auto_vacuum` space reclaim** — FULL commit-time truncation
-   (page relocation: move trailing pages into freelist gaps, fix parent pointers
-   + ptrmap) and `PRAGMA incremental_vacuum`. Files are already sound without it
-   (freed pages keep correct FREEPAGE entries); this is compaction only.
+1. **C6b-4 — `PRAGMA incremental_vacuum(N)`** — the on-demand shrink for
+   `auto_vacuum=INCREMENTAL`, reusing C6b-3's page relocator. (C6b-3 FULL
+   commit-time truncation is now done.)
 2. **D2 — FTS5** full-text search — the next big module on the vtab trait (now
    that `best_index` pushdown exists).
 3. **Planner leftovers** — **B0b** (`GROUP BY`/multi-term `ORDER BY` via index),
