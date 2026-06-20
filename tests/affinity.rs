@@ -64,6 +64,53 @@ fn comparison_affinity_matches_sqlite3() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// CAST across types, including blob reinterpretation and NUMERIC's text-vs-value
+/// distinction, checked against sqlite3 via quote() so blobs/types are explicit.
+#[test]
+fn cast_matches_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let c = Connection::open_memory().unwrap();
+    for e in [
+        "CAST(x'3132' AS TEXT)",
+        "CAST(x'3132' AS INTEGER)",
+        "CAST(x'3132' AS REAL)",
+        "CAST(x'3132' AS NUMERIC)",
+        "CAST('3.0' AS NUMERIC)",
+        "CAST(2.0 AS NUMERIC)",
+        "CAST('2e2' AS NUMERIC)",
+        "CAST('3.5' AS NUMERIC)",
+        "CAST('abc' AS NUMERIC)",
+        "CAST('5' AS NUMERIC)",
+        "CAST(65 AS BLOB)",
+        "CAST(3.5 AS BLOB)",
+        "CAST('1.9' AS INTEGER)",
+        "CAST(-3.9 AS INTEGER)",
+        "CAST('  12  ' AS INTEGER)",
+        "CAST(1e100 AS INTEGER)",
+        "typeof(CAST('5' AS NUMERIC))",
+        "typeof(CAST('5.5' AS NUMERIC))",
+    ] {
+        let q = format!("SELECT quote({e})");
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(format!("{q};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = match &c.query(&q).unwrap().rows[0][0] {
+            graphitesql::Value::Text(s) => s.clone(),
+            graphitesql::Value::Null => String::new(),
+            other => format!("{other:?}"),
+        };
+        assert_eq!(got, want, "CAST diverged: {e}");
+    }
+}
+
 /// Storage affinity: values are coerced to each column's affinity on INSERT
 /// (e.g. text '123' into an INTEGER column becomes the integer 123). Checked
 /// against sqlite3 via both `typeof` and the stored value.

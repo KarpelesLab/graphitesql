@@ -962,18 +962,19 @@ pub fn cast(v: Value, type_name: &str) -> Value {
         return Value::Null;
     }
     let aff = type_name.to_ascii_uppercase();
+    // Casting a blob to a non-blob type first reinterprets its bytes as text, so
+    // `CAST(x'3132' AS INTEGER)` reads "12" and yields 12 (not 0).
+    let v = if matches!(v, Value::Blob(_)) && !aff.contains("BLOB") {
+        Value::Text(to_text(&v))
+    } else {
+        v
+    };
     if aff.contains("INT") {
         Value::Integer(to_i64(&v))
     } else if aff.contains("CHAR") || aff.contains("CLOB") || aff.contains("TEXT") {
-        match v {
-            Value::Null => Value::Null,
-            other => Value::Text(to_text(&other)),
-        }
+        Value::Text(to_text(&v))
     } else if aff.contains("REAL") || aff.contains("FLOA") || aff.contains("DOUB") {
-        match v {
-            Value::Null => Value::Null,
-            other => Value::Real(number_as_f64(&to_number(&other))),
-        }
+        Value::Real(number_as_f64(&to_number(&v)))
     } else if aff.contains("BLOB") {
         // CAST to BLOB: the value becomes a blob of the bytes of its text form
         // (an existing blob is unchanged). Matches SQLite, e.g. `65` -> X'3635'.
@@ -985,8 +986,16 @@ pub fn cast(v: Value, type_name: &str) -> Value {
         // A type name with no affinity keyword leaves the value unchanged.
         v
     } else {
-        // NUMERIC affinity: prefer integer if exact, else real.
-        to_number(&v)
+        // NUMERIC affinity. Text is converted, reducing an integral real to an
+        // integer (`'3.0'` -> 3); an existing REAL/INTEGER value is kept as-is
+        // (`CAST(2.0 AS NUMERIC)` stays 2.0 — unlike NUMERIC *storage*).
+        match v {
+            Value::Text(_) => match to_number(&v) {
+                Value::Real(r) => integral_real_to_int(r).unwrap_or(Value::Real(r)),
+                other => other,
+            },
+            other => to_number(&other),
+        }
     }
 }
 
