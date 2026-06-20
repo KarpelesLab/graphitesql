@@ -25,6 +25,12 @@ pub enum Token {
     Ident(String),
     /// An integer literal.
     Integer(i64),
+    /// The decimal integer literal `9223372036854775808` (2^63) — the one
+    /// magnitude that overflows `i64` as a positive value but whose negation is
+    /// exactly `i64::MIN`. Used positively it is a real (like any overflowing
+    /// integer); negated, the parser folds it to `Integer(i64::MIN)`, matching
+    /// SQLite's handling of the `-9223372036854775808` literal.
+    Int2Pow63,
     /// A floating-point literal.
     Float(f64),
     /// A string literal (already unescaped).
@@ -414,7 +420,10 @@ impl<'a> Tokenizer<'a> {
         } else {
             match text.parse::<i64>() {
                 Ok(i) => Ok(Token::Integer(i)),
-                // Integers that overflow i64 become floats, as in SQLite.
+                // `2^63` is special: positive it is a real, but `-2^63` is exactly
+                // i64::MIN, so the parser may fold a leading minus into an integer.
+                Err(_) if text == "9223372036854775808" => Ok(Token::Int2Pow63),
+                // Other integers that overflow i64 become floats, as in SQLite.
                 Err(_) => text
                     .parse::<f64>()
                     .map(Token::Float)

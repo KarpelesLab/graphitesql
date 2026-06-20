@@ -1351,6 +1351,13 @@ impl Parser {
         match self.peek() {
             Some(Token::Minus) => {
                 self.pos += 1;
+                // `-9223372036854775808` (possibly after whitespace) is exactly
+                // i64::MIN — fold it into an integer literal like SQLite, rather
+                // than negating the real that `2^63` would otherwise produce.
+                if matches!(self.peek(), Some(Token::Int2Pow63)) {
+                    self.pos += 1;
+                    return Ok(Expr::Literal(Literal::Integer(i64::MIN)));
+                }
                 Ok(Expr::Unary {
                     op: UnaryOp::Negate,
                     expr: Box::new(self.expr_bp(BP_UNARY)?),
@@ -1398,6 +1405,8 @@ impl Parser {
     fn primary(&mut self) -> Result<Expr> {
         match self.advance() {
             Some(Token::Integer(i)) => Ok(Expr::Literal(Literal::Integer(i))),
+            // `2^63` used positively is a real, like any i64-overflowing integer.
+            Some(Token::Int2Pow63) => Ok(Expr::Literal(Literal::Real(9223372036854775808.0))),
             Some(Token::Float(f)) => Ok(Expr::Literal(Literal::Real(f))),
             Some(Token::Str(s)) => Ok(Expr::Literal(Literal::Str(s))),
             Some(Token::Blob(b)) => Ok(Expr::Literal(Literal::Blob(b))),

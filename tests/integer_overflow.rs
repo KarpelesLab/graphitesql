@@ -88,6 +88,32 @@ fn abs_of_min_integer_errors() {
 }
 
 #[test]
+fn min_int_literal_folds_to_integer() {
+    let c = Connection::open_memory().unwrap();
+    // `-9223372036854775808` is exactly i64::MIN: an integer, not a real.
+    assert_eq!(
+        c.query("SELECT -9223372036854775808").unwrap().rows[0][0],
+        Value::Integer(i64::MIN)
+    );
+    assert_eq!(
+        c.query("SELECT typeof(-9223372036854775808)").unwrap().rows[0][0],
+        Value::Text("integer".into())
+    );
+    // A leading whitespace between the sign and digits still folds.
+    assert_eq!(
+        c.query("SELECT - 9223372036854775808").unwrap().rows[0][0],
+        Value::Integer(i64::MIN)
+    );
+    // Used positively, the 2^63 magnitude overflows i64 and is a real.
+    assert!(matches!(
+        c.query("SELECT 9223372036854775808").unwrap().rows[0][0],
+        Value::Real(_)
+    ));
+    // abs() of the folded i64::MIN therefore overflows, like SQLite.
+    assert!(c.query("SELECT abs(-9223372036854775808)").is_err());
+}
+
+#[test]
 fn operators_fall_back_to_real_not_error() {
     // `+`/`*` overflow promotes to real (no error), unlike sum()/abs().
     let c = Connection::open_memory().unwrap();
