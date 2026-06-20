@@ -69,6 +69,14 @@ fn range_value_frames_match_sqlite3() {
     queries.push("SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM t ORDER BY id".into());
     queries.push("SELECT id, count(*) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE GROUP) FROM t ORDER BY id".into());
     queries.push("SELECT id, first_value(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM t ORDER BY id".into());
+    // FILTER (WHERE …) on window aggregates.
+    queries.push(
+        "SELECT id, count(*) FILTER (WHERE v > 10) OVER (ORDER BY id) FROM t ORDER BY id".into(),
+    );
+    queries.push("SELECT id, sum(v) FILTER (WHERE g = 1) OVER () FROM t ORDER BY id".into());
+    queries.push(
+        "SELECT id, avg(v) FILTER (WHERE v <> 10) OVER (PARTITION BY g) FROM t ORDER BY id".into(),
+    );
     for qq in &queries {
         let want = {
             let o = Command::new("sqlite3")

@@ -4315,21 +4315,30 @@ impl Connection {
     ) -> Result<Vec<Value>> {
         let Expr::Function {
             name,
+            distinct,
             args,
             star,
+            filter,
             over: Some(spec),
             ..
         } = wexpr
         else {
             return Err(Error::Error("not a window function".into()));
         };
+        // SQLite rejects DISTINCT in a window function.
+        if *distinct {
+            return Err(Error::Error(
+                "DISTINCT is not supported for window functions".into(),
+            ));
+        }
         let lname = name.to_ascii_lowercase();
         let n = rows.len();
 
-        // Per-row partition keys, order keys, and argument values.
+        // Per-row partition keys, order keys, argument values, and FILTER mask.
         let mut part_keys: Vec<Vec<Value>> = Vec::with_capacity(n);
         let mut ord_keys: Vec<Vec<Value>> = Vec::with_capacity(n);
         let mut arg_vals: Vec<Vec<Value>> = Vec::with_capacity(n);
+        let mut passes: Vec<bool> = Vec::with_capacity(n);
         for r in rows {
             let ctx = r.ctx(columns, params).with_subqueries(self);
             part_keys.push(
@@ -4349,6 +4358,11 @@ impl Connection {
                     .map(|e| eval::eval(e, &ctx))
                     .collect::<Result<_>>()?,
             );
+            // FILTER (WHERE …) restricts which rows the aggregate sees.
+            passes.push(match filter {
+                Some(pred) => eval::truth(&eval::eval(pred, &ctx)?) == Some(true),
+                None => true,
+            });
         }
         let descending: Vec<bool> = spec.order_by.iter().map(|t| t.descending).collect();
 
@@ -4382,6 +4396,7 @@ impl Connection {
                 &ordered,
                 &ord_keys,
                 &arg_vals,
+                &passes,
                 spec,
                 &mut result,
             )?;
@@ -4399,6 +4414,7 @@ impl Connection {
         ordered: &[usize],
         ord_keys: &[Vec<Value>],
         arg_vals: &[Vec<Value>],
+        passes: &[bool],
         spec: &WindowSpec,
         result: &mut [Value],
     ) -> Result<()> {
@@ -4526,10 +4542,13 @@ impl Connection {
                         Value::Null
                     }
                 }
-                // Aggregate windows over the frame.
+                // Aggregate windows over the frame (honoring any FILTER mask).
                 _ => {
-                    let frame: Vec<&Vec<Value>> =
-                        fpos.iter().map(|&k| &arg_vals[ordered[k]]).collect();
+                    let frame: Vec<&Vec<Value>> = fpos
+                        .iter()
+                        .filter(|&&k| passes[ordered[k]])
+                        .map(|&k| &arg_vals[ordered[k]])
+                        .collect();
                     window_aggregate(lname, star, &frame)?
                 }
             };
