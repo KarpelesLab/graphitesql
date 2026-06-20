@@ -218,11 +218,13 @@ Open EQP divergences (verified against sqlite3):
 - **B1b — Join order.** Reorder `FROM` tables by a simple cost model (smallest
   estimated cardinality / most-selective indexed table first) rather than textual
   order; results identical, order verified via EQP. *Ref:* `where.c`.
-- **B2b — Covering reads beyond the ordered scan.** ✅ *Done for `count(*)`*
-  (`count_covering_index` counts index entries when a single full index exists,
-  EQP `USING COVERING INDEX`). *Remaining:* covering reads on `WHERE`-driven
-  index seeks (range/IN/equality) — return columns straight from the seek's index
-  records when they're all covered.
+- ✅ **B2b — Covering reads beyond the ordered scan.** Done. `count(*)` counts
+  index entries (`count_covering_index`); and equality/range/IN `WHERE` seeks read
+  result rows straight from the index records when the chosen index covers every
+  referenced column (result + WHERE + ORDER BY), via the shared
+  `seek_index_covers` (+ `covering_seek_rows`), with `eqp_access` reporting
+  `SEARCH … USING COVERING INDEX` in lockstep. *(Covering on UPDATE/DELETE seeks
+  is out of scope — they always touch the table.)*
 - **B3 — Automatic indexes for unindexed joins.** Build a transient hash/sorted
   index on a join's inner table when no usable persistent index exists (the
   `auto-index` optimization); report `USING AUTOMATIC … INDEX`. Pairs with B1a.
