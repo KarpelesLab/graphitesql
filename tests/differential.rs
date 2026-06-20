@@ -525,6 +525,27 @@ fn corpus() -> Vec<String> {
     ] {
         q.push(format!("SELECT {e};"));
     }
+    // 28) Date/time validation and overflow normalization (invalid -> NULL;
+    // day-overflow normalized via the Julian-day round-trip; hour 24 preserved).
+    for e in [
+        "quote(date('2024-02-30'))",
+        "quote(date('2024-02-31'))",
+        "quote(date('2024-04-31'))",
+        "quote(date('2024-13-01'))",
+        "quote(date('2024-00-15'))",
+        "quote(date('2024-01-32'))",
+        "quote(time('25:00'))",
+        "quote(time('23:60'))",
+        "quote(time('23:59:60'))",
+        "quote(time('24:00:00'))",
+        "quote(time('24:00:30'))",
+        "quote(datetime('2024-02-30 12:00'))",
+        "quote(datetime('2024-02-30 25:00'))",
+        "quote(strftime('%H:%M:%S','2024-06-15 25:61:00'))",
+        "quote(datetime('2024-02-29 23:59:59','+1 second'))",
+    ] {
+        q.push(format!("SELECT {e};"));
+    }
 
     q
 }

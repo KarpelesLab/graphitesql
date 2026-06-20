@@ -165,6 +165,12 @@ fn parse_yyyy_mm_dd(z: &str, p: &mut DateTime) -> bool {
     let (day, ni) = read_int(bytes, i, 2);
     let Some(day) = day else { return false };
     i = ni;
+    // SQLite validates the month (1-12) and day (1-31); a day that overflows the
+    // month (e.g. Feb 30) is accepted here and normalized later via the Julian-day
+    // round-trip. Out-of-range components make the whole value NULL.
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return false;
+    }
     // optional time, after a separator
     while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'T' || bytes[i] == b't') {
         i += 1;
@@ -221,6 +227,11 @@ fn parse_hh_mm_ss(z: &str, p: &mut DateTime) -> bool {
             }
             sec += frac / scale;
         }
+    }
+    // SQLite range-checks the clock fields: hour 0-24, minute 0-59, second in
+    // [0, 60). Out-of-range makes the whole value NULL.
+    if !(0..=24).contains(&h) || !(0..=59).contains(&min) || !(0.0..60.0).contains(&sec) {
+        return false;
     }
     p.valid_jd = false;
     p.valid_hms = true;
@@ -577,6 +588,11 @@ fn is_date(args: &[Value]) -> Option<DateTime> {
         }
     }
     p.compute_jd();
+    // Re-derive Y/M/D from the Julian day so a day that overflows its month is
+    // normalized (e.g. `2024-02-30` -> `2024-03-01`), matching SQLite. The
+    // round-trip is the identity for in-range dates. The clock fields are kept as
+    // parsed so `time('24:00:00')` stays `24:00:00` (SQLite does not roll it over).
+    p.valid_ymd = false;
     Some(p)
 }
 
