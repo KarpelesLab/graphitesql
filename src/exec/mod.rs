@@ -299,6 +299,7 @@ impl Connection {
             "index_info" => self.pragma_index_info(p),
             "foreign_key_list" => self.pragma_foreign_key_list(p),
             "foreign_key_check" => self.pragma_foreign_key_check(p),
+            "integrity_check" | "quick_check" => self.pragma_integrity_check(),
             "foreign_keys" => Ok(single(
                 "foreign_keys",
                 Value::Integer(self.foreign_keys as i64),
@@ -591,6 +592,68 @@ impl Connection {
                 .collect(),
             rows,
         })
+    }
+
+    /// `PRAGMA integrity_check` / `quick_check`: walk every table and index
+    /// b-tree and verify each index holds exactly the entries its table implies
+    /// (honoring partial-index predicates). Returns the single value `ok` when the
+    /// database is consistent, else one row per detected problem.
+    fn pragma_integrity_check(&self) -> Result<QueryResult> {
+        use crate::schema::ObjectType;
+        let single = |v: Value| QueryResult {
+            columns: alloc::vec![String::from("integrity_check")],
+            rows: alloc::vec![alloc::vec![v]],
+        };
+        let tables: Vec<String> = self
+            .schema
+            .objects()
+            .iter()
+            .filter(|o| o.obj_type == ObjectType::Table && !o.name.starts_with("sqlite_"))
+            .map(|o| o.name.clone())
+            .collect();
+
+        let mut problems = Vec::new();
+        for table in &tables {
+            let meta = self.table_meta(table, None)?;
+            // The rows that physically exist, and how many each index should hold.
+            let rows: Vec<Vec<Value>> = if meta.without_rowid {
+                self.scan_without_rowid(&meta)?
+            } else {
+                self.scan_table(&meta)?
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect()
+            };
+            let no_params = Params::default();
+            for idx in self.indexes_of(table)? {
+                let expected = rows
+                    .iter()
+                    .filter_map(|r| self.row_in_index(&idx, &meta, r, None, &no_params).ok())
+                    .filter(|&keep| keep)
+                    .count();
+                // Count the index b-tree's entries.
+                let mut cur = crate::btree::IndexCursor::new(self.backend.source(), idx.root);
+                let mut got = 0usize;
+                while cur.next()?.is_some() {
+                    got += 1;
+                }
+                if got != expected {
+                    problems.push(alloc::format!("wrong # of entries in index {}", idx.name));
+                }
+            }
+        }
+
+        if problems.is_empty() {
+            Ok(single(Value::Text("ok".into())))
+        } else {
+            Ok(QueryResult {
+                columns: alloc::vec![String::from("integrity_check")],
+                rows: problems
+                    .into_iter()
+                    .map(|p| alloc::vec![Value::Text(p)])
+                    .collect(),
+            })
+        }
     }
 
     /// Execute a single non-`SELECT` statement, returning the number of rows

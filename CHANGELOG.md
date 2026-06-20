@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Track A: named windows — `WINDOW w AS (…)` definitions with `OVER w` references
   and `OVER (w ORDER BY …)` extension (a base window supplies `PARTITION BY`; the
   use may add `ORDER BY`/frame). Verified against `sqlite3`.
+- Track C: in-engine `PRAGMA integrity_check` / `quick_check`. Walks every table
+  and index b-tree and verifies each index holds exactly the entries its table
+  implies (honoring partial-index predicates), returning `ok` when consistent or
+  one row per problem — no longer delegated to `sqlite3`. Agrees with `sqlite3` on
+  valid databases (rowid/WITHOUT ROWID, multi-column/unique/partial/expression
+  indexes).
 - Track C: introspection PRAGMAs — `index_list`, `index_info`,
   `foreign_key_list`, `foreign_key_check`, `freelist_count`, `application_id`,
   `data_version`. Output matches SQLite's column layout and ordering;
