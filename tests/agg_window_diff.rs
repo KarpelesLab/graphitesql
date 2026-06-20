@@ -63,6 +63,14 @@ fn distinct_agg_and_window_match_sqlite3() {
         "SELECT id, ntile(3) OVER (ORDER BY id) FROM t ORDER BY id",
         "SELECT id, first_value(v) OVER (PARTITION BY g ORDER BY id) FROM t ORDER BY id",
         "SELECT id, sum(v) OVER (ORDER BY id RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+        // `*` / `table.*` mixed with aggregates: the bare columns take the
+        // representative row's value (the min/max row when a lone min/max is
+        // present, else the group's first row).
+        "SELECT *, count(*) FROM t",
+        "SELECT count(*), * FROM t",
+        "SELECT *, max(v) FROM t",
+        "SELECT t.*, count(*) FROM t",
+        "SELECT g, count(*), * FROM t GROUP BY g ORDER BY g",
     ];
     for q in queries {
         let want = {

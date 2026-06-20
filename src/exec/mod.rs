@@ -6027,15 +6027,20 @@ impl Connection {
         rows: Vec<InputRow>,
         params: &Params,
     ) -> Result<(Vec<String>, Vec<OutRow>)> {
-        // Wildcards make no sense with aggregation unless trivially grouped; keep
-        // it simple and reject for now.
-        if sel
+        // Expand any `*` / `table.*` into explicit column references so the
+        // bare-column rule below applies to them (SQLite allows `SELECT *,
+        // count(*) …`, each bare column taking the representative row's value).
+        let expanded;
+        let sel = if sel
             .columns
             .iter()
             .any(|c| matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_)))
         {
-            return Err(Error::Unsupported("'*' with aggregation"));
-        }
+            expanded = expand_agg_wildcards(sel, columns);
+            &expanded
+        } else {
+            sel
+        };
 
         // Partition rows into groups (first-seen order), comparing each grouping
         // key under its column collation.
@@ -6758,6 +6763,36 @@ struct TableMeta {
     /// (aligned with `columns`); `None` for an ordinary table. Drives write-time
     /// type checking.
     strict_types: Option<Vec<(StrictType, String)>>,
+}
+
+/// Return a copy of `sel` with any `*` / `table.*` result column expanded to
+/// explicit table-qualified column references drawn from `columns`. Used by the
+/// aggregate path so bare wildcards follow the same representative-row rule as
+/// named bare columns.
+fn expand_agg_wildcards(sel: &Select, columns: &[ColumnInfo]) -> Select {
+    let col_ref = |c: &ColumnInfo| ResultColumn::Expr {
+        expr: Expr::Column {
+            table: Some(c.table.clone()),
+            column: c.name.clone(),
+        },
+        alias: None,
+    };
+    let mut new_cols = Vec::new();
+    for col in &sel.columns {
+        match col {
+            ResultColumn::Wildcard => new_cols.extend(columns.iter().map(&col_ref)),
+            ResultColumn::TableWildcard(t) => new_cols.extend(
+                columns
+                    .iter()
+                    .filter(|c| c.table.eq_ignore_ascii_case(t))
+                    .map(&col_ref),
+            ),
+            other => new_cols.push(other.clone()),
+        }
+    }
+    let mut s = sel.clone();
+    s.columns = new_cols;
+    s
 }
 
 /// Wrap a runtime [`Value`] as a literal [`Expr`], so rows produced by an
