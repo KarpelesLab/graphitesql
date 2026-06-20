@@ -598,6 +598,12 @@ fn is_date(args: &[Value]) -> Option<DateTime> {
     // round-trip is the identity for in-range dates. The clock fields are kept as
     // parsed so `time('24:00:00')` stays `24:00:00` (SQLite does not roll it over).
     p.valid_ymd = false;
+    p.compute_ymd();
+    // SQLite's date functions return NULL once a computation runs past the end of
+    // year 9999 (`date('9999-12-31','+1 day')` is NULL, not `+10000-01-01`).
+    if p.y > 9999 {
+        return None;
+    }
     Some(p)
 }
 
@@ -788,10 +794,16 @@ pub fn strftime(args: &[Value]) -> Value {
     let Some(mut p) = is_date(&args[1..]) else {
         return Value::Null;
     };
-    Value::Text(render_strftime(fmt, &mut p))
+    match render_strftime(fmt, &mut p) {
+        Some(s) => Value::Text(s),
+        None => Value::Null,
+    }
 }
 
-fn render_strftime(fmt: &str, p: &mut DateTime) -> String {
+/// Render an `strftime` format. Returns `None` (SQL NULL) if the format contains
+/// any specifier SQLite does not recognize — SQLite aborts the whole conversion
+/// rather than emitting the unknown `%X` literally.
+fn render_strftime(fmt: &str, p: &mut DateTime) -> Option<String> {
     p.compute_ymd_hms();
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
@@ -842,6 +854,13 @@ fn render_strftime(fmt: &str, p: &mut DateTime) -> String {
                 let wd = (p.ijd + 129_600_000) / 86_400_000 % 7; // 0=Sun
                 out.push_str(&alloc::format!("{}", wd));
             }
+            Some('U') => {
+                // Week of year, Sunday as the first day (00-53): weeks before the
+                // first Sunday are week 00. `(yday0 + 7 - wday_sun0) / 7`.
+                let yday0 = day_of_year(p) - 1;
+                let wday = (p.ijd + 129_600_000) / 86_400_000 % 7; // 0 = Sunday
+                out.push_str(&alloc::format!("{:02}", (yday0 + 7 - wday) / 7));
+            }
             Some('W') => {
                 let mut y0 = *p;
                 y0.valid_jd = false;
@@ -872,14 +891,12 @@ fn render_strftime(fmt: &str, p: &mut DateTime) -> String {
                 out.push_str(&alloc::format!("{iw:02}"));
             }
             Some('%') => out.push('%'),
-            Some(other) => {
-                out.push('%');
-                out.push(other);
-            }
-            None => out.push('%'),
+            // An unrecognized specifier (or a trailing `%`) aborts the whole
+            // conversion to NULL, matching SQLite.
+            Some(_) | None => return None,
         }
     }
-    out
+    Some(out)
 }
 
 /// Day of year (1-366) for `p`, normalizing to midnight.
