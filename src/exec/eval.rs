@@ -545,11 +545,13 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 Some(s) => s.column(select, ctx)?,
                 None => return Err(Error::Unsupported("IN (SELECT …) in this context")),
             };
+            // Membership uses the left operand's collation, as in SQLite.
+            let coll = key_collation(expr, ctx);
             let mut saw_null = false;
             for iv in &set {
                 if matches!(iv, Value::Null) {
                     saw_null = true;
-                } else if compare(&v, iv) == Ordering::Equal {
+                } else if crate::value::cmp_values_coll(&v, iv, coll) == Ordering::Equal {
                     return Ok(bool_value(!negated));
                 }
             }

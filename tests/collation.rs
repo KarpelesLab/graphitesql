@@ -265,3 +265,25 @@ fn between_and_case_use_collation() {
         "0"
     );
 }
+
+#[test]
+fn in_subquery_uses_left_collation() {
+    let mut c = Connection::open_memory().unwrap();
+    for s in [
+        "CREATE TABLE t(a TEXT COLLATE NOCASE)",
+        "INSERT INTO t VALUES('X'),('y')",
+        "CREATE TABLE u(b TEXT)",
+        "INSERT INTO u VALUES('x'),('Z')",
+    ] {
+        c.execute(s).unwrap();
+    }
+    // `a IN (SELECT b …)` tests membership under a's NOCASE collation.
+    assert_eq!(
+        rows_str(&c, "SELECT a FROM t WHERE a IN (SELECT b FROM u) ORDER BY a"),
+        "X"
+    );
+    assert_eq!(
+        rows_str(&c, "SELECT a FROM t WHERE a NOT IN (SELECT b FROM u) ORDER BY a"),
+        "y"
+    );
+}
