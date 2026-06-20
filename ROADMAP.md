@@ -332,8 +332,13 @@ remains).
   stops at the lock-byte page, and any error rolls back to the sound in-place
   path; NONE/INCREMENTAL writes byte-identical. *Ref:* `btree.c`
   `autoVacuumCommit`.
-- **C6b-4 — `PRAGMA incremental_vacuum(N)`.** The on-demand shrink for
-  `auto_vacuum=INCREMENTAL`. *(C6b-3's relocator is directly reusable.)*
+- ✅ **C6b-4 — `PRAGMA incremental_vacuum(N)`.** Done — reclaims free pages on
+  demand for `auto_vacuum=INCREMENTAL`: the unbounded form drains the freelist,
+  `incremental_vacuum(N)`/`= N` reclaims at most N trailing pages, reusing the
+  bounded (`limit: u32`) C6b-3 relocator. No-op for NONE/FULL; FULL/NONE commit
+  byte-identical. Verified: a heavily-deleted INCREMENTAL db reclaimed to sqlite3
+  `integrity_check = ok`. **The whole `auto_vacuum` track (C6a/C6b-1..4) is now
+  complete — read, write, FULL auto-truncate, and INCREMENTAL on-demand reclaim.**
 
 *Storage / durability / concurrency (each independent):*
 
