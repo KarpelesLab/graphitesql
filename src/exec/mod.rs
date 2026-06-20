@@ -10190,8 +10190,15 @@ fn window_aggregate(lname: &str, star: bool, frame: &[&Vec<Value>]) -> Result<Va
             if vals.is_empty() {
                 Value::Null
             } else {
+                // The optional 2nd argument is the separator (default ","), the
+                // same for every row of the frame.
+                let sep = frame
+                    .first()
+                    .and_then(|r| r.get(1))
+                    .map(eval::to_text)
+                    .unwrap_or_else(|| String::from(","));
                 let parts: Vec<String> = vals.iter().map(eval::to_text).collect();
-                Value::Text(parts.join(","))
+                Value::Text(parts.join(&sep))
             }
         }
         _ => return Err(Error::Unsupported("window function")),
