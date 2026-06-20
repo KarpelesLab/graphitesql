@@ -201,3 +201,41 @@ fn collation_against_sqlite3() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn in_operator_uses_left_collation() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES('ABC','xyz'),('abc','XYZ'),('Abc','def')")
+        .unwrap();
+    // `a IN ('ABC')` matches case-insensitively via column a's NOCASE collation.
+    assert_eq!(
+        rows_str(&c, "SELECT a FROM t WHERE a IN ('ABC') ORDER BY b"),
+        "abc\nAbc\nABC"
+    );
+    // A BINARY column matches only the exact case.
+    assert_eq!(rows_str(&c, "SELECT b FROM t WHERE b IN ('xyz')"), "xyz");
+    // An explicit COLLATE on the left applies too.
+    assert_eq!(
+        rows_str(
+            &c,
+            "SELECT b FROM t WHERE b COLLATE NOCASE IN ('xyz') ORDER BY a"
+        ),
+        "xyz\nXYZ"
+    );
+}
+
+#[test]
+fn min_max_use_argument_collation() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES('ABC','xyz'),('abc','XYZ'),('Abc','def')")
+        .unwrap();
+    // Under NOCASE all three a-values are equal, so min and max both return the
+    // first ('ABC'), matching SQLite.
+    assert_eq!(rows_str(&c, "SELECT max(a), min(a) FROM t"), "ABC|ABC");
+    // A BINARY column compares by code point.
+    assert_eq!(rows_str(&c, "SELECT max(b), min(b) FROM t"), "xyz|XYZ");
+}

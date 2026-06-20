@@ -6589,6 +6589,15 @@ impl Connection {
             dedup_values(&mut vals, coll);
         }
 
+        // `min`/`max` compare under the argument's collation (e.g. a NOCASE
+        // column), not plain BINARY.
+        let arg_coll = if args.is_empty() {
+            crate::value::Collation::default()
+        } else {
+            let cctx = row_ctx(&[], columns, None, params);
+            eval::key_collation(&args[0], &cctx)
+        };
+
         Ok(match lname.as_str() {
             "count" => {
                 if star {
@@ -6637,7 +6646,8 @@ impl Connection {
             "min" => vals
                 .into_iter()
                 .reduce(|a, b| {
-                    if eval::compare(&b, &a) == core::cmp::Ordering::Less {
+                    if crate::value::cmp_values_coll(&b, &a, arg_coll) == core::cmp::Ordering::Less
+                    {
                         b
                     } else {
                         a
@@ -6647,7 +6657,9 @@ impl Connection {
             "max" => vals
                 .into_iter()
                 .reduce(|a, b| {
-                    if eval::compare(&b, &a) == core::cmp::Ordering::Greater {
+                    if crate::value::cmp_values_coll(&b, &a, arg_coll)
+                        == core::cmp::Ordering::Greater
+                    {
                         b
                     } else {
                         a

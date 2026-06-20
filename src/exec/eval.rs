@@ -779,6 +779,9 @@ fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<V
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
+    // The membership test uses the left operand's collation (an explicit
+    // COLLATE or the column's declared collation), matching SQLite.
+    let coll = key_collation(expr, ctx);
     let mut saw_null = false;
     for item in list {
         let iv = eval(item, ctx)?;
@@ -786,7 +789,7 @@ fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<V
             saw_null = true;
             continue;
         }
-        if compare(&v, &iv) == Ordering::Equal {
+        if crate::value::cmp_values_coll(&v, &iv, coll) == Ordering::Equal {
             return Ok(bool_value(!negated));
         }
     }
