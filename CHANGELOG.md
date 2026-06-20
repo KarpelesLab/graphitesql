@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: **`INSERT … SELECT`** — populate a table from a query (compound
+  sources and target column lists included). The query is snapshotted before any
+  insert, so `INSERT INTO t SELECT … FROM t` terminates; rows then flow through
+  the ordinary insert path (defaults, constraints, triggers, indexes). As part
+  of this, a bare `VALUES` row with an implicit column list is now required to
+  match the column count, matching SQLite.
 - **Schema catalog queryable** as `sqlite_schema` and the historical
   `sqlite_master` (read-only 5-column rowid table at page 1); direct DML against
   it is rejected with "table … may not be modified".

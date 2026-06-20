@@ -2001,10 +2001,21 @@ impl Connection {
 
     fn exec_insert(&mut self, ins: &Insert, params: &Params) -> Result<usize> {
         reject_schema_write(&ins.table)?;
-        let rows = match &ins.source {
-            InsertSource::Values(rows) => rows.clone(),
-            InsertSource::DefaultValues => alloc::vec![Vec::new()],
-            InsertSource::Select(_) => return Err(Error::Unsupported("INSERT ... SELECT")),
+        // `INSERT … SELECT` is evaluated to a snapshot of value rows first (so
+        // `INSERT INTO t SELECT … FROM t` reads the pre-insert state), then each
+        // row flows through the normal VALUES path as literal expressions.
+        let (rows, is_default_values) = match &ins.source {
+            InsertSource::Values(rows) => (rows.clone(), false),
+            InsertSource::DefaultValues => (alloc::vec![Vec::new()], true),
+            InsertSource::Select(sel) => {
+                let result = self.run_select(sel, params)?;
+                let rows = result
+                    .rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(value_to_literal_expr).collect())
+                    .collect();
+                (rows, false)
+            }
         };
         if self.is_view(&ins.table) {
             return self.exec_view_insert(ins, &rows, params);
@@ -2041,7 +2052,10 @@ impl Connection {
         let mut affected = 0;
         let mut replaced = false;
         for row_exprs in &rows {
-            if !ins.columns.is_empty() && row_exprs.len() != target.len() {
+            // Every supplied row must match the target column count (DEFAULT
+            // VALUES is the one exception — it supplies an empty row meaning
+            // "all defaults").
+            if !is_default_values && row_exprs.len() != target.len() {
                 return Err(Error::Error("INSERT column/value count mismatch".into()));
             }
             // Start every column at its DEFAULT (or NULL), then apply provided.
@@ -6744,6 +6758,18 @@ struct TableMeta {
     /// (aligned with `columns`); `None` for an ordinary table. Drives write-time
     /// type checking.
     strict_types: Option<Vec<(StrictType, String)>>,
+}
+
+/// Wrap a runtime [`Value`] as a literal [`Expr`], so rows produced by an
+/// `INSERT … SELECT` can flow through the ordinary VALUES insert path.
+fn value_to_literal_expr(v: Value) -> Expr {
+    Expr::Literal(match v {
+        Value::Null => Literal::Null,
+        Value::Integer(i) => Literal::Integer(i),
+        Value::Real(r) => Literal::Real(r),
+        Value::Text(s) => Literal::Str(s),
+        Value::Blob(b) => Literal::Blob(b),
+    })
 }
 
 /// Whether `name` refers to the main schema catalog table, which SQLite exposes

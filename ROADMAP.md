@@ -121,6 +121,10 @@ Order within a track is roughly by value/effort; tracks can progress in parallel
 
 Make the dialect complete. Each item lands with a differential corpus addition.
 
+- ✅ **`INSERT … SELECT`** — populate a table from a query (incl. compound
+  `SELECT` sources and a target column list); the query is snapshotted first so
+  `INSERT INTO t SELECT … FROM t` terminates, then rows flow through the normal
+  insert path (defaults, constraints, triggers, indexes).
 - ✅ **`CREATE TABLE … AS SELECT`** — columns from the query's labels, populated
   with its rows.
 - ✅ **Outer joins** — `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` (nested-loop, with
