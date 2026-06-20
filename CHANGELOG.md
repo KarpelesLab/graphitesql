@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **Schema catalog queryable** as `sqlite_schema` and the historical
+  `sqlite_master` (read-only 5-column rowid table at page 1); direct DML against
+  it is rejected with "table … may not be modified".
+- Fix: **`ALTER TABLE ADD COLUMN` constraint restrictions** — a `UNIQUE` or
+  `PRIMARY KEY` column is rejected, and a `NOT NULL` column with a NULL default
+  is rejected when the table already has rows, matching SQLite.
+- Fix: **subqueries rejected in CHECK constraints and generated columns** at
+  `CREATE` time (SQLite forbids them; graphite previously evaluated them).
 - Fix: **`sum()`/`abs()` integer overflow is an error** (not a silent real
   promotion), matching SQLite — the `+`/`*` operators still fall back to real.
 - Fix: **`-9223372036854775808` parses as `Integer(i64::MIN)`** (the literal
