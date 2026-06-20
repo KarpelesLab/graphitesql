@@ -212,7 +212,13 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
   cross-db reads.*
 - **C4 — `TEMP` tables/indexes/triggers.** A lazily-created `temp` database (seq
   1); `CREATE TEMP …` targets it; `sqlite_temp_schema`/`sqlite_temp_master`;
-  unqualified-name resolution searches `temp`→`main`.
+  unqualified-name resolution searches `temp`→`main`. *Design:* map `TEMP` to a
+  `schema = "temp"` qualifier (reusing C3's swap path for the write) and store
+  the temp db in a dedicated slot; generalize `resolve_db`/`swap_db`/`scan_db`
+  to a `DbRef { Main, Temp, Attached(i) }`. The substantive part is making
+  **unqualified** name resolution check temp before main (the query hot path) —
+  do it behind one resolver so the change is localized and the full differential
+  suite stays green.
 - **C5 — `ATTACH 'file.db' AS x`.** Open a real file as an attached database
   (`std`), reusing the pager; cross-database transaction semantics.
 
