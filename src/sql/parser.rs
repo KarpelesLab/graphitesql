@@ -163,7 +163,7 @@ impl Parser {
                 stmt: alloc::boxed::Box::new(stmt),
             });
         }
-        if self.check_kw("select") || self.check_kw("with") {
+        if self.check_kw("select") || self.check_kw("with") || self.check_kw("values") {
             return Ok(Statement::Select(self.select()?));
         }
         if self.check_kw("insert") || self.check_kw("replace") {
@@ -350,6 +350,9 @@ impl Parser {
     /// (no `WITH`, compound, `ORDER BY`, or `LIMIT` — those are handled by the
     /// enclosing [`select`](Self::select)).
     fn select_core(&mut self) -> Result<Select> {
+        if self.check_kw("values") {
+            return self.values_core();
+        }
         self.expect_kw("select")?;
         let distinct = if self.eat_kw("distinct") {
             true
@@ -400,6 +403,47 @@ impl Parser {
             limit: None,
             offset: None,
         })
+    }
+
+    /// Parse a `VALUES (…), (…), …` query, desugared to a `SELECT` of the first
+    /// row `UNION ALL`-ed with the rest. Columns are named `column1`, `column2`,
+    /// … as SQLite does.
+    fn values_core(&mut self) -> Result<Select> {
+        self.expect_kw("values")?;
+        let mut rows = Vec::new();
+        rows.push(self.value_row()?);
+        while self.eat(&Token::Comma) {
+            rows.push(self.value_row()?);
+        }
+        let make = |exprs: Vec<Expr>| -> Select {
+            let columns = exprs
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| ResultColumn::Expr {
+                    expr: e,
+                    alias: Some(alloc::format!("column{}", i + 1)),
+                })
+                .collect();
+            Select {
+                ctes: Vec::new(),
+                compound: Vec::new(),
+                distinct: false,
+                columns,
+                from: None,
+                where_clause: None,
+                group_by: Vec::new(),
+                having: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            }
+        };
+        let mut it = rows.into_iter();
+        let mut core = make(it.next().expect("VALUES has at least one row"));
+        for r in it {
+            core.compound.push((CompoundOp::UnionAll, make(r)));
+        }
+        Ok(core)
     }
 
     fn result_column(&mut self) -> Result<ResultColumn> {
