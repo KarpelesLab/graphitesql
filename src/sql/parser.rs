@@ -956,10 +956,18 @@ impl Parser {
             return Err(self.err("expected INDEX after CREATE UNIQUE"));
         }
         if self.eat_kw("view") {
-            return Ok(Statement::CreateView(self.create_view()?));
+            let mut cv = self.create_view()?;
+            if temp && cv.schema.is_none() {
+                cv.schema = Some("temp".into());
+            }
+            return Ok(Statement::CreateView(cv));
         }
         if self.eat_kw("trigger") {
-            return Ok(Statement::CreateTrigger(self.create_trigger()?));
+            let mut ct = self.create_trigger()?;
+            if temp && ct.schema.is_none() {
+                ct.schema = Some("temp".into());
+            }
+            return Ok(Statement::CreateTrigger(ct));
         }
         Err(self.err("expected TABLE, INDEX, VIEW, or TRIGGER after CREATE"))
     }

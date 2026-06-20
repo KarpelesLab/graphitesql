@@ -1113,12 +1113,9 @@ impl Connection {
             // The index lives in the schema named on the index (or, unqualified,
             // wherever its table lives — so a temp table's index goes to temp).
             Statement::CreateIndex(ci) => resolved(ci.schema.as_deref(), &ci.table),
-            // An explicitly-qualified view lives in the named schema; an
-            // unqualified `CREATE VIEW` (incl. `CREATE TEMP VIEW`) stays in main.
-            Statement::CreateView(cv) => match cv.schema.as_deref() {
-                Some(_) => self.resolve_db(cv.schema.as_deref()),
-                None => Ok(DbRef::Main),
-            },
+            // A view lives in the schema named on it (`CREATE TEMP VIEW` → temp);
+            // an unqualified `CREATE VIEW` stays in main.
+            Statement::CreateView(cv) => self.resolve_db(cv.schema.as_deref()),
             // A trigger lives in the schema named on it (or, unqualified,
             // wherever the table it fires on lives).
             Statement::CreateTrigger(ct) => resolved(ct.schema.as_deref(), &ct.table),
@@ -2321,8 +2318,14 @@ impl Connection {
             }
             return Err(Error::Error(format!("trigger {} already exists", ct.name)));
         }
-        // The target may be a table or (for INSTEAD OF triggers) a view.
-        if self.schema.table(&ct.table).is_none() && !self.is_view(&ct.table) {
+        // The target may be a table or (for INSTEAD OF triggers) a view. A temp
+        // trigger may fire on a main table, so when the temp database is the active
+        // schema also consult the swapped-out catalog (which then holds main).
+        let table_in_other = self
+            .temp_db
+            .as_ref()
+            .is_some_and(|t| t.schema.table(&ct.table).is_some());
+        if self.schema.table(&ct.table).is_none() && !table_in_other && !self.is_view(&ct.table) {
             return Err(Error::Error(format!("no such table: {}", ct.table)));
         }
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
@@ -2358,7 +2361,27 @@ impl Connection {
         timing: TriggerTiming,
     ) -> Result<Vec<CreateTrigger>> {
         let mut out = Vec::new();
-        for obj in self.schema.objects() {
+        // The active schema plus the temp catalog: a temp trigger fires on writes
+        // to its (possibly main) table, and a main trigger fires even while a temp
+        // database is swapped in. `swap_db` exchanges `self.schema` with the temp
+        // db's, so these two catalogs are always exactly {main, temp}.
+        self.collect_triggers(self.schema.objects(), table, kind, timing, &mut out);
+        if let Some(t) = &self.temp_db {
+            self.collect_triggers(t.schema.objects(), table, kind, timing, &mut out);
+        }
+        Ok(out)
+    }
+
+    /// Append triggers from `objects` matching `table`/`kind`/`timing` to `out`.
+    fn collect_triggers(
+        &self,
+        objects: &[crate::schema::SchemaObject],
+        table: &str,
+        kind: TrigEvent,
+        timing: TriggerTiming,
+        out: &mut Vec<CreateTrigger>,
+    ) {
+        for obj in objects {
             if obj.obj_type != crate::schema::ObjectType::Trigger
                 || !obj.tbl_name.eq_ignore_ascii_case(table)
             {
@@ -2378,7 +2401,6 @@ impl Connection {
                 out.push(ct);
             }
         }
-        Ok(out)
     }
 
     /// Fire row triggers for one row change. `old`/`new` carry the affected row's
@@ -2452,10 +2474,20 @@ impl Connection {
         });
     }
 
-    /// Whether `name` is a view.
+    /// Whether `name` is a view in main (or a temp view, which shadows main).
     fn is_view(&self, name: &str) -> bool {
-        self.schema.objects().iter().any(|o| {
-            o.obj_type == crate::schema::ObjectType::View && o.name.eq_ignore_ascii_case(name)
+        self.temp_has_view(name)
+            || self.schema.objects().iter().any(|o| {
+                o.obj_type == crate::schema::ObjectType::View && o.name.eq_ignore_ascii_case(name)
+            })
+    }
+
+    /// Whether the temp database holds a view named `name`.
+    fn temp_has_view(&self, name: &str) -> bool {
+        self.temp_db.as_ref().is_some_and(|t| {
+            t.schema.objects().iter().any(|o| {
+                o.obj_type == crate::schema::ObjectType::View && o.name.eq_ignore_ascii_case(name)
+            })
         })
     }
 
@@ -3861,6 +3893,8 @@ impl Connection {
     }
 
     /// If `name` is a view, run its `SELECT` and return its columns + rows.
+    /// A temp view shadows a main view of the same name (like a temp table), and
+    /// is read through its own (temp) database via [`scan_db_view`](Self::scan_db_view).
     fn try_view(
         &self,
         name: &str,
@@ -3868,6 +3902,9 @@ impl Connection {
         params: &Params,
     ) -> Result<Option<(Vec<ColumnInfo>, Vec<InputRow>)>> {
         use crate::schema::ObjectType;
+        if self.temp_has_view(name) {
+            return self.scan_db_view(DbRef::Temp, name, alias, params);
+        }
         let obj = match self
             .schema
             .objects()
