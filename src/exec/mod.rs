@@ -4247,9 +4247,15 @@ impl Connection {
             Some(e) => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize,
             None => 0,
         };
+        // A negative LIMIT means "no limit" in SQLite (OFFSET still applies).
         let limit = match &sel.limit {
             Some(e) => {
-                Some(eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize)
+                let n = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                if n < 0 {
+                    None
+                } else {
+                    Some(n as usize)
+                }
             }
             None => None,
         };
@@ -4641,9 +4647,15 @@ impl Connection {
             Some(e) => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize,
             None => 0,
         };
+        // A negative LIMIT means "no limit" in SQLite (OFFSET still applies).
         let limit = match &sel.limit {
             Some(e) => {
-                Some(eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize)
+                let n = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                if n < 0 {
+                    None
+                } else {
+                    Some(n as usize)
+                }
             }
             None => None,
         };

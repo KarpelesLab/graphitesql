@@ -560,6 +560,19 @@ fn corpus() -> Vec<String> {
     ] {
         q.push(format!("SELECT {e};"));
     }
+    // 30) Negative LIMIT means "no limit" (OFFSET still applies).
+    for lo in [
+        "LIMIT -1",
+        "LIMIT -5",
+        "LIMIT -1 OFFSET 3",
+        "LIMIT -1 OFFSET 100",
+        "LIMIT 0",
+    ] {
+        q.push(format!("SELECT id FROM t ORDER BY id {lo};"));
+    }
+    q.push(
+        "SELECT id FROM t WHERE g=1 UNION SELECT id FROM t WHERE g=2 ORDER BY id LIMIT -1;".into(),
+    );
 
     q
 }
