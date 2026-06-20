@@ -247,7 +247,14 @@ results; keep the differential corpus green at every step):
 
 - **B5 — VDBE: joins.** Nested-loop join opcodes (`OpenRead`/`Rewind`/`Column`/
   `Next` per cursor) so a two-table join runs on the register machine.
-- **B6 — VDBE: `HAVING` + aggregate `ORDER BY`** on the grouped path.
+- ✅ **B6 — VDBE: `HAVING` + aggregate `ORDER BY`** on the grouped path. Done —
+  a general `compile_group_select` path folds the referenced aggregates, then a
+  second emit loop (`GroupFinalize`/`GroupKey`/`GroupAgg`/`GroupNext` + a
+  register-binding table) compiles arbitrary `HAVING` and sort-key expressions
+  over grouping columns / aggregates / output aliases; `ORDER BY`/`LIMIT`/`OFFSET`
+  on the grouped output. Additive behind `query_vdbe`; ~28 parity tests vs the
+  tree-walker. *(Unsupported shapes — DISTINCT-group, FILTER/OVER aggregates,
+  non-constant LIMIT — fall back cleanly.)*
 - **B7 — VDBE becomes the execution path.** Migrate `Connection::query` onto the
   VDBE behind a flag, then by default.
 - **B8 — Real `EXPLAIN` (bytecode).** Emit the `addr|opcode|p1|p2|p3|p4|p5`
