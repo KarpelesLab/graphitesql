@@ -85,6 +85,82 @@ fn vdbe_matches_sqlite3() {
 }
 
 #[test]
+fn table_scan_matches_tree_walker() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT)")
+        .unwrap();
+    c.execute("INSERT INTO t(a,b) VALUES (3,'x'),(1,'y'),(2,'z')")
+        .unwrap();
+    // Plain projections and expressions over columns run through the VDBE and
+    // match the tree-walker; a WHERE clause cleanly falls back to Unsupported.
+    assert!(c.query_vdbe("SELECT a FROM t WHERE a > 1").is_err());
+    for q in [
+        "SELECT a, b FROM t",
+        "SELECT a * 2, b || '!' FROM t",
+        "SELECT *, a + id FROM t",
+        "SELECT CASE WHEN a > 1 THEN 'big' ELSE 'small' END FROM t",
+    ] {
+        assert_eq!(
+            c.query_vdbe(q).unwrap().rows,
+            c.query(q).unwrap().rows,
+            "VDBE vs tree-walker diverged on {q}"
+        );
+    }
+    // Empty table: the Rewind loop emits nothing.
+    c.execute("DELETE FROM t").unwrap();
+    assert!(c.query_vdbe("SELECT a FROM t").unwrap().rows.is_empty());
+}
+
+#[test]
+fn table_scan_matches_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-vdbe-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let setup = "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT);\
+                 INSERT INTO t(a,b) VALUES (3,'x'),(1,'y'),(2,'z')";
+    Command::new("sqlite3")
+        .arg(&path)
+        .arg(setup)
+        .output()
+        .unwrap();
+
+    // Build the same data in a separate in-memory db for the VDBE run (do not
+    // touch the sqlite3 reference file).
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+
+    let queries = [
+        "SELECT a FROM t",
+        "SELECT a, b FROM t",
+        "SELECT a + 1, b || b FROM t",
+    ];
+    for q in queries {
+        let want = {
+            let o = Command::new("sqlite3").arg(&path).arg(q).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = g
+            .query_vdbe(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.iter().map(render).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(got, want, "VDBE vs sqlite3 diverged on {q}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn falls_back_for_non_constant() {
     // Anything beyond a constant SELECT list is Unsupported, so the engine can
     // fall back to the tree-walker.

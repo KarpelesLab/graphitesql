@@ -170,12 +170,13 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
 - **VDBE bytecode IR** — 🚧 *spike landed* (`exec::vdbe`): a register-machine
   `Op`/`Program` with a program-counter interpreter, a compiler for constant
   `SELECT` projections covering arithmetic, concat, comparison, three-valued
-  boolean logic, `IS NULL`, and `CASE` (via `Goto`/`IfFalse` control flow),
-  running alongside the tree-walker with matching results. *Remaining:* grow it to
-  table cursors, filters, joins and migrate the executor onto it; then **real
-  `EXPLAIN`** (the `addr/opcode/p1…` listing) byte-comparable to SQLite's, and
-  query flattening / subquery co-routines. *Ref:* `vdbe.c`, `vdbeaux.c`,
-  `opcodes.h`.
+  boolean logic, `IS NULL`, `CASE` (via `Goto`/`IfFalse` control flow), and `CAST`,
+  plus a single-table scan (`Rewind`/`Column`/`Next`) wired into the engine via
+  `Connection::query_vdbe` — all running alongside the tree-walker with matching
+  results. *Remaining:* filters/`WHERE`, joins, aggregates on the VDBE, then
+  migrate the executor onto it; then **real `EXPLAIN`** (the `addr/opcode/p1…`
+  listing) byte-comparable to SQLite's, and query flattening / subquery
+  co-routines. *Ref:* `vdbe.c`, `vdbeaux.c`, `opcodes.h`.
 - **`EXPLAIN` (bytecode)** — currently `Error::Unsupported`; lands with the VDBE.
 
 ### Track C — Storage engine, transactions & **concurrency**

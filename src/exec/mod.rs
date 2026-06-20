@@ -234,6 +234,47 @@ impl Connection {
         self.query_params(sql, &Params::default())
     }
 
+    /// Run `sql` through the experimental VDBE engine instead of the tree-walker.
+    /// Supports constant projections and plain single-table scans
+    /// (`SELECT <exprs> FROM <table>` with no `WHERE`/joins/aggregates/`ORDER BY`);
+    /// returns `Unsupported` otherwise so callers can fall back to
+    /// [`query`](Self::query).
+    pub fn query_vdbe(&self, sql: &str) -> Result<QueryResult> {
+        let Statement::Select(sel) = sql::parse_one(sql)? else {
+            return Err(Error::Unsupported("query_vdbe expects SELECT"));
+        };
+        // Constant SELECT (no FROM): compile and run directly.
+        let Some(from) = &sel.from else {
+            let prog = vdbe::compile_const_select(&sel)?;
+            let rows = vdbe::run(&prog)?;
+            return Ok(QueryResult {
+                columns: prog.columns,
+                rows,
+            });
+        };
+        // Single plain table: materialize its rows and run a cursor program.
+        if !from.joins.is_empty() || from.first.subquery.is_some() || from.first.tvf_args.is_some()
+        {
+            return Err(Error::Unsupported("VDBE: only a single plain table"));
+        }
+        let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
+        let col_names: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+        let prog = vdbe::compile_table_select(&sel, &col_names)?;
+        let rows: Vec<Vec<Value>> = if meta.without_rowid {
+            self.scan_without_rowid(&meta)?
+        } else {
+            self.scan_table(&meta)?
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect()
+        };
+        let result = vdbe::run_rows(&prog, &rows)?;
+        Ok(QueryResult {
+            columns: prog.columns,
+            rows: result,
+        })
+    }
+
     /// Like [`query`](Self::query) but with bound parameters.
     pub fn query_params(&self, sql: &str, params: &Params) -> Result<QueryResult> {
         match sql::parse_one(sql)? {

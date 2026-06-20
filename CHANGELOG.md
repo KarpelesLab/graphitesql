@@ -100,7 +100,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sqlite3` for arithmetic, concatenation, comparison, three-valued `AND`/`OR`/
   `NOT`, `IS [NOT] NULL`, `CASE` (via `Goto`/`IfFalse` control flow on a
   program-counter interpreter), and `CAST` projections; unsupported queries
-  cleanly report `Unsupported` for fallback.
+  cleanly report `Unsupported` for fallback. The IR also scans a single plain
+  table (`Rewind`/`Column`/`Next` cursor ops over the materialized rows), wired
+  into the engine via the new `Connection::query_vdbe`, matching the tree-walker
+  and `sqlite3` for `SELECT <exprs> FROM <table>`.
 - Track B: `ANALYZE` and cost-based index selection. `ANALYZE [name]` gathers
   index selectivity into a `sqlite_stat1(tbl,idx,stat)` table, byte-compatible
   with SQLite's `nRow avgEq1 avgEq2 …` format (`avgEqK = (nRow + dK/2)/dK`);

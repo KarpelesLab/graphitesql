@@ -72,6 +72,14 @@ pub enum Op {
     Goto { target: usize },
     /// Jump to `target` when `reg` is false or NULL (i.e. not true).
     IfFalse { reg: usize, target: usize },
+    /// Position the table cursor at the first row; jump to `target` (the loop
+    /// exit) when the table is empty.
+    Rewind { target: usize },
+    /// Load column `col` of the cursor's current row into `dest`.
+    Column { col: usize, dest: usize },
+    /// Advance the cursor; jump back to `target` (the loop body) if a row remains,
+    /// else fall through.
+    Next { target: usize },
     /// `dest = -reg` (numeric negation).
     Negate { reg: usize, dest: usize },
     /// Emit registers `[start, start+count)` as one output row.
@@ -114,6 +122,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
     let mut c = Compiler {
         ops: Vec::new(),
         next_reg: count,
+        columns: Vec::new(),
     };
     let mut columns = Vec::new();
     for (i, rc) in sel.columns.iter().enumerate() {
@@ -136,9 +145,81 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
     })
 }
 
+/// Compile `SELECT <projection> FROM <single table>` (no `WHERE`/joins/aggregates/
+/// `ORDER BY`) into a program that scans the table via cursor ops. `columns` are
+/// the table's column names, used to resolve column references to indices.
+/// Returns `Unsupported` outside this grammar so the caller can fall back.
+pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program> {
+    if sel.where_clause.is_some()
+        || !sel.group_by.is_empty()
+        || !sel.compound.is_empty()
+        || !sel.order_by.is_empty()
+        || sel.distinct
+    {
+        return Err(Error::Unsupported("VDBE: only plain table projections"));
+    }
+    // Expand the projection list to concrete expressions/labels (supporting `*`).
+    let mut projections: Vec<(Expr, String)> = Vec::new();
+    for rc in &sel.columns {
+        match rc {
+            ResultColumn::Wildcard => {
+                for name in columns {
+                    projections.push((
+                        Expr::Column {
+                            table: None,
+                            column: name.clone(),
+                        },
+                        name.clone(),
+                    ));
+                }
+            }
+            ResultColumn::Expr { expr, alias } => {
+                let label = alias.clone().unwrap_or_else(|| match expr {
+                    Expr::Column { column, .. } => column.clone(),
+                    _ => alloc::format!("col{}", projections.len() + 1),
+                });
+                projections.push((expr.clone(), label));
+            }
+            ResultColumn::TableWildcard(_) => {
+                return Err(Error::Unsupported("VDBE: table.* not yet supported"))
+            }
+        }
+    }
+    if projections.is_empty() {
+        return Err(Error::Unsupported("VDBE: empty projection"));
+    }
+    let count = projections.len();
+    let mut c = Compiler {
+        ops: Vec::new(),
+        next_reg: count,
+        columns: columns.to_vec(),
+    };
+    // Rewind (target backpatched to the loop exit), then the loop body.
+    let rewind = c.ops.len();
+    c.ops.push(Op::Rewind { target: 0 });
+    let body = c.ops.len();
+    for (i, (expr, _)) in projections.iter().enumerate() {
+        c.compile_expr_into(expr, i)?;
+    }
+    c.ops.push(Op::ResultRow { start: 0, count });
+    c.ops.push(Op::Next { target: body });
+    let end = c.ops.len();
+    if let Op::Rewind { target } = &mut c.ops[rewind] {
+        *target = end;
+    }
+    c.ops.push(Op::Halt);
+    Ok(Program {
+        ops: c.ops,
+        n_registers: c.next_reg,
+        columns: projections.into_iter().map(|(_, l)| l).collect(),
+    })
+}
+
 struct Compiler {
     ops: Vec<Op>,
     next_reg: usize,
+    /// Table column names, for resolving `Expr::Column` to a `Column` op.
+    columns: Vec<String>,
 }
 
 impl Compiler {
@@ -176,6 +257,15 @@ impl Compiler {
                     }
                 };
                 self.ops.push(op);
+                Ok(())
+            }
+            Expr::Column { column, .. } => {
+                let idx = self
+                    .columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(column))
+                    .ok_or_else(|| Error::Error(alloc::format!("no such column: {column}")))?;
+                self.ops.push(Op::Column { col: idx, dest });
                 Ok(())
             }
             Expr::Paren(inner) => self.compile_expr_into(inner, dest),
@@ -342,16 +432,43 @@ impl Compiler {
     }
 }
 
-/// Run a compiled program, returning the emitted result rows. A program counter
-/// walks the instruction array so jumps (`Goto`/`IfFalse`) can branch.
+/// Run a compiled constant program (no table cursor), returning its result rows.
 pub fn run(program: &Program) -> Result<Vec<Vec<Value>>> {
+    run_rows(program, &[])
+}
+
+/// Run a compiled program over `table_rows` (the materialized rows of the single
+/// table the program scans, if any). A program counter walks the instruction
+/// array so jumps and the `Rewind`/`Next` loop can branch; `Column` reads from
+/// the cursor's current row.
+pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<Value>>> {
     let mut regs: Vec<Value> = alloc::vec![Value::Null; program.n_registers];
     let mut out = Vec::new();
+    let mut cursor: usize = 0; // index of the current row
     let mut pc = 0usize;
     while pc < program.ops.len() {
         let op = &program.ops[pc];
         pc += 1;
         match op {
+            Op::Rewind { target } => {
+                cursor = 0;
+                if table_rows.is_empty() {
+                    pc = *target;
+                }
+            }
+            Op::Column { col, dest } => {
+                regs[*dest] = table_rows
+                    .get(cursor)
+                    .and_then(|r| r.get(*col))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            Op::Next { target } => {
+                cursor += 1;
+                if cursor < table_rows.len() {
+                    pc = *target;
+                }
+            }
             Op::Goto { target } => {
                 pc = *target;
             }
