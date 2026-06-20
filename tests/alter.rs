@@ -110,3 +110,65 @@ fn rename_table_updates_catalog_and_indexes() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}-journal"));
 }
+
+#[test]
+fn drop_column_rewrites_rows_and_keeps_integrity() {
+    let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    let path = temp_path("dropcol.db");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT, c INT)")
+            .unwrap();
+        c.execute("CREATE INDEX it_c ON t(c)").unwrap();
+        c.execute("INSERT INTO t(a,b,c) VALUES (1,'x',10),(2,'y',20),(3,'z',30)")
+            .unwrap();
+
+        c.execute("ALTER TABLE t DROP COLUMN b").unwrap();
+
+        let r = c.query("SELECT * FROM t ORDER BY id").unwrap();
+        assert_eq!(r.columns, ["id", "a", "c"]);
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(
+            r.rows[0],
+            [Value::Integer(1), Value::Integer(1), Value::Integer(10)]
+        );
+        // The index on the surviving column still works (and its position shifted).
+        let q = c.query("SELECT id FROM t WHERE c = 20").unwrap();
+        assert_eq!(q.rows[0][0], Value::Integer(2));
+
+        // Structural columns cannot be dropped.
+        assert!(c.execute("ALTER TABLE t DROP COLUMN id").is_err()); // PRIMARY KEY
+        assert!(c.execute("ALTER TABLE t DROP COLUMN c").is_err()); // indexed
+        assert!(c.execute("ALTER TABLE t DROP COLUMN nope").is_err()); // missing
+    }
+    if sqlite {
+        let out = Command::new("sqlite3")
+            .arg(&path)
+            .arg("PRAGMA integrity_check; SELECT a,c FROM t ORDER BY id;")
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("ok"), "integrity: {s}");
+        assert!(s.contains("2|20"));
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+}
+
+#[test]
+fn create_temp_table_works() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TEMP TABLE t1(x INT)").unwrap();
+    c.execute("CREATE TEMPORARY TABLE t2(y TEXT)").unwrap();
+    c.execute("INSERT INTO t1 VALUES (1),(2)").unwrap();
+    c.execute("INSERT INTO t2 VALUES ('a')").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM t1").unwrap().rows[0][0],
+        Value::Integer(2)
+    );
+    assert_eq!(
+        c.query("SELECT y FROM t2").unwrap().rows[0][0],
+        Value::Text("a".into())
+    );
+}

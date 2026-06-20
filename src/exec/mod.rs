@@ -2863,7 +2863,11 @@ impl Connection {
             return Err(Error::Corrupt("schema sql is not CREATE TABLE".into()));
         };
 
+        if let AlterAction::DropColumn(name) = &a.action {
+            return self.exec_drop_column(a, ct, name);
+        }
         match &a.action {
+            AlterAction::DropColumn(_) => unreachable!("handled above"),
             AlterAction::AddColumn(cd) => {
                 if ct
                     .columns
@@ -2969,6 +2973,123 @@ impl Connection {
                 })?;
             }
         }
+
+        let cookie = self
+            .backend
+            .writer()?
+            .header()
+            .schema_cookie
+            .wrapping_add(1);
+        self.backend.writer()?.header_mut().schema_cookie = cookie;
+        self.schema = Schema::read(self.backend.source())?;
+        Ok(())
+    }
+
+    /// `ALTER TABLE … DROP COLUMN name`: remove the column from the schema and
+    /// rewrite every row without it, then rebuild the indexes. To stay correct,
+    /// columns that participate in the structure (PRIMARY KEY, UNIQUE, an index,
+    /// a foreign key, a CHECK, or generation) are refused — matching SQLite, which
+    /// rejects dropping such columns.
+    fn exec_drop_column(&mut self, a: &Alter, mut ct: CreateTable, name: &str) -> Result<()> {
+        let pos = ct
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::Error(format!("no such column: \"{name}\"")))?;
+        if ct.columns.len() <= 1 {
+            return Err(Error::Error(format!(
+                "cannot drop column \"{name}\": no other columns exist"
+            )));
+        }
+        let cannot = |why: &str| {
+            Err(Error::Error(format!(
+                "cannot drop column \"{name}\": {why}"
+            )))
+        };
+        // The dropped column must not be structural.
+        for c in &ct.columns[pos].constraints {
+            match c {
+                ColumnConstraint::PrimaryKey { .. } => return cannot("PRIMARY KEY"),
+                ColumnConstraint::Unique => return cannot("UNIQUE"),
+                ColumnConstraint::Check(_) => return cannot("CHECK"),
+                ColumnConstraint::References(_) => return cannot("FOREIGN KEY"),
+                ColumnConstraint::Generated { .. } => return cannot("generated"),
+                _ => {}
+            }
+        }
+        // Table-level constraints / other generated columns force a refusal too
+        // (conservatively, any of these on the table that could reference it).
+        for tc in &ct.constraints {
+            match tc {
+                TableConstraint::PrimaryKey(n) | TableConstraint::Unique(n) => {
+                    if n.iter().any(|x| x.eq_ignore_ascii_case(name)) {
+                        return cannot("PRIMARY KEY or UNIQUE");
+                    }
+                }
+                TableConstraint::Check(_) => return cannot("a table CHECK constraint exists"),
+                TableConstraint::ForeignKey(_) => {
+                    return cannot("a table FOREIGN KEY constraint exists")
+                }
+            }
+        }
+        if ct.columns.iter().enumerate().any(|(i, c)| {
+            i != pos
+                && c.constraints
+                    .iter()
+                    .any(|x| matches!(x, ColumnConstraint::Generated { .. }))
+        }) {
+            return cannot("a generated column exists");
+        }
+        let meta = self.table_meta(&a.table, None)?;
+        if meta.ipk == Some(pos) {
+            return cannot("PRIMARY KEY");
+        }
+        let indexes = self.indexes_of(&a.table)?;
+        if indexes
+            .iter()
+            .any(|i| i.cols.contains(&pos) || i.key_exprs.is_some() || i.partial.is_some())
+        {
+            return cannot("it is indexed");
+        }
+
+        // Read the rows, drop the column's value from each.
+        let new_rows: Vec<(i64, Vec<Value>)> = self
+            .scan_table(&meta)?
+            .into_iter()
+            .map(|(rid, mut vals)| {
+                vals.remove(pos);
+                (rid, vals)
+            })
+            .collect();
+
+        // Update the schema's CREATE TABLE text.
+        ct.columns.remove(pos);
+        let new_sql = sql::print::create_table(&ct);
+        let table = a.table.clone();
+        self.rewrite_schema_rows(|cols| {
+            if is_text(&cols[0], "table") && is_text(&cols[1], &table) {
+                cols[4] = Value::Text(new_sql.clone());
+                true
+            } else {
+                false
+            }
+        })?;
+        self.schema = Schema::read(self.backend.source())?;
+        let new_meta = self.table_meta(&a.table, None)?;
+
+        // Rewrite the table b-tree with the narrowed rows.
+        clear_table(self.backend.writer()?, new_meta.root)?;
+        for (rid, vals) in &new_rows {
+            let mut stored = vals.clone();
+            if let Some(ipk) = new_meta.ipk {
+                stored[ipk] = Value::Null;
+            }
+            let record = encode_record(&stored);
+            insert_table(self.backend.writer()?, new_meta.root, *rid, &record)?;
+        }
+        // Index column positions shifted; rebuild them.
+        let new_indexes = self.indexes_of(&a.table)?;
+        self.rebuild_indexes(&new_meta, &new_indexes)?;
 
         let cookie = self
             .backend

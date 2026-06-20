@@ -799,6 +799,9 @@ impl Parser {
     fn create(&mut self) -> Result<Statement> {
         self.expect_kw("create")?;
         let unique = self.eat_kw("unique");
+        // Accept TEMP/TEMPORARY before TABLE/VIEW/TRIGGER. graphitesql has a single
+        // schema, so a temporary object is created like an ordinary one.
+        let _temp = self.eat_kw("temp") || self.eat_kw("temporary");
         if self.eat_kw("table") {
             if unique {
                 return Err(self.err("UNIQUE is not valid for CREATE TABLE"));
@@ -813,9 +816,6 @@ impl Parser {
         }
         if self.eat_kw("view") {
             return Ok(Statement::CreateView(self.create_view()?));
-        }
-        if self.eat_kw("temp") || self.eat_kw("temporary") {
-            // accept TEMP/TEMPORARY before TRIGGER/TABLE (treated as ordinary)
         }
         if self.eat_kw("trigger") {
             return Ok(Statement::CreateTrigger(self.create_trigger()?));
@@ -1263,8 +1263,11 @@ impl Parser {
         } else if self.eat_kw("add") {
             let _ = self.eat_kw("column");
             AlterAction::AddColumn(self.column_def()?)
+        } else if self.eat_kw("drop") {
+            let _ = self.eat_kw("column");
+            AlterAction::DropColumn(self.ident()?)
         } else {
-            return Err(self.err("expected RENAME or ADD after ALTER TABLE"));
+            return Err(self.err("expected RENAME, ADD, or DROP after ALTER TABLE"));
         };
         Ok(Alter { table, action })
     }

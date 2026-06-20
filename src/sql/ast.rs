@@ -594,6 +594,8 @@ pub enum AlterAction {
     },
     /// `ADD [COLUMN] <column-def>`.
     AddColumn(ColumnDef),
+    /// `DROP [COLUMN] name`.
+    DropColumn(String),
 }
 
 /// A `PRAGMA` statement.
