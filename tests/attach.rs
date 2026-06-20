@@ -357,6 +357,52 @@ fn cross_database_transaction_file_durability() {
 }
 
 #[test]
+fn cross_database_savepoint() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE aux.t(a)").unwrap();
+    c.execute("INSERT INTO aux.t VALUES(1)").unwrap();
+
+    // ROLLBACK TO reverts the attached database to the savepoint.
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO aux.t VALUES(2)").unwrap();
+    c.execute("SAVEPOINT sp").unwrap();
+    c.execute("INSERT INTO aux.t VALUES(3)").unwrap();
+    c.execute("ROLLBACK TO sp").unwrap();
+    c.execute("COMMIT").unwrap();
+    assert_eq!(
+        c.query("SELECT a FROM aux.t ORDER BY a").unwrap().rows,
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+
+    // RELEASE keeps the staged changes in the attached database.
+    c.execute("BEGIN").unwrap();
+    c.execute("SAVEPOINT s2").unwrap();
+    c.execute("INSERT INTO aux.t VALUES(9)").unwrap();
+    c.execute("RELEASE s2").unwrap();
+    c.execute("COMMIT").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM aux.t").unwrap().rows[0][0],
+        Value::Integer(3)
+    );
+
+    // DDL in the attached database is reverted by ROLLBACK TO as well.
+    c.execute("BEGIN").unwrap();
+    c.execute("SAVEPOINT s3").unwrap();
+    c.execute("CREATE TABLE aux.z(x)").unwrap();
+    c.execute("ROLLBACK TO s3").unwrap();
+    c.execute("COMMIT").unwrap();
+    let names: Vec<_> = c
+        .query("SELECT name FROM aux.sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect();
+    assert_eq!(names, vec![Value::Text("t".into())]);
+}
+
+#[test]
 fn cross_database_view() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("ATTACH ':memory:' AS aux").unwrap();

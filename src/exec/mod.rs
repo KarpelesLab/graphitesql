@@ -896,11 +896,13 @@ impl Connection {
             }
             Statement::Savepoint(name) => {
                 self.backend.writer()?.savepoint(name);
+                self.savepoint_attached(name)?;
                 self.open_savepoints += 1;
                 return Ok(0);
             }
             Statement::Release(name) => {
                 self.backend.writer()?.release_savepoint(name)?;
+                self.release_attached(name)?;
                 self.open_savepoints = self.backend.writer()?.savepoint_depth();
                 // Releasing the outermost savepoint of an implicit transaction
                 // finalizes it.
@@ -913,6 +915,7 @@ impl Connection {
             }
             Statement::RollbackTo(name) => {
                 self.backend.writer()?.rollback_to_savepoint(name)?;
+                self.rollback_to_attached(name)?;
                 self.open_savepoints = self.backend.writer()?.savepoint_depth();
                 // The schema may have reverted to the savepoint's state.
                 self.schema = Schema::read(self.backend.source())?;
@@ -1016,6 +1019,49 @@ impl Connection {
         for d in &mut self.attached {
             d.backend.writer()?.rollback();
             d.schema = Schema::read(d.backend.source())?;
+        }
+        Ok(())
+    }
+
+    /// Open a savepoint in the temp + attached databases too, so a later
+    /// `ROLLBACK TO`/`RELEASE` reaches their staged changes.
+    fn savepoint_attached(&mut self, name: &str) -> Result<()> {
+        if let Some(t) = &mut self.temp_db {
+            t.backend.writer()?.savepoint(name);
+        }
+        for d in &mut self.attached {
+            d.backend.writer()?.savepoint(name);
+        }
+        Ok(())
+    }
+
+    /// Release a savepoint in the temp + attached databases. A database attached
+    /// after the savepoint was opened has no such savepoint; that is not an error
+    /// here (it simply had nothing staged at that point).
+    fn release_attached(&mut self, name: &str) -> Result<()> {
+        if let Some(t) = &mut self.temp_db {
+            let _ = t.backend.writer()?.release_savepoint(name);
+        }
+        for d in &mut self.attached {
+            let _ = d.backend.writer()?.release_savepoint(name);
+        }
+        Ok(())
+    }
+
+    /// Roll the temp + attached databases back to a savepoint, reloading the
+    /// catalog of each that actually had it (see [`release_attached`]).
+    fn rollback_to_attached(&mut self, name: &str) -> Result<()> {
+        if let Some(t) = &mut self.temp_db {
+            let did = t.backend.writer()?.rollback_to_savepoint(name).is_ok();
+            if did {
+                t.schema = Schema::read(t.backend.source())?;
+            }
+        }
+        for d in &mut self.attached {
+            let did = d.backend.writer()?.rollback_to_savepoint(name).is_ok();
+            if did {
+                d.schema = Schema::read(d.backend.source())?;
+            }
         }
         Ok(())
     }
