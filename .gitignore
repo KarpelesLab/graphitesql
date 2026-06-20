@@ -8,3 +8,6 @@ Cargo.lock
 /reference/sqlite-src-*/
 /reference/sqlite-fileformat2.html
 /reference/sqlite-doc-*/
+
+# Claude Code session worktrees
+.claude/worktrees/
