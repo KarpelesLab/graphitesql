@@ -419,9 +419,11 @@ impl Connection {
             Value::Text("main".into()),
             Value::Text(self.main_file.clone()),
         ]];
+        // SQLite reserves seq 1 for `temp` (shown only when it exists — C4), so
+        // attached databases begin at seq 2.
         for (i, db) in self.attached.iter().enumerate() {
             rows.push(alloc::vec![
-                Value::Integer((i + 1) as i64),
+                Value::Integer((i + 2) as i64),
                 Value::Text(db.name.clone()),
                 Value::Text(db.file.clone()),
             ]);
@@ -950,6 +952,14 @@ impl Connection {
                 self.exec_analyze(target.as_deref())?;
                 0
             }
+            Statement::Attach { file, name } => {
+                self.exec_attach(&file, &name, params)?;
+                0
+            }
+            Statement::Detach(name) => {
+                self.exec_detach(&name)?;
+                0
+            }
             Statement::Select(_) => return Err(Error::Unsupported("use query() for SELECT")),
             Statement::Explain { .. } => return Err(Error::Unsupported("use query() for EXPLAIN")),
             Statement::Begin
@@ -1009,6 +1019,65 @@ impl Connection {
         self.execute_params(sql, params)?;
         let rows = core::mem::take(&mut *self.returning_rows.borrow_mut());
         Ok(QueryResult { columns, rows })
+    }
+
+    /// `ATTACH <expr> AS <name>`: open another database under `name`. An empty
+    /// or `:memory:` path creates a fresh in-memory database; a real file path is
+    /// not yet supported (track piece C5).
+    fn exec_attach(&mut self, file: &Expr, name: &str, params: &Params) -> Result<()> {
+        let path = {
+            let ctx = EvalCtx::rowless(params).with_subqueries(self);
+            eval::to_text(&eval::eval(file, &ctx)?)
+        };
+        if name.eq_ignore_ascii_case("main")
+            || name.eq_ignore_ascii_case("temp")
+            || self
+                .attached
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(name))
+        {
+            return Err(Error::Error(alloc::format!(
+                "database {name} is already in use"
+            )));
+        }
+        if !(path.is_empty() || path.eq_ignore_ascii_case(":memory:")) {
+            return Err(Error::Unsupported("ATTACH of a file database"));
+        }
+        // A fresh in-memory database (same pattern as `open_memory`).
+        let vfs = crate::vfs::memory::MemoryVfs::new();
+        let f = vfs.open(name, OpenFlags::READ_WRITE_CREATE)?;
+        let mut db = WritePager::create(f, None, 4096)?;
+        db.commit()?;
+        let backend = Backend::Write(Box::new(db));
+        let schema = Schema::read(backend.source())?;
+        self.attached.push(AttachedDb {
+            name: name.to_string(),
+            file: String::new(),
+            backend,
+            schema,
+        });
+        Ok(())
+    }
+
+    /// `DETACH <name>`: close an attached database. `main`/`temp` cannot be
+    /// detached; an unknown name is an error.
+    fn exec_detach(&mut self, name: &str) -> Result<()> {
+        if name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("temp") {
+            return Err(Error::Error(alloc::format!(
+                "cannot detach database {name}"
+            )));
+        }
+        match self
+            .attached
+            .iter()
+            .position(|d| d.name.eq_ignore_ascii_case(name))
+        {
+            Some(i) => {
+                self.attached.remove(i);
+                Ok(())
+            }
+            None => Err(Error::Error(alloc::format!("no such database: {name}"))),
+        }
     }
 
     /// `VACUUM`: rebuild the database into a fresh, compact image (no free pages,

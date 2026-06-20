@@ -59,6 +59,15 @@ pub enum Statement {
     /// `ANALYZE [name]`: gather statistics into `sqlite_stat1`. `None` analyzes
     /// the whole database; `Some(name)` a single table or index.
     Analyze(Option<String>),
+    /// `ATTACH [DATABASE] <expr> AS <name>`: open another database under `name`.
+    Attach {
+        /// The file path expression (`':memory:'`/`''` → a new in-memory db).
+        file: Expr,
+        /// The schema name to attach as.
+        name: String,
+    },
+    /// `DETACH [DATABASE] <name>`: close an attached database.
+    Detach(String),
     /// `EXPLAIN [QUERY PLAN] <stmt>`.
     Explain {
         /// `EXPLAIN QUERY PLAN` (true) vs plain `EXPLAIN` (false, VDBE bytecode,

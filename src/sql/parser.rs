@@ -247,6 +247,20 @@ impl Parser {
             };
             return Ok(Statement::Analyze(target));
         }
+        if self.eat_kw("attach") {
+            // `ATTACH [DATABASE] <expr> AS <name>`.
+            let _ = self.eat_kw("database");
+            let file = self.expr()?;
+            self.expect_kw("as")?;
+            let name = self.ident()?;
+            return Ok(Statement::Attach { file, name });
+        }
+        if self.eat_kw("detach") {
+            // `DETACH [DATABASE] <name>`.
+            let _ = self.eat_kw("database");
+            let name = self.ident()?;
+            return Ok(Statement::Detach(name));
+        }
         Err(self.err("unrecognized statement"))
     }
 
