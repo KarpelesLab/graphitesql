@@ -23,6 +23,7 @@ use crate::vfs::File;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -48,6 +49,17 @@ pub struct WritePager {
     /// flushing at commit, so a second writer to the same file gets
     /// [`Error::Busy`](crate::Error::Busy). Released on commit/rollback.
     held: crate::vfs::LockLevel,
+    /// Open savepoints (innermost last); each snapshots the staged state so
+    /// `ROLLBACK TO` can restore it.
+    savepoints: Vec<Savepoint>,
+}
+
+/// A snapshot of the pager's staged state captured by `SAVEPOINT`.
+struct Savepoint {
+    name: String,
+    overlay: BTreeMap<u32, Vec<u8>>,
+    header: DatabaseHeader,
+    page_count: u32,
 }
 
 /// Live WAL state: the committed frames overlaid on the main file plus the
@@ -122,6 +134,7 @@ impl WritePager {
             wal_file,
             wal,
             held: crate::vfs::LockLevel::Unlocked,
+            savepoints: Vec::new(),
         })
     }
 
@@ -175,6 +188,7 @@ impl WritePager {
             wal_file,
             wal: None,
             held: crate::vfs::LockLevel::Unlocked,
+            savepoints: Vec::new(),
         };
         // Page 1: db header (0..100) + an empty table-leaf b-tree at offset 100.
         let mut page1 = vec![0u8; page_size as usize];
@@ -338,7 +352,59 @@ impl WritePager {
             Some(w) => w.db_size,
             None => self.disk_pages,
         };
+        self.savepoints.clear();
         self.release_locks();
+    }
+
+    /// Open a savepoint, snapshotting the current staged state.
+    pub fn savepoint(&mut self, name: &str) {
+        self.savepoints.push(Savepoint {
+            name: String::from(name),
+            overlay: self.overlay.clone(),
+            header: self.header.clone(),
+            page_count: self.page_count,
+        });
+    }
+
+    /// Number of open savepoints.
+    pub fn savepoint_depth(&self) -> usize {
+        self.savepoints.len()
+    }
+
+    /// `RELEASE name`: drop the named savepoint and any nested inside it, keeping
+    /// the staged changes. Errors if there is no such savepoint.
+    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        match self
+            .savepoints
+            .iter()
+            .rposition(|s| s.name.eq_ignore_ascii_case(name))
+        {
+            Some(idx) => {
+                self.savepoints.truncate(idx);
+                Ok(())
+            }
+            None => Err(Error::Error(format!("no such savepoint: {name}"))),
+        }
+    }
+
+    /// `ROLLBACK TO name`: restore the staged state to the named savepoint and
+    /// discard any nested inside it, but keep the savepoint open.
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        match self
+            .savepoints
+            .iter()
+            .rposition(|s| s.name.eq_ignore_ascii_case(name))
+        {
+            Some(idx) => {
+                let snap = &self.savepoints[idx];
+                self.overlay = snap.overlay.clone();
+                self.header = snap.header.clone();
+                self.page_count = snap.page_count;
+                self.savepoints.truncate(idx + 1);
+                Ok(())
+            }
+            None => Err(Error::Error(format!("no such savepoint: {name}"))),
+        }
     }
 
     /// Atomically flush all staged changes to the database file.
@@ -384,6 +450,7 @@ impl WritePager {
 
         self.disk_pages = self.page_count;
         self.overlay.clear();
+        self.savepoints.clear();
         self.release_locks();
         Ok(())
     }
@@ -492,6 +559,7 @@ impl WritePager {
             wal.frames.insert(page_no, data);
         }
         self.overlay.clear();
+        self.savepoints.clear();
         // WAL writers serialize via the write-intent lock taken in write_page;
         // readers stay concurrent. Release it now that the frames are durable.
         self.release_locks();

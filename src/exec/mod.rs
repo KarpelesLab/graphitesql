@@ -49,14 +49,14 @@ pub struct QueryResult {
 /// The storage backing a connection: a writable pager, or a read-only page
 /// source (e.g. a WAL-mode database opened read-only).
 enum Backend {
-    Write(WritePager),
+    Write(Box<WritePager>),
     Read(Box<dyn PageSource>),
 }
 
 impl Backend {
     fn source(&self) -> &dyn PageSource {
         match self {
-            Backend::Write(w) => w,
+            Backend::Write(w) => w.as_ref(),
             Backend::Read(r) => r.as_ref(),
         }
     }
@@ -98,6 +98,9 @@ pub struct Connection {
     /// of `INSERT`/`UPDATE`/`DELETE` execution when the statement has a
     /// `RETURNING` list.
     returning_rows: core::cell::RefCell<Vec<Vec<Value>>>,
+    /// Count of open savepoints. Like `in_tx`, a non-zero count suppresses
+    /// autocommit so changes accumulate until the outermost savepoint is released.
+    open_savepoints: usize,
 }
 
 /// A materialized common table expression: a named, in-memory relation.
@@ -124,7 +127,7 @@ enum TrigEvent {
 
 impl Connection {
     fn from_pager(db: WritePager) -> Result<Connection> {
-        let backend = Backend::Write(db);
+        let backend = Backend::Write(Box::new(db));
         let schema = Schema::read(backend.source())?;
         Ok(Connection {
             backend,
@@ -136,6 +139,7 @@ impl Connection {
             trigger_depth: core::cell::Cell::new(0),
             recursive_triggers: false,
             returning_rows: core::cell::RefCell::new(Vec::new()),
+            open_savepoints: 0,
         })
     }
 
@@ -152,6 +156,7 @@ impl Connection {
             trigger_depth: core::cell::Cell::new(0),
             recursive_triggers: false,
             returning_rows: core::cell::RefCell::new(Vec::new()),
+            open_savepoints: 0,
         })
     }
 
@@ -388,11 +393,36 @@ impl Connection {
             Statement::Commit => {
                 self.backend.writer()?.commit()?;
                 self.in_tx = false;
+                self.open_savepoints = 0;
+                return Ok(0);
+            }
+            Statement::Savepoint(name) => {
+                self.backend.writer()?.savepoint(name);
+                self.open_savepoints += 1;
+                return Ok(0);
+            }
+            Statement::Release(name) => {
+                self.backend.writer()?.release_savepoint(name)?;
+                self.open_savepoints = self.backend.writer()?.savepoint_depth();
+                // Releasing the outermost savepoint of an implicit transaction
+                // finalizes it.
+                if self.open_savepoints == 0 && !self.in_tx {
+                    self.backend.writer()?.commit()?;
+                    self.schema = Schema::read(self.backend.source())?;
+                }
+                return Ok(0);
+            }
+            Statement::RollbackTo(name) => {
+                self.backend.writer()?.rollback_to_savepoint(name)?;
+                self.open_savepoints = self.backend.writer()?.savepoint_depth();
+                // The schema may have reverted to the savepoint's state.
+                self.schema = Schema::read(self.backend.source())?;
                 return Ok(0);
             }
             Statement::Rollback => {
                 self.backend.writer()?.rollback();
                 self.in_tx = false;
+                self.open_savepoints = 0;
                 self.schema = Schema::read(self.backend.source())?;
                 return Ok(0);
             }
@@ -441,10 +471,15 @@ impl Connection {
             }
             Statement::Select(_) => return Err(Error::Unsupported("use query() for SELECT")),
             Statement::Explain { .. } => return Err(Error::Unsupported("use query() for EXPLAIN")),
-            Statement::Begin | Statement::Commit | Statement::Rollback => unreachable!(),
+            Statement::Begin
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::Savepoint(_)
+            | Statement::Release(_)
+            | Statement::RollbackTo(_) => unreachable!(),
         };
 
-        if !self.in_tx {
+        if !self.in_tx && self.open_savepoints == 0 {
             self.backend.writer()?.commit()?;
             // Refresh the catalog from the committed image.
             self.schema = Schema::read(self.backend.source())?;

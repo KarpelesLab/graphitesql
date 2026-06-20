@@ -189,8 +189,8 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
   can shrink on commit; `PRAGMA incremental_vacuum`. *Ref:* `btree.c` (ptrmap).
 - **`secure_delete`**, `PRAGMA cache_size`/`mmap_size`, a real page cache
   (`pcache`) for read performance.
-- **`SAVEPOINT` / `RELEASE` / `ROLLBACK TO`** — nested transactions over the
-  overlay/journal. *Ref:* `pager.c` (savepoints).
+- ✅ **`SAVEPOINT` / `RELEASE` / `ROLLBACK TO`** — nested transactions via staged
+  overlay snapshots in the write pager. *Ref:* `pager.c` (savepoints).
 - **`ATTACH` / `DETACH`** — multiple database schemas in one connection, with
   cross-database queries and the `main`/`temp`/attached namespaces; **TEMP**
   tables/indexes/triggers.

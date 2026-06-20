@@ -198,7 +198,18 @@ impl Parser {
         }
         if self.eat_kw("rollback") {
             let _ = self.eat_kw("transaction");
+            if self.eat_kw("to") {
+                let _ = self.eat_kw("savepoint");
+                return Ok(Statement::RollbackTo(self.ident()?));
+            }
             return Ok(Statement::Rollback);
+        }
+        if self.eat_kw("savepoint") {
+            return Ok(Statement::Savepoint(self.ident()?));
+        }
+        if self.eat_kw("release") {
+            let _ = self.eat_kw("savepoint");
+            return Ok(Statement::Release(self.ident()?));
         }
         if self.eat_kw("pragma") {
             return Ok(Statement::Pragma(self.pragma()?));

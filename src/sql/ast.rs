@@ -42,6 +42,13 @@ pub enum Statement {
     Commit,
     /// `ROLLBACK`.
     Rollback,
+    /// `SAVEPOINT name`: open a named savepoint (nested transaction).
+    Savepoint(String),
+    /// `RELEASE [SAVEPOINT] name`: keep changes since the savepoint, drop it.
+    Release(String),
+    /// `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name`: undo changes since the
+    /// savepoint, keeping it open.
+    RollbackTo(String),
     /// A `PRAGMA` statement.
     Pragma(Pragma),
     /// A `VACUUM` statement (accepted; a no-op compaction in this build).
