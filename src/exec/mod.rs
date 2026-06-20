@@ -3176,6 +3176,44 @@ impl Connection {
                 {
                     return Err(Error::Error(format!("duplicate column name: {}", cd.name)));
                 }
+                // SQLite forbids a few constraints on ADD COLUMN: a UNIQUE or
+                // PRIMARY KEY column is always rejected; a NOT NULL column whose
+                // default is NULL is rejected only when the table already has
+                // rows (which would otherwise hold a NULL).
+                for k in &cd.constraints {
+                    match k {
+                        ColumnConstraint::Unique => {
+                            return Err(Error::Error("Cannot add a UNIQUE column".into()));
+                        }
+                        ColumnConstraint::PrimaryKey { .. } => {
+                            return Err(Error::Error("Cannot add a PRIMARY KEY column".into()));
+                        }
+                        _ => {}
+                    }
+                }
+                let not_null = cd
+                    .constraints
+                    .iter()
+                    .any(|k| matches!(k, ColumnConstraint::NotNull));
+                if not_null {
+                    let default = cd.constraints.iter().find_map(|k| match k {
+                        ColumnConstraint::Default(e) => Some(e),
+                        _ => None,
+                    });
+                    let no_params = Params::default();
+                    let default_is_null = match default {
+                        None => true,
+                        Some(e) => {
+                            let ctx = EvalCtx::rowless(&no_params).with_subqueries(self);
+                            matches!(eval::eval(e, &ctx), Ok(Value::Null) | Err(_))
+                        }
+                    };
+                    if default_is_null && !self.table_is_empty(&a.table)? {
+                        return Err(Error::Error(
+                            "Cannot add a NOT NULL column with default value NULL".into(),
+                        ));
+                    }
+                }
                 ct.columns.push(cd.clone());
                 let new_sql = sql::print::create_table(&ct);
                 let table = a.table.clone();
@@ -5815,6 +5853,17 @@ impl Connection {
     }
 
     /// Scan a whole table into `(rowid, column values)`.
+    /// Whether the named table currently holds no rows (handles both rowid and
+    /// WITHOUT ROWID storage).
+    fn table_is_empty(&self, table: &str) -> Result<bool> {
+        let meta = self.table_meta(table, None)?;
+        if meta.without_rowid {
+            Ok(self.scan_without_rowid(&meta)?.is_empty())
+        } else {
+            Ok(self.scan_table(&meta)?.is_empty())
+        }
+    }
+
     fn scan_table(&self, meta: &TableMeta) -> Result<Vec<(i64, Vec<Value>)>> {
         let encoding = self.backend.source().header().text_encoding;
         let mut rows = Vec::new();
