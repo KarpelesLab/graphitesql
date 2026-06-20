@@ -58,6 +58,12 @@ pub enum Op {
         negated: bool,
         dest: usize,
     },
+    /// Copy `src` into `dest`.
+    Copy { src: usize, dest: usize },
+    /// Unconditional jump to instruction index `target`.
+    Goto { target: usize },
+    /// Jump to `target` when `reg` is false or NULL (i.e. not true).
+    IfFalse { reg: usize, target: usize },
     /// `dest = -reg` (numeric negation).
     Negate { reg: usize, dest: usize },
     /// Emit registers `[start, start+count)` as one output row.
@@ -243,17 +249,98 @@ impl Compiler {
                     _ => Err(Error::Unsupported("VDBE spike: this operator")),
                 }
             }
+            Expr::Case {
+                operand,
+                when_then,
+                else_result,
+            } => self.compile_case(operand.as_deref(), when_then, else_result.as_deref(), dest),
             _ => Err(Error::Unsupported("VDBE spike: this expression")),
         }
     }
+
+    /// Compile a `CASE` expression using conditional jumps. Each `WHEN` tests its
+    /// condition (`= operand` when a `CASE operand` form), jumps over its `THEN`
+    /// on failure, and the matched `THEN` (or `ELSE`/NULL) lands in `dest` before
+    /// jumping to the end.
+    fn compile_case(
+        &mut self,
+        operand: Option<&Expr>,
+        when_then: &[(Expr, Expr)],
+        else_result: Option<&Expr>,
+        dest: usize,
+    ) -> Result<()> {
+        // Register holding the CASE operand (for the `CASE x WHEN v` form).
+        let operand_reg = match operand {
+            Some(o) => Some(self.compile_expr(o)?),
+            None => None,
+        };
+        let mut end_jumps = Vec::new();
+        for (when, then) in when_then {
+            // Compute the branch condition into a register.
+            let cond = match operand_reg {
+                Some(oreg) => {
+                    let wreg = self.compile_expr(when)?;
+                    let c = self.alloc();
+                    self.ops.push(Op::Compare {
+                        op: BinaryOp::Eq,
+                        lhs: oreg,
+                        rhs: wreg,
+                        dest: c,
+                    });
+                    c
+                }
+                None => self.compile_expr(when)?,
+            };
+            // If the condition is not true, skip this THEN (target backpatched).
+            let skip = self.ops.len();
+            self.ops.push(Op::IfFalse {
+                reg: cond,
+                target: 0,
+            });
+            self.compile_expr_into(then, dest)?;
+            end_jumps.push(self.ops.len());
+            self.ops.push(Op::Goto { target: 0 });
+            // Backpatch the skip to here (the next WHEN / ELSE).
+            let here = self.ops.len();
+            if let Op::IfFalse { target, .. } = &mut self.ops[skip] {
+                *target = here;
+            }
+        }
+        // ELSE (or NULL when absent).
+        match else_result {
+            Some(e) => self.compile_expr_into(e, dest)?,
+            None => self.ops.push(Op::Null { dest }),
+        }
+        // Backpatch every THEN's exit jump to the instruction after the CASE.
+        let end = self.ops.len();
+        for j in end_jumps {
+            if let Op::Goto { target } = &mut self.ops[j] {
+                *target = end;
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Run a compiled program, returning the emitted result rows.
+/// Run a compiled program, returning the emitted result rows. A program counter
+/// walks the instruction array so jumps (`Goto`/`IfFalse`) can branch.
 pub fn run(program: &Program) -> Result<Vec<Vec<Value>>> {
     let mut regs: Vec<Value> = alloc::vec![Value::Null; program.n_registers];
     let mut out = Vec::new();
-    for op in &program.ops {
+    let mut pc = 0usize;
+    while pc < program.ops.len() {
+        let op = &program.ops[pc];
+        pc += 1;
         match op {
+            Op::Goto { target } => {
+                pc = *target;
+            }
+            Op::IfFalse { reg, target } => {
+                if crate::exec::eval::truth(&regs[*reg]) != Some(true) {
+                    pc = *target;
+                }
+            }
+            Op::Copy { src, dest } => regs[*dest] = regs[*src].clone(),
             Op::Integer { value, dest } => regs[*dest] = Value::Integer(*value),
             Op::Real { value, dest } => regs[*dest] = Value::Real(*value),
             Op::Str { value, dest } => regs[*dest] = Value::Text(value.clone()),

@@ -41,6 +41,9 @@ fn vdbe_matches_tree_walker() {
         "SELECT 1 AND 1, 1 AND 0, 0 OR 1, 0 OR 0",
         "SELECT NOT 0, NOT 1, NULL IS NULL, 1 IS NOT NULL",
         "SELECT (1 < 2) AND (3 < 4), (1 > 2) OR (5 = 5)",
+        "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 3 > 2 THEN 'b' ELSE 'c' END",
+        "SELECT CASE 5 WHEN 1 THEN 'one' WHEN 5 THEN 'five' ELSE '?' END",
+        "SELECT CASE WHEN 0 THEN 1 END, CASE WHEN 1 THEN 2 ELSE 3 END",
     ];
     for q in queries {
         let walker = c.query(q).unwrap().rows;

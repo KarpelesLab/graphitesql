@@ -168,7 +168,9 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
   optimization; covering-index detection; auto-indexes for unindexed joins;
   skip-scan. *Ref:* `where.c`, `wherecode.c`, `whereexpr.c`.
 - **VDBE bytecode IR** — 🚧 *spike landed* (`exec::vdbe`): a register-machine
-  `Op`/`Program`, a compiler for constant `SELECT` projections, and an interpreter,
+  `Op`/`Program` with a program-counter interpreter, a compiler for constant
+  `SELECT` projections covering arithmetic, concat, comparison, three-valued
+  boolean logic, `IS NULL`, and `CASE` (via `Goto`/`IfFalse` control flow),
   running alongside the tree-walker with matching results. *Remaining:* grow it to
   table cursors, filters, joins and migrate the executor onto it; then **real
   `EXPLAIN`** (the `addr/opcode/p1…` listing) byte-comparable to SQLite's, and
