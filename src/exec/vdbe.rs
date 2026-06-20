@@ -82,6 +82,8 @@ pub enum Op {
     Next { target: usize },
     /// Decrement `reg`; jump to `target` once it reaches zero (a `LIMIT` counter).
     DecrJumpZero { reg: usize, target: usize },
+    /// If `reg` is positive, decrement it and jump to `target` (an `OFFSET` skip).
+    IfPosDecr { reg: usize, target: usize },
     /// `dest = -reg` (numeric negation).
     Negate { reg: usize, dest: usize },
     /// Emit registers `[start, start+count)` as one output row.
@@ -208,9 +210,17 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
         }
         Some(_) => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
     };
-    if sel.offset.is_some() {
-        return Err(Error::Unsupported("VDBE: OFFSET not yet supported"));
-    }
+    // Optional OFFSET (constant integer only): a counter decremented while it is
+    // positive, skipping that many qualifying rows before any are emitted.
+    let offset_reg = match &sel.offset {
+        None => None,
+        Some(Expr::Literal(Literal::Integer(n))) => {
+            let r = c.alloc();
+            c.ops.push(Op::Integer { value: *n, dest: r });
+            Some(r)
+        }
+        Some(_) => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
+    };
     // Rewind (target backpatched to the loop exit), then the loop body.
     let rewind = c.ops.len();
     c.ops.push(Op::Rewind { target: 0 });
@@ -234,6 +244,13 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
         }
         None => None,
     };
+    // Optional OFFSET: skip this qualifying row (jump to Next) while the counter
+    // is still positive.
+    let offset_skip = offset_reg.map(|r| {
+        let at = c.ops.len();
+        c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+        at
+    });
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
     }
@@ -249,6 +266,11 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
     if let Some(at) = skip {
         if let Op::IfFalse { target, .. } = &mut c.ops[at] {
             *target = next; // a filtered-out row advances to the next
+        }
+    }
+    if let Some(at) = offset_skip {
+        if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
+            *target = next; // a skipped (offset) row advances to the next
         }
     }
     let end = c.ops.len();
@@ -534,6 +556,16 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                 };
                 regs[*reg] = Value::Integer(n - 1);
                 if n - 1 <= 0 {
+                    pc = *target;
+                }
+            }
+            Op::IfPosDecr { reg, target } => {
+                let n = match &regs[*reg] {
+                    Value::Integer(i) => *i,
+                    other => crate::exec::eval::to_i64(other),
+                };
+                if n > 0 {
+                    regs[*reg] = Value::Integer(n - 1);
                     pc = *target;
                 }
             }

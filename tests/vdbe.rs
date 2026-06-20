@@ -106,6 +106,10 @@ fn table_scan_matches_tree_walker() {
         "SELECT a FROM t LIMIT 0",
         "SELECT a FROM t LIMIT 100",
         "SELECT id FROM t WHERE a >= 1 LIMIT 1",
+        "SELECT a FROM t LIMIT 1 OFFSET 1",
+        "SELECT a FROM t LIMIT 2 OFFSET 1",
+        "SELECT a FROM t LIMIT 5 OFFSET 2",
+        "SELECT id FROM t WHERE a >= 1 LIMIT 1 OFFSET 1",
     ] {
         assert_eq!(
             c.query_vdbe(q).unwrap().rows,
