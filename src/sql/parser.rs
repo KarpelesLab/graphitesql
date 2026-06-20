@@ -2142,8 +2142,14 @@ impl Parser {
                             right: Box::new(right),
                         }),
                     })
+                } else if self.eat_kw("null") {
+                    // `expr NOT NULL` is the postfix form of `expr IS NOT NULL`.
+                    Ok(Expr::IsNull {
+                        expr: Box::new(left),
+                        negated: true,
+                    })
                 } else {
-                    Err(self.err("expected IN/LIKE/GLOB/BETWEEN after NOT"))
+                    Err(self.err("expected IN/LIKE/GLOB/BETWEEN/NULL after NOT"))
                 }
             }
         }
