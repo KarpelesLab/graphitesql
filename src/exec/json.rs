@@ -1,10 +1,18 @@
 //! A minimal JSON value model with the parser, serializer, and path navigation
 //! behind SQLite's core JSON functions (`json`, `json_extract`, `json_type`, …).
 //!
-//! This is RFC-8259 JSON with SQLite's conventions for the scalar mapping back
-//! to SQL values: JSON `true`/`false` become integers `1`/`0`, `null` becomes
-//! SQL `NULL`, numbers become INTEGER or REAL, strings become TEXT, and
-//! objects/arrays are returned as their minified JSON text.
+//! The parser accepts **JSON5** (a superset of RFC-8259) on input, matching the
+//! `sqlite3` CLI: unquoted/`'single-quoted'` object keys, single-quoted strings,
+//! one trailing comma, `// line` and `/* block */` comments, hexadecimal and
+//! `+`/leading-or-trailing-`.` numbers, and the `Infinity`/`NaN` literals. The
+//! canonical *output* (`serialize`/`to_sql`) stays strict minified JSON — JSON5
+//! in, canonical JSON out — exactly like sqlite, where `json('{a:1}')` yields
+//! `{"a":1}`. `Infinity` renders as `9e999` and `NaN` parses to JSON `null`.
+//!
+//! SQLite's conventions for the scalar mapping back to SQL values: JSON
+//! `true`/`false` become integers `1`/`0`, `null` becomes SQL `NULL`, numbers
+//! become INTEGER or REAL, strings become TEXT, and objects/arrays are returned
+//! as their minified JSON text.
 
 use crate::value::Value;
 use alloc::string::{String, ToString};
@@ -121,6 +129,11 @@ impl Json {
             Json::Bool(true) => out.push_str("true"),
             Json::Bool(false) => out.push_str("false"),
             Json::Int(i) => out.push_str(&i.to_string()),
+            Json::Real(r) if r.is_infinite() => {
+                // JSON has no infinity literal; sqlite renders it as `±9e999`
+                // (a value that round-trips to f64 infinity).
+                out.push_str(if *r < 0.0 { "-9e999" } else { "9e999" });
+            }
             Json::Real(r) => out.push_str(&crate::exec::eval::format_real(*r)),
             Json::Str(s) => write_json_string(s, out),
             Json::Array(items) => {
@@ -224,12 +237,39 @@ impl Parser<'_> {
         Err(self.pos)
     }
 
+    /// Skip whitespace and JSON5 comments (`// line` and `/* block */`). An
+    /// unterminated block comment is left for the caller to surface as an error
+    /// at the value position.
     fn skip_ws(&mut self) {
-        while let Some(c) = self.peek() {
-            if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
-                self.pos += 1;
-            } else {
-                break;
+        loop {
+            match self.peek() {
+                Some(b' ' | b'\t' | b'\n' | b'\r') => self.pos += 1,
+                Some(b'/') => match self.bytes.get(self.pos + 1) {
+                    Some(b'/') => {
+                        self.pos += 2;
+                        while let Some(c) = self.peek() {
+                            self.pos += 1;
+                            if c == b'\n' {
+                                break;
+                            }
+                        }
+                    }
+                    Some(b'*') => {
+                        self.pos += 2;
+                        // Scan to the closing `*/`; stop at EOF if unterminated.
+                        while self.pos < self.bytes.len() {
+                            if self.bytes[self.pos] == b'*'
+                                && self.bytes.get(self.pos + 1) == Some(&b'/')
+                            {
+                                self.pos += 2;
+                                break;
+                            }
+                            self.pos += 1;
+                        }
+                    }
+                    _ => break,
+                },
+                _ => break,
             }
         }
     }
@@ -239,11 +279,19 @@ impl Parser<'_> {
         match self.peek() {
             Some(b'{') => self.object(),
             Some(b'[') => self.array(),
-            Some(b'"') => self.string().map(Json::Str),
+            // JSON5 allows single-quoted strings as well as double-quoted.
+            Some(b'"') => self.string(b'"').map(Json::Str),
+            Some(b'\'') => self.string(b'\'').map(Json::Str),
             Some(b't') => self.literal("true", Json::Bool(true)),
             Some(b'f') => self.literal("false", Json::Bool(false)),
             Some(b'n') => self.literal("null", Json::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
+            // JSON5 `Infinity` / `NaN` (a leading `+`/`-` is consumed by
+            // `number`). `NaN` maps to JSON `null`, matching sqlite.
+            Some(b'I') => self.literal("Infinity", Json::Real(f64::INFINITY)),
+            Some(b'N') => self.literal("NaN", Json::Null),
+            // JSON5 numbers: leading `+`, hex (`0x…`), a leading or trailing
+            // decimal point, and the signed `Infinity`/`NaN` forms.
+            Some(b'-' | b'+' | b'.' | b'0'..=b'9') => self.number(),
             _ => self.err(),
         }
     }
@@ -260,21 +308,14 @@ impl Parser<'_> {
     fn object(&mut self) -> Result<Json, usize> {
         self.pos += 1; // '{'
         let mut members = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(Json::Object(members));
-        }
         loop {
             self.skip_ws();
-            if self.peek() != Some(b'"') {
-                // sqlite3 tolerates JSON5-style bare identifier keys, scanning
-                // the run of identifier bytes before failing; mirror its error
-                // position by skipping that run so we report its end.
-                self.skip_bare_key();
-                return self.err();
+            // Empty object, or a single trailing comma before `}`.
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+                return Ok(Json::Object(members));
             }
-            let key = self.string()?;
+            let key = self.object_key()?;
             self.skip_ws();
             if self.peek() != Some(b':') {
                 return self.err();
@@ -284,6 +325,8 @@ impl Parser<'_> {
             members.push((key, val));
             self.skip_ws();
             match self.peek() {
+                // A comma may be followed by another member or, in JSON5, by the
+                // closing `}` (one trailing comma); the loop re-checks for `}`.
                 Some(b',') => self.pos += 1,
                 Some(b'}') => {
                     self.pos += 1;
@@ -294,14 +337,37 @@ impl Parser<'_> {
         }
     }
 
-    /// Advance over a run of bare-key identifier bytes (`A-Za-z0-9_$`), used only
-    /// to align the reported error position with sqlite3 when a key is missing.
-    fn skip_bare_key(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' {
-                self.pos += 1;
-            } else {
-                break;
+    /// Parse an object key: a double- or single-quoted string, or a JSON5 bare
+    /// identifier (`[A-Za-z_$][A-Za-z0-9_$]*`).
+    fn object_key(&mut self) -> Result<String, usize> {
+        match self.peek() {
+            Some(b'"') => self.string(b'"'),
+            Some(b'\'') => self.string(b'\''),
+            Some(c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$' => {
+                let start = self.pos;
+                while let Some(c) = self.peek() {
+                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                // ASCII-only run, so this is always valid UTF-8.
+                Ok(core::str::from_utf8(&self.bytes[start..self.pos])
+                    .unwrap_or("")
+                    .to_string())
+            }
+            // Not a key: scan any identifier run so the reported position matches
+            // sqlite3, then fail.
+            _ => {
+                while let Some(c) = self.peek() {
+                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.err()
             }
         }
     }
@@ -309,12 +375,13 @@ impl Parser<'_> {
     fn array(&mut self) -> Result<Json, usize> {
         self.pos += 1; // '['
         let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(Json::Array(items));
-        }
         loop {
+            self.skip_ws();
+            // Empty array, or a single trailing comma before `]`.
+            if self.peek() == Some(b']') {
+                self.pos += 1;
+                return Ok(Json::Array(items));
+            }
             let val = self.value()?;
             items.push(val);
             self.skip_ws();
@@ -329,30 +396,57 @@ impl Parser<'_> {
         }
     }
 
-    fn string(&mut self) -> Result<String, usize> {
+    /// Parse a string literal opened by `quote` (`"` or, in JSON5, `'`). Both
+    /// quote styles share the same escapes; `\'` and `\"` are always accepted.
+    fn string(&mut self, quote: u8) -> Result<String, usize> {
         self.pos += 1; // opening quote
         let mut s = String::new();
         loop {
             let Some(c) = self.peek() else {
                 return self.err();
             };
+            if c == quote {
+                self.pos += 1;
+                return Ok(s);
+            }
             self.pos += 1;
             match c {
-                b'"' => return Ok(s),
                 b'\\' => {
+                    // The escape introducer position, used to report bad escapes
+                    // at the escape character itself (matching sqlite3).
+                    let esc_pos = self.pos;
                     let Some(esc) = self.peek() else {
                         return self.err();
                     };
                     self.pos += 1;
                     match esc {
                         b'"' => s.push('"'),
+                        b'\'' => s.push('\''),
                         b'\\' => s.push('\\'),
                         b'/' => s.push('/'),
                         b'n' => s.push('\n'),
-                        b't' => s.push('\t'),
+                        // JSON5: `\v` maps to U+0009 in sqlite (not U+000B).
+                        b't' | b'v' => s.push('\t'),
                         b'r' => s.push('\r'),
                         b'b' => s.push('\u{08}'),
                         b'f' => s.push('\u{0c}'),
+                        // JSON5: `\0` is a NUL.
+                        b'0' => s.push('\0'),
+                        // JSON5: a backslash before a line terminator is a line
+                        // continuation (the newline is dropped). `\r\n` counts
+                        // as one terminator.
+                        b'\n' => {}
+                        b'\r' => {
+                            if self.peek() == Some(b'\n') {
+                                self.pos += 1;
+                            }
+                        }
+                        // JSON5: `\xHH` is a two-digit hex escape.
+                        b'x' => {
+                            let hi = self.hex_digit()?;
+                            let lo = self.hex_digit()?;
+                            s.push((hi * 16 + lo) as u8 as char);
+                        }
                         b'u' => {
                             let cp = self.hex4()?;
                             // Surrogate pair?
@@ -380,7 +474,8 @@ impl Parser<'_> {
                                 }
                             }
                         }
-                        _ => return self.err(),
+                        // An unrecognized escape: report at the escape character.
+                        _ => return Err(esc_pos),
                     }
                 }
                 // A raw multi-byte UTF-8 sequence: copy the bytes through.
@@ -402,22 +497,74 @@ impl Parser<'_> {
     fn hex4(&mut self) -> Result<u32, usize> {
         let mut v = 0u32;
         for _ in 0..4 {
-            let Some(c) = self.peek() else {
-                return self.err();
-            };
-            let Some(d) = (c as char).to_digit(16) else {
-                return self.err();
-            };
-            v = v * 16 + d;
-            self.pos += 1;
+            v = v * 16 + self.hex_digit()?;
         }
         Ok(v)
     }
 
+    /// Consume one hexadecimal digit (`0-9A-Fa-f`), or fail at the current
+    /// position.
+    fn hex_digit(&mut self) -> Result<u32, usize> {
+        let Some(c) = self.peek() else {
+            return self.err();
+        };
+        let Some(d) = (c as char).to_digit(16) else {
+            return self.err();
+        };
+        self.pos += 1;
+        Ok(d)
+    }
+
+    /// Parse a number. Beyond RFC-8259 this accepts the JSON5 forms: a leading
+    /// `+`, hexadecimal (`0x…`), a leading or trailing decimal point, and the
+    /// `Infinity`/`NaN` literals (with an optional sign). `NaN` becomes JSON
+    /// `null`, matching sqlite.
     fn number(&mut self) -> Result<Json, usize> {
         let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
+        let neg = match self.peek() {
+            Some(b'-') => {
+                self.pos += 1;
+                true
+            }
+            Some(b'+') => {
+                self.pos += 1;
+                false
+            }
+            _ => false,
+        };
+        // Signed `Infinity` / `NaN`.
+        match self.peek() {
+            Some(b'I') => {
+                return self.literal(
+                    "Infinity",
+                    Json::Real(if neg {
+                        f64::NEG_INFINITY
+                    } else {
+                        f64::INFINITY
+                    }),
+                );
+            }
+            Some(b'N') => return self.literal("NaN", Json::Null),
+            _ => {}
+        }
+        // Hexadecimal integer (`0x…` / `0X…`).
+        if self.peek() == Some(b'0') && matches!(self.bytes.get(self.pos + 1), Some(b'x' | b'X')) {
+            self.pos += 2;
+            let digits_start = self.pos;
+            let mut v: u64 = 0;
+            while let Some(c) = self.peek() {
+                let Some(d) = (c as char).to_digit(16) else {
+                    break;
+                };
+                v = v.wrapping_mul(16).wrapping_add(d as u64);
+                self.pos += 1;
+            }
+            if self.pos == digits_start {
+                return Err(start); // `0x` with no digits
+            }
+            // SQLite stores the hex value modulo 2^64 as a signed integer.
+            let i = v as i64;
+            return Ok(Json::Int(if neg { i.wrapping_neg() } else { i }));
         }
         let mut is_real = false;
         while let Some(c) = self.peek() {
@@ -430,6 +577,9 @@ impl Parser<'_> {
                 _ => break,
             }
         }
+        if self.pos == start || (neg && self.pos == start + 1) {
+            return Err(start); // no digits consumed (e.g. bare `+`/`-`/`.`)
+        }
         let Ok(tok) = core::str::from_utf8(&self.bytes[start..self.pos]) else {
             return Err(start);
         };
@@ -438,11 +588,21 @@ impl Parser<'_> {
                 return Ok(Json::Int(i));
             }
         }
-        match tok.parse::<f64>() {
-            Ok(r) => Ok(Json::Real(r)),
-            Err(_) => Err(start),
+        // `f64::parse` rejects a leading `+` and a leading/trailing `.`; build a
+        // normalized form so JSON5 numbers like `+.5` / `5.` parse.
+        match parse_json5_real(tok) {
+            Some(r) => Ok(Json::Real(r)),
+            None => Err(start),
         }
     }
+}
+
+/// Parse a JSON5 real-number token. `f64::from_str` already accepts a leading or
+/// trailing decimal point (`.5`, `5.`, `5.e2`); the only extra JSON5 form is a
+/// leading `+`, which it rejects, so strip it first.
+fn parse_json5_real(tok: &str) -> Option<f64> {
+    let tok = tok.strip_prefix('+').unwrap_or(tok);
+    tok.parse::<f64>().ok()
 }
 
 /// Navigate a JSON value by a SQLite path expression (`$`, `.key`, `[index]`).
