@@ -1206,6 +1206,72 @@ impl Connection {
                 "must have at least one non-generated column".into(),
             ));
         }
+        // Duplicate column names are rejected.
+        for (i, c) in ct.columns.iter().enumerate() {
+            if ct.columns[..i]
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case(&c.name))
+            {
+                return Err(Error::Error(alloc::format!(
+                    "duplicate column name: {}",
+                    c.name
+                )));
+            }
+        }
+        // At most one PRIMARY KEY (column-level + table-level).
+        let pk_count = ct
+            .columns
+            .iter()
+            .flat_map(|c| &c.constraints)
+            .filter(|k| matches!(k, ColumnConstraint::PrimaryKey { .. }))
+            .count()
+            + ct.constraints
+                .iter()
+                .filter(|tc| matches!(tc, TableConstraint::PrimaryKey(_)))
+                .count();
+        if pk_count > 1 {
+            return Err(Error::Error(alloc::format!(
+                "table {} has more than one primary key",
+                ct.name
+            )));
+        }
+        // Table-level PRIMARY KEY/UNIQUE column lists must name real columns.
+        for tc in &ct.constraints {
+            let cols = match tc {
+                TableConstraint::PrimaryKey(cols) | TableConstraint::Unique(cols) => cols,
+                _ => continue,
+            };
+            for name in cols {
+                if !ct.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+                    return Err(Error::Error(alloc::format!("no such column: {name}")));
+                }
+            }
+        }
+        // AUTOINCREMENT is only valid on a rowid `INTEGER PRIMARY KEY` column.
+        let ipk = find_integer_primary_key(ct);
+        let has_autoinc = |i: usize| {
+            ct.columns[i].constraints.iter().any(|k| {
+                matches!(
+                    k,
+                    ColumnConstraint::PrimaryKey {
+                        autoincrement: true,
+                        ..
+                    }
+                )
+            })
+        };
+        if (0..ct.columns.len()).any(has_autoinc) {
+            if ct.without_rowid {
+                return Err(Error::Error(
+                    "AUTOINCREMENT not allowed on WITHOUT ROWID tables".into(),
+                ));
+            }
+            if !(0..ct.columns.len()).any(|i| has_autoinc(i) && Some(i) == ipk) {
+                return Err(Error::Error(
+                    "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY".into(),
+                ));
+            }
+        }
         // A WITHOUT ROWID table is stored as a PK-clustered index b-tree; an
         // ordinary table uses a rowid table b-tree.
         let root = if ct.without_rowid {

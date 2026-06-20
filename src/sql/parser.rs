@@ -1066,8 +1066,11 @@ impl Parser {
                     false
                 };
                 self.eat_conflict_clause();
-                let _ = self.eat_kw("autoincrement");
-                constraints.push(ColumnConstraint::PrimaryKey { descending });
+                let autoincrement = self.eat_kw("autoincrement");
+                constraints.push(ColumnConstraint::PrimaryKey {
+                    descending,
+                    autoincrement,
+                });
             } else if self.eat_kw("not") {
                 self.expect_kw("null")?;
                 self.eat_conflict_clause();

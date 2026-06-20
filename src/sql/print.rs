@@ -82,12 +82,18 @@ fn column_def(cd: &ColumnDef) -> String {
 
 fn column_constraint(c: &ColumnConstraint) -> String {
     match c {
-        ColumnConstraint::PrimaryKey { descending } => {
+        ColumnConstraint::PrimaryKey {
+            descending,
+            autoincrement,
+        } => {
+            let mut s = String::from("PRIMARY KEY");
             if *descending {
-                "PRIMARY KEY DESC".to_string()
-            } else {
-                "PRIMARY KEY".to_string()
+                s.push_str(" DESC");
             }
+            if *autoincrement {
+                s.push_str(" AUTOINCREMENT");
+            }
+            s
         }
         ColumnConstraint::NotNull => "NOT NULL".to_string(),
         ColumnConstraint::Unique => "UNIQUE".to_string(),

@@ -458,10 +458,12 @@ pub struct ForeignKey {
 /// A column-level constraint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnConstraint {
-    /// `PRIMARY KEY [ASC|DESC]`.
+    /// `PRIMARY KEY [ASC|DESC] [AUTOINCREMENT]`.
     PrimaryKey {
         /// Descending primary key?
         descending: bool,
+        /// `AUTOINCREMENT` present (only valid on an `INTEGER PRIMARY KEY`).
+        autoincrement: bool,
     },
     /// `NOT NULL`.
     NotNull,
