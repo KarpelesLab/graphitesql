@@ -137,6 +137,12 @@ Make the dialect complete. Each item lands with a differential corpus addition.
 - ✅ **Row values** — `(a, b) = (c, d)`, `(a,b) < (c,d)`, `(a, b) IN ((…),(…))`,
   `(a,b) IN (SELECT …)`, and `VALUES` as a standalone statement / table source.
 - ✅ **`ORDER BY` modifiers** — `NULLS FIRST`/`NULLS LAST`; `IS [NOT] DISTINCT FROM`.
+- ✅ **`STRICT` tables** — `CREATE TABLE … STRICT` (alone or combined with
+  `WITHOUT ROWID`): column types restricted to the six rigid types
+  (`INT`/`INTEGER`/`REAL`/`TEXT`/`BLOB`/`ANY`, validated at `CREATE`), and every
+  stored value type-checked against its column on INSERT/UPDATE/UPSERT (`ANY`
+  stores values without affinity). Cross-verified: `sqlite3` reads our STRICT
+  files and enforces them identically. *Ref:* `stricttables.html`, `build.c`.
 - **Aggregate/window extras** — ✅ `FILTER (WHERE …)` on aggregates, ✅ the
   `WINDOW name AS (…)` clause with named-window reuse, ✅ `percent_rank`/
   `cume_dist`, ✅ ordered aggregates (`group_concat(x ORDER BY y)`), ✅ frame

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: **`STRICT` tables**. `CREATE TABLE … STRICT` (alone or with `WITHOUT
+  ROWID`, in either order) restricts column types to `INT`/`INTEGER`/`REAL`/
+  `TEXT`/`BLOB`/`ANY` — any other or missing type is rejected at `CREATE` — and
+  type-checks every stored value against its column on INSERT/UPDATE/UPSERT
+  (`ANY` columns store values with no affinity). The whole type×value matrix,
+  the stored `typeof`/`quote`, and the `CREATE`-time rejections all match
+  `sqlite3`, which also reads our STRICT files and enforces them identically.
+- Fix: **UNIQUE enforcement for standalone indexes**. A `CREATE UNIQUE INDEX`
+  (plain, partial, expression, or multi-column) was maintained but never
+  *enforced* — duplicate keys were silently accepted. `find_conflicts` (and the
+  WITHOUT ROWID write paths) now check these indexes, collation- and NULL-aware,
+  covering INSERT/UPDATE/UPSERT/`OR IGNORE`/`OR REPLACE`.
 - Track B: **hash join**. A two-table join with an equi-join `left.col = right.col`
   in its `ON` now builds a hash index on the joined table and probes it per left
   row (the full `ON` is still re-evaluated on each candidate, so semantics are

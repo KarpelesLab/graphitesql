@@ -971,6 +971,7 @@ impl Parser {
                 columns: Vec::new(),
                 constraints: Vec::new(),
                 without_rowid: false,
+                strict: false,
                 as_select: Some(Box::new(select)),
             });
         }
@@ -990,18 +991,30 @@ impl Parser {
             }
         }
         self.expect(&Token::RParen)?;
-        let without_rowid = if self.eat_kw("without") {
-            self.expect_kw("rowid")?;
-            true
-        } else {
-            false
-        };
+        // Table options after the column list: `WITHOUT ROWID` and/or `STRICT`,
+        // comma-separated in any order.
+        let mut without_rowid = false;
+        let mut strict = false;
+        loop {
+            if self.eat_kw("without") {
+                self.expect_kw("rowid")?;
+                without_rowid = true;
+            } else if self.eat_kw("strict") {
+                strict = true;
+            } else {
+                break;
+            }
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
         Ok(CreateTable {
             if_not_exists,
             name,
             columns,
             constraints,
             without_rowid,
+            strict,
             as_select: None,
         })
     }

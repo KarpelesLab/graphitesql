@@ -1147,6 +1147,23 @@ impl Connection {
             }
             return Err(Error::Error(format!("table {} already exists", ct.name)));
         }
+        // STRICT tables restrict column types to the six rigid types; reject any
+        // other (or missing) declared type at CREATE, like SQLite.
+        if ct.strict {
+            for c in &ct.columns {
+                if strict_column_type(c.type_name.as_deref()).is_none() {
+                    return Err(match &c.type_name {
+                        Some(t) => Error::Error(format!(
+                            "unknown datatype for {}.{}: \"{t}\"",
+                            ct.name, c.name
+                        )),
+                        None => {
+                            Error::Error(format!("missing datatype for {}.{}", ct.name, c.name))
+                        }
+                    });
+                }
+            }
+        }
         // A WITHOUT ROWID table is stored as a PK-clustered index b-tree; an
         // ordinary table uses a rowid table b-tree.
         let root = if ct.without_rowid {
@@ -2042,6 +2059,7 @@ impl Connection {
                 values[ipk] = Value::Integer(rowid);
             }
             check_not_null(&meta, &values)?;
+            self.check_strict_types(&meta, &values)?;
             self.check_constraints(&meta, &values, Some(rowid), params)?;
             self.check_fk_child(&ins.table, &meta, &values)?;
 
@@ -2196,6 +2214,7 @@ impl Connection {
         apply_column_affinity(meta, &mut values);
         self.materialize_generated(meta, &mut values, params)?;
         check_not_null(meta, &values)?;
+        self.check_strict_types(meta, &values)?;
         self.check_constraints(meta, &values, Some(existing_rowid), params)?;
         self.check_fk_child(table, meta, &values)?;
         if self.foreign_keys {
@@ -2609,6 +2628,7 @@ impl Connection {
             apply_column_affinity(&meta, &mut values);
             self.materialize_generated(&meta, &mut values, params)?;
             check_not_null(&meta, &values)?;
+            self.check_strict_types(&meta, &values)?;
             self.check_constraints(&meta, &values, Some(rowid), params)?;
             // Foreign keys: this row as a child must still point at a parent, and
             // as a parent it must propagate referenced-key changes to children.
@@ -5532,6 +5552,7 @@ impl Connection {
         }
         apply_column_affinity(meta, &mut values);
         self.materialize_generated(meta, &mut values, params)?;
+        self.check_strict_types(meta, &values)?;
         Ok(values)
     }
 
@@ -5681,6 +5702,7 @@ impl Connection {
                 apply_column_affinity(meta, &mut row);
                 self.materialize_generated(meta, &mut row, params)?;
                 check_not_null(meta, &row)?;
+                self.check_strict_types(meta, &row)?;
                 self.check_constraints(meta, &row, None, params)?;
                 affected += 1;
             }
@@ -6513,6 +6535,28 @@ impl Connection {
             (false, Vec::new(), 0)
         };
 
+        // STRICT tables: record each column's rigid type for write-time checking,
+        // and give `ANY` columns no affinity (values stored exactly as supplied).
+        let strict_types: Option<Vec<(StrictType, String)>> = if ct.strict {
+            let mut v = Vec::with_capacity(columns.len());
+            for c in &ct.columns {
+                let st = strict_column_type(c.type_name.as_deref()).unwrap_or(StrictType::Any);
+                let decl = c.type_name.clone().unwrap_or_default();
+                v.push((st, decl));
+            }
+            Some(v)
+        } else {
+            None
+        };
+        let mut columns = columns;
+        if let Some(st) = &strict_types {
+            for (col, (ty, _)) in columns.iter_mut().zip(st) {
+                if *ty == StrictType::Any {
+                    col.affinity = eval::Affinity::Blob; // ANY: store as-is
+                }
+            }
+        }
+
         Ok(TableMeta {
             root: obj.rootpage,
             columns,
@@ -6525,7 +6569,45 @@ impl Connection {
             without_rowid,
             storage_order,
             pk_len,
+            strict_types,
         })
+    }
+
+    /// Enforce a `STRICT` table's column types against a row whose affinity has
+    /// already been applied. NULL always passes; otherwise the stored value's
+    /// storage class must match the column's rigid type (`ANY` accepts anything).
+    /// `INT`/`REAL` columns accept their numeric class after affinity coercion
+    /// (an integer in a `REAL` column has been turned into a real already).
+    fn check_strict_types(&self, meta: &TableMeta, values: &[Value]) -> Result<()> {
+        let Some(stypes) = &meta.strict_types else {
+            return Ok(());
+        };
+        for (i, (st, decl)) in stypes.iter().enumerate() {
+            let v = &values[i];
+            let ok = matches!(
+                (st, v),
+                (_, Value::Null)
+                    | (StrictType::Any, _)
+                    | (StrictType::Int, Value::Integer(_))
+                    | (StrictType::Real, Value::Real(_))
+                    | (StrictType::Text, Value::Text(_))
+                    | (StrictType::Blob, Value::Blob(_))
+            );
+            if !ok {
+                let class = match v {
+                    Value::Integer(_) => "INT",
+                    Value::Real(_) => "REAL",
+                    Value::Text(_) => "TEXT",
+                    Value::Blob(_) => "BLOB",
+                    Value::Null => unreachable!(),
+                };
+                return Err(Error::Constraint(format!(
+                    "cannot store {class} value in {decl} column {}.{}",
+                    meta.columns[i].table, meta.columns[i].name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Evaluate CHECK constraints against a fully-built row (with the IPK column
@@ -6572,6 +6654,40 @@ struct TableMeta {
     /// for ordinary rowid tables. `pk_len` is how many leading entries are PK.
     storage_order: Vec<usize>,
     pk_len: usize,
+    /// For a `STRICT` table, each column's rigid type and its declared type name
+    /// (aligned with `columns`); `None` for an ordinary table. Drives write-time
+    /// type checking.
+    strict_types: Option<Vec<(StrictType, String)>>,
+}
+
+/// The rigid column type of a `STRICT` table column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StrictType {
+    Int,
+    Real,
+    Text,
+    Blob,
+    Any,
+}
+
+/// The `STRICT` rigid type for a declared type name, or `None` if the name is
+/// not one of the six allowed (`INT`/`INTEGER`/`REAL`/`TEXT`/`BLOB`/`ANY`) — in
+/// which case a `STRICT` table rejects the `CREATE`.
+fn strict_column_type(type_name: Option<&str>) -> Option<StrictType> {
+    let t = type_name?.trim();
+    if t.eq_ignore_ascii_case("INT") || t.eq_ignore_ascii_case("INTEGER") {
+        Some(StrictType::Int)
+    } else if t.eq_ignore_ascii_case("REAL") {
+        Some(StrictType::Real)
+    } else if t.eq_ignore_ascii_case("TEXT") {
+        Some(StrictType::Text)
+    } else if t.eq_ignore_ascii_case("BLOB") {
+        Some(StrictType::Blob)
+    } else if t.eq_ignore_ascii_case("ANY") {
+        Some(StrictType::Any)
+    } else {
+        None
+    }
 }
 
 impl TableMeta {

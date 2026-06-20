@@ -401,6 +401,10 @@ pub struct CreateTable {
     pub constraints: Vec<TableConstraint>,
     /// `WITHOUT ROWID`?
     pub without_rowid: bool,
+    /// `STRICT`? A strict table restricts column types to the six rigid types
+    /// (`INT`/`INTEGER`/`REAL`/`TEXT`/`BLOB`/`ANY`) and type-checks every stored
+    /// value against its column's declared type.
+    pub strict: bool,
     /// `CREATE TABLE … AS SELECT …` — the table's columns and rows come from the
     /// query. When present, `columns`/`constraints` are empty until materialized.
     pub as_select: Option<Box<Select>>,

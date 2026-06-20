@@ -27,8 +27,11 @@ pub fn create_table(ct: &CreateTable) -> String {
     s.push('(');
     s.push_str(&parts.join(", "));
     s.push(')');
-    if ct.without_rowid {
-        s.push_str(" WITHOUT ROWID");
+    match (ct.without_rowid, ct.strict) {
+        (true, true) => s.push_str(" WITHOUT ROWID, STRICT"),
+        (true, false) => s.push_str(" WITHOUT ROWID"),
+        (false, true) => s.push_str(" STRICT"),
+        (false, false) => {}
     }
     s
 }
