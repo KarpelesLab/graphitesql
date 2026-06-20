@@ -23,7 +23,7 @@ pub fn is_aggregate(name: &str) -> bool {
 /// arguments and aggregate with exactly one (or `*`), matching SQLite.
 pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
     match name.to_ascii_lowercase().as_str() {
-        "count" | "sum" | "total" | "avg" | "group_concat" => true,
+        "count" | "sum" | "total" | "avg" | "group_concat" | "string_agg" => true,
         "json_group_array" => nargs == 1,
         "json_group_object" => nargs == 2,
         "min" | "max" => star || nargs == 1,

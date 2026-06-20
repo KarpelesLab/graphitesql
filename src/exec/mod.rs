@@ -6692,7 +6692,8 @@ impl Connection {
                     }
                 })
                 .unwrap_or(Value::Null),
-            "group_concat" => {
+            // `string_agg` is SQLite's standard-SQL alias for `group_concat`.
+            "group_concat" | "string_agg" => {
                 if vals.is_empty() {
                     Value::Null
                 } else {
@@ -7856,7 +7857,7 @@ fn window_aggregate(lname: &str, star: bool, frame: &[&Vec<Value>]) -> Result<Va
                 }
             })
             .unwrap_or(Value::Null),
-        "group_concat" => {
+        "group_concat" | "string_agg" => {
             if vals.is_empty() {
                 Value::Null
             } else {

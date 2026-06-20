@@ -86,3 +86,23 @@ fn distinct_agg_and_window_match_sqlite3() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn string_agg_is_group_concat_alias() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE s(g, v)").unwrap();
+    c.execute("INSERT INTO s VALUES('a','x'),('a','y'),('b','z')")
+        .unwrap();
+    let r = c
+        .query("SELECT g, string_agg(v, '-') FROM s GROUP BY g ORDER BY g")
+        .unwrap();
+    assert_eq!(r.rows[0][1], Value::Text("x-y".into()));
+    assert_eq!(r.rows[1][1], Value::Text("z".into()));
+    // DISTINCT works like group_concat.
+    assert_eq!(
+        c.query("SELECT string_agg(DISTINCT v, ',') FROM (SELECT 'a' v UNION ALL SELECT 'a' UNION ALL SELECT 'b')")
+            .unwrap()
+            .rows[0][0],
+        Value::Text("a,b".into())
+    );
+}
