@@ -215,3 +215,28 @@ fn pragma_table_valued_functions() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn table_info_default_value_is_sql_text() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    // dflt_value is the default *expression's* SQL text: a string keeps its
+    // quotes, DEFAULT NULL shows NULL, no default is NULL.
+    let ddl = "CREATE TABLE t(a DEFAULT 'x', b DEFAULT 5, c DEFAULT 3.14, e DEFAULT NULL, g)";
+    let want = {
+        let o = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg(format!(
+                "{ddl}; SELECT name, dflt_value FROM pragma_table_info('t');"
+            ))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let mut c = Connection::open_memory().unwrap();
+    c.execute(ddl).unwrap();
+    let got = rows_str(&c, "SELECT name, dflt_value FROM pragma_table_info('t')");
+    assert_eq!(got, want);
+}

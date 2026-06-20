@@ -422,8 +422,11 @@ impl Connection {
                 .constraints
                 .iter()
                 .any(|c| matches!(c, ColumnConstraint::NotNull));
+            // `dflt_value` is the SQL text of the default expression (SQLite
+            // preserves the literal as written — e.g. a string keeps its quotes,
+            // `DEFAULT NULL` shows `NULL`), so reprint rather than evaluate it.
             let dflt = col.constraints.iter().find_map(|c| match c {
-                ColumnConstraint::Default(Expr::Literal(l)) => Some(literal_text(l)),
+                ColumnConstraint::Default(e) => Some(sql::print::expr(e)),
                 _ => None,
             });
             let pk = if Some(i) == ipk
@@ -8361,18 +8364,6 @@ fn value_to_literal(v: Value) -> Literal {
         Value::Text(s) => Literal::Str(s),
         Value::Blob(b) => Literal::Blob(b),
     }
-}
-
-/// Render a literal as text (for `PRAGMA table_info`'s default-value column).
-fn literal_text(l: &Literal) -> String {
-    eval::to_text(&match l {
-        Literal::Null => Value::Null,
-        Literal::Integer(i) => Value::Integer(*i),
-        Literal::Real(r) => Value::Real(*r),
-        Literal::Str(s) => Value::Text(s.clone()),
-        Literal::Blob(b) => Value::Blob(b.clone()),
-        Literal::Boolean(b) => Value::Integer(*b as i64),
-    })
 }
 
 /// Best-effort label for an unaliased result expression.
