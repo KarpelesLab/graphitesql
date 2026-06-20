@@ -170,10 +170,12 @@ validation.
   A, then months, then take the residual via Julian-day difference for
   `D HH:MM:SS.SSS`. *Ref:* `date.c` `timediffFunc`. Acceptance: byte-match
   sqlite3 across sign, leap years, and month-length boundaries.
-- **A6 — `json_error_position(X)`.** Returns the 1-based byte position of the
-  first JSON parse error (0 if valid). Thread the failing offset out of
-  `exec::json::parse` (currently it returns `Option`, discarding position) and
-  match sqlite3's reported positions.
+- ✅ **A6 — `json_error_position(X)`.** Done: `parse_with_error_position` threads
+  the failing byte offset out; the function maps `Ok`→0, `Err(off)`→`off+1`,
+  NULL→NULL. Matches sqlite3 on well-formed JSON + common structural errors.
+  *Remaining edge:* JSON5 inputs sqlite accepts (unquoted keys, trailing commas)
+  diverge — graphite's JSON parser is strict RFC-8259 (a broader gap than this
+  function).
 - **A7 — multi-statement `execute_batch(sql)`.** A new API that runs a
   `;`-separated script (like `sqlite3_exec`). Needs a statement splitter aware
   that trigger bodies (`BEGIN … END`) and `CASE … END` contain inner `;` — track
@@ -202,7 +204,7 @@ Open EQP divergences (verified against sqlite3):
 |-------|----------------|------------------|-------|
 | `… FROM t JOIN u ON t.c=u.x` (`x` = `u` PK) | `SCAN t` + `SCAN u` | `SCAN t` + `SEARCH u USING INTEGER PRIMARY KEY (rowid=?)` | **B1a** |
 | `… FROM t JOIN u ON t.c=u.k` (`k` indexed) | `SCAN t` + `SCAN u` | `SCAN t` + `SEARCH u USING INDEX …` | **B1a/B3** |
-| `SELECT count(*) FROM t` (any index `ic`) | `SCAN t` | `SCAN t USING COVERING INDEX ic` | **B2b** |
+| `SELECT count(*) FROM t` (one full index `ic`) | ✅ now `SCAN t USING COVERING INDEX ic` | `SCAN t USING COVERING INDEX ic` | **B2b** ✅ |
 
 - **B0b — Index-driven `ORDER BY`/`GROUP BY`, remaining cases.** Extend the
   shared `order_index_scan` decision to: (a) a multi-term `ORDER BY` that is a
@@ -217,10 +219,11 @@ Open EQP divergences (verified against sqlite3):
 - **B1b — Join order.** Reorder `FROM` tables by a simple cost model (smallest
   estimated cardinality / most-selective indexed table first) rather than textual
   order; results identical, order verified via EQP. *Ref:* `where.c`.
-- **B2b — Covering reads beyond the ordered scan.** Reuse `index_covers_query`
-  on (a) `WHERE`-driven index seeks (range/IN/equality) and (b) the
-  `count(*)`-with-no-`WHERE` case (count index entries of the smallest full
-  index). EQP: `USING COVERING INDEX`.
+- **B2b — Covering reads beyond the ordered scan.** ✅ *Done for `count(*)`*
+  (`count_covering_index` counts index entries when a single full index exists,
+  EQP `USING COVERING INDEX`). *Remaining:* covering reads on `WHERE`-driven
+  index seeks (range/IN/equality) — return columns straight from the seek's index
+  records when they're all covered.
 - **B3 — Automatic indexes for unindexed joins.** Build a transient hash/sorted
   index on a join's inner table when no usable persistent index exists (the
   `auto-index` optimization); report `USING AUTOMATIC … INDEX`. Pairs with B1a.

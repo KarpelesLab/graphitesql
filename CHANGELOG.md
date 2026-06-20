@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **`json_error_position(X)`** scalar function — the 1-based byte position of the
+  first JSON syntax error (0 if valid, NULL for NULL). Matches sqlite3 on
+  well-formed JSON and the common structural-error shapes; JSON5 inputs sqlite
+  accepts (unquoted keys, trailing commas) diverge, since graphite's JSON parser
+  is strict RFC-8259.
+- **Planner (B2b): `SELECT count(*)` via a covering index.** A bare `count(*)`
+  over a single rowid table with exactly one full (non-partial) secondary index
+  now counts the index's entries instead of scanning the table, and `EXPLAIN
+  QUERY PLAN` reports `SCAN t USING COVERING INDEX <name>` (matching sqlite).
+  Conservative: any WHERE/GROUP BY/HAVING/DISTINCT/join, a WITHOUT ROWID table,
+  or zero/multiple candidate indexes falls back to the plain table scan.
+
 - **`json_pretty(X [, indent])`** -- reformats JSON with indentation (default 4
   spaces; empty arrays/objects and scalars stay compact), byte-compatible with
   sqlite3.
