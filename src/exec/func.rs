@@ -183,6 +183,12 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 v.get(2).cloned().unwrap_or(Value::Null)
             }
         }
+        // The SQLite release graphitesql tracks and writes into new file headers
+        // (`SQLITE_VERSION_NUMBER` 3_053_002 = 3.53.2).
+        "sqlite_version" => {
+            arity(&lname, args, 0)?;
+            Value::Text(crate::TARGET_SQLITE_VERSION.into())
+        }
         "zeroblob" => {
             arity(&lname, args, 1)?;
             match &v[0] {

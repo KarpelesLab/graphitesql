@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **`sqlite_version()`** scalar function -- returns the SQLite release graphitesql
+  tracks and writes into new file headers (`3.53.2`).
 - **`UPDATE OR IGNORE/REPLACE/ABORT/ROLLBACK/FAIL`** conflict clauses are now
   parsed and honored: `OR IGNORE` skips a row whose update would violate a
   UNIQUE/NOT NULL/CHECK constraint, `OR REPLACE` deletes the conflicting rows

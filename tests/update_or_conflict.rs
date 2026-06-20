@@ -30,7 +30,10 @@ fn pairs(c: &Connection) -> Vec<(i64, i64)> {
 fn or_ignore_skips_conflicting_row() {
     let mut c = setup();
     // Setting u=20 collides with row 2; OR IGNORE leaves everything unchanged.
-    assert_eq!(c.execute("UPDATE OR IGNORE t SET u=20 WHERE a=1").unwrap(), 0);
+    assert_eq!(
+        c.execute("UPDATE OR IGNORE t SET u=20 WHERE a=1").unwrap(),
+        0
+    );
     assert_eq!(pairs(&c), [(1, 10), (2, 20), (3, 30)]);
 }
 
@@ -48,7 +51,8 @@ fn or_ignore_skips_not_null_violation() {
     c.execute("CREATE TABLE n(a INTEGER PRIMARY KEY, b NOT NULL)")
         .unwrap();
     c.execute("INSERT INTO n VALUES(1,'x'),(2,'y')").unwrap();
-    c.execute("UPDATE OR IGNORE n SET b=NULL WHERE a=1").unwrap();
+    c.execute("UPDATE OR IGNORE n SET b=NULL WHERE a=1")
+        .unwrap();
     assert_eq!(
         c.query("SELECT b FROM n WHERE a=1").unwrap().rows[0][0],
         Value::Text("x".into())
@@ -60,7 +64,9 @@ fn default_and_or_abort_still_error_on_conflict() {
     let mut c = setup();
     assert!(c.execute("UPDATE t SET u=20 WHERE a=1").is_err());
     assert!(c.execute("UPDATE OR ABORT t SET u=20 WHERE a=1").is_err());
-    assert!(c.execute("UPDATE OR ROLLBACK t SET u=20 WHERE a=1").is_err());
+    assert!(c
+        .execute("UPDATE OR ROLLBACK t SET u=20 WHERE a=1")
+        .is_err());
     // Nothing changed.
     assert_eq!(pairs(&c), [(1, 10), (2, 20), (3, 30)]);
 }
