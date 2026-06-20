@@ -5295,6 +5295,21 @@ impl Connection {
                 }
                 Ok((columns, rows))
             }
+            // `pragma_<name>(arg)` is the table-valued form of a PRAGMA, usable in
+            // a FROM clause (e.g. `SELECT name FROM pragma_table_info('t')`).
+            pragma if pragma.starts_with("pragma_") => {
+                let p = Pragma {
+                    name: String::from(&pragma["pragma_".len()..]),
+                    value: args.first().cloned(),
+                };
+                let result = self.run_pragma(&p)?;
+                let columns = result
+                    .columns
+                    .iter()
+                    .map(|n| col(n, eval::Affinity::Blob))
+                    .collect();
+                Ok((columns, result.rows))
+            }
             _ => Err(Error::Error(format!(
                 "no such table-valued function: {}",
                 tref.name

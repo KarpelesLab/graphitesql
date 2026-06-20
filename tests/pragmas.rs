@@ -171,3 +171,47 @@ fn writable_user_version_and_application_id_persist() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn pragma_table_valued_functions() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let setup = "CREATE TABLE t(a INT, b TEXT, c INT); CREATE INDEX it ON t(a,c);";
+    let path = std::env::temp_dir().join(format!("gsql-ptvf-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    Command::new("sqlite3")
+        .arg(&path)
+        .arg(setup)
+        .output()
+        .unwrap();
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+    let queries = [
+        "SELECT group_concat(name) FROM pragma_table_info('t')",
+        "SELECT count(*) FROM pragma_index_info('it')",
+        "SELECT count(*) FROM pragma_index_xinfo('it')",
+        "SELECT name FROM pragma_table_info('t') WHERE pk = 0 ORDER BY cid",
+        "SELECT name, type FROM pragma_table_xinfo('t') ORDER BY cid",
+        "SELECT count(*) FROM pragma_index_list('t')",
+    ];
+    for q in queries {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(&path)
+                .arg(format!("{q};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = rows_str(&g, q);
+        assert_eq!(got, want, "pragma TVF diverged: {q}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
