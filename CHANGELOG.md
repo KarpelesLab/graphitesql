@@ -119,7 +119,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   folds each slot (counting rows for `count(*)`, collecting non-NULL arguments
   otherwise) and a single `ResultRow` emits the finalized values, reproducing the
   tree-walker's exact semantics (integer-`sum` overflow promotes to real, empty
-  group yields 0/NULL per function).
+  group yields 0/NULL per function). `GROUP BY <columns>` over a single table
+  compiles to `GroupStep`/`GroupEmit`: the scan folds per-group accumulators
+  (groups kept in first-seen order, NULLs grouping together, matching the
+  tree-walker) and one row per group is emitted, where each output column is
+  either a grouping-key value or a finalized aggregate. `HAVING`/`ORDER BY`/
+  non-grouped output expressions fall back to the tree-walker.
 - Track B: `ANALYZE` and cost-based index selection. `ANALYZE [name]` gathers
   index selectivity into a `sqlite_stat1(tbl,idx,stat)` table, byte-compatible
   with SQLite's `nRow avgEq1 avgEq2 …` format (`avgEqK = (nRow + dK/2)/dK`);

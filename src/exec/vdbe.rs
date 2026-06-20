@@ -126,8 +126,42 @@ pub enum Op {
         kind: AggKind,
         dest: usize,
     },
+    /// `GROUP BY` fold: find-or-create the group for the key in `[key_start,
+    /// key_start+key_count)` (first-seen order, NULLs group together) and step
+    /// each per-group aggregate.
+    GroupStep {
+        key_start: usize,
+        key_count: usize,
+        aggs: Vec<AggSpec>,
+    },
+    /// Emit one row per group (in first-seen order): each output is either a
+    /// group-key value or a finalized per-group aggregate.
+    GroupEmit {
+        outputs: Vec<GroupOut>,
+        agg_kinds: Vec<AggKind>,
+    },
     /// Stop execution.
     Halt,
+}
+
+/// One per-group aggregate in a [`Op::GroupStep`]: its function and the register
+/// holding the (already-evaluated) argument (`None` for `count(*)`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggSpec {
+    /// Which aggregate to fold.
+    pub kind: AggKind,
+    /// Argument register, or `None` for `count(*)`.
+    pub arg: Option<usize>,
+}
+
+/// One output column of a [`Op::GroupEmit`]: a group-key value (by key index) or
+/// a finalized aggregate (by slot index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupOut {
+    /// The group-key value at this index.
+    Key(usize),
+    /// The finalized aggregate at this slot.
+    Agg(usize),
 }
 
 /// The aggregate functions the VDBE can fold over a single-table scan.
@@ -153,6 +187,12 @@ pub struct SortKey {
     /// Explicit `NULLS FIRST`/`LAST`; `None` uses SQLite's default.
     pub nulls_first: Option<bool>,
 }
+
+/// One aggregate accumulator: collected non-NULL argument values plus a row
+/// counter (used by `count(*)`).
+type AggAcc = (Vec<Value>, i64);
+/// One `GROUP BY` group: its key values and one accumulator per aggregate slot.
+type Group = (Vec<Value>, Vec<AggAcc>);
 
 /// A compiled VDBE program: the instruction stream and the register-file size.
 #[derive(Debug, Clone, PartialEq)]
@@ -337,12 +377,138 @@ fn compile_aggregate_select(
     })
 }
 
+/// Compile `SELECT <group cols / aggregates> FROM <table> [WHERE …] GROUP BY
+/// <cols>`: each grouping key must be a bare column, and every output column must
+/// be either one of those grouping columns or an aggregate call. The scan folds
+/// per-group aggregates (first-seen group order), then `GroupEmit` produces one
+/// row per group. `HAVING`/`ORDER BY`/`DISTINCT`/`LIMIT`/`OFFSET` fall back.
+fn compile_group_select(
+    sel: &Select,
+    columns: &[String],
+    projections: &[(Expr, String)],
+) -> Result<Program> {
+    if sel.having.is_some()
+        || !sel.order_by.is_empty()
+        || sel.distinct
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+    {
+        return Err(Error::Unsupported("VDBE: plain GROUP BY only"));
+    }
+    // Resolve each grouping key to a table column index.
+    let col_index = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
+    let mut group_cols: Vec<usize> = Vec::new();
+    for g in &sel.group_by {
+        match g {
+            Expr::Column { column, .. } => match col_index(column) {
+                Some(i) => group_cols.push(i),
+                None => return Err(Error::Unsupported("VDBE: GROUP BY unknown column")),
+            },
+            _ => return Err(Error::Unsupported("VDBE: GROUP BY column refs only")),
+        }
+    }
+    // Classify each output column as a grouping-key reference or an aggregate.
+    let mut outputs: Vec<GroupOut> = Vec::new();
+    let mut agg_specs: Vec<(AggKind, Option<Expr>)> = Vec::new();
+    for (e, _) in projections {
+        if is_aggregate_expr(e) {
+            match agg_kind(e) {
+                Some(spec) => {
+                    outputs.push(GroupOut::Agg(agg_specs.len()));
+                    agg_specs.push(spec);
+                }
+                None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
+            }
+        } else if let Expr::Column { column, .. } = e {
+            // Must be one of the grouping columns (by table-column index).
+            match col_index(column).and_then(|ci| group_cols.iter().position(|&g| g == ci)) {
+                Some(k) => outputs.push(GroupOut::Key(k)),
+                None => return Err(Error::Unsupported("VDBE: non-grouped column")),
+            }
+        } else {
+            return Err(Error::Unsupported(
+                "VDBE: GROUP BY output must be key or aggregate",
+            ));
+        }
+    }
+
+    let mut c = Compiler {
+        ops: Vec::new(),
+        next_reg: 0,
+        columns: columns.to_vec(),
+    };
+    // Contiguous key registers, loaded per row from the grouping columns.
+    let key_start = c.next_reg;
+    for _ in &group_cols {
+        c.alloc();
+    }
+    let rewind = c.ops.len();
+    c.ops.push(Op::Rewind { target: 0 });
+    let body = c.ops.len();
+    let skip = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    for (k, &ci) in group_cols.iter().enumerate() {
+        c.ops.push(Op::Column {
+            col: ci,
+            dest: key_start + k,
+        });
+    }
+    // Evaluate each aggregate argument into a register for this row.
+    let mut aggs: Vec<AggSpec> = Vec::new();
+    for (kind, arg) in &agg_specs {
+        let arg_reg = match arg {
+            Some(expr) => Some(c.compile_expr(expr)?),
+            None => None,
+        };
+        aggs.push(AggSpec {
+            kind: *kind,
+            arg: arg_reg,
+        });
+    }
+    c.ops.push(Op::GroupStep {
+        key_start,
+        key_count: group_cols.len(),
+        aggs,
+    });
+    let next = c.ops.len();
+    c.ops.push(Op::Next { target: body });
+    if let Some(at) = skip {
+        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = next;
+        }
+    }
+    let end = c.ops.len();
+    if let Op::Rewind { target } = &mut c.ops[rewind] {
+        *target = end;
+    }
+    c.ops.push(Op::GroupEmit {
+        outputs,
+        agg_kinds: agg_specs.iter().map(|(k, _)| *k).collect(),
+    });
+    c.ops.push(Op::Halt);
+    Ok(Program {
+        ops: c.ops,
+        n_registers: c.next_reg,
+        columns: projections.iter().map(|(_, l)| l.clone()).collect(),
+    })
+}
+
 /// Compile `SELECT <projection> FROM <single table>` (no `WHERE`/joins/aggregates/
 /// `ORDER BY`) into a program that scans the table via cursor ops. `columns` are
 /// the table's column names, used to resolve column references to indices.
 /// Returns `Unsupported` outside this grammar so the caller can fall back.
 pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program> {
-    if !sel.group_by.is_empty() || !sel.compound.is_empty() {
+    if !sel.compound.is_empty() {
         return Err(Error::Unsupported("VDBE: only plain table projections"));
     }
     // Expand the projection list to concrete expressions/labels (supporting `*`).
@@ -374,6 +540,10 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
     }
     if projections.is_empty() {
         return Err(Error::Unsupported("VDBE: empty projection"));
+    }
+    // GROUP BY folds the scan into one row per group.
+    if !sel.group_by.is_empty() {
+        return compile_group_select(sel, columns, &projections);
     }
     // An all-aggregate projection (no GROUP BY) folds the scan into one row.
     if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
@@ -844,7 +1014,10 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
     let mut seen: Vec<Vec<Value>> = Vec::new();
     // Aggregate accumulators, one per slot: `(collected non-NULL values, row
     // count for count(*))`.
-    let mut agg: Vec<(Vec<Value>, i64)> = Vec::new();
+    let mut agg: Vec<AggAcc> = Vec::new();
+    // GROUP BY state: each group is `(key values, per-aggregate accumulators)`,
+    // kept in first-seen order.
+    let mut groups: Vec<Group> = Vec::new();
     let mut pc = 0usize;
     while pc < program.ops.len() {
         let op = &program.ops[pc];
@@ -1036,6 +1209,49 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                     None => (Vec::new(), 0),
                 };
                 regs[*dest] = finalize_agg(*kind, vals, star);
+            }
+            Op::GroupStep {
+                key_start,
+                key_count,
+                aggs,
+            } => {
+                let key = regs[*key_start..*key_start + *key_count].to_vec();
+                let gi = match groups.iter().position(|(k, _)| {
+                    k.len() == key.len() && k.iter().zip(&key).all(|(a, b)| distinct_eq(a, b))
+                }) {
+                    Some(i) => i,
+                    None => {
+                        groups.push((key, alloc::vec![(Vec::new(), 0); aggs.len()]));
+                        groups.len() - 1
+                    }
+                };
+                for (j, spec) in aggs.iter().enumerate() {
+                    if spec.kind == AggKind::CountStar {
+                        groups[gi].1[j].1 += 1;
+                    } else if let Some(r) = spec.arg {
+                        if !matches!(regs[r], Value::Null) {
+                            let v = regs[r].clone();
+                            groups[gi].1[j].0.push(v);
+                        }
+                    }
+                }
+            }
+            Op::GroupEmit { outputs, agg_kinds } => {
+                for (key, accs) in groups.drain(..) {
+                    let finals: Vec<Value> = agg_kinds
+                        .iter()
+                        .zip(accs)
+                        .map(|(k, (vals, star))| finalize_agg(*k, vals, star))
+                        .collect();
+                    let row: Vec<Value> = outputs
+                        .iter()
+                        .map(|o| match o {
+                            GroupOut::Key(i) => key[*i].clone(),
+                            GroupOut::Agg(j) => finals[*j].clone(),
+                        })
+                        .collect();
+                    out.push(row);
+                }
             }
             Op::Halt => break,
         }

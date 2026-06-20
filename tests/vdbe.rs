@@ -132,6 +132,13 @@ fn table_scan_matches_tree_walker() {
         "SELECT sum(a * 2), avg(a + 1) FROM t",
         "SELECT group_concat(b) FROM t",
         "SELECT count(*), min(a) FROM t WHERE b = 'nope'",
+        "SELECT a, count(*) FROM t GROUP BY a",
+        "SELECT a, count(*), sum(a) FROM t GROUP BY a",
+        "SELECT b, count(*) FROM t GROUP BY b",
+        "SELECT a, b, count(*) FROM t GROUP BY a, b",
+        "SELECT count(*), a FROM t GROUP BY a",
+        "SELECT a, max(b), min(b) FROM t WHERE a >= 1 GROUP BY a",
+        "SELECT a, group_concat(b) FROM t GROUP BY a",
     ] {
         assert_eq!(
             c.query_vdbe(q).unwrap().rows,

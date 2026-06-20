@@ -177,8 +177,9 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
   `IfFalse` + `DecrJumpZero` + `IfPosDecr`) wired into the engine via
   `Connection::query_vdbe` — all running alongside the tree-walker with matching
   results, plus whole-table aggregates (`count`/`sum`/`total`/`avg`/`min`/`max`/
-  `group_concat` via `AggStep`/`AggFinal`, no `GROUP BY`). *Remaining:* joins,
-  and `GROUP BY` aggregates on the VDBE,
+  `group_concat` via `AggStep`/`AggFinal`) and single-table `GROUP BY`
+  (`GroupStep`/`GroupEmit`, first-seen group order). *Remaining:* joins on the
+  VDBE, then `HAVING`/aggregate-`ORDER BY` on the grouped path,
   then migrate the executor onto it; then **real `EXPLAIN`** (the `addr/opcode/p1…`
   listing) byte-comparable to SQLite's, and query flattening / subquery
   co-routines. *Ref:* `vdbe.c`, `vdbeaux.c`, `opcodes.h`.
