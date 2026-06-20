@@ -239,3 +239,29 @@ fn min_max_use_argument_collation() {
     // A BINARY column compares by code point.
     assert_eq!(rows_str(&c, "SELECT max(b), min(b) FROM t"), "xyz|XYZ");
 }
+
+#[test]
+fn between_and_case_use_collation() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a TEXT COLLATE NOCASE)").unwrap();
+    c.execute("INSERT INTO t VALUES('Apple'),('BANANA'),('cherry')")
+        .unwrap();
+    // BETWEEN compares under the column's NOCASE collation.
+    assert_eq!(
+        rows_str(&c, "SELECT a FROM t WHERE a BETWEEN 'a' AND 'c' ORDER BY a"),
+        "Apple\nBANANA"
+    );
+    // CASE x WHEN y compares under x's collation.
+    assert_eq!(
+        rows_str(
+            &c,
+            "SELECT CASE a WHEN 'apple' THEN 'fruit' ELSE 'other' END FROM t WHERE a='Apple'"
+        ),
+        "fruit"
+    );
+    // A plain (BINARY) operand is unaffected.
+    assert_eq!(
+        rows_str(&c, "SELECT CASE 'x' WHEN 'X' THEN 1 ELSE 0 END"),
+        "0"
+    );
+}

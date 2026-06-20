@@ -497,8 +497,16 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             if matches!(v, Value::Null) {
                 return Ok(Value::Null);
             }
-            let ge = matches!(compare(&v, &lo), Ordering::Greater | Ordering::Equal);
-            let le = matches!(compare(&v, &hi), Ordering::Less | Ordering::Equal);
+            // Both bounds compare under the left operand's collation, as in SQLite.
+            let coll = key_collation(expr, ctx);
+            let ge = matches!(
+                crate::value::cmp_values_coll(&v, &lo, coll),
+                Ordering::Greater | Ordering::Equal
+            );
+            let le = matches!(
+                crate::value::cmp_values_coll(&v, &hi, coll),
+                Ordering::Less | Ordering::Equal
+            );
             let within = ge && le;
             Ok(bool_value(within != *negated))
         }
@@ -811,6 +819,8 @@ fn eval_case(
         Some(e) => Some(eval(e, ctx)?),
         None => None,
     };
+    // `CASE x WHEN y …` compares under x's collation (e.g. a NOCASE column).
+    let base_coll = operand.map(|e| key_collation(e, ctx)).unwrap_or_default();
     for (when, then) in when_then {
         let matched = match &base {
             // `CASE x WHEN y` matches when x = y.
@@ -818,7 +828,7 @@ fn eval_case(
                 let w = eval(when, ctx)?;
                 !matches!(b, Value::Null)
                     && !matches!(w, Value::Null)
-                    && compare(b, &w) == Ordering::Equal
+                    && crate::value::cmp_values_coll(b, &w, base_coll) == Ordering::Equal
             }
             // `CASE WHEN cond` matches when cond is true.
             None => truth(&eval(when, ctx)?) == Some(true),
