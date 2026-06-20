@@ -1043,7 +1043,13 @@ pub fn cast(v: Value, type_name: &str) -> Value {
         v
     };
     if aff.contains("INT") {
-        Value::Integer(to_i64(&v))
+        // CAST to INTEGER takes the leading *integer* prefix of text (stopping at
+        // a `.` or exponent), unlike numeric coercion which reads the whole float:
+        // `CAST('2e2' AS INTEGER)` is 2, not 200, and `CAST('2.9' AS INTEGER)` is 2.
+        Value::Integer(match &v {
+            Value::Text(s) => parse_int_prefix(s),
+            _ => to_i64(&v),
+        })
     } else if aff.contains("CHAR") || aff.contains("CLOB") || aff.contains("TEXT") {
         Value::Text(to_text(&v))
     } else if aff.contains("REAL") || aff.contains("FLOA") || aff.contains("DOUB") {
@@ -1119,6 +1125,56 @@ pub(crate) fn parse_decimal_f64(t: &str) -> Option<f64> {
     }
 }
 
+/// Parse the leading signed-integer prefix of `s` the way SQLite's
+/// `sqlite3Atoi64` does for `CAST(text AS INTEGER)`: skip leading ASCII
+/// whitespace, an optional sign, then decimal digits only — stopping at the
+/// first non-digit (so `.`/`e`/letters end it). No digits yields 0; overflow
+/// saturates to `i64::MIN`/`i64::MAX`.
+fn parse_int_prefix(s: &str) -> i64 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let neg = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let start = i;
+    // Accumulate as a negative magnitude so `i64::MIN` is representable exactly.
+    let mut acc: i64 = 0;
+    let mut overflow = false;
+    while i < b.len() && b[i].is_ascii_digit() {
+        let d = (b[i] - b'0') as i64;
+        match acc.checked_mul(10).and_then(|x| x.checked_sub(d)) {
+            Some(v) => acc = v,
+            None => {
+                overflow = true;
+                break;
+            }
+        }
+        i += 1;
+    }
+    if i == start {
+        return 0;
+    }
+    if overflow {
+        return if neg { i64::MIN } else { i64::MAX };
+    }
+    if neg {
+        acc
+    } else {
+        acc.checked_neg().unwrap_or(i64::MAX)
+    }
+}
+
 fn parse_number(s: &str) -> Value {
     let t = s.trim();
     if let Ok(i) = t.parse::<i64>() {
@@ -1127,7 +1183,8 @@ fn parse_number(s: &str) -> Value {
     if let Some(f) = parse_decimal_f64(t) {
         return Value::Real(f);
     }
-    // SQLite uses the longest valid numeric prefix; approximate that.
+    // SQLite uses the longest valid numeric prefix; approximate that, including a
+    // trailing exponent so `'3.5e2xyz'` reads `3.5e2` (350.0), not `3.5`.
     let mut end = 0;
     let bytes = t.as_bytes();
     let mut seen_dot = false;
@@ -1136,14 +1193,30 @@ fn parse_number(s: &str) -> Value {
         let c = bytes[end];
         if c.is_ascii_digit() {
             seen_digit = true;
+            end += 1;
         } else if c == b'.' && !seen_dot {
             seen_dot = true;
+            end += 1;
         } else if (c == b'-' || c == b'+') && end == 0 {
             // leading sign ok
+            end += 1;
+        } else if (c == b'e' || c == b'E') && seen_digit {
+            // An exponent `[eE][+-]?digit+` extends (and ends) the number. If no
+            // digit follows, the `e` is trailing junk and the prefix stops here.
+            let mut k = end + 1;
+            if k < bytes.len() && (bytes[k] == b'+' || bytes[k] == b'-') {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k].is_ascii_digit() {
+                while k < bytes.len() && bytes[k].is_ascii_digit() {
+                    k += 1;
+                }
+                end = k;
+            }
+            break;
         } else {
             break;
         }
-        end += 1;
     }
     if !seen_digit {
         return Value::Integer(0);

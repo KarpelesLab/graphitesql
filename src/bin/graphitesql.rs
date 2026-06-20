@@ -211,14 +211,11 @@ fn render_value(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
-        Value::Real(r) => {
-            // Mirror SQLite's whole-number rendering (`2.0`, not `2`).
-            if *r == r.trunc() && r.is_finite() {
-                format!("{r:.1}")
-            } else {
-                format!("{r}")
-            }
-        }
+        // Use the engine's canonical real rendering (15 significant digits with
+        // `%g`-style fixed/exponential switching, `Inf`/`-Inf`, `0.0` for zero) so
+        // the shell matches the `sqlite3` CLI for large/small/special magnitudes —
+        // e.g. `1e18` -> `1.0e+18`, `1e400` -> `Inf`, `-0.0` -> `0.0`.
+        Value::Real(r) => graphitesql::exec::eval::format_real(*r),
         Value::Text(s) => s.clone(),
         Value::Blob(b) => {
             let mut s = String::with_capacity(b.len() * 2);
