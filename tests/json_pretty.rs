@@ -25,7 +25,10 @@ fn pretty_default_four_space_indent() {
 #[test]
 fn pretty_custom_indent_and_compact_cases() {
     let c = Connection::open_memory().unwrap();
-    assert_eq!(text(&c, "SELECT json_pretty('{\"a\":1}', '  ')"), "{\n  \"a\": 1\n}");
+    assert_eq!(
+        text(&c, "SELECT json_pretty('{\"a\":1}', '  ')"),
+        "{\n  \"a\": 1\n}"
+    );
     // Empty containers and scalars stay on one line.
     assert_eq!(text(&c, "SELECT json_pretty('[]')"), "[]");
     assert_eq!(text(&c, "SELECT json_pretty('{}')"), "{}");
