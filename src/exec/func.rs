@@ -477,9 +477,11 @@ fn quote_value(v: &Value) -> String {
         Value::Real(r) => eval::format_real(*r),
         Value::Text(s) => alloc::format!("'{}'", s.replace('\'', "''")),
         Value::Blob(b) => {
-            let mut s = String::from("x'");
+            // SQLite renders blob literals as `X'ABCD'` — uppercase `X` and
+            // uppercase hex digits.
+            let mut s = String::from("X'");
             for byte in b {
-                s.push_str(&alloc::format!("{byte:02x}"));
+                s.push_str(&alloc::format!("{byte:02X}"));
             }
             s.push('\'');
             s

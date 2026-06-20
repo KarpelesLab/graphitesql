@@ -974,7 +974,15 @@ pub fn cast(v: Value, type_name: &str) -> Value {
             Value::Null => Value::Null,
             other => Value::Real(number_as_f64(&to_number(&other))),
         }
-    } else if aff.contains("BLOB") || aff.is_empty() {
+    } else if aff.contains("BLOB") {
+        // CAST to BLOB: the value becomes a blob of the bytes of its text form
+        // (an existing blob is unchanged). Matches SQLite, e.g. `65` -> X'3635'.
+        match v {
+            Value::Blob(_) => v,
+            other => Value::Blob(to_text(&other).into_bytes()),
+        }
+    } else if aff.is_empty() {
+        // A type name with no affinity keyword leaves the value unchanged.
         v
     } else {
         // NUMERIC affinity: prefer integer if exact, else real.
