@@ -262,6 +262,108 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 _ => Value::Null,
             }
         }
+        // JSON functions (see `super::json`).
+        "json" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => {
+                    let text = eval::to_text(other);
+                    match super::json::parse(&text) {
+                        Some(j) => Value::Text(j.serialize()),
+                        None => return Err(Error::Error("malformed JSON".into())),
+                    }
+                }
+            }
+        }
+        "json_valid" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => {
+                    let ok = super::json::parse(&eval::to_text(other)).is_some();
+                    Value::Integer(ok as i64)
+                }
+            }
+        }
+        "json_quote" => {
+            arity(&lname, args, 1)?;
+            Value::Text(super::json::value_to_json(&v[0]).serialize())
+        }
+        "json_type" => {
+            if v.is_empty() || v.len() > 2 {
+                return Err(Error::Error("json_type() takes 1 or 2 arguments".into()));
+            }
+            match json_root(&v[0])? {
+                None => Value::Null,
+                Some(root) => {
+                    let target = if v.len() == 2 {
+                        super::json::navigate(&root, &eval::to_text(&v[1]))
+                    } else {
+                        Some(&root)
+                    };
+                    match target {
+                        Some(j) => Value::Text(String::from(j.type_name())),
+                        None => Value::Null,
+                    }
+                }
+            }
+        }
+        "json_array_length" => {
+            if v.is_empty() || v.len() > 2 {
+                return Err(Error::Error(
+                    "json_array_length() takes 1 or 2 arguments".into(),
+                ));
+            }
+            match json_root(&v[0])? {
+                None => Value::Null,
+                Some(root) => {
+                    let target = if v.len() == 2 {
+                        super::json::navigate(&root, &eval::to_text(&v[1]))
+                    } else {
+                        Some(&root)
+                    };
+                    match target {
+                        Some(super::json::Json::Array(items)) => Value::Integer(items.len() as i64),
+                        Some(_) => Value::Integer(0),
+                        None => Value::Null,
+                    }
+                }
+            }
+        }
+        "json_extract" => {
+            if v.len() < 2 {
+                return Err(Error::Error(
+                    "json_extract() requires at least 2 arguments".into(),
+                ));
+            }
+            match json_root(&v[0])? {
+                None => Value::Null,
+                Some(root) => json_extract(&root, &v[1..]),
+            }
+        }
+        "json_array" => {
+            let mut items = Vec::with_capacity(v.len());
+            for (i, val) in v.iter().enumerate() {
+                items.push(arg_to_json(val, args.get(i)));
+            }
+            Value::Text(super::json::Json::Array(items).serialize())
+        }
+        "json_object" => {
+            if !v.len().is_multiple_of(2) {
+                return Err(Error::Error(
+                    "json_object() requires an even number of arguments".into(),
+                ));
+            }
+            let mut members = Vec::with_capacity(v.len() / 2);
+            for pair in v.chunks(2).enumerate() {
+                let (i, kv) = pair;
+                let key = eval::to_text(&kv[0]);
+                let val = arg_to_json(&kv[1], args.get(2 * i + 1));
+                members.push((key, val));
+            }
+            Value::Text(super::json::Json::Object(members).serialize())
+        }
         // Date/time functions (see `super::datetime`).
         "date" => super::datetime::date(&v),
         "time" => super::datetime::time(&v),
@@ -360,6 +462,72 @@ fn math1(name: &str, v: &[Value], f: impl Fn(f64) -> f64) -> Result<Value> {
         )));
     }
     Ok(math_finite(real_arg(&v[0]).map(f)))
+}
+
+/// Parse the first argument of a JSON function as a document: `NULL` → `None`;
+/// malformed JSON is an error (matching SQLite).
+fn json_root(v: &Value) -> Result<Option<super::json::Json>> {
+    match v {
+        Value::Null => Ok(None),
+        other => match super::json::parse(&eval::to_text(other)) {
+            Some(j) => Ok(Some(j)),
+            None => Err(Error::Error("malformed JSON".into())),
+        },
+    }
+}
+
+/// `json_extract`: one path returns the SQL value at that path (objects/arrays as
+/// minified JSON text); multiple paths return a JSON array of the extracted
+/// elements (missing paths become JSON `null`).
+fn json_extract(root: &super::json::Json, paths: &[Value]) -> Value {
+    if paths.len() == 1 {
+        return match super::json::navigate(root, &eval::to_text(&paths[0])) {
+            Some(j) => j.to_sql(),
+            None => Value::Null,
+        };
+    }
+    let items = paths
+        .iter()
+        .map(|p| match super::json::navigate(root, &eval::to_text(p)) {
+            Some(j) => j.clone(),
+            None => super::json::Json::Null,
+        })
+        .collect();
+    Value::Text(super::json::Json::Array(items).serialize())
+}
+
+/// Convert a constructor argument to JSON. If the source expression is itself a
+/// JSON-producing call (`json`, `json_array`, `json_object`), its text value is
+/// embedded as parsed JSON — mirroring SQLite's JSON subtype propagation — rather
+/// than quoted as a string.
+fn arg_to_json(val: &Value, expr: Option<&Expr>) -> super::json::Json {
+    if let (Value::Text(s), Some(e)) = (val, expr) {
+        if produces_json(e) {
+            if let Some(j) = super::json::parse(s) {
+                return j;
+            }
+        }
+    }
+    super::json::value_to_json(val)
+}
+
+/// Whether an expression yields a value carrying SQLite's JSON subtype.
+fn produces_json(e: &Expr) -> bool {
+    match e {
+        Expr::Function { name, .. } => matches!(
+            name.to_ascii_lowercase().as_str(),
+            "json"
+                | "json_array"
+                | "json_object"
+                | "json_insert"
+                | "json_replace"
+                | "json_set"
+                | "json_patch"
+                | "json_remove"
+        ),
+        Expr::Paren(inner) => produces_json(inner),
+        _ => false,
+    }
 }
 
 fn type_name(v: &Value) -> &'static str {

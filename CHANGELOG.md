@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: SQLite JSON functions — `json`, `json_valid`, `json_quote`,
+  `json_type`, `json_array_length`, `json_extract`, `json_array`, `json_object`.
+  Includes a pure-`core` RFC-8259 parser/serializer and `$`/`.key`/`[n]` path
+  navigation; JSON scalars map back to SQL values (`true`/`false`→1/0,
+  `null`→NULL), objects/arrays return minified JSON text, and nested
+  `json_array`/`json_object` calls embed as JSON (subtype propagation by call
+  origin). Verified against `sqlite3`. (Mutators `json_set`/`json_remove`/…, the
+  `->`/`->>` operators, and `json_each`/`json_tree` are not yet implemented.)
 - Track A: SQLite math functions — `pi`, `sqrt`, `exp`, `ln`, `log`/`log10`/
   `log2`, `pow`/`power`, `mod`, `ceil`/`ceiling`, `floor`, `trunc`, `sin`/`cos`/
   `tan`, `asin`/`acos`/`atan`/`atan2`, `sinh`/`cosh`/`tanh`,
