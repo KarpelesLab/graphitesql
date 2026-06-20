@@ -3025,12 +3025,17 @@ impl Connection {
                     .ok_or(Error::Unsupported(
                         "ORDER BY term must be an output column in a compound query",
                     ))?;
-                keys.push((idx, term.descending));
+                keys.push((idx, term.descending, term.nulls_first));
             }
             result.rows.sort_by(|a, b| {
-                for (idx, desc) in &keys {
-                    let ord = eval::compare(&a[*idx], &b[*idx]);
-                    let ord = if *desc { ord.reverse() } else { ord };
+                for (idx, desc, nf) in &keys {
+                    let ord = cmp_order(
+                        &a[*idx],
+                        &b[*idx],
+                        *desc,
+                        *nf,
+                        crate::value::Collation::Binary,
+                    );
                     if ord != core::cmp::Ordering::Equal {
                         return ord;
                     }
@@ -3390,9 +3395,13 @@ impl Connection {
             // Stable sort by the precomputed sort keys, each under its collation.
             out.sort_by(|a, b| {
                 for (i, term) in sel.order_by.iter().enumerate() {
-                    let ord =
-                        crate::value::cmp_values_coll(&a.sort_keys[i], &b.sort_keys[i], colls[i]);
-                    let ord = if term.descending { ord.reverse() } else { ord };
+                    let ord = cmp_order(
+                        &a.sort_keys[i],
+                        &b.sort_keys[i],
+                        term.descending,
+                        term.nulls_first,
+                        colls[i],
+                    );
                     if ord != core::cmp::Ordering::Equal {
                         return ord;
                     }
@@ -4668,15 +4677,60 @@ fn references_name_select(select: &Select, name: &str) -> bool {
 fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for (i, (x, y)) in a.iter().zip(b).enumerate() {
-        let mut o = eval::compare(x, y);
-        if desc.get(i).copied().unwrap_or(false) {
-            o = o.reverse();
-        }
+        let o = cmp_order(
+            x,
+            y,
+            desc.get(i).copied().unwrap_or(false),
+            None,
+            crate::value::Collation::Binary,
+        );
         if o != Ordering::Equal {
             return o;
         }
     }
     Ordering::Equal
+}
+
+/// Compare two `ORDER BY` key values honoring `DESC` and NULL placement. NULL
+/// ordering follows the explicit `NULLS FIRST`/`LAST` when given, else SQLite's
+/// default (NULLs first under `ASC`, last under `DESC`); the non-NULL comparison
+/// uses the column collation and is reversed by `DESC`.
+fn cmp_order(
+    a: &Value,
+    b: &Value,
+    descending: bool,
+    nulls_first: Option<bool>,
+    coll: crate::value::Collation,
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    let a_null = matches!(a, Value::Null);
+    let b_null = matches!(b, Value::Null);
+    let nulls_first = nulls_first.unwrap_or(!descending);
+    match (a_null, b_null) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => {
+            let ord = crate::value::cmp_values_coll(a, b, coll);
+            if descending {
+                ord.reverse()
+            } else {
+                ord
+            }
+        }
+    }
 }
 
 /// The `[start, end)` frame indices (into the ordered partition) for position

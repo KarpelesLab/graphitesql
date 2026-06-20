@@ -226,6 +226,10 @@ pub struct OrderTerm {
     pub expr: Expr,
     /// `DESC`?
     pub descending: bool,
+    /// Explicit `NULLS FIRST` (`Some(true)`) / `NULLS LAST` (`Some(false)`).
+    /// `None` uses SQLite's default: NULLs sort first under `ASC`, last under
+    /// `DESC`.
+    pub nulls_first: Option<bool>,
 }
 
 /// An `INSERT` statement.

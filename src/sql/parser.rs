@@ -493,7 +493,21 @@ impl Parser {
             let _ = self.eat_kw("asc");
             false
         };
-        Ok(OrderTerm { expr, descending })
+        let nulls_first = if self.eat_kw("nulls") {
+            if self.eat_kw("first") {
+                Some(true)
+            } else {
+                self.expect_kw("last")?;
+                Some(false)
+            }
+        } else {
+            None
+        };
+        Ok(OrderTerm {
+            expr,
+            descending,
+            nulls_first,
+        })
     }
 
     fn insert(&mut self) -> Result<Insert> {
@@ -1478,12 +1492,19 @@ impl Parser {
                         negated,
                     });
                 }
+                // `IS [NOT] DISTINCT FROM` is null-aware (in)equality: `IS DISTINCT
+                // FROM` == `IS NOT`, `IS NOT DISTINCT FROM` == `IS`.
+                let distinct = self.eat_kw("distinct");
+                if distinct {
+                    self.expect_kw("from")?;
+                }
                 let right = self.expr_bp(bp + 1)?;
+                let equality = if distinct { negated } else { !negated };
                 Ok(Expr::Binary {
-                    op: if negated {
-                        BinaryOp::IsNot
-                    } else {
+                    op: if equality {
                         BinaryOp::Is
+                    } else {
+                        BinaryOp::IsNot
                     },
                     left: Box::new(left),
                     right: Box::new(right),

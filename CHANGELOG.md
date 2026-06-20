@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: `ORDER BY … NULLS FIRST/LAST` and `IS [NOT] DISTINCT FROM`. NULL
+  placement in sorts is now controllable (default stays SQLite's: NULLs first
+  under `ASC`, last under `DESC`); `IS DISTINCT FROM`/`IS NOT DISTINCT FROM` are
+  the null-aware (in)equality operators. Verified against `sqlite3`.
 - Track C: VFS advisory-locking contract and writer serialization. A new
   `LockState` encodes SQLite's `SHARED`/`RESERVED`/`PENDING`/`EXCLUSIVE`
   compatibility rules; `MemoryVfs` and `StdVfs` now share one lock state per path
