@@ -285,7 +285,19 @@ impl Connection {
                     .into(),
                 ),
             )),
+            "freelist_count" => Ok(single(
+                "freelist_count",
+                Value::Integer(header.freelist_count as i64),
+            )),
+            "application_id" => Ok(single(
+                "application_id",
+                Value::Integer(header.application_id as i64),
+            )),
+            "data_version" => Ok(single("data_version", Value::Integer(1))),
             "table_info" => self.pragma_table_info(p),
+            "index_list" => self.pragma_index_list(p),
+            "index_info" => self.pragma_index_info(p),
+            "foreign_key_list" => self.pragma_foreign_key_list(p),
             "foreign_keys" => Ok(single(
                 "foreign_keys",
                 Value::Integer(self.foreign_keys as i64),
@@ -371,6 +383,160 @@ impl Connection {
                 .iter()
                 .map(|s| String::from(*s))
                 .collect(),
+            rows,
+        })
+    }
+
+    /// The single name argument of a `PRAGMA foo(name)` / `PRAGMA foo = name`.
+    fn pragma_arg_name(p: &Pragma) -> Result<String> {
+        match &p.value {
+            Some(Expr::Column { column, .. }) => Ok(column.clone()),
+            Some(Expr::Literal(Literal::Str(s))) => Ok(s.clone()),
+            _ => Err(Error::Error("PRAGMA requires a name argument".into())),
+        }
+    }
+
+    /// `PRAGMA index_list(table)` → `(seq, name, unique, origin, partial)`, newest
+    /// index first (as SQLite lists them).
+    fn pragma_index_list(&self, p: &Pragma) -> Result<QueryResult> {
+        let table = Self::pragma_arg_name(p)?;
+        let objs: Vec<_> = self.schema.indexes_on(&table).collect();
+        let mut rows = Vec::new();
+        for (seq, obj) in objs.iter().rev().enumerate() {
+            let (unique, origin, partial) = match &obj.sql {
+                Some(sql) => match sql::parse_one(sql) {
+                    Ok(Statement::CreateIndex(ci)) => {
+                        (ci.unique as i64, "c", ci.where_clause.is_some() as i64)
+                    }
+                    _ => (0, "c", 0),
+                },
+                None => (1, "u", 0), // an automatic UNIQUE/PK index
+            };
+            rows.push(alloc::vec![
+                Value::Integer(seq as i64),
+                Value::Text(obj.name.clone()),
+                Value::Integer(unique),
+                Value::Text(origin.into()),
+                Value::Integer(partial),
+            ]);
+        }
+        Ok(QueryResult {
+            columns: ["seq", "name", "unique", "origin", "partial"]
+                .iter()
+                .map(|s| String::from(*s))
+                .collect(),
+            rows,
+        })
+    }
+
+    /// `PRAGMA index_info(index)` → `(seqno, cid, name)` for each indexed column.
+    fn pragma_index_info(&self, p: &Pragma) -> Result<QueryResult> {
+        let index = Self::pragma_arg_name(p)?;
+        let obj = self
+            .schema
+            .index(&index)
+            .ok_or_else(|| Error::Error(format!("no such index: {index}")))?;
+        let tmeta = self.table_meta(&obj.tbl_name, None)?;
+        let cols: Vec<usize> = match &obj.sql {
+            Some(sql) => match sql::parse_one(sql)? {
+                Statement::CreateIndex(ci) => self.index_columns(&tmeta, &ci)?,
+                _ => Vec::new(),
+            },
+            None => autoindex_number(&obj.name, &obj.tbl_name)
+                .and_then(|n| tmeta.unique.get(n - 1).cloned())
+                .unwrap_or_default(),
+        };
+        let rows = cols
+            .iter()
+            .enumerate()
+            .map(|(seqno, &cid)| {
+                alloc::vec![
+                    Value::Integer(seqno as i64),
+                    Value::Integer(cid as i64),
+                    Value::Text(tmeta.columns[cid].name.clone()),
+                ]
+            })
+            .collect();
+        Ok(QueryResult {
+            columns: ["seqno", "cid", "name"]
+                .iter()
+                .map(|s| String::from(*s))
+                .collect(),
+            rows,
+        })
+    }
+
+    /// `PRAGMA foreign_key_list(table)` →
+    /// `(id, seq, table, from, to, on_update, on_delete, match)`.
+    fn pragma_foreign_key_list(&self, p: &Pragma) -> Result<QueryResult> {
+        let table = Self::pragma_arg_name(p)?;
+        let obj = self
+            .schema
+            .table(&table)
+            .ok_or_else(|| Error::Error(format!("no such table: {table}")))?;
+        let Statement::CreateTable(ct) = sql::parse_one(obj.sql.as_deref().unwrap_or(""))? else {
+            return Err(Error::Corrupt("schema sql is not CREATE TABLE".into()));
+        };
+        let action = |a: FkAction| -> &'static str {
+            match a {
+                FkAction::NoAction => "NO ACTION",
+                FkAction::Restrict => "RESTRICT",
+                FkAction::Cascade => "CASCADE",
+                FkAction::SetNull => "SET NULL",
+                FkAction::SetDefault => "SET DEFAULT",
+            }
+        };
+        // Collect (from-cols, fk) pairs from column-level and table-level FKs.
+        let mut fks: Vec<(Vec<String>, &ForeignKey)> = Vec::new();
+        for col in &ct.columns {
+            for c in &col.constraints {
+                if let ColumnConstraint::References(fk) = c {
+                    fks.push((alloc::vec![col.name.clone()], fk));
+                }
+            }
+        }
+        for c in &ct.constraints {
+            if let TableConstraint::ForeignKey(fk) = c {
+                fks.push((fk.columns.clone(), fk));
+            }
+        }
+        let mut rows = Vec::new();
+        // SQLite numbers foreign keys from the last declared (id 0) backward.
+        let n = fks.len();
+        for (i, (from_cols, fk)) in fks.iter().enumerate() {
+            let id = (n - 1 - i) as i64;
+            for (seq, from) in from_cols.iter().enumerate() {
+                let to = fk.ref_columns.get(seq).cloned().unwrap_or_default();
+                rows.push(alloc::vec![
+                    Value::Integer(id),
+                    Value::Integer(seq as i64),
+                    Value::Text(fk.ref_table.clone()),
+                    Value::Text(from.clone()),
+                    if to.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Text(to)
+                    },
+                    Value::Text(action(fk.on_update).into()),
+                    Value::Text(action(fk.on_delete).into()),
+                    Value::Text("NONE".into()),
+                ]);
+            }
+        }
+        Ok(QueryResult {
+            columns: [
+                "id",
+                "seq",
+                "table",
+                "from",
+                "to",
+                "on_update",
+                "on_delete",
+                "match",
+            ]
+            .iter()
+            .map(|s| String::from(*s))
+            .collect(),
             rows,
         })
     }

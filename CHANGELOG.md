@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track C: introspection PRAGMAs — `index_list`, `index_info`,
+  `foreign_key_list`, `freelist_count`, `application_id`, `data_version`. Output
+  matches SQLite's column layout and ordering. Verified against `sqlite3`.
 - Track A: partial indexes — `CREATE INDEX … WHERE <predicate>`. The index stores
   only rows satisfying the predicate; entries are added/removed as rows cross the
   boundary on insert/update/delete, so `sqlite3 integrity_check` passes. The
