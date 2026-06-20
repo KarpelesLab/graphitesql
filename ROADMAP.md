@@ -262,8 +262,13 @@ them (rather than corrupt the ptrmap it can't yet maintain).
 
 *Multi-schema leftovers (small):*
 
-- **C-ms1 — `CREATE TEMP INDEX/VIEW/TRIGGER`.** These still target `main`; route
-  them to the `temp` database like `CREATE TEMP TABLE` already does.
+- **C-ms1 — `CREATE TEMP VIEW/TRIGGER` catalog placement.** `CREATE TEMP INDEX`
+  already lands in the `temp` catalog (it follows its temp table). `CREATE TEMP
+  VIEW`/`TRIGGER` still land in `main`'s `sqlite_master` (they function, but
+  belong in `sqlite_temp_master`). Route them to `temp`, and extend unqualified
+  view/trigger resolution to consult the `temp` catalog so reads/firing still
+  work. Acceptance: a temp view/trigger appears in `sqlite_temp_master` (not
+  `sqlite_master`) and still resolves.
 
 *Storage — `auto_vacuum` write path (C6b), split so each lands testable:*
 
