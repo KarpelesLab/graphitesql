@@ -394,6 +394,13 @@ impl Connection {
                 "freelist_count",
                 Value::Integer(header.freelist_count as i64),
             )),
+            // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. Auto-vacuum is on when the
+            // header's largest-root-page field is non-zero; the incremental flag
+            // then distinguishes the two modes.
+            "auto_vacuum" => Ok(single(
+                "auto_vacuum",
+                Value::Integer(auto_vacuum_mode(header) as i64),
+            )),
             "application_id" => Ok(single(
                 "application_id",
                 Value::Integer(header.application_id as i32 as i64),
@@ -1092,6 +1099,29 @@ impl Connection {
             stmt,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
+        // graphite does not yet maintain pointer-map pages, so writing a page to
+        // an `auto_vacuum` database (one sqlite3 created with that mode) would
+        // corrupt its ptrmap. Refuse such writes rather than silently corrupt the
+        // file; reads, and writes to ordinary (auto_vacuum=NONE) databases, are
+        // unaffected. The active backend here is already the statement's target
+        // (a non-main write swaps its database in as `main` beforehand).
+        let mutates_pages = matches!(
+            stmt,
+            Statement::CreateTable(_)
+                | Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::CreateIndex(_)
+                | Statement::CreateView(_)
+                | Statement::CreateTrigger(_)
+                | Statement::Drop(_)
+                | Statement::Alter(_)
+        );
+        if mutates_pages && auto_vacuum_mode(self.backend.source().header()) != 0 {
+            return Err(Error::Unsupported(
+                "writing an auto_vacuum database (pointer-map maintenance not yet implemented)",
+            ));
+        }
         let affected = match stmt {
             Statement::CreateTable(ct) => {
                 self.exec_create_table(&ct, sql.trim())?;
@@ -1790,6 +1820,24 @@ impl Connection {
             if let Some(e) = &p.value {
                 let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?) as u32;
                 self.backend.writer()?.header_mut().application_id = v;
+            }
+        } else if p.name.eq_ignore_ascii_case("auto_vacuum") {
+            if let Some(e) = &p.value {
+                // Accept the symbolic and numeric spellings.
+                let mode = match pragma_text(e).to_ascii_lowercase().as_str() {
+                    "none" => 0,
+                    "full" => 1,
+                    "incremental" => 2,
+                    _ => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?),
+                };
+                // graphite creates only `auto_vacuum=NONE` databases and cannot
+                // maintain pointer-map pages, so accept NONE (the status quo) and
+                // reject FULL/INCREMENTAL rather than claim a mode it can't honor.
+                if mode != 0 {
+                    return Err(Error::Unsupported(
+                        "PRAGMA auto_vacuum = FULL/INCREMENTAL (pointer-map maintenance not yet implemented)",
+                    ));
+                }
             }
         }
         Ok(())
@@ -9479,6 +9527,19 @@ fn permute_row(meta: &TableMeta, declared: &[Value]) -> Vec<Value> {
         .iter()
         .map(|&i| declared[i].clone())
         .collect()
+}
+
+/// The auto-vacuum mode recorded in a database header: 0 = NONE, 1 = FULL,
+/// 2 = INCREMENTAL. Auto-vacuum is on iff the largest-root-page field is
+/// non-zero; the incremental-vacuum flag then selects the mode.
+fn auto_vacuum_mode(header: &crate::format::DatabaseHeader) -> u32 {
+    if header.largest_root_page == 0 {
+        0
+    } else if header.incremental_vacuum == 0 {
+        1
+    } else {
+        2
+    }
 }
 
 /// Remove an explicit `schema.` qualifier from a qualified `CREATE` statement's

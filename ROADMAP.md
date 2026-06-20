@@ -242,12 +242,22 @@ cross-database transactions. No multi-schema refinements remain outstanding.
 
 *Storage:*
 
-- **C6 — `auto_vacuum` (full + incremental) + ptrmap pages.** Implement
-  pointer-map pages so the file can shrink: track each page's parent, move pages
-  on free, truncate on commit (`auto_vacuum=FULL`) or via `PRAGMA
-  incremental_vacuum` (`auto_vacuum=INCREMENTAL`). Header `auto_vacuum` flag set
-  at create. Verify `sqlite3` reads the result with `integrity_check = ok`.
-  *Ref:* `btree.c` (ptrmap).
+- **C6 — `auto_vacuum` (full + incremental) + ptrmap pages.**
+  - ✅ **C6a — read + safety.** graphite *reads* `auto_vacuum` databases sqlite3
+    created (pointer-map pages aren't part of any b-tree, so scans/seeks skip
+    them; `integrity_check` ok). `PRAGMA auto_vacuum` reports the mode
+    (0/1/2 from the header's largest-root-page + incremental flag). Because
+    graphite does not yet maintain ptrmap pages, a *write* to an `auto_vacuum`
+    database is refused (`Unsupported`) instead of silently corrupting its
+    ptrmap, and `PRAGMA auto_vacuum=FULL|INCREMENTAL` is rejected; ordinary
+    `auto_vacuum=NONE` databases are unaffected. Tests: `tests/auto_vacuum.rs`.
+  - **C6b — write/maintain (remaining).** Implement pointer-map pages so the
+    file can shrink: create ptrmap pages at the right positions, track each
+    page's parent/type, update them on every alloc/free/split, move pages on
+    free, truncate on commit (`auto_vacuum=FULL`) or via `PRAGMA
+    incremental_vacuum` (`auto_vacuum=INCREMENTAL`). Set the header flag at
+    create. Verify `sqlite3` reads graphite's auto_vacuum file with
+    `integrity_check = ok`. *Ref:* `btree.c` (ptrmap).
 - **C7 — SQLite-format rollback journal.** Match the on-disk journal byte layout
   (ours is a private, recoverable format today) so a crashed graphitesql write is
   recoverable by `sqlite3`. Pairs with the crash-recovery test harness (§6).

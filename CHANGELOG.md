@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track C6a: **`auto_vacuum` awareness.** `PRAGMA auto_vacuum` now reports the
+  database's mode (0 = NONE, 1 = FULL, 2 = INCREMENTAL). graphite reads
+  `auto_vacuum` databases created by sqlite3 (pointer-map pages are skipped
+  naturally; `integrity_check` ok), but — because it does not yet maintain
+  ptrmap pages — refuses to *write* one (`Unsupported`) rather than corrupt its
+  pointer map, and rejects `PRAGMA auto_vacuum=FULL|INCREMENTAL`. Ordinary
+  (`auto_vacuum=NONE`) databases are unaffected.
 - Track C: **`ATTACH`/`DETACH`, `TEMP`, and cross-database queries** (C1–C5).
   `ATTACH ':memory:'/'file.db' AS x` and `DETACH x` manage an attached-database
   registry (`PRAGMA database_list`). Schema-qualified names (`aux.t`) work for
