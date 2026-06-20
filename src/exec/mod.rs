@@ -10940,6 +10940,10 @@ fn resolve_order_index(expr: &Expr, labels: &[String], ncols: usize) -> Option<u
             table: None,
             column,
         } => labels.iter().position(|l| l.eq_ignore_ascii_case(column)),
+        // `ORDER BY <alias> COLLATE …` (or a parenthesized term) still resolves to
+        // the output column; the explicit collation is applied by the sort
+        // comparison via `order_collations`/`key_collation`.
+        Expr::Collate { expr, .. } | Expr::Paren(expr) => resolve_order_index(expr, labels, ncols),
         _ => None,
     }
 }
