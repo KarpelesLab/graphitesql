@@ -483,6 +483,10 @@ pub struct ForeignKey {
     pub on_delete: FkAction,
     /// `ON UPDATE` action.
     pub on_update: FkAction,
+    /// `DEFERRABLE INITIALLY DEFERRED` — the constraint is checked at `COMMIT`
+    /// rather than at statement time. `false` for immediate / `NOT DEFERRABLE` /
+    /// `DEFERRABLE INITIALLY IMMEDIATE`.
+    pub initially_deferred: bool,
 }
 
 /// A column-level constraint.

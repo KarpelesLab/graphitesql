@@ -260,3 +260,110 @@ fn foreign_keys_against_sqlite3() {
         assert_eq!(run_graphite(ops, q), run_sqlite(ops, q), "ops: {ops}");
     }
 }
+
+/// A `DEFERRABLE INITIALLY DEFERRED` child connection.
+fn deferred_parent_child() -> Connection {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    c.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, \
+         pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .unwrap();
+    c
+}
+
+#[test]
+fn deferred_fk_tolerates_temporary_violation_then_commits() {
+    let mut c = deferred_parent_child();
+    c.execute("BEGIN").unwrap();
+    // The parent (100) does not exist yet — allowed because the check is deferred.
+    c.execute("INSERT INTO child VALUES(1, 100)").unwrap();
+    // Satisfy the constraint before committing.
+    c.execute("INSERT INTO parent VALUES(100)").unwrap();
+    c.execute("COMMIT").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM child").unwrap().rows[0][0],
+        graphitesql::Value::Integer(1)
+    );
+}
+
+#[test]
+fn deferred_fk_still_violated_fails_at_commit_and_keeps_tx_open() {
+    let mut c = deferred_parent_child();
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO child VALUES(1, 100)").unwrap();
+    // Still no parent 100 → COMMIT fails on the deferred constraint.
+    assert!(matches!(c.execute("COMMIT"), Err(Error::Constraint(_))));
+    // SQLite leaves the transaction active so it can be repaired and retried.
+    c.execute("INSERT INTO parent VALUES(100)").unwrap();
+    c.execute("COMMIT").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM child").unwrap().rows[0][0],
+        graphitesql::Value::Integer(1)
+    );
+}
+
+#[test]
+fn deferred_fk_in_autocommit_is_checked_immediately() {
+    // Outside an explicit transaction the statement is its own transaction, so
+    // the implicit commit checks the deferred key at once and rolls the row back.
+    let mut c = deferred_parent_child();
+    assert!(c.execute("INSERT INTO child VALUES(1, 100)").is_err());
+    assert_eq!(
+        c.query("SELECT count(*) FROM child").unwrap().rows[0][0],
+        graphitesql::Value::Integer(0)
+    );
+}
+
+#[test]
+fn non_deferred_fk_is_still_immediate() {
+    // A plain (immediate) FK rejects at statement time even inside a transaction.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    c.execute("CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))")
+        .unwrap();
+    c.execute("BEGIN").unwrap();
+    assert!(c.execute("INSERT INTO child VALUES(1, 100)").is_err());
+}
+
+#[test]
+fn initially_immediate_is_not_deferred() {
+    // `DEFERRABLE INITIALLY IMMEDIATE` is checked immediately, like a plain FK.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    c.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, \
+         pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY IMMEDIATE)",
+    )
+    .unwrap();
+    c.execute("BEGIN").unwrap();
+    assert!(c.execute("INSERT INTO child VALUES(1, 100)").is_err());
+}
+
+#[test]
+fn deferred_fk_disabled_when_pragma_off() {
+    // With foreign_keys OFF a deferred FK is never enforced (immediate or at
+    // commit) — byte-identical to the no-FK behavior.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    c.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, \
+         pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .unwrap();
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO child VALUES(1, 100)").unwrap();
+    c.execute("COMMIT").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM child").unwrap().rows[0][0],
+        graphitesql::Value::Integer(1)
+    );
+}

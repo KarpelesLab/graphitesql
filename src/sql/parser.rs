@@ -1467,6 +1467,7 @@ impl Parser {
         };
         let mut on_delete = FkAction::default();
         let mut on_update = FkAction::default();
+        let mut initially_deferred = false;
         loop {
             if self.eat_kw("on") {
                 let is_delete = self.eat_kw("delete");
@@ -1498,13 +1499,20 @@ impl Parser {
             } else if self.eat_kw("match") {
                 let _ = self.advance();
             } else if self.eat_kw("not") {
+                // `NOT DEFERRABLE [INITIALLY …]` — always checked immediately.
                 let _ = self.eat_kw("deferrable");
                 if self.eat_kw("initially") {
                     let _ = self.advance();
                 }
+                initially_deferred = false;
             } else if self.eat_kw("deferrable") {
+                // `DEFERRABLE` defaults to `INITIALLY IMMEDIATE`; only
+                // `INITIALLY DEFERRED` actually defers the check to COMMIT.
                 if self.eat_kw("initially") {
-                    let _ = self.advance();
+                    initially_deferred = self.eat_kw("deferred");
+                    if !initially_deferred {
+                        let _ = self.eat_kw("immediate");
+                    }
                 }
             } else {
                 break;
@@ -1516,6 +1524,7 @@ impl Parser {
             ref_columns,
             on_delete,
             on_update,
+            initially_deferred,
         })
     }
 

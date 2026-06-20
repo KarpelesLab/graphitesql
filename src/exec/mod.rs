@@ -1025,6 +1025,10 @@ impl Connection {
                         "cannot commit - no transaction is active".into(),
                     ));
                 }
+                // Deferred foreign keys are verified here. On violation the
+                // transaction stays open (SQLite leaves it active so the caller
+                // can repair the data and COMMIT again) — nothing is committed.
+                self.check_deferred_fks()?;
                 self.backend.writer()?.commit()?;
                 // Cross-database transaction: commit the temp + attached
                 // databases alongside main (a clean pager commit is a no-op).
@@ -1044,8 +1048,9 @@ impl Connection {
                 self.release_attached(name)?;
                 self.open_savepoints = self.backend.writer()?.savepoint_depth();
                 // Releasing the outermost savepoint of an implicit transaction
-                // finalizes it.
+                // finalizes it — verify deferred foreign keys first.
                 if self.open_savepoints == 0 && !self.in_tx {
+                    self.check_deferred_fks()?;
                     self.backend.writer()?.commit()?;
                     self.commit_attached()?;
                     self.schema = Schema::read(self.backend.source())?;
@@ -2051,12 +2056,51 @@ impl Connection {
             return Ok(());
         }
         for fk in self.foreign_keys_of(table)? {
+            // A `DEFERRABLE INITIALLY DEFERRED` key is checked at COMMIT, not now
+            // — but only inside an explicit transaction. In autocommit the
+            // statement *is* the transaction, so its implicit commit is immediate.
+            if fk.initially_deferred && self.in_tx {
+                continue;
+            }
             let key = match self.child_key_values(meta, &fk, values) {
                 Some(k) => k,
                 None => continue, // a NULL column => constraint satisfied
             };
             if !self.parent_has_key(&fk, &key)? {
                 return Err(Error::Constraint("FOREIGN KEY constraint failed".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify every `DEFERRABLE INITIALLY DEFERRED` foreign key across all tables
+    /// — run at `COMMIT` to catch a constraint that was temporarily violated
+    /// inside the transaction and never repaired.
+    fn check_deferred_fks(&self) -> Result<()> {
+        if !self.foreign_keys {
+            return Ok(());
+        }
+        for obj in self.schema.objects() {
+            if obj.obj_type != crate::schema::ObjectType::Table {
+                continue;
+            }
+            let fks: Vec<ForeignKey> = self
+                .foreign_keys_of(&obj.name)?
+                .into_iter()
+                .filter(|fk| fk.initially_deferred)
+                .collect();
+            if fks.is_empty() {
+                continue;
+            }
+            let meta = self.table_meta(&obj.name, None)?;
+            for (_, row) in self.scan_table(&meta)? {
+                for fk in &fks {
+                    if let Some(key) = self.child_key_values(&meta, fk, &row) {
+                        if !self.parent_has_key(fk, &key)? {
+                            return Err(Error::Constraint("FOREIGN KEY constraint failed".into()));
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -2160,6 +2204,12 @@ impl Connection {
             } else {
                 fk.on_update
             };
+            // A deferred FK's NO ACTION orphan check waits for COMMIT (inside an
+            // explicit transaction); RESTRICT and the data-changing actions
+            // (CASCADE / SET NULL / SET DEFAULT) always run now.
+            if action == FkAction::NoAction && fk.initially_deferred && self.in_tx {
+                continue;
+            }
             // If this is an UPDATE that didn't change the referenced key, skip.
             if let Some(nv) = new_vals {
                 let new_key: Vec<Value> = ppos.iter().map(|&p| nv[p].clone()).collect();
@@ -2687,6 +2737,19 @@ impl Connection {
         // `INSERT … SELECT` is evaluated to a snapshot of value rows first (so
         // `INSERT INTO t SELECT … FROM t` reads the pre-insert state), then each
         // row flows through the normal VALUES path as literal expressions.
+        // A multi-row `INSERT … VALUES (…),(…)` must have rows of equal arity.
+        // SQLite rejects a mismatch up front ("all VALUES must have the same
+        // number of terms"); validate before any row is written so a short row
+        // never half-completes the insert.
+        if let InsertSource::Values(rows) = &ins.source {
+            if let Some(first) = rows.first() {
+                if rows.iter().any(|r| r.len() != first.len()) {
+                    return Err(Error::Error(
+                        "all VALUES must have the same number of terms".into(),
+                    ));
+                }
+            }
+        }
         let (rows, is_default_values) = match &ins.source {
             InsertSource::Values(rows) => (rows.clone(), false),
             InsertSource::DefaultValues => (alloc::vec![Vec::new()], true),
@@ -6113,11 +6176,34 @@ impl Connection {
             let (cols, _) = self.scan_source(&first, params)?;
             self.output_collations(&first, &cols, params)
         };
+        // A multi-row `VALUES (…),(…)` desugars to a `UNION ALL` chain whose
+        // operands are bare projections (no FROM); a real set operation joins
+        // genuine SELECTs. SQLite rejects a column-count mismatch in either case,
+        // but with different wording, so pick the message by which kind this is.
+        let is_values = sel.from.is_none()
+            && sel.where_clause.is_none()
+            && sel.group_by.is_empty()
+            && sel
+                .compound
+                .iter()
+                .all(|(op, c)| *op == CompoundOp::UnionAll && c.from.is_none());
         for (op, operand) in &sel.compound {
             // Run the operand fully: a `VALUES (…),(…)` operand desugars to a
             // SELECT carrying its extra rows in its *own* compound tail, so it
             // must be expanded (not just its first core) or those rows are lost.
             let r = self.run_select_compound(operand, params)?;
+            // Every operand of a compound query (and every row of a multi-row
+            // `VALUES`) must project the same number of columns. SQLite rejects a
+            // mismatch; match that (errors-vs-succeeds, not exact text).
+            if r.columns.len() != result.columns.len() {
+                return Err(Error::Error(if is_values {
+                    "all VALUES must have the same number of terms".into()
+                } else {
+                    "SELECTs to the left and right of the compound operator do not have the same \
+                     number of result columns"
+                        .into()
+                }));
+            }
             result.rows = apply_compound(*op, result.rows, r.rows, &colls);
         }
         self.compound_order_limit(&mut result, sel, params, &colls)?;
@@ -6135,6 +6221,8 @@ impl Connection {
         colls: &[crate::value::Collation],
     ) -> Result<()> {
         if !sel.order_by.is_empty() {
+            // A positional ORDER BY term must name an output column (SQLite).
+            check_positional_terms(&[], &sel.order_by, result.columns.len())?;
             let mut keys = Vec::new();
             for term in &sel.order_by {
                 let idx = resolve_order_index(&term.expr, &result.columns, result.columns.len())
@@ -6864,6 +6952,12 @@ impl Connection {
             }
             None => sel,
         };
+
+        // A positional `GROUP BY` / `ORDER BY` term (an integer literal) must name
+        // an output column (1..=ncols); SQLite rejects one out of range. The count
+        // is taken after wildcard expansion.
+        let ncols = self.output_labels(sel, &columns).len();
+        check_positional_terms(&sel.group_by, &sel.order_by, ncols)?;
 
         // Apply WHERE.
         let mut rows: Vec<InputRow> = Vec::new();
@@ -10956,6 +11050,48 @@ fn project_column(
         }
         ResultColumn::Expr { expr, .. } => {
             out.push(eval::eval(expr, ctx)?);
+        }
+    }
+    Ok(())
+}
+
+/// If `expr` is a positional reference — a (possibly negated) integer literal,
+/// optionally wrapped in parentheses or a `COLLATE` clause — return its signed
+/// value. SQLite reads such a term in `GROUP BY` / `ORDER BY` as a 1-based output
+/// column index; an expression like `1+1` is *not* positional. Used only for
+/// range validation: in-range resolution still goes through
+/// [`resolve_order_index`].
+fn positional_int(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::Integer(n)) => Some(*n),
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Literal(Literal::Integer(n)) => Some(n.wrapping_neg()),
+            _ => None,
+        },
+        Expr::Collate { expr, .. } | Expr::Paren(expr) => positional_int(expr),
+        _ => None,
+    }
+}
+
+/// Reject any `GROUP BY` / `ORDER BY` positional term that falls outside
+/// `1..=ncols`, matching SQLite's "Nth GROUP BY/ORDER BY term out of range".
+/// `ncols` is the query's output-column count.
+fn check_positional_terms(group_by: &[Expr], order_by: &[OrderTerm], ncols: usize) -> Result<()> {
+    for g in group_by {
+        if let Some(n) = positional_int(g) {
+            if n < 1 || (n as u64) > ncols as u64 {
+                return Err(Error::Error("GROUP BY term out of range".into()));
+            }
+        }
+    }
+    for t in order_by {
+        if let Some(n) = positional_int(&t.expr) {
+            if n < 1 || (n as u64) > ncols as u64 {
+                return Err(Error::Error("ORDER BY term out of range".into()));
+            }
         }
     }
     Ok(())
