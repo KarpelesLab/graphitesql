@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Fix: a **multi-row `VALUES` on the right of a compound operator** (e.g.
+  `… UNION VALUES(2),(3)`) now contributes all its rows, not just the first.
 - Track A: **`UPDATE … SET … FROM <sources>`** (SQLite's UPDATE-FROM extension)
   — the target table is joined to the FROM tables (incl. multi-table and
   derived-table sources); each matched target row is updated using the joined
