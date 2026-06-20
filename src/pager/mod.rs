@@ -25,7 +25,7 @@ use core::cell::RefCell;
 pub mod wal;
 pub mod write;
 pub use wal::WalReader;
-pub use write::WritePager;
+pub use write::{AutoVacuum, WritePager};
 
 /// A single database page: its number and its raw bytes.
 ///

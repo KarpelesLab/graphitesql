@@ -29,6 +29,24 @@ use alloc::vec::Vec;
 
 const JOURNAL_MAGIC: &[u8; 8] = b"GSQLJRN1";
 
+/// Auto-vacuum mode of a database, as recorded in the file header.
+///
+/// SQLite encodes the mode in two header fields: `largest_root_page` (offset 52)
+/// is non-zero iff auto-vacuum is enabled, and `incremental_vacuum` (offset 64)
+/// distinguishes FULL (0) from INCREMENTAL (non-zero). See the file-format spec,
+/// "The Database Header".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoVacuum {
+    /// Auto-vacuum disabled (the default). `PRAGMA auto_vacuum` reports `0`.
+    None,
+    /// Full auto-vacuum: free pages are reclaimed automatically on each commit.
+    /// `PRAGMA auto_vacuum` reports `1`.
+    Full,
+    /// Incremental auto-vacuum: free pages are tracked but only reclaimed on
+    /// `PRAGMA incremental_vacuum`. `PRAGMA auto_vacuum` reports `2`.
+    Incremental,
+}
+
 /// A writable pager over a database file, with an optional journal file.
 pub struct WritePager {
     file: Box<dyn File>,
@@ -154,9 +172,38 @@ impl WritePager {
         wal_file: Option<Box<dyn File>>,
         page_size: u32,
     ) -> Result<WritePager> {
+        Self::create_auto_vacuum(file, journal, wal_file, page_size, AutoVacuum::None)
+    }
+
+    /// Create a brand-new, empty database in the given auto-vacuum `mode`.
+    ///
+    /// For an *empty* database (just page 1, no user tables) SQLite records the
+    /// mode purely in the header: `largest_root_page` (offset 52) is set to `1`
+    /// when auto-vacuum is enabled (FULL or INCREMENTAL) and `0` when it is off,
+    /// and `incremental_vacuum` (offset 64) is `1` for INCREMENTAL, `0`
+    /// otherwise. The file is still a single page — no pointer-map page exists
+    /// yet, so there is no ptrmap maintenance to do here. (Those values were
+    /// confirmed empirically against `sqlite3 3.50.4`.)
+    ///
+    /// This is the storage foundation for auto-vacuum; the ptrmap *write*
+    /// maintenance that keeps the map current as pages are allocated/freed is a
+    /// separate concern layered on top.
+    pub fn create_auto_vacuum(
+        file: Box<dyn File>,
+        journal: Option<Box<dyn File>>,
+        wal_file: Option<Box<dyn File>>,
+        page_size: u32,
+        mode: AutoVacuum,
+    ) -> Result<WritePager> {
         if page_size < 512 || !page_size.is_power_of_two() {
             return Err(Error::Error(format!("invalid page size {page_size}")));
         }
+        // Empty auto-vacuum db: page 1 is its own largest (and only) root.
+        let (largest_root_page, incremental_vacuum) = match mode {
+            AutoVacuum::None => (0, 0),
+            AutoVacuum::Full => (1, 0),
+            AutoVacuum::Incremental => (1, 1),
+        };
         let header = DatabaseHeader {
             page_size,
             write_version: 1,
@@ -169,10 +216,10 @@ impl WritePager {
             schema_cookie: 0,
             schema_format: 4,
             default_cache_size: 0,
-            largest_root_page: 0,
+            largest_root_page,
             text_encoding: TextEncoding::Utf8,
             user_version: 0,
-            incremental_vacuum: 0,
+            incremental_vacuum,
             application_id: 0,
             version_valid_for: 1,
             sqlite_version_number: 3_053_002,
@@ -466,6 +513,21 @@ impl WritePager {
     /// Whether the database is in WAL mode.
     pub fn wal_mode(&self) -> bool {
         self.wal.is_some()
+    }
+
+    /// The auto-vacuum mode recorded in the file header.
+    ///
+    /// Derived from `largest_root_page` (non-zero ⇒ auto-vacuum on) and
+    /// `incremental_vacuum` (non-zero ⇒ INCREMENTAL), matching how SQLite
+    /// reports `PRAGMA auto_vacuum`.
+    pub fn auto_vacuum(&self) -> AutoVacuum {
+        if self.header.largest_root_page == 0 {
+            AutoVacuum::None
+        } else if self.header.incremental_vacuum != 0 {
+            AutoVacuum::Incremental
+        } else {
+            AutoVacuum::Full
+        }
     }
 
     /// Switch the database into WAL mode (`PRAGMA journal_mode = WAL`). Stamps the
@@ -853,6 +915,35 @@ mod tests {
         assert_eq!(h.page_size, 4096);
         assert_eq!(h.size_in_pages, 1);
         assert_eq!(p1[100], 0x0d); // empty leaf
+    }
+
+    #[test]
+    fn auto_vacuum_header_bytes_match_sqlite() {
+        // Empirically confirmed against sqlite3 3.50.4: an empty auto-vacuum db
+        // sets largest_root_page (offset 52) = 1, with incremental_vacuum
+        // (offset 64) = 0 for FULL and = 1 for INCREMENTAL. NONE leaves both 0.
+        for (mode, lrp, inc, reported) in [
+            (AutoVacuum::None, 0u32, 0u32, AutoVacuum::None),
+            (AutoVacuum::Full, 1, 0, AutoVacuum::Full),
+            (AutoVacuum::Incremental, 1, 1, AutoVacuum::Incremental),
+        ] {
+            let vfs = MemoryVfs::new();
+            let file = vfs.open("db", OpenFlags::READ_WRITE_CREATE).unwrap();
+            let mut wp = WritePager::create_auto_vacuum(file, None, None, 4096, mode).unwrap();
+            wp.commit().unwrap();
+            let p1 = wp.read_page(1).unwrap();
+            assert_eq!(be32(&p1, 52), lrp, "largest_root_page for {mode:?}");
+            assert_eq!(be32(&p1, 64), inc, "incremental_vacuum for {mode:?}");
+            // The header round-trips and the mode is reported back.
+            let h = DatabaseHeader::parse(&p1).unwrap();
+            assert_eq!(h.largest_root_page, lrp);
+            assert_eq!(h.incremental_vacuum, inc);
+            assert_eq!(wp.auto_vacuum(), reported);
+            // And a reopen still reports the mode.
+            let file = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
+            let wp2 = WritePager::open(file, None).unwrap();
+            assert_eq!(wp2.auto_vacuum(), reported);
+        }
     }
 
     #[test]
