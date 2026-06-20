@@ -171,11 +171,11 @@ introduce a bytecode IR so `EXPLAIN` is real and the planner is testable.
   `Op`/`Program` with a program-counter interpreter, a compiler for constant
   `SELECT` projections covering arithmetic, concat, comparison, three-valued
   boolean logic, `IS NULL`, `CASE` (via `Goto`/`IfFalse` control flow), and `CAST`,
-  plus a single-table scan with `WHERE` filtering (`Rewind`/`Column`/`Next` +
-  `IfFalse`) wired into the engine via `Connection::query_vdbe` — all running
-  alongside the tree-walker with matching results. *Remaining:* joins, aggregates,
-  and `ORDER BY` on the VDBE, then migrate the executor onto it; then **real
-  `EXPLAIN`** (the `addr/opcode/p1…`
+  plus a single-table scan with `WHERE` filtering and `LIMIT` (`Rewind`/`Column`/
+  `Next` + `IfFalse` + `DecrJumpZero`) wired into the engine via
+  `Connection::query_vdbe` — all running alongside the tree-walker with matching
+  results. *Remaining:* `OFFSET`, joins, aggregates, and `ORDER BY` on the VDBE,
+  then migrate the executor onto it; then **real `EXPLAIN`** (the `addr/opcode/p1…`
   listing) byte-comparable to SQLite's, and query flattening / subquery
   co-routines. *Ref:* `vdbe.c`, `vdbeaux.c`, `opcodes.h`.
 - **`EXPLAIN` (bytecode)** — currently `Error::Unsupported`; lands with the VDBE.

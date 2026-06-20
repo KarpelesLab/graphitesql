@@ -80,6 +80,8 @@ pub enum Op {
     /// Advance the cursor; jump back to `target` (the loop body) if a row remains,
     /// else fall through.
     Next { target: usize },
+    /// Decrement `reg`; jump to `target` once it reaches zero (a `LIMIT` counter).
+    DecrJumpZero { reg: usize, target: usize },
     /// `dest = -reg` (numeric negation).
     Negate { reg: usize, dest: usize },
     /// Emit registers `[start, start+count)` as one output row.
@@ -108,6 +110,8 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         || !sel.group_by.is_empty()
         || !sel.compound.is_empty()
         || !sel.order_by.is_empty()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
         || sel.distinct
     {
         return Err(Error::Unsupported("VDBE spike: only constant SELECT lists"));
@@ -193,9 +197,29 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
         next_reg: count,
         columns: columns.to_vec(),
     };
+    // Optional LIMIT (constant integer only): a counter register decremented
+    // after each emitted row, halting the loop at zero.
+    let limit_reg = match &sel.limit {
+        None => None,
+        Some(Expr::Literal(Literal::Integer(n))) => {
+            let r = c.alloc();
+            c.ops.push(Op::Integer { value: *n, dest: r });
+            Some(r)
+        }
+        Some(_) => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
+    };
+    if sel.offset.is_some() {
+        return Err(Error::Unsupported("VDBE: OFFSET not yet supported"));
+    }
     // Rewind (target backpatched to the loop exit), then the loop body.
     let rewind = c.ops.len();
     c.ops.push(Op::Rewind { target: 0 });
+    // `LIMIT 0` emits nothing: skip the whole loop when the counter starts at 0.
+    let limit_skip = limit_reg.map(|r| {
+        let at = c.ops.len();
+        c.ops.push(Op::IfFalse { reg: r, target: 0 });
+        at
+    });
     let body = c.ops.len();
     // Optional WHERE: skip the row (jump to Next) when the predicate is not true.
     let skip = match &sel.where_clause {
@@ -214,6 +238,12 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
         c.compile_expr_into(expr, i)?;
     }
     c.ops.push(Op::ResultRow { start: 0, count });
+    // After emitting a row, decrement the LIMIT counter and stop at zero.
+    let mut limit_done = None;
+    if let Some(r) = limit_reg {
+        limit_done = Some(c.ops.len());
+        c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+    }
     let next = c.ops.len();
     c.ops.push(Op::Next { target: body });
     if let Some(at) = skip {
@@ -224,6 +254,16 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
     let end = c.ops.len();
     if let Op::Rewind { target } = &mut c.ops[rewind] {
         *target = end;
+    }
+    if let Some(at) = limit_skip {
+        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = end;
+        }
+    }
+    if let Some(at) = limit_done {
+        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
+            *target = end;
+        }
     }
     c.ops.push(Op::Halt);
     Ok(Program {
@@ -484,6 +524,16 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
             Op::Next { target } => {
                 cursor += 1;
                 if cursor < table_rows.len() {
+                    pc = *target;
+                }
+            }
+            Op::DecrJumpZero { reg, target } => {
+                let n = match &regs[*reg] {
+                    Value::Integer(i) => *i,
+                    other => crate::exec::eval::to_i64(other),
+                };
+                regs[*reg] = Value::Integer(n - 1);
+                if n - 1 <= 0 {
                     pc = *target;
                 }
             }

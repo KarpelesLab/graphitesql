@@ -104,7 +104,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table with an optional `WHERE` filter (`Rewind`/`Column`/`Next` cursor ops with
   an `IfFalse` row skip), wired into the engine via the new
   `Connection::query_vdbe`, matching the tree-walker and `sqlite3` for
-  `SELECT <exprs> FROM <table> [WHERE …]`.
+  `SELECT <exprs> FROM <table> [WHERE …] [LIMIT n]` (a `DecrJumpZero` counter
+  caps the row count).
 - Track B: `ANALYZE` and cost-based index selection. `ANALYZE [name]` gathers
   index selectivity into a `sqlite_stat1(tbl,idx,stat)` table, byte-compatible
   with SQLite's `nRow avgEq1 avgEq2 …` format (`avgEqK = (nRow + dK/2)/dK`);

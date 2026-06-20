@@ -102,6 +102,10 @@ fn table_scan_matches_tree_walker() {
         "SELECT id FROM t WHERE b = 'y'",
         "SELECT a FROM t WHERE a >= 2 AND b <> 'z'",
         "SELECT a FROM t WHERE 0",
+        "SELECT a FROM t LIMIT 2",
+        "SELECT a FROM t LIMIT 0",
+        "SELECT a FROM t LIMIT 100",
+        "SELECT id FROM t WHERE a >= 1 LIMIT 1",
     ] {
         assert_eq!(
             c.query_vdbe(q).unwrap().rows,
