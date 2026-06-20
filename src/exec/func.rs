@@ -387,6 +387,22 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 }
             }
         }
+        // `json_error_position(X)` — the 1-based byte position of the first JSON
+        // syntax error in X, or 0 when X is well-formed JSON. NULL yields NULL,
+        // matching sqlite3.
+        "json_error_position" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => {
+                    let pos = match super::json::parse_with_error_position(&eval::to_text(other)) {
+                        Ok(_) => 0,
+                        Err(off) => off as i64 + 1,
+                    };
+                    Value::Integer(pos)
+                }
+            }
+        }
         // `json_pretty(X [, indent])` — reformat with indentation (default 4
         // spaces). Empty arrays/objects and scalars stay compact, like SQLite.
         "json_pretty" => {
