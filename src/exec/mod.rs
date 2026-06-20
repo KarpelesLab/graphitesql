@@ -5501,10 +5501,28 @@ impl Connection {
                 values.push(eval::eval(&substituted, &repr_ctx)?);
             }
 
-            // HAVING (aggregate-aware).
+            // HAVING (aggregate-aware). It may reference SELECT-output aliases, so
+            // evaluate against a context that also exposes the output columns by
+            // their labels (table columns still take precedence).
             if let Some(having) = &sel.having {
                 let h = self.substitute_aggregates(having, columns, &rows, group, params)?;
-                if eval::truth(&eval::eval(&h, &repr_ctx)?) != Some(true) {
+                let mut aug_cols = columns.to_vec();
+                for label in &labels {
+                    aug_cols.push(ColumnInfo {
+                        name: label.clone(),
+                        table: String::new(),
+                        affinity: eval::Affinity::Blob,
+                        collation: crate::value::Collation::Binary,
+                    });
+                }
+                let mut aug_vals = repr.unwrap_or(&empty).values.clone();
+                aug_vals.extend(values.iter().cloned());
+                let aug_row = InputRow {
+                    values: aug_vals,
+                    rowid: repr.and_then(|r| r.rowid),
+                };
+                let actx = aug_row.ctx(&aug_cols, params).with_subqueries(self);
+                if eval::truth(&eval::eval(&h, &actx)?) != Some(true) {
                     continue;
                 }
             }

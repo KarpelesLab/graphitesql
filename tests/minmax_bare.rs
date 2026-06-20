@@ -64,6 +64,10 @@ fn bare_column_minmax_matches_sqlite3() {
         "SELECT g, max(v) AS m, name, id FROM t GROUP BY g ORDER BY g",
         "SELECT name, v FROM t GROUP BY g HAVING max(v)=v ORDER BY g",
         "SELECT g, min(v), name FROM t WHERE v IS NOT NULL GROUP BY g ORDER BY g",
+        // HAVING may reference SELECT-output aliases.
+        "SELECT g, sum(v) s FROM t GROUP BY g HAVING s > 30 ORDER BY g",
+        "SELECT g, count(*) c FROM t GROUP BY g HAVING c >= 2 ORDER BY g",
+        "SELECT g AS grp, max(v) m FROM t GROUP BY g HAVING m > 20 AND grp < 3 ORDER BY g",
     ];
     for q in queries {
         let want = {
