@@ -4843,7 +4843,10 @@ impl Connection {
         first.offset = None;
         let mut result = self.run_core(&first, params)?;
         for (op, operand) in &sel.compound {
-            let r = self.run_core(operand, params)?;
+            // Run the operand fully: a `VALUES (…),(…)` operand desugars to a
+            // SELECT carrying its extra rows in its *own* compound tail, so it
+            // must be expanded (not just its first core) or those rows are lost.
+            let r = self.run_select_compound(operand, params)?;
             result.rows = apply_compound(*op, result.rows, r.rows);
         }
         self.compound_order_limit(&mut result, sel, params)?;

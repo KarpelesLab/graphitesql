@@ -97,3 +97,26 @@ fn against_sqlite3() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn multi_row_values_as_compound_operand() {
+    // A multi-row VALUES on the *right* of a compound operator must contribute
+    // all its rows (regression: only the first row was kept).
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(rows_str(&c, "VALUES(1),(2) UNION VALUES(2),(3)"), "1\n2\n3");
+    assert_eq!(
+        rows_str(&c, "VALUES(1),(2) UNION ALL VALUES(3),(4)"),
+        "1\n2\n3\n4"
+    );
+    assert_eq!(rows_str(&c, "SELECT 1 UNION VALUES(2),(3)"), "1\n2\n3");
+    assert_eq!(
+        rows_str(&c, "VALUES(1),(2),(3) INTERSECT VALUES(2),(3)"),
+        "2\n3"
+    );
+    assert_eq!(rows_str(&c, "VALUES(1),(2),(3) EXCEPT VALUES(2)"), "1\n3");
+    // Chained compounds keep left-associative semantics.
+    assert_eq!(
+        rows_str(&c, "SELECT 1 UNION SELECT 2 UNION ALL SELECT 2"),
+        "1\n2\n2"
+    );
+}
