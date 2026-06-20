@@ -597,6 +597,13 @@ pub enum Expr {
     },
     /// A parenthesized expression (kept for fidelity; semantically transparent).
     Paren(Box<Expr>),
+    /// `expr COLLATE name` — assigns a collating sequence for comparison.
+    Collate {
+        /// The operand.
+        expr: Box<Expr>,
+        /// The collation name (`BINARY`/`NOCASE`/`RTRIM`).
+        collation: String,
+    },
     /// A scalar subquery `(SELECT …)` — yields its first row's first column.
     Subquery(Box<Select>),
     /// `[NOT] EXISTS (SELECT …)`.

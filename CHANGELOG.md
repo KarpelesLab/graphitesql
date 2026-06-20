@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: collating sequences — `BINARY`/`NOCASE`/`RTRIM` honored in comparisons,
+  `ORDER BY`, `GROUP BY`, `DISTINCT`, `count(DISTINCT …)`, `UNIQUE` enforcement, and
+  index b-tree ordering/seek. Resolution follows SQLite: explicit `COLLATE` (left
+  precedence) > column collation (left precedence) > `BINARY`. NOCASE/RTRIM indexes
+  order their keys by the collation so `sqlite3 integrity_check` passes, and
+  index-driven equality lookups find case-variant rows. Verified against `sqlite3`.
 - Track A: generated columns — `… AS (expr) [STORED|VIRTUAL]`. VIRTUAL columns
   are computed on read and not stored; STORED ones are materialized on write;
   writes to a generated column are rejected; indexes over generated columns work;

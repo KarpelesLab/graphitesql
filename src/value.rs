@@ -61,6 +61,55 @@ impl ValueRef<'_> {
     }
 }
 
+/// A text collating sequence. `BINARY` (the default) compares bytes; `NOCASE`
+/// folds ASCII letters; `RTRIM` ignores trailing spaces. Collations only affect
+/// text-vs-text comparison; storage-class ordering is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Collation {
+    /// `BINARY` — `memcmp` on the UTF-8 bytes.
+    #[default]
+    Binary,
+    /// `NOCASE` — ASCII case-insensitive.
+    NoCase,
+    /// `RTRIM` — like `BINARY` but trailing spaces are ignored.
+    RTrim,
+}
+
+impl Collation {
+    /// Parse a collation name (`BINARY`/`NOCASE`/`RTRIM`, case-insensitive).
+    pub fn parse(name: &str) -> Option<Collation> {
+        match name.to_ascii_lowercase().as_str() {
+            "binary" => Some(Collation::Binary),
+            "nocase" => Some(Collation::NoCase),
+            "rtrim" => Some(Collation::RTrim),
+            _ => None,
+        }
+    }
+}
+
+/// Compare two text strings under `coll`.
+pub fn cmp_text(x: &str, y: &str, coll: Collation) -> Ordering {
+    match coll {
+        Collation::Binary => x.as_bytes().cmp(y.as_bytes()),
+        Collation::NoCase => x
+            .bytes()
+            .map(|b| b.to_ascii_uppercase())
+            .cmp(y.bytes().map(|b| b.to_ascii_uppercase())),
+        Collation::RTrim => x
+            .trim_end_matches(' ')
+            .as_bytes()
+            .cmp(y.trim_end_matches(' ').as_bytes()),
+    }
+}
+
+/// Like [`cmp_values`] but applying `coll` to text-vs-text comparison.
+pub fn cmp_values_coll(a: &Value, b: &Value, coll: Collation) -> Ordering {
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => cmp_text(x, y, coll),
+        _ => cmp_values(a, b),
+    }
+}
+
 /// Compare two values in SQLite's total ordering: `NULL` < numbers < text <
 /// blobs; numbers compared numerically, text by byte (the `BINARY` collation),
 /// blobs by `memcmp`. This is the order used for index keys, `ORDER BY`, and

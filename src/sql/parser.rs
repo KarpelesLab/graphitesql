@@ -1093,8 +1093,22 @@ impl Parser {
                     expr: Box::new(self.expr_bp(BP_NOT_PREFIX)?),
                 })
             }
-            _ => self.primary(),
+            _ => self.primary_collate(),
         }
+    }
+
+    /// A primary expression, with any trailing `COLLATE name` postfix applied
+    /// (COLLATE binds tighter than every operator).
+    fn primary_collate(&mut self) -> Result<Expr> {
+        let mut e = self.primary()?;
+        while self.eat_kw("collate") {
+            let collation = self.ident()?;
+            e = Expr::Collate {
+                expr: Box::new(e),
+                collation,
+            };
+        }
+        Ok(e)
     }
 
     fn primary(&mut self) -> Result<Expr> {

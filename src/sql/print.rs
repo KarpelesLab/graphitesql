@@ -210,6 +210,12 @@ pub fn expr(e: &Expr) -> String {
             expr(low),
             expr(high)
         ),
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => {
+            format!("{} COLLATE {}", expr(inner), collation)
+        }
         Expr::Case {
             operand,
             when_then,

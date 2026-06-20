@@ -23,7 +23,7 @@ use crate::format::record::decode_record;
 use crate::format::TextEncoding;
 use crate::pager::{PageSource, WritePager};
 use crate::util::varint;
-use crate::value::{cmp_values, Value};
+use crate::value::{cmp_values_coll, Collation, Value};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -42,11 +42,16 @@ struct IdxSplit {
 /// the number of matches. The index record is `(indexed cols…, rowid)`, so the
 /// trailing rowid is returned for each match. This is what lets the planner use
 /// an index instead of a full table scan.
-pub fn index_seek_rowids(src: &dyn PageSource, root: u32, key: &[Value]) -> Result<Vec<i64>> {
+pub fn index_seek_rowids(
+    src: &dyn PageSource,
+    root: u32,
+    key: &[Value],
+    colls: &[Collation],
+) -> Result<Vec<i64>> {
     let enc = src.header().text_encoding;
     let usable = src.usable_size();
     let mut out = Vec::new();
-    seek_prefix(src, root, key, enc, usable, &mut out)?;
+    seek_prefix(src, root, key, enc, usable, colls, &mut out)?;
     Ok(out)
 }
 
@@ -56,6 +61,7 @@ fn seek_prefix(
     key: &[Value],
     enc: TextEncoding,
     usable: usize,
+    colls: &[Collation],
     out: &mut Vec<i64>,
 ) -> Result<()> {
     let page = src.page(page_no)?;
@@ -69,7 +75,7 @@ fn seek_prefix(
         PageType::LeafIndex => {
             for i in 0..bt.num_cells() {
                 let rec = record(i)?;
-                match prefix_cmp(key, &rec) {
+                match prefix_cmp(key, &rec, colls) {
                     Ordering::Greater => continue,
                     Ordering::Equal => out.push(rowid_of(&rec)),
                     Ordering::Less => break, // sorted: no further matches on this leaf
@@ -81,16 +87,16 @@ fn seek_prefix(
             let n = bt.num_cells();
             let mut i = 0;
             // Skip cells strictly less than the key.
-            while i < n && prefix_cmp(key, &record(i)?) == Ordering::Greater {
+            while i < n && prefix_cmp(key, &record(i)?, colls) == Ordering::Greater {
                 i += 1;
             }
             // Matches < cell[i] live in its left child.
-            seek_prefix(src, bt.child_pointer(i)?, key, enc, usable, out)?;
+            seek_prefix(src, bt.child_pointer(i)?, key, enc, usable, colls, out)?;
             // Equal interior cells are themselves matches; descend the child to
             // their right for further matches.
-            while i < n && prefix_cmp(key, &record(i)?) == Ordering::Equal {
+            while i < n && prefix_cmp(key, &record(i)?, colls) == Ordering::Equal {
                 out.push(rowid_of(&record(i)?));
-                seek_prefix(src, bt.child_pointer(i + 1)?, key, enc, usable, out)?;
+                seek_prefix(src, bt.child_pointer(i + 1)?, key, enc, usable, colls, out)?;
                 i += 1;
             }
             Ok(())
@@ -100,9 +106,10 @@ fn seek_prefix(
 }
 
 /// Compare a key against the leading columns of an index record.
-fn prefix_cmp(key: &[Value], rec: &[Value]) -> Ordering {
-    for (k, r) in key.iter().zip(rec.iter()) {
-        let o = cmp_values(k, r);
+fn prefix_cmp(key: &[Value], rec: &[Value], colls: &[Collation]) -> Ordering {
+    for (i, (k, r)) in key.iter().zip(rec.iter()).enumerate() {
+        let c = colls.get(i).copied().unwrap_or_default();
+        let o = cmp_values_coll(k, r, c);
         if o != Ordering::Equal {
             return o;
         }
@@ -129,9 +136,14 @@ pub fn create_index_root(wp: &mut WritePager) -> Result<u32> {
 
 /// Insert an index key `record` (indexed columns + trailing rowid) into the
 /// index b-tree at `root`.
-pub fn insert_index(wp: &mut WritePager, root: u32, record: &[u8]) -> Result<()> {
+pub fn insert_index(
+    wp: &mut WritePager,
+    root: u32,
+    record: &[u8],
+    colls: &[Collation],
+) -> Result<()> {
     let rcell = build_index_rcell(wp, record)?;
-    if let Some(split) = insert_rec(wp, root, record, rcell)? {
+    if let Some(split) = insert_rec(wp, root, record, rcell, colls)? {
         grow_root(wp, root, split)?;
     }
     Ok(())
@@ -234,6 +246,7 @@ fn insert_rec(
     page_no: u32,
     target: &[u8],
     rcell: Vec<u8>,
+    colls: &[Collation],
 ) -> Result<Option<IdxSplit>> {
     let enc = wp.header().text_encoding;
     let page = wp.page(page_no)?;
@@ -247,7 +260,7 @@ fn insert_rec(
             let mut entries = read_leaf(wp, &bt, usable)?;
             let mut pos = entries.len();
             for (i, (full, _)) in entries.iter().enumerate() {
-                match cmp_records(target, full, enc)? {
+                match cmp_records(target, full, enc, colls)? {
                     Ordering::Less => {
                         pos = i;
                         break;
@@ -285,7 +298,7 @@ fn insert_rec(
             let mut p = cells.len();
             let mut child = right;
             for (i, (c, full, _)) in cells.iter().enumerate() {
-                match cmp_records(target, full, enc)? {
+                match cmp_records(target, full, enc, colls)? {
                     Ordering::Less => {
                         p = i;
                         child = *c;
@@ -295,7 +308,7 @@ fn insert_rec(
                     Ordering::Greater => {}
                 }
             }
-            if let Some(s) = insert_rec(wp, child, target, rcell)? {
+            if let Some(s) = insert_rec(wp, child, target, rcell, colls)? {
                 if p < cells.len() {
                     let old = cells[p].clone();
                     cells[p] = (old.0, s.full, s.rcell);
@@ -378,11 +391,12 @@ fn rcells(entries: &[LeafEntry]) -> Vec<Vec<u8>> {
     entries.iter().map(|(_, c)| c.clone()).collect()
 }
 
-fn cmp_records(a: &[u8], b: &[u8], enc: TextEncoding) -> Result<Ordering> {
+fn cmp_records(a: &[u8], b: &[u8], enc: TextEncoding, colls: &[Collation]) -> Result<Ordering> {
     let va = decode_record(a, enc)?;
     let vb = decode_record(b, enc)?;
-    for (x, y) in va.iter().zip(vb.iter()) {
-        let o = cmp_values(x, y);
+    for (i, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
+        let c = colls.get(i).copied().unwrap_or_default();
+        let o = cmp_values_coll(x, y, c);
         if o != Ordering::Equal {
             return Ok(o);
         }

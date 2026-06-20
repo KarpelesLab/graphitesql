@@ -148,6 +148,8 @@ pub struct ColumnInfo {
     pub table: String,
     /// The column's type affinity (Blob/NONE when unknown).
     pub affinity: Affinity,
+    /// The column's declared collating sequence (`BINARY` by default).
+    pub collation: crate::value::Collation,
 }
 
 /// Bound parameter values, by position (1-based) and by name.
@@ -221,6 +223,16 @@ impl<'a> EvalCtx<'a> {
         self
     }
 
+    /// The declared collation of a column reference, if it resolves to one of
+    /// the current row's columns.
+    fn column_collation(&self, table: Option<&str>, name: &str) -> Option<Collation> {
+        self.columns.iter().find_map(|col| {
+            let name_ok = col.name.eq_ignore_ascii_case(name);
+            let table_ok = table.is_none_or(|t| col.table.eq_ignore_ascii_case(t));
+            (name_ok && table_ok).then_some(col.collation)
+        })
+    }
+
     fn resolve_column(&self, table: Option<&str>, name: &str) -> Result<Value> {
         // Special rowid aliases.
         if table.is_none() && is_rowid_alias(name) {
@@ -291,6 +303,63 @@ pub(crate) fn is_rowid_alias(name: &str) -> bool {
         || name.eq_ignore_ascii_case("oid")
 }
 
+use crate::value::Collation;
+
+/// Apply comparison operator `op` to `l`/`r` under collation `coll` (NULL if
+/// either operand is NULL).
+pub fn compare_op(op: BinaryOp, l: &Value, r: &Value, coll: Collation) -> Value {
+    use BinaryOp::*;
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Value::Null;
+    }
+    let ord = crate::value::cmp_values_coll(l, r, coll);
+    let res = match op {
+        Eq => ord == Ordering::Equal,
+        NotEq => ord != Ordering::Equal,
+        Lt => ord == Ordering::Less,
+        LtEq => ord != Ordering::Greater,
+        Gt => ord == Ordering::Greater,
+        GtEq => ord != Ordering::Less,
+        _ => unreachable!("compare_op on non-comparison operator"),
+    };
+    bool_value(res)
+}
+
+/// Resolve the collating sequence of a binary comparison: an explicit `COLLATE`
+/// on the left, else on the right, else the left column's declared collation,
+/// else the right column's, else `BINARY`. (Mirrors SQLite's rules.)
+fn resolve_collation(left: &Expr, right: &Expr, ctx: &EvalCtx) -> Collation {
+    explicit_collation(left)
+        .or_else(|| explicit_collation(right))
+        .or_else(|| column_collation_of(left, ctx))
+        .or_else(|| column_collation_of(right, ctx))
+        .unwrap_or_default()
+}
+
+fn explicit_collation(e: &Expr) -> Option<Collation> {
+    match e {
+        Expr::Collate { collation, .. } => Collation::parse(collation),
+        Expr::Paren(inner) => explicit_collation(inner),
+        _ => None,
+    }
+}
+
+fn column_collation_of(e: &Expr, ctx: &EvalCtx) -> Option<Collation> {
+    match e {
+        Expr::Column { table, column } => ctx.column_collation(table.as_deref(), column),
+        Expr::Paren(inner) | Expr::Collate { expr: inner, .. } => column_collation_of(inner, ctx),
+        _ => None,
+    }
+}
+
+/// The collation of an `ORDER BY`/`GROUP BY` key expression: an explicit
+/// `COLLATE`, else the underlying column's collation, else `BINARY`.
+pub fn key_collation(e: &Expr, ctx: &EvalCtx) -> Collation {
+    explicit_collation(e)
+        .or_else(|| column_collation_of(e, ctx))
+        .unwrap_or_default()
+}
+
 /// Evaluate `expr` against `ctx`.
 pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     match expr {
@@ -311,7 +380,7 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 // Short-circuit AND/OR per SQLite's three-valued logic.
                 And => eval_and(left, right, ctx),
                 Or => eval_or(left, right, ctx),
-                // Comparisons apply operand affinity before comparing.
+                // Comparisons apply operand affinity, then the resolved collation.
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {
                     let l = eval(left, ctx)?;
                     let r = eval(right, ctx)?;
@@ -321,7 +390,8 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                         r,
                         expr_affinity(right, ctx),
                     );
-                    eval_binary(*op, l, r)
+                    let coll = resolve_collation(left, right, ctx);
+                    Ok(compare_op(*op, &l, &r, coll))
                 }
                 _ => eval_binary(*op, eval(left, ctx)?, eval(right, ctx)?),
             }
@@ -359,6 +429,8 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             else_result,
         } => eval_case(operand.as_deref(), when_then, else_result.as_deref(), ctx),
         Expr::Cast { expr, type_name } => Ok(cast(eval(expr, ctx)?, type_name)),
+        // COLLATE only affects comparisons; the value itself is the operand's.
+        Expr::Collate { expr, .. } => eval(expr, ctx),
         Expr::Function {
             name, args, star, ..
         } => super::func::eval_scalar(name, args, *star, ctx),

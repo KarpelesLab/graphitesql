@@ -1111,6 +1111,7 @@ impl Connection {
                 name: c.name.clone(),
                 table: String::from(label),
                 affinity: c.affinity,
+                collation: c.collation,
             })
             .collect();
         self.outer_scope.borrow_mut().push(OuterFrame {
@@ -1416,7 +1417,7 @@ impl Connection {
             insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
             for idx in &indexes {
                 let key = index_key(&idx.cols, &index_values, rowid);
-                insert_index(self.backend.writer()?, idx.root, &key)?;
+                insert_index(self.backend.writer()?, idx.root, &key, &idx.collations)?;
             }
             self.fire_triggers(
                 &ins.table,
@@ -1461,7 +1462,8 @@ impl Connection {
                     continue; // a NULL makes the key distinct
                 }
                 let conflict = set.iter().zip(&new_tuple).all(|(&i, nv)| {
-                    crate::value::cmp_values(&ev[i], nv) == core::cmp::Ordering::Equal
+                    crate::value::cmp_values_coll(&ev[i], nv, meta.columns[i].collation)
+                        == core::cmp::Ordering::Equal
                 });
                 if conflict {
                     out.push(er);
@@ -1663,7 +1665,7 @@ impl Connection {
             return Err(Error::Error(format!("index {} already exists", ci.name)));
         }
         let tmeta = self.table_meta(&ci.table, None)?;
-        let cols = self.index_columns(&tmeta, ci)?;
+        let (cols, colls) = self.index_columns_coll(&tmeta, ci)?;
         let schema_next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
 
         // WITHOUT ROWID secondary indexes are keyed by (indexed cols, PK cols)
@@ -1671,10 +1673,12 @@ impl Connection {
         let root = if tmeta.without_rowid {
             let rows = self.scan_without_rowid(&tmeta)?;
             let pk_cols = tmeta.storage_order[..tmeta.pk_len].to_vec();
+            let mut key_colls = colls.clone();
+            key_colls.extend(self.col_collations(&tmeta, &pk_cols));
             let w = self.backend.writer()?;
             let root = create_index_root(w)?;
             for row in &rows {
-                insert_index(w, root, &wr_index_key(&cols, &pk_cols, row))?;
+                insert_index(w, root, &wr_index_key(&cols, &pk_cols, row), &key_colls)?;
             }
             root
         } else {
@@ -1682,7 +1686,7 @@ impl Connection {
             let w = self.backend.writer()?;
             let root = create_index_root(w)?;
             for (rowid, values) in &rows {
-                insert_index(w, root, &index_key(&cols, values, *rowid))?;
+                insert_index(w, root, &index_key(&cols, values, *rowid), &colls)?;
             }
             root
         };
@@ -1769,6 +1773,7 @@ impl Connection {
                 name: c.name.clone(),
                 table: label.to_string(),
                 affinity: c.affinity,
+                collation: c.collation,
             })
             .collect();
         Some((columns, b.rows.clone()))
@@ -1788,6 +1793,7 @@ impl Connection {
                 name: n,
                 table: cte.name.clone(),
                 affinity: eval::Affinity::Blob,
+                collation: crate::value::Collation::default(),
             })
             .collect()
     }
@@ -1974,6 +1980,7 @@ impl Connection {
                 name: n,
                 table: label.clone(),
                 affinity: eval::Affinity::Blob,
+                collation: crate::value::Collation::default(),
             })
             .collect();
         let rows = result
@@ -2257,27 +2264,32 @@ impl Connection {
 
         // Choose the index covering the longest leftmost prefix of equalities.
         let indexes = self.indexes_of(table_name)?;
-        let mut best: Option<(u32, Vec<Value>)> = None;
+        let mut best: Option<(u32, Vec<Value>, Vec<crate::value::Collation>)> = None;
         for idx in &indexes {
             let mut key = Vec::new();
-            for &c in &idx.cols {
+            let mut colls = Vec::new();
+            for (pos, &c) in idx.cols.iter().enumerate() {
                 match eqs.iter().find(|(col, _)| *col == c) {
-                    Some((_, v)) => key.push(meta.columns[c].affinity.coerce(v.clone())),
+                    Some((_, v)) => {
+                        key.push(meta.columns[c].affinity.coerce(v.clone()));
+                        colls.push(idx.collations[pos]);
+                    }
                     None => break,
                 }
             }
-            if key.len() > best.as_ref().map_or(0, |(_, k)| k.len()) {
-                best = Some((idx.root, key));
+            if key.len() > best.as_ref().map_or(0, |(_, k, _)| k.len()) {
+                best = Some((idx.root, key, colls));
             }
         }
-        let Some((root, key)) = best else {
+        let Some((root, key, seek_colls)) = best else {
             return Ok(None);
         };
         if key.is_empty() {
             return Ok(None);
         }
 
-        let rowids = crate::btree::index_seek_rowids(self.backend.source(), root, &key)?;
+        let rowids =
+            crate::btree::index_seek_rowids(self.backend.source(), root, &key, &seek_colls)?;
         let encoding = self.backend.source().header().text_encoding;
         let mut cur = TableCursor::new(self.backend.source(), meta.root);
         let mut out = Vec::new();
@@ -2466,19 +2478,22 @@ impl Connection {
                     let Statement::CreateIndex(ci) = sql::parse_one(sql)? else {
                         continue;
                     };
-                    let cols = self.index_columns(&tmeta, &ci)?;
+                    let (cols, collations) = self.index_columns_coll(&tmeta, &ci)?;
                     out.push(IndexMeta {
                         root: obj.rootpage,
                         cols,
+                        collations,
                     });
                 }
                 // Automatic index: its columns are the n-th UNIQUE/PK set.
                 None => {
                     if let Some(n) = autoindex_number(&obj.name, table) {
                         if let Some(cols) = tmeta.unique.get(n - 1) {
+                            let collations = self.col_collations(&tmeta, cols);
                             out.push(IndexMeta {
                                 root: obj.rootpage,
                                 cols: cols.clone(),
+                                collations,
                             });
                         }
                     }
@@ -2489,9 +2504,28 @@ impl Connection {
     }
 
     fn index_columns(&self, tmeta: &TableMeta, ci: &CreateIndex) -> Result<Vec<usize>> {
+        Ok(self.index_columns_coll(tmeta, ci)?.0)
+    }
+
+    /// Resolve an index's columns to `(positions, collations)`. A column may
+    /// carry an explicit `COLLATE name`; otherwise it inherits the table
+    /// column's declared collation.
+    fn index_columns_coll(
+        &self,
+        tmeta: &TableMeta,
+        ci: &CreateIndex,
+    ) -> Result<(Vec<usize>, Vec<crate::value::Collation>)> {
         let mut cols = Vec::new();
+        let mut colls = Vec::new();
         for term in &ci.columns {
-            let Expr::Column { column, .. } = &term.expr else {
+            // Peel an explicit COLLATE off the index column expression.
+            let (inner, explicit) = match &term.expr {
+                Expr::Collate { expr, collation } => {
+                    (expr.as_ref(), crate::value::Collation::parse(collation))
+                }
+                e => (e, None),
+            };
+            let Expr::Column { column, .. } = inner else {
                 return Err(Error::Unsupported("expression indexes"));
             };
             let pos = tmeta
@@ -2500,8 +2534,14 @@ impl Connection {
                 .position(|c| c.name.eq_ignore_ascii_case(column))
                 .ok_or_else(|| Error::Error(format!("no such column: {column}")))?;
             cols.push(pos);
+            colls.push(explicit.unwrap_or(tmeta.columns[pos].collation));
         }
-        Ok(cols)
+        Ok((cols, colls))
+    }
+
+    /// The declared collations of a set of table columns (for autoindexes).
+    fn col_collations(&self, tmeta: &TableMeta, cols: &[usize]) -> Vec<crate::value::Collation> {
+        cols.iter().map(|&c| tmeta.columns[c].collation).collect()
     }
 
     /// Rebuild every index of a table in place (used after DELETE/UPDATE).
@@ -2515,7 +2555,7 @@ impl Connection {
             clear_index(w, idx.root)?;
             for (rowid, values) in &rows {
                 let key = index_key(&idx.cols, values, *rowid);
-                insert_index(w, idx.root, &key)?;
+                insert_index(w, idx.root, &key, &idx.collations)?;
             }
         }
         Ok(())
@@ -2660,6 +2700,7 @@ impl Connection {
                 name: col_name.clone(),
                 table: String::new(),
                 affinity: eval::Affinity::Blob,
+                collation: crate::value::Collation::default(),
             });
             for (row, v) in rows.iter_mut().zip(values) {
                 row.values.push(v);
@@ -2873,6 +2914,48 @@ impl Connection {
         Ok(())
     }
 
+    /// The collating sequence to apply to each `ORDER BY` term (an explicit
+    /// `COLLATE`, else the underlying column's collation, else `BINARY`).
+    fn order_collations(
+        &self,
+        sel: &Select,
+        columns: &[ColumnInfo],
+        params: &Params,
+    ) -> Vec<crate::value::Collation> {
+        let ctx = row_ctx(&[], columns, None, params);
+        sel.order_by
+            .iter()
+            .map(|t| eval::key_collation(&t.expr, &ctx))
+            .collect()
+    }
+
+    /// The collation of each projected output column (a column's collation, an
+    /// explicit `COLLATE`, else `BINARY`). Wildcards expand to the source columns.
+    fn output_collations(
+        &self,
+        sel: &Select,
+        columns: &[ColumnInfo],
+        params: &Params,
+    ) -> Vec<crate::value::Collation> {
+        let ctx = row_ctx(&[], columns, None, params);
+        let mut out = Vec::new();
+        for col in &sel.columns {
+            match col {
+                ResultColumn::Expr { expr, .. } => out.push(eval::key_collation(expr, &ctx)),
+                ResultColumn::Wildcard => {
+                    out.extend(columns.iter().map(|c| c.collation));
+                }
+                ResultColumn::TableWildcard(t) => out.extend(
+                    columns
+                        .iter()
+                        .filter(|c| c.table.eq_ignore_ascii_case(t))
+                        .map(|c| c.collation),
+                ),
+            }
+        }
+        out
+    }
+
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
         let (mut columns, input_rows) = self.scan_source(sel, params)?;
 
@@ -2910,11 +2993,13 @@ impl Connection {
             self.eval_simple(sel, &columns, rows, params)?
         };
 
-        // DISTINCT (dedupe on output values, preserving first occurrence).
+        // DISTINCT (dedupe on output values, preserving first occurrence), each
+        // output column compared under its collation.
         if sel.distinct {
+            let colls = self.output_collations(sel, &columns, params);
             let mut seen: Vec<Vec<Value>> = Vec::new();
             out.retain(|row| {
-                if seen.iter().any(|s| rows_equal(s, &row.values)) {
+                if seen.iter().any(|s| rows_equal_coll(s, &row.values, &colls)) {
                     false
                 } else {
                     seen.push(row.values.clone());
@@ -2925,10 +3010,12 @@ impl Connection {
 
         // ORDER BY.
         if !sel.order_by.is_empty() {
-            // Stable sort by the precomputed sort keys.
+            let colls = self.order_collations(sel, &columns, params);
+            // Stable sort by the precomputed sort keys, each under its collation.
             out.sort_by(|a, b| {
                 for (i, term) in sel.order_by.iter().enumerate() {
-                    let ord = eval::compare(&a.sort_keys[i], &b.sort_keys[i]);
+                    let ord =
+                        crate::value::cmp_values_coll(&a.sort_keys[i], &b.sort_keys[i], colls[i]);
                     let ord = if term.descending { ord.reverse() } else { ord };
                     if ord != core::cmp::Ordering::Equal {
                         return ord;
@@ -3111,6 +3198,7 @@ impl Connection {
                 name: n.clone(),
                 table: label.clone(),
                 affinity: eval::Affinity::Blob,
+                collation: crate::value::Collation::default(),
             })
             .collect();
         Ok((columns, result.rows))
@@ -3230,9 +3318,7 @@ impl Connection {
 
             // Reject a duplicate primary key or any other UNIQUE constraint.
             let existing = self.scan_without_rowid(meta)?;
-            let dup = existing
-                .iter()
-                .any(|r| unique_match(&meta.unique, r, &values));
+            let dup = existing.iter().any(|r| unique_match(meta, r, &values));
             if dup {
                 match ins.on_conflict {
                     OnConflict::Abort => {
@@ -3245,13 +3331,14 @@ impl Connection {
                             meta,
                             existing
                                 .into_iter()
-                                .filter(|r| !unique_match(&meta.unique, r, &values)),
+                                .filter(|r| !unique_match(meta, r, &values)),
                         )?;
                     }
                 }
             }
             let record = encode_record(&permute_row(meta, &values));
-            insert_index(self.backend.writer()?, meta.root, &record)?;
+            let scolls = wr_storage_collations(meta);
+            insert_index(self.backend.writer()?, meta.root, &record, &scolls)?;
             affected += 1;
         }
         if affected > 0 {
@@ -3335,7 +3422,7 @@ impl Connection {
         // Reject duplicate primary keys or UNIQUE values produced by the update.
         for i in 0..out.len() {
             for j in (i + 1)..out.len() {
-                if unique_match(&meta.unique, &out[i], &out[j]) {
+                if unique_match(meta, &out[i], &out[j]) {
                     return Err(Error::Constraint("UNIQUE constraint failed".into()));
                 }
             }
@@ -3357,10 +3444,11 @@ impl Connection {
         let records: Vec<Vec<u8>> = rows
             .map(|r| encode_record(&permute_row(meta, &r)))
             .collect();
+        let scolls = wr_storage_collations(meta);
         let w = self.backend.writer()?;
         clear_index(w, meta.root)?;
         for rec in &records {
-            insert_index(w, meta.root, rec)?;
+            insert_index(w, meta.root, rec, &scolls)?;
         }
         Ok(())
     }
@@ -3374,11 +3462,20 @@ impl Connection {
         }
         let rows = self.scan_without_rowid(meta)?;
         let pk_cols = meta.storage_order[..meta.pk_len].to_vec();
+        let pk_colls: Vec<crate::value::Collation> =
+            pk_cols.iter().map(|&c| meta.columns[c].collation).collect();
         let w = self.backend.writer()?;
         for idx in &indexes {
+            let mut key_colls = idx.collations.clone();
+            key_colls.extend(pk_colls.iter().copied());
             clear_index(w, idx.root)?;
             for row in &rows {
-                insert_index(w, idx.root, &wr_index_key(&idx.cols, &pk_cols, row))?;
+                insert_index(
+                    w,
+                    idx.root,
+                    &wr_index_key(&idx.cols, &pk_cols, row),
+                    &key_colls,
+                )?;
             }
         }
         Ok(())
@@ -3544,7 +3641,15 @@ impl Connection {
             return Err(Error::Unsupported("'*' with aggregation"));
         }
 
-        // Partition rows into groups (first-seen order).
+        // Partition rows into groups (first-seen order), comparing each grouping
+        // key under its column collation.
+        let group_colls: Vec<crate::value::Collation> = {
+            let cctx = row_ctx(&[], columns, None, params);
+            sel.group_by
+                .iter()
+                .map(|g| eval::key_collation(g, &cctx))
+                .collect()
+        };
         let mut group_keys: Vec<Vec<Value>> = Vec::new();
         let mut groups: Vec<Vec<usize>> = Vec::new();
         for (i, r) in rows.iter().enumerate() {
@@ -3553,7 +3658,10 @@ impl Connection {
             for g in &sel.group_by {
                 key.push(eval::eval(g, &ctx)?);
             }
-            match group_keys.iter().position(|k| rows_equal(k, &key)) {
+            match group_keys
+                .iter()
+                .position(|k| rows_equal_coll(k, &key, &group_colls))
+            {
                 Some(idx) => groups[idx].push(i),
                 None => {
                     group_keys.push(key);
@@ -3769,7 +3877,13 @@ impl Connection {
             }
         }
         if distinct {
-            dedup_values(&mut vals);
+            let coll = if star || args.is_empty() {
+                crate::value::Collation::default()
+            } else {
+                let cctx = row_ctx(&[], columns, None, params);
+                eval::key_collation(&args[0], &cctx)
+            };
+            dedup_values(&mut vals, coll);
         }
 
         Ok(match lname.as_str() {
@@ -3897,6 +4011,7 @@ impl Connection {
                 name: c.name.clone(),
                 table: table_label.clone(),
                 affinity: eval::Affinity::from_type(c.type_name.as_deref()),
+                collation: column_collation(c),
             })
             .collect();
         let defaults: Vec<Option<Expr>> = ct
@@ -4058,6 +4173,8 @@ impl TableMeta {
 struct IndexMeta {
     root: u32,
     cols: Vec<usize>,
+    /// Collating sequence for each indexed column (aligned with `cols`).
+    collations: Vec<crate::value::Collation>,
 }
 
 impl Connection {
@@ -4505,12 +4622,12 @@ fn index_key(cols: &[usize], values: &[Value], rowid: i64) -> Vec<u8> {
 
 /// Whether rows `a` and `b` collide on any UNIQUE/PRIMARY KEY column set (all
 /// columns of the set equal and none NULL — NULLs are distinct, as in SQLite).
-fn unique_match(sets: &[Vec<usize>], a: &[Value], b: &[Value]) -> bool {
-    sets.iter().any(|set| {
+fn unique_match(meta: &TableMeta, a: &[Value], b: &[Value]) -> bool {
+    meta.unique.iter().any(|set| {
         set.iter().all(|&c| {
             !matches!(a[c], Value::Null)
                 && !matches!(b[c], Value::Null)
-                && eval::compare(&a[c], &b[c]).is_eq()
+                && crate::value::cmp_values_coll(&a[c], &b[c], meta.columns[c].collation).is_eq()
         })
     })
 }
@@ -4707,12 +4824,22 @@ fn rows_equal(a: &[Value], b: &[Value]) -> bool {
             .all(|(x, y)| eval::compare(x, y) == core::cmp::Ordering::Equal)
 }
 
-fn dedup_values(vals: &mut Vec<Value>) {
+/// Like [`rows_equal`] but comparing column `i` under collation `colls[i]`
+/// (missing entries default to `BINARY`).
+fn rows_equal_coll(a: &[Value], b: &[Value], colls: &[crate::value::Collation]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).enumerate().all(|(i, (x, y))| {
+            let c = colls.get(i).copied().unwrap_or_default();
+            crate::value::cmp_values_coll(x, y, c) == core::cmp::Ordering::Equal
+        })
+}
+
+fn dedup_values(vals: &mut Vec<Value>, coll: crate::value::Collation) {
     let mut seen: Vec<Value> = Vec::new();
     vals.retain(|v| {
         if seen
             .iter()
-            .any(|s| eval::compare(s, v) == core::cmp::Ordering::Equal)
+            .any(|s| crate::value::cmp_values_coll(s, v, coll) == core::cmp::Ordering::Equal)
         {
             false
         } else {
@@ -4758,6 +4885,27 @@ fn expr_label(expr: &Expr) -> String {
 
 /// Detect an `INTEGER PRIMARY KEY` rowid alias column (must be declared exactly
 /// `INTEGER`, per SQLite — `INT PRIMARY KEY` does not alias the rowid).
+/// The collating sequences for a `WITHOUT ROWID` table's stored columns, in
+/// on-disk (PK-first) order — used to order its clustered b-tree.
+fn wr_storage_collations(meta: &TableMeta) -> Vec<crate::value::Collation> {
+    meta.storage_order
+        .iter()
+        .map(|&c| meta.columns[c].collation)
+        .collect()
+}
+
+/// The declared collating sequence of a column (`COLLATE name`), `BINARY` if
+/// none or unrecognized.
+fn column_collation(col: &ColumnDef) -> crate::value::Collation {
+    col.constraints
+        .iter()
+        .find_map(|c| match c {
+            ColumnConstraint::Collate(name) => crate::value::Collation::parse(name),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// The UNIQUE / non-rowid PRIMARY KEY column-index sets of a table, in
 /// declaration order (column-level constraints first, in column order, then
 /// table-level constraints). This is exactly the order SQLite numbers its

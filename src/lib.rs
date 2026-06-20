@@ -52,7 +52,7 @@ pub mod error;
 pub mod util;
 
 mod value;
-pub use value::{cmp_values, SerialType, Value, ValueRef};
+pub use value::{cmp_text, cmp_values, cmp_values_coll, Collation, SerialType, Value, ValueRef};
 
 pub mod btree;
 pub mod exec;
