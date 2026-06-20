@@ -964,6 +964,9 @@ impl Connection {
             // The index lives in the schema named on the index (or, unqualified,
             // wherever its table lives — so a temp table's index goes to temp).
             Statement::CreateIndex(ci) => resolved(ci.schema.as_deref(), &ci.table),
+            // A trigger lives in the schema named on it (or, unqualified,
+            // wherever the table it fires on lives).
+            Statement::CreateTrigger(ct) => resolved(ct.schema.as_deref(), &ct.table),
             _ => Ok(DbRef::Main),
         }
     }
@@ -2030,6 +2033,15 @@ impl Connection {
 
     /// Store a `CREATE TRIGGER` in `sqlite_schema` (type `trigger`, no b-tree).
     fn exec_create_trigger(&mut self, ct: &CreateTrigger, sql_text: &str) -> Result<()> {
+        // A schema-qualified `CREATE TRIGGER aux.tr …` stores its SQL bare-named.
+        let stripped;
+        let sql_text = match ct.schema.as_deref() {
+            Some(s) => {
+                stripped = strip_schema_qualifier(sql_text, s)?;
+                stripped.as_str()
+            }
+            None => sql_text,
+        };
         if self
             .schema
             .objects()
@@ -9283,6 +9295,40 @@ fn permute_row(meta: &TableMeta, declared: &[Value]) -> Vec<Value> {
         .iter()
         .map(|&i| declared[i].clone())
         .collect()
+}
+
+/// Remove an explicit `schema.` qualifier from a qualified `CREATE` statement's
+/// text so the SQL stored in the target catalog is bare-named (the `schema.`
+/// prefix is invalid in that database's own namespace, and sqlite3 rejects it).
+///
+/// In an *explicitly* qualified CREATE the first `.` token is the object-name
+/// qualifier (only keywords precede the name). `schema` is the resolved
+/// qualifier; when it came from the `TEMP` keyword rather than the text (so the
+/// first `.` is something else, e.g. `NEW.col` in a trigger body) the leading
+/// identifier won't match and the text is returned unchanged.
+fn strip_schema_qualifier(sql: &str, schema: &str) -> Result<String> {
+    use crate::sql::token::Token;
+    let toks = crate::sql::token::tokenize(sql)?;
+    for (i, t) in toks.iter().enumerate() {
+        if i == 0 || !matches!(t.token, Token::Dot) {
+            continue;
+        }
+        let lead = match &toks[i - 1].token {
+            Token::Word(s) | Token::Ident(s) => Some(s.as_str()),
+            _ => None,
+        };
+        if lead.is_some_and(|s| s.eq_ignore_ascii_case(schema)) {
+            let schema_start = toks[i - 1].start;
+            let name_start = toks.get(i + 1).map_or(sql.len(), |s| s.start);
+            let mut out = String::with_capacity(sql.len());
+            out.push_str(&sql[..schema_start]);
+            out.push_str(&sql[name_start..]);
+            return Ok(out);
+        }
+        // The first `.` is not the object qualifier — nothing to strip.
+        break;
+    }
+    Ok(sql.into())
 }
 
 /// The inverse of [`permute_row`]: storage order back to declared column order.

@@ -211,8 +211,9 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
   materialized through its own backend, and 3-part column names
   (`aux.tbl.col`) parse. `WITHOUT ROWID` tables read cross-db too (sole
   source and join source). Qualified `ALTER TABLE aux.t …` (ADD / RENAME
-  COLUMN / RENAME TABLE) and `CREATE INDEX aux.idx ON t(…)` target the
-  attached database, cross-engine verified (stored bare-named).
+  COLUMN / RENAME TABLE), `CREATE INDEX aux.idx ON t(…)`, and
+  `CREATE TRIGGER aux.tr … ON t …` target the attached database, cross-engine
+  verified (stored bare-named; trigger bodies' `NEW.col` left intact).
 - ✅ **C4 — `TEMP` tables.** A lazily-created in-memory `temp` database (seq 1);
   `CREATE TEMP TABLE` targets it (modeled as a `schema = "temp"` qualifier);
   unqualified names resolve `temp`→`main` (a temp table shadows main);
@@ -229,7 +230,10 @@ transaction-state validation, and the introspection PRAGMAs (`index_list`,
 
 **The ATTACH/DETACH/TEMP multi-schema track (C1–C5) is complete** for in-memory
 and file databases, including cross-database joins. Remaining multi-schema
-refinements: qualified `CREATE VIEW|TRIGGER`, and cross-database transactions.
+refinements: cross-database **view reads** (`SELECT … FROM aux.someview` — the
+view body must resolve its tables in `aux`, which needs a read-path
+default-database context; qualified `CREATE VIEW` waits on this), and
+cross-database transactions.
 
 *Storage:*
 

@@ -579,6 +579,8 @@ pub enum TriggerEvent {
 pub struct CreateTrigger {
     /// `IF NOT EXISTS`?
     pub if_not_exists: bool,
+    /// Optional `schema.` (database) qualifier.
+    pub schema: Option<String>,
     /// Trigger name.
     pub name: String,
     /// `BEFORE`/`AFTER`/`INSTEAD OF`.

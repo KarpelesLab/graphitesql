@@ -923,7 +923,7 @@ impl Parser {
 
     fn create_trigger(&mut self) -> Result<CreateTrigger> {
         let if_not_exists = self.if_not_exists()?;
-        let name = self.ident()?;
+        let (schema, name) = self.qualified_name()?;
         let timing = if self.eat_kw("before") {
             TriggerTiming::Before
         } else if self.eat_kw("after") {
@@ -972,6 +972,7 @@ impl Parser {
         self.expect_kw("end")?;
         Ok(CreateTrigger {
             if_not_exists,
+            schema,
             name,
             timing,
             event,

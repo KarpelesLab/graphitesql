@@ -275,6 +275,79 @@ fn cross_database_create_index_file_cross_engine() {
 }
 
 #[test]
+fn cross_database_create_trigger() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE aux.t(a INT, b TEXT)").unwrap();
+    c.execute("CREATE TABLE aux.log(msg TEXT)").unwrap();
+    // A trigger on an attached table, with `NEW.col` in its body.
+    c.execute(
+        "CREATE TRIGGER aux.tr AFTER INSERT ON t BEGIN INSERT INTO log(msg) VALUES(NEW.b); END",
+    )
+    .unwrap();
+    c.execute("INSERT INTO aux.t VALUES(3,'z')").unwrap();
+    // It fires against the attached database.
+    assert_eq!(
+        c.query("SELECT msg FROM aux.log").unwrap().rows[0][0],
+        Value::Text("z".into())
+    );
+    // Stored bare-named (the `aux.` qualifier stripped, but `NEW.b` untouched).
+    assert_eq!(
+        c.query("SELECT sql FROM aux.sqlite_master WHERE name='tr'")
+            .unwrap()
+            .rows[0][0],
+        Value::Text(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log(msg) VALUES(NEW.b); END"
+                .into()
+        )
+    );
+    // Nothing leaked into main.
+    assert_eq!(
+        c.query("SELECT count(*) FROM main.sqlite_master")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(0)
+    );
+}
+
+#[test]
+fn cross_database_create_trigger_file_cross_engine() {
+    let sqlite = std::process::Command::new("sqlite3")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !sqlite {
+        return;
+    }
+    let mut p = std::env::temp_dir();
+    p.push(format!("graphitesql-attach-trig-{}.db", std::process::id()));
+    let path = p.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(&format!("ATTACH '{path}' AS d")).unwrap();
+        c.execute("CREATE TABLE d.t(a INT, b TEXT)").unwrap();
+        c.execute("CREATE TABLE d.log(msg TEXT)").unwrap();
+        c.execute(
+            "CREATE TRIGGER d.tr AFTER INSERT ON t BEGIN INSERT INTO log(msg) VALUES(NEW.b); END",
+        )
+        .unwrap();
+    }
+    // sqlite3 reads the file (bare-named trigger SQL), and the trigger it parsed
+    // fires on its own insert.
+    let out = std::process::Command::new("sqlite3")
+        .arg(&path)
+        .arg("PRAGMA integrity_check; INSERT INTO t VALUES(1,'hi'); SELECT msg FROM log;")
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("ok"), "integrity: {s}");
+    assert!(s.contains("hi"), "trigger fire under sqlite3: {s}");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-journal"));
+}
+
+#[test]
 fn cross_database_alter() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("ATTACH ':memory:' AS aux").unwrap();
