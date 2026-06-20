@@ -2978,13 +2978,23 @@ impl Connection {
 
     /// Build the column metadata for a CTE from its body's output labels (or its
     /// explicit `(col, …)` list), labeled with the CTE name.
-    fn cte_columns(&self, cte: &Cte, body_cols: &[String]) -> Vec<ColumnInfo> {
+    fn cte_columns(&self, cte: &Cte, body_cols: &[String]) -> Result<Vec<ColumnInfo>> {
         let names = if cte.columns.is_empty() {
             body_cols.to_vec()
         } else {
+            // An explicit column list must match the body's column count, as in
+            // SQLite (`table t has N values for M columns`).
+            if cte.columns.len() != body_cols.len() {
+                return Err(Error::Error(alloc::format!(
+                    "table {} has {} values for {} columns",
+                    cte.name,
+                    body_cols.len(),
+                    cte.columns.len()
+                )));
+            }
             cte.columns.clone()
         };
-        names
+        Ok(names
             .into_iter()
             .map(|n| ColumnInfo {
                 name: n,
@@ -2992,13 +3002,13 @@ impl Connection {
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
             })
-            .collect()
+            .collect())
     }
 
     /// A non-recursive CTE: run its body once.
     fn materialize_plain_cte(&self, cte: &Cte, params: &Params) -> Result<CteBinding> {
         let result = self.run_select(&cte.select, params)?;
-        let columns = self.cte_columns(cte, &result.columns);
+        let columns = self.cte_columns(cte, &result.columns)?;
         let rows = result
             .rows
             .into_iter()
@@ -3078,7 +3088,7 @@ impl Connection {
             anchor_rows.extend(r.rows);
         }
         let body_cols = self.run_select(&anchor[0], params)?.columns;
-        let columns = self.cte_columns(cte, &body_cols);
+        let columns = self.cte_columns(cte, &body_cols)?;
 
         if rec_distinct {
             dedup_rows(&mut anchor_rows);

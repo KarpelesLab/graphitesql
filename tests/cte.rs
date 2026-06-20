@@ -207,3 +207,24 @@ fn recursive_cte_limit_terminates_and_bounds() {
         vec![1, 2, 3, 4]
     );
 }
+
+#[test]
+fn cte_explicit_column_count_must_match() {
+    let c = Connection::open_memory().unwrap();
+    // Explicit column list longer/shorter than the body is rejected, like SQLite.
+    assert!(c
+        .query("WITH tt(a, b, c) AS (VALUES(1, 2)) SELECT * FROM tt")
+        .is_err());
+    assert!(c
+        .query("WITH tt(a) AS (VALUES(1, 2)) SELECT * FROM tt")
+        .is_err());
+    // A matching count (or no explicit list) is fine.
+    assert_eq!(
+        ints(&c, "WITH tt(a, b) AS (VALUES(7, 8)) SELECT a + b FROM tt"),
+        vec![15]
+    );
+    assert_eq!(
+        ints(&c, "WITH tt AS (VALUES(1, 2)) SELECT column1 FROM tt"),
+        vec![1]
+    );
+}
