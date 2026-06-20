@@ -5125,14 +5125,58 @@ impl Connection {
             *next_id += 1;
             out.push((id, parent, detail));
         }
-        for join in &from.joins {
-            let id = *next_id;
-            *next_id += 1;
-            out.push((
-                id,
-                parent,
-                alloc::format!("SCAN {}", eqp_label(&join.table)),
-            ));
+        // Fold each join in FROM order, tracking the accumulated left columns so
+        // the rowid-seek decision (shared with the executor via `rowid_join_seek`)
+        // can print `SEARCH … USING INTEGER PRIMARY KEY (rowid=?)` in lockstep
+        // with how it actually runs.
+        if !from.joins.is_empty() {
+            let mut left_columns = self.resolve_join_source(&from.first, params)?.0;
+            for join in &from.joins {
+                let id = *next_id;
+                *next_id += 1;
+                let label = eqp_label(&join.table);
+                let (detail, jcols) = match self.rowid_join_seek(join, &left_columns) {
+                    Some((_, inner_meta)) => (
+                        alloc::format!("SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"),
+                        inner_meta.columns,
+                    ),
+                    None => (
+                        alloc::format!("SCAN {label}"),
+                        self.resolve_join_source(&join.table, params)?.0,
+                    ),
+                };
+                out.push((id, parent, detail));
+                let left_width = left_columns.len();
+                left_columns.extend(jcols);
+                // Mirror the executor's NATURAL / USING coalescing: each join
+                // column folds into its left output position and the right
+                // duplicate is dropped, so a later join's `left_width` stays
+                // aligned (a rowid-seek join never uses NATURAL / USING).
+                if join.natural || !join.using.is_empty() {
+                    let mut drop: Vec<usize> = if join.natural {
+                        (left_width..left_columns.len())
+                            .filter(|&rl| {
+                                left_columns[..left_width]
+                                    .iter()
+                                    .any(|c| c.name.eq_ignore_ascii_case(&left_columns[rl].name))
+                            })
+                            .collect()
+                    } else {
+                        join.using
+                            .iter()
+                            .filter_map(|name| {
+                                (left_width..left_columns.len())
+                                    .find(|&rl| left_columns[rl].name.eq_ignore_ascii_case(name))
+                            })
+                            .collect()
+                    };
+                    drop.sort_unstable();
+                    drop.dedup();
+                    for &d in drop.iter().rev() {
+                        left_columns.remove(d);
+                    }
+                }
+            }
         }
         // ORDER BY that we satisfy with an in-memory sort — unless the rowid scan
         // already yields the requested order (no temp b-tree then, like sqlite).
@@ -6756,6 +6800,24 @@ impl Connection {
         // Fold each join in with a nested-loop, evaluating its ON predicate
         // against the columns accumulated so far plus the joined table's.
         for join in &from.joins {
+            // Roadmap B1a: when the inner table's join column is its rowid IPK,
+            // seek the one inner row by rowid per outer row instead of
+            // materializing and nested-looping it. Identical results to the
+            // materialize path (the full `ON` is re-evaluated on the seeked row).
+            if let Some((outer_col, inner_meta)) = self.rowid_join_seek(join, &columns) {
+                let (new_columns, joined) = self.exec_rowid_join_seek(
+                    join,
+                    &columns,
+                    &rows,
+                    outer_col,
+                    &inner_meta,
+                    params,
+                )?;
+                columns = new_columns;
+                rows = joined;
+                continue;
+            }
+
             let (jcols, jrows) = self.resolve_join_source(&join.table, params)?;
 
             let left_width = columns.len();
@@ -7069,6 +7131,143 @@ impl Connection {
             })
             .collect();
         Ok((columns, result.rows))
+    }
+
+    /// The single shared decision for the rowid-seek join optimization (roadmap
+    /// B1a): when a `JOIN`'s `ON` is a lone equi-join `outer.col = u.ipk` (or the
+    /// mirror) whose right side is the inner table `u`'s INTEGER PRIMARY KEY, the
+    /// inner row can be fetched by rowid per outer row instead of materializing
+    /// and nested-looping `u`. Returns `(outer_col_index, inner_meta)` when it
+    /// applies; `None` otherwise (the caller falls back to materialize/hash).
+    ///
+    /// Used by BOTH the executor (to seek) and the join EQP emitter (to print
+    /// `SEARCH … USING INTEGER PRIMARY KEY (rowid=?)` instead of `SCAN`), so the
+    /// two never diverge. `left_columns` is the column list accumulated for the
+    /// left side so far (its width is where the inner table's columns begin).
+    fn rowid_join_seek(
+        &self,
+        join: &Join,
+        left_columns: &[ColumnInfo],
+    ) -> Option<(usize, TableMeta)> {
+        // Only plain INNER / LEFT joins with a single `ON` equality — never
+        // NATURAL / USING / CROSS / RIGHT / FULL.
+        if !matches!(join.kind, JoinKind::Inner | JoinKind::Left)
+            || join.natural
+            || !join.using.is_empty()
+        {
+            return None;
+        }
+        let on = join.on.as_ref()?;
+        let tref = &join.table;
+        // The inner table must be a plain base table in `main`: not a subquery /
+        // CTE / view / TVF, and not schema-qualified.
+        if tref.subquery.is_some()
+            || tref.tvf_args.is_some()
+            || self.is_pragma_tvf(tref)
+            || tref.schema.is_some()
+            || self.lookup_cte(&tref.name, tref.alias.as_deref()).is_some()
+            || self.is_view(&tref.name)
+            || self.unqualified_db(&tref.name) != DbRef::Main
+        {
+            return None;
+        }
+        let meta = self.table_meta(&tref.name, tref.alias.as_deref()).ok()?;
+        // Must have a rowid IPK (rules out WITHOUT ROWID, which has `ipk == None`).
+        let ipk = meta.ipk?;
+        // The `ON` must be a single top-level `=` (after unwrapping parens), one
+        // side the inner table's IPK column and the other a left-side column.
+        let mut on = on;
+        while let Expr::Paren(inner) = on {
+            on = inner;
+        }
+        let left_width = left_columns.len();
+        let mut combined = left_columns.to_vec();
+        combined.extend(meta.columns.iter().cloned());
+        let (a, b) = match on {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => (col_index(left, &combined)?, col_index(right, &combined)?),
+            _ => return None,
+        };
+        // Identify which side is the inner IPK (`left_width + ipk`) and which is
+        // the outer column (a left-side index).
+        let inner_ipk = left_width + ipk;
+        let outer = if a == inner_ipk && b < left_width {
+            b
+        } else if b == inner_ipk && a < left_width {
+            a
+        } else {
+            return None;
+        };
+        Some((outer, meta))
+    }
+
+    /// Execute one rowid-seek join (decided by [`rowid_join_seek`](Self::rowid_join_seek)):
+    /// for each outer row, coerce its join column to an integer rowid, seek the
+    /// inner table's b-tree, and combine. The full `ON` is re-evaluated on the
+    /// fetched row so results are identical to the materialize/hash path. INNER
+    /// drops an outer row with no inner match; LEFT NULL-extends it.
+    fn exec_rowid_join_seek(
+        &self,
+        join: &Join,
+        columns: &[ColumnInfo],
+        rows: &[Vec<Value>],
+        outer_col: usize,
+        inner_meta: &TableMeta,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        let encoding = self.backend.source().header().text_encoding;
+        let mut new_columns = columns.to_vec();
+        new_columns.extend(inner_meta.columns.iter().cloned());
+        let n_jcols = inner_meta.columns.len();
+        let on = join.on.as_ref();
+        let is_left = matches!(join.kind, JoinKind::Left);
+
+        let mut cur = TableCursor::new(self.backend.source(), inner_meta.root);
+        let mut joined: Vec<Vec<Value>> = Vec::new();
+        for left in rows {
+            // Coerce the outer join value to a candidate rowid. A NULL (or any
+            // value that isn't an exact integer) never equi-joins; the `ON`
+            // re-eval below rejects a spurious truncation (e.g. `2.5` → 2).
+            let key = &left[outer_col];
+            let candidate = match key {
+                Value::Integer(i) => Some(*i),
+                Value::Real(_) | Value::Text(_) => match eval::to_number(key) {
+                    Value::Integer(i) => Some(i),
+                    Value::Real(r) if r == (r as i64) as f64 => Some(r as i64),
+                    _ => None,
+                },
+                Value::Null | Value::Blob(_) => None,
+            };
+            let mut matched = false;
+            if let Some(rid) = candidate {
+                if cur.seek(rid)? {
+                    let inner = self.decode_full_row(inner_meta, rid, &cur.payload()?, encoding)?;
+                    let mut combined = left.clone();
+                    combined.extend(inner);
+                    let keep = match on {
+                        Some(on) => {
+                            let ctx = row_ctx(&combined, &new_columns, None, params);
+                            eval::truth(&eval::eval(on, &ctx)?) == Some(true)
+                        }
+                        None => true,
+                    };
+                    if keep {
+                        joined.push(combined);
+                        matched = true;
+                    }
+                }
+            }
+            // LEFT: emit the outer row NULL-extended when nothing matched.
+            if !matched && is_left {
+                let mut combined = left.clone();
+                combined.extend(core::iter::repeat_n(Value::Null, n_jcols));
+                joined.push(combined);
+            }
+        }
+        Ok((new_columns, joined))
     }
 
     fn resolve_join_source(
