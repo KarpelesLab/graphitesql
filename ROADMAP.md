@@ -275,6 +275,14 @@ them (rather than corrupt the ptrmap it can't yet maintain).
 
 *Storage — `auto_vacuum` write path (C6b), split so each lands testable:*
 
+> Groundwork done: `src/btree/ptrmap.rs` — the pointer-map page cadence
+> (`ptrmap_pageno`/`is_ptrmap_page`/`ptrmap_entry_offset`, `n = usable/5`,
+> recurring every `n+1` from page 2) and the 5-byte entry encode/decode, with 13
+> unit tests cross-checked against a real sqlite3 `auto_vacuum` db. The write
+> path below consumes these helpers. (Note for C6b-2: also skip the
+> `PENDING_BYTE`/lock-byte page and source `usable_size` from the live header
+> incl. `reserved_space`.)
+
 - **C6b-1 — header flag + ptrmap page layout at create.** Honor `PRAGMA
   auto_vacuum=FULL|INCREMENTAL` on an empty database: set the header
   largest-root-page / incremental-vacuum fields and reserve pointer-map pages at
