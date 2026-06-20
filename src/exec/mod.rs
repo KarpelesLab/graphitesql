@@ -3647,6 +3647,29 @@ impl Connection {
                     }
                     Value::Integer(dr)
                 }
+                "percent_rank" => {
+                    // (rank - 1) / (rows - 1); 0 for a single-row partition.
+                    let mut r = p;
+                    while r > 0 && cmp_keys(&ord_keys[ordered[r - 1]], &ord_keys[idx], &[]).is_eq()
+                    {
+                        r -= 1;
+                    }
+                    if m > 1 {
+                        Value::Real(r as f64 / (m - 1) as f64)
+                    } else {
+                        Value::Real(0.0)
+                    }
+                }
+                "cume_dist" => {
+                    // (# rows ordered <= current, incl. peers) / rows.
+                    let mut last = p;
+                    while last + 1 < m
+                        && cmp_keys(&ord_keys[idx], &ord_keys[ordered[last + 1]], &[]).is_eq()
+                    {
+                        last += 1;
+                    }
+                    Value::Real((last + 1) as f64 / m as f64)
+                }
                 "ntile" => {
                     let buckets = arg_vals[idx].first().map(eval::to_i64).unwrap_or(1).max(1);
                     Value::Integer(ntile_bucket(p, m, buckets))

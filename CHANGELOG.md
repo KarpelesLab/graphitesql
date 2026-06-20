@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Track A: `percent_rank()` and `cume_dist()` window functions. Verified against
+  `sqlite3`.
 - Track A: named windows — `WINDOW w AS (…)` definitions with `OVER w` references
   and `OVER (w ORDER BY …)` extension (a base window supplies `PARTITION BY`; the
   use may add `ORDER BY`/frame). Verified against `sqlite3`.
