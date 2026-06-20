@@ -232,6 +232,10 @@ pub enum JoinKind {
     Inner,
     /// `LEFT [OUTER] JOIN`.
     Left,
+    /// `RIGHT [OUTER] JOIN`.
+    Right,
+    /// `FULL [OUTER] JOIN`.
+    Full,
 }
 
 /// A join onto a table.

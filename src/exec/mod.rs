@@ -4117,10 +4117,12 @@ impl Connection {
             new_columns.extend(jcols.iter().cloned());
             let n_jcols = jcols.len();
 
+            let left_width = columns.len();
             let mut joined: Vec<Vec<Value>> = Vec::new();
+            let mut right_matched = alloc::vec![false; jrows.len()];
             for left in &rows {
                 let mut matched = false;
-                for right in &jrows {
+                for (ri, right) in jrows.iter().enumerate() {
                     let mut combined = left.clone();
                     combined.extend(right.iter().cloned());
                     let keep = match &join.on {
@@ -4133,13 +4135,24 @@ impl Connection {
                     if keep {
                         joined.push(combined);
                         matched = true;
+                        right_matched[ri] = true;
                     }
                 }
-                // LEFT JOIN: emit the left row with NULLs when nothing matched.
-                if !matched && join.kind == JoinKind::Left {
+                // LEFT/FULL: emit the left row with NULLs when nothing matched.
+                if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
                     let mut combined = left.clone();
                     combined.extend(core::iter::repeat_n(Value::Null, n_jcols));
                     joined.push(combined);
+                }
+            }
+            // RIGHT/FULL: emit each unmatched right row with NULLs for the left.
+            if matches!(join.kind, JoinKind::Right | JoinKind::Full) {
+                for (ri, right) in jrows.iter().enumerate() {
+                    if !right_matched[ri] {
+                        let mut combined = alloc::vec![Value::Null; left_width];
+                        combined.extend(right.iter().cloned());
+                        joined.push(combined);
+                    }
                 }
             }
             columns = new_columns;

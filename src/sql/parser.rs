@@ -516,6 +516,14 @@ impl Parser {
                 let _ = self.eat_kw("outer");
                 self.expect_kw("join")?;
                 JoinKind::Left
+            } else if self.eat_kw("right") {
+                let _ = self.eat_kw("outer");
+                self.expect_kw("join")?;
+                JoinKind::Right
+            } else if self.eat_kw("full") {
+                let _ = self.eat_kw("outer");
+                self.expect_kw("join")?;
+                JoinKind::Full
             } else if self.eat_kw("inner") || self.eat_kw("cross") {
                 self.expect_kw("join")?;
                 JoinKind::Inner
@@ -1840,6 +1848,8 @@ fn is_reserved_after_expr(w: &str) -> bool {
             | "inner"
             | "left"
             | "right"
+            | "full"
+            | "outer"
             | "cross"
             | "on"
             | "using"

@@ -123,6 +123,8 @@ Make the dialect complete. Each item lands with a differential corpus addition.
 
 - ✅ **`CREATE TABLE … AS SELECT`** — columns from the query's labels, populated
   with its rows.
+- ✅ **Outer joins** — `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` (nested-loop, with
+  unmatched-side NULL fill).
 - ✅ **Generated columns** — `… AS (expr) [STORED|VIRTUAL]`: modeled in the AST,
   `VIRTUAL` computed on read, `STORED` materialized on write, writes rejected,
   indexable. *Ref:* `build.c`, expression eval.
