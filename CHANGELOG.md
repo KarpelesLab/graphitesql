@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `data_version`. Output matches SQLite's column layout and ordering;
   `foreign_key_check` reports `(table, rowid, parent, fkid)` for each dangling
   reference. Verified against `sqlite3`.
+- Track A: expression indexes — `CREATE INDEX … (lower(x))`, `(a + b)`, etc. The
+  index key is the per-row evaluation of the term expressions; entries are
+  maintained on insert/update/delete and rebuild, so `sqlite3 integrity_check`
+  (which recomputes the expressions) passes. The planner scans rather than
+  seeking an expression index. (Not supported on WITHOUT ROWID tables yet.)
+  Verified against `sqlite3`.
 - Track A: partial indexes — `CREATE INDEX … WHERE <predicate>`. The index stores
   only rows satisfying the predicate; entries are added/removed as rows cross the
   boundary on insert/update/delete, so `sqlite3 integrity_check` passes. The

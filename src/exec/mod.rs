@@ -1845,7 +1845,7 @@ impl Connection {
                 if !self.row_in_index(idx, &meta, &index_values, Some(rowid), params)? {
                     continue; // partial index excludes this row
                 }
-                let key = index_key(&idx.cols, &index_values, rowid);
+                let key = self.index_key_bytes(idx, &meta, &index_values, rowid, params)?;
                 insert_index(self.backend.writer()?, idx.root, &key, &idx.collations)?;
             }
             self.fire_triggers(
@@ -2264,7 +2264,12 @@ impl Connection {
             return Err(Error::Error(format!("index {} already exists", ci.name)));
         }
         let tmeta = self.table_meta(&ci.table, None)?;
-        let (cols, colls) = self.index_columns_coll(&tmeta, ci)?;
+        let (cols, key_exprs, colls) = self.index_key_spec(&tmeta, ci)?;
+        if key_exprs.is_some() && tmeta.without_rowid {
+            return Err(Error::Unsupported(
+                "expression indexes on WITHOUT ROWID tables",
+            ));
+        }
         let schema_next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
 
         // A partial index (`CREATE INDEX … WHERE p`) only stores rows for which
@@ -2302,16 +2307,32 @@ impl Connection {
             root
         } else {
             let rows = self.scan_table(&tmeta)?;
-            let keep: Vec<bool> = rows
-                .iter()
-                .map(|(rowid, values)| keep_row(values, Some(*rowid)))
-                .collect::<Result<_>>()?;
+            // Precompute the key bytes of every included row (column values, or
+            // evaluated expressions for an expression index) before the writer
+            // borrow.
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            for (rowid, values) in &rows {
+                if !keep_row(values, Some(*rowid))? {
+                    continue;
+                }
+                keys.push(match &key_exprs {
+                    None => index_key(&cols, values, *rowid),
+                    Some(exprs) => {
+                        let ctx = row_ctx(values, &tmeta.columns, Some(*rowid), &no_params)
+                            .with_subqueries(self);
+                        let mut k: Vec<Value> = exprs
+                            .iter()
+                            .map(|e| eval::eval(e, &ctx))
+                            .collect::<Result<_>>()?;
+                        k.push(Value::Integer(*rowid));
+                        encode_record(&k)
+                    }
+                });
+            }
             let w = self.backend.writer()?;
             let root = create_index_root(w)?;
-            for ((rowid, values), &k) in rows.iter().zip(&keep) {
-                if k {
-                    insert_index(w, root, &index_key(&cols, values, *rowid), &colls)?;
-                }
+            for key in &keys {
+                insert_index(w, root, key, &colls)?;
             }
             root
         };
@@ -2895,9 +2916,10 @@ impl Connection {
         let stats = self.stat1_map();
         let mut best: Option<(u32, Vec<Value>, Vec<crate::value::Collation>, u64)> = None;
         for idx in &indexes {
-            // A partial index covers only some rows; using it for a general
-            // equality seek could miss rows, so leave those to the table scan.
-            if idx.partial.is_some() {
+            // A partial index covers only some rows; an expression index is keyed
+            // by computed values, not columns. Neither is used for a plain
+            // column-equality seek — leave those to the table scan.
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
             }
             let mut key = Vec::new();
@@ -3142,13 +3164,14 @@ impl Connection {
                     let Statement::CreateIndex(ci) = sql::parse_one(sql)? else {
                         continue;
                     };
-                    let (cols, collations) = self.index_columns_coll(&tmeta, &ci)?;
+                    let (cols, key_exprs, collations) = self.index_key_spec(&tmeta, &ci)?;
                     out.push(IndexMeta {
                         name: obj.name.clone(),
                         root: obj.rootpage,
                         cols,
                         collations,
                         partial: ci.where_clause.clone(),
+                        key_exprs,
                     });
                 }
                 // Automatic index: its columns are the n-th UNIQUE/PK set.
@@ -3162,6 +3185,7 @@ impl Connection {
                                 cols: cols.clone(),
                                 collations,
                                 partial: None,
+                                key_exprs: None,
                             });
                         }
                     }
@@ -3207,6 +3231,76 @@ impl Connection {
         Ok((cols, colls))
     }
 
+    /// Resolve an index's key terms to `(cols, key_exprs, collations)`. When every
+    /// term is a plain column, `key_exprs` is `None` and `cols` holds the column
+    /// positions. When any term is an expression (`lower(x)`, `a + b`, …), it is
+    /// an expression index: `key_exprs` holds the COLLATE-peeled term expressions
+    /// (evaluated per row to form the key) and `cols` is empty.
+    #[allow(clippy::type_complexity)]
+    fn index_key_spec(
+        &self,
+        tmeta: &TableMeta,
+        ci: &CreateIndex,
+    ) -> Result<(Vec<usize>, Option<Vec<Expr>>, Vec<crate::value::Collation>)> {
+        let mut cols = Vec::new();
+        let mut exprs = Vec::new();
+        let mut colls = Vec::new();
+        let mut is_expr = false;
+        for term in &ci.columns {
+            let (inner, explicit) = match &term.expr {
+                Expr::Collate { expr, collation } => {
+                    (expr.as_ref(), crate::value::Collation::parse(collation))
+                }
+                e => (e, None),
+            };
+            exprs.push(inner.clone());
+            match inner {
+                Expr::Column { column, .. } => {
+                    let pos = tmeta
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(column))
+                        .ok_or_else(|| Error::Error(format!("no such column: {column}")))?;
+                    cols.push(pos);
+                    colls.push(explicit.unwrap_or(tmeta.columns[pos].collation));
+                }
+                _ => {
+                    is_expr = true;
+                    colls.push(explicit.unwrap_or_default());
+                }
+            }
+        }
+        if is_expr {
+            Ok((Vec::new(), Some(exprs), colls))
+        } else {
+            Ok((cols, None, colls))
+        }
+    }
+
+    /// The on-disk index key bytes for `idx` over a table row: evaluated key
+    /// expressions for an expression index, else the column values.
+    fn index_key_bytes(
+        &self,
+        idx: &IndexMeta,
+        meta: &TableMeta,
+        values: &[Value],
+        rowid: i64,
+        params: &Params,
+    ) -> Result<Vec<u8>> {
+        match &idx.key_exprs {
+            None => Ok(index_key(&idx.cols, values, rowid)),
+            Some(exprs) => {
+                let ctx = row_ctx(values, &meta.columns, Some(rowid), params).with_subqueries(self);
+                let mut key: Vec<Value> = exprs
+                    .iter()
+                    .map(|e| eval::eval(e, &ctx))
+                    .collect::<Result<_>>()?;
+                key.push(Value::Integer(rowid));
+                Ok(encode_record(&key))
+            }
+        }
+    }
+
     /// The declared collations of a set of table columns (for autoindexes).
     fn col_collations(&self, tmeta: &TableMeta, cols: &[usize]) -> Vec<crate::value::Collation> {
         cols.iter().map(|&c| tmeta.columns[c].collation).collect()
@@ -3237,25 +3331,24 @@ impl Connection {
             return Ok(());
         }
         let rows = self.scan_table(tmeta)?;
-        // Precompute, per index, which rows it includes (partial predicate) before
-        // taking the writer borrow.
-        let mut keep: Vec<Vec<usize>> = Vec::with_capacity(indexes.len());
+        let no_params = Params::default();
+        // Precompute, per index, the key bytes for each included row (partial
+        // predicate + expression evaluation) before taking the writer borrow.
+        let mut per_index: Vec<Vec<Vec<u8>>> = Vec::with_capacity(indexes.len());
         for idx in indexes {
-            let mut ks = Vec::new();
-            for (i, (rowid, values)) in rows.iter().enumerate() {
-                if self.row_in_index(idx, tmeta, values, Some(*rowid), &Params::default())? {
-                    ks.push(i);
+            let mut keys = Vec::new();
+            for (rowid, values) in &rows {
+                if self.row_in_index(idx, tmeta, values, Some(*rowid), &no_params)? {
+                    keys.push(self.index_key_bytes(idx, tmeta, values, *rowid, &no_params)?);
                 }
             }
-            keep.push(ks);
+            per_index.push(keys);
         }
         let w = self.backend.writer()?;
-        for (idx, ks) in indexes.iter().zip(&keep) {
+        for (idx, keys) in indexes.iter().zip(&per_index) {
             clear_index(w, idx.root)?;
-            for &i in ks {
-                let (rowid, values) = &rows[i];
-                let key = index_key(&idx.cols, values, *rowid);
-                insert_index(w, idx.root, &key, &idx.collations)?;
+            for key in keys {
+                insert_index(w, idx.root, key, &idx.collations)?;
             }
         }
         Ok(())
@@ -4935,6 +5028,10 @@ struct IndexMeta {
     /// `CREATE INDEX … WHERE <predicate>` — a partial index only stores rows for
     /// which the predicate is true. `None` for a full index.
     partial: Option<Expr>,
+    /// For an expression index (`CREATE INDEX … (lower(x))`), the per-term key
+    /// expressions evaluated against each row to form the key. `None` for an
+    /// ordinary column index (which uses `cols`).
+    key_exprs: Option<Vec<Expr>>,
 }
 
 impl Connection {
