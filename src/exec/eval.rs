@@ -942,22 +942,31 @@ fn arithmetic(op: BinaryOp, l: Value, r: Value) -> Value {
     }
     let a = number_as_f64(&ln);
     let b = number_as_f64(&rn);
+    // A NaN result (e.g. `inf - inf`) becomes NULL, as in SQLite. Infinities are
+    // kept (and printed as ±9.0e+999).
+    let real = |r: f64| {
+        if r.is_nan() {
+            Value::Null
+        } else {
+            Value::Real(r)
+        }
+    };
     match op {
-        Add => Value::Real(a + b),
-        Sub => Value::Real(a - b),
-        Mul => Value::Real(a * b),
+        Add => real(a + b),
+        Sub => real(a - b),
+        Mul => real(a * b),
         Div => {
             if b == 0.0 {
                 Value::Null
             } else {
-                Value::Real(a / b)
+                real(a / b)
             }
         }
         Mod => {
             if b == 0.0 {
                 Value::Null
             } else {
-                Value::Real(crate::util::float::fmod(a, b))
+                real(crate::util::float::fmod(a, b))
             }
         }
         _ => unreachable!(),
@@ -1145,10 +1154,11 @@ pub fn format_real(r: f64) -> String {
         return String::new();
     }
     if !r.is_finite() {
+        // SQLite prints infinities as `±9.0e+999` (a value past any real double).
         return if r < 0.0 {
-            String::from("-Inf")
+            String::from("-9.0e+999")
         } else {
-            String::from("Inf")
+            String::from("9.0e+999")
         };
     }
     if r == 0.0 {
