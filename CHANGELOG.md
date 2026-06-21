@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/KarpelesLab/graphitesql/compare/v0.0.5...v0.0.6) - 2026-06-21
+
+### Added
+
+- *(planner)* range-seek a secondary index on a WITHOUT ROWID table
+- *(planner)* seek a secondary index on a WITHOUT ROWID table
+- *(planner)* seek a WITHOUT ROWID PRIMARY KEY in joins
+- *(planner)* range-seek a WITHOUT ROWID PRIMARY KEY
+- *(planner)* seek a WITHOUT ROWID table's PRIMARY KEY instead of scanning
+- *(planner)* report unindexed equi-joins as an automatic covering index
+- *(json)* implement the JSONB binary-JSON family
+- *(pragma)* table_info over a view; keep type parameters
+- *(func)* add unistr(), unistr_quote() and subtype()
+- *(func)* implement random() and randomblob(); cap blob-builders at 1e9
+- *(pragma)* report SQLite defaults for unexposed tuning getters
+- *(cli)* render EXPLAIN QUERY PLAN as SQLite's QUERY PLAN tree
+- *(exec)* LIMIT/OFFSET may be a subquery or contain one
+- *(parser)* redundant FROM parens, schema-qualified PRAGMA, WITH+INSERT
+- *(func)* add the soundex(X) scalar function
+- *(exec)* reject sqlite-invalid statements; deferred foreign keys
+- *(pager)* PRAGMA incremental_vacuum(N) for auto_vacuum=INCREMENTAL (C6b-4)
+- *(parser)* postfix 'expr NOT NULL' operator
+- *(parser)* accept CTE 'AS [NOT] MATERIALIZED' hints
+- *(pager)* FULL auto_vacuum commit-time truncation (compaction)
+- *(parser)* string-literal aliases and empty CAST type name
+- *(vtab)* best_index constraint pushdown for virtual tables (D1b)
+- *(json)* end-relative paths and strict error semantics for json1
+- *(datetime)* support the subsec/subsecond modifier
+- *(pager)* write auto_vacuum databases with maintained pointer maps (C6b-2)
+- *(vdbe)* grouped HAVING and aggregate ORDER BY on the VDBE path (B6)
+- *(json)* accept JSON5 input in the JSON functions
+- *(vtab)* CREATE VIRTUAL TABLE + executor integration (D1b)
+- *(pager)* create empty auto_vacuum databases (C6b-1)
+- *(vtab)* virtual-table module trait + registry (D1a)
+- *(planner)* covering-index reads on WHERE-driven index seeks (B2b)
+
+### Documentation
+
+- prune completed work from ROADMAP and split remaining into smaller steps
+
+### Fixed
+
+- *(ddl)* propagate RENAME COLUMN into the table's own expressions
+- *(ddl)* DROP TABLE drops the table's triggers
+- *(json)* preserve a strict JSON number's source text
+- *(parser)* name unaliased result columns after their verbatim source
+- *(pragma)* correct table_info pk ordinal and index_list pk origin
+- *(printf)* cap float conversions at 16 significant digits like SQLite
+- *(shell)* print BLOB/TEXT as raw bytes to first NUL; length() stops at NUL
+- *(planner)* EXPLAIN QUERY PLAN reports implicit autoindex seeks (B-track)
+- *(cli)* split trigger BEGIN...END bodies correctly; print RETURNING rows
+- *(exec)* UPDATE assignments are simultaneous; parse row-value SET
+- *(cli)* route EXPLAIN and WITH-prefixed DML to the right method
+- *(eval)* empty IN () list is false even for a NULL left operand
+- *(func)* blob C-string coercion, unhex ignore-set, char() out-of-range
+- *(exec)* grouped output is ordered by the GROUP BY keys
+- *(eval)* apply comparison affinity in IN/BETWEEN and to bare rowid
+- *(exec)* dedup compound (UNION/INTERSECT/EXCEPT) output is sorted
+- *(exec)* json_group_array(DISTINCT x) dedupes its values
+- *(exec)* LIMIT/OFFSET require an integer value (OP_MustBeInt)
+- *(exec)* statement atomicity, conflict resolution, and RAISE() in triggers
+- *(math)* match sqlite3 on scalar math accuracy and overflow edges
+- *(exec)* positional GROUP BY resolves to the output column; generate_series step 0
+- *(datetime)* strict value parsing and modifier edge cases
+- *(cli)* route PRAGMA setters through execute so they take effect
+- *(printf)* alt-form flags, integer precision, and edge-case panics
+- *(exec)* arity guard for aggregates called with too few arguments
+- *(window)* honor the group_concat/string_agg separator argument
+- *(eval)* raw-byte blob concatenation, GLOB leading ], and overflow panics
+- *(func)* NULLIF collation, substr/min/max panics, and scalar-function edges
+- *(planner)* resolve ORDER BY output alias through a COLLATE/paren wrapper
+- *(datetime)* NULL on unknown strftime specifier, add %U, bound year at 9999
+- *(eval)* honor explicit COLLATE inside IN, CASE, and BETWEEN
+- match sqlite for real text rendering and numeric CAST prefixes
+- *(json)* json_valid(X) validates strict RFC-8259, not JSON5
+- *(reader)* never panic on malformed databases or SQL
+
+### Performance
+
+- *(planner)* seek/hash comma joins with the equality in WHERE
+- *(planner)* use partial and expression indexes for equality seeks (A3)
+- *(planner)* seek the inner join table by a secondary index (B1a²)
+- *(planner)* seek the inner join table by rowid (B1a)
+
+### Testing
+
+- *(dml)* don't differentially test DELETE/UPDATE...LIMIT (CI sqlite lacks it)
+- *(fk)* composite and self-referential foreign-key enforcement cases
+
 ## [0.0.5](https://github.com/KarpelesLab/graphitesql/compare/v0.0.4...v0.0.5) - 2026-06-20
 
 ### Added
