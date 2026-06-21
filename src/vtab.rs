@@ -540,6 +540,8 @@ impl VTabRegistry {
         let mut reg = VTabRegistry::new();
         reg.register("series", Box::new(SeriesModule))
             .expect("fresh registry has no name collisions");
+        reg.register("rtree", Box::new(RTreeModule))
+            .expect("fresh registry has no name collisions");
         reg
     }
 }
@@ -880,6 +882,186 @@ impl SeriesModule {
             done: false,
             generated: 0,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in module: `rtree` — an N-dimensional spatial index (roadmap D3a).
+// ---------------------------------------------------------------------------
+
+/// Built-in `rtree` module: `USING rtree(id, minX, maxX[, minY, maxY, …])`
+/// declares an integer `id` (which is the rowid) plus 2·N coordinate columns for
+/// an N-dimensional bounding box. Rows persist in the `<name>_data` backing table
+/// ([`persistent`](VTabModule::persistent) is `true`); spatial queries are answered
+/// by scanning that table and re-applying the `WHERE` — functionally correct (D3a).
+/// Efficient node-tree pushdown and byte-compatible `_node`/`_rowid`/`_parent`
+/// shadow formats are later increments (D3b/D3c). Coordinates are stored as 32-bit
+/// floats and the id as an integer, matching sqlite's value semantics.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RTreeModule;
+
+/// Unused cursor — a persistent module's reads scan the backing table, not a
+/// cursor. Present only to satisfy [`VTabModule`].
+pub struct RTreeCursor;
+/// Unused row type for [`RTreeCursor`].
+pub struct RTreeRow;
+
+impl VTabRow for RTreeRow {
+    fn column(&self, _i: usize) -> Value {
+        Value::Null
+    }
+    fn rowid(&self) -> i64 {
+        0
+    }
+}
+
+impl VTabCursor for RTreeCursor {
+    type Row = RTreeRow;
+    fn next(&mut self) -> Result<Option<RTreeRow>> {
+        Ok(None)
+    }
+}
+
+/// Coerce a value to the rtree id (a signed integer).
+fn rtree_i64(v: &Value) -> i64 {
+    match v {
+        Value::Integer(i) => *i,
+        Value::Real(r) => *r as i64,
+        Value::Text(t) => t.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// The raw numeric value of a coordinate expression.
+fn coord_f64(v: &Value) -> f64 {
+    match v {
+        Value::Integer(i) => *i as f64,
+        Value::Real(r) => *r,
+        Value::Text(t) => t.parse().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// `1 ∓ 2⁻²³` (2²³ = the f32 mantissa size) — SQLite's rtree rounding nudges.
+const RTREE_RND_TOWARDS: f64 = 1.0 - 1.0 / 8388608.0;
+const RTREE_RND_AWAY: f64 = 1.0 + 1.0 / 8388608.0;
+
+/// A *minimum* coordinate, rounded to a 32-bit float **not greater** than it
+/// (toward −∞) so the stored box never excludes the true point — byte-for-byte
+/// SQLite's `rtreeValueDown` (nudge the magnitude before the f32 cast).
+fn round_min_f32(d: f64) -> f64 {
+    let f = d as f32;
+    let f = if f64::from(f) > d {
+        (d * if d < 0.0 {
+            RTREE_RND_AWAY
+        } else {
+            RTREE_RND_TOWARDS
+        }) as f32
+    } else {
+        f
+    };
+    f64::from(f)
+}
+
+/// A *maximum* coordinate, rounded to a 32-bit float **not less** than it (toward
+/// +∞) — SQLite's `rtreeValueUp`.
+fn round_max_f32(d: f64) -> f64 {
+    let f = d as f32;
+    let f = if f64::from(f) < d {
+        (d * if d < 0.0 {
+            RTREE_RND_TOWARDS
+        } else {
+            RTREE_RND_AWAY
+        }) as f32
+    } else {
+        f
+    };
+    f64::from(f)
+}
+
+impl RTreeModule {
+    /// The stored record: an integer id, then f32 coordinates — each min (odd
+    /// column index) rounded down and each max (even index) rounded up. Errors
+    /// like sqlite if any pair has `min > max`.
+    fn record(values: &[Value]) -> Result<Vec<Value>> {
+        let mut rec = Vec::with_capacity(values.len());
+        rec.push(Value::Integer(rtree_i64(
+            values.first().unwrap_or(&Value::Null),
+        )));
+        for (i, v) in values.iter().enumerate().skip(1) {
+            let x = coord_f64(v);
+            rec.push(Value::Real(if i % 2 == 1 {
+                round_min_f32(x)
+            } else {
+                round_max_f32(x)
+            }));
+        }
+        let mut k = 1;
+        while k + 1 < rec.len() {
+            if let (Value::Real(lo), Value::Real(hi)) = (&rec[k], &rec[k + 1]) {
+                if lo > hi {
+                    return Err(Error::Error(alloc::string::String::from(
+                        "rtree constraint failed",
+                    )));
+                }
+            }
+            k += 2;
+        }
+        Ok(rec)
+    }
+}
+
+impl VTabModule for RTreeModule {
+    type Cursor = RTreeCursor;
+
+    fn connect(&self, args: &[&str]) -> Result<VTabSchema> {
+        // One id column + an even number (≥ 2) of coordinate columns.
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Err(Error::Error(alloc::string::String::from(
+                "rtree requires an odd number of columns (id + 2N coordinates), \
+                 at least 3",
+            )));
+        }
+        Ok(VTabSchema::new(args.iter().map(|s| String::from(*s))))
+    }
+
+    fn open(&self, _args: &[&str], _plan: &IndexPlan) -> Result<RTreeCursor> {
+        Ok(RTreeCursor)
+    }
+
+    fn persistent(&self) -> bool {
+        true
+    }
+
+    fn update(&self, _args: &[&str], change: VTabChange, store: &mut dyn VTabStore) -> Result<i64> {
+        match change {
+            VTabChange::Insert { values, .. } => {
+                let mut rec = RTreeModule::record(values)?;
+                // The id column is the rowid; a NULL id auto-assigns max+1.
+                let id = if matches!(values.first(), Some(Value::Null) | None) {
+                    store.rows()?.iter().map(|(r, _)| *r).max().unwrap_or(0) + 1
+                } else {
+                    rtree_i64(&values[0])
+                };
+                rec[0] = Value::Integer(id);
+                store.put(id, &rec)?;
+                Ok(id)
+            }
+            VTabChange::Delete { rowid } => {
+                store.delete(rowid)?;
+                Ok(rowid)
+            }
+            VTabChange::Update { rowid, values, .. } => {
+                let mut rec = RTreeModule::record(values)?;
+                let id = rtree_i64(&values[0]);
+                rec[0] = Value::Integer(id);
+                if id != rowid {
+                    store.delete(rowid)?;
+                }
+                store.put(id, &rec)?;
+                Ok(id)
+            }
+        }
     }
 }
 
