@@ -152,3 +152,36 @@ fn a_read_only_module_rejects_insert() {
         .unwrap();
     assert!(c.execute("INSERT INTO s VALUES (9)").is_err());
 }
+
+#[test]
+fn delete_and_update_a_writable_virtual_table() {
+    let mut c = Connection::open_memory().unwrap();
+    c.register_module("mem", MemModule::default()).unwrap();
+    c.execute("CREATE VIRTUAL TABLE m USING mem()").unwrap();
+    c.execute("INSERT INTO m VALUES ('a',1),('b',2),('c',3),('d',4)")
+        .unwrap();
+
+    // DELETE with a WHERE removes only the matching rows.
+    assert_eq!(c.execute("DELETE FROM m WHERE v > 2").unwrap(), 2);
+    assert_eq!(
+        c.query("SELECT k FROM m ORDER BY k").unwrap().rows,
+        [vec![Value::Text("a".into())], vec![Value::Text("b".into())]]
+    );
+
+    // UPDATE evaluates each SET RHS against the original row.
+    assert_eq!(
+        c.execute("UPDATE m SET v = v + 10 WHERE k = 'a'").unwrap(),
+        1
+    );
+    assert_eq!(
+        c.query("SELECT k, v FROM m ORDER BY k").unwrap().rows,
+        [
+            vec![Value::Text("a".into()), Value::Integer(11)],
+            vec![Value::Text("b".into()), Value::Integer(2)],
+        ]
+    );
+
+    // DELETE with no WHERE clears the table.
+    assert_eq!(c.execute("DELETE FROM m").unwrap(), 2);
+    assert!(c.query("SELECT * FROM m").unwrap().rows.is_empty());
+}

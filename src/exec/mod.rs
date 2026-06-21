@@ -3905,7 +3905,9 @@ impl Connection {
 
     fn exec_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
         reject_schema_write(&del.table)?;
-        self.reject_vtab_write(&del.table)?;
+        if self.is_virtual_table(&del.table) {
+            return self.exec_vtab_delete(del, params);
+        }
         if self.is_view(&del.table) {
             return self.exec_view_delete(del, params);
         }
@@ -4007,7 +4009,9 @@ impl Connection {
 
     fn exec_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
         reject_schema_write(&upd.table)?;
-        self.reject_vtab_write(&upd.table)?;
+        if self.is_virtual_table(&upd.table) {
+            return self.exec_vtab_update(upd, params);
+        }
         if self.is_view(&upd.table) {
             return self.exec_view_update(upd, params);
         }
@@ -4485,18 +4489,6 @@ impl Connection {
             })
     }
 
-    /// Reject an `UPDATE`/`DELETE` targeting a virtual table. (`INSERT` is routed
-    /// to the module's [`update`](crate::vtab::VTabModule::update) — see
-    /// `exec_vtab_insert`; `UPDATE`/`DELETE` routing is not yet modeled.)
-    fn reject_vtab_write(&self, name: &str) -> Result<()> {
-        if self.is_virtual_table(name) {
-            return Err(Error::Error(format!(
-                "cannot modify {name} — it is a read-only virtual table"
-            )));
-        }
-        Ok(())
-    }
-
     /// The module name, `USING` arguments, and declared column names of a virtual
     /// table — by reparsing its stored `CREATE VIRTUAL TABLE` and asking the
     /// module to `connect`. Used by the write path.
@@ -4568,6 +4560,100 @@ impl Connection {
                 &arg_refs,
                 VTabChange::Insert {
                     rowid: None,
+                    values: &values,
+                },
+            )?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// `DELETE` from a virtual table: scan it for rows matching the `WHERE`, then
+    /// call the module's [`update`](crate::vtab::VTabModule::update) with
+    /// [`VTabChange::Delete`] for each (over a materialized snapshot, so deleting
+    /// during iteration is safe).
+    fn exec_vtab_delete(&self, del: &Delete, params: &Params) -> Result<usize> {
+        if !del.returning.is_empty() {
+            return Err(Error::Unsupported("RETURNING on a virtual table"));
+        }
+        let (module_name, args, _) = self.vtab_meta(&del.table)?;
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (columns, rows) = self
+            .try_virtual_table(&del.table, None, None)?
+            .ok_or_else(|| Error::Error(format!("{} is not a virtual table", del.table)))?;
+        let module = self
+            .vtab_registry
+            .get(&module_name)
+            .ok_or_else(|| Error::Error(format!("no such module: {module_name}")))?;
+        let mut count = 0usize;
+        for r in &rows {
+            if let Some(pred) = &del.where_clause {
+                let ctx = r.ctx(&columns, params).with_subqueries(self);
+                if eval::truth(&eval::eval(pred, &ctx)?) != Some(true) {
+                    continue;
+                }
+            }
+            let rowid = r
+                .rowid
+                .ok_or_else(|| Error::Error("virtual-table row has no rowid".into()))?;
+            module.dyn_update(&arg_refs, VTabChange::Delete { rowid })?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// `UPDATE` of a virtual table: scan for rows matching the `WHERE`, evaluate
+    /// the `SET` assignments against each, and call the module's
+    /// [`update`](crate::vtab::VTabModule::update) with [`VTabChange::Update`].
+    fn exec_vtab_update(&self, upd: &Update, params: &Params) -> Result<usize> {
+        if !upd.returning.is_empty() {
+            return Err(Error::Unsupported("RETURNING on a virtual table"));
+        }
+        if upd.from.is_some() {
+            return Err(Error::Unsupported("UPDATE … FROM on a virtual table"));
+        }
+        let (module_name, args, col_names) = self.vtab_meta(&upd.table)?;
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // Resolve each SET target to a declared column position.
+        let assigns: Vec<(usize, &Expr)> = upd
+            .assignments
+            .iter()
+            .map(|(name, value)| {
+                col_names
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(name))
+                    .map(|pos| (pos, value))
+                    .ok_or_else(|| Error::Error(format!("no such column: {name}")))
+            })
+            .collect::<Result<_>>()?;
+        let (columns, rows) = self
+            .try_virtual_table(&upd.table, None, None)?
+            .ok_or_else(|| Error::Error(format!("{} is not a virtual table", upd.table)))?;
+        let module = self
+            .vtab_registry
+            .get(&module_name)
+            .ok_or_else(|| Error::Error(format!("no such module: {module_name}")))?;
+        let mut count = 0usize;
+        for r in &rows {
+            let ctx = r.ctx(&columns, params).with_subqueries(self);
+            if let Some(pred) = &upd.where_clause {
+                if eval::truth(&eval::eval(pred, &ctx)?) != Some(true) {
+                    continue;
+                }
+            }
+            // Every SET RHS evaluates against the original row (simultaneous).
+            let mut values = r.values.clone();
+            for (pos, expr) in &assigns {
+                values[*pos] = eval::eval(expr, &ctx)?;
+            }
+            let rowid = r
+                .rowid
+                .ok_or_else(|| Error::Error("virtual-table row has no rowid".into()))?;
+            module.dyn_update(
+                &arg_refs,
+                VTabChange::Update {
+                    rowid,
+                    new_rowid: rowid,
                     values: &values,
                 },
             )?;
