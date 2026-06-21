@@ -6011,19 +6011,18 @@ impl Connection {
         let stats = self.stat1_map();
         #[allow(clippy::type_complexity)]
         let mut best: Option<(String, Vec<usize>, Vec<usize>, u64)> = None;
-        for obj in self.schema.indexes_on(table) {
-            let Some(sql) = &obj.sql else { continue };
-            let Ok(Statement::CreateIndex(ci)) = sql::parse_one(sql) else {
+        // Iterate the SAME index set `try_index_lookup` does (via `indexes_of`,
+        // which includes the implicit `sqlite_autoindex_*` PK/UNIQUE indexes) so
+        // the EQP reports the seek the executor actually performs — e.g. a
+        // non-integer PRIMARY KEY or UNIQUE column reads as `SEARCH … USING INDEX
+        // sqlite_autoindex_…`, not `SCAN`. Partial/expression indexes are handled
+        // by the separate fallback below.
+        for idx in self.indexes_of(table)? {
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
-            };
-            if ci.where_clause.is_some() {
-                continue; // partial indexes are not used for seeks (see try_index_lookup)
             }
-            let Ok(cols) = self.index_columns(meta, &ci) else {
-                continue;
-            };
             let mut matched = Vec::new();
-            for &c in &cols {
+            for &c in &idx.cols {
                 if eqs.iter().any(|(col, _)| *col == c) {
                     matched.push(c);
                 } else {
@@ -6034,7 +6033,7 @@ impl Connection {
                 continue;
             }
             let est = stats
-                .get(&obj.name)
+                .get(&idx.name)
                 .and_then(|s| s.get(matched.len()).copied())
                 .unwrap_or(u64::MAX - matched.len() as u64);
             let better = match &best {
@@ -6042,7 +6041,7 @@ impl Connection {
                 Some((_, bm, _, be)) => est < *be || (est == *be && matched.len() > bm.len()),
             };
             if better {
-                best = Some((obj.name.clone(), matched, cols, est));
+                best = Some((idx.name.clone(), matched, idx.cols.clone(), est));
             }
         }
         if let Some((idx_name, matched, idx_cols, _)) = best {
