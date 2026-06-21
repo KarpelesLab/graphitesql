@@ -4306,13 +4306,20 @@ impl Connection {
         // "no limit", as elsewhere in SQLite.)
         let rec_limit = match &base.limit {
             Some(e) => {
-                let n = must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?;
+                let n = must_be_int(eval::eval(
+                    e,
+                    &EvalCtx::rowless(params).with_subqueries(self),
+                )?)?;
                 (n >= 0).then_some(n as usize)
             }
             None => None,
         };
         let rec_offset = match &base.offset {
-            Some(e) => must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?.max(0) as usize,
+            Some(e) => must_be_int(eval::eval(
+                e,
+                &EvalCtx::rowless(params).with_subqueries(self),
+            )?)?
+            .max(0) as usize,
             None => 0,
         };
         let compound = core::mem::take(&mut base.compound);
@@ -6405,7 +6412,11 @@ impl Connection {
             rowids = keyed.into_iter().map(|(r, _)| r).collect();
         }
         let off = match offset {
-            Some(e) => must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?.max(0) as usize,
+            Some(e) => must_be_int(eval::eval(
+                e,
+                &EvalCtx::rowless(params).with_subqueries(self),
+            )?)?
+            .max(0) as usize,
             None => 0,
         };
         if off > 0 {
@@ -6579,13 +6590,20 @@ impl Connection {
             });
         }
         let offset = match &sel.offset {
-            Some(e) => must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?.max(0) as usize,
+            Some(e) => must_be_int(eval::eval(
+                e,
+                &EvalCtx::rowless(params).with_subqueries(self),
+            )?)?
+            .max(0) as usize,
             None => 0,
         };
         // A negative LIMIT means "no limit" in SQLite (OFFSET still applies).
         let limit = match &sel.limit {
             Some(e) => {
-                let n = must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?;
+                let n = must_be_int(eval::eval(
+                    e,
+                    &EvalCtx::rowless(params).with_subqueries(self),
+                )?)?;
                 if n < 0 {
                     None
                 } else {
@@ -7382,13 +7400,20 @@ impl Connection {
 
         // OFFSET / LIMIT.
         let offset = match &sel.offset {
-            Some(e) => must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?.max(0) as usize,
+            Some(e) => must_be_int(eval::eval(
+                e,
+                &EvalCtx::rowless(params).with_subqueries(self),
+            )?)?
+            .max(0) as usize,
             None => 0,
         };
         // A negative LIMIT means "no limit" in SQLite (OFFSET still applies).
         let limit = match &sel.limit {
             Some(e) => {
-                let n = must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?;
+                let n = must_be_int(eval::eval(
+                    e,
+                    &EvalCtx::rowless(params).with_subqueries(self),
+                )?)?;
                 if n < 0 {
                     None
                 } else {
