@@ -566,6 +566,8 @@ impl VTabRegistry {
             .expect("fresh registry has no name collisions");
         reg.register("rtree", Box::new(RTreeModule))
             .expect("fresh registry has no name collisions");
+        reg.register("fts5", Box::new(Fts5Module))
+            .expect("fresh registry has no name collisions");
         reg
     }
 }
@@ -1089,6 +1091,127 @@ impl VTabModule for RTreeModule {
                 }
                 store.put(id, &rec)?;
                 Ok(id)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in module: `fts5` — full-text search (roadmap D2). This first slice is
+// the *document store*: `CREATE VIRTUAL TABLE … USING fts5(col, …)` declares the
+// text columns, and `INSERT`/`UPDATE`/`DELETE`/`SELECT` round-trip documents
+// through the persistent `<name>_data` backing table (W2). The tokenizer and the
+// `MATCH` query (the inverted index) build on top of this in a follow-up.
+// ---------------------------------------------------------------------------
+
+/// SQLite's [FTS5](https://www.sqlite.org/fts5.html) full-text-search module.
+///
+/// `USING fts5(<col>, <col>, …)` declares one untyped column per name (FTS5
+/// columns carry no type, like SQLite). Documents are stored in the persistent
+/// `<name>_data` backing table keyed by an implicit integer rowid, so the table
+/// behaves like an ordinary table for storage and retrieval. Column *options*
+/// (e.g. `tokenize = 'porter'`, `prefix = '2'`) and per-column modifiers
+/// (`col UNINDEXED`) are accepted and ignored by this slice — only the column
+/// names are honored. `MATCH` querying is not yet implemented.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Fts5Module;
+
+/// Unused cursor — FTS5 is persistent, so reads scan the backing table rather
+/// than a module cursor (see [`RTreeCursor`]).
+pub struct Fts5Cursor;
+/// Unused row type for [`Fts5Cursor`].
+pub struct Fts5Row;
+
+impl VTabRow for Fts5Row {
+    fn column(&self, _i: usize) -> Value {
+        Value::Null
+    }
+    fn rowid(&self) -> i64 {
+        0
+    }
+}
+
+impl VTabCursor for Fts5Cursor {
+    type Row = Fts5Row;
+    fn next(&mut self) -> Result<Option<Fts5Row>> {
+        Ok(None)
+    }
+}
+
+impl Fts5Module {
+    /// The column name declared by one `USING fts5(…)` argument, or `None` if the
+    /// argument is a configuration option (`key = value`) rather than a column.
+    ///
+    /// A column may carry a modifier (`title UNINDEXED`); only the leading
+    /// identifier is the name. An option arg contains an `=` outside of quotes —
+    /// for this slice the simple "`contains('=')`" test is enough, since column
+    /// names never contain one.
+    fn column_name(arg: &str) -> Option<String> {
+        let arg = arg.trim();
+        if arg.is_empty() || arg.contains('=') {
+            return None;
+        }
+        // Strip a trailing modifier like `UNINDEXED`; keep the first token, and
+        // unquote a `"quoted"` / `'quoted'` / `[bracketed]` identifier.
+        let first = arg.split_whitespace().next().unwrap_or(arg);
+        let name = first.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+        let name = name.strip_prefix('[').unwrap_or(name);
+        let name = name.strip_suffix(']').unwrap_or(name);
+        Some(String::from(name))
+    }
+}
+
+impl VTabModule for Fts5Module {
+    type Cursor = Fts5Cursor;
+
+    fn connect(&self, args: &[&str]) -> Result<VTabSchema> {
+        let columns: Vec<String> = args
+            .iter()
+            .filter_map(|a| Fts5Module::column_name(a))
+            .collect();
+        if columns.is_empty() {
+            return Err(Error::Error(alloc::string::String::from(
+                "fts5: no columns specified",
+            )));
+        }
+        // FTS5 columns are untyped (PRAGMA table_info reports an empty type).
+        Ok(VTabSchema::new(columns))
+    }
+
+    fn open(&self, _args: &[&str], _plan: &IndexPlan) -> Result<Fts5Cursor> {
+        Ok(Fts5Cursor)
+    }
+
+    fn persistent(&self) -> bool {
+        true
+    }
+
+    fn update(&self, _args: &[&str], change: VTabChange, store: &mut dyn VTabStore) -> Result<i64> {
+        match change {
+            VTabChange::Insert { rowid, values } => {
+                // An explicit rowid is honored; otherwise assign max+1 (a fresh
+                // table starts at 1), matching SQLite's implicit rowid.
+                let id = match rowid {
+                    Some(r) => r,
+                    None => store.rows()?.iter().map(|(r, _)| *r).max().unwrap_or(0) + 1,
+                };
+                store.put(id, values)?;
+                Ok(id)
+            }
+            VTabChange::Delete { rowid } => {
+                store.delete(rowid)?;
+                Ok(rowid)
+            }
+            VTabChange::Update {
+                rowid,
+                new_rowid,
+                values,
+            } => {
+                if new_rowid != rowid {
+                    store.delete(rowid)?;
+                }
+                store.put(new_rowid, values)?;
+                Ok(new_rowid)
             }
         }
     }
