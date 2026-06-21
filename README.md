@@ -20,12 +20,15 @@ format**.
 > aggregates, `GROUP BY`/`HAVING`, compound queries, (recursive) **CTEs**,
 > correlated subqueries & `EXISTS`, **window functions**, UPSERT, `RETURNING`,
 > `STRICT` tables, generated columns, **triggers**, **foreign keys**, **ATTACH /
-> TEMP** multi-schema, **virtual tables**, and a wide function library — date/time,
+> TEMP** multi-schema, **virtual tables** (built-in `series`, `rtree`, and
+> `fts5` modules — incl. full-text `MATCH` — plus `register_module` /
+> `register_function` for your own), and a wide function library — date/time,
 > `printf`, math, **JSON + JSONB**, and more — with an index-driven planner and
 > **`EXPLAIN QUERY PLAN`** matching sqlite. Everything is verified differentially
 > against `sqlite3` (a 1,600+ query corpus plus 140+ focused suites). What remains
-> is depth: FTS5 / R-Tree, the executor→VDBE migration, and concurrency — see
-> the full plan in **[ROADMAP.md](ROADMAP.md)**.
+> is depth: FTS5 ranking + on-disk format, R-Tree spatial pushdown, the
+> executor→VDBE migration, and concurrency — see the full plan in
+> **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why
 

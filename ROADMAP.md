@@ -394,6 +394,25 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
   `fts5*.c`. Break out: **D2a** tokenizer (unicode61/ascii); **D2b** inverted
   index in shadow tables + `INSERT`; **D2c** `MATCH` query; **D2d** `bm25()`
   ranking; **D2e** byte-compatible on-disk segment format.
+  - **D2a — tokenizer. ✅ DONE.** `fts5_tokenize` in `vtab.rs`: maximal
+    alphanumeric runs, case-folded — a faithful unicode61 approximation for
+    ASCII/basic text (diacritic folding + full Unicode category tables deferred).
+  - **D2b — document store. ✅ DONE (correct-results; inverted index deferred).**
+    The built-in `fts5` module (registered on every connection alongside
+    `series`/`rtree`) declares one untyped column per `USING fts5(col, …)` name
+    (ignoring `key = value` options and `col UNINDEXED` modifiers) and stores
+    documents in the persistent `<name>_data` backing table keyed by an implicit
+    rowid. CREATE/INSERT/UPDATE/DELETE/SELECT and `PRAGMA table_info` are
+    byte-identical to sqlite3. *(A real inverted index in shadow tables — for
+    scaling beyond a scan — is the remaining D2b work.)*
+  - **D2c — `MATCH` query. ✅ DONE (correct-results).** `t MATCH 'a b'` searches
+    all columns, `col MATCH 'x'` one column; query tokens are AND-ed and matched
+    case-insensitively against the tokenized document (scan + the re-applied
+    WHERE, like rtree D3a). Byte-identical to sqlite3 for these forms.
+    *(Remaining: phrase/`OR`/`NOT`/`NEAR`/prefix queries, `col:tok` column
+    filters in the query string.)*
+  - **D2d — `bm25()` ranking** and **D2e — byte-compatible segment format** are
+    the remaining FTS5 tracks (both require the real inverted index of D2b).
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
   (`register_function`, via `Subqueries::call_udf`) and aggregate ✅ DONE
   (`register_aggregate_function` + an `AggregateFunction` step/finalize trait;
