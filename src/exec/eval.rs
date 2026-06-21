@@ -306,6 +306,12 @@ fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Option<Affinity> {
                     return Some(col.affinity);
                 }
             }
+            // A bare rowid alias (`rowid`/`_rowid_`/`oid`) that does not name a
+            // real column resolves to the integer rowid, so it carries INTEGER
+            // affinity for comparison — `rowid = '2'` numerically coerces '2'.
+            if is_rowid_alias(column) && ctx.rowid.is_some() {
+                return Some(Affinity::Integer);
+            }
             // An unresolved column name has no affinity to contribute.
             None
         }
@@ -498,14 +504,20 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 return Ok(Value::Null);
             }
             // `x BETWEEN lo AND hi` is `x >= lo AND x <= hi`; each comparison
-            // resolves its own collation (left operand's, else an explicit
-            // `COLLATE` on that bound), as in SQLite.
+            // applies pre-comparison affinity (the left operand's affinity is
+            // pushed onto a bare literal bound) and resolves its own collation
+            // (left operand's, else an explicit `COLLATE` on that bound), as in
+            // SQLite — so `i BETWEEN '5' AND '15'` numerically coerces the text
+            // bounds when `i` has numeric affinity.
+            let ea = expr_affinity(expr, ctx);
+            let (vl, lo) = apply_comparison_affinity(v.clone(), ea, lo, expr_affinity(low, ctx));
+            let (vh, hi) = apply_comparison_affinity(v, ea, hi, expr_affinity(high, ctx));
             let ge = matches!(
-                crate::value::cmp_values_coll(&v, &lo, resolve_collation(expr, low, ctx)),
+                crate::value::cmp_values_coll(&vl, &lo, resolve_collation(expr, low, ctx)),
                 Ordering::Greater | Ordering::Equal
             );
             let le = matches!(
-                crate::value::cmp_values_coll(&v, &hi, resolve_collation(expr, high, ctx)),
+                crate::value::cmp_values_coll(&vh, &hi, resolve_collation(expr, high, ctx)),
                 Ordering::Less | Ordering::Equal
             );
             let within = ge && le;
@@ -805,6 +817,10 @@ fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<V
     } else {
         key_collation(expr, ctx)
     };
+    // Pre-comparison affinity: the left operand's affinity is pushed onto a bare
+    // literal list element, so `i IN ('10','20')` numerically coerces the text
+    // elements when `i` has numeric affinity (mirrors `=`).
+    let ea = expr_affinity(expr, ctx);
     let mut saw_null = false;
     for item in list {
         let iv = eval(item, ctx)?;
@@ -812,7 +828,8 @@ fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<V
             saw_null = true;
             continue;
         }
-        if crate::value::cmp_values_coll(&v, &iv, coll) == Ordering::Equal {
+        let (lv, iv) = apply_comparison_affinity(v.clone(), ea, iv, expr_affinity(item, ctx));
+        if crate::value::cmp_values_coll(&lv, &iv, coll) == Ordering::Equal {
             return Ok(bool_value(!negated));
         }
     }
