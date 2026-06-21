@@ -171,6 +171,53 @@ fn join_on_leading_pk_seeks_the_inner_table() {
 }
 
 #[test]
+fn secondary_index_on_a_without_rowid_table_seeks() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE w(a PRIMARY KEY, b, c) WITHOUT ROWID")
+        .unwrap();
+    c.execute("CREATE INDEX i ON w(b)").unwrap();
+    c.execute("INSERT INTO w VALUES (1,5,100),(2,5,200),(3,9,300)")
+        .unwrap();
+    // A named index holds the PK columns too, so reading a/b via it is covering.
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT a, b FROM w WHERE b=5"),
+        "SEARCH w USING COVERING INDEX i (b=?)"
+    );
+    // Referencing a column the index lacks (c) is a non-covering INDEX seek that
+    // fetches the full row by PK.
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT a, c FROM w WHERE b=5"),
+        "SEARCH w USING INDEX i (b=?)"
+    );
+    assert_eq!(
+        c.query("SELECT a, c FROM w WHERE b=5 ORDER BY a")
+            .unwrap()
+            .rows,
+        [
+            vec![Value::Integer(1), Value::Integer(100)],
+            vec![Value::Integer(2), Value::Integer(200)],
+        ]
+    );
+
+    // An implicit UNIQUE autoindex covers only its own column: referencing the PK
+    // too makes it a non-covering INDEX seek (matching sqlite), still correct.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE u(a PRIMARY KEY, b UNIQUE) WITHOUT ROWID")
+        .unwrap();
+    c.execute("INSERT INTO u VALUES (1,'x'),(2,'y')").unwrap();
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT a FROM u WHERE b='y'"),
+        "SEARCH u USING INDEX sqlite_autoindex_u_2 (b=?)"
+    );
+    assert_eq!(val(&c, "SELECT a FROM u WHERE b='y'"), Value::Integer(2));
+    // ...but covering when only the indexed column is read.
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT b FROM u WHERE b='x'"),
+        "SEARCH u USING COVERING INDEX sqlite_autoindex_u_2 (b=?)"
+    );
+}
+
+#[test]
 fn text_and_collated_primary_keys() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE PRIMARY KEY, n) WITHOUT ROWID")
