@@ -309,6 +309,27 @@ fn match_near_proximity() {
 }
 
 #[test]
+fn match_anchor_first_token() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES ('quick brown fox'),('the quick fox'),('brown quick')")
+        .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        rows(&c, sql)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("not an integer rowid"),
+            })
+            .collect::<Vec<_>>()
+    };
+    // `^token` matches only rows where the token is the first in the column.
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH '^quick'"), [1]);
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH '^brown'"), [3]);
+}
+
+#[test]
 fn match_against_null_pattern_is_null() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")

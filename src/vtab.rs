@@ -1161,8 +1161,8 @@ pub(crate) fn fts5_tokenize(text: &str) -> Vec<String> {
 }
 
 /// One term of an FTS5 query: a phrase of one or more consecutive tokens,
-/// optionally restricted to a named column (`col:token`) and/or ending in a
-/// prefix token (`token*`).
+/// optionally restricted to a named column (`col:token`), anchored to the start
+/// of the column (`^token`), and/or ending in a prefix token (`token*`).
 #[derive(Clone)]
 struct Fts5Term {
     /// The column the term is scoped to (`col:…`), or `None` for any column.
@@ -1172,6 +1172,18 @@ struct Fts5Term {
     phrase: Vec<String>,
     /// Whether the *last* token of the phrase is a prefix match (`token*`).
     prefix: bool,
+    /// Whether the phrase is anchored to the first token of the column (`^token`).
+    anchored: bool,
+}
+
+/// The start offsets at which `term` matches in a column's `tokens`, honoring an
+/// `^` anchor (which keeps only a match at offset 0).
+fn fts5_term_starts(term: &Fts5Term, tokens: &[String]) -> Vec<usize> {
+    let mut starts = fts5_phrase_starts(&term.phrase, term.prefix, tokens);
+    if term.anchored {
+        starts.retain(|&s| s == 0);
+    }
+    starts
 }
 
 /// Every start offset at which `phrase` occurs in `doc` as a run of consecutive
@@ -1194,11 +1206,6 @@ fn fts5_phrase_starts(phrase: &[String], prefix: bool, doc: &[String]) -> Vec<us
             })
         })
         .collect()
-}
-
-/// Whether `phrase` occurs in `doc` as a run of consecutive tokens (in order).
-fn fts5_phrase_in(phrase: &[String], prefix: bool, doc: &[String]) -> bool {
-    !fts5_phrase_starts(phrase, prefix, doc).is_empty()
 }
 
 /// Whether a `NEAR(p1 p2 …, n)` group is satisfied within a single column's
@@ -1286,6 +1293,11 @@ fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
             column = Some(chars[i..j].iter().collect());
             i = j + 1;
         }
+        // A leading `^` anchors the term to the first token of the column.
+        let anchored = i < n && chars[i] == '^';
+        if anchored {
+            i += 1;
+        }
         // The body: a quoted phrase, or a bare word that may end in `*`.
         let (text, prefix) = if i < n && chars[i] == '"' {
             i += 1;
@@ -1366,6 +1378,7 @@ fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
                 column,
                 phrase,
                 prefix,
+                anchored,
             }));
         }
     }
@@ -1485,13 +1498,14 @@ impl Fts5Parser<'_> {
     }
 }
 
-/// Whether a single term matches any in-scope column (respecting `col:` scoping).
+/// Whether a single term matches any in-scope column (respecting `col:` scoping
+/// and the `^` anchor).
 fn fts5_term_matches(term: &Fts5Term, cols: &[(&str, Vec<String>)]) -> bool {
     cols.iter().any(|(name, tokens)| {
         term.column
             .as_deref()
             .is_none_or(|c| name.eq_ignore_ascii_case(c))
-            && fts5_phrase_in(&term.phrase, term.prefix, tokens)
+            && !fts5_term_starts(term, tokens).is_empty()
     })
 }
 
@@ -1505,12 +1519,7 @@ fn fts5_near_group_matches(
     cols.iter().any(|(_, tokens)| {
         let positioned: Vec<(Vec<usize>, usize)> = phrases
             .iter()
-            .map(|p| {
-                (
-                    fts5_phrase_starts(&p.phrase, p.prefix, tokens),
-                    p.phrase.len(),
-                )
-            })
+            .map(|p| (fts5_term_starts(p, tokens), p.phrase.len()))
             .collect();
         fts5_near_matches(&positioned, dist)
     })
@@ -1756,6 +1765,24 @@ mod tests {
             "NEAR(quick brown, 2) AND fox",
             &adjacent
         ));
+    }
+
+    #[test]
+    fn fts5_anchor_requires_first_token() {
+        let doc = |s: &str| [(String::from("body"), String::from(s))];
+        // `^token` matches only when the token is at the start of the column.
+        assert!(fts5_query_matches("^quick", &doc("quick brown fox")));
+        assert!(!fts5_query_matches("^quick", &doc("the quick fox")));
+        // Anchored phrases too; an unanchored token still matches anywhere.
+        assert!(fts5_query_matches(
+            "^\"quick brown\"",
+            &doc("quick brown fox")
+        ));
+        assert!(!fts5_query_matches(
+            "^\"quick brown\"",
+            &doc("a quick brown")
+        ));
+        assert!(fts5_query_matches("quick", &doc("the quick fox")));
     }
 
     #[test]
