@@ -27,8 +27,12 @@ pub enum Json {
     Bool(bool),
     /// An integral number that fits in `i64`.
     Int(i64),
-    /// Any other number.
-    Real(f64),
+    /// Any other number. The optional string is the verbatim source text of the
+    /// number as it appeared in the input — SQLite preserves it in JSON *text*
+    /// output (`json('1e2')` → `1e2`, `json('1.50')` → `1.50`) while still
+    /// yielding the canonical `f64` as a SQL value. `None` for numbers built
+    /// programmatically (from a SQL REAL, arithmetic, or `Infinity`).
+    Real(f64, Option<String>),
     /// A string (unescaped).
     Str(String),
     /// An array.
@@ -45,7 +49,7 @@ impl Json {
             Json::Bool(true) => "true",
             Json::Bool(false) => "false",
             Json::Int(_) => "integer",
-            Json::Real(_) => "real",
+            Json::Real(..) => "real",
             Json::Str(_) => "text",
             Json::Array(_) => "array",
             Json::Object(_) => "object",
@@ -59,7 +63,7 @@ impl Json {
             Json::Null => Value::Null,
             Json::Bool(b) => Value::Integer(*b as i64),
             Json::Int(i) => Value::Integer(*i),
-            Json::Real(r) => Value::Real(*r),
+            Json::Real(r, _) => Value::Real(*r),
             Json::Str(s) => Value::Text(s.clone()),
             Json::Array(_) | Json::Object(_) => Value::Text(self.serialize()),
         }
@@ -77,7 +81,7 @@ impl Json {
     /// `±9.0e+999` (whereas a JSON-literal `9e999` round-trips verbatim through
     /// [`serialize`](Self::serialize)). `json_quote` only ever sees a scalar.
     pub fn quote(&self) -> String {
-        if let Json::Real(r) = self {
+        if let Json::Real(r, _) = self {
             if r.is_infinite() {
                 return String::from(if *r < 0.0 { "-9.0e+999" } else { "9.0e+999" });
             }
@@ -102,11 +106,15 @@ impl Json {
             Json::Bool(true) => push_jsonb(out, JSONB_TRUE, &[]),
             Json::Bool(false) => push_jsonb(out, JSONB_FALSE, &[]),
             Json::Int(i) => push_jsonb(out, JSONB_INT, i.to_string().as_bytes()),
-            Json::Real(r) => {
-                let s = if r.is_infinite() {
-                    String::from(if *r < 0.0 { "-9e999" } else { "9e999" })
-                } else {
-                    crate::exec::eval::format_real(*r)
+            Json::Real(r, src) => {
+                // The FLOAT payload is the number's source text when known, so a
+                // JSONB round-trip preserves it like SQLite.
+                let s = match src {
+                    Some(t) => t.clone(),
+                    None if r.is_infinite() => {
+                        String::from(if *r < 0.0 { "-9e999" } else { "9e999" })
+                    }
+                    None => crate::exec::eval::format_real(*r),
                 };
                 push_jsonb(out, JSONB_FLOAT, s.as_bytes());
             }
@@ -205,12 +213,15 @@ impl Json {
             Json::Bool(true) => out.push_str("true"),
             Json::Bool(false) => out.push_str("false"),
             Json::Int(i) => out.push_str(&i.to_string()),
-            Json::Real(r) if r.is_infinite() => {
+            Json::Real(r, _) if r.is_infinite() => {
                 // JSON has no infinity literal; sqlite renders it as `±9e999`
                 // (a value that round-trips to f64 infinity).
                 out.push_str(if *r < 0.0 { "-9e999" } else { "9e999" });
             }
-            Json::Real(r) => out.push_str(&crate::exec::eval::format_real(*r)),
+            // Preserve the number's verbatim source text when known (`1e2`,
+            // `1.50`, `-0.0`); otherwise render the canonical form.
+            Json::Real(_, Some(src)) => out.push_str(src),
+            Json::Real(r, None) => out.push_str(&crate::exec::eval::format_real(*r)),
             Json::Str(s) => write_json_string(s, out),
             Json::Array(items) => {
                 out.push('[');
@@ -317,7 +328,7 @@ fn decode_jsonb(b: &[u8]) -> Option<(Json, &[u8])> {
             // The number's text payload is reparsed through the JSON number path.
             let t = core::str::from_utf8(payload).ok()?;
             match parse(t) {
-                Some(j @ (Json::Int(_) | Json::Real(_))) => j,
+                Some(j @ (Json::Int(_) | Json::Real(..))) => j,
                 _ => return None,
             }
         }
@@ -676,7 +687,7 @@ impl Parser<'_> {
             Some(b'n') => self.literal("null", Json::Null),
             // JSON5 `Infinity` / `NaN` (a leading `+`/`-` is consumed by
             // `number`). `NaN` maps to JSON `null`, matching sqlite.
-            Some(b'I') => self.literal("Infinity", Json::Real(f64::INFINITY)),
+            Some(b'I') => self.literal("Infinity", Json::Real(f64::INFINITY, None)),
             Some(b'N') => self.literal("NaN", Json::Null),
             // JSON5 numbers: leading `+`, hex (`0x…`), a leading or trailing
             // decimal point, and the signed `Infinity`/`NaN` forms.
@@ -926,11 +937,14 @@ impl Parser<'_> {
             Some(b'I') => {
                 return self.literal(
                     "Infinity",
-                    Json::Real(if neg {
-                        f64::NEG_INFINITY
-                    } else {
-                        f64::INFINITY
-                    }),
+                    Json::Real(
+                        if neg {
+                            f64::NEG_INFINITY
+                        } else {
+                            f64::INFINITY
+                        },
+                        None,
+                    ),
                 );
             }
             Some(b'N') => return self.literal("NaN", Json::Null),
@@ -980,10 +994,58 @@ impl Parser<'_> {
         // `f64::parse` rejects a leading `+` and a leading/trailing `.`; build a
         // normalized form so JSON5 numbers like `+.5` / `5.` parse.
         match parse_json5_real(tok) {
-            Some(r) => Ok(Json::Real(r)),
+            // SQLite preserves a *strict* JSON number's text verbatim, but
+            // normalizes JSON5-only forms (leading/trailing `.`, leading `+`):
+            // `1e2` stays `1e2`, but `.5` renders as `0.5`.
+            Some(r) => Ok(Json::Real(
+                r,
+                is_strict_json_number(tok).then(|| String::from(tok)),
+            )),
             None => Err(start),
         }
     }
+}
+
+/// Whether `t` is a *strict* RFC-8259 number — `-?(0|[1-9]\d*)(\.\d+)?([eE][-+]?\d+)?`.
+/// Only such numbers keep their verbatim text in JSON output; JSON5-only forms
+/// (leading `+`, leading/trailing `.`, hex) are normalized by the caller.
+fn is_strict_json_number(t: &str) -> bool {
+    let b = t.as_bytes();
+    let mut i = 0;
+    if b.get(i) == Some(&b'-') {
+        i += 1;
+    }
+    match b.get(i) {
+        Some(b'0') => i += 1, // a lone leading zero (no further integer digits)
+        Some(c) if c.is_ascii_digit() => {
+            while b.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+        }
+        _ => return false, // leading `+`/`.` or empty integer part
+    }
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        if !b.get(i).is_some_and(u8::is_ascii_digit) {
+            return false; // trailing `.`
+        }
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if !b.get(i).is_some_and(u8::is_ascii_digit) {
+            return false;
+        }
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    i == b.len()
 }
 
 /// Parse a JSON5 real-number token. `f64::from_str` already accepts a leading or
@@ -1029,7 +1091,7 @@ pub fn value_to_json(v: &Value) -> Json {
     match v {
         Value::Null => Json::Null,
         Value::Integer(i) => Json::Int(*i),
-        Value::Real(r) => Json::Real(*r),
+        Value::Real(r) => Json::Real(*r, None),
         Value::Text(s) => Json::Str(s.clone()),
         Value::Blob(_) => Json::Str(String::new()),
     }

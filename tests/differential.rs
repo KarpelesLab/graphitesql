@@ -551,6 +551,17 @@ fn corpus() -> Vec<String> {
         "json_type(jsonb('[1,2,3]'))",
         "json_array_length(jsonb('[1,2,3,4]'))",
         "json(jsonb_object('a', 1, 'b', jsonb_array(2, 3)))",
+        // JSON preserves a number's verbatim source text in text output.
+        "json('1e2')",
+        "json('1E10')",
+        "json('-0.0')",
+        "json('[1e2, 1.50, 100, 2.0, 1.5e3]')",
+        "json('{\"a\":1e2,\"b\":2.50}')",
+        "hex(jsonb('1e10'))",
+        "hex(jsonb('1.50'))",
+        "json(jsonb('[1e2,2.50]'))",
+        // ...but an extracted scalar is the canonical SQL value.
+        "json_extract('[1e2]', '$[0]')",
     ] {
         q.push(format!("SELECT {e};"));
     }
