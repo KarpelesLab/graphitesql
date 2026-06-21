@@ -533,6 +533,24 @@ fn corpus() -> Vec<String> {
         "printf('%.2f', 3.14159)",
         "printf('%5d', 42)",
         "format('%x', 255)",
+        // JSONB: the binary encoding (via hex) and round-trips through json().
+        "hex(jsonb('null'))",
+        "hex(jsonb('42'))",
+        "hex(jsonb('-7'))",
+        "hex(jsonb('\"hi\"'))",
+        "hex(jsonb('\"a\\\"b\"'))",
+        "hex(jsonb('[1,2,3]'))",
+        "hex(jsonb('{\"a\":1,\"bb\":[2,3]}'))",
+        "hex(jsonb_array(1, 2, 3))",
+        "hex(jsonb_object('a', 1, 'b', 2))",
+        "json(jsonb('{\"a\":1,\"b\":[2,3,\"x\"]}'))",
+        "json(jsonb_set('{\"a\":1}', '$.b', 9))",
+        "json(jsonb_remove('{\"a\":1,\"b\":2}', '$.a'))",
+        "json(jsonb_patch('{\"a\":1}', '{\"b\":2}'))",
+        "json_extract(jsonb('{\"a\":10,\"b\":[20,30]}'), '$.b[1]')",
+        "json_type(jsonb('[1,2,3]'))",
+        "json_array_length(jsonb('[1,2,3,4]'))",
+        "json(jsonb_object('a', 1, 'b', jsonb_array(2, 3)))",
     ] {
         q.push(format!("SELECT {e};"));
     }

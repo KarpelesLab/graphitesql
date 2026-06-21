@@ -29,8 +29,8 @@ pub fn is_aggregate(name: &str) -> bool {
 pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "count" | "sum" | "total" | "avg" | "group_concat" | "string_agg" => true,
-        "json_group_array" => nargs == 1,
-        "json_group_object" => nargs == 2,
+        "json_group_array" | "jsonb_group_array" => nargs == 1,
+        "json_group_object" | "jsonb_group_object" => nargs == 2,
         "min" | "max" => star || nargs == 1,
         _ => false,
     }
@@ -482,15 +482,18 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         // JSON functions (see `super::json`).
         "json" => {
             arity(&lname, args, 1)?;
-            match &v[0] {
-                Value::Null => Value::Null,
-                other => {
-                    let text = eval::to_text(other);
-                    match super::json::parse(&text) {
-                        Some(j) => Value::Text(j.serialize()),
-                        None => return Err(Error::Error("malformed JSON".into())),
-                    }
-                }
+            match json_root(&v[0])? {
+                None => Value::Null,
+                Some(j) => Value::Text(j.serialize()),
+            }
+        }
+        // `jsonb(X)` — the JSONB (binary) form of `json(X)`: parse the JSON/JSON5
+        // text (or pass a JSONB blob through) and return its JSONB encoding.
+        "jsonb" => {
+            arity(&lname, args, 1)?;
+            match json_root(&v[0])? {
+                None => Value::Null,
+                Some(j) => Value::Blob(j.to_jsonb()),
             }
         }
         "json_valid" => {
@@ -535,9 +538,10 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                         Some(Value::Null) | None => alloc::string::String::from("    "),
                         Some(iv) => eval::to_text(iv),
                     };
-                    match super::json::parse(&eval::to_text(other)) {
+                    let _ = other;
+                    match json_root(&v[0])? {
+                        None => Value::Null,
                         Some(j) => Value::Text(j.pretty(&indent)),
-                        None => return Err(Error::Error("malformed JSON".into())),
                     }
                 }
             }
@@ -590,7 +594,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 }
             }
         }
-        "json_extract" => {
+        "json_extract" | "jsonb_extract" => {
             if v.len() < 2 {
                 return Err(Error::Error(
                     "json_extract() requires at least 2 arguments".into(),
@@ -598,18 +602,17 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             }
             match json_root(&v[0])? {
                 None => Value::Null,
-                Some(root) => json_extract(&root, &v[1..])?,
+                Some(root) => json_extract(&root, &v[1..], lname.starts_with("jsonb"))?,
             }
         }
-        "json_array" => {
+        "json_array" | "jsonb_array" => {
             let mut items = Vec::with_capacity(v.len());
             for (i, val) in v.iter().enumerate() {
-                reject_blob(val)?;
-                items.push(arg_to_json(val, args.get(i)));
+                items.push(json_value_arg(val, args.get(i))?);
             }
-            Value::Text(super::json::Json::Array(items).serialize())
+            json_doc_result(&lname, &super::json::Json::Array(items))
         }
-        "json_object" => {
+        "json_object" | "jsonb_object" => {
             if !v.len().is_multiple_of(2) {
                 return Err(Error::Error(
                     "json_object() requires an even number of arguments".into(),
@@ -623,22 +626,24 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 let Value::Text(key) = &kv[0] else {
                     return Err(Error::Error("json_object() labels must be TEXT".into()));
                 };
-                reject_blob(&kv[1])?;
-                let val = arg_to_json(&kv[1], args.get(2 * i + 1));
+                let val = json_value_arg(&kv[1], args.get(2 * i + 1))?;
                 members.push((key.clone(), val));
             }
-            Value::Text(super::json::Json::Object(members).serialize())
+            json_doc_result(&lname, &super::json::Json::Object(members))
         }
-        "json_set" | "json_insert" | "json_replace" => {
+        "json_set" | "json_insert" | "json_replace" | "jsonb_set" | "jsonb_insert"
+        | "jsonb_replace" => {
             if v.len() < 3 || v.len().is_multiple_of(2) {
                 return Err(Error::Error(alloc::format!(
                     "{lname}() requires a document and (path, value) pairs"
                 )));
             }
-            let mode = match lname.as_str() {
-                "json_set" => super::json::SetMode::Set,
-                "json_insert" => super::json::SetMode::Insert,
-                _ => super::json::SetMode::Replace,
+            let mode = if lname.ends_with("set") {
+                super::json::SetMode::Set
+            } else if lname.ends_with("insert") {
+                super::json::SetMode::Insert
+            } else {
+                super::json::SetMode::Replace
             };
             match json_root(&v[0])? {
                 None => Value::Null,
@@ -646,17 +651,16 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     let mut i = 1;
                     while i + 1 < v.len() {
                         check_path(&v[i])?;
-                        reject_blob(&v[i + 1])?;
                         let path = eval::to_text(&v[i]);
-                        let val = arg_to_json(&v[i + 1], args.get(i + 1));
+                        let val = json_value_arg(&v[i + 1], args.get(i + 1))?;
                         super::json::set_path(&mut root, &path, val, mode);
                         i += 2;
                     }
-                    Value::Text(root.serialize())
+                    json_doc_result(&lname, &root)
                 }
             }
         }
-        "json_remove" => {
+        "json_remove" | "jsonb_remove" => {
             if v.is_empty() {
                 return Err(Error::Error("json_remove() requires a document".into()));
             }
@@ -676,17 +680,17 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     if matches!(removed, Value::Null) {
                         Value::Null
                     } else {
-                        Value::Text(root.serialize())
+                        json_doc_result(&lname, &root)
                     }
                 }
             }
         }
-        "json_patch" => {
+        "json_patch" | "jsonb_patch" => {
             arity(&lname, args, 2)?;
             match (json_root(&v[0])?, json_root(&v[1])?) {
                 (Some(mut root), Some(patch)) => {
                     super::json::merge_patch(&mut root, &patch);
-                    Value::Text(root.serialize())
+                    json_doc_result(&lname, &root)
                 }
                 _ => Value::Null,
             }
@@ -966,9 +970,24 @@ fn math1(name: &str, v: &[Value], f: impl Fn(f64) -> f64) -> Result<Value> {
 
 /// Parse the first argument of a JSON function as a document: `NULL` → `None`;
 /// malformed JSON is an error (matching SQLite).
+/// Render a JSON document result as text (`json_*`) or as a JSONB blob
+/// (`jsonb_*`), chosen by the function name.
+fn json_doc_result(lname: &str, j: &super::json::Json) -> Value {
+    if lname.starts_with("jsonb") {
+        Value::Blob(j.to_jsonb())
+    } else {
+        Value::Text(j.serialize())
+    }
+}
+
 fn json_root(v: &Value) -> Result<Option<super::json::Json>> {
     match v {
         Value::Null => Ok(None),
+        // A BLOB document is JSONB (SQLite's binary JSON); text is JSON/JSON5.
+        Value::Blob(b) => match super::json::Json::from_jsonb(b) {
+            Some(j) => Ok(Some(j)),
+            None => Err(Error::Error("malformed JSON".into())),
+        },
         other => match super::json::parse(&eval::to_text(other)) {
             Some(j) => Ok(Some(j)),
             None => Err(Error::Error("malformed JSON".into())),
@@ -997,17 +1016,40 @@ fn reject_blob(v: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Convert a *value* argument of a JSON/JSONB constructor or mutator to JSON. A
+/// BLOB is embedded as its JSON when it decodes as JSONB (so `jsonb_*` results
+/// compose, e.g. `jsonb_object('a', jsonb_array(1,2))`) and otherwise rejected —
+/// graphite has no value subtypes, so it falls back to "does it parse as JSONB".
+fn json_value_arg(val: &Value, expr: Option<&Expr>) -> Result<super::json::Json> {
+    if let Value::Blob(b) = val {
+        return super::json::Json::from_jsonb(b)
+            .ok_or_else(|| Error::Error("JSON cannot hold BLOB values".into()));
+    }
+    Ok(arg_to_json(val, expr))
+}
+
 /// `json_extract`: one path returns the SQL value at that path (objects/arrays as
 /// minified JSON text); multiple paths return a JSON array of the extracted
-/// elements (missing paths become JSON `null`).
-fn json_extract(root: &super::json::Json, paths: &[Value]) -> Result<Value> {
+/// elements (missing paths become JSON `null`). `jsonb_extract` is the same but
+/// returns object/array results (and the multi-path array) as JSONB blobs.
+fn json_extract(root: &super::json::Json, paths: &[Value], jsonb: bool) -> Result<Value> {
     for p in paths {
         check_path(p)?;
     }
+    // A non-scalar single-path result is JSONB under jsonb_extract; scalars are
+    // returned as their SQL value either way.
+    let scalar_or_doc = |j: &super::json::Json| -> Value {
+        match j {
+            super::json::Json::Array(_) | super::json::Json::Object(_) if jsonb => {
+                Value::Blob(j.to_jsonb())
+            }
+            _ => j.to_sql(),
+        }
+    };
     if paths.len() == 1 {
         return Ok(
             match super::json::navigate(root, &eval::to_text(&paths[0])) {
-                Some(j) => j.to_sql(),
+                Some(j) => scalar_or_doc(j),
                 None => Value::Null,
             },
         );
@@ -1019,7 +1061,12 @@ fn json_extract(root: &super::json::Json, paths: &[Value]) -> Result<Value> {
             None => super::json::Json::Null,
         })
         .collect();
-    Ok(Value::Text(super::json::Json::Array(items).serialize()))
+    let arr = super::json::Json::Array(items);
+    Ok(if jsonb {
+        Value::Blob(arr.to_jsonb())
+    } else {
+        Value::Text(arr.serialize())
+    })
 }
 
 /// Convert a constructor argument to JSON. If the source expression is itself a

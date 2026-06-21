@@ -9655,7 +9655,7 @@ impl Connection {
                 "wrong number of arguments to function {lname}()"
             )));
         }
-        if lname == "json_group_object" && args.len() < 2 {
+        if (lname == "json_group_object" || lname == "jsonb_group_object") && args.len() < 2 {
             return Err(Error::Error(format!(
                 "wrong number of arguments to function {lname}()"
             )));
@@ -9699,7 +9699,7 @@ impl Connection {
         // JSON aggregates build their result directly from the (NULL-inclusive,
         // possibly multi-argument) per-row values, so they bypass the NULL-
         // stripping single-value collection used by the other aggregates.
-        if lname == "json_group_array" {
+        if lname == "json_group_array" || lname == "jsonb_group_array" {
             let mut vals = Vec::new();
             for &i in group {
                 let ctx = rows[i].ctx(columns, params).with_subqueries(self);
@@ -9714,9 +9714,14 @@ impl Connection {
                 .iter()
                 .map(|v| func::arg_to_json(v, args.first()))
                 .collect();
-            return Ok(Value::Text(json::Json::Array(items).serialize()));
+            let arr = json::Json::Array(items);
+            return Ok(if lname.starts_with("jsonb") {
+                Value::Blob(arr.to_jsonb())
+            } else {
+                Value::Text(arr.serialize())
+            });
         }
-        if lname == "json_group_object" {
+        if lname == "json_group_object" || lname == "jsonb_group_object" {
             let mut pairs = Vec::new();
             for &i in group {
                 let ctx = rows[i].ctx(columns, params).with_subqueries(self);
@@ -9724,7 +9729,12 @@ impl Connection {
                 let v = eval::eval(&args[1], &ctx)?;
                 pairs.push((eval::to_text(&k), func::arg_to_json(&v, args.get(1))));
             }
-            return Ok(Value::Text(json::Json::Object(pairs).serialize()));
+            let obj = json::Json::Object(pairs);
+            return Ok(if lname.starts_with("jsonb") {
+                Value::Blob(obj.to_jsonb())
+            } else {
+                Value::Text(obj.serialize())
+            });
         }
 
         // Gather the (non-NULL for most) argument values across the group.

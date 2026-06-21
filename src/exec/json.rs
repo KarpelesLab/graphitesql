@@ -85,6 +85,69 @@ impl Json {
         self.serialize()
     }
 
+    /// Encode to SQLite's **JSONB** binary format (the on-disk representation
+    /// behind `jsonb()` and the `jsonb_*` functions). Each element is a header
+    /// byte — low nibble = type, high nibble = payload-size class — followed by
+    /// the payload: ASCII digits for numbers, the (possibly escaped) bytes for
+    /// strings, and concatenated child elements for arrays/objects.
+    pub fn to_jsonb(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_jsonb(&mut out);
+        out
+    }
+
+    fn write_jsonb(&self, out: &mut Vec<u8>) {
+        match self {
+            Json::Null => push_jsonb(out, JSONB_NULL, &[]),
+            Json::Bool(true) => push_jsonb(out, JSONB_TRUE, &[]),
+            Json::Bool(false) => push_jsonb(out, JSONB_FALSE, &[]),
+            Json::Int(i) => push_jsonb(out, JSONB_INT, i.to_string().as_bytes()),
+            Json::Real(r) => {
+                let s = if r.is_infinite() {
+                    String::from(if *r < 0.0 { "-9e999" } else { "9e999" })
+                } else {
+                    crate::exec::eval::format_real(*r)
+                };
+                push_jsonb(out, JSONB_FLOAT, s.as_bytes());
+            }
+            Json::Str(s) => {
+                // A string with no characters needing escapes is stored raw
+                // (TEXT); otherwise its JSON-escaped body is stored as TEXTJ.
+                if json_needs_escape(s) {
+                    push_jsonb(out, JSONB_TEXTJ, json_escape_body(s).as_bytes());
+                } else {
+                    push_jsonb(out, JSONB_TEXT, s.as_bytes());
+                }
+            }
+            Json::Array(items) => {
+                let mut body = Vec::new();
+                for it in items {
+                    it.write_jsonb(&mut body);
+                }
+                push_jsonb(out, JSONB_ARRAY, &body);
+            }
+            Json::Object(members) => {
+                let mut body = Vec::new();
+                for (k, v) in members {
+                    if json_needs_escape(k) {
+                        push_jsonb(&mut body, JSONB_TEXTJ, json_escape_body(k).as_bytes());
+                    } else {
+                        push_jsonb(&mut body, JSONB_TEXT, k.as_bytes());
+                    }
+                    v.write_jsonb(&mut body);
+                }
+                push_jsonb(out, JSONB_OBJECT, &body);
+            }
+        }
+    }
+
+    /// Decode a complete JSONB value, returning `None` on malformed input or
+    /// trailing bytes.
+    pub fn from_jsonb(bytes: &[u8]) -> Option<Json> {
+        let (j, rest) = decode_jsonb(bytes)?;
+        rest.is_empty().then_some(j)
+    }
+
     /// Serialize to pretty-printed JSON using `indent` as the per-level unit
     /// (SQLite's `json_pretty`). Empty arrays/objects stay on one line; scalars
     /// render compactly.
@@ -173,6 +236,146 @@ impl Json {
             }
         }
     }
+}
+
+// JSONB element type tags (the low nibble of each element's header byte).
+const JSONB_NULL: u8 = 0;
+const JSONB_TRUE: u8 = 1;
+const JSONB_FALSE: u8 = 2;
+const JSONB_INT: u8 = 3;
+const JSONB_INT5: u8 = 4;
+const JSONB_FLOAT: u8 = 5;
+const JSONB_FLOAT5: u8 = 6;
+const JSONB_TEXT: u8 = 7;
+const JSONB_TEXTJ: u8 = 8;
+const JSONB_TEXT5: u8 = 9;
+const JSONB_TEXTRAW: u8 = 10;
+const JSONB_ARRAY: u8 = 11;
+const JSONB_OBJECT: u8 = 12;
+
+/// Append one JSONB element: the header byte (type in the low nibble, payload-
+/// size class in the high nibble) plus any size bytes, then the payload. Sizes
+/// 0–11 fit in the nibble; larger ones spill into 1/2/4/8 big-endian bytes.
+fn push_jsonb(out: &mut Vec<u8>, ty: u8, payload: &[u8]) {
+    let n = payload.len();
+    if n <= 11 {
+        out.push(((n as u8) << 4) | ty);
+    } else if n <= 0xFF {
+        out.push((12 << 4) | ty);
+        out.push(n as u8);
+    } else if n <= 0xFFFF {
+        out.push((13 << 4) | ty);
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+    } else if n <= 0xFFFF_FFFF {
+        out.push((14 << 4) | ty);
+        out.extend_from_slice(&(n as u32).to_be_bytes());
+    } else {
+        out.push((15 << 4) | ty);
+        out.extend_from_slice(&(n as u64).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+}
+
+/// Decode one JSONB element, returning it and the remaining bytes.
+fn decode_jsonb(b: &[u8]) -> Option<(Json, &[u8])> {
+    let header = *b.first()?;
+    let ty = header & 0x0F;
+    let mut rest = &b[1..];
+    let n = match header >> 4 {
+        d @ 0..=11 => d as usize,
+        12 => {
+            let v = *rest.first()? as usize;
+            rest = &rest[1..];
+            v
+        }
+        13 => {
+            let v = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]) as usize;
+            rest = &rest[2..];
+            v
+        }
+        14 => {
+            let mut a = [0u8; 4];
+            a.copy_from_slice(rest.get(..4)?);
+            rest = &rest[4..];
+            u32::from_be_bytes(a) as usize
+        }
+        _ => {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(rest.get(..8)?);
+            rest = &rest[8..];
+            u64::from_be_bytes(a) as usize
+        }
+    };
+    let payload = rest.get(..n)?;
+    let after = &rest[n..];
+    let text = || core::str::from_utf8(payload).ok().map(String::from);
+    let j = match ty {
+        JSONB_NULL => Json::Null,
+        JSONB_TRUE => Json::Bool(true),
+        JSONB_FALSE => Json::Bool(false),
+        JSONB_INT | JSONB_INT5 | JSONB_FLOAT | JSONB_FLOAT5 => {
+            // The number's text payload is reparsed through the JSON number path.
+            let t = core::str::from_utf8(payload).ok()?;
+            match parse(t) {
+                Some(j @ (Json::Int(_) | Json::Real(_))) => j,
+                _ => return None,
+            }
+        }
+        JSONB_TEXT | JSONB_TEXTRAW => Json::Str(text()?),
+        JSONB_TEXTJ | JSONB_TEXT5 => {
+            // Reparse the escaped body as a quoted JSON string.
+            let mut quoted = String::with_capacity(n + 2);
+            quoted.push('"');
+            quoted.push_str(core::str::from_utf8(payload).ok()?);
+            quoted.push('"');
+            match parse(&quoted)? {
+                Json::Str(s) => Json::Str(s),
+                _ => return None,
+            }
+        }
+        JSONB_ARRAY => {
+            let mut items = Vec::new();
+            let mut p = payload;
+            while !p.is_empty() {
+                let (it, next) = decode_jsonb(p)?;
+                items.push(it);
+                p = next;
+            }
+            Json::Array(items)
+        }
+        JSONB_OBJECT => {
+            let mut members = Vec::new();
+            let mut p = payload;
+            while !p.is_empty() {
+                let (label, next) = decode_jsonb(p)?;
+                let (val, next2) = decode_jsonb(next)?;
+                let key = match label {
+                    Json::Str(s) => s,
+                    _ => return None,
+                };
+                members.push((key, val));
+                p = next2;
+            }
+            Json::Object(members)
+        }
+        _ => return None,
+    };
+    Some((j, after))
+}
+
+/// Whether a string contains any character requiring a JSON escape.
+fn json_needs_escape(s: &str) -> bool {
+    s.chars()
+        .any(|c| matches!(c, '"' | '\\') || (c as u32) < 0x20)
+}
+
+/// The JSON-escaped body of a string *without* the surrounding quotes (the
+/// TEXTJ payload form).
+fn json_escape_body(s: &str) -> String {
+    let mut q = String::new();
+    write_json_string(s, &mut q);
+    // Strip the surrounding quotes `write_json_string` adds.
+    q[1..q.len() - 1].to_string()
 }
 
 /// Append a JSON-escaped string literal (with surrounding quotes).
