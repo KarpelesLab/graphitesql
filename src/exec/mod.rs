@@ -661,6 +661,16 @@ impl Connection {
     /// `PRAGMA table_info(name)` → one row per column
     /// `(cid, name, type, notnull, dflt_value, pk)`.
     fn pragma_table_info(&self, p: &Pragma, extended: bool) -> Result<QueryResult> {
+        fn table_info_columns(extended: bool) -> Vec<String> {
+            let mut c: Vec<String> = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+                .iter()
+                .map(|s| String::from(*s))
+                .collect();
+            if extended {
+                c.push(String::from("hidden"));
+            }
+            c
+        }
         let table = match &p.value {
             Some(Expr::Column { column, .. }) => column.clone(),
             Some(Expr::Literal(Literal::Str(s))) => s.clone(),
@@ -670,6 +680,38 @@ impl Connection {
                 ))
             }
         };
+        // The schema catalog is queryable but has no stored CREATE statement;
+        // report its fixed five columns, as SQLite does for `sqlite_master` /
+        // `sqlite_schema` (and their `sqlite_temp_*` aliases).
+        if matches!(
+            table.to_ascii_lowercase().as_str(),
+            "sqlite_master" | "sqlite_schema" | "sqlite_temp_master" | "sqlite_temp_schema"
+        ) {
+            let cols = [
+                ("type", "TEXT"),
+                ("name", "TEXT"),
+                ("tbl_name", "TEXT"),
+                ("rootpage", "INT"),
+                ("sql", "TEXT"),
+            ];
+            let mut rows = Vec::new();
+            for (i, (name, ty)) in cols.iter().enumerate() {
+                let mut row = alloc::vec![
+                    Value::Integer(i as i64),
+                    Value::Text((*name).into()),
+                    Value::Text((*ty).into()),
+                    Value::Integer(0),
+                    Value::Null,
+                    Value::Integer(0),
+                ];
+                if extended {
+                    row.push(Value::Integer(0));
+                }
+                rows.push(row);
+            }
+            let columns = table_info_columns(extended);
+            return Ok(QueryResult { columns, rows });
+        }
         let obj = self
             .schema
             .table(&table)
@@ -678,7 +720,10 @@ impl Connection {
         let Statement::CreateTable(ct) = sql::parse_one(sql)? else {
             return Err(Error::Corrupt("schema sql is not CREATE TABLE".into()));
         };
-        let ipk = find_integer_primary_key(&ct);
+        // The `pk` column is the 1-based position of the column within the
+        // PRIMARY KEY (0 if not part of it) — so a composite `PRIMARY KEY(b,a)`
+        // reports b=1, a=2, matching SQLite. A single-column or INTEGER PK is 1.
+        let pk_positions = primary_key_positions(&ct);
 
         let mut rows = Vec::new();
         for (i, col) in ct.columns.iter().enumerate() {
@@ -710,16 +755,10 @@ impl Connection {
                 ColumnConstraint::Default(e) => Some(sql::print::expr(e)),
                 _ => None,
             });
-            let pk = if Some(i) == ipk
-                || col
-                    .constraints
-                    .iter()
-                    .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
-            {
-                1
-            } else {
-                0
-            };
+            let pk = pk_positions
+                .iter()
+                .position(|&pos| pos == i)
+                .map_or(0, |n| n as i64 + 1);
             let mut row = alloc::vec![
                 Value::Integer(i as i64),
                 Value::Text(col.name.clone()),
@@ -733,26 +772,10 @@ impl Connection {
             }
             rows.push(row);
         }
-        let columns: Vec<String> = if extended {
-            [
-                "cid",
-                "name",
-                "type",
-                "notnull",
-                "dflt_value",
-                "pk",
-                "hidden",
-            ]
-            .iter()
-            .map(|s| String::from(*s))
-            .collect()
-        } else {
-            ["cid", "name", "type", "notnull", "dflt_value", "pk"]
-                .iter()
-                .map(|s| String::from(*s))
-                .collect()
-        };
-        Ok(QueryResult { columns, rows })
+        Ok(QueryResult {
+            columns: table_info_columns(extended),
+            rows,
+        })
     }
 
     /// The single name argument of a `PRAGMA foo(name)` / `PRAGMA foo = name`.
@@ -769,8 +792,36 @@ impl Connection {
     fn pragma_index_list(&self, p: &Pragma) -> Result<QueryResult> {
         let table = Self::pragma_arg_name(p)?;
         let objs: Vec<_> = self.schema.indexes_on(&table).collect();
+
+        // To label an automatic index's origin `pk` vs `u`, find the PRIMARY KEY's
+        // column set. An INTEGER PRIMARY KEY is the rowid (no auto-index), so only
+        // a non-integer / composite PK yields a `pk`-origin auto-index. The set
+        // matches one of `collect_unique_sets`, which mirrors SQLite's auto-index
+        // numbering.
+        let pk_set: Vec<usize> = self
+            .schema
+            .table(&table)
+            .and_then(|o| o.sql.as_deref())
+            .and_then(|sql| sql::parse_one(sql).ok())
+            .and_then(|st| match st {
+                Statement::CreateTable(ct) => {
+                    let ipk = find_integer_primary_key(&ct);
+                    let pk = primary_key_positions(&ct);
+                    // A single integer-PK column is the rowid, not an auto-index;
+                    // a table with no PK has no `pk`-origin auto-index either.
+                    if pk.is_empty() || (pk.len() == 1 && Some(pk[0]) == ipk) {
+                        None
+                    } else {
+                        Some(pk)
+                    }
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        let tmeta = self.table_meta(&table, None).ok();
+
         let mut rows = Vec::new();
-        for (seq, obj) in objs.iter().rev().enumerate() {
+        for obj in objs.iter().rev() {
             let (unique, origin, partial) = match &obj.sql {
                 Some(sql) => match sql::parse_one(sql) {
                     Ok(Statement::CreateIndex(ci)) => {
@@ -778,14 +829,40 @@ impl Connection {
                     }
                     _ => (0, "c", 0),
                 },
-                None => (1, "u", 0), // an automatic UNIQUE/PK index
+                None => {
+                    // Automatic index: `pk` when its column set is the PRIMARY
+                    // KEY's, otherwise a plain UNIQUE (`u`).
+                    let cols = autoindex_number(&obj.name, &table)
+                        .and_then(|n| tmeta.as_ref().and_then(|m| m.unique.get(n - 1)))
+                        .cloned()
+                        .unwrap_or_default();
+                    let origin = if !pk_set.is_empty() && cols == pk_set {
+                        "pk"
+                    } else {
+                        "u"
+                    };
+                    (1, origin, 0)
+                }
             };
             rows.push(alloc::vec![
-                Value::Integer(seq as i64),
+                Value::Integer(rows.len() as i64),
                 Value::Text(obj.name.clone()),
                 Value::Integer(unique),
                 Value::Text(origin.into()),
                 Value::Integer(partial),
+            ]);
+        }
+        // A WITHOUT ROWID table's PRIMARY KEY is the table b-tree itself; SQLite
+        // still reports it as `sqlite_autoindex_<t>_1` (origin `pk`) — and, being
+        // auto-index #1 (the oldest), it comes *last* in this newest-first list.
+        // graphite keeps no separate index object for it, so synthesize the row.
+        if tmeta.as_ref().is_some_and(|m| m.without_rowid) && !pk_set.is_empty() {
+            rows.push(alloc::vec![
+                Value::Integer(rows.len() as i64),
+                Value::Text(alloc::format!("sqlite_autoindex_{table}_1")),
+                Value::Integer(1),
+                Value::Text("pk".into()),
+                Value::Integer(0),
             ]);
         }
         Ok(QueryResult {
