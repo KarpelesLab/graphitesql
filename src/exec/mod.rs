@@ -5711,13 +5711,9 @@ impl Connection {
                 continue;
             }
             let mut key = Vec::new();
-            let mut colls = Vec::new();
-            for (pos, &c) in idx.cols.iter().enumerate() {
+            for &c in &idx.cols {
                 match eqs.iter().find(|(col, _)| *col == c) {
-                    Some((_, v)) => {
-                        key.push(meta.columns[c].affinity.coerce(v.clone()));
-                        colls.push(idx.collations[pos]);
-                    }
+                    Some((_, v)) => key.push(meta.columns[c].affinity.coerce(v.clone())),
                     None => break,
                 }
             }
@@ -5735,14 +5731,16 @@ impl Connection {
                 Some((_, bk, _, _, be)) => est < *be || (est == *be && key.len() > bk.len()),
             };
             if better {
-                best = Some((idx.root, key, colls, idx.cols.clone(), est));
+                // Carry the index's full collation vector so a trailing range on
+                // the column after the equality prefix can be seeked too.
+                best = Some((idx.root, key, idx.collations.clone(), idx.cols.clone(), est));
             }
         }
         // Plain column indexes take priority. If none applied, try a partial or
         // expression index whose eligibility we can prove from the `WHERE`
         // structure (see `partial_expr_seek`). This keeps plain-index behavior
         // byte-identical while extending seeks to the new index kinds.
-        let (root, key, seek_colls, idx_cols) = match best {
+        let (root, key, full_colls, idx_cols) = match best {
             Some((root, key, colls, idx_cols, _)) => (root, key, colls, idx_cols),
             None => {
                 return self.partial_expr_lookup(meta, table_name, sel, where_expr, params);
@@ -5761,7 +5759,58 @@ impl Connection {
             return Ok(Some(self.covering_seek_rows(meta, root, &idx_cols)?));
         }
 
-        self.index_seek_fetch(meta, root, &key, &seek_colls)
+        // Equality prefix followed by a range on the *next* index column
+        // (`x=? AND y>?`): extend the exact-prefix seek to a bounded range over
+        // `[eq…, low] .. [eq…, high]`, matching SQLite (and reported the same way
+        // by `eqp_access`). Falls through to the plain prefix seek otherwise.
+        let next_pos = key.len();
+        if let Some(&next_col) = idx_cols.get(next_pos) {
+            let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                alloc::collections::BTreeMap::new();
+            collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+            if let Some(b) = ranges.get(&next_col) {
+                let aff = meta.columns[next_col].affinity;
+                let colls = full_colls[..=next_pos].to_vec();
+                let mut lo_key = key.clone();
+                let lo_inc = match b.lower.as_ref() {
+                    Some((v, inc)) => {
+                        lo_key.push(aff.coerce(v.clone()));
+                        *inc
+                    }
+                    None => true,
+                };
+                let mut hi_key = key.clone();
+                let hi_inc = match b.upper.as_ref() {
+                    Some((v, inc)) => {
+                        hi_key.push(aff.coerce(v.clone()));
+                        *inc
+                    }
+                    None => true,
+                };
+                let rowids = crate::btree::index_range_rowids(
+                    self.backend.source(),
+                    root,
+                    Some((lo_key.as_slice(), lo_inc)),
+                    Some((hi_key.as_slice(), hi_inc)),
+                    &colls,
+                )?;
+                let encoding = self.backend.source().header().text_encoding;
+                let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                let mut out = Vec::new();
+                for rid in rowids {
+                    if cur.seek(rid)? {
+                        let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                        out.push(InputRow {
+                            values,
+                            rowid: Some(rid),
+                        });
+                    }
+                }
+                return Ok(Some(out));
+            }
+        }
+
+        self.index_seek_fetch(meta, root, &key, &full_colls[..key.len()])
     }
 
     /// Fetch table rows for an equality index seek: collect the matching rowids
@@ -6920,14 +6969,30 @@ impl Connection {
         }
         if let Some((idx_name, matched, idx_cols, _)) = best {
             if !matched.is_empty() {
-                let cond = matched
+                let mut conds = matched
                     .iter()
                     .map(|&c| alloc::format!("{}=?", meta.columns[c].name))
-                    .collect::<Vec<_>>()
-                    .join(" AND ");
+                    .collect::<Vec<_>>();
+                // A range on the column after the equality prefix is seeked too
+                // (matches the eq-prefix + range path in try_index_lookup).
+                if let Some(&next_col) = idx_cols.get(matched.len()) {
+                    let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                        alloc::collections::BTreeMap::new();
+                    collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+                    if let Some(b) = ranges.get(&next_col) {
+                        let name = &meta.columns[next_col].name;
+                        if b.lower.is_some() {
+                            conds.push(alloc::format!("{name}>?"));
+                        }
+                        if b.upper.is_some() {
+                            conds.push(alloc::format!("{name}<?"));
+                        }
+                    }
+                }
                 let kw = index_kw(&idx_cols);
                 return Ok(alloc::format!(
-                    "SEARCH {label} USING {kw} {idx_name} ({cond})"
+                    "SEARCH {label} USING {kw} {idx_name} ({})",
+                    conds.join(" AND ")
                 ));
             }
         }
