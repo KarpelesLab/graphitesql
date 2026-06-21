@@ -101,3 +101,31 @@ fn rows_persist_in_the_backing_table() {
         [vec![Value::Integer(7), Value::Real(1.0), Value::Real(2.0)]]
     );
 }
+
+#[test]
+fn alter_and_index_on_a_virtual_table() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, a, b)")
+        .unwrap();
+    c.execute("INSERT INTO r VALUES (1, 0, 5), (2, 10, 15)")
+        .unwrap();
+
+    // ADD COLUMN / CREATE INDEX on a vtab are rejected (matching sqlite), not the
+    // old confusing "schema sql is not CREATE TABLE".
+    assert!(c.execute("ALTER TABLE r ADD COLUMN z").is_err());
+    assert!(c.execute("CREATE INDEX i ON r(a)").is_err());
+
+    // RENAME works: the vtab and its `<name>_data` backing table are both renamed,
+    // and the rows survive.
+    c.execute("ALTER TABLE r RENAME TO r2").unwrap();
+    assert_eq!(
+        c.query("SELECT id, a, b FROM r2 ORDER BY id").unwrap().rows,
+        [
+            vec![Value::Integer(1), Value::Real(0.0), Value::Real(5.0)],
+            vec![Value::Integer(2), Value::Real(10.0), Value::Real(15.0)],
+        ]
+    );
+    // The old name is gone; the backing table moved too.
+    assert!(c.query("SELECT * FROM r").is_err());
+    assert!(c.query("SELECT * FROM r2_data").is_ok());
+}

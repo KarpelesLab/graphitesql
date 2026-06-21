@@ -4357,6 +4357,9 @@ impl Connection {
             }
             return Err(Error::Error(format!("index {} already exists", ci.name)));
         }
+        if self.is_virtual_table(&ci.table) {
+            return Err(Error::Error("virtual tables may not be indexed".into()));
+        }
         let tmeta = self.table_meta(&ci.table, None)?;
         // SQLite rejects non-deterministic functions in an index expression (or a
         // partial-index predicate): the stored key could never match a recomputed
@@ -5318,6 +5321,15 @@ impl Connection {
     }
 
     fn exec_alter(&mut self, a: &Alter) -> Result<()> {
+        // A virtual table can be renamed (sqlite renames its backing tables too),
+        // but not otherwise altered — and it isn't a CREATE TABLE, so it must not
+        // reach the regular path below.
+        if self.is_virtual_table(&a.table) {
+            if let AlterAction::RenameTable(new_name) = &a.action {
+                return self.rename_virtual_table(&a.table, new_name);
+            }
+            return Err(Error::Error("virtual tables may not be altered".into()));
+        }
         let obj = self
             .schema
             .table(&a.table)
@@ -5529,6 +5541,55 @@ impl Connection {
             }
         }
 
+        let cookie = self
+            .backend
+            .writer()?
+            .header()
+            .schema_cookie
+            .wrapping_add(1);
+        self.backend.writer()?.header_mut().schema_cookie = cookie;
+        self.schema = Schema::read(self.backend.source())?;
+        Ok(())
+    }
+
+    /// `ALTER TABLE … RENAME TO` for a virtual table: rename its persistent
+    /// `<name>_data` backing table (a normal table) and rewrite its own schema row
+    /// (name, tbl_name, and the stored `CREATE VIRTUAL TABLE` text), matching
+    /// sqlite, which renames a vtab and its shadow tables.
+    fn rename_virtual_table(&mut self, old: &str, new: &str) -> Result<()> {
+        if self
+            .schema
+            .objects()
+            .iter()
+            .any(|o| o.name.eq_ignore_ascii_case(new))
+        {
+            return Err(Error::Error(format!(
+                "there is already another table or index with this name: {new}"
+            )));
+        }
+        // Rename the persistent backing table first (it is an ordinary table).
+        let backing_old = format!("{old}_data");
+        if self.schema.table(&backing_old).is_some() {
+            self.exec_alter(&Alter {
+                schema: None,
+                table: backing_old,
+                action: AlterAction::RenameTable(format!("{new}_data")),
+            })?;
+        }
+        let old_s = old.to_string();
+        let new_s = new.to_string();
+        self.rewrite_schema_rows(|cols| {
+            if is_text(&cols[0], "table") && is_text(&cols[1], &old_s) {
+                cols[1] = Value::Text(new_s.clone());
+                cols[2] = Value::Text(new_s.clone());
+                if let Some(Value::Text(s)) = cols.get(4).cloned() {
+                    cols[4] = Value::Text(rewrite_ident_tokens(&s, &old_s, &new_s));
+                }
+                true
+            } else {
+                false
+            }
+        })?;
         let cookie = self
             .backend
             .writer()?
