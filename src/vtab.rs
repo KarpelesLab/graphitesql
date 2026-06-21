@@ -234,6 +234,36 @@ pub trait VTabCursor {
     fn next(&mut self) -> Result<Option<Self::Row>>;
 }
 
+/// A write delivered to [`VTabModule::update`] (SQLite's `xUpdate`). The engine
+/// resolves the affected row and evaluates its column values before the call.
+#[derive(Debug, Clone)]
+pub enum VTabChange<'a> {
+    /// Delete the row with this rowid.
+    Delete {
+        /// The rowid of the row to remove.
+        rowid: i64,
+    },
+    /// Insert a row. `rowid` is the explicit rowid the statement supplied (an
+    /// `INTEGER PRIMARY KEY` / `rowid` value), or `None` for the module to assign
+    /// one. `values` are the column values in the table's declared column order.
+    Insert {
+        /// The explicit rowid, if any.
+        rowid: Option<i64>,
+        /// One value per declared column, in order.
+        values: &'a [Value],
+    },
+    /// Replace the row `rowid` with `values`, moving it to `new_rowid` when the
+    /// statement changed the rowid.
+    Update {
+        /// The existing rowid of the row being changed.
+        rowid: i64,
+        /// The rowid after the change (equal to `rowid` unless it was set).
+        new_rowid: i64,
+        /// One value per declared column, in order.
+        values: &'a [Value],
+    },
+}
+
 /// A virtual-table module: the safe analog of `sqlite3_module`.
 ///
 /// A connection registers an implementation under a name (see [`VTabRegistry`]).
@@ -293,6 +323,19 @@ pub trait VTabModule {
     ) -> Result<Self::Cursor> {
         Ok(cursor)
     }
+
+    /// Apply a write to the table (SQLite's `xUpdate`), returning the rowid of the
+    /// inserted/updated row (ignored for a delete).
+    ///
+    /// `args` are the `USING <name>(<args>)` arguments (as for [`connect`](Self::connect)).
+    /// The default makes the table **read-only** — it returns an error — so an
+    /// existing read-only module needs no change. A writable module overrides this
+    /// to service [`VTabChange::Insert`]/`Delete`/`Update`.
+    fn update(&self, _args: &[&str], _change: VTabChange) -> Result<i64> {
+        Err(Error::Error(alloc::string::String::from(
+            "table is read-only",
+        )))
+    }
 }
 
 /// An object-safe erasure of [`VTabModule`] so heterogeneous modules can live in
@@ -319,6 +362,8 @@ pub trait DynVTabModule {
         plan: &IndexPlan,
         argv: &[Value],
     ) -> Result<Box<dyn DynCursor>>;
+    /// See [`VTabModule::update`].
+    fn dyn_update(&self, args: &[&str], change: VTabChange) -> Result<i64>;
 }
 
 /// A type-erased [`VTabRow`] yielded by a [`DynCursor`].
@@ -373,6 +418,9 @@ where
         let cursor = VTabModule::open(self, args, plan)?;
         let cursor = VTabModule::filter(self, cursor, plan, argv)?;
         Ok(Box::new(cursor) as Box<dyn DynCursor>)
+    }
+    fn dyn_update(&self, args: &[&str], change: VTabChange) -> Result<i64> {
+        VTabModule::update(self, args, change)
     }
 }
 

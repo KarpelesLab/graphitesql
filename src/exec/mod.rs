@@ -32,7 +32,9 @@ use crate::sql::ast::*;
 use crate::sql::{self};
 use crate::value::Value;
 use crate::vfs::{OpenFlags, Vfs};
-use crate::vtab::{ConstraintOp, IndexConstraint, IndexPlan, VTabRegistry};
+use crate::vtab::{
+    ConstraintOp, DynVTabModule, IndexConstraint, IndexPlan, VTabChange, VTabRegistry,
+};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -1310,6 +1312,19 @@ impl Connection {
     /// affected (0 for DDL and transaction control).
     pub fn execute(&mut self, sql: &str) -> Result<usize> {
         self.execute_params(sql, &Params::default())
+    }
+
+    /// Register a virtual-table [`module`](crate::vtab::VTabModule) under `name`,
+    /// the identifier used after `USING` in `CREATE VIRTUAL TABLE … USING <name>`.
+    /// A module implementing [`VTabModule::update`](crate::vtab::VTabModule::update)
+    /// makes its tables writable; the default leaves them read-only. Fails if a
+    /// module is already registered under that name (case-insensitively).
+    pub fn register_module(
+        &mut self,
+        name: &str,
+        module: impl DynVTabModule + 'static,
+    ) -> Result<()> {
+        self.vtab_registry.register(name, Box::new(module))
     }
 
     /// Execute a `;`-separated script of one or more statements, like SQLite's
@@ -3266,7 +3281,21 @@ impl Connection {
 
     fn exec_insert(&mut self, ins: &Insert, params: &Params) -> Result<usize> {
         reject_schema_write(&ins.table)?;
-        self.reject_vtab_write(&ins.table)?;
+        // A virtual table routes INSERT to its module's `update` (xUpdate); only
+        // the `VALUES`/`SELECT` source needs materializing first.
+        if self.is_virtual_table(&ins.table) {
+            let rows: Vec<Vec<Expr>> = match &ins.source {
+                InsertSource::Values(rows) => rows.clone(),
+                InsertSource::DefaultValues => alloc::vec![Vec::new()],
+                InsertSource::Select(sel) => self
+                    .run_select(sel, params)?
+                    .rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(value_to_literal_expr).collect())
+                    .collect(),
+            };
+            return self.exec_vtab_insert(ins, &rows, params);
+        }
         // `INSERT … SELECT` is evaluated to a snapshot of value rows first (so
         // `INSERT INTO t SELECT … FROM t` reads the pre-insert state), then each
         // row flows through the normal VALUES path as literal expressions.
@@ -4456,9 +4485,9 @@ impl Connection {
             })
     }
 
-    /// Reject an `INSERT`/`UPDATE`/`DELETE` targeting a virtual table. The
-    /// built-in modules are read-only; writes (SQLite's `xUpdate`) are not yet
-    /// modeled.
+    /// Reject an `UPDATE`/`DELETE` targeting a virtual table. (`INSERT` is routed
+    /// to the module's [`update`](crate::vtab::VTabModule::update) — see
+    /// `exec_vtab_insert`; `UPDATE`/`DELETE` routing is not yet modeled.)
     fn reject_vtab_write(&self, name: &str) -> Result<()> {
         if self.is_virtual_table(name) {
             return Err(Error::Error(format!(
@@ -4466,6 +4495,85 @@ impl Connection {
             )));
         }
         Ok(())
+    }
+
+    /// The module name, `USING` arguments, and declared column names of a virtual
+    /// table — by reparsing its stored `CREATE VIRTUAL TABLE` and asking the
+    /// module to `connect`. Used by the write path.
+    fn vtab_meta(&self, name: &str) -> Result<(String, Vec<String>, Vec<String>)> {
+        use crate::schema::ObjectType;
+        let obj = self
+            .schema
+            .objects()
+            .iter()
+            .find(|o| o.obj_type == ObjectType::Table && o.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::Error(format!("no such table: {name}")))?;
+        let Some(Ok(Statement::CreateVirtualTable(cvt))) = obj.sql.as_deref().map(sql::parse_one)
+        else {
+            return Err(Error::Error(format!("{name} is not a virtual table")));
+        };
+        let module = self
+            .vtab_registry
+            .get(&cvt.module)
+            .ok_or_else(|| Error::Error(format!("no such module: {}", cvt.module)))?;
+        let arg_refs: Vec<&str> = cvt.args.iter().map(String::as_str).collect();
+        let schema = module.dyn_connect(&arg_refs)?;
+        Ok((cvt.module.clone(), cvt.args.clone(), schema.columns))
+    }
+
+    /// `INSERT` into a virtual table: evaluate each row's values into the module's
+    /// declared column order and hand them to its
+    /// [`update`](crate::vtab::VTabModule::update) (SQLite's `xUpdate` insert).
+    /// A read-only module's default `update` rejects the write.
+    fn exec_vtab_insert(&self, ins: &Insert, rows: &[Vec<Expr>], params: &Params) -> Result<usize> {
+        if !ins.upsert.is_empty() || !ins.returning.is_empty() {
+            return Err(Error::Unsupported("UPSERT / RETURNING on a virtual table"));
+        }
+        let (module_name, args, col_names) = self.vtab_meta(&ins.table)?;
+        let ncols = col_names.len();
+        // Map the (possibly explicit) column list onto declared column positions.
+        let target: Vec<usize> = if ins.columns.is_empty() {
+            (0..ncols).collect()
+        } else {
+            ins.columns
+                .iter()
+                .map(|name| {
+                    col_names
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| Error::Error(format!("no such column: {name}")))
+                })
+                .collect::<Result<_>>()?
+        };
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let module = self
+            .vtab_registry
+            .get(&module_name)
+            .ok_or_else(|| Error::Error(format!("no such module: {module_name}")))?;
+        let mut count = 0usize;
+        for row in rows {
+            if row.len() != target.len() {
+                return Err(Error::Error(format!(
+                    "{} values for {} columns",
+                    row.len(),
+                    target.len()
+                )));
+            }
+            let mut values = alloc::vec![Value::Null; ncols];
+            for (j, expr) in row.iter().enumerate() {
+                let ctx = EvalCtx::rowless(params).with_subqueries(self);
+                values[target[j]] = eval::eval(expr, &ctx)?;
+            }
+            module.dyn_update(
+                &arg_refs,
+                VTabChange::Insert {
+                    rowid: None,
+                    values: &values,
+                },
+            )?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Produce the columns and rows of a virtual table used as a `FROM` source:
