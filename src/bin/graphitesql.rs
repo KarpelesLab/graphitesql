@@ -157,6 +157,12 @@ impl Shell {
                 }
                 Err(e) => return Err(e),
             }
+        } else if has_returning(sql) {
+            // INSERT/UPDATE/DELETE … RETURNING mutates *and* projects rows; run it
+            // via execute_returning and print the projected rows.
+            let result =
+                conn.execute_returning(sql, &graphitesql::exec::eval::Params::default())?;
+            self.print_result(&result);
         } else {
             match conn.execute(sql) {
                 Ok(_) => {}
@@ -262,6 +268,38 @@ fn returns_rows(sql: &str) -> bool {
     )
 }
 
+/// Whether `sql` contains a `RETURNING` keyword (as a whole word, outside string
+/// literals) — a CLI heuristic to route INSERT/UPDATE/DELETE … RETURNING to
+/// `execute_returning` so the projected rows are printed.
+fn has_returning(sql: &str) -> bool {
+    let mut in_str = false;
+    let mut word = String::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    in_str = false;
+                }
+            }
+            continue;
+        }
+        if c == '\'' {
+            in_str = true;
+        } else if c.is_alphabetic() || c == '_' {
+            word.push(c);
+        } else {
+            if word.eq_ignore_ascii_case("returning") {
+                return true;
+            }
+            word.clear();
+        }
+    }
+    word.eq_ignore_ascii_case("returning")
+}
+
 /// Whether `sql` is a `PRAGMA name = value` setter (which mutates connection
 /// state and so must run through `execute`, not `query`). The `= value` form is
 /// the distinguishing mark; bare/`(arg)` getter pragmas have no `=`.
@@ -282,25 +320,65 @@ fn split_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_str = false;
+    // Block nesting for `BEGIN … END` (trigger bodies) and `CASE … END`: a `;`
+    // inside one does not end the statement. A *transaction* `BEGIN`/`END` is a
+    // standalone statement (the first word, or with `depth == 0`), so it does not
+    // open/close a block — only a mid-statement `BEGIN`/`CASE` does.
+    let mut depth: u32 = 0;
+    let mut word = String::new();
     let mut chars = sql.chars().peekable();
+    let flush_word = |word: &mut String, cur: &str, depth: &mut u32| {
+        match word.to_ascii_uppercase().as_str() {
+            // A mid-statement BEGIN (content precedes it, e.g. `CREATE TRIGGER …
+            // BEGIN`) opens a trigger body; a *leading* BEGIN is a transaction
+            // statement. `cur` already ends with this word, so look at what comes
+            // before it.
+            "BEGIN" => {
+                let before = &cur[..cur.len().saturating_sub(word.len())];
+                if !before.trim().is_empty() {
+                    *depth += 1;
+                }
+            }
+            "CASE" => *depth += 1,
+            "END" => *depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        word.clear();
+    };
     while let Some(c) = chars.next() {
+        if in_str {
+            cur.push(c);
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    cur.push(chars.next().unwrap());
+                } else {
+                    in_str = false;
+                }
+            }
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            word.push(c);
+            cur.push(c);
+            continue;
+        }
+        // Word boundary: classify the keyword just read.
+        if !word.is_empty() {
+            flush_word(&mut word, &cur, &mut depth);
+        }
         match c {
             '\'' => {
-                in_str = !in_str;
-                // A doubled '' inside a string is an escaped quote.
-                if !in_str && chars.peek() == Some(&'\'') {
-                    cur.push('\'');
-                    cur.push(chars.next().unwrap());
-                    in_str = true;
-                    continue;
-                }
+                in_str = true;
                 cur.push(c);
             }
-            ';' if !in_str => {
+            ';' if depth == 0 => {
                 out.push(std::mem::take(&mut cur));
             }
             _ => cur.push(c),
         }
+    }
+    if !word.is_empty() {
+        flush_word(&mut word, &cur, &mut depth);
     }
     if !cur.trim().is_empty() {
         out.push(cur);

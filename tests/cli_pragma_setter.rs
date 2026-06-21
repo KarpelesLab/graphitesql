@@ -57,6 +57,31 @@ fn getter_pragmas_still_print_rows() {
 }
 
 #[test]
+fn trigger_bodies_and_returning() {
+    // A trigger's BEGIN…END body contains internal ';' — the splitter must keep
+    // the whole CREATE TRIGGER together (it previously broke at the first ';').
+    let (out, ok) = run(
+        "CREATE TABLE t(a); CREATE TABLE c(n); INSERT INTO c VALUES(0); \
+         CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE c SET n=n+1; END; \
+         INSERT INTO t VALUES(1),(2),(3); SELECT n FROM c",
+    );
+    assert!(ok, "trigger script should run: {out}");
+    assert_eq!(out.trim(), "3");
+
+    // A transaction BEGIN/END (not a trigger body) still splits normally.
+    let (out, ok) =
+        run("BEGIN; CREATE TABLE t(x); INSERT INTO t VALUES(1); COMMIT; SELECT x FROM t");
+    assert!(ok, "transaction script should run: {out}");
+    assert_eq!(out.trim(), "1");
+
+    // INSERT … RETURNING prints the projected rows (run via execute_returning).
+    let (out, ok) = run("CREATE TABLE t(a INTEGER PRIMARY KEY, b); \
+                         INSERT INTO t(b) VALUES('x') RETURNING a,b");
+    assert!(ok, "RETURNING should print rows: {out}");
+    assert_eq!(out.trim(), "1|x");
+}
+
+#[test]
 fn explain_and_with_dml_route_correctly() {
     // EXPLAIN returns rows: it must run via query (returns_rows now includes it),
     // not execute (which rejects EXPLAIN). The plan detail is shown, not an error.
