@@ -190,10 +190,11 @@ expressions.
   tokenizer-based `split_sql_script` (string/comment/`BEGIN…END`/`CASE…END`
   aware), each slice through `execute_params` (a `SELECT` runs and is discarded);
   stops at the first error. `execute()` stays single-statement.
-- **A8 — JSONB of JSON5-form numbers.** `jsonb('.5')`/`jsonb('0xFF')` emit a
-  normalized `FLOAT`/`INT` element; sqlite uses the `FLOAT5`/`INT5` tags with the
-  raw text. Needs the parser to keep the raw JSON5 number text and `to_jsonb` to
-  pick the `*5` tag for it. *Tiny edge; round-trips correctly today.*
+- **A8 — JSONB of JSON5-form numbers. ✅ DONE.** `jsonb('0xFF')` →
+  `INT5 "0xFF"`, `jsonb('.5')`/`jsonb('5.')` → `FLOAT5 ".5"/"5."`, byte-identical
+  to sqlite (`Json::Int` carries the hex raw text; `Json::Real` keeps the
+  leading/trailing-`.` text, dropping only a leading-`+` form which normalizes).
+  `json()` still renders them canonically.
 
 *ALTER rename — cross-object propagation* (a column/table rename must reach
 *other* schema objects, not just the table's own definition; today those break
@@ -466,9 +467,9 @@ smaller pieces to ship it. Suggested order:
    exercised the writable-vtab path.
 6. **B5/B7/B8 — the executor→VDBE migration** — the largest internal refactor;
    unblocks real bytecode `EXPLAIN`.
-7. **Smaller gaps** — **A8** (JSONB JSON5 numbers — tiny, deferred), **C8a/b/c**
-   (secure_delete, cache honoring). (**A4** `nullif` collation and **A7**
-   `execute_batch` are done.)
+7. **Smaller gaps** — **C8a/b/c** (secure_delete, cache honoring). (**A4**
+   `nullif` collation, **A7** `execute_batch`, and **A8** JSONB JSON5 numbers are
+   done.)
 
 Deferred / blocked: **C7/C9** (SQLite-format journal + cross-process
 locks/concurrency — durability depth), **D5/D6** (sessions, async wasm VFS),
