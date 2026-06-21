@@ -501,21 +501,31 @@ fn alter_rename_table_keeps_trigger_firing() {
 
 #[test]
 fn delete_update_limit_order_from_subquery() {
-    agree(
-        &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY)",
-            "INSERT INTO t VALUES(1),(2),(3),(4)",
-        ],
-        "DELETE FROM t ORDER BY id DESC LIMIT 2",
-        "SELECT id FROM t ORDER BY id",
+    // `DELETE`/`UPDATE ... ORDER BY ... LIMIT` cannot be compared differentially:
+    // the official sqlite3 build used by CI is compiled WITHOUT
+    // SQLITE_ENABLE_UPDATE_DELETE_LIMIT, so it rejects this grammar (some distro
+    // builds enable it). graphite supports it, so assert its behavior directly.
+    assert_eq!(
+        graphite_run(
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+                "INSERT INTO t VALUES(1),(2),(3),(4)",
+            ],
+            "DELETE FROM t ORDER BY id DESC LIMIT 2",
+            "SELECT id FROM t ORDER BY id",
+        ),
+        ("1\n2".to_string(), true),
     );
-    agree(
-        &[
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, n INT)",
-            "INSERT INTO t VALUES(1,0),(2,0),(3,0)",
-        ],
-        "UPDATE t SET n=1 ORDER BY id LIMIT 2",
-        "SELECT id,n FROM t ORDER BY id",
+    assert_eq!(
+        graphite_run(
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, n INT)",
+                "INSERT INTO t VALUES(1,0),(2,0),(3,0)",
+            ],
+            "UPDATE t SET n=1 ORDER BY id LIMIT 2",
+            "SELECT id,n FROM t ORDER BY id",
+        ),
+        ("1|1\n2|1\n3|0".to_string(), true),
     );
     agree(
         &[
