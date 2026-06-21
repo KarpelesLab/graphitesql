@@ -453,9 +453,12 @@ smaller pieces to ship it. Suggested order:
 3. **A-rn3 — cross-object RENAME COLUMN** (view/trigger/FK propagation), the one
    remaining *functional* ALTER gap (A-rn1 + A-rn2 RENAME TABLE→views are done);
    needs scope-aware column resolution, not the token rewrite A-rn2 used.
-4. **Planner leftovers** (perf-only, EQP-gated) — **B0b-i/ii/iii**, **B1b** join
-   reordering, **A3b** partial/expr range·IN seeks, **B4** `sqlite_stat4`. (**A2**
-   DESC seek direction and the composite eq-prefix + trailing-range seek are done.)
+4. **Planner leftovers** (perf-only, EQP-gated) — **B0b-iii** (ORDER BY from a
+   WHERE-chosen index; needs a shared seek-index-choice helper), the mixed-
+   direction partial sort, **B1b** join reordering, **A3b** partial/expr range·IN
+   seeks, **B4** `sqlite_stat4`. (**A2** DESC seeks, the composite eq-prefix +
+   trailing-range seek, **B0b-i** multi-term ORDER BY, and **B0b-ii** covered-query
+   covering scan are done.)
 5. **D2 — FTS5** (D2a–D2e) — the larger module, once W1/W2 and R-Tree have
    exercised the writable-vtab path.
 6. **B5/B7/B8 — the executor→VDBE migration** — the largest internal refactor;
