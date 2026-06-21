@@ -69,21 +69,38 @@ fn grouped_having_orderby_matches_tree_walker() {
     c.execute("INSERT INTO t(a,b) VALUES (3,10),(1,2),(2,5),(1,3),(2,7),(1,1)")
         .unwrap();
     for q in GROUPED {
-        assert_eq!(
-            c.query_vdbe(q).unwrap().rows,
-            c.query(q).unwrap().rows,
-            "VDBE vs tree-walker diverged on {q}"
-        );
+        compare_vdbe_vs_tree(&c, q);
     }
     // Empty table: every grouped query yields no rows.
     c.execute("DELETE FROM t").unwrap();
     for q in GROUPED {
-        assert_eq!(
-            c.query_vdbe(q).unwrap().rows,
-            c.query(q).unwrap().rows,
-            "VDBE vs tree-walker diverged on empty {q}"
-        );
+        compare_vdbe_vs_tree(&c, q);
     }
+}
+
+/// Compare the VDBE spike against the tree-walker. The tree-walker emits grouped
+/// output ordered by the GROUP BY keys (like SQLite); the VDBE spike emits groups
+/// in accumulation order. They produce the same SET of rows, so for a grouped
+/// query with no explicit ORDER BY we compare order-insensitively. ORDER BY
+/// queries are compared exactly.
+fn compare_vdbe_vs_tree(c: &Connection, q: &str) {
+    let mut got = c.query_vdbe(q).unwrap().rows;
+    let mut want = c.query(q).unwrap().rows;
+    let qu = q.to_ascii_uppercase();
+    if qu.contains("GROUP BY") && !qu.contains("ORDER BY") {
+        let rowcmp = |a: &Vec<graphitesql::Value>, b: &Vec<graphitesql::Value>| {
+            for (x, y) in a.iter().zip(b.iter()) {
+                let o = graphitesql::cmp_values(x, y);
+                if o != core::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            a.len().cmp(&b.len())
+        };
+        got.sort_by(rowcmp);
+        want.sort_by(rowcmp);
+    }
+    assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
 }
 
 #[test]

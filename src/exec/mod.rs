@@ -9008,6 +9008,27 @@ impl Connection {
         // (which yields one row even when there are zero input rows).
         if sel.group_by.is_empty() {
             groups = alloc::vec![(0..rows.len()).collect()];
+        } else {
+            // SQLite emits grouped rows ordered by the GROUP BY keys (ascending,
+            // under each key's collation, NULLs first) — its grouping is done via
+            // a sort. An explicit ORDER BY re-sorts later; with none, this is the
+            // order. Reorder the groups (and their keys) to match.
+            let mut order: Vec<usize> = (0..groups.len()).collect();
+            order.sort_by(|&i, &j| {
+                for (k, coll) in group_colls.iter().enumerate() {
+                    let ord =
+                        crate::value::cmp_values_coll(&group_keys[i][k], &group_keys[j][k], *coll);
+                    if ord != core::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            let mut sorted = Vec::with_capacity(groups.len());
+            for i in order {
+                sorted.push(core::mem::take(&mut groups[i]));
+            }
+            groups = sorted;
         }
 
         let labels = self.output_labels(sel, columns);
