@@ -82,3 +82,76 @@ fn builtin_takes_precedence() {
     c.register_function("upper", |_args: &[Value]| Ok(Value::Text("UDF".into())));
     assert_eq!(val(&c, "SELECT upper('hi')"), Value::Text("HI".into()));
 }
+
+// --- user-defined aggregate functions ---
+
+use graphitesql::AggregateFunction;
+
+/// Aggregate that multiplies all its integer arguments.
+struct Product {
+    acc: i64,
+}
+impl AggregateFunction for Product {
+    fn step(&mut self, args: &[Value]) -> Result<()> {
+        match args {
+            [Value::Integer(n)] => {
+                self.acc *= n;
+                Ok(())
+            }
+            _ => Err(Error::Error("product() takes one integer".into())),
+        }
+    }
+    fn finalize(&mut self) -> Result<Value> {
+        Ok(Value::Integer(self.acc))
+    }
+}
+
+fn with_product() -> Connection {
+    let mut c = Connection::open_memory().unwrap();
+    c.register_aggregate_function("product", || Box::new(Product { acc: 1 }));
+    c
+}
+
+#[test]
+fn aggregate_udf_over_whole_table() {
+    let mut c = with_product();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("INSERT INTO t VALUES (2),(3),(4)").unwrap();
+    assert_eq!(val(&c, "SELECT product(x) FROM t"), Value::Integer(24));
+}
+
+#[test]
+fn aggregate_udf_with_group_by() {
+    let mut c = with_product();
+    c.execute("CREATE TABLE t(g, x)").unwrap();
+    c.execute("INSERT INTO t VALUES ('a',2),('a',5),('b',3),('b',4)")
+        .unwrap();
+    assert_eq!(
+        c.query("SELECT g, product(x) FROM t GROUP BY g ORDER BY g")
+            .unwrap()
+            .rows,
+        [
+            vec![Value::Text("a".into()), Value::Integer(10)],
+            vec![Value::Text("b".into()), Value::Integer(12)],
+        ]
+    );
+    // Used inside a larger expression and with HAVING.
+    assert_eq!(
+        c.query("SELECT g FROM t GROUP BY g HAVING product(x) > 11 ORDER BY g")
+            .unwrap()
+            .rows,
+        [vec![Value::Text("b".into())]]
+    );
+}
+
+#[test]
+fn aggregate_udf_honors_distinct() {
+    let mut c = with_product();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("INSERT INTO t VALUES (2),(2),(3)").unwrap();
+    // DISTINCT folds the duplicate 2: 2*3 = 6, not 2*2*3 = 12.
+    assert_eq!(
+        val(&c, "SELECT product(DISTINCT x) FROM t"),
+        Value::Integer(6)
+    );
+}

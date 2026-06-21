@@ -64,7 +64,7 @@ pub mod vfs;
 pub mod vtab;
 
 pub use error::{Error, Result};
-pub use exec::{Connection, QueryResult};
+pub use exec::{AggregateFactory, AggregateFunction, Connection, QueryResult, ScalarFunction};
 
 /// The version of the SQLite file format graphitesql targets.
 ///

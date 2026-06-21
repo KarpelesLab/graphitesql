@@ -155,12 +155,30 @@ pub struct Connection {
     /// [`register_function`](Self::register_function), keyed by lowercased name.
     /// Built-in functions take precedence; these fill otherwise-unknown names.
     functions: alloc::collections::BTreeMap<String, ScalarFunction>,
+    /// User-defined aggregate functions registered via
+    /// [`register_aggregate_function`](Self::register_aggregate_function), keyed by
+    /// lowercased name. Built-in aggregates take precedence.
+    aggregates: alloc::collections::BTreeMap<String, AggregateFactory>,
 }
 
 /// A user-defined scalar function: it receives its evaluated argument values and
 /// returns a result [`Value`] (or an error). Registered with
 /// [`Connection::register_function`].
 pub type ScalarFunction = Box<dyn Fn(&[Value]) -> Result<Value>>;
+
+/// A user-defined aggregate's accumulator: `step` is called once per group row
+/// with the evaluated argument values, then `finalize` produces the result.
+/// A fresh accumulator is created (by the registered factory) for each group.
+pub trait AggregateFunction {
+    /// Fold one row's argument values into the accumulator.
+    fn step(&mut self, args: &[Value]) -> Result<()>;
+    /// Produce the aggregate's value for the group.
+    fn finalize(&mut self) -> Result<Value>;
+}
+
+/// Builds a fresh [`AggregateFunction`] accumulator per group. Registered with
+/// [`Connection::register_aggregate_function`].
+pub type AggregateFactory = Box<dyn Fn() -> Box<dyn AggregateFunction>>;
 
 /// Initial seed for a connection's `random()` generator. Under `std` it mixes
 /// the wall clock so repeated invocations of the binary produce different
@@ -251,6 +269,7 @@ impl Connection {
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
             functions: alloc::collections::BTreeMap::new(),
+            aggregates: alloc::collections::BTreeMap::new(),
         })
     }
 
@@ -282,6 +301,7 @@ impl Connection {
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
             functions: alloc::collections::BTreeMap::new(),
+            aggregates: alloc::collections::BTreeMap::new(),
         })
     }
 
@@ -1351,6 +1371,19 @@ impl Connection {
     ) {
         self.functions
             .insert(name.to_ascii_lowercase(), Box::new(f));
+    }
+
+    /// Register a user-defined aggregate function callable from SQL by `name`.
+    /// `factory` builds a fresh [`AggregateFunction`] accumulator for each group;
+    /// the engine calls `step` once per group row (with the evaluated arguments)
+    /// then `finalize`. Built-in aggregates of the same name take precedence.
+    pub fn register_aggregate_function(
+        &mut self,
+        name: &str,
+        factory: impl Fn() -> Box<dyn AggregateFunction> + 'static,
+    ) {
+        self.aggregates
+            .insert(name.to_ascii_lowercase(), Box::new(factory));
     }
 
     /// Execute a `;`-separated script of one or more statements, like SQLite's
@@ -11122,7 +11155,9 @@ impl Connection {
                 filter,
                 order_by,
                 over: None,
-            } if func::is_aggregate_call(name, args.len(), *star) => {
+            } if func::is_aggregate_call(name, args.len(), *star)
+                || self.aggregates.contains_key(&name.to_ascii_lowercase()) =>
+            {
                 // `FILTER (WHERE …)` narrows the group's rows before aggregating.
                 let filtered;
                 let group = match filter {
@@ -11485,15 +11520,47 @@ impl Connection {
                     Value::Text(parts.join(&sep))
                 }
             }
-            _ => return Err(Error::Unsupported("aggregate function")),
+            _ => {
+                // A user-defined aggregate registered via
+                // `register_aggregate_function`: build a fresh accumulator, step
+                // it over the group's evaluated argument values, then finalize.
+                if let Some(factory) = self.aggregates.get(&lname) {
+                    let mut acc = factory();
+                    let mut seen: Vec<Vec<Value>> = Vec::new();
+                    for &i in group {
+                        let ctx = rows[i].ctx(columns, params).with_subqueries(self);
+                        let vals: Vec<Value> = args
+                            .iter()
+                            .map(|a| eval::eval(a, &ctx))
+                            .collect::<Result<_>>()?;
+                        if distinct {
+                            if seen.contains(&vals) {
+                                continue;
+                            }
+                            seen.push(vals.clone());
+                        }
+                        acc.step(&vals)?;
+                    }
+                    return acc.finalize();
+                }
+                return Err(Error::Error(format!("no such function: {name}")));
+            }
         })
     }
 
     fn has_aggregate(&self, sel: &Select) -> bool {
+        // Recognize both built-in and user-registered aggregate names.
+        let is_agg = |name: &str, n: usize, star: bool| {
+            func::is_aggregate_call(name, n, star)
+                || self.aggregates.contains_key(&name.to_ascii_lowercase())
+        };
         sel.columns.iter().any(|c| match c {
-            ResultColumn::Expr { expr, .. } => contains_aggregate(expr),
+            ResultColumn::Expr { expr, .. } => expr_contains_agg(expr, &is_agg),
             _ => false,
-        }) || sel.having.as_ref().is_some_and(contains_aggregate)
+        }) || sel
+            .having
+            .as_ref()
+            .is_some_and(|h| expr_contains_agg(h, &is_agg))
     }
 
     fn output_labels(&self, sel: &Select, columns: &[ColumnInfo]) -> Vec<String> {
@@ -13862,7 +13929,12 @@ fn single_minmax_arg(sel: &Select) -> Option<(bool, Expr)> {
     }
 }
 
-fn contains_aggregate(expr: &Expr) -> bool {
+/// Whether `expr` contains an aggregate-function call, using a caller-supplied
+/// predicate to decide whether a function name (with its arg count / `*` flag) is
+/// an aggregate — so `has_aggregate` can recognize built-in *and* user-registered
+/// aggregate functions. A window call (`f(…) OVER (…)`) is not itself an aggregate.
+fn expr_contains_agg(expr: &Expr, is_agg: &dyn Fn(&str, usize, bool) -> bool) -> bool {
+    let rec = |e: &Expr| expr_contains_agg(e, is_agg);
     match expr {
         // A window function (`f(…) OVER (…)`) is not a plain aggregate, even when
         // `f` is an aggregate name; only its arguments might contain aggregates.
@@ -13870,33 +13942,27 @@ fn contains_aggregate(expr: &Expr) -> bool {
             over: Some(_),
             args,
             ..
-        } => args.iter().any(contains_aggregate),
+        } => args.iter().any(rec),
         Expr::Function {
             name, args, star, ..
-        } => {
-            func::is_aggregate_call(name, args.len(), *star) || args.iter().any(contains_aggregate)
-        }
-        Expr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
-        Expr::Unary { expr, .. } | Expr::Paren(expr) => contains_aggregate(expr),
-        Expr::IsNull { expr, .. } => contains_aggregate(expr),
+        } => is_agg(name, args.len(), *star) || args.iter().any(rec),
+        Expr::Binary { left, right, .. } => rec(left) || rec(right),
+        Expr::Unary { expr, .. } | Expr::Paren(expr) => rec(expr),
+        Expr::IsNull { expr, .. } => rec(expr),
         Expr::Between {
             expr, low, high, ..
-        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
-        Expr::InList { expr, list, .. } => {
-            contains_aggregate(expr) || list.iter().any(contains_aggregate)
-        }
+        } => rec(expr) || rec(low) || rec(high),
+        Expr::InList { expr, list, .. } => rec(expr) || list.iter().any(rec),
         Expr::Case {
             operand,
             when_then,
             else_result,
         } => {
-            operand.as_deref().is_some_and(contains_aggregate)
-                || when_then
-                    .iter()
-                    .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
-                || else_result.as_deref().is_some_and(contains_aggregate)
+            operand.as_deref().is_some_and(rec)
+                || when_then.iter().any(|(w, t)| rec(w) || rec(t))
+                || else_result.as_deref().is_some_and(rec)
         }
-        Expr::Cast { expr, .. } => contains_aggregate(expr),
+        Expr::Cast { expr, .. } => rec(expr),
         _ => false,
     }
 }
