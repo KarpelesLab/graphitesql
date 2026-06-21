@@ -1189,7 +1189,23 @@ impl Connection {
             .table(&table)
             .ok_or_else(|| Error::Error(format!("no such table: {table}")))?;
         let Statement::CreateTable(ct) = sql::parse_one(obj.sql.as_deref().unwrap_or(""))? else {
-            return Err(Error::Corrupt("schema sql is not CREATE TABLE".into()));
+            // A virtual table (non-CREATE-TABLE schema) has no foreign keys.
+            return Ok(QueryResult {
+                columns: [
+                    "id",
+                    "seq",
+                    "table",
+                    "from",
+                    "to",
+                    "on_update",
+                    "on_delete",
+                    "match",
+                ]
+                .iter()
+                .map(|s| String::from(*s))
+                .collect(),
+                rows: Vec::new(),
+            });
         };
         let action = |a: FkAction| -> &'static str {
             match a {
@@ -1987,11 +2003,42 @@ impl Connection {
 
         let quote = |n: &str| alloc::format!("\"{}\"", n.replace('"', "\"\""));
 
+        // Virtual tables and their `<name>_data` backing tables need special care:
+        // recreating the `CREATE VIRTUAL TABLE` already creates the backing table,
+        // so the backing table must not be created (or its rows copied) separately
+        // — a persistent vtab's rows are repopulated by re-inserting through the
+        // vtab itself, and a computed (non-persistent) vtab has no rows to copy.
+        let is_vtab = |sql: &Option<String>| {
+            matches!(
+                sql.as_deref().map(sql::parse_one),
+                Some(Ok(Statement::CreateVirtualTable(_)))
+            )
+        };
+        let vtab_names: alloc::collections::BTreeSet<String> = objs
+            .iter()
+            .filter(|(ty, _, sql)| *ty == ObjectType::Table && is_vtab(sql))
+            .map(|(_, n, _)| n.clone())
+            .collect();
+        let table_names: alloc::collections::BTreeSet<String> = objs
+            .iter()
+            .filter(|(ty, _, _)| *ty == ObjectType::Table)
+            .map(|(_, n, _)| n.clone())
+            .collect();
+        let is_backing = |name: &str| {
+            name.strip_suffix("_data")
+                .is_some_and(|p| vtab_names.contains(p))
+        };
+        // A vtab is persistent (has rows to copy) iff its backing table exists.
+        let persistent_vtab = |name: &str| {
+            vtab_names.contains(name) && table_names.contains(&alloc::format!("{name}_data"))
+        };
+
         // Build a compact copy in a throwaway in-memory database.
         let mut tmp = Connection::open_memory()?;
-        // 1. Tables (this also recreates their automatic indexes).
-        for (ty, _, sql) in &objs {
-            if *ty == ObjectType::Table {
+        // 1. Tables (this also recreates their automatic indexes). Skip a vtab's
+        //    backing table — its `CREATE VIRTUAL TABLE` recreates it.
+        for (ty, name, sql) in &objs {
+            if *ty == ObjectType::Table && !is_backing(name) {
                 if let Some(s) = sql {
                     tmp.execute(s)?;
                 }
@@ -2006,8 +2053,14 @@ impl Connection {
             }
         }
         // 3. Re-insert every table's rows (before triggers exist, so none fire).
+        //    Skip a vtab's backing table (repopulated through the vtab) and a
+        //    computed vtab (no rows); a persistent vtab is copied via the vtab,
+        //    whose INSERTs rewrite the backing table.
         for (ty, name, _) in &objs {
-            if *ty != ObjectType::Table {
+            if *ty != ObjectType::Table
+                || is_backing(name)
+                || (vtab_names.contains(name) && !persistent_vtab(name))
+            {
                 continue;
             }
             let result = self.query(&alloc::format!("SELECT * FROM {}", quote(name)))?;

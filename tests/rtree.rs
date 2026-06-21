@@ -165,3 +165,43 @@ fn integrity_check_passes_with_a_virtual_table() {
         Value::Text("ok".into())
     );
 }
+
+#[test]
+fn vacuum_preserves_a_persistent_virtual_table() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("INSERT INTO t VALUES (1),(2)").unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, a, b)")
+        .unwrap();
+    c.execute("INSERT INTO r VALUES (1, 0, 5), (2, 3, 8)")
+        .unwrap();
+    c.execute("VACUUM").unwrap();
+    // Both the regular table and the vtab (via its backing table) survive.
+    assert_eq!(
+        rows(&c, "SELECT x FROM t ORDER BY x"),
+        [vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+    assert_eq!(
+        rows(&c, "SELECT id, a, b FROM r ORDER BY id"),
+        [
+            vec![Value::Integer(1), Value::Real(0.0), Value::Real(5.0)],
+            vec![Value::Integer(2), Value::Real(3.0), Value::Real(8.0)],
+        ]
+    );
+    assert_eq!(
+        c.query("PRAGMA integrity_check").unwrap().rows[0][0],
+        Value::Text("ok".into())
+    );
+}
+
+#[test]
+fn foreign_key_list_on_a_vtab_is_empty() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, a, b)")
+        .unwrap();
+    assert!(c
+        .query("PRAGMA foreign_key_list(r)")
+        .unwrap()
+        .rows
+        .is_empty());
+}
