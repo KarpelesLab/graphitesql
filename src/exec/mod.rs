@@ -7978,53 +7978,75 @@ impl Connection {
             || !sel.group_by.is_empty()
             || sel.having.is_some()
             || sel.distinct
-            || sel.order_by.len() != 1
+            || sel.order_by.is_empty()
         {
             return None;
         }
         if self.has_aggregate(sel) || window::has_window(sel) {
             return None;
         }
-        let term = &sel.order_by[0];
-        let (tbl, col_name) = match &term.expr {
-            Expr::Column { table, column } => (table.as_deref(), column.as_str()),
-            _ => return None,
-        };
         if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
             return None;
         }
         let label = t.alias.as_deref().unwrap_or(&t.name);
-        if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
-            return None;
-        }
         let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
         if meta.without_rowid {
             return None;
         }
-        let col = meta
-            .columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(col_name))?;
-        if meta.ipk == Some(col) {
-            return None; // the rowid/IPK case is handled by rowid_ordered_scan
+        // Resolve every `ORDER BY` term to a plain table column. A secondary index
+        // (stored ascending) can satisfy the ordering only when all terms share
+        // one direction — walked forward for all-ASC, reversed for all-DESC — and
+        // use the default NULLs placement, which the walk already yields (NULLs
+        // first ascending, last descending). Mixed directions, an explicit `NULLS
+        // FIRST`/`LAST`, a `COLLATE`, or any non-column term disqualifies it.
+        let descending = sel.order_by[0].descending;
+        let mut cols: Vec<usize> = Vec::with_capacity(sel.order_by.len());
+        for term in &sel.order_by {
+            if term.descending != descending || term.nulls_first.is_some() {
+                return None;
+            }
+            let (tbl, col_name) = match &term.expr {
+                Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+                _ => return None,
+            };
+            if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
+                return None;
+            }
+            let col = meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))?;
+            cols.push(col);
         }
-        let col_coll = meta.columns[col].collation;
-        // A full index whose leading column is `col` with the column's collation.
+        // A lone rowid/IPK term is the `rowid_ordered_scan` case.
+        if cols.len() == 1 && meta.ipk == Some(cols[0]) {
+            return None;
+        }
+        // A full index whose leading columns are exactly `cols` (in order), each
+        // with the column's own collation (so index order == ORDER BY order).
         for idx in self.indexes_of(&t.name).ok()? {
             if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
             }
-            if idx.cols.first() == Some(&col) && idx.collations.first() == Some(&col_coll) {
-                let covering = self.index_covers_query(sel, &meta, &idx.cols);
-                return Some(OrderIndexScan {
-                    name: idx.name,
-                    root: idx.root,
-                    colls: idx.collations,
-                    cols: idx.cols,
-                    descending: term.descending,
-                    covering,
-                });
+            if idx.cols.len() < cols.len() || idx.cols[..cols.len()] != cols[..] {
+                continue;
             }
+            let coll_ok = cols
+                .iter()
+                .enumerate()
+                .all(|(i, &c)| idx.collations[i] == meta.columns[c].collation);
+            if !coll_ok {
+                continue;
+            }
+            let covering = self.index_covers_query(sel, &meta, &idx.cols);
+            return Some(OrderIndexScan {
+                name: idx.name,
+                root: idx.root,
+                colls: idx.collations,
+                cols: idx.cols,
+                descending,
+                covering,
+            });
         }
         None
     }
