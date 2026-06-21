@@ -9330,12 +9330,20 @@ impl Connection {
         // possibly multi-argument) per-row values, so they bypass the NULL-
         // stripping single-value collection used by the other aggregates.
         if lname == "json_group_array" {
-            let mut items = Vec::new();
+            let mut vals = Vec::new();
             for &i in group {
                 let ctx = rows[i].ctx(columns, params).with_subqueries(self);
-                let v = eval::eval(&args[0], &ctx)?;
-                items.push(func::arg_to_json(&v, args.first()));
+                vals.push(eval::eval(&args[0], &ctx)?);
             }
+            // `json_group_array(DISTINCT x)` dedupes the values (first-seen order),
+            // like other DISTINCT aggregates, before serializing.
+            if distinct {
+                dedup_values(&mut vals, crate::value::Collation::default());
+            }
+            let items: Vec<_> = vals
+                .iter()
+                .map(|v| func::arg_to_json(v, args.first()))
+                .collect();
             return Ok(Value::Text(json::Json::Array(items).serialize()));
         }
         if lname == "json_group_object" {
