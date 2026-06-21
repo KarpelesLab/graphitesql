@@ -25,7 +25,10 @@ fn ints(col: &[Vec<Value>], i: usize) -> Vec<i64> {
 #[test]
 fn select_columns_with_rowid_alias() {
     let c = conn("basic.db");
-    let r = c.query("SELECT a, b FROM t").unwrap();
+    // ORDER BY a for a deterministic order: an unqualified `SELECT a, b` is
+    // answered by the covering index on b (as sqlite does), so it would otherwise
+    // arrive in b order, not rowid order.
+    let r = c.query("SELECT a, b FROM t ORDER BY a").unwrap();
     assert_eq!(r.columns, vec!["a", "b"]);
     // `a` is INTEGER PRIMARY KEY -> aliases the rowid (1,2,3).
     assert_eq!(ints(&r.rows, 0), vec![1, 2, 3]);

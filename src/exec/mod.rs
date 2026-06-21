@@ -6564,6 +6564,11 @@ impl Connection {
                         "INDEX"
                     };
                     alloc::format!("SCAN {label} USING {kind} {}", s.name)
+                }
+                // A covered query with no seek reads from a covering index (B2),
+                // in lockstep with `run_core`'s `covering_scan`.
+                else if let Some((name, _, _)) = self.covering_scan(sel, &meta) {
+                    alloc::format!("SCAN {label} USING COVERING INDEX {name}")
                 } else {
                     self.eqp_access(
                         &label,
@@ -8154,6 +8159,97 @@ impl Connection {
         sel.order_by.iter().all(|t| col_ok(&t.expr))
     }
 
+    /// Thorough covering test for a *full-table covering scan*: every column the
+    /// query references anywhere — result projection (including aggregate
+    /// arguments), `GROUP BY`, `HAVING`, `ORDER BY`, and `WHERE` — is held by
+    /// `idx_cols` or is the rowid. Conservative: a wildcard over an uncovered
+    /// column, a generated column, a window function, or a subquery makes it
+    /// `false`. Unlike [`index_covers_query`](Self::index_covers_query) (plain
+    /// projections only) this recurses through function calls, so an aggregate
+    /// like `count(*)` / `sum(b)` over covered columns qualifies.
+    fn query_cols_covered(&self, sel: &Select, meta: &TableMeta, idx_cols: &[usize]) -> bool {
+        if meta.generated.iter().any(|g| g.is_some()) {
+            return false;
+        }
+        let covered_all =
+            (0..meta.columns.len()).all(|ci| idx_cols.contains(&ci) || meta.ipk == Some(ci));
+        for rc in &sel.columns {
+            match rc {
+                ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => {
+                    if !covered_all {
+                        return false;
+                    }
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    if !where_cols_covered(expr, meta, idx_cols) {
+                        return false;
+                    }
+                }
+            }
+        }
+        sel.group_by
+            .iter()
+            .all(|e| where_cols_covered(e, meta, idx_cols))
+            && sel
+                .having
+                .as_ref()
+                .is_none_or(|h| where_cols_covered(h, meta, idx_cols))
+            && sel
+                .order_by
+                .iter()
+                .all(|t| where_cols_covered(&t.expr, meta, idx_cols))
+            && sel
+                .where_clause
+                .as_ref()
+                .is_none_or(|w| where_cols_covered(w, meta, idx_cols))
+    }
+
+    /// Choose a full secondary index to satisfy a query by a *covering scan* —
+    /// reading every needed column from the index instead of the table — when no
+    /// `WHERE` seek and no ORDER-BY index walk applies. Restricted to the
+    /// no-`WHERE` case so no seek competes for the plan (keeping `eqp_select` and
+    /// `run_core` trivially in lockstep), to ordinary rowid tables, and — like
+    /// [`count_covering_index`](Self::count_covering_index) — to the *unambiguous*
+    /// case of **exactly one** covering index, so the chosen name matches sqlite
+    /// without replicating its cost-based tie-break. Returns `(name, root, cols)`.
+    fn covering_scan(&self, sel: &Select, meta: &TableMeta) -> Option<(String, u32, Vec<usize>)> {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let t = &from.first;
+        if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
+            return None;
+        }
+        if sel.where_clause.is_some() || window::has_window(sel) || meta.without_rowid {
+            return None;
+        }
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        // If the ORDER BY is already satisfied by a scan's natural order — the
+        // rowid order of a table scan (`rowid_ordered_scan`) or an index walk
+        // (`order_index_scan`) — leave it alone. A covering scan reads in index
+        // order, which would silently break a `rowid_ordered_scan` that assumed
+        // the rows arrive in rowid order (and the ordered-index case already
+        // renders as covering).
+        if self.order_satisfied_by_scan(sel).is_some() {
+            return None;
+        }
+        let mut covering = self.indexes_of(&t.name).ok()?.into_iter().filter(|idx| {
+            idx.partial.is_none()
+                && idx.key_exprs.is_none()
+                && self.query_cols_covered(sel, meta, &idx.cols)
+        });
+        let chosen = covering.next()?;
+        // Ambiguous (two or more covering indexes): keep the plain scan rather
+        // than guess which one sqlite's cost model would pick.
+        if covering.next().is_some() {
+            return None;
+        }
+        Some((chosen.name, chosen.root, chosen.cols))
+    }
+
     /// `SELECT count(*) FROM <single rowid table>` can be answered by counting a
     /// full secondary index's entries instead of scanning the table — a full,
     /// non-partial index has exactly one entry per table row, and its b-tree is
@@ -8610,6 +8706,16 @@ impl Connection {
                     }
                 }
                 return Ok((first_meta.columns, input_rows));
+            }
+            // Covering scan (B2): no seek and no ORDER-BY index walk applied, but a
+            // full index holds every column the query needs — read the rows from
+            // that index instead of the table. `eqp_select` reports the matching
+            // `SCAN … USING COVERING INDEX`.
+            if let Some((_, root, cols)) = self.covering_scan(sel, &first_meta) {
+                return Ok((
+                    first_meta.columns.clone(),
+                    self.covering_seek_rows(&first_meta, root, &cols)?,
+                ));
             }
             let input_rows = self
                 .scan_table(&first_meta)?
