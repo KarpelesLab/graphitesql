@@ -466,6 +466,23 @@ impl Connection {
                 };
                 Ok(single("journal_mode", Value::Text(mode.into())))
             }
+            // Read-only getters for tuning knobs graphite does not expose. It
+            // has no configurable page cache, durability mode, or lock manager
+            // beyond what it already implements, so each reports SQLite's fixed
+            // default — what an unconfigured connection observes. This keeps the
+            // shell drop-in for tools/ORMs that probe these on connect.
+            "cache_size" => Ok(single("cache_size", Value::Integer(-2000))),
+            "synchronous" => Ok(single("synchronous", Value::Integer(2))),
+            "temp_store" => Ok(single("temp_store", Value::Integer(0))),
+            "secure_delete" => Ok(single("secure_delete", Value::Integer(0))),
+            "read_uncommitted" => Ok(single("read_uncommitted", Value::Integer(0))),
+            "cell_size_check" => Ok(single("cell_size_check", Value::Integer(0))),
+            "checkpoint_fullfsync" => Ok(single("checkpoint_fullfsync", Value::Integer(0))),
+            "fullfsync" => Ok(single("fullfsync", Value::Integer(0))),
+            "busy_timeout" => Ok(single("timeout", Value::Integer(0))),
+            "wal_autocheckpoint" => Ok(single("wal_autocheckpoint", Value::Integer(1000))),
+            "max_page_count" => Ok(single("max_page_count", Value::Integer(4294967294))),
+            "locking_mode" => Ok(single("locking_mode", Value::Text("normal".into()))),
             _ => Err(Error::Unsupported("this PRAGMA")),
         }
     }
