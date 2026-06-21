@@ -661,16 +661,6 @@ impl Connection {
     /// `PRAGMA table_info(name)` → one row per column
     /// `(cid, name, type, notnull, dflt_value, pk)`.
     fn pragma_table_info(&self, p: &Pragma, extended: bool) -> Result<QueryResult> {
-        fn table_info_columns(extended: bool) -> Vec<String> {
-            let mut c: Vec<String> = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
-                .iter()
-                .map(|s| String::from(*s))
-                .collect();
-            if extended {
-                c.push(String::from("hidden"));
-            }
-            c
-        }
         let table = match &p.value {
             Some(Expr::Column { column, .. }) => column.clone(),
             Some(Expr::Literal(Literal::Str(s))) => s.clone(),
@@ -711,6 +701,17 @@ impl Connection {
             }
             let columns = table_info_columns(extended);
             return Ok(QueryResult { columns, rows });
+        }
+        // A VIEW also answers table_info: its columns with their resolved types
+        // (notnull/dflt/pk are always 0/empty for a view).
+        if let Some(vobj) = self.schema.objects().iter().find(|o| {
+            o.obj_type == crate::schema::ObjectType::View && o.name.eq_ignore_ascii_case(&table)
+        }) {
+            if let Some(sql) = &vobj.sql {
+                if let Statement::CreateView(cv) = sql::parse_one(sql)? {
+                    return self.view_table_info(&cv, &table, extended);
+                }
+            }
         }
         let obj = self
             .schema
@@ -776,6 +777,162 @@ impl Connection {
             columns: table_info_columns(extended),
             rows,
         })
+    }
+
+    /// `table_info` for a VIEW: its output columns, each with the declared type
+    /// SQLite reports — a direct column reference takes its origin column's type
+    /// (an untyped origin shows `BLOB`), and any other expression shows an empty
+    /// type. notnull/dflt/pk are always 0/NULL/0.
+    fn view_table_info(
+        &self,
+        cv: &CreateView,
+        view_name: &str,
+        extended: bool,
+    ) -> Result<QueryResult> {
+        // (name, declared type) per output column. Prefer the static resolver;
+        // fall back to running the view for names (with empty types) when the
+        // body is too complex to resolve column origins statically.
+        let mut cols: NamedColumns = match self.resolved_view_columns(&cv.select) {
+            Some(c) => c,
+            None => self
+                .view_columns(view_name, &Params::default())?
+                .into_iter()
+                .map(|c| (c.name, None))
+                .collect(),
+        };
+        // An explicit `CREATE VIEW v(x, y)` column list overrides the names.
+        if !cv.columns.is_empty() && cv.columns.len() == cols.len() {
+            for (slot, name) in cols.iter_mut().zip(&cv.columns) {
+                slot.0 = name.clone();
+            }
+        }
+        let rows = cols
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                let mut row = alloc::vec![
+                    Value::Integer(i as i64),
+                    Value::Text(name),
+                    Value::Text(ty.unwrap_or_default()),
+                    Value::Integer(0),
+                    Value::Null,
+                    Value::Integer(0),
+                ];
+                if extended {
+                    row.push(Value::Integer(0));
+                }
+                row
+            })
+            .collect();
+        Ok(QueryResult {
+            columns: table_info_columns(extended),
+            rows,
+        })
+    }
+
+    /// Resolve a SELECT's output columns to `(name, declared-type)` pairs for
+    /// `view_table_info`, recursing through subqueries and views. Returns `None`
+    /// when a source cannot be resolved statically (a table-valued function, or a
+    /// wildcard over a NATURAL/USING join whose column coalescing isn't modelled),
+    /// so the caller can fall back to names-only.
+    fn resolved_view_columns(&self, select: &Select) -> Option<NamedColumns> {
+        // Resolve each FROM source to its labelled (name, type) columns.
+        let mut sources: Vec<(String, NamedColumns)> = Vec::new();
+        if let Some(fc) = &select.from {
+            let mut refs = alloc::vec![&fc.first];
+            let mut coalesced = false;
+            for j in &fc.joins {
+                refs.push(&j.table);
+                if j.natural || !j.using.is_empty() {
+                    coalesced = true;
+                }
+            }
+            let has_wild = select
+                .columns
+                .iter()
+                .any(|c| matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_)));
+            if coalesced && has_wild {
+                return None; // `*` over coalesced columns — don't guess.
+            }
+            for tref in refs {
+                let label = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+                sources.push((label, self.source_columns_of(tref)?));
+            }
+        }
+        let lookup = |table: Option<&str>, col: &str| -> Option<String> {
+            for (label, cols) in &sources {
+                if table.is_some_and(|t| !t.eq_ignore_ascii_case(label)) {
+                    continue;
+                }
+                if let Some((_, ty)) = cols.iter().find(|(n, _)| n.eq_ignore_ascii_case(col)) {
+                    return ty.clone();
+                }
+            }
+            None
+        };
+        let mut out = Vec::new();
+        for rc in &select.columns {
+            match rc {
+                ResultColumn::Wildcard => {
+                    for (_, cols) in &sources {
+                        out.extend(cols.iter().cloned());
+                    }
+                }
+                ResultColumn::TableWildcard(t) => {
+                    let (_, cols) = sources.iter().find(|(l, _)| l.eq_ignore_ascii_case(t))?;
+                    out.extend(cols.iter().cloned());
+                }
+                ResultColumn::Expr {
+                    expr,
+                    alias,
+                    source,
+                } => {
+                    let name = result_column_label(expr, alias, source);
+                    // Only a bare column reference carries a type through.
+                    let ty = match expr {
+                        Expr::Column { table, column } => lookup(table.as_deref(), column),
+                        _ => None,
+                    };
+                    out.push((name, ty));
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// The `(name, declared-type)` columns a FROM source contributes. A base
+    /// table's untyped columns report `BLOB` (as SQLite does for a view); views
+    /// and subqueries recurse; TVFs return `None` (unresolved).
+    fn source_columns_of(&self, tref: &TableRef) -> Option<NamedColumns> {
+        if tref.tvf_args.is_some() {
+            return None;
+        }
+        if let Some(sub) = &tref.subquery {
+            return self.resolved_view_columns(sub);
+        }
+        // A named source: a view recurses; otherwise a base table's columns.
+        if let Some(o) = self.schema.objects().iter().find(|o| {
+            o.obj_type == crate::schema::ObjectType::View && o.name.eq_ignore_ascii_case(&tref.name)
+        }) {
+            if let Some(Ok(Statement::CreateView(cv))) = o.sql.as_deref().map(sql::parse_one) {
+                return self.resolved_view_columns(&cv.select);
+            }
+            return None;
+        }
+        let obj = self.schema.table(&tref.name)?;
+        let Ok(Statement::CreateTable(ct)) = sql::parse_one(obj.sql.as_deref()?) else {
+            return None;
+        };
+        Some(
+            ct.columns
+                .iter()
+                .map(|c| {
+                    // A direct reference to an untyped column shows `BLOB`.
+                    let ty = c.type_name.clone().unwrap_or_else(|| String::from("BLOB"));
+                    (c.name.clone(), Some(ty))
+                })
+                .collect(),
+        )
     }
 
     /// The single name argument of a `PRAGMA foo(name)` / `PRAGMA foo = name`.
@@ -11994,6 +12151,22 @@ fn value_to_literal(v: Value) -> Literal {
         Value::Text(s) => Literal::Str(s),
         Value::Blob(b) => Literal::Blob(b),
     }
+}
+
+/// A list of `(column name, declared type)` pairs — a resolved column set for
+/// `view_table_info` (the type is `None` for an expression column).
+type NamedColumns = Vec<(String, Option<String>)>;
+
+/// The column headers for `PRAGMA table_info` / `table_xinfo`.
+fn table_info_columns(extended: bool) -> Vec<String> {
+    let mut c: Vec<String> = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        .iter()
+        .map(|s| String::from(*s))
+        .collect();
+    if extended {
+        c.push(String::from("hidden"));
+    }
+    c
 }
 
 /// Best-effort label for an unaliased result expression.

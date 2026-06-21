@@ -1447,25 +1447,42 @@ impl Parser {
         let name = self.ident()?;
         // Optional type name: one or more bare words, optionally with (n[,m]).
         let mut type_name = None;
-        if let Some(Token::Word(_)) = self.peek() {
-            if !is_column_constraint_kw(self.peek()) {
-                let mut t = self.ident()?;
-                while let Some(Token::Word(_)) = self.peek() {
-                    if is_column_constraint_kw(self.peek()) {
-                        break;
-                    }
-                    t.push(' ');
-                    t.push_str(&self.ident()?);
-                }
-                if self.eat(&Token::LParen) {
-                    // length/precision args; consume to matching paren
-                    while !self.check(&Token::RParen) && !self.at_end() {
-                        self.advance();
-                    }
-                    self.expect(&Token::RParen)?;
-                }
-                type_name = Some(t);
+        if matches!(self.peek(), Some(Token::Word(_)) | Some(Token::Ident(_)))
+            && !is_column_constraint_kw(self.peek())
+        {
+            // Capture the type's verbatim source span — including any
+            // `(length[, scale])` — so `VARCHAR(10)` / `DECIMAL(4,2)` keep
+            // their parameters, as SQLite reports them in table_info. A quoted
+            // type name (`"weird type"`) is accepted too.
+            let start_pos = self.pos;
+            let start = self.tokens.get(self.pos).map(|s| s.start);
+            self.advance(); // first type word
+            while matches!(self.peek(), Some(Token::Word(_)) | Some(Token::Ident(_)))
+                && !is_column_constraint_kw(self.peek())
+            {
+                self.advance();
             }
+            let had_paren = self.eat(&Token::LParen);
+            if had_paren {
+                while !self.check(&Token::RParen) && !self.at_end() {
+                    self.advance();
+                }
+                self.expect(&Token::RParen)?;
+            }
+            // A lone quoted identifier (`"weird type"`) is the unquoted token
+            // value; everything else is the verbatim span (preserving `(10)`).
+            let single_ident = (!had_paren && self.pos == start_pos + 1)
+                .then(|| match &self.tokens[start_pos].token {
+                    Token::Ident(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .flatten();
+            type_name = single_ident.or_else(|| match (start, self.tokens.get(self.pos - 1)) {
+                (Some(s), Some(last)) if s <= last.end && last.end <= self.source.len() => {
+                    Some(String::from(self.source[s..last.end].trim()))
+                }
+                _ => None,
+            });
         }
         let mut constraints = Vec::new();
         loop {

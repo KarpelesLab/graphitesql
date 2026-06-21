@@ -207,6 +207,10 @@ pub struct Select {
 }
 
 /// A single result column in a `SELECT`.
+// `Expr` is by far the most common variant and carries a full `Expr`; boxing it
+// to shrink the unit `Wildcard`/`TableWildcard` variants would pessimise the
+// common case for no real gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultColumn {
     /// `*`
