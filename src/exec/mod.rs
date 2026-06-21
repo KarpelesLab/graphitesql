@@ -1300,6 +1300,25 @@ impl Connection {
         self.execute_params(sql, &Params::default())
     }
 
+    /// Execute a `;`-separated script of one or more statements, like SQLite's
+    /// `sqlite3_exec`. Each statement runs in order through the normal
+    /// single-statement path (so per-statement `CREATE` text is preserved and
+    /// each autocommits unless the script opens its own transaction); execution
+    /// stops at the first error. `;` inside string literals, `--`/`/* */`
+    /// comments, and `BEGIN…END` / `CASE…END` blocks does not split a statement.
+    /// A `SELECT` runs and its rows are discarded (as `sqlite3_exec` does without
+    /// a callback). [`execute`](Self::execute) stays single-statement.
+    pub fn execute_batch(&mut self, sql: &str) -> Result<()> {
+        for stmt in split_sql_script(sql) {
+            if matches!(sql::parse_one(stmt), Ok(Statement::Select(_))) {
+                self.query(stmt)?;
+            } else {
+                self.execute_params(stmt, &Params::default())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Like [`execute`](Self::execute) but with bound parameters.
     pub fn execute_params(&mut self, sql: &str, params: &Params) -> Result<usize> {
         let stmt = sql::parse_one(sql)?;
@@ -13169,6 +13188,50 @@ fn rename_table_in_expr(e: &mut Expr, old: &str, new: &str) {
             rename_table_in_select(select, old, new);
         }
     }
+}
+
+/// Split a `;`-separated SQL script into trimmed statement slices for
+/// [`Connection::execute_batch`]. Reuses the tokenizer, so string literals and
+/// `--`/`/* */` comments never split a statement, and tracks `BEGIN…END` /
+/// `CASE…END` nesting so a `;` inside a trigger body or `CASE` expression is not
+/// a boundary. A leading `BEGIN` (transaction control) does not open a block —
+/// only a mid-statement one (e.g. `CREATE TRIGGER … BEGIN`) does. Comment-only
+/// and empty segments are dropped.
+fn split_sql_script(sql: &str) -> Vec<&str> {
+    let toks = match sql::token::tokenize(sql) {
+        Ok(t) => t,
+        // Let the caller surface the real parse error on the whole input.
+        Err(_) => return alloc::vec![sql.trim()],
+    };
+    let mut out = Vec::new();
+    let mut depth: u32 = 0;
+    let mut seg_start = 0usize;
+    let mut seen = false;
+    for sp in &toks {
+        match &sp.token {
+            sql::token::Token::Semicolon if depth == 0 => {
+                if seen {
+                    out.push(sql[seg_start..sp.start].trim());
+                }
+                seg_start = sp.end;
+                seen = false;
+            }
+            sql::token::Token::Word(w) => {
+                match w.to_ascii_uppercase().as_str() {
+                    "BEGIN" if seen => depth += 1,
+                    "CASE" => depth += 1,
+                    "END" => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                seen = true;
+            }
+            _ => seen = true,
+        }
+    }
+    if seen {
+        out.push(sql[seg_start..].trim());
+    }
+    out
 }
 
 /// The text stored in `sqlite_master.sql` for a DDL statement: the source from
