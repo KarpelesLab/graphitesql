@@ -241,13 +241,21 @@ all matching the tree-walker via `query_vdbe`.
 **Remaining optimizer pieces** *(perf-only — results already correct; acceptance:
 the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep):*
 
-- **B0b-i — multi-term `ORDER BY` via a multi-column index prefix.** Extend
-  `order_index_scan` to satisfy an `ORDER BY (c1, c2)` from an index whose leading
-  columns are `(c1, c2, …)` (skip the sort).
+- **B0b-i — multi-term `ORDER BY` via a multi-column index prefix. ✅ DONE.**
+  `order_index_scan` now matches an `ORDER BY (c1, c2, …)` against an index whose
+  leading columns are those columns (uniform direction, matching collations,
+  default NULLs) and walks the index instead of sorting. *Remaining sub-case: a
+  **mixed-direction** ORDER BY whose leading terms an index satisfies — sqlite
+  walks the index for the prefix and emits `USE TEMP B-TREE FOR LAST TERM OF ORDER
+  BY` (a partial sort); graphite still full-sorts. Results correct; EQP differs.*
 - **B0b-ii — `GROUP BY` over an indexed prefix.** Consume groups in index order
-  (no hash) when `GROUP BY` is a prefix of an available index.
+  (no hash) when `GROUP BY` is a prefix of an available index; sqlite reports
+  `SCAN … USING [COVERING] INDEX`.
 - **B0b-iii — `ORDER BY` from a `WHERE`-chosen index.** Today B0 fires only with
-  no `WHERE`; reuse the index a `WHERE` seek already picked to also skip the sort.
+  no `WHERE`; reuse the index a `WHERE` seek already picked to also skip the sort
+  (`WHERE a=? ORDER BY b` over an index on `(a, b)`). The seek already walks the
+  index in key order, so the rows arrive ordered — `order_satisfied_by_scan` just
+  needs to recognize it.
 - **B1b — Join reordering.** Beyond the comma-join promotion (done), reorder
   `FROM` tables by a simple cost model (most-selective indexed table inner)
   instead of textual order; results identical, order verified via EQP. Preserve
