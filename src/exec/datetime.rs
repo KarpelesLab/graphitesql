@@ -1404,7 +1404,7 @@ pub fn printf(args: &[Value]) -> Value {
                     nonfinite(f, plus, space)
                 } else {
                     let p = prec.unwrap_or(6);
-                    let mut s = fixed(f, p);
+                    let mut s = fixed(f, p, bang);
                     if alt && p == 0 && !s.contains('.') {
                         s.push('.');
                     }
@@ -1420,7 +1420,7 @@ pub fn printf(args: &[Value]) -> Value {
                 if !f.is_finite() {
                     nonfinite(f, plus, space)
                 } else {
-                    let mut s = fmt_exp(f, prec.unwrap_or(6), conv == 'E');
+                    let mut s = fmt_exp(f, prec.unwrap_or(6), conv == 'E', bang);
                     if bang {
                         s = strip_zeros_keep_one(&s);
                     }
@@ -1585,7 +1585,28 @@ pub fn printf(args: &[Value]) -> Value {
 /// rounded half away from zero like SQLite. Rust's formatter takes the precision
 /// as a `u16`, so a precision beyond what an `f64` can represent exactly is
 /// rendered at a safe cap and the (necessarily-zero) tail is appended.
-fn fixed(f: f64, p: usize) -> String {
+fn fixed(f: f64, p: usize, bang: bool) -> String {
+    // SQLite renders floats from their 16-significant-digit decimal, padding any
+    // requested digits beyond that with zeros — so `%.20f` of 0.1 is
+    // `0.10000000000000000000`, not C's true `0.10000000000000000555`. When the
+    // requested fractional length exceeds that representation, emit it and append
+    // zeros (no rounding needed in this regime). The `!` flag (bang) lifts the
+    // cap and uses full f64 precision, so it skips this path.
+    if !bang && f.is_finite() && f != 0.0 {
+        let sd = shortest_sig_count(f);
+        let kshort = ((sd as i32 - 1) - lead_exp10(f)).max(0) as usize;
+        if p > kshort {
+            let r = crate::exec::func::round_half_away(f, kshort as u32);
+            let mut s = alloc::format!("{r:.kshort$}");
+            if kshort == 0 {
+                s.push('.');
+            }
+            for _ in 0..(p - kshort) {
+                s.push('0');
+            }
+            return s;
+        }
+    }
     // An f64's smallest denormal contributes at most ~1074 nonzero fractional
     // digits; anything past that is exact zeros.
     const CAP: usize = 1100;
@@ -1709,7 +1730,7 @@ fn fmt_general(f: f64, prec: usize, upper: bool, alt: bool, bang: bool) -> Strin
     }
     // Decimal exponent of the value rounded to p significant digits: format in
     // exponential first to read the exponent after rounding.
-    let e_str = fmt_exp(f, p - 1, false);
+    let e_str = fmt_exp(f, p - 1, false, bang);
     let exp: i32 = e_str
         .split(['e', 'E'])
         .nth(1)
@@ -1717,7 +1738,7 @@ fn fmt_general(f: f64, prec: usize, upper: bool, alt: bool, bang: bool) -> Strin
         .unwrap_or(0);
     if exp < -4 || exp >= p as i32 {
         // Exponential form, mantissa trailing zeros stripped.
-        let upper_e = fmt_exp(f, p - 1, upper);
+        let upper_e = fmt_exp(f, p - 1, upper, bang);
         let (mant, e) = match upper_e.find(['e', 'E']) {
             Some(pos) => upper_e.split_at(pos),
             None => return upper_e,
@@ -1726,7 +1747,7 @@ fn fmt_general(f: f64, prec: usize, upper: bool, alt: bool, bang: bool) -> Strin
     } else {
         // Fixed form with prec-1-exp fraction digits, trailing zeros stripped.
         let frac = (p as i32 - 1 - exp).max(0) as usize;
-        shape(&fixed(f, frac))
+        shape(&fixed(f, frac, bang))
     }
 }
 
@@ -1741,12 +1762,60 @@ fn strip_trailing_zeros(s: &str) -> String {
 }
 
 /// Format `%e` style: `d.dddde±dd`.
-fn fmt_exp(f: f64, prec: usize, upper: bool) -> String {
+/// `f`'s magnitude rounded to SQLite's printf cap of **16 significant digits**,
+/// returned as its trailing-zero-stripped significant digits and the base-10
+/// exponent of the leading digit. SQLite renders floats to at most 16 sig digits
+/// (the `!` flag lifts the cap); padding past that is zeros, so e.g. `1.0/3.0`
+/// prints 16 threes and `0.1+0.2` collapses to `0.3`. `f` must be finite and
+/// non-zero. (Value-to-text rendering uses 15 digits — see `eval::format_real`;
+/// printf deliberately uses one more.)
+fn capped16(f: f64) -> (alloc::string::String, i32) {
+    let s = alloc::format!("{:.15e}", f.abs());
+    let (mant, exp) = s.split_once(['e', 'E']).unwrap_or((s.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let digs: alloc::string::String = mant
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(char::from)
+        .collect();
+    let stripped = digs.trim_end_matches('0');
+    let stripped = if stripped.is_empty() { "0" } else { stripped };
+    (alloc::string::String::from(stripped), exp)
+}
+
+/// Significant-digit count of the 16-sig-capped representation (see [`capped16`]).
+fn shortest_sig_count(f: f64) -> usize {
+    capped16(f).0.len()
+}
+
+/// Base-10 exponent of the leading digit of the 16-sig-capped value.
+fn lead_exp10(f: f64) -> i32 {
+    capped16(f).1
+}
+
+fn fmt_exp(f: f64, prec: usize, upper: bool, bang: bool) -> String {
     // Rust's `{:.*e}` takes the precision as a `u16`; beyond what the f64
     // mantissa can carry the extra fraction digits are zeros, so render at a safe
     // cap and splice the zero tail into the mantissa before the exponent.
     const CAP: usize = 1100;
-    let s = if prec <= CAP {
+    let s = if !bang && f.is_finite() && f != 0.0 && prec >= shortest_sig_count(f) {
+        // Padding regime: SQLite emits the shortest mantissa then zeros, rather
+        // than C's true trailing digits. `%.20e` of 0.1 is `1.00000000000000000000e-01`.
+        let sd = shortest_sig_count(f);
+        let short = alloc::format!("{:.*e}", sd - 1, f);
+        match short.split_once(['e', 'E']) {
+            Some((mant, exp)) => {
+                let zeros = "0".repeat(prec - (sd - 1));
+                let mant = if mant.contains('.') {
+                    alloc::format!("{mant}{zeros}")
+                } else {
+                    alloc::format!("{mant}.{zeros}")
+                };
+                alloc::format!("{mant}e{exp}")
+            }
+            None => short,
+        }
+    } else if prec <= CAP {
         alloc::format!("{:.*e}", prec, f)
     } else {
         let head = alloc::format!("{:.*e}", CAP, f);
