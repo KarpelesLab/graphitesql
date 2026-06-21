@@ -154,7 +154,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "soundex" => {
             arity(&lname, args, 1)?;
             // NULL/non-alpha input yields "?000" (SQLite does not propagate NULL).
-            Value::Text(soundex(&eval::to_text(&v[0])))
+            Value::Text(soundex(&c_text(&v[0])))
         }
         "typeof" => Value::Text(String::from(type_name(&v[0]))),
         "nullif" => {
@@ -321,29 +321,21 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             if v.is_empty() || v.len() > 2 {
                 return Err(Error::Error("unhex() takes 1 or 2 arguments".into()));
             }
-            // `unhex(X, Y)` first removes any characters of Y from X.
-            let cleaned = match v.get(1) {
+            // A NULL hex string or NULL ignore-set both yield NULL.
+            let ignore = match v.get(1) {
                 Some(Value::Null) => return Ok(Value::Null),
-                Some(ignore) => {
-                    let set: alloc::vec::Vec<char> = eval::to_text(ignore).chars().collect();
-                    Some(
-                        eval::to_text(&v[0])
-                            .chars()
-                            .filter(|c| !set.contains(c))
-                            .collect::<String>(),
-                    )
-                }
+                // The ignore set is itself coerced as a C string (NUL-terminated).
+                Some(set) => Some(c_text(set)),
                 None => None,
             };
             match &v[0] {
                 Value::Null => Value::Null,
-                other => {
-                    let text = cleaned.unwrap_or_else(|| eval::to_text(other));
-                    match unhex(&text) {
-                        Some(b) => Value::Blob(b),
-                        None => Value::Null,
-                    }
-                }
+                // The hex input is read as a NUL-terminated C string, matching
+                // SQLite's `unhexFunc` (`sqlite3_value_text`).
+                other => match unhex(&c_text(other), ignore.as_deref()) {
+                    Some(b) => Value::Blob(b),
+                    None => Value::Null,
+                },
             }
         }
         // Math functions (SQLite's `-DSQLITE_ENABLE_MATH_FUNCTIONS` set; the CLI
@@ -668,27 +660,43 @@ fn quote_value(v: &Value) -> String {
     }
 }
 
-/// Decode a hex string to bytes (even length, all hex digits), else `None`.
-fn unhex(s: &str) -> Option<alloc::vec::Vec<u8>> {
-    let bytes = s.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
-        return None;
-    }
-    let hexval = |c: u8| -> Option<u8> {
+/// Decode a hex string to bytes, returning `None` on malformed input. A faithful
+/// port of SQLite's `unhexFunc`:
+///
+/// - with no ignore set (`ignore` is `None`), the input must be an even number of
+///   hex digits and nothing else;
+/// - with an ignore set (the 2-argument form), characters from `ignore` may
+///   appear *before*, *between*, and *after* complete byte pairs, but never
+///   *within* a pair — so `unhex('AB CD', ' ')` is `X'ABCD'` while
+///   `unhex('A BCD', ' ')` is `NULL`. Any character that is neither a hex digit
+///   nor in the ignore set fails the whole decode.
+fn unhex(s: &str, ignore: Option<&str>) -> Option<alloc::vec::Vec<u8>> {
+    let hexval = |c: char| -> Option<u8> {
         match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
+            '0'..='9' => Some(c as u8 - b'0'),
+            'a'..='f' => Some(c as u8 - b'a' + 10),
+            'A'..='F' => Some(c as u8 - b'A' + 10),
             _ => None,
         }
     };
-    let mut out = alloc::vec::Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        out.push((hexval(bytes[i])? << 4) | hexval(bytes[i + 1])?);
-        i += 2;
+    let ignored = |c: char| -> bool { ignore.is_some_and(|set| set.contains(c)) };
+    let mut out = alloc::vec::Vec::new();
+    let mut it = s.chars();
+    loop {
+        // Skip any leading/inter-pair ignore characters. A non-ignored,
+        // non-hex-digit character (or running out of input) ends this phase.
+        let hi = loop {
+            match it.next() {
+                None => return Some(out),
+                Some(c) if hexval(c).is_some() => break c,
+                Some(c) if ignored(c) => continue,
+                Some(_) => return None,
+            }
+        };
+        // The second nibble must immediately follow the first.
+        let lo = it.next()?;
+        out.push((hexval(hi)? << 4) | hexval(lo)?);
     }
-    Some(out)
 }
 
 fn arity(name: &str, args: &[Expr], n: usize) -> Result<()> {
@@ -752,10 +760,30 @@ fn soundex(s: &str) -> String {
     out
 }
 
+/// Coerce a value to text for the string functions (`trim`/`upper`/`lower`/
+/// `replace`/`substr`/`soundex`).
+///
+/// When the value is a BLOB, SQLite reads it as a NUL-terminated C string
+/// (`sqlite3_value_text`), so an embedded `NUL` byte truncates the coerced
+/// text: `trim(X'00200041…')` is `''`, not `'   A   '`. We reproduce that for
+/// the blob path. A genuine TEXT value keeps its embedded NULs: this engine's
+/// TEXT model is NUL-preserving (e.g. the JSON5 `\0` escape stores a real NUL
+/// character — see `tests/json5.rs`), and `length`/`unicode` count through it,
+/// so truncating TEXT here would be inconsistent with the rest of the engine.
+fn c_text(v: &Value) -> String {
+    match v {
+        Value::Blob(b) => {
+            let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
+            String::from_utf8_lossy(&b[..end]).into_owned()
+        }
+        other => eval::to_text(other),
+    }
+}
+
 fn str_map(v: &Value, f: impl Fn(&str) -> String) -> Value {
     match v {
         Value::Null => Value::Null,
-        other => Value::Text(f(&eval::to_text(other))),
+        other => Value::Text(f(&c_text(other))),
     }
 }
 
@@ -903,9 +931,9 @@ fn trim_fn(v: &[Value], left: bool, right: bool) -> Value {
     if v.is_empty() || matches!(v[0], Value::Null) {
         return Value::Null;
     }
-    let s = eval::to_text(&v[0]);
+    let s = c_text(&v[0]);
     let trim_chars: Vec<char> = if v.len() >= 2 {
-        eval::to_text(&v[1]).chars().collect()
+        c_text(&v[1]).chars().collect()
     } else {
         alloc::vec![' ']
     };
@@ -1023,9 +1051,9 @@ fn replace(v: &[Value]) -> Result<Value> {
     if v.iter().any(|x| matches!(x, Value::Null)) {
         return Ok(Value::Null);
     }
-    let s = eval::to_text(&v[0]);
-    let from = eval::to_text(&v[1]);
-    let to = eval::to_text(&v[2]);
+    let s = c_text(&v[0]);
+    let from = c_text(&v[1]);
+    let to = c_text(&v[2]);
     if from.is_empty() {
         return Ok(Value::Text(s));
     }
@@ -1176,9 +1204,18 @@ fn nibble(n: u8) -> char {
 fn char_fn(v: &[Value]) -> Value {
     let mut s = String::new();
     for x in v {
-        if let Some(c) = char::from_u32(eval::to_i64(x) as u32) {
-            s.push(c);
-        }
+        // SQLite's `charFunc` reads each argument as a code point and substitutes
+        // U+FFFD for an out-of-range value (negative or > U+10FFFF) rather than
+        // dropping the character. Surrogates (U+D800..=U+DFFF) cannot be held in
+        // Rust's UTF-8 `String`, so they too fall back to U+FFFD (SQLite emits
+        // their raw 3-byte encoding — a faithful match would need invalid UTF-8,
+        // which this engine's TEXT representation forbids).
+        let cp = eval::to_i64(x);
+        let c = u32::try_from(cp)
+            .ok()
+            .and_then(char::from_u32)
+            .unwrap_or('\u{FFFD}');
+        s.push(c);
     }
     Value::Text(s)
 }
