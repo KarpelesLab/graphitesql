@@ -185,9 +185,20 @@ impl Shell {
         if self.headers {
             let _ = writeln!(out, "{}", result.columns.join("|"));
         }
+        // Write rows as bytes, not as a String: a BLOB column prints its raw
+        // bytes (which need not be valid UTF-8) in list mode, matching the
+        // sqlite3 CLI — e.g. `SELECT x'48656c6c6f'` prints `Hello`, not its hex.
+        let mut line: Vec<u8> = Vec::new();
         for row in &result.rows {
-            let cells: Vec<String> = row.iter().map(render_value).collect();
-            let _ = writeln!(out, "{}", cells.join("|"));
+            line.clear();
+            for (i, v) in row.iter().enumerate() {
+                if i > 0 {
+                    line.push(b'|');
+                }
+                render_value_into(v, &mut line);
+            }
+            line.push(b'\n');
+            let _ = out.write_all(&line);
         }
     }
 
@@ -265,24 +276,34 @@ fn print_help() {
     eprintln!(".quit / .exit      Exit the shell");
 }
 
-/// Render a value the way the `sqlite3` shell does in list mode (NULL prints as
-/// the empty string).
-fn render_value(v: &Value) -> String {
+/// Render a value the way the `sqlite3` shell does in list mode, appending its
+/// bytes to `out` (NULL prints as the empty string).
+///
+/// A BLOB emits its raw bytes verbatim — they need not be valid UTF-8 — but, as
+/// the `sqlite3` CLI does, only up to the first NUL: list mode hands the blob to
+/// C string routines, so `x'410042'` prints as `A`, and `x'00ff'` prints as
+/// nothing.
+fn render_value_into(v: &Value, out: &mut Vec<u8>) {
     match v {
-        Value::Null => String::new(),
-        Value::Integer(i) => i.to_string(),
+        Value::Null => {}
+        Value::Integer(i) => out.extend_from_slice(i.to_string().as_bytes()),
         // Use the engine's canonical real rendering (15 significant digits with
         // `%g`-style fixed/exponential switching, `Inf`/`-Inf`, `0.0` for zero) so
         // the shell matches the `sqlite3` CLI for large/small/special magnitudes —
         // e.g. `1e18` -> `1.0e+18`, `1e400` -> `Inf`, `-0.0` -> `0.0`.
-        Value::Real(r) => graphitesql::exec::eval::format_real(*r),
-        Value::Text(s) => s.clone(),
+        Value::Real(r) => {
+            out.extend_from_slice(graphitesql::exec::eval::format_real(*r).as_bytes())
+        }
+        // Both TEXT and BLOB stop at the first NUL: list mode renders through C
+        // string routines, so `'A'||char(0)||'B'` and `x'410042'` both print `A`.
+        Value::Text(s) => {
+            let b = s.as_bytes();
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            out.extend_from_slice(&b[..end]);
+        }
         Value::Blob(b) => {
-            let mut s = String::with_capacity(b.len() * 2);
-            for byte in b {
-                s.push_str(&format!("{byte:02x}"));
-            }
-            s
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            out.extend_from_slice(&b[..end]);
         }
     }
 }

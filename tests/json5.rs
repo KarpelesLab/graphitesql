@@ -144,9 +144,16 @@ fn string_escapes() {
         int(&c, r#"SELECT unicode(json_extract('{"x":"\x41"}','$.x'))"#),
         65 // 'A'
     );
+    // The `\0` escape yields a single NUL byte: it is stored (hex `00`), but
+    // `length()` counts characters up to the first NUL, so it reports 0 — both
+    // matching the sqlite3 CLI.
+    assert_eq!(
+        text(&c, r#"SELECT hex(json_extract('{"x":"\0"}','$.x'))"#),
+        "00"
+    );
     assert_eq!(
         int(&c, r#"SELECT length(json_extract('{"x":"\0"}','$.x'))"#),
-        1 // a single NUL character
+        0 // no characters precede the single NUL
     );
 }
 

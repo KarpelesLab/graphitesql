@@ -117,7 +117,17 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             match &v[0] {
                 Value::Null => Value::Null,
                 Value::Blob(b) => Value::Integer(b.len() as i64),
-                other => Value::Integer(eval::to_text(other).chars().count() as i64),
+                // For a string, SQLite counts characters up to (not including)
+                // the first NUL — `length('A'||char(0)||'B')` is 1, not 3.
+                // Numbers stringify without NULs, so they are unaffected.
+                other => {
+                    let t = eval::to_text(other);
+                    let n = match t.find('\0') {
+                        Some(i) => t[..i].chars().count(),
+                        None => t.chars().count(),
+                    };
+                    Value::Integer(n as i64)
+                }
             }
         }
         "octet_length" => {
