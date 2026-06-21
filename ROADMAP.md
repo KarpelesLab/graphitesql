@@ -359,10 +359,15 @@ tables** (ordinary b-trees) — which graphite already writes byte-compatibly �
 the path is: give modules writable shadow storage, then build the two modules on
 top. Build bottom-up (each step lands testable on `:memory:` first):
 
-- **W1 — writable-vtab trait + DML routing.** Add an `update` method to
-  `VTabModule` (the `xUpdate` analog: insert / update / delete a row, default =
-  the current read-only error), and route `INSERT`/`UPDATE`/`DELETE` on a vtab to
-  it in the executor (today rejected).
+- **W1 — writable-vtab trait + DML routing. ✅ DONE.** `VTabModule::update`
+  (the `xUpdate` analog) takes a `VTabChange::Insert`/`Delete`/`Update`; the
+  default keeps a table read-only. `Connection::register_module` registers a
+  custom module. The executor routes all three DML verbs to it
+  (`exec_vtab_insert`/`exec_vtab_delete`/`exec_vtab_update`): INSERT maps the
+  column list and evaluates values; UPDATE/DELETE scan via the cursor, filter by
+  `WHERE`, and call `update` per matching row. Tests: `tests/writable_vtab.rs`.
+  *(Remaining: explicit-rowid INSERT, hidden columns, RETURNING / `UPDATE … FROM`
+  on a vtab.)*
 - **W2 — shadow-table storage for modules.** A helper so a module can create and
   read/write backing *regular* tables (`<name>_data`, …) on `connect`/`update` —
   reusing graphite's normal table machinery, so persistence is byte-compatible for
