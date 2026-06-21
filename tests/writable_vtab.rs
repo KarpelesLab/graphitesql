@@ -1,14 +1,17 @@
-//! Roadmap W1 (first increment): a virtual-table module can be writable. A module
-//! that overrides `VTabModule::update` services `INSERT` through `xUpdate`; the
+//! Roadmap W1/W2: writable virtual tables. A module that overrides
+//! `VTabModule::update` services INSERT/UPDATE/DELETE through `xUpdate`; the
 //! default leaves the table read-only. `Connection::register_module` registers a
-//! custom module.
+//! custom module. A `persistent()` module keeps its rows in a real `<vtab>_data`
+//! backing table (W2), so they survive reopening the database file.
 
 #![cfg(feature = "std")]
 
 use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use graphitesql::vtab::{IndexPlan, VTabChange, VTabCursor, VTabModule, VTabRow, VTabSchema};
+use graphitesql::vtab::{
+    IndexPlan, VTabChange, VTabCursor, VTabModule, VTabRow, VTabSchema, VTabStore,
+};
 use graphitesql::{Connection, Result, Value};
 
 /// Shared `(rowid, values)` storage behind a [`MemModule`].
@@ -67,7 +70,12 @@ impl VTabModule for MemModule {
         })
     }
 
-    fn update(&self, _args: &[&str], change: VTabChange) -> Result<i64> {
+    fn update(
+        &self,
+        _args: &[&str],
+        change: VTabChange,
+        _store: &mut dyn VTabStore,
+    ) -> Result<i64> {
         match change {
             VTabChange::Insert { rowid, values } => {
                 let id = rowid.unwrap_or_else(|| {
@@ -204,4 +212,123 @@ fn insert_with_an_explicit_rowid() {
             vec![Value::Integer(100), Value::Text("x".into())],
         ]
     );
+}
+
+// --- W2: a persistent module backed by a real <name>_data table ---
+
+/// A persistent writable module: `persistent()` is true, so the engine creates a
+/// `<vtab>_data` backing table, scans it for reads, and hands `update` a store.
+struct PersistModule;
+
+/// Never used (persistent reads scan the backing table, not the cursor).
+struct EmptyCursor;
+impl VTabCursor for EmptyCursor {
+    type Row = MemRow;
+    fn next(&mut self) -> Result<Option<MemRow>> {
+        Ok(None)
+    }
+}
+
+impl VTabModule for PersistModule {
+    type Cursor = EmptyCursor;
+    fn connect(&self, _args: &[&str]) -> Result<VTabSchema> {
+        Ok(VTabSchema::new(["k", "v"]))
+    }
+    fn open(&self, _args: &[&str], _plan: &IndexPlan) -> Result<EmptyCursor> {
+        Ok(EmptyCursor)
+    }
+    fn persistent(&self) -> bool {
+        true
+    }
+    fn update(&self, _args: &[&str], change: VTabChange, store: &mut dyn VTabStore) -> Result<i64> {
+        match change {
+            VTabChange::Insert { rowid, values } => {
+                let id = match rowid {
+                    Some(r) => r,
+                    None => store.rows()?.iter().map(|(id, _)| *id).max().unwrap_or(0) + 1,
+                };
+                store.put(id, values)?;
+                Ok(id)
+            }
+            VTabChange::Delete { rowid } => {
+                store.delete(rowid)?;
+                Ok(rowid)
+            }
+            VTabChange::Update {
+                rowid,
+                new_rowid,
+                values,
+            } => {
+                if new_rowid != rowid {
+                    store.delete(rowid)?;
+                }
+                store.put(new_rowid, values)?;
+                Ok(new_rowid)
+            }
+        }
+    }
+}
+
+#[test]
+fn persistent_module_stores_rows_in_a_real_backing_table() {
+    let mut c = Connection::open_memory().unwrap();
+    c.register_module("kv", PersistModule).unwrap();
+    c.execute("CREATE VIRTUAL TABLE p USING kv()").unwrap();
+    c.execute("INSERT INTO p VALUES ('a', 1), ('b', 2), ('c', 3)")
+        .unwrap();
+
+    // Reads come from the backing table.
+    assert_eq!(
+        c.query("SELECT k, v FROM p ORDER BY k").unwrap().rows,
+        [
+            vec![Value::Text("a".into()), Value::Integer(1)],
+            vec![Value::Text("b".into()), Value::Integer(2)],
+            vec![Value::Text("c".into()), Value::Integer(3)],
+        ]
+    );
+    // The backing `p_data` table really exists and holds the rows.
+    assert_eq!(
+        c.query("SELECT k, v FROM p_data ORDER BY k").unwrap().rows,
+        [
+            vec![Value::Text("a".into()), Value::Integer(1)],
+            vec![Value::Text("b".into()), Value::Integer(2)],
+            vec![Value::Text("c".into()), Value::Integer(3)],
+        ]
+    );
+
+    // DELETE and UPDATE persist through the store too.
+    c.execute("DELETE FROM p WHERE v = 1").unwrap();
+    c.execute("UPDATE p SET v = 20 WHERE k = 'b'").unwrap();
+    assert_eq!(
+        c.query("SELECT k, v FROM p ORDER BY k").unwrap().rows,
+        [
+            vec![Value::Text("b".into()), Value::Integer(20)],
+            vec![Value::Text("c".into()), Value::Integer(3)],
+        ]
+    );
+}
+
+#[test]
+fn persistent_vtab_survives_reopening_the_file() {
+    let mut path = std::env::temp_dir();
+    path.push(format!("graphitesql-w2-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.register_module("kv", PersistModule).unwrap();
+        c.execute("CREATE VIRTUAL TABLE p USING kv()").unwrap();
+        c.execute("INSERT INTO p VALUES ('x', 9)").unwrap();
+    }
+    // Reopen: the rows are still there (they were written to the real db file).
+    {
+        let mut c = Connection::open(&path).unwrap();
+        c.register_module("kv", PersistModule).unwrap();
+        assert_eq!(
+            c.query("SELECT k, v FROM p").unwrap().rows,
+            [vec![Value::Text("x".into()), Value::Integer(9)]]
+        );
+    }
+    let _ = std::fs::remove_file(&path);
 }

@@ -72,11 +72,16 @@
 //! module did not fully consume is still filtered by the executor, so the plan is
 //! always a superset of the answer and pushdown can never produce a wrong row.
 //!
-//! Still stubbed:
+//! # Writes (roadmap W1/W2)
 //!
-//! * **Writes.** `xUpdate` (INSERT/UPDATE/DELETE through a virtual table) is not
-//!   modeled; virtual tables are read/scan only, and the executor rejects writes
-//!   to them.
+//! [`VTabModule::update`] is the analog of SQLite's `xUpdate`: the executor routes
+//! `INSERT`/`UPDATE`/`DELETE` on a virtual table to it as a [`VTabChange`]. The
+//! default leaves a module read-only (it errors), so a scan-only module needs no
+//! change. A [`persistent`](VTabModule::persistent) module keeps its rows in a real
+//! `<vtab>_data` backing table; the engine creates it at `CREATE VIRTUAL TABLE`,
+//! scans it for reads, and hands the module a [`VTabStore`] over it in `update`, so
+//! the rows are transactional and survive reopening the database. Register a custom
+//! module with `Connection::register_module`.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -264,6 +269,20 @@ pub enum VTabChange<'a> {
     },
 }
 
+/// Persistent backing storage handed to a writable module's
+/// [`update`](VTabModule::update). A persistent module's rows live in a real
+/// regular table (`<vtab>_data`) — exactly how SQLite's FTS5 / R-Tree keep their
+/// shadow tables — so writes go through the engine's normal, transactional table
+/// machinery and the stored bytes are ordinary b-trees.
+pub trait VTabStore {
+    /// Every `(rowid, column values)` row currently in the backing table.
+    fn rows(&self) -> Result<alloc::vec::Vec<(i64, alloc::vec::Vec<Value>)>>;
+    /// Insert (or replace) the row `rowid` with `values`.
+    fn put(&mut self, rowid: i64, values: &[Value]) -> Result<()>;
+    /// Remove the row `rowid` (a no-op if absent).
+    fn delete(&mut self, rowid: i64) -> Result<()>;
+}
+
 /// A virtual-table module: the safe analog of `sqlite3_module`.
 ///
 /// A connection registers an implementation under a name (see [`VTabRegistry`]).
@@ -324,14 +343,30 @@ pub trait VTabModule {
         Ok(cursor)
     }
 
+    /// Whether this module keeps its rows in a persistent backing table (see
+    /// [`VTabStore`]). When `true`, the engine creates a `<vtab>_data` table at
+    /// `CREATE VIRTUAL TABLE`, scans it to answer queries, and hands the module a
+    /// [`VTabStore`] over it in [`update`](Self::update). The default `false` is a
+    /// computed/read-only module (e.g. `series`).
+    fn persistent(&self) -> bool {
+        false
+    }
+
     /// Apply a write to the table (SQLite's `xUpdate`), returning the rowid of the
     /// inserted/updated row (ignored for a delete).
     ///
     /// `args` are the `USING <name>(<args>)` arguments (as for [`connect`](Self::connect)).
-    /// The default makes the table **read-only** — it returns an error — so an
-    /// existing read-only module needs no change. A writable module overrides this
-    /// to service [`VTabChange::Insert`]/`Delete`/`Update`.
-    fn update(&self, _args: &[&str], _change: VTabChange) -> Result<i64> {
+    /// `store` is the module's persistent backing table (meaningful only when
+    /// [`persistent`](Self::persistent) is `true`). The default makes the table
+    /// **read-only** — it returns an error — so an existing read-only module needs
+    /// no change. A writable module overrides this to service
+    /// [`VTabChange::Insert`]/`Delete`/`Update`, persisting through `store`.
+    fn update(
+        &self,
+        _args: &[&str],
+        _change: VTabChange,
+        _store: &mut dyn VTabStore,
+    ) -> Result<i64> {
         Err(Error::Error(alloc::string::String::from(
             "table is read-only",
         )))
@@ -362,8 +397,15 @@ pub trait DynVTabModule {
         plan: &IndexPlan,
         argv: &[Value],
     ) -> Result<Box<dyn DynCursor>>;
+    /// See [`VTabModule::persistent`].
+    fn dyn_persistent(&self) -> bool;
     /// See [`VTabModule::update`].
-    fn dyn_update(&self, args: &[&str], change: VTabChange) -> Result<i64>;
+    fn dyn_update(
+        &self,
+        args: &[&str],
+        change: VTabChange,
+        store: &mut dyn VTabStore,
+    ) -> Result<i64>;
 }
 
 /// A type-erased [`VTabRow`] yielded by a [`DynCursor`].
@@ -419,8 +461,16 @@ where
         let cursor = VTabModule::filter(self, cursor, plan, argv)?;
         Ok(Box::new(cursor) as Box<dyn DynCursor>)
     }
-    fn dyn_update(&self, args: &[&str], change: VTabChange) -> Result<i64> {
-        VTabModule::update(self, args, change)
+    fn dyn_persistent(&self) -> bool {
+        VTabModule::persistent(self)
+    }
+    fn dyn_update(
+        &self,
+        args: &[&str],
+        change: VTabChange,
+        store: &mut dyn VTabStore,
+    ) -> Result<i64> {
+        VTabModule::update(self, args, change, store)
     }
 }
 

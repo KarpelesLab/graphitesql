@@ -33,7 +33,7 @@ use crate::sql::{self};
 use crate::value::Value;
 use crate::vfs::{OpenFlags, Vfs};
 use crate::vtab::{
-    ConstraintOp, DynVTabModule, IndexConstraint, IndexPlan, VTabChange, VTabRegistry,
+    ConstraintOp, DynVTabModule, IndexConstraint, IndexPlan, VTabChange, VTabRegistry, VTabStore,
 };
 use alloc::boxed::Box;
 use alloc::format;
@@ -4444,7 +4444,27 @@ impl Connection {
             .get(&cvt.module)
             .ok_or_else(|| Error::Error(format!("no such module: {}", cvt.module)))?;
         let arg_refs: Vec<&str> = cvt.args.iter().map(String::as_str).collect();
-        module.dyn_connect(&arg_refs)?;
+        let schema = module.dyn_connect(&arg_refs)?;
+        let persistent = module.dyn_persistent();
+        let cols = schema.columns;
+        // A persistent module keeps its rows in a backing `<name>_data` regular
+        // table (as SQLite's FTS5/R-Tree shadow tables do). Create it now, reusing
+        // the normal table machinery so it is transactional and integrity-checked.
+        if persistent {
+            let coldefs = cols
+                .iter()
+                .map(|c| sql::print::ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let backing_sql = format!(
+                "CREATE TABLE {}({coldefs})",
+                sql::print::ident(&format!("{}_data", cvt.name))
+            );
+            let Statement::CreateTable(ct) = sql::parse_one(&backing_sql)? else {
+                unreachable!("constructed a CREATE TABLE");
+            };
+            self.exec_create_table(&ct, &backing_sql)?;
+        }
 
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
@@ -4517,7 +4537,44 @@ impl Connection {
     /// declared column order and hand them to its
     /// [`update`](crate::vtab::VTabModule::update) (SQLite's `xUpdate` insert).
     /// A read-only module's default `update` rejects the write.
-    fn exec_vtab_insert(&self, ins: &Insert, rows: &[Vec<Expr>], params: &Params) -> Result<usize> {
+    /// Run `f` with the named module taken out of the registry and a [`VTabStore`]
+    /// over its `<table>_data` backing table, re-registering the module afterward.
+    /// Taking the module out lets the store hold `&mut Connection` without aliasing
+    /// the borrowed module. Callers do all read-only work (evaluating values,
+    /// scanning rows) *before* this, then only persist inside `f`.
+    fn with_vtab_store<F>(
+        &mut self,
+        module_name: &str,
+        args: &[String],
+        table: &str,
+        f: F,
+    ) -> Result<usize>
+    where
+        F: FnOnce(&dyn DynVTabModule, &mut dyn VTabStore, &[&str]) -> Result<usize>,
+    {
+        let module = self
+            .vtab_registry
+            .unregister(module_name)
+            .ok_or_else(|| Error::Error(format!("no such module: {module_name}")))?;
+        let backing = format!("{table}_data");
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = {
+            let mut store = ExecVTabStore {
+                conn: self,
+                backing: &backing,
+            };
+            f(&*module, &mut store, &arg_refs)
+        };
+        self.vtab_registry.register(module_name, module)?;
+        result
+    }
+
+    fn exec_vtab_insert(
+        &mut self,
+        ins: &Insert,
+        rows: &[Vec<Expr>],
+        params: &Params,
+    ) -> Result<usize> {
         if !ins.upsert.is_empty() || !ins.returning.is_empty() {
             return Err(Error::Unsupported("UPSERT / RETURNING on a virtual table"));
         }
@@ -4546,12 +4603,8 @@ impl Connection {
                 )
                 .collect::<Result<_>>()?
         };
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let module = self
-            .vtab_registry
-            .get(&module_name)
-            .ok_or_else(|| Error::Error(format!("no such module: {module_name}")))?;
-        let mut count = 0usize;
+        // Evaluate every row up front (a read-only borrow of self), then persist.
+        let mut changes: Vec<(Option<i64>, Vec<Value>)> = Vec::with_capacity(rows.len());
         for row in rows {
             if row.len() != target.len() {
                 return Err(Error::Error(format!(
@@ -4570,36 +4623,42 @@ impl Connection {
                     None => rowid = Some(eval::to_i64(&v)),
                 }
             }
-            module.dyn_update(
-                &arg_refs,
-                VTabChange::Insert {
-                    rowid,
-                    values: &values,
-                },
-            )?;
-            count += 1;
+            changes.push((rowid, values));
         }
-        Ok(count)
+        self.with_vtab_store(
+            &module_name,
+            &args,
+            &ins.table,
+            |module, store, arg_refs| {
+                for (rowid, values) in &changes {
+                    module.dyn_update(
+                        arg_refs,
+                        VTabChange::Insert {
+                            rowid: *rowid,
+                            values,
+                        },
+                        store,
+                    )?;
+                }
+                Ok(changes.len())
+            },
+        )
     }
 
     /// `DELETE` from a virtual table: scan it for rows matching the `WHERE`, then
     /// call the module's [`update`](crate::vtab::VTabModule::update) with
     /// [`VTabChange::Delete`] for each (over a materialized snapshot, so deleting
     /// during iteration is safe).
-    fn exec_vtab_delete(&self, del: &Delete, params: &Params) -> Result<usize> {
+    fn exec_vtab_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
         if !del.returning.is_empty() {
             return Err(Error::Unsupported("RETURNING on a virtual table"));
         }
         let (module_name, args, _) = self.vtab_meta(&del.table)?;
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (columns, rows) = self
             .try_virtual_table(&del.table, None, None)?
             .ok_or_else(|| Error::Error(format!("{} is not a virtual table", del.table)))?;
-        let module = self
-            .vtab_registry
-            .get(&module_name)
-            .ok_or_else(|| Error::Error(format!("no such module: {module_name}")))?;
-        let mut count = 0usize;
+        // Collect the matching rowids first (read-only), then persist.
+        let mut victims: Vec<i64> = Vec::new();
         for r in &rows {
             if let Some(pred) = &del.where_clause {
                 let ctx = r.ctx(&columns, params).with_subqueries(self);
@@ -4607,19 +4666,28 @@ impl Connection {
                     continue;
                 }
             }
-            let rowid = r
-                .rowid
-                .ok_or_else(|| Error::Error("virtual-table row has no rowid".into()))?;
-            module.dyn_update(&arg_refs, VTabChange::Delete { rowid })?;
-            count += 1;
+            victims.push(
+                r.rowid
+                    .ok_or_else(|| Error::Error("virtual-table row has no rowid".into()))?,
+            );
         }
-        Ok(count)
+        self.with_vtab_store(
+            &module_name,
+            &args,
+            &del.table,
+            |module, store, arg_refs| {
+                for rowid in &victims {
+                    module.dyn_update(arg_refs, VTabChange::Delete { rowid: *rowid }, store)?;
+                }
+                Ok(victims.len())
+            },
+        )
     }
 
     /// `UPDATE` of a virtual table: scan for rows matching the `WHERE`, evaluate
     /// the `SET` assignments against each, and call the module's
     /// [`update`](crate::vtab::VTabModule::update) with [`VTabChange::Update`].
-    fn exec_vtab_update(&self, upd: &Update, params: &Params) -> Result<usize> {
+    fn exec_vtab_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
         if !upd.returning.is_empty() {
             return Err(Error::Unsupported("RETURNING on a virtual table"));
         }
@@ -4627,7 +4695,6 @@ impl Connection {
             return Err(Error::Unsupported("UPDATE … FROM on a virtual table"));
         }
         let (module_name, args, col_names) = self.vtab_meta(&upd.table)?;
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         // Resolve each SET target to a declared column position.
         let assigns: Vec<(usize, &Expr)> = upd
             .assignments
@@ -4643,11 +4710,8 @@ impl Connection {
         let (columns, rows) = self
             .try_virtual_table(&upd.table, None, None)?
             .ok_or_else(|| Error::Error(format!("{} is not a virtual table", upd.table)))?;
-        let module = self
-            .vtab_registry
-            .get(&module_name)
-            .ok_or_else(|| Error::Error(format!("no such module: {module_name}")))?;
-        let mut count = 0usize;
+        // Compute the new (rowid, values) for each matching row first, then persist.
+        let mut changes: Vec<(i64, Vec<Value>)> = Vec::new();
         for r in &rows {
             let ctx = r.ctx(&columns, params).with_subqueries(self);
             if let Some(pred) = &upd.where_clause {
@@ -4663,17 +4727,27 @@ impl Connection {
             let rowid = r
                 .rowid
                 .ok_or_else(|| Error::Error("virtual-table row has no rowid".into()))?;
-            module.dyn_update(
-                &arg_refs,
-                VTabChange::Update {
-                    rowid,
-                    new_rowid: rowid,
-                    values: &values,
-                },
-            )?;
-            count += 1;
+            changes.push((rowid, values));
         }
-        Ok(count)
+        self.with_vtab_store(
+            &module_name,
+            &args,
+            &upd.table,
+            |module, store, arg_refs| {
+                for (rowid, values) in &changes {
+                    module.dyn_update(
+                        arg_refs,
+                        VTabChange::Update {
+                            rowid: *rowid,
+                            new_rowid: *rowid,
+                            values,
+                        },
+                        store,
+                    )?;
+                }
+                Ok(changes.len())
+            },
+        )
     }
 
     /// Produce the columns and rows of a virtual table used as a `FROM` source:
@@ -4728,6 +4802,22 @@ impl Connection {
                 collation: crate::value::Collation::default(),
             })
             .collect();
+        // A persistent module keeps its rows in the `<vtab>_data` backing table;
+        // scan that directly (run_core re-applies the full WHERE, so the rows are
+        // a valid superset). Computed modules go through the cursor path below.
+        if module.dyn_persistent() {
+            let backing = format!("{name}_data");
+            let bmeta = self.table_meta(&backing, None)?;
+            let rows = self
+                .scan_table(&bmeta)?
+                .into_iter()
+                .map(|(rowid, values)| InputRow {
+                    values,
+                    rowid: Some(rowid),
+                })
+                .collect();
+            return Ok(Some((columns, rows)));
+        }
         // Constraint pushdown: offer the WHERE's usable comparisons to the module,
         // let it choose a plan, then hand back the bound values it requested.
         let (constraints, bound_values) = match pushdown {
@@ -12723,6 +12813,37 @@ fn find_expr_in_values(key_expr: &Expr, e: &Expr, params: &Params) -> Option<Vec
             Some(vals)
         }
         _ => None,
+    }
+}
+
+/// The executor's [`VTabStore`] implementation: a persistent virtual table's
+/// backing `<vtab>_data` regular table, read/written through the normal table
+/// machinery. Built (with the module taken out of the registry, so
+/// `&mut Connection` doesn't alias the borrowed module) for one `update` call.
+struct ExecVTabStore<'a> {
+    conn: &'a mut Connection,
+    backing: &'a str,
+}
+
+impl VTabStore for ExecVTabStore<'_> {
+    fn rows(&self) -> Result<Vec<(i64, Vec<Value>)>> {
+        let meta = self.conn.table_meta(self.backing, None)?;
+        self.conn.scan_table(&meta)
+    }
+    fn put(&mut self, rowid: i64, values: &[Value]) -> Result<()> {
+        let root = self.conn.table_meta(self.backing, None)?.root;
+        let payload = encode_record(values);
+        let w = self.conn.backend.writer()?;
+        // Replace semantics: drop any existing row, then insert.
+        crate::btree::delete_table(w, root, rowid)?;
+        crate::btree::insert_table(w, root, rowid, &payload)?;
+        Ok(())
+    }
+    fn delete(&mut self, rowid: i64) -> Result<()> {
+        let root = self.conn.table_meta(self.backing, None)?.root;
+        let w = self.conn.backend.writer()?;
+        crate::btree::delete_table(w, root, rowid)?;
+        Ok(())
     }
 }
 
