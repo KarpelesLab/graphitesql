@@ -55,6 +55,23 @@ pub fn index_seek_rowids(
     Ok(out)
 }
 
+/// Like [`index_seek_rowids`], but returns the full decoded *records* of the
+/// matching entries rather than a trailing rowid. This is what a `WITHOUT ROWID`
+/// table needs: its b-tree entries are the rows themselves (stored PK-first), so
+/// an equality-prefix seek on the PK yields the rows directly.
+pub fn index_seek_records(
+    src: &dyn PageSource,
+    root: u32,
+    key: &[Value],
+    colls: &[Collation],
+) -> Result<Vec<Vec<Value>>> {
+    let enc = src.header().text_encoding;
+    let usable = src.usable_size();
+    let mut out = Vec::new();
+    seek_prefix_records(src, root, key, enc, usable, colls, &mut out)?;
+    Ok(out)
+}
+
 /// Range variant of [`index_seek_rowids`]: return the rowids of every index
 /// entry whose leading column(s) fall within the given bounds, in index order.
 /// `lower`/`upper` are optional `(key_prefix, inclusive)` constraints compared
@@ -217,6 +234,54 @@ fn seek_prefix(
             while i < n && prefix_cmp(key, &record(i)?, colls) == Ordering::Equal {
                 out.push(rowid_of(&record(i)?));
                 seek_prefix(src, bt.child_pointer(i + 1)?, key, enc, usable, colls, out)?;
+                i += 1;
+            }
+            Ok(())
+        }
+        _ => Err(Error::Corrupt("index seek on a non-index b-tree".into())),
+    }
+}
+
+/// As [`seek_prefix`], but collects the full matching records instead of their
+/// trailing rowid — for `WITHOUT ROWID` table seeks.
+fn seek_prefix_records(
+    src: &dyn PageSource,
+    page_no: u32,
+    key: &[Value],
+    enc: TextEncoding,
+    usable: usize,
+    colls: &[Collation],
+    out: &mut Vec<Vec<Value>>,
+) -> Result<()> {
+    let page = src.page(page_no)?;
+    let bt = BtreePage::parse(page)?;
+    let record = |i: usize| -> Result<Vec<Value>> {
+        let cell = bt.index_cell(i, usable)?;
+        let full = read_payload(src, bt.data(), &cell.payload)?;
+        decode_record(&full, enc)
+    };
+    match bt.page_type() {
+        PageType::LeafIndex => {
+            for i in 0..bt.num_cells() {
+                let rec = record(i)?;
+                match prefix_cmp(key, &rec, colls) {
+                    Ordering::Greater => continue,
+                    Ordering::Equal => out.push(rec),
+                    Ordering::Less => break,
+                }
+            }
+            Ok(())
+        }
+        PageType::InteriorIndex => {
+            let n = bt.num_cells();
+            let mut i = 0;
+            while i < n && prefix_cmp(key, &record(i)?, colls) == Ordering::Greater {
+                i += 1;
+            }
+            seek_prefix_records(src, bt.child_pointer(i)?, key, enc, usable, colls, out)?;
+            while i < n && prefix_cmp(key, &record(i)?, colls) == Ordering::Equal {
+                out.push(record(i)?);
+                seek_prefix_records(src, bt.child_pointer(i + 1)?, key, enc, usable, colls, out)?;
                 i += 1;
             }
             Ok(())

@@ -5238,6 +5238,63 @@ impl Connection {
         Ok(out)
     }
 
+    /// Seek a `WITHOUT ROWID` table's clustered PRIMARY KEY b-tree for the rows
+    /// whose leading PK columns the `WHERE` constrains by equality (`… WHERE
+    /// pk = ?`), instead of scanning. The b-tree entries are the rows themselves,
+    /// stored PK-first, so an equality-prefix seek yields them directly.
+    /// `run_core` re-applies the full `WHERE`, so returning a superset is fine.
+    /// Returns `None` (→ caller scans) when no leading-PK equality is usable.
+    fn try_without_rowid_pk_seek(
+        &self,
+        meta: &TableMeta,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let Some(where_expr) = &sel.where_clause else {
+            return Ok(None);
+        };
+        let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
+        if matches!(hint, Some(IndexHint::NotIndexed)) {
+            return Ok(None);
+        }
+        let pk = &meta.storage_order[..meta.pk_len];
+        if pk.is_empty() {
+            return Ok(None);
+        }
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        // Build the seek key from the longest leading-PK prefix the WHERE
+        // constrains by `= const`, with the b-tree's storage collations.
+        let storage_colls = wr_storage_collations(meta);
+        let mut key = Vec::new();
+        let mut colls = Vec::new();
+        for (i, &c) in pk.iter().enumerate() {
+            let Some((_, v)) = eqs.iter().find(|(col, _)| *col == c) else {
+                break;
+            };
+            if matches!(v, Value::Null) {
+                break; // PK columns are NOT NULL; `pk = NULL` matches nothing
+            }
+            key.push(meta.columns[c].affinity.coerce(v.clone()));
+            colls.push(storage_colls[i]);
+        }
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let records =
+            crate::btree::index_seek_records(self.backend.source(), meta.root, &key, &colls)?;
+        let mut out = Vec::with_capacity(records.len());
+        for storage in records {
+            let mut row = unpermute_row(meta, storage);
+            self.compute_generated(meta, &mut row, params)?;
+            out.push(InputRow {
+                values: row,
+                rowid: None,
+            });
+        }
+        Ok(Some(out))
+    }
+
     /// The index metadata (root + indexed column positions) for `table`.
     /// Try to satisfy a single-table query with an index equality lookup instead
     /// of a full scan: pick the index whose longest leftmost column prefix is
@@ -6349,6 +6406,25 @@ impl Connection {
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
         eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        // WITHOUT ROWID: the executor seeks the clustered PRIMARY KEY b-tree on a
+        // leading-PK equality (`try_without_rowid_pk_seek`) and otherwise scans —
+        // it never uses a secondary index — so report exactly that.
+        if meta.without_rowid {
+            let pk = &meta.storage_order[..meta.pk_len];
+            let mut names = Vec::new();
+            for &c in pk {
+                if eqs.iter().any(|(col, _)| *col == c) {
+                    names.push(alloc::format!("{}=?", meta.columns[c].name));
+                } else {
+                    break;
+                }
+            }
+            return Ok(if names.is_empty() {
+                alloc::format!("SCAN {label}")
+            } else {
+                alloc::format!("SEARCH {label} USING PRIMARY KEY ({})", names.join(" AND "))
+            });
+        }
         // Rowid equality wins, as in try_index_lookup.
         if let Some(ipk) = meta.ipk {
             if eqs.iter().any(|(c, _)| *c == ipk) {
@@ -7915,6 +7991,10 @@ impl Connection {
         if from.joins.is_empty() {
             let first_meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
             if first_meta.without_rowid {
+                // A leading-PK equality seeks the clustered b-tree; else scan.
+                if let Some(rows) = self.try_without_rowid_pk_seek(&first_meta, sel, params)? {
+                    return Ok((first_meta.columns, rows));
+                }
                 let input_rows = self
                     .scan_without_rowid(&first_meta)?
                     .into_iter()
