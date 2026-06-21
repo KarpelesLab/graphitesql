@@ -62,6 +62,12 @@ pub trait Subqueries {
     fn call_udf(&self, _name: &str, _args: &[Value]) -> Option<Result<Value>> {
         None
     }
+    /// The FTS5 relevance score (`bm25()` / `rank`) of the row with this `rowid`,
+    /// when the current query is a full-text `MATCH` over an `fts5` table. `None`
+    /// otherwise (so `bm25()`/`rank` fall back to the usual unknown-name error).
+    fn fts5_rank(&self, _rowid: i64) -> Option<f64> {
+        None
+    }
 }
 
 /// A column's type affinity (SQLite, `datatype3.html` §3).
@@ -293,6 +299,13 @@ impl<'a> EvalCtx<'a> {
         if let Some(s) = self.subqueries {
             if let Some(v) = s.resolve_outer(table, name) {
                 return Ok(v);
+            }
+        }
+        // The FTS5 `rank` hidden column: the current row's relevance score, when a
+        // `MATCH` query over an `fts5` table is in scope (else just an unknown name).
+        if table.is_none() && name.eq_ignore_ascii_case("rank") {
+            if let Some(score) = self.rowid.and_then(|r| self.subqueries?.fts5_rank(r)) {
+                return Ok(Value::Real(score));
             }
         }
         Err(Error::Error(alloc::format!("no such column: {name}")))

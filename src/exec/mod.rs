@@ -159,6 +159,11 @@ pub struct Connection {
     /// [`register_aggregate_function`](Self::register_aggregate_function), keyed by
     /// lowercased name. Built-in aggregates take precedence.
     aggregates: alloc::collections::BTreeMap<String, AggregateFactory>,
+    /// Per-query FTS5 relevance scores (rowid → `bm25()`), set by `run_core` while
+    /// executing a `SELECT … MATCH …` over an `fts5` table that references `rank`
+    /// or `bm25()`, and read back by those special forms during projection and
+    /// `ORDER BY`. `None` outside such a query.
+    fts5_rank: core::cell::RefCell<Option<alloc::collections::BTreeMap<i64, f64>>>,
 }
 
 /// A user-defined scalar function: it receives its evaluated argument values and
@@ -270,6 +275,7 @@ impl Connection {
             cache_size: core::cell::Cell::new(-2000),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
+            fts5_rank: core::cell::RefCell::new(None),
         })
     }
 
@@ -302,6 +308,7 @@ impl Connection {
             cache_size: core::cell::Cell::new(-2000),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
+            fts5_rank: core::cell::RefCell::new(None),
         })
     }
 
@@ -9318,6 +9325,79 @@ impl Connection {
         Some((k, descending))
     }
 
+    /// The first `match(query, operand)` call in a WHERE clause's `AND`/`OR` tree,
+    /// as `(query text, operand column name)`. The operand names either the table
+    /// (a table-wide match) or a single column (`col MATCH …`, which scopes the
+    /// score to that column).
+    fn fts5_match_query(&self, expr: &Expr, params: &Params) -> Option<(String, String)> {
+        match expr {
+            Expr::Function { name, args, .. }
+                if name.eq_ignore_ascii_case("match") && args.len() == 2 =>
+            {
+                let v = eval::eval(&args[0], &eval::EvalCtx::rowless(params)).ok()?;
+                let operand = match &args[1] {
+                    Expr::Column { column, .. } => column.clone(),
+                    _ => return None,
+                };
+                Some((eval::to_text(&v), operand))
+            }
+            Expr::Binary { left, right, .. } => self
+                .fts5_match_query(left, params)
+                .or_else(|| self.fts5_match_query(right, params)),
+            Expr::Unary { expr, .. } | Expr::Paren(expr) => self.fts5_match_query(expr, params),
+            _ => None,
+        }
+    }
+
+    /// Per-rowid FTS5 `bm25()` / `rank` scores for this query, or `None` when it is
+    /// not a `rank`/`bm25()`-referencing `MATCH` query over a single `fts5` table.
+    /// `input_rows` are the freshly scanned backing-table rows (the whole corpus),
+    /// `columns` their column metadata.
+    fn fts5_rank_scores(
+        &self,
+        sel: &Select,
+        columns: &[ColumnInfo],
+        input_rows: &[InputRow],
+        params: &Params,
+    ) -> Option<alloc::collections::BTreeMap<i64, f64>> {
+        if !select_mentions_rank(sel) {
+            return None;
+        }
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty()
+            || from.first.subquery.is_some()
+            || from.first.tvf_args.is_some()
+            || from.first.schema.is_some()
+        {
+            return None;
+        }
+        // The source must be an `fts5` virtual table.
+        let (module, _, _) = self.vtab_meta(&from.first.name).ok()?;
+        if !module.eq_ignore_ascii_case("fts5") {
+            return None;
+        }
+        let (query, operand) = self.fts5_match_query(sel.where_clause.as_ref()?, params)?;
+        let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        // A `col MATCH …` operand scopes the score to that column; a table-wide
+        // `t MATCH …` (operand names the table, not a column) does not.
+        let scope = col_names
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(&operand))
+            .map(String::as_str);
+        let docs: Vec<Vec<String>> = input_rows
+            .iter()
+            .map(|r| r.values.iter().map(eval::to_text).collect())
+            .collect();
+        let scores = crate::vtab::fts5_bm25_scores(&query, &col_names, &docs, scope);
+        Some(
+            input_rows
+                .iter()
+                .zip(scores)
+                .filter_map(|(r, s)| Some((r.rowid?, s)))
+                .collect(),
+        )
+    }
+
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
         // Promote `FROM a, b WHERE a.x = b.y` to an explicit join `ON` so the join
         // fold can seek/hash it (the equality stays in WHERE, so results are
@@ -9348,6 +9428,18 @@ impl Connection {
         }
 
         let (mut columns, input_rows) = self.scan_source(sel, params)?;
+
+        // FTS5 relevance: if this query references `rank` / `bm25()` over an `fts5`
+        // table, score every scanned (corpus) row now and expose the scores by
+        // rowid for projection and ORDER BY. The guard restores any outer query's
+        // scores (and clears them for a non-ranking query) when this scope ends.
+        let _fts5_rank_guard = Fts5RankGuard {
+            conn: self,
+            prev: core::mem::replace(
+                &mut self.fts5_rank.borrow_mut(),
+                self.fts5_rank_scores(sel, &columns, &input_rows, params),
+            ),
+        };
 
         // SQLite lets WHERE/GROUP BY/HAVING reference a SELECT-list alias, with a
         // real column of the same name taking precedence. Rewrite those clauses
@@ -12439,6 +12531,9 @@ impl eval::Subqueries for Connection {
     fn call_udf(&self, name: &str, args: &[Value]) -> Option<Result<Value>> {
         self.functions.get(name).map(|f| f(args))
     }
+    fn fts5_rank(&self, rowid: i64) -> Option<f64> {
+        self.fts5_rank.borrow().as_ref()?.get(&rowid).copied()
+    }
     fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value> {
         self.with_outer_frame(outer, |params| {
             let r = self.run_select(select, params)?;
@@ -14214,6 +14309,61 @@ fn single_minmax_arg(sel: &Select) -> Option<(bool, Expr)> {
 /// predicate to decide whether a function name (with its arg count / `*` flag) is
 /// an aggregate — so `has_aggregate` can recognize built-in *and* user-registered
 /// aggregate functions. A window call (`f(…) OVER (…)`) is not itself an aggregate.
+/// Restores [`Connection::fts5_rank`] when a `run_core` invocation ends, so a
+/// nested query's FTS5 scores never leak into the caller (or vice versa).
+struct Fts5RankGuard<'a> {
+    conn: &'a Connection,
+    prev: Option<alloc::collections::BTreeMap<i64, f64>>,
+}
+
+impl core::ops::Drop for Fts5RankGuard<'_> {
+    fn drop(&mut self) {
+        *self.conn.fts5_rank.borrow_mut() = self.prev.take();
+    }
+}
+
+/// Whether an expression references the FTS5 `rank` hidden column or `bm25(…)`.
+fn expr_mentions_rank(expr: &Expr) -> bool {
+    let rec = |e: &Expr| expr_mentions_rank(e);
+    match expr {
+        Expr::Column {
+            table: None,
+            column,
+        } => column.eq_ignore_ascii_case("rank"),
+        Expr::Function { name, args, .. } => {
+            name.eq_ignore_ascii_case("bm25") || args.iter().any(rec)
+        }
+        Expr::Binary { left, right, .. } => rec(left) || rec(right),
+        Expr::Unary { expr, .. } | Expr::Paren(expr) => rec(expr),
+        Expr::IsNull { expr, .. } => rec(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => rec(expr) || rec(low) || rec(high),
+        Expr::InList { expr, list, .. } => rec(expr) || list.iter().any(rec),
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(rec)
+                || when_then.iter().any(|(w, t)| rec(w) || rec(t))
+                || else_result.as_deref().is_some_and(rec)
+        }
+        Expr::Cast { expr, .. } => rec(expr),
+        _ => false,
+    }
+}
+
+/// Whether a SELECT's projection, `ORDER BY`, or `HAVING` references `rank` /
+/// `bm25(…)` — the cheap gate before computing FTS5 relevance scores.
+fn select_mentions_rank(sel: &Select) -> bool {
+    sel.columns
+        .iter()
+        .any(|c| matches!(c, ResultColumn::Expr { expr, .. } if expr_mentions_rank(expr)))
+        || sel.order_by.iter().any(|t| expr_mentions_rank(&t.expr))
+        || sel.having.as_ref().is_some_and(expr_mentions_rank)
+}
+
 fn expr_contains_agg(expr: &Expr, is_agg: &dyn Fn(&str, usize, bool) -> bool) -> bool {
     let rec = |e: &Expr| expr_contains_agg(e, is_agg);
     match expr {

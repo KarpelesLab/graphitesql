@@ -330,6 +330,68 @@ fn match_anchor_first_token() {
 }
 
 #[test]
+fn bm25_rank_orders_by_relevance() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+        .unwrap();
+    c.execute(
+        "INSERT INTO t VALUES \
+         ('the quick brown fox'),('quick quick fox'),\
+         ('a slow green turtle'),('fox fox fox jumps')",
+    )
+    .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        rows(&c, sql)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("not an integer rowid"),
+            })
+            .collect::<Vec<_>>()
+    };
+    // `ORDER BY rank` returns the most relevant rows first (row 4 has three
+    // `fox` hits, then row 2, then row 1) — byte-for-byte sqlite's bm25 order.
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'fox' ORDER BY rank"),
+        [4, 2, 1]
+    );
+    // `bm25(t)` and the `rank` column expose the same (negative) score.
+    let r = c
+        .query("SELECT bm25(t), rank FROM t WHERE t MATCH 'fox' ORDER BY rowid")
+        .unwrap();
+    for row in &r.rows {
+        match (&row[0], &row[1]) {
+            (Value::Real(a), Value::Real(b)) => {
+                assert!((a - b).abs() < 1e-12 && *a < 0.0, "bm25={a} rank={b}")
+            }
+            o => panic!("not reals: {o:?}"),
+        }
+    }
+}
+
+#[test]
+fn bm25_outside_an_fts5_match_is_unavailable() {
+    // `rank` / `bm25()` only mean something for an fts5 MATCH query; elsewhere
+    // they are an ordinary unknown column / function (an error), as in sqlite.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE r(x)").unwrap();
+    c.execute("INSERT INTO r VALUES (1)").unwrap();
+    assert!(c.query("SELECT rank FROM r").is_err());
+    assert!(c.query("SELECT bm25(r) FROM r").is_err());
+    // A real column literally named `rank` still works.
+    c.execute("CREATE TABLE s(rank)").unwrap();
+    c.execute("INSERT INTO s VALUES (3),(1),(2)").unwrap();
+    assert_eq!(
+        rows(&c, "SELECT rank FROM s ORDER BY rank"),
+        [
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)]
+        ]
+    );
+}
+
+#[test]
 fn match_against_null_pattern_is_null() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
