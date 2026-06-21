@@ -328,8 +328,11 @@ is C8b/C8c.
   sqlite-format journal on open.
 - **C8a — `secure_delete`.** Zero freed cell/page content (`PRAGMA
   secure_delete=ON`).
-- **C8b — honor `PRAGMA cache_size` / `mmap_size`.** Getters report defaults
-  today; store the set value and bound the page cache accordingly.
+- **C8b — honor `PRAGMA cache_size` / `mmap_size`. ✅ DONE.** `cache_size` round-
+  trips its set value on the connection (default −2000); `mmap_size` returns no
+  rows (the reference build disables mmap) instead of erroring. Both verified vs
+  sqlite. The set `cache_size` is stored but does not yet bound a real cache —
+  that is C8c.
 - **C8c — a real `pcache` with LRU eviction.** Replace the keep-everything page
   map with a bounded cache (depends on C8b's size). *Perf, not correctness.*
 - **C9a — reader `SHARED`-lock enforcement / multi-reader.** Let multiple readers
