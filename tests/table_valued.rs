@@ -150,3 +150,74 @@ fn against_sqlite3() {
         failures.join("\n")
     );
 }
+
+// --- json_each / json_tree path argument (roadmap: real bug fix) ---
+
+fn pairs(c: &Connection, sql: &str) -> Vec<(String, String)> {
+    c.query(sql)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| (render(&r[0]), render(&r[1])))
+        .collect()
+}
+
+#[test]
+fn json_each_navigates_a_path_argument() {
+    let c = Connection::open_memory().unwrap();
+    // An array at the path iterates its elements (keys = indices).
+    assert_eq!(
+        pairs(
+            &c,
+            "SELECT key, value FROM json_each('{\"a\":[10,20]}', '$.a')"
+        ),
+        [("0".into(), "10".into()), ("1".into(), "20".into())]
+    );
+    // An object at the path iterates its members.
+    assert_eq!(
+        pairs(
+            &c,
+            "SELECT key, value FROM json_each('{\"a\":{\"b\":5,\"c\":6}}', '$.a')"
+        ),
+        [("b".into(), "5".into()), ("c".into(), "6".into())]
+    );
+    // A scalar at the path is a single row with a NULL key.
+    assert_eq!(
+        pairs(&c, "SELECT key, value FROM json_each('{\"a\":7}', '$.a')"),
+        [(String::new(), "7".into())]
+    );
+    // fullkey/path are rooted at the navigated path.
+    assert_eq!(
+        pairs(
+            &c,
+            "SELECT fullkey, path FROM json_each('{\"a\":[10,20]}', '$.a')"
+        ),
+        [
+            ("$.a[0]".into(), "$.a".into()),
+            ("$.a[1]".into(), "$.a".into())
+        ]
+    );
+    // A path that does not resolve yields no rows.
+    assert!(c
+        .query("SELECT * FROM json_each('{\"a\":1}', '$.zzz')")
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+#[test]
+fn json_tree_roots_at_a_path_argument() {
+    let c = Connection::open_memory().unwrap();
+    let r = c
+        .query("SELECT key, value, type, fullkey, path FROM json_tree('{\"x\":[1,2]}', '$.x')")
+        .unwrap();
+    // Root row: key = the path's last component, fullkey = the path, path = its parent.
+    assert_eq!(render(&r.rows[0][0]), "x");
+    assert_eq!(render(&r.rows[0][2]), "array");
+    assert_eq!(render(&r.rows[0][3]), "$.x");
+    assert_eq!(render(&r.rows[0][4]), "$");
+    // Children are walked under the path.
+    assert_eq!(render(&r.rows[1][3]), "$.x[0]");
+    assert_eq!(render(&r.rows[1][1]), "1");
+    assert_eq!(render(&r.rows[2][3]), "$.x[1]");
+}

@@ -9402,12 +9402,37 @@ impl Connection {
                 let Some(root) = crate::exec::json::parse(&eval::to_text(&doc)) else {
                     return Err(Error::Error("malformed JSON".into()));
                 };
+                // An optional second argument is a path to navigate to first; the
+                // walk is then rooted at that element (e.g. `json_each(x, '$.a')`
+                // iterates `$.a`'s children, with `$.a…` paths). A path that does
+                // not resolve yields no rows.
+                let (target, root_path) = match args.get(1) {
+                    Some(path_arg) => {
+                        let p = eval::to_text(&eval::eval(path_arg, &ctx)?);
+                        match crate::exec::json::navigate(&root, &p) {
+                            Some(sub) => (sub, p),
+                            None => return Ok((columns, Vec::new())),
+                        }
+                    }
+                    None => (&root, String::from("$")),
+                };
                 let mut rows = Vec::new();
                 let mut next_id = 0i64;
                 if lname == "json_tree" {
-                    json_tree_walk(&root, None, "$", "$", None, &mut next_id, &mut rows);
+                    // The root row carries the path's final component as its key and
+                    // its parent path in the `path` column.
+                    let (parent_path, key) = split_json_path(&root_path);
+                    json_tree_walk(
+                        target,
+                        key,
+                        &root_path,
+                        &parent_path,
+                        None,
+                        &mut next_id,
+                        &mut rows,
+                    );
                 } else {
-                    json_each_children(&root, &mut next_id, &mut rows);
+                    json_each_children(target, &root_path, &mut next_id, &mut rows);
                 }
                 Ok((columns, rows))
             }
@@ -11996,9 +12021,11 @@ fn json_emit_node(
 }
 
 /// `json_each`: emit a row for each *direct* child of `root` (or a single row for
-/// a scalar root).
+/// a scalar root). `root_path` is the document path `root` sits at (`"$"`, or the
+/// `json_each(x, path)` argument), used as the prefix of each child's `fullkey`.
 fn json_each_children(
     root: &crate::exec::json::Json,
+    root_path: &str,
     next_id: &mut i64,
     rows: &mut Vec<Vec<Value>>,
 ) {
@@ -12006,12 +12033,12 @@ fn json_each_children(
     match root {
         Json::Object(members) => {
             for (k, v) in members {
-                let fullkey = alloc::format!("$.{k}");
+                let fullkey = alloc::format!("{root_path}.{k}");
                 json_emit_node(
                     v,
                     Some(Value::Text(k.clone())),
                     &fullkey,
-                    "$",
+                    root_path,
                     None,
                     next_id,
                     rows,
@@ -12020,12 +12047,12 @@ fn json_each_children(
         }
         Json::Array(items) => {
             for (i, v) in items.iter().enumerate() {
-                let fullkey = alloc::format!("$[{i}]");
+                let fullkey = alloc::format!("{root_path}[{i}]");
                 json_emit_node(
                     v,
                     Some(Value::Integer(i as i64)),
                     &fullkey,
-                    "$",
+                    root_path,
                     None,
                     next_id,
                     rows,
@@ -12033,9 +12060,30 @@ fn json_each_children(
             }
         }
         scalar => {
-            json_emit_node(scalar, None, "$", "$", None, next_id, rows);
+            json_emit_node(scalar, None, root_path, root_path, None, next_id, rows);
         }
     }
+}
+
+/// Split a JSON path (`$.a.b`, `$.a[2]`, `$[0]`) into its parent path and the
+/// final component rendered as a `json_tree` root key (a text member name or an
+/// integer array index). The bare root `$` yields `("$", None)`.
+fn split_json_path(path: &str) -> (alloc::string::String, Option<Value>) {
+    if path.ends_with(']') {
+        if let Some(open) = path.rfind('[') {
+            if let Ok(i) = path[open + 1..path.len() - 1].parse::<i64>() {
+                return (String::from(&path[..open]), Some(Value::Integer(i)));
+            }
+        }
+    }
+    if let Some(dot) = path.rfind('.') {
+        let name = path[dot + 1..].trim_matches('"');
+        return (
+            String::from(&path[..dot]),
+            Some(Value::Text(String::from(name))),
+        );
+    }
+    (String::from(path), None)
 }
 
 /// `json_tree`: emit `node` then recurse depth-first into its children.
