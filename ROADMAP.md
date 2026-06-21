@@ -378,10 +378,14 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
   holds the vtab's own columns; FTS5/R-Tree will declare module-specific shadow
   schemas on top of the same `VTabStore` mechanism.)*
 - **D3 — R-Tree** (smaller of the two; build on W1/W2). *Ref:* `rtree.c`.
-  - **D3a — module + correct results.** Parse `rtree(id, minX, maxX[, …])`,
-    store rows in shadow tables, answer queries by scan + filter (functionally
-    correct, differentially testable). *(Test graphite directly — confirm the CI
-    sqlite3 build has R-Tree before differential-comparing.)*
+  - **D3a — module + correct results. ✅ DONE.** Built-in `rtree` module
+    (`vtab.rs`, registered on every connection) on top of W1/W2: parses
+    `rtree(id, minX, maxX[, …])`, persists rows in `<name>_data`, answers spatial
+    queries by scan + the re-applied WHERE. Coordinates use sqlite's exact f32
+    directional rounding (`rtreeValueDown`/`Up`'s `1 ∓ 2⁻²³` nudge — min↓, max↑);
+    id is the integer rowid; rejects `min>max` and bad arity. Differentially clean
+    vs sqlite3 (`tests/rtree.rs`). *(The shadow table is W2a's `<name>_data`, not
+    sqlite's `_node`/`_rowid`/`_parent` — that byte-compat layout is D3c.)*
   - **D3b — `best_index` spatial pushdown** of the coordinate constraints.
   - **D3c — byte-compatible node format.** Pack bounding boxes into the
     `<name>_node` blob layout sqlite uses, so a graphite-written R-Tree round-trips
