@@ -188,6 +188,45 @@ fn match_column_filter_syntax() {
 }
 
 #[test]
+fn match_phrase_and_prefix_queries() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+        .unwrap();
+    c.execute(
+        "INSERT INTO t VALUES \
+         ('the quick brown fox'),('the brown quick cat'),('quick foxes run')",
+    )
+    .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        rows(&c, sql)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("not an integer rowid"),
+            })
+            .collect::<Vec<_>>()
+    };
+    // A quoted phrase requires the tokens to be adjacent and in order.
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH '\"quick brown\"'"),
+        [1]
+    );
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH '\"brown quick\"'"),
+        [2]
+    );
+    // A `token*` prefix matches any token starting with it.
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'fox*' ORDER BY rowid"),
+        [1, 3]
+    );
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'qu*' ORDER BY rowid"),
+        [1, 2, 3]
+    );
+}
+
+#[test]
 fn match_against_null_pattern_is_null() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")

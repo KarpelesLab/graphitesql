@@ -1160,29 +1160,94 @@ pub(crate) fn fts5_tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
-/// One term of an FTS5 query: a token to find, optionally restricted to a named
-/// column (`col:token`).
+/// One term of an FTS5 query: a phrase of one or more consecutive tokens,
+/// optionally restricted to a named column (`col:token`) and/or ending in a
+/// prefix token (`token*`).
 struct Fts5Term {
-    /// The column the token is scoped to (`col:token`), or `None` for any column.
+    /// The column the term is scoped to (`col:…`), or `None` for any column.
     column: Option<String>,
-    /// The (already tokenized/case-folded) token to look for.
-    token: String,
+    /// The tokens that must appear consecutively and in order. A bare token is a
+    /// one-element phrase; `"quick brown"` is a two-element phrase.
+    phrase: Vec<String>,
+    /// Whether the *last* token of the phrase is a prefix match (`token*`).
+    prefix: bool,
+}
+
+/// Whether `phrase` occurs in `doc` as a run of consecutive tokens (in order).
+/// When `prefix` is set, the final phrase token matches any document token that
+/// starts with it (`fox*` matches `foxes`).
+fn fts5_phrase_in(phrase: &[String], prefix: bool, doc: &[String]) -> bool {
+    if phrase.is_empty() || doc.len() < phrase.len() {
+        return false;
+    }
+    let last = phrase.len() - 1;
+    (0..=doc.len() - phrase.len()).any(|start| {
+        phrase.iter().enumerate().all(|(k, want)| {
+            let got = &doc[start + k];
+            if k == last && prefix {
+                got.starts_with(want.as_str())
+            } else {
+                got == want
+            }
+        })
+    })
 }
 
 /// Parse an FTS5 query string into its AND-ed terms. Each whitespace-separated
-/// word is either `column:token` (scoped) or a bare `token` (any column); the
-/// token half is tokenized, so punctuation is stripped and case folded.
+/// word is `[column:]body`, where `body` is a `"quoted phrase"` or a bare word
+/// optionally ending in `*` for a prefix match. Tokens are case-folded like the
+/// documents. (Boolean `AND`/`OR`/`NOT`/`NEAR` operators are not yet parsed — a
+/// bare `OR`/`NOT` is treated as an ordinary token.)
 fn fts5_parse_query(pattern: &str) -> Vec<Fts5Term> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
     let mut terms = Vec::new();
-    for word in pattern.split_whitespace() {
-        let (column, rest) = match word.split_once(':') {
-            Some((c, r)) if !c.is_empty() => (Some(String::from(c)), r),
-            _ => (None, word),
+    while i < n {
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // An optional `column:` prefix: a run of identifier chars then a colon.
+        let mut column = None;
+        let mut j = i;
+        while j < n && (chars[j].is_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        if j > i && j < n && chars[j] == ':' {
+            column = Some(chars[i..j].iter().collect());
+            i = j + 1;
+        }
+        // The body: a quoted phrase, or a bare word that may end in `*`.
+        let (text, prefix) = if i < n && chars[i] == '"' {
+            i += 1;
+            let start = i;
+            while i < n && chars[i] != '"' {
+                i += 1;
+            }
+            let body: String = chars[start..i].iter().collect();
+            if i < n {
+                i += 1; // closing quote
+            }
+            (body, false)
+        } else {
+            let start = i;
+            while i < n && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            let mut body: String = chars[start..i].iter().collect();
+            let prefix = body.ends_with('*');
+            if prefix {
+                body.pop();
+            }
+            (body, prefix)
         };
-        for token in fts5_tokenize(rest) {
+        let phrase = fts5_tokenize(&text);
+        if !phrase.is_empty() {
             terms.push(Fts5Term {
-                column: column.clone(),
-                token,
+                column,
+                phrase,
+                prefix,
             });
         }
     }
@@ -1191,11 +1256,12 @@ fn fts5_parse_query(pattern: &str) -> Vec<Fts5Term> {
 
 /// Whether the in-scope columns satisfy the FTS5 query `pattern`. `cols` is the
 /// `(name, text)` of each searchable column (one entry for a column-scoped
-/// `col MATCH …`, every column for a table-wide `tbl MATCH …`). Query terms are
+/// `col MATCH …`, every column for a table-wide `tbl MATCH …`). Terms are
 /// implicitly AND-ed (SQLite's default): the document matches when *every* term
-/// is found — a bare token in any in-scope column, a `col:token` term only in the
-/// column it names. A query with no tokens matches nothing. Phrase queries,
-/// `OR`/`NOT`/`NEAR`, and prefix tokens are not yet supported.
+/// is found — a bare token (or `token*` prefix, or `"quoted phrase"`) in any
+/// in-scope column, a `col:…` term only in the column it names. A query with no
+/// tokens matches nothing. Boolean `OR`/`NOT`/`NEAR` operators are not yet
+/// supported.
 pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)]) -> bool {
     let terms = fts5_parse_query(pattern);
     if terms.is_empty() {
@@ -1210,7 +1276,7 @@ pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)]) -> bo
             term.column
                 .as_deref()
                 .is_none_or(|c| name.eq_ignore_ascii_case(c))
-                && tokens.contains(&term.token)
+                && fts5_phrase_in(&term.phrase, term.prefix, tokens)
         })
     })
 }
@@ -1339,6 +1405,25 @@ mod tests {
         assert!(!fts5_query_matches("body:fox", &cols)); // fox is in title, not body
         assert!(fts5_query_matches("title:mixed body:dog", &cols)); // AND across columns
         assert!(!fts5_query_matches("title:dog", &cols)); // dog is in body, not title
+    }
+
+    #[test]
+    fn fts5_phrase_and_prefix_queries() {
+        let doc = [(
+            String::from("body"),
+            String::from("the quick brown fox runs"),
+        )];
+        // A quoted phrase requires consecutive, ordered tokens.
+        assert!(fts5_query_matches("\"quick brown\"", &doc));
+        assert!(!fts5_query_matches("\"brown quick\"", &doc)); // wrong order
+        assert!(!fts5_query_matches("\"quick fox\"", &doc)); // not adjacent
+                                                             // A `token*` prefix matches any token starting with it.
+        assert!(fts5_query_matches("fo*", &doc)); // fox
+        assert!(fts5_query_matches("run*", &doc)); // runs
+        assert!(!fts5_query_matches("cat*", &doc));
+        // Column-scoped phrase / prefix.
+        assert!(fts5_query_matches("body:\"quick brown\"", &doc));
+        assert!(fts5_query_matches("body:ru*", &doc));
     }
 
     #[test]
