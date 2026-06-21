@@ -267,6 +267,33 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 1)?;
             Value::Text(quote_value(&v[0]))
         }
+        "unistr" => {
+            // Decode `\uXXXX` / `\UXXXXXXXX` / `\\` escapes in the argument's
+            // text. NULL passes through; any other escape errors, as in SQLite.
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => Value::Text(unistr_decode(&eval::to_text(other))?),
+            }
+        }
+        "unistr_quote" => {
+            // Like quote(), except a text value containing a control character
+            // (< U+0020) is rendered as `unistr('…')` with those characters
+            // escaped `\uXXXX`. Non-text values match quote() exactly.
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Text(s) if s.chars().any(|c| (c as u32) < 0x20) => {
+                    Value::Text(unistr_quote_text(s))
+                }
+                other => Value::Text(quote_value(other)),
+            }
+        }
+        "subtype" => {
+            // The value's subtype. graphite tracks no subtypes, so this is
+            // always 0 (SQLite also returns 0 for ordinary, non-JSON values).
+            arity(&lname, args, 1)?;
+            Value::Integer(0)
+        }
         "sign" => {
             arity(&lname, args, 1)?;
             // Numeric (or losslessly-numeric text) only; otherwise NULL.
@@ -703,6 +730,73 @@ fn quote_value(v: &Value) -> String {
             s
         }
     }
+}
+
+/// Decode SQLite `unistr()` escapes: `\uXXXX` (4 hex), `\UXXXXXXXX` (8 hex), and
+/// `\\` (a literal backslash). Any other backslash sequence — including a `\u`/
+/// `\U` with too few hex digits or a trailing `\` — is an error, matching
+/// SQLite's "invalid Unicode escape". A code point Rust cannot represent (a lone
+/// surrogate or one past U+10FFFF) becomes the replacement char `U+FFFD`; SQLite
+/// emits raw WTF-8 there, an extreme edge graphite cannot store in a `String`.
+fn unistr_decode(s: &str) -> Result<String> {
+    let cs: alloc::vec::Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let invalid = || Error::Error(String::from("invalid Unicode escape"));
+    let hex_char = |cs: &[char], at: usize, n: usize| -> Option<u32> {
+        let slice = cs.get(at..at + n)?;
+        if !slice.iter().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let s: String = slice.iter().collect();
+        u32::from_str_radix(&s, 16).ok()
+    };
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '\\' {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        match cs.get(i + 1) {
+            Some('\\') => {
+                out.push('\\');
+                i += 2;
+            }
+            Some('u') => {
+                let cp = hex_char(&cs, i + 2, 4).ok_or_else(invalid)?;
+                out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                i += 6;
+            }
+            Some('U') => {
+                let cp = hex_char(&cs, i + 2, 8).ok_or_else(invalid)?;
+                out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                i += 10;
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(out)
+}
+
+/// Render a control-character-bearing text value as SQLite's `unistr('…')`: each
+/// character below U+0020 becomes `\uXXXX`, a backslash doubles, a single quote
+/// doubles, everything else (including non-ASCII) is kept literal.
+fn unistr_quote_text(s: &str) -> String {
+    let mut out = String::from("unistr('");
+    for c in s.chars() {
+        let cp = c as u32;
+        if cp < 0x20 {
+            out.push_str(&alloc::format!("\\u{cp:04x}"));
+        } else if c == '\\' {
+            out.push_str("\\\\");
+        } else if c == '\'' {
+            out.push_str("''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push_str("')");
+    out
 }
 
 /// Decode a hex string to bytes, returning `None` on malformed input. A faithful
