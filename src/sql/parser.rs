@@ -2252,6 +2252,20 @@ impl Parser {
                     "in" => (InfixOp::In { negated: false }, BP_EQ),
                     "like" => (InfixOp::Like { negated: false }, BP_EQ),
                     "glob" => (InfixOp::Binary(BinaryOp::Glob), BP_EQ),
+                    "match" => (
+                        InfixOp::Func {
+                            name: "match",
+                            negated: false,
+                        },
+                        BP_EQ,
+                    ),
+                    "regexp" => (
+                        InfixOp::Func {
+                            name: "regexp",
+                            negated: false,
+                        },
+                        BP_EQ,
+                    ),
                     "between" => (InfixOp::Between { negated: false }, BP_EQ),
                     "not" => (InfixOp::NotPrefixed, BP_EQ),
                     "isnull" => (InfixOp::IsNullKw { negated: false }, BP_EQ),
@@ -2322,6 +2336,11 @@ impl Parser {
                 self.pos += 1; // LIKE
                 self.parse_like(left, negated)
             }
+            InfixOp::Func { name, negated } => {
+                self.pos += 1; // the operator keyword
+                let right = self.expr_bp(bp + 1)?;
+                self.func_operator(name, left, right, negated)
+            }
             InfixOp::NotPrefixed => {
                 // NOT IN / NOT LIKE / NOT GLOB / NOT BETWEEN
                 self.pos += 1; // NOT
@@ -2341,6 +2360,12 @@ impl Parser {
                             right: Box::new(right),
                         }),
                     })
+                } else if self.eat_kw("match") {
+                    let right = self.expr_bp(bp + 1)?;
+                    self.func_operator("match", left, right, true)
+                } else if self.eat_kw("regexp") {
+                    let right = self.expr_bp(bp + 1)?;
+                    self.func_operator("regexp", left, right, true)
                 } else if self.eat_kw("null") {
                     // `expr NOT NULL` is the postfix form of `expr IS NOT NULL`.
                     Ok(Expr::IsNull {
@@ -2352,6 +2377,28 @@ impl Parser {
                 }
             }
         }
+    }
+
+    /// Build the function-call sugar `left OP right` ⇒ `name(right, left)`
+    /// (SQLite's `MATCH`/`REGEXP`), wrapping in `NOT` when negated.
+    fn func_operator(&self, name: &str, left: Expr, right: Expr, negated: bool) -> Result<Expr> {
+        let call = Expr::Function {
+            name: String::from(name),
+            distinct: false,
+            args: alloc::vec![right, left],
+            star: false,
+            filter: None,
+            order_by: Vec::new(),
+            over: None,
+        };
+        Ok(if negated {
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(call),
+            }
+        } else {
+            call
+        })
     }
 
     /// Parse the right-hand side of `text LIKE pattern [ESCAPE c]`. Without
@@ -2436,10 +2483,25 @@ impl Parser {
 enum InfixOp {
     Binary(BinaryOp),
     Is,
-    IsNullKw { negated: bool },
-    In { negated: bool },
-    Between { negated: bool },
-    Like { negated: bool },
+    IsNullKw {
+        negated: bool,
+    },
+    In {
+        negated: bool,
+    },
+    Between {
+        negated: bool,
+    },
+    Like {
+        negated: bool,
+    },
+    /// An operator that is sugar for a two-argument function call, `x OP y` ⇒
+    /// `name(y, x)` — SQLite's `MATCH`/`REGEXP` (which have no built-in
+    /// implementation; an application registers the function).
+    Func {
+        name: &'static str,
+        negated: bool,
+    },
     NotPrefixed,
 }
 
