@@ -11,17 +11,21 @@ A pure, safe, `no_std`-capable Rust re-implementation of **SQLite**, as a single
 crate, aiming for **byte-for-byte compatibility with the SQLite 3 database file
 format**.
 
-> **Status: read + write working, with broad SQL.** graphitesql opens real
-> SQLite files (incl. WAL-mode reads), **creates databases and runs
-> `CREATE TABLE`/`INSERT`/`UPDATE`/`DELETE` with transactions and secondary
-> indexes** — and the databases it writes are opened by the real `sqlite3` CLI
-> with `PRAGMA integrity_check = ok`. The SQL surface now covers joins,
-> aggregates, `GROUP BY`/`HAVING`, compound queries, (recursive) CTEs,
-> correlated subqueries & `EXISTS`, **window functions**, **date/time &
-> `printf`**, **`EXPLAIN QUERY PLAN`**, **foreign keys** (`PRAGMA foreign_keys`),
-> and **triggers** — all verified differentially against `sqlite3`. Still to
-> come: WAL writes, `WITHOUT ROWID`, and more (see the roadmap). The full build
-> plan and status is in **[ROADMAP.md](ROADMAP.md)**.
+> **Status: read + write working, with a broad SQL engine.** graphitesql opens
+> real SQLite files and **creates databases** that the real `sqlite3` CLI opens
+> with `PRAGMA integrity_check = ok`. Storage covers rowid **and `WITHOUT ROWID`**
+> tables, secondary/`UNIQUE`/partial/expression indexes, overflow pages, `VACUUM`,
+> the full **`auto_vacuum`** track, and the **WAL read *and* write** path. The SQL
+> surface covers `INNER`/`LEFT`/`RIGHT`/`FULL`/`NATURAL`/`USING` **joins**,
+> aggregates, `GROUP BY`/`HAVING`, compound queries, (recursive) **CTEs**,
+> correlated subqueries & `EXISTS`, **window functions**, UPSERT, `RETURNING`,
+> `STRICT` tables, generated columns, **triggers**, **foreign keys**, **ATTACH /
+> TEMP** multi-schema, **virtual tables**, and a wide function library — date/time,
+> `printf`, math, **JSON + JSONB**, and more — with an index-driven planner and
+> **`EXPLAIN QUERY PLAN`** matching sqlite. Everything is verified differentially
+> against `sqlite3` (a 1,600+ query corpus plus 140+ focused suites). What remains
+> is depth: FTS5 / R-Tree, the executor→VDBE migration, and concurrency — see
+> the full plan in **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why
 
