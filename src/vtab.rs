@@ -1160,18 +1160,59 @@ pub(crate) fn fts5_tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
-/// Whether `doc` satisfies the FTS5 query `pattern`. This slice models the common
-/// case: a bare list of tokens, implicitly AND-ed (SQLite's default), matching a
-/// document that contains *every* query token (case-insensitively). A query with
-/// no tokens matches nothing. Phrase queries, `OR`/`NOT`/`NEAR`, prefixes, and
-/// column filters are not yet supported.
-pub(crate) fn fts5_query_matches(pattern: &str, doc: &str) -> bool {
-    let needles = fts5_tokenize(pattern);
-    if needles.is_empty() {
+/// One term of an FTS5 query: a token to find, optionally restricted to a named
+/// column (`col:token`).
+struct Fts5Term {
+    /// The column the token is scoped to (`col:token`), or `None` for any column.
+    column: Option<String>,
+    /// The (already tokenized/case-folded) token to look for.
+    token: String,
+}
+
+/// Parse an FTS5 query string into its AND-ed terms. Each whitespace-separated
+/// word is either `column:token` (scoped) or a bare `token` (any column); the
+/// token half is tokenized, so punctuation is stripped and case folded.
+fn fts5_parse_query(pattern: &str) -> Vec<Fts5Term> {
+    let mut terms = Vec::new();
+    for word in pattern.split_whitespace() {
+        let (column, rest) = match word.split_once(':') {
+            Some((c, r)) if !c.is_empty() => (Some(String::from(c)), r),
+            _ => (None, word),
+        };
+        for token in fts5_tokenize(rest) {
+            terms.push(Fts5Term {
+                column: column.clone(),
+                token,
+            });
+        }
+    }
+    terms
+}
+
+/// Whether the in-scope columns satisfy the FTS5 query `pattern`. `cols` is the
+/// `(name, text)` of each searchable column (one entry for a column-scoped
+/// `col MATCH …`, every column for a table-wide `tbl MATCH …`). Query terms are
+/// implicitly AND-ed (SQLite's default): the document matches when *every* term
+/// is found — a bare token in any in-scope column, a `col:token` term only in the
+/// column it names. A query with no tokens matches nothing. Phrase queries,
+/// `OR`/`NOT`/`NEAR`, and prefix tokens are not yet supported.
+pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)]) -> bool {
+    let terms = fts5_parse_query(pattern);
+    if terms.is_empty() {
         return false;
     }
-    let haystack = fts5_tokenize(doc);
-    needles.iter().all(|n| haystack.contains(n))
+    let tokenized: Vec<(&str, Vec<String>)> = cols
+        .iter()
+        .map(|(name, text)| (name.as_str(), fts5_tokenize(text)))
+        .collect();
+    terms.iter().all(|term| {
+        tokenized.iter().any(|(name, tokens)| {
+            term.column
+                .as_deref()
+                .is_none_or(|c| name.eq_ignore_ascii_case(c))
+                && tokens.contains(&term.token)
+        })
+    })
 }
 
 impl Fts5Module {
@@ -1279,11 +1320,25 @@ mod tests {
 
     #[test]
     fn fts5_query_matches_are_token_anded() {
-        let doc = "the quick brown fox";
-        assert!(fts5_query_matches("fox", doc));
-        assert!(fts5_query_matches("QUICK fox", doc)); // case-insensitive AND
-        assert!(!fts5_query_matches("quick zebra", doc)); // one token missing
-        assert!(!fts5_query_matches("", doc)); // empty query matches nothing
+        let doc = [(String::from("body"), String::from("the quick brown fox"))];
+        assert!(fts5_query_matches("fox", &doc));
+        assert!(fts5_query_matches("QUICK fox", &doc)); // case-insensitive AND
+        assert!(!fts5_query_matches("quick zebra", &doc)); // one token missing
+        assert!(!fts5_query_matches("", &doc)); // empty query matches nothing
+    }
+
+    #[test]
+    fn fts5_column_filters_scope_tokens() {
+        let cols = [
+            (String::from("title"), String::from("Mixed Fox")),
+            (String::from("body"), String::from("and the dog")),
+        ];
+        // A bare token matches in any column; `col:token` only in that column.
+        assert!(fts5_query_matches("fox", &cols));
+        assert!(fts5_query_matches("title:fox", &cols));
+        assert!(!fts5_query_matches("body:fox", &cols)); // fox is in title, not body
+        assert!(fts5_query_matches("title:mixed body:dog", &cols)); // AND across columns
+        assert!(!fts5_query_matches("title:dog", &cols)); // dog is in body, not title
     }
 
     #[test]

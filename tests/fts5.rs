@@ -153,6 +153,41 @@ fn match_queries_tokens() {
 }
 
 #[test]
+fn match_column_filter_syntax() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+        .unwrap();
+    c.execute(
+        "INSERT INTO t VALUES \
+         ('Hello World','the quick brown fox'),\
+         ('Goodbye','the lazy dog'),\
+         ('Mixed Fox','and Dog')",
+    )
+    .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        rows(&c, sql)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("not an integer rowid"),
+            })
+            .collect::<Vec<_>>()
+    };
+    // `col:token` in a table-wide MATCH restricts the token to that column.
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'body:dog' ORDER BY rowid"),
+        [2, 3]
+    );
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'title:fox'"), [3]);
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'title:hello'"), [1]);
+    // Column-filtered terms AND together across columns.
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'body:dog title:mixed'"),
+        [3]
+    );
+}
+
+#[test]
 fn match_against_null_pattern_is_null() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
