@@ -139,6 +139,31 @@ pub struct Connection {
     /// that follows `USING` in `CREATE VIRTUAL TABLE`. Seeded with the built-in
     /// `series` module; a public registration API is roadmap D4.
     vtab_registry: VTabRegistry,
+    /// State for `random()`/`randomblob()`, advanced one SplitMix64 step per
+    /// value. Seeded from the system clock under `std` (so each process run
+    /// differs, like SQLite reseeding from the OS) and from a fixed constant in
+    /// `no_std` builds (which have no entropy source) — non-determinism that no
+    /// differential test can observe either way.
+    rng_state: core::cell::Cell<u64>,
+}
+
+/// Initial seed for a connection's `random()` generator. Under `std` it mixes
+/// the wall clock so repeated invocations of the binary produce different
+/// sequences; `no_std` builds, lacking any entropy source, fall back to a fixed
+/// constant (the SplitMix64 golden-ratio increment).
+fn initial_rng_seed() -> u64 {
+    #[cfg(feature = "std")]
+    {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        nanos ^ 0x9E37_79B9_7F4A_7C15
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        0x9E37_79B9_7F4A_7C15
+    }
 }
 
 /// Which database an operation targets: `main`, the lazily-created `temp`
@@ -208,6 +233,7 @@ impl Connection {
             total_changes: core::cell::Cell::new(0),
             read_default: core::cell::Cell::new(DbRef::Main),
             vtab_registry: VTabRegistry::with_builtins(),
+            rng_state: core::cell::Cell::new(initial_rng_seed()),
         })
     }
 
@@ -236,6 +262,7 @@ impl Connection {
             total_changes: core::cell::Cell::new(0),
             read_default: core::cell::Cell::new(DbRef::Main),
             vtab_registry: VTabRegistry::with_builtins(),
+            rng_state: core::cell::Cell::new(initial_rng_seed()),
         })
     }
 
@@ -1805,6 +1832,11 @@ impl Connection {
                     ColumnConstraint::Generated { expr, .. } if expr_has_subquery(expr) => {
                         return Err(Error::Error(
                             "subqueries prohibited in generated columns".into(),
+                        ));
+                    }
+                    ColumnConstraint::Generated { expr, .. } if expr_is_nondeterministic(expr) => {
+                        return Err(Error::Error(
+                            "non-deterministic functions prohibited in generated columns".into(),
                         ));
                     }
                     _ => {}
@@ -3933,6 +3965,19 @@ impl Connection {
             return Err(Error::Error(format!("index {} already exists", ci.name)));
         }
         let tmeta = self.table_meta(&ci.table, None)?;
+        // SQLite rejects non-deterministic functions in an index expression (or a
+        // partial-index predicate): the stored key could never match a recomputed
+        // probe. Reject before building anything.
+        if ci.columns.iter().any(|t| expr_is_nondeterministic(&t.expr))
+            || ci
+                .where_clause
+                .as_ref()
+                .is_some_and(expr_is_nondeterministic)
+        {
+            return Err(Error::Error(
+                "non-deterministic functions prohibited in index expressions".into(),
+            ));
+        }
         let (cols, key_exprs, colls) = self.index_key_spec(&tmeta, ci)?;
         if key_exprs.is_some() && tmeta.without_rowid {
             return Err(Error::Unsupported(
@@ -10018,6 +10063,26 @@ fn expr_has_subquery(e: &Expr) -> bool {
     found
 }
 
+/// Whether `e` calls a non-deterministic function — one that can return a
+/// different value for the same inputs. SQLite prohibits these in contexts that
+/// must be reproducible (index expressions, generated columns): an index built
+/// over `random()` would never match a recomputed probe. Only the unambiguous
+/// per-call-varying builtins are flagged here.
+fn expr_is_nondeterministic(e: &Expr) -> bool {
+    let mut found = false;
+    window::visit(e, &mut |n| {
+        if let Expr::Function { name, .. } = n {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "random" | "randomblob" | "last_insert_rowid" | "changes" | "total_changes"
+            ) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
 /// The rigid column type of a `STRICT` table column.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StrictType {
@@ -10128,6 +10193,18 @@ impl eval::Subqueries for Connection {
     }
     fn total_changes(&self) -> i64 {
         self.total_changes.get()
+    }
+    fn next_random(&self) -> i64 {
+        // SplitMix64: advance a 64-bit counter by the golden-ratio increment,
+        // then avalanche. Good distribution, tiny state, no_std-friendly, and
+        // works from any seed (including 0).
+        let s = self.rng_state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.rng_state.set(s);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        z as i64
     }
     fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value> {
         self.with_outer_frame(outer, |params| {

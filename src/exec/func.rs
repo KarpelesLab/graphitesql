@@ -11,6 +11,11 @@ use crate::value::Value;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// SQLite's default `SQLITE_MAX_LENGTH`: the largest string/blob a single value
+/// may hold. `zeroblob`/`randomblob` error with "string or blob too big" past it
+/// rather than attempting a multi-gigabyte allocation.
+const MAX_BLOB_LEN: usize = 1_000_000_000;
+
 /// Names that *can* be aggregates (used for catalog/name checks).
 pub fn is_aggregate(name: &str) -> bool {
     matches!(
@@ -55,6 +60,33 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 _ => s.total_changes(),
             });
             return Ok(Value::Integer(n));
+        }
+        "random" => {
+            arity(&lname, args, 0)?;
+            return Ok(Value::Integer(
+                ctx.subqueries.map_or(0, |s| s.next_random()),
+            ));
+        }
+        "randomblob" => {
+            arity(&lname, args, 1)?;
+            // SQLite coerces the argument to an integer (NULL/non-numeric text
+            // become 0, reals truncate) and clamps N < 1 to a single byte — so
+            // randomblob(NULL) is a 1-byte blob, not NULL.
+            let n = eval::to_i64(&eval::eval(&args[0], ctx)?);
+            let len = if n < 1 { 1 } else { n as usize };
+            if len > MAX_BLOB_LEN {
+                return Err(Error::Error("string or blob too big".into()));
+            }
+            let mut bytes = Vec::new();
+            if let Some(s) = ctx.subqueries {
+                while bytes.len() < len {
+                    bytes.extend_from_slice(&s.next_random().to_le_bytes());
+                }
+                bytes.truncate(len);
+            } else {
+                bytes.resize(len, 0);
+            }
+            return Ok(Value::Blob(bytes));
         }
         _ => {}
     }
@@ -224,6 +256,9 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 Value::Null => Value::Null,
                 other => {
                     let n = eval::to_i64(other).max(0) as usize;
+                    if n > MAX_BLOB_LEN {
+                        return Err(Error::Error("string or blob too big".into()));
+                    }
                     Value::Blob(alloc::vec![0u8; n])
                 }
             }

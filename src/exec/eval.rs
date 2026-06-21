@@ -49,6 +49,12 @@ pub trait Subqueries {
     fn total_changes(&self) -> i64 {
         0
     }
+    /// One pseudo-random `i64`, advancing the connection's generator — backs
+    /// `random()` and `randomblob()`. The default (no connection in scope, e.g.
+    /// rowless constant evaluation) is a fixed 0.
+    fn next_random(&self) -> i64 {
+        0
+    }
 }
 
 /// A column's type affinity (SQLite, `datatype3.html` §3).
