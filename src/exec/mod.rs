@@ -5027,15 +5027,35 @@ impl Connection {
                     return Err(Error::Error(format!("duplicate column name: {new}")));
                 }
                 ct.columns[pos].name = new.clone();
-                // Update table-level PK/UNIQUE column lists that name the column.
+                // Propagate the rename into the table's own expressions and
+                // column lists, which still reference the old name (otherwise the
+                // CHECK / generated / default would break after the rename).
+                let rename = |e: &mut Expr| rename_column_ref(e, &a.table, old, new);
+                for col in &mut ct.columns {
+                    for k in &mut col.constraints {
+                        match k {
+                            ColumnConstraint::Check(e) | ColumnConstraint::Default(e) => rename(e),
+                            ColumnConstraint::Generated { expr, .. } => rename(expr),
+                            _ => {}
+                        }
+                    }
+                }
                 for tc in &mut ct.constraints {
-                    let names = match tc {
-                        TableConstraint::PrimaryKey(n) | TableConstraint::Unique(n) => n,
-                        _ => continue,
-                    };
-                    for nm in names {
-                        if nm.eq_ignore_ascii_case(old) {
-                            *nm = new.clone();
+                    match tc {
+                        TableConstraint::PrimaryKey(n) | TableConstraint::Unique(n) => {
+                            for nm in n {
+                                if nm.eq_ignore_ascii_case(old) {
+                                    *nm = new.clone();
+                                }
+                            }
+                        }
+                        TableConstraint::Check(e) => rename(e),
+                        TableConstraint::ForeignKey(fk) => {
+                            for nm in &mut fk.columns {
+                                if nm.eq_ignore_ascii_case(old) {
+                                    *nm = new.clone();
+                                }
+                            }
                         }
                     }
                 }
@@ -12953,6 +12973,36 @@ fn table_info_columns(extended: bool) -> Vec<String> {
         c.push(String::from("hidden"));
     }
     c
+}
+
+/// Rename every reference to column `old` (of table `table`) to `new` within an
+/// expression — both unqualified (`old`) and table-qualified (`table.old`) forms.
+/// Used to keep CHECK / generated / DEFAULT expressions valid across an
+/// `ALTER TABLE … RENAME COLUMN`. (CHECK/generated/default forbid subqueries, so
+/// the non-recursing `replace_expr` covers them.)
+fn rename_column_ref(e: &mut Expr, table: &str, old: &str, new: &str) {
+    window::replace_expr(
+        e,
+        &Expr::Column {
+            table: None,
+            column: String::from(old),
+        },
+        &Expr::Column {
+            table: None,
+            column: String::from(new),
+        },
+    );
+    window::replace_expr(
+        e,
+        &Expr::Column {
+            table: Some(String::from(table)),
+            column: String::from(old),
+        },
+        &Expr::Column {
+            table: Some(String::from(table)),
+            column: String::from(new),
+        },
+    );
 }
 
 /// Best-effort label for an unaliased result expression.

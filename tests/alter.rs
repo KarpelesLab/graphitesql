@@ -222,3 +222,38 @@ fn rename_collisions_are_rejected() {
     assert!(c.execute("ALTER TABLE t RENAME TO t").is_err());
     assert!(c.execute("ALTER TABLE t RENAME TO renamed").is_ok());
 }
+
+#[test]
+fn rename_column_keeps_check_generated_and_default_working() {
+    // After RENAME COLUMN, the table's own CHECK / generated / DEFAULT
+    // expressions still refer to the column (by its new name), so the table
+    // keeps working — matching sqlite, where it previously broke with
+    // "no such column".
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b CHECK(b > a), c AS (a + 1), d DEFAULT 7)")
+        .unwrap();
+    c.execute("ALTER TABLE t RENAME COLUMN a TO x").unwrap();
+
+    // CHECK still enforced under the new name.
+    assert!(c.execute("INSERT INTO t(x, b) VALUES (5, 3)").is_err());
+    c.execute("INSERT INTO t(x, b) VALUES (3, 5)").unwrap();
+    // Generated column and default still compute.
+    assert_eq!(
+        c.query("SELECT x, b, c, d FROM t").unwrap().rows,
+        [vec![
+            Value::Integer(3),
+            Value::Integer(5),
+            Value::Integer(4),
+            Value::Integer(7),
+        ]]
+    );
+
+    // A table-level CHECK and a composite PK list are renamed too.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE u(a, b, CHECK(a < b), PRIMARY KEY(a, b))")
+        .unwrap();
+    c.execute("ALTER TABLE u RENAME COLUMN b TO y").unwrap();
+    assert!(c.execute("INSERT INTO u VALUES (3, 1)").is_err()); // 3 < 1 false
+    c.execute("INSERT INTO u VALUES (1, 3)").unwrap();
+    assert!(c.execute("INSERT INTO u VALUES (1, 3)").is_err()); // PK(a,y) dup
+}
