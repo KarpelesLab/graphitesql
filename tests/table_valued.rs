@@ -221,3 +221,25 @@ fn json_tree_roots_at_a_path_argument() {
     assert_eq!(render(&r.rows[1][1]), "1");
     assert_eq!(render(&r.rows[2][3]), "$.x[1]");
 }
+
+#[test]
+fn explain_query_plan_over_a_virtual_table() {
+    // Previously EXPLAIN QUERY PLAN over a virtual table errored ("schema sql is
+    // not CREATE TABLE"); it now renders sqlite's VIRTUAL TABLE node shape.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE s USING series(1, 5)")
+        .unwrap();
+    let detail = |sql: &str| -> String {
+        match c.query(sql).unwrap().rows.last().unwrap().last().unwrap() {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    assert_eq!(
+        detail("EXPLAIN QUERY PLAN SELECT * FROM s"),
+        "SCAN s VIRTUAL TABLE INDEX 0:"
+    );
+    // A pushed constraint shows in the index string (graphite's own plan number).
+    assert!(detail("EXPLAIN QUERY PLAN SELECT * FROM s WHERE value > 2")
+        .starts_with("SCAN s VIRTUAL TABLE INDEX "));
+}

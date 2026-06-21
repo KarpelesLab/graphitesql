@@ -7038,6 +7038,58 @@ impl Connection {
     }
 
     /// Emit query-plan nodes for one SELECT under `parent`.
+    /// EXPLAIN QUERY PLAN detail for a virtual-table scan: sqlite's
+    /// `SCAN <label> VIRTUAL TABLE INDEX <idxNum>:<idxStr>`. The module's
+    /// `best_index` chooses the plan from the offered `WHERE` constraints; a
+    /// persistent module (which scans its backing table) reports a plain scan.
+    fn eqp_vtab_detail(
+        &self,
+        name: &str,
+        label: &str,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<String> {
+        use crate::schema::ObjectType;
+        let plain = || alloc::format!("SCAN {label} VIRTUAL TABLE INDEX 0:");
+        let cvt = self
+            .schema
+            .objects()
+            .iter()
+            .find(|o| o.obj_type == ObjectType::Table && o.name.eq_ignore_ascii_case(name))
+            .and_then(|o| o.sql.as_deref())
+            .and_then(|s| match sql::parse_one(s) {
+                Ok(Statement::CreateVirtualTable(cvt)) => Some(cvt),
+                _ => None,
+            });
+        let Some(cvt) = cvt else { return Ok(plain()) };
+        let Some(module) = self.vtab_registry.get(&cvt.module) else {
+            return Ok(plain());
+        };
+        // A persistent module bypasses best_index (it scans `<name>_data`).
+        if module.dyn_persistent() {
+            return Ok(plain());
+        }
+        let arg_refs: Vec<&str> = cvt.args.iter().map(String::as_str).collect();
+        let schema = module.dyn_connect(&arg_refs)?;
+        let columns: Vec<ColumnInfo> = schema
+            .columns
+            .iter()
+            .map(|n| ColumnInfo {
+                name: n.clone(),
+                table: label.to_string(),
+                affinity: eval::Affinity::Blob,
+                collation: crate::value::Collation::default(),
+            })
+            .collect();
+        let (constraints, _) = collect_vtab_constraints(sel, &columns, params);
+        let plan = module.dyn_best_index(&constraints)?;
+        Ok(alloc::format!(
+            "SCAN {label} VIRTUAL TABLE INDEX {}:{}",
+            plan.idx_num,
+            plan.idx_str.as_deref().unwrap_or("")
+        ))
+    }
+
     fn eqp_select(
         &self,
         sel: &Select,
@@ -7059,9 +7111,25 @@ impl Connection {
         let Some(from) = &sel.from else {
             return Ok(()); // SELECT with no FROM => no scan node
         };
+        let label = eqp_label(&from.first);
+        // A virtual table scans through its module, not a b-tree — render sqlite's
+        // `VIRTUAL TABLE INDEX <n>:<str>` node and skip the regular-table planning
+        // (which would otherwise parse the CREATE VIRTUAL TABLE as a CREATE TABLE
+        // and fail).
+        if from.joins.is_empty()
+            && from.first.subquery.is_none()
+            && from.first.tvf_args.is_none()
+            && self.lookup_cte(&from.first.name, None).is_none()
+            && self.is_virtual_table(&from.first.name)
+        {
+            let detail = self.eqp_vtab_detail(&from.first.name, &label, sel, params)?;
+            let id = *next_id;
+            *next_id += 1;
+            out.push((id, parent, detail));
+            return Ok(());
+        }
         // First source.
         let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
-        let label = eqp_label(&from.first);
         // A top-level OR of seekable disjuncts is a MULTI-INDEX OR plan (multiple
         // rows); otherwise a single SCAN/SEARCH node.
         if from.joins.is_empty()
