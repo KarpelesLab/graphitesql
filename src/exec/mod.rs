@@ -4524,17 +4524,26 @@ impl Connection {
         let (module_name, args, col_names) = self.vtab_meta(&ins.table)?;
         let ncols = col_names.len();
         // Map the (possibly explicit) column list onto declared column positions.
-        let target: Vec<usize> = if ins.columns.is_empty() {
-            (0..ncols).collect()
+        // `None` marks a `rowid`/`_rowid_`/`oid` term (a vtab's hidden rowid),
+        // whose value becomes the inserted row's explicit rowid.
+        let target: Vec<Option<usize>> = if ins.columns.is_empty() {
+            (0..ncols).map(Some).collect()
         } else {
             ins.columns
                 .iter()
-                .map(|name| {
-                    col_names
-                        .iter()
-                        .position(|c| c.eq_ignore_ascii_case(name))
-                        .ok_or_else(|| Error::Error(format!("no such column: {name}")))
-                })
+                .map(
+                    |name| match col_names.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+                        Some(p) => Ok(Some(p)),
+                        None if matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "rowid" | "_rowid_" | "oid"
+                        ) =>
+                        {
+                            Ok(None)
+                        }
+                        None => Err(Error::Error(format!("no such column: {name}"))),
+                    },
+                )
                 .collect::<Result<_>>()?
         };
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -4552,14 +4561,19 @@ impl Connection {
                 )));
             }
             let mut values = alloc::vec![Value::Null; ncols];
+            let mut rowid = None;
             for (j, expr) in row.iter().enumerate() {
                 let ctx = EvalCtx::rowless(params).with_subqueries(self);
-                values[target[j]] = eval::eval(expr, &ctx)?;
+                let v = eval::eval(expr, &ctx)?;
+                match target[j] {
+                    Some(col) => values[col] = v,
+                    None => rowid = Some(eval::to_i64(&v)),
+                }
             }
             module.dyn_update(
                 &arg_refs,
                 VTabChange::Insert {
-                    rowid: None,
+                    rowid,
                     values: &values,
                 },
             )?;

@@ -185,3 +185,23 @@ fn delete_and_update_a_writable_virtual_table() {
     assert_eq!(c.execute("DELETE FROM m").unwrap(), 2);
     assert!(c.query("SELECT * FROM m").unwrap().rows.is_empty());
 }
+
+#[test]
+fn insert_with_an_explicit_rowid() {
+    let mut c = Connection::open_memory().unwrap();
+    c.register_module("mem", MemModule::default()).unwrap();
+    c.execute("CREATE VIRTUAL TABLE m USING mem()").unwrap();
+    // An explicit `rowid` term sets the row's rowid (the module honors it).
+    c.execute("INSERT INTO m(rowid, k, v) VALUES (100, 'x', 1)")
+        .unwrap();
+    c.execute("INSERT INTO m(k, v) VALUES ('y', 2)").unwrap();
+    assert_eq!(
+        c.query("SELECT rowid, k FROM m ORDER BY rowid")
+            .unwrap()
+            .rows,
+        [
+            vec![Value::Integer(1), Value::Text("y".into())],
+            vec![Value::Integer(100), Value::Text("x".into())],
+        ]
+    );
+}
