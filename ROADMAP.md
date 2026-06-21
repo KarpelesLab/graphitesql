@@ -175,11 +175,12 @@ expressions.
   single-column index seeks equality / range / `IN` with correct results and the
   `SEARCH … USING INDEX` plan; a `DESC` second column in a composite eq-prefix +
   range seek is handled too. Differentially identical to sqlite.
-- **A3b — partial/expression index for range/IN seeks.** Range half ✅ DONE:
-  `try_index_range` consults a new `partial_expr_range` (a bound on a partial
-  index's leading column with its predicate guaranteed, or on an expression
-  index's keyed expression), with `eqp_access` in lockstep — `SEARCH … USING INDEX
-  i (b>?)` / `(<expr>>?)`. *Remaining: the `IN`-seek half (`try_index_in`).*
+- **A3b — partial/expression index for range/IN seeks. ✅ DONE.** Both
+  `try_index_range` (via `partial_expr_range`) and `try_index_in` (via
+  `partial_pred_guaranteed` + `find_expr_in_values`) now seek a partial index's
+  leading column (predicate proven by the WHERE) or an expression index's keyed
+  expression, for `<`/`<=`/`>`/`>=` and `IN (…)`. `eqp_access` in lockstep —
+  `SEARCH … USING INDEX i (b>?)`, `(<expr>>?)`, `(b=?)`, `(<expr>=?)`.
 - **A4 — `NULLIF` collation in `func.rs`. ✅ DONE / verified.** `nullif(x, y)`
   already resolves the comparison collation via `resolve_collation` (explicit
   `COLLATE` on either operand, then a column's declared collation, then BINARY);
@@ -457,9 +458,9 @@ smaller pieces to ship it. Suggested order:
    needs scope-aware column resolution, not the token rewrite A-rn2 used.
 4. **Planner leftovers** (perf-only, EQP-gated) — **B0b-iii** (ORDER BY from a
    WHERE-chosen index; needs a shared seek-index-choice helper), the mixed-
-   direction partial sort, **B1b** join reordering, **A3b**'s remaining `IN`-seek
-   half, **B4** `sqlite_stat4`. (**A2** DESC seeks, the composite eq-prefix +
-   trailing-range seek, **B0b-i** multi-term ORDER BY, and **B0b-ii** covered-query
+   direction partial sort, **B1b** join reordering, **B4** `sqlite_stat4`. (**A2**
+   DESC seeks, the composite eq-prefix + trailing-range seek, **A3b** partial/expr
+   range·IN seeks, **B0b-i** multi-term ORDER BY, and **B0b-ii** covered-query
    covering scan are done.)
 5. **D2 — FTS5** (D2a–D2e) — the larger module, once W1/W2 and R-Tree have
    exercised the writable-vtab path.
