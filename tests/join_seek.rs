@@ -130,39 +130,51 @@ fn coerced_keys_match_like_sqlite() {
 }
 
 #[test]
-fn non_ipk_join_column_still_scans() {
+fn non_ipk_join_column_uses_an_automatic_index() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, k)")
         .unwrap();
     c.execute("CREATE TABLE t(a, uid)").unwrap();
     c.execute("INSERT INTO v VALUES(1,100),(2,200)").unwrap();
     c.execute("INSERT INTO t VALUES(10,100),(20,200)").unwrap();
-    // Joining on a non-IPK column (`v.k`) is not a rowid seek: still a SCAN.
+    // Joining on a non-IPK column (`v.k`) is not a rowid seek; the executor
+    // hash-joins it, reported (as sqlite does) as an automatic covering index.
     assert_eq!(
         detail(
             &c,
             "EXPLAIN QUERY PLAN SELECT t.a FROM t JOIN v ON t.uid=v.k"
         ),
-        ["SCAN t", "SCAN v"]
+        [
+            "SCAN t",
+            "BLOOM FILTER ON v (k=?)",
+            "SEARCH v USING AUTOMATIC COVERING INDEX (k=?)",
+        ]
     );
 }
 
 #[test]
-fn without_rowid_inner_still_scans() {
+fn without_rowid_inner_uses_an_automatic_index() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE w(id INTEGER PRIMARY KEY, n) WITHOUT ROWID")
         .unwrap();
     c.execute("CREATE TABLE t(a, uid)").unwrap();
     c.execute("INSERT INTO w VALUES(1,'x'),(2,'y')").unwrap();
     c.execute("INSERT INTO t VALUES(10,1),(20,2)").unwrap();
-    // A WITHOUT ROWID table has no rowid IPK: the join stays on the scan path,
-    // and the results are still correct.
+    // graphite does not yet seek a WITHOUT ROWID table's PRIMARY KEY in a join,
+    // so it hash-joins instead — an honest automatic-index plan. (sqlite seeks
+    // the PK here: `SEARCH w USING PRIMARY KEY (id=?)`; matching that needs a
+    // WITHOUT ROWID PK join-seek, a separate execution optimization.) Results
+    // are correct either way.
     assert_eq!(
         detail(
             &c,
             "EXPLAIN QUERY PLAN SELECT t.a,w.n FROM t JOIN w ON t.uid=w.id"
         ),
-        ["SCAN t", "SCAN w"]
+        [
+            "SCAN t",
+            "BLOOM FILTER ON w (id=?)",
+            "SEARCH w USING AUTOMATIC COVERING INDEX (id=?)",
+        ]
     );
     assert_eq!(
         rows(

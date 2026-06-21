@@ -138,11 +138,13 @@ fn null_key_never_matches() {
 }
 
 #[test]
-fn non_indexed_join_column_still_scans() {
+fn non_indexed_join_column_uses_an_automatic_index() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, k, n)")
         .unwrap();
-    // No index on `k`: the join column is neither rowid nor indexed.
+    // No index on `k`: the join column is neither rowid nor indexed, so the
+    // executor builds a transient hash index — reported (as sqlite does) as a
+    // BLOOM FILTER plus an AUTOMATIC COVERING INDEX seek.
     c.execute("CREATE TABLE t(a, uk)").unwrap();
     c.execute("INSERT INTO u VALUES(1,100,'x'),(2,200,'y')")
         .unwrap();
@@ -152,7 +154,11 @@ fn non_indexed_join_column_still_scans() {
             &c,
             "EXPLAIN QUERY PLAN SELECT t.a,u.n FROM t JOIN u ON t.uk=u.k"
         ),
-        ["SCAN t", "SCAN u"]
+        [
+            "SCAN t",
+            "BLOOM FILTER ON u (k=?)",
+            "SEARCH u USING AUTOMATIC COVERING INDEX (k=?)",
+        ]
     );
     // Results are still correct on the scan path.
     assert_eq!(

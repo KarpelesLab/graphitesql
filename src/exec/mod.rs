@@ -6147,30 +6147,76 @@ impl Connection {
         if !from.joins.is_empty() {
             let mut left_columns = self.resolve_join_source(&from.first, params)?.0;
             for join in &from.joins {
-                let id = *next_id;
-                *next_id += 1;
                 let label = eqp_label(&join.table);
-                let (detail, jcols) = if let Some((_, inner_meta)) =
+                // Most joins emit one plan row; an automatic-index (hash) join
+                // emits two (a BLOOM FILTER then the SEARCH), so collect details.
+                let (details, jcols): (Vec<String>, Vec<ColumnInfo>) = if let Some((
+                    _,
+                    inner_meta,
+                )) =
                     self.rowid_join_seek(join, &left_columns)
                 {
                     (
-                        alloc::format!("SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"),
+                        alloc::vec![alloc::format!(
+                            "SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"
+                        )],
                         inner_meta.columns,
                     )
                 } else if let Some((_, inner_meta, idx)) = self.index_join_seek(join, &left_columns)
                 {
                     let col = &inner_meta.columns[idx.cols[0]].name;
                     (
-                        alloc::format!("SEARCH {label} USING INDEX {} ({col}=?)", idx.name),
+                        alloc::vec![alloc::format!(
+                            "SEARCH {label} USING INDEX {} ({col}=?)",
+                            idx.name
+                        )],
                         inner_meta.columns,
                     )
                 } else {
-                    (
-                        alloc::format!("SCAN {label}"),
-                        self.resolve_join_source(&join.table, params)?.0,
-                    )
+                    let jcols = self.resolve_join_source(&join.table, params)?.0;
+                    // The executor builds a transient hash index for an INNER/LEFT
+                    // equi-join (`ON l.x = r.y`) on an otherwise-unindexed inner
+                    // table; SQLite reports that as a BLOOM FILTER + AUTOMATIC
+                    // COVERING INDEX seek (NATURAL/USING and non-equi joins stay a
+                    // plain SCAN, as graphite runs them with a nested loop).
+                    let auto_col = if join.natural
+                        || !join.using.is_empty()
+                        || !matches!(join.kind, JoinKind::Inner | JoinKind::Left)
+                    {
+                        None
+                    } else {
+                        join.on.as_ref().and_then(|on| {
+                            let mut combined = left_columns.clone();
+                            combined.extend(jcols.iter().cloned());
+                            join_equi_cols(on, &combined, left_columns.len())
+                                .map(|(_, ri)| jcols[ri].name.clone())
+                        })
+                    };
+                    match auto_col {
+                        Some(col) => {
+                            let suffix = if matches!(join.kind, JoinKind::Left) {
+                                " LEFT-JOIN"
+                            } else {
+                                ""
+                            };
+                            (
+                                alloc::vec![
+                                    alloc::format!("BLOOM FILTER ON {label} ({col}=?)"),
+                                    alloc::format!(
+                                        "SEARCH {label} USING AUTOMATIC COVERING INDEX ({col}=?){suffix}"
+                                    ),
+                                ],
+                                jcols,
+                            )
+                        }
+                        None => (alloc::vec![alloc::format!("SCAN {label}")], jcols),
+                    }
                 };
-                out.push((id, parent, detail));
+                for detail in details {
+                    let id = *next_id;
+                    *next_id += 1;
+                    out.push((id, parent, detail));
+                }
                 let left_width = left_columns.len();
                 left_columns.extend(jcols);
                 // Mirror the executor's NATURAL / USING coalescing: each join
