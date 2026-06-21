@@ -6297,6 +6297,21 @@ impl Connection {
                         )],
                         inner_meta.columns,
                     )
+                } else if let Some((_, inner_meta)) =
+                    self.without_rowid_pk_join_seek(join, &left_columns)
+                {
+                    let col = &inner_meta.columns[inner_meta.storage_order[0]].name;
+                    let suffix = if matches!(join.kind, JoinKind::Left) {
+                        " LEFT-JOIN"
+                    } else {
+                        ""
+                    };
+                    (
+                        alloc::vec![alloc::format!(
+                            "SEARCH {label} USING PRIMARY KEY ({col}=?){suffix}"
+                        )],
+                        inner_meta.columns,
+                    )
                 } else {
                     let jcols = self.resolve_join_source(&join.table, params)?.0;
                     // The executor builds a transient hash index for an INNER/LEFT
@@ -8204,6 +8219,22 @@ impl Connection {
                 continue;
             }
 
+            // WITHOUT ROWID inner table joined on its leading PRIMARY KEY: seek the
+            // clustered b-tree per outer row instead of materializing it.
+            if let Some((outer_col, inner_meta)) = self.without_rowid_pk_join_seek(join, &columns) {
+                let (new_columns, joined) = self.exec_without_rowid_pk_join_seek(
+                    join,
+                    &columns,
+                    &rows,
+                    outer_col,
+                    &inner_meta,
+                    params,
+                )?;
+                columns = new_columns;
+                rows = joined;
+                continue;
+            }
+
             let (jcols, jrows) = self.resolve_join_source(&join.table, params)?;
 
             let left_width = columns.len();
@@ -8671,6 +8702,127 @@ impl Connection {
             i.partial.is_none() && i.key_exprs.is_none() && i.cols.first() == Some(&inner_idx)
         })?;
         Some((outer, meta, idx))
+    }
+
+    /// The WITHOUT ROWID companion of [`index_join_seek`](Self::index_join_seek):
+    /// when the inner table is WITHOUT ROWID and the `ON` equates an outer column
+    /// with its *leading* PRIMARY KEY column, the inner row is found by seeking
+    /// the clustered b-tree per outer row (`SEARCH … USING PRIMARY KEY (col=?)`)
+    /// instead of scanning. Callers consult this after `rowid_join_seek` and
+    /// `index_join_seek` (which both decline WITHOUT ROWID tables). Returns
+    /// `(outer column index, inner meta)`.
+    fn without_rowid_pk_join_seek(
+        &self,
+        join: &Join,
+        left_columns: &[ColumnInfo],
+    ) -> Option<(usize, TableMeta)> {
+        if !matches!(join.kind, JoinKind::Inner | JoinKind::Left)
+            || join.natural
+            || !join.using.is_empty()
+        {
+            return None;
+        }
+        let on = join.on.as_ref()?;
+        let tref = &join.table;
+        if tref.subquery.is_some()
+            || tref.tvf_args.is_some()
+            || self.is_pragma_tvf(tref)
+            || tref.schema.is_some()
+            || self.lookup_cte(&tref.name, tref.alias.as_deref()).is_some()
+            || self.is_view(&tref.name)
+            || self.unqualified_db(&tref.name) != DbRef::Main
+        {
+            return None;
+        }
+        let meta = self.table_meta(&tref.name, tref.alias.as_deref()).ok()?;
+        if !meta.without_rowid || meta.pk_len == 0 {
+            return None;
+        }
+        let lead_pk = meta.storage_order[0];
+        let mut on = on;
+        while let Expr::Paren(inner) = on {
+            on = inner;
+        }
+        let left_width = left_columns.len();
+        let mut combined = left_columns.to_vec();
+        combined.extend(meta.columns.iter().cloned());
+        let (a, b) = match on {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => (col_index(left, &combined)?, col_index(right, &combined)?),
+            _ => return None,
+        };
+        let (inner_idx, outer) = if a >= left_width && b < left_width {
+            (a - left_width, b)
+        } else if b >= left_width && a < left_width {
+            (b - left_width, a)
+        } else {
+            return None;
+        };
+        if inner_idx != lead_pk {
+            return None;
+        }
+        Some((outer, meta))
+    }
+
+    /// Execute a WITHOUT ROWID PK-seek join (decided by
+    /// [`without_rowid_pk_join_seek`](Self::without_rowid_pk_join_seek)): for each
+    /// outer row, seek the inner table's clustered b-tree by the join key, decode
+    /// each matching record to a row, combine, and re-evaluate the full `ON`.
+    /// INNER drops an unmatched outer row; LEFT NULL-extends it.
+    fn exec_without_rowid_pk_join_seek(
+        &self,
+        join: &Join,
+        columns: &[ColumnInfo],
+        rows: &[Vec<Value>],
+        outer_col: usize,
+        inner_meta: &TableMeta,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        let mut new_columns = columns.to_vec();
+        new_columns.extend(inner_meta.columns.iter().cloned());
+        let n_jcols = inner_meta.columns.len();
+        let on = join.on.as_ref();
+        let is_left = matches!(join.kind, JoinKind::Left);
+        let lead = inner_meta.storage_order[0];
+        let coll = wr_storage_collations(inner_meta)[0];
+        let src = self.backend.source();
+        let mut joined: Vec<Vec<Value>> = Vec::new();
+        for left in rows {
+            let mut matched = false;
+            if !matches!(left[outer_col], Value::Null) {
+                let key = [inner_meta.columns[lead]
+                    .affinity
+                    .coerce(left[outer_col].clone())];
+                let records =
+                    crate::btree::index_seek_records(src, inner_meta.root, &key, &[coll])?;
+                for storage in records {
+                    let mut inner = unpermute_row(inner_meta, storage);
+                    self.compute_generated(inner_meta, &mut inner, params)?;
+                    let mut row = left.clone();
+                    row.extend(inner);
+                    let keep = match on {
+                        Some(on) => {
+                            let ctx = row_ctx(&row, &new_columns, None, params);
+                            eval::truth(&eval::eval(on, &ctx)?) == Some(true)
+                        }
+                        None => true,
+                    };
+                    if keep {
+                        joined.push(row);
+                        matched = true;
+                    }
+                }
+            }
+            if !matched && is_left {
+                let mut combined = left.clone();
+                combined.extend(core::iter::repeat_n(Value::Null, n_jcols));
+                joined.push(combined);
+            }
+        }
+        Ok((new_columns, joined))
     }
 
     /// Execute one index-seek join (decided by

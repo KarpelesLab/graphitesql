@@ -123,6 +123,54 @@ fn leading_pk_range_walks_the_primary_key() {
 }
 
 #[test]
+fn join_on_leading_pk_seeks_the_inner_table() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE w(id PRIMARY KEY, n) WITHOUT ROWID")
+        .unwrap();
+    c.execute("INSERT INTO w VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    c.execute("CREATE TABLE t(a, uid)").unwrap();
+    c.execute("INSERT INTO t VALUES (10,1),(20,3),(30,9)")
+        .unwrap();
+    // INNER: the unmatched outer row (uid 9) drops out.
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT t.a, w.n FROM t JOIN w ON t.uid=w.id"
+        ),
+        "SCAN t | SEARCH w USING PRIMARY KEY (id=?)"
+    );
+    assert_eq!(
+        c.query("SELECT t.a, w.n FROM t JOIN w ON t.uid=w.id ORDER BY t.a")
+            .unwrap()
+            .rows,
+        [
+            vec![Value::Integer(10), Value::Text("a".into())],
+            vec![Value::Integer(20), Value::Text("c".into())],
+        ]
+    );
+    // LEFT: the unmatched outer row is NULL-extended; the plan carries the
+    // LEFT-JOIN marker.
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT t.a, w.n FROM t LEFT JOIN w ON t.uid=w.id"
+        ),
+        "SCAN t | SEARCH w USING PRIMARY KEY (id=?) LEFT-JOIN"
+    );
+    assert_eq!(
+        c.query("SELECT t.a, w.n FROM t LEFT JOIN w ON t.uid=w.id ORDER BY t.a")
+            .unwrap()
+            .rows,
+        [
+            vec![Value::Integer(10), Value::Text("a".into())],
+            vec![Value::Integer(20), Value::Text("c".into())],
+            vec![Value::Integer(30), Value::Null],
+        ]
+    );
+}
+
+#[test]
 fn text_and_collated_primary_keys() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE PRIMARY KEY, n) WITHOUT ROWID")

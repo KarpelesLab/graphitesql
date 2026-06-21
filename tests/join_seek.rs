@@ -153,28 +153,21 @@ fn non_ipk_join_column_uses_an_automatic_index() {
 }
 
 #[test]
-fn without_rowid_inner_uses_an_automatic_index() {
+fn without_rowid_inner_seeks_its_primary_key() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE w(id INTEGER PRIMARY KEY, n) WITHOUT ROWID")
         .unwrap();
     c.execute("CREATE TABLE t(a, uid)").unwrap();
     c.execute("INSERT INTO w VALUES(1,'x'),(2,'y')").unwrap();
     c.execute("INSERT INTO t VALUES(10,1),(20,2)").unwrap();
-    // graphite does not yet seek a WITHOUT ROWID table's PRIMARY KEY in a join,
-    // so it hash-joins instead — an honest automatic-index plan. (sqlite seeks
-    // the PK here: `SEARCH w USING PRIMARY KEY (id=?)`; matching that needs a
-    // WITHOUT ROWID PK join-seek, a separate execution optimization.) Results
-    // are correct either way.
+    // Joining a WITHOUT ROWID table on its leading PRIMARY KEY seeks the
+    // clustered b-tree per outer row, matching sqlite.
     assert_eq!(
         detail(
             &c,
             "EXPLAIN QUERY PLAN SELECT t.a,w.n FROM t JOIN w ON t.uid=w.id"
         ),
-        [
-            "SCAN t",
-            "BLOOM FILTER ON w (id=?)",
-            "SEARCH w USING AUTOMATIC COVERING INDEX (id=?)",
-        ]
+        ["SCAN t", "SEARCH w USING PRIMARY KEY (id=?)"]
     );
     assert_eq!(
         rows(
