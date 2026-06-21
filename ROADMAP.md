@@ -248,10 +248,13 @@ the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep)
 - **B0b-i — multi-term `ORDER BY` via a multi-column index prefix. ✅ DONE.**
   `order_index_scan` now matches an `ORDER BY (c1, c2, …)` against an index whose
   leading columns are those columns (uniform direction, matching collations,
-  default NULLs) and walks the index instead of sorting. *Remaining sub-case: a
-  **mixed-direction** ORDER BY whose leading terms an index satisfies — sqlite
-  walks the index for the prefix and emits `USE TEMP B-TREE FOR LAST TERM OF ORDER
-  BY` (a partial sort); graphite still full-sorts. Results correct; EQP differs.*
+  default NULLs) and walks the index instead of sorting. The **mixed-direction
+  partial sort** over a `WHERE` seek is now reported like sqlite too: when the
+  seek walks a leading prefix of the `ORDER BY` in order but a later term breaks
+  (e.g. `WHERE a>? ORDER BY a, b DESC`), EXPLAIN reads `USE TEMP B-TREE FOR LAST
+  n TERM[S] OF ORDER BY` (via `seek_order_prefix`, shared with B0b-iii). *(A
+  mixed-direction partial sort over a no-`WHERE` full-index scan still full-sorts;
+  results are correct in every case — only that EQP label differs.)*
 - **B0b-ii — covered query over an index. ✅ DONE (EQP/read side).** A no-`WHERE`
   query whose every referenced column is held by exactly one full index now reads
   from that index (`covering_scan` + `query_cols_covered`), reporting `SCAN …

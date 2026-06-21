@@ -7478,12 +7478,23 @@ impl Connection {
                 }
             }
         }
-        // ORDER BY that we satisfy with an in-memory sort — unless the rowid scan
-        // already yields the requested order (no temp b-tree then, like sqlite).
+        // ORDER BY that we satisfy with an in-memory sort — unless the scan already
+        // yields the requested order (no temp b-tree then, like sqlite). When a
+        // seek walks a *prefix* of the ORDER BY in order, only the trailing terms
+        // are sorted, which sqlite reports as "LAST n TERM[S] OF ORDER BY".
         if !sel.order_by.is_empty() && self.order_satisfied_by_scan(sel, params).is_none() {
+            let n = sel.order_by.len();
+            let sorted = n - self
+                .seek_order_prefix(sel, params)
+                .map_or(0, |(k, _)| k.min(n));
+            let detail = match sorted {
+                _ if sorted >= n => String::from("USE TEMP B-TREE FOR ORDER BY"),
+                1 => String::from("USE TEMP B-TREE FOR LAST TERM OF ORDER BY"),
+                _ => alloc::format!("USE TEMP B-TREE FOR LAST {sorted} TERMS OF ORDER BY"),
+            };
             let id = *next_id;
             *next_id += 1;
-            out.push((id, parent, String::from("USE TEMP B-TREE FOR ORDER BY")));
+            out.push((id, parent, detail));
         }
         Ok(())
     }
@@ -9160,137 +9171,32 @@ impl Connection {
         if let Some(s) = self.order_index_scan(sel) {
             return Some(s.descending);
         }
-        if let Some(d) = self.order_satisfied_by_seek(sel, params) {
-            return Some(d);
+        // A `WHERE` seek that walks an index in key order satisfies the ORDER BY
+        // when *every* term matches the walked columns (B0b-iii).
+        match self.seek_order_prefix(sel, params) {
+            Some((k, descending)) if k == sel.order_by.len() => Some(descending),
+            _ => None,
         }
-        self.order_satisfied_by_range_seek(sel, params)
     }
 
-    /// B0b-iii: a `WHERE`-equality seek can also satisfy the `ORDER BY` when the
-    /// ordered columns are exactly the index columns that follow the equality
-    /// prefix. `try_index_lookup` seeks that prefix and walks the index in key
-    /// order, so within the fixed prefix the rows already arrive ordered by the
-    /// next columns — no sort needed. Returns `Some(descending)` only in the
-    /// *unambiguous* case of exactly one plain secondary index whose leading
-    /// column the `WHERE` constrains by equality (so the executor must pick it);
-    /// otherwise `None` (→ the always-correct sort). A too-loose result would be
-    /// caught by the ORDER-BY-guarded differential corpus.
-    fn order_satisfied_by_seek(&self, sel: &Select, params: &Params) -> Option<bool> {
-        let from = sel.from.as_ref()?;
-        if !from.joins.is_empty() {
-            return None;
-        }
-        let t = &from.first;
-        if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
-            return None;
-        }
-        // A hint biases the seek's index choice; don't second-guess it here.
-        if from.first.index_hint.is_some() {
-            return None;
-        }
-        let where_expr = sel.where_clause.as_ref()?;
-        if sel.order_by.is_empty()
-            || !sel.group_by.is_empty()
-            || sel.having.is_some()
-            || sel.distinct
-            || self.has_aggregate(sel)
-            || window::has_window(sel)
-        {
-            return None;
-        }
-        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
-            return None;
-        }
-        let label = t.alias.as_deref().unwrap_or(&t.name);
-        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
-        if meta.without_rowid {
-            return None;
-        }
-        // Resolve ORDER BY to plain columns, uniform direction, default NULLs (the
-        // index walk yields NULLs first ascending, last descending).
-        let descending = sel.order_by[0].descending;
-        let mut ord_cols: Vec<usize> = Vec::with_capacity(sel.order_by.len());
-        for term in &sel.order_by {
-            if term.descending != descending || term.nulls_first.is_some() {
-                return None;
-            }
-            let (tbl, col_name) = match &term.expr {
-                Expr::Column { table, column } => (table.as_deref(), column.as_str()),
-                _ => return None,
-            };
-            if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
-                return None;
-            }
-            ord_cols.push(
-                meta.columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(col_name))?,
-            );
-        }
-        // Equality-constrained columns. A rowid/IPK equality makes the seek return
-        // at most one row — a different path; bail to the cheap, correct sort.
-        let mut eqs: Vec<(usize, Value)> = Vec::new();
-        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
-        eqs.retain(|(_, v)| !matches!(v, Value::Null));
-        if eqs.is_empty() {
-            return None;
-        }
-        if meta
-            .ipk
-            .is_some_and(|ipk| eqs.iter().any(|(c, _)| *c == ipk))
-        {
-            return None;
-        }
-        // Exactly one plain secondary index whose leading column is eq-constrained,
-        // so try_index_lookup must seek it (no ambiguous cost-based choice).
-        let mut seekable = self.indexes_of(&t.name).ok()?.into_iter().filter(|idx| {
-            idx.partial.is_none()
-                && idx.key_exprs.is_none()
-                && idx
-                    .cols
-                    .first()
-                    .is_some_and(|c| eqs.iter().any(|(col, _)| col == c))
-        });
-        let idx = seekable.next()?;
-        if seekable.next().is_some() {
-            return None;
-        }
-        // The equality prefix length: the longest leading run of eq-constrained
-        // index columns.
-        let prefix = idx
-            .cols
-            .iter()
-            .take_while(|&&c| eqs.iter().any(|(col, _)| *col == c))
-            .count();
-        // The ORDER BY columns must be exactly the index columns following the
-        // prefix, each compared under the column's own collation.
-        if prefix + ord_cols.len() > idx.cols.len() {
-            return None;
-        }
-        for (i, &oc) in ord_cols.iter().enumerate() {
-            if idx.cols[prefix + i] != oc
-                || idx.collations[prefix + i] != meta.columns[oc].collation
-            {
-                return None;
-            }
-        }
-        Some(descending)
-    }
-
-    /// B0b-iii (range case): a leading-column range seek ([`try_index_range`])
-    /// walks its index in key order, so an `ORDER BY` over that index's columns is
-    /// already satisfied — no sort needed. Mirrors `try_index_range`'s choice
-    /// conservatively so it never claims an order the executor won't produce:
-    /// fires only with **no** column equality (so `try_index_lookup` declines and
-    /// the executor reaches `try_index_range`), **no** partial/expression index on
-    /// the table (so the equality path's `partial_expr_lookup` also declines and
-    /// the chosen index is plain), **no** range on the rowid (which would take the
-    /// clustered-b-tree path instead), and **exactly one** plain secondary index
-    /// whose leading column is the range column and whose columns are the uniform-
-    /// direction `ORDER BY` prefix. Returns `Some(descending)`, else `None` (→ the
-    /// always-correct sort). Any looseness is caught by the ORDER-BY differential
-    /// corpus, which compares row order against `sqlite3`.
-    fn order_satisfied_by_range_seek(&self, sel: &Select, params: &Params) -> Option<bool> {
+    /// How many leading `ORDER BY` terms a `WHERE` seek already produces in order,
+    /// and the walk direction — the shared core of B0b-iii (full match → skip the
+    /// sort) and the partial-sort EXPLAIN label. A seek walks its index in key
+    /// order, so the rows arrive ordered by the index columns that follow any
+    /// equality prefix; this returns `(k, descending)` where `k` of the ORDER BY
+    /// terms match that walk (uniform direction, matching collation, default
+    /// NULLs). `k == order_by.len()` means no sort is needed; `0 < k < n` is a
+    /// partial sort. Returns `None` when no unambiguous seek applies.
+    ///
+    /// Mirrors `try_index_lookup` / `try_index_range`'s index choice conservatively
+    /// so it never claims an order the executor will not produce: an equality seek
+    /// needs exactly one plain secondary index whose leading column the `WHERE`
+    /// constrains by equality (and no rowid equality); a range seek needs no column
+    /// equality at all (so `try_index_lookup` declines), no partial/expression
+    /// index on the table, no range on the rowid, and exactly one plain secondary
+    /// index whose leading column is range-constrained. Any looseness only mislabels
+    /// EXPLAIN (the sort still runs), and the ORDER-BY differential corpus catches it.
+    fn seek_order_prefix(&self, sel: &Select, params: &Params) -> Option<(usize, bool)> {
         let from = sel.from.as_ref()?;
         if !from.joins.is_empty() {
             return None;
@@ -9321,77 +9227,95 @@ impl Connection {
         if meta.without_rowid {
             return None;
         }
-        // No column equality at all: ensures `try_index_lookup` declines (its
-        // `eqs` are empty), so the executor reaches `try_index_range`.
+        let indexes = self.indexes_of(&t.name).ok()?;
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
         eqs.retain(|(_, v)| !matches!(v, Value::Null));
-        if !eqs.is_empty() {
-            return None;
-        }
-        // Resolve ORDER BY to plain columns, uniform direction, default NULLs (the
-        // index walk yields NULLs first ascending, last descending).
-        let descending = sel.order_by[0].descending;
-        let mut ord_cols: Vec<usize> = Vec::with_capacity(sel.order_by.len());
-        for term in &sel.order_by {
-            if term.descending != descending || term.nulls_first.is_some() {
+        // The columns the chosen seek walks in index-ascending order (those after
+        // any equality prefix), with their index collations.
+        let (walk_cols, walk_colls): (&[usize], &[crate::value::Collation]) = if !eqs.is_empty() {
+            // Equality seek (try_index_lookup). A rowid/IPK equality returns at most
+            // one row — a different path; bail to the cheap, correct sort.
+            if meta
+                .ipk
+                .is_some_and(|ipk| eqs.iter().any(|(c, _)| *c == ipk))
+            {
                 return None;
+            }
+            let mut seekable = indexes.iter().filter(|idx| {
+                idx.partial.is_none()
+                    && idx.key_exprs.is_none()
+                    && idx
+                        .cols
+                        .first()
+                        .is_some_and(|c| eqs.iter().any(|(col, _)| col == c))
+            });
+            let idx = seekable.next()?;
+            if seekable.next().is_some() {
+                return None;
+            }
+            let prefix = idx
+                .cols
+                .iter()
+                .take_while(|&&c| eqs.iter().any(|(col, _)| *col == c))
+                .count();
+            (&idx.cols[prefix..], &idx.collations[prefix..])
+        } else {
+            // Range seek (try_index_range). Guard so the chosen index is exactly the
+            // one the executor walks (see the doc comment).
+            let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                alloc::collections::BTreeMap::new();
+            collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+            if ranges.is_empty() {
+                return None;
+            }
+            if meta.ipk.is_some_and(|ipk| ranges.contains_key(&ipk)) {
+                return None;
+            }
+            if indexes
+                .iter()
+                .any(|idx| idx.partial.is_some() || idx.key_exprs.is_some())
+            {
+                return None;
+            }
+            let mut seekable = indexes
+                .iter()
+                .filter(|idx| idx.cols.first().is_some_and(|c| ranges.contains_key(c)));
+            let idx = seekable.next()?;
+            if seekable.next().is_some() {
+                return None;
+            }
+            (&idx.cols[..], &idx.collations[..])
+        };
+        // Count the leading ORDER BY terms the walk already produces: each must be a
+        // plain column of this table, in the walk's uniform direction (default
+        // NULLs), matching the next walked column under its own collation.
+        let descending = sel.order_by[0].descending;
+        let mut k = 0;
+        for term in &sel.order_by {
+            if k >= walk_cols.len() || term.descending != descending || term.nulls_first.is_some() {
+                break;
             }
             let (tbl, col_name) = match &term.expr {
                 Expr::Column { table, column } => (table.as_deref(), column.as_str()),
-                _ => return None,
+                _ => break,
             };
             if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
-                return None;
+                break;
             }
-            ord_cols.push(
-                meta.columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(col_name))?,
-            );
-        }
-        // The range-constrained columns.
-        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
-            alloc::collections::BTreeMap::new();
-        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
-        if ranges.is_empty() {
-            return None;
-        }
-        // A range on the rowid would take the clustered-b-tree (rowid-order) path,
-        // not a secondary index — don't claim the index order then.
-        if meta.ipk.is_some_and(|ipk| ranges.contains_key(&ipk)) {
-            return None;
-        }
-        // No partial/expression index on the table: guarantees `try_index_lookup`'s
-        // `partial_expr_lookup` also declines, and that the plain index chosen below
-        // is exactly the one `try_index_range` walks.
-        let indexes = self.indexes_of(&t.name).ok()?;
-        if indexes
-            .iter()
-            .any(|idx| idx.partial.is_some() || idx.key_exprs.is_some())
-        {
-            return None;
-        }
-        // Exactly one plain secondary index whose leading column is range-
-        // constrained, so `try_index_range`'s first-match choice is unambiguous.
-        let mut seekable = indexes
-            .iter()
-            .filter(|idx| idx.cols.first().is_some_and(|c| ranges.contains_key(c)));
-        let idx = seekable.next()?;
-        if seekable.next().is_some() {
-            return None;
-        }
-        // The ORDER BY columns must be the index columns from the start, each
-        // compared under the column's own collation.
-        if ord_cols.len() > idx.cols.len() {
-            return None;
-        }
-        for (i, &oc) in ord_cols.iter().enumerate() {
-            if idx.cols[i] != oc || idx.collations[i] != meta.columns[oc].collation {
-                return None;
+            let Some(oc) = meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            else {
+                break;
+            };
+            if walk_cols[k] != oc || walk_colls[k] != meta.columns[oc].collation {
+                break;
             }
+            k += 1;
         }
-        Some(descending)
+        Some((k, descending))
     }
 
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {

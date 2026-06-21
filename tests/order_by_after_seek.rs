@@ -146,6 +146,62 @@ fn range_seek_with_wrong_order_still_sorts() {
 }
 
 #[test]
+fn partial_sort_reports_last_terms() {
+    // When a seek satisfies a leading prefix of the ORDER BY but a later term
+    // breaks (here a descending term against an ascending walk), only the trailing
+    // terms are sorted — sqlite's "USE TEMP B-TREE FOR LAST n TERM(S) OF ORDER BY".
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE u(a, b, x, y)").unwrap();
+    c.execute("CREATE INDEX iu ON u(a, b, x)").unwrap();
+    c.execute("INSERT INTO u VALUES (1,2,3,'p'),(1,5,6,'q'),(2,1,1,'r')")
+        .unwrap();
+    // One trailing term needs sorting (b DESC against the ascending walk).
+    assert_eq!(
+        plan(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT y FROM u WHERE a > 0 ORDER BY a, b DESC"
+        ),
+        [
+            "SEARCH u USING INDEX iu (a>?)",
+            "USE TEMP B-TREE FOR LAST TERM OF ORDER BY"
+        ]
+    );
+    // Two trailing terms after the satisfied leading `a`.
+    assert_eq!(
+        plan(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT y FROM u WHERE a > 0 ORDER BY a, b DESC, x"
+        ),
+        [
+            "SEARCH u USING INDEX iu (a>?)",
+            "USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY"
+        ]
+    );
+    // Equality prefix then one in-order column then a reversed one.
+    assert_eq!(
+        plan(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT y FROM u WHERE a = 1 ORDER BY b, x DESC"
+        ),
+        [
+            "SEARCH u USING INDEX iu (a=?)",
+            "USE TEMP B-TREE FOR LAST TERM OF ORDER BY"
+        ]
+    );
+    // No leading term satisfied → the whole ORDER BY is sorted.
+    assert_eq!(
+        plan(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT y FROM u WHERE a > 0 ORDER BY b, a"
+        ),
+        [
+            "SEARCH u USING INDEX iu (a>?)",
+            "USE TEMP B-TREE FOR ORDER BY"
+        ]
+    );
+}
+
+#[test]
 fn ambiguous_index_choice_falls_back_to_a_sort() {
     let mut c = setup();
     // A second index whose leading column `a` is also eq-seekable makes the
