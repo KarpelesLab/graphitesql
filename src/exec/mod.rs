@@ -1549,24 +1549,24 @@ impl Connection {
         }
         let affected = match stmt {
             Statement::CreateTable(ct) => {
-                self.exec_create_table(&ct, sql.trim())?;
+                self.exec_create_table(&ct, ddl_text(sql))?;
                 0
             }
             Statement::Insert(_) | Statement::Delete(_) | Statement::Update(_) => unreachable!(),
             Statement::CreateIndex(ci) => {
-                self.exec_create_index(&ci, sql.trim())?;
+                self.exec_create_index(&ci, ddl_text(sql))?;
                 0
             }
             Statement::CreateView(cv) => {
-                self.exec_create_view(&cv, sql.trim())?;
+                self.exec_create_view(&cv, ddl_text(sql))?;
                 0
             }
             Statement::CreateTrigger(ct) => {
-                self.exec_create_trigger(&ct, sql.trim())?;
+                self.exec_create_trigger(&ct, ddl_text(sql))?;
                 0
             }
             Statement::CreateVirtualTable(cvt) => {
-                self.exec_create_virtual_table(&cvt, sql.trim())?;
+                self.exec_create_virtual_table(&cvt, ddl_text(sql))?;
                 0
             }
             Statement::Drop(d) => {
@@ -5006,6 +5006,17 @@ impl Connection {
                             }
                         }
                         true
+                    } else if is_text(&cols[0], "view") {
+                        // A view whose SELECT references the renamed table: rewrite
+                        // the table name throughout its stored body (formatting
+                        // preserved), so `SELECT … FROM v` keeps working.
+                        match cols.get(4).cloned() {
+                            Some(Value::Text(vsql)) if view_uses_table(&vsql, &old) => {
+                                cols[4] = Value::Text(rewrite_ident_tokens(&vsql, &old, &new_name));
+                                true
+                            }
+                            _ => false,
+                        }
                     } else {
                         false
                     }
@@ -13003,6 +13014,232 @@ fn rename_column_ref(e: &mut Expr, table: &str, old: &str, new: &str) {
             column: String::from(new),
         },
     );
+}
+
+/// Rename every reference to table `old` → `new` throughout a `Select`: its
+/// `FROM` table references and every table-qualified `old.col` / `old.*`, recursing
+/// into subqueries, CTE bodies, and compound parts. Used to keep a dependent view
+/// body valid across `ALTER TABLE … RENAME TO`. A same-level CTE named `old`
+/// shadows the table, so `FROM old`/`old.*` there is left alone.
+fn rename_table_in_select(sel: &mut Select, old: &str, new: &str) {
+    let shadowed = sel.ctes.iter().any(|c| c.name.eq_ignore_ascii_case(old));
+    for cte in &mut sel.ctes {
+        rename_table_in_select(&mut cte.select, old, new);
+    }
+    if let Some(from) = &mut sel.from {
+        rename_table_in_ref(&mut from.first, old, new, shadowed);
+        for j in &mut from.joins {
+            rename_table_in_ref(&mut j.table, old, new, shadowed);
+            if let Some(on) = &mut j.on {
+                rename_table_in_expr(on, old, new);
+            }
+        }
+    }
+    for rc in &mut sel.columns {
+        match rc {
+            ResultColumn::Expr { expr, .. } => rename_table_in_expr(expr, old, new),
+            ResultColumn::TableWildcard(t) if !shadowed && t.eq_ignore_ascii_case(old) => {
+                *t = String::from(new);
+            }
+            _ => {}
+        }
+    }
+    if let Some(w) = &mut sel.where_clause {
+        rename_table_in_expr(w, old, new);
+    }
+    for e in &mut sel.group_by {
+        rename_table_in_expr(e, old, new);
+    }
+    if let Some(h) = &mut sel.having {
+        rename_table_in_expr(h, old, new);
+    }
+    for t in &mut sel.order_by {
+        rename_table_in_expr(&mut t.expr, old, new);
+    }
+    for (_, ws) in &mut sel.window_defs {
+        rename_table_in_window(ws, old, new);
+    }
+    if let Some(e) = &mut sel.limit {
+        rename_table_in_expr(e, old, new);
+    }
+    if let Some(e) = &mut sel.offset {
+        rename_table_in_expr(e, old, new);
+    }
+    for (_, comp) in &mut sel.compound {
+        rename_table_in_select(comp, old, new);
+    }
+}
+
+/// Rename a table reference within a `FROM` source (recursing into a derived
+/// subquery). A real table named `old` (not schema-qualified, not shadowed by a
+/// same-level CTE) is repointed to `new`.
+fn rename_table_in_ref(tref: &mut TableRef, old: &str, new: &str, shadowed: bool) {
+    if let Some(sub) = &mut tref.subquery {
+        rename_table_in_select(sub, old, new);
+    } else if tref.schema.is_none() && !shadowed && tref.name.eq_ignore_ascii_case(old) {
+        tref.name = String::from(new);
+    }
+}
+
+/// Rename `old` → `new` in a window spec's `PARTITION BY` / `ORDER BY` expressions.
+fn rename_table_in_window(ws: &mut WindowSpec, old: &str, new: &str) {
+    for e in &mut ws.partition_by {
+        rename_table_in_expr(e, old, new);
+    }
+    for t in &mut ws.order_by {
+        rename_table_in_expr(&mut t.expr, old, new);
+    }
+}
+
+/// Rename a table qualifier `old.col` → `new.col` throughout an expression,
+/// recursing into every sub-expression and nested subquery.
+fn rename_table_in_expr(e: &mut Expr, old: &str, new: &str) {
+    match e {
+        Expr::Column { table: Some(t), .. } if t.eq_ignore_ascii_case(old) => {
+            *t = String::from(new)
+        }
+        Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::Collate { expr, .. } => rename_table_in_expr(expr, old, new),
+        Expr::Binary { left, right, .. } => {
+            rename_table_in_expr(left, old, new);
+            rename_table_in_expr(right, old, new);
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            over,
+            ..
+        } => {
+            for a in args {
+                rename_table_in_expr(a, old, new);
+            }
+            if let Some(f) = filter {
+                rename_table_in_expr(f, old, new);
+            }
+            for t in order_by {
+                rename_table_in_expr(&mut t.expr, old, new);
+            }
+            if let Some(w) = over {
+                rename_table_in_window(w, old, new);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            rename_table_in_expr(expr, old, new);
+            for a in list {
+                rename_table_in_expr(a, old, new);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rename_table_in_expr(expr, old, new);
+            rename_table_in_expr(low, old, new);
+            rename_table_in_expr(high, old, new);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                rename_table_in_expr(o, old, new);
+            }
+            for (w, t) in when_then {
+                rename_table_in_expr(w, old, new);
+                rename_table_in_expr(t, old, new);
+            }
+            if let Some(el) = else_result {
+                rename_table_in_expr(el, old, new);
+            }
+        }
+        Expr::RowValue(items) => {
+            for i in items {
+                rename_table_in_expr(i, old, new);
+            }
+        }
+        Expr::Subquery(s) => rename_table_in_select(s, old, new),
+        Expr::Exists { select, .. } => rename_table_in_select(select, old, new),
+        Expr::InSelect { expr, select, .. } => {
+            rename_table_in_expr(expr, old, new);
+            rename_table_in_select(select, old, new);
+        }
+    }
+}
+
+/// The text stored in `sqlite_master.sql` for a DDL statement: the source from
+/// its first real token (skipping leading comments and whitespace) to the trimmed
+/// end. SQLite records the schema text from the `CREATE` keyword onward, so an
+/// inter-statement `-- comment` preceding the statement is not captured.
+fn ddl_text(sql: &str) -> &str {
+    match sql::token::tokenize(sql) {
+        Ok(toks) if !toks.is_empty() => sql[toks[0].start..].trim_end(),
+        _ => sql.trim(),
+    }
+}
+
+/// Does this stored `CREATE VIEW` body reference table `name`? Used to decide
+/// whether an `ALTER TABLE name RENAME TO` must rewrite the view to stay valid —
+/// we parse and run the table-rename walker against a sentinel and see if it
+/// touched anything, so unrelated views are left byte-for-byte untouched.
+fn view_uses_table(view_sql: &str, name: &str) -> bool {
+    match sql::parse_one(view_sql) {
+        Ok(Statement::CreateView(cv)) => {
+            let mut probe = cv.select.clone();
+            rename_table_in_select(
+                &mut probe,
+                name,
+                "\u{1}\u{1}graphite_rename_probe\u{1}\u{1}",
+            );
+            *probe != *cv.select
+        }
+        _ => false,
+    }
+}
+
+/// Rewrite stored DDL text, repointing every bare or double-quoted identifier
+/// token equal to `old` (case-insensitively) to `new` while preserving all other
+/// source text — whitespace, comments, and string/blob literals (which tokenize
+/// as `Str`/`Blob`, never identifiers, so their contents are never touched). This
+/// mirrors SQLite's text-preserving rename rather than reprinting from the AST.
+fn rewrite_ident_tokens(sql: &str, old: &str, new: &str) -> String {
+    let toks = match sql::token::tokenize(sql) {
+        Ok(t) => t,
+        Err(_) => return String::from(sql),
+    };
+    // SQLite double-quotes the substituted name in a rename rewrite; match that.
+    let rendered = sql::print::ident(new);
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for (i, sp) in toks.iter().enumerate() {
+        let hit = matches!(
+            &sp.token,
+            sql::token::Token::Word(w) | sql::token::Token::Ident(w) if w.eq_ignore_ascii_case(old)
+        );
+        if !hit {
+            continue;
+        }
+        // A token equal to the table name is only a *table reference* worth
+        // renaming when it is neither a column-name tail (`x.old`) nor a function
+        // name (`old(`). Skipping those keeps a like-named column or function
+        // (e.g. a table named `count` vs the `count()` function) intact.
+        let after_dot = i > 0 && matches!(toks[i - 1].token, sql::token::Token::Dot);
+        let before_lparen = toks
+            .get(i + 1)
+            .is_some_and(|n| matches!(n.token, sql::token::Token::LParen));
+        if after_dot || before_lparen {
+            continue;
+        }
+        out.push_str(&sql[cursor..sp.start]);
+        out.push_str(&rendered);
+        cursor = sp.end;
+    }
+    out.push_str(&sql[cursor..]);
+    out
 }
 
 /// Best-effort label for an unaliased result expression.

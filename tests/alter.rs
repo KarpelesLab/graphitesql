@@ -257,3 +257,98 @@ fn rename_column_keeps_check_generated_and_default_working() {
     c.execute("INSERT INTO u VALUES (1, 3)").unwrap();
     assert!(c.execute("INSERT INTO u VALUES (1, 3)").is_err()); // PK(a,y) dup
 }
+
+#[test]
+fn rename_table_rewrites_dependent_views() {
+    // A view whose SELECT references a table keeps working after the table is
+    // renamed: the stored body is repointed to the new name, matching sqlite.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    c.execute("CREATE VIEW v AS SELECT a, b FROM t WHERE b > 5")
+        .unwrap();
+    c.execute("CREATE VIEW vq AS SELECT t.a AS x, count(*) AS c FROM t GROUP BY t.a")
+        .unwrap();
+    // An unrelated view (no reference to t) must be left untouched.
+    c.execute("CREATE VIEW other AS SELECT 1 AS z").unwrap();
+    let other_sql_before = c
+        .query("SELECT sql FROM sqlite_master WHERE name='other'")
+        .unwrap()
+        .rows[0][0]
+        .clone();
+
+    c.execute("ALTER TABLE t RENAME TO t2").unwrap();
+
+    // The views still resolve and return the same rows.
+    assert_eq!(
+        c.query("SELECT * FROM v ORDER BY a").unwrap().rows,
+        [
+            vec![Value::Integer(1), Value::Integer(10)],
+            vec![Value::Integer(2), Value::Integer(20)],
+        ]
+    );
+    assert_eq!(
+        c.query("SELECT * FROM vq ORDER BY x").unwrap().rows,
+        [
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(2), Value::Integer(1)],
+        ]
+    );
+    // Stored bodies repoint the table (double-quoted, as sqlite does); the
+    // count() function name is left intact, and the unrelated view is unchanged.
+    let sql_v = c
+        .query("SELECT sql FROM sqlite_master WHERE name='v'")
+        .unwrap()
+        .rows[0][0]
+        .clone();
+    assert_eq!(
+        sql_v,
+        Value::Text("CREATE VIEW v AS SELECT a, b FROM \"t2\" WHERE b > 5".into())
+    );
+    let sql_vq = c
+        .query("SELECT sql FROM sqlite_master WHERE name='vq'")
+        .unwrap()
+        .rows[0][0]
+        .clone();
+    assert_eq!(
+        sql_vq,
+        Value::Text(
+            "CREATE VIEW vq AS SELECT \"t2\".a AS x, count(*) AS c FROM \"t2\" GROUP BY \"t2\".a"
+                .into()
+        )
+    );
+    let other_sql_after = c
+        .query("SELECT sql FROM sqlite_master WHERE name='other'")
+        .unwrap()
+        .rows[0][0]
+        .clone();
+    assert_eq!(other_sql_before, other_sql_after);
+
+    // The result database still passes an integrity check.
+    assert_eq!(
+        c.query("PRAGMA integrity_check").unwrap().rows[0][0],
+        Value::Text("ok".into())
+    );
+}
+
+#[test]
+fn rename_table_named_like_a_function_spares_calls() {
+    // A table named the same as a SQL function (`count`) is renamed only where it
+    // is a table reference; the `count(*)` call is preserved.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE count(x)").unwrap();
+    c.execute("INSERT INTO count VALUES (1), (2), (3)").unwrap();
+    c.execute("CREATE VIEW cv AS SELECT count(*) AS n FROM count")
+        .unwrap();
+    c.execute("ALTER TABLE count RENAME TO tally").unwrap();
+    assert_eq!(
+        c.query("SELECT n FROM cv").unwrap().rows[0][0],
+        Value::Integer(3)
+    );
+    assert_eq!(
+        c.query("SELECT sql FROM sqlite_master WHERE name='cv'")
+            .unwrap()
+            .rows[0][0],
+        Value::Text("CREATE VIEW cv AS SELECT count(*) AS n FROM \"tally\"".into())
+    );
+}
