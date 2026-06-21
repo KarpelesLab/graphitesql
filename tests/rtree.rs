@@ -146,3 +146,22 @@ fn drop_removes_the_backing_table() {
         Value::Integer(0)
     );
 }
+
+#[test]
+fn integrity_check_passes_with_a_virtual_table() {
+    // integrity_check used to error on a vtab (it has no b-tree of its own);
+    // it now skips the vtab and still validates the regular tables + the
+    // `<name>_data` backing table.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    c.execute("CREATE INDEX iy ON t(y)").unwrap();
+    c.execute("INSERT INTO t VALUES (1,'a'),(2,'b')").unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, a, b)")
+        .unwrap();
+    c.execute("INSERT INTO r VALUES (1, 0, 5)").unwrap();
+    assert_eq!(
+        c.query("PRAGMA integrity_check").unwrap().rows[0][0],
+        Value::Text("ok".into())
+    );
+}

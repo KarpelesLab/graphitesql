@@ -1320,7 +1320,17 @@ impl Connection {
             .schema
             .objects()
             .iter()
-            .filter(|o| o.obj_type == ObjectType::Table && !o.name.starts_with("sqlite_"))
+            // Skip virtual tables: they have no b-tree of their own (a persistent
+            // module's rows live in its `<name>_data` backing table, itself an
+            // ordinary table that is checked here).
+            .filter(|o| {
+                o.obj_type == ObjectType::Table
+                    && !o.name.starts_with("sqlite_")
+                    && !matches!(
+                        o.sql.as_deref().map(sql::parse_one),
+                        Some(Ok(Statement::CreateVirtualTable(_)))
+                    )
+            })
             .map(|o| o.name.clone())
             .collect();
 
