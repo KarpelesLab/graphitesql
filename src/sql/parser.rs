@@ -247,7 +247,16 @@ impl Parser {
                 stmt: alloc::boxed::Box::new(stmt),
             });
         }
-        if self.check_kw("select") || self.check_kw("with") || self.check_kw("values") {
+        // A leading `WITH …` clause may prefix a SELECT or an INSERT … SELECT.
+        // For the SELECT case the CTEs are parsed inside `select()`; for
+        // `WITH … INSERT … SELECT` they are attached to the inserted SELECT
+        // (which is where the executor materializes them). `WITH`-prefixed
+        // UPDATE/DELETE and INSERT … VALUES need executor-visible CTE scoping
+        // that does not exist yet, so they are left to error (see ROADMAP).
+        if self.check_kw("with") {
+            return self.with_prefixed();
+        }
+        if self.check_kw("select") || self.check_kw("values") {
             return Ok(Statement::Select(self.select()?));
         }
         if self.check_kw("insert") || self.check_kw("replace") {
@@ -348,8 +357,42 @@ impl Parser {
         Err(self.err("unrecognized statement"))
     }
 
+    /// Parse a statement that begins with a `WITH …` common-table-expression
+    /// clause. The clause may prefix either a `SELECT` or an `INSERT … SELECT`.
+    fn with_prefixed(&mut self) -> Result<Statement> {
+        // Consume the CTE list once, then route by the keyword that follows it:
+        // a `SELECT`/`VALUES` body, or an `INSERT … SELECT` the CTEs attach to.
+        let _guard = self.enter()?;
+        self.expect_kw("with")?;
+        let ctes = self.parse_cte_list()?;
+        if self.check_kw("insert") || self.check_kw("replace") {
+            let mut ins = self.insert()?;
+            match &mut ins.source {
+                // The executor materializes a CTE while running the inserted
+                // SELECT, so the clause rides along on that SELECT.
+                InsertSource::Select(sel) => sel.ctes = ctes,
+                _ => {
+                    return Err(self
+                        .err("WITH may only prefix INSERT … SELECT (not VALUES / DEFAULT VALUES)"))
+                }
+            }
+            return Ok(Statement::Insert(ins));
+        }
+        // Otherwise it must be a SELECT / VALUES query: parse the body and
+        // attach the CTEs to the resulting (possibly compound) select.
+        let mut sel = self.select_body()?;
+        sel.ctes = ctes;
+        Ok(Statement::Select(sel))
+    }
+
     fn pragma(&mut self) -> Result<Pragma> {
-        let name = self.ident()?;
+        // `PRAGMA [schema.]name` — a `schema.` qualifier selects the database the
+        // pragma applies to. Our pragmas are connection-scoped, so the qualifier
+        // is accepted and the bare name kept (as for ANALYZE/REINDEX).
+        let mut name = self.ident()?;
+        if self.eat(&Token::Dot) {
+            name = self.ident()?;
+        }
         let value = if self.eat(&Token::Eq) {
             Some(self.pragma_value()?)
         } else if self.eat(&Token::LParen) {
@@ -379,45 +422,63 @@ impl Parser {
         self.expr()
     }
 
-    fn select(&mut self) -> Result<Select> {
-        let _guard = self.enter()?;
+    /// Parse the body of a `WITH [RECURSIVE] cte, …` clause, assuming the `WITH`
+    /// keyword has already been consumed. Returns the parsed CTE definitions.
+    /// Shared by `SELECT` and the `WITH …`-prefixed DML statements.
+    fn parse_cte_list(&mut self) -> Result<Vec<Cte>> {
+        // `RECURSIVE` is accepted as a keyword but recursion is not yet run.
+        let _ = self.eat_kw("recursive");
         let mut ctes = Vec::new();
-        if self.eat_kw("with") {
-            // `RECURSIVE` is accepted as a keyword but recursion is not yet run.
-            let _ = self.eat_kw("recursive");
-            loop {
-                let name = self.ident()?;
-                let mut columns = Vec::new();
-                if self.eat(&Token::LParen) {
+        loop {
+            let name = self.ident()?;
+            let mut columns = Vec::new();
+            if self.eat(&Token::LParen) {
+                columns.push(self.ident()?);
+                while self.eat(&Token::Comma) {
                     columns.push(self.ident()?);
-                    while self.eat(&Token::Comma) {
-                        columns.push(self.ident()?);
-                    }
-                    self.expect(&Token::RParen)?;
                 }
-                self.expect_kw("as")?;
-                // An optional `MATERIALIZED` / `NOT MATERIALIZED` hint follows
-                // `AS` (an optimizer directive; accepted and ignored). A lone
-                // `NOT` here must be part of `NOT MATERIALIZED`.
-                if !self.eat_kw("materialized") && self.eat_kw("not") {
-                    self.expect_kw("materialized")?;
-                }
-                self.expect(&Token::LParen)?;
-                let select = Box::new(self.select()?);
                 self.expect(&Token::RParen)?;
-                ctes.push(Cte {
-                    name,
-                    columns,
-                    select,
-                });
-                if !self.eat(&Token::Comma) {
-                    break;
-                }
+            }
+            self.expect_kw("as")?;
+            // An optional `MATERIALIZED` / `NOT MATERIALIZED` hint follows
+            // `AS` (an optimizer directive; accepted and ignored). A lone
+            // `NOT` here must be part of `NOT MATERIALIZED`.
+            if !self.eat_kw("materialized") && self.eat_kw("not") {
+                self.expect_kw("materialized")?;
+            }
+            self.expect(&Token::LParen)?;
+            let select = Box::new(self.select()?);
+            self.expect(&Token::RParen)?;
+            ctes.push(Cte {
+                name,
+                columns,
+                select,
+            });
+            if !self.eat(&Token::Comma) {
+                break;
             }
         }
+        Ok(ctes)
+    }
+
+    fn select(&mut self) -> Result<Select> {
+        let _guard = self.enter()?;
+        let ctes = if self.eat_kw("with") {
+            self.parse_cte_list()?
+        } else {
+            Vec::new()
+        };
+        let mut sel = self.select_body()?;
+        sel.ctes = ctes;
+        Ok(sel)
+    }
+
+    /// Parse a SELECT/VALUES query body — the query core(s), any compound
+    /// continuations, and the trailing `ORDER BY`/`LIMIT`/`OFFSET` — without a
+    /// leading `WITH` clause (the caller attaches CTEs to the returned select).
+    fn select_body(&mut self) -> Result<Select> {
         // First query core, then any compound continuations (left-associative).
         let mut outer = self.select_core()?;
-        outer.ctes = ctes;
         while let Some(op) = self.compound_op() {
             let right = self.select_core()?;
             outer.compound.push((op, right));
@@ -726,19 +787,38 @@ impl Parser {
     }
 
     fn table_ref(&mut self) -> Result<TableRef> {
-        // A derived table: `(SELECT …) [AS] alias`.
         if self.eat(&Token::LParen) {
-            let select = self.select()?;
+            // A derived table: `(SELECT …) [AS] alias`.
+            if self.check_kw("select") || self.check_kw("with") || self.check_kw("values") {
+                let select = self.select()?;
+                self.expect(&Token::RParen)?;
+                let alias = self.opt_alias()?;
+                return Ok(TableRef {
+                    name: String::new(),
+                    schema: None,
+                    alias,
+                    subquery: Some(Box::new(select)),
+                    index_hint: None,
+                    tvf_args: None,
+                });
+            }
+            // Otherwise the parens wrap a `table-or-subquery` (SQLite allows
+            // redundant parentheses around a single FROM element, e.g.
+            // `((SELECT 1) x)` or `((t))`). Recurse, then require `)`: a `,` or
+            // JOIN keyword here would start a parenthesized *join group*, which
+            // the executor's flat join model does not represent yet, so we let
+            // it surface as a parse error rather than mis-parse it.
+            let mut inner = self.table_ref()?;
             self.expect(&Token::RParen)?;
-            let alias = self.opt_alias()?;
-            return Ok(TableRef {
-                name: String::new(),
-                schema: None,
-                alias,
-                subquery: Some(Box::new(select)),
-                index_hint: None,
-                tvf_args: None,
-            });
+            // An alias written outside the parens overrides any inner one.
+            if let Some(alias) = self.opt_alias()? {
+                inner.alias = Some(alias);
+            }
+            // A trailing index hint binds to the (now un-parenthesized) element.
+            if inner.index_hint.is_none() {
+                inner.index_hint = self.index_hint()?;
+            }
+            return Ok(inner);
         }
         // `[schema .] name` — a `.` qualifier names the database to resolve in.
         let mut name = self.ident()?;
