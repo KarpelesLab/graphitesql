@@ -175,9 +175,11 @@ expressions.
   single-column index seeks equality / range / `IN` with correct results and the
   `SEARCH … USING INDEX` plan; a `DESC` second column in a composite eq-prefix +
   range seek is handled too. Differentially identical to sqlite.
-- **A3b — partial/expression index for range/IN seeks.** Equality seeks already
-  use them (A3); extend `try_index_range`/`try_index_in` to consult
-  `partial_expr_seek` the same way, with `eqp_access` in lockstep.
+- **A3b — partial/expression index for range/IN seeks.** Range half ✅ DONE:
+  `try_index_range` consults a new `partial_expr_range` (a bound on a partial
+  index's leading column with its predicate guaranteed, or on an expression
+  index's keyed expression), with `eqp_access` in lockstep — `SEARCH … USING INDEX
+  i (b>?)` / `(<expr>>?)`. *Remaining: the `IN`-seek half (`try_index_in`).*
 - **A4 — `NULLIF` collation in `func.rs`. ✅ DONE / verified.** `nullif(x, y)`
   already resolves the comparison collation via `resolve_collation` (explicit
   `COLLATE` on either operand, then a column's declared collation, then BINARY);
@@ -455,8 +457,8 @@ smaller pieces to ship it. Suggested order:
    needs scope-aware column resolution, not the token rewrite A-rn2 used.
 4. **Planner leftovers** (perf-only, EQP-gated) — **B0b-iii** (ORDER BY from a
    WHERE-chosen index; needs a shared seek-index-choice helper), the mixed-
-   direction partial sort, **B1b** join reordering, **A3b** partial/expr range·IN
-   seeks, **B4** `sqlite_stat4`. (**A2** DESC seeks, the composite eq-prefix +
+   direction partial sort, **B1b** join reordering, **A3b**'s remaining `IN`-seek
+   half, **B4** `sqlite_stat4`. (**A2** DESC seeks, the composite eq-prefix +
    trailing-range seek, **B0b-i** multi-term ORDER BY, and **B0b-ii** covered-query
    covering scan are done.)
 5. **D2 — FTS5** (D2a–D2e) — the larger module, once W1/W2 and R-Tree have
