@@ -151,6 +151,9 @@ impl Shell {
         // method was used, retry with the other one.
         if returns_rows(sql) && !is_pragma_setter(sql) {
             match conn.query(sql) {
+                // EXPLAIN QUERY PLAN renders as SQLite's `QUERY PLAN` tree rather
+                // than the raw (id, parent, notused, detail) rows.
+                Ok(result) if is_explain_query_plan(sql) => self.print_eqp_tree(&result),
                 Ok(result) => self.print_result(&result),
                 Err(graphitesql::Error::Unsupported(m)) if m.contains("use execute()") => {
                     conn.execute(sql)?;
@@ -186,6 +189,36 @@ impl Shell {
             let cells: Vec<String> = row.iter().map(render_value).collect();
             let _ = writeln!(out, "{}", cells.join("|"));
         }
+    }
+
+    /// Render an EXPLAIN QUERY PLAN result as SQLite's `QUERY PLAN` tree. The
+    /// rows are `(id, parent, notused, detail)`; children link to their parent's
+    /// `id` (top-level rows have parent 0). The last child of a node uses `` `-- ``
+    /// (others `|--`), with `   ` / `|  ` continuation indent.
+    fn print_eqp_tree(&self, result: &QueryResult) {
+        let nodes: Vec<(i64, i64, String)> = result
+            .rows
+            .iter()
+            .filter_map(|r| {
+                let id = match r.first() {
+                    Some(Value::Integer(i)) => *i,
+                    _ => return None,
+                };
+                let parent = match r.get(1) {
+                    Some(Value::Integer(i)) => *i,
+                    _ => return None,
+                };
+                let detail = match r.last() {
+                    Some(Value::Text(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                Some((id, parent, detail))
+            })
+            .collect();
+        let out = io::stdout();
+        let mut out = out.lock();
+        let _ = writeln!(out, "QUERY PLAN");
+        render_eqp(&mut out, &nodes, 0, "");
     }
 
     /// Handle a `.dot` command. Returns `true` if the shell should exit.
@@ -266,6 +299,32 @@ fn returns_rows(sql: &str) -> bool {
         word.as_str(),
         "SELECT" | "PRAGMA" | "WITH" | "VALUES" | "EXPLAIN"
     )
+}
+
+/// Recursively render the children of `parent` in an EXPLAIN QUERY PLAN tree.
+fn render_eqp(out: &mut dyn Write, nodes: &[(i64, i64, String)], parent: i64, prefix: &str) {
+    let children: Vec<&(i64, i64, String)> =
+        nodes.iter().filter(|(_, p, _)| *p == parent).collect();
+    let last_i = children.len().wrapping_sub(1);
+    for (i, (id, _, detail)) in children.iter().enumerate() {
+        let last = i == last_i;
+        let connector = if last { "`--" } else { "|--" };
+        let _ = writeln!(out, "{prefix}{connector}{detail}");
+        let child_prefix = format!("{prefix}{}", if last { "   " } else { "|  " });
+        render_eqp(out, nodes, *id, &child_prefix);
+    }
+}
+
+/// Whether `sql` is an `EXPLAIN QUERY PLAN …` statement (rendered as a tree).
+fn is_explain_query_plan(sql: &str) -> bool {
+    let mut words = sql.split_whitespace();
+    words
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("explain"))
+        && words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("query"))
+        && words.next().is_some_and(|w| w.eq_ignore_ascii_case("plan"))
 }
 
 /// Whether `sql` contains a `RETURNING` keyword (as a whole word, outside string

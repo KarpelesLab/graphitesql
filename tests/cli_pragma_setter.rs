@@ -88,7 +88,12 @@ fn explain_and_with_dml_route_correctly() {
     let (out, ok) = run("CREATE TABLE t(a,b); CREATE INDEX i ON t(a); \
                          EXPLAIN QUERY PLAN SELECT * FROM t WHERE a=1");
     assert!(ok, "EXPLAIN should succeed: {out}");
-    assert!(out.contains("USING INDEX i"), "got: {out}");
+    // Rendered as SQLite's QUERY PLAN tree, not the raw (id|parent|...) rows.
+    assert_eq!(out.trim(), "QUERY PLAN\n`--SEARCH t USING INDEX i (a=?)");
+
+    // A plain table scan.
+    let (out, _) = run("CREATE TABLE t(a,b); EXPLAIN QUERY PLAN SELECT * FROM t");
+    assert_eq!(out.trim(), "QUERY PLAN\n`--SCAN t");
 
     // A WITH-prefixed statement that is actually DML looks row-returning (first
     // word WITH) but must fall back to execute.
