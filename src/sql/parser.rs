@@ -1065,10 +1065,37 @@ impl Parser {
         self.expect_kw("set")?;
         let mut assignments = Vec::new();
         loop {
-            let col = self.ident()?;
-            self.expect(&Token::Eq)?;
-            let value = self.expr()?;
-            assignments.push((col, value));
+            if self.eat(&Token::LParen) {
+                // Column-list assignment `(c1, c2, …) = (e1, e2, …)` (SQLite): the
+                // i-th column gets the i-th expression. Desugared into individual
+                // assignments. (The `= (SELECT …)` row-subquery form is not yet
+                // supported — `expr()` will reject a SELECT here.)
+                let mut cols = alloc::vec![self.ident()?];
+                while self.eat(&Token::Comma) {
+                    cols.push(self.ident()?);
+                }
+                self.expect(&Token::RParen)?;
+                self.expect(&Token::Eq)?;
+                self.expect(&Token::LParen)?;
+                let mut exprs = alloc::vec![self.expr()?];
+                while self.eat(&Token::Comma) {
+                    exprs.push(self.expr()?);
+                }
+                self.expect(&Token::RParen)?;
+                if cols.len() != exprs.len() {
+                    return Err(
+                        self.err("number of columns and values differ in UPDATE SET (…)=(…)")
+                    );
+                }
+                for (c, e) in cols.into_iter().zip(exprs) {
+                    assignments.push((c, e));
+                }
+            } else {
+                let col = self.ident()?;
+                self.expect(&Token::Eq)?;
+                let value = self.expr()?;
+                assignments.push((col, value));
+            }
             if !self.eat(&Token::Comma) {
                 break;
             }

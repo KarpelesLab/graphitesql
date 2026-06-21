@@ -2788,7 +2788,8 @@ impl Connection {
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col))
                     .ok_or_else(|| Error::Error(format!("no such column: {col}")))?;
-                let ctx = row_ctx(&new, &cols, None, params).with_subqueries(self);
+                // Simultaneous assignment: evaluate against the original row.
+                let ctx = row_ctx(&old, &cols, None, params).with_subqueries(self);
                 new[pos] = eval::eval(expr, &ctx)?;
             }
             self.fire_triggers(
@@ -3792,16 +3793,19 @@ impl Connection {
                         "cannot UPDATE generated column \"{col}\""
                     )));
                 }
+                // SQLite evaluates every SET expression against the ORIGINAL row
+                // (assignments are simultaneous): `SET a=b, b=a` swaps. Evaluate
+                // against `old_row`, not the progressively-mutated `values`.
                 let new = match &matched_from {
                     Some(fr) => {
-                        let mut combined = values.clone();
+                        let mut combined = old_row.clone();
                         combined.extend_from_slice(fr);
                         let ctx = row_ctx(&combined, &combined_columns, Some(rowid), params)
                             .with_subqueries(self);
                         eval::eval(expr, &ctx)?
                     }
                     None => {
-                        let ctx = row_ctx(&values, &meta.columns, Some(rowid), params)
+                        let ctx = row_ctx(&old_row, &meta.columns, Some(rowid), params)
                             .with_subqueries(self);
                         eval::eval(expr, &ctx)?
                     }
@@ -8525,6 +8529,9 @@ impl Connection {
                 None => true,
             };
             if matches {
+                // Assignments are simultaneous: evaluate every SET expression
+                // against the original row, not the progressively-mutated one.
+                let original = row.clone();
                 for (col, expr) in &upd.assignments {
                     let pos = meta
                         .columns
@@ -8536,7 +8543,7 @@ impl Connection {
                             "cannot UPDATE generated column \"{col}\""
                         )));
                     }
-                    let ctx = row_ctx(&row, &meta.columns, None, params).with_subqueries(self);
+                    let ctx = row_ctx(&original, &meta.columns, None, params).with_subqueries(self);
                     row[pos] = eval::eval(expr, &ctx)?;
                 }
                 apply_column_affinity(meta, &mut row);
