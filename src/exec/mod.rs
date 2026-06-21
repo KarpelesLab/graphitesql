@@ -9706,8 +9706,12 @@ impl Connection {
                         labels.push(c.name.clone());
                     }
                 }
-                ResultColumn::Expr { expr, alias } => {
-                    labels.push(alias.clone().unwrap_or_else(|| expr_label(expr)));
+                ResultColumn::Expr {
+                    expr,
+                    alias,
+                    source,
+                } => {
+                    labels.push(result_column_label(expr, alias, source));
                 }
             }
         }
@@ -9965,6 +9969,7 @@ fn expand_agg_wildcards(sel: &Select, columns: &[ColumnInfo]) -> Select {
             column: c.name.clone(),
         },
         alias: None,
+        source: None,
     };
     let mut new_cols = Vec::new();
     for col in &sel.columns {
@@ -9996,6 +10001,7 @@ fn alias_substituted(sel: &Select, columns: &[ColumnInfo]) -> Option<Select> {
         if let ResultColumn::Expr {
             expr,
             alias: Some(name),
+            ..
         } = c
         {
             if !columns
@@ -11624,8 +11630,12 @@ fn returning_labels(returning: &[ResultColumn], columns: &[ColumnInfo]) -> Vec<S
                     }
                 }
             }
-            ResultColumn::Expr { expr, alias } => {
-                labels.push(alias.clone().unwrap_or_else(|| expr_label(expr)));
+            ResultColumn::Expr {
+                expr,
+                alias,
+                source,
+            } => {
+                labels.push(result_column_label(expr, alias, source));
             }
         }
     }
@@ -11995,6 +12005,20 @@ fn expr_label(expr: &Expr) -> String {
         Expr::Function { name, .. } => name.clone(),
         Expr::Paren(e) => expr_label(e),
         _ => "expr".to_string(),
+    }
+}
+
+/// The name of a result column, matching SQLite: an `AS` alias wins; a bare
+/// column reference uses the column name; any other expression is named after
+/// its verbatim source span (`SELECT a+b` → `a+b`), falling back to
+/// [`expr_label`] when no span was captured (synthetic columns).
+fn result_column_label(expr: &Expr, alias: &Option<String>, source: &Option<String>) -> String {
+    if let Some(a) = alias {
+        return a.clone();
+    }
+    match expr {
+        Expr::Column { column, .. } => column.clone(),
+        _ => source.clone().unwrap_or_else(|| expr_label(expr)),
     }
 }
 

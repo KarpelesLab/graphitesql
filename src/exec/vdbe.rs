@@ -251,7 +251,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
     };
     let mut columns = Vec::new();
     for (i, rc) in sel.columns.iter().enumerate() {
-        let ResultColumn::Expr { expr, alias } = rc else {
+        let ResultColumn::Expr { expr, alias, .. } = rc else {
             return Err(Error::Unsupported("VDBE spike: only scalar result columns"));
         };
         c.compile_expr_into(expr, i)?;
@@ -951,7 +951,7 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
                     ));
                 }
             }
-            ResultColumn::Expr { expr, alias } => {
+            ResultColumn::Expr { expr, alias, .. } => {
                 let label = alias.clone().unwrap_or_else(|| match expr {
                     Expr::Column { column, .. } => column.clone(),
                     _ => alloc::format!("col{}", projections.len() + 1),

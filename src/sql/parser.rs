@@ -29,7 +29,7 @@ const BP_UNARY: u8 = 100;
 /// Parse a SQL string into a list of statements (split on `;`).
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     let tokens = tokenize(sql)?;
-    let mut parser = Parser::new(tokens);
+    let mut parser = Parser::new(tokens, sql);
     let mut statements = Vec::new();
     loop {
         while parser.eat(&Token::Semicolon) {}
@@ -105,6 +105,9 @@ const MAX_PARSE_DEPTH: usize = 30;
 
 struct Parser {
     tokens: Vec<Spanned>,
+    /// The original SQL text, for slicing verbatim spans (e.g. result-column
+    /// names of unaliased expressions).
+    source: String,
     pos: usize,
     /// Current recursive-descent nesting depth (guarded by [`MAX_PARSE_DEPTH`]).
     ///
@@ -126,9 +129,10 @@ impl core::ops::Drop for DepthGuard {
 }
 
 impl Parser {
-    fn new(tokens: Vec<Spanned>) -> Parser {
+    fn new(tokens: Vec<Spanned>, source: &str) -> Parser {
         Parser {
             tokens,
+            source: String::from(source),
             pos: 0,
             depth: alloc::rc::Rc::new(core::cell::Cell::new(0)),
         }
@@ -641,6 +645,7 @@ impl Parser {
                 .map(|(i, e)| ResultColumn::Expr {
                     expr: e,
                     alias: Some(alloc::format!("column{}", i + 1)),
+                    source: None,
                 })
                 .collect();
             Select {
@@ -683,9 +688,25 @@ impl Parser {
                 self.pos = save;
             }
         }
+        // Record the byte span of the expression so an unaliased result column
+        // can be named after its verbatim source text, as SQLite does.
+        let start = self.tokens.get(self.pos).map(|s| s.start);
         let expr = self.expr()?;
+        let source = match (
+            start,
+            self.pos.checked_sub(1).and_then(|i| self.tokens.get(i)),
+        ) {
+            (Some(start), Some(last)) if last.end <= self.source.len() && start <= last.end => {
+                Some(String::from(&self.source[start..last.end]))
+            }
+            _ => None,
+        };
         let alias = self.opt_alias()?;
-        Ok(ResultColumn::Expr { expr, alias })
+        Ok(ResultColumn::Expr {
+            expr,
+            alias,
+            source,
+        })
     }
 
     fn opt_alias(&mut self) -> Result<Option<String>> {

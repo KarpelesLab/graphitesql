@@ -219,6 +219,11 @@ pub enum ResultColumn {
         expr: Expr,
         /// `AS alias`, if present.
         alias: Option<String>,
+        /// The verbatim source text of `expr` (whitespace preserved), captured by
+        /// the parser. SQLite names an unaliased non-column result column after
+        /// this span — `SELECT a  +  b` yields a column literally named `a  +  b`.
+        /// `None` for synthetically constructed columns (no source span).
+        source: Option<String>,
     },
 }
 
