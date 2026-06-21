@@ -365,13 +365,18 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
   custom module. The executor routes all three DML verbs to it
   (`exec_vtab_insert`/`exec_vtab_delete`/`exec_vtab_update`): INSERT maps the
   column list and evaluates values; UPDATE/DELETE scan via the cursor, filter by
-  `WHERE`, and call `update` per matching row. Tests: `tests/writable_vtab.rs`.
-  *(Remaining: explicit-rowid INSERT, hidden columns, RETURNING / `UPDATE … FROM`
-  on a vtab.)*
-- **W2 — shadow-table storage for modules.** A helper so a module can create and
-  read/write backing *regular* tables (`<name>_data`, …) on `connect`/`update` —
-  reusing graphite's normal table machinery, so persistence is byte-compatible for
-  free. Give the module access to the connection (the trait is stateless today).
+  `WHERE`, and call `update` per matching row. Explicit-rowid INSERT (W1c) too.
+  Tests: `tests/writable_vtab.rs`. *(Remaining: hidden columns, RETURNING /
+  `UPDATE … FROM` on a vtab.)*
+- **W2 — shadow-table storage for modules. ✅ DONE.** A `persistent()` module
+  keeps its rows in a real `<vtab>_data` regular table (created at CREATE VIRTUAL
+  TABLE, reusing the normal table machinery → transactional + integrity-checked).
+  Reads scan it; `update` gets a `VTabStore` (rows/put/delete) over it. The
+  re-entrancy (executor `&mut self` while the module is registry-borrowed) is
+  solved by `with_vtab_store`, which takes the module out of the registry for the
+  write phase. Data survives reopening the file (tested). *(W2a: the backing table
+  holds the vtab's own columns; FTS5/R-Tree will declare module-specific shadow
+  schemas on top of the same `VTabStore` mechanism.)*
 - **D3 — R-Tree** (smaller of the two; build on W1/W2). *Ref:* `rtree.c`.
   - **D3a — module + correct results.** Parse `rtree(id, minX, maxX[, …])`,
     store rows in shadow tables, answer queries by scan + filter (functionally
