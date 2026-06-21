@@ -171,22 +171,22 @@ expressions.
 
 **Remaining pieces** (small, each function/clause-scoped):
 
-- **A2 — DESC index columns honored in seeks.** A `DESC` index gives correct
-  results today by scan/superset; teach the seek paths
-  (`try_index_lookup`/`try_index_range`, `index_range_rowids`) to walk a `DESC`
-  b-tree in the right direction. *Perf-only; acceptance: `EXPLAIN QUERY PLAN`
-  shows the seek and results unchanged.*
+- **A2 — DESC index columns honored in seeks. ✅ DONE / verified.** A `DESC`
+  single-column index seeks equality / range / `IN` with correct results and the
+  `SEARCH … USING INDEX` plan; a `DESC` second column in a composite eq-prefix +
+  range seek is handled too. Differentially identical to sqlite.
 - **A3b — partial/expression index for range/IN seeks.** Equality seeks already
   use them (A3); extend `try_index_range`/`try_index_in` to consult
   `partial_expr_seek` the same way, with `eqp_access` in lockstep.
-- **A4 — `NULLIF` collation in `func.rs`.** The IN/CASE/BETWEEN literal-left
-  collation cases are done; `nullif(x, y)` should still honor an explicit
-  `COLLATE` on either operand. *Ref:* `resolve.c` collation-of rules.
-- **A7 — multi-statement `execute_batch(sql)` API.** The CLI shell already has a
-  `BEGIN`/`CASE`/`END`-depth-aware splitter; lift it into a public API that runs
-  a `;`-separated script (like `sqlite3_exec`), running each slice through
-  `execute_params` so per-statement CREATE text is preserved. *(`execute()` stays
-  single-statement.)*
+- **A4 — `NULLIF` collation in `func.rs`. ✅ DONE / verified.** `nullif(x, y)`
+  already resolves the comparison collation via `resolve_collation` (explicit
+  `COLLATE` on either operand, then a column's declared collation, then BINARY);
+  differentially identical to sqlite, including column-declared collations.
+- **A7 — multi-statement `execute_batch(sql)` API. ✅ DONE.** `Connection::
+  execute_batch` runs a `;`-separated script like `sqlite3_exec` via a
+  tokenizer-based `split_sql_script` (string/comment/`BEGIN…END`/`CASE…END`
+  aware), each slice through `execute_params` (a `SELECT` runs and is discarded);
+  stops at the first error. `execute()` stays single-statement.
 - **A8 — JSONB of JSON5-form numbers.** `jsonb('.5')`/`jsonb('0xFF')` emit a
   normalized `FLOAT`/`INT` element; sqlite uses the `FLOAT5`/`INT5` tags with the
   raw text. Needs the parser to keep the raw JSON5 number text and `to_jsonb` to
@@ -196,18 +196,23 @@ expressions.
 *other* schema objects, not just the table's own definition; today those break
 with "no such table/column" after a rename). Build bottom-up:
 
-- **A-rn1 — table-rename AST walker.** A `rename_table_in(stmt, old, new)` that
-  walks a `Select`/trigger body renaming every `FROM`/`JOIN` `TableRef.name == old`
-  and every qualified `old.col` reference, recursing into subqueries and CTEs
-  (respecting a CTE that shadows the name). The reusable primitive for A-rn2/3.
-- **A-rn2 — RENAME TABLE rewrites dependent view bodies.** Using A-rn1, on
-  `ALTER TABLE t RENAME TO t2` rewrite every view whose body references `t`
-  (triggers already work — they fire via the repointed `tbl_name`). *Acceptance:
-  `SELECT … FROM v` works after the rename.*
+- **A-rn1 — table-rename AST walker. ✅ DONE.** `rename_table_in_select` walks a
+  `Select` renaming every `FROM`/`JOIN` `TableRef.name == old`, `old.*`, and
+  qualified `old.col`, recursing subqueries / CTEs / windows / compound parts and
+  respecting a same-level CTE that shadows the name.
+- **A-rn2 — RENAME TABLE rewrites dependent view bodies. ✅ DONE.** On
+  `ALTER TABLE t RENAME TO t2`, every view whose body references `t` is rewritten
+  with a text-preserving token rewrite (only genuine table references — a
+  like-named column tail or function call is spared; the substituted name is
+  double-quoted, matching sqlite byte-for-byte). `SELECT … FROM v` works after the
+  rename; unrelated views are untouched. (Triggers already fire via the repointed
+  `tbl_name`.)
 - **A-rn3 — RENAME COLUMN reaches dependent objects.** Extend `rename_column_ref`
-  use to dependent view/trigger bodies (scope-aware: only references resolving to
-  the renamed table's column) and to foreign keys in *other* tables that name the
-  renamed parent column.
+  use to dependent view/trigger bodies and to foreign keys in *other* tables that
+  name the renamed parent column. *Harder than A-rn2: column renames are
+  scope-aware — a bare `oldcol` token can belong to another table, so the
+  token-rewrite trick used for A-rn2 is unsafe here; this needs real name
+  resolution mapping resolved column refs back to source spans.*
 - **A-rn4 — text-preserving schema edits** *(cosmetic, lower priority).* graphite
   reprints the affected CREATE from its AST (quoted/canonical), so
   `SELECT sql FROM sqlite_master` after an ALTER differs from sqlite's
@@ -217,7 +222,9 @@ with "no such table/column" after a rename). Build bottom-up:
 ### Track B — Query planner, statistics & the VDBE
 
 Done: `ANALYZE` + `sqlite_stat1` (byte-compatible) with stats-driven index
-choice; equality/range/`IN`/OR-union seeks; **inner-join seeks** — rowid/IPK
+choice; equality/range/`IN`/OR-union seeks (including a **composite equality
+prefix + a trailing range** on the next index column, `x=? AND y>?`, seeked as one
+bounded range and rendered the same way in EQP); **inner-join seeks** — rowid/IPK
 (**B1a**), secondary-index (**B1a²**), and the **complete `WITHOUT ROWID` seek
 family** (PK equality + range, PK joins, secondary-index equality + range, with
 the named-index-vs-autoindex covering rule); a **hash join** for unindexed
@@ -432,17 +439,19 @@ smaller pieces to ship it. Suggested order:
    writable module proves it before D2/D3).
 2. **D3 — R-Tree** on top of W1/W2 (D3a correct results → D3b pushdown → D3c
    byte-compatible nodes). Smaller and more bounded than FTS5; do it first.
-3. **A-rn2/A-rn3 — cross-object ALTER rename** (view/trigger/FK propagation), the
-   one remaining *functional* correctness gap; needs the A-rn1 walker.
+3. **A-rn3 — cross-object RENAME COLUMN** (view/trigger/FK propagation), the one
+   remaining *functional* ALTER gap (A-rn1 + A-rn2 RENAME TABLE→views are done);
+   needs scope-aware column resolution, not the token rewrite A-rn2 used.
 4. **Planner leftovers** (perf-only, EQP-gated) — **B0b-i/ii/iii**, **B1b** join
-   reordering, **A2** DESC seek direction, **A3b** partial/expr range·IN seeks,
-   **B4** `sqlite_stat4`.
+   reordering, **A3b** partial/expr range·IN seeks, **B4** `sqlite_stat4`. (**A2**
+   DESC seek direction and the composite eq-prefix + trailing-range seek are done.)
 5. **D2 — FTS5** (D2a–D2e) — the larger module, once W1/W2 and R-Tree have
    exercised the writable-vtab path.
 6. **B5/B7/B8 — the executor→VDBE migration** — the largest internal refactor;
    unblocks real bytecode `EXPLAIN`.
-7. **Smaller gaps** — **A4** (`nullif` collation), **A7** (`execute_batch` API),
-   **A8** (JSONB JSON5 numbers), **C8a/b/c** (secure_delete, cache honoring).
+7. **Smaller gaps** — **A8** (JSONB JSON5 numbers — tiny, deferred), **C8a/b/c**
+   (secure_delete, cache honoring). (**A4** `nullif` collation and **A7**
+   `execute_batch` are done.)
 
 Deferred / blocked: **C7/C9** (SQLite-format journal + cross-process
 locks/concurrency — durability depth), **D5/D6** (sessions, async wasm VFS),
