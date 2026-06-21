@@ -145,11 +145,27 @@ impl Shell {
         // setter through it would silently no-op (e.g. `PRAGMA foreign_keys=ON`).
         // Getter pragmas (`PRAGMA foreign_keys`, `PRAGMA table_info(t)`) have no
         // `=` and still return rows via `query`.
+        // `returns_rows`/`is_pragma_setter` are first-word heuristics and can
+        // misroute: a `WITH …`-prefixed statement may be DML (INSERT/UPDATE/
+        // DELETE), and `EXPLAIN` returns rows. When the engine reports the wrong
+        // method was used, retry with the other one.
         if returns_rows(sql) && !is_pragma_setter(sql) {
-            let result = conn.query(sql)?;
-            self.print_result(&result);
+            match conn.query(sql) {
+                Ok(result) => self.print_result(&result),
+                Err(graphitesql::Error::Unsupported(m)) if m.contains("use execute()") => {
+                    conn.execute(sql)?;
+                }
+                Err(e) => return Err(e),
+            }
         } else {
-            conn.execute(sql)?;
+            match conn.execute(sql) {
+                Ok(_) => {}
+                Err(graphitesql::Error::Unsupported(m)) if m.contains("use query()") => {
+                    let result = conn.query(sql)?;
+                    self.print_result(&result);
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -240,7 +256,10 @@ fn returns_rows(sql: &str) -> bool {
         .find(|w| !w.is_empty())
         .unwrap_or("")
         .to_ascii_uppercase();
-    matches!(word.as_str(), "SELECT" | "PRAGMA" | "WITH" | "VALUES")
+    matches!(
+        word.as_str(),
+        "SELECT" | "PRAGMA" | "WITH" | "VALUES" | "EXPLAIN"
+    )
 }
 
 /// Whether `sql` is a `PRAGMA name = value` setter (which mutates connection

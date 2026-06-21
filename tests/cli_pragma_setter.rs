@@ -55,3 +55,22 @@ fn getter_pragmas_still_print_rows() {
     let (out, _) = run("CREATE TABLE t(a INT, b TEXT); PRAGMA table_info(t)");
     assert!(out.contains("a") && out.contains("b"), "got: {out}");
 }
+
+#[test]
+fn explain_and_with_dml_route_correctly() {
+    // EXPLAIN returns rows: it must run via query (returns_rows now includes it),
+    // not execute (which rejects EXPLAIN). The plan detail is shown, not an error.
+    let (out, ok) = run("CREATE TABLE t(a,b); CREATE INDEX i ON t(a); \
+                         EXPLAIN QUERY PLAN SELECT * FROM t WHERE a=1");
+    assert!(ok, "EXPLAIN should succeed: {out}");
+    assert!(out.contains("USING INDEX i"), "got: {out}");
+
+    // A WITH-prefixed statement that is actually DML looks row-returning (first
+    // word WITH) but must fall back to execute.
+    let (out, ok) = run(
+        "CREATE TABLE t(a); WITH s(v) AS (VALUES(1),(2),(3)) INSERT INTO t SELECT v FROM s; \
+         SELECT group_concat(a) FROM (SELECT a FROM t ORDER BY a)",
+    );
+    assert!(ok, "WITH+INSERT should succeed: {out}");
+    assert_eq!(out.trim(), "1,2,3");
+}
