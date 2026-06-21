@@ -66,3 +66,26 @@ fn setting_an_unexposed_tuning_pragma_is_accepted_and_ignored() {
 fn alloc_pragma(name: &str) -> String {
     format!("PRAGMA {name}")
 }
+
+#[test]
+fn cache_size_round_trips_the_set_value() {
+    let mut c = Connection::open_memory().unwrap();
+    // Default is -2000; setting it (a page count when positive, KiB when negative)
+    // round-trips verbatim, matching sqlite. graphite keeps all pages resident, so
+    // this only affects what the getter reports.
+    assert_eq!(one(&c, "PRAGMA cache_size"), Value::Integer(-2000));
+    c.execute("PRAGMA cache_size=2000").unwrap();
+    assert_eq!(one(&c, "PRAGMA cache_size"), Value::Integer(2000));
+    c.execute("PRAGMA cache_size=-4000").unwrap();
+    assert_eq!(one(&c, "PRAGMA cache_size"), Value::Integer(-4000));
+}
+
+#[test]
+fn mmap_size_yields_no_rows() {
+    // The reference sqlite build disables memory-mapped I/O, so `PRAGMA mmap_size`
+    // returns no rows (rather than erroring). Setting it is an accepted no-op.
+    let mut c = Connection::open_memory().unwrap();
+    assert!(c.query("PRAGMA mmap_size").unwrap().rows.is_empty());
+    c.execute("PRAGMA mmap_size=65536").unwrap();
+    assert!(c.query("PRAGMA mmap_size").unwrap().rows.is_empty());
+}

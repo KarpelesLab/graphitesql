@@ -145,6 +145,10 @@ pub struct Connection {
     /// `no_std` builds (which have no entropy source) — non-determinism that no
     /// differential test can observe either way.
     rng_state: core::cell::Cell<u64>,
+    /// `PRAGMA cache_size` setting, round-tripped verbatim (a positive value is a
+    /// page count, a negative value is KiB; default −2000). graphite keeps every
+    /// page resident, so this is reported back but does not bound a real cache.
+    cache_size: core::cell::Cell<i64>,
 }
 
 /// Initial seed for a connection's `random()` generator. Under `std` it mixes
@@ -234,6 +238,7 @@ impl Connection {
             read_default: core::cell::Cell::new(DbRef::Main),
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
+            cache_size: core::cell::Cell::new(-2000),
         })
     }
 
@@ -263,6 +268,7 @@ impl Connection {
             read_default: core::cell::Cell::new(DbRef::Main),
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
+            cache_size: core::cell::Cell::new(-2000),
         })
     }
 
@@ -498,7 +504,13 @@ impl Connection {
             // beyond what it already implements, so each reports SQLite's fixed
             // default — what an unconfigured connection observes. This keeps the
             // shell drop-in for tools/ORMs that probe these on connect.
-            "cache_size" => Ok(single("cache_size", Value::Integer(-2000))),
+            "cache_size" => Ok(single("cache_size", Value::Integer(self.cache_size.get()))),
+            // The reference sqlite build has memory-mapped I/O disabled
+            // (SQLITE_MAX_MMAP_SIZE = 0), so `PRAGMA mmap_size` yields no rows.
+            "mmap_size" => Ok(QueryResult {
+                columns: alloc::vec![String::from("mmap_size")],
+                rows: Vec::new(),
+            }),
             "synchronous" => Ok(single("synchronous", Value::Integer(2))),
             "temp_store" => Ok(single("temp_store", Value::Integer(0))),
             "secure_delete" => Ok(single("secure_delete", Value::Integer(0))),
@@ -2323,6 +2335,13 @@ impl Connection {
         } else if p.name.eq_ignore_ascii_case("recursive_triggers") {
             if let Some(e) = &p.value {
                 self.recursive_triggers = pragma_truth(e, params);
+            }
+        } else if p.name.eq_ignore_ascii_case("cache_size") {
+            // Round-trip the value verbatim (graphite keeps all pages resident, so
+            // it changes nothing) — `PRAGMA cache_size` then reports it back.
+            if let Some(e) = &p.value {
+                self.cache_size
+                    .set(eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?));
             }
         } else if p.name.eq_ignore_ascii_case("journal_mode") {
             if let Some(e) = &p.value {
