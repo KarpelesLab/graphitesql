@@ -1163,6 +1163,7 @@ pub(crate) fn fts5_tokenize(text: &str) -> Vec<String> {
 /// One term of an FTS5 query: a phrase of one or more consecutive tokens,
 /// optionally restricted to a named column (`col:token`) and/or ending in a
 /// prefix token (`token*`).
+#[derive(Clone)]
 struct Fts5Term {
     /// The column the term is scoped to (`col:…`), or `None` for any column.
     column: Option<String>,
@@ -1193,18 +1194,38 @@ fn fts5_phrase_in(phrase: &[String], prefix: bool, doc: &[String]) -> bool {
     })
 }
 
-/// Parse an FTS5 query string into its AND-ed terms. Each whitespace-separated
-/// word is `[column:]body`, where `body` is a `"quoted phrase"` or a bare word
-/// optionally ending in `*` for a prefix match. Tokens are case-folded like the
-/// documents. (Boolean `AND`/`OR`/`NOT`/`NEAR` operators are not yet parsed — a
-/// bare `OR`/`NOT` is treated as an ordinary token.)
-fn fts5_parse_query(pattern: &str) -> Vec<Fts5Term> {
+/// A lexed token of an FTS5 query: a boolean operator, a parenthesis, or a term.
+enum Fts5Lex {
+    Or,
+    And,
+    Not,
+    LParen,
+    RParen,
+    Term(Fts5Term),
+}
+
+/// Lex an FTS5 query string into operators, parentheses, and terms. `OR`/`AND`/
+/// `NOT` are operators only as bare uppercase words (a lowercase `and` or a
+/// `col:and` is an ordinary token, as in SQLite). A term is `[column:]body`,
+/// where `body` is a `"quoted phrase"` or a bare word optionally ending in `*`.
+fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
     let chars: Vec<char> = pattern.chars().collect();
     let n = chars.len();
     let mut i = 0;
-    let mut terms = Vec::new();
+    let mut out = Vec::new();
     while i < n {
-        if chars[i].is_whitespace() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if ch == '(' {
+            out.push(Fts5Lex::LParen);
+            i += 1;
+            continue;
+        }
+        if ch == ')' {
+            out.push(Fts5Lex::RParen);
             i += 1;
             continue;
         }
@@ -1232,10 +1253,29 @@ fn fts5_parse_query(pattern: &str) -> Vec<Fts5Term> {
             (body, false)
         } else {
             let start = i;
-            while i < n && !chars[i].is_whitespace() {
+            while i < n && !chars[i].is_whitespace() && chars[i] != '(' && chars[i] != ')' {
                 i += 1;
             }
-            let mut body: String = chars[start..i].iter().collect();
+            let raw: String = chars[start..i].iter().collect();
+            // A bare, uncolumned uppercase keyword is a boolean operator.
+            if column.is_none() {
+                match raw.as_str() {
+                    "OR" => {
+                        out.push(Fts5Lex::Or);
+                        continue;
+                    }
+                    "AND" => {
+                        out.push(Fts5Lex::And);
+                        continue;
+                    }
+                    "NOT" => {
+                        out.push(Fts5Lex::Not);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            let mut body = raw;
             let prefix = body.ends_with('*');
             if prefix {
                 body.pop();
@@ -1244,41 +1284,144 @@ fn fts5_parse_query(pattern: &str) -> Vec<Fts5Term> {
         };
         let phrase = fts5_tokenize(&text);
         if !phrase.is_empty() {
-            terms.push(Fts5Term {
+            out.push(Fts5Lex::Term(Fts5Term {
                 column,
                 phrase,
                 prefix,
-            });
+            }));
         }
     }
-    terms
+    out
+}
+
+/// A parsed FTS5 boolean query tree (`A NOT B` means "A and not B").
+enum Fts5Query {
+    Term(Fts5Term),
+    And(Box<Fts5Query>, Box<Fts5Query>),
+    Or(Box<Fts5Query>, Box<Fts5Query>),
+    Not(Box<Fts5Query>, Box<Fts5Query>),
+}
+
+/// Recursive-descent parser for the FTS5 boolean grammar, lowest precedence
+/// (`OR`) outermost: `OR` of `AND`s (explicit or implicit by juxtaposition) of
+/// `NOT`s of primaries, where a primary is a parenthesized query or a term.
+struct Fts5Parser<'a> {
+    toks: &'a [Fts5Lex],
+    pos: usize,
+}
+
+impl Fts5Parser<'_> {
+    fn parse(&mut self) -> Option<Fts5Query> {
+        let q = self.parse_or();
+        // A trailing unmatched operator/paren is simply ignored.
+        q
+    }
+
+    fn parse_or(&mut self) -> Option<Fts5Query> {
+        let mut left = self.parse_and()?;
+        while matches!(self.toks.get(self.pos), Some(Fts5Lex::Or)) {
+            self.pos += 1;
+            match self.parse_and() {
+                Some(right) => left = Fts5Query::Or(Box::new(left), Box::new(right)),
+                None => break,
+            }
+        }
+        Some(left)
+    }
+
+    fn parse_and(&mut self) -> Option<Fts5Query> {
+        let mut left = self.parse_not()?;
+        loop {
+            match self.toks.get(self.pos) {
+                Some(Fts5Lex::And) => self.pos += 1,
+                // Juxtaposition (a term or `(`) is an implicit AND.
+                Some(Fts5Lex::Term(_) | Fts5Lex::LParen) => {}
+                _ => break,
+            }
+            match self.parse_not() {
+                Some(right) => left = Fts5Query::And(Box::new(left), Box::new(right)),
+                None => break,
+            }
+        }
+        Some(left)
+    }
+
+    fn parse_not(&mut self) -> Option<Fts5Query> {
+        let mut left = self.parse_primary()?;
+        while matches!(self.toks.get(self.pos), Some(Fts5Lex::Not)) {
+            self.pos += 1;
+            match self.parse_primary() {
+                Some(right) => left = Fts5Query::Not(Box::new(left), Box::new(right)),
+                None => break,
+            }
+        }
+        Some(left)
+    }
+
+    fn parse_primary(&mut self) -> Option<Fts5Query> {
+        match self.toks.get(self.pos) {
+            Some(Fts5Lex::LParen) => {
+                self.pos += 1;
+                let inner = self.parse_or();
+                if matches!(self.toks.get(self.pos), Some(Fts5Lex::RParen)) {
+                    self.pos += 1;
+                }
+                inner
+            }
+            Some(Fts5Lex::Term(t)) => {
+                let t = t.clone();
+                self.pos += 1;
+                Some(Fts5Query::Term(t))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether a single term matches any in-scope column (respecting `col:` scoping).
+fn fts5_term_matches(term: &Fts5Term, cols: &[(&str, Vec<String>)]) -> bool {
+    cols.iter().any(|(name, tokens)| {
+        term.column
+            .as_deref()
+            .is_none_or(|c| name.eq_ignore_ascii_case(c))
+            && fts5_phrase_in(&term.phrase, term.prefix, tokens)
+    })
+}
+
+/// Evaluate a parsed query tree against the tokenized in-scope columns.
+fn fts5_eval(query: &Fts5Query, cols: &[(&str, Vec<String>)]) -> bool {
+    match query {
+        Fts5Query::Term(t) => fts5_term_matches(t, cols),
+        Fts5Query::And(a, b) => fts5_eval(a, cols) && fts5_eval(b, cols),
+        Fts5Query::Or(a, b) => fts5_eval(a, cols) || fts5_eval(b, cols),
+        Fts5Query::Not(a, b) => fts5_eval(a, cols) && !fts5_eval(b, cols),
+    }
 }
 
 /// Whether the in-scope columns satisfy the FTS5 query `pattern`. `cols` is the
 /// `(name, text)` of each searchable column (one entry for a column-scoped
-/// `col MATCH …`, every column for a table-wide `tbl MATCH …`). Terms are
-/// implicitly AND-ed (SQLite's default): the document matches when *every* term
-/// is found — a bare token (or `token*` prefix, or `"quoted phrase"`) in any
-/// in-scope column, a `col:…` term only in the column it names. A query with no
-/// tokens matches nothing. Boolean `OR`/`NOT`/`NEAR` operators are not yet
-/// supported.
+/// `col MATCH …`, every column for a table-wide `tbl MATCH …`). The query
+/// supports bare tokens, `token*` prefixes, `"quoted phrases"`, `col:…` column
+/// filters, and the boolean operators `AND` (explicit or implicit by
+/// juxtaposition), `OR`, and `NOT` (binding tightest to loosest: `NOT`, `AND`,
+/// `OR`) with parentheses — matching SQLite's default precedence. A query with no
+/// tokens matches nothing. `NEAR` is not yet supported.
 pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)]) -> bool {
-    let terms = fts5_parse_query(pattern);
-    if terms.is_empty() {
-        return false;
-    }
+    let toks = fts5_lex(pattern);
+    let query = match (Fts5Parser {
+        toks: &toks,
+        pos: 0,
+    })
+    .parse()
+    {
+        Some(q) => q,
+        None => return false,
+    };
     let tokenized: Vec<(&str, Vec<String>)> = cols
         .iter()
         .map(|(name, text)| (name.as_str(), fts5_tokenize(text)))
         .collect();
-    terms.iter().all(|term| {
-        tokenized.iter().any(|(name, tokens)| {
-            term.column
-                .as_deref()
-                .is_none_or(|c| name.eq_ignore_ascii_case(c))
-                && fts5_phrase_in(&term.phrase, term.prefix, tokens)
-        })
-    })
+    fts5_eval(&query, &tokenized)
 }
 
 impl Fts5Module {
@@ -1424,6 +1567,45 @@ mod tests {
         // Column-scoped phrase / prefix.
         assert!(fts5_query_matches("body:\"quick brown\"", &doc));
         assert!(fts5_query_matches("body:ru*", &doc));
+    }
+
+    #[test]
+    fn fts5_boolean_operators_and_precedence() {
+        let doc = |s: &str| [(String::from("body"), String::from(s))];
+        // OR / AND / NOT.
+        assert!(fts5_query_matches("apple OR cherry", &doc("apple banana")));
+        assert!(!fts5_query_matches("apple AND date", &doc("apple banana")));
+        assert!(fts5_query_matches("apple AND date", &doc("apple date")));
+        assert!(fts5_query_matches(
+            "banana NOT cherry",
+            &doc("apple banana")
+        ));
+        assert!(!fts5_query_matches(
+            "banana NOT cherry",
+            &doc("banana cherry")
+        ));
+        // AND binds tighter than OR: `apple OR banana AND cherry`.
+        assert!(fts5_query_matches(
+            "apple OR banana AND cherry",
+            &doc("apple only")
+        ));
+        assert!(fts5_query_matches(
+            "apple OR banana AND cherry",
+            &doc("banana cherry")
+        ));
+        assert!(!fts5_query_matches(
+            "apple OR banana AND cherry",
+            &doc("banana only")
+        ));
+        // Parentheses override precedence.
+        assert!(fts5_query_matches(
+            "(apple OR banana) AND date",
+            &doc("apple date")
+        ));
+        assert!(!fts5_query_matches(
+            "(apple OR banana) AND date",
+            &doc("apple only")
+        ));
     }
 
     #[test]

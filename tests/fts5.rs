@@ -227,6 +227,49 @@ fn match_phrase_and_prefix_queries() {
 }
 
 #[test]
+fn match_boolean_operators() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+        .unwrap();
+    c.execute(
+        "INSERT INTO t VALUES \
+         ('apple banana'),('banana cherry'),('cherry date'),('apple date')",
+    )
+    .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        rows(&c, sql)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("not an integer rowid"),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'apple OR cherry' ORDER BY rowid"),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'apple AND date'"),
+        [4]
+    );
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'banana NOT cherry'"),
+        [1]
+    );
+    // AND binds tighter than OR.
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'apple OR banana AND cherry' ORDER BY rowid"),
+        [1, 2, 4]
+    );
+    // Parentheses override precedence.
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH '(apple OR banana) AND date'"),
+        [4]
+    );
+}
+
+#[test]
 fn match_against_null_pattern_is_null() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
