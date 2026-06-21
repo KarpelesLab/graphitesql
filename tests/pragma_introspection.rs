@@ -21,7 +21,8 @@ fn t(s: &str) -> Value {
 #[test]
 fn table_info_pk_is_the_one_based_ordinal() {
     let mut c = Connection::open_memory().unwrap();
-    c.execute("CREATE TABLE t(a, b, PRIMARY KEY(b, a))").unwrap();
+    c.execute("CREATE TABLE t(a, b, PRIMARY KEY(b, a))")
+        .unwrap();
     // pk column (index 5): b is PK position 1, a is position 2.
     let r = rows(&c, "PRAGMA table_info(t)");
     assert_eq!(r[0][1], t("a"));
@@ -30,7 +31,8 @@ fn table_info_pk_is_the_one_based_ordinal() {
     assert_eq!(r[1][5], i(1), "b is the 1st PK column");
 
     // A single / INTEGER primary key is ordinal 1.
-    c.execute("CREATE TABLE s(x INTEGER PRIMARY KEY, y)").unwrap();
+    c.execute("CREATE TABLE s(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
     let r = rows(&c, "PRAGMA table_info(s)");
     assert_eq!(r[0][5], i(1));
     assert_eq!(r[1][5], i(0));
@@ -39,7 +41,8 @@ fn table_info_pk_is_the_one_based_ordinal() {
 #[test]
 fn index_list_origin_distinguishes_pk_from_unique() {
     let mut c = Connection::open_memory().unwrap();
-    c.execute("CREATE TABLE t(a UNIQUE, b PRIMARY KEY)").unwrap();
+    c.execute("CREATE TABLE t(a UNIQUE, b PRIMARY KEY)")
+        .unwrap();
     // Newest-first: b's PK auto-index (origin pk), then a's UNIQUE (origin u).
     let r = rows(&c, "PRAGMA index_list(t)");
     assert_eq!(r[0][1], t("sqlite_autoindex_t_2"));
