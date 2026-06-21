@@ -205,3 +205,20 @@ fn foreign_key_list_on_a_vtab_is_empty() {
         .rows
         .is_empty());
 }
+
+#[test]
+fn table_info_reports_rtree_column_types() {
+    // The rtree module declares typed columns (id INT, coords REAL), so table_info
+    // matches sqlite byte-for-byte.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, minX, maxX)")
+        .unwrap();
+    let r = c.query("PRAGMA table_info(r)").unwrap();
+    let ty = |i: usize| match &r.rows[i][2] {
+        Value::Text(s) => s.clone(),
+        o => panic!("not text: {o:?}"),
+    };
+    assert_eq!(ty(0), "INT");
+    assert_eq!(ty(1), "REAL");
+    assert_eq!(ty(2), "REAL");
+}

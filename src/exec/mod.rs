@@ -758,20 +758,21 @@ impl Connection {
                 }
             }
         }
-        // A virtual table answers table_info with its module's declared columns.
-        // The safe module interface carries no per-column type / notnull / default /
-        // pk info, so those are reported empty/0 (sqlite, which has full type info,
-        // may show declared types here).
+        // A virtual table answers table_info with its module's declared columns
+        // and (optionally) their types; notnull / default / pk are 0/empty (the
+        // safe module interface carries no such info).
         if self.is_virtual_table(&table) {
-            let (_, _, col_names) = self.vtab_meta(&table)?;
-            let rows = col_names
+            let (_, _, schema) = self.vtab_meta(&table)?;
+            let rows = schema
+                .columns
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
+                    let ty = schema.types.get(i).cloned().unwrap_or_default();
                     let mut row = alloc::vec![
                         Value::Integer(i as i64),
                         Value::Text(name.clone()),
-                        Value::Text(String::new()),
+                        Value::Text(ty),
                         Value::Integer(0),
                         Value::Null,
                         Value::Integer(0),
@@ -4666,7 +4667,7 @@ impl Connection {
     /// The module name, `USING` arguments, and declared column names of a virtual
     /// table — by reparsing its stored `CREATE VIRTUAL TABLE` and asking the
     /// module to `connect`. Used by the write path.
-    fn vtab_meta(&self, name: &str) -> Result<(String, Vec<String>, Vec<String>)> {
+    fn vtab_meta(&self, name: &str) -> Result<(String, Vec<String>, crate::vtab::VTabSchema)> {
         use crate::schema::ObjectType;
         let obj = self
             .schema
@@ -4684,7 +4685,7 @@ impl Connection {
             .ok_or_else(|| Error::Error(format!("no such module: {}", cvt.module)))?;
         let arg_refs: Vec<&str> = cvt.args.iter().map(String::as_str).collect();
         let schema = module.dyn_connect(&arg_refs)?;
-        Ok((cvt.module.clone(), cvt.args.clone(), schema.columns))
+        Ok((cvt.module.clone(), cvt.args.clone(), schema))
     }
 
     /// `INSERT` into a virtual table: evaluate each row's values into the module's
@@ -4732,7 +4733,8 @@ impl Connection {
         if !ins.upsert.is_empty() || !ins.returning.is_empty() {
             return Err(Error::Unsupported("UPSERT / RETURNING on a virtual table"));
         }
-        let (module_name, args, col_names) = self.vtab_meta(&ins.table)?;
+        let (module_name, args, schema) = self.vtab_meta(&ins.table)?;
+        let col_names = schema.columns;
         let ncols = col_names.len();
         // Map the (possibly explicit) column list onto declared column positions.
         // `None` marks a `rowid`/`_rowid_`/`oid` term (a vtab's hidden rowid),
@@ -4848,7 +4850,8 @@ impl Connection {
         if upd.from.is_some() {
             return Err(Error::Unsupported("UPDATE … FROM on a virtual table"));
         }
-        let (module_name, args, col_names) = self.vtab_meta(&upd.table)?;
+        let (module_name, args, schema) = self.vtab_meta(&upd.table)?;
+        let col_names = schema.columns;
         // Resolve each SET target to a declared column position.
         let assigns: Vec<(usize, &Expr)> = upd
             .assignments

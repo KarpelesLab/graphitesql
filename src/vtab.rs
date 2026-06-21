@@ -103,17 +103,41 @@ pub struct VTabSchema {
     /// The column names, in declaration order. `column(i)` on a row refers to
     /// the column at this index.
     pub columns: Vec<String>,
+    /// The declared type of each column (parallel to `columns`; an empty string
+    /// is untyped). Reported by `PRAGMA table_info`. Empty when built with
+    /// [`new`](Self::new).
+    pub types: Vec<String>,
 }
 
 impl VTabSchema {
-    /// Build a schema from a list of column names.
+    /// Build a schema from a list of (untyped) column names.
     pub fn new<I, S>(columns: I) -> VTabSchema
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let columns: Vec<String> = columns.into_iter().map(Into::into).collect();
+        let types = alloc::vec![String::new(); columns.len()];
+        VTabSchema { columns, types }
+    }
+
+    /// Build a schema from `(name, type)` pairs (a type may be empty for an
+    /// untyped column). The declared types are reported by `PRAGMA table_info`.
+    pub fn typed<I, S, T>(columns: I) -> VTabSchema
+    where
+        I: IntoIterator<Item = (S, T)>,
+        S: Into<String>,
+        T: Into<String>,
+    {
+        let mut names = Vec::new();
+        let mut types = Vec::new();
+        for (n, t) in columns {
+            names.push(n.into());
+            types.push(t.into());
+        }
         VTabSchema {
-            columns: columns.into_iter().map(Into::into).collect(),
+            columns: names,
+            types,
         }
     }
 
@@ -1022,7 +1046,12 @@ impl VTabModule for RTreeModule {
                  at least 3",
             )));
         }
-        Ok(VTabSchema::new(args.iter().map(|s| String::from(*s))))
+        // The id column is an integer; every coordinate is a 32-bit float (REAL),
+        // matching sqlite's declared rtree column types.
+        Ok(VTabSchema::typed(args.iter().enumerate().map(|(i, s)| {
+            let ty = if i == 0 { "INT" } else { "REAL" };
+            (String::from(*s), ty)
+        })))
     }
 
     fn open(&self, _args: &[&str], _plan: &IndexPlan) -> Result<RTreeCursor> {
