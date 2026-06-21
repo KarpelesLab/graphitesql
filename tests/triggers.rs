@@ -383,3 +383,31 @@ fn new_and_old_rowid_in_trigger_bodies() {
         Value::Integer(2)
     );
 }
+
+#[test]
+fn dropping_a_table_drops_its_triggers() {
+    // SQLite cascades a table's triggers when the table is dropped; triggers on
+    // other tables are left intact.
+    let mut c = Connection::open_memory().unwrap();
+    for s in [
+        "CREATE TABLE t(a)",
+        "CREATE TABLE u(b)",
+        "CREATE TRIGGER tr1 AFTER INSERT ON t BEGIN SELECT 1; END",
+        "CREATE TRIGGER tr2 BEFORE DELETE ON t BEGIN SELECT 2; END",
+        "CREATE TRIGGER tu AFTER INSERT ON u BEGIN SELECT 3; END",
+        "DROP TABLE t",
+    ] {
+        c.execute(s).unwrap();
+    }
+    let names: Vec<_> = c
+        .query("SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["tu"]); // only u's trigger survives
+}

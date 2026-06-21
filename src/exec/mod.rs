@@ -4867,6 +4867,13 @@ impl Connection {
                 roots_to_free.push(idx.rootpage);
                 names_to_remove.push(idx.name.clone());
             }
+            // Triggers on the table are dropped with it (SQLite cascades these).
+            for o in self.schema.objects() {
+                if o.obj_type == ObjectType::Trigger && o.tbl_name.eq_ignore_ascii_case(&obj.name) {
+                    roots_to_free.push(o.rootpage); // triggers have rootpage 0
+                    names_to_remove.push(o.name.clone());
+                }
+            }
         }
         // Map names -> sqlite_schema rowids (scan page 1).
         let victim_rowids = self.schema_rowids_for(&names_to_remove)?;
