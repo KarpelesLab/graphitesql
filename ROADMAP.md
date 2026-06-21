@@ -248,9 +248,12 @@ the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep)
   **mixed-direction** ORDER BY whose leading terms an index satisfies — sqlite
   walks the index for the prefix and emits `USE TEMP B-TREE FOR LAST TERM OF ORDER
   BY` (a partial sort); graphite still full-sorts. Results correct; EQP differs.*
-- **B0b-ii — `GROUP BY` over an indexed prefix.** Consume groups in index order
-  (no hash) when `GROUP BY` is a prefix of an available index; sqlite reports
-  `SCAN … USING [COVERING] INDEX`.
+- **B0b-ii — covered query over an index. ✅ DONE (EQP/read side).** A no-`WHERE`
+  query whose every referenced column is held by exactly one full index now reads
+  from that index (`covering_scan` + `query_cols_covered`), reporting `SCAN …
+  USING COVERING INDEX` like sqlite — covering plain projections, `DISTINCT`, and
+  `GROUP BY`/aggregates over covered columns. *(Still hash-grouped, not stream-
+  grouped in index order; results identical.)*
 - **B0b-iii — `ORDER BY` from a `WHERE`-chosen index.** Today B0 fires only with
   no `WHERE`; reuse the index a `WHERE` seek already picked to also skip the sort
   (`WHERE a=? ORDER BY b` over an index on `(a, b)`). The seek already walks the
