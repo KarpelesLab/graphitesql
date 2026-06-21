@@ -218,6 +218,38 @@ fn secondary_index_on_a_without_rowid_table_seeks() {
 }
 
 #[test]
+fn secondary_index_range_on_a_without_rowid_table() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE w(a PRIMARY KEY, b, c) WITHOUT ROWID")
+        .unwrap();
+    c.execute("CREATE INDEX i ON w(b)").unwrap();
+    c.execute("INSERT INTO w VALUES (1,5,100),(2,15,200),(3,25,300)")
+        .unwrap();
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT a, b FROM w WHERE b>10"),
+        "SEARCH w USING COVERING INDEX i (b>?)"
+    );
+    // Referencing c (not in the index) makes it a non-covering INDEX range that
+    // fetches the row by PK.
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT a, c FROM w WHERE b BETWEEN 10 AND 20"
+        ),
+        "SEARCH w USING INDEX i (b>? AND b<?)"
+    );
+    assert_eq!(
+        c.query("SELECT a, c FROM w WHERE b>=15 ORDER BY a")
+            .unwrap()
+            .rows,
+        [
+            vec![Value::Integer(2), Value::Integer(200)],
+            vec![Value::Integer(3), Value::Integer(300)],
+        ]
+    );
+}
+
+#[test]
 fn text_and_collated_primary_keys() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE PRIMARY KEY, n) WITHOUT ROWID")

@@ -5410,59 +5410,156 @@ impl Connection {
                 continue;
             }
             let records = crate::btree::index_seek_records(src, idx.root, &key, &colls)?;
-            // For covering, a *named* index counts as holding its columns plus the
-            // trailing PK columns; an implicit UNIQUE/PK autoindex counts only its
-            // own columns (matching SQLite's `COVERING INDEX` vs `INDEX`). The
-            // record still carries the PK either way, so a non-covering seek can
-            // fetch the row by PK below.
-            let mut avail = idx.cols.clone();
-            if !idx.name.starts_with("sqlite_autoindex_") {
-                for &p in &pk {
-                    if !avail.contains(&p) {
-                        avail.push(p);
-                    }
+            let covering = self.wr_index_covers(idx, &pk, meta, sel, where_expr);
+            return Ok(Some(
+                self.wr_index_rows(meta, idx, &pk, records, covering, params)?,
+            ));
+        }
+        Ok(None)
+    }
+
+    /// Whether a WITHOUT ROWID secondary index covers the query (so its rows can
+    /// be read straight from the index records). A *named* index counts as holding
+    /// its columns plus the trailing PK columns; an implicit UNIQUE/PK autoindex
+    /// (`sqlite_autoindex_*`) counts only its own — matching SQLite's `COVERING
+    /// INDEX` vs `INDEX` wording.
+    fn wr_index_covers(
+        &self,
+        idx: &IndexMeta,
+        pk: &[usize],
+        meta: &TableMeta,
+        sel: &Select,
+        where_expr: &Expr,
+    ) -> bool {
+        let mut avail = idx.cols.clone();
+        if !idx.name.starts_with("sqlite_autoindex_") {
+            for &p in pk {
+                if !avail.contains(&p) {
+                    avail.push(p);
                 }
             }
-            let mut out = Vec::with_capacity(records.len());
-            if self.seek_index_covers(sel, meta, &avail, where_expr) {
-                // Covering: reconstruct the referenced columns from the record;
-                // the rest are unreferenced (left NULL). No generated columns
-                // here (index_covers_query declines those).
-                for rec in &records {
-                    let mut values = alloc::vec![Value::Null; meta.columns.len()];
-                    for (i, &mc) in idx.cols.iter().enumerate() {
-                        values[mc] = rec[i].clone();
-                    }
-                    for (j, &pc) in pk.iter().enumerate() {
-                        values[pc] = rec[idx.cols.len() + j].clone();
-                    }
+        }
+        self.seek_index_covers(sel, meta, &avail, where_expr)
+    }
+
+    /// Build rows from a WITHOUT ROWID secondary index's seeked/scanned records.
+    /// Each record is `(indexed cols…, PK cols…)`: when `covering`, reconstruct
+    /// the referenced columns straight from it (the rest are unreferenced, left
+    /// NULL); otherwise the trailing PK columns seek the clustered b-tree for the
+    /// full row.
+    fn wr_index_rows(
+        &self,
+        meta: &TableMeta,
+        idx: &IndexMeta,
+        pk: &[usize],
+        records: Vec<Vec<Value>>,
+        covering: bool,
+        params: &Params,
+    ) -> Result<Vec<InputRow>> {
+        let mut out = Vec::with_capacity(records.len());
+        if covering {
+            for rec in &records {
+                let mut values = alloc::vec![Value::Null; meta.columns.len()];
+                for (i, &mc) in idx.cols.iter().enumerate() {
+                    values[mc] = rec[i].clone();
+                }
+                for (j, &pc) in pk.iter().enumerate() {
+                    values[pc] = rec[idx.cols.len() + j].clone();
+                }
+                out.push(InputRow {
+                    values,
+                    rowid: None,
+                });
+            }
+        } else {
+            let src = self.backend.source();
+            let pk_colls: Vec<crate::value::Collation> =
+                wr_storage_collations(meta)[..pk.len()].to_vec();
+            for rec in &records {
+                let pk_key: Vec<Value> = (0..pk.len())
+                    .map(|j| rec[idx.cols.len() + j].clone())
+                    .collect();
+                for storage in crate::btree::index_seek_records(src, meta.root, &pk_key, &pk_colls)?
+                {
+                    let mut row = unpermute_row(meta, storage);
+                    self.compute_generated(meta, &mut row, params)?;
                     out.push(InputRow {
-                        values,
+                        values: row,
                         rowid: None,
                     });
                 }
-            } else {
-                // Non-covering: the trailing PK columns of each record seek the
-                // clustered b-tree for the full row.
-                let pk_colls: Vec<crate::value::Collation> =
-                    wr_storage_collations(meta)[..pk.len()].to_vec();
-                for rec in &records {
-                    let pk_key: Vec<Value> = (0..pk.len())
-                        .map(|j| rec[idx.cols.len() + j].clone())
-                        .collect();
-                    for storage in
-                        crate::btree::index_seek_records(src, meta.root, &pk_key, &pk_colls)?
-                    {
-                        let mut row = unpermute_row(meta, storage);
-                        self.compute_generated(meta, &mut row, params)?;
-                        out.push(InputRow {
-                            values: row,
-                            rowid: None,
-                        });
-                    }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Range variant of [`try_without_rowid_index_seek`](Self::try_without_rowid_index_seek):
+    /// a bound on the *leading* column of a WITHOUT ROWID secondary index walks
+    /// the index between bounds (covering or PK-fetching, as above).
+    fn try_without_rowid_index_range(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let Some(where_expr) = &sel.where_clause else {
+            return Ok(None);
+        };
+        let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
+        if matches!(hint, Some(IndexHint::NotIndexed)) {
+            return Ok(None);
+        }
+        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+            alloc::collections::BTreeMap::new();
+        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let pk: Vec<usize> = meta.storage_order[..meta.pk_len].to_vec();
+        let indexes = self.indexes_of(table_name)?;
+        if let Some(IndexHint::IndexedBy(n)) = hint {
+            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
+                return Err(Error::Error(alloc::format!("no such index: {n}")));
+            }
+        }
+        for idx in &indexes {
+            if let Some(IndexHint::IndexedBy(n)) = hint {
+                if !idx.name.eq_ignore_ascii_case(n) {
+                    continue;
                 }
             }
-            return Ok(Some(out));
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
+                continue;
+            }
+            let Some(&lead) = idx.cols.first() else {
+                continue;
+            };
+            let Some(b) = ranges.get(&lead) else {
+                continue;
+            };
+            let aff = meta.columns[lead].affinity;
+            let coll = idx.collations.first().copied().unwrap_or_default();
+            let lower = b.lower.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i));
+            let upper = b.upper.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i));
+            let colls = [coll];
+            let lower_arg = lower
+                .as_ref()
+                .map(|(v, inc)| (core::slice::from_ref(v), *inc));
+            let upper_arg = upper
+                .as_ref()
+                .map(|(v, inc)| (core::slice::from_ref(v), *inc));
+            let records = crate::btree::index_range_records(
+                self.backend.source(),
+                idx.root,
+                lower_arg,
+                upper_arg,
+                &colls,
+            )?;
+            let covering = self.wr_index_covers(idx, &pk, meta, sel, where_expr);
+            return Ok(Some(
+                self.wr_index_rows(meta, idx, &pk, records, covering, params)?,
+            ));
         }
         Ok(None)
     }
@@ -6669,6 +6766,47 @@ impl Connection {
                     .map(|&c| alloc::format!("{}=?", meta.columns[c].name))
                     .collect::<Vec<_>>()
                     .join(" AND ");
+                return Ok(alloc::format!(
+                    "SEARCH {label} USING {kw} {} ({cond})",
+                    idx.name
+                ));
+            }
+            // Else a range bound on a secondary index's leading column
+            // (matches try_without_rowid_index_range).
+            let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                alloc::collections::BTreeMap::new();
+            collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+            for idx in self.indexes_of(table)? {
+                if idx.partial.is_some() || idx.key_exprs.is_some() {
+                    continue;
+                }
+                let Some(&lead) = idx.cols.first() else {
+                    continue;
+                };
+                let Some(b) = ranges.get(&lead) else {
+                    continue;
+                };
+                let name = &meta.columns[lead].name;
+                let cond = match (&b.lower, &b.upper) {
+                    (Some(_), Some(_)) => alloc::format!("{name}>? AND {name}<?"),
+                    (Some(_), None) => alloc::format!("{name}>?"),
+                    (None, Some(_)) => alloc::format!("{name}<?"),
+                    (None, None) => continue,
+                };
+                let mut avail = idx.cols.clone();
+                if !idx.name.starts_with("sqlite_autoindex_") {
+                    for &p in pk {
+                        if !avail.contains(&p) {
+                            avail.push(p);
+                        }
+                    }
+                }
+                let kw = match sel {
+                    Some(s) if self.seek_index_covers(s, meta, &avail, where_expr) => {
+                        "COVERING INDEX"
+                    }
+                    _ => "INDEX",
+                };
                 return Ok(alloc::format!(
                     "SEARCH {label} USING {kw} {} ({cond})",
                     idx.name
@@ -8252,6 +8390,11 @@ impl Connection {
                 }
                 if let Some(rows) =
                     self.try_without_rowid_index_seek(&first_meta, &from.first.name, sel, params)?
+                {
+                    return Ok((first_meta.columns, rows));
+                }
+                if let Some(rows) =
+                    self.try_without_rowid_index_range(&first_meta, &from.first.name, sel, params)?
                 {
                     return Ok((first_meta.columns, rows));
                 }
