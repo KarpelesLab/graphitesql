@@ -22,12 +22,13 @@ format**.
 > `STRICT` tables, generated columns, **triggers**, **foreign keys**, **ATTACH /
 > TEMP** multi-schema, **virtual tables** (built-in `series`, `rtree`, and
 > `fts5` modules — full-text `MATCH` with phrases, prefixes, column filters,
-> `AND`/`OR`/`NOT`, `NEAR`, and `^` anchors — plus `register_module` /
-> `register_function` for your own), and a wide function library — date/time,
+> `AND`/`OR`/`NOT`, `NEAR`, `^` anchors, and `bm25()`/`rank` relevance ordering —
+> plus `register_module` / `register_function` for your own), and a wide function
+> library — date/time,
 > `printf`, math, **JSON + JSONB**, and more — with an index-driven planner and
 > **`EXPLAIN QUERY PLAN`** matching sqlite. Everything is verified differentially
 > against `sqlite3` (a 1,600+ query corpus plus 140+ focused suites). What remains
-> is depth: FTS5 ranking + on-disk format, R-Tree spatial pushdown, the
+> is depth: the FTS5 / R-Tree on-disk index formats, R-Tree spatial pushdown, the
 > executor→VDBE migration, and concurrency — see the full plan in
 > **[ROADMAP.md](ROADMAP.md)**.
 

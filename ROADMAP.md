@@ -425,10 +425,19 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     boolean operators `AND` (explicit or implicit), `OR`, `NOT` with SQLite's
     precedence (`NOT`>`AND`>`OR`) and parentheses, and the `NEAR(p1 p2 …, n)`
     proximity group. Byte-identical to sqlite3 across all these forms — the core
-    FTS5 query language is complete. *(Remaining: `bm25()` relevance ranking and
-    the byte-compatible on-disk segment format.)*
-  - **D2d — `bm25()` ranking** and **D2e — byte-compatible segment format** are
-    the remaining FTS5 tracks (both require the real inverted index of D2b).
+    FTS5 query language is complete.
+  - **D2d — `bm25()` ranking + the `rank` column. ✅ DONE (correct-results).**
+    `ORDER BY rank` / `ORDER BY bm25(t)` sorts most-relevant-first and `bm25(t)`
+    / `rank` expose the score, byte-for-byte sqlite's Okapi BM25 (`k1=1.2`,
+    `b=0.75`, idf clamped up to `1e-6`, sum negated). `fts5_bm25_scores`
+    (`vtab.rs`) scores the corpus honoring `col:` filters and a `col MATCH …`
+    scope; `run_core` computes the per-rowid scores for a single-`fts5`-table
+    MATCH query into a connection-scoped `fts5_rank` cell that the `bm25()`
+    special form and the `rank` column read during projection / `ORDER BY`.
+    Outside an fts5 MATCH, `rank`/`bm25()` stay ordinary unknown names.
+  - **D2e — byte-compatible on-disk segment format** is the remaining FTS5 track
+    (the `%_data`/`%_idx` inverted-index b-tree layout sqlite writes; needs the
+    real inverted index of D2b — graphite's fts5 is currently scan-based).
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
   (`register_function`, via `Subqueries::call_udf`) and aggregate ✅ DONE
   (`register_aggregate_function` + an `AggregateFunction` step/finalize trait;
