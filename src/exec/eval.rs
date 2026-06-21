@@ -803,6 +803,11 @@ fn eval_or(left: &Expr, right: &Expr, ctx: &EvalCtx) -> Result<Value> {
 }
 
 fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<Value> {
+    // An empty IN list is always false (`NOT IN`: always true) — SQLite
+    // short-circuits before NULL semantics, so even `NULL IN ()` is 0, not NULL.
+    if list.is_empty() {
+        return Ok(bool_value(negated));
+    }
     let v = eval(expr, ctx)?;
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
