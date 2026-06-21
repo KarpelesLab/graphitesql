@@ -102,6 +102,17 @@ pub struct Connection {
     foreign_keys: bool,
     /// Re-entrancy depth of trigger firing.
     trigger_depth: core::cell::Cell<usize>,
+    /// Set by an `OR FAIL` conflict before it raises: tells the statement-level
+    /// atomicity wrapper to keep the rows changed before the failure (rather than
+    /// rolling the statement back, which is the `OR ABORT` default).
+    stmt_keep_partial: core::cell::Cell<bool>,
+    /// Set by an `OR ROLLBACK` conflict before it raises: the surrounding
+    /// transaction must be unwound, not just the current statement.
+    stmt_rollback_tx: core::cell::Cell<bool>,
+    /// Set when a `BEFORE` trigger runs `SELECT RAISE(IGNORE)`: the row operation
+    /// that fired the trigger is silently abandoned (no error). The firing caller
+    /// reads and clears it.
+    raise_ignore: core::cell::Cell<bool>,
     /// Whether triggers may fire other triggers (`PRAGMA recursive_triggers`).
     /// Off by default, matching SQLite: triggers then fire only at the top level.
     recursive_triggers: bool,
@@ -186,6 +197,9 @@ impl Connection {
             outer_scope: core::cell::RefCell::new(Vec::new()),
             foreign_keys: false,
             trigger_depth: core::cell::Cell::new(0),
+            stmt_keep_partial: core::cell::Cell::new(false),
+            stmt_rollback_tx: core::cell::Cell::new(false),
+            raise_ignore: core::cell::Cell::new(false),
             recursive_triggers: false,
             returning_rows: core::cell::RefCell::new(Vec::new()),
             open_savepoints: 0,
@@ -211,6 +225,9 @@ impl Connection {
             outer_scope: core::cell::RefCell::new(Vec::new()),
             foreign_keys: false,
             trigger_depth: core::cell::Cell::new(0),
+            stmt_keep_partial: core::cell::Cell::new(false),
+            stmt_rollback_tx: core::cell::Cell::new(false),
+            raise_ignore: core::cell::Cell::new(false),
             recursive_triggers: false,
             returning_rows: core::cell::RefCell::new(Vec::new()),
             open_savepoints: 0,
@@ -1240,14 +1257,24 @@ impl Connection {
         // `WritePager::rebuild_ptrmap`), so the C6a guard that used to refuse
         // such writes has been lifted. auto_vacuum=NONE databases take the
         // unchanged plain write path.
+        // An INSERT/UPDATE/DELETE is atomic: if it fails partway (a constraint
+        // violation, a trigger `RAISE(ABORT)`, …) the rows it already changed are
+        // undone, leaving the database as if the statement never ran — unless the
+        // failing conflict policy was `OR FAIL`, which keeps the partial change.
+        // We realise this with an internal savepoint snapshotting the writer
+        // overlay(s) before the statement and rolling back to it on an
+        // abort-class error. (A no-op for DDL, which doesn't set `is_dml`.)
+        if is_dml {
+            self.stmt_keep_partial.set(false);
+            self.stmt_rollback_tx.set(false);
+            return self.run_dml_atomic(stmt, params);
+        }
         let affected = match stmt {
             Statement::CreateTable(ct) => {
                 self.exec_create_table(&ct, sql.trim())?;
                 0
             }
-            Statement::Insert(ins) => self.exec_insert(&ins, params)?,
-            Statement::Delete(del) => self.exec_delete(&del, params)?,
-            Statement::Update(upd) => self.exec_update(&upd, params)?,
+            Statement::Insert(_) | Statement::Delete(_) | Statement::Update(_) => unreachable!(),
             Statement::CreateIndex(ci) => {
                 self.exec_create_index(&ci, sql.trim())?;
                 0
@@ -1304,17 +1331,89 @@ impl Connection {
             | Statement::RollbackTo(_) => unreachable!(),
         };
 
-        if is_dml {
-            self.changes.set(affected as i64);
-            self.total_changes
-                .set(self.total_changes.get() + affected as i64);
-        }
         if !self.in_tx && self.open_savepoints == 0 {
             self.backend.writer()?.commit()?;
             // Refresh the catalog from the committed image.
             self.schema = Schema::read(self.backend.source())?;
         }
         Ok(affected)
+    }
+
+    /// Execute one INSERT/UPDATE/DELETE under an internal savepoint so it is
+    /// atomic: on an abort-class failure (a constraint violation, a trigger
+    /// `RAISE(ABORT)`, …) the writer overlay(s) are rolled back to the
+    /// pre-statement snapshot, so no partial change survives. `OR FAIL` keeps the
+    /// rows changed before the failure; `OR ROLLBACK` unwinds the whole
+    /// transaction.
+    /// Build the constraint error for a conflict under conflict policy `oc`,
+    /// arming the statement-atomicity flags so `run_dml_atomic` keeps partial
+    /// changes (`OR FAIL`) or unwinds the transaction (`OR ROLLBACK`).
+    fn conflict_error(&self, oc: OnConflict, msg: &str) -> Error {
+        match oc {
+            OnConflict::Fail => self.stmt_keep_partial.set(true),
+            OnConflict::Rollback => self.stmt_rollback_tx.set(true),
+            _ => {}
+        }
+        Error::Constraint(String::from(msg))
+    }
+
+    fn run_dml_atomic(&mut self, stmt: Statement, params: &Params) -> Result<usize> {
+        const SP: &str = "\u{0}graphite_stmt";
+        self.backend.writer()?.savepoint(SP);
+        self.savepoint_attached(SP)?;
+        let result = match stmt {
+            Statement::Insert(ins) => self.exec_insert(&ins, params),
+            Statement::Delete(del) => self.exec_delete(&del, params),
+            Statement::Update(upd) => self.exec_update(&upd, params),
+            _ => unreachable!("run_dml_atomic only handles DML"),
+        };
+        match result {
+            Ok(affected) => {
+                let _ = self.backend.writer()?.release_savepoint(SP);
+                let _ = self.release_attached(SP);
+                self.changes.set(affected as i64);
+                self.total_changes
+                    .set(self.total_changes.get() + affected as i64);
+                if !self.in_tx && self.open_savepoints == 0 {
+                    self.backend.writer()?.commit()?;
+                    self.schema = Schema::read(self.backend.source())?;
+                }
+                Ok(affected)
+            }
+            Err(e) => {
+                if self.stmt_rollback_tx.get() {
+                    // `OR ROLLBACK`: discard the entire (implicit or explicit)
+                    // transaction's staged changes.
+                    self.backend.writer()?.rollback();
+                    self.rollback_attached()?;
+                    self.in_tx = false;
+                    self.open_savepoints = 0;
+                    self.schema = Schema::read(self.backend.source())?;
+                } else if self.stmt_keep_partial.get() {
+                    // `OR FAIL`: keep what was changed before the failure.
+                    let _ = self.backend.writer()?.release_savepoint(SP);
+                    let _ = self.release_attached(SP);
+                    if !self.in_tx && self.open_savepoints == 0 {
+                        self.backend.writer()?.commit()?;
+                        self.schema = Schema::read(self.backend.source())?;
+                    }
+                } else {
+                    // `OR ABORT` (the default): undo just this statement.
+                    let _ = self.backend.writer()?.rollback_to_savepoint(SP);
+                    let _ = self.backend.writer()?.release_savepoint(SP);
+                    let _ = self.rollback_to_attached(SP);
+                    let _ = self.release_attached(SP);
+                    if !self.in_tx && self.open_savepoints == 0 {
+                        // Outside a transaction the rolled-back statement leaves
+                        // nothing to commit; drop any other staged state too.
+                        self.backend.writer()?.rollback();
+                        self.rollback_attached()?;
+                        self.schema = Schema::read(self.backend.source())?;
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Execute an `INSERT`/`UPDATE`/`DELETE` with a `RETURNING` clause, returning
@@ -1904,7 +2003,7 @@ impl Connection {
                 columns: Vec::new(),
                 source: InsertSource::Values(value_rows),
                 on_conflict: OnConflict::Abort,
-                upsert: None,
+                upsert: Vec::new(),
                 returning: Vec::new(),
             };
             self.exec_insert(&ins, &Params::default())?;
@@ -2609,6 +2708,9 @@ impl Connection {
                 params,
                 None,
             )?;
+            if self.raise_ignore.replace(false) {
+                continue;
+            }
             affected += 1;
         }
         Ok(affected)
@@ -2647,6 +2749,9 @@ impl Connection {
                 params,
                 None,
             )?;
+            if self.raise_ignore.replace(false) {
+                continue;
+            }
             affected += 1;
         }
         Ok(affected)
@@ -2696,6 +2801,9 @@ impl Connection {
                 params,
                 Some(&changed),
             )?;
+            if self.raise_ignore.replace(false) {
+                continue;
+            }
             affected += 1;
         }
         Ok(affected)
@@ -2723,12 +2831,115 @@ impl Connection {
                     Statement::Delete(d) => {
                         self.exec_delete(d, params)?;
                     }
-                    Statement::Select(_) => {} // side-effect free in our engine
+                    // A `SELECT` in a trigger body is side-effect free *except* for
+                    // a `RAISE(…)`, which aborts or ignores the firing operation.
+                    Statement::Select(sel) => {
+                        self.run_trigger_select(sel, params)?;
+                        // `RAISE(IGNORE)` abandons the row: stop running the rest of
+                        // this (and later) trigger program(s).
+                        if self.raise_ignore.get() {
+                            return Ok(());
+                        }
+                    }
                     _ => return Err(Error::Unsupported("statement type in trigger body")),
                 }
             }
         }
         Ok(())
+    }
+
+    /// Evaluate a trigger-body `SELECT` for a `RAISE(…)` call. A bare
+    /// `SELECT RAISE(…)` (optionally wrapped in a single `CASE`) is the standard
+    /// form; we evaluate each projected expression so any `RAISE` that the row
+    /// reaches takes effect. `RAISE(ABORT|FAIL|ROLLBACK, msg)` raises a constraint
+    /// error (arming the statement-atomicity flags); `RAISE(IGNORE)` sets
+    /// `raise_ignore` so the firing row operation is silently skipped.
+    fn run_trigger_select(&self, sel: &Select, params: &Params) -> Result<()> {
+        for col in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                self.eval_raise_expr(expr, params)?;
+                if self.raise_ignore.get() {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate `expr` looking for a `RAISE(…)` that the row reaches: a direct
+    /// `RAISE(…)` call, or one selected by a `CASE` branch. Other expressions are
+    /// side-effect free here and are skipped.
+    fn eval_raise_expr(&self, expr: &Expr, params: &Params) -> Result<()> {
+        match expr {
+            Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("raise") => {
+                self.fire_raise(args, params)
+            }
+            Expr::Paren(inner) => self.eval_raise_expr(inner, params),
+            Expr::Case {
+                operand,
+                when_then,
+                else_result,
+            } => {
+                let ctx = EvalCtx::rowless(params).with_subqueries(self);
+                let base = match operand {
+                    Some(op) => Some(eval::eval(op, &ctx)?),
+                    None => None,
+                };
+                for (when, then) in when_then {
+                    let hit = match &base {
+                        // `CASE x WHEN v …`: the branch fires when x == v.
+                        Some(b) => {
+                            let w = eval::eval(when, &ctx)?;
+                            crate::value::cmp_values(b, &w) == core::cmp::Ordering::Equal
+                        }
+                        // `CASE WHEN cond …`: the branch fires when cond is true.
+                        None => eval::truth(&eval::eval(when, &ctx)?) == Some(true),
+                    };
+                    if hit {
+                        return self.eval_raise_expr(then, params);
+                    }
+                }
+                if let Some(e) = else_result {
+                    return self.eval_raise_expr(e, params);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Apply a parsed `RAISE(action[, msg])`. `action` is the lower-cased keyword
+    /// stored as the first argument; `msg` (when present) is the second.
+    fn fire_raise(&self, args: &[Expr], params: &Params) -> Result<()> {
+        let action = match args.first() {
+            Some(Expr::Literal(Literal::Str(s))) => s.as_str(),
+            _ => return Err(Error::Error("malformed RAISE()".into())),
+        };
+        if action == "ignore" {
+            self.raise_ignore.set(true);
+            return Ok(());
+        }
+        let ctx = EvalCtx::rowless(params).with_subqueries(self);
+        let msg = match args.get(1) {
+            Some(e) => match eval::eval(e, &ctx)? {
+                Value::Null => String::new(),
+                Value::Text(s) => s,
+                Value::Integer(i) => {
+                    let mut s = String::new();
+                    let _ = core::fmt::write(&mut s, format_args!("{i}"));
+                    s
+                }
+                Value::Real(r) => eval::format_real(r),
+                Value::Blob(_) => String::new(),
+            },
+            None => String::new(),
+        };
+        match action {
+            "fail" => self.stmt_keep_partial.set(true),
+            "rollback" => self.stmt_rollback_tx.set(true),
+            _ => {} // "abort" — the default statement rollback
+        }
+        Err(Error::Constraint(msg))
     }
 
     fn exec_insert(&mut self, ins: &Insert, params: &Params) -> Result<usize> {
@@ -2768,7 +2979,7 @@ impl Connection {
         }
         let meta = self.table_meta(&ins.table, None)?;
         if meta.without_rowid {
-            if ins.upsert.is_some() || !ins.returning.is_empty() {
+            if !ins.upsert.is_empty() || !ins.returning.is_empty() {
                 return Err(Error::Unsupported(
                     "UPSERT / RETURNING on WITHOUT ROWID tables",
                 ));
@@ -2846,16 +3057,40 @@ impl Connection {
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Integer(rowid);
             }
-            check_not_null(&meta, &values)?;
-            self.check_strict_types(&meta, &values)?;
-            self.check_constraints(&meta, &values, Some(rowid), params)?;
+            // NOT NULL / STRICT-type / CHECK constraints. `INSERT OR IGNORE`
+            // skips a row that violates any of these (rather than failing the
+            // statement); every other conflict policy lets the error propagate.
+            {
+                let r = check_not_null(&meta, &values)
+                    .and_then(|()| self.check_strict_types(&meta, &values))
+                    .and_then(|()| self.check_constraints(&meta, &values, Some(rowid), params));
+                match r {
+                    Ok(()) => {}
+                    Err(Error::Constraint(_)) if ins.on_conflict == OnConflict::Ignore => continue,
+                    Err(Error::Constraint(m)) => {
+                        return Err(self.conflict_error(ins.on_conflict, &m))
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             self.check_fk_child(&ins.table, &meta, &values)?;
 
             // Resolve UNIQUE / PRIMARY KEY (incl. rowid) conflicts.
             let conflicts = self.find_conflicts(&ins.table, &meta, rowid, &values, None, params)?;
             if !conflicts.is_empty() {
-                // An `ON CONFLICT … DO …` upsert clause intercepts the conflict.
-                if let Some(up) = &ins.upsert {
+                // An `ON CONFLICT … DO …` upsert clause intercepts the conflict,
+                // but only when the conflict is on the index it targets (a bare
+                // `ON CONFLICT` with no target matches any unique conflict). A
+                // conflict on a *different* index is a hard error, exactly as in
+                // SQLite.
+                let mut matched = None;
+                for up in &ins.upsert {
+                    if self.upsert_target_matches(&meta, up, &conflicts, &values, rowid, params)? {
+                        matched = Some(up);
+                        break;
+                    }
+                }
+                if let Some(up) = matched {
                     match &up.action {
                         UpsertAction::Nothing => continue, // skip the conflicting row
                         UpsertAction::Update {
@@ -2880,8 +3115,8 @@ impl Connection {
                     }
                 }
                 match ins.on_conflict {
-                    OnConflict::Abort => {
-                        return Err(Error::Constraint("UNIQUE constraint failed".into()))
+                    oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
+                        return Err(self.conflict_error(oc, "UNIQUE constraint failed"))
                     }
                     OnConflict::Ignore => continue, // skip this row
                     OnConflict::Replace => {
@@ -2904,6 +3139,10 @@ impl Connection {
                 params,
                 None,
             )?;
+            // A `BEFORE INSERT` trigger's `RAISE(IGNORE)` abandons just this row.
+            if self.raise_ignore.replace(false) {
+                continue;
+            }
             let record = self.encode_table_record(&meta, &index_values);
             insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
             // `last_insert_rowid()` tracks the most recent insert (a later insert
@@ -3194,6 +3433,67 @@ impl Connection {
         Ok(out)
     }
 
+    /// Does an `ON CONFLICT (target…) DO …` upsert clause apply to the conflict
+    /// that just occurred? A bare `ON CONFLICT` (no target) absorbs any unique
+    /// conflict. A targeted clause applies only when the proposed row actually
+    /// collides with a conflicting row on the **target** columns — a conflict on
+    /// a different unique index is a hard error, exactly as SQLite behaves.
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_target_matches(
+        &self,
+        meta: &TableMeta,
+        up: &Upsert,
+        conflicts: &[i64],
+        values: &[Value],
+        rowid: i64,
+        params: &Params,
+    ) -> Result<bool> {
+        if up.target.is_empty() {
+            return Ok(true);
+        }
+        // Resolve the target column names to column indices.
+        let target_cols: Vec<usize> = up
+            .target
+            .iter()
+            .map(|name| {
+                meta.columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| Error::Error(format!("no such column: {name}")))
+            })
+            .collect::<Result<_>>()?;
+        // The target names the rowid / INTEGER PRIMARY KEY: it matches when a
+        // conflicting row shares the candidate rowid.
+        if let Some(ipk) = meta.ipk {
+            if target_cols == [ipk] {
+                return Ok(conflicts.contains(&rowid));
+            }
+        }
+        // The conflict matches the target only if the proposed row equals some
+        // conflicting row on every target column (NULLs never match — a NULL key
+        // is distinct, so it could not have produced this conflict). The target
+        // must also actually be a UNIQUE/PK constraint, but if the rows collide on
+        // those columns there necessarily is one.
+        for &er in conflicts {
+            let Some(existing) = self.read_row(meta, er)? else {
+                continue;
+            };
+            let collide = target_cols.iter().all(|&c| {
+                !matches!(values[c], Value::Null)
+                    && crate::value::cmp_values_coll(
+                        &existing[c],
+                        &values[c],
+                        meta.columns[c].collation,
+                    ) == core::cmp::Ordering::Equal
+            });
+            if collide {
+                return Ok(true);
+            }
+        }
+        let _ = params;
+        Ok(false)
+    }
+
     /// The key values for a row under `idx` (excluding the trailing rowid): the
     /// indexed column values, or the evaluated key expressions for an expression
     /// index. Used for uniqueness comparison (collation applied by the caller).
@@ -3277,12 +3577,10 @@ impl Connection {
                 params,
             )?;
         }
+        let mut deleted = 0;
         for rowid in &victims {
             let old = self.read_row(&meta, *rowid)?;
             if let Some(old) = &old {
-                if !del.returning.is_empty() {
-                    self.collect_returning(&del.returning, &meta, old, Some(*rowid), params)?;
-                }
                 self.fire_triggers(
                     &del.table,
                     TrigEvent::Delete,
@@ -3293,6 +3591,13 @@ impl Connection {
                     params,
                     None,
                 )?;
+                // A `BEFORE DELETE` trigger's `RAISE(IGNORE)` spares this row.
+                if self.raise_ignore.replace(false) {
+                    continue;
+                }
+                if !del.returning.is_empty() {
+                    self.collect_returning(&del.returning, &meta, old, Some(*rowid), params)?;
+                }
             }
             // Enforce referential actions on dependent child tables.
             if self.foreign_keys {
@@ -3301,6 +3606,7 @@ impl Connection {
                 }
             }
             delete_table(self.backend.writer()?, meta.root, *rowid)?;
+            deleted += 1;
             if let Some(old) = &old {
                 self.fire_triggers(
                     &del.table,
@@ -3314,11 +3620,11 @@ impl Connection {
                 )?;
             }
         }
-        if !victims.is_empty() {
+        if deleted > 0 {
             self.compact_table(&meta)?;
             self.rebuild_indexes(&meta, &indexes)?;
         }
-        Ok(victims.len())
+        Ok(deleted)
     }
 
     /// Reclaim empty/underfull table b-tree pages left by deletes: if the table
@@ -3513,6 +3819,9 @@ impl Connection {
                 match r {
                     Ok(()) => {}
                     Err(Error::Constraint(_)) if upd.on_conflict == OnConflict::Ignore => continue,
+                    Err(Error::Constraint(m)) => {
+                        return Err(self.conflict_error(upd.on_conflict, &m))
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -3537,6 +3846,10 @@ impl Connection {
                 params,
                 Some(&changed),
             )?;
+            // A `BEFORE UPDATE` trigger's `RAISE(IGNORE)` leaves this row alone.
+            if self.raise_ignore.replace(false) {
+                continue;
+            }
             // UNIQUE/PK conflict against any other row. `UPDATE OR IGNORE` skips
             // this row; `UPDATE OR REPLACE` deletes the conflicting rows first.
             let conflicts =
@@ -3549,8 +3862,8 @@ impl Connection {
                             delete_table(self.backend.writer()?, meta.root, cr)?;
                         }
                     }
-                    OnConflict::Abort => {
-                        return Err(Error::Constraint("UNIQUE constraint failed".into()))
+                    oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
+                        return Err(self.conflict_error(oc, "UNIQUE constraint failed"))
                     }
                 }
             }
@@ -8053,14 +8366,26 @@ impl Connection {
                 return Err(Error::Error("INSERT column/value count mismatch".into()));
             }
             let values = self.build_insert_row(meta, &target, row_exprs, params)?;
-            // PRIMARY KEY columns are implicitly NOT NULL in a WITHOUT ROWID table.
-            for &c in pk {
-                if matches!(values[c], Value::Null) {
-                    return Err(Error::Constraint("NOT NULL constraint failed".into()));
+            // PRIMARY KEY / NOT NULL / CHECK constraints. `INSERT OR IGNORE`
+            // skips a violating row; any other policy lets the error propagate.
+            {
+                let r = (|| {
+                    // PRIMARY KEY columns are implicitly NOT NULL in a WITHOUT
+                    // ROWID table.
+                    for &c in pk {
+                        if matches!(values[c], Value::Null) {
+                            return Err(Error::Constraint("NOT NULL constraint failed".into()));
+                        }
+                    }
+                    check_not_null(meta, &values)?;
+                    self.check_constraints(meta, &values, None, params)
+                })();
+                match r {
+                    Ok(()) => {}
+                    Err(Error::Constraint(_)) if ins.on_conflict == OnConflict::Ignore => continue,
+                    Err(e) => return Err(e),
                 }
             }
-            check_not_null(meta, &values)?;
-            self.check_constraints(meta, &values, None, params)?;
 
             // Reject a duplicate primary key, an inline UNIQUE constraint, or a
             // standalone UNIQUE index (incl. partial). Collect colliding rows so
@@ -8076,8 +8401,8 @@ impl Connection {
             }
             if !collide.is_empty() {
                 match ins.on_conflict {
-                    OnConflict::Abort => {
-                        return Err(Error::Constraint("UNIQUE constraint failed".into()))
+                    oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
+                        return Err(self.conflict_error(oc, "UNIQUE constraint failed"))
                     }
                     OnConflict::Ignore => continue,
                     OnConflict::Replace => {

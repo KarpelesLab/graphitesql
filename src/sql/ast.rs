@@ -315,8 +315,10 @@ pub struct Insert {
     pub source: InsertSource,
     /// Conflict resolution (`INSERT OR …` / `REPLACE`).
     pub on_conflict: OnConflict,
-    /// `ON CONFLICT … DO …` upsert clause, if present.
-    pub upsert: Option<Upsert>,
+    /// `ON CONFLICT … DO …` upsert clauses, in order. SQLite allows several
+    /// chained clauses with distinct conflict targets; the one whose target the
+    /// conflict matches wins (a final target-less clause is the catch-all).
+    pub upsert: Vec<Upsert>,
     /// `RETURNING` projection, empty when absent.
     pub returning: Vec<ResultColumn>,
 }
@@ -355,8 +357,14 @@ pub enum UpsertAction {
 /// Conflict resolution policy for `INSERT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnConflict {
-    /// Default: fail the statement on a constraint conflict.
+    /// Default: fail the statement and roll back the changes it made so far
+    /// (but keep changes from earlier statements in the transaction).
     Abort,
+    /// `OR FAIL`: fail the statement but keep the rows it already changed before
+    /// the failure (no statement-level rollback).
+    Fail,
+    /// `OR ROLLBACK`: fail and roll back the entire surrounding transaction.
+    Rollback,
     /// Skip the conflicting row.
     Ignore,
     /// Replace the conflicting row(s).

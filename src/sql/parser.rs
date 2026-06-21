@@ -910,8 +910,12 @@ impl Parser {
                     OnConflict::Replace
                 } else if self.eat_kw("ignore") {
                     OnConflict::Ignore
+                } else if self.eat_kw("fail") {
+                    OnConflict::Fail
+                } else if self.eat_kw("rollback") {
+                    OnConflict::Rollback
                 } else {
-                    let _ = self.advance(); // ABORT / ROLLBACK / FAIL
+                    let _ = self.advance(); // ABORT
                     OnConflict::Abort
                 };
             }
@@ -958,54 +962,57 @@ impl Parser {
     }
 
     /// Parse an optional `ON CONFLICT [(target) [WHERE …]] DO {NOTHING | UPDATE …}`.
-    fn upsert_clause(&mut self) -> Result<Option<Upsert>> {
-        if !self.eat_kw("on") {
-            return Ok(None);
-        }
-        self.expect_kw("conflict")?;
-        let mut target = Vec::new();
-        let mut target_where = None;
-        if self.eat(&Token::LParen) {
-            target.push(self.ident()?);
-            while self.eat(&Token::Comma) {
+    fn upsert_clause(&mut self) -> Result<Vec<Upsert>> {
+        let mut clauses = Vec::new();
+        // SQLite permits a chain of `ON CONFLICT … DO …` clauses with distinct
+        // targets; only the last may be target-less.
+        while self.eat_kw("on") {
+            self.expect_kw("conflict")?;
+            let mut target = Vec::new();
+            let mut target_where = None;
+            if self.eat(&Token::LParen) {
                 target.push(self.ident()?);
-            }
-            self.expect(&Token::RParen)?;
-            if self.eat_kw("where") {
-                target_where = Some(self.expr()?);
-            }
-        }
-        self.expect_kw("do")?;
-        let action = if self.eat_kw("nothing") {
-            UpsertAction::Nothing
-        } else {
-            self.expect_kw("update")?;
-            self.expect_kw("set")?;
-            let mut assignments = Vec::new();
-            loop {
-                let col = self.ident()?;
-                self.expect(&Token::Eq)?;
-                let value = self.expr()?;
-                assignments.push((col, value));
-                if !self.eat(&Token::Comma) {
-                    break;
+                while self.eat(&Token::Comma) {
+                    target.push(self.ident()?);
+                }
+                self.expect(&Token::RParen)?;
+                if self.eat_kw("where") {
+                    target_where = Some(self.expr()?);
                 }
             }
-            let where_clause = if self.eat_kw("where") {
-                Some(self.expr()?)
+            self.expect_kw("do")?;
+            let action = if self.eat_kw("nothing") {
+                UpsertAction::Nothing
             } else {
-                None
+                self.expect_kw("update")?;
+                self.expect_kw("set")?;
+                let mut assignments = Vec::new();
+                loop {
+                    let col = self.ident()?;
+                    self.expect(&Token::Eq)?;
+                    let value = self.expr()?;
+                    assignments.push((col, value));
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                let where_clause = if self.eat_kw("where") {
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                }
             };
-            UpsertAction::Update {
-                assignments,
-                where_clause,
-            }
-        };
-        Ok(Some(Upsert {
-            target,
-            target_where,
-            action,
-        }))
+            clauses.push(Upsert {
+                target,
+                target_where,
+                action,
+            });
+        }
+        Ok(clauses)
     }
 
     /// Parse an optional `RETURNING <result columns>`; empty when absent.
@@ -1034,14 +1041,19 @@ impl Parser {
 
     fn update(&mut self) -> Result<Update> {
         self.expect_kw("update")?;
-        // `UPDATE OR <action>` conflict clause (REPLACE/IGNORE keep their own
-        // resolution; ROLLBACK/ABORT/FAIL all abort the statement, like INSERT).
+        // `UPDATE OR <action>` conflict clause. REPLACE/IGNORE keep their own
+        // resolution; ABORT (the default) rolls the statement back, FAIL keeps
+        // partial changes, ROLLBACK unwinds the surrounding transaction.
         let on_conflict = if self.eat_kw("or") {
             if self.eat_kw("replace") {
                 OnConflict::Replace
             } else if self.eat_kw("ignore") {
                 OnConflict::Ignore
-            } else if self.eat_kw("rollback") || self.eat_kw("abort") || self.eat_kw("fail") {
+            } else if self.eat_kw("fail") {
+                OnConflict::Fail
+            } else if self.eat_kw("rollback") {
+                OnConflict::Rollback
+            } else if self.eat_kw("abort") {
                 OnConflict::Abort
             } else {
                 return Err(self.err("expected REPLACE/IGNORE/ROLLBACK/ABORT/FAIL after UPDATE OR"));
@@ -1830,6 +1842,7 @@ impl Parser {
                     "current_timestamp" => Ok(now_datetime_fn("datetime")),
                     "case" => self.case_expr(),
                     "cast" => self.cast_expr(),
+                    "raise" if self.check(&Token::LParen) => self.raise_expr(),
                     "exists" => {
                         self.expect(&Token::LParen)?;
                         let sel = self.select()?;
@@ -2109,6 +2122,38 @@ impl Parser {
         }
         self.expect(&Token::RParen)?;
         Ok(Expr::Cast { expr, type_name })
+    }
+
+    /// `RAISE ( IGNORE )` or `RAISE ( ABORT|FAIL|ROLLBACK , 'message' )`, valid
+    /// only inside a trigger body. Represented canonically as a `raise(...)`
+    /// function call whose first argument is the lower-cased action keyword and
+    /// whose optional second argument is the message; the executor recognizes this
+    /// shape and turns it into the appropriate abort/ignore behavior.
+    fn raise_expr(&mut self) -> Result<Expr> {
+        self.expect(&Token::LParen)?;
+        let action = self.ident()?.to_ascii_lowercase();
+        let mut args = alloc::vec![Expr::Literal(Literal::Str(action.clone()))];
+        match action.as_str() {
+            "ignore" => {}
+            "abort" | "fail" | "rollback" => {
+                self.expect(&Token::Comma)?;
+                let msg = self.expr()?;
+                args.push(msg);
+            }
+            _ => {
+                return Err(self.err("RAISE() expects IGNORE, ABORT, FAIL, or ROLLBACK"));
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Expr::Function {
+            name: String::from("raise"),
+            distinct: false,
+            args,
+            star: false,
+            filter: None,
+            order_by: Vec::new(),
+            over: None,
+        })
     }
 
     /// Peek at the current infix operator and its binding power, if any.
