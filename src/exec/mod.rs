@@ -5239,6 +5239,19 @@ impl Connection {
 
     fn exec_drop(&mut self, d: &Drop) -> Result<()> {
         use crate::schema::ObjectType;
+        // Dropping a persistent virtual table also drops its `<name>_data` backing
+        // table, as sqlite removes a vtab's shadow tables.
+        if matches!(d.kind, DropKind::Table) && self.is_virtual_table(&d.name) {
+            let backing = format!("{}_data", d.name);
+            if self.schema.table(&backing).is_some() {
+                self.exec_drop(&Drop {
+                    kind: DropKind::Table,
+                    if_exists: false,
+                    name: backing,
+                    schema: d.schema.clone(),
+                })?;
+            }
+        }
         let want = match d.kind {
             DropKind::Table => ObjectType::Table,
             DropKind::Index => ObjectType::Index,

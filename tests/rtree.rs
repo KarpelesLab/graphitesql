@@ -129,3 +129,20 @@ fn alter_and_index_on_a_virtual_table() {
     assert!(c.query("SELECT * FROM r").is_err());
     assert!(c.query("SELECT * FROM r2_data").is_ok());
 }
+
+#[test]
+fn drop_removes_the_backing_table() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, a, b)")
+        .unwrap();
+    c.execute("INSERT INTO r VALUES (1, 0, 5)").unwrap();
+    assert!(c.query("SELECT * FROM r_data").is_ok());
+    c.execute("DROP TABLE r").unwrap();
+    // Both the vtab and its backing table are gone.
+    assert!(c.query("SELECT * FROM r").is_err());
+    assert!(c.query("SELECT * FROM r_data").is_err());
+    assert_eq!(
+        c.query("SELECT count(*) FROM sqlite_master").unwrap().rows[0][0],
+        Value::Integer(0)
+    );
+}
