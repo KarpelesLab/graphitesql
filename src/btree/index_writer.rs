@@ -88,7 +88,28 @@ pub fn index_range_rowids(
     let enc = src.header().text_encoding;
     let usable = src.usable_size();
     let mut out = Vec::new();
-    range_scan(src, root, lower, upper, enc, usable, colls, &mut out)?;
+    range_scan(src, root, lower, upper, enc, usable, colls, &mut |rec| {
+        out.push(rowid_of(&rec));
+    })?;
+    Ok(out)
+}
+
+/// Record-returning variant of [`index_range_rowids`] — for a `WITHOUT ROWID`
+/// table's clustered b-tree, whose entries are the rows. Returns every record
+/// whose leading column(s) fall within the bounds, in index (PK) order.
+pub fn index_range_records(
+    src: &dyn PageSource,
+    root: u32,
+    lower: Option<(&[Value], bool)>,
+    upper: Option<(&[Value], bool)>,
+    colls: &[Collation],
+) -> Result<Vec<Vec<Value>>> {
+    let enc = src.header().text_encoding;
+    let usable = src.usable_size();
+    let mut out = Vec::new();
+    range_scan(src, root, lower, upper, enc, usable, colls, &mut |rec| {
+        out.push(rec);
+    })?;
     Ok(out)
 }
 
@@ -128,7 +149,7 @@ fn range_scan(
     enc: TextEncoding,
     usable: usize,
     colls: &[Collation],
-    out: &mut Vec<i64>,
+    collect: &mut dyn FnMut(Vec<Value>),
 ) -> Result<bool> {
     let page = src.page(page_no)?;
     let bt = BtreePage::parse(page)?;
@@ -145,7 +166,7 @@ fn range_scan(
                     return Ok(false);
                 }
                 if passes_lower(lower, &rec, colls) {
-                    out.push(rowid_of(&rec));
+                    collect(rec);
                 }
             }
             Ok(true)
@@ -162,7 +183,7 @@ fn range_scan(
                     enc,
                     usable,
                     colls,
-                    out,
+                    collect,
                 )? {
                     return Ok(false);
                 }
@@ -171,7 +192,7 @@ fn range_scan(
                     return Ok(false);
                 }
                 if passes_lower(lower, &rec, colls) {
-                    out.push(rowid_of(&rec));
+                    collect(rec);
                 }
             }
             // Right-most child.
@@ -183,7 +204,7 @@ fn range_scan(
                 enc,
                 usable,
                 colls,
-                out,
+                collect,
             )
         }
         _ => Err(Error::Corrupt(

@@ -97,6 +97,32 @@ fn a_non_leading_predicate_still_scans() {
 }
 
 #[test]
+fn leading_pk_range_walks_the_primary_key() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE w(id PRIMARY KEY, n) WITHOUT ROWID")
+        .unwrap();
+    c.execute("INSERT INTO w VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')")
+        .unwrap();
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM w WHERE id>2"),
+        "SEARCH w USING PRIMARY KEY (id>?)"
+    );
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM w WHERE id>=2 AND id<=3"
+        ),
+        "SEARCH w USING PRIMARY KEY (id>? AND id<?)"
+    );
+    assert_eq!(
+        c.query("SELECT id FROM w WHERE id>=2 AND id<4 ORDER BY id")
+            .unwrap()
+            .rows,
+        [vec![Value::Integer(2)], vec![Value::Integer(3)]]
+    );
+}
+
+#[test]
 fn text_and_collated_primary_keys() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE PRIMARY KEY, n) WITHOUT ROWID")

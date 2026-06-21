@@ -5295,6 +5295,64 @@ impl Connection {
         Ok(Some(out))
     }
 
+    /// Range variant of [`try_without_rowid_pk_seek`](Self::try_without_rowid_pk_seek):
+    /// a `< / <= / > / >= / BETWEEN` bound on the *leading* PK column walks the
+    /// clustered b-tree between bounds instead of scanning. A superset is fine
+    /// (`run_core` re-applies the full `WHERE`). Returns `None` (→ scan) when the
+    /// leading PK column has no range bound.
+    fn try_without_rowid_pk_range(
+        &self,
+        meta: &TableMeta,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let Some(where_expr) = &sel.where_clause else {
+            return Ok(None);
+        };
+        let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
+        if matches!(hint, Some(IndexHint::NotIndexed)) {
+            return Ok(None);
+        }
+        let pk = &meta.storage_order[..meta.pk_len];
+        let Some(&lead) = pk.first() else {
+            return Ok(None);
+        };
+        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+            alloc::collections::BTreeMap::new();
+        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+        let Some(b) = ranges.get(&lead) else {
+            return Ok(None);
+        };
+        let aff = meta.columns[lead].affinity;
+        let coll = wr_storage_collations(meta)[0];
+        let lower = b.lower.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i));
+        let upper = b.upper.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i));
+        let colls = [coll];
+        let lower_arg = lower
+            .as_ref()
+            .map(|(v, inc)| (core::slice::from_ref(v), *inc));
+        let upper_arg = upper
+            .as_ref()
+            .map(|(v, inc)| (core::slice::from_ref(v), *inc));
+        let records = crate::btree::index_range_records(
+            self.backend.source(),
+            meta.root,
+            lower_arg,
+            upper_arg,
+            &colls,
+        )?;
+        let mut out = Vec::with_capacity(records.len());
+        for storage in records {
+            let mut row = unpermute_row(meta, storage);
+            self.compute_generated(meta, &mut row, params)?;
+            out.push(InputRow {
+                values: row,
+                rowid: None,
+            });
+        }
+        Ok(Some(out))
+    }
+
     /// The index metadata (root + indexed column positions) for `table`.
     /// Try to satisfy a single-table query with an index equality lookup instead
     /// of a full scan: pick the index whose longest leftmost column prefix is
@@ -6411,6 +6469,7 @@ impl Connection {
         // it never uses a secondary index — so report exactly that.
         if meta.without_rowid {
             let pk = &meta.storage_order[..meta.pk_len];
+            // A leading-PK equality prefix (matches try_without_rowid_pk_seek).
             let mut names = Vec::new();
             for &c in pk {
                 if eqs.iter().any(|(col, _)| *col == c) {
@@ -6419,11 +6478,32 @@ impl Connection {
                     break;
                 }
             }
-            return Ok(if names.is_empty() {
-                alloc::format!("SCAN {label}")
-            } else {
-                alloc::format!("SEARCH {label} USING PRIMARY KEY ({})", names.join(" AND "))
-            });
+            if !names.is_empty() {
+                return Ok(alloc::format!(
+                    "SEARCH {label} USING PRIMARY KEY ({})",
+                    names.join(" AND ")
+                ));
+            }
+            // Else a range bound on the leading PK column (try_without_rowid_pk_range).
+            if let Some(&lead) = pk.first() {
+                let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                    alloc::collections::BTreeMap::new();
+                collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+                if let Some(b) = ranges.get(&lead) {
+                    let name = &meta.columns[lead].name;
+                    // SQLite renders bounds as `>`/`<` regardless of inclusivity.
+                    let cond = match (&b.lower, &b.upper) {
+                        (Some(_), Some(_)) => alloc::format!("{name}>? AND {name}<?"),
+                        (Some(_), None) => alloc::format!("{name}>?"),
+                        (None, Some(_)) => alloc::format!("{name}<?"),
+                        (None, None) => String::new(),
+                    };
+                    if !cond.is_empty() {
+                        return Ok(alloc::format!("SEARCH {label} USING PRIMARY KEY ({cond})"));
+                    }
+                }
+            }
+            return Ok(alloc::format!("SCAN {label}"));
         }
         // Rowid equality wins, as in try_index_lookup.
         if let Some(ipk) = meta.ipk {
@@ -7991,8 +8071,12 @@ impl Connection {
         if from.joins.is_empty() {
             let first_meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
             if first_meta.without_rowid {
-                // A leading-PK equality seeks the clustered b-tree; else scan.
+                // A leading-PK equality or range seeks the clustered b-tree; else
+                // scan.
                 if let Some(rows) = self.try_without_rowid_pk_seek(&first_meta, sel, params)? {
+                    return Ok((first_meta.columns, rows));
+                }
+                if let Some(rows) = self.try_without_rowid_pk_range(&first_meta, sel, params)? {
                     return Ok((first_meta.columns, rows));
                 }
                 let input_rows = self

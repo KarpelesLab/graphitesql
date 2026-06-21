@@ -17,8 +17,8 @@ pub mod writer;
 
 pub use cursor::{IndexCursor, TableCursor};
 pub use index_writer::{
-    clear_index, create_index_root, free_tree, index_range_rowids, index_seek_records,
-    index_seek_rowids, insert_index,
+    clear_index, create_index_root, free_tree, index_range_records, index_range_rowids,
+    index_seek_records, index_seek_rowids, insert_index,
 };
 pub use page::{BtreePage, IndexCell, PageType, Payload, TableLeafCell};
 pub use writer::{
