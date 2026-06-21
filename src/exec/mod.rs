@@ -6740,7 +6740,7 @@ impl Connection {
                 }
                 // A covered query with no seek reads from a covering index (B2),
                 // in lockstep with `run_core`'s `covering_scan`.
-                else if let Some((name, _, _)) = self.covering_scan(sel, &meta) {
+                else if let Some((name, _, _)) = self.covering_scan(sel, &meta, params) {
                     alloc::format!("SCAN {label} USING COVERING INDEX {name}")
                 } else {
                     self.eqp_access(
@@ -6886,7 +6886,7 @@ impl Connection {
         }
         // ORDER BY that we satisfy with an in-memory sort — unless the rowid scan
         // already yields the requested order (no temp b-tree then, like sqlite).
-        if !sel.order_by.is_empty() && self.order_satisfied_by_scan(sel).is_none() {
+        if !sel.order_by.is_empty() && self.order_satisfied_by_scan(sel, params).is_none() {
             let id = *next_id;
             *next_id += 1;
             out.push((id, parent, String::from("USE TEMP B-TREE FOR ORDER BY")));
@@ -8439,7 +8439,12 @@ impl Connection {
     /// [`count_covering_index`](Self::count_covering_index) — to the *unambiguous*
     /// case of **exactly one** covering index, so the chosen name matches sqlite
     /// without replicating its cost-based tie-break. Returns `(name, root, cols)`.
-    fn covering_scan(&self, sel: &Select, meta: &TableMeta) -> Option<(String, u32, Vec<usize>)> {
+    fn covering_scan(
+        &self,
+        sel: &Select,
+        meta: &TableMeta,
+        params: &Params,
+    ) -> Option<(String, u32, Vec<usize>)> {
         let from = sel.from.as_ref()?;
         if !from.joins.is_empty() {
             return None;
@@ -8460,7 +8465,7 @@ impl Connection {
         // order, which would silently break a `rowid_ordered_scan` that assumed
         // the rows arrive in rowid order (and the ordered-index case already
         // renders as covering).
-        if self.order_satisfied_by_scan(sel).is_some() {
+        if self.order_satisfied_by_scan(sel, params).is_some() {
             return None;
         }
         let mut covering = self.indexes_of(&t.name).ok()?.into_iter().filter(|idx| {
@@ -8554,11 +8559,125 @@ impl Connection {
     /// Whether a single-table scan already yields rows in the query's `ORDER BY`
     /// order (so `run_core` can skip the sort, reversing for `DESC`). Combines the
     /// rowid/IPK and secondary-index cases; shared with `eqp_access`.
-    fn order_satisfied_by_scan(&self, sel: &Select) -> Option<bool> {
+    fn order_satisfied_by_scan(&self, sel: &Select, params: &Params) -> Option<bool> {
         if let Some(d) = self.rowid_ordered_scan(sel) {
             return Some(d);
         }
-        self.order_index_scan(sel).map(|s| s.descending)
+        if let Some(s) = self.order_index_scan(sel) {
+            return Some(s.descending);
+        }
+        self.order_satisfied_by_seek(sel, params)
+    }
+
+    /// B0b-iii: a `WHERE`-equality seek can also satisfy the `ORDER BY` when the
+    /// ordered columns are exactly the index columns that follow the equality
+    /// prefix. `try_index_lookup` seeks that prefix and walks the index in key
+    /// order, so within the fixed prefix the rows already arrive ordered by the
+    /// next columns — no sort needed. Returns `Some(descending)` only in the
+    /// *unambiguous* case of exactly one plain secondary index whose leading
+    /// column the `WHERE` constrains by equality (so the executor must pick it);
+    /// otherwise `None` (→ the always-correct sort). A too-loose result would be
+    /// caught by the ORDER-BY-guarded differential corpus.
+    fn order_satisfied_by_seek(&self, sel: &Select, params: &Params) -> Option<bool> {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let t = &from.first;
+        if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
+            return None;
+        }
+        // A hint biases the seek's index choice; don't second-guess it here.
+        if from.first.index_hint.is_some() {
+            return None;
+        }
+        let where_expr = sel.where_clause.as_ref()?;
+        if sel.order_by.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || self.has_aggregate(sel)
+            || window::has_window(sel)
+        {
+            return None;
+        }
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+        if meta.without_rowid {
+            return None;
+        }
+        // Resolve ORDER BY to plain columns, uniform direction, default NULLs (the
+        // index walk yields NULLs first ascending, last descending).
+        let descending = sel.order_by[0].descending;
+        let mut ord_cols: Vec<usize> = Vec::with_capacity(sel.order_by.len());
+        for term in &sel.order_by {
+            if term.descending != descending || term.nulls_first.is_some() {
+                return None;
+            }
+            let (tbl, col_name) = match &term.expr {
+                Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+                _ => return None,
+            };
+            if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
+                return None;
+            }
+            ord_cols.push(
+                meta.columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col_name))?,
+            );
+        }
+        // Equality-constrained columns. A rowid/IPK equality makes the seek return
+        // at most one row — a different path; bail to the cheap, correct sort.
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        if eqs.is_empty() {
+            return None;
+        }
+        if meta
+            .ipk
+            .is_some_and(|ipk| eqs.iter().any(|(c, _)| *c == ipk))
+        {
+            return None;
+        }
+        // Exactly one plain secondary index whose leading column is eq-constrained,
+        // so try_index_lookup must seek it (no ambiguous cost-based choice).
+        let mut seekable = self.indexes_of(&t.name).ok()?.into_iter().filter(|idx| {
+            idx.partial.is_none()
+                && idx.key_exprs.is_none()
+                && idx
+                    .cols
+                    .first()
+                    .is_some_and(|c| eqs.iter().any(|(col, _)| col == c))
+        });
+        let idx = seekable.next()?;
+        if seekable.next().is_some() {
+            return None;
+        }
+        // The equality prefix length: the longest leading run of eq-constrained
+        // index columns.
+        let prefix = idx
+            .cols
+            .iter()
+            .take_while(|&&c| eqs.iter().any(|(col, _)| *col == c))
+            .count();
+        // The ORDER BY columns must be exactly the index columns following the
+        // prefix, each compared under the column's own collation.
+        if prefix + ord_cols.len() > idx.cols.len() {
+            return None;
+        }
+        for (i, &oc) in ord_cols.iter().enumerate() {
+            if idx.cols[prefix + i] != oc
+                || idx.collations[prefix + i] != meta.columns[oc].collation
+            {
+                return None;
+            }
+        }
+        Some(descending)
     }
 
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
@@ -8671,7 +8790,7 @@ impl Connection {
         // just reversing for DESC — matching sqlite's plain SCAN with no temp
         // b-tree.
         if !sel.order_by.is_empty() {
-            match self.order_satisfied_by_scan(sel) {
+            match self.order_satisfied_by_scan(sel, params) {
                 Some(true) => out.reverse(),
                 Some(false) => {}
                 None => {
@@ -8938,7 +9057,7 @@ impl Connection {
             // full index holds every column the query needs — read the rows from
             // that index instead of the table. `eqp_select` reports the matching
             // `SCAN … USING COVERING INDEX`.
-            if let Some((_, root, cols)) = self.covering_scan(sel, &first_meta) {
+            if let Some((_, root, cols)) = self.covering_scan(sel, &first_meta, params) {
                 return Ok((
                     first_meta.columns.clone(),
                     self.covering_seek_rows(&first_meta, root, &cols)?,
