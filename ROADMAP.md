@@ -394,10 +394,12 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
   `fts5*.c`. Break out: **D2a** tokenizer (unicode61/ascii); **D2b** inverted
   index in shadow tables + `INSERT`; **D2c** `MATCH` query; **D2d** `bm25()`
   ranking; **D2e** byte-compatible on-disk segment format.
-- **D4 — User-defined functions from Rust.** Register scalar/aggregate/window
-  functions and custom collations through a safe public API (the read side of
-  what `func`/`collate` already do internally). Pairs with a public vtab-module
-  registration API.
+- **D4 — User-defined functions from Rust.** Scalar half ✅ DONE:
+  `Connection::register_function(name, |&[Value]| -> Result<Value>)` (via a new
+  `Subqueries::call_udf`; built-ins win, user functions fill unknown names).
+  *Remaining: aggregate/window UDFs (hook the aggregate evaluator) and custom
+  collations (the `Collation` enum would need a user variant).* Pairs with
+  `register_module`.
 - **D5 — `sqlite3_session`** — changesets/patchsets for replication.
 - **D6 — Async VFS for wasm** — non-blocking I/O over IndexedDB/OPFS.
 - **D7 — C-API shim** — a `libsqlite3`-compatible surface as a *separate* crate.
