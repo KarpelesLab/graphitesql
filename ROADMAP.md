@@ -85,7 +85,7 @@ cost-based planner.
 ## 3. Foundation ✅ *(done)*
 
 The layered foundation and a broad SQL engine are complete and differentially
-verified against `sqlite3` (a 1,600+ query corpus plus ~80 focused test suites).
+verified against `sqlite3` (a 1,600+ query corpus plus 140+ focused test suites).
 Detailed history lives in `CHANGELOG.md`; in summary, graphitesql today:
 
 **Reads & writes real SQLite files.** Opens `sqlite3`-written databases
@@ -93,7 +93,9 @@ Detailed history lives in `CHANGELOG.md`; in summary, graphitesql today:
 `PRAGMA integrity_check = ok`. Storage covers rowid and **`WITHOUT ROWID`**
 tables, automatic/secondary/`UNIQUE` indexes (incl. `sqlite_autoindex_*`),
 overflow pages, the freelist with **page merging on delete**, real **`VACUUM`**,
-and the **WAL read *and* write** path (`journal_mode=WAL`, `wal_checkpoint`).
+the full **`auto_vacuum`** track (read, write, FULL auto-truncate, INCREMENTAL
+reclaim), and the **WAL read *and* write** path (`journal_mode=WAL`,
+`wal_checkpoint`).
 
 **Runs a broad SQL dialect.** `SELECT` with `WHERE`/`GROUP BY`/`HAVING` (incl.
 without `GROUP BY`)/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT` and SELECT-list
@@ -106,17 +108,25 @@ sources; **window functions** (`ROWS`/`RANGE`/`GROUPS`, `EXCLUDE`, `FILTER`,
 named windows); `INSERT … SELECT`, `UPDATE … FROM`, `UPDATE OR
 IGNORE/REPLACE/…`, UPSERT, `RETURNING`, row values, `STRICT` tables, generated
 columns; a broad scalar/aggregate function library incl. **date/time**
-(+ `CURRENT_DATE`/`TIME`/`TIMESTAMP`, `timediff`), `printf`/`format`, **JSON**
-(`json_*`, `json_group_array`/`object`, `json_pretty`, `json_each`/`json_tree`,
-**JSON5 input** with strict `json_valid`), **virtual tables**
-(`CREATE VIRTUAL TABLE … USING module`), `iif`/`if`,
+(+ `CURRENT_DATE`/`TIME`/`TIMESTAMP`, `timediff`), `printf`/`format` (16-sig-digit
+float cap like sqlite), `random`/`randomblob`, `unistr`/`unistr_quote`,
+`subtype`, **JSON** (`json_*`, `json_group_array`/`object`, `json_pretty`,
+`json_each`/`json_tree`, **JSON5 input** with strict `json_valid`, verbatim
+number-text preservation) and the **JSONB binary family** (`jsonb`,
+`jsonb_array`/`object`/`extract`/`set`/`insert`/`replace`/`remove`/`patch`,
+`jsonb_group_array`/`object`, and JSONB-blob input to every `json_*`), **virtual
+tables** (`CREATE VIRTUAL TABLE … USING module`), `iif`/`if`,
 `sqlite_version`, math (pure-`core`); **type affinity** and SQLite-exact real
-formatting; collation (`BINARY`/`NOCASE`/`RTRIM`) honored across comparisons,
+formatting; column names matching sqlite's verbatim source spans; collation
+(`BINARY`/`NOCASE`/`RTRIM`) honored across comparisons,
 `IN`/`BETWEEN`/`CASE`, `min`/`max`, set ops,
 `ORDER BY`/`GROUP BY`/`DISTINCT`/`UNIQUE`/index keys; `EXPLAIN QUERY PLAN` with
-an index-driven planner (equality/range/`IN`/OR-union seeks, **index-driven
-`ORDER BY`** with **covering-index reads**, stats-driven choice via
-`ANALYZE`/`sqlite_stat1`); constraint enforcement (`NOT NULL`, `CHECK`,
+an index-driven planner (equality/range/`IN`/OR-union seeks, **inner-join seeks**
+incl. the full **`WITHOUT ROWID`** PK/secondary-index seek family, **comma-join**
+`WHERE`-equality promotion, **automatic-index** reporting for unindexed
+equi-joins, **index-driven `ORDER BY`** with **covering-index reads**,
+stats-driven choice via `ANALYZE`/`sqlite_stat1`); constraint enforcement
+(`NOT NULL`, `CHECK`,
 `UNIQUE`/`PK`, standalone/partial/expression UNIQUE indexes; **foreign keys**
 enforced at runtime under `PRAGMA foreign_keys=ON` — child INSERT/UPDATE parent
 checks and parent DELETE/UPDATE actions NO ACTION/RESTRICT/CASCADE/SET NULL/SET
@@ -125,9 +135,13 @@ DEFAULT, composite + self-referential; *deferred:* DEFERRABLE/INITIALLY DEFERRED
 `WHEN`, recursive, `NEW`/`OLD` incl. rowid); `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`;
 **`ATTACH`/`DETACH`/`TEMP`** multi-schema (cross-database reads, writes, joins,
 qualified DDL, view reads, transactions & savepoints); DDL with full CREATE-time
-and ALTER validation; the schema catalog queryable as
-`sqlite_schema`/`sqlite_master`, with `table_list`/`collation_list`/`database_list`
-and bare `pragma_*` table-valued functions.
+and ALTER validation (incl. `DROP TABLE` cascading the table's triggers, and
+`RENAME COLUMN` propagating into the table's own CHECK/generated/DEFAULT
+expressions); the schema catalog queryable as `sqlite_schema`/`sqlite_master`
+(incl. `table_info` over a view and over the catalog itself, the composite-PK
+`pk` ordinal, and `index_list` `pk`/`u` origins), with
+`table_list`/`collation_list`/`database_list` and bare `pragma_*` table-valued
+functions.
 
 What remains is breadth and depth toward full SQLite parity, below.
 
@@ -141,125 +155,116 @@ test and keeps `master` green). Tracks can progress in parallel.
 
 ### Track A — SQL language & functions breadth  *(substantially complete)*
 
-Done: outer joins + `NATURAL`/`USING` (with coalescing), generated columns,
-collations, UPSERT, `UPDATE OR IGNORE/REPLACE/…`, `RETURNING`, row values,
-`ORDER BY` modifiers (`NULLS FIRST/LAST`, `IS [NOT] DISTINCT FROM`), `STRICT`
-tables, `CREATE TABLE … AS SELECT`, `INSERT … SELECT`, `UPDATE … SET … FROM`,
-`*`/`table.*` with aggregates, HAVING without GROUP BY, SELECT-list aliases in
-WHERE/GROUP BY/HAVING, `CURRENT_DATE`/`TIME`/`TIMESTAMP`, `iif`/`if`,
-`sqlite_version`, `json_pretty`, the window-function suite, the math + JSON +
-`printf` libraries, partial/expression/UNIQUE-index breadth, and full DDL
-validation.
+Done: outer joins + `NATURAL`/`USING` (coalescing), generated columns,
+collations, UPSERT, `UPDATE OR …`, `RETURNING`, row values, `ORDER BY` modifiers,
+`STRICT` tables, `CREATE TABLE … AS SELECT`, `INSERT … SELECT`, `UPDATE … FROM`,
+HAVING without GROUP BY, SELECT-list aliases in WHERE/GROUP BY/HAVING,
+`CURRENT_DATE`/`TIME`/`TIMESTAMP`, `iif`/`if`, `sqlite_version`, the
+window-function suite; the math + `printf`/`format` (16-sig-digit float cap) +
+JSON libraries incl. JSON5 input, `timediff` (A5), `json_error_position` (A6),
+`random`/`randomblob`, `unistr`/`unistr_quote`/`subtype`, the **JSONB binary
+family**, and JSON verbatim-number preservation; partial/expression index
+*equality* seeks (A3); column names matching sqlite's verbatim source spans;
+type names keeping their `(len[,scale])`; and DDL validation incl. `DROP TABLE`
+cascading triggers and `RENAME COLUMN` propagating into the table's own
+expressions.
 
-**Remaining pieces** (small, each one function/clause-scoped):
+**Remaining pieces** (small, each function/clause-scoped):
 
-- **A1 — `random()` / `randomblob()`.** *(Intentionally deferred: non-
-  deterministic, untestable differentially without an RNG; revisit if a seedable
-  RNG lands. `zeroblob` already works.)*
 - **A2 — DESC index columns honored in seeks.** A `DESC` index gives correct
   results today by scan/superset; teach the seek paths
   (`try_index_lookup`/`try_index_range`, `index_range_rowids`) to walk a `DESC`
   b-tree in the right direction. *Perf-only; acceptance: `EXPLAIN QUERY PLAN`
-  shows the seek and results are unchanged.*
-- ✅ **A3 — partial/expression index use in the planner (equality seeks).** Done
-  via a shared `partial_expr_seek` consulted by `try_index_lookup` + `eqp_access`
-  in lockstep: a *partial* index is used when its predicate is a top-level `AND`
-  conjunct of the `WHERE` (conjunct membership, not general implication); an
-  *expression* index when a conjunct is `<key_expr> = <const>` matching the
-  indexed expression. `SEARCH … USING INDEX` in EQP, results unchanged (superset
-  re-filtered). *Remaining:* range/IN seeks still skip these indexes.
-- **A4 — literal-left collation fallback.** A literal compared to a collated
-  column/subquery (`'x' = nocase_col`, `'x' IN (SELECT nocase_col)`) should adopt
-  the *right* side's collation when the left has none; also window-frame
-  `min`/`max` collation. *Ref:* `resolve.c` collation-of rules.
-- ✅ **A5 — `timediff(A,B)`.** Done — faithful port of `date.c` `timediffFunc`
-  (two mirror branches snapping `d2`'s year/month toward `d1`, residual span via
-  the Julian-day difference biased by `0000-01-01`). Byte-identical to sqlite3
-  across 2000+ randomized pairs + edge cases.
-- ✅ **A6 — `json_error_position(X)`.** Done: `parse_with_error_position` threads
-  the failing byte offset out; the function maps `Ok`→0, `Err(off)`→`off+1`,
-  NULL→NULL. Matches sqlite3.
-- ✅ **JSON5 input.** The JSON functions now accept the JSON5 superset sqlite
-  takes (unquoted keys, single quotes, trailing commas, comments, hex/`Infinity`/
-  `NaN`, JSON5 escapes); canonical output stays strict minified JSON.
-  `json_valid(X)` validates strict RFC-8259 (via a separate `is_strict_json`),
-  matching sqlite's 1-arg behavior. *(Minor residual: a couple of JSON5-only
-  escapes re-serialize in a different style — values identical.)*
-- **A7 — multi-statement `execute_batch(sql)`.** A new API that runs a
-  `;`-separated script (like `sqlite3_exec`). Needs a statement splitter aware
-  that trigger bodies (`BEGIN … END`) and `CASE … END` contain inner `;` — track
-  `BEGIN`/`CASE`/`END` depth over the token stream, then run each slice through
-  `execute_params` so per-statement CREATE text is preserved. *(`execute()`
-  stays single-statement.)*
+  shows the seek and results unchanged.*
+- **A3b — partial/expression index for range/IN seeks.** Equality seeks already
+  use them (A3); extend `try_index_range`/`try_index_in` to consult
+  `partial_expr_seek` the same way, with `eqp_access` in lockstep.
+- **A4 — `NULLIF` collation in `func.rs`.** The IN/CASE/BETWEEN literal-left
+  collation cases are done; `nullif(x, y)` should still honor an explicit
+  `COLLATE` on either operand. *Ref:* `resolve.c` collation-of rules.
+- **A7 — multi-statement `execute_batch(sql)` API.** The CLI shell already has a
+  `BEGIN`/`CASE`/`END`-depth-aware splitter; lift it into a public API that runs
+  a `;`-separated script (like `sqlite3_exec`), running each slice through
+  `execute_params` so per-statement CREATE text is preserved. *(`execute()` stays
+  single-statement.)*
+- **A8 — JSONB of JSON5-form numbers.** `jsonb('.5')`/`jsonb('0xFF')` emit a
+  normalized `FLOAT`/`INT` element; sqlite uses the `FLOAT5`/`INT5` tags with the
+  raw text. Needs the parser to keep the raw JSON5 number text and `to_jsonb` to
+  pick the `*5` tag for it. *Tiny edge; round-trips correctly today.*
+
+*ALTER rename — cross-object propagation* (a column/table rename must reach
+*other* schema objects, not just the table's own definition; today those break
+with "no such table/column" after a rename). Build bottom-up:
+
+- **A-rn1 — table-rename AST walker.** A `rename_table_in(stmt, old, new)` that
+  walks a `Select`/trigger body renaming every `FROM`/`JOIN` `TableRef.name == old`
+  and every qualified `old.col` reference, recursing into subqueries and CTEs
+  (respecting a CTE that shadows the name). The reusable primitive for A-rn2/3.
+- **A-rn2 — RENAME TABLE rewrites dependent view bodies.** Using A-rn1, on
+  `ALTER TABLE t RENAME TO t2` rewrite every view whose body references `t`
+  (triggers already work — they fire via the repointed `tbl_name`). *Acceptance:
+  `SELECT … FROM v` works after the rename.*
+- **A-rn3 — RENAME COLUMN reaches dependent objects.** Extend `rename_column_ref`
+  use to dependent view/trigger bodies (scope-aware: only references resolving to
+  the renamed table's column) and to foreign keys in *other* tables that name the
+  renamed parent column.
+- **A-rn4 — text-preserving schema edits** *(cosmetic, lower priority).* graphite
+  reprints the affected CREATE from its AST (quoted/canonical), so
+  `SELECT sql FROM sqlite_master` after an ALTER differs from sqlite's
+  text-preserving token edit. Match it by editing the stored text in place. *Not
+  in the differential corpus.*
 
 ### Track B — Query planner, statistics & the VDBE
 
 Done: `ANALYZE` + `sqlite_stat1` (byte-compatible) with stats-driven index
-choice; range/`IN`/OR-union seeks; a hash join for equi-joins; **B0
-index-driven `ORDER BY`** (rowid/IPK *and* secondary-index cases, ASC+DESC, in
-lockstep across `scan_source`/`run_core`/`eqp_access`); **B2 covering-index
-reads** for that ordered scan (rows built from index records, EQP reports
-`USING COVERING INDEX`); and the VDBE spike (`exec::vdbe`) covering constant
-projections, single-table scan + `WHERE` + `ORDER BY` + `DISTINCT` +
-`LIMIT`/`OFFSET`, whole-table aggregates, and single-table `GROUP BY`, all
-matching the tree-walker via `query_vdbe`.
+choice; equality/range/`IN`/OR-union seeks; **inner-join seeks** — rowid/IPK
+(**B1a**), secondary-index (**B1a²**), and the **complete `WITHOUT ROWID` seek
+family** (PK equality + range, PK joins, secondary-index equality + range, with
+the named-index-vs-autoindex covering rule); a **hash join** for unindexed
+equi-joins with **B3 automatic-index** EQP (`BLOOM FILTER` + `SEARCH … USING
+AUTOMATIC COVERING INDEX`); **comma-join `WHERE`-equality promotion** (`FROM a, b
+WHERE a.x=b.y` planned like an explicit `JOIN … ON`); **B0** index-driven
+`ORDER BY` (rowid + secondary, ASC+DESC); **B2/B2b covering reads** (ordered scan,
+`count(*)` via index, and equality/range/`IN` seeks reading straight from a
+covering index); and the VDBE spike (`exec::vdbe`) covering constant projections,
+single-table scan + `WHERE`/`ORDER BY`/`DISTINCT`/`LIMIT`, whole-table aggregates,
+single-table `GROUP BY`, and grouped `HAVING` + aggregate `ORDER BY` (**B6**) —
+all matching the tree-walker via `query_vdbe`.
 
-**Remaining pieces.** The optimizer ones are *perf-only* (results already
-correct) and share one acceptance gate: the chosen plan must match sqlite3's
-`EXPLAIN QUERY PLAN` *and* execution must stay in lockstep with what EQP claims.
-Open EQP divergences (verified against sqlite3):
+**Remaining optimizer pieces** *(perf-only — results already correct; acceptance:
+the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep):*
 
-| query | graphite today | sqlite3 (target) | piece |
-|-------|----------------|------------------|-------|
-| `… FROM t JOIN u ON t.c=u.x` (`x` = `u` PK) | ✅ now `SCAN t` + `SEARCH u USING INTEGER PRIMARY KEY (rowid=?)` | (same) | **B1a** ✅ |
-| `… FROM t JOIN u ON t.c=u.k` (`k` indexed) | ✅ now `SCAN t` + `SEARCH u USING INDEX …` | (same) | **B1a²** ✅ |
-| `SELECT count(*) FROM t` (one full index `ic`) | ✅ now `SCAN t USING COVERING INDEX ic` | `SCAN t USING COVERING INDEX ic` | **B2b** ✅ |
-
-- **B0b — Index-driven `ORDER BY`/`GROUP BY`, remaining cases.** Extend the
-  shared `order_index_scan` decision to: (a) a multi-term `ORDER BY` that is a
-  prefix of a multi-column index; (b) `GROUP BY` over an indexed prefix (consume
-  groups in index order, no hash); (c) `ORDER BY` satisfied by the index a
-  `WHERE` seek already chose (today B0 only fires with no `WHERE`).
-- ✅ **B1a — Seek the inner table of a join (rowid/IPK case).** Done — an
-  INNER/LEFT join whose `ON` is `outer.col = u.rowid` seeks `u` by rowid per
-  outer row (`rowid_join_seek` + `exec_rowid_join_seek`), reporting `SEARCH u
-  USING INTEGER PRIMARY KEY (rowid=?)` in lockstep with execution; the full `ON`
-  is re-checked so results are identical. ✅ **B1a²** also done — the same seek
-  for a non-PK **indexed** inner column (`index_join_seek`/`exec_index_join_seek`,
-  `SEARCH … USING INDEX …`), with non-unique-key fan-out and collation-superset
-  re-eval. *Remaining:* RIGHT/FULL joins (still materialized).
-- **B1b — Join order.** Reorder `FROM` tables by a simple cost model (smallest
-  estimated cardinality / most-selective indexed table first) rather than textual
-  order; results identical, order verified via EQP. *Ref:* `where.c`.
-- ✅ **B2b — Covering reads beyond the ordered scan.** Done. `count(*)` counts
-  index entries (`count_covering_index`); and equality/range/IN `WHERE` seeks read
-  result rows straight from the index records when the chosen index covers every
-  referenced column (result + WHERE + ORDER BY), via the shared
-  `seek_index_covers` (+ `covering_seek_rows`), with `eqp_access` reporting
-  `SEARCH … USING COVERING INDEX` in lockstep. *(Covering on UPDATE/DELETE seeks
-  is out of scope — they always touch the table.)*
-- **B3 — Automatic indexes for unindexed joins.** Build a transient hash/sorted
-  index on a join's inner table when no usable persistent index exists (the
-  `auto-index` optimization); report `USING AUTOMATIC … INDEX`. Pairs with B1a.
+- **B0b-i — multi-term `ORDER BY` via a multi-column index prefix.** Extend
+  `order_index_scan` to satisfy an `ORDER BY (c1, c2)` from an index whose leading
+  columns are `(c1, c2, …)` (skip the sort).
+- **B0b-ii — `GROUP BY` over an indexed prefix.** Consume groups in index order
+  (no hash) when `GROUP BY` is a prefix of an available index.
+- **B0b-iii — `ORDER BY` from a `WHERE`-chosen index.** Today B0 fires only with
+  no `WHERE`; reuse the index a `WHERE` seek already picked to also skip the sort.
+- **B1b — Join reordering.** Beyond the comma-join promotion (done), reorder
+  `FROM` tables by a simple cost model (most-selective indexed table inner)
+  instead of textual order; results identical, order verified via EQP. Preserve
+  LEFT/RIGHT/FULL semantics. *Ref:* `where.c`.
+- **B1c — RIGHT/FULL join inner seeks.** B1a/B1a²/WITHOUT-ROWID seeks cover
+  INNER/LEFT; RIGHT/FULL joins still materialize the inner table.
 - **B4 — `sqlite_stat4` histograms.** Extend `ANALYZE` to gather per-index sample
   histograms (byte-compatible `sqlite_stat4` rows) and use them for range
-  selectivity. *Ref:* `analyze.c`.
+  selectivity. Split: **B4a** write/read the `sqlite_stat4` rows; **B4b** consult
+  them in the seek-cost chooser. *Ref:* `analyze.c`.
 
 *VDBE migration* (the largest internal refactor — changes representation, not
-results; keep the differential corpus green at every step):
+results; keep the differential corpus green at every step). Done so far: the
+spike covers single-table scans, aggregates, `GROUP BY`, and grouped `HAVING` +
+aggregate `ORDER BY` (**B6**), all parity-checked via `query_vdbe`. Remaining,
+each additive behind `query_vdbe` until B7:
 
-- **B5 — VDBE: joins.** Nested-loop join opcodes (`OpenRead`/`Rewind`/`Column`/
-  `Next` per cursor) so a two-table join runs on the register machine.
-- ✅ **B6 — VDBE: `HAVING` + aggregate `ORDER BY`** on the grouped path. Done —
-  a general `compile_group_select` path folds the referenced aggregates, then a
-  second emit loop (`GroupFinalize`/`GroupKey`/`GroupAgg`/`GroupNext` + a
-  register-binding table) compiles arbitrary `HAVING` and sort-key expressions
-  over grouping columns / aggregates / output aliases; `ORDER BY`/`LIMIT`/`OFFSET`
-  on the grouped output. Additive behind `query_vdbe`; ~28 parity tests vs the
-  tree-walker. *(Unsupported shapes — DISTINCT-group, FILTER/OVER aggregates,
-  non-constant LIMIT — fall back cleanly.)*
-- **B7 — VDBE becomes the execution path.** Migrate `Connection::query` onto the
-  VDBE behind a flag, then by default.
+- **B5a — VDBE two-table nested-loop join.** `OpenRead`/`Rewind`/`Column`/`Next`
+  per cursor for a single INNER join + `ON`.
+- **B5b — VDBE join: index/PK inner seek + outer-join NULL-extend.** Add the
+  seek-driven inner cursor and LEFT NULL-extension to the join opcodes.
+- **B5c — VDBE: subqueries / compound / window** shapes still on the tree-walker.
+- **B7a — route `query()` onto the VDBE behind a flag** (opt-in), corpus green.
+- **B7b — flip the default** to the VDBE once parity holds across the suite.
 - **B8 — Real `EXPLAIN` (bytecode).** Emit the `addr|opcode|p1|p2|p3|p4|p5`
   listing from a compiled `Program` (today `Error::Unsupported`). *Ref:*
   `vdbe.c`, `opcodes.h`.
@@ -284,74 +289,25 @@ auto_vacuum databases that sqlite3 reads with `integrity_check = ok` (only the
 optional space-reclaim — FULL truncate C6b-3, `incremental_vacuum` C6b-4 —
 remains).
 
-**Remaining pieces.**
+The **multi-schema track is complete** (C1–C5 + C-ms1 `CREATE TEMP
+VIEW/TRIGGER` catalog placement), and the **whole `auto_vacuum` track is complete**
+(C6a read; C6b-1 empty-db header; C6b-2 commit-time `rebuild_ptrmap`; C6b-3 FULL
+auto-truncate; C6b-4 `incremental_vacuum(N)` on-demand reclaim — all cross-checked
+with sqlite3 `integrity_check = ok`). Tuning PRAGMAs (`cache_size`, `synchronous`,
+`busy_timeout`, `locking_mode`, …) now *report* sqlite's defaults; honoring them
+is C8b/C8c.
 
-*Multi-schema leftovers (small):*
-
-- ✅ **C-ms1 — `CREATE TEMP VIEW/TRIGGER` catalog placement.** Done — the parser
-  tags an unqualified TEMP view/trigger with `schema="temp"`; `target_db` routes
-  it to the temp catalog (stored bare-named). `try_view`/`is_view` consult the
-  temp catalog first (shadowing main) and run a temp view via
-  `scan_db_view(Temp)`; `triggers_for` scans the active + temp catalogs so a temp
-  trigger fires on writes to its table (incl. a `main` table). Now appears in
-  `sqlite_temp_master`, not `sqlite_master`. **The multi-schema track is fully
-  complete — no leftovers.**
-
-*Storage — `auto_vacuum` write path (C6b), split so each lands testable:*
-
-> Groundwork done: `src/btree/ptrmap.rs` — the pointer-map page cadence
-> (`ptrmap_pageno`/`is_ptrmap_page`/`ptrmap_entry_offset`, `n = usable/5`,
-> recurring every `n+1` from page 2) and the 5-byte entry encode/decode, with 13
-> unit tests cross-checked against a real sqlite3 `auto_vacuum` db. The write
-> path below consumes these helpers. (Note for C6b-2: also skip the
-> `PENDING_BYTE`/lock-byte page and source `usable_size` from the live header
-> incl. `reserved_space`.)
-
-- ✅ **C6b-1 — empty-db header.** Done — `WritePager::create_auto_vacuum(.., mode)`
-  + `AutoVacuum` enum writes the header largest-root-page (1) and incremental
-  flag for FULL/INCREMENTAL on an empty db; sqlite3 opens the files with
-  `integrity_check = ok` and `PRAGMA auto_vacuum` = 1/2 (values confirmed against
-  sqlite3). *Remaining for the write path:* reserving/using ptrmap pages as the
-  db grows is C6b-2; the `PRAGMA auto_vacuum=…` SQL wiring (currently rejected by
-  C6a) is still to be connected.
-- ✅ **C6b-2 — maintain ptrmap entries (write auto_vacuum DBs).** Done — graphite
-  writes auto_vacuum databases that sqlite3 reads with `integrity_check = ok`, and
-  the C6a write-refusal is **lifted**. Instead of per-writer parent bookkeeping,
-  the pager *rebuilds the whole pointer map at commit* (`rebuild_ptrmap`,
-  auto_vacuum mode only): discover roots from `sqlite_schema`, walk each b-tree
-  emitting `RootPage`/`Btree(parent)`/`Overflow1/2` entries, mark freelist pages
-  `FreePage`, stamp `largest_root_page`; the allocator skips/materializes ptrmap
-  pages. Verified on a ~2454-page FULL file crossing 3 ptrmap boundaries (overflow
-  + index + deletes). `auto_vacuum=NONE` byte-unaffected. *(`PRAGMA
-  auto_vacuum=FULL` on an empty db switches the mode.)*
-- ✅ **C6b-3 — `auto_vacuum=FULL` truncate on commit.** Done —
-  `autovacuum_truncate` (FULL mode only) moves each live non-root data page from
-  the end of the file into the lowest free slot, fixing the one reference that
-  named it (parent child-pointer for b-tree pages; holder/prev links for overflow
-  pages), then `rebuild_ptrmap` regenerates the map and the freelist is rebuilt.
-  A FULL db deleting ~80% shrinks 2479→1217 pages (~51%) with sqlite3
-  `integrity_check = ok`. Best-effort + gated on `auto_vacuum()==Full`: b-tree
-  ROOT relocation is skipped (rootpages cached in the executor schema), the loop
-  stops at the lock-byte page, and any error rolls back to the sound in-place
-  path; NONE/INCREMENTAL writes byte-identical. *Ref:* `btree.c`
-  `autoVacuumCommit`.
-- ✅ **C6b-4 — `PRAGMA incremental_vacuum(N)`.** Done — reclaims free pages on
-  demand for `auto_vacuum=INCREMENTAL`: the unbounded form drains the freelist,
-  `incremental_vacuum(N)`/`= N` reclaims at most N trailing pages, reusing the
-  bounded (`limit: u32`) C6b-3 relocator. No-op for NONE/FULL; FULL/NONE commit
-  byte-identical. Verified: a heavily-deleted INCREMENTAL db reclaimed to sqlite3
-  `integrity_check = ok`. **The whole `auto_vacuum` track (C6a/C6b-1..4) is now
-  complete — read, write, FULL auto-truncate, and INCREMENTAL on-demand reclaim.**
-
-*Storage / durability / concurrency (each independent):*
+**Remaining pieces** *(storage / durability / concurrency — each independent):*
 
 - **C7 — SQLite-format rollback journal.** Match the on-disk journal byte layout
   (ours is a private, recoverable format today) so a crash mid-write is
-  recoverable by `sqlite3`. Pairs with the crash-recovery harness (§6).
+  recoverable by `sqlite3`. Pairs with the crash-recovery harness (§6). Split:
+  **C7a** write the sqlite journal header + page records; **C7b** recover from a
+  sqlite-format journal on open.
 - **C8a — `secure_delete`.** Zero freed cell/page content (`PRAGMA
   secure_delete=ON`).
-- **C8b — `PRAGMA cache_size` / `mmap_size`.** Accept and honor (today parsed as
-  no-ops); bound the page cache accordingly.
+- **C8b — honor `PRAGMA cache_size` / `mmap_size`.** Getters report defaults
+  today; store the set value and bound the page cache accordingly.
 - **C8c — a real `pcache` with LRU eviction.** Replace the keep-everything page
   map with a bounded cache (depends on C8b's size). *Perf, not correctness.*
 - **C9a — reader `SHARED`-lock enforcement / multi-reader.** Let multiple readers
@@ -365,41 +321,44 @@ remains).
 
 ### Track D — Virtual tables & ecosystem extensions
 
-Done: a table-valued-function mechanism (`generate_series`, `json_each`,
-`json_tree` as `FROM` sources).
+Done: the **read-only** virtual-table foundation — a table-valued-function
+mechanism (`generate_series`, `json_each`, `json_tree`); the `VTabModule` trait +
+`VTabRegistry` (**D1a**); `CREATE VIRTUAL TABLE … USING module[(args)]` parsing,
+persistence, and `FROM`-source integration incl. joins and `DROP` (**D1b**); and
+`best_index`/`filter` constraint pushdown (**D1b²**). Today a vtab is read-only
+(INSERT/UPDATE/DELETE rejected) and stateless (modules get no storage).
 
-**Remaining pieces:**
+**The blocker for FTS5/R-Tree is a *writable, persistent* vtab.** Both store data
+that must survive in the file, byte-compatibly. SQLite backs them with **shadow
+tables** (ordinary b-trees) — which graphite already writes byte-compatibly — so
+the path is: give modules writable shadow storage, then build the two modules on
+top. Build bottom-up (each step lands testable on `:memory:` first):
 
-- ✅ **D1a — `sqlite3_module` analog: the trait + registry.** Done in
-  `src/vtab.rs`: the `VTabModule` trait (`connect`→`VTabSchema`, `best_index`→
-  `IndexPlan` with a no-pushdown default, `open`→cursor), an iterator-shaped
-  `VTabCursor` (`next`→`Result<Option<Row>>`, per-row `column`/`rowid`),
-  object-safe `Dyn*` erasure so a `VTabRegistry` holds heterogeneous modules by
-  name, a `SeriesModule` example, and 14 unit tests. `no_std`+alloc, no unsafe.
-  Constraint pushdown / writes are stubbed for D1b.
-- ✅ **D1b — `CREATE VIRTUAL TABLE` + executor integration.** Done —
-  `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module[(args)]` parses and
-  persists a `sqlite_schema` row (type `table`, `rootpage=0`, the CREATE text);
-  `Connection` carries a `VTabRegistry` seeded with a built-in `series` module;
-  a vtab is a `FROM` source (single + join side) via the trait
-  (connect→open→cursor, WHERE re-applied by `run_core`); `DROP` works;
-  INSERT/UPDATE/DELETE are rejected (read-only). File round-trip verified.
-  *Remaining:* a public module-registration API (overlaps D4). Foundation for D2–D3.
-- ✅ **D1b² — `best_index` constraint pushdown.** Done — vtab scans push usable
-  WHERE constraints into the module via an xBestIndex/xFilter-style interface:
-  `IndexConstraint{column,op}` → `best_index` → `IndexPlan` (per-constraint
-  `argv_index`, `omit`, `order_by_consumed`, cost); `filter(cursor, plan, argv)`
-  seeds the cursor. `series` consumes `=`/`>=`/`>`/`<=`/`<` (+ `BETWEEN`),
-  narrowing generation for ascending/descending series. Correctness: `omit` is
-  never set so `run_core` re-applies the full WHERE (pushed bounds only shrink to
-  a superset; the narrowed start stays grid-aligned). Joins keep the full-scan
-  path. Proven by an instrumented generation counter + instant completion over a
-  billion-row series. *(Match/Like/Glob recognized but not yet consumed.)*
-- **D2 — FTS5** full-text search (a module on D1). *Ref:* `fts5*.c`.
-- **D3 — R-Tree** spatial index (a module on D1). *Ref:* `rtree.c`.
+- **W1 — writable-vtab trait + DML routing.** Add an `update` method to
+  `VTabModule` (the `xUpdate` analog: insert / update / delete a row, default =
+  the current read-only error), and route `INSERT`/`UPDATE`/`DELETE` on a vtab to
+  it in the executor (today rejected).
+- **W2 — shadow-table storage for modules.** A helper so a module can create and
+  read/write backing *regular* tables (`<name>_data`, …) on `connect`/`update` —
+  reusing graphite's normal table machinery, so persistence is byte-compatible for
+  free. Give the module access to the connection (the trait is stateless today).
+- **D3 — R-Tree** (smaller of the two; build on W1/W2). *Ref:* `rtree.c`.
+  - **D3a — module + correct results.** Parse `rtree(id, minX, maxX[, …])`,
+    store rows in shadow tables, answer queries by scan + filter (functionally
+    correct, differentially testable). *(Test graphite directly — confirm the CI
+    sqlite3 build has R-Tree before differential-comparing.)*
+  - **D3b — `best_index` spatial pushdown** of the coordinate constraints.
+  - **D3c — byte-compatible node format.** Pack bounding boxes into the
+    `<name>_node` blob layout sqlite uses, so a graphite-written R-Tree round-trips
+    through sqlite3. *(Required for file compatibility; large.)*
+- **D2 — FTS5** full-text search (build on W1/W2; the larger module). *Ref:*
+  `fts5*.c`. Break out: **D2a** tokenizer (unicode61/ascii); **D2b** inverted
+  index in shadow tables + `INSERT`; **D2c** `MATCH` query; **D2d** `bm25()`
+  ranking; **D2e** byte-compatible on-disk segment format.
 - **D4 — User-defined functions from Rust.** Register scalar/aggregate/window
-  functions and custom collations through a safe API (the read side of what
-  `func`/`collate` already do internally).
+  functions and custom collations through a safe public API (the read side of
+  what `func`/`collate` already do internally). Pairs with a public vtab-module
+  registration API.
 - **D5 — `sqlite3_session`** — changesets/patchsets for replication.
 - **D6 — Async VFS for wasm** — non-blocking I/O over IndexedDB/OPFS.
 - **D7 — C-API shim** — a `libsqlite3`-compatible surface as a *separate* crate.
@@ -461,32 +420,33 @@ on contents**, not byte-identical independently-built databases.
 
 ## 7. Immediate next steps
 
-Done so far: Track A breadth (incl. `timediff`, `json_error_position`, JSON5,
-the `subsec`/`subsecond` datetime modifier, end-relative `$[#]` JSON paths +
-strict json1 error/blob semantics), the full multi-schema track, the planner's
-index-driven `ORDER BY`/covering reads (B0/B2/B2b) and inner-join seeks
-(B1a/B1a²), partial/expression-index use (A3), the virtual-table interface with
-`best_index` pushdown (D1a/D1b/D1b²), the **complete `auto_vacuum` track**
-(C6a/C6b-1..4: read, write, FULL auto-truncate, INCREMENTAL reclaim), VDBE
-grouped `HAVING`/aggregate `ORDER BY` (B6), and the corruption-robustness fuzz
-harness. Recent differential hardening: shell real rendering + numeric CAST
-prefixes, explicit `COLLATE` in IN/CASE/BETWEEN, strftime NULL-on-unknown + `%U`
-+ year bound, **printf/format** full surface, raw-byte blob `||`, GLOB `]`,
-i64-overflow promotions, CTE `MATERIALIZED`, postfix `NOT NULL`, windowed
-`group_concat` separator, and an aggregate-arity panic guard. Suggested next order:
+The bounded SQL-language, function, and planner correctness items are essentially
+closed (the whole `WITHOUT ROWID` seek family, comma-join promotion, automatic-
+index EQP, JSONB, JSON number-provenance, `random`/`randomblob`, `unistr`/
+`subtype`, view `table_info`, the `DROP`/`RENAME COLUMN` DDL fixes, etc.). What's
+left is **bigger, multi-step work** — each track above is now broken into the
+smaller pieces to ship it. Suggested order:
 
-1. **D2 — FTS5** full-text search — the next big module on the vtab trait (now
-   that `best_index` pushdown exists). *(FOREIGN KEY runtime enforcement turned
-   out to be already done — only DEFERRABLE/INITIALLY DEFERRED remains there.)*
-3. **Planner leftovers** — **B0b** (`GROUP BY`/multi-term `ORDER BY` via index),
-   **B1b** (join reordering, now that inner tables can be seeked), **B3**
-   (auto-index EQP), **A2** (DESC seek direction), **B4** (`sqlite_stat4`).
-   Perf-only, EQP-gated. *(A4 literal-left collation: the IN/CASE/BETWEEN
-   `COLLATE` cases are now done; NULLIF collation in `func.rs` remains.)*
-4. **A7 — `execute_batch`** and the smaller API/ergonomics gaps.
-5. **B5/B7/B8 — the executor→VDBE migration** — the largest internal refactor;
-   unblocks real `EXPLAIN`.
+1. **W1 + W2 — writable, persistent vtabs.** The single unlock for the two
+   headline modules. Small, self-contained, and testable on its own (a trivial
+   writable module proves it before D2/D3).
+2. **D3 — R-Tree** on top of W1/W2 (D3a correct results → D3b pushdown → D3c
+   byte-compatible nodes). Smaller and more bounded than FTS5; do it first.
+3. **A-rn2/A-rn3 — cross-object ALTER rename** (view/trigger/FK propagation), the
+   one remaining *functional* correctness gap; needs the A-rn1 walker.
+4. **Planner leftovers** (perf-only, EQP-gated) — **B0b-i/ii/iii**, **B1b** join
+   reordering, **A2** DESC seek direction, **A3b** partial/expr range·IN seeks,
+   **B4** `sqlite_stat4`.
+5. **D2 — FTS5** (D2a–D2e) — the larger module, once W1/W2 and R-Tree have
+   exercised the writable-vtab path.
+6. **B5/B7/B8 — the executor→VDBE migration** — the largest internal refactor;
+   unblocks real bytecode `EXPLAIN`.
+7. **Smaller gaps** — **A4** (`nullif` collation), **A7** (`execute_batch` API),
+   **A8** (JSONB JSON5 numbers), **C8a/b/c** (secure_delete, cache honoring).
 
-Deferred: **A1** (`random*` — needs an RNG), **C7/C9** (SQLite-format journal,
-cross-process locks/concurrency — durability/concurrency depth), **D7** (C-API —
-blocked by `#![forbid(unsafe_code)]`).
+Deferred / blocked: **C7/C9** (SQLite-format journal + cross-process
+locks/concurrency — durability depth), **D5/D6** (sessions, async wasm VFS),
+**D7** (C-API — blocked by `#![forbid(unsafe_code)]`), **A-rn4** (cosmetic
+text-preserving schema edits). The **SQLite TCL suite** (§6) isn't runnable
+against a Rust crate — the differential corpus + `integrity_check` remain the
+green proxy.
