@@ -6081,16 +6081,47 @@ impl Connection {
                 break;
             }
         }
-        let Some((root, bound, coll, idx_cols)) = chosen else {
-            return Ok(None);
-        };
-
-        // Covering range seek: read from the index when it holds every referenced
-        // column (kept in lockstep with `eqp_access`'s `USING COVERING INDEX`).
-        if self.seek_index_covers(sel, meta, &idx_cols, where_expr) {
-            return Ok(Some(self.covering_seek_rows(meta, root, &idx_cols)?));
+        match chosen {
+            Some((root, bound, coll, idx_cols)) => {
+                // Covering range seek: read from the index when it holds every
+                // referenced column (lockstep with `eqp_access`'s `COVERING INDEX`).
+                if self.seek_index_covers(sel, meta, &idx_cols, where_expr) {
+                    return Ok(Some(self.covering_seek_rows(meta, root, &idx_cols)?));
+                }
+                Ok(Some(self.range_seek_fetch(meta, root, &bound, coll)?))
+            }
+            None => {
+                // A3b: a partial or expression index whose key column / expression
+                // has a range bound (and, for a partial index, whose predicate the
+                // WHERE guarantees). Always a non-covering fetch — `eqp_access`
+                // mirrors this in its partial/expression range fallback.
+                for idx in &indexes {
+                    if let Some(IndexHint::IndexedBy(n)) = hint {
+                        if !idx.name.eq_ignore_ascii_case(n) {
+                            continue;
+                        }
+                    }
+                    if let Some((bound, coll)) =
+                        self.partial_expr_range(idx, where_expr, meta, params)
+                    {
+                        return Ok(Some(self.range_seek_fetch(meta, idx.root, &bound, coll)?));
+                    }
+                }
+                Ok(None)
+            }
         }
+    }
 
+    /// Walk an index between `bound`'s lower/upper keys (single leading column,
+    /// under `coll`) and fetch each matching row from the table by rowid. Returns
+    /// a superset — `run_core` re-applies the full `WHERE`.
+    fn range_seek_fetch(
+        &self,
+        meta: &TableMeta,
+        root: u32,
+        bound: &RangeBound,
+        coll: crate::value::Collation,
+    ) -> Result<Vec<InputRow>> {
         let colls = [coll];
         let lower_key = bound.lower.as_ref().map(|(v, _)| core::slice::from_ref(v));
         let upper_key = bound.upper.as_ref().map(|(v, _)| core::slice::from_ref(v));
@@ -6111,7 +6142,88 @@ impl Connection {
                 });
             }
         }
-        Ok(Some(out))
+        Ok(out)
+    }
+
+    /// A3b range analogue of [`partial_expr_seek`](Self::partial_expr_seek): for a
+    /// partial or expression index, return the range bound (and collation) to seek
+    /// — a `<`/`<=`/`>`/`>=` constraint on the partial index's leading column (with
+    /// its predicate guaranteed by the `WHERE`), or on an expression index's keyed
+    /// expression. `None` when the index doesn't apply.
+    fn partial_expr_range(
+        &self,
+        idx: &IndexMeta,
+        where_expr: &Expr,
+        meta: &TableMeta,
+        params: &Params,
+    ) -> Option<(RangeBound, crate::value::Collation)> {
+        if idx.partial.is_none() && idx.key_exprs.is_none() {
+            return None;
+        }
+        let mut conjuncts = Vec::new();
+        and_conjuncts(where_expr, &mut conjuncts);
+        if let Some(pred) = &idx.partial {
+            if !conjuncts.iter().any(|c| expr_eq_modulo_parens(c, pred)) {
+                return None;
+            }
+        }
+        let coll = idx.collations.first().copied().unwrap_or_default();
+        match &idx.key_exprs {
+            // Partial index over plain columns: a range on the leading column.
+            None => {
+                let lead = *idx.cols.first()?;
+                let mut ranges = alloc::collections::BTreeMap::new();
+                collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+                let b = ranges.get(&lead)?;
+                let aff = meta.columns[lead].affinity;
+                Some((
+                    RangeBound {
+                        lower: b.lower.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i)),
+                        upper: b.upper.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i)),
+                    },
+                    coll,
+                ))
+            }
+            // Expression index: collect range conjuncts `<key_expr> <op> <const>`.
+            Some(exprs) => {
+                let [key_expr] = exprs.as_slice() else {
+                    return None;
+                };
+                let mut bound = RangeBound {
+                    lower: None,
+                    upper: None,
+                };
+                for c in &conjuncts {
+                    let Expr::Binary { op, left, right } = unparen(c) else {
+                        continue;
+                    };
+                    // Normalize to `key_expr <op> const`, mirroring the operator
+                    // when the expression is on the right.
+                    let (val, op) = if expr_eq_modulo_parens(left, key_expr) {
+                        (const_value(right, params), *op)
+                    } else if expr_eq_modulo_parens(right, key_expr) {
+                        (const_value(left, params), mirror_comparison(*op))
+                    } else {
+                        continue;
+                    };
+                    let Some(v) = val else { continue };
+                    if matches!(v, Value::Null) {
+                        continue;
+                    }
+                    match op {
+                        BinaryOp::Gt => bound.lower = Some((v, false)),
+                        BinaryOp::GtEq => bound.lower = Some((v, true)),
+                        BinaryOp::Lt => bound.upper = Some((v, false)),
+                        BinaryOp::LtEq => bound.upper = Some((v, true)),
+                        _ => {}
+                    }
+                }
+                if bound.lower.is_none() && bound.upper.is_none() {
+                    return None;
+                }
+                Some((bound, coll))
+            }
+        }
     }
 
     /// Try to satisfy a single-table query with per-value index seeks for a
@@ -7089,6 +7201,29 @@ impl Connection {
                 return Ok(alloc::format!(
                     "SEARCH {label} USING {kw} {idx_name} ({cond})"
                 ));
+            }
+        }
+
+        // A3b: a partial or expression index range seek (mirrors the
+        // `partial_expr_range` fallback in try_index_range; always non-covering).
+        for idx in self.indexes_of(table)? {
+            if let Some((bound, _)) = self.partial_expr_range(&idx, where_expr, meta, params) {
+                let cond = |name: &str| match (&bound.lower, &bound.upper) {
+                    (Some(_), Some(_)) => alloc::format!("{name}>? AND {name}<?"),
+                    (Some(_), None) => alloc::format!("{name}>?"),
+                    (None, Some(_)) => alloc::format!("{name}<?"),
+                    (None, None) => String::new(),
+                };
+                let rendered = match &idx.key_exprs {
+                    None => cond(&meta.columns[idx.cols[0]].name),
+                    Some(_) => cond("<expr>"),
+                };
+                if !rendered.is_empty() {
+                    return Ok(alloc::format!(
+                        "SEARCH {label} USING INDEX {} ({rendered})",
+                        idx.name
+                    ));
+                }
             }
         }
 
@@ -12081,6 +12216,18 @@ fn eqp_label(t: &TableRef) -> String {
 /// an unknown column name that is not a rowid alias, or a construct whose columns
 /// can't be enumerated locally (a scalar subquery / `EXISTS` / `IN (SELECT …)`),
 /// so the caller conservatively falls back to the table-fetch path.
+/// Flip a comparison operator for a swapped operand order: `a < b` ⇔ `b > a`.
+/// Non-ordering operators are returned unchanged.
+fn mirror_comparison(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
+}
+
 fn where_cols_covered(e: &Expr, meta: &TableMeta, idx_cols: &[usize]) -> bool {
     let covered = |ci: usize| idx_cols.contains(&ci) || meta.ipk == Some(ci);
     match e {
