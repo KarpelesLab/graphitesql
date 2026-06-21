@@ -151,7 +151,16 @@ pub struct Connection {
     /// page count, a negative value is KiB; default −2000). graphite keeps every
     /// page resident, so this is reported back but does not bound a real cache.
     cache_size: core::cell::Cell<i64>,
+    /// User-defined scalar functions registered via
+    /// [`register_function`](Self::register_function), keyed by lowercased name.
+    /// Built-in functions take precedence; these fill otherwise-unknown names.
+    functions: alloc::collections::BTreeMap<String, ScalarFunction>,
 }
+
+/// A user-defined scalar function: it receives its evaluated argument values and
+/// returns a result [`Value`] (or an error). Registered with
+/// [`Connection::register_function`].
+pub type ScalarFunction = Box<dyn Fn(&[Value]) -> Result<Value>>;
 
 /// Initial seed for a connection's `random()` generator. Under `std` it mixes
 /// the wall clock so repeated invocations of the binary produce different
@@ -241,6 +250,7 @@ impl Connection {
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
+            functions: alloc::collections::BTreeMap::new(),
         })
     }
 
@@ -271,6 +281,7 @@ impl Connection {
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
+            functions: alloc::collections::BTreeMap::new(),
         })
     }
 
@@ -1325,6 +1336,21 @@ impl Connection {
         module: impl DynVTabModule + 'static,
     ) -> Result<()> {
         self.vtab_registry.register(name, Box::new(module))
+    }
+
+    /// Register a user-defined scalar function callable from SQL by `name`. `f`
+    /// receives the evaluated argument values and returns a result [`Value`]. A
+    /// built-in function of the same name takes precedence; registering an existing
+    /// user function replaces it. The callback should validate its own argument
+    /// count and types (returning an error otherwise), like SQLite's
+    /// `sqlite3_create_function` callbacks.
+    pub fn register_function(
+        &mut self,
+        name: &str,
+        f: impl Fn(&[Value]) -> Result<Value> + 'static,
+    ) {
+        self.functions
+            .insert(name.to_ascii_lowercase(), Box::new(f));
     }
 
     /// Execute a `;`-separated script of one or more statements, like SQLite's
@@ -12061,6 +12087,9 @@ impl eval::Subqueries for Connection {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^= z >> 31;
         z as i64
+    }
+    fn call_udf(&self, name: &str, args: &[Value]) -> Option<Result<Value>> {
+        self.functions.get(name).map(|f| f(args))
     }
     fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value> {
         self.with_outer_frame(outer, |params| {

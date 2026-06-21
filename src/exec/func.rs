@@ -707,7 +707,14 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             super::datetime::timediff(&v[0], &v[1])
         }
         "printf" | "format" => super::datetime::printf(&v),
-        _ => return Err(Error::Unsupported("unknown scalar function")),
+        _ => {
+            // A user-defined function registered via `register_function`. Builtins
+            // above take precedence; this fires only for an otherwise-unknown name.
+            if let Some(result) = ctx.subqueries.and_then(|s| s.call_udf(&lname, &v)) {
+                return result;
+            }
+            return Err(Error::Error(alloc::format!("no such function: {name}")));
+        }
     })
 }
 

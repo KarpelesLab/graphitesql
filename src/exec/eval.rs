@@ -55,6 +55,13 @@ pub trait Subqueries {
     fn next_random(&self) -> i64 {
         0
     }
+    /// Invoke a user-defined scalar function registered on the connection (via
+    /// `Connection::register_function`) with its evaluated argument values.
+    /// Returns `None` when no function is registered under `name` (lowercased), so
+    /// the caller can fall back to "no such function". The default is `None`.
+    fn call_udf(&self, _name: &str, _args: &[Value]) -> Option<Result<Value>> {
+        None
+    }
 }
 
 /// A column's type affinity (SQLite, `datatype3.html` §3).
