@@ -217,6 +217,12 @@ fn corpus() -> Vec<String> {
     // 10) Joins.
     q.push("SELECT t.id, u.w FROM t JOIN u ON t.id = u.t_id ORDER BY t.id, u.w;".into());
     q.push("SELECT t.g, count(*) FROM t JOIN u ON t.id = u.t_id GROUP BY t.g ORDER BY t.g;".into());
+    // Comma joins with the equality in WHERE (promoted to a seek/hash internally).
+    q.push("SELECT t.id, u.w FROM t, u WHERE t.id = u.t_id ORDER BY t.id, u.w;".into());
+    q.push(
+        "SELECT t.id, u.w FROM t, u WHERE t.id = u.t_id AND t.a > 30 ORDER BY t.id, u.w;".into(),
+    );
+    q.push("SELECT x.id, y.id FROM t x, t y WHERE x.g = y.g AND x.id < y.id AND x.id < 5 ORDER BY x.id, y.id;".into());
     q.push(
         "SELECT t.id FROM t LEFT JOIN u ON t.id = u.t_id WHERE u.w IS NULL ORDER BY t.id;".into(),
     );

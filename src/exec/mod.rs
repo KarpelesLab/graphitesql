@@ -6084,6 +6084,16 @@ impl Connection {
         out: &mut Vec<(i64, i64, String)>,
         params: &Params,
     ) -> Result<()> {
+        // Mirror run_core's comma-join → ON promotion so the plan reflects how the
+        // query actually runs.
+        let rewritten;
+        let sel = match promote_comma_join_ons(sel) {
+            Some(r) => {
+                rewritten = r;
+                &rewritten
+            }
+            None => sel,
+        };
         let Some(from) = &sel.from else {
             return Ok(()); // SELECT with no FROM => no scan node
         };
@@ -7620,6 +7630,17 @@ impl Connection {
     }
 
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
+        // Promote `FROM a, b WHERE a.x = b.y` to an explicit join `ON` so the join
+        // fold can seek/hash it (the equality stays in WHERE, so results are
+        // identical). All later uses of `sel` see the rewritten form.
+        let rewritten;
+        let sel = match promote_comma_join_ons(sel) {
+            Some(r) => {
+                rewritten = r;
+                &rewritten
+            }
+            None => sel,
+        };
         // `SELECT count(*) FROM t` over a single rowid table with exactly one full
         // secondary index counts that index's entries instead of scanning the
         // table (B2b). Kept in lockstep with `eqp_select` via the shared
@@ -11471,6 +11492,88 @@ fn join_keys_of(v: &Value) -> Vec<JoinKey> {
             keys
         }
         Value::Blob(b) => alloc::vec![JoinKey::Blob(b.clone())],
+    }
+}
+
+/// Promote a comma join's filtering equality from `WHERE` into its `ON`, so the
+/// common `FROM a, b WHERE a.x = b.y` pattern can use the same hash/index seek
+/// path (and EXPLAIN QUERY PLAN node) as `a JOIN b ON a.x = b.y`. The equality is
+/// *copied*, not moved — it stays in `WHERE` — so the result is unchanged: the
+/// `ON` is a subset of `WHERE`, applied redundantly. Only a qualified
+/// `t.col = u.col` equality linking the joined table to an already-introduced one
+/// is promoted. Returns the rewritten `Select`, or `None` if nothing applied.
+fn promote_comma_join_ons(sel: &Select) -> Option<Select> {
+    let from = sel.from.as_ref()?;
+    let where_clause = sel.where_clause.as_ref()?;
+    let promotable = |j: &Join| {
+        j.on.is_none() && !j.natural && j.using.is_empty() && matches!(j.kind, JoinKind::Inner)
+    };
+    if !from.joins.iter().any(promotable) {
+        return None;
+    }
+    let mut conjuncts: Vec<&Expr> = Vec::new();
+    and_conjuncts(where_clause, &mut conjuncts);
+    let label = |t: &TableRef| t.alias.clone().unwrap_or_else(|| t.name.clone());
+    let mut available: Vec<String> = alloc::vec![label(&from.first)];
+    let mut new_joins = from.joins.clone();
+    let mut changed = false;
+    for (i, join) in from.joins.iter().enumerate() {
+        let jlabel = label(&join.table);
+        if promotable(join) {
+            if let Some(cond) = conjuncts
+                .iter()
+                .find_map(|c| eligible_join_equi(c, &jlabel, &available))
+            {
+                new_joins[i].on = Some(cond);
+                changed = true;
+            }
+        }
+        available.push(jlabel);
+    }
+    if !changed {
+        return None;
+    }
+    let mut new_sel = sel.clone();
+    new_sel.from = Some(FromClause {
+        first: from.first.clone(),
+        joins: new_joins,
+    });
+    Some(new_sel)
+}
+
+/// A qualified `A.x = B.y` equality where one qualifier is `jlabel` and the other
+/// is in `available` — eligible to become a comma join's `ON`. Returns the cloned
+/// equality (with any enclosing parens stripped).
+fn eligible_join_equi(c: &Expr, jlabel: &str, available: &[String]) -> Option<Expr> {
+    let mut c = c;
+    while let Expr::Paren(inner) = c {
+        c = inner;
+    }
+    let (l, r) = match c {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => (left.as_ref(), right.as_ref()),
+        _ => return None,
+    };
+    let lt = column_qualifier(l)?;
+    let rt = column_qualifier(r)?;
+    let here = |t: &str| t.eq_ignore_ascii_case(jlabel);
+    let earlier = |t: &str| available.iter().any(|a| a.eq_ignore_ascii_case(t));
+    if (here(lt) && earlier(rt)) || (here(rt) && earlier(lt)) {
+        Some(c.clone())
+    } else {
+        None
+    }
+}
+
+/// The table qualifier of a qualified column reference (`t.col` → `t`).
+fn column_qualifier(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Column { table: Some(t), .. } => Some(t),
+        Expr::Paren(inner) => column_qualifier(inner),
+        _ => None,
     }
 }
 
