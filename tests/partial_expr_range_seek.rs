@@ -109,3 +109,46 @@ fn expression_index_range_seek() {
         [-5, 3]
     );
 }
+
+#[test]
+fn partial_index_in_seek() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("CREATE INDEX ip ON t(b) WHERE a > 2").unwrap();
+    c.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)")
+        .unwrap();
+    // Each IN value is seeked as an equality on the partial index.
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT b FROM t WHERE a>2 AND b IN (20,30,40)"
+        ),
+        "SEARCH t USING INDEX ip (b=?)"
+    );
+    assert_eq!(
+        ints(
+            &c,
+            "SELECT b FROM t WHERE a>2 AND b IN (20,30,40) ORDER BY b"
+        ),
+        [30, 40]
+    );
+}
+
+#[test]
+fn expression_index_in_seek() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE u(x)").unwrap();
+    c.execute("CREATE INDEX ie ON u(abs(x))").unwrap();
+    c.execute("INSERT INTO u VALUES (-5),(-1),(3),(7)").unwrap();
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT x FROM u WHERE abs(x) IN (5,7)"
+        ),
+        "SEARCH u USING INDEX ie (<expr>=?)"
+    );
+    assert_eq!(
+        ints(&c, "SELECT x FROM u WHERE abs(x) IN (5,7) ORDER BY x"),
+        [-5, 7]
+    );
+}

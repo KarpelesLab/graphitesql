@@ -6145,6 +6145,41 @@ impl Connection {
         Ok(out)
     }
 
+    /// Seek each key through an index (single leading column/expression, under
+    /// `colls`), union the matching rowids, and fetch each row from the table.
+    /// Shared by the plain, partial, and expression `IN`-list seek paths. Returns
+    /// a superset (`run_core` re-applies the full `WHERE`).
+    fn in_seek_fetch(
+        &self,
+        meta: &TableMeta,
+        root: u32,
+        colls: &[crate::value::Collation],
+        keys: &[Vec<Value>],
+    ) -> Result<Vec<InputRow>> {
+        let src = self.backend.source();
+        let encoding = src.header().text_encoding;
+        let mut rowids: Vec<i64> = Vec::new();
+        for key in keys {
+            for rid in crate::btree::index_seek_rowids(src, root, key, colls)? {
+                if !rowids.contains(&rid) {
+                    rowids.push(rid);
+                }
+            }
+        }
+        let mut cur = TableCursor::new(src, meta.root);
+        let mut out = Vec::new();
+        for rid in rowids {
+            if cur.seek(rid)? {
+                let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                out.push(InputRow {
+                    values,
+                    rowid: Some(rid),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// A3b range analogue of [`partial_expr_seek`](Self::partial_expr_seek): for a
     /// partial or expression index, return the range bound (and collation) to seek
     /// — a `<`/`<=`/`>`/`>=` constraint on the partial index's leading column (with
@@ -6245,101 +6280,108 @@ impl Connection {
         if matches!(hint, Some(IndexHint::NotIndexed)) {
             return Ok(None);
         }
-        let Some((col, values)) = find_in_constraint(where_expr, &meta.columns, params) else {
-            return Ok(None);
-        };
-        // Skip if any list value is NULL (`x IN (NULL)` is never true/usable here).
-        if values.iter().any(|v| matches!(v, Value::Null)) {
-            return Ok(None);
-        }
-        let encoding = self.backend.source().header().text_encoding;
-
-        // Rowid IN-list: seek the table b-tree directly for each value.
-        if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
-            if let Some(ipk) = meta.ipk {
-                if col == ipk {
-                    let mut cur = TableCursor::new(self.backend.source(), meta.root);
-                    let mut out = Vec::new();
-                    let mut seen: Vec<i64> = Vec::new();
-                    for v in &values {
-                        let rid = eval::to_i64(v);
-                        if seen.contains(&rid) {
-                            continue;
-                        }
-                        seen.push(rid);
-                        if cur.seek(rid)? {
-                            let values =
-                                self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
-                            out.push(InputRow {
-                                values,
-                                rowid: Some(rid),
-                            });
-                        }
-                    }
-                    return Ok(Some(out));
-                }
-            }
-        }
-
-        // Otherwise pick a plain index whose leading column is the IN column.
         let indexes = self.indexes_of(table_name)?;
         if let Some(IndexHint::IndexedBy(n)) = hint {
             if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
                 return Err(Error::Error(alloc::format!("no such index: {n}")));
             }
         }
-        let mut chosen: Option<(u32, crate::value::Collation, Vec<usize>)> = None;
-        for idx in &indexes {
-            if let Some(IndexHint::IndexedBy(n)) = hint {
-                if !idx.name.eq_ignore_ascii_case(n) {
-                    continue;
-                }
-            }
-            if idx.partial.is_some() || idx.key_exprs.is_some() {
-                continue;
-            }
-            if idx.cols.first() == Some(&col) {
-                chosen = Some((
-                    idx.root,
-                    idx.collations.first().copied().unwrap_or_default(),
-                    idx.cols.clone(),
-                ));
-                break;
-            }
-        }
-        let Some((root, coll, idx_cols)) = chosen else {
-            return Ok(None);
+        let by_name = |idx: &IndexMeta| match hint {
+            Some(IndexHint::IndexedBy(n)) => idx.name.eq_ignore_ascii_case(n),
+            _ => true,
         };
 
-        // Covering IN seek: read from the index when it holds every referenced
-        // column (kept in lockstep with `eqp_access`'s `USING COVERING INDEX`).
-        if self.seek_index_covers(sel, meta, &idx_cols, where_expr) {
-            return Ok(Some(self.covering_seek_rows(meta, root, &idx_cols)?));
-        }
+        // Column `IN (…)`: rowid b-tree, a plain index, or a partial index whose
+        // leading column is the IN column (and whose predicate the WHERE proves).
+        if let Some((col, values)) = find_in_constraint(where_expr, &meta.columns, params) {
+            // `x IN (NULL)` is never true/usable as a seek key.
+            if !values.iter().any(|v| matches!(v, Value::Null)) {
+                let encoding = self.backend.source().header().text_encoding;
+                let aff = meta.columns[col].affinity;
 
-        let aff = meta.columns[col].affinity;
-        let colls = [coll];
-        let mut rowids: Vec<i64> = Vec::new();
-        for v in &values {
-            let key = [aff.coerce(v.clone())];
-            for rid in crate::btree::index_seek_rowids(self.backend.source(), root, &key, &colls)? {
-                if !rowids.contains(&rid) {
-                    rowids.push(rid);
+                // Rowid IN-list: seek the table b-tree directly for each value.
+                if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
+                    if let Some(ipk) = meta.ipk {
+                        if col == ipk {
+                            let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                            let mut out = Vec::new();
+                            let mut seen: Vec<i64> = Vec::new();
+                            for v in &values {
+                                let rid = eval::to_i64(v);
+                                if seen.contains(&rid) {
+                                    continue;
+                                }
+                                seen.push(rid);
+                                if cur.seek(rid)? {
+                                    let values =
+                                        self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                                    out.push(InputRow {
+                                        values,
+                                        rowid: Some(rid),
+                                    });
+                                }
+                            }
+                            return Ok(Some(out));
+                        }
+                    }
+                }
+
+                let keys: Vec<Vec<Value>> = values
+                    .iter()
+                    .map(|v| alloc::vec![aff.coerce(v.clone())])
+                    .collect();
+                // A plain index whose leading column is the IN column.
+                for idx in &indexes {
+                    if !by_name(idx) || idx.partial.is_some() || idx.key_exprs.is_some() {
+                        continue;
+                    }
+                    if idx.cols.first() == Some(&col) {
+                        if self.seek_index_covers(sel, meta, &idx.cols, where_expr) {
+                            return Ok(Some(self.covering_seek_rows(meta, idx.root, &idx.cols)?));
+                        }
+                        let coll = idx.collations.first().copied().unwrap_or_default();
+                        return Ok(Some(self.in_seek_fetch(meta, idx.root, &[coll], &keys)?));
+                    }
+                }
+                // A3b: a partial index on the IN column with its predicate proven.
+                for idx in &indexes {
+                    if !by_name(idx) || idx.key_exprs.is_some() || idx.partial.is_none() {
+                        continue;
+                    }
+                    if idx.cols.first() == Some(&col) && partial_pred_guaranteed(idx, where_expr) {
+                        let coll = idx.collations.first().copied().unwrap_or_default();
+                        return Ok(Some(self.in_seek_fetch(meta, idx.root, &[coll], &keys)?));
+                    }
                 }
             }
         }
-        let mut cur = TableCursor::new(self.backend.source(), meta.root);
-        let mut out = Vec::new();
-        for rid in rowids {
-            if cur.seek(rid)? {
-                let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
-                out.push(InputRow {
-                    values,
-                    rowid: Some(rid),
-                });
+
+        // A3b: an expression index keyed by `<expr>` with `<expr> IN (…)`.
+        for idx in &indexes {
+            if !by_name(idx) {
+                continue;
             }
+            let Some(exprs) = &idx.key_exprs else {
+                continue;
+            };
+            let [key_expr] = exprs.as_slice() else {
+                continue;
+            };
+            if !partial_pred_guaranteed(idx, where_expr) {
+                continue;
+            }
+            let Some(values) = find_expr_in_values(key_expr, where_expr, params) else {
+                continue;
+            };
+            if values.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            let coll = idx.collations.first().copied().unwrap_or_default();
+            let keys: Vec<Vec<Value>> = values.iter().map(|v| alloc::vec![v.clone()]).collect();
+            return Ok(Some(self.in_seek_fetch(meta, idx.root, &[coll], &keys)?));
         }
-        Ok(Some(out))
+
+        Ok(None)
     }
 
     /// Find a plain (non-partial, non-expression) index whose leading column is
@@ -7227,7 +7269,8 @@ impl Connection {
             }
         }
 
-        // IN-list seek: rowid b-tree, or an index on the IN column.
+        // IN-list seek: rowid b-tree, a plain/partial index on the IN column, or
+        // an expression index keyed by the IN'd expression (mirrors try_index_in).
         if let Some((col, _)) = find_in_constraint(where_expr, &meta.columns, params) {
             if meta.ipk == Some(col) {
                 return Ok(alloc::format!(
@@ -7239,6 +7282,36 @@ impl Connection {
                 let kw = index_kw(&idx_cols);
                 return Ok(alloc::format!(
                     "SEARCH {label} USING {kw} {idx_name} ({name}=?)"
+                ));
+            }
+            // A3b: a partial index on the IN column with its predicate proven.
+            for idx in self.indexes_of(table)? {
+                if idx.key_exprs.is_some() || idx.partial.is_none() {
+                    continue;
+                }
+                if idx.cols.first() == Some(&col) && partial_pred_guaranteed(&idx, where_expr) {
+                    let name = &meta.columns[col].name;
+                    return Ok(alloc::format!(
+                        "SEARCH {label} USING INDEX {} ({name}=?)",
+                        idx.name
+                    ));
+                }
+            }
+        }
+        // A3b: an expression index keyed by `<expr>` with `<expr> IN (…)`.
+        for idx in self.indexes_of(table)? {
+            let Some(exprs) = &idx.key_exprs else {
+                continue;
+            };
+            let [key_expr] = exprs.as_slice() else {
+                continue;
+            };
+            if partial_pred_guaranteed(&idx, where_expr)
+                && find_expr_in_values(key_expr, where_expr, params).is_some()
+            {
+                return Ok(alloc::format!(
+                    "SEARCH {label} USING INDEX {} (<expr>=?)",
+                    idx.name
                 ));
             }
         }
@@ -12216,6 +12289,49 @@ fn eqp_label(t: &TableRef) -> String {
 /// an unknown column name that is not a rowid alias, or a construct whose columns
 /// can't be enumerated locally (a scalar subquery / `EXISTS` / `IN (SELECT …)`),
 /// so the caller conservatively falls back to the table-fetch path.
+/// Is a partial index's predicate guaranteed by a top-level conjunct of the
+/// `WHERE`? Always true for a non-partial index.
+fn partial_pred_guaranteed(idx: &IndexMeta, where_expr: &Expr) -> bool {
+    match &idx.partial {
+        None => true,
+        Some(pred) => {
+            let mut conjuncts = Vec::new();
+            and_conjuncts(where_expr, &mut conjuncts);
+            conjuncts.iter().any(|c| expr_eq_modulo_parens(c, pred))
+        }
+    }
+}
+
+/// Find a conjunct `<key_expr> IN (const, …)` (walking top-level `AND`s) and
+/// return the evaluated list values — the expression-index analogue of
+/// [`find_in_constraint`].
+fn find_expr_in_values(key_expr: &Expr, e: &Expr, params: &Params) -> Option<Vec<Value>> {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => find_expr_in_values(key_expr, left, params)
+            .or_else(|| find_expr_in_values(key_expr, right, params)),
+        Expr::Paren(inner) => find_expr_in_values(key_expr, inner, params),
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            if list.is_empty() || !expr_eq_modulo_parens(expr, key_expr) {
+                return None;
+            }
+            let mut vals = Vec::with_capacity(list.len());
+            for item in list {
+                vals.push(const_value(item, params)?);
+            }
+            Some(vals)
+        }
+        _ => None,
+    }
+}
+
 /// Flip a comparison operator for a swapped operand order: `a < b` ⇔ `b > a`.
 /// Non-ordering operators are returned unchanged.
 fn mirror_comparison(op: BinaryOp) -> BinaryOp {
