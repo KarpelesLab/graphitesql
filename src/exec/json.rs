@@ -25,13 +25,18 @@ pub enum Json {
     Null,
     /// `true` / `false`
     Bool(bool),
-    /// An integral number that fits in `i64`.
-    Int(i64),
+    /// An integral number that fits in `i64`. `Some` carries the verbatim source
+    /// text of a JSON5-only integer form (a hexadecimal `0x…` literal), which
+    /// SQLite stores under the JSONB `INT5` tag; `None` is a strict decimal
+    /// integer (`INT`, rendered canonically).
+    Int(i64, Option<String>),
     /// Any other number. The optional string is the verbatim source text of the
-    /// number as it appeared in the input — SQLite preserves it in JSON *text*
-    /// output (`json('1e2')` → `1e2`, `json('1.50')` → `1.50`) while still
-    /// yielding the canonical `f64` as a SQL value. `None` for numbers built
-    /// programmatically (from a SQL REAL, arithmetic, or `Infinity`).
+    /// number as it appeared in the input. SQLite preserves a *strict* number's
+    /// text in JSON output (`json('1e2')` → `1e2`, `json('1.50')` → `1.50`) under
+    /// the `FLOAT` tag, and keeps a JSON5-only form (a leading/trailing `.`, e.g.
+    /// `.5` / `5.`) verbatim under the `FLOAT5` tag while rendering it canonically
+    /// in `json()`. `None` is a number built programmatically (a SQL REAL,
+    /// arithmetic, `Infinity`) or one normalized from a leading-`+` form.
     Real(f64, Option<String>),
     /// A string (unescaped).
     Str(String),
@@ -48,7 +53,7 @@ impl Json {
             Json::Null => "null",
             Json::Bool(true) => "true",
             Json::Bool(false) => "false",
-            Json::Int(_) => "integer",
+            Json::Int(..) => "integer",
             Json::Real(..) => "real",
             Json::Str(_) => "text",
             Json::Array(_) => "array",
@@ -62,7 +67,7 @@ impl Json {
         match self {
             Json::Null => Value::Null,
             Json::Bool(b) => Value::Integer(*b as i64),
-            Json::Int(i) => Value::Integer(*i),
+            Json::Int(i, _) => Value::Integer(*i),
             Json::Real(r, _) => Value::Real(*r),
             Json::Str(s) => Value::Text(s.clone()),
             Json::Array(_) | Json::Object(_) => Value::Text(self.serialize()),
@@ -105,18 +110,30 @@ impl Json {
             Json::Null => push_jsonb(out, JSONB_NULL, &[]),
             Json::Bool(true) => push_jsonb(out, JSONB_TRUE, &[]),
             Json::Bool(false) => push_jsonb(out, JSONB_FALSE, &[]),
-            Json::Int(i) => push_jsonb(out, JSONB_INT, i.to_string().as_bytes()),
+            // A hexadecimal source form is stored verbatim under INT5; a strict
+            // decimal integer is the canonical text under INT.
+            Json::Int(_, Some(raw)) => push_jsonb(out, JSONB_INT5, raw.as_bytes()),
+            Json::Int(i, None) => push_jsonb(out, JSONB_INT, i.to_string().as_bytes()),
             Json::Real(r, src) => {
-                // The FLOAT payload is the number's source text when known, so a
-                // JSONB round-trip preserves it like SQLite.
-                let s = match src {
-                    Some(t) => t.clone(),
-                    None if r.is_infinite() => {
-                        String::from(if *r < 0.0 { "-9e999" } else { "9e999" })
+                // The payload is the number's source text when known, so a JSONB
+                // round-trip preserves it like SQLite. A *strict* number uses the
+                // FLOAT tag; a JSON5-only form (a leading/trailing `.`) keeps its
+                // raw text under FLOAT5.
+                match src {
+                    Some(t) if is_strict_json_number(t) => {
+                        push_jsonb(out, JSONB_FLOAT, t.as_bytes())
                     }
-                    None => crate::exec::eval::format_real(*r),
-                };
-                push_jsonb(out, JSONB_FLOAT, s.as_bytes());
+                    Some(t) => push_jsonb(out, JSONB_FLOAT5, t.as_bytes()),
+                    None if r.is_infinite() => {
+                        let s = if *r < 0.0 { "-9e999" } else { "9e999" };
+                        push_jsonb(out, JSONB_FLOAT, s.as_bytes());
+                    }
+                    None => push_jsonb(
+                        out,
+                        JSONB_FLOAT,
+                        crate::exec::eval::format_real(*r).as_bytes(),
+                    ),
+                }
             }
             Json::Str(s) => {
                 // A string with no characters needing escapes is stored raw
@@ -212,16 +229,17 @@ impl Json {
             Json::Null => out.push_str("null"),
             Json::Bool(true) => out.push_str("true"),
             Json::Bool(false) => out.push_str("false"),
-            Json::Int(i) => out.push_str(&i.to_string()),
+            Json::Int(i, _) => out.push_str(&i.to_string()),
             Json::Real(r, _) if r.is_infinite() => {
                 // JSON has no infinity literal; sqlite renders it as `±9e999`
                 // (a value that round-trips to f64 infinity).
                 out.push_str(if *r < 0.0 { "-9e999" } else { "9e999" });
             }
-            // Preserve the number's verbatim source text when known (`1e2`,
-            // `1.50`, `-0.0`); otherwise render the canonical form.
-            Json::Real(_, Some(src)) => out.push_str(src),
-            Json::Real(r, None) => out.push_str(&crate::exec::eval::format_real(*r)),
+            // Preserve a *strict* number's verbatim source text (`1e2`, `1.50`,
+            // `-0.0`); a JSON5-only form (`.5`, `5.`) and a computed value render
+            // in canonical form (`.5` → `0.5`), matching sqlite's `json()`.
+            Json::Real(_, Some(src)) if is_strict_json_number(src) => out.push_str(src),
+            Json::Real(r, _) => out.push_str(&crate::exec::eval::format_real(*r)),
             Json::Str(s) => write_json_string(s, out),
             Json::Array(items) => {
                 out.push('[');
@@ -328,7 +346,7 @@ fn decode_jsonb(b: &[u8]) -> Option<(Json, &[u8])> {
             // The number's text payload is reparsed through the JSON number path.
             let t = core::str::from_utf8(payload).ok()?;
             match parse(t) {
-                Some(j @ (Json::Int(_) | Json::Real(..))) => j,
+                Some(j @ (Json::Int(..) | Json::Real(..))) => j,
                 _ => return None,
             }
         }
@@ -965,9 +983,13 @@ impl Parser<'_> {
             if self.pos == digits_start {
                 return Err(start); // `0x` with no digits
             }
-            // SQLite stores the hex value modulo 2^64 as a signed integer.
+            // SQLite stores the hex value modulo 2^64 as a signed integer, and
+            // keeps the verbatim `0x…` text for the JSONB INT5 tag.
             let i = v as i64;
-            return Ok(Json::Int(if neg { i.wrapping_neg() } else { i }));
+            let raw = core::str::from_utf8(&self.bytes[start..self.pos])
+                .ok()
+                .map(String::from);
+            return Ok(Json::Int(if neg { i.wrapping_neg() } else { i }, raw));
         }
         let mut is_real = false;
         while let Some(c) = self.peek() {
@@ -988,18 +1010,20 @@ impl Parser<'_> {
         };
         if !is_real {
             if let Ok(i) = tok.parse::<i64>() {
-                return Ok(Json::Int(i));
+                return Ok(Json::Int(i, None));
             }
         }
         // `f64::parse` rejects a leading `+` and a leading/trailing `.`; build a
         // normalized form so JSON5 numbers like `+.5` / `5.` parse.
         match parse_json5_real(tok) {
-            // SQLite preserves a *strict* JSON number's text verbatim, but
-            // normalizes JSON5-only forms (leading/trailing `.`, leading `+`):
-            // `1e2` stays `1e2`, but `.5` renders as `0.5`.
+            // Keep the verbatim text for both strict numbers (`1e2`, `1.50`) and
+            // JSON5 leading/trailing-`.` forms (`.5`, `5.`) — the encoders pick the
+            // FLOAT vs FLOAT5 tag and the canonical-vs-verbatim `json()` rendering
+            // by re-checking `is_strict_json_number`. A leading-`+` form is dropped
+            // to `None` so it normalizes (`+0.5` → `0.5`), matching sqlite.
             Some(r) => Ok(Json::Real(
                 r,
-                is_strict_json_number(tok).then(|| String::from(tok)),
+                (!tok.starts_with('+')).then(|| String::from(tok)),
             )),
             None => Err(start),
         }
@@ -1090,7 +1114,7 @@ pub fn navigate<'a>(root: &'a Json, path: &str) -> Option<&'a Json> {
 pub fn value_to_json(v: &Value) -> Json {
     match v {
         Value::Null => Json::Null,
-        Value::Integer(i) => Json::Int(*i),
+        Value::Integer(i) => Json::Int(*i, None),
         Value::Real(r) => Json::Real(*r, None),
         Value::Text(s) => Json::Str(s.clone()),
         Value::Blob(_) => Json::Str(String::new()),

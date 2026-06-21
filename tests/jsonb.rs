@@ -111,3 +111,47 @@ fn jsonb_mutators_and_aggregates() {
         Value::Blob(_)
     ));
 }
+
+#[test]
+fn json5_number_forms_use_int5_float5_tags() {
+    // JSON5-only number forms keep their verbatim text under the INT5/FLOAT5 tags
+    // (matching sqlite byte-for-byte), while `json()` still renders them
+    // canonically. A leading `+` is normalized to a strict INT/FLOAT.
+    let c = Connection::open_memory().unwrap();
+
+    // `.5` and `5.` → FLOAT5 (type nibble 6) with the raw text.
+    assert_eq!(hex(&c, "jsonb('.5')"), "262E35"); // size 2, type 6, ".5"
+    assert_eq!(hex(&c, "jsonb('5.')"), "26352E"); // ".", raw "5."
+    assert_eq!(hex(&c, "jsonb('-.5')"), "362D2E35"); // size 3, type 6, "-.5"
+
+    // Hex integers → INT5 (type nibble 4) with the raw `0x…` text.
+    assert_eq!(hex(&c, "jsonb('0xFF')"), "4430784646"); // size 4, type 4, "0xFF"
+    assert_eq!(hex(&c, "jsonb('0x10')"), "4430783130");
+
+    // Strict numbers keep the FLOAT (type 5) tag and verbatim text.
+    assert_eq!(hex(&c, "jsonb('1.5e3')"), "55312E356533");
+    assert_eq!(hex(&c, "jsonb('1.50')"), "45312E3530");
+
+    // A leading `+` normalizes (no `*5` tag): `+5` → INT "5", `+0.5` → FLOAT "0.5".
+    assert_eq!(hex(&c, "jsonb('+5')"), "1335"); // size 1, type 3 (INT), "5"
+    assert_eq!(hex(&c, "jsonb('+0.5')"), "35302E35"); // type 5 (FLOAT), "0.5"
+
+    // `json()` of these renders canonically.
+    assert_eq!(
+        one(&c, "SELECT json(jsonb('.5'))"),
+        Value::Text("0.5".into())
+    );
+    assert_eq!(
+        one(&c, "SELECT json(jsonb('0xFF'))"),
+        Value::Text("255".into())
+    );
+    assert_eq!(
+        one(&c, "SELECT json(jsonb('5.'))"),
+        Value::Text("5.0".into())
+    );
+    // ...but a strict form keeps its verbatim text.
+    assert_eq!(
+        one(&c, "SELECT json(jsonb('1.50'))"),
+        Value::Text("1.50".into())
+    );
+}
