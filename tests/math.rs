@@ -140,6 +140,101 @@ fn against_sqlite3() {
     );
 }
 
+/// Render a scalar the way the engine prints a result row, so the
+/// 15-significant-digit text can be compared against `sqlite3`. `CAST(x AS TEXT)`
+/// uses the same REAL→text formatting as a result column (verified to agree with
+/// the CLI for `Inf`, scientific notation, and 15-sig values).
+fn text(c: &Connection, sql: &str) -> String {
+    match c
+        .query(&format!("SELECT CAST(({sql}) AS TEXT)"))
+        .unwrap()
+        .rows[0][0]
+        .clone()
+    {
+        Value::Null => String::new(),
+        Value::Text(t) => t,
+        other => format!("{other:?}"),
+    }
+}
+
+/// `exp`/`pow`/`sinh`/`cosh` overflow to `Inf`, not NULL, exactly as SQLite. The
+/// hard-coded strings are the observed `sqlite3` 3.50.4 outputs.
+#[test]
+fn overflow_is_infinity() {
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(one(&c, "SELECT exp(710)"), Value::Real(f64::INFINITY));
+    assert_eq!(one(&c, "SELECT exp(1000)"), Value::Real(f64::INFINITY));
+    assert_eq!(one(&c, "SELECT pow(2, 2000)"), Value::Real(f64::INFINITY));
+    assert_eq!(one(&c, "SELECT pow(-2, 2000)"), Value::Real(f64::INFINITY));
+    assert_eq!(
+        one(&c, "SELECT pow(-2, 1025)"),
+        Value::Real(f64::NEG_INFINITY)
+    );
+    assert_eq!(one(&c, "SELECT pow(0, -1)"), Value::Real(f64::INFINITY));
+    assert_eq!(one(&c, "SELECT pow(0, -0.5)"), Value::Real(f64::INFINITY));
+    assert_eq!(one(&c, "SELECT sinh(800)"), Value::Real(f64::INFINITY));
+    assert_eq!(one(&c, "SELECT cosh(800)"), Value::Real(f64::INFINITY));
+    assert_eq!(one(&c, "SELECT sinh(-800)"), Value::Real(f64::NEG_INFINITY));
+    // Extreme arguments must not overflow the internal exponent cast.
+    assert_eq!(one(&c, "SELECT exp(1e308)"), Value::Real(f64::INFINITY));
+    assert_eq!(one(&c, "SELECT sinh(1e308)"), Value::Real(f64::INFINITY));
+    assert_eq!(one(&c, "SELECT atanh(1)"), Value::Real(f64::INFINITY));
+    assert_eq!(one(&c, "SELECT atanh(-1)"), Value::Real(f64::NEG_INFINITY));
+    // Underflow: smallest subnormal, then flush to zero (matches SQLite).
+    assert_eq!(one(&c, "SELECT exp(-745)"), Value::Real(f64::from_bits(1)));
+    assert_eq!(one(&c, "SELECT exp(-746)"), Value::Real(0.0));
+    assert_eq!(one(&c, "SELECT exp(-1000)"), Value::Real(0.0));
+}
+
+/// Domain errors return NULL (the result is NaN), distinct from overflow above.
+#[test]
+fn domain_errors_are_null() {
+    let c = Connection::open_memory().unwrap();
+    for sql in [
+        "SELECT sqrt(-1)",
+        "SELECT ln(0)",
+        "SELECT ln(-1)",
+        "SELECT log10(0)",
+        "SELECT log2(0)",
+        "SELECT log(0)",
+        "SELECT log(0, 5)", // base 0
+        "SELECT log(1, 5)", // base 1
+        "SELECT log(5, 0)", // x = 0
+        "SELECT log(5, -1)",
+        "SELECT acos(2)",
+        "SELECT asin(-2)",
+        "SELECT acosh(0.5)",
+        "SELECT atanh(2)",
+        "SELECT pow(-8, 1.0/3)", // negative base, fractional exponent
+    ] {
+        assert_eq!(one(&c, sql), Value::Null, "{sql} should be NULL");
+    }
+}
+
+/// Accuracy: the 15-significant-digit rendering now matches SQLite for cases the
+/// old ~1-ulp-low `exp`/`pow` rendered differently. Strings are observed
+/// `sqlite3` 3.50.4 output.
+#[test]
+fn rendering_matches_sqlite() {
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(text(&c, "SELECT exp(1)"), "2.71828182845905");
+    assert_eq!(text(&c, "SELECT exp(709)"), "8.21840746155497e+307");
+    assert_eq!(text(&c, "SELECT pow(2, 0.5)"), "1.4142135623731");
+    assert_eq!(text(&c, "SELECT pow(0.5, -0.5)"), "1.4142135623731");
+    assert_eq!(text(&c, "SELECT exp(710)"), "Inf");
+    assert_eq!(text(&c, "SELECT sinh(-800)"), "-Inf");
+}
+
+/// IEEE signed-zero handling of `atan2`, matching SQLite's observed output.
+#[test]
+fn atan2_signed_zero_matches_sqlite() {
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(text(&c, "SELECT atan2(-0.0, -1)"), "-3.14159265358979");
+    assert_eq!(text(&c, "SELECT atan2(0.0, -1)"), "3.14159265358979");
+    assert_eq!(text(&c, "SELECT atan2(0.0, -0.0)"), "3.14159265358979");
+    assert_eq!(text(&c, "SELECT atan2(-0.0, -0.0)"), "-3.14159265358979");
+}
+
 #[test]
 fn modulo_operator_truncates_to_integer() {
     // The `%` operator truncates both operands to integers (unlike the mod()

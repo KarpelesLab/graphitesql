@@ -378,6 +378,10 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             } else {
                 arity(&lname, args, 2)?;
                 match (real_arg(&v[0]), real_arg(&v[1])) {
+                    // `log(B, X)` is NULL unless `B > 0`, `B != 1`, and `X > 0`
+                    // (SQLite). A base of 1 makes `ln(B) == 0`, which the bare
+                    // division would turn into ±Inf instead of NULL, so guard it.
+                    (Some(1.0), Some(_)) => Value::Null,
                     (Some(b), Some(x)) => {
                         math_finite(Some(crate::util::float::ln(x) / crate::util::float::ln(b)))
                     }
@@ -709,13 +713,22 @@ fn real_arg(v: &Value) -> Option<f64> {
     }
 }
 
-/// Wrap a computed math result: `NULL` for a missing argument or a non-finite
-/// result (domain error), else a `REAL`. Matches SQLite, where e.g. `ln(0)` and
-/// `sqrt(-1)` yield `NULL`.
+/// Wrap a computed math result, matching SQLite's split between a *domain error*
+/// and an *overflow*:
+///
+/// - a missing argument or a `NaN` result (`sqrt(-1)`, `ln(0)`, `acos(2)`, …)
+///   becomes SQL `NULL`;
+/// - a `±∞` result is kept as a `REAL` — both genuine overflow (`exp(710)`,
+///   `pow(2,2000)`) and poles (`pow(0,-1)`, `atanh(1)`) render as `Inf`/`-Inf`,
+///   exactly as SQLite reports them.
+///
+/// Each underlying `float` routine is responsible for returning `NaN` (not `±∞`)
+/// on a domain error, so that the NULL-vs-Inf decision is made consistently here.
 fn math_finite(r: Option<f64>) -> Value {
     match r {
-        Some(x) if x.is_finite() => Value::Real(x),
-        _ => Value::Null,
+        Some(x) if x.is_nan() => Value::Null,
+        Some(x) => Value::Real(x),
+        None => Value::Null,
     }
 }
 
