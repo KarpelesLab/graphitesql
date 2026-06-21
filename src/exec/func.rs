@@ -151,6 +151,11 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "trim" => trim_fn(&v, true, true),
         "ltrim" => trim_fn(&v, true, false),
         "rtrim" => trim_fn(&v, false, true),
+        "soundex" => {
+            arity(&lname, args, 1)?;
+            // NULL/non-alpha input yields "?000" (SQLite does not propagate NULL).
+            Value::Text(soundex(&eval::to_text(&v[0])))
+        }
         "typeof" => Value::Text(String::from(type_name(&v[0]))),
         "nullif" => {
             arity(&lname, args, 2)?;
@@ -695,6 +700,56 @@ fn arity(name: &str, args: &[Expr], n: usize) -> Result<()> {
             args.len()
         )))
     }
+}
+
+/// SQLite's `soundex(X)`: the phonetic code of the first word in `X` — the first
+/// letter followed by up to three digits, padded with `0`. Input with no letters
+/// (including NULL, which `to_text` maps to "") yields `"?000"`. Faithful port of
+/// `soundexFunc`: each letter maps to a digit; a digit is emitted only when it is
+/// nonzero and differs from the previous letter's code; a zero-code character
+/// (vowel, `H`/`W`/`Y`, or non-letter) resets the running code.
+fn soundex(s: &str) -> String {
+    // Code for a-z (index `c.to_ascii_lowercase() - b'a'`); 0 = not coded.
+    const CODE: [u8; 26] = [
+        0, 1, 2, 3, 0, 1, 2, 0, 0, 2, 2, 4, 5, 5, 0, 1, 2, 6, 2, 3, 0, 1, 0, 2, 0, 2,
+    ];
+    let code_of = |c: u8| -> u8 {
+        if c.is_ascii_alphabetic() {
+            CODE[(c.to_ascii_lowercase() - b'a') as usize]
+        } else {
+            0
+        }
+    };
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && !b[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i >= b.len() {
+        return String::from("?000");
+    }
+    let mut out = String::with_capacity(4);
+    out.push(b[i].to_ascii_uppercase() as char);
+    let mut prev = code_of(b[i]);
+    let mut j = 1;
+    while j < 4 && i < b.len() {
+        let code = code_of(b[i]);
+        if code > 0 {
+            if code != prev {
+                prev = code;
+                out.push((b'0' + code) as char);
+                j += 1;
+            }
+        } else {
+            prev = 0;
+        }
+        i += 1;
+    }
+    while j < 4 {
+        out.push('0');
+        j += 1;
+    }
+    out
 }
 
 fn str_map(v: &Value, f: impl Fn(&str) -> String) -> Value {
