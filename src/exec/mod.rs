@@ -4306,13 +4306,13 @@ impl Connection {
         // "no limit", as elsewhere in SQLite.)
         let rec_limit = match &base.limit {
             Some(e) => {
-                let n = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                let n = must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?;
                 (n >= 0).then_some(n as usize)
             }
             None => None,
         };
         let rec_offset = match &base.offset {
-            Some(e) => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize,
+            Some(e) => must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?.max(0) as usize,
             None => 0,
         };
         let compound = core::mem::take(&mut base.compound);
@@ -6405,7 +6405,7 @@ impl Connection {
             rowids = keyed.into_iter().map(|(r, _)| r).collect();
         }
         let off = match offset {
-            Some(e) => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize,
+            Some(e) => must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?.max(0) as usize,
             None => 0,
         };
         if off > 0 {
@@ -6557,13 +6557,13 @@ impl Connection {
             });
         }
         let offset = match &sel.offset {
-            Some(e) => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize,
+            Some(e) => must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?.max(0) as usize,
             None => 0,
         };
         // A negative LIMIT means "no limit" in SQLite (OFFSET still applies).
         let limit = match &sel.limit {
             Some(e) => {
-                let n = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                let n = must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?;
                 if n < 0 {
                     None
                 } else {
@@ -7360,13 +7360,13 @@ impl Connection {
 
         // OFFSET / LIMIT.
         let offset = match &sel.offset {
-            Some(e) => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?).max(0) as usize,
+            Some(e) => must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?.max(0) as usize,
             None => 0,
         };
         // A negative LIMIT means "no limit" in SQLite (OFFSET still applies).
         let limit = match &sel.limit {
             Some(e) => {
-                let n = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                let n = must_be_int(eval::eval(e, &EvalCtx::rowless(params))?)?;
                 if n < 0 {
                     None
                 } else {
@@ -11445,6 +11445,40 @@ fn check_positional_terms(group_by: &[Expr], order_by: &[OrderTerm], ncols: usiz
         }
     }
     Ok(())
+}
+
+/// Apply SQLite's `OP_MustBeInt` to a `LIMIT`/`OFFSET` value: it must be an
+/// integer, or a real / fully-numeric text string that is exactly integer-valued
+/// and in range. A non-integral real (`1.9`), text with trailing garbage
+/// (`'2abc'`), NULL, or a blob is a `datatype mismatch` error — SQLite does not
+/// silently truncate or treat NULL as zero here.
+fn must_be_int(v: Value) -> Result<i64> {
+    fn real_exact(r: f64) -> Result<i64> {
+        if r.is_finite()
+            && r == crate::util::float::trunc(r)
+            && r >= i64::MIN as f64
+            && r < 9_223_372_036_854_775_808.0
+        {
+            Ok(r as i64)
+        } else {
+            Err(Error::Error("datatype mismatch".into()))
+        }
+    }
+    match v {
+        Value::Integer(i) => Ok(i),
+        Value::Real(r) => real_exact(r),
+        Value::Text(s) => {
+            let t = s.trim();
+            if let Ok(i) = t.parse::<i64>() {
+                Ok(i)
+            } else if let Ok(r) = t.parse::<f64>() {
+                real_exact(r)
+            } else {
+                Err(Error::Error("datatype mismatch".into()))
+            }
+        }
+        Value::Null | Value::Blob(_) => Err(Error::Error("datatype mismatch".into())),
+    }
 }
 
 /// Resolve an `ORDER BY` term to an output-column index when it refers to one:
