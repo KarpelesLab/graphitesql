@@ -405,12 +405,14 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     rowid. CREATE/INSERT/UPDATE/DELETE/SELECT and `PRAGMA table_info` are
     byte-identical to sqlite3. *(A real inverted index in shadow tables — for
     scaling beyond a scan — is the remaining D2b work.)*
-  - **D2c — `MATCH` query. ✅ DONE (correct-results).** `t MATCH 'a b'` searches
-    all columns, `col MATCH 'x'` one column; query tokens are AND-ed and matched
-    case-insensitively against the tokenized document (scan + the re-applied
-    WHERE, like rtree D3a). Byte-identical to sqlite3 for these forms.
-    *(Remaining: phrase/`OR`/`NOT`/`NEAR`/prefix queries, `col:tok` column
-    filters in the query string.)*
+  - **D2c — `MATCH` query. ✅ DONE (correct-results, full core query language).**
+    `t MATCH …` searches all columns, `col MATCH …` one column (scan + the
+    re-applied WHERE, like rtree D3a). A recursive-descent parser in `vtab.rs`
+    handles the full FTS5 query grammar: bare tokens, `token*` prefixes,
+    `"quoted phrases"` (consecutive/ordered), `col:…` column filters, and the
+    boolean operators `AND` (explicit or implicit), `OR`, `NOT` with SQLite's
+    precedence (`NOT`>`AND`>`OR`) and parentheses. Byte-identical to sqlite3
+    across all these forms. *(Remaining: the `NEAR(…)` operator.)*
   - **D2d — `bm25()` ranking** and **D2e — byte-compatible segment format** are
     the remaining FTS5 tracks (both require the real inverted index of D2b).
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
