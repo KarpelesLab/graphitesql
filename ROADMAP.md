@@ -258,11 +258,20 @@ the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep)
   USING COVERING INDEX` like sqlite — covering plain projections, `DISTINCT`, and
   `GROUP BY`/aggregates over covered columns. *(Still hash-grouped, not stream-
   grouped in index order; results identical.)*
-- **B0b-iii — `ORDER BY` from a `WHERE`-chosen index.** Today B0 fires only with
-  no `WHERE`; reuse the index a `WHERE` seek already picked to also skip the sort
-  (`WHERE a=? ORDER BY b` over an index on `(a, b)`). The seek already walks the
-  index in key order, so the rows arrive ordered — `order_satisfied_by_scan` just
-  needs to recognize it.
+- **B0b-iii — `ORDER BY` from a `WHERE`-chosen index. ✅ DONE.** A `WHERE` seek
+  walks its index in key order, so the rows already arrive ordered and the sort is
+  skipped. Two cases, both recognized by `order_satisfied_by_scan` (so EQP and
+  execution stay in lockstep): an **equality** seek satisfies an `ORDER BY` on the
+  index columns following the equality prefix (`WHERE a=? ORDER BY b`, via
+  `order_satisfied_by_seek`); a leading-column **range** seek satisfies an `ORDER
+  BY` over the index columns themselves (`WHERE a>? ORDER BY a, b`, via
+  `order_satisfied_by_range_seek`). Both are conservative — they fire only when
+  exactly one plain secondary index can seek (no equality, no partial/expression
+  index, no rowid range for the range case), so the executor's choice is
+  unambiguous; otherwise the always-correct sort stands. Byte-identical EQP and
+  row order vs sqlite3 (`tests/order_by_after_seek.rs`). *Remaining sub-case: the
+  **mixed-direction** `ORDER BY a, b DESC` partial sort (B0b-i), still a full
+  sort.*
 - **B1b — Join reordering.** Beyond the comma-join promotion (done), reorder
   `FROM` tables by a simple cost model (most-selective indexed table inner)
   instead of textual order; results identical, order verified via EQP. Preserve

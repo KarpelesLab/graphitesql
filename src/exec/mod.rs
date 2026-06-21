@@ -9160,7 +9160,10 @@ impl Connection {
         if let Some(s) = self.order_index_scan(sel) {
             return Some(s.descending);
         }
-        self.order_satisfied_by_seek(sel, params)
+        if let Some(d) = self.order_satisfied_by_seek(sel, params) {
+            return Some(d);
+        }
+        self.order_satisfied_by_range_seek(sel, params)
     }
 
     /// B0b-iii: a `WHERE`-equality seek can also satisfy the `ORDER BY` when the
@@ -9268,6 +9271,123 @@ impl Connection {
             if idx.cols[prefix + i] != oc
                 || idx.collations[prefix + i] != meta.columns[oc].collation
             {
+                return None;
+            }
+        }
+        Some(descending)
+    }
+
+    /// B0b-iii (range case): a leading-column range seek ([`try_index_range`])
+    /// walks its index in key order, so an `ORDER BY` over that index's columns is
+    /// already satisfied — no sort needed. Mirrors `try_index_range`'s choice
+    /// conservatively so it never claims an order the executor won't produce:
+    /// fires only with **no** column equality (so `try_index_lookup` declines and
+    /// the executor reaches `try_index_range`), **no** partial/expression index on
+    /// the table (so the equality path's `partial_expr_lookup` also declines and
+    /// the chosen index is plain), **no** range on the rowid (which would take the
+    /// clustered-b-tree path instead), and **exactly one** plain secondary index
+    /// whose leading column is the range column and whose columns are the uniform-
+    /// direction `ORDER BY` prefix. Returns `Some(descending)`, else `None` (→ the
+    /// always-correct sort). Any looseness is caught by the ORDER-BY differential
+    /// corpus, which compares row order against `sqlite3`.
+    fn order_satisfied_by_range_seek(&self, sel: &Select, params: &Params) -> Option<bool> {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let t = &from.first;
+        if t.subquery.is_some()
+            || t.tvf_args.is_some()
+            || t.schema.is_some()
+            || from.first.index_hint.is_some()
+        {
+            return None;
+        }
+        let where_expr = sel.where_clause.as_ref()?;
+        if sel.order_by.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || self.has_aggregate(sel)
+            || window::has_window(sel)
+        {
+            return None;
+        }
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+        if meta.without_rowid {
+            return None;
+        }
+        // No column equality at all: ensures `try_index_lookup` declines (its
+        // `eqs` are empty), so the executor reaches `try_index_range`.
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        if !eqs.is_empty() {
+            return None;
+        }
+        // Resolve ORDER BY to plain columns, uniform direction, default NULLs (the
+        // index walk yields NULLs first ascending, last descending).
+        let descending = sel.order_by[0].descending;
+        let mut ord_cols: Vec<usize> = Vec::with_capacity(sel.order_by.len());
+        for term in &sel.order_by {
+            if term.descending != descending || term.nulls_first.is_some() {
+                return None;
+            }
+            let (tbl, col_name) = match &term.expr {
+                Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+                _ => return None,
+            };
+            if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
+                return None;
+            }
+            ord_cols.push(
+                meta.columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col_name))?,
+            );
+        }
+        // The range-constrained columns.
+        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+            alloc::collections::BTreeMap::new();
+        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+        if ranges.is_empty() {
+            return None;
+        }
+        // A range on the rowid would take the clustered-b-tree (rowid-order) path,
+        // not a secondary index — don't claim the index order then.
+        if meta.ipk.is_some_and(|ipk| ranges.contains_key(&ipk)) {
+            return None;
+        }
+        // No partial/expression index on the table: guarantees `try_index_lookup`'s
+        // `partial_expr_lookup` also declines, and that the plain index chosen below
+        // is exactly the one `try_index_range` walks.
+        let indexes = self.indexes_of(&t.name).ok()?;
+        if indexes
+            .iter()
+            .any(|idx| idx.partial.is_some() || idx.key_exprs.is_some())
+        {
+            return None;
+        }
+        // Exactly one plain secondary index whose leading column is range-
+        // constrained, so `try_index_range`'s first-match choice is unambiguous.
+        let mut seekable = indexes
+            .iter()
+            .filter(|idx| idx.cols.first().is_some_and(|c| ranges.contains_key(c)));
+        let idx = seekable.next()?;
+        if seekable.next().is_some() {
+            return None;
+        }
+        // The ORDER BY columns must be the index columns from the start, each
+        // compared under the column's own collation.
+        if ord_cols.len() > idx.cols.len() {
+            return None;
+        }
+        for (i, &oc) in ord_cols.iter().enumerate() {
+            if idx.cols[i] != oc || idx.collations[i] != meta.columns[oc].collation {
                 return None;
             }
         }
