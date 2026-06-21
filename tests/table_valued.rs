@@ -243,3 +243,17 @@ fn explain_query_plan_over_a_virtual_table() {
     assert!(detail("EXPLAIN QUERY PLAN SELECT * FROM s WHERE value > 2")
         .starts_with("SCAN s VIRTUAL TABLE INDEX "));
 }
+
+#[test]
+fn pragma_table_info_over_a_virtual_table() {
+    // table_info over a vtab previously errored; it now lists the module's columns
+    // (cid, name; type/notnull/dflt/pk are empty/0 — the safe module interface
+    // carries no per-column type info).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE s USING series(1, 5)")
+        .unwrap();
+    let r = c.query("PRAGMA table_info(s)").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0][0], Value::Integer(0)); // cid
+    assert_eq!(r.rows[0][1], Value::Text("value".into())); // name
+}

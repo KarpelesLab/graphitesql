@@ -758,6 +758,35 @@ impl Connection {
                 }
             }
         }
+        // A virtual table answers table_info with its module's declared columns.
+        // The safe module interface carries no per-column type / notnull / default /
+        // pk info, so those are reported empty/0 (sqlite, which has full type info,
+        // may show declared types here).
+        if self.is_virtual_table(&table) {
+            let (_, _, col_names) = self.vtab_meta(&table)?;
+            let rows = col_names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let mut row = alloc::vec![
+                        Value::Integer(i as i64),
+                        Value::Text(name.clone()),
+                        Value::Text(String::new()),
+                        Value::Integer(0),
+                        Value::Null,
+                        Value::Integer(0),
+                    ];
+                    if extended {
+                        row.push(Value::Integer(0));
+                    }
+                    row
+                })
+                .collect();
+            return Ok(QueryResult {
+                columns: table_info_columns(extended),
+                rows,
+            });
+        }
         let obj = self
             .schema
             .table(&table)
