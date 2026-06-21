@@ -270,6 +270,45 @@ fn match_boolean_operators() {
 }
 
 #[test]
+fn match_near_proximity() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+        .unwrap();
+    c.execute(
+        "INSERT INTO t VALUES \
+         ('the quick brown fox jumps'),\
+         ('quick the lazy brown'),\
+         ('brown then many words later quick')",
+    )
+    .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        rows(&c, sql)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("not an integer rowid"),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'NEAR(quick brown)' ORDER BY rowid"),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'NEAR(quick brown, 2)' ORDER BY rowid"),
+        [1, 2]
+    );
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'NEAR(quick brown, 1)'"),
+        [1]
+    );
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'NEAR(quick brown, 0)'"),
+        [1]
+    );
+}
+
+#[test]
 fn match_against_null_pattern_is_null() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")

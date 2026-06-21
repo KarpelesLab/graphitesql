@@ -1174,27 +1174,73 @@ struct Fts5Term {
     prefix: bool,
 }
 
-/// Whether `phrase` occurs in `doc` as a run of consecutive tokens (in order).
-/// When `prefix` is set, the final phrase token matches any document token that
-/// starts with it (`fox*` matches `foxes`).
-fn fts5_phrase_in(phrase: &[String], prefix: bool, doc: &[String]) -> bool {
+/// Every start offset at which `phrase` occurs in `doc` as a run of consecutive
+/// tokens (in order), ascending. When `prefix` is set, the final phrase token
+/// matches any document token that starts with it (`fox*` matches `foxes`).
+fn fts5_phrase_starts(phrase: &[String], prefix: bool, doc: &[String]) -> Vec<usize> {
     if phrase.is_empty() || doc.len() < phrase.len() {
-        return false;
+        return Vec::new();
     }
     let last = phrase.len() - 1;
-    (0..=doc.len() - phrase.len()).any(|start| {
-        phrase.iter().enumerate().all(|(k, want)| {
-            let got = &doc[start + k];
-            if k == last && prefix {
-                got.starts_with(want.as_str())
-            } else {
-                got == want
-            }
+    (0..=doc.len() - phrase.len())
+        .filter(|&start| {
+            phrase.iter().enumerate().all(|(k, want)| {
+                let got = &doc[start + k];
+                if k == last && prefix {
+                    got.starts_with(want.as_str())
+                } else {
+                    got == want
+                }
+            })
         })
-    })
+        .collect()
 }
 
-/// A lexed token of an FTS5 query: a boolean operator, a parenthesis, or a term.
+/// Whether `phrase` occurs in `doc` as a run of consecutive tokens (in order).
+fn fts5_phrase_in(phrase: &[String], prefix: bool, doc: &[String]) -> bool {
+    !fts5_phrase_starts(phrase, prefix, doc).is_empty()
+}
+
+/// Whether a `NEAR(p1 p2 …, n)` group is satisfied within a single column's
+/// `tokens`: there is one instance of each phrase such that the span from the
+/// first to the last token (inclusive) is at most `n` larger than the phrases'
+/// combined length — SQLite's rule `(max_end − min_start + 1) ≤ n + total_len`.
+/// Uses the "smallest range covering K sorted lists" sweep: each phrase's start
+/// offsets are ascending and (with constant phrase length) so are its ends, so
+/// repeatedly advancing the phrase at the current minimum start finds the
+/// tightest window.
+fn fts5_near_matches(phrases: &[(Vec<usize>, usize)], n: usize) -> bool {
+    if phrases.iter().any(|(starts, _)| starts.is_empty()) {
+        return false;
+    }
+    let total_len: usize = phrases.iter().map(|(_, len)| *len).sum();
+    let mut ptr = alloc::vec![0usize; phrases.len()];
+    loop {
+        let mut min_start = usize::MAX;
+        let mut max_end = 0;
+        let mut min_phrase = 0;
+        for (i, (starts, len)) in phrases.iter().enumerate() {
+            let s = starts[ptr[i]];
+            let e = s + len - 1;
+            if s < min_start {
+                min_start = s;
+                min_phrase = i;
+            }
+            max_end = max_end.max(e);
+        }
+        if max_end - min_start < n + total_len {
+            return true;
+        }
+        // Advance the phrase at the smallest start to try to tighten the window.
+        ptr[min_phrase] += 1;
+        if ptr[min_phrase] >= phrases[min_phrase].0.len() {
+            return false;
+        }
+    }
+}
+
+/// A lexed token of an FTS5 query: a boolean operator, a parenthesis, a term, or
+/// a `NEAR(phrase … , n)` group (its phrases and distance, default 10).
 enum Fts5Lex {
     Or,
     And,
@@ -1202,6 +1248,7 @@ enum Fts5Lex {
     LParen,
     RParen,
     Term(Fts5Term),
+    Near(Vec<Fts5Term>, usize),
 }
 
 /// Lex an FTS5 query string into operators, parentheses, and terms. `OR`/`AND`/
@@ -1272,6 +1319,37 @@ fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
                         out.push(Fts5Lex::Not);
                         continue;
                     }
+                    // `NEAR(p1 p2 …, n)`: a parenthesized phrase group. Without a
+                    // following `(`, plain `NEAR` is an ordinary token.
+                    "NEAR" => {
+                        let mut k = i;
+                        while k < n && chars[k].is_whitespace() {
+                            k += 1;
+                        }
+                        if k < n && chars[k] == '(' {
+                            let start = k + 1;
+                            let mut depth = 1;
+                            let mut e = start;
+                            while e < n && depth > 0 {
+                                match chars[e] {
+                                    '(' => depth += 1,
+                                    ')' => depth -= 1,
+                                    _ => {}
+                                }
+                                if depth == 0 {
+                                    break;
+                                }
+                                e += 1;
+                            }
+                            let inside: String = chars[start..e].iter().collect();
+                            i = if e < n { e + 1 } else { e };
+                            let (phrases, dist) = fts5_parse_near(&inside);
+                            if !phrases.is_empty() {
+                                out.push(Fts5Lex::Near(phrases, dist));
+                            }
+                            continue;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1294,9 +1372,33 @@ fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
     out
 }
 
+/// Split the body of a `NEAR(…)` group into its phrases and distance. The
+/// distance is the integer after a trailing comma (`NEAR(a b, 5)`); without one
+/// it defaults to 10, as in SQLite.
+fn fts5_parse_near(inside: &str) -> (Vec<Fts5Term>, usize) {
+    let (phrases_part, distance) = match inside.rsplit_once(',') {
+        Some((left, right))
+            if !right.trim().is_empty() && right.trim().bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            (left, right.trim().parse::<usize>().unwrap_or(10))
+        }
+        _ => (inside, 10),
+    };
+    let phrases = fts5_lex(phrases_part)
+        .into_iter()
+        .filter_map(|t| match t {
+            Fts5Lex::Term(term) => Some(term),
+            _ => None,
+        })
+        .collect();
+    (phrases, distance)
+}
+
 /// A parsed FTS5 boolean query tree (`A NOT B` means "A and not B").
 enum Fts5Query {
     Term(Fts5Term),
+    /// A `NEAR(phrase … , n)` group: all phrases must appear within `n` tokens.
+    Near(Vec<Fts5Term>, usize),
     And(Box<Fts5Query>, Box<Fts5Query>),
     Or(Box<Fts5Query>, Box<Fts5Query>),
     Not(Box<Fts5Query>, Box<Fts5Query>),
@@ -1334,8 +1436,8 @@ impl Fts5Parser<'_> {
         loop {
             match self.toks.get(self.pos) {
                 Some(Fts5Lex::And) => self.pos += 1,
-                // Juxtaposition (a term or `(`) is an implicit AND.
-                Some(Fts5Lex::Term(_) | Fts5Lex::LParen) => {}
+                // Juxtaposition (a term, NEAR group, or `(`) is an implicit AND.
+                Some(Fts5Lex::Term(_) | Fts5Lex::Near(..) | Fts5Lex::LParen) => {}
                 _ => break,
             }
             match self.parse_not() {
@@ -1373,6 +1475,11 @@ impl Fts5Parser<'_> {
                 self.pos += 1;
                 Some(Fts5Query::Term(t))
             }
+            Some(Fts5Lex::Near(phrases, dist)) => {
+                let q = Fts5Query::Near(phrases.clone(), *dist);
+                self.pos += 1;
+                Some(q)
+            }
             _ => None,
         }
     }
@@ -1388,10 +1495,32 @@ fn fts5_term_matches(term: &Fts5Term, cols: &[(&str, Vec<String>)]) -> bool {
     })
 }
 
+/// Whether a `NEAR` group is satisfied: some single in-scope column contains all
+/// of its phrases within the distance window.
+fn fts5_near_group_matches(
+    phrases: &[Fts5Term],
+    dist: usize,
+    cols: &[(&str, Vec<String>)],
+) -> bool {
+    cols.iter().any(|(_, tokens)| {
+        let positioned: Vec<(Vec<usize>, usize)> = phrases
+            .iter()
+            .map(|p| {
+                (
+                    fts5_phrase_starts(&p.phrase, p.prefix, tokens),
+                    p.phrase.len(),
+                )
+            })
+            .collect();
+        fts5_near_matches(&positioned, dist)
+    })
+}
+
 /// Evaluate a parsed query tree against the tokenized in-scope columns.
 fn fts5_eval(query: &Fts5Query, cols: &[(&str, Vec<String>)]) -> bool {
     match query {
         Fts5Query::Term(t) => fts5_term_matches(t, cols),
+        Fts5Query::Near(phrases, dist) => fts5_near_group_matches(phrases, *dist, cols),
         Fts5Query::And(a, b) => fts5_eval(a, cols) && fts5_eval(b, cols),
         Fts5Query::Or(a, b) => fts5_eval(a, cols) || fts5_eval(b, cols),
         Fts5Query::Not(a, b) => fts5_eval(a, cols) && !fts5_eval(b, cols),
@@ -1404,8 +1533,8 @@ fn fts5_eval(query: &Fts5Query, cols: &[(&str, Vec<String>)]) -> bool {
 /// supports bare tokens, `token*` prefixes, `"quoted phrases"`, `col:…` column
 /// filters, and the boolean operators `AND` (explicit or implicit by
 /// juxtaposition), `OR`, and `NOT` (binding tightest to loosest: `NOT`, `AND`,
-/// `OR`) with parentheses — matching SQLite's default precedence. A query with no
-/// tokens matches nothing. `NEAR` is not yet supported.
+/// `OR`) with parentheses — matching SQLite's default precedence — and the
+/// `NEAR(p1 p2 …, n)` proximity group. A query with no tokens matches nothing.
 pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)]) -> bool {
     let toks = fts5_lex(pattern);
     let query = match (Fts5Parser {
@@ -1605,6 +1734,27 @@ mod tests {
         assert!(!fts5_query_matches(
             "(apple OR banana) AND date",
             &doc("apple only")
+        ));
+    }
+
+    #[test]
+    fn fts5_near_proximity_groups() {
+        let doc = |s: &str| [(String::from("body"), String::from(s))];
+        let adjacent = doc("the quick brown fox");
+        let gap2 = doc("quick the lazy brown");
+        let gap4 = doc("brown a b c d quick");
+        // Default distance (10) catches all; tighter distances exclude wider gaps.
+        assert!(fts5_query_matches("NEAR(quick brown)", &adjacent));
+        assert!(fts5_query_matches("NEAR(quick brown)", &gap4));
+        assert!(fts5_query_matches("NEAR(quick brown, 2)", &gap2));
+        assert!(!fts5_query_matches("NEAR(quick brown, 1)", &gap2));
+        assert!(fts5_query_matches("NEAR(quick brown, 0)", &adjacent));
+        assert!(!fts5_query_matches("NEAR(quick brown, 0)", &gap2));
+        // A missing phrase never matches; NEAR composes with the boolean operators.
+        assert!(!fts5_query_matches("NEAR(quick zebra, 5)", &adjacent));
+        assert!(fts5_query_matches(
+            "NEAR(quick brown, 2) AND fox",
+            &adjacent
         ));
     }
 

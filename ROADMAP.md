@@ -411,8 +411,10 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     handles the full FTS5 query grammar: bare tokens, `token*` prefixes,
     `"quoted phrases"` (consecutive/ordered), `col:…` column filters, and the
     boolean operators `AND` (explicit or implicit), `OR`, `NOT` with SQLite's
-    precedence (`NOT`>`AND`>`OR`) and parentheses. Byte-identical to sqlite3
-    across all these forms. *(Remaining: the `NEAR(…)` operator.)*
+    precedence (`NOT`>`AND`>`OR`) and parentheses, and the `NEAR(p1 p2 …, n)`
+    proximity group. Byte-identical to sqlite3 across all these forms — the core
+    FTS5 query language is complete. *(Remaining: `bm25()` relevance ranking and
+    the byte-compatible on-disk segment format.)*
   - **D2d — `bm25()` ranking** and **D2e — byte-compatible segment format** are
     the remaining FTS5 tracks (both require the real inverted index of D2b).
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
