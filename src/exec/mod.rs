@@ -6519,6 +6519,28 @@ impl Connection {
             }
             result.rows = apply_compound(*op, result.rows, r.rows, &colls);
         }
+        // A dedup set operation (UNION/INTERSECT/EXCEPT) yields rows in sorted
+        // order in SQLite — its dedup is implemented via a sorter — whereas
+        // UNION ALL preserves order. With no explicit ORDER BY, sort the combined
+        // result by all output columns (ascending, under each column's collation;
+        // NULLs first) to match. An explicit ORDER BY is applied below instead.
+        if sel.order_by.is_empty()
+            && sel
+                .compound
+                .iter()
+                .any(|(op, _)| *op != CompoundOp::UnionAll)
+        {
+            result.rows.sort_by(|a, b| {
+                for (i, va) in a.iter().enumerate() {
+                    let coll = colls.get(i).copied().unwrap_or_default();
+                    let ord = crate::value::cmp_values_coll(va, &b[i], coll);
+                    if ord != core::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+        }
         self.compound_order_limit(&mut result, sel, params, &colls)?;
         Ok(result)
     }
