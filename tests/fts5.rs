@@ -109,6 +109,60 @@ fn config_options_are_ignored_only_columns_declared() {
 }
 
 #[test]
+fn match_queries_tokens() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+        .unwrap();
+    c.execute(
+        "INSERT INTO t VALUES \
+         ('Hello World','the quick brown fox'),\
+         ('Goodbye','the lazy dog'),\
+         ('Mixed','Fox and Dog')",
+    )
+    .unwrap();
+
+    let ids = |sql: &str| -> Vec<i64> {
+        rows(&c, sql)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("not an integer rowid"),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // `t MATCH x` searches across all columns; column refs scope to one column.
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'fox' ORDER BY rowid"),
+        [1, 3]
+    );
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE body MATCH 'dog' ORDER BY rowid"),
+        [2, 3]
+    );
+    assert_eq!(ids("SELECT rowid FROM t WHERE title MATCH 'hello'"), [1]);
+    // Space-separated tokens are AND-ed; matching is case-insensitive.
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'quick fox'"), [1]);
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'FOX' ORDER BY rowid"),
+        [1, 3]
+    );
+    // No match, and a column-scoped token that lives in a different column.
+    assert!(ids("SELECT rowid FROM t WHERE t MATCH 'zebra'").is_empty());
+    assert!(ids("SELECT rowid FROM t WHERE title MATCH 'fox'").is_empty());
+}
+
+#[test]
+fn match_against_null_pattern_is_null() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES ('hello')").unwrap();
+    // A NULL query matches nothing (NULL is not true in a WHERE clause).
+    assert!(rows(&c, "SELECT rowid FROM t WHERE t MATCH NULL").is_empty());
+}
+
+#[test]
 fn persists_and_passes_integrity_check() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")

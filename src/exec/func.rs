@@ -36,6 +36,39 @@ pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
     }
 }
 
+/// The document text an FTS5 `MATCH` operand refers to, or `None` if the operand
+/// is not a column or table-name reference (so `MATCH` is not a full-text query
+/// in this context). A reference to an indexed column yields that column's text;
+/// an unqualified reference to the table's own name yields every column joined by
+/// a space (SQLite's table-wide `MATCH`).
+fn fts5_match_document(operand: &Expr, ctx: &EvalCtx) -> Option<String> {
+    let (table, column) = match operand {
+        Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+        Expr::Paren(e) => return fts5_match_document(e, ctx),
+        _ => return None,
+    };
+    // A reference to a specific indexed column.
+    if let Some(i) = ctx.columns.iter().position(|c| {
+        c.name.eq_ignore_ascii_case(column) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+    }) {
+        return Some(eval::to_text(&ctx.row[i]));
+    }
+    // An unqualified reference to the table itself matches across every column.
+    if table.is_none() {
+        let parts: Vec<String> = ctx
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.table.eq_ignore_ascii_case(column))
+            .map(|(i, _)| eval::to_text(&ctx.row[i]))
+            .collect();
+        if !parts.is_empty() {
+            return Some(parts.join(" "));
+        }
+    }
+    None
+}
+
 /// Evaluate a scalar function call.
 pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Result<Value> {
     let lname = name.to_ascii_lowercase();
@@ -87,6 +120,24 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 bytes.resize(len, 0);
             }
             return Ok(Value::Blob(bytes));
+        }
+        // FTS5 `MATCH`: `x MATCH 'query'` parsed to `match('query', x)`. When the
+        // operand `x` references an indexed column (or the table itself), run the
+        // full-text query against that document. When it is not a column/table
+        // reference (e.g. a literal), fall through so a user-registered `match`
+        // function — or the "no such function" error — applies, matching SQLite,
+        // where a bare `MATCH` outside a virtual-table context is an error.
+        "match" if args.len() == 2 => {
+            if let Some(doc) = fts5_match_document(&args[1], ctx) {
+                let pattern = eval::eval(&args[0], ctx)?;
+                return Ok(match pattern {
+                    Value::Null => Value::Null,
+                    p => {
+                        let q = eval::to_text(&p);
+                        Value::Integer(crate::vtab::fts5_query_matches(&q, &doc) as i64)
+                    }
+                });
+            }
         }
         _ => {}
     }

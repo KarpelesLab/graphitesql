@@ -1138,6 +1138,42 @@ impl VTabCursor for Fts5Cursor {
     }
 }
 
+/// Split `text` into FTS5 tokens: maximal runs of alphanumeric characters, each
+/// folded to lowercase. This is a faithful approximation of SQLite's default
+/// `unicode61` tokenizer for ASCII and basic text — it splits on every
+/// non-alphanumeric byte and case-folds, so `"The quick-brown Fox!"` yields
+/// `["the", "quick", "brown", "fox"]`. (Diacritic removal and the full Unicode
+/// category tables are not modeled; ASCII text matches sqlite byte-for-byte.)
+pub(crate) fn fts5_tokenize(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            cur.extend(ch.to_lowercase());
+        } else if !cur.is_empty() {
+            tokens.push(core::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// Whether `doc` satisfies the FTS5 query `pattern`. This slice models the common
+/// case: a bare list of tokens, implicitly AND-ed (SQLite's default), matching a
+/// document that contains *every* query token (case-insensitively). A query with
+/// no tokens matches nothing. Phrase queries, `OR`/`NOT`/`NEAR`, prefixes, and
+/// column filters are not yet supported.
+pub(crate) fn fts5_query_matches(pattern: &str, doc: &str) -> bool {
+    let needles = fts5_tokenize(pattern);
+    if needles.is_empty() {
+        return false;
+    }
+    let haystack = fts5_tokenize(doc);
+    needles.iter().all(|n| haystack.contains(n))
+}
+
 impl Fts5Module {
     /// The column name declared by one `USING fts5(…)` argument, or `None` if the
     /// argument is a configuration option (`key = value`) rather than a column.
@@ -1221,6 +1257,51 @@ impl VTabModule for Fts5Module {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn fts5_tokenizer_splits_and_folds() {
+        assert_eq!(
+            fts5_tokenize("The quick-brown Fox!"),
+            vec![
+                String::from("the"),
+                String::from("quick"),
+                String::from("brown"),
+                String::from("fox"),
+            ]
+        );
+        // Digits are tokens; runs of punctuation/whitespace are separators only.
+        assert_eq!(
+            fts5_tokenize("  a1  b2,c3 "),
+            vec![String::from("a1"), String::from("b2"), String::from("c3")]
+        );
+        assert!(fts5_tokenize("   ,. !").is_empty());
+    }
+
+    #[test]
+    fn fts5_query_matches_are_token_anded() {
+        let doc = "the quick brown fox";
+        assert!(fts5_query_matches("fox", doc));
+        assert!(fts5_query_matches("QUICK fox", doc)); // case-insensitive AND
+        assert!(!fts5_query_matches("quick zebra", doc)); // one token missing
+        assert!(!fts5_query_matches("", doc)); // empty query matches nothing
+    }
+
+    #[test]
+    fn fts5_column_name_skips_options_and_modifiers() {
+        assert_eq!(
+            Fts5Module::column_name("title"),
+            Some(String::from("title"))
+        );
+        assert_eq!(
+            Fts5Module::column_name("body UNINDEXED"),
+            Some(String::from("body"))
+        );
+        assert_eq!(Fts5Module::column_name("tokenize = 'porter'"), None);
+        assert_eq!(
+            Fts5Module::column_name("\"quoted\""),
+            Some(String::from("quoted"))
+        );
+    }
 
     /// Drain a typed cursor into a vec of `(rowid, value)` pairs.
     fn drain(mut cur: SeriesCursor) -> Vec<(i64, i64)> {
