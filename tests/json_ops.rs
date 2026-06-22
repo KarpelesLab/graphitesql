@@ -132,3 +132,44 @@ fn against_sqlite3() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn set_creates_intermediate_containers() {
+    // json_set / json_insert materialize missing intermediate objects/arrays along
+    // a multi-level path (object for a key, array for an index), atomically — a
+    // no-op leaf write leaves the document unchanged — byte-for-byte like sqlite3.
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(
+        one(&c, r#"SELECT json_set('{}','$.a.b',1)"#),
+        r#"{"a":{"b":1}}"#
+    );
+    assert_eq!(
+        one(&c, r#"SELECT json_set('{}','$.a.b.c',1)"#),
+        r#"{"a":{"b":{"c":1}}}"#
+    );
+    assert_eq!(
+        one(&c, r#"SELECT json_insert('{}','$.a.b',1)"#),
+        r#"{"a":{"b":1}}"#
+    );
+    // The intermediate is an array when the next segment is an index.
+    assert_eq!(
+        one(&c, r#"SELECT json_set('{}','$.a[0]',1)"#),
+        r#"{"a":[1]}"#
+    );
+    assert_eq!(
+        one(&c, r#"SELECT json_set('[]','$[0].x',1)"#),
+        r#"[{"x":1}]"#
+    );
+    // A scalar intermediate aborts the whole write (no-op).
+    assert_eq!(
+        one(&c, r#"SELECT json_set('{"a":5}','$.a.b',1)"#),
+        r#"{"a":5}"#
+    );
+    // An out-of-range leaf index discards the would-be intermediate (atomic no-op).
+    assert_eq!(one(&c, r#"SELECT json_set('{}','$.y[2]',1)"#), "{}");
+    // A literal index at the append position grows the array; further is a no-op.
+    assert_eq!(one(&c, r#"SELECT json_set('[7]','$[1]',9)"#), "[7,9]");
+    assert_eq!(one(&c, r#"SELECT json_set('[7]','$[2]',9)"#), "[7]");
+    // json_replace never creates.
+    assert_eq!(one(&c, r#"SELECT json_replace('{}','$.a.b',1)"#), "{}");
+}

@@ -1315,9 +1315,50 @@ fn walk_to_parent<'a>(mut cur: &'a mut Json, segs: &[Seg]) -> Option<&'a mut Jso
     Some(cur)
 }
 
-/// Apply one `(path, value)` write to `root` under `mode`. Missing parent
-/// containers are left untouched (matching SQLite, which only writes the leaf).
-/// Returns `None` if the path is malformed (a `bad JSON path` for the caller).
+/// Like [`walk_to_parent`], but for `json_set`/`json_insert`: a missing interior
+/// object key or array append slot is *created* — as an object when the next
+/// segment is a key, an array when it is an index — so a multi-level path like
+/// `$.a.b` materializes the intermediate containers, matching SQLite. A segment
+/// that resolves to an existing scalar (which cannot be descended) aborts the
+/// whole write (`None`), so `json_set('{"a":5}', '$.a.b', 1)` is a no-op.
+fn walk_to_parent_creating<'a>(mut cur: &'a mut Json, segs: &[Seg]) -> Option<&'a mut Json> {
+    if segs.is_empty() {
+        return Some(cur);
+    }
+    for i in 0..segs.len() - 1 {
+        let make = || match &segs[i + 1] {
+            Seg::Key(_) => Json::Object(Vec::new()),
+            Seg::Index(_) => Json::Array(Vec::new()),
+        };
+        cur = match (cur, &segs[i]) {
+            (Json::Object(m), Seg::Key(k)) => {
+                if !m.iter().any(|(kk, _)| kk == k) {
+                    m.push((k.clone(), make()));
+                }
+                m.iter_mut().find(|(kk, _)| kk == k).map(|(_, v)| v)?
+            }
+            (Json::Array(a), Seg::Index(idx)) => match idx.resolve_read(a.len()) {
+                Some(n) if n < a.len() => a.get_mut(n)?,
+                // The immediate append slot (`[#]` or `[len]`) grows the array;
+                // any other out-of-range index cannot be created.
+                _ if matches!(idx, Idx::FromEnd(0))
+                    || matches!(idx, Idx::Abs(n) if *n == a.len()) =>
+                {
+                    a.push(make());
+                    a.last_mut()?
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+/// Apply one `(path, value)` write to `root` under `mode`. For `json_set`/
+/// `json_insert`, missing intermediate containers along the path are created;
+/// `json_replace` only writes where the parent already resolves. Returns `None`
+/// if the path is malformed (a `bad JSON path` for the caller).
 pub fn set_path(root: &mut Json, path: &str, value: Json, mode: SetMode) -> Option<()> {
     let segs = parse_path(path)?;
     if segs.is_empty() {
@@ -1327,41 +1368,73 @@ pub fn set_path(root: &mut Json, path: &str, value: Json, mode: SetMode) -> Opti
         return Some(());
     }
     let (last, parents) = segs.split_last()?;
-    let Some(cur) = walk_to_parent(root, parents) else {
-        return Some(()); // an unresolved parent: nothing to write, not an error
-    };
+    if mode == SetMode::Replace {
+        // Replace never creates, so it writes directly with no orphan risk.
+        if let Some(cur) = walk_to_parent(root, parents) {
+            write_leaf(cur, last, value, mode);
+        }
+        return Some(());
+    }
+    // json_set / json_insert create missing intermediates, but the write is
+    // *atomic*: build it on a clone and commit only if the leaf actually writes,
+    // so a no-op leaf (e.g. an out-of-range index) leaves the document — and the
+    // would-be intermediates — unchanged, exactly as SQLite does.
+    let mut work = root.clone();
+    if let Some(cur) = walk_to_parent_creating(&mut work, &segs) {
+        if write_leaf(cur, last, value, mode) {
+            *root = work;
+        }
+    }
+    Some(())
+}
+
+/// Write `value` at the leaf segment `last` of the already-resolved parent `cur`
+/// under `mode`. Returns whether a write actually happened (so an atomic caller
+/// can discard created intermediates on a no-op).
+fn write_leaf(cur: &mut Json, last: &Seg, value: Json, mode: SetMode) -> bool {
     match (cur, last) {
         (Json::Object(m), Seg::Key(k)) => {
             let slot = m.iter_mut().find(|(kk, _)| kk == k);
             match (slot, mode) {
-                (Some(s), SetMode::Set) | (Some(s), SetMode::Replace) => s.1 = value,
-                (None, SetMode::Set) | (None, SetMode::Insert) => m.push((k.clone(), value)),
-                _ => {}
+                (Some(s), SetMode::Set) | (Some(s), SetMode::Replace) => {
+                    s.1 = value;
+                    true
+                }
+                (None, SetMode::Set) | (None, SetMode::Insert) => {
+                    m.push((k.clone(), value));
+                    true
+                }
+                _ => false,
             }
         }
         (Json::Array(a), Seg::Index(idx)) => {
-            // An in-range index overwrites; `[#]` (and any end-relative slot that
-            // resolves past the start) is the append slot. A literal index past
-            // the end is a no-op (SQLite does not grow the array for it).
-            match idx.resolve_read(a.len()) {
-                Some(n) if n < a.len() => match mode {
-                    SetMode::Set | SetMode::Replace => a[n] = value,
-                    SetMode::Insert => {}
+            // An in-range index overwrites; the append slot — `[#]` or a literal
+            // `[len]` one past the last element — grows the array for json_set/
+            // json_insert. A literal index further past the end, or `[#-k]` past
+            // the start, is a no-op (SQLite does not grow the array for it).
+            let len = a.len();
+            match idx.resolve_read(len) {
+                Some(n) if n < len => match mode {
+                    SetMode::Set | SetMode::Replace => {
+                        a[n] = value;
+                        true
+                    }
+                    SetMode::Insert => false,
                 },
                 _ => {
-                    // Only the append slot `[#]` (FromEnd(0)) grows the array;
-                    // `[#-k]` past the start and out-of-range literals are no-ops.
-                    if matches!(idx, Idx::FromEnd(0))
-                        && matches!(mode, SetMode::Set | SetMode::Insert)
-                    {
+                    let is_append =
+                        matches!(idx, Idx::FromEnd(0)) || matches!(idx, Idx::Abs(n) if *n == len);
+                    if is_append && matches!(mode, SetMode::Set | SetMode::Insert) {
                         a.push(value);
+                        true
+                    } else {
+                        false
                     }
                 }
             }
         }
-        _ => return Some(()),
+        _ => false,
     }
-    Some(())
 }
 
 /// Remove the element at `path` from `root` if present. Returns `None` if the
