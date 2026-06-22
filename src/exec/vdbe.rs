@@ -16,7 +16,7 @@
 use crate::error::{Error, Result};
 use crate::exec::eval::Affinity;
 use crate::sql::ast::{BinaryOp, Expr, Literal, ResultColumn, Select};
-use crate::value::Value;
+use crate::value::{Collation, Value};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -95,6 +95,8 @@ pub enum Op {
         dest: usize,
         la: Option<Affinity>,
         ra: Option<Affinity>,
+        /// The comparison's collating sequence (column-derived; `BINARY` default).
+        coll: Collation,
     },
     /// `dest = lhs AND rhs` (three-valued).
     And { lhs: usize, rhs: usize, dest: usize },
@@ -244,14 +246,16 @@ pub enum AggKind {
     GroupConcat,
 }
 
-/// One `ORDER BY` key for [`Op::SorterSort`]: direction and NULL placement
-/// (collation is binary in the VDBE scan path).
+/// One `ORDER BY` key for [`Op::SorterSort`]: direction, NULL placement, and the
+/// key's collating sequence (column-derived; `BINARY` default).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SortKey {
     /// `DESC` when true.
     pub descending: bool,
     /// Explicit `NULLS FIRST`/`LAST`; `None` uses SQLite's default.
     pub nulls_first: Option<bool>,
+    /// The collating sequence to compare this key under.
+    pub collation: Collation,
 }
 
 /// One aggregate accumulator: collected non-NULL argument values plus a row
@@ -360,6 +364,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         columns: Vec::new(),
         tables: Vec::new(),
         affinities: Vec::new(),
+        collations: Vec::new(),
         bindings: Vec::new(),
         forbid_raw_columns: false,
     };
@@ -466,10 +471,18 @@ fn compile_aggregate_select(
     columns: &[String],
     tables: &[String],
     affinities: &[Affinity],
+    collations: &[Collation],
     projections: &[(Expr, String)],
 ) -> Result<Program> {
     if !sel.order_by.is_empty() || sel.limit.is_some() || sel.offset.is_some() || sel.distinct {
         return Err(Error::Unsupported("VDBE: bare aggregate only"));
+    }
+    // Aggregate reduction (min/max) compares under BINARY; a non-BINARY column
+    // collation would diverge, so defer the whole query to the tree-walker.
+    if collations.iter().any(|c| *c != Collation::Binary) {
+        return Err(Error::Unsupported(
+            "VDBE: non-BINARY collation in aggregate",
+        ));
     }
     // Every projection must be exactly one supported aggregate call.
     let mut slots: Vec<(AggKind, Option<Expr>)> = Vec::new();
@@ -486,6 +499,7 @@ fn compile_aggregate_select(
         columns: columns.to_vec(),
         tables: tables.to_vec(),
         affinities: affinities.to_vec(),
+        collations: collations.to_vec(),
         bindings: Vec::new(),
         forbid_raw_columns: false,
     };
@@ -600,10 +614,16 @@ fn compile_group_select(
     columns: &[String],
     tables: &[String],
     affinities: &[Affinity],
+    collations: &[Collation],
     projections: &[(Expr, String)],
 ) -> Result<Program> {
     if sel.distinct {
         return Err(Error::Unsupported("VDBE: GROUP BY + DISTINCT"));
+    }
+    // Group-key matching and min/max reduction compare under BINARY; a non-BINARY
+    // column collation would diverge, so defer to the tree-walker.
+    if collations.iter().any(|c| *c != Collation::Binary) {
+        return Err(Error::Unsupported("VDBE: non-BINARY collation in GROUP BY"));
     }
     let has_having = sel.having.is_some();
     let has_order = !sel.order_by.is_empty();
@@ -623,7 +643,15 @@ fn compile_group_select(
 
     // The plain path (no HAVING / ORDER BY / LIMIT) keeps its compact `GroupEmit`.
     if !has_having && !has_order && !has_limit {
-        return compile_group_emit(sel, columns, tables, affinities, projections, &group_cols);
+        return compile_group_emit(
+            sel,
+            columns,
+            tables,
+            affinities,
+            collations,
+            projections,
+            &group_cols,
+        );
     }
 
     // General path: gather every distinct aggregate referenced by the projection,
@@ -654,6 +682,7 @@ fn compile_group_select(
         columns: columns.to_vec(),
         tables: tables.to_vec(),
         affinities: affinities.to_vec(),
+        collations: collations.to_vec(),
         bindings: Vec::new(),
         forbid_raw_columns: false,
     };
@@ -801,11 +830,13 @@ fn compile_group_select(
             }
             other => other.clone(),
         };
+        let collation = c.col_collation(&expr).unwrap_or_default();
         key_specs.push((
             expr,
             SortKey {
                 descending: term.descending,
                 nulls_first: term.nulls_first,
+                collation,
             },
         ));
     }
@@ -1002,6 +1033,7 @@ fn compile_group_emit(
     columns: &[String],
     tables: &[String],
     affinities: &[Affinity],
+    collations: &[Collation],
     projections: &[(Expr, String)],
     group_cols: &[usize],
 ) -> Result<Program> {
@@ -1037,6 +1069,7 @@ fn compile_group_emit(
         columns: columns.to_vec(),
         tables: tables.to_vec(),
         affinities: affinities.to_vec(),
+        collations: collations.to_vec(),
         bindings: Vec::new(),
         forbid_raw_columns: false,
     };
@@ -1115,6 +1148,7 @@ pub fn compile_table_select(
     columns: &[String],
     tables: &[String],
     affinities: &[Affinity],
+    collations: &[Collation],
 ) -> Result<Program> {
     if !sel.compound.is_empty() {
         return Err(Error::Unsupported("VDBE: only plain table projections"));
@@ -1172,11 +1206,18 @@ pub fn compile_table_select(
     }
     // GROUP BY folds the scan into one row per group.
     if !sel.group_by.is_empty() {
-        return compile_group_select(sel, columns, tables, affinities, &projections);
+        return compile_group_select(sel, columns, tables, affinities, collations, &projections);
     }
     // An all-aggregate projection (no GROUP BY) folds the scan into one row.
     if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
-        return compile_aggregate_select(sel, columns, tables, affinities, &projections);
+        return compile_aggregate_select(
+            sel,
+            columns,
+            tables,
+            affinities,
+            collations,
+            &projections,
+        );
     }
     let count = projections.len();
     let mut c = Compiler {
@@ -1185,6 +1226,7 @@ pub fn compile_table_select(
         columns: columns.to_vec(),
         tables: tables.to_vec(),
         affinities: affinities.to_vec(),
+        collations: collations.to_vec(),
         bindings: Vec::new(),
         forbid_raw_columns: false,
     };
@@ -1243,11 +1285,13 @@ pub fn compile_table_select(
                 }
                 other => other.clone(),
             };
+            let collation = c.col_collation(&expr).unwrap_or_default();
             key_specs.push((
                 expr,
                 SortKey {
                     descending: term.descending,
                     nulls_first: term.nulls_first,
+                    collation,
                 },
             ));
         }
@@ -1292,6 +1336,13 @@ pub fn compile_table_select(
         c.compile_expr_into(expr, i)?;
     }
     // Optional DISTINCT: skip the row (jump to Next) when an equal one was emitted.
+    // DISTINCT compares rows under BINARY, so a non-BINARY column collation would
+    // diverge — defer to the tree-walker.
+    if sel.distinct && c.collations.iter().any(|cl| *cl != Collation::Binary) {
+        return Err(Error::Unsupported(
+            "VDBE: non-BINARY collation with DISTINCT",
+        ));
+    }
     let distinct_skip = if sel.distinct {
         let at = c.ops.len();
         c.ops.push(Op::DistinctCheck {
@@ -1424,6 +1475,10 @@ struct Compiler {
     /// constant `SELECT` with no table). Used to apply SQLite's pre-comparison
     /// affinity in `Op::Compare`, matching the tree-walker.
     affinities: Vec<Affinity>,
+    /// Each column's declared collating sequence, parallel to `columns`. Drives
+    /// the collation of comparisons / `ORDER BY` / `DISTINCT` / `GROUP BY` over a
+    /// column (`BINARY` when unknown), matching the tree-walker.
+    collations: Vec<Collation>,
     /// Expression → register overrides consulted before normal compilation.
     /// Used by the grouped `HAVING`/`ORDER BY` path to resolve aggregate calls
     /// and grouping-column references to per-group registers (so an arbitrary
@@ -1488,6 +1543,28 @@ impl Compiler {
         }
     }
 
+    /// The declared collating sequence a column expression carries, if it resolves
+    /// to a column (transparent through parentheses), else `None`. (An explicit
+    /// `COLLATE` is not handled here — `Expr::Collate` bails in the compiler.)
+    fn col_collation(&self, expr: &Expr) -> Option<Collation> {
+        match expr {
+            Expr::Column { table, column } => self
+                .resolve_column(table.as_deref(), column)
+                .ok()
+                .and_then(|i| self.collations.get(i).copied()),
+            Expr::Paren(e) => self.col_collation(e),
+            _ => None,
+        }
+    }
+
+    /// The collating sequence of a binary comparison, mirroring SQLite: a column
+    /// collation on the left wins, else the right, else `BINARY`.
+    fn compare_collation(&self, left: &Expr, right: &Expr) -> Collation {
+        self.col_collation(left)
+            .or_else(|| self.col_collation(right))
+            .unwrap_or_default()
+    }
+
     /// Push an `Op::Compare`, computing each operand's comparison affinity from
     /// its source expression so the runtime coerces operands like the tree-walker.
     fn push_compare(
@@ -1501,6 +1578,7 @@ impl Compiler {
     ) {
         let la = self.expr_affinity(left);
         let ra = self.expr_affinity(right);
+        let coll = self.compare_collation(left, right);
         self.ops.push(Op::Compare {
             op,
             lhs,
@@ -1508,6 +1586,7 @@ impl Compiler {
             dest,
             la,
             ra,
+            coll,
         });
     }
 
@@ -2056,17 +2135,18 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                 dest,
                 la,
                 ra,
+                coll,
             } => {
                 // Apply SQLite's pre-comparison affinity to the operands (exactly
-                // as the tree-walker does) before comparing.
+                // as the tree-walker does) before comparing under the resolved
+                // collating sequence.
                 let (l, r) = crate::exec::eval::apply_comparison_affinity(
                     regs[*lhs].clone(),
                     *la,
                     regs[*rhs].clone(),
                     *ra,
                 );
-                regs[*dest] =
-                    crate::exec::eval::compare_op(*op, &l, &r, crate::value::Collation::Binary);
+                regs[*dest] = crate::exec::eval::compare_op(*op, &l, &r, *coll);
             }
             Op::And { lhs, rhs, dest } => {
                 regs[*dest] = three_valued_and(&regs[*lhs], &regs[*rhs]);
@@ -2120,7 +2200,7 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                             &b.0[i],
                             k.descending,
                             k.nulls_first,
-                            crate::value::Collation::Binary,
+                            k.collation,
                         );
                         if ord != core::cmp::Ordering::Equal {
                             return ord;

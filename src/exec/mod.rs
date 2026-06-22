@@ -449,7 +449,9 @@ impl Connection {
             .unwrap_or_else(|| from.first.name.clone());
         let tables: Vec<String> = meta.columns.iter().map(|_| qualifier.clone()).collect();
         let affinities: Vec<eval::Affinity> = meta.columns.iter().map(|c| c.affinity).collect();
-        vdbe::compile_table_select(sel, &cols, &tables, &affinities)
+        let collations: Vec<crate::value::Collation> =
+            meta.columns.iter().map(|c| c.collation).collect();
+        vdbe::compile_table_select(sel, &cols, &tables, &affinities, &collations)
     }
 
     /// Plain `EXPLAIN <select>` (Track B, B8): compile the query to graphite's
@@ -508,11 +510,12 @@ impl Connection {
         };
         // Materialize a plain table source's column names and rows. Subqueries
         // and table-valued functions are out of the spike's scope.
-        // (column names, owning-table qualifier per column, affinities, rows).
+        // (column names, owning-table qualifier, affinities, collations, rows).
         type ScanOut = (
             Vec<String>,
             Vec<String>,
             Vec<eval::Affinity>,
+            Vec<crate::value::Collation>,
             Vec<Vec<Value>>,
         );
         let scan_one = |tr: &sql::ast::TableRef| -> Result<ScanOut> {
@@ -520,18 +523,8 @@ impl Connection {
                 return Err(Error::Unsupported("VDBE: only plain table sources"));
             }
             let meta = self.table_meta(&tr.name, tr.alias.as_deref())?;
-            // The VDBE compares/sorts/groups under BINARY only; a column with a
-            // declared non-BINARY collation (NOCASE/RTRIM) would diverge, so defer
-            // to the tree-walker. (An explicit `COLLATE` expression already bails
-            // in the compiler — `Expr::Collate` is unsupported there.)
-            if meta
-                .columns
-                .iter()
-                .any(|c| c.collation != crate::value::Collation::Binary)
-            {
-                return Err(Error::Unsupported("VDBE: non-BINARY column collation"));
-            }
             let cols = meta.columns.iter().map(|c| c.name.clone()).collect();
+            let collations = meta.columns.iter().map(|c| c.collation).collect();
             // The qualifier a `t.col` reference must use: the alias if present,
             // else the table name.
             let qualifier = tr.alias.clone().unwrap_or_else(|| tr.name.clone());
@@ -545,7 +538,7 @@ impl Connection {
                     .map(|(_, v)| v)
                     .collect()
             };
-            Ok((cols, tables, affinities, rows))
+            Ok((cols, tables, affinities, collations, rows))
         };
 
         // Two-table inner join (B5a): an inner join is a filtered cross-product,
@@ -567,8 +560,8 @@ impl Connection {
             {
                 return Err(Error::Unsupported("VDBE: table.* over a join"));
             }
-            let (c1, t1, a1, r1) = scan_one(&from.first)?;
-            let (c2, t2, a2, r2) = scan_one(&join.table)?;
+            let (c1, t1, a1, l1, r1) = scan_one(&from.first)?;
+            let (c2, t2, a2, l2, r2) = scan_one(&join.table)?;
             // The combined schema is t1's columns then t2's. Shared bare names are
             // allowed: a qualified `t.col` reference disambiguates them, and an
             // ambiguous *bare* reference makes the compiler bail (→ tree-walker).
@@ -578,6 +571,8 @@ impl Connection {
             combined_tables.extend(t2.iter().cloned());
             let mut combined_aff: Vec<eval::Affinity> = a1.clone();
             combined_aff.extend(a2.iter().copied());
+            let mut combined_coll: Vec<crate::value::Collation> = l1.clone();
+            combined_coll.extend(l2.iter().copied());
             // Cross-product rows, outer table first (matching sqlite's row order).
             let mut rows: Vec<Vec<Value>> = Vec::with_capacity(r1.len().saturating_mul(r2.len()));
             for a in &r1 {
@@ -600,8 +595,13 @@ impl Connection {
             };
             let mut joined = sel.clone();
             joined.where_clause = merged;
-            let prog =
-                vdbe::compile_table_select(&joined, &combined, &combined_tables, &combined_aff)?;
+            let prog = vdbe::compile_table_select(
+                &joined,
+                &combined,
+                &combined_tables,
+                &combined_aff,
+                &combined_coll,
+            )?;
             let result = vdbe::run_rows(&prog, &rows)?;
             return Ok(QueryResult {
                 columns: prog.columns,
@@ -613,7 +613,7 @@ impl Connection {
         if from.first.subquery.is_some() || from.first.tvf_args.is_some() {
             return Err(Error::Unsupported("VDBE: only a single plain table"));
         }
-        let (col_names, col_tables, col_aff, rows) = scan_one(&from.first)?;
+        let (col_names, col_tables, col_aff, col_coll, rows) = scan_one(&from.first)?;
         // A `t.*` projection is only handled when its qualifier names this single
         // table (by name or alias); any other qualifier falls back so the
         // tree-walker can resolve or reject it.
@@ -630,7 +630,7 @@ impl Connection {
                 }
             }
         }
-        let prog = vdbe::compile_table_select(sel, &col_names, &col_tables, &col_aff)?;
+        let prog = vdbe::compile_table_select(sel, &col_names, &col_tables, &col_aff, &col_coll)?;
         let result = vdbe::run_rows(&prog, &rows)?;
         Ok(QueryResult {
             columns: prog.columns,
