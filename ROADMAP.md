@@ -467,9 +467,19 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     `best_index` for the reported plan (fts5 keeps `INDEX 0:`). *(Execution still
     scans the backing table + re-applies WHERE; narrowing the scan via the node
     tree — true pushdown — would build on D3c's node format.)*
-  - **D3c — byte-compatible node format.** Pack bounding boxes into the
-    `<name>_node` blob layout sqlite uses, so a graphite-written R-Tree round-trips
-    through sqlite3. *(Required for file compatibility; large.)*
+  - **D3c — byte-compatible node format. ✅ DONE.** R-Trees (no aux columns) use
+    sqlite's on-disk node format — the `<name>_node` b-tree of nodes + `_rowid` /
+    `_parent` maps — so a graphite-written R-Tree round-trips through sqlite3
+    (`rtreecheck` + `integrity_check` ok, queries identical), and graphite reads a
+    sqlite-written one. A node blob is a 2-byte BE depth (root) + 2-byte BE cell
+    count + cells (8-byte BE rowid/child + n_coord 4-byte BE f32/i32 coords),
+    padded to `min(page_size-64, 4+51*cell_size)`. Each write reads the current
+    entries, applies the change, and BULK-REBUILDS a balanced tree (sqlite reads
+    any valid tree, so the incremental quadratic-split shape need not be
+    reproduced). Wired through CREATE/INSERT/DELETE/UPDATE/DROP/RENAME/VACUUM;
+    conservative f32 rounding + min>max rejection preserved. `tests/rtree.rs`.
+    *(A write rebuilds the whole tree — O(n)/statement; incremental insert/split
+    is a later perf optimization. Aux-column R-Trees keep `_data`.)*
 - **D2 — FTS5** full-text search (build on W1/W2; the larger module). *Ref:*
   `fts5*.c`. Break out: **D2a** tokenizer (unicode61/ascii); **D2b** inverted
   index in shadow tables + `INSERT`; **D2c** `MATCH` query; **D2d** `bm25()`
