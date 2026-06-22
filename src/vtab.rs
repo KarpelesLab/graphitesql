@@ -1632,14 +1632,22 @@ fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
             continue;
         }
         // An optional `column:` prefix: a run of identifier chars then a colon.
+        // SQLite allows whitespace around the colon (`col : token` == `col:token`).
         let mut column = None;
         let mut j = i;
         while j < n && (chars[j].is_alphanumeric() || chars[j] == '_') {
             j += 1;
         }
-        if j > i && j < n && chars[j] == ':' {
+        let mut k = j;
+        while k < n && chars[k].is_whitespace() {
+            k += 1;
+        }
+        if j > i && k < n && chars[k] == ':' {
             column = Some(chars[i..j].iter().collect());
-            i = j + 1;
+            i = k + 1;
+            while i < n && chars[i].is_whitespace() {
+                i += 1;
+            }
         }
         // A leading `^` anchors the term to the first token of the column.
         let anchored = i < n && chars[i] == '^';

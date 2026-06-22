@@ -186,6 +186,10 @@ fn match_column_filter_syntax() {
         ids("SELECT rowid FROM t WHERE t MATCH 'body:dog title:mixed'"),
         [3]
     );
+    // SQLite allows whitespace around the `:` — all forms are equivalent.
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'title : fox'"), [3]);
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'title: fox'"), [3]);
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'title :fox'"), [3]);
 }
 
 #[test]
