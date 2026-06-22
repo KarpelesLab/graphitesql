@@ -4933,13 +4933,42 @@ impl Connection {
             }
             changes.push((rowid, values));
         }
+        let on_conflict = ins.on_conflict;
+        let table = ins.table.clone();
+        let id_col = col_names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| String::from("rowid"));
         self.with_vtab_store(
             &module_name,
             &args,
             &ins.table,
             |module, store, arg_refs| {
+                // An explicit rowid that already exists is a UNIQUE conflict on the
+                // implicit rowid — error (or skip/replace per `OR IGNORE`/`REPLACE`),
+                // matching sqlite, rather than silently overwriting the row. Only a
+                // store-backed (persistent) vtab is checked here; a non-persistent
+                // module (no `<name>_data` table → `rows()` errors) manages its own.
+                let mut existing: alloc::collections::BTreeSet<i64> = store
+                    .rows()
+                    .map(|rows| rows.iter().map(|(r, _)| *r).collect())
+                    .unwrap_or_default();
+                let mut n = 0;
                 for (rowid, values) in &changes {
-                    module.dyn_update(
+                    if let Some(id) = rowid {
+                        if existing.contains(id) {
+                            match on_conflict {
+                                OnConflict::Replace => {}
+                                OnConflict::Ignore => continue,
+                                _ => {
+                                    return Err(Error::Constraint(format!(
+                                        "UNIQUE constraint failed: {table}.{id_col}"
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                    let assigned = module.dyn_update(
                         arg_refs,
                         VTabChange::Insert {
                             rowid: *rowid,
@@ -4947,8 +4976,10 @@ impl Connection {
                         },
                         store,
                     )?;
+                    existing.insert(assigned);
+                    n += 1;
                 }
-                Ok(changes.len())
+                Ok(n)
             },
         )
     }

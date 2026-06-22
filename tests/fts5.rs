@@ -154,6 +154,35 @@ fn match_queries_tokens() {
 }
 
 #[test]
+fn explicit_duplicate_rowid_is_rejected() {
+    // Inserting an explicit rowid that already exists is a UNIQUE conflict on the
+    // implicit rowid — it errors (and `OR IGNORE`/`OR REPLACE` skip/replace),
+    // matching sqlite, rather than silently overwriting the row.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(x)").unwrap();
+    c.execute("INSERT INTO t(rowid, x) VALUES (1, 'a')")
+        .unwrap();
+    // A plain INSERT with the same rowid fails and leaves the row untouched.
+    assert!(c
+        .execute("INSERT INTO t(rowid, x) VALUES (1, 'b')")
+        .is_err());
+    assert_eq!(rows(&c, "SELECT x FROM t"), [vec![text("a")]]);
+    // OR IGNORE skips the conflicting row.
+    c.execute("INSERT OR IGNORE INTO t(rowid, x) VALUES (1, 'b')")
+        .unwrap();
+    assert_eq!(rows(&c, "SELECT x FROM t"), [vec![text("a")]]);
+    // OR REPLACE overwrites it.
+    c.execute("INSERT OR REPLACE INTO t(rowid, x) VALUES (1, 'b')")
+        .unwrap();
+    assert_eq!(rows(&c, "SELECT x FROM t"), [vec![text("b")]]);
+    // A duplicate within a single multi-row INSERT also fails.
+    c.execute("DELETE FROM t").unwrap();
+    assert!(c
+        .execute("INSERT INTO t(rowid, x) VALUES (1, 'a'), (1, 'b')")
+        .is_err());
+}
+
+#[test]
 fn porter_tokenizer_stems_tokens() {
     // `tokenize='porter'` Porter-stems every token at index and query time, so a
     // query matches any inflected form, byte-for-byte like sqlite3.
