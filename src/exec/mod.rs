@@ -7258,6 +7258,55 @@ impl Connection {
                 collation: crate::value::Collation::default(),
             })
             .collect();
+        // FTS5's plan is driven by `MATCH` (a desugared `match()` function the
+        // generic constraint collector doesn't see) and `ORDER BY rank`, so report
+        // it directly to match sqlite's `xBestIndex`: `MATCH` is `M<col>` (the
+        // matched column's 0-based index, or the column count for a table-wide
+        // match), a rowid equality is `=`, and `ORDER BY rank` sets the
+        // order-by-consumed bit (32) in idxNum.
+        if cvt.module.eq_ignore_ascii_case("fts5") {
+            let mut idx_str = String::new();
+            let mut matched = false;
+            if let Some(where_expr) = &sel.where_clause {
+                if let Some((_, operand)) = self.fts5_match_query(where_expr, params) {
+                    let col = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(&operand))
+                        .unwrap_or(schema.columns.len());
+                    idx_str = alloc::format!("M{col}");
+                    matched = true;
+                } else if fts5_rowid_eq(where_expr, params) {
+                    idx_str.push('=');
+                }
+            }
+            // With a MATCH, FTS5 can return rows already ordered by `rank` (idxNum
+            // bit 32) or by `rowid` (bit 64), consuming the ORDER BY.
+            let order_bit = if matched && sel.order_by.len() == 1 && !sel.order_by[0].descending {
+                match &sel.order_by[0].expr {
+                    Expr::Column {
+                        table: None,
+                        column,
+                    } if column.eq_ignore_ascii_case("rank") => 32,
+                    Expr::Column {
+                        table: None,
+                        column,
+                    } if matches!(
+                        column.to_ascii_lowercase().as_str(),
+                        "rowid" | "_rowid_" | "oid"
+                    ) =>
+                    {
+                        64
+                    }
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            return Ok(alloc::format!(
+                "SCAN {label} VIRTUAL TABLE INDEX {order_bit}:{idx_str}"
+            ));
+        }
         let (constraints, _) = collect_vtab_constraints(sel, &columns, params);
         let plan = module.dyn_best_index(&constraints)?;
         Ok(alloc::format!(
@@ -13432,6 +13481,32 @@ fn where_cols_covered(e: &Expr, meta: &TableMeta, idx_cols: &[usize]) -> bool {
 /// bound of `constraints[i]`. Only the comparison *shape* goes to the module (as
 /// SQLite does); the values are held back and handed to `filter` per the plan's
 /// `argv_index`.
+/// Whether a WHERE clause contains a `rowid = <const>` term (rowid/`_rowid_`/`oid`)
+/// in its `AND` tree — used to report FTS5's `INDEX 0:=` rowid-lookup plan.
+fn fts5_rowid_eq(expr: &Expr, params: &Params) -> bool {
+    let is_rowid = |e: &Expr| {
+        matches!(e, Expr::Column { column, .. }
+            if matches!(column.to_ascii_lowercase().as_str(), "rowid" | "_rowid_" | "oid"))
+    };
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            (is_rowid(left) && const_value(right, params).is_some())
+                || (is_rowid(right) && const_value(left, params).is_some())
+        }
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => fts5_rowid_eq(left, params) || fts5_rowid_eq(right, params),
+        Expr::Paren(e) => fts5_rowid_eq(e, params),
+        _ => false,
+    }
+}
+
 fn collect_vtab_constraints(
     sel: &Select,
     columns: &[ColumnInfo],

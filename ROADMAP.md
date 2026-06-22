@@ -443,6 +443,11 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     MATCH query into a connection-scoped `Fts5QueryCtx` cell that the `bm25()`
     special form and the `rank` column read during projection / `ORDER BY`.
     Outside an fts5 MATCH, `rank`/`bm25()` stay ordinary unknown names.
+  - **D2 EXPLAIN QUERY PLAN. ✅ DONE.** `EXPLAIN QUERY PLAN` over an `fts5` table
+    reports sqlite's `idxNum:idxStr`: a table-wide `MATCH` is `INDEX 0:M<ncols>`,
+    a column `MATCH` is `M<colidx>`, a rowid lookup is `=`, and `ORDER BY rank` /
+    `ORDER BY rowid` set the order-consumed bit (32 / 64) — byte-identical to
+    sqlite3 (`eqp_vtab_detail`'s fts5 branch).
   - **D2-aux — `highlight()`. ✅ DONE (correct-results).** `highlight(t, col,
     open, close)` wraps each matched-phrase token in the markers (one pair per
     phrase instance; original inter-token text preserved; case-insensitive,

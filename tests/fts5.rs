@@ -432,6 +432,40 @@ fn highlight_wraps_matched_terms() {
 }
 
 #[test]
+fn explain_query_plan_reports_match_index() {
+    // The reported `idxNum:idxStr` matches sqlite's fts5 xBestIndex: a table-wide
+    // MATCH is `INDEX 0:M<ncols>`, a column MATCH is `M<colidx>`, a rowid lookup is
+    // `=`, and `ORDER BY rank`/`rowid` set the order-consumed bit (32 / 64).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE f USING fts5(a, b, c)")
+        .unwrap();
+    let plan = |sql: &str| match c.query(sql).unwrap().rows.last().unwrap().last() {
+        Some(Value::Text(s)) => s.clone(),
+        o => panic!("not text: {o:?}"),
+    };
+    assert_eq!(
+        plan("EXPLAIN QUERY PLAN SELECT * FROM f WHERE f MATCH 'x'"),
+        "SCAN f VIRTUAL TABLE INDEX 0:M3"
+    );
+    assert_eq!(
+        plan("EXPLAIN QUERY PLAN SELECT * FROM f WHERE b MATCH 'x'"),
+        "SCAN f VIRTUAL TABLE INDEX 0:M1"
+    );
+    assert_eq!(
+        plan("EXPLAIN QUERY PLAN SELECT * FROM f WHERE rowid = 5"),
+        "SCAN f VIRTUAL TABLE INDEX 0:="
+    );
+    assert_eq!(
+        plan("EXPLAIN QUERY PLAN SELECT * FROM f WHERE f MATCH 'x' ORDER BY rank"),
+        "SCAN f VIRTUAL TABLE INDEX 32:M3"
+    );
+    assert_eq!(
+        plan("EXPLAIN QUERY PLAN SELECT * FROM f WHERE f MATCH 'x' ORDER BY rowid"),
+        "SCAN f VIRTUAL TABLE INDEX 64:M3"
+    );
+}
+
+#[test]
 fn bm25_outside_an_fts5_match_is_unavailable() {
     // `rank` / `bm25()` only mean something for an fts5 MATCH query; elsewhere
     // they are an ordinary unknown column / function (an error), as in sqlite.
