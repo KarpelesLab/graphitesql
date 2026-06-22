@@ -16,6 +16,32 @@ fn t(c: &Connection, sql: &str) -> String {
 }
 
 #[test]
+fn unixepoch_subsec_returns_fractional_real() {
+    let c = Connection::open_memory().unwrap();
+    // With `subsec`, unixepoch() returns a REAL carrying the fractional second;
+    // without it, an INTEGER — matching SQLite.
+    let one = |sql: &str| c.query(sql).unwrap().rows.remove(0).remove(0);
+    assert_eq!(
+        one("SELECT unixepoch('2020-01-01 00:00:00.5','subsec')"),
+        Value::Real(1_577_836_800.5)
+    );
+    assert_eq!(
+        one("SELECT unixepoch('2020-01-01 00:00:00.123','subsecond')"),
+        Value::Real(1_577_836_800.123)
+    );
+    // Whole-second input with subsec is still a real (`.0`).
+    assert_eq!(
+        one("SELECT unixepoch('2020-01-01 00:00:00','subsec')"),
+        Value::Real(1_577_836_800.0)
+    );
+    // No modifier → integer seconds, unchanged.
+    assert_eq!(
+        one("SELECT unixepoch('2020-01-01')"),
+        Value::Integer(1_577_836_800)
+    );
+}
+
+#[test]
 fn subsec_renders_milliseconds() {
     let c = Connection::open_memory().unwrap();
     // Whole seconds gain `.000`; a fractional input is preserved to 3 digits.

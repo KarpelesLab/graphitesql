@@ -882,10 +882,19 @@ pub fn julianday(args: &[Value]) -> Value {
     }
 }
 
-/// `unixepoch(...)` -> integer seconds since 1970 (no fractional modifier).
+/// `unixepoch(...)` -> seconds since 1970. Integer by default; with a
+/// `subsec`/`subsecond` modifier, a real carrying the fractional (millisecond)
+/// part, matching SQLite.
 pub fn unixepoch(args: &[Value]) -> Value {
     match is_date(args) {
-        Some(p) => Value::Integer((p.ijd - 210_866_760_000_000) / 1000),
+        Some(p) => {
+            let ms = p.ijd - 210_866_760_000_000;
+            if p.subsec {
+                Value::Real(ms as f64 / 1000.0)
+            } else {
+                Value::Integer(ms / 1000)
+            }
+        }
         None => Value::Null,
     }
 }
