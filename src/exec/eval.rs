@@ -1056,6 +1056,23 @@ pub fn like_glob_values(glob: bool, l: &Value, r: &Value) -> Value {
     bool_value(m)
 }
 
+/// Concatenate two values for `||`, matching SQLite: NULL on either side yields
+/// NULL; otherwise the operands' byte representations are joined (a blob
+/// contributes its bytes, a number its decimal text), yielding text when the
+/// result is valid UTF-8 and a blob otherwise (so `x'00' || x'ff'` keeps its
+/// exact bytes). Public wrapper used by the VDBE interpreter.
+pub fn concat_values(l: &Value, r: &Value) -> Value {
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Value::Null;
+    }
+    let mut bytes = text_bytes(l);
+    bytes.extend_from_slice(&text_bytes(r));
+    match String::from_utf8(bytes) {
+        Ok(s) => Value::Text(s),
+        Err(e) => Value::Blob(e.into_bytes()),
+    }
+}
+
 /// Apply `IS` / `IS NOT` to two values, treating NULL as a comparable value
 /// (never returns NULL). Public wrapper used by the VDBE interpreter.
 pub fn is_values(is: bool, l: &Value, r: &Value) -> Value {

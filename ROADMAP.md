@@ -332,17 +332,21 @@ each additive behind `query_vdbe` until B7:
   flushed out and fixed several real VDBE bugs — comparison **affinity**
   (`g <= '1'`), `IS TRUE`/`IS FALSE` truthiness, `LIMIT 0`/negative, and unsafe
   routing of correlated-subquery inner scans (gated off via `outer_scope`).
-- **B7b — flip the default** to the VDBE once parity holds across the suite.
-  The compiler now does **qualified `(table, column)` resolution** (a per-column
-  table-qualifier list parallel to the names), so `t.col` references and
-  shared-name joins resolve correctly and an ambiguous *bare* reference bails.
-  Routing is applied **per query block in `run_core`** (not at the whole-query
-  level), so each arm of a **compound query** (`UNION`/`INTERSECT`/`EXCEPT`) is
-  VDBE-accelerated while the tree-walker still performs the set combination; the
-  corpus-routing parity test stays byte-identical. Remaining before the flip:
-  broaden the still-unhandled single-block shapes (correlated subqueries, window
-  functions) so falling back stays the exception, then gain confidence to
-  default-on.
+- **B7b — flip the default to the VDBE. ✅ DONE.** `use_vdbe` now defaults to
+  **on**: `query()` runs `SELECT` through the VDBE first and falls back
+  transparently to the tree-walker for any shape it does not handle (every
+  unsupported shape, and every error, defers — the tree-walker stays the source
+  of truth). Validated by running the **entire test suite** with the default on
+  (not just the differential corpus): byte-identical throughout. Getting there
+  flushed out and fixed a series of real VDBE gaps — comparison/ORDER BY
+  **collation**, `IS TRUE`/`LIMIT 0`, qualified-column resolution, the
+  grouped-bare-column / attached-schema / column-label cases, plus (this step)
+  an ORDER-BY-satisfied-by-index-scan bail (tie/NULL order follows the scan),
+  `HAVING`-without-GROUP-BY and index-hint bails, JSON-subtype-aware functions
+  excluded from the scalar whitelist, blob `||` concatenation, and `-(i64::MIN)`
+  overflow promotion. The compiler also does qualified `(table, column)`
+  resolution, and routing is per query block (`run_core`) so compound-query arms
+  are accelerated while the tree-walker combines.
 - **B8 — `EXPLAIN` (bytecode). ✅ DONE.** Plain `EXPLAIN <select>` compiles the
   query to graphite's VDBE program and returns the listing as `(addr, opcode,
   detail)` rows (`Program::explain_rows` + `Connection::explain_bytecode`, via a

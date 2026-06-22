@@ -327,9 +327,15 @@ fn is_pure_scalar_fn(name: &str, argc: usize) -> bool {
         "coalesce" | "ifnull" => argc >= 1,
         // Pattern predicates in function form.
         "glob" | "like" => argc == 2,
-        // JSON (operate purely on their value arguments).
-        "json" | "json_valid" | "json_type" | "json_quote" | "json_array_length"
-        | "json_extract" | "json_array" | "json_object" | "jsonb" => true,
+        // JSON functions that operate purely on their argument *values*. The
+        // subtype-aware ones (`json_array`/`json_object`/`json_quote`, which embed
+        // a `json(...)`-typed argument as JSON rather than quoting it) are
+        // excluded: the VDBE passes `eval_scalar` literal-reconstructed values, so
+        // the argument's JSON subtype — carried by its source expression — is
+        // lost. They fall back to the tree-walker, which sees the real expression.
+        "json" | "json_valid" | "json_type" | "json_array_length" | "json_extract" | "jsonb" => {
+            true
+        }
         // Variadic scalar min/max need at least two args (one arg is the aggregate).
         "min" | "max" => argc >= 2,
         _ => false,
@@ -474,7 +480,12 @@ fn compile_aggregate_select(
     collations: &[Collation],
     projections: &[(Expr, String)],
 ) -> Result<Program> {
-    if !sel.order_by.is_empty() || sel.limit.is_some() || sel.offset.is_some() || sel.distinct {
+    if !sel.order_by.is_empty()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+        || sel.distinct
+        || sel.having.is_some()
+    {
         return Err(Error::Unsupported("VDBE: bare aggregate only"));
     }
     // Aggregate reduction (min/max) compares under BINARY; a non-BINARY column
@@ -813,6 +824,10 @@ fn compile_group_select(
         let expr = match &term.expr {
             Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count => {
                 projections[*k as usize - 1].0.clone()
+            }
+            // An out-of-range positional ORDER BY term is an error in SQLite.
+            Expr::Literal(Literal::Integer(_)) => {
+                return Err(Error::Unsupported("VDBE: ORDER BY ordinal out of range"))
             }
             Expr::Column {
                 table: None,
@@ -1219,6 +1234,12 @@ pub fn compile_table_select(
             &projections,
         );
     }
+    // A `HAVING` on a non-grouped, non-aggregate query is either an aggregate
+    // filter or invalid; either way the plain scan path does not model it, so
+    // defer to the tree-walker (which evaluates or rejects it).
+    if sel.having.is_some() {
+        return Err(Error::Unsupported("VDBE: HAVING without GROUP BY"));
+    }
     let count = projections.len();
     let mut c = Compiler {
         ops: Vec::new(),
@@ -1266,6 +1287,10 @@ pub fn compile_table_select(
                 // A bare positive integer is a 1-based output-column ordinal.
                 Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count => {
                     projections[*k as usize - 1].0.clone()
+                }
+                // An out-of-range positional ORDER BY term is an error in SQLite.
+                Expr::Literal(Literal::Integer(_)) => {
+                    return Err(Error::Unsupported("VDBE: ORDER BY ordinal out of range"))
                 }
                 // A bare name that is an output alias (and not a table column)
                 // refers to that projection.
@@ -2054,7 +2079,12 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
             Op::Null { dest } => regs[*dest] = Value::Null,
             Op::Negate { reg, dest } => {
                 regs[*dest] = match crate::exec::eval::to_number(&regs[*reg]) {
-                    Value::Integer(i) => Value::Integer(i.wrapping_neg()),
+                    // Negating `i64::MIN` overflows; SQLite promotes it to a real
+                    // (matching the tree-walker), rather than wrapping.
+                    Value::Integer(i) => i
+                        .checked_neg()
+                        .map(Value::Integer)
+                        .unwrap_or(Value::Real(-(i as f64))),
                     Value::Real(r) => Value::Real(-r),
                     _ => Value::Null,
                 };
@@ -2119,14 +2149,7 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                 regs[*dest] = crate::exec::func::eval_scalar(name, &lit_args, false, &ctx)?;
             }
             Op::Concat { lhs, rhs, dest } => {
-                regs[*dest] =
-                    if matches!(regs[*lhs], Value::Null) || matches!(regs[*rhs], Value::Null) {
-                        Value::Null
-                    } else {
-                        let mut s = crate::exec::eval::to_text(&regs[*lhs]);
-                        s.push_str(&crate::exec::eval::to_text(&regs[*rhs]));
-                        Value::Text(s)
-                    };
+                regs[*dest] = crate::exec::eval::concat_values(&regs[*lhs], &regs[*rhs]);
             }
             Op::Compare {
                 op,

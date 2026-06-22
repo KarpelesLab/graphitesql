@@ -165,11 +165,13 @@ pub struct Connection {
     /// `highlight()` special forms. `None` outside such a query.
     #[cfg(feature = "fts5")]
     fts5_rank: core::cell::RefCell<Option<Fts5QueryCtx>>,
-    /// Opt-in (default off): try the experimental VDBE engine for a `SELECT`
-    /// before the tree-walking executor, falling back transparently when the
-    /// VDBE does not support the query's shape. Toggled by
-    /// [`set_use_vdbe`](Self::set_use_vdbe) (Track B, step B7a). The result must
-    /// be identical either way; this only changes which engine produces it.
+    /// Whether `SELECT` execution tries the VDBE engine first, falling back
+    /// transparently to the tree-walker for any query shape it does not support.
+    /// **On by default** (Track B, B7b): the VDBE is the primary engine, parity-
+    /// validated across the full test suite and the differential corpus. Toggled
+    /// by [`set_use_vdbe`](Self::set_use_vdbe) — turn it off to force the
+    /// tree-walker. The result is identical either way; this only chooses which
+    /// engine produces it.
     use_vdbe: core::cell::Cell<bool>,
 }
 
@@ -284,7 +286,7 @@ impl Connection {
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
             fts5_rank: core::cell::RefCell::new(None),
-            use_vdbe: core::cell::Cell::new(false),
+            use_vdbe: core::cell::Cell::new(true),
         })
     }
 
@@ -319,7 +321,7 @@ impl Connection {
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
             fts5_rank: core::cell::RefCell::new(None),
-            use_vdbe: core::cell::Cell::new(false),
+            use_vdbe: core::cell::Cell::new(true),
         })
     }
 
@@ -416,10 +418,10 @@ impl Connection {
         self.run_select_vdbe(&sel)
     }
 
-    /// Enable or disable the opt-in VDBE fast path for `SELECT` (Track B, B7a).
-    /// When on, [`query`](Self::query) tries the experimental VDBE engine first
-    /// and falls back transparently to the tree-walker for any query shape it
-    /// does not handle. Off by default; the result is identical either way.
+    /// Enable or disable the VDBE engine for `SELECT` (Track B). When on (the
+    /// default), [`query`](Self::query) runs through the VDBE and falls back
+    /// transparently to the tree-walker for any query shape it does not handle;
+    /// turning it off forces the tree-walker. The result is identical either way.
     pub fn set_use_vdbe(&self, on: bool) {
         self.use_vdbe.set(on);
     }
@@ -499,6 +501,18 @@ impl Connection {
                 return Err(Error::Unsupported("VDBE: schema-qualified source"));
             }
         }
+        // When the tree-walker satisfies `ORDER BY` via an index/rowid/seek scan,
+        // its tie/NULL order follows that (possibly reversed) scan; the VDBE
+        // sorter would emit a different — valid, but SQL-unspecified — tie order.
+        // Defer such queries to the tree-walker so the observable order matches.
+        if sel.from.is_some()
+            && !sel.order_by.is_empty()
+            && self
+                .order_satisfied_by_scan(sel, &eval::Params::default())
+                .is_some()
+        {
+            return Err(Error::Unsupported("VDBE: ORDER BY satisfied by a scan"));
+        }
         // Constant SELECT (no FROM): compile and run directly.
         let Some(from) = &sel.from else {
             let prog = vdbe::compile_const_select(sel)?;
@@ -521,6 +535,12 @@ impl Connection {
         let scan_one = |tr: &sql::ast::TableRef| -> Result<ScanOut> {
             if tr.subquery.is_some() || tr.tvf_args.is_some() {
                 return Err(Error::Unsupported("VDBE: only plain table sources"));
+            }
+            // The VDBE always full-scans and does not model `INDEXED BY`/`NOT
+            // INDEXED` (and an invalid `INDEXED BY` must error); defer to the
+            // tree-walker so the hint is honoured or rejected.
+            if tr.index_hint.is_some() {
+                return Err(Error::Unsupported("VDBE: index hint"));
             }
             let meta = self.table_meta(&tr.name, tr.alias.as_deref())?;
             let cols = meta.columns.iter().map(|c| c.name.clone()).collect();
