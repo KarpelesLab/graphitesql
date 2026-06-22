@@ -333,8 +333,12 @@ each additive behind `query_vdbe` until B7:
   (`g <= '1'`), `IS TRUE`/`IS FALSE` truthiness, `LIMIT 0`/negative, and unsafe
   routing of correlated-subquery inner scans (gated off via `outer_scope`).
 - **B7b — flip the default** to the VDBE once parity holds across the suite.
-  (Remaining gap: the VDBE resolves columns by bare name, so qualified/correlated
-  references and shared-name joins must resolve qualifiers first — see B5b.)
+  The compiler now does **qualified `(table, column)` resolution** (a per-column
+  table-qualifier list parallel to the names), so `t.col` references and
+  shared-name joins resolve correctly and an ambiguous *bare* reference bails;
+  the corpus-routing parity test handles 1779/1898. Remaining before the flip:
+  broaden coverage of the ~120 still-unhandled shapes (subqueries, compound,
+  window) so falling back stays the exception, then gain confidence to default-on.
 - **B8 — Real `EXPLAIN` (bytecode).** Emit the `addr|opcode|p1|p2|p3|p4|p5`
   listing from a compiled `Program` (today `Error::Unsupported`). *Ref:*
   `vdbe.c`, `opcodes.h`.

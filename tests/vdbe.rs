@@ -187,6 +187,9 @@ fn table_scan_matches_tree_walker() {
         "SELECT t.*, a + 1 FROM t WHERE a > 1",
         "SELECT x.* FROM t x",
         "SELECT x.* FROM t AS x ORDER BY a DESC",
+        // Qualified single-table column references (by name and by alias).
+        "SELECT t.a, t.b FROM t WHERE t.a > 1 ORDER BY t.id",
+        "SELECT x.a FROM t x WHERE x.b = 'y' ORDER BY x.a",
     ] {
         let mut got = c.query_vdbe(q).unwrap().rows;
         let mut want = c.query(q).unwrap().rows;
@@ -298,14 +301,31 @@ fn two_table_join_matches_tree_walker() {
         let _ = std::fs::remove_file(&path);
     }
 
-    // Shared column names are ambiguous: the VDBE bails so the tree-walker
-    // resolves it (here both tables have `id`).
+    // Shared column names: a *qualified* reference disambiguates them, so a join
+    // of two tables that both have `id` now works and matches the tree-walker.
     c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, v)")
         .unwrap();
     c.execute("CREATE TABLE q(id INTEGER PRIMARY KEY, w)")
         .unwrap();
+    c.execute("INSERT INTO p(id,v) VALUES (1,'a'),(2,'b')")
+        .unwrap();
+    c.execute("INSERT INTO q(id,w) VALUES (1,'x'),(2,'y')")
+        .unwrap();
+    for q in [
+        "SELECT v, w FROM p JOIN q ON p.id = q.id",
+        "SELECT p.id, v, w FROM p JOIN q ON p.id = q.id ORDER BY p.id",
+        "SELECT v FROM p JOIN q ON p.id = q.id WHERE q.id = 1",
+    ] {
+        assert_eq!(
+            c.query_vdbe(q).unwrap().rows,
+            c.query(q).unwrap().rows,
+            "qualified join diverged on {q}"
+        );
+    }
+    // A *bare* reference to a shared name is ambiguous: the VDBE bails so the
+    // tree-walker resolves or rejects it identically.
     assert!(c
-        .query_vdbe("SELECT v, w FROM p JOIN q ON p.id = q.id")
+        .query_vdbe("SELECT id FROM p JOIN q ON p.id = q.id")
         .is_err());
     // Outer joins are not handled by the spike (NULL-extension); they bail.
     assert!(c

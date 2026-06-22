@@ -438,13 +438,23 @@ impl Connection {
         };
         // Materialize a plain table source's column names and rows. Subqueries
         // and table-valued functions are out of the spike's scope.
-        type ScanOut = (Vec<String>, Vec<eval::Affinity>, Vec<Vec<Value>>);
+        // (column names, owning-table qualifier per column, affinities, rows).
+        type ScanOut = (
+            Vec<String>,
+            Vec<String>,
+            Vec<eval::Affinity>,
+            Vec<Vec<Value>>,
+        );
         let scan_one = |tr: &sql::ast::TableRef| -> Result<ScanOut> {
             if tr.subquery.is_some() || tr.tvf_args.is_some() {
                 return Err(Error::Unsupported("VDBE: only plain table sources"));
             }
             let meta = self.table_meta(&tr.name, tr.alias.as_deref())?;
             let cols = meta.columns.iter().map(|c| c.name.clone()).collect();
+            // The qualifier a `t.col` reference must use: the alias if present,
+            // else the table name.
+            let qualifier = tr.alias.clone().unwrap_or_else(|| tr.name.clone());
+            let tables = meta.columns.iter().map(|_| qualifier.clone()).collect();
             let affinities = meta.columns.iter().map(|c| c.affinity).collect();
             let rows: Vec<Vec<Value>> = if meta.without_rowid {
                 self.scan_without_rowid(&meta)?
@@ -454,7 +464,7 @@ impl Connection {
                     .map(|(_, v)| v)
                     .collect()
             };
-            Ok((cols, affinities, rows))
+            Ok((cols, tables, affinities, rows))
         };
 
         // Two-table inner join (B5a): an inner join is a filtered cross-product,
@@ -476,17 +486,15 @@ impl Connection {
             {
                 return Err(Error::Unsupported("VDBE: table.* over a join"));
             }
-            let (c1, a1, r1) = scan_one(&from.first)?;
-            let (c2, a2, r2) = scan_one(&join.table)?;
-            // Bail on a name shared by both tables: a bare reference would be
-            // ambiguous, and the spike resolves columns by name only.
+            let (c1, t1, a1, r1) = scan_one(&from.first)?;
+            let (c2, t2, a2, r2) = scan_one(&join.table)?;
+            // The combined schema is t1's columns then t2's. Shared bare names are
+            // allowed: a qualified `t.col` reference disambiguates them, and an
+            // ambiguous *bare* reference makes the compiler bail (→ tree-walker).
             let mut combined: Vec<String> = c1.clone();
             combined.extend(c2.iter().cloned());
-            for (i, name) in combined.iter().enumerate() {
-                if combined[..i].iter().any(|p| p.eq_ignore_ascii_case(name)) {
-                    return Err(Error::Unsupported("VDBE: ambiguous join column name"));
-                }
-            }
+            let mut combined_tables: Vec<String> = t1.clone();
+            combined_tables.extend(t2.iter().cloned());
             let mut combined_aff: Vec<eval::Affinity> = a1.clone();
             combined_aff.extend(a2.iter().copied());
             // Cross-product rows, outer table first (matching sqlite's row order).
@@ -511,7 +519,8 @@ impl Connection {
             };
             let mut joined = sel.clone();
             joined.where_clause = merged;
-            let prog = vdbe::compile_table_select(&joined, &combined, &combined_aff)?;
+            let prog =
+                vdbe::compile_table_select(&joined, &combined, &combined_tables, &combined_aff)?;
             let result = vdbe::run_rows(&prog, &rows)?;
             return Ok(QueryResult {
                 columns: prog.columns,
@@ -523,7 +532,7 @@ impl Connection {
         if from.first.subquery.is_some() || from.first.tvf_args.is_some() {
             return Err(Error::Unsupported("VDBE: only a single plain table"));
         }
-        let (col_names, col_aff, rows) = scan_one(&from.first)?;
+        let (col_names, col_tables, col_aff, rows) = scan_one(&from.first)?;
         // A `t.*` projection is only handled when its qualifier names this single
         // table (by name or alias); any other qualifier falls back so the
         // tree-walker can resolve or reject it.
@@ -540,7 +549,7 @@ impl Connection {
                 }
             }
         }
-        let prog = vdbe::compile_table_select(sel, &col_names, &col_aff)?;
+        let prog = vdbe::compile_table_select(sel, &col_names, &col_tables, &col_aff)?;
         let result = vdbe::run_rows(&prog, &rows)?;
         Ok(QueryResult {
             columns: prog.columns,

@@ -332,6 +332,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         ops: Vec::new(),
         next_reg: count,
         columns: Vec::new(),
+        tables: Vec::new(),
         affinities: Vec::new(),
         bindings: Vec::new(),
     };
@@ -415,6 +416,7 @@ fn agg_kind(expr: &Expr) -> Option<(AggKind, Option<Expr>)> {
 fn compile_aggregate_select(
     sel: &Select,
     columns: &[String],
+    tables: &[String],
     affinities: &[Affinity],
     projections: &[(Expr, String)],
 ) -> Result<Program> {
@@ -434,6 +436,7 @@ fn compile_aggregate_select(
         ops: Vec::new(),
         next_reg: count,
         columns: columns.to_vec(),
+        tables: tables.to_vec(),
         affinities: affinities.to_vec(),
         bindings: Vec::new(),
     };
@@ -546,6 +549,7 @@ fn collect_aggregates(expr: &Expr, out: &mut Vec<Expr>) {
 fn compile_group_select(
     sel: &Select,
     columns: &[String],
+    tables: &[String],
     affinities: &[Affinity],
     projections: &[(Expr, String)],
 ) -> Result<Program> {
@@ -570,7 +574,7 @@ fn compile_group_select(
 
     // The plain path (no HAVING / ORDER BY / LIMIT) keeps its compact `GroupEmit`.
     if !has_having && !has_order && !has_limit {
-        return compile_group_emit(sel, columns, affinities, projections, &group_cols);
+        return compile_group_emit(sel, columns, tables, affinities, projections, &group_cols);
     }
 
     // General path: gather every distinct aggregate referenced by the projection,
@@ -599,6 +603,7 @@ fn compile_group_select(
         ops: Vec::new(),
         next_reg: 0,
         columns: columns.to_vec(),
+        tables: tables.to_vec(),
         affinities: affinities.to_vec(),
         bindings: Vec::new(),
     };
@@ -668,13 +673,27 @@ fn compile_group_select(
     for _ in &agg_specs {
         c.alloc();
     }
-    // Grouping-column reference (by table-column index) → its key register.
+    // Grouping-column reference → its key register. Bind both the bare form
+    // (`g`) and the qualified form (`t.g`) so a qualified reference in the
+    // projection / HAVING / ORDER BY resolves to the key register too (otherwise
+    // it would compile to a scan-column read that is invalid during emit).
     for (k, &ci) in group_cols.iter().enumerate() {
-        let bind_expr = Expr::Column {
-            table: None,
-            column: columns[ci].clone(),
-        };
-        c.bindings.push((bind_expr, gkey_start + k));
+        c.bindings.push((
+            Expr::Column {
+                table: None,
+                column: columns[ci].clone(),
+            },
+            gkey_start + k,
+        ));
+        if let Some(t) = tables.get(ci) {
+            c.bindings.push((
+                Expr::Column {
+                    table: Some(t.clone()),
+                    column: columns[ci].clone(),
+                },
+                gkey_start + k,
+            ));
+        }
     }
     // Each aggregate call → its final register.
     for (j, e) in agg_exprs.iter().enumerate() {
@@ -925,6 +944,7 @@ fn compile_group_select(
 fn compile_group_emit(
     sel: &Select,
     columns: &[String],
+    tables: &[String],
     affinities: &[Affinity],
     projections: &[(Expr, String)],
     group_cols: &[usize],
@@ -959,6 +979,7 @@ fn compile_group_emit(
         ops: Vec::new(),
         next_reg: 0,
         columns: columns.to_vec(),
+        tables: tables.to_vec(),
         affinities: affinities.to_vec(),
         bindings: Vec::new(),
     };
@@ -1035,6 +1056,7 @@ fn compile_group_emit(
 pub fn compile_table_select(
     sel: &Select,
     columns: &[String],
+    tables: &[String],
     affinities: &[Affinity],
 ) -> Result<Program> {
     if !sel.compound.is_empty() {
@@ -1092,17 +1114,18 @@ pub fn compile_table_select(
     }
     // GROUP BY folds the scan into one row per group.
     if !sel.group_by.is_empty() {
-        return compile_group_select(sel, columns, affinities, &projections);
+        return compile_group_select(sel, columns, tables, affinities, &projections);
     }
     // An all-aggregate projection (no GROUP BY) folds the scan into one row.
     if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
-        return compile_aggregate_select(sel, columns, affinities, &projections);
+        return compile_aggregate_select(sel, columns, tables, affinities, &projections);
     }
     let count = projections.len();
     let mut c = Compiler {
         ops: Vec::new(),
         next_reg: count,
         columns: columns.to_vec(),
+        tables: tables.to_vec(),
         affinities: affinities.to_vec(),
         bindings: Vec::new(),
     };
@@ -1334,6 +1357,10 @@ struct Compiler {
     next_reg: usize,
     /// Table column names, for resolving `Expr::Column` to a `Column` op.
     columns: Vec<String>,
+    /// Each column's owning-table qualifier (alias if present, else table name),
+    /// parallel to `columns`. Empty for a constant `SELECT`. Used to resolve a
+    /// qualified `t.col` reference and to disambiguate a join's shared names.
+    tables: Vec<String>,
     /// Each column's comparison affinity, parallel to `columns` (empty for a
     /// constant `SELECT` with no table). Used to apply SQLite's pre-comparison
     /// affinity in `Op::Compare`, matching the tree-walker.
@@ -1352,16 +1379,43 @@ impl Compiler {
         r
     }
 
+    /// Resolve a column reference to its index in the row, honouring an optional
+    /// `table.` qualifier. Returns `Unsupported` when the name is unknown or a
+    /// bare name is ambiguous across a join's two tables (so the tree-walker —
+    /// which would resolve or reject it identically — takes over).
+    fn resolve_column(&self, table: Option<&str>, column: &str) -> Result<usize> {
+        let mut found = None;
+        for (i, c) in self.columns.iter().enumerate() {
+            if !c.eq_ignore_ascii_case(column) {
+                continue;
+            }
+            if let Some(t) = table {
+                if !self
+                    .tables
+                    .get(i)
+                    .is_some_and(|tn| tn.eq_ignore_ascii_case(t))
+                {
+                    continue;
+                }
+            }
+            if found.is_some() {
+                // A bare name matching two tables is ambiguous.
+                return Err(Error::Unsupported("VDBE: ambiguous column reference"));
+            }
+            found = Some(i);
+        }
+        found.ok_or(Error::Unsupported("VDBE: unresolved column reference"))
+    }
+
     /// The comparison affinity an expression contributes (mirrors the
     /// tree-walker's `expr_affinity`): a column's declared affinity, a `CAST`'s
     /// target affinity, transparent through parentheses, else `None` (a literal
     /// or computed value has no affinity).
     fn expr_affinity(&self, expr: &Expr) -> Option<Affinity> {
         match expr {
-            Expr::Column { column, .. } => self
-                .columns
-                .iter()
-                .position(|c| c.eq_ignore_ascii_case(column))
+            Expr::Column { table, column } => self
+                .resolve_column(table.as_deref(), column)
+                .ok()
                 .and_then(|i| self.affinities.get(i).copied()),
             Expr::Cast { type_name, .. } => Some(Affinity::from_type(Some(type_name))),
             Expr::Paren(e) => self.expr_affinity(e),
@@ -1431,12 +1485,8 @@ impl Compiler {
                 self.ops.push(op);
                 Ok(())
             }
-            Expr::Column { column, .. } => {
-                let idx = self
-                    .columns
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(column))
-                    .ok_or_else(|| Error::Error(alloc::format!("no such column: {column}")))?;
+            Expr::Column { table, column } => {
+                let idx = self.resolve_column(table.as_deref(), column)?;
                 self.ops.push(Op::Column { col: idx, dest });
                 Ok(())
             }
