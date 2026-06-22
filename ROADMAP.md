@@ -468,11 +468,10 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     sentence boundary (token 0 or after a `.`/`:` + space) with a `+120`/`+100`
     bonus; best score wins, earliest start on ties; a window reaching the column
     end appends the trailing text (so a final `.` survives) instead of an
-    ellipsis. Validated at 0 mismatches over ~10.9k random differential cases
-    (terms/OR/phrase, 1–2 columns, every `n`, punctuated sentences). *(Known
-    upstream gap, not snippet: the `col : token` column filter with surrounding
-    spaces isn't lexed — `col:token` works; affects MATCH/highlight/snippet
-    alike.)*
+    ellipsis. The auto-column form `snippet(t, -1, …)` scores every column and
+    renders the best (ties → first column). Validated at 0 mismatches over ~17k
+    random differential cases (terms/OR/phrase, 1–3 columns, explicit and `-1`
+    columns, every `n`, punctuated sentences, spaced/unspaced `col:token`).
   - **D2-fts5-feature.** The whole module is behind a default-on `fts5` Cargo
     feature; `--no-default-features` (or any build without `fts5`) drops it and
     `USING fts5` then reports `no such module: fts5`, as SQLite does uncompiled.
