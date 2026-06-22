@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/KarpelesLab/graphitesql/compare/v0.0.6...v0.0.7) - 2026-06-22
+
+### Added
+
+- *(fts5)* highlight() auxiliary function
+- *(fts5)* bm25() per-column weights
+- *(fts5)* bm25() relevance ranking and the rank column (D2d)
+- *(fts5)* MATCH ^ anchor for column-initial tokens
+- *(fts5)* MATCH NEAR(...) proximity groups
+- *(fts5)* MATCH boolean operators (AND/OR/NOT) with parentheses
+- *(fts5)* MATCH phrase and prefix queries
+- *(fts5)* MATCH column-filter syntax (col:token)
+- *(fts5)* MATCH full-text queries with a unicode61-style tokenizer
+- *(fts5)* built-in fts5 module stores and retrieves documents
+- *(parser)* MATCH and REGEXP operators desugar to function calls
+- *(vtab)* VTabSchema can declare column types; rtree table_info matches sqlite
+- *(api)* register user-defined aggregate functions from Rust (D4)
+- *(api)* register user-defined scalar functions from Rust (D4)
+- *(vtab)* built-in rtree spatial-index module (D3a)
+- *(vtab)* persistent virtual tables via a backing table (W2)
+- *(vtab)* honor an explicit rowid in a virtual-table INSERT (W1c)
+- *(vtab)* route UPDATE and DELETE to a writable module (W1b)
+- *(vtab)* writable virtual tables — INSERT via a module's update (W1a)
+- *(pragma)* round-trip cache_size and report mmap_size like sqlite (C8b)
+- *(json)* encode JSON5-form numbers under the JSONB INT5/FLOAT5 tags
+- *(api)* add Connection::execute_batch for multi-statement scripts
+
+### Documentation
+
+- record FTS5 highlight() done
+- record FTS5 bm25 ranking (D2d) done
+- README details the complete FTS5 MATCH query language
+- FTS5 MATCH now supports the full core query language
+- record FTS5 D2a/D2b/D2c progress and built-in modules
+- mark D4 aggregate UDFs done (window/collation remain)
+- mark D4 scalar UDFs done (aggregate/window/collation remain)
+- mark D3a (rtree module, correct results) done
+- mark W2 (persistent shadow-table storage) done
+- mark W1 (writable-vtab trait + DML routing) done
+- mark B0b-iii single-index case done (ORDER BY after a WHERE seek)
+- mark C8b done (cache_size round-trip, mmap_size no-rows)
+- mark A8 done (JSONB INT5/FLOAT5 for JSON5-form numbers)
+- mark A3b fully done (partial/expression index range + IN seeks)
+- mark A3b range-seek half done (partial/expression index ranges)
+- update planner-leftovers ordering (B0b-i/ii done; B0b-iii needs shared seek-choice helper)
+- mark B0b-ii (covered-query covering scan) done in ROADMAP
+- mark B0b-i done; note mixed-direction partial-sort + B0b-ii/iii nuances
+- mark A-rn1/A-rn2, A4, A7, A2 + composite eq-prefix range seek done in ROADMAP
+- refresh README status — WAL writes, WITHOUT ROWID, auto_vacuum, JSONB, vtabs are done
+
+### Fixed
+
+- *(vtab)* VACUUM and foreign_key_list handle virtual tables
+- *(pragma)* integrity_check skips virtual tables instead of erroring
+- *(drop)* DROP TABLE on a persistent vtab removes its backing table
+- *(alter)* handle ALTER and CREATE INDEX on a virtual table
+- *(pragma)* table_info over a virtual table lists its columns, not an error
+- *(eqp)* EXPLAIN QUERY PLAN over a virtual table no longer errors
+- *(json)* json_each/json_tree honor the optional path argument
+- *(alter)* rewrite dependent view bodies on RENAME TABLE
+
+### Performance
+
+- *(planner)* report mixed-direction partial sorts like sqlite (B0b-i)
+- *(planner)* ORDER BY satisfied by a leading-column range seek (B0b-iii)
+- *(planner)* skip the sort when a WHERE-seek already orders by an index suffix
+- *(planner)* seek partial and expression indexes for IN-list queries
+- *(planner)* seek partial and expression indexes for range queries
+- *(planner)* answer a covered query with a covering-index scan
+- *(planner)* satisfy a multi-term ORDER BY from a composite index prefix
+- *(planner)* seek a composite index's equality prefix plus a trailing range
+
 ## [0.0.6](https://github.com/KarpelesLab/graphitesql/compare/v0.0.5...v0.0.6) - 2026-06-21
 
 ### Added
