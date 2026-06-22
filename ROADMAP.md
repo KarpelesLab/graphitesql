@@ -306,10 +306,16 @@ the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep)
   `scan_order_prefix`, and the NON-covering case via `order_index_scan`'s
   `sorted_suffix` (the walk orders the prefix, `order_satisfied_by_scan` reports
   not-fully-satisfied so the caller sorts the suffix). `tests/order_by_partial_sort.rs`.
-- **B1b — Join reordering.** Beyond the comma-join promotion (done), reorder
-  `FROM` tables by a simple cost model (most-selective indexed table inner)
-  instead of textual order; results identical, order verified via EQP. Preserve
-  LEFT/RIGHT/FULL semantics. *Ref:* `where.c`.
+- **B1b — Join reordering.** ⚠ *Larger than "reorder by cost" — graphite's join
+  planner diverges from sqlite by DESIGN.* For a 2-table join graphite keeps
+  textual order and picks per-cursor seeks/automatic covering indexes/**bloom
+  filters** (`SCAN big / SEARCH small USING INTEGER PRIMARY KEY`), whereas the
+  oracle here cost-reorders to the small table and plain-scans both (`SCAN small
+  / SCAN big`). Matching sqlite's join EQP would require both a faithful
+  cost-model reorder AND abandoning graphite's (often cheaper) access choices to
+  mimic sqlite's scans — a large planner-alignment effort, and results are already
+  correct. Verified 2026-06-23 this is a design divergence, not a bug. *Ref:*
+  `where.c`.
 - **B1c — RIGHT/FULL join inner seeks.** B1a/B1a²/WITHOUT-ROWID seeks cover
   INNER/LEFT; RIGHT/FULL joins still materialize the inner table.
 - **B4 — `sqlite_stat4` histograms. ⛔ BLOCKED by the differential oracle.** The
