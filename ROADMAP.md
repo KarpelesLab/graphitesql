@@ -521,6 +521,16 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
   - **D2-fts5-feature.** The whole module is behind a default-on `fts5` Cargo
     feature; `--no-default-features` (or any build without `fts5`) drops it and
     `USING fts5` then reports `no such module: fts5`, as SQLite does uncompiled.
+  - **D2-vocab — `fts5vocab`. ✅ DONE (correct-results).** The `fts5vocab`
+    module (`Fts5VocabModule` in `vtab.rs`, registered when `fts5` is enabled)
+    presents another FTS5 table's vocabulary in all three forms: `row` (term,
+    doc, cnt), `col` (term, col, doc, cnt), and `instance` (term, doc, col,
+    offset). `connect` validates `(table, type)` and declares the form's columns;
+    the executor's `scan_fts5vocab` tokenizes the referenced table's documents
+    (same `fts5_tokenize` as indexing) and aggregates, byte-identical to sqlite3
+    (`tests/fts5vocab.rs`). *(The `instance` form's `offset` column must be
+    quoted in graphite — `offset` is a reserved word in its parser, an orthogonal
+    gap.)*
   - **D2e — byte-compatible on-disk segment format** is the remaining FTS5 track
     (the `%_data`/`%_idx` inverted-index b-tree layout sqlite writes; needs the
     real inverted index of D2b — graphite's fts5 is currently scan-based).

@@ -5561,6 +5561,12 @@ impl Connection {
             Ok(Statement::CreateVirtualTable(cvt)) => cvt,
             _ => return Ok(None),
         };
+        // `fts5vocab` is derived from another FTS5 table's documents; compute it
+        // here (the module's cursor has no database access).
+        #[cfg(feature = "fts5")]
+        if cvt.module.eq_ignore_ascii_case("fts5vocab") {
+            return Ok(Some(self.scan_fts5vocab(&cvt.args, name, alias)?));
+        }
         let module = self
             .vtab_registry
             .get(&cvt.module)
@@ -12162,6 +12168,147 @@ impl Connection {
             }
         }
 
+        Ok((columns, rows))
+    }
+
+    /// The `fts5vocab` virtual table: a read-only view over another FTS5 table's
+    /// vocabulary. `args` is the `USING fts5vocab(...)` list; `vocab_name`/`alias`
+    /// label the result. Tokenizes the referenced table's documents (with the
+    /// same `fts5_tokenize` used for indexing) and aggregates per the requested
+    /// form — `row` (term, doc, cnt), `col` (term, col, doc, cnt), or `instance`
+    /// (term, doc, col, offset) — byte-compatible with SQLite's fts5vocab.
+    #[cfg(feature = "fts5")]
+    fn scan_fts5vocab(
+        &self,
+        args: &[String],
+        vocab_name: &str,
+        alias: Option<&str>,
+    ) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
+        use alloc::collections::{BTreeMap, BTreeSet};
+
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (ft_name, form) = crate::vtab::fts5vocab_args(&arg_refs)?;
+
+        let label = alias.unwrap_or(vocab_name).to_string();
+        let colnames: &[&str] = match form.as_str() {
+            "row" => &["term", "doc", "cnt"],
+            "col" => &["term", "col", "doc", "cnt"],
+            _ => &["term", "doc", "col", "offset"],
+        };
+        let columns: Vec<ColumnInfo> = colnames
+            .iter()
+            .map(|n| ColumnInfo {
+                name: String::from(*n),
+                table: label.clone(),
+                affinity: eval::Affinity::Blob,
+                collation: crate::value::Collation::default(),
+            })
+            .collect();
+
+        // The referenced FTS5 table: its column names + documents (the persistent
+        // `<ft>_data` backing table holds one row per document, column-ordered).
+        let (ft_module, _ft_args, ft_schema) = self.vtab_meta(&ft_name)?;
+        if !ft_module.eq_ignore_ascii_case("fts5") {
+            return Err(Error::Error(format!("no such fts5 table: {ft_name}")));
+        }
+        let ft_cols = ft_schema.columns;
+        let bmeta = self.table_meta(&format!("{ft_name}_data"), None)?;
+        let docs = self.scan_table(&bmeta)?;
+
+        // FTS5 columns store text; coerce other stored types the way SQLite does
+        // (NULL/blob contribute no tokens).
+        let to_text = |v: &Value| -> Option<String> {
+            match v {
+                Value::Text(s) => Some(s.clone()),
+                Value::Integer(i) => Some(i.to_string()),
+                Value::Real(r) => Some(eval::format_real(*r)),
+                Value::Null | Value::Blob(_) => None,
+            }
+        };
+
+        let mut rows: Vec<InputRow> = Vec::new();
+        match form.as_str() {
+            "row" => {
+                // term → (distinct documents, total occurrences)
+                let mut map: BTreeMap<String, (BTreeSet<i64>, i64)> = BTreeMap::new();
+                for (rowid, vals) in &docs {
+                    for v in vals.iter().take(ft_cols.len()) {
+                        if let Some(t) = to_text(v) {
+                            for tok in crate::vtab::fts5_tokenize(&t, false) {
+                                let e = map.entry(tok).or_default();
+                                e.0.insert(*rowid);
+                                e.1 += 1;
+                            }
+                        }
+                    }
+                }
+                for (term, (ds, cnt)) in map {
+                    rows.push(InputRow {
+                        values: alloc::vec![
+                            Value::Text(term),
+                            Value::Integer(ds.len() as i64),
+                            Value::Integer(cnt),
+                        ],
+                        rowid: None,
+                    });
+                }
+            }
+            "col" => {
+                // (term, column index) → (distinct documents, total occurrences)
+                let mut map: BTreeMap<(String, usize), (BTreeSet<i64>, i64)> = BTreeMap::new();
+                for (rowid, vals) in &docs {
+                    for (ci, v) in vals.iter().take(ft_cols.len()).enumerate() {
+                        if let Some(t) = to_text(v) {
+                            for tok in crate::vtab::fts5_tokenize(&t, false) {
+                                let e = map.entry((tok, ci)).or_default();
+                                e.0.insert(*rowid);
+                                e.1 += 1;
+                            }
+                        }
+                    }
+                }
+                for ((term, ci), (ds, cnt)) in map {
+                    rows.push(InputRow {
+                        values: alloc::vec![
+                            Value::Text(term),
+                            Value::Text(ft_cols[ci].clone()),
+                            Value::Integer(ds.len() as i64),
+                            Value::Integer(cnt),
+                        ],
+                        rowid: None,
+                    });
+                }
+            }
+            _ => {
+                // instance: one row per token occurrence (term, doc, col, offset),
+                // offset being the 0-based token position within that column.
+                let mut insts: Vec<(String, i64, usize, i64)> = Vec::new();
+                for (rowid, vals) in &docs {
+                    for (ci, v) in vals.iter().take(ft_cols.len()).enumerate() {
+                        if let Some(t) = to_text(v) {
+                            for (off, tok) in crate::vtab::fts5_tokenize(&t, false)
+                                .into_iter()
+                                .enumerate()
+                            {
+                                insts.push((tok, *rowid, ci, off as i64));
+                            }
+                        }
+                    }
+                }
+                insts.sort();
+                for (term, rowid, ci, off) in insts {
+                    rows.push(InputRow {
+                        values: alloc::vec![
+                            Value::Text(term),
+                            Value::Integer(rowid),
+                            Value::Text(ft_cols[ci].clone()),
+                            Value::Integer(off),
+                        ],
+                        rowid: None,
+                    });
+                }
+            }
+        }
         Ok((columns, rows))
     }
 

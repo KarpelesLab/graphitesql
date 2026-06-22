@@ -585,6 +585,9 @@ impl VTabRegistry {
         #[cfg(feature = "fts5")]
         reg.register("fts5", Box::new(Fts5Module))
             .expect("fresh registry has no name collisions");
+        #[cfg(feature = "fts5")]
+        reg.register("fts5vocab", Box::new(Fts5VocabModule))
+            .expect("fresh registry has no name collisions");
         reg
     }
 }
@@ -2561,6 +2564,67 @@ impl VTabModule for Fts5Module {
                 Ok(new_rowid)
             }
         }
+    }
+}
+
+/// The `fts5vocab` module: a read-only view over another FTS5 table's
+/// vocabulary. `connect` validates the `(fts5-table, type)` arguments and
+/// declares the columns for the requested `type`. The rows are computed by the
+/// executor (`scan_fts5vocab`), which has access to the referenced table's
+/// documents — so this module's cursor is never drained (like [`Fts5Cursor`]).
+#[cfg(feature = "fts5")]
+pub struct Fts5VocabModule;
+
+/// Parse an `fts5vocab` argument list into `(referenced-table, form)`. Accepts
+/// `(table, type)` and `(db, table, type)`; the `type` token is unquoted and
+/// case-folded to one of `row` / `col` / `instance`.
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5vocab_args(
+    args: &[&str],
+) -> Result<(alloc::string::String, alloc::string::String)> {
+    let strip = |s: &str| {
+        alloc::string::String::from(s.trim().trim_matches(|c| c == '\'' || c == '"' || c == '`'))
+    };
+    let (table, form) = match args.len() {
+        2 => (strip(args[0]), strip(args[1])),
+        3 => (strip(args[1]), strip(args[2])),
+        _ => {
+            return Err(Error::Error(alloc::string::String::from(
+                "fts5vocab: expected (fts5-table, type)",
+            )))
+        }
+    };
+    let form = form.to_ascii_lowercase();
+    if !matches!(form.as_str(), "row" | "col" | "instance") {
+        return Err(Error::Error(alloc::format!(
+            "fts5vocab: unknown table type: {form:?}"
+        )));
+    }
+    Ok((table, form))
+}
+
+#[cfg(feature = "fts5")]
+impl VTabModule for Fts5VocabModule {
+    type Cursor = Fts5Cursor;
+
+    fn connect(&self, args: &[&str]) -> Result<VTabSchema> {
+        let (_table, form) = fts5vocab_args(args)?;
+        let columns: &[&str] = match form.as_str() {
+            "row" => &["term", "doc", "cnt"],
+            "col" => &["term", "col", "doc", "cnt"],
+            // instance
+            _ => &["term", "doc", "col", "offset"],
+        };
+        Ok(VTabSchema::new(columns.iter().copied()))
+    }
+
+    fn open(&self, _args: &[&str], _plan: &IndexPlan) -> Result<Fts5Cursor> {
+        Ok(Fts5Cursor)
+    }
+
+    // Derived from the referenced table — no backing storage of its own.
+    fn persistent(&self) -> bool {
+        false
     }
 }
 
