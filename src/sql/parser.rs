@@ -1800,8 +1800,17 @@ impl Parser {
                 let _ = self.eat_kw("column");
                 let old = self.ident()?;
                 self.expect_kw("to")?;
+                // SQLite reproduces the new name in the stored schema text exactly
+                // as written: a quoted identifier stays double-quoted, a bare word
+                // stays bare.
+                let new_quoted = matches!(self.peek(), Some(Token::Ident(_)));
                 let new = self.ident()?;
-                AlterAction::RenameColumn { old, new }
+                let new_text = if new_quoted {
+                    crate::sql::print::ident(&new)
+                } else {
+                    new.clone()
+                };
+                AlterAction::RenameColumn { old, new, new_text }
             }
         } else if self.eat_kw("add") {
             let _ = self.eat_kw("column");

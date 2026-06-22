@@ -699,8 +699,12 @@ pub enum AlterAction {
     RenameColumn {
         /// Existing column name.
         old: String,
-        /// New column name.
+        /// New column name (unquoted).
         new: String,
+        /// The new name rendered for the stored schema text — bare if the user
+        /// wrote it as a bare word, double-quoted if they quoted it — so a
+        /// text-preserving rewrite reproduces SQLite's output.
+        new_text: String,
     },
     /// `ADD [COLUMN] <column-def>`. The second field is the column definition's
     /// verbatim source text, which SQLite appends to the stored CREATE text as

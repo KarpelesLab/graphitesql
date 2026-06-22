@@ -5664,7 +5664,11 @@ impl Connection {
                         // preserved), so `SELECT … FROM v` keeps working.
                         match cols.get(4).cloned() {
                             Some(Value::Text(vsql)) if view_uses_table(&vsql, &old) => {
-                                cols[4] = Value::Text(rewrite_ident_tokens(&vsql, &old, &new_name));
+                                cols[4] = Value::Text(rewrite_ident_tokens(
+                                    &vsql,
+                                    &old,
+                                    &sql::print::ident(&new_name),
+                                ));
                                 true
                             }
                             _ => false,
@@ -5674,7 +5678,7 @@ impl Connection {
                     }
                 })?;
             }
-            AlterAction::RenameColumn { old, new } => {
+            AlterAction::RenameColumn { old, new, new_text } => {
                 let pos = ct
                     .columns
                     .iter()
@@ -5724,31 +5728,26 @@ impl Connection {
                         }
                     }
                 }
-                let new_table_sql = sql::print::create_table(&ct);
+                // The AST reprint is only a fallback; normally we edit the stored
+                // text in place so the column's formatting is preserved like sqlite.
+                let reprint = sql::print::create_table(&ct);
                 let table = a.table.clone();
                 let old = old.clone();
-                let new = new.clone();
+                let new_text = new_text.clone();
                 self.rewrite_schema_rows(|cols| {
                     if is_text(&cols[0], "table") && is_text(&cols[1], &table) {
-                        cols[4] = Value::Text(new_table_sql.clone());
+                        cols[4] = Value::Text(match cols.get(4) {
+                            Some(Value::Text(s)) => rewrite_ident_tokens(s, &old, &new_text),
+                            _ => reprint.clone(),
+                        });
                         true
                     } else if is_text(&cols[0], "index") && is_text(&cols[2], &table) {
                         // Rewrite an index over this table if it names the column.
                         if let Some(Value::Text(isql)) = cols.get(4).cloned() {
-                            if let Ok(Statement::CreateIndex(mut ci)) = sql::parse_one(&isql) {
-                                let mut changed = false;
-                                for term in &mut ci.columns {
-                                    if let Expr::Column { column, .. } = &mut term.expr {
-                                        if column.eq_ignore_ascii_case(&old) {
-                                            *column = new.clone();
-                                            changed = true;
-                                        }
-                                    }
-                                }
-                                if changed {
-                                    cols[4] = Value::Text(sql::print::create_index(&ci));
-                                    return true;
-                                }
+                            let rewritten = rewrite_ident_tokens(&isql, &old, &new_text);
+                            if rewritten != isql {
+                                cols[4] = Value::Text(rewritten);
+                                return true;
                             }
                         }
                         false
@@ -5801,7 +5800,8 @@ impl Connection {
                 cols[1] = Value::Text(new_s.clone());
                 cols[2] = Value::Text(new_s.clone());
                 if let Some(Value::Text(s)) = cols.get(4).cloned() {
-                    cols[4] = Value::Text(rewrite_ident_tokens(&s, &old_s, &new_s));
+                    cols[4] =
+                        Value::Text(rewrite_ident_tokens(&s, &old_s, &sql::print::ident(&new_s)));
                 }
                 true
             } else {
@@ -15061,17 +15061,18 @@ fn view_uses_table(view_sql: &str, name: &str) -> bool {
 }
 
 /// Rewrite stored DDL text, repointing every bare or double-quoted identifier
-/// token equal to `old` (case-insensitively) to `new` while preserving all other
-/// source text — whitespace, comments, and string/blob literals (which tokenize
-/// as `Str`/`Blob`, never identifiers, so their contents are never touched). This
-/// mirrors SQLite's text-preserving rename rather than reprinting from the AST.
-fn rewrite_ident_tokens(sql: &str, old: &str, new: &str) -> String {
+/// token equal to `old` (case-insensitively) to the already-rendered `rendered`
+/// text while preserving all other source text — whitespace, comments, and
+/// string/blob literals (which tokenize as `Str`/`Blob`, never identifiers, so
+/// their contents are never touched). This mirrors SQLite's text-preserving
+/// rename rather than reprinting from the AST. `rendered` is the replacement as
+/// it should appear (a table rename passes the double-quoted name; a column
+/// rename passes the new name bare or quoted exactly as the user wrote it).
+fn rewrite_ident_tokens(sql: &str, old: &str, rendered: &str) -> String {
     let toks = match sql::token::tokenize(sql) {
         Ok(t) => t,
         Err(_) => return String::from(sql),
     };
-    // SQLite double-quotes the substituted name in a rename rewrite; match that.
-    let rendered = sql::print::ident(new);
     let mut out = String::new();
     let mut cursor = 0usize;
     for (i, sp) in toks.iter().enumerate() {
@@ -15094,7 +15095,7 @@ fn rewrite_ident_tokens(sql: &str, old: &str, new: &str) -> String {
             continue;
         }
         out.push_str(&sql[cursor..sp.start]);
-        out.push_str(&rendered);
+        out.push_str(rendered);
         cursor = sp.end;
     }
     out.push_str(&sql[cursor..]);

@@ -96,6 +96,56 @@ fn add_column_appends_verbatim_to_schema_text() {
 }
 
 #[test]
+fn rename_column_preserves_schema_text() {
+    // ALTER … RENAME COLUMN edits the column name in the stored CREATE text in
+    // place (renaming it inside CHECK/generated expressions and dependent index
+    // definitions too), reproducing the new name exactly as written — bare for a
+    // bare word, double-quoted for a quoted identifier — like sqlite.
+    let sql_after = |create: &[&str], rename: &str, ty: &str| -> String {
+        let mut c = Connection::open_memory().unwrap();
+        for s in create {
+            c.execute(s).unwrap();
+        }
+        c.execute(rename).unwrap();
+        match &c
+            .query(&format!("SELECT sql FROM sqlite_master WHERE type='{ty}'"))
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    // Renamed inside a CHECK expression, bare new name.
+    assert_eq!(
+        sql_after(
+            &["CREATE TABLE t(aa INT, b, CHECK(aa>0))"],
+            "ALTER TABLE t RENAME COLUMN aa TO yy",
+            "table",
+        ),
+        "CREATE TABLE t(yy INT, b, CHECK(yy>0))"
+    );
+    // A quoted new name stays double-quoted.
+    assert_eq!(
+        sql_after(
+            &["CREATE TABLE t(a, b)"],
+            "ALTER TABLE t RENAME COLUMN a TO \"x y\"",
+            "table",
+        ),
+        "CREATE TABLE t(\"x y\", b)"
+    );
+    // A dependent index is repointed in place too.
+    assert_eq!(
+        sql_after(
+            &["CREATE TABLE t(a, b)", "CREATE INDEX i ON t(a, b)"],
+            "ALTER TABLE t RENAME COLUMN a TO x",
+            "index",
+        ),
+        "CREATE INDEX i ON t(x, b)"
+    );
+}
+
+#[test]
 fn drop_column_preserves_schema_text() {
     // ALTER … DROP COLUMN removes the column (and one adjacent comma) from the
     // stored CREATE text in place, preserving the others verbatim — like sqlite.

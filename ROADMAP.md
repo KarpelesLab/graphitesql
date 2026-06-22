@@ -217,19 +217,18 @@ with "no such table/column" after a rename). Build bottom-up:
   scope-aware — a bare `oldcol` token can belong to another table, so the
   token-rewrite trick used for A-rn2 is unsafe here; this needs real name
   resolution mapping resolved column refs back to source spans.*
-- **A-rn4 — text-preserving schema edits** *(cosmetic, lower priority).* graphite
-  reprints the affected CREATE from its AST (quoted/canonical), so
-  `SELECT sql FROM sqlite_master` after an ALTER differs from sqlite's
-  text-preserving token edit. Match it by editing the stored text in place. **`RENAME
-  TO` ✅ DONE** — `rename_table_token_after` edits just the table-name token (in the
-  table's own CREATE and in each dependent index's `ON` clause), quoting only the
-  new name and preserving the body verbatim, byte-identical to sqlite. **`ADD
-  COLUMN` ✅ DONE** — `append_column_to_create` splices the column's verbatim
-  source text before the column-list's closing paren. **`DROP COLUMN` ✅ DONE** —
-  `drop_column_from_create` removes the column segment and one adjacent comma,
-  preserving the others verbatim. *Remaining: `RENAME COLUMN` still reprints from
-  the AST — an in-place token rename needs sqlite's keyword list to decide when to
-  quote the new name (it quotes a keyword / non-simple identifier, else bare).*
+- **A-rn4 — text-preserving schema edits. ✅ DONE.** Every `ALTER TABLE` now edits
+  the stored CREATE text in place rather than reprinting the (quoted/canonical) AST,
+  so `SELECT sql FROM sqlite_master` is byte-identical to sqlite: **`RENAME TO`**
+  (`rename_table_token_after` edits just the table-name token in the table's own
+  CREATE and each dependent index's `ON` clause); **`ADD COLUMN`**
+  (`append_column_to_create` splices the column's verbatim source before the
+  closing paren); **`DROP COLUMN`** (`drop_column_from_create` removes the column
+  segment + one adjacent comma); **`RENAME COLUMN`** (`rewrite_ident_tokens`
+  repoints the column identifier in the CREATE — inside CHECK/generated exprs and
+  dependent index defs too — reproducing the new name bare or double-quoted exactly
+  as the user wrote it, captured as `AlterAction::RenameColumn::new_text`; no
+  keyword list needed since SQLite preserves the user's quoting, not a re-decision).
 
 ### Track B — Query planner, statistics & the VDBE
 
