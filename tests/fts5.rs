@@ -763,3 +763,66 @@ fn persists_and_passes_integrity_check() {
         text("ok")
     );
 }
+
+// ── D2e (M1): read a SQLite-written FTS5 (its `%_content` documents) ─────────
+
+/// graphite reads an FTS5 table written by `sqlite3` — whose documents live in
+/// `<name>_content` and inverted index in `<name>_data`/`_idx` — by reading the
+/// content and answering queries (including `MATCH`) with its scan-based matcher.
+/// Also exercises the parser accepting SQLite's single-quoted shadow-table names
+/// (`CREATE TABLE 'ft_data'(…)`), without which the file would not even parse.
+#[test]
+fn reads_sqlite_written_fts5_content() {
+    use std::process::Command;
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-fts5-d2e-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let o = Command::new("sqlite3")
+        .arg(&path)
+        .arg(
+            "CREATE VIRTUAL TABLE ft USING fts5(a, b); \
+             INSERT INTO ft VALUES('hello world','foo bar'),('the quick fox','lazy dog'),\
+                                  ('hello again','more foo');",
+        )
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "sqlite build failed: {o:?}");
+
+    let c = Connection::open(&path).unwrap();
+    assert_eq!(
+        rows(&c, "SELECT count(*) FROM ft"),
+        [vec![Value::Integer(3)]]
+    );
+    assert_eq!(
+        rows(&c, "SELECT rowid, a, b FROM ft ORDER BY rowid"),
+        [
+            vec![Value::Integer(1), text("hello world"), text("foo bar")],
+            vec![Value::Integer(2), text("the quick fox"), text("lazy dog")],
+            vec![Value::Integer(3), text("hello again"), text("more foo")],
+        ]
+    );
+    // MATCH (table-wide, multi-hit, and column-scoped) is answered from the docs.
+    assert_eq!(
+        rows(&c, "SELECT rowid FROM ft WHERE ft MATCH 'fox'"),
+        [vec![Value::Integer(2)]]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT rowid FROM ft WHERE ft MATCH 'hello' ORDER BY rowid"
+        ),
+        [vec![Value::Integer(1)], vec![Value::Integer(3)]]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT rowid FROM ft WHERE b MATCH 'foo' ORDER BY rowid"
+        ),
+        [vec![Value::Integer(1)], vec![Value::Integer(3)]]
+    );
+    let _ = std::fs::remove_file(&path);
+}

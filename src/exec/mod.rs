@@ -5858,6 +5858,32 @@ impl Connection {
                     return Ok(Some((columns, rows)));
                 }
             }
+            // A SQLite-written FTS5 keeps its documents in `<name>_content`
+            // (`id, c0, c1, …`), with the inverted index in `<name>_data`/`_idx`.
+            // graphite answers queries — including `MATCH` — from the documents via
+            // its scan-based matcher, so reading the content is sufficient.
+            // (graphite's own FTS5 has no `_content`; it stores docs in `_data`.)
+            #[cfg(feature = "fts5")]
+            if cvt.module.eq_ignore_ascii_case("fts5")
+                && self.schema.table(&format!("{name}_content")).is_some()
+            {
+                let cmeta = self.table_meta(&format!("{name}_content"), None)?;
+                let rows = self
+                    .scan_table(&cmeta)?
+                    .into_iter()
+                    .map(|(rowid, mut values)| {
+                        // Drop the leading `id` column; the rest are the fts5 columns.
+                        if !values.is_empty() {
+                            values.remove(0);
+                        }
+                        InputRow {
+                            values,
+                            rowid: Some(rowid),
+                        }
+                    })
+                    .collect();
+                return Ok(Some((columns, rows)));
+            }
             let backing = format!("{name}_data");
             let bmeta = self.table_meta(&backing, None)?;
             let rows = self

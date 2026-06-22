@@ -918,11 +918,23 @@ impl Parser {
 
     /// Parse `[schema .] name`, returning the optional schema qualifier and name.
     fn qualified_name(&mut self) -> Result<(Option<String>, String)> {
-        let first = self.ident()?;
+        let first = self.object_name()?;
         if self.eat(&Token::Dot) {
-            Ok((Some(first), self.ident()?))
+            Ok((Some(first), self.object_name()?))
         } else {
             Ok((None, first))
+        }
+    }
+
+    /// A schema-object name. Besides a bare/`"quoted"` identifier, SQLite accepts
+    /// a string literal in a name position — its FTS5 shadow tables are stored as
+    /// `CREATE TABLE 'fts_data'(…)` — so a `Str` token is taken as the name too.
+    fn object_name(&mut self) -> Result<String> {
+        match self.advance() {
+            Some(Token::Word(w)) => Ok(w),
+            Some(Token::Ident(i)) => Ok(i),
+            Some(Token::Str(s)) => Ok(s),
+            other => Err(Error::Parse(format!("expected a name, found {other:?}"))),
         }
     }
 
