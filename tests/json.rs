@@ -126,6 +126,18 @@ fn against_sqlite3() {
         r#"SELECT json_valid(jsonb('{"a":1}'),1)"#,
         r#"SELECT json_valid('5',8)"#,
         r#"SELECT json_valid(jsonb('5'))"#,
+        // JSON subtype propagation: the json aggregates, multi-path json_extract,
+        // and the `->` operator all carry the JSON subtype, so an enclosing
+        // json_quote / json_array / json_object embeds them as JSON rather than
+        // re-quoting the text. (`->>` and single-path scalar extracts do not.)
+        r#"SELECT json_quote(json_group_array(value)) FROM (SELECT 1 AS value UNION SELECT 2)"#,
+        r#"SELECT json_quote(json_group_object('a',1))"#,
+        r#"SELECT json_array(json_group_array(value)) FROM (SELECT 1 AS value UNION SELECT 2)"#,
+        r#"SELECT json_object('k', json_group_array(value)) FROM (SELECT 1 AS value UNION SELECT 2)"#,
+        r#"SELECT json_quote(json_extract('{"a":1,"b":2}','$.a','$.b'))"#,
+        r#"SELECT json_quote('{"a":1}' -> '$.a')"#,
+        r#"SELECT json_quote('{"a":"hi"}' -> '$.a')"#,
+        r#"SELECT json_quote('{"a":1}' ->> '$.a')"#,
     ];
     let c = Connection::open_memory().unwrap();
     let mut failures = Vec::new();

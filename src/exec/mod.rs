@@ -12699,7 +12699,28 @@ impl Connection {
                 let v = self.compute_aggregate(
                     name, *distinct, args, *star, order_by, columns, rows, group, params,
                 )?;
-                Expr::Literal(value_to_literal(v))
+                let lit = Expr::Literal(value_to_literal(v));
+                // The JSON aggregates emit a value carrying SQLite's JSON subtype.
+                // Substitution to a bare literal would drop that, so an enclosing
+                // json_quote/json_array/json_object would re-quote it. Re-wrap in
+                // json() (idempotent on valid JSON) so the subtype marker — which
+                // func::produces_json keys off the expression — survives.
+                if matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "json_group_array" | "json_group_object"
+                ) {
+                    Expr::Function {
+                        name: String::from("json"),
+                        distinct: false,
+                        args: alloc::vec![lit],
+                        star: false,
+                        filter: None,
+                        order_by: Vec::new(),
+                        over: None,
+                    }
+                } else {
+                    lit
+                }
             }
             Expr::Function {
                 name,

@@ -1259,20 +1259,31 @@ pub(crate) fn arg_to_json(val: &Value, expr: Option<&Expr>) -> super::json::Json
     super::json::value_to_json(val)
 }
 
-/// Whether an expression yields a value carrying SQLite's JSON subtype.
+/// Whether an expression *statically* yields a value carrying SQLite's JSON
+/// subtype. Functions that always emit a JSON structure (including the
+/// `json_group_array`/`json_group_object` aggregates) qualify; `json_extract`
+/// only with two or more paths (then its result is always a JSON array — a
+/// single path's subtype is value-dependent and needs the runtime subtype, not
+/// modelled here); the `->` operator always carries the subtype (`->>` does not).
 fn produces_json(e: &Expr) -> bool {
     match e {
-        Expr::Function { name, .. } => matches!(
-            name.to_ascii_lowercase().as_str(),
-            "json"
-                | "json_array"
-                | "json_object"
-                | "json_insert"
-                | "json_replace"
-                | "json_set"
-                | "json_patch"
-                | "json_remove"
-        ),
+        Expr::Function { name, args, .. } => {
+            let lname = name.to_ascii_lowercase();
+            match lname.as_str() {
+                "json" | "json_array" | "json_object" | "json_insert" | "json_replace"
+                | "json_set" | "json_patch" | "json_remove" | "json_group_array"
+                | "json_group_object" => true,
+                // Multiple paths → a JSON array (subtype). One path's subtype is
+                // value-dependent (structure vs scalar), so don't claim it here.
+                "json_extract" => args.len() >= 3,
+                _ => false,
+            }
+        }
+        // `->` (JsonExtract) carries the JSON subtype; `->>` (JsonExtractText) does not.
+        Expr::Binary {
+            op: crate::sql::ast::BinaryOp::JsonExtract,
+            ..
+        } => true,
         Expr::Paren(inner) => produces_json(inner),
         _ => false,
     }
