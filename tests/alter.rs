@@ -523,3 +523,75 @@ fn rename_column_propagates_into_foreign_keys() {
     // The parent's own column is renamed (existing behavior).
     assert_eq!(sql("p"), "CREATE TABLE p(label)");
 }
+
+#[test]
+fn rename_column_propagates_into_single_source_view() {
+    // Renaming a column propagates into a view that draws from ONLY that table —
+    // every reference (bare, table-qualified, and through an alias) is rewritten
+    // byte-for-byte like sqlite3, and the view still queries correctly.
+    let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    let cases = [
+        "CREATE VIEW v AS SELECT a, b FROM t",
+        "CREATE VIEW v AS SELECT t.a, b FROM t WHERE t.a > 0",
+        "CREATE VIEW v AS SELECT a AS x FROM t ORDER BY a",
+    ];
+    for view in cases {
+        let ddl = format!("CREATE TABLE t(a INT, b INT); {view};");
+        let alter = "ALTER TABLE t RENAME COLUMN a TO renamed;";
+        let mut c = Connection::open_memory().unwrap();
+        for s in ddl.split(';').chain(alter.split(';')) {
+            if !s.trim().is_empty() {
+                c.execute(s).unwrap();
+            }
+        }
+        let got = match &c
+            .query("SELECT sql FROM sqlite_master WHERE name='v'")
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        };
+        assert!(
+            !got.contains(" a ") && !got.contains(",a") && !got.contains(".a "),
+            "view still references the old column: {got}"
+        );
+        if sqlite {
+            let want = {
+                let o = Command::new("sqlite3")
+                    .arg(":memory:")
+                    .arg(format!(
+                        "{ddl} {alter} SELECT sql FROM sqlite_master WHERE name='v';"
+                    ))
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+            };
+            assert_eq!(got, want, "view rewrite diverged for: {view}");
+        }
+    }
+}
+
+#[test]
+fn rename_column_does_not_corrupt_multi_table_view() {
+    // A multi-table view needs scope-aware resolution (the A-rn3 remainder); the
+    // safe path must NOT corrupt the other table's same-named column — it leaves
+    // the view unchanged rather than blindly renaming `u.a`.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INT, b INT)").unwrap();
+    c.execute("CREATE TABLE u(a INT, c INT)").unwrap();
+    c.execute("CREATE VIEW v AS SELECT t.a, u.a AS ua FROM t JOIN u ON t.b = u.c")
+        .unwrap();
+    c.execute("ALTER TABLE t RENAME COLUMN a TO renamed")
+        .unwrap();
+    let got = match &c
+        .query("SELECT sql FROM sqlite_master WHERE name='v'")
+        .unwrap()
+        .rows[0][0]
+    {
+        Value::Text(s) => s.clone(),
+        o => panic!("not text: {o:?}"),
+    };
+    // `u.a` (the other table's column) is never touched.
+    assert!(got.contains("u.a AS ua"), "corrupted u.a: {got}");
+}

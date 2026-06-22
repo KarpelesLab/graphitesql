@@ -6152,6 +6152,30 @@ impl Connection {
                             }
                         }
                         false
+                    } else if is_text(&cols[0], "view") {
+                        // A view that draws from ONLY the renamed table (no joins,
+                        // subqueries, CTEs, or compound parts, and no alias named
+                        // `old`): every column reference resolves to that table, so
+                        // a bare/qualified column-token rewrite is provably safe.
+                        // Multi-source views need scope-aware resolution and are
+                        // left unchanged (A-rn3 remainder).
+                        match cols.get(4).cloned() {
+                            Some(Value::Text(vsql)) => {
+                                match view_single_source_column_quals(&vsql, &table, &old) {
+                                    Some(quals) => {
+                                        let rewritten =
+                                            rewrite_column_tokens(&vsql, &quals, &old, &new_text);
+                                        if rewritten != vsql {
+                                            cols[4] = Value::Text(rewritten);
+                                            return true;
+                                        }
+                                        false
+                                    }
+                                    None => false,
+                                }
+                            }
+                            _ => false,
+                        }
                     } else {
                         false
                     }
@@ -15630,6 +15654,118 @@ fn rewrite_fk_parent_column(sql: &str, parent: &str, old: &str, rendered: &str) 
         out.push_str(&sql[cursor..s]);
         out.push_str(rendered);
         cursor = e;
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
+/// For a `CREATE VIEW` whose `SELECT` draws from exactly one source — the
+/// renamed `table`, with no joins, subqueries, CTEs, or compound parts — return
+/// the qualifiers under which that table's columns can appear (its name plus any
+/// alias) so a column rename can be applied by a token rewrite. Returns `None`
+/// when a rewrite could be unsafe (multi-source, a subquery that could reach
+/// another table, the renamed column's name collides with the table or an alias)
+/// — those views are left unchanged, the remaining scope-aware A-rn3 work.
+fn view_single_source_column_quals(view_sql: &str, table: &str, old: &str) -> Option<Vec<String>> {
+    let Ok(Statement::CreateView(cv)) = sql::parse_one(view_sql) else {
+        return None;
+    };
+    let sel = &cv.select;
+    if !sel.ctes.is_empty() || !sel.compound.is_empty() {
+        return None;
+    }
+    // A column named the same as its table would make the table-name token in
+    // `FROM <table>` indistinguishable from a column reference — bail.
+    if old.eq_ignore_ascii_case(table) {
+        return None;
+    }
+    let from = sel.from.as_ref()?;
+    if !from.joins.is_empty() || from.first.subquery.is_some() || from.first.tvf_args.is_some() {
+        return None;
+    }
+    if !from.first.name.eq_ignore_ascii_case(table) {
+        return None;
+    }
+    let mut quals = alloc::vec![table.to_string()];
+    if let Some(a) = &from.first.alias {
+        if a.eq_ignore_ascii_case(old) {
+            return None; // alias collides with the renamed column name
+        }
+        quals.push(a.clone());
+    }
+    // Any subquery could reference another table (breaking the single-source
+    // guarantee); a result-column alias equal to `old` would be wrongly renamed.
+    for rc in &sel.columns {
+        if let ResultColumn::Expr { expr, alias, .. } = rc {
+            if expr_has_subquery(expr) {
+                return None;
+            }
+            if alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(old))
+            {
+                return None;
+            }
+        }
+    }
+    let mut clean = true;
+    for e in sel
+        .where_clause
+        .iter()
+        .chain(sel.group_by.iter())
+        .chain(sel.having.iter())
+    {
+        clean &= !expr_has_subquery(e);
+    }
+    for t in &sel.order_by {
+        clean &= !expr_has_subquery(&t.expr);
+    }
+    if !clean {
+        return None;
+    }
+    Some(quals)
+}
+
+/// Token-rewrite a column rename in DDL where every reference to `old` is known
+/// to belong to one of `quals` (a single-source object's table name / aliases):
+/// rename a bare `old` ident and a qualified `<q>.old` whose qualifier `q` is in
+/// `quals`, preserving all other text. A function name (`old(`) and a column tail
+/// qualified by anything else are left intact.
+fn rewrite_column_tokens(sql: &str, quals: &[String], old: &str, rendered: &str) -> String {
+    use sql::token::Token;
+    let toks = match sql::token::tokenize(sql) {
+        Ok(t) => t,
+        Err(_) => return String::from(sql),
+    };
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for (i, sp) in toks.iter().enumerate() {
+        let hit =
+            matches!(&sp.token, Token::Word(w) | Token::Ident(w) if w.eq_ignore_ascii_case(old));
+        if !hit {
+            continue;
+        }
+        // A function name (`old(`) is never a column reference.
+        if toks
+            .get(i + 1)
+            .is_some_and(|n| matches!(n.token, Token::LParen))
+        {
+            continue;
+        }
+        let after_dot = i > 0 && matches!(toks[i - 1].token, Token::Dot);
+        if after_dot {
+            // Rename only `<qualifier>.old` where the qualifier is the table or an
+            // alias; leave any other `x.old` untouched.
+            let qual_ok = i >= 2
+                && matches!(&toks[i - 2].token, Token::Word(q) | Token::Ident(q)
+                    if quals.iter().any(|t| t.eq_ignore_ascii_case(q)));
+            if !qual_ok {
+                continue;
+            }
+        }
+        out.push_str(&sql[cursor..sp.start]);
+        out.push_str(rendered);
+        cursor = sp.end;
     }
     out.push_str(&sql[cursor..]);
     out
