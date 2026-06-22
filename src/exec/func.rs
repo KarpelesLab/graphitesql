@@ -639,14 +639,40 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             }
         }
         "json_valid" => {
-            arity(&lname, args, 1)?;
+            if v.is_empty() || v.len() > 2 {
+                return Err(Error::Error(
+                    "wrong number of arguments to function json_valid()".into(),
+                ));
+            }
+            // The optional flags select which well-formedness checks count, and
+            // must be 1..=15 (sqlite errors otherwise): 0x01 = strict RFC-8259
+            // JSON text, 0x02 = JSON5 text, 0x04 = a BLOB that looks like JSONB,
+            // 0x08 = a BLOB that is fully-valid JSONB. The 1-argument form is 0x01
+            // (strict JSON only) — JSON5 acceptance needs the explicit flag.
+            let flags = match v.get(1) {
+                None => 1,
+                Some(f) => {
+                    let n = eval::to_i64(f);
+                    if !(1..=15).contains(&n) {
+                        return Err(Error::Error(
+                            "FLAGS parameter to json_valid() must be between 1 and 15".into(),
+                        ));
+                    }
+                    n
+                }
+            };
             match &v[0] {
                 Value::Null => Value::Null,
-                // The 1-argument form is restricted to strict RFC-8259 JSON
-                // (sqlite reserves JSON5 acceptance for the 2-argument flag form),
-                // unlike `json()`/`json_extract()` which accept the JSON5 superset.
+                // A BLOB is only ever judged against the JSONB flag bits; text bits
+                // do not apply (and vice versa for a text value).
+                Value::Blob(b) => {
+                    let ok = flags & 0x0c != 0 && super::json::Json::from_jsonb(b).is_some();
+                    Value::Integer(ok as i64)
+                }
                 other => {
-                    let ok = super::json::is_strict_json(&eval::to_text(other));
+                    let text = eval::to_text(other);
+                    let ok = (flags & 0x01 != 0 && super::json::is_strict_json(&text))
+                        || (flags & 0x02 != 0 && super::json::parse(&text).is_some());
                     Value::Integer(ok as i64)
                 }
             }

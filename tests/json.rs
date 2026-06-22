@@ -113,6 +113,19 @@ fn against_sqlite3() {
         r#"SELECT json_quote('5')"#,
         r#"SELECT json_quote(5)"#,
         r#"SELECT json_quote(2.5)"#,
+        // json_valid flags: 0x01 strict JSON, 0x02 JSON5, 0x04/0x08 JSONB blob
+        // (the harness reads one column, so each case is a single expression).
+        r#"SELECT json_valid('{"a":1}')"#,
+        r#"SELECT json_valid('{a:1}')"#,
+        r#"SELECT json_valid('{a:1}',2)"#,
+        r#"SELECT json_valid('{a:1}',3)"#,
+        r#"SELECT json_valid('nope',2)"#,
+        r#"SELECT json_valid('{a:1}',4)"#,
+        r#"SELECT json_valid(jsonb('{"a":1}'))"#,
+        r#"SELECT json_valid(jsonb('{"a":1}'),8)"#,
+        r#"SELECT json_valid(jsonb('{"a":1}'),1)"#,
+        r#"SELECT json_valid('5',8)"#,
+        r#"SELECT json_valid(jsonb('5'))"#,
     ];
     let c = Connection::open_memory().unwrap();
     let mut failures = Vec::new();
