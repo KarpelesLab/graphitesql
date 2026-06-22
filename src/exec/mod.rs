@@ -414,13 +414,90 @@ impl Connection {
                 rows,
             });
         };
-        // Single plain table: materialize its rows and run a cursor program.
-        if !from.joins.is_empty() || from.first.subquery.is_some() || from.first.tvf_args.is_some()
-        {
+        // Materialize a plain table source's column names and rows. Subqueries
+        // and table-valued functions are out of the spike's scope.
+        let scan_one = |tr: &sql::ast::TableRef| -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+            if tr.subquery.is_some() || tr.tvf_args.is_some() {
+                return Err(Error::Unsupported("VDBE: only plain table sources"));
+            }
+            let meta = self.table_meta(&tr.name, tr.alias.as_deref())?;
+            let cols = meta.columns.iter().map(|c| c.name.clone()).collect();
+            let rows: Vec<Vec<Value>> = if meta.without_rowid {
+                self.scan_without_rowid(&meta)?
+            } else {
+                self.scan_table(&meta)?
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect()
+            };
+            Ok((cols, rows))
+        };
+
+        // Two-table inner join (B5a): an inner join is a filtered cross-product,
+        // so materialize `t1 × t2` as one combined row set, fold the `ON`/join
+        // predicate into the `WHERE`, and reuse the single-cursor scan compiler.
+        if !from.joins.is_empty() {
+            if from.joins.len() != 1 {
+                return Err(Error::Unsupported("VDBE: only a two-table join"));
+            }
+            let join = &from.joins[0];
+            if join.kind != sql::ast::JoinKind::Inner || join.natural || !join.using.is_empty() {
+                return Err(Error::Unsupported("VDBE: only a plain inner join"));
+            }
+            // `t.*` over a join would need per-table expansion; not yet handled.
+            if sel
+                .columns
+                .iter()
+                .any(|rc| matches!(rc, sql::ast::ResultColumn::TableWildcard(_)))
+            {
+                return Err(Error::Unsupported("VDBE: table.* over a join"));
+            }
+            let (c1, r1) = scan_one(&from.first)?;
+            let (c2, r2) = scan_one(&join.table)?;
+            // Bail on a name shared by both tables: a bare reference would be
+            // ambiguous, and the spike resolves columns by name only.
+            let mut combined: Vec<String> = c1.clone();
+            combined.extend(c2.iter().cloned());
+            for (i, name) in combined.iter().enumerate() {
+                if combined[..i].iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                    return Err(Error::Unsupported("VDBE: ambiguous join column name"));
+                }
+            }
+            // Cross-product rows, outer table first (matching sqlite's row order).
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(r1.len().saturating_mul(r2.len()));
+            for a in &r1 {
+                for b in &r2 {
+                    let mut row = a.clone();
+                    row.extend(b.iter().cloned());
+                    rows.push(row);
+                }
+            }
+            // Merge the existing WHERE with the join's ON predicate.
+            let merged = match (sel.where_clause.clone(), join.on.clone()) {
+                (Some(w), Some(on)) => Some(sql::ast::Expr::Binary {
+                    op: sql::ast::BinaryOp::And,
+                    left: alloc::boxed::Box::new(w),
+                    right: alloc::boxed::Box::new(on),
+                }),
+                (Some(w), None) => Some(w),
+                (None, Some(on)) => Some(on),
+                (None, None) => None,
+            };
+            let mut joined = sel.clone();
+            joined.where_clause = merged;
+            let prog = vdbe::compile_table_select(&joined, &combined)?;
+            let result = vdbe::run_rows(&prog, &rows)?;
+            return Ok(QueryResult {
+                columns: prog.columns,
+                rows: result,
+            });
+        }
+
+        // Single plain table.
+        if from.first.subquery.is_some() || from.first.tvf_args.is_some() {
             return Err(Error::Unsupported("VDBE: only a single plain table"));
         }
-        let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
-        let col_names: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+        let (col_names, rows) = scan_one(&from.first)?;
         // A `t.*` projection is only handled when its qualifier names this single
         // table (by name or alias); any other qualifier falls back so the
         // tree-walker can resolve or reject it.
@@ -438,14 +515,6 @@ impl Connection {
             }
         }
         let prog = vdbe::compile_table_select(&sel, &col_names)?;
-        let rows: Vec<Vec<Value>> = if meta.without_rowid {
-            self.scan_without_rowid(&meta)?
-        } else {
-            self.scan_table(&meta)?
-                .into_iter()
-                .map(|(_, v)| v)
-                .collect()
-        };
         let result = vdbe::run_rows(&prog, &rows)?;
         Ok(QueryResult {
             columns: prog.columns,

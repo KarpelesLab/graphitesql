@@ -310,10 +310,17 @@ spike covers single-table scans, aggregates, `GROUP BY`, and grouped `HAVING` +
 aggregate `ORDER BY` (**B6**), all parity-checked via `query_vdbe`. Remaining,
 each additive behind `query_vdbe` until B7:
 
-- **B5a — VDBE two-table nested-loop join.** `OpenRead`/`Rewind`/`Column`/`Next`
-  per cursor for a single INNER join + `ON`.
-- **B5b — VDBE join: index/PK inner seek + outer-join NULL-extend.** Add the
-  seek-driven inner cursor and LEFT NULL-extension to the join opcodes.
+- **B5a — VDBE two-table inner join. ✅ DONE (cross-product form).** A single
+  INNER/CROSS/comma join materializes `t1 × t2` as one combined row set with the
+  `ON`/join predicate folded into the `WHERE`, then reuses the single-cursor
+  scan compiler + interpreter unchanged (`query_vdbe`). Bails (→ tree-walker) on
+  outer joins, `NATURAL`/`USING`, `t.*` over a join, 3+ tables, and ambiguous
+  shared column names. *Remaining for B5b:* a true per-cursor nested loop
+  (`OpenRead`/`Rewind`/`Column`/`Next`) so the inner side isn't fully
+  materialized, plus index/PK inner seeks.
+- **B5b — VDBE join: per-cursor nested loop, index/PK inner seek + outer-join
+  NULL-extend.** Replace the materialized cross-product with cursor opcodes; add
+  the seek-driven inner cursor and LEFT NULL-extension.
 - **B5c — VDBE: subqueries / compound / window** shapes still on the tree-walker.
 - **B7a — route `query()` onto the VDBE behind a flag** (opt-in), corpus green.
 - **B7b — flip the default** to the VDBE once parity holds across the suite.

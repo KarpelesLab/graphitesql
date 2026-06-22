@@ -217,6 +217,103 @@ fn table_scan_matches_tree_walker() {
 }
 
 #[test]
+fn two_table_join_matches_tree_walker() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE emp(eid INTEGER PRIMARY KEY, name TEXT, dept INT)")
+        .unwrap();
+    c.execute("CREATE TABLE dep(did INTEGER PRIMARY KEY, dname TEXT)")
+        .unwrap();
+    c.execute("INSERT INTO emp(name,dept) VALUES ('a',1),('b',2),('c',1),('d',9)")
+        .unwrap();
+    c.execute("INSERT INTO dep(dname) VALUES ('eng'),('sales')")
+        .unwrap();
+    // An inner join is a filtered cross-product; the VDBE path matches the
+    // tree-walker for explicit JOIN ... ON, comma joins, CROSS, projections,
+    // WHERE, ORDER BY, LIMIT, and aggregates over the join.
+    for q in [
+        "SELECT name, dname FROM emp JOIN dep ON dept = did",
+        "SELECT name, dname FROM emp, dep WHERE dept = did",
+        "SELECT name, dname FROM emp CROSS JOIN dep",
+        "SELECT name, dname FROM emp INNER JOIN dep ON dept = did ORDER BY name",
+        "SELECT name, dname FROM emp JOIN dep ON dept = did WHERE name <> 'a'",
+        "SELECT name FROM emp JOIN dep ON dept = did ORDER BY dname, name",
+        "SELECT count(*) FROM emp JOIN dep ON dept = did",
+        "SELECT dname, count(*) FROM emp JOIN dep ON dept = did GROUP BY dname",
+        "SELECT name || ':' || dname FROM emp JOIN dep ON dept = did",
+        "SELECT * FROM emp JOIN dep ON dept = did",
+        "SELECT name, dname FROM emp JOIN dep ON dept = did LIMIT 2",
+    ] {
+        let mut got = c.query_vdbe(q).unwrap().rows;
+        let mut want = c.query(q).unwrap().rows;
+        let qu = q.to_ascii_uppercase();
+        if qu.contains("GROUP BY") && !qu.contains("ORDER BY") {
+            let rowcmp = |a: &Vec<graphitesql::Value>, b: &Vec<graphitesql::Value>| {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    let o = graphitesql::cmp_values(x, y);
+                    if o != core::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                a.len().cmp(&b.len())
+            };
+            got.sort_by(rowcmp);
+            want.sort_by(rowcmp);
+        }
+        assert_eq!(got, want, "VDBE join vs tree-walker diverged on {q}");
+    }
+
+    // Direct differential check against sqlite3 for the join (ordered output).
+    if Command::new("sqlite3").arg("--version").output().is_ok() {
+        let path = std::env::temp_dir().join(format!("gsql-vjoin-{}.db", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+        let setup = "CREATE TABLE emp(eid INTEGER PRIMARY KEY, name TEXT, dept INT);\
+                     CREATE TABLE dep(did INTEGER PRIMARY KEY, dname TEXT);\
+                     INSERT INTO emp(name,dept) VALUES ('a',1),('b',2),('c',1),('d',9);\
+                     INSERT INTO dep(dname) VALUES ('eng'),('sales')";
+        Command::new("sqlite3")
+            .arg(&path)
+            .arg(setup)
+            .output()
+            .unwrap();
+        for q in [
+            "SELECT name, dname FROM emp JOIN dep ON dept = did ORDER BY name",
+            "SELECT count(*) FROM emp JOIN dep ON dept = did",
+            "SELECT name||'/'||dname FROM emp, dep WHERE dept = did ORDER BY 1",
+        ] {
+            let want = {
+                let o = Command::new("sqlite3").arg(&path).arg(q).output().unwrap();
+                String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+            };
+            let got = c
+                .query_vdbe(q)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.iter().map(render).collect::<Vec<_>>().join("|"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(got, want, "VDBE join vs sqlite3 diverged on {q}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Shared column names are ambiguous: the VDBE bails so the tree-walker
+    // resolves it (here both tables have `id`).
+    c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, v)")
+        .unwrap();
+    c.execute("CREATE TABLE q(id INTEGER PRIMARY KEY, w)")
+        .unwrap();
+    assert!(c
+        .query_vdbe("SELECT v, w FROM p JOIN q ON p.id = q.id")
+        .is_err());
+    // Outer joins are not handled by the spike (NULL-extension); they bail.
+    assert!(c
+        .query_vdbe("SELECT name, dname FROM emp LEFT JOIN dep ON dept = did")
+        .is_err());
+}
+
+#[test]
 fn table_scan_matches_sqlite3() {
     if Command::new("sqlite3").arg("--version").output().is_err() {
         eprintln!("sqlite3 not found; skipping");
