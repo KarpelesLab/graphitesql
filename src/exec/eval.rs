@@ -1038,6 +1038,17 @@ pub fn arithmetic_values(op: BinaryOp, l: &Value, r: &Value) -> Value {
     arithmetic(op, l.clone(), r.clone())
 }
 
+/// Apply `IS` / `IS NOT` to two values, treating NULL as a comparable value
+/// (never returns NULL). Public wrapper used by the VDBE interpreter.
+pub fn is_values(is: bool, l: &Value, r: &Value) -> Value {
+    let eq = match (l, r) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        _ => compare(l, r) == core::cmp::Ordering::Equal,
+    };
+    bool_value(eq == is)
+}
+
 /// Apply a bitwise `BinaryOp` (`&`, `|`, `<<`, `>>`) to two values, matching
 /// SQLite: NULL on either side yields NULL, otherwise both sides coerce to
 /// integers. Public wrapper used by the VDBE interpreter.

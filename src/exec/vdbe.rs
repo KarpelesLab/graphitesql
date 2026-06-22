@@ -48,6 +48,14 @@ pub enum Op {
         rhs: usize,
         dest: usize,
     },
+    /// `dest = lhs IS rhs` (`is` true) or `lhs IS NOT rhs` (`is` false); treats
+    /// NULL as comparable, always 1/0.
+    Is {
+        is: bool,
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
     /// `dest = lhs || rhs` (text concatenation).
     Concat { lhs: usize, rhs: usize, dest: usize },
     /// `dest = lhs <op> rhs` for a comparison `BinaryOp` (Eq/NotEq/Lt/…), with
@@ -1379,6 +1387,15 @@ impl Compiler {
                         });
                         Ok(())
                     }
+                    Is | IsNot => {
+                        self.ops.push(Op::Is {
+                            is: matches!(op, Is),
+                            lhs: l,
+                            rhs: r,
+                            dest,
+                        });
+                        Ok(())
+                    }
                     _ => Err(Error::Unsupported("VDBE spike: this operator")),
                 }
             }
@@ -1399,6 +1416,48 @@ impl Compiler {
                 when_then,
                 else_result,
             } => self.compile_case(operand.as_deref(), when_then, else_result.as_deref(), dest),
+            // `x BETWEEN lo AND hi` desugars to `(x >= lo) AND (x <= hi)`, and the
+            // negated form to its `NOT`. `x` is evaluated once and reused.
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => {
+                let x = self.compile_expr(inner)?;
+                let lo = self.compile_expr(low)?;
+                let hi = self.compile_expr(high)?;
+                let ge = self.alloc();
+                self.ops.push(Op::Compare {
+                    op: BinaryOp::GtEq,
+                    lhs: x,
+                    rhs: lo,
+                    dest: ge,
+                });
+                let le = self.alloc();
+                self.ops.push(Op::Compare {
+                    op: BinaryOp::LtEq,
+                    lhs: x,
+                    rhs: hi,
+                    dest: le,
+                });
+                if *negated {
+                    let both = self.alloc();
+                    self.ops.push(Op::And {
+                        lhs: ge,
+                        rhs: le,
+                        dest: both,
+                    });
+                    self.ops.push(Op::Not { reg: both, dest });
+                } else {
+                    self.ops.push(Op::And {
+                        lhs: ge,
+                        rhs: le,
+                        dest,
+                    });
+                }
+                Ok(())
+            }
             _ => Err(Error::Unsupported("VDBE spike: this expression")),
         }
     }
@@ -1579,6 +1638,9 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
             }
             Op::Bitwise { op, lhs, rhs, dest } => {
                 regs[*dest] = crate::exec::eval::bitwise_values(*op, &regs[*lhs], &regs[*rhs]);
+            }
+            Op::Is { is, lhs, rhs, dest } => {
+                regs[*dest] = crate::exec::eval::is_values(*is, &regs[*lhs], &regs[*rhs]);
             }
             Op::Concat { lhs, rhs, dest } => {
                 regs[*dest] =
