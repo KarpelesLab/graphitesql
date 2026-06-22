@@ -103,10 +103,13 @@ pub trait Subqueries {
     fn fts5_indexed_columns(&self, _table: &str) -> Option<Vec<String>> {
         None
     }
-    /// Whether the `fts5` table `table` uses the `porter` tokenizer (so its tokens
-    /// are Porter-stemmed at index and query time). `false` otherwise.
-    fn fts5_porter(&self, _table: &str) -> bool {
-        false
+    /// The `fts5` table `table`'s resolved tokenizer config (Porter stemming +
+    /// `remove_diacritics` level), so a `MATCH` query folds exactly like the
+    /// indexed documents. The default (`remove_diacritics 1`, no stemming) is
+    /// returned when `table` is not a known `fts5` virtual table.
+    #[cfg(feature = "fts5")]
+    fn fts5_tok(&self, _table: &str) -> crate::vtab::Fts5Tok {
+        crate::vtab::Fts5Tok::default()
     }
 }
 

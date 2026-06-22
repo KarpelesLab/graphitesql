@@ -350,3 +350,60 @@ fn sqlite_matches_extended_latin_graphite_fts5() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// The `unicode61 remove_diacritics` tokenizer option (0/1/2): graphite parses it
+/// from the `tokenize=` arg and folds at the matching level on BOTH the index and
+/// query sides, so a graphite-written table with a non-default level is
+/// integrity-clean and MATCHes identically to stock sqlite3.
+#[test]
+fn sqlite_matches_remove_diacritics_levels_graphite_fts5() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Level 0: diacritics are KEPT, so the token is `café`, not `cafe`.
+    let p0 = tmp_path();
+    {
+        let mut c = Connection::create(&p0).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(b, tokenize='unicode61 remove_diacritics 0')")
+            .unwrap();
+        c.execute("INSERT INTO t(rowid,b) VALUES (1,'café crème')")
+            .unwrap();
+    }
+    assert_eq!(sqlite_run(&p0, "PRAGMA integrity_check"), "ok");
+    // The accented form matches; the de-accented form does NOT (level 0 keeps it).
+    assert_eq!(
+        sqlite_run(&p0, "SELECT rowid FROM t WHERE t MATCH 'café'"),
+        "1"
+    );
+    assert_eq!(
+        sqlite_run(&p0, "SELECT rowid FROM t WHERE t MATCH 'cafe'"),
+        ""
+    );
+    // graphite's own MATCH agrees (query folds at the same level 0).
+    {
+        let c = Connection::open(&p0).unwrap();
+        let hit = c.query("SELECT rowid FROM t WHERE t MATCH 'café'").unwrap();
+        assert_eq!(hit.rows.len(), 1);
+        let miss = c.query("SELECT rowid FROM t WHERE t MATCH 'cafe'").unwrap();
+        assert_eq!(miss.rows.len(), 0);
+    }
+    let _ = std::fs::remove_file(&p0);
+
+    // Level 2: folds even the double-accented Vietnamese vowels that level 1 keeps.
+    let p2 = tmp_path();
+    {
+        let mut c = Connection::create(&p2).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(b, tokenize='unicode61 remove_diacritics 2')")
+            .unwrap();
+        c.execute("INSERT INTO t(rowid,b) VALUES (1,'Tiếng Việt')")
+            .unwrap();
+    }
+    assert_eq!(sqlite_run(&p2, "PRAGMA integrity_check"), "ok");
+    // `viet`/`tieng` match under level 2 (ệ→e, ế→e); they would NOT under level 1.
+    assert_eq!(
+        sqlite_run(&p2, "SELECT rowid FROM t WHERE t MATCH 'tieng viet'"),
+        "1"
+    );
+    let _ = std::fs::remove_file(&p2);
+}

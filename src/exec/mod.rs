@@ -10709,7 +10709,7 @@ impl Connection {
         let arg_refs: Vec<&str> = vargs.iter().map(String::as_str).collect();
         let all = crate::vtab::fts5_indexed_columns(&arg_refs);
         let indexed = (all.len() != columns.len()).then_some(all);
-        let stem = crate::vtab::fts5_uses_porter(&arg_refs);
+        let tok = crate::vtab::fts5_tok_config(&arg_refs);
         let (query, operand) = self.fts5_match_query(sel.where_clause.as_ref()?, params)?;
         let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         // A `col MATCH …` operand scopes the query to that column; a table-wide
@@ -10730,7 +10730,7 @@ impl Connection {
                 &docs,
                 scope.as_deref(),
                 indexed.as_deref(),
-                stem,
+                tok,
             );
             let index = input_rows
                 .iter()
@@ -10744,7 +10744,7 @@ impl Connection {
             query,
             scope,
             indexed,
-            stem,
+            tok,
             bm25,
         })
     }
@@ -12759,11 +12759,14 @@ impl Connection {
 
         // The referenced FTS5 table: its column names + documents (the persistent
         // `<ft>_data` backing table holds one row per document, column-ordered).
-        let (ft_module, _ft_args, ft_schema) = self.vtab_meta(&ft_name)?;
+        let (ft_module, ft_args, ft_schema) = self.vtab_meta(&ft_name)?;
         if !ft_module.eq_ignore_ascii_case("fts5") {
             return Err(Error::Error(format!("no such fts5 table: {ft_name}")));
         }
         let ft_cols = ft_schema.columns;
+        // Tokenize with the referenced table's own tokenizer (porter / diacritics).
+        let ft_refs: Vec<&str> = ft_args.iter().map(String::as_str).collect();
+        let ft_tok = crate::vtab::fts5_tok_config(&ft_refs);
         // Documents live in `<ft>_content` (sqlite's layout): `(id, c0, c1, …)`.
         // Drop the leading `id` so `vals` is the column-ordered document.
         let bmeta = self.table_meta(&format!("{ft_name}_content"), None)?;
@@ -12797,7 +12800,7 @@ impl Connection {
                 for (rowid, vals) in &docs {
                     for v in vals.iter().take(ft_cols.len()) {
                         if let Some(t) = to_text(v) {
-                            for tok in crate::vtab::fts5_tokenize(&t, false) {
+                            for tok in crate::vtab::fts5_tokenize(&t, ft_tok) {
                                 let e = map.entry(tok).or_default();
                                 e.0.insert(*rowid);
                                 e.1 += 1;
@@ -12822,7 +12825,7 @@ impl Connection {
                 for (rowid, vals) in &docs {
                     for (ci, v) in vals.iter().take(ft_cols.len()).enumerate() {
                         if let Some(t) = to_text(v) {
-                            for tok in crate::vtab::fts5_tokenize(&t, false) {
+                            for tok in crate::vtab::fts5_tokenize(&t, ft_tok) {
                                 let e = map.entry((tok, ci)).or_default();
                                 e.0.insert(*rowid);
                                 e.1 += 1;
@@ -12849,7 +12852,7 @@ impl Connection {
                 for (rowid, vals) in &docs {
                     for (ci, v) in vals.iter().take(ft_cols.len()).enumerate() {
                         if let Some(t) = to_text(v) {
-                            for (off, tok) in crate::vtab::fts5_tokenize(&t, false)
+                            for (off, tok) in crate::vtab::fts5_tokenize(&t, ft_tok)
                                 .into_iter()
                                 .enumerate()
                             {
@@ -13153,7 +13156,7 @@ impl Connection {
         let (_module, args, schema) = self.vtab_meta(name)?;
         let ncols = schema.columns.len();
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let stem = crate::vtab::fts5_uses_porter(&arg_refs);
+        let tok = crate::vtab::fts5_tok_config(&arg_refs);
 
         let cmeta = self.table_meta(&format!("{name}_content"), None)?;
         let docs = self.scan_table(&cmeta)?;
@@ -13169,7 +13172,7 @@ impl Connection {
                     Some(v) if !matches!(v, Value::Null) => eval::to_text(v),
                     _ => String::new(),
                 };
-                let toks = crate::vtab::fts5_tokenize(&text, stem);
+                let toks = crate::vtab::fts5_tokenize(&text, tok);
                 sizes[c] = toks.len() as u64;
                 col_totals[c] += toks.len() as u64;
                 for (pos, tok) in toks.iter().enumerate() {
@@ -14797,7 +14800,7 @@ impl eval::Subqueries for Connection {
             ctx.scope.as_deref(),
             col,
             text,
-            ctx.stem,
+            ctx.tok,
             open,
             close,
         ))
@@ -14812,12 +14815,15 @@ impl eval::Subqueries for Connection {
         Some(crate::vtab::fts5_indexed_columns(&refs))
     }
     #[cfg(feature = "fts5")]
-    fn fts5_porter(&self, table: &str) -> bool {
+    fn fts5_tok(&self, table: &str) -> crate::vtab::Fts5Tok {
         let Ok((module, args, _)) = self.vtab_meta(table) else {
-            return false;
+            return crate::vtab::Fts5Tok::default();
         };
+        if !module.eq_ignore_ascii_case("fts5") {
+            return crate::vtab::Fts5Tok::default();
+        }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        module.eq_ignore_ascii_case("fts5") && crate::vtab::fts5_uses_porter(&refs)
+        crate::vtab::fts5_tok_config(&refs)
     }
     #[cfg(feature = "fts5")]
     fn fts5_snippet(
@@ -14838,7 +14844,7 @@ impl eval::Subqueries for Connection {
             col,
             cols,
             ctx.indexed.as_deref(),
-            ctx.stem,
+            ctx.tok,
             open,
             close,
             ellipsis,
@@ -16978,8 +16984,9 @@ struct Fts5QueryCtx {
     /// The searchable (indexed) column names — every column except those declared
     /// `UNINDEXED`. `None` when all columns are indexed (the common case).
     indexed: Option<Vec<String>>,
-    /// Whether the table uses the `porter` tokenizer (tokens are Porter-stemmed).
-    stem: bool,
+    /// The table's resolved tokenizer config (Porter stemming + `remove_diacritics`
+    /// level), so `highlight()`/`snippet()` fold exactly like the indexed docs.
+    tok: crate::vtab::Fts5Tok,
     /// The bm25 corpus + rowid→document-index map — present only when `rank` /
     /// `bm25()` is referenced (`highlight()` needs only the query, not the corpus).
     bm25: Option<(

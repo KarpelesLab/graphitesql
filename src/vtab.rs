@@ -1559,24 +1559,98 @@ pub(crate) fn fold_diacritic(ch: char) -> char {
     }
 }
 
-/// Split `text` into lowercased tokens on every non-alphanumeric character,
-/// folding accented Latin-1 to its base (`fold_diacritic`) like `unicode61`.
-/// With `stem`, each token is Porter-stemmed (the `porter` tokenizer).
+/// The extra precomposed letters that `unicode61 remove_diacritics 2` folds to an
+/// ASCII base but the default level 1 keeps verbatim — chiefly the double-accented
+/// Vietnamese vowels (`ệ`→`e`, `ố`→`o`, `ự`→`u`) and a few combining-mark stacks
+/// (`Ḉ`→`c`, `Ḯ`→`i`). Derived byte-exactly from `sqlite3` 3.50.4 by diffing the
+/// `fts5vocab` term at `remove_diacritics` 1 vs 2 over U+00C0–U+1EFF. Disjoint from
+/// [`fold_diacritic`]; the stroke letters (`ł`, `đ`, …) stay kept even at level 2.
 #[cfg(feature = "fts5")]
-pub(crate) fn fts5_tokenize(text: &str, stem: bool) -> Vec<String> {
+fn fold_diacritic2(ch: char) -> char {
+    match ch {
+        'Ǟ' | 'ǟ' | 'Ǻ' | 'ǻ' | 'Ấ' | 'ấ' | 'Ầ' | 'ầ' | 'Ẩ' | 'ẩ' | 'Ẫ' | 'ẫ' | 'Ậ' | 'ậ' | 'Ắ'
+        | 'ắ' | 'Ằ' | 'ằ' | 'Ẳ' | 'ẳ' | 'Ẵ' | 'ẵ' | 'Ặ' | 'ặ' => 'a',
+        'Ḉ' | 'ḉ' => 'c',
+        'Ḕ' | 'ḕ' | 'Ḗ' | 'ḗ' | 'Ḝ' | 'ḝ' | 'Ế' | 'ế' | 'Ề' | 'ề' | 'Ể' | 'ể' | 'Ễ' | 'ễ' | 'Ệ'
+        | 'ệ' => 'e',
+        'Ḯ' | 'ḯ' => 'i',
+        'Ḹ' | 'ḹ' => 'l',
+        'Ǭ' | 'ǭ' | 'Ȫ' | 'ȫ' | 'Ȭ' | 'ȭ' | 'Ȱ' | 'ȱ' | 'Ṍ' | 'ṍ' | 'Ṏ' | 'ṏ' | 'Ṑ' | 'ṑ' | 'Ṓ'
+        | 'ṓ' | 'Ố' | 'ố' | 'Ồ' | 'ồ' | 'Ổ' | 'ổ' | 'Ỗ' | 'ỗ' | 'Ộ' | 'ộ' | 'Ớ' | 'ớ' | 'Ờ'
+        | 'ờ' | 'Ở' | 'ở' | 'Ỡ' | 'ỡ' | 'Ợ' | 'ợ' => 'o',
+        'Ṝ' | 'ṝ' => 'r',
+        'Ṥ' | 'ṥ' | 'Ṧ' | 'ṧ' | 'Ṩ' | 'ṩ' => 's',
+        'Ǖ' | 'ǖ' | 'Ǘ' | 'ǘ' | 'Ǚ' | 'ǚ' | 'Ǜ' | 'ǜ' | 'Ṹ' | 'ṹ' | 'Ṻ' | 'ṻ' | 'Ứ' | 'ứ' | 'Ừ'
+        | 'ừ' | 'Ử' | 'ử' | 'Ữ' | 'ữ' | 'Ự' | 'ự' => 'u',
+        other => other,
+    }
+}
+
+/// A resolved FTS5 tokenizer configuration, parsed once from the table's
+/// `CREATE VIRTUAL TABLE` args by `fts5_tok_config` and threaded through every
+/// tokenization (document indexing, query parsing, `MATCH`, `highlight`,
+/// `snippet`) so the doc and query sides always fold identically.
+#[cfg(feature = "fts5")]
+#[derive(Clone, Copy)]
+pub struct Fts5Tok {
+    /// The `porter` tokenizer wraps another tokenizer and Porter-stems each token.
+    pub stem: bool,
+    /// `unicode61`'s `remove_diacritics` level: 0 (keep all), 1 (default), 2.
+    pub diacritics: u8,
+}
+
+#[cfg(feature = "fts5")]
+impl Default for Fts5Tok {
+    fn default() -> Self {
+        // The `unicode61` default: no stemming, `remove_diacritics=1`.
+        Fts5Tok {
+            stem: false,
+            diacritics: 1,
+        }
+    }
+}
+
+/// Fold `ch` for diacritics according to the tokenizer's `remove_diacritics`
+/// level: 0 leaves it unchanged, 1 applies [`fold_diacritic`], 2 additionally
+/// applies [`fold_diacritic2`] (the disjoint extra table).
+#[cfg(feature = "fts5")]
+fn fold_for(ch: char, level: u8) -> char {
+    match level {
+        0 => ch,
+        1 => fold_diacritic(ch),
+        _ => {
+            let f = fold_diacritic(ch);
+            if f != ch {
+                f
+            } else {
+                fold_diacritic2(ch)
+            }
+        }
+    }
+}
+
+/// Split `text` into lowercased tokens on every non-alphanumeric character,
+/// folding accents per `tok.diacritics` (`fold_for`) like `unicode61`. With
+/// `tok.stem`, each token is Porter-stemmed (the `porter` tokenizer).
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_tokenize(text: &str, tok: Fts5Tok) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     for ch in text.chars() {
-        let ch = fold_diacritic(ch);
+        let ch = fold_for(ch, tok.diacritics);
         if ch.is_alphanumeric() {
             cur.extend(ch.to_lowercase());
         } else if !cur.is_empty() {
             let t = core::mem::take(&mut cur);
-            tokens.push(if stem { fts5_porter_stem(&t) } else { t });
+            tokens.push(if tok.stem { fts5_porter_stem(&t) } else { t });
         }
     }
     if !cur.is_empty() {
-        tokens.push(if stem { fts5_porter_stem(&cur) } else { cur });
+        tokens.push(if tok.stem {
+            fts5_porter_stem(&cur)
+        } else {
+            cur
+        });
     }
     tokens
 }
@@ -1586,18 +1660,18 @@ pub(crate) fn fts5_tokenize(text: &str, stem: bool) -> Vec<String> {
 /// preserving the surrounding original characters. The span is over the original
 /// text even when the token itself is Porter-stemmed.
 #[cfg(feature = "fts5")]
-fn fts5_tokenize_spans(text: &str, stem: bool) -> Vec<(String, usize, usize)> {
+fn fts5_tokenize_spans(text: &str, tok: Fts5Tok) -> Vec<(String, usize, usize)> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut start = 0;
     let push = |cur: &mut String, start: usize, end: usize, out: &mut Vec<_>| {
         let t = core::mem::take(cur);
-        out.push((if stem { fts5_porter_stem(&t) } else { t }, start, end));
+        out.push((if tok.stem { fts5_porter_stem(&t) } else { t }, start, end));
     };
     for (i, ch) in text.char_indices() {
         // Fold accents like `fts5_tokenize` so highlight tokens match; the span
-        // [start, i) stays over the ORIGINAL bytes (folding is 1:1 for Latin-1).
-        let ch = fold_diacritic(ch);
+        // [start, i) stays over the ORIGINAL bytes (folding is 1:1 in byte count).
+        let ch = fold_for(ch, tok.diacritics);
         if ch.is_alphanumeric() {
             if cur.is_empty() {
                 start = i;
@@ -1626,7 +1700,7 @@ pub(crate) fn fts5_highlight(
     scope: Option<&str>,
     col: usize,
     text: &str,
-    stem: bool,
+    tok: Fts5Tok,
     open: &str,
     close: &str,
 ) -> String {
@@ -1638,7 +1712,7 @@ pub(crate) fn fts5_highlight(
     }) {
         return String::from(text);
     }
-    let toks = fts5_lex(query);
+    let toks = fts5_lex(query, tok);
     let parsed = match (Fts5Parser {
         toks: &toks,
         pos: 0,
@@ -1651,7 +1725,7 @@ pub(crate) fn fts5_highlight(
     let mut terms = Vec::new();
     fts5_collect_terms(&parsed, &mut terms);
 
-    let spans = fts5_tokenize_spans(text, stem);
+    let spans = fts5_tokenize_spans(text, tok);
     let col_tokens: Vec<String> = spans.iter().map(|(t, _, _)| t.clone()).collect();
     // Each phrase *instance* is one highlight span `[start, end)` (token indices);
     // SQLite wraps each separately, so two adjacent single-token matches become
@@ -1666,7 +1740,7 @@ pub(crate) fn fts5_highlight(
         }) {
             continue;
         }
-        for start in fts5_term_starts(term, &col_tokens, stem) {
+        for start in fts5_term_starts(term, &col_tokens, tok) {
             hits.push((start, (start + term.phrase.len()).min(spans.len())));
         }
     }
@@ -1711,7 +1785,7 @@ pub(crate) fn fts5_snippet(
     col: i64,
     cols: &[String],
     indexed: Option<&[String]>,
-    stem: bool,
+    tok: Fts5Tok,
     open: &str,
     close: &str,
     ellipsis: &str,
@@ -1730,7 +1804,7 @@ pub(crate) fn fts5_snippet(
     if col >= 0 && !searchable(col as usize) {
         return cols.get(col as usize).cloned().unwrap_or_default();
     }
-    let lexed = fts5_lex(query);
+    let lexed = fts5_lex(query, tok);
     let parsed = (Fts5Parser {
         toks: &lexed,
         pos: 0,
@@ -1746,7 +1820,7 @@ pub(crate) fn fts5_snippet(
     type Inst = Vec<(usize, usize, usize)>;
     let select = |ci: usize| -> (i64, usize, usize, Spans, Inst) {
         let text = cols.get(ci).map(String::as_str).unwrap_or("");
-        let spans = fts5_tokenize_spans(text, stem);
+        let spans = fts5_tokenize_spans(text, tok);
         let n = spans.len();
         // Operand-level scope (`col MATCH …`) and per-term `col:token` filters both
         // gate which instances count toward this column.
@@ -1767,7 +1841,7 @@ pub(crate) fn fts5_snippet(
                 }) {
                     continue;
                 }
-                for start in fts5_term_starts(term, &col_tokens, stem) {
+                for start in fts5_term_starts(term, &col_tokens, tok) {
                     inst.push((start, (start + term.phrase.len()).min(n), ti));
                 }
             }
@@ -1939,11 +2013,11 @@ struct Fts5Term {
 /// The start offsets at which `term` matches in a column's `tokens`, honoring an
 /// `^` anchor (which keeps only a match at offset 0).
 #[cfg(feature = "fts5")]
-fn fts5_term_starts(term: &Fts5Term, tokens: &[String], stem: bool) -> Vec<usize> {
+fn fts5_term_starts(term: &Fts5Term, tokens: &[String], tok: Fts5Tok) -> Vec<usize> {
     // Under the `porter` tokenizer the document tokens are stemmed, so the query
     // phrase must be stemmed the same way to match (including the prefix token —
     // SQLite runs query tokens through the tokenizer too).
-    let phrase: Vec<String> = if stem {
+    let phrase: Vec<String> = if tok.stem {
         term.phrase.iter().map(|t| fts5_porter_stem(t)).collect()
     } else {
         term.phrase.clone()
@@ -2035,7 +2109,7 @@ enum Fts5Lex {
 /// `col:and` is an ordinary token, as in SQLite). A term is `[column:]body`,
 /// where `body` is a `"quoted phrase"` or a bare word optionally ending in `*`.
 #[cfg(feature = "fts5")]
-fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
+fn fts5_lex(pattern: &str, tok: Fts5Tok) -> Vec<Fts5Lex> {
     let chars: Vec<char> = pattern.chars().collect();
     let n = chars.len();
     let mut i = 0;
@@ -2136,7 +2210,7 @@ fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
                             }
                             let inside: String = chars[start..e].iter().collect();
                             i = if e < n { e + 1 } else { e };
-                            let (phrases, dist) = fts5_parse_near(&inside);
+                            let (phrases, dist) = fts5_parse_near(&inside, tok);
                             if !phrases.is_empty() {
                                 out.push(Fts5Lex::Near(phrases, dist));
                             }
@@ -2155,7 +2229,8 @@ fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
         };
         // The query phrase is kept raw here; Porter stemming (if any) is applied at
         // match time in `fts5_term_starts` so the prefix flag is handled correctly.
-        let phrase = fts5_tokenize(&text, false);
+        // Diacritics ARE folded at the table's level so the query matches the docs.
+        let phrase = fts5_tokenize(&text, Fts5Tok { stem: false, ..tok });
         if !phrase.is_empty() {
             out.push(Fts5Lex::Term(Fts5Term {
                 column,
@@ -2172,7 +2247,7 @@ fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
 /// distance is the integer after a trailing comma (`NEAR(a b, 5)`); without one
 /// it defaults to 10, as in SQLite.
 #[cfg(feature = "fts5")]
-fn fts5_parse_near(inside: &str) -> (Vec<Fts5Term>, usize) {
+fn fts5_parse_near(inside: &str, tok: Fts5Tok) -> (Vec<Fts5Term>, usize) {
     let (phrases_part, distance) = match inside.rsplit_once(',') {
         Some((left, right))
             if !right.trim().is_empty() && right.trim().bytes().all(|b| b.is_ascii_digit()) =>
@@ -2181,7 +2256,7 @@ fn fts5_parse_near(inside: &str) -> (Vec<Fts5Term>, usize) {
         }
         _ => (inside, 10),
     };
-    let phrases = fts5_lex(phrases_part)
+    let phrases = fts5_lex(phrases_part, tok)
         .into_iter()
         .filter_map(|t| match t {
             Fts5Lex::Term(term) => Some(term),
@@ -2288,12 +2363,12 @@ impl Fts5Parser<'_> {
 /// Whether a single term matches any in-scope column (respecting `col:` scoping
 /// and the `^` anchor).
 #[cfg(feature = "fts5")]
-fn fts5_term_matches(term: &Fts5Term, cols: &[(&str, Vec<String>)], stem: bool) -> bool {
+fn fts5_term_matches(term: &Fts5Term, cols: &[(&str, Vec<String>)], tok: Fts5Tok) -> bool {
     cols.iter().any(|(name, tokens)| {
         term.column
             .as_deref()
             .is_none_or(|c| name.eq_ignore_ascii_case(c))
-            && !fts5_term_starts(term, tokens, stem).is_empty()
+            && !fts5_term_starts(term, tokens, tok).is_empty()
     })
 }
 
@@ -2304,12 +2379,12 @@ fn fts5_near_group_matches(
     phrases: &[Fts5Term],
     dist: usize,
     cols: &[(&str, Vec<String>)],
-    stem: bool,
+    tok: Fts5Tok,
 ) -> bool {
     cols.iter().any(|(_, tokens)| {
         let positioned: Vec<(Vec<usize>, usize)> = phrases
             .iter()
-            .map(|p| (fts5_term_starts(p, tokens, stem), p.phrase.len()))
+            .map(|p| (fts5_term_starts(p, tokens, tok), p.phrase.len()))
             .collect();
         fts5_near_matches(&positioned, dist)
     })
@@ -2317,13 +2392,13 @@ fn fts5_near_group_matches(
 
 /// Evaluate a parsed query tree against the tokenized in-scope columns.
 #[cfg(feature = "fts5")]
-fn fts5_eval(query: &Fts5Query, cols: &[(&str, Vec<String>)], stem: bool) -> bool {
+fn fts5_eval(query: &Fts5Query, cols: &[(&str, Vec<String>)], tok: Fts5Tok) -> bool {
     match query {
-        Fts5Query::Term(t) => fts5_term_matches(t, cols, stem),
-        Fts5Query::Near(phrases, dist) => fts5_near_group_matches(phrases, *dist, cols, stem),
-        Fts5Query::And(a, b) => fts5_eval(a, cols, stem) && fts5_eval(b, cols, stem),
-        Fts5Query::Or(a, b) => fts5_eval(a, cols, stem) || fts5_eval(b, cols, stem),
-        Fts5Query::Not(a, b) => fts5_eval(a, cols, stem) && !fts5_eval(b, cols, stem),
+        Fts5Query::Term(t) => fts5_term_matches(t, cols, tok),
+        Fts5Query::Near(phrases, dist) => fts5_near_group_matches(phrases, *dist, cols, tok),
+        Fts5Query::And(a, b) => fts5_eval(a, cols, tok) && fts5_eval(b, cols, tok),
+        Fts5Query::Or(a, b) => fts5_eval(a, cols, tok) || fts5_eval(b, cols, tok),
+        Fts5Query::Not(a, b) => fts5_eval(a, cols, tok) && !fts5_eval(b, cols, tok),
     }
 }
 
@@ -2336,8 +2411,8 @@ fn fts5_eval(query: &Fts5Query, cols: &[(&str, Vec<String>)], stem: bool) -> boo
 /// `OR`) with parentheses — matching SQLite's default precedence — and the
 /// `NEAR(p1 p2 …, n)` proximity group. A query with no tokens matches nothing.
 #[cfg(feature = "fts5")]
-pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)], stem: bool) -> bool {
-    let toks = fts5_lex(pattern);
+pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)], tok: Fts5Tok) -> bool {
+    let toks = fts5_lex(pattern, tok);
     let query = match (Fts5Parser {
         toks: &toks,
         pos: 0,
@@ -2349,9 +2424,9 @@ pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)], stem:
     };
     let tokenized: Vec<(&str, Vec<String>)> = cols
         .iter()
-        .map(|(name, text)| (name.as_str(), fts5_tokenize(text, stem)))
+        .map(|(name, text)| (name.as_str(), fts5_tokenize(text, tok)))
         .collect();
-    fts5_eval(&query, &tokenized, stem)
+    fts5_eval(&query, &tokenized, tok)
 }
 
 /// Collect every phrase term of a parsed query (flattening the boolean tree),
@@ -2386,7 +2461,7 @@ pub(crate) fn fts5_bm25_corpus(
     docs: &[Vec<String>],
     scope: Option<&str>,
     indexed: Option<&[String]>,
-    stem: bool,
+    tok: Fts5Tok,
 ) -> Fts5Bm25 {
     let n = docs.len();
     // A column is searchable unless it is declared `UNINDEXED`.
@@ -2396,7 +2471,7 @@ pub(crate) fn fts5_bm25_corpus(
             _ => true,
         }
     };
-    let toks = fts5_lex(query);
+    let toks = fts5_lex(query, tok);
     let parsed = (Fts5Parser {
         toks: &toks,
         pos: 0,
@@ -2416,7 +2491,7 @@ pub(crate) fn fts5_bm25_corpus(
     // token count across all columns (independent of any `col:` scoping).
     let tok_docs: Vec<Vec<Vec<String>>> = docs
         .iter()
-        .map(|cols| cols.iter().map(|t| fts5_tokenize(t, stem)).collect())
+        .map(|cols| cols.iter().map(|t| fts5_tokenize(t, tok)).collect())
         .collect();
     let dl: Vec<f64> = tok_docs
         .iter()
@@ -2455,7 +2530,7 @@ pub(crate) fn fts5_bm25_corpus(
                 {
                     continue;
                 }
-                let c = fts5_term_starts(term, ctoks, stem).len();
+                let c = fts5_term_starts(term, ctoks, tok).len();
                 if c > 0 {
                     occ[i][t][ci] = c as f64;
                     any = true;
@@ -2569,21 +2644,53 @@ pub(crate) fn fts5_indexed_columns(args: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Whether an `fts5` table uses the `porter` tokenizer (`tokenize = 'porter …'`),
-/// in which case every token is Porter-stemmed. The first word of the tokenize
-/// option is the tokenizer name; `porter` may wrap another tokenizer.
+/// Parse an `fts5` table's `tokenize = '…'` option into a resolved [`Fts5Tok`].
+/// The value is a whitespace-separated tokenizer chain: an optional leading
+/// `porter` (⇒ Porter stemming, possibly wrapping a base tokenizer), then a base
+/// tokenizer (`unicode61` default, or `ascii`), then base-tokenizer options. We
+/// honor `unicode61`'s `remove_diacritics 0|1|2` (default 1); the `ascii`
+/// tokenizer keeps all bytes verbatim, so it maps to level 0 (no diacritic fold).
+/// Unknown options are ignored, as the default tokenizer config (`remove_diacritics
+/// 1`, no stemming) is returned when there is no `tokenize` option at all.
 #[cfg(feature = "fts5")]
-pub(crate) fn fts5_uses_porter(args: &[&str]) -> bool {
-    args.iter().any(|a| {
-        a.split_once('=').is_some_and(|(k, v)| {
-            k.trim().eq_ignore_ascii_case("tokenize")
-                && v.trim()
-                    .trim_matches(|c| c == '\'' || c == '"')
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(|t| t.eq_ignore_ascii_case("porter"))
+pub(crate) fn fts5_tok_config(args: &[&str]) -> Fts5Tok {
+    let value = args.iter().find_map(|a| {
+        a.split_once('=').and_then(|(k, v)| {
+            k.trim()
+                .eq_ignore_ascii_case("tokenize")
+                .then(|| v.trim().trim_matches(|c| c == '\'' || c == '"'))
         })
-    })
+    });
+    let value = match value {
+        Some(v) => v,
+        None => return Fts5Tok::default(),
+    };
+    let words: Vec<&str> = value.split_whitespace().collect();
+    let mut i = 0;
+    let stem = words
+        .first()
+        .is_some_and(|w| w.eq_ignore_ascii_case("porter"));
+    if stem {
+        i += 1; // skip `porter`; what follows is the wrapped base tokenizer
+    }
+    // The base tokenizer name (if present); default `unicode61`.
+    let base_ascii = words
+        .get(i)
+        .is_some_and(|w| w.eq_ignore_ascii_case("ascii"));
+    let mut diacritics = if base_ascii { 0 } else { 1 };
+    if !base_ascii {
+        // Scan the option words for `remove_diacritics <N>`.
+        let mut j = i;
+        while j + 1 < words.len() {
+            if words[j].eq_ignore_ascii_case("remove_diacritics") {
+                if let Ok(n) = words[j + 1].parse::<u8>() {
+                    diacritics = n.min(2);
+                }
+            }
+            j += 1;
+        }
+    }
+    Fts5Tok { stem, diacritics }
 }
 
 #[cfg(feature = "fts5")]
@@ -2798,7 +2905,7 @@ mod tests {
     #[cfg(feature = "fts5")]
     fn fts5_tokenizer_splits_and_folds() {
         assert_eq!(
-            fts5_tokenize("The quick-brown Fox!", false),
+            fts5_tokenize("The quick-brown Fox!", Fts5Tok::default()),
             vec![
                 String::from("the"),
                 String::from("quick"),
@@ -2808,20 +2915,52 @@ mod tests {
         );
         // Digits are tokens; runs of punctuation/whitespace are separators only.
         assert_eq!(
-            fts5_tokenize("  a1  b2,c3 ", false),
+            fts5_tokenize("  a1  b2,c3 ", Fts5Tok::default()),
             vec![String::from("a1"), String::from("b2"), String::from("c3")]
         );
-        assert!(fts5_tokenize("   ,. !", false).is_empty());
+        assert!(fts5_tokenize("   ,. !", Fts5Tok::default()).is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn fts5_tok_config_parses_tokenize_option() {
+        let cfg = |opt: &str| fts5_tok_config(&[opt]);
+        // No tokenize option → the unicode61 default: no stemming, level 1.
+        let d = fts5_tok_config(&["body"]);
+        assert!(!d.stem && d.diacritics == 1);
+        // remove_diacritics levels (quoting and spacing as sqlite writes them).
+        assert_eq!(
+            cfg("tokenize='unicode61 remove_diacritics 0'").diacritics,
+            0
+        );
+        assert_eq!(
+            cfg("tokenize = 'unicode61 remove_diacritics 2'").diacritics,
+            2
+        );
+        assert_eq!(cfg("tokenize='unicode61'").diacritics, 1);
+        // porter wraps a base tokenizer → stemming on, base level preserved.
+        let p = cfg("tokenize='porter unicode61 remove_diacritics 2'");
+        assert!(p.stem && p.diacritics == 2);
+        assert!(cfg("tokenize=porter").stem);
+        // ascii keeps all bytes verbatim → level 0 (no diacritic fold).
+        assert_eq!(cfg("tokenize=ascii").diacritics, 0);
+        assert!(cfg("tokenize='porter ascii'").stem);
+        assert_eq!(cfg("tokenize='porter ascii'").diacritics, 0);
+        // An out-of-range level is clamped to 2 (matching our fold table).
+        assert_eq!(
+            cfg("tokenize='unicode61 remove_diacritics 9'").diacritics,
+            2
+        );
     }
 
     #[test]
     #[cfg(feature = "fts5")]
     fn fts5_query_matches_are_token_anded() {
         let doc = [(String::from("body"), String::from("the quick brown fox"))];
-        assert!(fts5_query_matches("fox", &doc, false));
-        assert!(fts5_query_matches("QUICK fox", &doc, false)); // case-insensitive AND
-        assert!(!fts5_query_matches("quick zebra", &doc, false)); // one token missing
-        assert!(!fts5_query_matches("", &doc, false)); // empty query matches nothing
+        assert!(fts5_query_matches("fox", &doc, Fts5Tok::default()));
+        assert!(fts5_query_matches("QUICK fox", &doc, Fts5Tok::default())); // case-insensitive AND
+        assert!(!fts5_query_matches("quick zebra", &doc, Fts5Tok::default())); // one token missing
+        assert!(!fts5_query_matches("", &doc, Fts5Tok::default())); // empty query matches nothing
     }
 
     #[test]
@@ -2832,11 +2971,15 @@ mod tests {
             (String::from("body"), String::from("and the dog")),
         ];
         // A bare token matches in any column; `col:token` only in that column.
-        assert!(fts5_query_matches("fox", &cols, false));
-        assert!(fts5_query_matches("title:fox", &cols, false));
-        assert!(!fts5_query_matches("body:fox", &cols, false)); // fox is in title, not body
-        assert!(fts5_query_matches("title:mixed body:dog", &cols, false)); // AND across columns
-        assert!(!fts5_query_matches("title:dog", &cols, false)); // dog is in body, not title
+        assert!(fts5_query_matches("fox", &cols, Fts5Tok::default()));
+        assert!(fts5_query_matches("title:fox", &cols, Fts5Tok::default()));
+        assert!(!fts5_query_matches("body:fox", &cols, Fts5Tok::default())); // fox is in title, not body
+        assert!(fts5_query_matches(
+            "title:mixed body:dog",
+            &cols,
+            Fts5Tok::default()
+        )); // AND across columns
+        assert!(!fts5_query_matches("title:dog", &cols, Fts5Tok::default())); // dog is in body, not title
     }
 
     #[test]
@@ -2847,16 +2990,32 @@ mod tests {
             String::from("the quick brown fox runs"),
         )];
         // A quoted phrase requires consecutive, ordered tokens.
-        assert!(fts5_query_matches("\"quick brown\"", &doc, false));
-        assert!(!fts5_query_matches("\"brown quick\"", &doc, false)); // wrong order
-        assert!(!fts5_query_matches("\"quick fox\"", &doc, false)); // not adjacent
-                                                                    // A `token*` prefix matches any token starting with it.
-        assert!(fts5_query_matches("fo*", &doc, false)); // fox
-        assert!(fts5_query_matches("run*", &doc, false)); // runs
-        assert!(!fts5_query_matches("cat*", &doc, false));
+        assert!(fts5_query_matches(
+            "\"quick brown\"",
+            &doc,
+            Fts5Tok::default()
+        ));
+        assert!(!fts5_query_matches(
+            "\"brown quick\"",
+            &doc,
+            Fts5Tok::default()
+        )); // wrong order
+        assert!(!fts5_query_matches(
+            "\"quick fox\"",
+            &doc,
+            Fts5Tok::default()
+        )); // not adjacent
+            // A `token*` prefix matches any token starting with it.
+        assert!(fts5_query_matches("fo*", &doc, Fts5Tok::default())); // fox
+        assert!(fts5_query_matches("run*", &doc, Fts5Tok::default())); // runs
+        assert!(!fts5_query_matches("cat*", &doc, Fts5Tok::default()));
         // Column-scoped phrase / prefix.
-        assert!(fts5_query_matches("body:\"quick brown\"", &doc, false));
-        assert!(fts5_query_matches("body:ru*", &doc, false));
+        assert!(fts5_query_matches(
+            "body:\"quick brown\"",
+            &doc,
+            Fts5Tok::default()
+        ));
+        assert!(fts5_query_matches("body:ru*", &doc, Fts5Tok::default()));
     }
 
     #[test]
@@ -2867,54 +3026,54 @@ mod tests {
         assert!(fts5_query_matches(
             "apple OR cherry",
             &doc("apple banana"),
-            false
+            Fts5Tok::default()
         ));
         assert!(!fts5_query_matches(
             "apple AND date",
             &doc("apple banana"),
-            false
+            Fts5Tok::default()
         ));
         assert!(fts5_query_matches(
             "apple AND date",
             &doc("apple date"),
-            false
+            Fts5Tok::default()
         ));
         assert!(fts5_query_matches(
             "banana NOT cherry",
             &doc("apple banana"),
-            false
+            Fts5Tok::default()
         ));
         assert!(!fts5_query_matches(
             "banana NOT cherry",
             &doc("banana cherry"),
-            false
+            Fts5Tok::default()
         ));
         // AND binds tighter than OR: `apple OR banana AND cherry`.
         assert!(fts5_query_matches(
             "apple OR banana AND cherry",
             &doc("apple only"),
-            false
+            Fts5Tok::default()
         ));
         assert!(fts5_query_matches(
             "apple OR banana AND cherry",
             &doc("banana cherry"),
-            false
+            Fts5Tok::default()
         ));
         assert!(!fts5_query_matches(
             "apple OR banana AND cherry",
             &doc("banana only"),
-            false
+            Fts5Tok::default()
         ));
         // Parentheses override precedence.
         assert!(fts5_query_matches(
             "(apple OR banana) AND date",
             &doc("apple date"),
-            false
+            Fts5Tok::default()
         ));
         assert!(!fts5_query_matches(
             "(apple OR banana) AND date",
             &doc("apple only"),
-            false
+            Fts5Tok::default()
         ));
     }
 
@@ -2926,22 +3085,46 @@ mod tests {
         let gap2 = doc("quick the lazy brown");
         let gap4 = doc("brown a b c d quick");
         // Default distance (10) catches all; tighter distances exclude wider gaps.
-        assert!(fts5_query_matches("NEAR(quick brown)", &adjacent, false));
-        assert!(fts5_query_matches("NEAR(quick brown)", &gap4, false));
-        assert!(fts5_query_matches("NEAR(quick brown, 2)", &gap2, false));
-        assert!(!fts5_query_matches("NEAR(quick brown, 1)", &gap2, false));
-        assert!(fts5_query_matches("NEAR(quick brown, 0)", &adjacent, false));
-        assert!(!fts5_query_matches("NEAR(quick brown, 0)", &gap2, false));
+        assert!(fts5_query_matches(
+            "NEAR(quick brown)",
+            &adjacent,
+            Fts5Tok::default()
+        ));
+        assert!(fts5_query_matches(
+            "NEAR(quick brown)",
+            &gap4,
+            Fts5Tok::default()
+        ));
+        assert!(fts5_query_matches(
+            "NEAR(quick brown, 2)",
+            &gap2,
+            Fts5Tok::default()
+        ));
+        assert!(!fts5_query_matches(
+            "NEAR(quick brown, 1)",
+            &gap2,
+            Fts5Tok::default()
+        ));
+        assert!(fts5_query_matches(
+            "NEAR(quick brown, 0)",
+            &adjacent,
+            Fts5Tok::default()
+        ));
+        assert!(!fts5_query_matches(
+            "NEAR(quick brown, 0)",
+            &gap2,
+            Fts5Tok::default()
+        ));
         // A missing phrase never matches; NEAR composes with the boolean operators.
         assert!(!fts5_query_matches(
             "NEAR(quick zebra, 5)",
             &adjacent,
-            false
+            Fts5Tok::default()
         ));
         assert!(fts5_query_matches(
             "NEAR(quick brown, 2) AND fox",
             &adjacent,
-            false
+            Fts5Tok::default()
         ));
     }
 
@@ -2958,8 +3141,9 @@ mod tests {
             doc("apple banana cherry date"),
         ];
         let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
-        let score =
-            |q: &str, i: usize| fts5_bm25_corpus(q, &names, &docs, None, None, false).score(i, &[]);
+        let score = |q: &str, i: usize| {
+            fts5_bm25_corpus(q, &names, &docs, None, None, Fts5Tok::default()).score(i, &[])
+        };
 
         // A common term (idf clamped to 1e-6): the exact values sqlite3 returns.
         assert!(close(score("apple", 0), -1.347_921_225_382_93e-6));
@@ -2977,7 +3161,7 @@ mod tests {
         // A per-column weight scales the effective term frequency, which sits in
         // both the numerator and denominator — so a heavier weight gives a larger
         // magnitude, but not a linear multiple of the unweighted score.
-        let corpus = fts5_bm25_corpus("apple", &names, &docs, None, None, false);
+        let corpus = fts5_bm25_corpus("apple", &names, &docs, None, None, Fts5Tok::default());
         assert!(corpus.score(0, &[10.0]) < corpus.score(0, &[]));
         assert_eq!(corpus.score(3, &[10.0]), 0.0); // still 0 where the term is absent
     }
@@ -2986,7 +3170,9 @@ mod tests {
     #[cfg(feature = "fts5")]
     fn fts5_highlight_wraps_matched_tokens() {
         let names = [String::from("body")];
-        let hl = |q: &str, text: &str| fts5_highlight(q, &names, None, 0, text, false, "[", "]");
+        let hl = |q: &str, text: &str| {
+            fts5_highlight(q, &names, None, 0, text, Fts5Tok::default(), "[", "]")
+        };
         // A single matched token, preserving the surrounding text.
         assert_eq!(
             hl("fox", "the quick brown fox jumps"),
@@ -3015,20 +3201,32 @@ mod tests {
     fn fts5_anchor_requires_first_token() {
         let doc = |s: &str| [(String::from("body"), String::from(s))];
         // `^token` matches only when the token is at the start of the column.
-        assert!(fts5_query_matches("^quick", &doc("quick brown fox"), false));
-        assert!(!fts5_query_matches("^quick", &doc("the quick fox"), false));
+        assert!(fts5_query_matches(
+            "^quick",
+            &doc("quick brown fox"),
+            Fts5Tok::default()
+        ));
+        assert!(!fts5_query_matches(
+            "^quick",
+            &doc("the quick fox"),
+            Fts5Tok::default()
+        ));
         // Anchored phrases too; an unanchored token still matches anywhere.
         assert!(fts5_query_matches(
             "^\"quick brown\"",
             &doc("quick brown fox"),
-            false
+            Fts5Tok::default()
         ));
         assert!(!fts5_query_matches(
             "^\"quick brown\"",
             &doc("a quick brown"),
-            false
+            Fts5Tok::default()
         ));
-        assert!(fts5_query_matches("quick", &doc("the quick fox"), false));
+        assert!(fts5_query_matches(
+            "quick",
+            &doc("the quick fox"),
+            Fts5Tok::default()
+        ));
     }
 
     #[test]
