@@ -10452,6 +10452,14 @@ impl Connection {
                     )),
                 };
             }
+            // `dbstat`: an eponymous read-only virtual table reporting per-page
+            // b-tree storage statistics. A real user table named `dbstat` wins.
+            if from.first.schema.is_none()
+                && from.first.name.eq_ignore_ascii_case("dbstat")
+                && self.schema.table("dbstat").is_none()
+            {
+                return self.scan_dbstat(from.first.alias.as_deref());
+            }
             let db = match from.first.schema.as_deref() {
                 Some(_) => self.resolve_db(from.first.schema.as_deref())?,
                 // Don't let a temp table shadow a CTE or view of the same name.
@@ -11994,6 +12002,167 @@ impl Connection {
             })
             .collect();
         Ok(Some((columns, rows)))
+    }
+
+    /// The `dbstat` eponymous read-only virtual table: one row per b-tree page
+    /// (plus one per overflow page), reporting SQLite-compatible per-page storage
+    /// statistics (`name, path, pageno, pagetype, ncell, payload, unused,
+    /// mx_payload, pgoffset, pgsize`). Byte-compatible with SQLite's dbstat
+    /// extension: `unused` is derived from the page header's free-space pointer,
+    /// fragmented-bytes count, and freeblock chain; `payload` sums the locally
+    /// stored cell bytes; `mx_payload` is the largest total cell payload. The
+    /// `path` strings use SQLite's `/<hex-child>/` and `+<hex-overflow>` format.
+    fn scan_dbstat(&self, alias: Option<&str>) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
+        use crate::btree::page::{BtreePage, PageType};
+        use eval::Affinity::{Integer, Text};
+
+        let label = alias.unwrap_or("dbstat").to_string();
+        let col = |name: &str, affinity| ColumnInfo {
+            name: String::from(name),
+            table: label.clone(),
+            affinity,
+            collation: crate::value::Collation::default(),
+        };
+        let columns = alloc::vec![
+            col("name", Text),
+            col("path", Text),
+            col("pageno", Integer),
+            col("pagetype", Text),
+            col("ncell", Integer),
+            col("payload", Integer),
+            col("unused", Integer),
+            col("mx_payload", Integer),
+            col("pgoffset", Integer),
+            col("pgsize", Integer),
+        ];
+
+        let src = self.backend.source();
+        let usable = src.usable_size();
+        let page_size = src.header().page_size as i64;
+        let be16 = |d: &[u8], off: usize| u16::from_be_bytes([d[off], d[off + 1]]) as usize;
+
+        // The b-trees to walk: `sqlite_schema` (page 1) first, then every object
+        // that owns a root page (tables and indexes), in catalog order.
+        let mut btrees: Vec<(String, u32)> = alloc::vec![(String::from("sqlite_schema"), 1)];
+        for obj in self.schema.objects() {
+            if obj.rootpage != 0 {
+                btrees.push((obj.name.clone(), obj.rootpage));
+            }
+        }
+
+        let mut rows: Vec<InputRow> = Vec::new();
+        for (name, root) in btrees {
+            // Pre-order DFS; child order does not affect per-page stats.
+            let mut stack = alloc::vec![(root, String::from("/"))];
+            while let Some((pgno, path)) = stack.pop() {
+                let page = src.page(pgno)?;
+                let bp = BtreePage::parse(page)?;
+                let data = bp.data();
+                let body = if pgno == 1 { 100 } else { 0 };
+                let ncell = bp.num_cells();
+                let is_leaf = bp.page_type().is_leaf();
+                let nhdr = body + if is_leaf { 8 } else { 12 };
+                let ptype = if is_leaf { "leaf" } else { "internal" };
+
+                let mut payload = 0i64;
+                let mut mx = 0i64;
+                // SQLite's dbstat reports an overflow page's `pgoffset` as the
+                // offset of the *previously visited* page (the owning leaf for a
+                // chain's first page, the prior chain page after) — an off-by-one
+                // in its statSizeAndOffset. `prev_pgno` reproduces that lag; it
+                // starts at the leaf and carries across this page's cells.
+                let mut prev_pgno = pgno;
+                // Sum local payload and emit overflow-page rows.
+                for i in 0..ncell {
+                    let pl = match bp.page_type() {
+                        PageType::LeafTable => bp.table_leaf_cell(i, usable)?.payload,
+                        PageType::LeafIndex | PageType::InteriorIndex => {
+                            bp.index_cell(i, usable)?.payload
+                        }
+                        // Interior-table cells carry no payload.
+                        PageType::InteriorTable => continue,
+                    };
+                    payload += pl.local_len as i64;
+                    mx = mx.max(pl.total_len as i64);
+
+                    // Walk this cell's overflow chain, one row per overflow page.
+                    let mut ovfl = pl.overflow;
+                    let mut remaining = pl.total_len - pl.local_len;
+                    let mut iovfl = 0usize;
+                    while ovfl != 0 {
+                        let opage = src.page(ovfl)?;
+                        let odata = opage.data();
+                        let next = u32::from_be_bytes([odata[0], odata[1], odata[2], odata[3]]);
+                        let cap = usable - 4;
+                        let (opayload, ounused) = if remaining <= cap {
+                            (remaining as i64, (cap - remaining) as i64)
+                        } else {
+                            (cap as i64, 0)
+                        };
+                        rows.push(InputRow {
+                            values: alloc::vec![
+                                Value::Text(name.clone()),
+                                Value::Text(alloc::format!("{path}{i:03x}+{iovfl:06x}")),
+                                Value::Integer(ovfl as i64),
+                                Value::Text(String::from("overflow")),
+                                Value::Integer(0),
+                                Value::Integer(opayload),
+                                Value::Integer(ounused),
+                                Value::Integer(0),
+                                Value::Integer((prev_pgno as i64 - 1) * page_size),
+                                Value::Integer(page_size),
+                            ],
+                            rowid: None,
+                        });
+                        remaining = remaining.saturating_sub(cap);
+                        iovfl += 1;
+                        prev_pgno = ovfl;
+                        ovfl = next;
+                    }
+                }
+
+                // Free space: (cell-content-area-start - header - cell-pointer
+                // array) + fragmented free bytes + the freeblock chain.
+                let cc = match be16(data, body + 5) {
+                    0 => 65536,
+                    n => n,
+                };
+                let mut unused = cc as i64 - nhdr as i64 - 2 * ncell as i64 + data[body + 7] as i64;
+                let mut fb = be16(data, body + 1);
+                while fb != 0 && fb + 4 <= data.len() {
+                    unused += be16(data, fb + 2) as i64;
+                    fb = be16(data, fb);
+                }
+
+                rows.push(InputRow {
+                    values: alloc::vec![
+                        Value::Text(name.clone()),
+                        Value::Text(path.clone()),
+                        Value::Integer(pgno as i64),
+                        Value::Text(String::from(ptype)),
+                        Value::Integer(ncell as i64),
+                        Value::Integer(payload),
+                        Value::Integer(unused),
+                        Value::Integer(mx),
+                        Value::Integer((pgno as i64 - 1) * page_size),
+                        Value::Integer(page_size),
+                    ],
+                    rowid: None,
+                });
+
+                // Descend into children of an interior page.
+                if !is_leaf {
+                    for i in 0..=ncell {
+                        let child = bp.child_pointer(i)?;
+                        if child != 0 {
+                            stack.push((child, alloc::format!("{path}{i:03x}/")));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((columns, rows))
     }
 
     fn scan_table(&self, meta: &TableMeta) -> Result<Vec<(i64, Vec<Value>)>> {

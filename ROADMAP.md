@@ -531,6 +531,19 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
   BY/HAVING/DISTINCT). Built-ins win. *Remaining: window UDFs and custom
   collations (the `Collation` enum would need a user variant — invasive).* Pairs
   with `register_module`.
+- **D-introspect — `dbstat`. ✅ DONE.** The eponymous read-only `dbstat` virtual
+  table reports per-page b-tree storage stats (`name, path, pageno, pagetype,
+  ncell, payload, unused, mx_payload, pgoffset, pgsize`), one row per page plus
+  one per overflow page. `scan_dbstat` (`exec/mod.rs`) DFS-walks every b-tree
+  (`sqlite_schema` at page 1, then each table/index root) and computes, byte-for-
+  byte like SQLite's dbstat.c: `unused` from the page header's cell-content
+  pointer, fragmented-bytes count, and freeblock chain; `payload` as the summed
+  local cell bytes; `mx_payload` as the largest total cell payload; SQLite's
+  `/<hex-child>/` + `+<hex-overflow>` path strings; and even reproduces dbstat's
+  off-by-one overflow `pgoffset` (the lagged previous-page offset). A real user
+  table named `dbstat` shadows it. Differentially clean vs sqlite3 over small,
+  indexed, multi-level, and overflow-chain databases (`tests/dbstat.rs`).
+  *(Sibling `dbpage` — writable raw page access — not yet built.)*
 - **D5 — `sqlite3_session`** — changesets/patchsets for replication.
 - **D6 — Async VFS for wasm** — non-blocking I/O over IndexedDB/OPFS.
 - **D7 — C-API shim** — a `libsqlite3`-compatible surface as a *separate* crate.
