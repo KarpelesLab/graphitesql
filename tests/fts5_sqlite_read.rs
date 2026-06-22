@@ -9,6 +9,40 @@
 
 use graphitesql::Connection;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn tmp_path() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let p = std::env::temp_dir().join(format!(
+        "gsql-fts5-m2b-{}-{}.db",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let p = p.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+/// Run a query through stock sqlite3 against the file and return its sorted,
+/// `|`-joined output (asserting success).
+fn sqlite_run(path: &str, q: &str) -> String {
+    let o = Command::new("sqlite3").arg(path).arg(q).output().unwrap();
+    assert!(
+        o.status.success(),
+        "sqlite3 failed for {q:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mut v: Vec<String> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    v.sort();
+    v.join("|")
+}
+
+fn have_sqlite() -> bool {
+    Command::new("sqlite3").arg("--version").output().is_ok()
+}
 
 #[test]
 fn sqlite_reads_and_matches_graphite_written_fts5() {
@@ -89,5 +123,134 @@ fn sqlite_reads_and_matches_graphite_written_fts5() {
     );
     assert_eq!(sqlite("PRAGMA integrity_check"), "ok");
 
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A larger table whose segment spans multiple leaf pages: sqlite must use
+/// graphite's `%_idx` to find terms across leaves. Each doc has a shared term
+/// ("common") plus a unique one ("wordNNNN").
+#[test]
+fn sqlite_matches_multi_leaf_graphite_fts5() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+            .unwrap();
+        let mut sql = String::from("INSERT INTO t(rowid, body) VALUES ");
+        for i in 1..=400 {
+            if i > 1 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({i},'common word{i:04}')"));
+        }
+        c.execute(&sql).unwrap();
+    }
+    // "common" is in every doc → 400 hits across many leaves.
+    assert_eq!(
+        sqlite_run(&path, "SELECT count(*) FROM t WHERE t MATCH 'common'"),
+        "400"
+    );
+    // A unique term on (likely) a non-first leaf resolves via %_idx.
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'word0377'"),
+        "377"
+    );
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'word0001'"),
+        "1"
+    );
+    assert_eq!(sqlite_run(&path, "PRAGMA integrity_check"), "ok");
+    let chk = Command::new("sqlite3")
+        .arg(&path)
+        .arg("INSERT INTO t(t) VALUES('integrity-check');")
+        .output()
+        .unwrap();
+    assert!(
+        chk.status.success(),
+        "fts5 integrity-check: {}",
+        String::from_utf8_lossy(&chk.stderr)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The porter tokenizer: graphite stems tokens when indexing, so sqlite's
+/// porter-stemmed MATCH finds them in a graphite-written table.
+#[test]
+fn sqlite_matches_porter_graphite_fts5() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(body, tokenize='porter')")
+            .unwrap();
+        c.execute(
+            "INSERT INTO t(rowid, body) VALUES \
+             (1,'the runners are running'),(2,'a connection was connected')",
+        )
+        .unwrap();
+    }
+    // "running"/"runners" and "run" all stem to "run".
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'run'"),
+        "1"
+    );
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'connect'"),
+        "2"
+    );
+    assert_eq!(sqlite_run(&path, "PRAGMA integrity_check"), "ok");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// After UPDATE and DELETE the index is rebuilt, so sqlite sees the current
+/// documents and MATCH reflects the edits.
+#[test]
+fn sqlite_reads_graphite_fts5_after_update_delete() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+            .unwrap();
+        c.execute(
+            "INSERT INTO t(rowid, body) VALUES (1,'alpha beta'),(2,'gamma delta'),(3,'epsilon')",
+        )
+        .unwrap();
+        c.execute("UPDATE t SET body='zeta eta' WHERE rowid=2")
+            .unwrap();
+        c.execute("DELETE FROM t WHERE rowid=3").unwrap();
+    }
+    // Doc 2's old terms are gone, its new terms present; doc 3 is gone.
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'gamma'"),
+        ""
+    );
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'zeta'"),
+        "2"
+    );
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'epsilon'"),
+        ""
+    );
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'alpha'"),
+        "1"
+    );
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid, body FROM t ORDER BY rowid"),
+        "1|alpha beta|2|zeta eta"
+    );
+    assert_eq!(sqlite_run(&path, "PRAGMA integrity_check"), "ok");
     let _ = std::fs::remove_file(&path);
 }
