@@ -5898,11 +5898,20 @@ impl Connection {
 
         // Update the schema's CREATE TABLE text.
         ct.columns.remove(pos);
-        let new_sql = sql::print::create_table(&ct);
+        // Remove the column from the stored CREATE text in place (preserving the
+        // other columns verbatim), like sqlite; fall back to an AST reprint.
+        let reprint = sql::print::create_table(&ct);
         let table = a.table.clone();
+        let dropped = name.to_string();
         self.rewrite_schema_rows(|cols| {
             if is_text(&cols[0], "table") && is_text(&cols[1], &table) {
-                cols[4] = Value::Text(new_sql.clone());
+                let updated = match cols.get(4) {
+                    Some(Value::Text(old)) => {
+                        drop_column_from_create(old, &dropped).unwrap_or_else(|| reprint.clone())
+                    }
+                    _ => reprint.clone(),
+                };
+                cols[4] = Value::Text(updated);
                 true
             } else {
                 false
@@ -15159,6 +15168,56 @@ fn append_column_to_create(sql: &str, col_text: &str) -> Option<String> {
     out.push_str(", ");
     out.push_str(col_text.trim());
     out.push_str(&sql[pos..]);
+    Some(out)
+}
+
+/// Remove the column named `col` (and one adjacent comma) from a `CREATE TABLE`
+/// statement's text, preserving everything else verbatim — how SQLite records a
+/// `DROP COLUMN`. Returns `None` if the column or list can't be located.
+fn drop_column_from_create(sql: &str, col: &str) -> Option<String> {
+    use sql::token::Token;
+    let toks = sql::token::tokenize(sql).ok()?;
+    let open = toks.iter().position(|t| matches!(t.token, Token::LParen))?;
+    // The matching close of the column list, and the top-level comma separators.
+    let mut depth = 0i32;
+    let mut close = None;
+    let mut seps = Vec::new();
+    for (i, sp) in toks.iter().enumerate().skip(open) {
+        match sp.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            Token::Comma if depth == 1 => seps.push(i),
+            _ => {}
+        }
+    }
+    let close = close?;
+    // Segment boundaries: the opener, each top-level comma, then the closer. The
+    // first token after each boundary begins a column def or table constraint.
+    let mut bounds = alloc::vec![open];
+    bounds.extend_from_slice(&seps);
+    bounds.push(close);
+    let n = bounds.len() - 1; // number of segments
+    let is_named = |i: usize| {
+        matches!(&toks.get(i).map(|t| &t.token),
+            Some(Token::Word(w) | Token::Ident(w)) if w.eq_ignore_ascii_case(col))
+    };
+    let j = (0..n).find(|&j| bounds[j] + 1 < bounds[j + 1] && is_named(bounds[j] + 1))?;
+    let (del_start, del_end) = if j < n - 1 {
+        // Not the last segment: drop it and the comma that follows.
+        (toks[bounds[j] + 1].start, toks[bounds[j + 1] + 1].start)
+    } else {
+        // The last segment: drop the comma that precedes it through its last token.
+        (toks[bounds[j]].start, toks[close - 1].end)
+    };
+    let mut out = String::with_capacity(sql.len());
+    out.push_str(&sql[..del_start]);
+    out.push_str(&sql[del_end..]);
     Some(out)
 }
 

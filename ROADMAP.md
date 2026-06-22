@@ -225,8 +225,11 @@ with "no such table/column" after a rename). Build bottom-up:
   table's own CREATE and in each dependent index's `ON` clause), quoting only the
   new name and preserving the body verbatim, byte-identical to sqlite. **`ADD
   COLUMN` ✅ DONE** — `append_column_to_create` splices the column's verbatim
-  source text before the column-list's closing paren. *Remaining: `RENAME COLUMN`
-  / `DROP COLUMN` (in-place token edit/removal) still reprint from the AST.*
+  source text before the column-list's closing paren. **`DROP COLUMN` ✅ DONE** —
+  `drop_column_from_create` removes the column segment and one adjacent comma,
+  preserving the others verbatim. *Remaining: `RENAME COLUMN` still reprints from
+  the AST — an in-place token rename needs sqlite's keyword list to decide when to
+  quote the new name (it quotes a keyword / non-simple identifier, else bare).*
 
 ### Track B — Query planner, statistics & the VDBE
 

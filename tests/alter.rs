@@ -96,6 +96,41 @@ fn add_column_appends_verbatim_to_schema_text() {
 }
 
 #[test]
+fn drop_column_preserves_schema_text() {
+    // ALTER … DROP COLUMN removes the column (and one adjacent comma) from the
+    // stored CREATE text in place, preserving the others verbatim — like sqlite.
+    let sql_after = |create: &str, drop: &str| -> String {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(create).unwrap();
+        c.execute(drop).unwrap();
+        match &c
+            .query("SELECT sql FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    // Middle, last, and first columns; formatting preserved.
+    assert_eq!(
+        sql_after(
+            "CREATE TABLE t(a INT, b TEXT DEFAULT 'x', c)",
+            "ALTER TABLE t DROP COLUMN b"
+        ),
+        "CREATE TABLE t(a INT, c)"
+    );
+    assert_eq!(
+        sql_after("CREATE TABLE t(a, b, c)", "ALTER TABLE t DROP COLUMN c"),
+        "CREATE TABLE t(a, b)"
+    );
+    assert_eq!(
+        sql_after("CREATE TABLE t(a, b, c)", "ALTER TABLE t DROP COLUMN a"),
+        "CREATE TABLE t(b, c)"
+    );
+}
+
+#[test]
 fn rename_table_preserves_schema_text() {
     // ALTER … RENAME TO edits the table name in the stored CREATE text in place
     // (quoting only the new name), preserving the original column formatting —
