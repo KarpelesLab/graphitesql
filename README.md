@@ -38,12 +38,14 @@ format**.
 > sqlite's `_content`/`_data`/`_idx`/`_docsize`/`_config` shadow tables) is
 > opened, full-text-`MATCH`ed, and integrity-checked by stock `sqlite3`, and an
 > R-Tree round-trips through its `_node` on-disk format. *(FTS5 sqlite-readability
-> covers ASCII and accented Latin-1 text — graphite now folds diacritics like
-> `unicode61`'s default, `café`→`cafe`; Latin Extended-A and beyond are not yet
-> folded.)* What remains is depth: the rest of the `unicode61` folding,
-> R-Tree spatial pushdown, finishing the VDBE (per-cursor joins, more
-> single-block shapes), and concurrency — see the full plan in
-> **[ROADMAP.md](ROADMAP.md)**.
+> covers ASCII, Latin-1, Latin Extended-A/B, and Latin Extended Additional text —
+> graphite folds diacritics exactly like `unicode61`'s default
+> `remove_diacritics=1` (`café`→`cafe`, `Dvořák`→`dvorak`, `mạ`→`ma`), a table
+> derived byte-for-byte from `sqlite3`; CJK and other scripts pass through
+> unfolded, as in sqlite.)* What remains is depth: tokenizer options
+> (`remove_diacritics=2`, `tokenchars`), R-Tree spatial pushdown, finishing the
+> VDBE (per-cursor joins, more single-block shapes), and concurrency — see the
+> full plan in **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why
 

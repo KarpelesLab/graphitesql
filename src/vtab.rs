@@ -1483,23 +1483,78 @@ pub(crate) fn fts5_porter_stem(word: &str) -> String {
 }
 
 #[cfg(feature = "fts5")]
-/// Fold a precomposed accented Latin-1 letter to its base, matching SQLite's
-/// `unicode61` default (`remove_diacritics`), which NFD-decomposes and drops
-/// combining marks (`café`→`cafe`, `résumé`→`resume`, `über`→`uber`). Distinct
-/// letters that are NOT just an accented base — `Æ`/`æ`, `Ø`/`ø`, `ß`, `Þ`/`þ`,
-/// `Ð`/`ð` — and everything outside Latin-1 are returned unchanged. Without this,
-/// accented tokens diverge from `unicode61`, so a graphite-written FTS5 index is
-/// "malformed" to sqlite. (Latin Extended-A and beyond are not yet folded.)
+/// Fold a precomposed accented Latin letter to its ASCII base, matching SQLite's
+/// `unicode61` default tokenizer (`remove_diacritics=1`), which strips combining
+/// marks (`café`→`cafe`, `résumé`→`resume`, `über`→`uber`, `Việt`→`viet`). The
+/// table covers the Latin-1 Supplement, Latin Extended-A, the accented part of
+/// Latin Extended-B, and Latin Extended Additional (U+1E00–U+1EFF). It is derived
+/// byte-exactly from `sqlite3` 3.50.4 via `fts5vocab` — every entry is a codepoint
+/// that the C tokenizer folds to a single ASCII letter.
+///
+/// Distinct letters that are NOT merely an accented base — `Æ`/`æ`, `Ø`/`ø`, `ß`,
+/// `Þ`/`þ`, `Ð`/`ð`, `Ł`/`ł`, `Đ`/`đ`, `Œ`/`œ`, … — and the double-accented chars
+/// `remove_diacritics=1` leaves alone (e.g. `Ḉ`→`ḉ`) are returned unchanged; their
+/// case folding is then handled by `char::to_lowercase`, which matches sqlite. The
+/// non-letter `×`/`÷` are not token characters in either engine. Without this fold
+/// an accented token diverges from `unicode61` and a graphite-written FTS5 index
+/// reads as "malformed inverted index" to sqlite.
+#[cfg(feature = "fts5")]
 pub(crate) fn fold_diacritic(ch: char) -> char {
     match ch {
-        'À'..='Å' | 'à'..='å' => 'a',
-        'Ç' | 'ç' => 'c',
-        'È'..='Ë' | 'è'..='ë' => 'e',
-        'Ì'..='Ï' | 'ì'..='ï' => 'i',
-        'Ñ' | 'ñ' => 'n',
-        'Ò'..='Ö' | 'ò'..='ö' => 'o',
-        'Ù'..='Ü' | 'ù'..='ü' => 'u',
-        'Ý' | 'ý' | 'ÿ' => 'y',
+        'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'Ā' | 'ā' | 'Ă'
+        | 'ă' | 'Ą' | 'ą' | 'Ǎ' | 'ǎ' | 'Ȁ' | 'ȁ' | 'Ȃ' | 'ȃ' | 'Ȧ' | 'ȧ' | 'Ḁ' | 'ḁ' | 'Ạ'
+        | 'ạ' | 'Ả' | 'ả' => 'a',
+        'Ḃ' | 'ḃ' | 'Ḅ' | 'ḅ' | 'Ḇ' | 'ḇ' => 'b',
+        'Ç' | 'ç' | 'Ć' | 'ć' | 'Ĉ' | 'ĉ' | 'Ċ' | 'ċ' | 'Č' | 'č' => 'c',
+        'Ď' | 'ď' | 'Ḋ' | 'ḋ' | 'Ḍ' | 'ḍ' | 'Ḏ' | 'ḏ' | 'Ḑ' | 'ḑ' | 'Ḓ' | 'ḓ' => {
+            'd'
+        }
+        'È' | 'É' | 'Ê' | 'Ë' | 'è' | 'é' | 'ê' | 'ë' | 'Ē' | 'ē' | 'Ĕ' | 'ĕ' | 'Ė' | 'ė' | 'Ę'
+        | 'ę' | 'Ě' | 'ě' | 'Ȅ' | 'ȅ' | 'Ȇ' | 'ȇ' | 'Ȩ' | 'ȩ' | 'Ḙ' | 'ḙ' | 'Ḛ' | 'ḛ' | 'Ẹ'
+        | 'ẹ' | 'Ẻ' | 'ẻ' | 'Ẽ' | 'ẽ' => 'e',
+        'Ḟ' | 'ḟ' => 'f',
+        'Ĝ' | 'ĝ' | 'Ğ' | 'ğ' | 'Ġ' | 'ġ' | 'Ģ' | 'ģ' | 'Ǧ' | 'ǧ' | 'Ǵ' | 'ǵ' | 'Ḡ' | 'ḡ' => {
+            'g'
+        }
+        'Ĥ' | 'ĥ' | 'Ȟ' | 'ȟ' | 'Ḣ' | 'ḣ' | 'Ḥ' | 'ḥ' | 'Ḧ' | 'ḧ' | 'Ḩ' | 'ḩ' | 'Ḫ' | 'ḫ' | 'ẖ' => {
+            'h'
+        }
+        'Ì' | 'Í' | 'Î' | 'Ï' | 'ì' | 'í' | 'î' | 'ï' | 'Ĩ' | 'ĩ' | 'Ī' | 'ī' | 'Ĭ' | 'ĭ' | 'Į'
+        | 'į' | 'İ' | 'Ǐ' | 'ǐ' | 'Ȉ' | 'ȉ' | 'Ȋ' | 'ȋ' | 'Ḭ' | 'ḭ' | 'Ỉ' | 'ỉ' | 'Ị' | 'ị' => {
+            'i'
+        }
+        'Ĵ' | 'ĵ' | 'ǰ' => 'j',
+        'Ķ' | 'ķ' | 'Ǩ' | 'ǩ' | 'Ḱ' | 'ḱ' | 'Ḳ' | 'ḳ' | 'Ḵ' | 'ḵ' => 'k',
+        'Ĺ' | 'ĺ' | 'Ļ' | 'ļ' | 'Ľ' | 'ľ' | 'Ḷ' | 'ḷ' | 'Ḻ' | 'ḻ' | 'Ḽ' | 'ḽ' => {
+            'l'
+        }
+        'Ḿ' | 'ḿ' | 'Ṁ' | 'ṁ' | 'Ṃ' | 'ṃ' => 'm',
+        'Ñ' | 'ñ' | 'Ń' | 'ń' | 'Ņ' | 'ņ' | 'Ň' | 'ň' | 'Ǹ' | 'ǹ' | 'Ṅ' | 'ṅ' | 'Ṇ' | 'ṇ' | 'Ṉ'
+        | 'ṉ' | 'Ṋ' | 'ṋ' => 'n',
+        'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'Ō' | 'ō' | 'Ŏ' | 'ŏ' | 'Ő'
+        | 'ő' | 'Ơ' | 'ơ' | 'Ǒ' | 'ǒ' | 'Ǫ' | 'ǫ' | 'Ȍ' | 'ȍ' | 'Ȏ' | 'ȏ' | 'Ȯ' | 'ȯ' | 'Ọ'
+        | 'ọ' | 'Ỏ' | 'ỏ' => 'o',
+        'Ṕ' | 'ṕ' | 'Ṗ' | 'ṗ' => 'p',
+        'Ŕ' | 'ŕ' | 'Ŗ' | 'ŗ' | 'Ř' | 'ř' | 'Ȑ' | 'ȑ' | 'Ȓ' | 'ȓ' | 'Ṙ' | 'ṙ' | 'Ṛ' | 'ṛ' | 'Ṟ'
+        | 'ṟ' => 'r',
+        'Ś' | 'ś' | 'Ŝ' | 'ŝ' | 'Ş' | 'ş' | 'Š' | 'š' | 'ſ' | 'Ș' | 'ș' | 'Ṡ' | 'ṡ' | 'Ṣ' | 'ṣ'
+        | 'ẛ' => 's',
+        'Ţ' | 'ţ' | 'Ť' | 'ť' | 'Ț' | 'ț' | 'Ṫ' | 'ṫ' | 'Ṭ' | 'ṭ' | 'Ṯ' | 'ṯ' | 'Ṱ' | 'ṱ' | 'ẗ' => {
+            't'
+        }
+        'Ù' | 'Ú' | 'Û' | 'Ü' | 'ù' | 'ú' | 'û' | 'ü' | 'Ũ' | 'ũ' | 'Ū' | 'ū' | 'Ŭ' | 'ŭ' | 'Ů'
+        | 'ů' | 'Ű' | 'ű' | 'Ų' | 'ų' | 'Ư' | 'ư' | 'Ǔ' | 'ǔ' | 'Ȕ' | 'ȕ' | 'Ȗ' | 'ȗ' | 'Ṳ'
+        | 'ṳ' | 'Ṵ' | 'ṵ' | 'Ṷ' | 'ṷ' | 'Ụ' | 'ụ' | 'Ủ' | 'ủ' => 'u',
+        'Ṽ' | 'ṽ' | 'Ṿ' | 'ṿ' => 'v',
+        'Ŵ' | 'ŵ' | 'Ẁ' | 'ẁ' | 'Ẃ' | 'ẃ' | 'Ẅ' | 'ẅ' | 'Ẇ' | 'ẇ' | 'Ẉ' | 'ẉ' | 'ẘ' => {
+            'w'
+        }
+        'Ẋ' | 'ẋ' | 'Ẍ' | 'ẍ' => 'x',
+        'Ý' | 'ý' | 'ÿ' | 'Ŷ' | 'ŷ' | 'Ÿ' | 'Ȳ' | 'ȳ' | 'Ẏ' | 'ẏ' | 'ẙ' | 'Ỳ' | 'ỳ' | 'Ỵ' | 'ỵ'
+        | 'Ỷ' | 'ỷ' | 'Ỹ' | 'ỹ' => 'y',
+        'Ź' | 'ź' | 'Ż' | 'ż' | 'Ž' | 'ž' | 'Ẑ' | 'ẑ' | 'Ẓ' | 'ẓ' | 'Ẕ' | 'ẕ' => {
+            'z'
+        }
         other => other,
     }
 }

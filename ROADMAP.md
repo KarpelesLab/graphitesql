@@ -636,13 +636,21 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     only structural validity is needed for sqlite to read it, and that holds.*
     **TOKENIZER diacritic folding (found+fixed 2026-06-23):** sqlite-readability
     requires graphite's tokens to match `unicode61`, whose DEFAULT removes
-    diacritics (`café`→`cafe`). `fts5_tokenize` now folds accented **Latin-1**
-    letters (`fold_diacritic`) so accented Latin docs are integrity-clean and
-    MATCH correctly under sqlite (`tests/fts5_sqlite_read.rs::
-    sqlite_matches_accented_graphite_fts5`); this also aligns graphite's own
-    `MATCH` with sqlite for that text (a pre-existing divergence). *Remaining:*
-    Latin Extended-A and the rest of `unicode61`'s folding table — a doc with
-    those rarer accents still indexes terms sqlite recomputes differently.
+    diacritics (`café`→`cafe`). `fts5_tokenize` folds accented Latin via
+    `fold_diacritic`, a **376-entry table covering the Latin-1 Supplement, Latin
+    Extended-A, the accented part of Latin Extended-B, and Latin Extended
+    Additional (U+1E00–U+1EFF)** — derived byte-exactly from `sqlite3` 3.50.4 by
+    probing `fts5vocab`, so it reproduces `remove_diacritics=1` precisely,
+    including the chars it deliberately keeps (the stroke letter `ł`→`ł`, the
+    double-accented `ệ`→`ệ`, `×`/`÷` as non-tokens). Accented Latin docs
+    (French, Polish, Czech, Romanian, Vietnamese single-mark) are now
+    integrity-clean and MATCH correctly under sqlite (`tests/fts5_sqlite_read.rs::
+    sqlite_matches_accented_graphite_fts5` + `::sqlite_matches_extended_latin_
+    graphite_fts5`); this also aligns graphite's own `MATCH` with sqlite for that
+    text. *Remaining:* the non-default tokenizer options (`remove_diacritics=2`,
+    which additionally strips the kept double-accents; `tokenchars`/`separators`),
+    and folding for non-Latin scripts (which `unicode61` passes through unchanged
+    anyway, so graphite already matches there).
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
   (`register_function`, via `Subqueries::call_udf`) and aggregate ✅ DONE
   (`register_aggregate_function` + an `AggregateFunction` step/finalize trait;

@@ -295,3 +295,58 @@ fn sqlite_matches_accented_graphite_fts5() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// Latin Extended-A and Latin Extended Additional: graphite's full diacritic
+/// table (derived from sqlite 3.50.4) folds Polish, Czech, Romanian, and
+/// Vietnamese precomposed accents the same way unicode61's `remove_diacritics=1`
+/// does, so a graphite-written index is integrity-clean and MATCHes the
+/// de-accented query under stock sqlite3.
+#[test]
+fn sqlite_matches_extended_latin_graphite_fts5() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+            .unwrap();
+        c.execute(
+            "INSERT INTO t(rowid, body) VALUES \
+             (1,'zażółć gęślą jaźń'),(2,'Dvořák Antonín'),\
+             (3,'București România'),(4,'Tiếng Việt Nam mạ lủ')",
+        )
+        .unwrap();
+    }
+    assert_eq!(sqlite_run(&path, "PRAGMA integrity_check"), "ok");
+    // Polish ż/ó/ć/ę/ś/ą/ź fold to ASCII bases (gęślą→gesla, jaźń→jazn). The
+    // stroke letter ł is NOT a diacritic, so unicode61 keeps it (zażółć→zazołc);
+    // graphite keeps it identically.
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'gesla'"),
+        "1"
+    );
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'jazn'"),
+        "1"
+    );
+    // Czech ř/á.
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'dvorak'"),
+        "2"
+    );
+    // Romanian ș/â.
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'bucuresti'"),
+        "3"
+    );
+    // Vietnamese single-mark ạ/ủ (Latin Extended Additional) fold to a/u; the
+    // double-accented ế/ệ are kept verbatim by remove_diacritics=1 (so 'viet'
+    // would NOT match) — graphite keeps them identically, so this stays in sync.
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'ma lu'"),
+        "4"
+    );
+    let _ = std::fs::remove_file(&path);
+}
