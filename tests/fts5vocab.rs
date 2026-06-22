@@ -82,10 +82,9 @@ fn fts5vocab_col() {
 
 #[test]
 fn fts5vocab_instance() {
-    // `offset` is a reserved word in graphite's parser, so quote the column.
     check(
         &format!("{CORPUS}; CREATE VIRTUAL TABLE v USING fts5vocab(ft, 'instance')"),
-        r#"SELECT term, doc, col, "offset" FROM v ORDER BY term, doc, col, "offset""#,
+        "SELECT term, doc, col, offset FROM v ORDER BY term, doc, col, offset",
     );
 }
 

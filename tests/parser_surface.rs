@@ -175,6 +175,56 @@ fn deferred_forms_still_rejected() {
     assert!(parse("WITH x AS (SELECT 1) INSERT INTO t(a) VALUES (1)").is_err());
 }
 
+/// `offset` and `end` are usable as bare (unqualified) column names in
+/// expression position, like SQLite — they only *end* an expression (as the
+/// `LIMIT … OFFSET` / `CASE … END` clause keywords) rather than being barred
+/// from starting one. The genuinely-reserved clause keywords stay rejected.
+#[test]
+fn offset_and_end_are_usable_column_names() {
+    if !sqlite_available() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let mut g = Connection::open_memory().unwrap();
+    g.execute("CREATE TABLE k(\"offset\" INT, \"end\" INT)")
+        .unwrap();
+    g.execute("INSERT INTO k VALUES (3, 7), (1, 9)").unwrap();
+
+    let path = std::env::temp_dir().join(format!("gsql-kw-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let o = Command::new("sqlite3")
+        .arg(&path)
+        .arg("CREATE TABLE k(\"offset\" INT, \"end\" INT); INSERT INTO k VALUES (3,7),(1,9);")
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+
+    // Bare keyword column refs parse and evaluate identically to sqlite.
+    for q in [
+        "SELECT offset FROM k ORDER BY offset",
+        "SELECT end FROM k ORDER BY end",
+        "SELECT offset + end FROM k ORDER BY offset",
+        "SELECT offset FROM k ORDER BY offset LIMIT 1 OFFSET 1",
+    ] {
+        let want = sqlite_query(&path, q);
+        let got = render(&g.query(q).unwrap());
+        assert_eq!(got, want, "diverged: {q}");
+    }
+    let _ = std::fs::remove_file(&path);
+
+    // Genuinely-reserved clause keywords remain rejected as bare column names.
+    for q in [
+        "SELECT order FROM k",
+        "SELECT limit FROM k",
+        "SELECT table FROM k",
+        "SELECT where FROM k",
+        "SELECT from FROM k",
+    ] {
+        assert!(parse(q).is_err(), "should still reject: {q}");
+    }
+}
+
 /// Sanity: the redundant-paren handling does not change how a real subquery or
 /// a row-value expression parses (no regression in the overloaded `(`).
 #[test]

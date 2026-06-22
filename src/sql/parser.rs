@@ -2623,7 +2623,9 @@ fn is_reserved_after_expr(w: &str) -> bool {
 /// are the SQLite reserved words that are never usable as bare identifiers in
 /// expression position (so `SELECT FROM` is a syntax error, not a column named
 /// `FROM`). The list is intentionally conservative — words SQLite allows as
-/// identifiers (e.g. `key`, `default` in some contexts) are not included.
+/// bare identifiers in expression position (e.g. `key`, `default`, and notably
+/// `offset`/`end`, which only end an expression — see [`is_reserved_after_expr`]
+/// — rather than being barred from starting one) are not included.
 fn is_reserved_keyword(lower: &str) -> bool {
     matches!(
         lower,
@@ -2634,7 +2636,6 @@ fn is_reserved_keyword(lower: &str) -> bool {
             | "having"
             | "order"
             | "limit"
-            | "offset"
             | "join"
             | "inner"
             | "left"
@@ -2646,7 +2647,6 @@ fn is_reserved_keyword(lower: &str) -> bool {
             | "when"
             | "then"
             | "else"
-            | "end"
             | "into"
             | "values"
             | "set"
