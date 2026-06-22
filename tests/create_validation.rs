@@ -77,6 +77,15 @@ fn matches_sqlite_cli() {
         "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b)",
         "CREATE TABLE t(x INT GENERATED ALWAYS AS (1) VIRTUAL)",
         "CREATE TABLE t(a, b, PRIMARY KEY(a, b))",
+        // A CHECK / generated-column expression referencing an unknown column is
+        // rejected at CREATE; a forward reference to a later column is fine, and a
+        // CHECK (but not a generated column) may reference the rowid.
+        "CREATE TABLE t(a, b AS (a + x))",
+        "CREATE TABLE t(a, CHECK(a + x > 0))",
+        "CREATE TABLE t(a, b AS (a + rowid))",
+        "CREATE TABLE t(a, CHECK(rowid > 0))",
+        "CREATE TABLE t(a, b AS (c + 1), c)",
+        "CREATE TABLE t(a, b, CHECK(a < b))",
     ] {
         agree(ddl);
     }

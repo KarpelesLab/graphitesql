@@ -2566,6 +2566,31 @@ impl Connection {
                 }
             }
         }
+        // A CHECK / generated-column expression may reference only the table's own
+        // columns, like SQLite (which rejects an unknown column at CREATE). A
+        // generated column additionally may not reference the rowid; a CHECK may.
+        let known: Vec<String> = ct.columns.iter().map(|c| c.name.clone()).collect();
+        for c in &ct.columns {
+            for k in &c.constraints {
+                let bad = match k {
+                    ColumnConstraint::Check(e, _) => unknown_column_ref(e, &known, true),
+                    ColumnConstraint::Generated { expr, .. } => {
+                        unknown_column_ref(expr, &known, false)
+                    }
+                    _ => None,
+                };
+                if let Some(col) = bad {
+                    return Err(Error::Error(format!("no such column: {col}")));
+                }
+            }
+        }
+        for tc in &ct.constraints {
+            if let TableConstraint::Check(e, _) = tc {
+                if let Some(col) = unknown_column_ref(e, &known, true) {
+                    return Err(Error::Error(format!("no such column: {col}")));
+                }
+            }
+        }
         // A table must have at least one non-generated (real) column, as in SQLite.
         if !ct.columns.is_empty()
             && ct.columns.iter().all(|c| {
@@ -13096,6 +13121,25 @@ fn schema_table_meta(label: &str) -> TableMeta {
         pk_len: 0,
         strict_types: None,
     }
+}
+
+/// The first column reference in `e` that names neither a column in `known` nor
+/// (when `allow_rowid`) a rowid alias — the unknown column SQLite rejects at
+/// `CREATE` in a CHECK constraint or generated-column expression. Generated
+/// columns may not reference the rowid (`allow_rowid=false`); a CHECK may.
+fn unknown_column_ref(e: &Expr, known: &[String], allow_rowid: bool) -> Option<String> {
+    let mut bad: Option<String> = None;
+    window::visit(e, &mut |n| {
+        if let Expr::Column { column, .. } = n {
+            if bad.is_none()
+                && !known.iter().any(|c| c.eq_ignore_ascii_case(column))
+                && !(allow_rowid && eval::is_rowid_alias(column))
+            {
+                bad = Some(column.clone());
+            }
+        }
+    });
+    bad
 }
 
 /// Whether `e` contains a subquery (scalar `(SELECT …)`, `EXISTS`, or `IN
