@@ -389,6 +389,7 @@ impl<'a> Tokenizer<'a> {
             self.pos += 2;
             let hstart = self.pos;
             self.consume_digit_run(|c| c.is_ascii_hexdigit());
+            self.reject_number_suffix()?;
             // SQLite allows `_` digit separators between digits (3.46+); strip
             // them before parsing.
             let digits = self.src[hstart..self.pos].replace('_', "");
@@ -412,6 +413,7 @@ impl<'a> Tokenizer<'a> {
             }
             self.consume_digit_run(|c| c.is_ascii_digit());
         }
+        self.reject_number_suffix()?;
         let text = self.src[start..self.pos].replace('_', "");
         if is_float {
             text.parse::<f64>()
@@ -429,6 +431,18 @@ impl<'a> Tokenizer<'a> {
                     .map(Token::Float)
                     .map_err(|_| self.err("invalid integer literal")),
             }
+        }
+    }
+
+    /// Reject a numeric literal that is immediately followed by an identifier
+    /// character (`123abc`, `0x1p4`, `12e3f`): SQLite treats the whole run as one
+    /// "unrecognized token" rather than a number adjacent to a name.
+    fn reject_number_suffix(&self) -> Result<()> {
+        match self.peek() {
+            Some(c) if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 => {
+                Err(self.err("unrecognized token"))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -515,6 +529,30 @@ mod tests {
             .into_iter()
             .map(|s| s.token)
             .collect()
+    }
+
+    #[test]
+    fn number_followed_by_identifier_is_rejected() {
+        // A numeric literal immediately followed by an identifier character is one
+        // "unrecognized token", not a number adjacent to a name — as in sqlite.
+        for bad in [
+            "123abc", "1.5xyz", "0xffz", "0x1p4", "12e3f", "5abc", "1e3e4", "0b1",
+        ] {
+            assert!(
+                tokenize(&alloc::format!("SELECT {bad}")).is_err(),
+                "expected {bad} to be rejected"
+            );
+        }
+        // Valid numbers — and a number properly separated from a name — still lex.
+        for ok in [
+            "123", "1.5", "0xff", "1e3", ".5", "5.", "0x0", "5e+3", "1_000", "0xff_ff", "5 abc",
+            "5 AS abc",
+        ] {
+            assert!(
+                tokenize(&alloc::format!("SELECT {ok}")).is_ok(),
+                "expected {ok} to lex"
+            );
+        }
     }
 
     #[test]
