@@ -74,6 +74,28 @@ fn rename_column_updates_table_and_index() {
 }
 
 #[test]
+fn add_column_appends_verbatim_to_schema_text() {
+    // ALTER … ADD COLUMN appends the column's verbatim text before the column
+    // list's closing paren, preserving the original definition — like sqlite.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INT NOT NULL, b)").unwrap();
+    c.execute("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'hi' CHECK(c<>'')")
+        .unwrap();
+    let sql = match &c
+        .query("SELECT sql FROM sqlite_master WHERE type='table'")
+        .unwrap()
+        .rows[0][0]
+    {
+        Value::Text(s) => s.clone(),
+        o => panic!("not text: {o:?}"),
+    };
+    assert_eq!(
+        sql,
+        "CREATE TABLE t(a INT NOT NULL, b, c TEXT DEFAULT 'hi' CHECK(c<>''))"
+    );
+}
+
+#[test]
 fn rename_table_preserves_schema_text() {
     // ALTER … RENAME TO edits the table name in the stored CREATE text in place
     // (quoting only the new name), preserving the original column formatting —

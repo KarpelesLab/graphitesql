@@ -1805,7 +1805,9 @@ impl Parser {
             }
         } else if self.eat_kw("add") {
             let _ = self.eat_kw("column");
-            AlterAction::AddColumn(self.column_def()?)
+            let start = self.tokens.get(self.pos).map(|s| s.start);
+            let cd = self.column_def()?;
+            AlterAction::AddColumn(cd, self.span_text(start))
         } else if self.eat_kw("drop") {
             let _ = self.eat_kw("column");
             AlterAction::DropColumn(self.ident()?)

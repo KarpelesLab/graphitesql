@@ -702,8 +702,10 @@ pub enum AlterAction {
         /// New column name.
         new: String,
     },
-    /// `ADD [COLUMN] <column-def>`.
-    AddColumn(ColumnDef),
+    /// `ADD [COLUMN] <column-def>`. The second field is the column definition's
+    /// verbatim source text, which SQLite appends to the stored CREATE text as
+    /// written (rather than reprinting from the AST).
+    AddColumn(ColumnDef, Option<String>),
     /// `DROP [COLUMN] name`.
     DropColumn(String),
 }

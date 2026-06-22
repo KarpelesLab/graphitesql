@@ -5550,7 +5550,7 @@ impl Connection {
         }
         match &a.action {
             AlterAction::DropColumn(_) => unreachable!("handled above"),
-            AlterAction::AddColumn(cd) => {
+            AlterAction::AddColumn(cd, col_text) => {
                 if ct
                     .columns
                     .iter()
@@ -5597,11 +5597,21 @@ impl Connection {
                     }
                 }
                 ct.columns.push(cd.clone());
-                let new_sql = sql::print::create_table(&ct);
+                // Append the new column's verbatim text to the stored CREATE (like
+                // sqlite); fall back to reprinting from the AST if its source or
+                // the column-list close can't be located.
+                let reprint = sql::print::create_table(&ct);
                 let table = a.table.clone();
+                let col_text = col_text.clone();
                 self.rewrite_schema_rows(|cols| {
                     if is_text(&cols[0], "table") && is_text(&cols[1], &table) {
-                        cols[4] = Value::Text(new_sql.clone());
+                        let updated = match (&col_text, cols.get(4)) {
+                            (Some(t), Some(Value::Text(old))) => {
+                                append_column_to_create(old, t).unwrap_or_else(|| reprint.clone())
+                            }
+                            _ => reprint.clone(),
+                        };
+                        cols[4] = Value::Text(updated);
                         true
                     } else {
                         false
@@ -15119,6 +15129,37 @@ fn rename_table_token_after(sql: &str, anchor: &str, new: &str) -> String {
     out.push_str(&sql::print::ident(new));
     out.push_str(&sql[sp.end..]);
     out
+}
+
+/// Insert `, <col_text>` before the column-list's closing paren of a `CREATE
+/// TABLE` statement's text, preserving everything else verbatim — how SQLite
+/// records an `ADD COLUMN`. Returns `None` if the column list can't be located.
+fn append_column_to_create(sql: &str, col_text: &str) -> Option<String> {
+    use sql::token::Token;
+    let toks = sql::token::tokenize(sql).ok()?;
+    let open = toks.iter().position(|t| matches!(t.token, Token::LParen))?;
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, sp) in toks.iter().enumerate().skip(open) {
+        match sp.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let pos = toks[close?].start;
+    let mut out = String::with_capacity(sql.len() + col_text.len() + 2);
+    out.push_str(&sql[..pos]);
+    out.push_str(", ");
+    out.push_str(col_text.trim());
+    out.push_str(&sql[pos..]);
+    Some(out)
 }
 
 /// Best-effort label for an unaliased result expression.

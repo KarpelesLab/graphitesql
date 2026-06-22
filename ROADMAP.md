@@ -223,9 +223,10 @@ with "no such table/column" after a rename). Build bottom-up:
   text-preserving token edit. Match it by editing the stored text in place. **`RENAME
   TO` ✅ DONE** — `rename_table_token_after` edits just the table-name token (in the
   table's own CREATE and in each dependent index's `ON` clause), quoting only the
-  new name and preserving the body verbatim, byte-identical to sqlite. *Remaining:
-  `ADD COLUMN` (append the verbatim column text), `RENAME COLUMN`/`DROP COLUMN`
-  (in-place token edit/removal) still reprint from the AST.*
+  new name and preserving the body verbatim, byte-identical to sqlite. **`ADD
+  COLUMN` ✅ DONE** — `append_column_to_create` splices the column's verbatim
+  source text before the column-list's closing paren. *Remaining: `RENAME COLUMN`
+  / `DROP COLUMN` (in-place token edit/removal) still reprint from the AST.*
 
 ### Track B — Query planner, statistics & the VDBE
 
