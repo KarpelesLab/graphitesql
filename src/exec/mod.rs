@@ -424,6 +424,61 @@ impl Connection {
         self.use_vdbe.set(on);
     }
 
+    /// Compile a `SELECT` to a VDBE program *without running it*, gathering only
+    /// the schema (column names / qualifiers / affinities) it needs — no row
+    /// scan. Used by plain `EXPLAIN`. Covers the constant and single-table cases;
+    /// joins and other shapes return `Unsupported`.
+    fn compile_select_program(&self, sel: &Select) -> Result<vdbe::Program> {
+        let Some(from) = &sel.from else {
+            return vdbe::compile_const_select(sel);
+        };
+        if !from.joins.is_empty() {
+            return Err(Error::Unsupported(
+                "EXPLAIN: VDBE join programs not yet listed",
+            ));
+        }
+        if from.first.subquery.is_some() || from.first.tvf_args.is_some() {
+            return Err(Error::Unsupported("EXPLAIN: only plain table sources"));
+        }
+        let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
+        let cols: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+        let qualifier = from
+            .first
+            .alias
+            .clone()
+            .unwrap_or_else(|| from.first.name.clone());
+        let tables: Vec<String> = meta.columns.iter().map(|_| qualifier.clone()).collect();
+        let affinities: Vec<eval::Affinity> = meta.columns.iter().map(|c| c.affinity).collect();
+        vdbe::compile_table_select(sel, &cols, &tables, &affinities)
+    }
+
+    /// Plain `EXPLAIN <select>` (Track B, B8): compile the query to graphite's
+    /// VDBE bytecode and return the program listing as `(addr, opcode, detail)`
+    /// rows. Returns `Unsupported` for a query shape the VDBE cannot compile.
+    fn explain_bytecode(&self, stmt: &Statement) -> Result<QueryResult> {
+        let Statement::Select(sel) = stmt else {
+            return Err(Error::Unsupported(
+                "EXPLAIN: only SELECT is compiled to bytecode",
+            ));
+        };
+        let prog = self.compile_select_program(sel)?;
+        let rows = prog
+            .explain_rows()
+            .into_iter()
+            .map(|(addr, opcode, detail)| {
+                alloc::vec![
+                    Value::Integer(addr as i64),
+                    Value::Text(opcode),
+                    Value::Text(detail),
+                ]
+            })
+            .collect();
+        Ok(QueryResult {
+            columns: alloc::vec!["addr".into(), "opcode".into(), "detail".into()],
+            rows,
+        })
+    }
+
     /// Compile and run a parsed `SELECT` through the VDBE engine, or `Unsupported`
     /// when its shape is outside the spike's grammar (so callers fall back).
     fn run_select_vdbe(&self, sel: &Select) -> Result<QueryResult> {
@@ -563,12 +618,11 @@ impl Connection {
             Statement::Select(sel) => self.run_select(&sel, params),
             Statement::Pragma(p) => self.run_pragma(&p),
             Statement::Explain { query_plan, stmt } => {
-                if !query_plan {
-                    return Err(Error::Unsupported(
-                        "plain EXPLAIN (VDBE bytecode); use EXPLAIN QUERY PLAN",
-                    ));
+                if query_plan {
+                    self.explain_query_plan(&stmt, params)
+                } else {
+                    self.explain_bytecode(&stmt)
                 }
-                self.explain_query_plan(&stmt, params)
             }
             _ => Err(Error::Unsupported(
                 "use execute() for non-SELECT statements",

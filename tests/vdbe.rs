@@ -418,6 +418,51 @@ fn vdbe_routing_handles_compound_via_per_arm() {
 }
 
 #[test]
+fn explain_lists_vdbe_bytecode() {
+    // Plain `EXPLAIN <select>` (B8) returns graphite's VDBE program as
+    // (addr, opcode, detail) rows: sequential addresses, a recognizable opcode
+    // stream, and a terminating Halt.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+
+    let r = c.query("EXPLAIN SELECT 1 + 2").unwrap();
+    assert_eq!(r.columns, vec!["addr", "opcode", "detail"]);
+    assert!(!r.rows.is_empty());
+    // Addresses are 0..n in order.
+    for (i, row) in r.rows.iter().enumerate() {
+        assert_eq!(row[0], Value::Integer(i as i64));
+    }
+    let opcodes = |q: &str| -> Vec<String> {
+        c.query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| match &row[1] {
+                Value::Text(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    };
+    let consts = opcodes("EXPLAIN SELECT 1 + 2");
+    assert!(consts.contains(&"Integer".to_string()));
+    assert!(consts.contains(&"Arith".to_string()));
+    assert!(consts.contains(&"ResultRow".to_string()));
+    assert_eq!(consts.last().unwrap(), "Halt");
+
+    // A table scan compiles to a Rewind/Column/Next loop.
+    let scan = opcodes("EXPLAIN SELECT a FROM t WHERE a > 1");
+    for op in ["Rewind", "Column", "Compare", "IfFalse", "Next", "Halt"] {
+        assert!(
+            scan.contains(&op.to_string()),
+            "missing opcode {op} in {scan:?}"
+        );
+    }
+
+    // A shape the VDBE cannot compile reports Unsupported (no bytecode).
+    assert!(c.query("EXPLAIN SELECT a FROM t, t AS t2").is_err());
+}
+
+#[test]
 fn falls_back_for_non_constant() {
     // Anything beyond a constant SELECT list is Unsupported, so the engine can
     // fall back to the tree-walker.

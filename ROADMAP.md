@@ -343,9 +343,14 @@ each additive behind `query_vdbe` until B7:
   broaden the still-unhandled single-block shapes (correlated subqueries, window
   functions) so falling back stays the exception, then gain confidence to
   default-on.
-- **B8 — Real `EXPLAIN` (bytecode).** Emit the `addr|opcode|p1|p2|p3|p4|p5`
-  listing from a compiled `Program` (today `Error::Unsupported`). *Ref:*
-  `vdbe.c`, `opcodes.h`.
+- **B8 — `EXPLAIN` (bytecode). ✅ DONE.** Plain `EXPLAIN <select>` compiles the
+  query to graphite's VDBE program and returns the listing as `(addr, opcode,
+  detail)` rows (`Program::explain_rows` + `Connection::explain_bytecode`, via a
+  no-row `compile_select_program`). This is graphite's own register-machine IR;
+  it intentionally does **not** mirror SQLite's `vdbe.c` opcode set (documented
+  as unstable, and never compared in the differential corpus). Covers the
+  constant and single-table cases; joins/other shapes report `Unsupported`
+  (EXPLAIN QUERY PLAN remains the full-coverage path). *Ref:* `vdbe.c`.
 
 ### Track C — Storage engine, transactions, concurrency & multi-schema
 

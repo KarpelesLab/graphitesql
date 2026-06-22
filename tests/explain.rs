@@ -362,9 +362,15 @@ fn aliased_table() {
 }
 
 #[test]
-fn plain_explain_unsupported() {
+fn plain_explain_lists_bytecode() {
+    // Plain `EXPLAIN <select>` (B8) now compiles the query to graphite's VDBE
+    // program and lists it as (addr, opcode, detail) rows.
     let c = setup();
-    assert!(c.query("EXPLAIN SELECT * FROM t").is_err());
+    let r = c.query("EXPLAIN SELECT * FROM t").unwrap();
+    assert_eq!(r.columns, ["addr", "opcode", "detail"]);
+    assert!(!r.rows.is_empty());
+    // A shape the VDBE cannot compile to a program still reports an error.
+    assert!(c.query("EXPLAIN SELECT * FROM t, t AS t2").is_err());
 }
 
 #[test]

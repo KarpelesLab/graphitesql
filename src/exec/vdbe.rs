@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::exec::eval::Affinity;
 use crate::sql::ast::{BinaryOp, Expr, Literal, ResultColumn, Select};
 use crate::value::Value;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 /// One VDBE instruction. Registers are addressed by index into the register file.
@@ -269,6 +269,32 @@ pub struct Program {
     pub n_registers: usize,
     /// Output column labels (parallel to each `ResultRow`'s register span).
     pub columns: Vec<String>,
+}
+
+impl Program {
+    /// A human-readable listing of the program for `EXPLAIN` (Track B, B8): one
+    /// `(address, opcode, detail)` triple per instruction. The opcode is the
+    /// `Op` variant name and the detail is its operand dump. This is graphite's
+    /// own register-machine IR — it intentionally does not mirror SQLite's
+    /// `vdbe.c` opcode set, which is documented as unstable and implementation-
+    /// specific (and is never compared in the differential corpus).
+    pub fn explain_rows(&self) -> Vec<(usize, String, String)> {
+        self.ops
+            .iter()
+            .enumerate()
+            .map(|(addr, op)| {
+                let detail = alloc::format!("{op:?}");
+                // The variant name is the token before the first ` ` or `{`.
+                let opcode = detail
+                    .split([' ', '{'])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                (addr, opcode, detail)
+            })
+            .collect()
+    }
 }
 
 /// Whether `name`/`argc` is a pure, context-free scalar function the VDBE spike
