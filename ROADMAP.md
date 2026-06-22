@@ -298,9 +298,13 @@ the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep)
   exactly one plain secondary index can seek (no equality, no partial/expression
   index, no rowid range for the range case), so the executor's choice is
   unambiguous; otherwise the always-correct sort stands. Byte-identical EQP and
-  row order vs sqlite3 (`tests/order_by_after_seek.rs`). *Remaining sub-case: the
-  **mixed-direction** `ORDER BY a, b DESC` partial sort (B0b-i), still a full
-  sort.*
+  row order vs sqlite3 (`tests/order_by_after_seek.rs`). The **mixed-direction**
+  `ORDER BY a, b DESC` partial sort over a no-`WHERE` COVERING-index scan now
+  reports like sqlite too (`scan_order_prefix`: the covering index yields a
+  uniform leading prefix, so only the trailing terms sort → `USE TEMP B-TREE FOR
+  LAST n TERM[S] OF ORDER BY` with identical rows; `tests/order_by_partial_sort.rs`).
+  *Remaining: the same mixed-direction case over a NON-covering index scan (graphite
+  still full-table-scans + full-sorts there).*
 - **B1b — Join reordering.** Beyond the comma-join promotion (done), reorder
   `FROM` tables by a simple cost model (most-selective indexed table inner)
   instead of textual order; results identical, order verified via EQP. Preserve

@@ -8714,9 +8714,14 @@ impl Connection {
         // are sorted, which sqlite reports as "LAST n TERM[S] OF ORDER BY".
         if !sel.order_by.is_empty() && self.order_satisfied_by_scan(sel, params).is_none() {
             let n = sel.order_by.len();
-            let sorted = n - self
+            // A WHERE seek may walk a prefix of the ORDER BY in order; otherwise a
+            // no-WHERE covering-index scan may yield a leading prefix (mixed
+            // directions). Either way only the trailing terms are sorted.
+            let prefix = self
                 .seek_order_prefix(sel, params)
-                .map_or(0, |(k, _)| k.min(n));
+                .map(|(k, _)| k)
+                .unwrap_or_else(|| self.scan_order_prefix(sel, params));
+            let sorted = n - prefix.min(n);
             let detail = match sorted {
                 _ if sorted >= n => String::from("USE TEMP B-TREE FOR ORDER BY"),
                 1 => String::from("USE TEMP B-TREE FOR LAST TERM OF ORDER BY"),
@@ -10125,6 +10130,69 @@ impl Connection {
             });
         }
         None
+    }
+
+    /// For a no-`WHERE` query whose access is a covering-index scan
+    /// ([`covering_scan`]) but whose `ORDER BY` is NOT fully satisfied by that
+    /// walk (mixed directions), the number of LEADING `ORDER BY` terms the index
+    /// already yields in order. The walk direction is fixed by the first term;
+    /// each further term must stay in that direction and continue matching the
+    /// index's columns/collations, else the prefix ends there. sqlite sorts only
+    /// the remaining terms — "USE TEMP B-TREE FOR LAST n TERMS OF ORDER BY". Zero
+    /// when no covering scan applies or the first term already breaks.
+    fn scan_order_prefix(&self, sel: &Select, params: &Params) -> usize {
+        if sel.order_by.is_empty() {
+            return 0;
+        }
+        let Some(from) = sel.from.as_ref() else {
+            return 0;
+        };
+        if !from.joins.is_empty() {
+            return 0;
+        }
+        let Ok(meta) = self.table_meta(&from.first.name, from.first.alias.as_deref()) else {
+            return 0;
+        };
+        // The index `covering_scan` reads from (its choice must match the EQP).
+        let Some((name, _, _)) = self.covering_scan(sel, &meta, params) else {
+            return 0;
+        };
+        let Ok(indexes) = self.indexes_of(&from.first.name) else {
+            return 0;
+        };
+        let Some(idx) = indexes
+            .into_iter()
+            .find(|i| i.name.eq_ignore_ascii_case(&name))
+        else {
+            return 0;
+        };
+        let label = from.first.alias.as_deref().unwrap_or(&from.first.name);
+        let backward = sel.order_by[0].descending;
+        let mut k = 0usize;
+        for (i, term) in sel.order_by.iter().enumerate() {
+            if i >= idx.cols.len() || term.nulls_first.is_some() || term.descending != backward {
+                break;
+            }
+            let (tbl, col_name) = match &term.expr {
+                Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+                _ => break,
+            };
+            if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
+                break;
+            }
+            let Some(col) = meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            else {
+                break;
+            };
+            if col != idx.cols[i] || idx.collations[i] != meta.columns[col].collation {
+                break;
+            }
+            k += 1;
+        }
+        k
     }
 
     /// Covering check for a WHERE-driven *seek* (B2b, seek case): on top of
