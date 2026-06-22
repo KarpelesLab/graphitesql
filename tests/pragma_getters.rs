@@ -71,6 +71,54 @@ fn alloc_pragma(name: &str) -> String {
 }
 
 #[test]
+fn legacy_and_boolean_noop_pragmas_report_sqlite_defaults() {
+    // Deprecated / no-op boolean pragmas graphite does not act on but reports
+    // SQLite 3.50.4's fixed default for, so probing tools see a normal connection.
+    let c = Connection::open_memory().unwrap();
+    let zero: &[&str] = &[
+        "legacy_alter_table",
+        "count_changes",
+        "full_column_names",
+        "empty_result_callbacks",
+        "defer_foreign_keys",
+        "ignore_check_constraints",
+        "reverse_unordered_selects",
+        "query_only",
+        "writable_schema",
+        "threads",
+        "soft_heap_limit",
+        "hard_heap_limit",
+    ];
+    for name in zero {
+        assert_eq!(
+            one(&c, &alloc_pragma(name)),
+            Value::Integer(0),
+            "PRAGMA {name}"
+        );
+    }
+    // These default ON (1).
+    assert_eq!(one(&c, "PRAGMA short_column_names"), Value::Integer(1));
+    assert_eq!(one(&c, "PRAGMA automatic_index"), Value::Integer(1));
+    // These yield no rows in SQLite (deprecated / setter-only spellings).
+    for name in ["legacy_file_format", "case_sensitive_like"] {
+        assert!(
+            c.query(&alloc_pragma(name)).unwrap().rows.is_empty(),
+            "PRAGMA {name} should yield no rows"
+        );
+    }
+    // Their setter forms must not error.
+    let mut m = Connection::open_memory().unwrap();
+    for s in [
+        "PRAGMA query_only=1",
+        "PRAGMA legacy_alter_table=1",
+        "PRAGMA case_sensitive_like=1",
+        "PRAGMA automatic_index=0",
+    ] {
+        m.execute(s).unwrap_or_else(|e| panic!("{s}: {e:?}"));
+    }
+}
+
+#[test]
 fn cache_size_round_trips_the_set_value() {
     let mut c = Connection::open_memory().unwrap();
     // Default is -2000; setting it (a page count when positive, KiB when negative)

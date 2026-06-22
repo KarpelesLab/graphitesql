@@ -789,6 +789,27 @@ impl Connection {
             "wal_autocheckpoint" => Ok(single("wal_autocheckpoint", Value::Integer(1000))),
             "max_page_count" => Ok(single("max_page_count", Value::Integer(4294967294))),
             "locking_mode" => Ok(single("locking_mode", Value::Text("normal".into()))),
+            // Recognized boolean / legacy no-op pragmas: graphite does not act on
+            // them, but reports SQLite's fixed default so a probing tool/ORM sees a
+            // normal connection. `legacy_file_format` and `case_sensitive_like`
+            // (a setter-only spelling) yield no rows, as in SQLite.
+            "legacy_file_format" | "case_sensitive_like" => Ok(QueryResult {
+                columns: alloc::vec![name.clone()],
+                rows: Vec::new(),
+            }),
+            "short_column_names" | "automatic_index" => Ok(single(&name, Value::Integer(1))),
+            "legacy_alter_table"
+            | "count_changes"
+            | "full_column_names"
+            | "empty_result_callbacks"
+            | "defer_foreign_keys"
+            | "ignore_check_constraints"
+            | "reverse_unordered_selects"
+            | "query_only"
+            | "writable_schema"
+            | "threads"
+            | "soft_heap_limit"
+            | "hard_heap_limit" => Ok(single(&name, Value::Integer(0))),
             _ => Err(Error::Unsupported("this PRAGMA")),
         }
     }
