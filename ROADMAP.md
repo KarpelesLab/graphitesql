@@ -576,9 +576,12 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     form, the structure record's config cookie + write counter (= leaf count),
     and the `%_idx` separator rows (each the shortest prefix of a leaf's first
     term that exceeds the previous leaf's last term). `tests/fts5_segment.rs`.
-    *Remaining encoder sub-cases:* the "first rowid before first term" carry when
-    a single term's doclist spans leaf boundaries, doclist-index pages (dli flag),
-    and segment b-tree interior `_data` pages (height > 0). **M2b — storage wiring
+    The doclist-spanning carry is also verified now: a single term whose doclist
+    crosses leaves reproduces byte-for-byte (entry header may overshoot `pgsz`,
+    the collist carries to the next leaf, the continuation leaf's first rowid is
+    absolute with a non-zero first-rowid header offset, one `%_idx` row).
+    *Remaining encoder sub-cases:* doclist-index pages (dli flag) and segment
+    b-tree interior `_data` pages (height > 0), which appear only at large scale. **M2b — storage wiring
     (remaining):** swap graphite's generic `<name>_data` backing table for
     sqlite's five shadow tables (`_content`/`_data`/`_idx`/`_docsize`/`_config`),
     maintaining them on insert/delete/update and porting the verified encoder.

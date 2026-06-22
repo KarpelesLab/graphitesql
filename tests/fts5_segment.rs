@@ -15,8 +15,12 @@
 //! and — by lowering FTS5's logical page size (`pgsz`) — MULTI-LEAF segments:
 //! the leaf-packing split threshold, each leaf's re-stated first term, the
 //! structure record's config cookie + write counter, and the `%_idx` separator
-//! rows (each a shortest-distinguishing prefix of a leaf's first term). The
-//! encoder here is the reference the storage rework will port into the lib.
+//! rows (each a shortest-distinguishing prefix of a leaf's first term). It also
+//! covers a single term whose DOCLIST spans leaves: the byte-level split (an
+//! entry header may overshoot `pgsz`, then the collist carries to the next leaf),
+//! the absolute first rowid on a continuation leaf, the non-zero first-rowid
+//! header offset, and the single `%_idx` row. The encoder here is the reference
+//! the storage rework will port into the lib.
 
 #![cfg(feature = "std")]
 #![cfg(feature = "fts5")]
@@ -221,6 +225,102 @@ fn idx_separator(prev_last: &[u8], first: &[u8]) -> Vec<u8> {
     first[..=i.min(first.len() - 1)].to_vec()
 }
 
+/// The page-index (footer): first term's absolute page offset, then deltas.
+fn build_pgidx(offsets: &[usize]) -> Vec<u8> {
+    let mut pgidx = Vec::new();
+    let mut prev = 0usize;
+    for (i, &off) in offsets.iter().enumerate() {
+        put_varint(&mut pgidx, (if i == 0 { off } else { off - prev }) as u64);
+        prev = off;
+    }
+    pgidx
+}
+
+/// Assemble a leaf from its body (the content after the 4-byte header), its term
+/// page-offsets, and the offset of the first rowid that precedes the first term
+/// (0 if none). Layout: [u16 first-rowid-off][u16 footer-off][body][pgidx].
+fn finish_leaf(body: &[u8], term_offsets: &[usize], first_rowid_off: usize) -> Vec<u8> {
+    let footer_off = 4 + body.len();
+    let mut leaf = Vec::new();
+    leaf.extend_from_slice(&(first_rowid_off as u16).to_be_bytes());
+    leaf.extend_from_slice(&(footer_off as u16).to_be_bytes());
+    leaf.extend_from_slice(body);
+    leaf.extend_from_slice(&build_pgidx(term_offsets));
+    leaf
+}
+
+/// Streaming encoder for a segment holding a SINGLE term whose doclist is large
+/// enough to span leaf boundaries. Mirrors FTS5's writer: the doclist byte stream
+/// fills each leaf to `pgsz`, splitting even mid-poslist; a continuation leaf
+/// leads with the carried poslist tail, then the first whole rowid written as an
+/// ABSOLUTE varint (header first-rowid-offset points at it), then deltas resume.
+/// Continuation leaves carry no term, so an empty pgidx and no `%_idx` row.
+fn encode_single_term_segment(term: &str, postings: &[Posting], pgsz: usize) -> Vec<Vec<u8>> {
+    let key = term_key(term);
+    let mut leaves: Vec<Vec<u8>> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    let mut term_offsets: Vec<usize> = Vec::new();
+    let mut first_rowid_off = 0usize; // 0 = no rowid precedes the first term
+    let mut prev_rowid = 0i64; // reset to 0 at each leaf start → first rowid absolute
+    let pgidx_len = |offs: &[usize]| build_pgidx(offs).len();
+
+    // Leaf 1 opens with the term record (full size+blob form).
+    term_offsets.push(4);
+    put_varint(&mut body, key.len() as u64);
+    body.extend_from_slice(&key);
+
+    for p in postings {
+        // Entry start: flush only if the leaf is ALREADY over pgsz (sqlite lets an
+        // entry header overshoot, then carries the collist). The first rowid on a
+        // fresh leaf is written absolute (prev_rowid reset to 0).
+        if 4 + body.len() + pgidx_len(&term_offsets) > pgsz && !term_offsets.is_empty() {
+            leaves.push(finish_leaf(&body, &term_offsets, first_rowid_off));
+            body.clear();
+            term_offsets.clear();
+            first_rowid_off = 0;
+            prev_rowid = 0;
+        }
+        if term_offsets.is_empty() && first_rowid_off == 0 {
+            first_rowid_off = 4 + body.len(); // a rowid precedes any term here
+        }
+        // Atomic entry header: rowid varint + the poslist size varint (the
+        // leading varint of the encoded poslist).
+        let poslist = encode_poslist(p);
+        let size_len = get_varint(&poslist).1;
+        put_varint(&mut body, (p.rowid - prev_rowid) as u64);
+        body.extend_from_slice(&poslist[..size_len]);
+        prev_rowid = p.rowid;
+        // Collist bytes are byte-splittable; carry the remainder to the next leaf.
+        for &b in &poslist[size_len..] {
+            if 4 + body.len() + pgidx_len(&term_offsets) >= pgsz {
+                leaves.push(finish_leaf(&body, &term_offsets, first_rowid_off));
+                body.clear();
+                term_offsets.clear();
+                first_rowid_off = 0;
+                prev_rowid = 0;
+            }
+            body.push(b);
+        }
+    }
+    leaves.push(finish_leaf(&body, &term_offsets, first_rowid_off));
+    leaves
+}
+
+/// Decode a varint, returning (value, bytes consumed).
+fn get_varint(buf: &[u8]) -> (u64, usize) {
+    let mut v = 0u64;
+    for (i, &b) in buf.iter().enumerate().take(9) {
+        if i == 8 {
+            return (v << 8 | b as u64, 9);
+        }
+        v = (v << 7) | (b & 0x7f) as u64;
+        if b & 0x80 == 0 {
+            return (v, i + 1);
+        }
+    }
+    (v, buf.len())
+}
+
 const SEG_LEAF_ROWID: i64 = (1i64 << 37) | 1; // segid=1, height=0, dli=0, pgno=1
 
 /// Parse one `X'..'` hex blob literal as printed by `sqlite3`.
@@ -373,6 +473,63 @@ fn sqlite_segment(pgsz: usize, body: &str) -> (Vec<Vec<u8>>, Vec<u8>, Vec<(i64, 
     (leaves, structure, idx)
 }
 
+/// Like [`sqlite_segment`] but inserts several `(rowid, body)` docs in one
+/// statement (one segment), for exercising doclists that span leaves.
+#[allow(clippy::type_complexity)]
+fn sqlite_segment_rows(
+    pgsz: usize,
+    docs: &[(i64, &str)],
+) -> (Vec<Vec<u8>>, Vec<u8>, Vec<(i64, Vec<u8>)>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "gsql-fts5dl-{}-{}.db",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let values: Vec<String> = docs.iter().map(|(r, b)| format!("({r},'{b}')")).collect();
+    let script = format!(
+        "CREATE VIRTUAL TABLE t USING fts5(body);\
+         INSERT INTO t(t,rank) VALUES('pgsz',{pgsz});\
+         INSERT INTO t(rowid,body) VALUES {};",
+        values.join(",")
+    );
+    let o = Command::new("sqlite3")
+        .arg(&path)
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "sqlite build failed: {o:?}");
+    let run = |q: &str| {
+        String::from_utf8_lossy(
+            &Command::new("sqlite3")
+                .arg(&path)
+                .arg(q)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned()
+    };
+    let leaves: Vec<Vec<u8>> = run("SELECT quote(block) FROM t_data WHERE id>100 ORDER BY id;")
+        .lines()
+        .map(parse_hex)
+        .collect();
+    let structure = parse_hex(&run("SELECT quote(block) FROM t_data WHERE id=10;"));
+    let idx: Vec<(i64, Vec<u8>)> =
+        run("SELECT pgno || '|' || quote(term) FROM t_idx ORDER BY pgno;")
+            .lines()
+            .map(|l| {
+                let (p, t) = l.split_once('|').unwrap();
+                (p.parse().unwrap(), parse_hex(t))
+            })
+            .collect();
+    let _ = std::fs::remove_file(&path);
+    (leaves, structure, idx)
+}
+
 /// Build the body's index and pack it into leaves with the same `pgsz`, then
 /// assert the leaves, structure, and `%_idx` rows match sqlite byte-for-byte.
 fn check_segment(pgsz: usize, body: &str) {
@@ -457,4 +614,45 @@ fn multi_leaf_varied_pgsz() {
         .join(" ");
     check_segment(80, &body);
     check_segment(128, &body);
+}
+
+/// One term repeated across many docs: its doclist spans several leaves, so the
+/// continuation leaves exercise the carry (split poslist tail + absolute first
+/// rowid + non-zero header offset). The whole segment has ONE %_idx row.
+fn check_doclist_spans(n_docs: i64, pgsz: usize) {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Each doc is the single token "x" (so one term, one position per doc).
+    let body = vec!["x"; n_docs as usize].join(" ");
+    // sqlite stores all docs under rowid 1.. via a single multi-VALUES insert; to
+    // get distinct rowids we instead build the index directly from (rowid,"x").
+    let docs: Vec<(i64, &str)> = (1..=n_docs).map(|r| (r, "x")).collect();
+    let (sq_leaves, sq_structure, sq_idx) = sqlite_segment_rows(pgsz, &docs);
+    let (terms, _, _) = build_index(&docs);
+    assert_eq!(terms.len(), 1, "expected a single term");
+    let leaves = encode_single_term_segment(&terms[0].0, &terms[0].1, pgsz);
+    assert!(
+        leaves.len() > 1,
+        "doclist did not span leaves (body={body:?})"
+    );
+    assert_eq!(leaves.len(), sq_leaves.len(), "leaf count");
+    for (i, (mine, sq)) in leaves.iter().zip(&sq_leaves).enumerate() {
+        assert_eq!(mine, sq, "leaf {} (pgno {})", i, i + 1);
+    }
+    assert_eq!(
+        encode_structure(leaves.len() as u64, 1),
+        sq_structure,
+        "structure"
+    );
+    // Exactly one %_idx row — leaf 1, empty separator.
+    assert_eq!(sq_idx, vec![(2i64, Vec::new())], "%_idx rows");
+}
+
+#[test]
+fn doclist_spans_leaves() {
+    check_doclist_spans(30, 64);
+    check_doclist_spans(50, 80);
+    check_doclist_spans(100, 128);
 }
