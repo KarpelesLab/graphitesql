@@ -74,6 +74,39 @@ fn rename_column_updates_table_and_index() {
 }
 
 #[test]
+fn rename_table_preserves_schema_text() {
+    // ALTER … RENAME TO edits the table name in the stored CREATE text in place
+    // (quoting only the new name), preserving the original column formatting —
+    // and repoints a dependent index's `ON` clause the same way — exactly like
+    // sqlite, rather than reprinting the whole definition from the AST.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INT NOT NULL, b TEXT DEFAULT 'x', CHECK(a>0))")
+        .unwrap();
+    c.execute("CREATE INDEX i ON t(a COLLATE NOCASE, b)")
+        .unwrap();
+    c.execute("ALTER TABLE t RENAME TO t2").unwrap();
+
+    let sql = |ty: &str| -> String {
+        match &c
+            .query(&format!("SELECT sql FROM sqlite_master WHERE type='{ty}'"))
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    assert_eq!(
+        sql("table"),
+        "CREATE TABLE \"t2\"(a INT NOT NULL, b TEXT DEFAULT 'x', CHECK(a>0))"
+    );
+    assert_eq!(
+        sql("index"),
+        "CREATE INDEX i ON \"t2\"(a COLLATE NOCASE, b)"
+    );
+}
+
+#[test]
 fn rename_table_updates_catalog_and_indexes() {
     let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
     let path = temp_path("rename.db");

@@ -5621,26 +5621,30 @@ impl Connection {
                         "there is already another table or index with this name: {new_name}"
                     )));
                 }
-                ct.name = new_name.clone();
-                let new_table_sql = sql::print::create_table(&ct);
                 let old = a.table.clone();
                 let new_name = new_name.clone();
                 self.rewrite_schema_rows(|cols| {
                     if is_text(&cols[0], "table") && is_text(&cols[1], &old) {
                         cols[1] = Value::Text(new_name.clone());
                         cols[2] = Value::Text(new_name.clone());
-                        cols[4] = Value::Text(new_table_sql.clone());
+                        // Edit the table name in the stored CREATE text in place
+                        // (preserving the body verbatim), like SQLite — rather than
+                        // reprinting the whole definition from the AST.
+                        if let Some(Value::Text(old_sql)) = cols.get(4).cloned() {
+                            cols[4] =
+                                Value::Text(rename_table_token_after(&old_sql, "table", &new_name));
+                        }
                         true
                     } else if is_text(&cols[2], &old) {
                         // Dependent index/trigger/view: repoint, and rewrite an
                         // index's CREATE text to reference the new table name.
                         cols[2] = Value::Text(new_name.clone());
                         if is_text(&cols[0], "index") {
+                            // Repoint the index's `ON <table>` to the new name in
+                            // place (preserving the rest), like SQLite.
                             if let Some(Value::Text(isql)) = cols.get(4).cloned() {
-                                if let Ok(Statement::CreateIndex(mut ci)) = sql::parse_one(&isql) {
-                                    ci.table = new_name.clone();
-                                    cols[4] = Value::Text(sql::print::create_index(&ci));
-                                }
+                                cols[4] =
+                                    Value::Text(rename_table_token_after(&isql, "on", &new_name));
                             }
                         }
                         true
@@ -15075,6 +15079,45 @@ fn rewrite_ident_tokens(sql: &str, old: &str, new: &str) -> String {
         cursor = sp.end;
     }
     out.push_str(&sql[cursor..]);
+    out
+}
+
+/// Replace the table-name token that follows the `anchor` keyword (`TABLE` for a
+/// `CREATE TABLE`, `ON` for a `CREATE INDEX`) with `new` (double-quoted, as
+/// SQLite does), preserving the rest of the text verbatim — so a `RENAME TO`
+/// keeps the original formatting rather than reprinting from the AST. Returns the
+/// input unchanged if the name token can't be located.
+fn rename_table_token_after(sql: &str, anchor: &str, new: &str) -> String {
+    use sql::token::Token;
+    let toks = match sql::token::tokenize(sql) {
+        Ok(t) => t,
+        Err(_) => return String::from(sql),
+    };
+    let kw = |t: &Token, k: &str| matches!(t, Token::Word(w) if w.eq_ignore_ascii_case(k));
+    let mut i = 0;
+    while i < toks.len() && !kw(&toks[i].token, anchor) {
+        i += 1;
+    }
+    i += 1;
+    // Optional `IF NOT EXISTS` (only after TABLE).
+    if i + 2 < toks.len()
+        && kw(&toks[i].token, "if")
+        && kw(&toks[i + 1].token, "not")
+        && kw(&toks[i + 2].token, "exists")
+    {
+        i += 3;
+    }
+    // Optional `schema.` qualifier before the table name.
+    if i + 1 < toks.len() && matches!(toks[i + 1].token, Token::Dot) {
+        i += 2;
+    }
+    let Some(sp) = toks.get(i) else {
+        return String::from(sql);
+    };
+    let mut out = String::with_capacity(sql.len() + new.len());
+    out.push_str(&sql[..sp.start]);
+    out.push_str(&sql::print::ident(new));
+    out.push_str(&sql[sp.end..]);
     out
 }
 

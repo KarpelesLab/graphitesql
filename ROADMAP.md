@@ -220,8 +220,12 @@ with "no such table/column" after a rename). Build bottom-up:
 - **A-rn4 — text-preserving schema edits** *(cosmetic, lower priority).* graphite
   reprints the affected CREATE from its AST (quoted/canonical), so
   `SELECT sql FROM sqlite_master` after an ALTER differs from sqlite's
-  text-preserving token edit. Match it by editing the stored text in place. *Not
-  in the differential corpus.*
+  text-preserving token edit. Match it by editing the stored text in place. **`RENAME
+  TO` ✅ DONE** — `rename_table_token_after` edits just the table-name token (in the
+  table's own CREATE and in each dependent index's `ON` clause), quoting only the
+  new name and preserving the body verbatim, byte-identical to sqlite. *Remaining:
+  `ADD COLUMN` (append the verbatim column text), `RENAME COLUMN`/`DROP COLUMN`
+  (in-place token edit/removal) still reprint from the AST.*
 
 ### Track B — Query planner, statistics & the VDBE
 
