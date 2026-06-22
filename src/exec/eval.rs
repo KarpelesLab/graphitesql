@@ -69,6 +69,18 @@ pub trait Subqueries {
     fn fts5_bm25(&self, _rowid: i64, _weights: &[f64]) -> Option<f64> {
         None
     }
+    /// FTS5 `highlight(t, col, open, close)`: column `col`'s `text` with each
+    /// matched token wrapped in `open`…`close`, when a `MATCH` over an `fts5` table
+    /// is in scope. `None` otherwise.
+    fn fts5_highlight(
+        &self,
+        _col: usize,
+        _text: &str,
+        _open: &str,
+        _close: &str,
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// A column's type affinity (SQLite, `datatype3.html` §3).

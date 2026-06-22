@@ -157,6 +157,23 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 return Ok(Value::Real(score));
             }
         }
+        // FTS5 `highlight(<table>, col, open, close)`: column `col`'s text with the
+        // matched tokens wrapped, in scope for a `MATCH` query over an `fts5` table.
+        "highlight" if args.len() == 4 => {
+            let col = eval::to_i64(&eval::eval(&args[1], ctx)?);
+            let open = eval::to_text(&eval::eval(&args[2], ctx)?);
+            let close = eval::to_text(&eval::eval(&args[3], ctx)?);
+            // The column text is the current row's value for that column.
+            if let Ok(col) = usize::try_from(col) {
+                let text = ctx.row.get(col).map(eval::to_text).unwrap_or_default();
+                if let Some(s) = ctx
+                    .subqueries
+                    .and_then(|s| s.fts5_highlight(col, &text, &open, &close))
+                {
+                    return Ok(Value::Text(s));
+                }
+            }
+        }
         _ => {}
     }
 

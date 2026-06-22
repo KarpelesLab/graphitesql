@@ -400,6 +400,38 @@ fn bm25_column_weights() {
 }
 
 #[test]
+fn highlight_wraps_matched_terms() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES ('Hello World','the quick brown fox jumps over the lazy dog')")
+        .unwrap();
+    let one = |sql: &str| match &c.query(sql).unwrap().rows[0][0] {
+        Value::Text(s) => s.clone(),
+        o => panic!("not text: {o:?}"),
+    };
+    // A single matched token in the body, surrounding text preserved.
+    assert_eq!(
+        one("SELECT highlight(t, 1, '[', ']') FROM t WHERE t MATCH 'fox'"),
+        "the quick brown [fox] jumps over the lazy dog"
+    );
+    // Case-insensitive match, case-preserving output, in the title column.
+    assert_eq!(
+        one("SELECT highlight(t, 0, '<b>', '</b>') FROM t WHERE t MATCH 'hello'"),
+        "<b>Hello</b> World"
+    );
+    // A matched phrase shares one pair of markers; two separate tokens do not.
+    assert_eq!(
+        one("SELECT highlight(t, 1, '[', ']') FROM t WHERE t MATCH '\"quick brown\"'"),
+        "the [quick brown] fox jumps over the lazy dog"
+    );
+    assert_eq!(
+        one("SELECT highlight(t, 1, '[', ']') FROM t WHERE t MATCH 'the dog'"),
+        "[the] quick brown fox jumps over [the] lazy [dog]"
+    );
+}
+
+#[test]
 fn bm25_outside_an_fts5_match_is_unavailable() {
     // `rank` / `bm25()` only mean something for an fts5 MATCH query; elsewhere
     // they are an ordinary unknown column / function (an error), as in sqlite.

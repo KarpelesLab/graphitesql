@@ -1160,6 +1160,108 @@ pub(crate) fn fts5_tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
+/// Like [`fts5_tokenize`], but also returns each token's `[start, end)` byte range
+/// in the original `text` — so [`fts5_highlight`] can wrap matched tokens while
+/// preserving the surrounding original characters.
+fn fts5_tokenize_spans(text: &str) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut start = 0;
+    for (i, ch) in text.char_indices() {
+        if ch.is_alphanumeric() {
+            if cur.is_empty() {
+                start = i;
+            }
+            cur.extend(ch.to_lowercase());
+        } else if !cur.is_empty() {
+            out.push((core::mem::take(&mut cur), start, i));
+        }
+    }
+    if !cur.is_empty() {
+        out.push((cur, start, text.len()));
+    }
+    out
+}
+
+/// SQLite's `highlight(t, col, open, close)`: return column `col`'s `text` with
+/// every token that is part of a `query` phrase match wrapped in `open`…`close`.
+/// Adjacent matched tokens (e.g. a matched phrase) share one pair of markers, and
+/// the original inter-token characters are preserved. `scope` is the operand
+/// column of a `col MATCH …` query (the whole query is restricted to it).
+pub(crate) fn fts5_highlight(
+    query: &str,
+    col_names: &[String],
+    scope: Option<&str>,
+    col: usize,
+    text: &str,
+    open: &str,
+    close: &str,
+) -> String {
+    // A column outside the query's scope has nothing highlighted.
+    if scope.is_some_and(|s| {
+        col_names
+            .get(col)
+            .is_none_or(|n| !n.eq_ignore_ascii_case(s))
+    }) {
+        return String::from(text);
+    }
+    let toks = fts5_lex(query);
+    let parsed = match (Fts5Parser {
+        toks: &toks,
+        pos: 0,
+    })
+    .parse()
+    {
+        Some(q) => q,
+        None => return String::from(text),
+    };
+    let mut terms = Vec::new();
+    fts5_collect_terms(&parsed, &mut terms);
+
+    let spans = fts5_tokenize_spans(text);
+    let col_tokens: Vec<String> = spans.iter().map(|(t, _, _)| t.clone()).collect();
+    // Each phrase *instance* is one highlight span `[start, end)` (token indices);
+    // SQLite wraps each separately, so two adjacent single-token matches become
+    // `[fox] [fox]`, while a matched two-word phrase is one `[quick brown]`.
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for term in &terms {
+        // Skip a term scoped to a different column.
+        if term.column.as_deref().is_some_and(|c| {
+            col_names
+                .get(col)
+                .is_none_or(|n| !n.eq_ignore_ascii_case(c))
+        }) {
+            continue;
+        }
+        for start in fts5_term_starts(term, &col_tokens) {
+            hits.push((start, (start + term.phrase.len()).min(spans.len())));
+        }
+    }
+    hits.sort_unstable();
+    // Merge only genuinely overlapping instances (a shared token); adjacent ones
+    // (`end == next start`) stay separate, matching SQLite.
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in hits {
+        match merged.last_mut() {
+            Some(last) if s < last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+
+    // Rebuild the text, wrapping each span's token run in the markers.
+    let mut out = String::new();
+    let mut last = 0;
+    for (s, e) in merged {
+        out.push_str(&text[last..spans[s].1]);
+        out.push_str(open);
+        out.push_str(&text[spans[s].1..spans[e - 1].2]);
+        out.push_str(close);
+        last = spans[e - 1].2;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// One term of an FTS5 query: a phrase of one or more consecutive tokens,
 /// optionally restricted to a named column (`col:token`), anchored to the start
 /// of the column (`^token`), and/or ending in a prefix token (`token*`).
@@ -1948,6 +2050,33 @@ mod tests {
         let corpus = fts5_bm25_corpus("apple", &names, &docs, None);
         assert!(corpus.score(0, &[10.0]) < corpus.score(0, &[]));
         assert_eq!(corpus.score(3, &[10.0]), 0.0); // still 0 where the term is absent
+    }
+
+    #[test]
+    fn fts5_highlight_wraps_matched_tokens() {
+        let names = [String::from("body")];
+        let hl = |q: &str, text: &str| fts5_highlight(q, &names, None, 0, text, "[", "]");
+        // A single matched token, preserving the surrounding text.
+        assert_eq!(
+            hl("fox", "the quick brown fox jumps"),
+            "the quick brown [fox] jumps"
+        );
+        // Two non-adjacent matches get their own markers.
+        assert_eq!(
+            hl("quick dog", "the quick brown fox and the lazy dog"),
+            "the [quick] brown fox and the lazy [dog]"
+        );
+        // A matched phrase (adjacent tokens) shares one pair of markers.
+        assert_eq!(
+            hl("\"quick brown\"", "a quick brown fox"),
+            "a [quick brown] fox"
+        );
+        // Two separate single-token matches are wrapped separately (not merged).
+        assert_eq!(hl("fox", "fox fox"), "[fox] [fox]");
+        // Case-insensitive matching, case-preserving output.
+        assert_eq!(hl("hello", "Hello World"), "[Hello] World");
+        // No match leaves the text untouched.
+        assert_eq!(hl("zebra", "the quick fox"), "the quick fox");
     }
 
     #[test]
