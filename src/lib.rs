@@ -60,6 +60,8 @@ pub use value::{cmp_text, cmp_values, cmp_values_coll, Collation, SerialType, Va
 pub mod btree;
 pub mod exec;
 pub mod format;
+#[cfg(feature = "fts5")]
+pub(crate) mod fts5_index;
 pub mod pager;
 pub mod schema;
 pub mod sql;

@@ -555,7 +555,7 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     (`tests/fts5vocab.rs`). *(The `instance` form's `offset` column must be
     quoted in graphite — `offset` is a reserved word in its parser, an orthogonal
     gap.)*
-  - **D2e — byte-compatible on-disk format. READ ✅ DONE (M1); WRITE remains
+  - **D2e — byte-compatible on-disk format. READ ✅ DONE (M1); WRITE ✅ DONE
     (M2).** **M1:** graphite reads a sqlite-written FTS5 — its parser now accepts
     sqlite's single-quoted shadow-table names (`CREATE TABLE 'ft_data'(…)`), and
     `try_virtual_table` reads the documents from `<name>_content`, answering
@@ -586,11 +586,17 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     a spanning doclist in the COMBINED case (a spanning term followed by many
     paginated terms — off by one term vs sqlite; needs the fts5 writer source),
     doclist-index pages (dli flag), and segment b-tree interior `_data` pages
-    (height > 0), which appear only at large scale. **M2b — storage wiring
-    (remaining):** swap graphite's generic `<name>_data` backing table for
-    sqlite's five shadow tables (`_content`/`_data`/`_idx`/`_docsize`/`_config`),
-    maintaining them on insert/delete/update and porting the verified encoder.
-    The larger remaining file-compat piece.
+    (height > 0), which appear only at large scale. **M2b — storage wiring ✅
+    DONE:** graphite's own FTS5 now uses sqlite's five shadow tables
+    (`_content`/`_data`/`_idx`/`_docsize`/`_config`) instead of the generic
+    `<name>_data` store. `src/fts5_index.rs` ports the verified encoder (multi-
+    column poslists); `fts5_create_storage` builds the shadow tables and
+    `fts5_rebuild_index` re-derives the segment from `_content` after each write
+    (a bulk rebuild, like the R-Tree). A graphite-written FTS5 table is now read,
+    full-text-`MATCH`ed, and integrity-checked by stock sqlite3 3.50.4
+    (`tests/fts5_sqlite_read.rs`). *Not byte-identical to sqlite at every page
+    size (the pgsz fill heuristic and large-scale doclist-index pages differ) —
+    only structural validity is needed for sqlite to read it, and that holds.*
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
   (`register_function`, via `Subqueries::call_udf`) and aggregate ✅ DONE
   (`register_aggregate_function` + an `AggregateFunction` step/finalize trait;

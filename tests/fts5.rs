@@ -750,9 +750,10 @@ fn persists_and_passes_integrity_check() {
         .unwrap();
     c.execute("INSERT INTO t VALUES ('alpha'),('beta')")
         .unwrap();
-    // The documents live in the real backing table.
+    // The documents live in sqlite's `_content` shadow table (id + c0, c1, …);
+    // the inverted index is in `_data`/`_idx`.
     assert_eq!(
-        rows(&c, "SELECT rowid, body FROM t_data ORDER BY rowid"),
+        rows(&c, "SELECT id, c0 FROM t_content ORDER BY id"),
         [
             vec![Value::Integer(1), text("alpha")],
             vec![Value::Integer(2), text("beta")],

@@ -2344,7 +2344,11 @@ impl Connection {
             .map(|(_, n, _)| n.clone())
             .collect();
         let is_backing = |name: &str| {
-            ["_data", "_node", "_rowid", "_parent"].iter().any(|sfx| {
+            [
+                "_data", "_node", "_rowid", "_parent", "_content", "_docsize", "_config", "_idx",
+            ]
+            .iter()
+            .any(|sfx| {
                 name.strip_suffix(sfx)
                     .is_some_and(|p| vtab_names.contains(p))
             })
@@ -5347,9 +5351,18 @@ impl Connection {
             || cvt.module.eq_ignore_ascii_case("rtree_i32"))
         .then(|| crate::vtab::RTreeModule::n_coords(&arg_refs))
         .filter(|n| cols.len() == 1 + n);
+        #[cfg(feature = "fts5")]
+        let is_fts5 = cvt.module.eq_ignore_ascii_case("fts5");
+        #[cfg(not(feature = "fts5"))]
+        let is_fts5 = false;
         if let Some(n_coord) = rtree_n_coord {
             let integer = cvt.module.eq_ignore_ascii_case("rtree_i32");
             self.rtree_create_storage(&cvt.name, n_coord, integer)?;
+        } else if is_fts5 {
+            // FTS5 uses sqlite's five shadow tables (so the file round-trips
+            // through stock sqlite), not the generic `<name>_data` store.
+            #[cfg(feature = "fts5")]
+            self.fts5_create_storage(&cvt.name, cols.len())?;
         } else if persistent {
             let coldefs = cols
                 .iter()
@@ -5456,12 +5469,19 @@ impl Connection {
             .vtab_registry
             .unregister(module_name)
             .ok_or_else(|| Error::Error(format!("no such module: {module_name}")))?;
-        let backing = format!("{table}_data");
+        // FTS5 keeps its documents in `<name>_content` (sqlite's layout); every
+        // other persistent module uses the generic `<name>_data` store.
+        let backing = if module_name.eq_ignore_ascii_case("fts5") {
+            format!("{table}_content")
+        } else {
+            format!("{table}_data")
+        };
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = {
             let mut store = ExecVTabStore {
                 conn: self,
                 backing: &backing,
+                ipk_prefix: module_name.eq_ignore_ascii_case("fts5"),
             };
             f(&*module, &mut store, &arg_refs)
         };
@@ -5604,7 +5624,7 @@ impl Connection {
             self.rtree_apply(&table, n_coord, integer, cells, &[])?;
             return Ok(n);
         }
-        self.with_vtab_store(
+        let inserted = self.with_vtab_store(
             &module_name,
             &args,
             &ins.table,
@@ -5654,7 +5674,9 @@ impl Connection {
                 }
                 Ok(n)
             },
-        )
+        )?;
+        self.fts5_maybe_rebuild(&module_name, &ins.table)?;
+        Ok(inserted)
     }
 
     /// `DELETE` from a virtual table: scan it for rows matching the `WHERE`, then
@@ -5694,7 +5716,7 @@ impl Connection {
             self.rtree_apply(&del.table, n_coord, integer, Vec::new(), &victims)?;
             return Ok(victims.len());
         }
-        self.with_vtab_store(
+        let deleted = self.with_vtab_store(
             &module_name,
             &args,
             &del.table,
@@ -5704,7 +5726,9 @@ impl Connection {
                 }
                 Ok(victims.len())
             },
-        )
+        )?;
+        self.fts5_maybe_rebuild(&module_name, &del.table)?;
+        Ok(deleted)
     }
 
     /// `UPDATE` of a virtual table: scan for rows matching the `WHERE`, evaluate
@@ -5780,7 +5804,7 @@ impl Connection {
             self.rtree_apply(&upd.table, n_coord, integer, inserts, &deletes)?;
             return Ok(changes.len());
         }
-        self.with_vtab_store(
+        let updated = self.with_vtab_store(
             &module_name,
             &args,
             &upd.table,
@@ -5798,7 +5822,9 @@ impl Connection {
                 }
                 Ok(changes.len())
             },
-        )
+        )?;
+        self.fts5_maybe_rebuild(&module_name, &upd.table)?;
+        Ok(updated)
     }
 
     /// Produce the columns and rows of a virtual table used as a `FROM` source:
@@ -6254,7 +6280,9 @@ impl Connection {
         // sqlite does: the generic `<name>_data` backing, or an R-Tree's
         // `_node`/`_rowid`/`_parent` node tables.
         if matches!(d.kind, DropKind::Table) && self.is_virtual_table(&d.name) {
-            for suffix in ["_data", "_node", "_rowid", "_parent"] {
+            for suffix in [
+                "_data", "_node", "_rowid", "_parent", "_content", "_docsize", "_config", "_idx",
+            ] {
                 let backing = format!("{}{suffix}", d.name);
                 if self.schema.table(&backing).is_some() {
                     self.exec_drop(&Drop {
@@ -6744,7 +6772,9 @@ impl Connection {
         }
         // Rename the persistent shadow tables first (ordinary tables): the
         // generic `<name>_data`, or an R-Tree's `_node`/`_rowid`/`_parent`.
-        for suffix in ["_data", "_node", "_rowid", "_parent"] {
+        for suffix in [
+            "_data", "_node", "_rowid", "_parent", "_content", "_docsize", "_config", "_idx",
+        ] {
             let backing_old = format!("{old}{suffix}");
             if self.schema.table(&backing_old).is_some() {
                 self.exec_alter(&Alter {
@@ -12615,8 +12645,19 @@ impl Connection {
             return Err(Error::Error(format!("no such fts5 table: {ft_name}")));
         }
         let ft_cols = ft_schema.columns;
-        let bmeta = self.table_meta(&format!("{ft_name}_data"), None)?;
-        let docs = self.scan_table(&bmeta)?;
+        // Documents live in `<ft>_content` (sqlite's layout): `(id, c0, c1, …)`.
+        // Drop the leading `id` so `vals` is the column-ordered document.
+        let bmeta = self.table_meta(&format!("{ft_name}_content"), None)?;
+        let docs: Vec<(i64, Vec<Value>)> = self
+            .scan_table(&bmeta)?
+            .into_iter()
+            .map(|(rowid, mut vals)| {
+                if !vals.is_empty() {
+                    vals.remove(0);
+                }
+                (rowid, vals)
+            })
+            .collect();
 
         // FTS5 columns store text; coerce other stored types the way SQLite does
         // (NULL/blob contribute no tokens).
@@ -12902,6 +12943,175 @@ impl Connection {
         entries.extend(inserts);
         let build = rtree_bulk_build(entries, n_coord, integer, self.rtree_node_size_for(n_coord));
         self.rtree_write_build(name, &build)
+    }
+
+    /// After a write to an FTS5 table, rebuild its inverted index from the
+    /// updated `<name>_content` documents. A no-op for every other module.
+    fn fts5_maybe_rebuild(&mut self, module_name: &str, table: &str) -> Result<()> {
+        #[cfg(feature = "fts5")]
+        if module_name.eq_ignore_ascii_case("fts5") {
+            return self.fts5_rebuild_index(table);
+        }
+        let _ = (module_name, table);
+        Ok(())
+    }
+
+    /// Create an FTS5 table's storage: SQLite's five shadow tables
+    /// (`_content`/`_docsize`/`_config`/`_idx`/`_data`) instead of graphite's
+    /// generic `<name>_data` store, so a graphite-written FTS5 table is readable
+    /// (and `MATCH`-able) by stock sqlite. `_content` holds the documents (same
+    /// `(id, c0, c1, …)` shape graphite already reads); the inverted index in
+    /// `_data`/`_idx` is rebuilt from `_content` on every write.
+    #[cfg(feature = "fts5")]
+    fn fts5_create_storage(&mut self, name: &str, ncols: usize) -> Result<()> {
+        let content_cols: Vec<String> = (0..ncols).map(|c| format!("c{c}")).collect();
+        let q = |s: &str| sql::print::ident(s);
+        let defs = [
+            (
+                format!("{name}_content"),
+                format!("id INTEGER PRIMARY KEY, {}", content_cols.join(", ")),
+                "",
+            ),
+            (
+                format!("{name}_docsize"),
+                "id INTEGER PRIMARY KEY, sz BLOB".to_string(),
+                "",
+            ),
+            (
+                format!("{name}_config"),
+                "k PRIMARY KEY, v".to_string(),
+                " WITHOUT ROWID",
+            ),
+            (
+                format!("{name}_idx"),
+                "segid, term, pgno, PRIMARY KEY(segid, term)".to_string(),
+                " WITHOUT ROWID",
+            ),
+            (
+                format!("{name}_data"),
+                "id INTEGER PRIMARY KEY, block BLOB".to_string(),
+                "",
+            ),
+        ];
+        for (tname, cols, tail) in &defs {
+            let sql = format!("CREATE TABLE {}({cols}){tail}", q(tname));
+            let Statement::CreateTable(ct) = sql::parse_one(&sql)? else {
+                unreachable!("constructed a CREATE TABLE")
+            };
+            self.exec_create_table(&ct, &sql)?;
+        }
+        // The configuration version row, then the empty segment index. The vtab's
+        // own schema row is not inserted yet, so write the initial `_data` rows
+        // directly (the index is rebuilt from `_content` on the first write).
+        self.execute_params(
+            &format!(
+                "INSERT INTO {} VALUES('version', 4)",
+                q(&format!("{name}_config"))
+            ),
+            &Params::default(),
+        )?;
+        let seg = crate::fts5_index::build_segment(&[], 0, &alloc::vec![0u64; ncols], &[], 4050, 0);
+        let data_t = q(&format!("{name}_data"));
+        for (id, block) in &seg.data {
+            self.execute_params(
+                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                &Params {
+                    positional: alloc::vec![Value::Integer(*id), Value::Blob(block.clone())],
+                    named: Vec::new(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild an FTS5 table's `%_data`/`%_idx`/`%_docsize` from the documents in
+    /// `<name>_content` (a bulk rebuild, like the R-Tree). Tokenizes each column
+    /// with the table's tokenizer and writes a byte-compatible segment index.
+    #[cfg(feature = "fts5")]
+    fn fts5_rebuild_index(&mut self, name: &str) -> Result<()> {
+        use crate::fts5_index::{self, IdxRow, Posting};
+        use alloc::collections::BTreeMap;
+        let (_module, args, schema) = self.vtab_meta(name)?;
+        let ncols = schema.columns.len();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let stem = crate::vtab::fts5_uses_porter(&arg_refs);
+
+        let cmeta = self.table_meta(&format!("{name}_content"), None)?;
+        let docs = self.scan_table(&cmeta)?;
+
+        // term bytes -> rowid -> per-column positions
+        let mut index: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u32>>>> = BTreeMap::new();
+        let mut col_totals = alloc::vec![0u64; ncols];
+        let mut doc_sizes: Vec<(i64, Vec<u64>)> = Vec::new();
+        for (rowid, values) in &docs {
+            let mut sizes = alloc::vec![0u64; ncols];
+            for c in 0..ncols {
+                let text = match values.get(c + 1) {
+                    Some(v) if !matches!(v, Value::Null) => eval::to_text(v),
+                    _ => String::new(),
+                };
+                let toks = crate::vtab::fts5_tokenize(&text, stem);
+                sizes[c] = toks.len() as u64;
+                col_totals[c] += toks.len() as u64;
+                for (pos, tok) in toks.iter().enumerate() {
+                    index
+                        .entry(tok.as_bytes().to_vec())
+                        .or_default()
+                        .entry(*rowid)
+                        .or_insert_with(|| alloc::vec![Vec::new(); ncols])[c]
+                        .push(pos as u32);
+                }
+            }
+            doc_sizes.push((*rowid, sizes));
+        }
+        let terms: Vec<(Vec<u8>, Vec<Posting>)> = index
+            .into_iter()
+            .map(|(term, per_doc)| {
+                let postings = per_doc
+                    .into_iter()
+                    .map(|(rowid, cols)| Posting { rowid, cols })
+                    .collect();
+                (term, postings)
+            })
+            .collect();
+
+        let seg =
+            fts5_index::build_segment(&terms, docs.len() as u64, &col_totals, &doc_sizes, 4050, 0);
+
+        let q = |s: &str| sql::print::ident(s);
+        let pv = |vals: Vec<Value>| Params {
+            positional: vals,
+            named: Vec::new(),
+        };
+        self.execute(&format!("DELETE FROM {}", q(&format!("{name}_data"))))?;
+        self.execute(&format!("DELETE FROM {}", q(&format!("{name}_idx"))))?;
+        self.execute(&format!("DELETE FROM {}", q(&format!("{name}_docsize"))))?;
+        let data_t = q(&format!("{name}_data"));
+        for (id, block) in &seg.data {
+            self.execute_params(
+                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![Value::Integer(*id), Value::Blob(block.clone())]),
+            )?;
+        }
+        let idx_t = q(&format!("{name}_idx"));
+        for IdxRow { segid, term, pgno } in &seg.idx {
+            self.execute_params(
+                &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                &pv(alloc::vec![
+                    Value::Integer(*segid),
+                    Value::Blob(term.clone()),
+                    Value::Integer(*pgno)
+                ]),
+            )?;
+        }
+        let docsize_t = q(&format!("{name}_docsize"));
+        for (rowid, sz) in &seg.docsize {
+            self.execute_params(
+                &format!("INSERT INTO {docsize_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![Value::Integer(*rowid), Value::Blob(sz.clone())]),
+            )?;
+        }
+        Ok(())
     }
 
     fn scan_table(&self, meta: &TableMeta) -> Result<Vec<(i64, Vec<Value>)>> {
@@ -15175,16 +15385,35 @@ fn find_expr_in_values(key_expr: &Expr, e: &Expr, params: &Params) -> Option<Vec
 struct ExecVTabStore<'a> {
     conn: &'a mut Connection,
     backing: &'a str,
+    /// The backing table leads with an `INTEGER PRIMARY KEY` `id` column (FTS5's
+    /// `_content`), stored as a NULL placeholder serial (the rowid is the b-tree
+    /// key). Module values are the columns after `id`, so prepend a NULL on write
+    /// and drop the leading value on read.
+    ipk_prefix: bool,
 }
 
 impl VTabStore for ExecVTabStore<'_> {
     fn rows(&self) -> Result<Vec<(i64, Vec<Value>)>> {
         let meta = self.conn.table_meta(self.backing, None)?;
-        self.conn.scan_table(&meta)
+        let mut rows = self.conn.scan_table(&meta)?;
+        if self.ipk_prefix {
+            for (_, values) in &mut rows {
+                if !values.is_empty() {
+                    values.remove(0);
+                }
+            }
+        }
+        Ok(rows)
     }
     fn put(&mut self, rowid: i64, values: &[Value]) -> Result<()> {
         let root = self.conn.table_meta(self.backing, None)?.root;
-        let payload = encode_record(values);
+        let payload = if self.ipk_prefix {
+            let mut row = alloc::vec![Value::Null];
+            row.extend_from_slice(values);
+            encode_record(&row)
+        } else {
+            encode_record(values)
+        };
         let w = self.conn.backend.writer()?;
         // Replace semantics: drop any existing row, then insert.
         crate::btree::delete_table(w, root, rowid)?;
