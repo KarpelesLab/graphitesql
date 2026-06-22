@@ -298,13 +298,14 @@ the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep)
   exactly one plain secondary index can seek (no equality, no partial/expression
   index, no rowid range for the range case), so the executor's choice is
   unambiguous; otherwise the always-correct sort stands. Byte-identical EQP and
-  row order vs sqlite3 (`tests/order_by_after_seek.rs`). The **mixed-direction**
-  `ORDER BY a, b DESC` partial sort over a no-`WHERE` COVERING-index scan now
-  reports like sqlite too (`scan_order_prefix`: the covering index yields a
-  uniform leading prefix, so only the trailing terms sort → `USE TEMP B-TREE FOR
-  LAST n TERM[S] OF ORDER BY` with identical rows; `tests/order_by_partial_sort.rs`).
-  *Remaining: the same mixed-direction case over a NON-covering index scan (graphite
-  still full-table-scans + full-sorts there).*
+  row order vs sqlite3 (`tests/order_by_after_seek.rs`). **B0b-i mixed-direction
+  partial sort ✅ DONE** — a no-`WHERE` `ORDER BY a, b DESC` whose index yields a
+  uniform leading prefix now walks that index and sorts only the trailing terms,
+  reported like sqlite (`SCAN … USING [COVERING] INDEX i` + `USE TEMP B-TREE FOR
+  LAST n TERM[S] OF ORDER BY`, identical rows): the COVERING case via
+  `scan_order_prefix`, and the NON-covering case via `order_index_scan`'s
+  `sorted_suffix` (the walk orders the prefix, `order_satisfied_by_scan` reports
+  not-fully-satisfied so the caller sorts the suffix). `tests/order_by_partial_sort.rs`.
 - **B1b — Join reordering.** Beyond the comma-join promotion (done), reorder
   `FROM` tables by a simple cost model (most-selective indexed table inner)
   instead of textual order; results identical, order verified via EQP. Preserve

@@ -95,3 +95,45 @@ fn mixed_direction_partial_sort_over_covering_index() {
         }
     }
 }
+
+#[test]
+fn mixed_direction_partial_sort_over_noncovering_index() {
+    // index (a,b) but the projection needs `d` (not in the index) → non-covering.
+    // sqlite walks the index for the leading prefix then sorts the trailing term:
+    // `SCAN t USING INDEX i` + `USE TEMP B-TREE FOR LAST TERM OF ORDER BY`.
+    let have_sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    const NC: &str = "CREATE TABLE t(a,b,d); CREATE INDEX i ON t(a,b); \
+                      INSERT INTO t VALUES (1,1,9),(1,2,8),(2,1,7),(2,2,6),(3,5,5);";
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in NC.split_inclusive(';') {
+        if !stmt.trim().is_empty() {
+            c.execute(stmt).unwrap();
+        }
+    }
+    let queries = [
+        "SELECT a,b,d FROM t ORDER BY a, b DESC",
+        "SELECT a,b,d FROM t ORDER BY a DESC, b",
+    ];
+    for q in queries {
+        let g = g_eqp(&c, q);
+        assert!(
+            g.contains("USING INDEX i") && g.contains("LAST TERM"),
+            "expected non-covering index walk + partial sort, got: {g} ({q})"
+        );
+        if have_sqlite {
+            let want_eqp = sqlite_out(&format!("{NC} EXPLAIN QUERY PLAN {q};"))
+                .lines()
+                .filter(|l| !l.trim().eq_ignore_ascii_case("QUERY PLAN"))
+                .map(|l| l.trim_start_matches(|ch| "|`- ".contains(ch)).to_string())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert_eq!(g, want_eqp, "EQP diverged for: {q}");
+            let want_rows = sqlite_out(&format!("{NC} {q};"));
+            assert_eq!(
+                g_rows(&c, q).trim(),
+                want_rows.trim(),
+                "rows diverged for: {q}"
+            );
+        }
+    }
+}

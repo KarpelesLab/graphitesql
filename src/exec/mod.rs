@@ -8714,14 +8714,17 @@ impl Connection {
         // are sorted, which sqlite reports as "LAST n TERM[S] OF ORDER BY".
         if !sel.order_by.is_empty() && self.order_satisfied_by_scan(sel, params).is_none() {
             let n = sel.order_by.len();
-            // A WHERE seek may walk a prefix of the ORDER BY in order; otherwise a
-            // no-WHERE covering-index scan may yield a leading prefix (mixed
-            // directions). Either way only the trailing terms are sorted.
-            let prefix = self
-                .seek_order_prefix(sel, params)
-                .map(|(k, _)| k)
-                .unwrap_or_else(|| self.scan_order_prefix(sel, params));
-            let sorted = n - prefix.min(n);
+            // Only the trailing terms are sorted when the access walks a prefix of
+            // the ORDER BY in order: a non-covering index walk (mixed direction,
+            // `order_index_scan.sorted_suffix`), a WHERE seek (`seek_order_prefix`),
+            // or a no-WHERE covering-index scan (`scan_order_prefix`).
+            let sorted = if let Some(s) = self.order_index_scan(sel) {
+                s.sorted_suffix.min(n)
+            } else if let Some((k, _)) = self.seek_order_prefix(sel, params) {
+                n - k.min(n)
+            } else {
+                n - self.scan_order_prefix(sel, params).min(n)
+            };
             let detail = match sorted {
                 _ if sorted >= n => String::from("USE TEMP B-TREE FOR ORDER BY"),
                 1 => String::from("USE TEMP B-TREE FOR LAST TERM OF ORDER BY"),
@@ -10075,15 +10078,18 @@ impl Connection {
             return None;
         }
         // Resolve every `ORDER BY` term to a plain table column. A secondary index
-        // (stored ascending) can satisfy the ordering only when all terms share
-        // one direction — walked forward for all-ASC, reversed for all-DESC — and
-        // use the default NULLs placement, which the walk already yields (NULLs
-        // first ascending, last descending). Mixed directions, an explicit `NULLS
-        // FIRST`/`LAST`, a `COLLATE`, or any non-column term disqualifies it.
+        // (stored ascending; reversed for a leading DESC) walks its columns in ONE
+        // direction, so it satisfies a uniform leading PREFIX of the ORDER BY;
+        // trailing terms that change direction are sorted by the caller (`sorted_
+        // suffix`). The default-NULLs walk can't honour an explicit `NULLS
+        // FIRST`/`LAST`, and a `COLLATE`/non-column term isn't a plain column —
+        // both still disqualify the scan entirely.
         let descending = sel.order_by[0].descending;
         let mut cols: Vec<usize> = Vec::with_capacity(sel.order_by.len());
+        let mut uniform_prefix = 0usize;
+        let mut prefix_open = true;
         for term in &sel.order_by {
-            if term.descending != descending || term.nulls_first.is_some() {
+            if term.nulls_first.is_some() {
                 return None;
             }
             let (tbl, col_name) = match &term.expr {
@@ -10098,13 +10104,23 @@ impl Connection {
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case(col_name))?;
             cols.push(col);
+            if prefix_open && term.descending == descending {
+                uniform_prefix += 1;
+            } else {
+                prefix_open = false;
+            }
         }
+        let sorted_suffix = sel.order_by.len() - uniform_prefix;
         // A lone rowid/IPK term is the `rowid_ordered_scan` case.
         if cols.len() == 1 && meta.ipk == Some(cols[0]) {
             return None;
         }
         // A full index whose leading columns are exactly `cols` (in order), each
-        // with the column's own collation (so index order == ORDER BY order).
+        // with the column's own collation (so index order == ORDER BY order for
+        // the uniform prefix). When the ORDER BY is fully uniform (`sorted_suffix
+        // == 0`) the walk needs no sort; a mixed-direction ORDER BY is taken only
+        // for the NON-covering case (the covered one is `covering_scan` +
+        // `scan_order_prefix`, which already reads in order).
         for idx in self.indexes_of(&t.name).ok()? {
             if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
@@ -10120,6 +10136,9 @@ impl Connection {
                 continue;
             }
             let covering = self.index_covers_query(sel, &meta, &idx.cols);
+            if sorted_suffix > 0 && covering {
+                continue;
+            }
             return Some(OrderIndexScan {
                 name: idx.name,
                 root: idx.root,
@@ -10127,6 +10146,7 @@ impl Connection {
                 cols: idx.cols,
                 descending,
                 covering,
+                sorted_suffix,
             });
         }
         None
@@ -10476,7 +10496,11 @@ impl Connection {
             return Some(d);
         }
         if let Some(s) = self.order_index_scan(sel) {
-            return Some(s.descending);
+            // A mixed-direction walk only orders the leading prefix; the caller
+            // still sorts, so the ORDER BY is not fully satisfied by the scan.
+            if s.sorted_suffix == 0 {
+                return Some(s.descending);
+            }
         }
         // A `WHERE` seek that walks an index in key order satisfies the ORDER BY
         // when *every* term matches the walked columns (B0b-iii).
@@ -14570,6 +14594,12 @@ struct OrderIndexScan {
     /// The index holds every column the query references (B2): rows can be built
     /// from index records without touching the table b-tree.
     covering: bool,
+    /// Number of trailing `ORDER BY` terms the index walk does NOT order (because
+    /// they change direction): the walk yields the uniform leading prefix, then
+    /// the caller still sorts. 0 means the walk fully satisfies the ORDER BY (no
+    /// sort). Only set (>0) for the NON-covering mixed-direction case — the
+    /// covered mixed case is handled by `covering_scan` + `scan_order_prefix`.
+    sorted_suffix: usize,
 }
 
 struct IndexMeta {
