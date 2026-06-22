@@ -3630,6 +3630,52 @@ impl Connection {
 
     /// `UPDATE` a view: fire `INSTEAD OF UPDATE` triggers with OLD/NEW for each
     /// selected row.
+    /// Apply `SET (cols) = (SELECT …)` row-value-subquery assignments for one
+    /// target row: run each subquery once against `ctx` (the caller's original-row
+    /// context, so it is a correlated, simultaneous read) and write its first
+    /// row's columns into `target` at the positions named by the assignment's
+    /// column list (no row → NULLs; a column-count mismatch errors). `meta`, when
+    /// given, rejects assigning to a generated column.
+    fn apply_row_subquery_assignments(
+        &self,
+        row_assignments: &[(Vec<String>, Box<Select>)],
+        cols: &[ColumnInfo],
+        meta: Option<&TableMeta>,
+        ctx: &EvalCtx,
+        target: &mut [Value],
+    ) -> Result<()> {
+        for (targets, select) in row_assignments {
+            let mut positions = Vec::with_capacity(targets.len());
+            for c in targets {
+                let pos = cols
+                    .iter()
+                    .position(|mc| mc.name.eq_ignore_ascii_case(c))
+                    .ok_or_else(|| Error::Error(format!("no such column: {c}")))?;
+                if meta.is_some_and(|m| m.is_generated(pos)) {
+                    return Err(Error::Error(format!(
+                        "cannot UPDATE generated column \"{c}\""
+                    )));
+                }
+                positions.push(pos);
+            }
+            let produced = eval::Subqueries::rows(self, select, ctx)?;
+            let first = produced.into_iter().next();
+            if let Some(r) = &first {
+                if r.len() != positions.len() {
+                    return Err(Error::Error(format!(
+                        "{} columns assigned {} values",
+                        positions.len(),
+                        r.len()
+                    )));
+                }
+            }
+            for (i, &pos) in positions.iter().enumerate() {
+                target[pos] = first.as_ref().map_or(Value::Null, |r| r[i].clone());
+            }
+        }
+        Ok(())
+    }
+
     fn exec_view_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
         let (cols, rows) = self
             .try_view(&upd.table, None, params)?
@@ -3643,7 +3689,10 @@ impl Connection {
                 upd.table
             )));
         }
-        let changed: Vec<String> = upd.assignments.iter().map(|(c, _)| c.clone()).collect();
+        let mut changed: Vec<String> = upd.assignments.iter().map(|(c, _)| c.clone()).collect();
+        for (rcols, _) in &upd.row_assignments {
+            changed.extend(rcols.iter().cloned());
+        }
         let mut affected = 0;
         for row in rows {
             let old = row.values.clone();
@@ -3662,6 +3711,16 @@ impl Connection {
                 // Simultaneous assignment: evaluate against the original row.
                 let ctx = row_ctx(&old, &cols, None, params).with_subqueries(self);
                 new[pos] = eval::eval(expr, &ctx)?;
+            }
+            if !upd.row_assignments.is_empty() {
+                let ctx = row_ctx(&old, &cols, None, params).with_subqueries(self);
+                self.apply_row_subquery_assignments(
+                    &upd.row_assignments,
+                    &cols,
+                    None,
+                    &ctx,
+                    &mut new,
+                )?;
             }
             self.fire_triggers(
                 &upd.table,
@@ -4752,7 +4811,10 @@ impl Connection {
         }
         let indexes = self.indexes_of(&upd.table)?;
         // Columns named in the SET list — drives `UPDATE OF col,…` trigger firing.
-        let changed: Vec<String> = upd.assignments.iter().map(|(c, _)| c.clone()).collect();
+        let mut changed: Vec<String> = upd.assignments.iter().map(|(c, _)| c.clone()).collect();
+        for (rcols, _) in &upd.row_assignments {
+            changed.extend(rcols.iter().cloned());
+        }
         // UPDATE … FROM: materialize the extra tables once. Each target row is
         // joined to the first FROM-row combination satisfying WHERE, and that
         // row's columns are visible to SET/WHERE. Without FROM, `from_rows` is
@@ -4893,6 +4955,28 @@ impl Connection {
                     }
                 };
                 values[pos] = new;
+            }
+            if !upd.row_assignments.is_empty() {
+                // Build the same (possibly FROM-combined) original-row context the
+                // per-expr assignments used, then run each row-value subquery.
+                let combined_row;
+                let (ctx_row, ctx_cols): (&[Value], &[ColumnInfo]) = match &matched_from {
+                    Some(fr) => {
+                        let mut c = old_row.clone();
+                        c.extend_from_slice(fr);
+                        combined_row = c;
+                        (&combined_row, &combined_columns)
+                    }
+                    None => (&old_row, &meta.columns),
+                };
+                let ctx = row_ctx(ctx_row, ctx_cols, Some(rowid), params).with_subqueries(self);
+                self.apply_row_subquery_assignments(
+                    &upd.row_assignments,
+                    &meta.columns,
+                    Some(&meta),
+                    &ctx,
+                    &mut values,
+                )?;
             }
             apply_column_affinity(&meta, &mut values);
             self.materialize_generated(&meta, &mut values, params)?;
@@ -5514,6 +5598,11 @@ impl Connection {
     fn exec_vtab_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
         if !upd.returning.is_empty() {
             return Err(Error::Unsupported("RETURNING on a virtual table"));
+        }
+        if !upd.row_assignments.is_empty() {
+            return Err(Error::Unsupported(
+                "UPDATE SET (…) = (SELECT …) on a virtual table",
+            ));
         }
         if upd.from.is_some() {
             return Err(Error::Unsupported("UPDATE … FROM on a virtual table"));
@@ -11795,6 +11884,16 @@ impl Connection {
                     let ctx = row_ctx(&original, &meta.columns, None, params).with_subqueries(self);
                     row[pos] = eval::eval(expr, &ctx)?;
                 }
+                if !upd.row_assignments.is_empty() {
+                    let ctx = row_ctx(&original, &meta.columns, None, params).with_subqueries(self);
+                    self.apply_row_subquery_assignments(
+                        &upd.row_assignments,
+                        &meta.columns,
+                        Some(meta),
+                        &ctx,
+                        &mut row,
+                    )?;
+                }
                 apply_column_affinity(meta, &mut row);
                 self.materialize_generated(meta, &mut row, params)?;
                 check_not_null(meta, &row)?;
@@ -16460,6 +16559,7 @@ fn trigger_single_source_quals(trigger_sql: &str, table: &str, old: &str) -> Opt
                     && u.from.is_none()
                     && u.returning.is_empty()
                     && u.table.eq_ignore_ascii_case(table)
+                    && u.row_assignments.is_empty()
                     && !u.assignments.iter().any(|(_, e)| expr_has_subquery(e))
                     && !u.where_clause.as_ref().is_some_and(expr_has_subquery)
                     && !u.order_by.iter().any(|t| expr_has_subquery(&t.expr))

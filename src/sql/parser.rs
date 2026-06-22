@@ -1094,12 +1094,13 @@ impl Parser {
         let (schema, table) = self.qualified_name()?;
         self.expect_kw("set")?;
         let mut assignments = Vec::new();
+        let mut row_assignments: Vec<(Vec<String>, Box<Select>)> = Vec::new();
         loop {
             if self.eat(&Token::LParen) {
-                // Column-list assignment `(c1, c2, …) = (e1, e2, …)` (SQLite): the
-                // i-th column gets the i-th expression. Desugared into individual
-                // assignments. (The `= (SELECT …)` row-subquery form is not yet
-                // supported — `expr()` will reject a SELECT here.)
+                // Column-list assignment `(c1, c2, …) = …`. Two forms: a parallel
+                // expression tuple `(e1, e2, …)` (the i-th column gets the i-th
+                // expression, desugared to individual assignments), or a row-value
+                // subquery `(SELECT …)` whose first row's columns are assigned.
                 let mut cols = alloc::vec![self.ident()?];
                 while self.eat(&Token::Comma) {
                     cols.push(self.ident()?);
@@ -1107,18 +1108,24 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 self.expect(&Token::Eq)?;
                 self.expect(&Token::LParen)?;
-                let mut exprs = alloc::vec![self.expr()?];
-                while self.eat(&Token::Comma) {
-                    exprs.push(self.expr()?);
-                }
-                self.expect(&Token::RParen)?;
-                if cols.len() != exprs.len() {
-                    return Err(
-                        self.err("number of columns and values differ in UPDATE SET (…)=(…)")
-                    );
-                }
-                for (c, e) in cols.into_iter().zip(exprs) {
-                    assignments.push((c, e));
+                if self.check_kw("select") || self.check_kw("values") || self.check_kw("with") {
+                    let select = self.select()?;
+                    self.expect(&Token::RParen)?;
+                    row_assignments.push((cols, Box::new(select)));
+                } else {
+                    let mut exprs = alloc::vec![self.expr()?];
+                    while self.eat(&Token::Comma) {
+                        exprs.push(self.expr()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                    if cols.len() != exprs.len() {
+                        return Err(
+                            self.err("number of columns and values differ in UPDATE SET (…)=(…)")
+                        );
+                    }
+                    for (c, e) in cols.into_iter().zip(exprs) {
+                        assignments.push((c, e));
+                    }
                 }
             } else {
                 let col = self.ident()?;
@@ -1151,6 +1158,7 @@ impl Parser {
             on_conflict,
             on_conflict_explicit,
             assignments,
+            row_assignments,
             from,
             where_clause,
             order_by,

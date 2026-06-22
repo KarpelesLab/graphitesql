@@ -410,6 +410,10 @@ pub struct Update {
     pub on_conflict_explicit: bool,
     /// `SET col = expr` assignments.
     pub assignments: Vec<(String, Expr)>,
+    /// `SET (c1, c2, …) = (SELECT …)` row-value-subquery assignments: the
+    /// subquery is run once per target row (correlated allowed) and its first
+    /// row's columns are assigned to the listed columns (no row → NULLs).
+    pub row_assignments: Vec<(Vec<String>, Box<Select>)>,
     /// `UPDATE … SET … FROM <sources>` — extra tables joined to the target so
     /// the `SET`/`WHERE` expressions can read their columns (SQLite extension).
     pub from: Option<FromClause>,
