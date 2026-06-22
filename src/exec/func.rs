@@ -141,11 +141,19 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 });
             }
         }
-        // FTS5 `bm25(<table>)`: the relevance score of the current row, computed by
-        // `run_core` for a `MATCH` query over an `fts5` table. Falls through when no
-        // such score is in scope (so `bm25()` elsewhere is the usual unknown name).
-        "bm25" if !args.is_empty() => {
-            if let Some(score) = ctx.rowid.and_then(|r| ctx.subqueries?.fts5_rank(r)) {
+        // FTS5 `bm25(<table>[, w1, w2, …])`: the relevance score of the current row
+        // (optionally with per-column weights), computed by `run_core` for a `MATCH`
+        // query over an `fts5` table. Falls through when no such score is in scope
+        // (so `bm25()` elsewhere is the usual unknown name).
+        "bm25" if !args.is_empty() && ctx.rowid.is_some() => {
+            let weights: Vec<f64> = args[1..]
+                .iter()
+                .map(|a| Ok(eval::to_f64(&eval::eval(a, ctx)?)))
+                .collect::<Result<_>>()?;
+            if let Some(score) = ctx
+                .rowid
+                .and_then(|r| ctx.subqueries?.fts5_bm25(r, &weights))
+            {
                 return Ok(Value::Real(score));
             }
         }

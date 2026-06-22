@@ -370,6 +370,36 @@ fn bm25_rank_orders_by_relevance() {
 }
 
 #[test]
+fn bm25_column_weights() {
+    // `bm25(t, w1, w2)` weights each column's contribution; a title-heavy weight
+    // ranks a title hit above a doubled body hit — byte-for-byte like sqlite3.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES ('apple','nothing here'),('nothing','apple apple')")
+        .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        rows(&c, sql)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("not an integer rowid"),
+            })
+            .collect::<Vec<_>>()
+    };
+    // Title weighted 10×: the title hit (row 1) outranks the double body hit.
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'apple' ORDER BY bm25(t, 10.0, 1.0)"),
+        [1, 2]
+    );
+    // Body weighted 5×: the body hits (row 2) win instead.
+    assert_eq!(
+        ids("SELECT rowid FROM t WHERE t MATCH 'apple' ORDER BY bm25(t, 1.0, 5.0)"),
+        [2, 1]
+    );
+}
+
+#[test]
 fn bm25_outside_an_fts5_match_is_unavailable() {
     // `rank` / `bm25()` only mean something for an fts5 MATCH query; elsewhere
     // they are an ordinary unknown column / function (an error), as in sqlite.

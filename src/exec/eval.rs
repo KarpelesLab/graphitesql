@@ -63,9 +63,10 @@ pub trait Subqueries {
         None
     }
     /// The FTS5 relevance score (`bm25()` / `rank`) of the row with this `rowid`,
-    /// when the current query is a full-text `MATCH` over an `fts5` table. `None`
-    /// otherwise (so `bm25()`/`rank` fall back to the usual unknown-name error).
-    fn fts5_rank(&self, _rowid: i64) -> Option<f64> {
+    /// with optional per-column `weights` (empty → all 1.0), when the current query
+    /// is a full-text `MATCH` over an `fts5` table. `None` otherwise (so
+    /// `bm25()`/`rank` fall back to the usual unknown-name error).
+    fn fts5_bm25(&self, _rowid: i64, _weights: &[f64]) -> Option<f64> {
         None
     }
 }
@@ -304,7 +305,7 @@ impl<'a> EvalCtx<'a> {
         // The FTS5 `rank` hidden column: the current row's relevance score, when a
         // `MATCH` query over an `fts5` table is in scope (else just an unknown name).
         if table.is_none() && name.eq_ignore_ascii_case("rank") {
-            if let Some(score) = self.rowid.and_then(|r| self.subqueries?.fts5_rank(r)) {
+            if let Some(score) = self.rowid.and_then(|r| self.subqueries?.fts5_bm25(r, &[])) {
                 return Ok(Value::Real(score));
             }
         }

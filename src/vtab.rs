@@ -1586,30 +1586,28 @@ fn fts5_collect_terms<'a>(q: &'a Fts5Query, out: &mut Vec<&'a Fts5Term>) {
 /// occurrence count in the row (across its in-scope columns), `D` the row's total
 /// token count, and `avgdl` the mean. The sum is **negated** so that the smallest
 /// (most negative) score sorts first, exactly as `ORDER BY rank` expects.
-pub(crate) fn fts5_bm25_scores(
+pub(crate) fn fts5_bm25_corpus(
     query: &str,
     col_names: &[String],
     docs: &[Vec<String>],
     scope: Option<&str>,
-) -> Vec<f64> {
-    const K1: f64 = 1.2;
-    const B: f64 = 0.75;
+) -> Fts5Bm25 {
     let n = docs.len();
-    if n == 0 {
-        return Vec::new();
-    }
     let toks = fts5_lex(query);
-    let parsed = match (Fts5Parser {
+    let parsed = (Fts5Parser {
         toks: &toks,
         pos: 0,
     })
-    .parse()
-    {
-        Some(q) => q,
-        None => return alloc::vec![0.0; n],
+    .parse();
+    let terms: Vec<&Fts5Term> = match &parsed {
+        Some(q) => {
+            let mut t = Vec::new();
+            fts5_collect_terms(q, &mut t);
+            t
+        }
+        None => Vec::new(),
     };
-    let mut terms: Vec<&Fts5Term> = Vec::new();
-    fts5_collect_terms(&parsed, &mut terms);
+    let nterms = terms.len();
 
     // Tokenize each column of each row once; the document length `D` is the total
     // token count across all columns (independent of any `col:` scoping).
@@ -1617,23 +1615,27 @@ pub(crate) fn fts5_bm25_scores(
         .iter()
         .map(|cols| cols.iter().map(|t| fts5_tokenize(t)).collect())
         .collect();
-    let dl: Vec<usize> = tok_docs
+    let dl: Vec<f64> = tok_docs
         .iter()
-        .map(|cols| cols.iter().map(Vec::len).sum())
+        .map(|cols| cols.iter().map(Vec::len).sum::<usize>() as f64)
         .collect();
-    let avgdl = dl.iter().sum::<usize>() as f64 / n as f64;
+    let avgdl = if n == 0 {
+        0.0
+    } else {
+        dl.iter().sum::<f64>() / n as f64
+    };
 
-    let mut scores = alloc::vec![0.0f64; n];
-    for term in &terms {
-        // The phrase's occurrence count in each row (summed over its in-scope
-        // columns), and how many rows contain it (for the idf).
-        let mut freq = alloc::vec![0usize; n];
+    // Per document: the occurrence count of each term in each column (already
+    // scoped by the `col MATCH …` operand and any `col:` term filter), so a later
+    // `bm25(t, w1, …)` call can apply arbitrary per-column weights.
+    let mut occ: Vec<Vec<Vec<f64>>> =
+        alloc::vec![alloc::vec![alloc::vec![0.0; col_names.len()]; nterms]; n];
+    let mut idf = alloc::vec![0.0f64; nterms];
+    for (t, term) in terms.iter().enumerate() {
         let mut docfreq = 0usize;
         for (i, cols) in tok_docs.iter().enumerate() {
-            let mut f = 0usize;
+            let mut any = false;
             for (ci, ctoks) in cols.iter().enumerate() {
-                // A `col MATCH …` operand scopes the whole query to one column; a
-                // `col:` term scopes that term. Both filters apply.
                 let name = col_names.get(ci);
                 if scope.is_some_and(|s| name.is_none_or(|nm| !nm.eq_ignore_ascii_case(s)))
                     || term
@@ -1643,27 +1645,69 @@ pub(crate) fn fts5_bm25_scores(
                 {
                     continue;
                 }
-                f += fts5_term_starts(term, ctoks).len();
+                let c = fts5_term_starts(term, ctoks).len();
+                if c > 0 {
+                    occ[i][t][ci] = c as f64;
+                    any = true;
+                }
             }
-            freq[i] = f;
-            if f > 0 {
+            if any {
                 docfreq += 1;
             }
         }
-        let mut idf = crate::util::float::ln(((n - docfreq) as f64 + 0.5) / (docfreq as f64 + 0.5));
-        if idf <= 0.0 {
-            idf = 1e-6;
-        }
-        for i in 0..n {
-            let f = freq[i] as f64;
+        let raw = crate::util::float::ln(((n - docfreq) as f64 + 0.5) / (docfreq as f64 + 0.5));
+        idf[t] = if raw <= 0.0 { 1e-6 } else { raw };
+    }
+
+    Fts5Bm25 {
+        avgdl,
+        idf,
+        docs: dl
+            .into_iter()
+            .zip(occ)
+            .map(|(dl, occ)| Fts5Bm25Doc { dl, occ })
+            .collect(),
+    }
+}
+
+/// A precomputed bm25 corpus for one `MATCH` query: enough per-document and
+/// global statistics to score any row with arbitrary per-column weights.
+pub(crate) struct Fts5Bm25 {
+    avgdl: f64,
+    /// Inverse document frequency of each query term (already idf-clamped).
+    idf: Vec<f64>,
+    docs: Vec<Fts5Bm25Doc>,
+}
+
+/// One document's bm25 inputs: its length and per-term, per-column occurrences.
+struct Fts5Bm25Doc {
+    dl: f64,
+    occ: Vec<Vec<f64>>,
+}
+
+impl Fts5Bm25 {
+    /// SQLite's `bm25()` for document `i` with per-column `weights` (a missing or
+    /// empty weight defaults to 1.0). The score is negated, so the most relevant
+    /// row is the smallest — exactly what `ORDER BY rank` expects.
+    pub(crate) fn score(&self, i: usize, weights: &[f64]) -> f64 {
+        const K1: f64 = 1.2;
+        const B: f64 = 0.75;
+        let doc = &self.docs[i];
+        let mut s = 0.0;
+        for (t, occ_cols) in doc.occ.iter().enumerate() {
+            let f: f64 = occ_cols
+                .iter()
+                .enumerate()
+                .map(|(c, &o)| weights.get(c).copied().unwrap_or(1.0) * o)
+                .sum();
             if f == 0.0 {
                 continue;
             }
-            let norm = 1.0 - B + B * dl[i] as f64 / avgdl;
-            scores[i] += idf * (f * (K1 + 1.0)) / (f + K1 * norm);
+            let norm = 1.0 - B + B * doc.dl / self.avgdl;
+            s += self.idf[t] * (f * (K1 + 1.0)) / (f + K1 * norm);
         }
+        -s
     }
-    scores.iter().map(|s| -s).collect()
 }
 
 impl Fts5Module {
@@ -1883,22 +1927,27 @@ mod tests {
             doc("apple banana cherry date"),
         ];
         let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        let score = |q: &str, i: usize| fts5_bm25_corpus(q, &names, &docs, None).score(i, &[]);
 
         // A common term (idf clamped to 1e-6): the exact values sqlite3 returns.
-        let s = fts5_bm25_scores("apple", &names, &docs, None);
-        assert!(close(s[0], -1.347_921_225_382_93e-6), "{}", s[0]);
-        assert!(close(s[1], -1.132_352_941_176_47e-6), "{}", s[1]);
-        assert!(close(s[4], -8.508_287_292_817_68e-7), "{}", s[4]);
-        assert_eq!(s[3], 0.0); // a row without the term scores 0
+        assert!(close(score("apple", 0), -1.347_921_225_382_93e-6));
+        assert!(close(score("apple", 1), -1.132_352_941_176_47e-6));
+        assert!(close(score("apple", 4), -8.508_287_292_817_68e-7));
+        assert_eq!(score("apple", 3), 0.0); // a row without the term scores 0
 
         // A rare term keeps a real (un-clamped) idf.
-        let s = fts5_bm25_scores("elderberry", &names, &docs, None);
-        assert!(close(s[2], -1.067_421_403_500_88), "{}", s[2]);
+        assert!(close(score("elderberry", 2), -1.067_421_403_500_88));
 
         // Two AND-ed terms sum their contributions.
-        let s = fts5_bm25_scores("apple banana", &names, &docs, None);
-        assert!(close(s[0], -2.319_530_058_190_5e-6), "{}", s[0]);
-        assert!(close(s[4], -1.701_657_458_563_54e-6), "{}", s[4]);
+        assert!(close(score("apple banana", 0), -2.319_530_058_190_5e-6));
+        assert!(close(score("apple banana", 4), -1.701_657_458_563_54e-6));
+
+        // A per-column weight scales the effective term frequency, which sits in
+        // both the numerator and denominator — so a heavier weight gives a larger
+        // magnitude, but not a linear multiple of the unweighted score.
+        let corpus = fts5_bm25_corpus("apple", &names, &docs, None);
+        assert!(corpus.score(0, &[10.0]) < corpus.score(0, &[]));
+        assert_eq!(corpus.score(3, &[10.0]), 0.0); // still 0 where the term is absent
     }
 
     #[test]

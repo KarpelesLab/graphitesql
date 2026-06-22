@@ -159,11 +159,18 @@ pub struct Connection {
     /// [`register_aggregate_function`](Self::register_aggregate_function), keyed by
     /// lowercased name. Built-in aggregates take precedence.
     aggregates: alloc::collections::BTreeMap<String, AggregateFactory>,
-    /// Per-query FTS5 relevance scores (rowid → `bm25()`), set by `run_core` while
-    /// executing a `SELECT … MATCH …` over an `fts5` table that references `rank`
-    /// or `bm25()`, and read back by those special forms during projection and
-    /// `ORDER BY`. `None` outside such a query.
-    fts5_rank: core::cell::RefCell<Option<alloc::collections::BTreeMap<i64, f64>>>,
+    /// Per-query FTS5 relevance state, set by `run_core` while executing a
+    /// `SELECT … MATCH …` over an `fts5` table that references `rank` or `bm25()`:
+    /// the precomputed bm25 corpus plus a map from rowid to its document index.
+    /// Read back (with optional per-column weights) by those special forms during
+    /// projection and `ORDER BY`. `None` outside such a query.
+    #[allow(clippy::type_complexity)]
+    fts5_rank: core::cell::RefCell<
+        Option<(
+            crate::vtab::Fts5Bm25,
+            alloc::collections::BTreeMap<i64, usize>,
+        )>,
+    >,
 }
 
 /// A user-defined scalar function: it receives its evaluated argument values and
@@ -9353,13 +9360,17 @@ impl Connection {
     /// not a `rank`/`bm25()`-referencing `MATCH` query over a single `fts5` table.
     /// `input_rows` are the freshly scanned backing-table rows (the whole corpus),
     /// `columns` their column metadata.
+    #[allow(clippy::type_complexity)]
     fn fts5_rank_scores(
         &self,
         sel: &Select,
         columns: &[ColumnInfo],
         input_rows: &[InputRow],
         params: &Params,
-    ) -> Option<alloc::collections::BTreeMap<i64, f64>> {
+    ) -> Option<(
+        crate::vtab::Fts5Bm25,
+        alloc::collections::BTreeMap<i64, usize>,
+    )> {
         if !select_mentions_rank(sel) {
             return None;
         }
@@ -9388,14 +9399,14 @@ impl Connection {
             .iter()
             .map(|r| r.values.iter().map(eval::to_text).collect())
             .collect();
-        let scores = crate::vtab::fts5_bm25_scores(&query, &col_names, &docs, scope);
-        Some(
-            input_rows
-                .iter()
-                .zip(scores)
-                .filter_map(|(r, s)| Some((r.rowid?, s)))
-                .collect(),
-        )
+        let corpus = crate::vtab::fts5_bm25_corpus(&query, &col_names, &docs, scope);
+        // Map each row's rowid to its document index in the corpus.
+        let index = input_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| Some((r.rowid?, i)))
+            .collect();
+        Some((corpus, index))
     }
 
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
@@ -9436,7 +9447,7 @@ impl Connection {
         let _fts5_rank_guard = Fts5RankGuard {
             conn: self,
             prev: core::mem::replace(
-                &mut self.fts5_rank.borrow_mut(),
+                &mut *self.fts5_rank.borrow_mut(),
                 self.fts5_rank_scores(sel, &columns, &input_rows, params),
             ),
         };
@@ -12531,8 +12542,10 @@ impl eval::Subqueries for Connection {
     fn call_udf(&self, name: &str, args: &[Value]) -> Option<Result<Value>> {
         self.functions.get(name).map(|f| f(args))
     }
-    fn fts5_rank(&self, rowid: i64) -> Option<f64> {
-        self.fts5_rank.borrow().as_ref()?.get(&rowid).copied()
+    fn fts5_bm25(&self, rowid: i64, weights: &[f64]) -> Option<f64> {
+        let cell = self.fts5_rank.borrow();
+        let (corpus, index) = cell.as_ref()?;
+        Some(corpus.score(*index.get(&rowid)?, weights))
     }
     fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value> {
         self.with_outer_frame(outer, |params| {
@@ -14313,7 +14326,11 @@ fn single_minmax_arg(sel: &Select) -> Option<(bool, Expr)> {
 /// nested query's FTS5 scores never leak into the caller (or vice versa).
 struct Fts5RankGuard<'a> {
     conn: &'a Connection,
-    prev: Option<alloc::collections::BTreeMap<i64, f64>>,
+    #[allow(clippy::type_complexity)]
+    prev: Option<(
+        crate::vtab::Fts5Bm25,
+        alloc::collections::BTreeMap<i64, usize>,
+    )>,
 }
 
 impl core::ops::Drop for Fts5RankGuard<'_> {
