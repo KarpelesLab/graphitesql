@@ -64,6 +64,8 @@ fn vdbe_matches_tree_walker() {
         "SELECT 2 IN (1,2,3), 5 IN (1,2,3), 2 NOT IN (1,2,3)",
         "SELECT 1 IN (2,3,NULL), 1 IN (1,NULL), NULL IN (1,2)",
         "SELECT 'b' IN ('a','b','c'), 9 IN ()",
+        "SELECT '{\"a\":5}' -> '$.a', '{\"a\":5}' ->> '$.a'",
+        "SELECT '[1,2,3]' -> 1, '[1,2,3]' ->> 2, '{\"x\":null}' ->> '$.x'",
     ];
     for q in queries {
         let walker = c.query(q).unwrap().rows;

@@ -64,6 +64,14 @@ pub enum Op {
         rhs: usize,
         dest: usize,
     },
+    /// `dest = lhs -> rhs` (`as_text` false) or `lhs ->> rhs` (`as_text` true):
+    /// the JSON extraction operators.
+    Json {
+        as_text: bool,
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
     /// `dest = lhs || rhs` (text concatenation).
     Concat { lhs: usize, rhs: usize, dest: usize },
     /// `dest = lhs <op> rhs` for a comparison `BinaryOp` (Eq/NotEq/Lt/…), with
@@ -1413,7 +1421,15 @@ impl Compiler {
                         });
                         Ok(())
                     }
-                    _ => Err(Error::Unsupported("VDBE spike: this operator")),
+                    JsonExtract | JsonExtractText => {
+                        self.ops.push(Op::Json {
+                            as_text: matches!(op, JsonExtractText),
+                            lhs: l,
+                            rhs: r,
+                            dest,
+                        });
+                        Ok(())
+                    }
                 }
             }
             Expr::Cast {
@@ -1709,6 +1725,14 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                 dest,
             } => {
                 regs[*dest] = crate::exec::eval::like_glob_values(*glob, &regs[*lhs], &regs[*rhs]);
+            }
+            Op::Json {
+                as_text,
+                lhs,
+                rhs,
+                dest,
+            } => {
+                regs[*dest] = crate::exec::json::arrow(&regs[*lhs], &regs[*rhs], *as_text);
             }
             Op::Concat { lhs, rhs, dest } => {
                 regs[*dest] =
