@@ -346,6 +346,16 @@ each additive behind `query_vdbe` until B7:
   NULL-extend.** Replace the materialized cross-product with cursor opcodes; add
   the seek-driven inner cursor and LEFT NULL-extension.
 - **B5c — VDBE: subqueries / compound / window** shapes still on the tree-walker.
+  *Coverage audited 2026-06-23 (`query_vdbe` strict-mode probe):* the VDBE already
+  compiles single-table scans with `WHERE`, `ORDER BY`, `GROUP BY`, `DISTINCT`,
+  constant `LIMIT`, and the 2-table inner join; what defers is **compound
+  SELECT** (`UNION`/etc.), subqueries-in-`FROM`, correlated subqueries, and window
+  functions — each substantial. Note a FOUNDATIONAL limit: the VDBE engine runs
+  with `Params::default()` (it is param-less), so any **parameterized** query
+  (`WHERE a=?`, `LIMIT ?`) must keep falling back until parameters are threaded
+  through compile+run — a prerequisite for most remaining real-query coverage.
+  All of this is perf-neutral (the tree-walker fallback already returns correct
+  results); the acceptance is `query_vdbe` parity, not new behavior.
 - **B7a — route `query()` onto the VDBE behind a flag. ✅ DONE.**
   `Connection::set_use_vdbe(true)` makes `query()` try the VDBE engine first and
   fall back transparently (on any unsupported shape *or* error) to the
