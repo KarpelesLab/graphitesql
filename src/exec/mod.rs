@@ -7109,6 +7109,33 @@ impl Connection {
         if matches!(hint, Some(IndexHint::NotIndexed)) {
             return Ok(None);
         }
+        // `rowid` / `_rowid_` / `oid` `= N` or `IN (list)`: seek the rowid table
+        // b-tree directly — works with or without an explicit INTEGER PRIMARY KEY
+        // column, and is cheaper than any secondary index. `INDEXED BY` names a
+        // specific index, so it forbids this fast path. (`run_core` re-applies the
+        // full WHERE, so the seeked rows are a valid superset.)
+        if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
+            if let Some(rowids) = rowid_seek_constraint(where_expr, &meta.columns, params) {
+                let encoding = self.backend.source().header().text_encoding;
+                let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                let mut out = Vec::new();
+                let mut seen: Vec<i64> = Vec::new();
+                for rid in rowids {
+                    if seen.contains(&rid) {
+                        continue;
+                    }
+                    seen.push(rid);
+                    if cur.seek(rid)? {
+                        let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                        out.push(InputRow {
+                            values,
+                            rowid: Some(rid),
+                        });
+                    }
+                }
+                return Ok(Some(out));
+            }
+        }
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
         if eqs.is_empty() || eqs.iter().any(|(_, v)| matches!(v, Value::Null)) {
@@ -8675,6 +8702,13 @@ impl Connection {
                 ));
             }
             return Ok(alloc::format!("SCAN {label}"));
+        }
+        // A `rowid`/`_rowid_`/`oid` `= N` or `IN (list)` seek wins (matches the
+        // rowid fast path at the top of try_index_lookup), with or without an IPK.
+        if rowid_seek_constraint(where_expr, &meta.columns, params).is_some() {
+            return Ok(alloc::format!(
+                "SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"
+            ));
         }
         // Rowid equality wins, as in try_index_lookup.
         if let Some(ipk) = meta.ipk {
@@ -15281,6 +15315,62 @@ fn find_in_constraint(
                 vals.push(const_value(item, params)?);
             }
             Some((ci, vals))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `e` is a `rowid` / `_rowid_` / `oid` reference (case-insensitive,
+/// optionally table-qualified) that is NOT shadowed by a real column of that
+/// name — i.e. it denotes the table's rowid, seekable directly in the table
+/// b-tree whether or not the table has an explicit INTEGER PRIMARY KEY column.
+fn is_rowid_ref(e: &Expr, columns: &[ColumnInfo]) -> bool {
+    matches!(e, Expr::Column { column, .. }
+        if matches!(column.to_ascii_lowercase().as_str(), "rowid" | "_rowid_" | "oid")
+            && !columns.iter().any(|c| c.name.eq_ignore_ascii_case(column)))
+}
+
+/// Detect a `rowid = const` equality or `rowid IN (list)` in `where_expr` (the
+/// rowid alias not shadowed by a real column), returning the candidate rowids to
+/// seek directly in the table b-tree. `run_core` re-applies the full WHERE, so a
+/// non-integer literal (`rowid = 5.5`) is a harmless superset.
+fn rowid_seek_constraint(
+    where_expr: &Expr,
+    columns: &[ColumnInfo],
+    params: &Params,
+) -> Option<Vec<i64>> {
+    match where_expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => rowid_seek_constraint(left, columns, params)
+            .or_else(|| rowid_seek_constraint(right, columns, params)),
+        Expr::Paren(inner) => rowid_seek_constraint(inner, columns, params),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            let other = if is_rowid_ref(left, columns) {
+                right
+            } else if is_rowid_ref(right, columns) {
+                left
+            } else {
+                return None;
+            };
+            Some(alloc::vec![eval::to_i64(&const_value(other, params)?)])
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } if is_rowid_ref(expr, columns) && !list.is_empty() => {
+            let mut out = Vec::with_capacity(list.len());
+            for item in list {
+                out.push(eval::to_i64(&const_value(item, params)?));
+            }
+            Some(out)
         }
         _ => None,
     }

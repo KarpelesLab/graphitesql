@@ -393,3 +393,74 @@ fn rowid_lookup_returns_correct_row() {
     let r = c.query("SELECT * FROM t WHERE id = 7.5").unwrap();
     assert_eq!(r.rows.len(), 0);
 }
+
+#[test]
+fn rowid_keyword_alias_seeks_like_sqlite() {
+    // `rowid` / `_rowid_` / `oid` (the keyword aliases, not the IPK column name)
+    // now seek the table b-tree directly — for an INTEGER PRIMARY KEY table AND a
+    // plain rowid table — matching SQLite's EQP, instead of a full scan.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE ipk(id INTEGER PRIMARY KEY, a)")
+        .unwrap();
+    c.execute("INSERT INTO ipk VALUES(1,'x'),(2,'y'),(3,'z')")
+        .unwrap();
+    c.execute("CREATE TABLE imp(a, b)").unwrap();
+    c.execute("INSERT INTO imp VALUES('p','q'),('r','s'),('t','u')")
+        .unwrap();
+
+    let seek = ["SEARCH ipk USING INTEGER PRIMARY KEY (rowid=?)"];
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM ipk WHERE rowid=1"),
+        seek
+    );
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM ipk WHERE rowid IN (1,2)"
+        ),
+        seek
+    );
+    let seek_imp = ["SEARCH imp USING INTEGER PRIMARY KEY (rowid=?)"];
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM imp WHERE rowid=2"),
+        seek_imp
+    );
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM imp WHERE _rowid_ IN (1,3)"
+        ),
+        seek_imp
+    );
+
+    // Results are correct (the rowid seek returns the right rows).
+    let mut got: Vec<i64> = c
+        .query("SELECT rowid FROM imp WHERE rowid IN (1,3)")
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(i) => i,
+            _ => panic!(),
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, [1, 3]);
+
+    // A real column literally named `rowid` shadows the keyword: no rowid seek.
+    c.execute("CREATE TABLE shadow(rowid TEXT, b)").unwrap();
+    c.execute("INSERT INTO shadow VALUES('k', 9)").unwrap();
+    assert_eq!(
+        detail(
+            &c,
+            "EXPLAIN QUERY PLAN SELECT * FROM shadow WHERE rowid='k'"
+        ),
+        ["SCAN shadow"]
+    );
+    assert_eq!(
+        c.query("SELECT b FROM shadow WHERE rowid='k'")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(9)
+    );
+}
