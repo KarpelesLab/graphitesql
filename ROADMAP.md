@@ -580,8 +580,13 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     crosses leaves reproduces byte-for-byte (entry header may overshoot `pgsz`,
     the collist carries to the next leaf, the continuation leaf's first rowid is
     absolute with a non-zero first-rowid header offset, one `%_idx` row).
-    *Remaining encoder sub-cases:* doclist-index pages (dli flag) and segment
-    b-tree interior `_data` pages (height > 0), which appear only at large scale. **M2b — storage wiring
+    A UNIFIED streaming writer (`encode_segment`) now reproduces both pure term
+    pagination and pure doclist-spanning through one code path (the logic the lib
+    will port). *Remaining encoder sub-cases:* the leaf-fill boundary right after
+    a spanning doclist in the COMBINED case (a spanning term followed by many
+    paginated terms — off by one term vs sqlite; needs the fts5 writer source),
+    doclist-index pages (dli flag), and segment b-tree interior `_data` pages
+    (height > 0), which appear only at large scale. **M2b — storage wiring
     (remaining):** swap graphite's generic `<name>_data` backing table for
     sqlite's five shadow tables (`_content`/`_data`/`_idx`/`_docsize`/`_config`),
     maintaining them on insert/delete/update and porting the verified encoder.

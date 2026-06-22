@@ -321,6 +321,178 @@ fn get_varint(buf: &[u8]) -> (u64, usize) {
     (v, buf.len())
 }
 
+/// A unified streaming segment writer covering MULTIPLE terms with prefix
+/// compression + leaf pagination AND any term whose doclist spans leaves — the
+/// general single-segment case (everything bar the rare dlidx / interior pages).
+/// Returns the leaf bytes (in page order) and the `%_idx` rows `(pgno<<1, sep)`.
+///
+/// The leaf is a byte buffer flushed when it reaches `pgsz`. A term record is
+/// written whole (flush first if it would not fit); a doclist streams its
+/// entries — the rowid+poslist-size header is atomic (may overshoot pgsz), the
+/// collist splits byte-wise and carries to the next leaf. A continuation leaf's
+/// first rowid is absolute; a leaf that introduces a term gets one `%_idx` row.
+struct SegWriter {
+    pgsz: usize,
+    leaves: Vec<Vec<u8>>,
+    idx: Vec<(i64, Vec<u8>)>,
+    body: Vec<u8>,
+    term_offsets: Vec<usize>,
+    first_rowid_off: usize,
+    prev_term_key: Option<Vec<u8>>, // last term on the current leaf (compression)
+    prev_rowid: i64,                // reset to 0 at each leaf start
+    leaf_first_term: Option<Vec<u8>>,
+    leaf_last_term: Option<Vec<u8>>,
+    prev_leaf_last_term: Option<Vec<u8>>,
+    pgno: i64,
+}
+
+impl SegWriter {
+    fn new(pgsz: usize) -> Self {
+        SegWriter {
+            pgsz,
+            leaves: Vec::new(),
+            idx: Vec::new(),
+            body: Vec::new(),
+            term_offsets: Vec::new(),
+            first_rowid_off: 0,
+            prev_term_key: None,
+            prev_rowid: 0,
+            leaf_first_term: None,
+            leaf_last_term: None,
+            prev_leaf_last_term: None,
+            pgno: 1,
+        }
+    }
+
+    fn leaf_size(&self) -> usize {
+        4 + self.body.len() + build_pgidx(&self.term_offsets).len()
+    }
+
+    fn flush(&mut self) {
+        self.leaves.push(finish_leaf(
+            &self.body,
+            &self.term_offsets,
+            self.first_rowid_off,
+        ));
+        if let Some(ft) = self.leaf_first_term.take() {
+            let sep = match &self.prev_leaf_last_term {
+                Some(p) => idx_separator(p, &ft),
+                None => Vec::new(),
+            };
+            self.idx.push((self.pgno << 1, sep));
+        }
+        if let Some(lt) = self.leaf_last_term.take() {
+            self.prev_leaf_last_term = Some(lt);
+        }
+        self.body.clear();
+        self.term_offsets.clear();
+        self.first_rowid_off = 0;
+        self.prev_term_key = None;
+        self.prev_rowid = 0;
+        self.pgno += 1;
+    }
+
+    /// This term's on-leaf record, prefix-compressed against the previous term on
+    /// the current leaf (full size+blob form when it's the first term on the leaf).
+    fn term_record(&self, key: &[u8]) -> Vec<u8> {
+        let mut rec = Vec::new();
+        match &self.prev_term_key {
+            None => {
+                put_varint(&mut rec, key.len() as u64);
+                rec.extend_from_slice(key);
+            }
+            Some(prev) => {
+                let n_common = key
+                    .iter()
+                    .zip(prev.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                put_varint(&mut rec, n_common as u64);
+                put_varint(&mut rec, (key.len() - n_common) as u64);
+                rec.extend_from_slice(&key[n_common..]);
+            }
+        }
+        rec
+    }
+
+    /// pgidx byte length if a term were added at the current body offset.
+    fn pgidx_with(&self) -> usize {
+        let mut probe = self.term_offsets.clone();
+        probe.push(4 + self.body.len());
+        build_pgidx(&probe).len()
+    }
+
+    fn add_term(&mut self, term: &str, postings: &[Posting]) {
+        let key = term_key(term);
+        let doclist = encode_doclist(postings); // whole doclist (deltas from rowid 0)
+                                                // FTS5 decides per whole term UNIT (record + its full doclist): if it does
+                                                // not fit the current leaf, flush; then if it still does not fit an (now
+                                                // fresh) leaf, the doclist is streamed across leaves.
+        let rec = self.term_record(&key);
+        if !self.body.is_empty()
+            && 4 + self.body.len() + rec.len() + doclist.len() + self.pgidx_with() >= self.pgsz
+        {
+            self.flush();
+        }
+        let rec = self.term_record(&key); // prev_term_key may have been reset by flush
+        let fits_whole =
+            4 + self.body.len() + rec.len() + doclist.len() + self.pgidx_with() <= self.pgsz;
+        self.term_offsets.push(4 + self.body.len());
+        if self.leaf_first_term.is_none() {
+            self.leaf_first_term = Some(key.clone());
+        }
+        self.leaf_last_term = Some(key.clone());
+        self.body.extend_from_slice(&rec);
+        self.prev_term_key = Some(key);
+        if fits_whole {
+            self.body.extend_from_slice(&doclist);
+            return;
+        }
+        // Stream the doclist: entry header (rowid + poslist size) is atomic and may
+        // overshoot pgsz; collist bytes split, carrying to continuation leaves
+        // whose first rowid is absolute (prev_rowid reset to 0 on each flush).
+        self.prev_rowid = 0;
+        for p in postings {
+            if self.leaf_size() > self.pgsz && !self.body.is_empty() {
+                self.flush();
+            }
+            if self.term_offsets.is_empty() && self.first_rowid_off == 0 {
+                self.first_rowid_off = 4 + self.body.len();
+            }
+            let poslist = encode_poslist(p);
+            let size_len = get_varint(&poslist).1;
+            put_varint(&mut self.body, (p.rowid - self.prev_rowid) as u64);
+            self.body.extend_from_slice(&poslist[..size_len]);
+            self.prev_rowid = p.rowid;
+            for &b in &poslist[size_len..] {
+                if self.leaf_size() >= self.pgsz {
+                    self.flush();
+                }
+                self.body.push(b);
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn finish(mut self) -> (Vec<Vec<u8>>, Vec<(i64, Vec<u8>)>) {
+        self.flush();
+        (self.leaves, self.idx)
+    }
+}
+
+/// Encode a whole segment (sorted terms) via the unified streaming writer.
+#[allow(clippy::type_complexity)]
+fn encode_segment(
+    terms: &[(String, Vec<Posting>)],
+    pgsz: usize,
+) -> (Vec<Vec<u8>>, Vec<(i64, Vec<u8>)>) {
+    let mut w = SegWriter::new(pgsz);
+    for (term, postings) in terms {
+        w.add_term(term, postings);
+    }
+    w.finish()
+}
+
 const SEG_LEAF_ROWID: i64 = (1i64 << 37) | 1; // segid=1, height=0, dli=0, pgno=1
 
 /// Parse one `X'..'` hex blob literal as printed by `sqlite3`.
@@ -656,3 +828,53 @@ fn doclist_spans_leaves() {
     check_doclist_spans(50, 80);
     check_doclist_spans(100, 128);
 }
+
+/// Validate the UNIFIED writer (`encode_segment`) — multiple terms with
+/// pagination plus any doclist-spanning — against sqlite for the given docs/pgsz.
+fn check_unified(pgsz: usize, docs: &[(i64, &str)]) {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let (sq_leaves, sq_structure, sq_idx) = sqlite_segment_rows(pgsz, docs);
+    let (terms, _, _) = build_index(docs);
+    let (leaves, idx) = encode_segment(&terms, pgsz);
+    assert_eq!(leaves.len(), sq_leaves.len(), "leaf count for {docs:?}");
+    for (i, (mine, sq)) in leaves.iter().zip(&sq_leaves).enumerate() {
+        assert_eq!(mine, sq, "leaf {} (pgno {})", i, i + 1);
+    }
+    assert_eq!(
+        encode_structure(leaves.len() as u64, 1),
+        sq_structure,
+        "structure"
+    );
+    assert_eq!(idx, sq_idx, "%_idx rows");
+}
+
+#[test]
+fn unified_reproduces_term_pagination() {
+    // Many distinct single-doc terms → pure term pagination, via encode_segment.
+    let docs: Vec<(i64, String)> = vec![(
+        1,
+        (1..=40)
+            .map(|i| format!("term{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )];
+    let refs: Vec<(i64, &str)> = docs.iter().map(|(r, b)| (*r, b.as_str())).collect();
+    check_unified(64, &refs);
+}
+
+#[test]
+fn unified_reproduces_doclist_spanning() {
+    // One term across many docs → spanning doclist, via encode_segment.
+    let docs: Vec<(i64, &str)> = (1..=40).map(|r| (r, "x")).collect();
+    check_unified(64, &docs);
+}
+
+// NOTE: the combined case — a single term whose doclist SPANS leaves immediately
+// followed by many paginated terms — is not yet byte-exact: sqlite applies a
+// subtle leaf-fill boundary on the leaves right after a spanning doclist (it
+// moves one term earlier than a plain `unit <= pgsz` rule predicts). Pinning it
+// needs fts5_index.c's writer; the two cases above (pure pagination and pure
+// spanning, both via the unified `encode_segment`) are the verified coverage.
