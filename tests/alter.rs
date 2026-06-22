@@ -699,6 +699,61 @@ fn rename_column_propagates_into_single_source_view() {
 }
 
 #[test]
+fn rename_column_propagates_into_multi_source_view() {
+    // A MULTI-source view (a join of base tables): a `<renamed-table>.col`
+    // reference is always rewritten, and a bare `col` only when that name is
+    // unique across the join's sources — byte-for-byte like sqlite3. (A-rn3.)
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let cases: &[(&str, &str)] = &[
+        // Unique column `a`: bare + qualified refs all rewrite.
+        (
+            "CREATE TABLE t(a,b); CREATE TABLE u(c,d); \
+             CREATE VIEW v AS SELECT a, c, t.b FROM t JOIN u ON a=c WHERE a>0;",
+            "ALTER TABLE t RENAME COLUMN a TO a2;",
+        ),
+        // Ambiguous column `x` (in both tables): only the `t.x` qualified ref moves.
+        (
+            "CREATE TABLE t(x,b); CREATE TABLE u(x,d); \
+             CREATE VIEW v AS SELECT t.x, u.x FROM t JOIN u ON t.b=u.d;",
+            "ALTER TABLE t RENAME COLUMN x TO x2;",
+        ),
+        // Comma join, unique column.
+        (
+            "CREATE TABLE t(a,b); CREATE TABLE u(c,d); \
+             CREATE VIEW v AS SELECT a,b,c,d FROM t,u WHERE b=d;",
+            "ALTER TABLE t RENAME COLUMN a TO aa;",
+        ),
+    ];
+    for (ddl, alter) in cases {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute_batch(ddl).unwrap();
+        c.execute(alter).unwrap();
+        let got = match &c
+            .query("SELECT sql FROM sqlite_master WHERE name='v'")
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        };
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(format!(
+                    "{ddl} {alter} SELECT sql FROM sqlite_master WHERE name='v';"
+                ))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        assert_eq!(got, want, "multi-source view rewrite diverged for: {ddl}");
+    }
+}
+
+#[test]
 fn rename_column_propagates_into_single_source_trigger() {
     // Renaming a column propagates into a trigger ON that table whose body
     // references only it: NEW./OLD., table-qualified, and bare refs are all

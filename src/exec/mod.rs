@@ -6577,6 +6577,23 @@ impl Connection {
                 let table = a.table.clone();
                 let old = old.clone();
                 let new_text = new_text.clone();
+                // Snapshot every base table's column names, so a multi-source view
+                // rewrite (A-rn3) can tell whether the renamed column name is
+                // unique across a join's sources.
+                let table_cols: alloc::collections::BTreeMap<String, Vec<String>> = self
+                    .schema
+                    .objects()
+                    .iter()
+                    .filter(|o| o.obj_type == crate::schema::ObjectType::Table)
+                    .filter_map(|o| {
+                        self.table_meta(&o.name, None).ok().map(|m| {
+                            (
+                                o.name.clone(),
+                                m.columns.iter().map(|c| c.name.clone()).collect(),
+                            )
+                        })
+                    })
+                    .collect();
                 self.rewrite_schema_rows(|cols| {
                     if is_text(&cols[0], "table") && is_text(&cols[1], &table) {
                         cols[4] = Value::Text(match cols.get(4) {
@@ -6607,27 +6624,30 @@ impl Connection {
                         }
                         false
                     } else if is_text(&cols[0], "view") {
-                        // A view that draws from ONLY the renamed table (no joins,
-                        // subqueries, CTEs, or compound parts, and no alias named
-                        // `old`): every column reference resolves to that table, so
-                        // a bare/qualified column-token rewrite is provably safe.
-                        // Multi-source views need scope-aware resolution and are
-                        // left unchanged (A-rn3 remainder).
+                        // A single-source view (only the renamed table) rewrites
+                        // every reference (bare + qualified). A multi-source view
+                        // (a join of base tables) rewrites `<renamed-table>.old`
+                        // always, and a bare `old` only when that name is unique
+                        // across the sources (A-rn3). Views with subqueries/CTEs/
+                        // non-base sources are still left untouched.
                         match cols.get(4).cloned() {
                             Some(Value::Text(vsql)) => {
-                                match view_single_source_column_quals(&vsql, &table, &old) {
-                                    Some(quals) => {
-                                        let rewritten = rewrite_column_tokens(
-                                            &vsql, &quals, &old, &new_text, true,
-                                        );
-                                        if rewritten != vsql {
-                                            cols[4] = Value::Text(rewritten);
-                                            return true;
-                                        }
-                                        false
-                                    }
-                                    None => false,
+                                let rewritten = if let Some(quals) =
+                                    view_single_source_column_quals(&vsql, &table, &old)
+                                {
+                                    rewrite_column_tokens(&vsql, &quals, &old, &new_text, true)
+                                } else if let Some((quals, bare)) =
+                                    view_multi_source_quals(&vsql, &table, &old, &table_cols)
+                                {
+                                    rewrite_column_tokens(&vsql, &quals, &old, &new_text, bare)
+                                } else {
+                                    vsql.clone()
+                                };
+                                if rewritten != vsql {
+                                    cols[4] = Value::Text(rewritten);
+                                    return true;
                                 }
+                                false
                             }
                             _ => false,
                         }
@@ -17134,6 +17154,112 @@ fn view_single_source_column_quals(view_sql: &str, table: &str, old: &str) -> Op
         return None;
     }
     Some(quals)
+}
+
+/// A-rn3: column-rename rewrite plan for a MULTI-source view (a join of plain
+/// base tables). Returns `(quals, rewrite_bare)`: SQLite always renames a
+/// `<renamed-table>.old` reference (so `quals` is the renamed table's name +
+/// alias), and renames a *bare* `old` only when that column name is unique across
+/// all the join's sources (else a bare `old` would be ambiguous — an invalid view
+/// anyway). Bails (→ None, leaving the view untouched) on any subquery/CTE/
+/// compound, a NATURAL/USING join, a non-base-table source, the renamed table
+/// appearing other than exactly once, or a result alias colliding with `old`.
+/// `table_cols` maps each base table's name to its column names.
+fn view_multi_source_quals(
+    view_sql: &str,
+    table: &str,
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<(Vec<String>, bool)> {
+    let Ok(Statement::CreateView(cv)) = sql::parse_one(view_sql) else {
+        return None;
+    };
+    let sel = &cv.select;
+    if !sel.ctes.is_empty() || !sel.compound.is_empty() || old.eq_ignore_ascii_case(table) {
+        return None;
+    }
+    let from = sel.from.as_ref()?;
+    if from.joins.is_empty() {
+        return None; // single-source is handled separately
+    }
+    // Collect every source; each must be a plain base table (no subquery/tvf/
+    // schema-qualifier), and a NATURAL/USING join's column coalescing is bailed.
+    let mut srcs: Vec<(String, Option<String>)> = Vec::new();
+    let mut push = |tr: &crate::sql::ast::TableRef| -> bool {
+        if tr.subquery.is_some() || tr.tvf_args.is_some() || tr.schema.is_some() {
+            return false;
+        }
+        srcs.push((tr.name.clone(), tr.alias.clone()));
+        true
+    };
+    if !push(&from.first) {
+        return None;
+    }
+    for j in &from.joins {
+        if j.natural || !j.using.is_empty() || !push(&j.table) {
+            return None;
+        }
+    }
+    // The renamed table must be a source exactly once; its name+alias qualify it.
+    let renamed: Vec<&(String, Option<String>)> = srcs
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case(table))
+        .collect();
+    if renamed.len() != 1 {
+        return None;
+    }
+    let mut quals = alloc::vec![renamed[0].0.clone()];
+    if let Some(a) = &renamed[0].1 {
+        if a.eq_ignore_ascii_case(old) {
+            return None;
+        }
+        quals.push(a.clone());
+    }
+    // `old` is safe to rename as a bare reference only if exactly one source has a
+    // column of that name. Every source must be a known base table.
+    let has_old = |name: &str| -> Option<bool> {
+        let cols = table_cols
+            .iter()
+            .find(|(t, _)| t.eq_ignore_ascii_case(name))
+            .map(|(_, c)| c)?;
+        Some(cols.iter().any(|c| c.eq_ignore_ascii_case(old)))
+    };
+    let mut count = 0usize;
+    for (n, _) in &srcs {
+        if has_old(n)? {
+            count += 1;
+        }
+    }
+    let rewrite_bare = count == 1;
+    // A subquery anywhere could reach another table (breaking the analysis); a
+    // result alias equal to `old` would be wrongly renamed.
+    for rc in &sel.columns {
+        if let ResultColumn::Expr { expr, alias, .. } = rc {
+            if expr_has_subquery(expr)
+                || alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(old))
+            {
+                return None;
+            }
+        }
+    }
+    for e in sel
+        .where_clause
+        .iter()
+        .chain(sel.group_by.iter())
+        .chain(sel.having.iter())
+    {
+        if expr_has_subquery(e) {
+            return None;
+        }
+    }
+    for t in &sel.order_by {
+        if expr_has_subquery(&t.expr) {
+            return None;
+        }
+    }
+    Some((quals, rewrite_bare))
 }
 
 /// Whether a `SELECT` references at most the single source `table` (its `FROM`,
