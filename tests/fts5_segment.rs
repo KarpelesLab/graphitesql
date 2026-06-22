@@ -890,3 +890,197 @@ fn unified_reproduces_doclist_spanning() {
 // heuristic in fts5_index.c, not a post-span effect. For functional M2b
 // compatibility byte-identity is not required (a structurally valid index is
 // enough; the differential corpus compares query output, not file bytes).
+
+// ---- Multi-column poslists -------------------------------------------------
+// A term's poslist in a multi-column table: column 0's collist is written
+// directly; each later column `c` that has positions is prefixed `0x01,
+// varint(c)`. Positions are per-column (each starts at 0). Verified vs sqlite.
+
+/// One doc's contribution to a term across columns: `cols[c]` = sorted positions
+/// in column `c` (empty if the term does not occur in that column).
+struct PostingMc {
+    rowid: i64,
+    cols: Vec<Vec<u32>>,
+}
+
+fn encode_collist(positions: &[u32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut prev = 0u32;
+    for (i, &pos) in positions.iter().enumerate() {
+        put_varint(
+            &mut out,
+            ((if i == 0 { pos } else { pos - prev }) as u64) + 2,
+        );
+        prev = pos;
+    }
+    out
+}
+
+/// Multi-column poslist: `[size][col0 collist]([0x01][varint col][collist])*`.
+fn encode_poslist_mc(p: &PostingMc) -> Vec<u8> {
+    let mut content = Vec::new();
+    for (c, positions) in p.cols.iter().enumerate() {
+        if positions.is_empty() {
+            continue;
+        }
+        if c != 0 {
+            content.push(0x01);
+            put_varint(&mut content, c as u64);
+        }
+        content.extend_from_slice(&encode_collist(positions));
+    }
+    let mut out = Vec::new();
+    put_varint(&mut out, (content.len() as u64) * 2);
+    out.extend_from_slice(&content);
+    out
+}
+
+fn encode_doclist_mc(postings: &[PostingMc]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut prev = 0i64;
+    for (i, p) in postings.iter().enumerate() {
+        put_varint(
+            &mut out,
+            (if i == 0 { p.rowid } else { p.rowid - prev }) as u64,
+        );
+        out.extend_from_slice(&encode_poslist_mc(p));
+        prev = p.rowid;
+    }
+    out
+}
+
+/// A single leaf for multi-column terms (the common small-table case).
+fn encode_leaf_mc(terms: &[(String, Vec<PostingMc>)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut offsets = Vec::new();
+    let mut prev_key: Vec<u8> = Vec::new();
+    for (term, postings) in terms {
+        offsets.push(4 + body.len());
+        let key = term_key(term);
+        if prev_key.is_empty() {
+            put_varint(&mut body, key.len() as u64);
+            body.extend_from_slice(&key);
+        } else {
+            let n_common = key
+                .iter()
+                .zip(prev_key.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            put_varint(&mut body, n_common as u64);
+            put_varint(&mut body, (key.len() - n_common) as u64);
+            body.extend_from_slice(&key[n_common..]);
+        }
+        body.extend_from_slice(&encode_doclist_mc(postings));
+        prev_key = key;
+    }
+    finish_leaf(&body, &offsets, 0)
+}
+
+/// Build a multi-column index: tokenize each column (split on spaces) and collect
+/// term → sorted postings with per-column positions, plus per-column token totals.
+#[allow(clippy::type_complexity)]
+fn build_index_mc(
+    docs: &[(i64, Vec<&str>)],
+    ncols: usize,
+) -> (Vec<(String, Vec<PostingMc>)>, Vec<u64>) {
+    use std::collections::BTreeMap;
+    // term -> rowid -> per-column positions
+    let mut idx: BTreeMap<String, BTreeMap<i64, Vec<Vec<u32>>>> = BTreeMap::new();
+    let mut totals = vec![0u64; ncols];
+    for (rowid, cols) in docs {
+        for (c, text) in cols.iter().enumerate() {
+            for (pos, tok) in text.split_whitespace().enumerate() {
+                totals[c] += 1;
+                idx.entry(tok.to_string())
+                    .or_default()
+                    .entry(*rowid)
+                    .or_insert_with(|| vec![Vec::new(); ncols])[c]
+                    .push(pos as u32);
+            }
+        }
+    }
+    let terms = idx
+        .into_iter()
+        .map(|(term, docs)| {
+            let postings = docs
+                .into_iter()
+                .map(|(rowid, cols)| PostingMc { rowid, cols })
+                .collect();
+            (term, postings)
+        })
+        .collect();
+    (terms, totals)
+}
+
+fn check_mc(docs: &[(i64, Vec<&str>)], ncols: usize) {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "gsql-fts5mc-{}-{}.db",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let coldefs: Vec<String> = (0..ncols).map(|c| format!("c{c}")).collect();
+    let collist = coldefs.join(",");
+    let values: Vec<String> = docs
+        .iter()
+        .map(|(r, cols)| {
+            let vs: Vec<String> = cols.iter().map(|t| format!("'{t}'")).collect();
+            format!("({r},{})", vs.join(","))
+        })
+        .collect();
+    let script = format!(
+        "CREATE VIRTUAL TABLE t USING fts5({collist});\
+         INSERT INTO t(rowid,{collist}) VALUES {};",
+        values.join(",")
+    );
+    let o = Command::new("sqlite3")
+        .arg(&path)
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "sqlite build failed: {o:?}");
+    let q = |sql: &str| {
+        parse_hex(&String::from_utf8_lossy(
+            &Command::new("sqlite3")
+                .arg(&path)
+                .arg(sql)
+                .output()
+                .unwrap()
+                .stdout,
+        ))
+    };
+    let sq_leaf = q(&format!(
+        "SELECT quote(block) FROM t_data WHERE id={SEG_LEAF_ROWID};"
+    ));
+    let sq_avg = q("SELECT quote(block) FROM t_data WHERE id=1;");
+    let (terms, totals) = build_index_mc(docs, ncols);
+    assert_eq!(
+        encode_leaf_mc(&terms),
+        sq_leaf,
+        "multi-col leaf for {docs:?}"
+    );
+    let mut avg = Vec::new();
+    put_varint(&mut avg, docs.len() as u64);
+    for t in &totals {
+        put_varint(&mut avg, *t);
+    }
+    assert_eq!(avg, sq_avg, "averages");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn multi_column_poslists() {
+    // "hello" in both columns, "there" only in col1, "world" only in col0.
+    check_mc(&[(1, vec!["hello world", "hello there"])], 2);
+    // three columns, varied occupancy
+    check_mc(&[(1, vec!["a b", "b c", "c a"])], 3);
+    // two docs, multi-column rowid deltas
+    check_mc(&[(1, vec!["x y", "y"]), (2, vec!["x", "x y"])], 2);
+}
