@@ -182,6 +182,11 @@ fn table_scan_matches_tree_walker() {
         "SELECT a, substr(b, 1, 1), typeof(a) FROM t",
         "SELECT b FROM t WHERE length(b) = 1",
         "SELECT coalesce(b, 'none'), round(a * 1.5, 1) FROM t",
+        // `t.*` projection expands to all columns (by table name and alias).
+        "SELECT t.* FROM t",
+        "SELECT t.*, a + 1 FROM t WHERE a > 1",
+        "SELECT x.* FROM t x",
+        "SELECT x.* FROM t AS x ORDER BY a DESC",
     ] {
         let mut got = c.query_vdbe(q).unwrap().rows;
         let mut want = c.query(q).unwrap().rows;

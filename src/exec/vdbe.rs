@@ -1038,8 +1038,19 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
                 });
                 projections.push((expr.clone(), label));
             }
+            // In a single-table scan the only valid `t.*` qualifier is this
+            // table (the caller verifies the name matches before using the VDBE),
+            // so it expands to every column exactly like a bare `*`.
             ResultColumn::TableWildcard(_) => {
-                return Err(Error::Unsupported("VDBE: table.* not yet supported"))
+                for name in columns {
+                    projections.push((
+                        Expr::Column {
+                            table: None,
+                            column: name.clone(),
+                        },
+                        name.clone(),
+                    ));
+                }
             }
         }
     }

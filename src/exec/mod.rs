@@ -421,6 +421,22 @@ impl Connection {
         }
         let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
         let col_names: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+        // A `t.*` projection is only handled when its qualifier names this single
+        // table (by name or alias); any other qualifier falls back so the
+        // tree-walker can resolve or reject it.
+        for rc in &sel.columns {
+            if let sql::ast::ResultColumn::TableWildcard(q) = rc {
+                let matches = q.eq_ignore_ascii_case(&from.first.name)
+                    || from
+                        .first
+                        .alias
+                        .as_deref()
+                        .is_some_and(|a| q.eq_ignore_ascii_case(a));
+                if !matches {
+                    return Err(Error::Unsupported("VDBE: unknown table.* qualifier"));
+                }
+            }
+        }
         let prog = vdbe::compile_table_select(&sel, &col_names)?;
         let rows: Vec<Vec<Value>> = if meta.without_rowid {
             self.scan_without_rowid(&meta)?
