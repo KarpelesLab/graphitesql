@@ -9571,10 +9571,15 @@ impl Connection {
             return None;
         }
         // The source must be an `fts5` virtual table.
-        let (module, _, _) = self.vtab_meta(&from.first.name).ok()?;
+        let (module, vargs, _) = self.vtab_meta(&from.first.name).ok()?;
         if !module.eq_ignore_ascii_case("fts5") {
             return None;
         }
+        // Columns declared `UNINDEXED` are excluded from matching/ranking; `None`
+        // when every column is searchable (avoids per-row name checks).
+        let arg_refs: Vec<&str> = vargs.iter().map(String::as_str).collect();
+        let all = crate::vtab::fts5_indexed_columns(&arg_refs);
+        let indexed = (all.len() != columns.len()).then_some(all);
         let (query, operand) = self.fts5_match_query(sel.where_clause.as_ref()?, params)?;
         let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         // A `col MATCH …` operand scopes the query to that column; a table-wide
@@ -9589,7 +9594,13 @@ impl Connection {
                 .iter()
                 .map(|r| r.values.iter().map(eval::to_text).collect())
                 .collect();
-            let corpus = crate::vtab::fts5_bm25_corpus(&query, &col_names, &docs, scope.as_deref());
+            let corpus = crate::vtab::fts5_bm25_corpus(
+                &query,
+                &col_names,
+                &docs,
+                scope.as_deref(),
+                indexed.as_deref(),
+            );
             let index = input_rows
                 .iter()
                 .enumerate()
@@ -9601,6 +9612,7 @@ impl Connection {
             col_names,
             query,
             scope,
+            indexed,
             bm25,
         })
     }
@@ -12756,6 +12768,10 @@ impl eval::Subqueries for Connection {
     fn fts5_highlight(&self, col: usize, text: &str, open: &str, close: &str) -> Option<String> {
         let cell = self.fts5_rank.borrow();
         let ctx = cell.as_ref()?;
+        // An `UNINDEXED` column carries no matches, so it is returned verbatim.
+        if ctx.col_names.get(col).is_some_and(|n| !ctx.col_indexed(n)) {
+            return Some(String::from(text));
+        }
         Some(crate::vtab::fts5_highlight(
             &ctx.query,
             &ctx.col_names,
@@ -12765,6 +12781,15 @@ impl eval::Subqueries for Connection {
             open,
             close,
         ))
+    }
+    #[cfg(feature = "fts5")]
+    fn fts5_indexed_columns(&self, table: &str) -> Option<Vec<String>> {
+        let (module, args, _) = self.vtab_meta(table).ok()?;
+        if !module.eq_ignore_ascii_case("fts5") {
+            return None;
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        Some(crate::vtab::fts5_indexed_columns(&refs))
     }
     #[cfg(feature = "fts5")]
     fn fts5_snippet(
@@ -12784,6 +12809,7 @@ impl eval::Subqueries for Connection {
             ctx.scope.as_deref(),
             col,
             cols,
+            ctx.indexed.as_deref(),
             open,
             close,
             ellipsis,
@@ -14628,12 +14654,25 @@ struct Fts5QueryCtx {
     query: String,
     /// A `col MATCH …` operand column (whole-query scope), if any.
     scope: Option<String>,
+    /// The searchable (indexed) column names — every column except those declared
+    /// `UNINDEXED`. `None` when all columns are indexed (the common case).
+    indexed: Option<Vec<String>>,
     /// The bm25 corpus + rowid→document-index map — present only when `rank` /
     /// `bm25()` is referenced (`highlight()` needs only the query, not the corpus).
     bm25: Option<(
         crate::vtab::Fts5Bm25,
         alloc::collections::BTreeMap<i64, usize>,
     )>,
+}
+
+#[cfg(feature = "fts5")]
+impl Fts5QueryCtx {
+    /// Whether `col` is searchable (not `UNINDEXED`).
+    fn col_indexed(&self, col: &str) -> bool {
+        self.indexed
+            .as_ref()
+            .is_none_or(|cols| cols.iter().any(|n| n.eq_ignore_ascii_case(col)))
+    }
 }
 
 /// Restores [`Connection::fts5_rank`] when a `run_core` invocation ends, so a

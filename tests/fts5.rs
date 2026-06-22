@@ -154,6 +154,47 @@ fn match_queries_tokens() {
 }
 
 #[test]
+fn unindexed_columns_are_not_searched() {
+    // A column declared `UNINDEXED` is stored and retrievable but excluded from
+    // the full-text index — matching, `bm25()`, `highlight()`, and `snippet()` all
+    // ignore it, byte-for-byte like sqlite3.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(a, b UNINDEXED)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES('cat dog','cat bird')")
+        .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        rows(&c, sql)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("not a rowid"),
+            })
+            .collect::<Vec<_>>()
+    };
+    let one = |sql: &str| match &c.query(sql).unwrap().rows[0][0] {
+        Value::Text(s) => s.clone(),
+        o => panic!("not text: {o:?}"),
+    };
+    // `bird` only appears in the unindexed column → no match.
+    assert!(ids("SELECT rowid FROM t WHERE t MATCH 'bird'").is_empty());
+    // `dog` is in the indexed column → matches.
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'dog'"), [1]);
+    // A column-scoped MATCH on the unindexed column matches nothing.
+    assert!(ids("SELECT rowid FROM t WHERE b MATCH 'cat'").is_empty());
+    // highlight()/snippet() leave the unindexed column verbatim even though the
+    // query term also appears there.
+    assert_eq!(
+        one("SELECT highlight(t, 1, '[', ']') FROM t WHERE t MATCH 'cat'"),
+        "cat bird"
+    );
+    assert_eq!(
+        one("SELECT highlight(t, 0, '[', ']') FROM t WHERE t MATCH 'cat'"),
+        "[cat] dog"
+    );
+}
+
+#[test]
 fn match_column_filter_syntax() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")

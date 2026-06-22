@@ -49,20 +49,35 @@ fn fts5_match_columns(operand: &Expr, ctx: &EvalCtx) -> Option<Vec<(String, Stri
         Expr::Paren(e) => return fts5_match_columns(e, ctx),
         _ => return None,
     };
-    // A reference to a specific indexed column searches only that column.
+    // A reference to a specific indexed column searches only that column. An
+    // `UNINDEXED` column matches nothing (it carries no full-text index).
     if let Some(i) = ctx.columns.iter().position(|c| {
         c.name.eq_ignore_ascii_case(column) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
     }) {
         let c = &ctx.columns[i];
+        let unindexed = ctx
+            .subqueries
+            .and_then(|s| s.fts5_indexed_columns(&c.table))
+            .is_some_and(|cols| !cols.iter().any(|n| n.eq_ignore_ascii_case(&c.name)));
+        if unindexed {
+            return Some(Vec::new());
+        }
         return Some(alloc::vec![(c.name.clone(), eval::to_text(&ctx.row[i]))]);
     }
-    // An unqualified reference to the table itself searches across every column.
+    // An unqualified reference to the table itself searches across every indexed
+    // column (`UNINDEXED` columns are stored but excluded from the full-text index).
     if table.is_none() {
+        let indexed = ctx.subqueries.and_then(|s| s.fts5_indexed_columns(column));
         let cols: Vec<(String, String)> = ctx
             .columns
             .iter()
             .enumerate()
             .filter(|(_, c)| c.table.eq_ignore_ascii_case(column))
+            .filter(|(_, c)| {
+                indexed
+                    .as_ref()
+                    .is_none_or(|cols| cols.iter().any(|n| n.eq_ignore_ascii_case(&c.name)))
+            })
             .map(|(i, c)| (c.name.clone(), eval::to_text(&ctx.row[i])))
             .collect();
         if !cols.is_empty() {

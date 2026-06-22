@@ -97,6 +97,12 @@ pub trait Subqueries {
     ) -> Option<String> {
         None
     }
+    /// The searchable (indexed) column names of the `fts5` table `table`, i.e.
+    /// every declared column except those marked `UNINDEXED`. `None` when `table`
+    /// is not a known `fts5` virtual table (so callers fall back to all columns).
+    fn fts5_indexed_columns(&self, _table: &str) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// A column's type affinity (SQLite, `datatype3.html` §3).

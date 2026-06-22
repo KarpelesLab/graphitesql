@@ -1342,12 +1342,25 @@ pub(crate) fn fts5_snippet(
     scope: Option<&str>,
     col: i64,
     cols: &[String],
+    indexed: Option<&[String]>,
     open: &str,
     close: &str,
     ellipsis: &str,
     ntokens: usize,
 ) -> String {
     let ntok = ntokens.max(1);
+    // A column is searchable unless declared `UNINDEXED`; an unindexed column has
+    // no matches, and SQLite renders it verbatim.
+    let searchable = |ci: usize| -> bool {
+        match (indexed, col_names.get(ci)) {
+            (Some(cols), Some(name)) => cols.iter().any(|c| c.eq_ignore_ascii_case(name)),
+            _ => true,
+        }
+    };
+    // An explicit `UNINDEXED` column is returned as-is (no window, no markers).
+    if col >= 0 && !searchable(col as usize) {
+        return cols.get(col as usize).cloned().unwrap_or_default();
+    }
     let lexed = fts5_lex(query);
     let parsed = (Fts5Parser {
         toks: &lexed,
@@ -1368,11 +1381,12 @@ pub(crate) fn fts5_snippet(
         let n = spans.len();
         // Operand-level scope (`col MATCH …`) and per-term `col:token` filters both
         // gate which instances count toward this column.
-        let in_scope = scope.is_none_or(|s| {
-            col_names
-                .get(ci)
-                .is_some_and(|nm| nm.eq_ignore_ascii_case(s))
-        });
+        let in_scope = searchable(ci)
+            && scope.is_none_or(|s| {
+                col_names
+                    .get(ci)
+                    .is_some_and(|nm| nm.eq_ignore_ascii_case(s))
+            });
         let mut inst: Inst = Vec::new();
         if in_scope {
             let col_tokens: Vec<String> = spans.iter().map(|(t, _, _)| t.clone()).collect();
@@ -1991,8 +2005,16 @@ pub(crate) fn fts5_bm25_corpus(
     col_names: &[String],
     docs: &[Vec<String>],
     scope: Option<&str>,
+    indexed: Option<&[String]>,
 ) -> Fts5Bm25 {
     let n = docs.len();
+    // A column is searchable unless it is declared `UNINDEXED`.
+    let searchable = |ci: usize| -> bool {
+        match (indexed, col_names.get(ci)) {
+            (Some(cols), Some(name)) => cols.iter().any(|c| c.eq_ignore_ascii_case(name)),
+            _ => true,
+        }
+    };
     let toks = fts5_lex(query);
     let parsed = (Fts5Parser {
         toks: &toks,
@@ -2017,7 +2039,13 @@ pub(crate) fn fts5_bm25_corpus(
         .collect();
     let dl: Vec<f64> = tok_docs
         .iter()
-        .map(|cols| cols.iter().map(Vec::len).sum::<usize>() as f64)
+        .map(|cols| {
+            cols.iter()
+                .enumerate()
+                .filter(|(ci, _)| searchable(*ci))
+                .map(|(_, c)| c.len())
+                .sum::<usize>() as f64
+        })
         .collect();
     let avgdl = if n == 0 {
         0.0
@@ -2037,7 +2065,8 @@ pub(crate) fn fts5_bm25_corpus(
             let mut any = false;
             for (ci, ctoks) in cols.iter().enumerate() {
                 let name = col_names.get(ci);
-                if scope.is_some_and(|s| name.is_none_or(|nm| !nm.eq_ignore_ascii_case(s)))
+                if !searchable(ci)
+                    || scope.is_some_and(|s| name.is_none_or(|nm| !nm.eq_ignore_ascii_case(s)))
                     || term
                         .column
                         .as_deref()
@@ -2135,6 +2164,28 @@ impl Fts5Module {
         let name = name.strip_suffix(']').unwrap_or(name);
         Some(String::from(name))
     }
+
+    /// Whether a column-declaration arg carries the `UNINDEXED` modifier (the
+    /// column is stored and retrievable but excluded from the full-text index).
+    #[cfg(feature = "fts5")]
+    fn is_unindexed(arg: &str) -> bool {
+        arg.split_whitespace()
+            .skip(1)
+            .any(|w| w.eq_ignore_ascii_case("UNINDEXED"))
+    }
+}
+
+/// The names of the *searchable* (indexed) columns of an `fts5` table, given its
+/// `USING fts5(…)` argument list — i.e. every declared column except those marked
+/// `UNINDEXED`. A table-wide `MATCH` searches only these.
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_indexed_columns(args: &[&str]) -> Vec<String> {
+    args.iter()
+        .filter_map(|a| {
+            let name = Fts5Module::column_name(a)?;
+            (!Fts5Module::is_unindexed(a)).then_some(name)
+        })
+        .collect()
 }
 
 #[cfg(feature = "fts5")]
@@ -2339,7 +2390,8 @@ mod tests {
             doc("apple banana cherry date"),
         ];
         let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
-        let score = |q: &str, i: usize| fts5_bm25_corpus(q, &names, &docs, None).score(i, &[]);
+        let score =
+            |q: &str, i: usize| fts5_bm25_corpus(q, &names, &docs, None, None).score(i, &[]);
 
         // A common term (idf clamped to 1e-6): the exact values sqlite3 returns.
         assert!(close(score("apple", 0), -1.347_921_225_382_93e-6));
@@ -2357,7 +2409,7 @@ mod tests {
         // A per-column weight scales the effective term frequency, which sits in
         // both the numerator and denominator — so a heavier weight gives a larger
         // magnitude, but not a linear multiple of the unweighted score.
-        let corpus = fts5_bm25_corpus("apple", &names, &docs, None);
+        let corpus = fts5_bm25_corpus("apple", &names, &docs, None, None);
         assert!(corpus.score(0, &[10.0]) < corpus.score(0, &[]));
         assert_eq!(corpus.score(3, &[10.0]), 0.0); // still 0 where the term is absent
     }
