@@ -492,3 +492,34 @@ fn rename_table_named_like_a_function_spares_calls() {
         Value::Text("CREATE VIEW cv AS SELECT count(*) AS n FROM \"tally\"".into())
     );
 }
+
+#[test]
+fn rename_column_propagates_into_foreign_keys() {
+    // Renaming a column referenced by another table's FOREIGN KEY rewrites the
+    // `REFERENCES <parent>(col)` clause, byte-for-byte like sqlite3, while a child
+    // column that happens to share the old name is left untouched.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE p(name)").unwrap();
+    c.execute("CREATE TABLE c(name, pid REFERENCES p(name))")
+        .unwrap();
+
+    c.execute("ALTER TABLE p RENAME COLUMN name TO label")
+        .unwrap();
+
+    let sql = |name: &str| -> String {
+        match &c
+            .query(&format!(
+                "SELECT sql FROM sqlite_master WHERE name='{name}'"
+            ))
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    // The FK reference is rewritten; the child's own `name` column is not.
+    assert_eq!(sql("c"), "CREATE TABLE c(name, pid REFERENCES p(label))");
+    // The parent's own column is renamed (existing behavior).
+    assert_eq!(sql("p"), "CREATE TABLE p(label)");
+}

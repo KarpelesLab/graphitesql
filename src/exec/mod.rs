@@ -5819,6 +5819,18 @@ impl Connection {
                             }
                         }
                         false
+                    } else if is_text(&cols[0], "table") {
+                        // Another table whose foreign key references the renamed
+                        // parent column: rewrite `REFERENCES <table>(old)` only.
+                        if let Some(Value::Text(csql)) = cols.get(4).cloned() {
+                            let rewritten =
+                                rewrite_fk_parent_column(&csql, &table, &old, &new_text);
+                            if rewritten != csql {
+                                cols[4] = Value::Text(rewritten);
+                                return true;
+                            }
+                        }
+                        false
                     } else {
                         false
                     }
@@ -15226,6 +15238,54 @@ fn view_uses_table(view_sql: &str, name: &str) -> bool {
 /// rename rather than reprinting from the AST. `rendered` is the replacement as
 /// it should appear (a table rename passes the double-quoted name; a column
 /// rename passes the new name bare or quoted exactly as the user wrote it).
+/// Rewrite a foreign-key parent-column reference after the parent's column is
+/// renamed: in `sql` (another table's `CREATE`), rename `old` → `rendered` but
+/// only inside a `REFERENCES <parent>(…)` column list — so a child column that
+/// happens to share the old name is left untouched. Used for cross-object
+/// `ALTER TABLE … RENAME COLUMN` propagation into foreign keys.
+fn rewrite_fk_parent_column(sql: &str, parent: &str, old: &str, rendered: &str) -> String {
+    use sql::token::Token;
+    let toks = match sql::token::tokenize(sql) {
+        Ok(t) => t,
+        Err(_) => return String::from(sql),
+    };
+    let is_word = |t: &Token, w: &str| matches!(t, Token::Word(x) | Token::Ident(x) if x.eq_ignore_ascii_case(w));
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        // `REFERENCES <parent> ( … )` — rename `old` within the column list.
+        if is_word(&toks[i].token, "references")
+            && toks.get(i + 1).is_some_and(|p| is_word(&p.token, parent))
+            && toks
+                .get(i + 2)
+                .is_some_and(|l| matches!(l.token, Token::LParen))
+        {
+            let mut m = i + 3;
+            while m < toks.len() && !matches!(toks[m].token, Token::RParen) {
+                if is_word(&toks[m].token, old) {
+                    spans.push((toks[m].start, toks[m].end));
+                }
+                m += 1;
+            }
+            i = m;
+            continue;
+        }
+        i += 1;
+    }
+    if spans.is_empty() {
+        return String::from(sql);
+    }
+    let mut out = String::new();
+    let mut cursor = 0;
+    for (s, e) in spans {
+        out.push_str(&sql[cursor..s]);
+        out.push_str(rendered);
+        cursor = e;
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
 fn rewrite_ident_tokens(sql: &str, old: &str, rendered: &str) -> String {
     let toks = match sql::token::tokenize(sql) {
         Ok(t) => t,
