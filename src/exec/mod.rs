@@ -3626,7 +3626,10 @@ impl Connection {
                 }
                 match ins.on_conflict {
                     oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
-                        return Err(self.conflict_error(oc, "UNIQUE constraint failed"))
+                        let m = self.unique_violation_message(
+                            &ins.table, &meta, rowid, &values, None, params,
+                        );
+                        return Err(self.conflict_error(oc, &m));
                     }
                     OnConflict::Ignore => continue, // skip this row
                     OnConflict::Replace => {
@@ -3785,7 +3788,14 @@ impl Connection {
             )?
             .is_empty()
         {
-            return Err(Error::Constraint("UNIQUE constraint failed".into()));
+            return Err(Error::Constraint(self.unique_violation_message(
+                table,
+                meta,
+                new_rowid,
+                &values,
+                Some(existing_rowid),
+                params,
+            )));
         }
         let new_full = values.clone();
         let record = self.encode_table_record(meta, &new_full);
@@ -3941,6 +3951,104 @@ impl Connection {
             }
         }
         Ok(out)
+    }
+
+    /// SQLite's UNIQUE-violation message for the *first* unique constraint the new
+    /// row collides on: `UNIQUE constraint failed: t.a[, t.b]` (or `: index 'name'`
+    /// for an expression index). Checks the rowid/INTEGER PRIMARY KEY, then inline
+    /// `UNIQUE`/`PRIMARY KEY` sets, then standalone unique indexes — falling back to
+    /// the bare message if none can be pinpointed. Runs only on the (cold) error
+    /// path, so the extra table scans are immaterial.
+    fn unique_violation_message(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        rowid: i64,
+        values: &[Value],
+        exclude: Option<i64>,
+        params: &Params,
+    ) -> String {
+        let bare = String::from("UNIQUE constraint failed");
+        let qualify = |cols: &[usize]| {
+            cols.iter()
+                .map(|&i| alloc::format!("{}.{}", meta.columns[i].table, meta.columns[i].name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let rows = match self.scan_table(meta) {
+            Ok(r) => r,
+            Err(_) => return bare,
+        };
+        // A rowid / INTEGER PRIMARY KEY collision.
+        if let Some(ipk) = meta.ipk {
+            if rows
+                .iter()
+                .any(|(er, _)| *er == rowid && Some(*er) != exclude)
+            {
+                return alloc::format!("UNIQUE constraint failed: {}", qualify(&[ipk]));
+            }
+        }
+        // Inline UNIQUE / PRIMARY KEY constraint sets, in declaration order.
+        for set in &meta.unique {
+            if set.iter().any(|&i| matches!(values[i], Value::Null)) {
+                continue;
+            }
+            let hit = rows.iter().any(|(er, ev)| {
+                Some(*er) != exclude
+                    && set.iter().all(|&i| {
+                        crate::value::cmp_values_coll(&ev[i], &values[i], meta.columns[i].collation)
+                            == core::cmp::Ordering::Equal
+                    })
+            });
+            if hit {
+                return alloc::format!("UNIQUE constraint failed: {}", qualify(set));
+            }
+        }
+        // Standalone unique indexes (a `CREATE UNIQUE INDEX`; the inline sets'
+        // automatic indexes are already covered above and skipped here).
+        if let Ok(idxs) = self.indexes_of(table) {
+            for idx in idxs
+                .iter()
+                .filter(|i| i.unique && autoindex_number(&i.name, table).is_none())
+            {
+                if !self
+                    .row_in_index(idx, meta, values, Some(rowid), params)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Ok(new_key) = self.index_key_values(idx, meta, values, rowid, params) else {
+                    continue;
+                };
+                if new_key.iter().any(|v| matches!(v, Value::Null)) {
+                    continue;
+                }
+                let hit = rows.iter().any(|(er, ev)| {
+                    Some(*er) != exclude
+                        && self
+                            .row_in_index(idx, meta, ev, Some(*er), params)
+                            .unwrap_or(false)
+                        && self
+                            .index_key_values(idx, meta, ev, *er, params)
+                            .map(|ek| {
+                                ek.iter().zip(&new_key).enumerate().all(|(k, (a, b))| {
+                                    crate::value::cmp_values_coll(a, b, idx.collations[k])
+                                        == core::cmp::Ordering::Equal
+                                })
+                            })
+                            .unwrap_or(false)
+                });
+                if hit {
+                    let detail = if idx.key_exprs.is_some() {
+                        alloc::format!("index '{}'", idx.name)
+                    } else {
+                        qualify(&idx.cols)
+                    };
+                    return alloc::format!("UNIQUE constraint failed: {detail}");
+                }
+            }
+        }
+        bare
     }
 
     /// Does an `ON CONFLICT (target…) DO …` upsert clause apply to the conflict
@@ -4380,7 +4488,15 @@ impl Connection {
                         }
                     }
                     oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
-                        return Err(self.conflict_error(oc, "UNIQUE constraint failed"))
+                        let m = self.unique_violation_message(
+                            &upd.table,
+                            &meta,
+                            new_rowid,
+                            &values,
+                            Some(rowid),
+                            params,
+                        );
+                        return Err(self.conflict_error(oc, &m));
                     }
                 }
             }
