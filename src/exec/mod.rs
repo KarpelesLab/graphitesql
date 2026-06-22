@@ -482,6 +482,21 @@ impl Connection {
     /// Compile and run a parsed `SELECT` through the VDBE engine, or `Unsupported`
     /// when its shape is outside the spike's grammar (so callers fall back).
     fn run_select_vdbe(&self, sel: &Select) -> Result<QueryResult> {
+        // The VDBE resolves table names in the `main` schema only
+        // (`table_meta`). Whenever an attached or `temp` database is in scope, or
+        // a non-main database is the current resolution default, or a source is
+        // schema-qualified, defer to the tree-walker so the right schema is used.
+        if self.temp_db.is_some()
+            || !self.attached.is_empty()
+            || self.read_default.get() != DbRef::Main
+        {
+            return Err(Error::Unsupported("VDBE: non-main schema in scope"));
+        }
+        if let Some(f) = &sel.from {
+            if f.first.schema.is_some() || f.joins.iter().any(|j| j.table.schema.is_some()) {
+                return Err(Error::Unsupported("VDBE: schema-qualified source"));
+            }
+        }
         // Constant SELECT (no FROM): compile and run directly.
         let Some(from) = &sel.from else {
             let prog = vdbe::compile_const_select(sel)?;
@@ -505,6 +520,17 @@ impl Connection {
                 return Err(Error::Unsupported("VDBE: only plain table sources"));
             }
             let meta = self.table_meta(&tr.name, tr.alias.as_deref())?;
+            // The VDBE compares/sorts/groups under BINARY only; a column with a
+            // declared non-BINARY collation (NOCASE/RTRIM) would diverge, so defer
+            // to the tree-walker. (An explicit `COLLATE` expression already bails
+            // in the compiler — `Expr::Collate` is unsupported there.)
+            if meta
+                .columns
+                .iter()
+                .any(|c| c.collation != crate::value::Collation::Binary)
+            {
+                return Err(Error::Unsupported("VDBE: non-BINARY column collation"));
+            }
             let cols = meta.columns.iter().map(|c| c.name.clone()).collect();
             // The qualifier a `t.col` reference must use: the alias if present,
             // else the table name.

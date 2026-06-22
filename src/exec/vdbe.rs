@@ -361,18 +361,20 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         tables: Vec::new(),
         affinities: Vec::new(),
         bindings: Vec::new(),
+        forbid_raw_columns: false,
     };
     let mut columns = Vec::new();
     for (i, rc) in sel.columns.iter().enumerate() {
-        let ResultColumn::Expr { expr, alias, .. } = rc else {
+        let ResultColumn::Expr {
+            expr,
+            alias,
+            source,
+        } = rc
+        else {
             return Err(Error::Unsupported("VDBE spike: only scalar result columns"));
         };
         c.compile_expr_into(expr, i)?;
-        columns.push(
-            alias
-                .clone()
-                .unwrap_or_else(|| alloc::format!("col{}", i + 1)),
-        );
+        columns.push(result_label(expr, alias, source, i));
     }
     c.ops.push(Op::ResultRow { start: 0, count });
     c.ops.push(Op::Halt);
@@ -384,6 +386,26 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
 }
 
 /// Is `expr` a (top-level) aggregate function call the VDBE can fold?
+/// The output-column label for a result column, matching the tree-walker's
+/// `result_column_label`: an explicit alias, else a bare column's name, else the
+/// projection's verbatim source span, else a positional `colN` fallback.
+fn result_label(
+    expr: &Expr,
+    alias: &Option<String>,
+    source: &Option<String>,
+    idx: usize,
+) -> String {
+    if let Some(a) = alias {
+        return a.clone();
+    }
+    match expr {
+        Expr::Column { column, .. } => column.clone(),
+        _ => source
+            .clone()
+            .unwrap_or_else(|| alloc::format!("col{}", idx + 1)),
+    }
+}
+
 /// Strip enclosing parentheses from an expression.
 fn unparen(e: &Expr) -> &Expr {
     match e {
@@ -465,6 +487,7 @@ fn compile_aggregate_select(
         tables: tables.to_vec(),
         affinities: affinities.to_vec(),
         bindings: Vec::new(),
+        forbid_raw_columns: false,
     };
     let rewind = c.ops.len();
     c.ops.push(Op::Rewind { target: 0 });
@@ -632,6 +655,7 @@ fn compile_group_select(
         tables: tables.to_vec(),
         affinities: affinities.to_vec(),
         bindings: Vec::new(),
+        forbid_raw_columns: false,
     };
     // Contiguous key registers, loaded per row from the grouping columns.
     let key_start = c.next_reg;
@@ -818,6 +842,12 @@ fn compile_group_select(
             dest: gagg_start + j,
         });
     }
+    // The emit phase has no current scan row: every column reference must be a
+    // grouping key or aggregate (resolved via a binding). A bare non-grouped
+    // column (e.g. from `*`) is the "use a representative row" case SQLite allows
+    // but the VDBE does not model — forbid raw column reads so it bails here and
+    // the tree-walker handles it.
+    c.forbid_raw_columns = true;
     // Project the output row into the contiguous output block first, so HAVING
     // (and ORDER BY) can reference output aliases — matching the tree-walker,
     // where a HAVING/ORDER-BY name that isn't a table column resolves to the
@@ -1008,6 +1038,7 @@ fn compile_group_emit(
         tables: tables.to_vec(),
         affinities: affinities.to_vec(),
         bindings: Vec::new(),
+        forbid_raw_columns: false,
     };
     // Contiguous key registers, loaded per row from the grouping columns.
     let key_start = c.next_reg;
@@ -1103,11 +1134,12 @@ pub fn compile_table_select(
                     ));
                 }
             }
-            ResultColumn::Expr { expr, alias, .. } => {
-                let label = alias.clone().unwrap_or_else(|| match expr {
-                    Expr::Column { column, .. } => column.clone(),
-                    _ => alloc::format!("col{}", projections.len() + 1),
-                });
+            ResultColumn::Expr {
+                expr,
+                alias,
+                source,
+            } => {
+                let label = result_label(expr, alias, source, projections.len());
                 projections.push((expr.clone(), label));
             }
             // In a single-table scan the only valid `t.*` qualifier is this
@@ -1154,6 +1186,7 @@ pub fn compile_table_select(
         tables: tables.to_vec(),
         affinities: affinities.to_vec(),
         bindings: Vec::new(),
+        forbid_raw_columns: false,
     };
     // Optional LIMIT (constant integer only): a counter register decremented
     // after each emitted row, halting the loop at zero.
@@ -1396,6 +1429,12 @@ struct Compiler {
     /// and grouping-column references to per-group registers (so an arbitrary
     /// predicate / sort-key expression over them compiles to ordinary ops).
     bindings: Vec<(Expr, usize)>,
+    /// When set, an `Expr::Column` that is not satisfied by a `binding` is a
+    /// compile error rather than a scan-row read. The grouped emit phase sets
+    /// this: there is no current scan row, so a bare non-grouped, non-aggregate
+    /// column (e.g. `SELECT g, count(*), * FROM t GROUP BY g`, where SQLite takes
+    /// the value from a representative row) must bail to the tree-walker.
+    forbid_raw_columns: bool,
 }
 
 impl Compiler {
@@ -1512,6 +1551,11 @@ impl Compiler {
                 Ok(())
             }
             Expr::Column { table, column } => {
+                // In the grouped emit phase there is no scan row; a column that
+                // was not bound to a key/aggregate register cannot be read.
+                if self.forbid_raw_columns {
+                    return Err(Error::Unsupported("VDBE: bare column in grouped output"));
+                }
                 let idx = self.resolve_column(table.as_deref(), column)?;
                 self.ops.push(Op::Column { col: idx, dest });
                 Ok(())
