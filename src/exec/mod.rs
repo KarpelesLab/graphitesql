@@ -9557,7 +9557,7 @@ impl Connection {
         input_rows: &[InputRow],
         params: &Params,
     ) -> Option<Fts5QueryCtx> {
-        const AUX: &[&str] = &["rank", "bm25", "highlight"];
+        const AUX: &[&str] = &["rank", "bm25", "highlight", "snippet"];
         const RANK: &[&str] = &["rank", "bm25"];
         if !select_mentions(sel, AUX) {
             return None;
@@ -12764,6 +12764,30 @@ impl eval::Subqueries for Connection {
             text,
             open,
             close,
+        ))
+    }
+    #[cfg(feature = "fts5")]
+    fn fts5_snippet(
+        &self,
+        col: usize,
+        text: &str,
+        open: &str,
+        close: &str,
+        ellipsis: &str,
+        ntokens: usize,
+    ) -> Option<String> {
+        let cell = self.fts5_rank.borrow();
+        let ctx = cell.as_ref()?;
+        Some(crate::vtab::fts5_snippet(
+            &ctx.query,
+            &ctx.col_names,
+            ctx.scope.as_deref(),
+            col,
+            text,
+            open,
+            close,
+            ellipsis,
+            ntokens,
         ))
     }
     fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value> {

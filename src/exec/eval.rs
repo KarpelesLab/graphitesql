@@ -81,6 +81,22 @@ pub trait Subqueries {
     ) -> Option<String> {
         None
     }
+    /// FTS5 `snippet(t, col, open, close, ellipsis, n)`: an up-to-`n`-token window
+    /// of `text` covering the query's phrases, matched tokens wrapped and trimmed
+    /// ends marked with `ellipsis`, when a `MATCH` over an `fts5` table is in scope.
+    /// `None` otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn fts5_snippet(
+        &self,
+        _col: usize,
+        _text: &str,
+        _open: &str,
+        _close: &str,
+        _ellipsis: &str,
+        _ntokens: usize,
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// A column's type affinity (SQLite, `datatype3.html` §3).

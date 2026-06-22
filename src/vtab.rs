@@ -1327,6 +1327,181 @@ pub(crate) fn fts5_highlight(
     out
 }
 
+/// SQLite's `snippet(t, col, open, close, ellipsis, n)`: a window of up to `n`
+/// tokens from column `col` chosen to best cover the query's phrases, with the
+/// matched tokens wrapped in `open`…`close` and `ellipsis` prepended/appended when
+/// the window doesn't reach the column's start/end. The window is the candidate
+/// (centered on a phrase instance, or pinned to either end) maximizing distinct
+/// phrase coverage, earliest on a tie — matching fts5's `snippet` aux function.
+#[cfg(feature = "fts5")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fts5_snippet(
+    query: &str,
+    col_names: &[String],
+    scope: Option<&str>,
+    col: usize,
+    text: &str,
+    open: &str,
+    close: &str,
+    ellipsis: &str,
+    ntokens: usize,
+) -> String {
+    let spans = fts5_tokenize_spans(text);
+    let n = spans.len();
+    if n == 0 {
+        return String::from(text);
+    }
+    let col_tokens: Vec<String> = spans.iter().map(|(t, _, _)| t.clone()).collect();
+
+    // Phrase instances `(start, end, term)` in this column, when it is in scope.
+    let in_scope = scope.is_none_or(|s| {
+        col_names
+            .get(col)
+            .is_some_and(|n| n.eq_ignore_ascii_case(s))
+    });
+    let lexed = fts5_lex(query);
+    let parsed = if in_scope {
+        (Fts5Parser {
+            toks: &lexed,
+            pos: 0,
+        })
+        .parse()
+    } else {
+        None
+    };
+    let mut terms = Vec::new();
+    if let Some(p) = &parsed {
+        fts5_collect_terms(p, &mut terms);
+    }
+    let mut inst: Vec<(usize, usize, usize)> = Vec::new();
+    for (ti, term) in terms.iter().enumerate() {
+        if term.column.as_deref().is_some_and(|c| {
+            col_names
+                .get(col)
+                .is_none_or(|nm| !nm.eq_ignore_ascii_case(c))
+        }) {
+            continue;
+        }
+        for start in fts5_term_starts(term, &col_tokens) {
+            inst.push((start, (start + term.phrase.len()).min(n), ti));
+        }
+    }
+
+    let ntok = ntokens.max(1);
+    let (ws, we) = if n <= ntok {
+        (0, n)
+    } else if inst.is_empty() {
+        // No match in this column: SQLite returns the leading `ntok`-token window.
+        (0, ntok)
+    } else {
+        // SQLite's `snippet` aux (`fts5SnippetFunction`): for each phrase instance,
+        // score the window starting at it and consider two starts — the *centered*
+        // `iAdj`, and the enclosing *sentence boundary* (with a +120/+100 bonus that
+        // favors snapping to a sentence/column start). Best score wins, first anchor
+        // breaking ties. `iLast - iFirst` spans the cluster found inside the window;
+        // `score` weights distinct phrases (1000) far above repeats (1).
+        let max_start = (n - ntok) as isize;
+        inst.sort_unstable();
+        // Sentence starts (token indices): token 0, plus any token immediately
+        // preceded by whitespace whose nearest non-space byte before it is `.`/`:`.
+        let bytes = text.as_bytes();
+        let mut sentences = alloc::vec![0usize];
+        for (t, &(_, start_off, _)) in spans.iter().enumerate().skip(1) {
+            let mut i = start_off as isize - 1;
+            while i >= 0 && matches!(bytes[i as usize], b' ' | b'\t' | b'\n' | b'\r') {
+                i -= 1;
+            }
+            if i != start_off as isize - 1 && i >= 0 && matches!(bytes[i as usize], b'.' | b':') {
+                sentences.push(t);
+            }
+        }
+        // Score window `[a, a+ntok)`; return (score, iFirst, iLast) of its cluster.
+        let win = |a: usize| -> (i64, Option<(usize, usize)>) {
+            let e = a + ntok;
+            let mut seen = alloc::vec![false; terms.len()];
+            let mut sc = 0;
+            let (mut first, mut last) = (None, 0);
+            for &(p, pe, ti) in inst.iter().filter(|(p, _, _)| *p >= a && *p < e) {
+                sc += if seen[ti] { 1 } else { 1000 };
+                seen[ti] = true;
+                first.get_or_insert(p);
+                last = pe;
+            }
+            (sc, first.map(|f| (f, last)))
+        };
+        let mut best_score = 0;
+        let mut best_start = 0;
+        for &(io, _, _) in &inst {
+            // Centered candidate at the anchor.
+            let (score, cluster) = win(io);
+            if score > best_score {
+                best_score = score;
+                let (f, l) = cluster.unwrap_or((io, io));
+                let adj = (f as isize - (ntok as isize - (l - f) as isize) / 2).min(max_start);
+                best_start = adj.max(0) as usize;
+            }
+            // Sentence-boundary candidate enclosing the anchor.
+            let mut jj = 0;
+            while jj + 1 < sentences.len() && sentences[jj + 1] <= io {
+                jj += 1;
+            }
+            let s = sentences[jj];
+            if s < io {
+                let score = win(s).0 + if s == 0 { 120 } else { 100 };
+                if score > best_score {
+                    best_score = score;
+                    best_start = s;
+                }
+            }
+        }
+        // A sentence-boundary start is not clamped to `max_start`, so the window may
+        // run to the column end (SQLite renders to the last token there).
+        (best_start, (best_start + ntok).min(n))
+    };
+
+    // Build the snippet: ellipsis, then the window's original text with matched
+    // tokens wrapped (instances merged like `highlight`), then ellipsis.
+    let mut hits: Vec<(usize, usize)> = inst
+        .iter()
+        .filter(|(s, _, _)| *s >= ws && *s < we)
+        .map(|(s, e, _)| (*s, (*e).min(we)))
+        .collect();
+    hits.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in hits {
+        match merged.last_mut() {
+            Some(l) if s < l.1 => l.1 = l.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+
+    let mut out = String::new();
+    if ws > 0 {
+        out.push_str(ellipsis);
+    }
+    // When the window reaches the last token, SQLite appends the remaining input
+    // text (so a trailing `.` survives) instead of an ellipsis.
+    let reaches_end = we == n;
+    let win_end = if reaches_end {
+        text.len()
+    } else {
+        spans[we - 1].2
+    };
+    let mut last = spans[ws].1;
+    for (s, e) in merged {
+        out.push_str(&text[last..spans[s].1]);
+        out.push_str(open);
+        out.push_str(&text[spans[s].1..spans[e - 1].2]);
+        out.push_str(close);
+        last = spans[e - 1].2;
+    }
+    out.push_str(&text[last..win_end]);
+    if !reaches_end {
+        out.push_str(ellipsis);
+    }
+    out
+}
+
 /// One term of an FTS5 query: a phrase of one or more consecutive tokens,
 /// optionally restricted to a named column (`col:token`), anchored to the start
 /// of the column (`^token`), and/or ending in a prefix token (`token*`).

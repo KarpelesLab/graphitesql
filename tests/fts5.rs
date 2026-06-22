@@ -433,6 +433,98 @@ fn highlight_wraps_matched_terms() {
 }
 
 #[test]
+fn snippet_selects_best_window() {
+    // Every expected string was captured from sqlite3 3.50.4 verbatim; the window
+    // selection (centering, sentence/column-start snapping, distinct-phrase scoring)
+    // and trailing-text rules match `fts5SnippetFunction` byte-for-byte.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(a, b)")
+        .unwrap();
+    let snip = |c: &mut Connection, doc_a: &str, doc_b: &str, sql: &str| -> String {
+        c.execute("DELETE FROM t").unwrap();
+        // The test corpus contains no single quotes, so inline insertion is safe.
+        c.execute(&format!("INSERT INTO t(a,b) VALUES('{doc_a}','{doc_b}')"))
+            .unwrap();
+        match &c.query(sql).unwrap().rows[0][0] {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    let dog = "the quick brown fox jumps over the lazy dog";
+    // A lone hit near the start snaps the window to the column head, with a
+    // trailing ellipsis because the window stops short of the end.
+    assert_eq!(
+        snip(
+            &mut c,
+            dog,
+            "x",
+            "SELECT snippet(t,0,'[',']','...',4) FROM t WHERE t MATCH 'fox'"
+        ),
+        "the quick brown [fox]..."
+    );
+    // Two distinct phrases: the window maximizing distinct coverage wins.
+    assert_eq!(
+        snip(
+            &mut c,
+            "a fox runs river the sat mat fox away jumps over red cat",
+            "x",
+            "SELECT snippet(t,0,'[',']','...',10) FROM t WHERE t MATCH 'sat OR red'"
+        ),
+        "...river the [sat] mat fox away jumps over [red] cat"
+    );
+    // An adjacent cluster outscores an earlier lone hit (the +1-per-repeat term).
+    assert_eq!(
+        snip(
+            &mut c,
+            "a a a a near a a a a a a a near near river",
+            "x",
+            "SELECT snippet(t,0,'[',']','.',4) FROM t WHERE t MATCH 'near'"
+        ),
+        ".a [near] [near] river"
+    );
+    // Reaching the column end appends the remaining text (the trailing period).
+    assert_eq!(
+        snip(
+            &mut c,
+            "mat over jumps lazy river.",
+            "x",
+            "SELECT snippet(t,0,'[',']','...',8) FROM t WHERE t MATCH 'river'"
+        ),
+        "mat over jumps lazy [river]."
+    );
+    // A `.`-delimited sentence boundary is a candidate window start.
+    assert_eq!(
+        snip(
+            &mut c,
+            "one two three. four five fox six seven eight nine ten",
+            "x",
+            "SELECT snippet(t,0,'[',']','...',4) FROM t WHERE t MATCH 'fox'"
+        ),
+        "...four five [fox] six..."
+    );
+    // A column-scoped term highlights nothing in a different column.
+    assert_eq!(
+        snip(
+            &mut c,
+            "red fox cat dog",
+            "red away of sat",
+            "SELECT snippet(t,1,'<','>','.',3) FROM t WHERE t MATCH 'a:red'"
+        ),
+        "red away of."
+    );
+    // A matched phrase shares one pair of markers.
+    assert_eq!(
+        snip(
+            &mut c,
+            "the quick brown fox jumps over",
+            "x",
+            "SELECT snippet(t,0,'[',']','...',5) FROM t WHERE t MATCH '\"brown fox\"'"
+        ),
+        "the quick [brown fox] jumps..."
+    );
+}
+
+#[test]
 fn explain_query_plan_reports_match_index() {
     // The reported `idxNum:idxStr` matches sqlite's fts5 xBestIndex: a table-wide
     // MATCH is `INDEX 0:M<ncols>`, a column MATCH is `M<colidx>`, a rowid lookup is

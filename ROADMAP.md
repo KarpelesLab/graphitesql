@@ -460,8 +460,22 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     phrase instance; original inter-token text preserved; case-insensitive,
     case-preserving), byte-identical to sqlite3. Reuses the `Fts5QueryCtx` cell
     (the MATCH query; no corpus needed) via a position-aware tokenizer
-    (`fts5_tokenize_spans`). *(Remaining aux: `snippet()` — its relevance-scored
-    sliding-window selection is fiddly to match byte-for-byte.)*
+    (`fts5_tokenize_spans`).
+  - **D2-aux — `snippet()`. ✅ DONE (correct-results).** `snippet(t, col, open,
+    close, ellipsis, n)` reproduces `fts5SnippetFunction` byte-for-byte: per
+    phrase instance it scores the anchor window (`1000`/distinct phrase + `1`/
+    repeat) and considers two starts — the centered `iAdj`, and the enclosing
+    sentence boundary (token 0 or after a `.`/`:` + space) with a `+120`/`+100`
+    bonus; best score wins, earliest start on ties; a window reaching the column
+    end appends the trailing text (so a final `.` survives) instead of an
+    ellipsis. Validated at 0 mismatches over ~10.9k random differential cases
+    (terms/OR/phrase, 1–2 columns, every `n`, punctuated sentences). *(Known
+    upstream gap, not snippet: the `col : token` column filter with surrounding
+    spaces isn't lexed — `col:token` works; affects MATCH/highlight/snippet
+    alike.)*
+  - **D2-fts5-feature.** The whole module is behind a default-on `fts5` Cargo
+    feature; `--no-default-features` (or any build without `fts5`) drops it and
+    `USING fts5` then reports `no such module: fts5`, as SQLite does uncompiled.
   - **D2e — byte-compatible on-disk segment format** is the remaining FTS5 track
     (the `%_data`/`%_idx` inverted-index b-tree layout sqlite writes; needs the
     real inverted index of D2b — graphite's fts5 is currently scan-based).

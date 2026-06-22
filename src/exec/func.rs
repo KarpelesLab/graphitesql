@@ -178,6 +178,26 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 }
             }
         }
+        // FTS5 `snippet(<table>, col, open, close, ellipsis, n)`: a window of up
+        // to `n` tokens from column `col`, matched tokens wrapped, ellipsis at any
+        // trimmed end. In scope for a `MATCH` query over an `fts5` table.
+        #[cfg(feature = "fts5")]
+        "snippet" if args.len() == 6 => {
+            let col = eval::to_i64(&eval::eval(&args[1], ctx)?);
+            let open = eval::to_text(&eval::eval(&args[2], ctx)?);
+            let close = eval::to_text(&eval::eval(&args[3], ctx)?);
+            let ellipsis = eval::to_text(&eval::eval(&args[4], ctx)?);
+            let ntokens = eval::to_i64(&eval::eval(&args[5], ctx)?);
+            if let (Ok(col), Ok(ntokens)) = (usize::try_from(col), usize::try_from(ntokens)) {
+                let text = ctx.row.get(col).map(eval::to_text).unwrap_or_default();
+                if let Some(s) = ctx
+                    .subqueries
+                    .and_then(|s| s.fts5_snippet(col, &text, &open, &close, &ellipsis, ntokens))
+                {
+                    return Ok(Value::Text(s));
+                }
+            }
+        }
         _ => {}
     }
 
