@@ -52,6 +52,21 @@ fn names_the_violated_columns() {
 }
 
 #[test]
+fn names_columns_for_without_rowid() {
+    // WITHOUT ROWID tables report the colliding primary-key / unique columns too.
+    assert!(violation(
+        "CREATE TABLE t(a TEXT PRIMARY KEY) WITHOUT ROWID; INSERT INTO t VALUES ('x')",
+        "INSERT INTO t VALUES ('x')",
+    )
+    .contains("UNIQUE constraint failed: t.a"));
+    assert!(violation(
+        "CREATE TABLE t(a, b, PRIMARY KEY(a, b)) WITHOUT ROWID; INSERT INTO t VALUES (1, 2)",
+        "INSERT INTO t VALUES (1, 2)",
+    )
+    .contains("UNIQUE constraint failed: t.a, t.b"));
+}
+
+#[test]
 fn names_columns_on_update_conflict() {
     let msg = violation(
         "CREATE TABLE t(a UNIQUE); INSERT INTO t VALUES (1), (2)",

@@ -10963,7 +10963,8 @@ impl Connection {
             if !collide.is_empty() {
                 match ins.on_conflict {
                     oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
-                        return Err(self.conflict_error(oc, "UNIQUE constraint failed"))
+                        let m = wr_unique_message(meta, &existing[collide[0]], &values);
+                        return Err(self.conflict_error(oc, &m));
                     }
                     OnConflict::Ignore => continue,
                     OnConflict::Replace => {
@@ -11072,7 +11073,7 @@ impl Connection {
                 if unique_match(meta, &out[i], &out[j])
                     || self.wr_index_collision(&upd.table, meta, &out[i], &out[j], params)?
                 {
-                    return Err(Error::Constraint("UNIQUE constraint failed".into()));
+                    return Err(Error::Constraint(wr_unique_message(meta, &out[i], &out[j])));
                 }
             }
         }
@@ -14200,6 +14201,31 @@ fn unique_match(meta: &TableMeta, a: &[Value], b: &[Value]) -> bool {
                 && crate::value::cmp_values_coll(&a[c], &b[c], meta.columns[c].collation).is_eq()
         })
     })
+}
+
+/// SQLite's UNIQUE-violation message for two WITHOUT ROWID rows that collide on
+/// an inline `UNIQUE`/`PRIMARY KEY` set (`UNIQUE constraint failed: t.a[, t.b]`),
+/// or the bare message when the collision is on a standalone unique index.
+fn wr_unique_message(meta: &TableMeta, a: &[Value], b: &[Value]) -> String {
+    meta.unique
+        .iter()
+        .find(|set| {
+            set.iter().all(|&c| {
+                !matches!(a[c], Value::Null)
+                    && !matches!(b[c], Value::Null)
+                    && crate::value::cmp_values_coll(&a[c], &b[c], meta.columns[c].collation)
+                        .is_eq()
+            })
+        })
+        .map(|set| {
+            let cols = set
+                .iter()
+                .map(|&i| alloc::format!("{}.{}", meta.columns[i].table, meta.columns[i].name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            alloc::format!("UNIQUE constraint failed: {cols}")
+        })
+        .unwrap_or_else(|| String::from("UNIQUE constraint failed"))
 }
 
 /// An index record for a `WITHOUT ROWID` table: the indexed columns followed by
