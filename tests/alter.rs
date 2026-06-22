@@ -585,6 +585,72 @@ fn rename_table_rewrites_dependent_trigger_bodies() {
 }
 
 #[test]
+fn rename_column_propagates_into_trigger_bodies() {
+    // RENAME COLUMN propagates into a trigger ON the renamed table: NEW.col /
+    // OLD.col (and the WHEN clause) always bind to that table, so they are
+    // rewritten byte-for-byte like sqlite3 even when the trigger body also
+    // touches another table — while NEW/OLD of a trigger on a *different* table
+    // (where they bind elsewhere) are left untouched.
+    let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    let after = |create: &str, alter: &str| -> String {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute_batch(create).unwrap();
+        c.execute(alter).unwrap();
+        match &c
+            .query("SELECT sql FROM sqlite_master WHERE name='tr'")
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    let want = |create: &str, alter: &str| -> String {
+        let o = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg(format!(
+                "{create} {alter} SELECT sql FROM sqlite_master WHERE name='tr';"
+            ))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+    };
+    let alter = "ALTER TABLE t RENAME COLUMN a TO a2;";
+    // (description, setup) — each trigger is on `t` and also writes to `l`.
+    let cases = [
+        "CREATE TABLE t(a,b); CREATE TABLE l(x); \
+         CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO l(x) VALUES(NEW.a); END;",
+        "CREATE TABLE t(a,b); CREATE TABLE l(x); \
+         CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.a > 0 BEGIN INSERT INTO l(x) VALUES(1); END;",
+        "CREATE TABLE t(a,b); CREATE TABLE l(x); \
+         CREATE TRIGGER tr BEFORE DELETE ON t BEGIN INSERT INTO l(x) VALUES(OLD.a); END;",
+    ];
+    for setup in cases {
+        let got = after(setup, alter);
+        assert!(
+            got.contains(".a2") && !got.contains(".a "),
+            "NEW/OLD not rewritten: {got}"
+        );
+        if sqlite {
+            assert_eq!(got, want(setup, alter), "diverged for: {setup}");
+        }
+    }
+
+    // A trigger on a *different* table whose NEW.a binds to that table's own `a`
+    // is left untouched (NEW does not refer to the renamed table here).
+    let other = "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN UPDATE t SET b = NEW.a; END;";
+    let got = after(other, alter);
+    assert!(
+        got.contains("NEW.a") && !got.contains("NEW.a2"),
+        "wrongly rewritten: {got}"
+    );
+    if sqlite {
+        assert_eq!(got, want(other, alter));
+    }
+}
+
+#[test]
 fn rename_column_propagates_into_single_source_view() {
     // Renaming a column propagates into a view that draws from ONLY that table —
     // every reference (bare, table-qualified, and through an alias) is rewritten

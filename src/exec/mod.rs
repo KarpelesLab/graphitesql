@@ -6318,8 +6318,9 @@ impl Connection {
                             Some(Value::Text(vsql)) => {
                                 match view_single_source_column_quals(&vsql, &table, &old) {
                                     Some(quals) => {
-                                        let rewritten =
-                                            rewrite_column_tokens(&vsql, &quals, &old, &new_text);
+                                        let rewritten = rewrite_column_tokens(
+                                            &vsql, &quals, &old, &new_text, true,
+                                        );
                                         if rewritten != vsql {
                                             cols[4] = Value::Text(rewritten);
                                             return true;
@@ -6334,22 +6335,34 @@ impl Connection {
                     } else if is_text(&cols[0], "trigger") {
                         // A trigger ON the renamed table whose body references ONLY
                         // that table: NEW/OLD and bare/qualified column refs all
-                        // resolve to it, so a token rewrite is safe and complete.
-                        // Triggers touching other tables are left unchanged.
+                        // resolve to it, so a full token rewrite is safe and
+                        // complete. When the body also touches other tables, the
+                        // bare refs are ambiguous, but `NEW.old`/`OLD.old` still
+                        // bind to the renamed table, so rewrite just those. (The
+                        // remaining multi-source bare/`UPDATE OF` refs are the
+                        // A-rn3 remainder.)
                         match cols.get(4).cloned() {
                             Some(Value::Text(tsql)) => {
-                                match trigger_single_source_quals(&tsql, &table, &old) {
-                                    Some(quals) => {
-                                        let rewritten =
-                                            rewrite_column_tokens(&tsql, &quals, &old, &new_text);
-                                        if rewritten != tsql {
-                                            cols[4] = Value::Text(rewritten);
-                                            return true;
-                                        }
-                                        false
-                                    }
-                                    None => false,
+                                let rewritten = if let Some(quals) =
+                                    trigger_single_source_quals(&tsql, &table, &old)
+                                {
+                                    rewrite_column_tokens(&tsql, &quals, &old, &new_text, true)
+                                } else if trigger_on_renamed_table(&tsql, &table, &old) {
+                                    rewrite_column_tokens(
+                                        &tsql,
+                                        &[String::from("NEW"), String::from("OLD")],
+                                        &old,
+                                        &new_text,
+                                        false,
+                                    )
+                                } else {
+                                    tsql.clone()
+                                };
+                                if rewritten != tsql {
+                                    cols[4] = Value::Text(rewritten);
+                                    return true;
                                 }
+                                false
                             }
                             _ => false,
                         }
@@ -16426,12 +16439,35 @@ fn trigger_single_source_quals(trigger_sql: &str, table: &str, old: &str) -> Opt
     ])
 }
 
+/// Whether `trigger_sql` is a trigger attached to `table`, with `old` not an
+/// ambiguous name (the table itself or the `NEW`/`OLD` aliases). When true, the
+/// trigger's `NEW.old` / `OLD.old` references unambiguously bind to `table`'s
+/// renamed column — safe to rewrite even when the body touches other tables
+/// (unlike [`trigger_single_source_quals`], which also needs bare refs to resolve).
+fn trigger_on_renamed_table(trigger_sql: &str, table: &str, old: &str) -> bool {
+    matches!(sql::parse_one(trigger_sql), Ok(Statement::CreateTrigger(ct))
+        if ct.table.eq_ignore_ascii_case(table)
+            && !old.eq_ignore_ascii_case(table)
+            && !old.eq_ignore_ascii_case("new")
+            && !old.eq_ignore_ascii_case("old"))
+}
+
 /// Token-rewrite a column rename in DDL where every reference to `old` is known
 /// to belong to one of `quals` (a single-source object's table name / aliases):
-/// rename a bare `old` ident and a qualified `<q>.old` whose qualifier `q` is in
-/// `quals`, preserving all other text. A function name (`old(`) and a column tail
+/// rename a qualified `<q>.old` whose qualifier `q` is in `quals`, preserving all
+/// other text. When `rewrite_bare` is true, an unqualified `old` ident is also
+/// renamed (safe only when every bare reference provably resolves to the renamed
+/// table — i.e. a single-source object); when false, only qualified references
+/// are touched (e.g. a multi-source trigger where only `NEW.old`/`OLD.old` are
+/// provably the renamed column). A function name (`old(`) and a column tail
 /// qualified by anything else are left intact.
-fn rewrite_column_tokens(sql: &str, quals: &[String], old: &str, rendered: &str) -> String {
+fn rewrite_column_tokens(
+    sql: &str,
+    quals: &[String],
+    old: &str,
+    rendered: &str,
+    rewrite_bare: bool,
+) -> String {
     use sql::token::Token;
     let toks = match sql::token::tokenize(sql) {
         Ok(t) => t,
@@ -16462,6 +16498,10 @@ fn rewrite_column_tokens(sql: &str, quals: &[String], old: &str, rendered: &str)
             if !qual_ok {
                 continue;
             }
+        } else if !rewrite_bare {
+            // A bare reference is only provably the renamed column in a
+            // single-source context; skip it otherwise.
+            continue;
         }
         out.push_str(&sql[cursor..sp.start]);
         out.push_str(rendered);
