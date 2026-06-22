@@ -8752,27 +8752,10 @@ impl Connection {
     // ---- SELECT execution ---------------------------------------------------
 
     fn run_select(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
-        // Opt-in VDBE fast path (Track B, B7a): when enabled and the query takes
-        // no bound parameters, try the experimental engine first and use its
-        // result only on success — every unsupported shape, and every error, is
-        // left to the tree-walker, which remains the source of truth. The VDBE
-        // never alters state, so a failed attempt is side-effect-free.
-        // Skip the VDBE inside a correlated/nested scope: the spike resolves
-        // columns by bare name and would mis-resolve an outer-qualified reference
-        // (e.g. `WHERE u.t_id = t.id` in a subquery over `u`) to a same-named
-        // inner column. Top-level queries with a correlated subquery still bail in
-        // the compiler (subquery exprs are unsupported) and fall back here.
-        if self.use_vdbe.get()
-            && params.positional.is_empty()
-            && params.named.is_empty()
-            && self.outer_scope.borrow().is_empty()
-        {
-            if let Ok(result) = self.run_select_vdbe(sel) {
-                return Ok(result);
-            }
-        }
         // Materialize this query's `WITH` CTEs into the environment for the
-        // duration of the query, then restore the previous scope.
+        // duration of the query, then restore the previous scope. (The opt-in
+        // VDBE fast path is attempted per query block inside `run_core`, so it
+        // also covers each arm of a compound query.)
         let base = self.cte_env.borrow().len();
         let pushed = self.push_ctes(sel, params);
         let result = pushed.and_then(|()| self.run_select_compound(sel, params));
@@ -9938,6 +9921,26 @@ impl Connection {
     }
 
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
+        // Opt-in VDBE fast path (Track B, B7a): when enabled and this block takes
+        // no bound parameters, try the experimental engine first and use its
+        // result only on success — every unsupported shape, and every error, is
+        // left to the tree-walker, which remains the source of truth. The VDBE
+        // never alters state, so a failed attempt is side-effect-free. Routing
+        // here (per query block) rather than at the whole-query level means each
+        // arm of a compound query is accelerated too, while the tree-walker still
+        // performs the set combination. Skipped inside a correlated/nested scope
+        // (non-empty `outer_scope`): the spike resolves columns by bare name and
+        // would mis-resolve an outer-qualified reference to a same-named inner
+        // column.
+        if self.use_vdbe.get()
+            && params.positional.is_empty()
+            && params.named.is_empty()
+            && self.outer_scope.borrow().is_empty()
+        {
+            if let Ok(result) = self.run_select_vdbe(sel) {
+                return Ok(result);
+            }
+        }
         // Promote `FROM a, b WHERE a.x = b.y` to an explicit join `ON` so the join
         // fold can seek/hash it (the equality stays in WHERE, so results are
         // identical). All later uses of `sel` see the rewritten form.

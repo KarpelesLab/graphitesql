@@ -389,6 +389,35 @@ fn table_scan_matches_sqlite3() {
 }
 
 #[test]
+fn vdbe_routing_handles_compound_via_per_arm() {
+    // With routing enabled, `query()` accelerates each arm of a compound query
+    // through the VDBE while the tree-walker performs the set combination; the
+    // result is identical to running entirely on the tree-walker.
+    let mut vdbe = Connection::open_memory().unwrap();
+    let mut plain = Connection::open_memory().unwrap();
+    for c in [&mut vdbe, &mut plain] {
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT)")
+            .unwrap();
+        c.execute("INSERT INTO t(a) VALUES (3),(1),(2),(1),(4)")
+            .unwrap();
+    }
+    vdbe.set_use_vdbe(true);
+    for q in [
+        "SELECT a FROM t WHERE a > 1 UNION ALL SELECT a FROM t WHERE a = 1",
+        "SELECT a FROM t UNION SELECT a FROM t ORDER BY a",
+        "SELECT a FROM t WHERE a >= 2 INTERSECT SELECT a FROM t WHERE a <= 3 ORDER BY a",
+        "SELECT a FROM t EXCEPT SELECT a FROM t WHERE a = 1 ORDER BY a",
+        "SELECT a FROM t WHERE a < 3 UNION ALL SELECT a*10 FROM t WHERE a > 2 ORDER BY 1",
+    ] {
+        assert_eq!(
+            vdbe.query(q).unwrap().rows,
+            plain.query(q).unwrap().rows,
+            "compound routing diverged on {q}"
+        );
+    }
+}
+
+#[test]
 fn falls_back_for_non_constant() {
     // Anything beyond a constant SELECT list is Unsupported, so the engine can
     // fall back to the tree-walker.

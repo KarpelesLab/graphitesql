@@ -335,10 +335,14 @@ each additive behind `query_vdbe` until B7:
 - **B7b — flip the default** to the VDBE once parity holds across the suite.
   The compiler now does **qualified `(table, column)` resolution** (a per-column
   table-qualifier list parallel to the names), so `t.col` references and
-  shared-name joins resolve correctly and an ambiguous *bare* reference bails;
-  the corpus-routing parity test handles 1779/1898. Remaining before the flip:
-  broaden coverage of the ~120 still-unhandled shapes (subqueries, compound,
-  window) so falling back stays the exception, then gain confidence to default-on.
+  shared-name joins resolve correctly and an ambiguous *bare* reference bails.
+  Routing is applied **per query block in `run_core`** (not at the whole-query
+  level), so each arm of a **compound query** (`UNION`/`INTERSECT`/`EXCEPT`) is
+  VDBE-accelerated while the tree-walker still performs the set combination; the
+  corpus-routing parity test stays byte-identical. Remaining before the flip:
+  broaden the still-unhandled single-block shapes (correlated subqueries, window
+  functions) so falling back stays the exception, then gain confidence to
+  default-on.
 - **B8 — Real `EXPLAIN` (bytecode).** Emit the `addr|opcode|p1|p2|p3|p4|p5`
   listing from a compiled `Program` (today `Error::Unsupported`). *Ref:*
   `vdbe.c`, `opcodes.h`.
