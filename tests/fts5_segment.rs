@@ -866,15 +866,27 @@ fn unified_reproduces_term_pagination() {
 }
 
 #[test]
+fn unified_varying_rowids() {
+    // 25 single-word docs at distinct rowids 1..25 (non-uniform rowid deltas),
+    // each a distinct term — pagination with varied doclists, via encode_segment.
+    let docs: Vec<(i64, String)> = (1..=25).map(|i| (i, format!("word{i:03}"))).collect();
+    let refs: Vec<(i64, &str)> = docs.iter().map(|(r, b)| (*r, b.as_str())).collect();
+    check_unified(80, &refs);
+    check_unified(128, &refs);
+}
+
+#[test]
 fn unified_reproduces_doclist_spanning() {
     // One term across many docs → spanning doclist, via encode_segment.
     let docs: Vec<(i64, &str)> = (1..=40).map(|r| (r, "x")).collect();
     check_unified(64, &docs);
 }
 
-// NOTE: the combined case — a single term whose doclist SPANS leaves immediately
-// followed by many paginated terms — is not yet byte-exact: sqlite applies a
-// subtle leaf-fill boundary on the leaves right after a spanning doclist (it
-// moves one term earlier than a plain `unit <= pgsz` rule predicts). Pinning it
-// needs fts5_index.c's writer; the two cases above (pure pagination and pure
-// spanning, both via the unified `encode_segment`) are the verified coverage.
+// NOTE: the unified `encode_segment` is byte-verified at pgsz 64/80/128 (pure
+// pagination, varying rowids, and doclist-spanning). A narrow leaf-fill subtlety
+// remains at SOME page sizes (e.g. pgsz=96, which is stored as 96, not clamped):
+// sqlite flushes a leaf one term earlier than a plain `unit <= pgsz` rule
+// predicts, and non-monotonically vs pgsz — so it is a pgsz-specific writer
+// heuristic in fts5_index.c, not a post-span effect. For functional M2b
+// compatibility byte-identity is not required (a structurally valid index is
+// enough; the differential corpus compares query output, not file bytes).
