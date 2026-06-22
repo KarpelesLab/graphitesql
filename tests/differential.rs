@@ -773,3 +773,69 @@ fn differential_against_sqlite3() {
         );
     }
 }
+
+/// Track B / B7a: with the opt-in VDBE fast path enabled, the entire corpus must
+/// produce results byte-identical to the tree-walker. The VDBE engine handles
+/// what it can and falls back transparently for the rest, so enabling it can
+/// only ever change *which engine* answers — never the answer. No `sqlite3`
+/// needed: this is a pure internal parity check.
+#[test]
+fn vdbe_routing_matches_tree_walker_on_corpus() {
+    let build = || {
+        let mut db = Connection::open_memory().unwrap();
+        for stmt in SETUP.split(';') {
+            if !stmt.trim().is_empty() {
+                db.execute(stmt).unwrap();
+            }
+        }
+        for ins in dataset_inserts() {
+            db.execute(ins.trim_end_matches(';')).unwrap();
+        }
+        db
+    };
+    let plain = build();
+    let vdbe = build();
+    vdbe.set_use_vdbe(true);
+
+    let queries = corpus();
+    let total = queries.len();
+    let mut handled = 0; // queries where the VDBE engine actually produced the row set
+    let mut failures = Vec::new();
+    for sql in &queries {
+        let q = sql.trim_end_matches(';');
+        let want = plain.query(q);
+        let got = vdbe.query(q);
+        match (want, got) {
+            (Ok(a), Ok(b)) => {
+                if render(&a) != render(&b) {
+                    failures.push(format!(
+                        "SQL: {sql}\n  tree-walker: {:?}\n  vdbe: {:?}",
+                        render(&a),
+                        render(&b)
+                    ));
+                } else if vdbe.query_vdbe(q).is_ok() {
+                    handled += 1;
+                }
+            }
+            (Err(_), Err(_)) => {}
+            (a, b) => failures.push(format!(
+                "SQL: {sql}\n  tree-walker ok={}  vdbe ok={}",
+                a.is_ok(),
+                b.is_ok()
+            )),
+        }
+    }
+    eprintln!("vdbe routing: {handled}/{total} corpus queries handled by the VDBE engine");
+    assert!(
+        failures.is_empty(),
+        "{} of {} corpus queries diverged under VDBE routing:\n{}",
+        failures.len(),
+        total,
+        failures
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}

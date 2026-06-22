@@ -165,6 +165,12 @@ pub struct Connection {
     /// `highlight()` special forms. `None` outside such a query.
     #[cfg(feature = "fts5")]
     fts5_rank: core::cell::RefCell<Option<Fts5QueryCtx>>,
+    /// Opt-in (default off): try the experimental VDBE engine for a `SELECT`
+    /// before the tree-walking executor, falling back transparently when the
+    /// VDBE does not support the query's shape. Toggled by
+    /// [`set_use_vdbe`](Self::set_use_vdbe) (Track B, step B7a). The result must
+    /// be identical either way; this only changes which engine produces it.
+    use_vdbe: core::cell::Cell<bool>,
 }
 
 /// A user-defined scalar function: it receives its evaluated argument values and
@@ -278,6 +284,7 @@ impl Connection {
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
             fts5_rank: core::cell::RefCell::new(None),
+            use_vdbe: core::cell::Cell::new(false),
         })
     }
 
@@ -312,6 +319,7 @@ impl Connection {
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
             fts5_rank: core::cell::RefCell::new(None),
+            use_vdbe: core::cell::Cell::new(false),
         })
     }
 
@@ -405,9 +413,23 @@ impl Connection {
         let Statement::Select(sel) = sql::parse_one(sql)? else {
             return Err(Error::Unsupported("query_vdbe expects SELECT"));
         };
+        self.run_select_vdbe(&sel)
+    }
+
+    /// Enable or disable the opt-in VDBE fast path for `SELECT` (Track B, B7a).
+    /// When on, [`query`](Self::query) tries the experimental VDBE engine first
+    /// and falls back transparently to the tree-walker for any query shape it
+    /// does not handle. Off by default; the result is identical either way.
+    pub fn set_use_vdbe(&self, on: bool) {
+        self.use_vdbe.set(on);
+    }
+
+    /// Compile and run a parsed `SELECT` through the VDBE engine, or `Unsupported`
+    /// when its shape is outside the spike's grammar (so callers fall back).
+    fn run_select_vdbe(&self, sel: &Select) -> Result<QueryResult> {
         // Constant SELECT (no FROM): compile and run directly.
         let Some(from) = &sel.from else {
-            let prog = vdbe::compile_const_select(&sel)?;
+            let prog = vdbe::compile_const_select(sel)?;
             let rows = vdbe::run(&prog)?;
             return Ok(QueryResult {
                 columns: prog.columns,
@@ -416,12 +438,14 @@ impl Connection {
         };
         // Materialize a plain table source's column names and rows. Subqueries
         // and table-valued functions are out of the spike's scope.
-        let scan_one = |tr: &sql::ast::TableRef| -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        type ScanOut = (Vec<String>, Vec<eval::Affinity>, Vec<Vec<Value>>);
+        let scan_one = |tr: &sql::ast::TableRef| -> Result<ScanOut> {
             if tr.subquery.is_some() || tr.tvf_args.is_some() {
                 return Err(Error::Unsupported("VDBE: only plain table sources"));
             }
             let meta = self.table_meta(&tr.name, tr.alias.as_deref())?;
             let cols = meta.columns.iter().map(|c| c.name.clone()).collect();
+            let affinities = meta.columns.iter().map(|c| c.affinity).collect();
             let rows: Vec<Vec<Value>> = if meta.without_rowid {
                 self.scan_without_rowid(&meta)?
             } else {
@@ -430,7 +454,7 @@ impl Connection {
                     .map(|(_, v)| v)
                     .collect()
             };
-            Ok((cols, rows))
+            Ok((cols, affinities, rows))
         };
 
         // Two-table inner join (B5a): an inner join is a filtered cross-product,
@@ -452,8 +476,8 @@ impl Connection {
             {
                 return Err(Error::Unsupported("VDBE: table.* over a join"));
             }
-            let (c1, r1) = scan_one(&from.first)?;
-            let (c2, r2) = scan_one(&join.table)?;
+            let (c1, a1, r1) = scan_one(&from.first)?;
+            let (c2, a2, r2) = scan_one(&join.table)?;
             // Bail on a name shared by both tables: a bare reference would be
             // ambiguous, and the spike resolves columns by name only.
             let mut combined: Vec<String> = c1.clone();
@@ -463,6 +487,8 @@ impl Connection {
                     return Err(Error::Unsupported("VDBE: ambiguous join column name"));
                 }
             }
+            let mut combined_aff: Vec<eval::Affinity> = a1.clone();
+            combined_aff.extend(a2.iter().copied());
             // Cross-product rows, outer table first (matching sqlite's row order).
             let mut rows: Vec<Vec<Value>> = Vec::with_capacity(r1.len().saturating_mul(r2.len()));
             for a in &r1 {
@@ -485,7 +511,7 @@ impl Connection {
             };
             let mut joined = sel.clone();
             joined.where_clause = merged;
-            let prog = vdbe::compile_table_select(&joined, &combined)?;
+            let prog = vdbe::compile_table_select(&joined, &combined, &combined_aff)?;
             let result = vdbe::run_rows(&prog, &rows)?;
             return Ok(QueryResult {
                 columns: prog.columns,
@@ -497,7 +523,7 @@ impl Connection {
         if from.first.subquery.is_some() || from.first.tvf_args.is_some() {
             return Err(Error::Unsupported("VDBE: only a single plain table"));
         }
-        let (col_names, rows) = scan_one(&from.first)?;
+        let (col_names, col_aff, rows) = scan_one(&from.first)?;
         // A `t.*` projection is only handled when its qualifier names this single
         // table (by name or alias); any other qualifier falls back so the
         // tree-walker can resolve or reject it.
@@ -514,7 +540,7 @@ impl Connection {
                 }
             }
         }
-        let prog = vdbe::compile_table_select(&sel, &col_names)?;
+        let prog = vdbe::compile_table_select(sel, &col_names, &col_aff)?;
         let result = vdbe::run_rows(&prog, &rows)?;
         Ok(QueryResult {
             columns: prog.columns,
@@ -8717,6 +8743,25 @@ impl Connection {
     // ---- SELECT execution ---------------------------------------------------
 
     fn run_select(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
+        // Opt-in VDBE fast path (Track B, B7a): when enabled and the query takes
+        // no bound parameters, try the experimental engine first and use its
+        // result only on success — every unsupported shape, and every error, is
+        // left to the tree-walker, which remains the source of truth. The VDBE
+        // never alters state, so a failed attempt is side-effect-free.
+        // Skip the VDBE inside a correlated/nested scope: the spike resolves
+        // columns by bare name and would mis-resolve an outer-qualified reference
+        // (e.g. `WHERE u.t_id = t.id` in a subquery over `u`) to a same-named
+        // inner column. Top-level queries with a correlated subquery still bail in
+        // the compiler (subquery exprs are unsupported) and fall back here.
+        if self.use_vdbe.get()
+            && params.positional.is_empty()
+            && params.named.is_empty()
+            && self.outer_scope.borrow().is_empty()
+        {
+            if let Ok(result) = self.run_select_vdbe(sel) {
+                return Ok(result);
+            }
+        }
         // Materialize this query's `WITH` CTEs into the environment for the
         // duration of the query, then restore the previous scope.
         let base = self.cte_env.borrow().len();

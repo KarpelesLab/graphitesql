@@ -401,7 +401,7 @@ fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Option<Affinity> {
 /// The second rule deliberately does **not** fire when the other side is a
 /// typeless column (BLOB/NONE affinity): SQLite compares `none_col = text_col`
 /// without coercion, so `1 = '1'` across such columns is false.
-fn apply_comparison_affinity(
+pub fn apply_comparison_affinity(
     l: Value,
     la: Option<Affinity>,
     r: Value,

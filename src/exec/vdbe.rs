@@ -14,6 +14,7 @@
 //! comparison, three-valued boolean logic, `IS NULL`, `CASE`, `CAST`).
 
 use crate::error::{Error, Result};
+use crate::exec::eval::Affinity;
 use crate::sql::ast::{BinaryOp, Expr, Literal, ResultColumn, Select};
 use crate::value::Value;
 use alloc::string::String;
@@ -84,12 +85,16 @@ pub enum Op {
     /// `dest = lhs || rhs` (text concatenation).
     Concat { lhs: usize, rhs: usize, dest: usize },
     /// `dest = lhs <op> rhs` for a comparison `BinaryOp` (Eq/NotEq/Lt/…), with
-    /// SQLite's NULL-yields-NULL three-valued result (1/0/NULL).
+    /// SQLite's NULL-yields-NULL three-valued result (1/0/NULL). `la`/`ra` are the
+    /// operands' comparison affinities (from their source expressions), applied
+    /// before comparing exactly as the tree-walker does.
     Compare {
         op: BinaryOp,
         lhs: usize,
         rhs: usize,
         dest: usize,
+        la: Option<Affinity>,
+        ra: Option<Affinity>,
     },
     /// `dest = lhs AND rhs` (three-valued).
     And { lhs: usize, rhs: usize, dest: usize },
@@ -327,6 +332,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         ops: Vec::new(),
         next_reg: count,
         columns: Vec::new(),
+        affinities: Vec::new(),
         bindings: Vec::new(),
     };
     let mut columns = Vec::new();
@@ -351,6 +357,14 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
 }
 
 /// Is `expr` a (top-level) aggregate function call the VDBE can fold?
+/// Strip enclosing parentheses from an expression.
+fn unparen(e: &Expr) -> &Expr {
+    match e {
+        Expr::Paren(inner) => unparen(inner),
+        _ => e,
+    }
+}
+
 fn is_aggregate_expr(expr: &Expr) -> bool {
     matches!(
         expr,
@@ -401,6 +415,7 @@ fn agg_kind(expr: &Expr) -> Option<(AggKind, Option<Expr>)> {
 fn compile_aggregate_select(
     sel: &Select,
     columns: &[String],
+    affinities: &[Affinity],
     projections: &[(Expr, String)],
 ) -> Result<Program> {
     if !sel.order_by.is_empty() || sel.limit.is_some() || sel.offset.is_some() || sel.distinct {
@@ -419,6 +434,7 @@ fn compile_aggregate_select(
         ops: Vec::new(),
         next_reg: count,
         columns: columns.to_vec(),
+        affinities: affinities.to_vec(),
         bindings: Vec::new(),
     };
     let rewind = c.ops.len();
@@ -530,6 +546,7 @@ fn collect_aggregates(expr: &Expr, out: &mut Vec<Expr>) {
 fn compile_group_select(
     sel: &Select,
     columns: &[String],
+    affinities: &[Affinity],
     projections: &[(Expr, String)],
 ) -> Result<Program> {
     if sel.distinct {
@@ -553,7 +570,7 @@ fn compile_group_select(
 
     // The plain path (no HAVING / ORDER BY / LIMIT) keeps its compact `GroupEmit`.
     if !has_having && !has_order && !has_limit {
-        return compile_group_emit(sel, columns, projections, &group_cols);
+        return compile_group_emit(sel, columns, affinities, projections, &group_cols);
     }
 
     // General path: gather every distinct aggregate referenced by the projection,
@@ -582,6 +599,7 @@ fn compile_group_select(
         ops: Vec::new(),
         next_reg: 0,
         columns: columns.to_vec(),
+        affinities: affinities.to_vec(),
         bindings: Vec::new(),
     };
     // Contiguous key registers, loaded per row from the grouping columns.
@@ -907,6 +925,7 @@ fn compile_group_select(
 fn compile_group_emit(
     sel: &Select,
     columns: &[String],
+    affinities: &[Affinity],
     projections: &[(Expr, String)],
     group_cols: &[usize],
 ) -> Result<Program> {
@@ -940,6 +959,7 @@ fn compile_group_emit(
         ops: Vec::new(),
         next_reg: 0,
         columns: columns.to_vec(),
+        affinities: affinities.to_vec(),
         bindings: Vec::new(),
     };
     // Contiguous key registers, loaded per row from the grouping columns.
@@ -1012,7 +1032,11 @@ fn compile_group_emit(
 /// `ORDER BY`) into a program that scans the table via cursor ops. `columns` are
 /// the table's column names, used to resolve column references to indices.
 /// Returns `Unsupported` outside this grammar so the caller can fall back.
-pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program> {
+pub fn compile_table_select(
+    sel: &Select,
+    columns: &[String],
+    affinities: &[Affinity],
+) -> Result<Program> {
     if !sel.compound.is_empty() {
         return Err(Error::Unsupported("VDBE: only plain table projections"));
     }
@@ -1057,25 +1081,37 @@ pub fn compile_table_select(sel: &Select, columns: &[String]) -> Result<Program>
     if projections.is_empty() {
         return Err(Error::Unsupported("VDBE: empty projection"));
     }
+    // A constant `LIMIT 0` yields no rows for any query shape: emit a program
+    // that halts immediately (the column labels are still reported).
+    if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
+        return Ok(Program {
+            ops: alloc::vec![Op::Halt],
+            n_registers: projections.len(),
+            columns: projections.iter().map(|(_, l)| l.clone()).collect(),
+        });
+    }
     // GROUP BY folds the scan into one row per group.
     if !sel.group_by.is_empty() {
-        return compile_group_select(sel, columns, &projections);
+        return compile_group_select(sel, columns, affinities, &projections);
     }
     // An all-aggregate projection (no GROUP BY) folds the scan into one row.
     if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
-        return compile_aggregate_select(sel, columns, &projections);
+        return compile_aggregate_select(sel, columns, affinities, &projections);
     }
     let count = projections.len();
     let mut c = Compiler {
         ops: Vec::new(),
         next_reg: count,
         columns: columns.to_vec(),
+        affinities: affinities.to_vec(),
         bindings: Vec::new(),
     };
     // Optional LIMIT (constant integer only): a counter register decremented
     // after each emitted row, halting the loop at zero.
     let limit_reg = match &sel.limit {
         None => None,
+        // A negative LIMIT means "unlimited" in SQLite.
+        Some(Expr::Literal(Literal::Integer(n))) if *n < 0 => None,
         Some(Expr::Literal(Literal::Integer(n))) => {
             let r = c.alloc();
             c.ops.push(Op::Integer { value: *n, dest: r });
@@ -1298,6 +1334,10 @@ struct Compiler {
     next_reg: usize,
     /// Table column names, for resolving `Expr::Column` to a `Column` op.
     columns: Vec<String>,
+    /// Each column's comparison affinity, parallel to `columns` (empty for a
+    /// constant `SELECT` with no table). Used to apply SQLite's pre-comparison
+    /// affinity in `Op::Compare`, matching the tree-walker.
+    affinities: Vec<Affinity>,
     /// Expression → register overrides consulted before normal compilation.
     /// Used by the grouped `HAVING`/`ORDER BY` path to resolve aggregate calls
     /// and grouping-column references to per-group registers (so an arbitrary
@@ -1310,6 +1350,46 @@ impl Compiler {
         let r = self.next_reg;
         self.next_reg += 1;
         r
+    }
+
+    /// The comparison affinity an expression contributes (mirrors the
+    /// tree-walker's `expr_affinity`): a column's declared affinity, a `CAST`'s
+    /// target affinity, transparent through parentheses, else `None` (a literal
+    /// or computed value has no affinity).
+    fn expr_affinity(&self, expr: &Expr) -> Option<Affinity> {
+        match expr {
+            Expr::Column { column, .. } => self
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(column))
+                .and_then(|i| self.affinities.get(i).copied()),
+            Expr::Cast { type_name, .. } => Some(Affinity::from_type(Some(type_name))),
+            Expr::Paren(e) => self.expr_affinity(e),
+            _ => None,
+        }
+    }
+
+    /// Push an `Op::Compare`, computing each operand's comparison affinity from
+    /// its source expression so the runtime coerces operands like the tree-walker.
+    fn push_compare(
+        &mut self,
+        op: BinaryOp,
+        lhs: usize,
+        left: &Expr,
+        rhs: usize,
+        right: &Expr,
+        dest: usize,
+    ) {
+        let la = self.expr_affinity(left);
+        let ra = self.expr_affinity(right);
+        self.ops.push(Op::Compare {
+            op,
+            lhs,
+            rhs,
+            dest,
+            la,
+            ra,
+        });
     }
 
     /// Compile `expr` into a freshly allocated register, returning its index.
@@ -1434,12 +1514,7 @@ impl Compiler {
                         Ok(())
                     }
                     Eq | NotEq | Lt | LtEq | Gt | GtEq => {
-                        self.ops.push(Op::Compare {
-                            op: *op,
-                            lhs: l,
-                            rhs: r,
-                            dest,
-                        });
+                        self.push_compare(*op, l, left, r, right, dest);
                         Ok(())
                     }
                     And => {
@@ -1459,6 +1534,14 @@ impl Compiler {
                         Ok(())
                     }
                     Is | IsNot => {
+                        // `x IS TRUE`/`IS FALSE` is a truthiness test, not value
+                        // equality (SQLite special-cases a boolean-literal operand);
+                        // bail so the tree-walker handles it.
+                        let is_bool =
+                            |e: &Expr| matches!(unparen(e), Expr::Literal(Literal::Boolean(_)));
+                        if is_bool(left) || is_bool(right) {
+                            return Err(Error::Unsupported("VDBE spike: IS TRUE/FALSE"));
+                        }
                         self.ops.push(Op::Is {
                             is: matches!(op, Is),
                             lhs: l,
@@ -1516,19 +1599,9 @@ impl Compiler {
                 let lo = self.compile_expr(low)?;
                 let hi = self.compile_expr(high)?;
                 let ge = self.alloc();
-                self.ops.push(Op::Compare {
-                    op: BinaryOp::GtEq,
-                    lhs: x,
-                    rhs: lo,
-                    dest: ge,
-                });
+                self.push_compare(BinaryOp::GtEq, x, inner, lo, low, ge);
                 let le = self.alloc();
-                self.ops.push(Op::Compare {
-                    op: BinaryOp::LtEq,
-                    lhs: x,
-                    rhs: hi,
-                    dest: le,
-                });
+                self.push_compare(BinaryOp::LtEq, x, inner, hi, high, le);
                 if *negated {
                     let both = self.alloc();
                     self.ops.push(Op::And {
@@ -1565,12 +1638,7 @@ impl Compiler {
                 for elem in list {
                     let e = self.compile_expr(elem)?;
                     let eq = self.alloc();
-                    self.ops.push(Op::Compare {
-                        op: BinaryOp::Eq,
-                        lhs: x,
-                        rhs: e,
-                        dest: eq,
-                    });
+                    self.push_compare(BinaryOp::Eq, x, inner, e, elem, eq);
                     let next = self.alloc();
                     self.ops.push(Op::Or {
                         lhs: acc,
@@ -1654,12 +1722,8 @@ impl Compiler {
                 Some(oreg) => {
                     let wreg = self.compile_expr(when)?;
                     let c = self.alloc();
-                    self.ops.push(Op::Compare {
-                        op: BinaryOp::Eq,
-                        lhs: oreg,
-                        rhs: wreg,
-                        dest: c,
-                    });
+                    // operand_reg is Some exactly when `operand` is Some.
+                    self.push_compare(BinaryOp::Eq, oreg, operand.unwrap(), wreg, when, c);
                     c
                 }
                 None => self.compile_expr(when)?,
@@ -1865,13 +1929,24 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                         Value::Text(s)
                     };
             }
-            Op::Compare { op, lhs, rhs, dest } => {
-                regs[*dest] = crate::exec::eval::compare_op(
-                    *op,
-                    &regs[*lhs],
-                    &regs[*rhs],
-                    crate::value::Collation::Binary,
+            Op::Compare {
+                op,
+                lhs,
+                rhs,
+                dest,
+                la,
+                ra,
+            } => {
+                // Apply SQLite's pre-comparison affinity to the operands (exactly
+                // as the tree-walker does) before comparing.
+                let (l, r) = crate::exec::eval::apply_comparison_affinity(
+                    regs[*lhs].clone(),
+                    *la,
+                    regs[*rhs].clone(),
+                    *ra,
                 );
+                regs[*dest] =
+                    crate::exec::eval::compare_op(*op, &l, &r, crate::value::Collation::Binary);
             }
             Op::And { lhs, rhs, dest } => {
                 regs[*dest] = three_valued_and(&regs[*lhs], &regs[*rhs]);

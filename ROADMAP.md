@@ -322,8 +322,19 @@ each additive behind `query_vdbe` until B7:
   NULL-extend.** Replace the materialized cross-product with cursor opcodes; add
   the seek-driven inner cursor and LEFT NULL-extension.
 - **B5c — VDBE: subqueries / compound / window** shapes still on the tree-walker.
-- **B7a — route `query()` onto the VDBE behind a flag** (opt-in), corpus green.
+- **B7a — route `query()` onto the VDBE behind a flag. ✅ DONE.**
+  `Connection::set_use_vdbe(true)` makes `query()` try the VDBE engine first and
+  fall back transparently (on any unsupported shape *or* error) to the
+  tree-walker, which stays the source of truth. Off by default. A corpus-parity
+  test (`vdbe_routing_matches_tree_walker_on_corpus`) runs the full differential
+  corpus with routing on and asserts byte-identical output: **1773 / 1898
+  queries (93 %) are answered by the VDBE**, the rest fall back. Validating this
+  flushed out and fixed several real VDBE bugs — comparison **affinity**
+  (`g <= '1'`), `IS TRUE`/`IS FALSE` truthiness, `LIMIT 0`/negative, and unsafe
+  routing of correlated-subquery inner scans (gated off via `outer_scope`).
 - **B7b — flip the default** to the VDBE once parity holds across the suite.
+  (Remaining gap: the VDBE resolves columns by bare name, so qualified/correlated
+  references and shared-name joins must resolve qualifiers first — see B5b.)
 - **B8 — Real `EXPLAIN` (bytecode).** Emit the `addr|opcode|p1|p2|p3|p4|p5`
   listing from a compiled `Program` (today `Error::Unsupported`). *Ref:*
   `vdbe.c`, `opcodes.h`.
