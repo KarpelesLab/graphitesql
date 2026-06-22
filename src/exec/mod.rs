@@ -6726,6 +6726,19 @@ impl Connection {
                                         &new_text,
                                         false,
                                     )
+                                } else if trigger_body_single_source_over(&tsql, &table, &old) {
+                                    // A trigger on ANOTHER table whose body reads/
+                                    // writes only the renamed table: every bare and
+                                    // `<table>.`-qualified ref binds to it (its own
+                                    // NEW/OLD belong to a different table and are
+                                    // left alone, as `<table>` is the only qual).
+                                    rewrite_column_tokens(
+                                        &tsql,
+                                        core::slice::from_ref(&table),
+                                        &old,
+                                        &new_text,
+                                        true,
+                                    )
                                 } else {
                                     tsql.clone()
                                 };
@@ -17625,6 +17638,67 @@ fn trigger_single_source_quals(trigger_sql: &str, table: &str, old: &str) -> Opt
         String::from("NEW"),
         String::from("OLD"),
     ])
+}
+
+/// Whether `trigger_sql`'s body+WHEN reference `table` as their ONLY base table
+/// (every body statement targets/reads just `table`, no other table, no
+/// subquery, no alias/CTE/compound) — regardless of which table the trigger is
+/// attached to. When true, every bare and `table.`-qualified column reference in
+/// the body binds to `table`, so a rename can be token-rewritten safely. Used for
+/// a trigger on ANOTHER table whose body reads/writes the renamed table (the
+/// cross-object case `trigger_single_source_quals` does not cover, since that
+/// one also rewrites `NEW`/`OLD`, which here belong to the trigger's own table).
+/// Conservative: any construct it cannot prove single-source makes it `false`.
+fn trigger_body_single_source_over(trigger_sql: &str, table: &str, old: &str) -> bool {
+    let Ok(Statement::CreateTrigger(ct)) = sql::parse_one(trigger_sql) else {
+        return false;
+    };
+    // `old` colliding with NEW/OLD would make a bare-vs-pseudo-column ambiguous.
+    if old.eq_ignore_ascii_case("new") || old.eq_ignore_ascii_case("old") {
+        return false;
+    }
+    if ct.when.as_ref().is_some_and(expr_has_subquery) {
+        return false;
+    }
+    for stmt in &ct.body {
+        let safe = match stmt {
+            Statement::Select(sel) => select_single_source_ok(sel, table),
+            Statement::Insert(i) => {
+                i.schema.is_none()
+                    && i.returning.is_empty()
+                    && i.upsert.is_empty()
+                    && i.table.eq_ignore_ascii_case(table)
+                    && match &i.source {
+                        InsertSource::DefaultValues => true,
+                        InsertSource::Values(rows) => {
+                            !rows.iter().any(|r| r.iter().any(expr_has_subquery))
+                        }
+                        InsertSource::Select(sel) => select_single_source_ok(sel, table),
+                    }
+            }
+            Statement::Update(u) => {
+                u.schema.is_none()
+                    && u.from.is_none()
+                    && u.returning.is_empty()
+                    && u.table.eq_ignore_ascii_case(table)
+                    && u.row_assignments.is_empty()
+                    && !u.assignments.iter().any(|(_, e)| expr_has_subquery(e))
+                    && !u.where_clause.as_ref().is_some_and(expr_has_subquery)
+            }
+            Statement::Delete(d) => {
+                d.schema.is_none()
+                    && d.returning.is_empty()
+                    && d.table.eq_ignore_ascii_case(table)
+                    && !d.where_clause.as_ref().is_some_and(expr_has_subquery)
+            }
+            _ => false,
+        };
+        if !safe {
+            return false;
+        }
+    }
+    // Require at least one statement (an empty body has nothing to rewrite).
+    !ct.body.is_empty()
 }
 
 /// Whether `trigger_sql` is a trigger attached to `table`, with `old` not an

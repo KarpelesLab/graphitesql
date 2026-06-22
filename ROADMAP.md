@@ -211,12 +211,20 @@ with "no such table/column" after a rename). Build bottom-up:
   double-quoted, matching sqlite byte-for-byte). `SELECT … FROM v` works after the
   rename; unrelated views are untouched. (Triggers already fire via the repointed
   `tbl_name`.)
-- **A-rn3 — RENAME COLUMN reaches dependent objects.** Extend `rename_column_ref`
-  use to dependent view/trigger bodies and to foreign keys in *other* tables that
-  name the renamed parent column. *Harder than A-rn2: column renames are
-  scope-aware — a bare `oldcol` token can belong to another table, so the
-  token-rewrite trick used for A-rn2 is unsafe here; this needs real name
-  resolution mapping resolved column refs back to source spans.*
+- **A-rn3 — RENAME COLUMN reaches dependent objects. ✅ DONE for the
+  provably-safe cases.** RENAME COLUMN now propagates into: foreign keys in other
+  tables (`REFERENCES parent(col)`), single- and multi-source VIEW bodies
+  (qualified always; bare only where the column is unique across the join's base
+  sources), triggers ON the renamed table (single-source: all refs; multi-source:
+  `NEW`/`OLD`), and — newly — triggers on ANOTHER table whose body reads/writes
+  ONLY the renamed table (`trigger_body_single_source_over` → bare + `table.`-
+  qualified refs). All differentially byte-exact vs sqlite (`tests/alter.rs`).
+  *The token rewrite is scope-aware by bailing conservatively*: any construct it
+  cannot prove safe (subqueries, aliases, a body spanning a second table, bare
+  refs ambiguous across multiple sources) is left UNCHANGED — never corrupted.
+  *Remaining (rare): bare/ambiguous refs in genuinely multi-table view/trigger
+  bodies, which need full per-ref name resolution (graphite's AST has no
+  per-column-ref spans).*
 - **A-rn4 — text-preserving schema edits. ✅ DONE.** Every `ALTER TABLE` now edits
   the stored CREATE text in place rather than reprinting the (quoted/canonical) AST,
   so `SELECT sql FROM sqlite_master` is byte-identical to sqlite: **`RENAME TO`**

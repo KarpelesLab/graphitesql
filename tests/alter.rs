@@ -651,6 +651,68 @@ fn rename_column_propagates_into_trigger_bodies() {
 }
 
 #[test]
+fn rename_column_propagates_into_cross_object_trigger_body() {
+    // A trigger attached to ANOTHER table, whose body reads/writes ONLY the
+    // renamed table, has every bare and `<table>.`-qualified reference to the
+    // renamed column rewritten byte-for-byte like sqlite3 — while its own
+    // NEW/OLD (which bind to the trigger's table) are left untouched. Conservative:
+    // a body touching a second table is left unchanged (never corrupted).
+    let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    let after = |create: &str, alter: &str| -> String {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute_batch(create).unwrap();
+        c.execute(alter).unwrap();
+        match &c
+            .query("SELECT sql FROM sqlite_master WHERE name='tr'")
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    let want = |create: &str, alter: &str| -> String {
+        let o = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg(format!(
+                "{create} {alter} SELECT sql FROM sqlite_master WHERE name='tr';"
+            ))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+    };
+    let alter = "ALTER TABLE t RENAME COLUMN a TO a2;";
+    let cases = [
+        // Body updates only `t`: bare `a` (SET target and expression) rewritten.
+        "CREATE TABLE t(a,b); CREATE TABLE u(x); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN UPDATE t SET a = a + 1 WHERE a > 0; END;",
+        // Body deletes from only `t`; OLD.x belongs to `u` and stays.
+        "CREATE TABLE t(a,b); CREATE TABLE u(x); \
+         CREATE TRIGGER tr BEFORE DELETE ON u BEGIN DELETE FROM t WHERE t.a = OLD.x; END;",
+        // Body inserts into only `t`.
+        "CREATE TABLE t(a,b); CREATE TABLE u(x); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO t(a,b) VALUES(NEW.x, 0); END;",
+    ];
+    for setup in cases {
+        let got = after(setup, alter);
+        if sqlite {
+            assert_eq!(got, want(setup, alter), "diverged for: {setup}");
+        }
+    }
+
+    // Conservative bail: a body that touches a SECOND table (INSERT INTO l SELECT
+    // FROM t) is left unchanged rather than risk a wrong rewrite — so it does NOT
+    // match sqlite here, but it is never corrupted (graphite keeps the old text).
+    let two = "CREATE TABLE t(a,b); CREATE TABLE l(y); \
+         CREATE TRIGGER tr AFTER INSERT ON l BEGIN INSERT INTO l(y) SELECT a FROM t; END;";
+    let got = after(two, alter);
+    assert!(
+        got.contains("SELECT a FROM t"),
+        "should be left intact: {got}"
+    );
+}
+
+#[test]
 fn rename_column_propagates_into_single_source_view() {
     // Renaming a column propagates into a view that draws from ONLY that table —
     // every reference (bare, table-qualified, and through an alias) is rewritten
