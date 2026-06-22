@@ -250,6 +250,16 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 Ok(a)
             };
         }
+        // `json_quote(X)` returns a JSON-subtyped argument as-is (it is already
+        // JSON text), and only quotes a value that is *not* JSON. graphite has no
+        // value subtypes, so it approximates the subtype syntactically: an arg
+        // that is itself a JSON-producing call (`json`, `json_array`, …) carries
+        // the subtype. Anything else falls through to the quoting arm below.
+        "json_quote" if args.len() == 1 && produces_json(&args[0]) => {
+            let val = eval::eval(&args[0], ctx)?;
+            reject_blob(&val)?;
+            return Ok(val);
+        }
         _ => {}
     }
 

@@ -103,6 +103,16 @@ fn against_sqlite3() {
         r#"SELECT json_valid('{"ok":true}')"#,
         r#"SELECT json_quote('he said "hi"')"#,
         r#"SELECT json_extract('{"u":"café"}','$.u')"#,
+        // json_quote returns a JSON-subtyped argument as-is (already JSON text),
+        // and quotes a plain value.
+        r#"SELECT json_quote(json('5'))"#,
+        r#"SELECT json_quote(json('[1,2,3]'))"#,
+        r#"SELECT json_quote(json('{"a":1}'))"#,
+        r#"SELECT json_quote(json_array(1,2))"#,
+        r#"SELECT json_quote(json_object('k','v'))"#,
+        r#"SELECT json_quote('5')"#,
+        r#"SELECT json_quote(5)"#,
+        r#"SELECT json_quote(2.5)"#,
     ];
     let c = Connection::open_memory().unwrap();
     let mut failures = Vec::new();
