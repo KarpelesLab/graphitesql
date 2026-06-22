@@ -432,9 +432,16 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     `b=0.75`, idf clamped up to `1e-6`, sum negated). `fts5_bm25_scores`
     (`vtab.rs`) scores the corpus honoring `col:` filters and a `col MATCH …`
     scope; `run_core` computes the per-rowid scores for a single-`fts5`-table
-    MATCH query into a connection-scoped `fts5_rank` cell that the `bm25()`
+    MATCH query into a connection-scoped `Fts5QueryCtx` cell that the `bm25()`
     special form and the `rank` column read during projection / `ORDER BY`.
     Outside an fts5 MATCH, `rank`/`bm25()` stay ordinary unknown names.
+  - **D2-aux — `highlight()`. ✅ DONE (correct-results).** `highlight(t, col,
+    open, close)` wraps each matched-phrase token in the markers (one pair per
+    phrase instance; original inter-token text preserved; case-insensitive,
+    case-preserving), byte-identical to sqlite3. Reuses the `Fts5QueryCtx` cell
+    (the MATCH query; no corpus needed) via a position-aware tokenizer
+    (`fts5_tokenize_spans`). *(Remaining aux: `snippet()` — its relevance-scored
+    sliding-window selection is fiddly to match byte-for-byte.)*
   - **D2e — byte-compatible on-disk segment format** is the remaining FTS5 track
     (the `%_data`/`%_idx` inverted-index b-tree layout sqlite writes; needs the
     real inverted index of D2b — graphite's fts5 is currently scan-based).

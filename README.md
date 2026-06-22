@@ -22,8 +22,9 @@ format**.
 > `STRICT` tables, generated columns, **triggers**, **foreign keys**, **ATTACH /
 > TEMP** multi-schema, **virtual tables** (built-in `series`, `rtree`, and
 > `fts5` modules — full-text `MATCH` with phrases, prefixes, column filters,
-> `AND`/`OR`/`NOT`, `NEAR`, `^` anchors, and `bm25()`/`rank` relevance ordering —
-> plus `register_module` / `register_function` for your own), and a wide function
+> `AND`/`OR`/`NOT`, `NEAR`, `^` anchors, `bm25()`/`rank` relevance ordering, and
+> `highlight()` — plus `register_module` / `register_function` for your own), and
+> a wide function
 > library — date/time,
 > `printf`, math, **JSON + JSONB**, and more — with an index-driven planner and
 > **`EXPLAIN QUERY PLAN`** matching sqlite. Everything is verified differentially
