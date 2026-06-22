@@ -1978,8 +1978,8 @@ impl Connection {
                 self.exec_pragma(&p, params)?;
                 0
             }
-            Statement::Vacuum => {
-                self.exec_vacuum()?;
+            Statement::Vacuum(into) => {
+                self.exec_vacuum(into.as_deref())?;
                 0
             }
             // Indexes are kept current on every write, so REINDEX is a no-op.
@@ -2269,13 +2269,15 @@ impl Connection {
     /// stored `CREATE` statements and re-inserting all rows into a throwaway
     /// in-memory database, then copying its pages over. A no-op for read-only
     /// backends.
-    fn exec_vacuum(&mut self) -> Result<()> {
+    fn exec_vacuum(&mut self, into: Option<&Expr>) -> Result<()> {
         use crate::schema::ObjectType;
-        if !matches!(self.backend, Backend::Write(_)) {
+        // In-place VACUUM on a read-only backend is a no-op; `VACUUM … INTO`
+        // only reads the source, so it proceeds regardless of the backend.
+        if into.is_none() && !matches!(self.backend, Backend::Write(_)) {
             return Ok(());
         }
-        // Flush any WAL frames into the main image first.
-        if self.backend.wal_mode() {
+        // Flush any WAL frames into the main image first (in-place rewrite only).
+        if into.is_none() && self.backend.wal_mode() {
             self.backend.writer()?.checkpoint()?;
         }
         let user_version = self.backend.source().header().user_version;
@@ -2384,12 +2386,19 @@ impl Connection {
             }
         }
 
-        // Copy the compact image's pages over the current database file.
+        // Snapshot the compact image's pages.
         let count = tmp.backend.source().page_count();
         let mut image = Vec::with_capacity(count as usize);
         for n in 1..=count {
             image.push(tmp.backend.source().page(n)?.data().to_vec());
         }
+
+        // `VACUUM … INTO <file>`: write the image to a new database file.
+        if let Some(expr) = into {
+            return self.vacuum_write_into(expr, image);
+        }
+
+        // Plain `VACUUM`: copy the compact image's pages over the current file.
         self.backend.writer()?.replace_image(image)?;
 
         // Preserve user_version across the rebuild.
@@ -2403,6 +2412,46 @@ impl Connection {
         }
         self.schema = Schema::read(self.backend.source())?;
         Ok(())
+    }
+
+    /// Write a freshly-built compact page `image` to a NEW database file for
+    /// `VACUUM … INTO <file>`. The target path comes from evaluating `expr`; it
+    /// must not already exist (matching SQLite). `std`-only — creating a file
+    /// needs the OS VFS.
+    #[cfg(feature = "std")]
+    fn vacuum_write_into(&self, expr: &Expr, image: Vec<Vec<u8>>) -> Result<()> {
+        let params = Params::default();
+        let path = match eval::eval(expr, &EvalCtx::rowless(&params))? {
+            Value::Null => return Err(Error::Error("VACUUM INTO target is NULL".into())),
+            Value::Text(s) => s,
+            other => eval::to_text(&other),
+        };
+        if std::path::Path::new(&path).exists() {
+            return Err(Error::Error(alloc::format!(
+                "output file already exists: {path}"
+            )));
+        }
+        let user_version = self.backend.source().header().user_version;
+        let mut dst = Connection::create(&path)?;
+        dst.backend.writer()?.replace_image(image)?;
+        if user_version != 0 {
+            dst.backend.writer()?.header_mut().user_version = user_version;
+        }
+        // Stamp page 1 (the header, incl. user_version) and flush to disk.
+        let mut page1 = dst.backend.writer()?.read_page(1)?;
+        dst.backend.writer()?.header().write_to(&mut page1)?;
+        dst.backend.writer()?.write_page(1, page1)?;
+        dst.backend.writer()?.commit()?;
+        Ok(())
+    }
+
+    /// Without `std` there is no file VFS to create the target, so `VACUUM …
+    /// INTO` is unsupported (the in-place form still works).
+    #[cfg(not(feature = "std"))]
+    fn vacuum_write_into(&self, _expr: &Expr, _image: Vec<Vec<u8>>) -> Result<()> {
+        Err(Error::Error(
+            "VACUUM INTO requires the std feature (file I/O)".into(),
+        ))
     }
 
     /// `ANALYZE`: gather index selectivity statistics into the `sqlite_stat1`

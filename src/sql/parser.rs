@@ -312,14 +312,18 @@ impl Parser {
             return Ok(Statement::Pragma(self.pragma()?));
         }
         if self.eat_kw("vacuum") {
-            // Accept `VACUUM [schema] [INTO 'file']`; the clauses don't affect us.
-            if !self.check(&Token::Semicolon) && !self.at_end() && !self.eat_kw("into") {
+            // `VACUUM [schema] [INTO <file>]`. A bare token before INTO is the
+            // optional schema name (ignored — single-schema). INTO captures the
+            // target-file expression.
+            if !self.check(&Token::Semicolon) && !self.at_end() && !self.check_kw("into") {
                 let _ = self.advance(); // optional schema name
             }
-            if self.eat_kw("into") {
-                let _ = self.expr()?;
-            }
-            return Ok(Statement::Vacuum);
+            let into = if self.eat_kw("into") {
+                Some(Box::new(self.expr()?))
+            } else {
+                None
+            };
+            return Ok(Statement::Vacuum(into));
         }
         if self.eat_kw("reindex") {
             // `REINDEX` / `REINDEX name` / `REINDEX schema.name` (a no-op here).

@@ -53,8 +53,10 @@ pub enum Statement {
     RollbackTo(String),
     /// A `PRAGMA` statement.
     Pragma(Pragma),
-    /// A `VACUUM` statement (accepted; a no-op compaction in this build).
-    Vacuum,
+    /// A `VACUUM` statement. Plain `VACUUM [schema]` compacts in place; `VACUUM
+    /// [schema] INTO <file>` writes a compact copy to a new database file (the
+    /// expression evaluates to the target path).
+    Vacuum(Option<Box<Expr>>),
     /// `REINDEX [name]` — accepted as a no-op: graphitesql rebuilds an index
     /// whenever the underlying rows change, so indexes are always current.
     Reindex,

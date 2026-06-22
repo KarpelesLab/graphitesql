@@ -376,6 +376,13 @@ auto_vacuum databases that sqlite3 reads with `integrity_check = ok` (only the
 optional space-reclaim — FULL truncate C6b-3, `incremental_vacuum` C6b-4 —
 remains).
 
+**`VACUUM … INTO <file>` ✅ DONE** — writes a compact copy of the database to a
+new file (the in-place `VACUUM` reuses the same compact-rebuild; `vacuum_write_into`
+evaluates the target path, refuses an existing file like sqlite, and stamps the
+preserved `user_version`). `std`-only (needs the OS VFS). The output is read by
+`sqlite3` with `integrity_check = ok` and matches sqlite's own `VACUUM INTO`
+logical content (`tests/vacuum_into.rs`).
+
 The **multi-schema track is complete** (C1–C5 + C-ms1 `CREATE TEMP
 VIEW/TRIGGER` catalog placement), and the **whole `auto_vacuum` track is complete**
 (C6a read; C6b-1 empty-db header; C6b-2 commit-time `rebuild_ptrmap`; C6b-3 FULL
