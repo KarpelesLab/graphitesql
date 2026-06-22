@@ -1243,9 +1243,10 @@ impl Connection {
             }
         }
         let mut rows = Vec::new();
-        // SQLite numbers foreign keys from the last declared (id 0) backward.
+        // SQLite numbers foreign keys from the last declared (id 0) backward, and
+        // lists them by id ascending — so iterate in reverse declaration order.
         let n = fks.len();
-        for (i, (from_cols, fk)) in fks.iter().enumerate() {
+        for (i, (from_cols, fk)) in fks.iter().enumerate().rev() {
             let id = (n - 1 - i) as i64;
             for (seq, from) in from_cols.iter().enumerate() {
                 let to = fk.ref_columns.get(seq).cloned().unwrap_or_default();

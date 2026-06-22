@@ -42,12 +42,16 @@ fn against_sqlite3() {
         "CREATE INDEX ixp ON t(a) WHERE c > 0",
         "CREATE TABLE p(id INTEGER PRIMARY KEY, k)",
         "CREATE TABLE ch(x, y, FOREIGN KEY(x) REFERENCES p(id) ON DELETE CASCADE)",
+        // Two FKs: foreign_key_list numbers them last-declared-first (id 0) and
+        // lists them id-ascending — exercises that ordering.
+        "CREATE TABLE ch2(x REFERENCES p(id), y REFERENCES p(k) ON DELETE CASCADE)",
     ];
     let queries = [
         "PRAGMA index_list(t)",
         "PRAGMA index_info(ix)",
         "PRAGMA index_info(ixp)",
         "PRAGMA foreign_key_list(ch)",
+        "PRAGMA foreign_key_list(ch2)",
         "PRAGMA freelist_count",
         "PRAGMA application_id",
         "PRAGMA table_info(t)",
