@@ -4479,11 +4479,14 @@ impl Connection {
                 .collect();
         }
 
-        let mut affected = 0;
+        // Evaluate every target row's SET assignments against the table as it is
+        // BEFORE any write, so a subquery in a SET expression sees a consistent
+        // snapshot — `UPDATE t SET b=(SELECT sum(b) FROM t)` uses the original sum
+        // for every row, exactly like sqlite — rather than observing rows updated
+        // earlier in the same statement. Writes happen in the second pass below.
+        let mut prepared: Vec<(i64, Vec<Value>, Vec<Value>)> = Vec::with_capacity(targets.len());
         for (rowid, mut values, matched_from) in targets {
             let old_row = values.clone();
-            // Apply SET assignments evaluated against the current row (joined to
-            // the matched FROM row, for UPDATE … FROM).
             for (col, expr) in &upd.assignments {
                 let pos = meta
                     .columns
@@ -4516,6 +4519,11 @@ impl Connection {
             }
             apply_column_affinity(&meta, &mut values);
             self.materialize_generated(&meta, &mut values, params)?;
+            prepared.push((rowid, old_row, values));
+        }
+
+        let mut affected = 0;
+        for (rowid, old_row, mut values) in prepared {
             // NOT NULL / CHECK / STRICT-type constraints. `UPDATE OR IGNORE` skips
             // a row that violates one rather than failing the statement.
             {

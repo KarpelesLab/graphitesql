@@ -57,3 +57,26 @@ fn row_value_column_list_assignment() {
     // A length mismatch is rejected.
     assert!(c.execute("UPDATE t SET (a,b)=(1,2,3)").is_err());
 }
+
+#[test]
+fn set_subquery_sees_pre_update_snapshot() {
+    // A subquery in a SET expression sees the table as it was BEFORE the UPDATE
+    // started, for every row — not rows updated earlier in the same statement —
+    // matching sqlite3.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("INSERT INTO t VALUES(1,10),(2,20)").unwrap();
+    c.execute("UPDATE t SET b=(SELECT sum(b) FROM t)").unwrap();
+    // Both rows use the original sum (30), not 30 then 30+20.
+    assert_eq!(c.query("SELECT b FROM t").unwrap().rows, [[i(30)], [i(30)]]);
+
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("INSERT INTO t VALUES(1),(2),(3)").unwrap();
+    c.execute("UPDATE t SET a=(SELECT count(*) FROM t)")
+        .unwrap();
+    assert_eq!(
+        c.query("SELECT a FROM t").unwrap().rows,
+        [[i(3)], [i(3)], [i(3)]]
+    );
+}
