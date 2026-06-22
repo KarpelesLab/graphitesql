@@ -56,6 +56,14 @@ pub enum Op {
         rhs: usize,
         dest: usize,
     },
+    /// `dest = lhs LIKE rhs` (`glob` false) or `lhs GLOB rhs` (`glob` true);
+    /// NULL on either side yields NULL.
+    Like {
+        glob: bool,
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
     /// `dest = lhs || rhs` (text concatenation).
     Concat { lhs: usize, rhs: usize, dest: usize },
     /// `dest = lhs <op> rhs` for a comparison `BinaryOp` (Eq/NotEq/Lt/…), with
@@ -1396,6 +1404,15 @@ impl Compiler {
                         });
                         Ok(())
                     }
+                    Like | Glob => {
+                        self.ops.push(Op::Like {
+                            glob: matches!(op, Glob),
+                            lhs: l,
+                            rhs: r,
+                            dest,
+                        });
+                        Ok(())
+                    }
                     _ => Err(Error::Unsupported("VDBE spike: this operator")),
                 }
             }
@@ -1455,6 +1472,49 @@ impl Compiler {
                         rhs: le,
                         dest,
                     });
+                }
+                Ok(())
+            }
+            // `x IN (a, b, …)` is a three-valued OR-chain of `x = elem`: SQLite's
+            // NULL rules fall out exactly (no match with a NULL element → NULL,
+            // an empty list → 0). The negated form wraps the result in `NOT`.
+            Expr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let x = self.compile_expr(inner)?;
+                // Accumulate the running OR into `acc`, seeded with 0 (false) so an
+                // empty list yields 0.
+                let acc = self.alloc();
+                self.ops.push(Op::Integer {
+                    value: 0,
+                    dest: acc,
+                });
+                for elem in list {
+                    let e = self.compile_expr(elem)?;
+                    let eq = self.alloc();
+                    self.ops.push(Op::Compare {
+                        op: BinaryOp::Eq,
+                        lhs: x,
+                        rhs: e,
+                        dest: eq,
+                    });
+                    let next = self.alloc();
+                    self.ops.push(Op::Or {
+                        lhs: acc,
+                        rhs: eq,
+                        dest: next,
+                    });
+                    self.ops.push(Op::Copy {
+                        src: next,
+                        dest: acc,
+                    });
+                }
+                if *negated {
+                    self.ops.push(Op::Not { reg: acc, dest });
+                } else {
+                    self.ops.push(Op::Copy { src: acc, dest });
                 }
                 Ok(())
             }
@@ -1641,6 +1701,14 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
             }
             Op::Is { is, lhs, rhs, dest } => {
                 regs[*dest] = crate::exec::eval::is_values(*is, &regs[*lhs], &regs[*rhs]);
+            }
+            Op::Like {
+                glob,
+                lhs,
+                rhs,
+                dest,
+            } => {
+                regs[*dest] = crate::exec::eval::like_glob_values(*glob, &regs[*lhs], &regs[*rhs]);
             }
             Op::Concat { lhs, rhs, dest } => {
                 regs[*dest] =

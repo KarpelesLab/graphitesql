@@ -58,6 +58,12 @@ fn vdbe_matches_tree_walker() {
         "SELECT 5 BETWEEN 1 AND 10, 5 BETWEEN 6 AND 10, 5 BETWEEN 5 AND 5",
         "SELECT 5 NOT BETWEEN 1 AND 10, 5 NOT BETWEEN 6 AND 10",
         "SELECT 'm' BETWEEN 'a' AND 'z', NULL BETWEEN 1 AND 10",
+        "SELECT 'abc' LIKE 'a%', 'abc' LIKE 'A_C', 'abc' LIKE 'x%'",
+        "SELECT 'abc' GLOB 'a*', 'abc' GLOB 'A*', 'abc' GLOB '?b?'",
+        "SELECT NULL LIKE 'a%', 'abc' NOT LIKE 'a%'",
+        "SELECT 2 IN (1,2,3), 5 IN (1,2,3), 2 NOT IN (1,2,3)",
+        "SELECT 1 IN (2,3,NULL), 1 IN (1,NULL), NULL IN (1,2)",
+        "SELECT 'b' IN ('a','b','c'), 9 IN ()",
     ];
     for q in queries {
         let walker = c.query(q).unwrap().rows;
@@ -81,6 +87,8 @@ fn vdbe_matches_sqlite3() {
         "SELECT ~0, ~5, +7, (5 & 3) | 8",
         "SELECT 1 IS 1, 1 IS NOT 2, NULL IS NULL",
         "SELECT 5 BETWEEN 1 AND 10, 5 NOT BETWEEN 6 AND 10",
+        "SELECT 'abc' LIKE 'a%', 'abc' GLOB '?b?'",
+        "SELECT 2 IN (1,2,3), 5 NOT IN (1,2,3)",
     ];
     for q in queries {
         let want = {

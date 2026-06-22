@@ -1038,6 +1038,24 @@ pub fn arithmetic_values(op: BinaryOp, l: &Value, r: &Value) -> Value {
     arithmetic(op, l.clone(), r.clone())
 }
 
+/// Apply `LIKE` (`glob` false) or `GLOB` (`glob` true) to two values, matching
+/// SQLite: NULL on either side yields NULL, otherwise both coerce to text and
+/// the left value is matched against the right pattern. Public wrapper used by
+/// the VDBE interpreter.
+pub fn like_glob_values(glob: bool, l: &Value, r: &Value) -> Value {
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Value::Null;
+    }
+    let text = to_text(l);
+    let pat = to_text(r);
+    let m = if glob {
+        glob_match(&pat, &text)
+    } else {
+        like_match(&pat, &text)
+    };
+    bool_value(m)
+}
+
 /// Apply `IS` / `IS NOT` to two values, treating NULL as a comparable value
 /// (never returns NULL). Public wrapper used by the VDBE interpreter.
 pub fn is_values(is: bool, l: &Value, r: &Value) -> Value {
