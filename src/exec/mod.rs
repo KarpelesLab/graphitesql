@@ -2740,6 +2740,27 @@ impl Connection {
             schema_rowid += 1;
         }
 
+        // An `AUTOINCREMENT` table requires the `sqlite_sequence` catalog, which
+        // SQLite creates (empty) the first time such a table is created.
+        let is_autoinc = ipk.is_some_and(|i| {
+            ct.columns[i].constraints.iter().any(|k| {
+                matches!(
+                    k,
+                    ColumnConstraint::PrimaryKey {
+                        autoincrement: true,
+                        ..
+                    }
+                )
+            })
+        });
+        if is_autoinc && self.schema.table("sqlite_sequence").is_none() {
+            const SEQ_SQL: &str = "CREATE TABLE sqlite_sequence(name,seq)";
+            let Statement::CreateTable(seq_ct) = sql::parse_one(SEQ_SQL)? else {
+                unreachable!()
+            };
+            self.exec_create_table(&seq_ct, SEQ_SQL)?;
+        }
+
         let cookie = self
             .backend
             .writer()?
@@ -3744,6 +3765,47 @@ impl Connection {
         Err(Error::Constraint(msg))
     }
 
+    /// The AUTOINCREMENT high-water mark stored for `table` in `sqlite_sequence`,
+    /// or `None` if that catalog or row is absent.
+    fn sequence_value(&self, table: &str) -> Result<Option<i64>> {
+        if self.schema.table("sqlite_sequence").is_none() {
+            return Ok(None);
+        }
+        let meta = self.table_meta("sqlite_sequence", None)?;
+        for (_, vals) in self.scan_table(&meta)? {
+            if matches!(&vals[0], Value::Text(t) if t == table) {
+                return Ok(Some(eval::to_i64(&vals[1])));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Persist the AUTOINCREMENT high-water mark `seq` for `table` into
+    /// `sqlite_sequence` — updating the existing row in place (same rowid) or
+    /// inserting a new one — like SQLite. A no-op if the catalog is absent.
+    fn set_sequence(&mut self, table: &str, seq: i64) -> Result<()> {
+        let Some(seq_obj) = self.schema.table("sqlite_sequence") else {
+            return Ok(());
+        };
+        let root = seq_obj.rootpage;
+        let meta = self.table_meta("sqlite_sequence", None)?;
+        let existing: Option<i64> = self
+            .scan_table(&meta)?
+            .into_iter()
+            .find(|(_, v)| matches!(&v[0], Value::Text(t) if t == table))
+            .map(|(rid, _)| rid);
+        let rec = encode_record(&[Value::Text(table.into()), Value::Integer(seq)]);
+        let rid = match existing {
+            Some(rid) => {
+                delete_table(self.backend.writer()?, root, rid)?;
+                rid
+            }
+            None => self.next_rowid(root)?,
+        };
+        insert_table(self.backend.writer()?, root, rid, &rec)?;
+        Ok(())
+    }
+
     fn exec_insert(&mut self, ins: &Insert, params: &Params) -> Result<usize> {
         reject_schema_write(&ins.table)?;
         // A virtual table routes INSERT to its module's `update` (xUpdate); only
@@ -3822,6 +3884,13 @@ impl Connection {
 
         let indexes = self.indexes_of(&ins.table)?;
         let mut next_auto = self.next_rowid(meta.root)?;
+        // AUTOINCREMENT never reuses a rowid at or below the persisted high-water
+        // mark, so seed the counter past it (a deleted maximum is not recycled).
+        if meta.autoincrement {
+            if let Some(seq) = self.sequence_value(&ins.table)? {
+                next_auto = next_auto.max(seq + 1);
+            }
+        }
         let mut affected = 0;
         let mut replaced = false;
         for row_exprs in &rows {
@@ -4008,6 +4077,15 @@ impl Connection {
                 self.collect_returning(&ins.returning, &meta, &index_values, Some(rowid), params)?;
             }
             affected += 1;
+        }
+        // Persist the AUTOINCREMENT high-water mark: `next_auto - 1` is the largest
+        // rowid assigned or seen this statement. Only advance `sqlite_sequence`
+        // (never lower it), matching SQLite.
+        if meta.autoincrement && affected > 0 {
+            let high = next_auto - 1;
+            if high > self.sequence_value(&ins.table)?.unwrap_or(i64::MIN) {
+                self.set_sequence(&ins.table, high)?;
+            }
         }
         // REPLACE removed rows whose index entries were maintained incrementally;
         // rebuild from the final table state to be safe.
@@ -5938,6 +6016,21 @@ impl Connection {
         let cookie = w.header().schema_cookie.wrapping_add(1);
         w.header_mut().schema_cookie = cookie;
         self.schema = Schema::read(self.backend.source())?;
+        // Dropping a table also removes its AUTOINCREMENT row from
+        // `sqlite_sequence`, like SQLite.
+        if want == ObjectType::Table && self.schema.table("sqlite_sequence").is_some() {
+            let root = self.schema.table("sqlite_sequence").unwrap().rootpage;
+            let meta = self.table_meta("sqlite_sequence", None)?;
+            let victims: Vec<i64> = self
+                .scan_table(&meta)?
+                .into_iter()
+                .filter(|(_, v)| matches!(&v[0], Value::Text(t) if t == &obj.name))
+                .map(|(rid, _)| rid)
+                .collect();
+            for rid in victims {
+                delete_table(self.backend.writer()?, root, rid)?;
+            }
+        }
         Ok(())
     }
 
@@ -12858,6 +12951,17 @@ impl Connection {
             storage_order,
             pk_len,
             strict_types,
+            autoincrement: ipk.is_some_and(|i| {
+                ct.columns[i].constraints.iter().any(|k| {
+                    matches!(
+                        k,
+                        ColumnConstraint::PrimaryKey {
+                            autoincrement: true,
+                            ..
+                        }
+                    )
+                })
+            }),
         })
     }
 
@@ -12953,6 +13057,10 @@ struct TableMeta {
     /// (aligned with `columns`); `None` for an ordinary table. Drives write-time
     /// type checking.
     strict_types: Option<Vec<(StrictType, String)>>,
+    /// `true` when the `INTEGER PRIMARY KEY` is declared `AUTOINCREMENT`: assigned
+    /// rowids never reuse a value below the high-water mark persisted in
+    /// `sqlite_sequence`, matching SQLite.
+    autoincrement: bool,
 }
 
 /// Return a copy of `sel` with any `*` / `table.*` result column expanded to
@@ -13124,6 +13232,7 @@ fn schema_table_meta(label: &str) -> TableMeta {
         storage_order: Vec::new(),
         pk_len: 0,
         strict_types: None,
+        autoincrement: false,
     }
 }
 
