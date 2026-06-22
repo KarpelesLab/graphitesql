@@ -307,10 +307,15 @@ the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep)
   LEFT/RIGHT/FULL semantics. *Ref:* `where.c`.
 - **B1c — RIGHT/FULL join inner seeks.** B1a/B1a²/WITHOUT-ROWID seeks cover
   INNER/LEFT; RIGHT/FULL joins still materialize the inner table.
-- **B4 — `sqlite_stat4` histograms.** Extend `ANALYZE` to gather per-index sample
-  histograms (byte-compatible `sqlite_stat4` rows) and use them for range
-  selectivity. Split: **B4a** write/read the `sqlite_stat4` rows; **B4b** consult
-  them in the seek-cost chooser. *Ref:* `analyze.c`.
+- **B4 — `sqlite_stat4` histograms. ⛔ BLOCKED by the differential oracle.** The
+  pinned `sqlite3 3.50.4` used as the test oracle is NOT built with
+  `SQLITE_ENABLE_STAT4` — `ANALYZE` writes only `sqlite_stat1`, never
+  `sqlite_stat4` (verified 2026-06-23). So there is no oracle to diff
+  byte-compatible `sqlite_stat4` rows against, and worse: a graphite planner that
+  consulted stat4 would make *different* index/seek choices than the stat1-only
+  reference, **diverging the `EXPLAIN QUERY PLAN` corpus**. Implementing B4 is
+  therefore actively harmful under the current methodology; it would only become
+  viable against a STAT4-enabled oracle. Left out of scope. *Ref:* `analyze.c`.
 
 *VDBE migration* (the largest internal refactor — changes representation, not
 results; keep the differential corpus green at every step). Done so far: the
