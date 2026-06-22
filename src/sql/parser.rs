@@ -36,6 +36,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         if parser.at_end() {
             break;
         }
+        parser.max_param = 0; // parameters are numbered per statement
         statements.push(parser.statement()?);
         if !parser.at_end() && !parser.check(&Token::Semicolon) {
             return Err(parser.err("expected ';' or end of input after statement"));
@@ -114,6 +115,11 @@ struct Parser {
     /// Shared via [`Rc`] so a [`DepthGuard`] can decrement it on drop without
     /// borrowing the parser, which stays mutably borrowed during recursion.
     depth: alloc::rc::Rc<core::cell::Cell<usize>>,
+    /// Largest positional parameter number assigned so far in the CURRENT
+    /// statement. A bare `?` is numbered one greater (SQLite's rule), so its
+    /// index is fixed by parse position rather than evaluation order (which would
+    /// mis-map under AND/OR short-circuit). Reset per statement in [`parse`].
+    max_param: u32,
 }
 
 /// Decrements the parser's depth counter when dropped, so recursion accounting
@@ -135,6 +141,7 @@ impl Parser {
             source: String::from(source),
             pos: 0,
             depth: alloc::rc::Rc::new(core::cell::Cell::new(0)),
+            max_param: 0,
         }
     }
 
@@ -1956,7 +1963,24 @@ impl Parser {
             Some(Token::Float(f)) => Ok(Expr::Literal(Literal::Real(f))),
             Some(Token::Str(s)) => Ok(Expr::Literal(Literal::Str(s))),
             Some(Token::Blob(b)) => Ok(Expr::Literal(Literal::Blob(b))),
-            Some(Token::Param(p)) => Ok(Expr::Parameter(p)),
+            Some(Token::Param(p)) => {
+                // Number parameters by parse position (SQLite's rule) so a bare
+                // `?` binds to a fixed index regardless of evaluation order: a
+                // bare `?` becomes one greater than the largest number assigned so
+                // far; `?N` and named params just update / leave that maximum.
+                let p = match p {
+                    crate::sql::token::Param::Anonymous => {
+                        self.max_param += 1;
+                        crate::sql::token::Param::Numbered(self.max_param)
+                    }
+                    crate::sql::token::Param::Numbered(n) => {
+                        self.max_param = self.max_param.max(n);
+                        crate::sql::token::Param::Numbered(n)
+                    }
+                    named => named,
+                };
+                Ok(Expr::Parameter(p))
+            }
             Some(Token::LParen) => {
                 if self.check_kw("select") || self.check_kw("with") {
                     let sel = self.select()?;
