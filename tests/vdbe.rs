@@ -46,6 +46,13 @@ fn vdbe_matches_tree_walker() {
         "SELECT CASE WHEN 0 THEN 1 END, CASE WHEN 1 THEN 2 ELSE 3 END",
         "SELECT CAST(3.9 AS INTEGER), CAST('42' AS INTEGER), CAST(5 AS TEXT)",
         "SELECT CAST('3.14' AS REAL), CAST(7 AS REAL)",
+        "SELECT x'01ff', x''",
+        "SELECT CASE WHEN 1 THEN x'aa' ELSE x'bb' END",
+        "SELECT x'00' IS NULL, x'01' IS NOT NULL",
+        "SELECT 12 & 10, 12 | 10, 1 << 4, 256 >> 2",
+        "SELECT ~0, ~5, ~-1, +7, +(3 * 2)",
+        "SELECT (5 & 3) | 8, ~(1 << 3)",
+        "SELECT 6 & NULL, NULL | 1, ~NULL",
     ];
     for q in queries {
         let walker = c.query(q).unwrap().rows;
@@ -65,6 +72,8 @@ fn vdbe_matches_sqlite3() {
         "SELECT 'x' || 'y'",
         "SELECT 10 - 4, 8 / 2",
         "SELECT (2 + 3) * 4",
+        "SELECT 12 & 10, 12 | 10, 1 << 4, 256 >> 2",
+        "SELECT ~0, ~5, +7, (5 & 3) | 8",
     ];
     for q in queries {
         let want = {

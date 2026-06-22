@@ -1038,6 +1038,25 @@ pub fn arithmetic_values(op: BinaryOp, l: &Value, r: &Value) -> Value {
     arithmetic(op, l.clone(), r.clone())
 }
 
+/// Apply a bitwise `BinaryOp` (`&`, `|`, `<<`, `>>`) to two values, matching
+/// SQLite: NULL on either side yields NULL, otherwise both sides coerce to
+/// integers. Public wrapper used by the VDBE interpreter.
+pub fn bitwise_values(op: BinaryOp, l: &Value, r: &Value) -> Value {
+    use BinaryOp::*;
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Value::Null;
+    }
+    let a = to_i64(l);
+    let b = to_i64(r);
+    Value::Integer(match op {
+        BitAnd => a & b,
+        BitOr => a | b,
+        LShift => shift_left(a, b),
+        RShift => shift_right(a, b),
+        _ => return Value::Null,
+    })
+}
+
 fn arithmetic(op: BinaryOp, l: Value, r: Value) -> Value {
     use BinaryOp::*;
     if matches!(l, Value::Null) || matches!(r, Value::Null) {

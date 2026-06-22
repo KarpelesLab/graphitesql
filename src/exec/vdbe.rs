@@ -29,10 +29,20 @@ pub enum Op {
     Real { value: f64, dest: usize },
     /// Load a text constant into `dest`.
     Str { value: String, dest: usize },
+    /// Load a blob constant into `dest`.
+    Blob { value: Vec<u8>, dest: usize },
     /// Load `NULL` into `dest`.
     Null { dest: usize },
     /// `dest = lhs <op> rhs` for an arithmetic `BinaryOp` (Add/Sub/Mul/Div/Mod).
     Arith {
+        op: BinaryOp,
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    /// `dest = lhs <op> rhs` for a bitwise `BinaryOp` (BitAnd/BitOr/LShift/RShift),
+    /// with SQLite's NULL-yields-NULL semantics.
+    Bitwise {
         op: BinaryOp,
         lhs: usize,
         rhs: usize,
@@ -86,6 +96,8 @@ pub enum Op {
     IfPosDecr { reg: usize, target: usize },
     /// `dest = -reg` (numeric negation).
     Negate { reg: usize, dest: usize },
+    /// `dest = ~reg` (bitwise NOT; NULL stays NULL).
+    BitNot { reg: usize, dest: usize },
     /// Emit registers `[start, start+count)` as one output row.
     ResultRow { start: usize, count: usize },
     /// `DISTINCT` gate: if the row in `[start, start+count)` was already seen,
@@ -1252,9 +1264,10 @@ impl Compiler {
                         value: *b as i64,
                         dest,
                     },
-                    Literal::Blob(_) => {
-                        return Err(Error::Unsupported("VDBE spike: blob literals"))
-                    }
+                    Literal::Blob(b) => Op::Blob {
+                        value: b.clone(),
+                        dest,
+                    },
                 };
                 self.ops.push(op);
                 Ok(())
@@ -1285,6 +1298,19 @@ impl Compiler {
                 self.ops.push(Op::Not { reg: r, dest });
                 Ok(())
             }
+            Expr::Unary {
+                op: crate::sql::ast::UnaryOp::BitNot,
+                expr: inner,
+            } => {
+                let r = self.compile_expr(inner)?;
+                self.ops.push(Op::BitNot { reg: r, dest });
+                Ok(())
+            }
+            // Unary `+` is a no-op: compile the operand directly into `dest`.
+            Expr::Unary {
+                op: crate::sql::ast::UnaryOp::Identity,
+                expr: inner,
+            } => self.compile_expr_into(inner, dest),
             Expr::IsNull {
                 expr: inner,
                 negated,
@@ -1304,6 +1330,15 @@ impl Compiler {
                 match op {
                     Add | Sub | Mul | Div | Mod => {
                         self.ops.push(Op::Arith {
+                            op: *op,
+                            lhs: l,
+                            rhs: r,
+                            dest,
+                        });
+                        Ok(())
+                    }
+                    BitAnd | BitOr | LShift | RShift => {
+                        self.ops.push(Op::Bitwise {
                             op: *op,
                             lhs: l,
                             rhs: r,
@@ -1524,6 +1559,7 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
             Op::Integer { value, dest } => regs[*dest] = Value::Integer(*value),
             Op::Real { value, dest } => regs[*dest] = Value::Real(*value),
             Op::Str { value, dest } => regs[*dest] = Value::Text(value.clone()),
+            Op::Blob { value, dest } => regs[*dest] = Value::Blob(value.clone()),
             Op::Null { dest } => regs[*dest] = Value::Null,
             Op::Negate { reg, dest } => {
                 regs[*dest] = match crate::exec::eval::to_number(&regs[*reg]) {
@@ -1532,8 +1568,17 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                     _ => Value::Null,
                 };
             }
+            Op::BitNot { reg, dest } => {
+                regs[*dest] = match &regs[*reg] {
+                    Value::Null => Value::Null,
+                    v => Value::Integer(!crate::exec::eval::to_i64(v)),
+                };
+            }
             Op::Arith { op, lhs, rhs, dest } => {
                 regs[*dest] = crate::exec::eval::arithmetic_values(*op, &regs[*lhs], &regs[*rhs]);
+            }
+            Op::Bitwise { op, lhs, rhs, dest } => {
+                regs[*dest] = crate::exec::eval::bitwise_values(*op, &regs[*lhs], &regs[*rhs]);
             }
             Op::Concat { lhs, rhs, dest } => {
                 regs[*dest] =
