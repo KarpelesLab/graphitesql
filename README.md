@@ -33,11 +33,14 @@ format**.
 > **register-machine VDBE engine by default** (it falls back to the tree-walker
 > for shapes it does not yet compile), with plain `EXPLAIN` listing the compiled
 > bytecode. Everything is verified differentially against `sqlite3` (a 1,600+
-> query corpus plus 140+ focused suites). R-Tree files are now byte-compatible
-> with sqlite (read and written in its `_node` on-disk format). What remains is
-> depth: the FTS5 on-disk index format, R-Tree spatial pushdown, finishing the
-> VDBE (per-cursor joins, more single-block shapes), and concurrency — see the
-> full plan in **[ROADMAP.md](ROADMAP.md)**.
+> query corpus plus 140+ focused suites). R-Tree **and FTS5** files are now
+> byte-compatible with sqlite: an FTS5 table written by graphite (stored in
+> sqlite's `_content`/`_data`/`_idx`/`_docsize`/`_config` shadow tables) is
+> opened, full-text-`MATCH`ed, and integrity-checked by stock `sqlite3`, and an
+> R-Tree round-trips through its `_node` on-disk format. What remains is depth:
+> R-Tree spatial pushdown, finishing the VDBE (per-cursor joins, more
+> single-block shapes), and concurrency — see the full plan in
+> **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why
 
