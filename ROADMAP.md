@@ -634,15 +634,15 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     (`tests/fts5_sqlite_read.rs`). *Not byte-identical to sqlite at every page
     size (the pgsz fill heuristic and large-scale doclist-index pages differ) —
     only structural validity is needed for sqlite to read it, and that holds.*
-    ⚠ **TOKENIZER GAP (found 2026-06-23):** sqlite-readability requires graphite's
-    tokens to match `unicode61`. They do for ASCII, but graphite's tokenizer keeps
-    diacritics (Rust `is_alphanumeric` + `to_lowercase`) whereas `unicode61`'s
-    DEFAULT removes them (`café`→`cafe`), so a document with accented characters
-    indexes terms sqlite's integrity-check rejects as "malformed" (and a graphite
-    `MATCH` on such tokens diverges from sqlite — a PRE-EXISTING tokenizer gap that
-    D2e-M2 newly exposes via the on-disk index). The fix is a `unicode61`
-    case/diacritic FOLDING TABLE in `fts5_tokenize` — a bounded but real
-    unicode-table effort; ASCII corpora are unaffected.
+    **TOKENIZER diacritic folding (found+fixed 2026-06-23):** sqlite-readability
+    requires graphite's tokens to match `unicode61`, whose DEFAULT removes
+    diacritics (`café`→`cafe`). `fts5_tokenize` now folds accented **Latin-1**
+    letters (`fold_diacritic`) so accented Latin docs are integrity-clean and
+    MATCH correctly under sqlite (`tests/fts5_sqlite_read.rs::
+    sqlite_matches_accented_graphite_fts5`); this also aligns graphite's own
+    `MATCH` with sqlite for that text (a pre-existing divergence). *Remaining:*
+    Latin Extended-A and the rest of `unicode61`'s folding table — a doc with
+    those rarer accents still indexes terms sqlite recomputes differently.
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
   (`register_function`, via `Subqueries::call_udf`) and aggregate ✅ DONE
   (`register_aggregate_function` + an `AggregateFunction` step/finalize trait;

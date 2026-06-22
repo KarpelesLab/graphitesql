@@ -254,3 +254,44 @@ fn sqlite_reads_graphite_fts5_after_update_delete() {
     assert_eq!(sqlite_run(&path, "PRAGMA integrity_check"), "ok");
     let _ = std::fs::remove_file(&path);
 }
+
+/// Accented Latin text: graphite folds diacritics like sqlite's unicode61
+/// default (`café`→`cafe`), so a graphite-written FTS5 table with accents is
+/// integrity-clean and MATCHes correctly under stock sqlite3.
+#[test]
+fn sqlite_matches_accented_graphite_fts5() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+            .unwrap();
+        c.execute(
+            "INSERT INTO t(rowid, body) VALUES \
+             (1,'café résumé'),(2,'naïve über'),(3,'Pâté à la française')",
+        )
+        .unwrap();
+    }
+    assert_eq!(sqlite_run(&path, "PRAGMA integrity_check"), "ok");
+    // sqlite folds the query too, so the de-accented form matches.
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'cafe'"),
+        "1"
+    );
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'resume'"),
+        "1"
+    );
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'naive'"),
+        "2"
+    );
+    assert_eq!(
+        sqlite_run(&path, "SELECT rowid FROM t WHERE t MATCH 'francaise'"),
+        "3"
+    );
+    let _ = std::fs::remove_file(&path);
+}

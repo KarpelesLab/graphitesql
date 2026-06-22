@@ -1482,19 +1482,37 @@ pub(crate) fn fts5_porter_stem(word: &str) -> String {
     String::from_utf8(b).unwrap_or_else(|_| String::from(word))
 }
 
-/// Split `text` into FTS5 tokens: maximal runs of alphanumeric characters, each
-/// folded to lowercase. This is a faithful approximation of SQLite's default
-/// `unicode61` tokenizer for ASCII and basic text — it splits on every
-/// non-alphanumeric byte and case-folds, so `"The quick-brown Fox!"` yields
-/// `["the", "quick", "brown", "fox"]`. (Diacritic removal and the full Unicode
-/// category tables are not modeled; ASCII text matches sqlite byte-for-byte.)
-/// With `stem`, each token is then reduced by the Porter stemmer (the `porter`
-/// tokenizer).
+#[cfg(feature = "fts5")]
+/// Fold a precomposed accented Latin-1 letter to its base, matching SQLite's
+/// `unicode61` default (`remove_diacritics`), which NFD-decomposes and drops
+/// combining marks (`café`→`cafe`, `résumé`→`resume`, `über`→`uber`). Distinct
+/// letters that are NOT just an accented base — `Æ`/`æ`, `Ø`/`ø`, `ß`, `Þ`/`þ`,
+/// `Ð`/`ð` — and everything outside Latin-1 are returned unchanged. Without this,
+/// accented tokens diverge from `unicode61`, so a graphite-written FTS5 index is
+/// "malformed" to sqlite. (Latin Extended-A and beyond are not yet folded.)
+pub(crate) fn fold_diacritic(ch: char) -> char {
+    match ch {
+        'À'..='Å' | 'à'..='å' => 'a',
+        'Ç' | 'ç' => 'c',
+        'È'..='Ë' | 'è'..='ë' => 'e',
+        'Ì'..='Ï' | 'ì'..='ï' => 'i',
+        'Ñ' | 'ñ' => 'n',
+        'Ò'..='Ö' | 'ò'..='ö' => 'o',
+        'Ù'..='Ü' | 'ù'..='ü' => 'u',
+        'Ý' | 'ý' | 'ÿ' => 'y',
+        other => other,
+    }
+}
+
+/// Split `text` into lowercased tokens on every non-alphanumeric character,
+/// folding accented Latin-1 to its base (`fold_diacritic`) like `unicode61`.
+/// With `stem`, each token is Porter-stemmed (the `porter` tokenizer).
 #[cfg(feature = "fts5")]
 pub(crate) fn fts5_tokenize(text: &str, stem: bool) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     for ch in text.chars() {
+        let ch = fold_diacritic(ch);
         if ch.is_alphanumeric() {
             cur.extend(ch.to_lowercase());
         } else if !cur.is_empty() {
@@ -1522,6 +1540,9 @@ fn fts5_tokenize_spans(text: &str, stem: bool) -> Vec<(String, usize, usize)> {
         out.push((if stem { fts5_porter_stem(&t) } else { t }, start, end));
     };
     for (i, ch) in text.char_indices() {
+        // Fold accents like `fts5_tokenize` so highlight tokens match; the span
+        // [start, i) stays over the ORIGINAL bytes (folding is 1:1 for Latin-1).
+        let ch = fold_diacritic(ch);
         if ch.is_alphanumeric() {
             if cur.is_empty() {
                 start = i;
