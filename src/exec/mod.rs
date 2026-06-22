@@ -6176,6 +6176,28 @@ impl Connection {
                             }
                             _ => false,
                         }
+                    } else if is_text(&cols[0], "trigger") {
+                        // A trigger ON the renamed table whose body references ONLY
+                        // that table: NEW/OLD and bare/qualified column refs all
+                        // resolve to it, so a token rewrite is safe and complete.
+                        // Triggers touching other tables are left unchanged.
+                        match cols.get(4).cloned() {
+                            Some(Value::Text(tsql)) => {
+                                match trigger_single_source_quals(&tsql, &table, &old) {
+                                    Some(quals) => {
+                                        let rewritten =
+                                            rewrite_column_tokens(&tsql, &quals, &old, &new_text);
+                                        if rewritten != tsql {
+                                            cols[4] = Value::Text(rewritten);
+                                            return true;
+                                        }
+                                        false
+                                    }
+                                    None => false,
+                                }
+                            }
+                            _ => false,
+                        }
                     } else {
                         false
                     }
@@ -15724,6 +15746,117 @@ fn view_single_source_column_quals(view_sql: &str, table: &str, old: &str) -> Op
         return None;
     }
     Some(quals)
+}
+
+/// Whether a `SELECT` references at most the single source `table` (its `FROM`,
+/// if any, is exactly `table` with no alias, joins, subquery source, CTEs,
+/// compound parts, or any subquery expression). Conservative: a `false` result
+/// just means "don't token-rewrite", never corruption.
+fn select_single_source_ok(sel: &Select, table: &str) -> bool {
+    if !sel.ctes.is_empty() || !sel.compound.is_empty() {
+        return false;
+    }
+    if let Some(from) = &sel.from {
+        if !from.joins.is_empty()
+            || from.first.subquery.is_some()
+            || from.first.tvf_args.is_some()
+            || from.first.alias.is_some()
+            || !from.first.name.eq_ignore_ascii_case(table)
+        {
+            return false;
+        }
+    }
+    let mut ok = true;
+    for rc in &sel.columns {
+        if let ResultColumn::Expr { expr, alias, .. } = rc {
+            ok &= !expr_has_subquery(expr) && alias.is_none();
+        }
+    }
+    for e in sel
+        .where_clause
+        .iter()
+        .chain(sel.group_by.iter())
+        .chain(sel.having.iter())
+    {
+        ok &= !expr_has_subquery(e);
+    }
+    for t in &sel.order_by {
+        ok &= !expr_has_subquery(&t.expr);
+    }
+    ok
+}
+
+/// For a `CREATE TRIGGER` ON the renamed `table` whose body and `WHEN` reference
+/// ONLY that table (every body statement targets `table`, draws from at most
+/// `table`, and contains no subquery), return the qualifiers under which the
+/// renamed column can appear (`table`, `NEW`, `OLD`) so a column rename can be
+/// token-rewritten. Returns `None` (leave the trigger unchanged) on anything
+/// outside this provably-safe shape — the multi-table / scope-aware remainder.
+fn trigger_single_source_quals(trigger_sql: &str, table: &str, old: &str) -> Option<Vec<String>> {
+    let Ok(Statement::CreateTrigger(ct)) = sql::parse_one(trigger_sql) else {
+        return None;
+    };
+    // Only triggers attached to the renamed table (so NEW/OLD are its rows). A
+    // column named like the table or like the NEW/OLD aliases is ambiguous.
+    if !ct.table.eq_ignore_ascii_case(table)
+        || old.eq_ignore_ascii_case(table)
+        || old.eq_ignore_ascii_case("new")
+        || old.eq_ignore_ascii_case("old")
+    {
+        return None;
+    }
+    if ct.when.as_ref().is_some_and(expr_has_subquery) {
+        return None;
+    }
+    // A subquery anywhere could reach another table, breaking the single-source
+    // guarantee; `expr_has_subquery` is a plain fn so it passes by value freely.
+    for stmt in &ct.body {
+        let safe = match stmt {
+            Statement::Select(sel) => select_single_source_ok(sel, table),
+            Statement::Insert(i) => {
+                i.schema.is_none()
+                    && i.returning.is_empty()
+                    && i.upsert.is_empty()
+                    && i.table.eq_ignore_ascii_case(table)
+                    && match &i.source {
+                        InsertSource::DefaultValues => true,
+                        InsertSource::Values(rows) => {
+                            !rows.iter().any(|r| r.iter().any(expr_has_subquery))
+                        }
+                        InsertSource::Select(sel) => select_single_source_ok(sel, table),
+                    }
+            }
+            Statement::Update(u) => {
+                u.schema.is_none()
+                    && u.from.is_none()
+                    && u.returning.is_empty()
+                    && u.table.eq_ignore_ascii_case(table)
+                    && !u.assignments.iter().any(|(_, e)| expr_has_subquery(e))
+                    && !u.where_clause.as_ref().is_some_and(expr_has_subquery)
+                    && !u.order_by.iter().any(|t| expr_has_subquery(&t.expr))
+                    && !u.limit.as_ref().is_some_and(expr_has_subquery)
+                    && !u.offset.as_ref().is_some_and(expr_has_subquery)
+            }
+            Statement::Delete(d) => {
+                d.schema.is_none()
+                    && d.returning.is_empty()
+                    && d.table.eq_ignore_ascii_case(table)
+                    && !d.where_clause.as_ref().is_some_and(expr_has_subquery)
+                    && !d.order_by.iter().any(|t| expr_has_subquery(&t.expr))
+                    && !d.limit.as_ref().is_some_and(expr_has_subquery)
+                    && !d.offset.as_ref().is_some_and(expr_has_subquery)
+            }
+            _ => false,
+        };
+        if !safe {
+            return None;
+        }
+    }
+    Some(alloc::vec![
+        table.to_string(),
+        String::from("NEW"),
+        String::from("OLD"),
+    ])
 }
 
 /// Token-rewrite a column rename in DDL where every reference to `old` is known

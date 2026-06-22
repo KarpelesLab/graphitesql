@@ -573,6 +573,68 @@ fn rename_column_propagates_into_single_source_view() {
 }
 
 #[test]
+fn rename_column_propagates_into_single_source_trigger() {
+    // Renaming a column propagates into a trigger ON that table whose body
+    // references only it: NEW./OLD., table-qualified, and bare refs are all
+    // rewritten byte-for-byte like sqlite3. A trigger that also writes another
+    // table is left unchanged (uncorrupted) — the scope-aware remainder.
+    let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    let trig_sql = |create: &[&str]| -> String {
+        let mut c = Connection::open_memory().unwrap();
+        for s in create {
+            c.execute(s).unwrap();
+        }
+        c.execute("ALTER TABLE t RENAME COLUMN a TO renamed")
+            .unwrap();
+        match &c
+            .query("SELECT sql FROM sqlite_master WHERE name='tr'")
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    let single = trig_sql(&[
+        "CREATE TABLE t(a INT, b INT)",
+        "CREATE TRIGGER tr AFTER UPDATE ON t WHEN NEW.a > 0 \
+         BEGIN UPDATE t SET b = NEW.a WHERE a = OLD.a; END",
+    ]);
+    assert!(
+        !single.contains("NEW.a ") && single.contains("NEW.renamed"),
+        "trigger not propagated: {single}"
+    );
+    if sqlite {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(
+                    "CREATE TABLE t(a INT, b INT);\
+                     CREATE TRIGGER tr AFTER UPDATE ON t WHEN NEW.a > 0 \
+                     BEGIN UPDATE t SET b = NEW.a WHERE a = OLD.a; END;\
+                     ALTER TABLE t RENAME COLUMN a TO renamed;\
+                     SELECT sql FROM sqlite_master WHERE name='tr';",
+                )
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        assert_eq!(single, want);
+    }
+    // A trigger that writes to another table is left unchanged (no corruption of
+    // the other table's column).
+    let multi = trig_sql(&[
+        "CREATE TABLE t(a INT, b INT)",
+        "CREATE TABLE log(a INT)",
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES(NEW.a); END",
+    ]);
+    assert!(
+        multi.contains("INSERT INTO log"),
+        "trigger corrupted: {multi}"
+    );
+}
+
+#[test]
 fn rename_column_does_not_corrupt_multi_table_view() {
     // A multi-table view needs scope-aware resolution (the A-rn3 remainder); the
     // safe path must NOT corrupt the other table's same-named column — it leaves
