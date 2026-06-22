@@ -4953,10 +4953,18 @@ impl Connection {
                     .rows()
                     .map(|rows| rows.iter().map(|(r, _)| *r).collect())
                     .unwrap_or_default();
+                // The effective rowid is the explicit `rowid` term, or — for a
+                // module with a rowid-alias column (rtree's `id`) — that column's
+                // value when not NULL.
+                let rowid_col = module.dyn_rowid_column();
                 let mut n = 0;
                 for (rowid, values) in &changes {
-                    if let Some(id) = rowid {
-                        if existing.contains(id) {
+                    let effective = rowid.or_else(|| {
+                        let v = values.get(rowid_col?)?;
+                        (!matches!(v, Value::Null)).then(|| eval::to_i64(v))
+                    });
+                    if let Some(id) = effective {
+                        if existing.contains(&id) {
                             match on_conflict {
                                 OnConflict::Replace => {}
                                 OnConflict::Ignore => continue,

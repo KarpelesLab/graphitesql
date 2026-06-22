@@ -325,3 +325,30 @@ fn rtree_i32_stores_integer_coordinates() {
     let info = c.query("PRAGMA table_info(r)").unwrap();
     assert_eq!(info.rows[1][2], Value::Text("INT".into()));
 }
+
+#[test]
+fn duplicate_id_is_rejected() {
+    // The rtree `id` is the rowid alias, so inserting an existing id is a UNIQUE
+    // conflict (errors / OR IGNORE skips / OR REPLACE overwrites), matching sqlite,
+    // rather than silently overwriting the box.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, x0, x1)")
+        .unwrap();
+    c.execute("INSERT INTO r VALUES (1, 0, 5)").unwrap();
+    // A plain duplicate id fails and leaves the original box in place.
+    assert!(c.execute("INSERT INTO r VALUES (1, 9, 9)").is_err());
+    assert_eq!(rows(&c, "SELECT x0 FROM r"), [vec![Value::Real(0.0)]]);
+    // OR IGNORE skips it; OR REPLACE overwrites it.
+    c.execute("INSERT OR IGNORE INTO r VALUES (1, 9, 9)")
+        .unwrap();
+    assert_eq!(rows(&c, "SELECT x0 FROM r"), [vec![Value::Real(0.0)]]);
+    c.execute("INSERT OR REPLACE INTO r VALUES (1, 9, 9)")
+        .unwrap();
+    assert_eq!(rows(&c, "SELECT x0 FROM r"), [vec![Value::Real(9.0)]]);
+    // A NULL/absent id still auto-assigns (no false conflict).
+    c.execute("INSERT INTO r(x0, x1) VALUES (2, 7)").unwrap();
+    assert_eq!(
+        rows(&c, "SELECT count(*) FROM r"),
+        [vec![Value::Integer(2)]]
+    );
+}

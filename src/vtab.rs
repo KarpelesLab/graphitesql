@@ -376,6 +376,15 @@ pub trait VTabModule {
         false
     }
 
+    /// The index of the declared column that is an alias for the table's rowid
+    /// (like an `INTEGER PRIMARY KEY`), if any — e.g. the `rtree` `id` column. When
+    /// set, an `INSERT` providing that column gives the row's rowid, so a duplicate
+    /// is a UNIQUE conflict. `None` (the default) means the rowid is implicit (only
+    /// an explicit `rowid`/`_rowid_`/`oid` term sets it).
+    fn rowid_column(&self) -> Option<usize> {
+        None
+    }
+
     /// Apply a write to the table (SQLite's `xUpdate`), returning the rowid of the
     /// inserted/updated row (ignored for a delete).
     ///
@@ -423,6 +432,8 @@ pub trait DynVTabModule {
     ) -> Result<Box<dyn DynCursor>>;
     /// See [`VTabModule::persistent`].
     fn dyn_persistent(&self) -> bool;
+    /// See [`VTabModule::rowid_column`].
+    fn dyn_rowid_column(&self) -> Option<usize>;
     /// See [`VTabModule::update`].
     fn dyn_update(
         &self,
@@ -487,6 +498,9 @@ where
     }
     fn dyn_persistent(&self) -> bool {
         VTabModule::persistent(self)
+    }
+    fn dyn_rowid_column(&self) -> Option<usize> {
+        VTabModule::rowid_column(self)
     }
     fn dyn_update(
         &self,
@@ -1110,6 +1124,11 @@ impl VTabModule for RTreeModule {
 
     fn persistent(&self) -> bool {
         true
+    }
+
+    fn rowid_column(&self) -> Option<usize> {
+        // The first column (`id`) is the rowid alias.
+        Some(0)
     }
 
     /// Choose a plan from the offered constraints, matching SQLite's rtree
