@@ -297,3 +297,31 @@ fn auxiliary_columns_store_and_query() {
     assert_eq!(info.rows[3][1], Value::Text("label".into()));
     assert_eq!(info.rows[3][2], Value::Text("".into()));
 }
+
+#[test]
+fn rtree_i32_stores_integer_coordinates() {
+    // The `rtree_i32` variant stores coordinates as 32-bit integers (floats
+    // truncate toward zero), with INT-typed columns, byte-for-byte like sqlite3.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree_i32(id, x0, x1)")
+        .unwrap();
+    c.execute("INSERT INTO r VALUES (1, 5,15), (2, 2.7,8.2), (3, -3.9,4.1)")
+        .unwrap();
+    // Float inputs truncate toward zero; the values come back as integers.
+    assert_eq!(
+        rows(&c, "SELECT id, x0, x1 FROM r ORDER BY id"),
+        [
+            vec![Value::Integer(1), Value::Integer(5), Value::Integer(15)],
+            vec![Value::Integer(2), Value::Integer(2), Value::Integer(8)],
+            vec![Value::Integer(3), Value::Integer(-3), Value::Integer(4)],
+        ]
+    );
+    // A spatial filter works as for the float variant.
+    assert_eq!(
+        rows(&c, "SELECT id FROM r WHERE x0 <= 4 ORDER BY id"),
+        [vec![Value::Integer(2)], vec![Value::Integer(3)]]
+    );
+    // Columns are declared INT (not REAL).
+    let info = c.query("PRAGMA table_info(r)").unwrap();
+    assert_eq!(info.rows[1][2], Value::Text("INT".into()));
+}

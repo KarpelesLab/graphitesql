@@ -564,7 +564,9 @@ impl VTabRegistry {
         let mut reg = VTabRegistry::new();
         reg.register("series", Box::new(SeriesModule))
             .expect("fresh registry has no name collisions");
-        reg.register("rtree", Box::new(RTreeModule))
+        reg.register("rtree", Box::new(RTreeModule { integer: false }))
+            .expect("fresh registry has no name collisions");
+        reg.register("rtree_i32", Box::new(RTreeModule { integer: true }))
             .expect("fresh registry has no name collisions");
         #[cfg(feature = "fts5")]
         reg.register("fts5", Box::new(Fts5Module))
@@ -925,7 +927,11 @@ impl SeriesModule {
 /// shadow formats are later increments (D3b/D3c). Coordinates are stored as 32-bit
 /// floats and the id as an integer, matching sqlite's value semantics.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct RTreeModule;
+pub struct RTreeModule {
+    /// `true` for the `rtree_i32` variant: coordinates are 32-bit integers
+    /// (floats truncate toward zero) rather than 32-bit floats.
+    pub integer: bool,
+}
 
 /// Unused cursor — a persistent module's reads scan the backing table, not a
 /// cursor. Present only to satisfy [`VTabModule`].
@@ -1019,41 +1025,51 @@ impl RTreeModule {
         aux_start.saturating_sub(1)
     }
 
-    /// The stored record: an integer id, then `n_coords` f32 coordinates — each min
-    /// (odd column index) rounded down and each max (even index) rounded up — then
-    /// any auxiliary column values verbatim. Errors like sqlite if a coordinate
-    /// pair has `min > max`.
-    fn record(values: &[Value], n_coords: usize) -> Result<Vec<Value>> {
+    /// The stored record: an integer id, then `n_coords` coordinates — for the
+    /// float `rtree` each min (odd column index) rounded down and each max (even
+    /// index) rounded up; for `rtree_i32` each coordinate truncated toward zero to
+    /// a 32-bit integer — then any auxiliary column values verbatim. Errors like
+    /// sqlite if a coordinate pair has `min > max`.
+    fn record(&self, values: &[Value], n_coords: usize) -> Result<Vec<Value>> {
         let mut rec = Vec::with_capacity(values.len());
         rec.push(Value::Integer(rtree_i64(
             values.first().unwrap_or(&Value::Null),
         )));
         for (i, v) in values.iter().enumerate().skip(1) {
-            if i <= n_coords {
+            if i > n_coords {
+                // Auxiliary column: stored as-is (not a coordinate).
+                rec.push(v.clone());
+            } else if self.integer {
+                rec.push(Value::Integer(coord_i32(v)));
+            } else {
                 let x = coord_f64(v);
                 rec.push(Value::Real(if i % 2 == 1 {
                     round_min_f32(x)
                 } else {
                     round_max_f32(x)
                 }));
-            } else {
-                // Auxiliary column: stored as-is (not a coordinate).
-                rec.push(v.clone());
             }
         }
         let mut k = 1;
         while k < n_coords && k + 1 < rec.len() {
-            if let (Value::Real(lo), Value::Real(hi)) = (&rec[k], &rec[k + 1]) {
-                if lo > hi {
-                    return Err(Error::Error(alloc::string::String::from(
-                        "rtree constraint failed",
-                    )));
-                }
+            let (lo, hi) = (coord_f64(&rec[k]), coord_f64(&rec[k + 1]));
+            if lo > hi {
+                return Err(Error::Error(alloc::string::String::from(
+                    "rtree constraint failed",
+                )));
             }
             k += 2;
         }
         Ok(rec)
     }
+}
+
+/// Coerce a value to an `rtree_i32` coordinate: truncate toward zero (the C `int`
+/// cast) and clamp to the signed 32-bit range.
+fn coord_i32(v: &Value) -> i64 {
+    // An `f64 as i64` cast truncates toward zero and maps NaN to 0; clamp the
+    // result to the signed 32-bit range.
+    (coord_f64(v) as i64).clamp(i32::MIN as i64, i32::MAX as i64)
 }
 
 impl VTabModule for RTreeModule {
@@ -1075,7 +1091,8 @@ impl VTabModule for RTreeModule {
             if i == 0 {
                 (String::from(*s), String::from("INT"))
             } else if i <= n_coords {
-                (String::from(*s), String::from("REAL"))
+                let ty = if self.integer { "INT" } else { "REAL" };
+                (String::from(*s), String::from(ty))
             } else {
                 // An auxiliary `+name [type]` column: SQLite reports an empty type
                 // for it (the declared type is not retained), and stores values
@@ -1155,7 +1172,7 @@ impl VTabModule for RTreeModule {
         let n_coords = RTreeModule::n_coords(args);
         match change {
             VTabChange::Insert { values, .. } => {
-                let mut rec = RTreeModule::record(values, n_coords)?;
+                let mut rec = self.record(values, n_coords)?;
                 // The id column is the rowid; a NULL id auto-assigns max+1.
                 let id = if matches!(values.first(), Some(Value::Null) | None) {
                     store.rows()?.iter().map(|(r, _)| *r).max().unwrap_or(0) + 1
@@ -1171,7 +1188,7 @@ impl VTabModule for RTreeModule {
                 Ok(rowid)
             }
             VTabChange::Update { rowid, values, .. } => {
-                let mut rec = RTreeModule::record(values, n_coords)?;
+                let mut rec = self.record(values, n_coords)?;
                 let id = rtree_i64(&values[0]);
                 rec[0] = Value::Integer(id);
                 if id != rowid {
