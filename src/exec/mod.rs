@@ -10761,13 +10761,27 @@ impl Connection {
         // (non-empty `outer_scope`): the spike resolves columns by bare name and
         // would mis-resolve an outer-qualified reference to a same-named inner
         // column.
-        if self.use_vdbe.get()
-            && params.positional.is_empty()
-            && params.named.is_empty()
-            && self.outer_scope.borrow().is_empty()
-        {
-            if let Ok(result) = self.run_select_vdbe(sel) {
-                return Ok(result);
+        if self.use_vdbe.get() && self.outer_scope.borrow().is_empty() {
+            // No params → run the VDBE on `sel` directly. With params, substitute
+            // the explicit (`?N`/`:name`) ones into the compiled expressions so the
+            // param-less VDBE can run the query; an anonymous `?` (or no explicit
+            // param in those expressions) returns None → fall through.
+            let substituted;
+            let vsel = if params.positional.is_empty() && params.named.is_empty() {
+                Some(sel)
+            } else {
+                match substitute_params(sel, params) {
+                    Some(s) => {
+                        substituted = s;
+                        Some(&substituted)
+                    }
+                    None => None,
+                }
+            };
+            if let Some(vsel) = vsel {
+                if let Ok(result) = self.run_select_vdbe(vsel) {
+                    return Ok(result);
+                }
             }
         }
         // Promote `FROM a, b WHERE a.x = b.y` to an explicit join `ON` so the join
@@ -14580,6 +14594,102 @@ impl TableMeta {
 /// An index's b-tree root and the table column positions it covers.
 /// A planner decision to satisfy `ORDER BY` by scanning a secondary index in key
 /// order (B0), shared by `scan_source`, `run_core`, and `eqp_access`.
+/// Apply `f` to each expression the VDBE actually compiles for a single-block
+/// query: projections, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`
+/// and join `ON`s. (Not CTEs/compound/subqueries — the VDBE bails on those.)
+fn vdbe_block_exprs<'a>(sel: &'a Select, f: &mut impl FnMut(&'a Expr)) {
+    for c in &sel.columns {
+        if let ResultColumn::Expr { expr, .. } = c {
+            f(expr);
+        }
+    }
+    sel.where_clause.iter().for_each(&mut *f);
+    sel.group_by.iter().for_each(&mut *f);
+    sel.having.iter().for_each(&mut *f);
+    for t in &sel.order_by {
+        f(&t.expr);
+    }
+    sel.limit.iter().for_each(&mut *f);
+    sel.offset.iter().for_each(&mut *f);
+    if let Some(from) = &sel.from {
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                f(on);
+            }
+        }
+    }
+}
+
+/// Mutable counterpart of [`vdbe_block_exprs`].
+fn vdbe_block_exprs_mut(sel: &mut Select, f: &mut impl FnMut(&mut Expr)) {
+    for c in &mut sel.columns {
+        if let ResultColumn::Expr { expr, .. } = c {
+            f(expr);
+        }
+    }
+    sel.where_clause.iter_mut().for_each(&mut *f);
+    sel.group_by.iter_mut().for_each(&mut *f);
+    sel.having.iter_mut().for_each(&mut *f);
+    for t in &mut sel.order_by {
+        f(&mut t.expr);
+    }
+    sel.limit.iter_mut().for_each(&mut *f);
+    sel.offset.iter_mut().for_each(&mut *f);
+    if let Some(from) = &mut sel.from {
+        for j in &mut from.joins {
+            if let Some(on) = &mut j.on {
+                f(on);
+            }
+        }
+    }
+}
+
+/// Substitute bound parameters into the expressions the VDBE compiles so a
+/// PARAMETERIZED query can run on the (otherwise param-less) VDBE engine.
+/// Returns the rewritten `Select`, or `None` to leave the query to the
+/// tree-walker when an ANONYMOUS `?` is present — its index is assigned at eval
+/// time (`EvalCtx::anon_counter`, affected by AND/OR short-circuit), so a static
+/// substitution could diverge — or when those expressions hold no explicit
+/// (`?N`/`:name`) parameter to substitute.
+fn substitute_params(sel: &Select, params: &Params) -> Option<Select> {
+    use crate::sql::token::Param;
+    let mut anon = false;
+    let mut explicit: Vec<Param> = Vec::new();
+    vdbe_block_exprs(sel, &mut |e| {
+        window::visit(e, &mut |x| {
+            if let Expr::Parameter(p) = x {
+                if matches!(p, Param::Anonymous) {
+                    anon = true;
+                } else if !explicit.contains(p) {
+                    explicit.push(p.clone());
+                }
+            }
+        });
+    });
+    if anon || explicit.is_empty() {
+        return None;
+    }
+    let mut out = sel.clone();
+    for p in &explicit {
+        let v = match p {
+            Param::Numbered(n) => params
+                .positional
+                .get((*n as usize).checked_sub(1)?)?
+                .clone(),
+            Param::Named(name) => params
+                .named
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())?,
+            Param::Anonymous => return None,
+        };
+        let target = Expr::Parameter(p.clone());
+        let repl = Expr::Literal(value_to_literal(v));
+        vdbe_block_exprs_mut(&mut out, &mut |e| window::replace_expr(e, &target, &repl));
+    }
+    Some(out)
+}
+
 struct OrderIndexScan {
     /// The index name (for `EXPLAIN QUERY PLAN`).
     name: String,

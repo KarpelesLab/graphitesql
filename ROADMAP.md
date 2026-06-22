@@ -350,12 +350,15 @@ each additive behind `query_vdbe` until B7:
   compiles single-table scans with `WHERE`, `ORDER BY`, `GROUP BY`, `DISTINCT`,
   constant `LIMIT`, and the 2-table inner join; what defers is **compound
   SELECT** (`UNION`/etc.), subqueries-in-`FROM`, correlated subqueries, and window
-  functions — each substantial. Note a FOUNDATIONAL limit: the VDBE engine runs
-  with `Params::default()` (it is param-less), so any **parameterized** query
-  (`WHERE a=?`, `LIMIT ?`) must keep falling back until parameters are threaded
-  through compile+run — a prerequisite for most remaining real-query coverage.
-  All of this is perf-neutral (the tree-walker fallback already returns correct
-  results); the acceptance is `query_vdbe` parity, not new behavior.
+  functions — each substantial. The param-less limit is now **partly lifted**:
+  EXPLICIT parameters (`?N`, `:name`/`$x`) are substituted into the VDBE-compiled
+  expressions before compile (`substitute_params` in `exec`), so `WHERE a=?1`,
+  `LIMIT ?1`, etc. run on the VDBE and match the tree-walker
+  (`tests/vdbe_params.rs`; the whole param suite stays green now that those route
+  through the VDBE). **Anonymous `?` still falls back** — its index is assigned at
+  eval time (`anon_counter`, affected by AND/OR short-circuit), so a static
+  substitution could diverge. All perf-neutral (fallback already correct);
+  acceptance is VDBE-vs-tree-walker parity.
 - **B7a — route `query()` onto the VDBE behind a flag. ✅ DONE.**
   `Connection::set_use_vdbe(true)` makes `query()` try the VDBE engine first and
   fall back transparently (on any unsupported shape *or* error) to the
