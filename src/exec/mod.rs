@@ -163,6 +163,7 @@ pub struct Connection {
     /// is referenced, the bm25 corpus), set by `run_core` while executing a
     /// `SELECT … MATCH …` over an `fts5` table and read by the `rank`/`bm25()`/
     /// `highlight()` special forms. `None` outside such a query.
+    #[cfg(feature = "fts5")]
     fts5_rank: core::cell::RefCell<Option<Fts5QueryCtx>>,
 }
 
@@ -275,6 +276,7 @@ impl Connection {
             cache_size: core::cell::Cell::new(-2000),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
+            #[cfg(feature = "fts5")]
             fts5_rank: core::cell::RefCell::new(None),
         })
     }
@@ -308,6 +310,7 @@ impl Connection {
             cache_size: core::cell::Cell::new(-2000),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
+            #[cfg(feature = "fts5")]
             fts5_rank: core::cell::RefCell::new(None),
         })
     }
@@ -7405,6 +7408,7 @@ impl Connection {
         // matched column's 0-based index, or the column count for a table-wide
         // match), a rowid equality is `=`, and `ORDER BY rank` sets the
         // order-by-consumed bit (32) in idxNum.
+        #[cfg(feature = "fts5")]
         if cvt.module.eq_ignore_ascii_case("fts5") {
             let mut idx_str = String::new();
             let mut matched = false;
@@ -9520,6 +9524,7 @@ impl Connection {
     /// as `(query text, operand column name)`. The operand names either the table
     /// (a table-wide match) or a single column (`col MATCH …`, which scopes the
     /// score to that column).
+    #[cfg(feature = "fts5")]
     fn fts5_match_query(&self, expr: &Expr, params: &Params) -> Option<(String, String)> {
         match expr {
             Expr::Function { name, args, .. }
@@ -9544,6 +9549,7 @@ impl Connection {
     /// `fts5` table that references `rank`/`bm25()`/`highlight()`, or `None`. The
     /// bm25 corpus is computed (over `input_rows`, the whole scanned corpus) only
     /// when `rank`/`bm25()` is referenced — `highlight()` needs just the query.
+    #[cfg(feature = "fts5")]
     fn fts5_query_ctx(
         &self,
         sel: &Select,
@@ -9635,6 +9641,7 @@ impl Connection {
         // expose it to `rank`/`bm25()`/`highlight()` during projection and ORDER BY.
         // The guard restores any outer query's context (and clears it for a
         // non-FTS5 query) when this scope ends.
+        #[cfg(feature = "fts5")]
         let _fts5_rank_guard = Fts5RankGuard {
             conn: self,
             prev: core::mem::replace(
@@ -12739,11 +12746,13 @@ impl eval::Subqueries for Connection {
     fn call_udf(&self, name: &str, args: &[Value]) -> Option<Result<Value>> {
         self.functions.get(name).map(|f| f(args))
     }
+    #[cfg(feature = "fts5")]
     fn fts5_bm25(&self, rowid: i64, weights: &[f64]) -> Option<f64> {
         let cell = self.fts5_rank.borrow();
         let (corpus, index) = cell.as_ref()?.bm25.as_ref()?;
         Some(corpus.score(*index.get(&rowid)?, weights))
     }
+    #[cfg(feature = "fts5")]
     fn fts5_highlight(&self, col: usize, text: &str, open: &str, close: &str) -> Option<String> {
         let cell = self.fts5_rank.borrow();
         let ctx = cell.as_ref()?;
@@ -13630,6 +13639,7 @@ fn where_cols_covered(e: &Expr, meta: &TableMeta, idx_cols: &[usize]) -> bool {
 /// `argv_index`.
 /// Whether a WHERE clause contains a `rowid = <const>` term (rowid/`_rowid_`/`oid`)
 /// in its `AND` tree — used to report FTS5's `INDEX 0:=` rowid-lookup plan.
+#[cfg(feature = "fts5")]
 fn fts5_rowid_eq(expr: &Expr, params: &Params) -> bool {
     let is_rowid = |e: &Expr| {
         matches!(e, Expr::Column { column, .. }
@@ -14586,6 +14596,7 @@ fn single_minmax_arg(sel: &Select) -> Option<(bool, Expr)> {
 /// Per-query FTS5 state for the aux columns/functions, built by `run_core` for a
 /// `MATCH` query over a single `fts5` table and read by `rank`/`bm25()`/
 /// `highlight()` during projection and `ORDER BY`.
+#[cfg(feature = "fts5")]
 struct Fts5QueryCtx {
     /// The fts5 table's column names.
     col_names: Vec<String>,
@@ -14603,11 +14614,13 @@ struct Fts5QueryCtx {
 
 /// Restores [`Connection::fts5_rank`] when a `run_core` invocation ends, so a
 /// nested query's FTS5 state never leaks into the caller (or vice versa).
+#[cfg(feature = "fts5")]
 struct Fts5RankGuard<'a> {
     conn: &'a Connection,
     prev: Option<Fts5QueryCtx>,
 }
 
+#[cfg(feature = "fts5")]
 impl core::ops::Drop for Fts5RankGuard<'_> {
     fn drop(&mut self) {
         *self.conn.fts5_rank.borrow_mut() = self.prev.take();
@@ -14616,6 +14629,7 @@ impl core::ops::Drop for Fts5RankGuard<'_> {
 
 /// Whether an expression references one of `names` as an unqualified column (the
 /// FTS5 `rank` column) or as a function call (`bm25(…)`, `highlight(…)`, …).
+#[cfg(feature = "fts5")]
 fn expr_mentions_any(expr: &Expr, names: &[&str]) -> bool {
     let rec = |e: &Expr| expr_mentions_any(e, names);
     match expr {
@@ -14649,6 +14663,7 @@ fn expr_mentions_any(expr: &Expr, names: &[&str]) -> bool {
 
 /// Whether a SELECT's projection, `ORDER BY`, or `HAVING` references any of
 /// `names` — the cheap gate before building FTS5 query state.
+#[cfg(feature = "fts5")]
 fn select_mentions(sel: &Select, names: &[&str]) -> bool {
     sel.columns
         .iter()

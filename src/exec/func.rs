@@ -42,6 +42,7 @@ pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
 /// yields just that column; an unqualified reference to the table's own name
 /// yields every column (SQLite's table-wide `MATCH`, where `col:token` filters
 /// pick out individual columns).
+#[cfg(feature = "fts5")]
 fn fts5_match_columns(operand: &Expr, ctx: &EvalCtx) -> Option<Vec<(String, String)>> {
     let (table, column) = match operand {
         Expr::Column { table, column } => (table.as_deref(), column.as_str()),
@@ -129,6 +130,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         // reference (e.g. a literal), fall through so a user-registered `match`
         // function — or the "no such function" error — applies, matching SQLite,
         // where a bare `MATCH` outside a virtual-table context is an error.
+        #[cfg(feature = "fts5")]
         "match" if args.len() == 2 => {
             if let Some(cols) = fts5_match_columns(&args[1], ctx) {
                 let pattern = eval::eval(&args[0], ctx)?;
@@ -145,6 +147,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         // (optionally with per-column weights), computed by `run_core` for a `MATCH`
         // query over an `fts5` table. Falls through when no such score is in scope
         // (so `bm25()` elsewhere is the usual unknown name).
+        #[cfg(feature = "fts5")]
         "bm25" if !args.is_empty() && ctx.rowid.is_some() => {
             let weights: Vec<f64> = args[1..]
                 .iter()
@@ -159,6 +162,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         // FTS5 `highlight(<table>, col, open, close)`: column `col`'s text with the
         // matched tokens wrapped, in scope for a `MATCH` query over an `fts5` table.
+        #[cfg(feature = "fts5")]
         "highlight" if args.len() == 4 => {
             let col = eval::to_i64(&eval::eval(&args[1], ctx)?);
             let open = eval::to_text(&eval::eval(&args[2], ctx)?);

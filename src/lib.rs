@@ -29,6 +29,9 @@
 //!
 //! * `std` *(default)* — enables the [`std`]-file VFS and `std::error::Error`.
 //!   Disable for `no_std` targets; an in-memory VFS is always available.
+//! * `fts5` *(default)* — registers the built-in FTS5 full-text-search virtual
+//!   table (the `MATCH` query language, `bm25()`/`rank` ranking, `highlight()`).
+//!   Disable to drop full-text search and shrink the build.
 //!
 //! ## Attribution
 //!

@@ -4,6 +4,7 @@
 //! backing table. The tokenizer and `MATCH` querying build on top of this.
 
 #![cfg(feature = "std")]
+#![cfg(feature = "fts5")]
 
 use graphitesql::{Connection, Value};
 

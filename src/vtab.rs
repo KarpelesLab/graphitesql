@@ -566,6 +566,7 @@ impl VTabRegistry {
             .expect("fresh registry has no name collisions");
         reg.register("rtree", Box::new(RTreeModule))
             .expect("fresh registry has no name collisions");
+        #[cfg(feature = "fts5")]
         reg.register("fts5", Box::new(Fts5Module))
             .expect("fresh registry has no name collisions");
         reg
@@ -1170,14 +1171,18 @@ impl VTabModule for RTreeModule {
 /// (`col UNINDEXED`) are accepted and ignored by this slice — only the column
 /// names are honored. `MATCH` querying is not yet implemented.
 #[derive(Debug, Default, Clone, Copy)]
+#[cfg(feature = "fts5")]
 pub struct Fts5Module;
 
 /// Unused cursor — FTS5 is persistent, so reads scan the backing table rather
 /// than a module cursor (see [`RTreeCursor`]).
+#[cfg(feature = "fts5")]
 pub struct Fts5Cursor;
 /// Unused row type for [`Fts5Cursor`].
+#[cfg(feature = "fts5")]
 pub struct Fts5Row;
 
+#[cfg(feature = "fts5")]
 impl VTabRow for Fts5Row {
     fn column(&self, _i: usize) -> Value {
         Value::Null
@@ -1187,6 +1192,7 @@ impl VTabRow for Fts5Row {
     }
 }
 
+#[cfg(feature = "fts5")]
 impl VTabCursor for Fts5Cursor {
     type Row = Fts5Row;
     fn next(&mut self) -> Result<Option<Fts5Row>> {
@@ -1200,6 +1206,7 @@ impl VTabCursor for Fts5Cursor {
 /// non-alphanumeric byte and case-folds, so `"The quick-brown Fox!"` yields
 /// `["the", "quick", "brown", "fox"]`. (Diacritic removal and the full Unicode
 /// category tables are not modeled; ASCII text matches sqlite byte-for-byte.)
+#[cfg(feature = "fts5")]
 pub(crate) fn fts5_tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
@@ -1219,6 +1226,7 @@ pub(crate) fn fts5_tokenize(text: &str) -> Vec<String> {
 /// Like [`fts5_tokenize`], but also returns each token's `[start, end)` byte range
 /// in the original `text` — so [`fts5_highlight`] can wrap matched tokens while
 /// preserving the surrounding original characters.
+#[cfg(feature = "fts5")]
 fn fts5_tokenize_spans(text: &str) -> Vec<(String, usize, usize)> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -1244,6 +1252,7 @@ fn fts5_tokenize_spans(text: &str) -> Vec<(String, usize, usize)> {
 /// Adjacent matched tokens (e.g. a matched phrase) share one pair of markers, and
 /// the original inter-token characters are preserved. `scope` is the operand
 /// column of a `col MATCH …` query (the whole query is restricted to it).
+#[cfg(feature = "fts5")]
 pub(crate) fn fts5_highlight(
     query: &str,
     col_names: &[String],
@@ -1322,6 +1331,7 @@ pub(crate) fn fts5_highlight(
 /// optionally restricted to a named column (`col:token`), anchored to the start
 /// of the column (`^token`), and/or ending in a prefix token (`token*`).
 #[derive(Clone)]
+#[cfg(feature = "fts5")]
 struct Fts5Term {
     /// The column the term is scoped to (`col:…`), or `None` for any column.
     column: Option<String>,
@@ -1336,6 +1346,7 @@ struct Fts5Term {
 
 /// The start offsets at which `term` matches in a column's `tokens`, honoring an
 /// `^` anchor (which keeps only a match at offset 0).
+#[cfg(feature = "fts5")]
 fn fts5_term_starts(term: &Fts5Term, tokens: &[String]) -> Vec<usize> {
     let mut starts = fts5_phrase_starts(&term.phrase, term.prefix, tokens);
     if term.anchored {
@@ -1347,6 +1358,7 @@ fn fts5_term_starts(term: &Fts5Term, tokens: &[String]) -> Vec<usize> {
 /// Every start offset at which `phrase` occurs in `doc` as a run of consecutive
 /// tokens (in order), ascending. When `prefix` is set, the final phrase token
 /// matches any document token that starts with it (`fox*` matches `foxes`).
+#[cfg(feature = "fts5")]
 fn fts5_phrase_starts(phrase: &[String], prefix: bool, doc: &[String]) -> Vec<usize> {
     if phrase.is_empty() || doc.len() < phrase.len() {
         return Vec::new();
@@ -1374,6 +1386,7 @@ fn fts5_phrase_starts(phrase: &[String], prefix: bool, doc: &[String]) -> Vec<us
 /// offsets are ascending and (with constant phrase length) so are its ends, so
 /// repeatedly advancing the phrase at the current minimum start finds the
 /// tightest window.
+#[cfg(feature = "fts5")]
 fn fts5_near_matches(phrases: &[(Vec<usize>, usize)], n: usize) -> bool {
     if phrases.iter().any(|(starts, _)| starts.is_empty()) {
         return false;
@@ -1406,6 +1419,7 @@ fn fts5_near_matches(phrases: &[(Vec<usize>, usize)], n: usize) -> bool {
 
 /// A lexed token of an FTS5 query: a boolean operator, a parenthesis, a term, or
 /// a `NEAR(phrase … , n)` group (its phrases and distance, default 10).
+#[cfg(feature = "fts5")]
 enum Fts5Lex {
     Or,
     And,
@@ -1420,6 +1434,7 @@ enum Fts5Lex {
 /// `NOT` are operators only as bare uppercase words (a lowercase `and` or a
 /// `col:and` is an ordinary token, as in SQLite). A term is `[column:]body`,
 /// where `body` is a `"quoted phrase"` or a bare word optionally ending in `*`.
+#[cfg(feature = "fts5")]
 fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
     let chars: Vec<char> = pattern.chars().collect();
     let n = chars.len();
@@ -1546,6 +1561,7 @@ fn fts5_lex(pattern: &str) -> Vec<Fts5Lex> {
 /// Split the body of a `NEAR(…)` group into its phrases and distance. The
 /// distance is the integer after a trailing comma (`NEAR(a b, 5)`); without one
 /// it defaults to 10, as in SQLite.
+#[cfg(feature = "fts5")]
 fn fts5_parse_near(inside: &str) -> (Vec<Fts5Term>, usize) {
     let (phrases_part, distance) = match inside.rsplit_once(',') {
         Some((left, right))
@@ -1566,6 +1582,7 @@ fn fts5_parse_near(inside: &str) -> (Vec<Fts5Term>, usize) {
 }
 
 /// A parsed FTS5 boolean query tree (`A NOT B` means "A and not B").
+#[cfg(feature = "fts5")]
 enum Fts5Query {
     Term(Fts5Term),
     /// A `NEAR(phrase … , n)` group: all phrases must appear within `n` tokens.
@@ -1578,11 +1595,13 @@ enum Fts5Query {
 /// Recursive-descent parser for the FTS5 boolean grammar, lowest precedence
 /// (`OR`) outermost: `OR` of `AND`s (explicit or implicit by juxtaposition) of
 /// `NOT`s of primaries, where a primary is a parenthesized query or a term.
+#[cfg(feature = "fts5")]
 struct Fts5Parser<'a> {
     toks: &'a [Fts5Lex],
     pos: usize,
 }
 
+#[cfg(feature = "fts5")]
 impl Fts5Parser<'_> {
     fn parse(&mut self) -> Option<Fts5Query> {
         let q = self.parse_or();
@@ -1658,6 +1677,7 @@ impl Fts5Parser<'_> {
 
 /// Whether a single term matches any in-scope column (respecting `col:` scoping
 /// and the `^` anchor).
+#[cfg(feature = "fts5")]
 fn fts5_term_matches(term: &Fts5Term, cols: &[(&str, Vec<String>)]) -> bool {
     cols.iter().any(|(name, tokens)| {
         term.column
@@ -1669,6 +1689,7 @@ fn fts5_term_matches(term: &Fts5Term, cols: &[(&str, Vec<String>)]) -> bool {
 
 /// Whether a `NEAR` group is satisfied: some single in-scope column contains all
 /// of its phrases within the distance window.
+#[cfg(feature = "fts5")]
 fn fts5_near_group_matches(
     phrases: &[Fts5Term],
     dist: usize,
@@ -1684,6 +1705,7 @@ fn fts5_near_group_matches(
 }
 
 /// Evaluate a parsed query tree against the tokenized in-scope columns.
+#[cfg(feature = "fts5")]
 fn fts5_eval(query: &Fts5Query, cols: &[(&str, Vec<String>)]) -> bool {
     match query {
         Fts5Query::Term(t) => fts5_term_matches(t, cols),
@@ -1702,6 +1724,7 @@ fn fts5_eval(query: &Fts5Query, cols: &[(&str, Vec<String>)]) -> bool {
 /// juxtaposition), `OR`, and `NOT` (binding tightest to loosest: `NOT`, `AND`,
 /// `OR`) with parentheses — matching SQLite's default precedence — and the
 /// `NEAR(p1 p2 …, n)` proximity group. A query with no tokens matches nothing.
+#[cfg(feature = "fts5")]
 pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)]) -> bool {
     let toks = fts5_lex(pattern);
     let query = match (Fts5Parser {
@@ -1722,6 +1745,7 @@ pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)]) -> bo
 
 /// Collect every phrase term of a parsed query (flattening the boolean tree),
 /// because bm25 sums each phrase's contribution regardless of `AND`/`OR`/`NOT`.
+#[cfg(feature = "fts5")]
 fn fts5_collect_terms<'a>(q: &'a Fts5Query, out: &mut Vec<&'a Fts5Term>) {
     match q {
         Fts5Query::Term(t) => out.push(t),
@@ -1744,6 +1768,7 @@ fn fts5_collect_terms<'a>(q: &'a Fts5Query, out: &mut Vec<&'a Fts5Term>) {
 /// occurrence count in the row (across its in-scope columns), `D` the row's total
 /// token count, and `avgdl` the mean. The sum is **negated** so that the smallest
 /// (most negative) score sorts first, exactly as `ORDER BY rank` expects.
+#[cfg(feature = "fts5")]
 pub(crate) fn fts5_bm25_corpus(
     query: &str,
     col_names: &[String],
@@ -1830,6 +1855,7 @@ pub(crate) fn fts5_bm25_corpus(
 
 /// A precomputed bm25 corpus for one `MATCH` query: enough per-document and
 /// global statistics to score any row with arbitrary per-column weights.
+#[cfg(feature = "fts5")]
 pub(crate) struct Fts5Bm25 {
     avgdl: f64,
     /// Inverse document frequency of each query term (already idf-clamped).
@@ -1838,11 +1864,13 @@ pub(crate) struct Fts5Bm25 {
 }
 
 /// One document's bm25 inputs: its length and per-term, per-column occurrences.
+#[cfg(feature = "fts5")]
 struct Fts5Bm25Doc {
     dl: f64,
     occ: Vec<Vec<f64>>,
 }
 
+#[cfg(feature = "fts5")]
 impl Fts5Bm25 {
     /// SQLite's `bm25()` for document `i` with per-column `weights` (a missing or
     /// empty weight defaults to 1.0). The score is negated, so the most relevant
@@ -1868,6 +1896,7 @@ impl Fts5Bm25 {
     }
 }
 
+#[cfg(feature = "fts5")]
 impl Fts5Module {
     /// The column name declared by one `USING fts5(…)` argument, or `None` if the
     /// argument is a configuration option (`key = value`) rather than a column.
@@ -1891,6 +1920,7 @@ impl Fts5Module {
     }
 }
 
+#[cfg(feature = "fts5")]
 impl VTabModule for Fts5Module {
     type Cursor = Fts5Cursor;
 
@@ -1953,6 +1983,7 @@ mod tests {
     use alloc::vec;
 
     #[test]
+    #[cfg(feature = "fts5")]
     fn fts5_tokenizer_splits_and_folds() {
         assert_eq!(
             fts5_tokenize("The quick-brown Fox!"),
@@ -1972,6 +2003,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fts5")]
     fn fts5_query_matches_are_token_anded() {
         let doc = [(String::from("body"), String::from("the quick brown fox"))];
         assert!(fts5_query_matches("fox", &doc));
@@ -1981,6 +2013,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fts5")]
     fn fts5_column_filters_scope_tokens() {
         let cols = [
             (String::from("title"), String::from("Mixed Fox")),
@@ -1995,6 +2028,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fts5")]
     fn fts5_phrase_and_prefix_queries() {
         let doc = [(
             String::from("body"),
@@ -2014,6 +2048,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fts5")]
     fn fts5_boolean_operators_and_precedence() {
         let doc = |s: &str| [(String::from("body"), String::from(s))];
         // OR / AND / NOT.
@@ -2053,6 +2088,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fts5")]
     fn fts5_near_proximity_groups() {
         let doc = |s: &str| [(String::from("body"), String::from(s))];
         let adjacent = doc("the quick brown fox");
@@ -2074,6 +2110,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fts5")]
     fn fts5_bm25_matches_sqlite() {
         let names = [String::from("body")];
         let doc = |s: &str| alloc::vec![String::from(s)];
@@ -2109,6 +2146,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fts5")]
     fn fts5_highlight_wraps_matched_tokens() {
         let names = [String::from("body")];
         let hl = |q: &str, text: &str| fts5_highlight(q, &names, None, 0, text, "[", "]");
@@ -2136,6 +2174,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fts5")]
     fn fts5_anchor_requires_first_token() {
         let doc = |s: &str| [(String::from("body"), String::from(s))];
         // `^token` matches only when the token is at the start of the column.
@@ -2154,6 +2193,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fts5")]
     fn fts5_column_name_skips_options_and_modifiers() {
         assert_eq!(
             Fts5Module::column_name("title"),

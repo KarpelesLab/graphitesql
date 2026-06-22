@@ -113,9 +113,11 @@ SQLite's default `|`-separated list mode.
 | feature | default | effect |
 |---------|---------|--------|
 | `std`   | on      | std-file `Vfs`, `std::error::Error` impl |
+| `fts5`  | on      | built-in FTS5 full-text search (`MATCH`, `bm25()`/`rank`, `highlight()`) |
 
 Disable default features for `no_std`. An in-memory VFS (`:memory:`) is always
-available, including on wasm.
+available, including on wasm. Drop `fts5` (e.g. `--no-default-features --features
+std`) to build without full-text search.
 
 ## Building & testing
 

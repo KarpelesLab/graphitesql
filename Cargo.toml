@@ -23,8 +23,12 @@ required-features = ["std"]
 # `std` is on by default and brings the std-backed VFS (real files) plus
 # std::error::Error impls. Turn it off for no_std targets (wasm, embedded);
 # graphitesql then runs entirely in-memory unless you supply your own Vfs.
-default = ["std"]
+default = ["std", "fts5"]
 std = []
+# `fts5` registers the built-in FTS5 full-text-search virtual table (the
+# `MATCH` query language, `bm25()`/`rank` ranking, and `highlight()`). On by
+# default; disable it to drop full-text search and shrink the build.
+fts5 = []
 
 [dependencies]
 # Intentionally none. graphitesql is pure Rust over `core` + `alloc` only.
