@@ -94,3 +94,24 @@ fn create_view_if_not_exists() {
     c.execute("CREATE VIEW IF NOT EXISTS v AS SELECT id FROM t")
         .unwrap();
 }
+
+#[test]
+fn drop_if_exists_still_rejects_wrong_object_kind() {
+    // `IF EXISTS` suppresses a *missing* object, not a *wrong-type* one: dropping
+    // a table as a view (or vice versa) errors even with IF EXISTS, like sqlite,
+    // while a genuinely missing object is a silent no-op.
+    let mut c = setup();
+    c.execute("CREATE VIEW v AS SELECT id FROM t").unwrap();
+    // `t` is a table, `v` is a view (from setup + here).
+    assert!(c.execute("DROP VIEW IF EXISTS t").is_err());
+    assert!(c.execute("DROP TABLE IF EXISTS v").is_err());
+    // Missing objects: no-op.
+    c.execute("DROP VIEW IF EXISTS nope").unwrap();
+    c.execute("DROP TABLE IF EXISTS nope").unwrap();
+    // The misused objects are intact.
+    assert!(c.query("SELECT * FROM t").is_ok());
+    assert!(c.query("SELECT * FROM v").is_ok());
+    // And the correct DROP works.
+    c.execute("DROP VIEW IF EXISTS v").unwrap();
+    assert!(c.query("SELECT * FROM v").is_err());
+}

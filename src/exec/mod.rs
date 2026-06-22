@@ -5844,11 +5844,9 @@ impl Connection {
             .find(|o| o.obj_type == want && o.name == d.name)
             .cloned();
         let Some(obj) = target else {
-            if d.if_exists {
-                return Ok(());
-            }
             // SQLite's table↔view confusion hint when a same-named object of the
-            // other kind exists; otherwise a lowercase "no such <kind>".
+            // other kind exists. This fires even with `IF EXISTS` — that clause
+            // suppresses a *missing* object, not a *wrong-type* one.
             if let Some(other) = self.schema.objects().iter().find(|o| o.name == d.name) {
                 match (d.kind, other.obj_type) {
                     (DropKind::Table, ObjectType::View) => {
@@ -5865,6 +5863,9 @@ impl Connection {
                     }
                     _ => {}
                 }
+            }
+            if d.if_exists {
+                return Ok(());
             }
             let kind = match d.kind {
                 DropKind::Table => "table",
