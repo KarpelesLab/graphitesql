@@ -548,9 +548,16 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     (`tests/fts5vocab.rs`). *(The `instance` form's `offset` column must be
     quoted in graphite — `offset` is a reserved word in its parser, an orthogonal
     gap.)*
-  - **D2e — byte-compatible on-disk segment format** is the remaining FTS5 track
-    (the `%_data`/`%_idx` inverted-index b-tree layout sqlite writes; needs the
-    real inverted index of D2b — graphite's fts5 is currently scan-based).
+  - **D2e — byte-compatible on-disk format. READ ✅ DONE (M1); WRITE remains
+    (M2).** **M1:** graphite reads a sqlite-written FTS5 — its parser now accepts
+    sqlite's single-quoted shadow-table names (`CREATE TABLE 'ft_data'(…)`), and
+    `try_virtual_table` reads the documents from `<name>_content`, answering
+    queries (incl. `MATCH`) with the scan-based matcher (the segment index need
+    not be decoded). `tests/fts5.rs`. **M2 (remaining):** for graphite's *own*
+    FTS5 files to be sqlite-readable, write the `%_data`/`%_idx` inverted-index
+    segment layout (doclists, varint postings, segment b-tree) — sqlite's `MATCH`
+    + FTS5 integrity-check need a valid index, so (unlike the R-Tree) a scan-based
+    store is not enough. The larger remaining file-compat piece.
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
   (`register_function`, via `Subqueries::call_udf`) and aggregate ✅ DONE
   (`register_aggregate_function` + an `AggregateFunction` step/finalize trait;
