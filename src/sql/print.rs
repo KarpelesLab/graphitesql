@@ -99,7 +99,7 @@ fn column_constraint(c: &ColumnConstraint) -> String {
         ColumnConstraint::Unique => "UNIQUE".to_string(),
         ColumnConstraint::Default(e) => format!("DEFAULT {}", expr(e)),
         ColumnConstraint::Collate(n) => format!("COLLATE {n}"),
-        ColumnConstraint::Check(e) => format!("CHECK ({})", expr(e)),
+        ColumnConstraint::Check(e, _) => format!("CHECK ({})", expr(e)),
         ColumnConstraint::References(fk) => {
             format!("REFERENCES {}", foreign_key_target(fk))
         }
@@ -153,7 +153,7 @@ fn table_constraint(c: &TableConstraint) -> String {
     match c {
         TableConstraint::PrimaryKey(names) => format!("PRIMARY KEY({})", cols(names)),
         TableConstraint::Unique(names) => format!("UNIQUE({})", cols(names)),
-        TableConstraint::Check(e) => format!("CHECK ({})", expr(e)),
+        TableConstraint::Check(e, _) => format!("CHECK ({})", expr(e)),
         TableConstraint::ForeignKey(fk) => format!(
             "FOREIGN KEY({}) REFERENCES {}",
             cols(&fk.columns),

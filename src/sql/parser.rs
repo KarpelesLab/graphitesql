@@ -1485,10 +1485,16 @@ impl Parser {
             });
         }
         let mut constraints = Vec::new();
+        // A `CONSTRAINT <name>` prefix names the constraint that follows; SQLite
+        // uses it in a CHECK violation message. Carried to the next kind.
+        let mut pending_name: Option<String> = None;
         loop {
             if self.eat_kw("constraint") {
-                let _ = self.ident()?; // named constraint; the constraint follows
-            } else if self.eat_kw("primary") {
+                pending_name = Some(self.ident()?);
+                continue;
+            }
+            let cname = pending_name.take();
+            if self.eat_kw("primary") {
                 self.expect_kw("key")?;
                 let descending = if self.eat_kw("desc") {
                     true
@@ -1525,9 +1531,11 @@ impl Parser {
                 constraints.push(ColumnConstraint::Collate(self.ident()?));
             } else if self.eat_kw("check") {
                 self.expect(&Token::LParen)?;
+                let start = self.tokens.get(self.pos).map(|s| s.start);
                 let e = self.expr()?;
+                let label = cname.or_else(|| self.span_text(start));
                 self.expect(&Token::RParen)?;
-                constraints.push(ColumnConstraint::Check(e));
+                constraints.push(ColumnConstraint::Check(e, label));
             } else if self.eat_kw("references") {
                 let fk = self.parse_fk_clause(alloc::vec![name.clone()])?;
                 constraints.push(ColumnConstraint::References(fk));
@@ -1573,12 +1581,31 @@ impl Parser {
             || self.check_kw("foreign")
     }
 
+    /// The verbatim source text from byte offset `start` up to the end of the
+    /// most recently consumed token — used to capture a CHECK expression's text
+    /// exactly as written (SQLite reports it in the violation message).
+    fn span_text(&self, start: Option<usize>) -> Option<String> {
+        match (
+            start,
+            self.pos.checked_sub(1).and_then(|i| self.tokens.get(i)),
+        ) {
+            (Some(s), Some(last)) if last.end <= self.source.len() && s <= last.end => {
+                Some(String::from(&self.source[s..last.end]))
+            }
+            _ => None,
+        }
+    }
+
     /// Parse one table constraint, returning `None` for kinds we accept but do
     /// not yet model (`CHECK`, `FOREIGN KEY`).
     fn table_constraint(&mut self) -> Result<Option<TableConstraint>> {
-        if self.eat_kw("constraint") {
-            let _ = self.ident()?; // named constraint
-        }
+        // `CONSTRAINT <name>` names the constraint; SQLite uses the name in a
+        // CHECK violation message (`CHECK constraint failed: <name>`).
+        let name = if self.eat_kw("constraint") {
+            Some(self.ident()?)
+        } else {
+            None
+        };
         if self.eat_kw("primary") {
             self.expect_kw("key")?;
             let cols = self.paren_columns()?;
@@ -1590,9 +1617,12 @@ impl Parser {
             Ok(Some(TableConstraint::Unique(cols)))
         } else if self.eat_kw("check") {
             self.expect(&Token::LParen)?;
+            let start = self.tokens.get(self.pos).map(|s| s.start);
             let e = self.expr()?;
+            // The label is the constraint name if given, else the verbatim expr.
+            let label = name.or_else(|| self.span_text(start));
             self.expect(&Token::RParen)?;
-            Ok(Some(TableConstraint::Check(e)))
+            Ok(Some(TableConstraint::Check(e, label)))
         } else if self.eat_kw("foreign") {
             self.expect_kw("key")?;
             let columns = self.paren_columns()?;
@@ -2606,8 +2636,8 @@ fn is_reserved_keyword(lower: &str) -> bool {
 fn is_column_constraint_kw(tok: Option<&Token>) -> bool {
     matches!(tok, Some(Token::Word(w)) if matches!(
         w.to_ascii_lowercase().as_str(),
-        "primary" | "not" | "null" | "unique" | "default" | "collate" | "check"
-            | "references" | "generated" | "as"
+        "constraint" | "primary" | "not" | "null" | "unique" | "default" | "collate"
+            | "check" | "references" | "generated" | "as"
     ))
 }
 

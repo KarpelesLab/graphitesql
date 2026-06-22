@@ -2263,7 +2263,7 @@ impl Connection {
         for c in &ct.columns {
             for k in &c.constraints {
                 match k {
-                    ColumnConstraint::Check(e) if expr_has_subquery(e) => {
+                    ColumnConstraint::Check(e, _) if expr_has_subquery(e) => {
                         return Err(Error::Error(
                             "subqueries prohibited in CHECK constraints".into(),
                         ));
@@ -2283,7 +2283,7 @@ impl Connection {
             }
         }
         for tc in &ct.constraints {
-            if let TableConstraint::Check(e) = tc {
+            if let TableConstraint::Check(e, _) = tc {
                 if expr_has_subquery(e) {
                     return Err(Error::Error(
                         "subqueries prohibited in CHECK constraints".into(),
@@ -5683,7 +5683,9 @@ impl Connection {
                 for col in &mut ct.columns {
                     for k in &mut col.constraints {
                         match k {
-                            ColumnConstraint::Check(e) | ColumnConstraint::Default(e) => rename(e),
+                            ColumnConstraint::Check(e, _) | ColumnConstraint::Default(e) => {
+                                rename(e)
+                            }
                             ColumnConstraint::Generated { expr, .. } => rename(expr),
                             _ => {}
                         }
@@ -5698,7 +5700,7 @@ impl Connection {
                                 }
                             }
                         }
-                        TableConstraint::Check(e) => rename(e),
+                        TableConstraint::Check(e, _) => rename(e),
                         TableConstraint::ForeignKey(fk) => {
                             for nm in &mut fk.columns {
                                 if nm.eq_ignore_ascii_case(old) {
@@ -5829,7 +5831,7 @@ impl Connection {
             match c {
                 ColumnConstraint::PrimaryKey { .. } => return cannot("PRIMARY KEY"),
                 ColumnConstraint::Unique => return cannot("UNIQUE"),
-                ColumnConstraint::Check(_) => return cannot("CHECK"),
+                ColumnConstraint::Check(..) => return cannot("CHECK"),
                 ColumnConstraint::References(_) => return cannot("FOREIGN KEY"),
                 ColumnConstraint::Generated { .. } => return cannot("generated"),
                 _ => {}
@@ -5844,7 +5846,7 @@ impl Connection {
                         return cannot("PRIMARY KEY or UNIQUE");
                     }
                 }
-                TableConstraint::Check(_) => return cannot("a table CHECK constraint exists"),
+                TableConstraint::Check(..) => return cannot("a table CHECK constraint exists"),
                 TableConstraint::ForeignKey(_) => {
                     return cannot("a table FOREIGN KEY constraint exists")
                 }
@@ -12210,17 +12212,17 @@ impl Connection {
             .collect();
         // CHECK constraints (column-level + table-level); each is evaluated
         // against the full row on INSERT/UPDATE.
-        let mut checks: Vec<Expr> = Vec::new();
+        let mut checks: Vec<(Expr, Option<String>)> = Vec::new();
         for col in &ct.columns {
             for k in &col.constraints {
-                if let ColumnConstraint::Check(e) = k {
-                    checks.push(e.clone());
+                if let ColumnConstraint::Check(e, label) = k {
+                    checks.push((e.clone(), label.clone()));
                 }
             }
         }
         for tc in &ct.constraints {
-            if let TableConstraint::Check(e) = tc {
-                checks.push(e.clone());
+            if let TableConstraint::Check(e, label) = tc {
+                checks.push((e.clone(), label.clone()));
             }
         }
         // UNIQUE / PRIMARY KEY column sets that must be unique (the rowid IPK is
@@ -12335,10 +12337,14 @@ impl Connection {
         rowid: Option<i64>,
         params: &Params,
     ) -> Result<()> {
-        for expr in &meta.checks {
+        for (expr, label) in &meta.checks {
             let ctx = row_ctx(values, &meta.columns, rowid, params).with_subqueries(self);
             if eval::truth(&eval::eval(expr, &ctx)?) == Some(false) {
-                return Err(Error::Constraint("CHECK constraint failed".into()));
+                let msg = match label {
+                    Some(l) => alloc::format!("CHECK constraint failed: {l}"),
+                    None => String::from("CHECK constraint failed"),
+                };
+                return Err(Error::Constraint(msg));
             }
         }
         Ok(())
@@ -12353,7 +12359,8 @@ struct TableMeta {
     /// Per-column `NOT NULL` flag (aligned with `columns`).
     not_null: Vec<bool>,
     /// CHECK constraint expressions (column-level and table-level).
-    checks: Vec<Expr>,
+    /// CHECK constraints with their error-message label (name or source text).
+    checks: Vec<(Expr, Option<String>)>,
     /// Column-index sets that must be UNIQUE (excludes the rowid IPK).
     unique: Vec<Vec<usize>>,
     ipk: Option<usize>,

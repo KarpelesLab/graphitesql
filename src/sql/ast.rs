@@ -524,8 +524,11 @@ pub enum ColumnConstraint {
     Default(Expr),
     /// `COLLATE <name>`.
     Collate(String),
-    /// `CHECK (<expr>)`.
-    Check(Expr),
+    /// `CHECK (<expr>)`. The second field is the constraint's *label* for error
+    /// messages — its name if written `CONSTRAINT <name> CHECK …`, else the
+    /// verbatim source text of `<expr>` — matching SQLite's
+    /// `CHECK constraint failed: <label>`.
+    Check(Expr, Option<String>),
     /// `REFERENCES parent(cols) …` — a column-level foreign key.
     References(ForeignKey),
     /// `[GENERATED ALWAYS] AS (expr) [STORED|VIRTUAL]` — a generated column.
@@ -545,8 +548,9 @@ pub enum TableConstraint {
     PrimaryKey(Vec<String>),
     /// `UNIQUE (cols…)`.
     Unique(Vec<String>),
-    /// `CHECK (<expr>)`.
-    Check(Expr),
+    /// `CHECK (<expr>)`. The second field is the constraint's *label* (see
+    /// [`ColumnConstraint::Check`]).
+    Check(Expr, Option<String>),
     /// `FOREIGN KEY (cols) REFERENCES parent(cols) …`.
     ForeignKey(ForeignKey),
 }
