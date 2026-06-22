@@ -562,12 +562,20 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     the `FTS5_MAIN_PREFIX` '0', doclists with rowid deltas, position lists with
     collist deltas) are reproduced byte-for-byte vs sqlite 3.50.4 across every
     doclist shape — `tests/fts5_segment.rs` (a differential reference encoder).
-    **M2b — storage wiring (remaining):** swap graphite's generic `<name>_data`
-    backing table for sqlite's five shadow tables (`_content`/`_data`/`_idx`/
-    `_docsize`/`_config`), maintaining them on insert/delete/update; then
-    **M2c — pagination** (multi-leaf segments, the segment b-tree interior pages,
-    and doclist-index pages) for tables too large for one leaf. The larger
-    remaining file-compat piece.
+    **M2c — multi-leaf pagination encoder verified ✅:** by lowering FTS5's
+    logical `pgsz`, the differential test also reproduces multi-leaf segments
+    byte-for-byte — the leaf-packing split threshold (flush before a term would
+    take the encoded leaf `>= pgsz`), each leaf re-stating its first term in full
+    form, the structure record's config cookie + write counter (= leaf count),
+    and the `%_idx` separator rows (each the shortest prefix of a leaf's first
+    term that exceeds the previous leaf's last term). `tests/fts5_segment.rs`.
+    *Remaining encoder sub-cases:* the "first rowid before first term" carry when
+    a single term's doclist spans leaf boundaries, doclist-index pages (dli flag),
+    and segment b-tree interior `_data` pages (height > 0). **M2b — storage wiring
+    (remaining):** swap graphite's generic `<name>_data` backing table for
+    sqlite's five shadow tables (`_content`/`_data`/`_idx`/`_docsize`/`_config`),
+    maintaining them on insert/delete/update and porting the verified encoder.
+    The larger remaining file-compat piece.
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
   (`register_function`, via `Subqueries::call_udf`) and aggregate ✅ DONE
   (`register_aggregate_function` + an `AggregateFunction` step/finalize trait;

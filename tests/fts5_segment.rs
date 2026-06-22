@@ -7,12 +7,16 @@
 //! storage-layer rework (swap the generic backing table for sqlite's five shadow
 //! tables). Its core risk is reproducing sqlite's segment bytes exactly.
 //!
-//! This test retires that risk: it builds a single-leaf segment (the structure
-//! record, the averages record, and the leaf page) in Rust and proves the bytes
-//! are identical to what `sqlite3` 3.50.4 writes, across several doclist shapes
+//! This test retires that risk: it builds segments in Rust and proves the bytes
+//! identical to what `sqlite3` 3.50.4 writes. It covers single-leaf segments
+//! (structure record, averages record, leaf page) across every doclist shape
 //! (multiple docs per term → rowid deltas, multiple positions per doc → collist
-//! deltas, term prefix compression including the `FTS5_MAIN_PREFIX` '0' byte).
-//! The encoder here is the reference the storage rework will port into the lib.
+//! deltas, term prefix compression including the `FTS5_MAIN_PREFIX` '0' byte),
+//! and — by lowering FTS5's logical page size (`pgsz`) — MULTI-LEAF segments:
+//! the leaf-packing split threshold, each leaf's re-stated first term, the
+//! structure record's config cookie + write counter, and the `%_idx` separator
+//! rows (each a shortest-distinguishing prefix of a leaf's first term). The
+//! encoder here is the reference the storage rework will port into the lib.
 
 #![cfg(feature = "std")]
 #![cfg(feature = "fts5")]
@@ -52,6 +56,7 @@ fn put_varint(out: &mut Vec<u8>, v: u64) {
 
 /// A document's contribution to one term: its rowid and the sorted token
 /// positions within column 0.
+#[derive(Clone)]
 struct Posting {
     rowid: i64,
     positions: Vec<u32>,
@@ -147,15 +152,73 @@ fn encode_averages(n_row: u64, total_tokens_col0: u64) -> Vec<u8> {
     out
 }
 
-/// The structure record (id=10) for one fresh segment: 4-byte cookie, then
-/// nLevel, nSegment, nWriteCounter, then per level nMerge/nSeg, then per segment
-/// segid/pgnoFirst/pgnoLast.
-fn encode_structure() -> Vec<u8> {
-    let mut out = vec![0, 0, 0, 0]; // configuration cookie 0 (not a V2 record)
-    for v in [1u64, 1, 1, /*level0:*/ 0, 1, /*seg:*/ 1, 1, 1] {
+/// The structure record (id=10) for one fresh segment of `n_leaves` leaf pages:
+/// 4-byte BE config cookie (bumped once per `%_config` change — 0 for a fresh
+/// table, 1 after one `pgsz` write), then nLevel, nSegment, nWriteCounter (=
+/// total leaves), then per level nMerge/nSeg, then per segment
+/// segid/pgnoFirst/pgnoLast (= 1..n_leaves).
+fn encode_structure(n_leaves: u64, cookie: u32) -> Vec<u8> {
+    let mut out = cookie.to_be_bytes().to_vec(); // not a V2 record
+    for v in [
+        1, 1, n_leaves, /*level0:*/ 0, 1, /*seg:*/ 1, 1, n_leaves,
+    ] {
         put_varint(&mut out, v);
     }
     out
+}
+
+/// Greedily pack the sorted terms into leaf pages of at most `pgsz` bytes
+/// (matching sqlite's FTS5 logical page size). Returns, per leaf, its encoded
+/// bytes and its first term key (the '0'-prefixed token). A term is moved to a
+/// new leaf when appending it would push the fully-encoded leaf over `pgsz`; a
+/// lone first term that already exceeds `pgsz` still occupies its own leaf.
+struct Leaf {
+    bytes: Vec<u8>,
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
+}
+
+fn pack_leaves(terms: &[(String, Vec<Posting>)], pgsz: usize) -> Vec<Leaf> {
+    let mut leaves = Vec::new();
+    let mut cur: Vec<(String, Vec<Posting>)> = Vec::new();
+    let flush = |cur: &[(String, Vec<Posting>)]| Leaf {
+        bytes: encode_leaf(cur),
+        first_key: term_key(&cur[0].0),
+        last_key: term_key(&cur[cur.len() - 1].0),
+    };
+    for (term, postings) in terms {
+        if !cur.is_empty() {
+            let mut trial = cur.clone();
+            trial.push((term.clone(), postings.clone()));
+            if encode_leaf(&trial).len() >= pgsz {
+                leaves.push(flush(&cur));
+                cur.clear();
+            }
+        }
+        cur.push((term.clone(), postings.clone()));
+    }
+    if !cur.is_empty() {
+        leaves.push(flush(&cur));
+    }
+    leaves
+}
+
+/// The '0'-prefixed (`FTS5_MAIN_PREFIX`) key for a term.
+fn term_key(term: &str) -> Vec<u8> {
+    let mut key = vec![b'0'];
+    key.extend_from_slice(term.as_bytes());
+    key
+}
+
+/// The `%_idx` separator: the shortest prefix of `first` (the leaf's first term
+/// key) that is strictly greater than `prev_last` (the previous leaf's last term
+/// key) — i.e. `first` truncated just past the first byte where they differ.
+fn idx_separator(prev_last: &[u8], first: &[u8]) -> Vec<u8> {
+    let mut i = 0;
+    while i < prev_last.len() && i < first.len() && prev_last[i] == first[i] {
+        i += 1;
+    }
+    first[..=i.min(first.len() - 1)].to_vec()
 }
 
 const SEG_LEAF_ROWID: i64 = (1i64 << 37) | 1; // segid=1, height=0, dli=0, pgno=1
@@ -254,8 +317,98 @@ fn check(docs: &[(i64, &str)]) {
         avg,
         "averages mismatch"
     );
-    assert_eq!(encode_structure(), structure, "structure mismatch");
+    assert_eq!(encode_structure(1, 0), structure, "structure mismatch");
     assert_eq!(encode_leaf(&terms), leaf, "leaf mismatch for {docs:?}");
+}
+
+/// Fetch a multi-leaf segment built with a small `pgsz`: all leaf blobs ordered
+/// by page, the structure record, and the `%_idx` rows `(pgno_field, term)`.
+#[allow(clippy::type_complexity)]
+fn sqlite_segment(pgsz: usize, body: &str) -> (Vec<Vec<u8>>, Vec<u8>, Vec<(i64, Vec<u8>)>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "gsql-fts5ml-{}-{}.db",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let script = format!(
+        "CREATE VIRTUAL TABLE t USING fts5(body);\
+         INSERT INTO t(t,rank) VALUES('pgsz',{pgsz});\
+         INSERT INTO t(rowid,body) VALUES (1,'{body}');"
+    );
+    let o = Command::new("sqlite3")
+        .arg(&path)
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "sqlite build failed: {o:?}");
+    let run = |q: &str| {
+        String::from_utf8_lossy(
+            &Command::new("sqlite3")
+                .arg(&path)
+                .arg(q)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned()
+    };
+    let leaves: Vec<Vec<u8>> = run("SELECT quote(block) FROM t_data WHERE id>100 ORDER BY id;")
+        .lines()
+        .map(parse_hex)
+        .collect();
+    let structure = parse_hex(&run("SELECT quote(block) FROM t_data WHERE id=10;"));
+    let idx: Vec<(i64, Vec<u8>)> =
+        run("SELECT pgno || '|' || quote(term) FROM t_idx ORDER BY pgno;")
+            .lines()
+            .map(|l| {
+                let (p, t) = l.split_once('|').unwrap();
+                (p.parse().unwrap(), parse_hex(t))
+            })
+            .collect();
+    let _ = std::fs::remove_file(&path);
+    (leaves, structure, idx)
+}
+
+/// Build the body's index and pack it into leaves with the same `pgsz`, then
+/// assert the leaves, structure, and `%_idx` rows match sqlite byte-for-byte.
+fn check_segment(pgsz: usize, body: &str) {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let (sq_leaves, sq_structure, sq_idx) = sqlite_segment(pgsz, body);
+    let (terms, _, _) = build_index(&[(1, body)]);
+    let leaves = pack_leaves(&terms, pgsz);
+    assert!(leaves.len() > 1, "test did not produce multiple leaves");
+    assert_eq!(leaves.len(), sq_leaves.len(), "leaf count");
+    for (i, (leaf, sq)) in leaves.iter().zip(&sq_leaves).enumerate() {
+        assert_eq!(&leaf.bytes, sq, "leaf {} (pgno {}) bytes", i, i + 1);
+    }
+    assert_eq!(
+        encode_structure(leaves.len() as u64, 1),
+        sq_structure,
+        "structure"
+    );
+    // %_idx: one row per leaf — (pgno<<1, separator); leaf 1's separator is empty,
+    // later leaves get the shortest prefix distinguishing them from the prior leaf.
+    let want_idx: Vec<(i64, Vec<u8>)> = leaves
+        .iter()
+        .enumerate()
+        .map(|(i, leaf)| {
+            let pgno = (i as i64) + 1;
+            let term = if i == 0 {
+                Vec::new()
+            } else {
+                idx_separator(&leaves[i - 1].last_key, &leaf.first_key)
+            };
+            (pgno << 1, term)
+        })
+        .collect();
+    assert_eq!(want_idx, sq_idx, "%_idx rows");
 }
 
 #[test]
@@ -284,4 +437,24 @@ fn multi_position_collist() {
 #[test]
 fn mixed_three_terms() {
     check(&[(1, "red green"), (2, "green blue")]);
+}
+
+#[test]
+fn multi_leaf_pagination() {
+    // 40 distinct terms in one doc, pgsz=64 → sqlite splits into 6 leaves.
+    let body: String = (1..=40)
+        .map(|i| format!("term{i:03}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    check_segment(64, &body);
+}
+
+#[test]
+fn multi_leaf_varied_pgsz() {
+    let body: String = (1..=50)
+        .map(|i| format!("term{i:03}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    check_segment(80, &body);
+    check_segment(128, &body);
 }
