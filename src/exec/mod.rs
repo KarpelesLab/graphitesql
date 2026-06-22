@@ -755,8 +755,12 @@ impl Connection {
                 Value::Integer(self.recursive_triggers as i64),
             )),
             "journal_mode" => {
+                // An in-memory database (empty main file) uses the `memory`
+                // journal, like sqlite; a file database defaults to `delete`.
                 let mode = if self.backend.wal_mode() {
                     "wal"
+                } else if self.main_file.is_empty() {
+                    "memory"
                 } else {
                     "delete"
                 };

@@ -39,6 +39,9 @@ fn tuning_pragma_getters_report_sqlite_defaults() {
         );
     }
     assert_eq!(one(&c, "PRAGMA locking_mode"), Value::Text("normal".into()));
+    // An in-memory database uses the `memory` journal, like sqlite (a file
+    // database defaults to `delete`).
+    assert_eq!(one(&c, "PRAGMA journal_mode"), Value::Text("memory".into()));
 }
 
 #[test]
