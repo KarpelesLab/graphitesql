@@ -251,10 +251,14 @@ all matching the tree-walker via `query_vdbe`. The spike's scalar-expression
 compiler now spans literals (incl. blobs), arithmetic, concatenation,
 comparison + three-valued boolean logic, `IS`/`IS NOT`, the bitwise operators
 (`& | << >> ~`), unary `+`/`-`/`NOT`, `IS NULL`, `CASE`, `CAST`, `BETWEEN`,
-`LIKE`/`GLOB`, `IN (list)`, and the `->`/`->>` JSON operators (its binary-op
-match is now exhaustive); scalar **function calls** remain the next slice
-(blocked on a value-level dispatch — today's `eval_scalar` takes `Expr` + a row
-context).
+`LIKE`/`GLOB`, `IN (list)`, the `->`/`->>` JSON operators (its binary-op match
+is now exhaustive), and **pure scalar function calls** (`Op::Func` defers to
+`eval_scalar` over literal-reconstructed argument values, whitelisted to
+context-free functions so `random`/`last_insert_rowid`/date-time/FTS5/UDFs fall
+back). Remaining VDBE expression gaps are the context-dependent shapes
+(`Collate` threading, `Parameter` binding, correlated `Subquery`/`Exists`/
+`InSelect`) — these belong with the executor-integration steps (**B5c**/**B7**),
+not the standalone spike.
 
 **Remaining optimizer pieces** *(perf-only — results already correct; acceptance:
 the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep):*
