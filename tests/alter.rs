@@ -525,6 +525,66 @@ fn rename_column_propagates_into_foreign_keys() {
 }
 
 #[test]
+fn rename_table_rewrites_dependent_trigger_bodies() {
+    // ALTER TABLE … RENAME TO rewrites the renamed table's name inside trigger
+    // bodies that reference it — whether the trigger is attached to it or to
+    // another table — byte-for-byte like sqlite3, while an unrelated trigger is
+    // left untouched.
+    let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    let after = |create: &[&str]| -> String {
+        let mut c = Connection::open_memory().unwrap();
+        for s in create {
+            c.execute(s).unwrap();
+        }
+        c.execute("ALTER TABLE t RENAME TO t2").unwrap();
+        match &c
+            .query("SELECT sql FROM sqlite_master WHERE name='tr'")
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    // Trigger on another table whose body inserts into the renamed table.
+    let body = after(&[
+        "CREATE TABLE t(a)",
+        "CREATE TABLE u(x)",
+        "CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO t VALUES(NEW.x); END",
+    ]);
+    assert!(
+        body.contains("\"t2\"") && !body.contains("INTO t "),
+        "not rewritten: {body}"
+    );
+    if sqlite {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(
+                    "CREATE TABLE t(a); CREATE TABLE u(x);\
+                     CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO t VALUES(NEW.x); END;\
+                     ALTER TABLE t RENAME TO t2;\
+                     SELECT sql FROM sqlite_master WHERE name='tr';",
+                )
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        assert_eq!(body, want);
+    }
+    // An unrelated trigger (touches only `u`) is unchanged.
+    let unrelated = after(&[
+        "CREATE TABLE t(a)",
+        "CREATE TABLE u(x)",
+        "CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO u VALUES(NEW.x); END",
+    ]);
+    assert_eq!(
+        unrelated,
+        "CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO u VALUES(NEW.x); END"
+    );
+}
+
+#[test]
 fn rename_column_propagates_into_single_source_view() {
     // Renaming a column propagates into a view that draws from ONLY that table —
     // every reference (bare, table-qualified, and through an alias) is rewritten

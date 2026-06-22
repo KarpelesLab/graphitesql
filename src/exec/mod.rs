@@ -6036,7 +6036,7 @@ impl Connection {
                         true
                     } else if is_text(&cols[2], &old) {
                         // Dependent index/trigger/view: repoint, and rewrite an
-                        // index's CREATE text to reference the new table name.
+                        // index's `ON` clause / a trigger's body to the new name.
                         cols[2] = Value::Text(new_name.clone());
                         if is_text(&cols[0], "index") {
                             // Repoint the index's `ON <table>` to the new name in
@@ -6044,6 +6044,17 @@ impl Connection {
                             if let Some(Value::Text(isql)) = cols.get(4).cloned() {
                                 cols[4] =
                                     Value::Text(rename_table_token_after(&isql, "on", &new_name));
+                            }
+                        } else if is_text(&cols[0], "trigger") {
+                            // A trigger ON the renamed table: rewrite the renamed
+                            // name throughout its stored text (the `ON` clause and
+                            // any body references), like SQLite.
+                            if let Some(Value::Text(tsql)) = cols.get(4).cloned() {
+                                cols[4] = Value::Text(rewrite_ident_tokens(
+                                    &tsql,
+                                    &old,
+                                    &sql::print::ident(&new_name),
+                                ));
                             }
                         }
                         true
@@ -6055,6 +6066,21 @@ impl Connection {
                             Some(Value::Text(vsql)) if view_uses_table(&vsql, &old) => {
                                 cols[4] = Value::Text(rewrite_ident_tokens(
                                     &vsql,
+                                    &old,
+                                    &sql::print::ident(&new_name),
+                                ));
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else if is_text(&cols[0], "trigger") {
+                        // A trigger on ANOTHER table whose body references the
+                        // renamed table (e.g. `INSERT INTO <table> …`): rewrite the
+                        // renamed name throughout its stored text.
+                        match cols.get(4).cloned() {
+                            Some(Value::Text(tsql)) if trigger_uses_table(&tsql, &old) => {
+                                cols[4] = Value::Text(rewrite_ident_tokens(
+                                    &tsql,
                                     &old,
                                     &sql::print::ident(&new_name),
                                 ));
@@ -15610,6 +15636,52 @@ fn ddl_text(sql: &str) -> &str {
 /// whether an `ALTER TABLE name RENAME TO` must rewrite the view to stay valid —
 /// we parse and run the table-rename walker against a sentinel and see if it
 /// touched anything, so unrelated views are left byte-for-byte untouched.
+/// Whether a `SELECT` references base table `name` anywhere (FROM/joins/
+/// subqueries/CTEs/compound) — detected by probe-renaming it to a sentinel and
+/// checking the AST changed (reuses `rename_table_in_select`'s full walk).
+fn select_reads_table(sel: &Select, name: &str) -> bool {
+    let mut probe = sel.clone();
+    rename_table_in_select(
+        &mut probe,
+        name,
+        "\u{1}\u{1}graphite_rename_probe\u{1}\u{1}",
+    );
+    probe != *sel
+}
+
+/// Whether a `FROM` clause names table `name` as its first source or a join.
+fn from_refs_table(f: &FromClause, name: &str) -> bool {
+    f.first.name.eq_ignore_ascii_case(name)
+        || f.joins
+            .iter()
+            .any(|j| j.table.name.eq_ignore_ascii_case(name))
+}
+
+/// Whether a `CREATE TRIGGER` references table `name` — either it is attached to
+/// it (`ON name`) or a body statement targets/reads it. Used to decide whether a
+/// `RENAME TABLE` must rewrite the renamed name inside the trigger's stored text.
+fn trigger_uses_table(trigger_sql: &str, name: &str) -> bool {
+    let Ok(Statement::CreateTrigger(ct)) = sql::parse_one(trigger_sql) else {
+        return false;
+    };
+    if ct.table.eq_ignore_ascii_case(name) {
+        return true;
+    }
+    ct.body.iter().any(|s| match s {
+        Statement::Select(sel) => select_reads_table(sel, name),
+        Statement::Insert(i) => {
+            i.table.eq_ignore_ascii_case(name)
+                || matches!(&i.source, InsertSource::Select(sel) if select_reads_table(sel, name))
+        }
+        Statement::Update(u) => {
+            u.table.eq_ignore_ascii_case(name)
+                || u.from.as_ref().is_some_and(|f| from_refs_table(f, name))
+        }
+        Statement::Delete(d) => d.table.eq_ignore_ascii_case(name),
+        _ => false,
+    })
+}
+
 fn view_uses_table(view_sql: &str, name: &str) -> bool {
     match sql::parse_one(view_sql) {
         Ok(Statement::CreateView(cv)) => {
