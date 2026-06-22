@@ -37,7 +37,11 @@ format**.
 > byte-compatible with sqlite: an FTS5 table written by graphite (stored in
 > sqlite's `_content`/`_data`/`_idx`/`_docsize`/`_config` shadow tables) is
 > opened, full-text-`MATCH`ed, and integrity-checked by stock `sqlite3`, and an
-> R-Tree round-trips through its `_node` on-disk format. What remains is depth:
+> R-Tree round-trips through its `_node` on-disk format. *(FTS5 sqlite-readability
+> currently holds for text whose tokenization matches `unicode61` — ASCII and
+> already-folded text; graphite's tokenizer does not yet remove diacritics like
+> `unicode61`'s default, so a document with accented characters indexes different
+> terms than sqlite recomputes.)* What remains is depth: that tokenizer folding,
 > R-Tree spatial pushdown, finishing the VDBE (per-cursor joins, more
 > single-block shapes), and concurrency — see the full plan in
 > **[ROADMAP.md](ROADMAP.md)**.

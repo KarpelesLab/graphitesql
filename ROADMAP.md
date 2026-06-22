@@ -634,6 +634,15 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     (`tests/fts5_sqlite_read.rs`). *Not byte-identical to sqlite at every page
     size (the pgsz fill heuristic and large-scale doclist-index pages differ) —
     only structural validity is needed for sqlite to read it, and that holds.*
+    ⚠ **TOKENIZER GAP (found 2026-06-23):** sqlite-readability requires graphite's
+    tokens to match `unicode61`. They do for ASCII, but graphite's tokenizer keeps
+    diacritics (Rust `is_alphanumeric` + `to_lowercase`) whereas `unicode61`'s
+    DEFAULT removes them (`café`→`cafe`), so a document with accented characters
+    indexes terms sqlite's integrity-check rejects as "malformed" (and a graphite
+    `MATCH` on such tokens diverges from sqlite — a PRE-EXISTING tokenizer gap that
+    D2e-M2 newly exposes via the on-disk index). The fix is a `unicode61`
+    case/diacritic FOLDING TABLE in `fts5_tokenize` — a bounded but real
+    unicode-table effort; ASCII corpora are unaffected.
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
   (`register_function`, via `Subqueries::call_udf`) and aggregate ✅ DONE
   (`register_aggregate_function` + an `AggregateFunction` step/finalize trait;
