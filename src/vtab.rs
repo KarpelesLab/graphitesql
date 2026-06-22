@@ -1007,24 +1007,42 @@ fn round_max_f32(d: f64) -> f64 {
 }
 
 impl RTreeModule {
-    /// The stored record: an integer id, then f32 coordinates — each min (odd
-    /// column index) rounded down and each max (even index) rounded up. Errors
-    /// like sqlite if any pair has `min > max`.
-    fn record(values: &[Value]) -> Result<Vec<Value>> {
+    /// The number of coordinate columns declared by a `USING rtree(…)` arg list:
+    /// the id is column 0, the coordinates follow, and any trailing `+name`
+    /// columns are auxiliary (non-spatial) data. Returns the coordinate count.
+    fn n_coords(args: &[&str]) -> usize {
+        let aux_start = args
+            .iter()
+            .skip(1)
+            .position(|a| a.trim_start().starts_with('+'))
+            .map_or(args.len(), |p| p + 1);
+        aux_start.saturating_sub(1)
+    }
+
+    /// The stored record: an integer id, then `n_coords` f32 coordinates — each min
+    /// (odd column index) rounded down and each max (even index) rounded up — then
+    /// any auxiliary column values verbatim. Errors like sqlite if a coordinate
+    /// pair has `min > max`.
+    fn record(values: &[Value], n_coords: usize) -> Result<Vec<Value>> {
         let mut rec = Vec::with_capacity(values.len());
         rec.push(Value::Integer(rtree_i64(
             values.first().unwrap_or(&Value::Null),
         )));
         for (i, v) in values.iter().enumerate().skip(1) {
-            let x = coord_f64(v);
-            rec.push(Value::Real(if i % 2 == 1 {
-                round_min_f32(x)
+            if i <= n_coords {
+                let x = coord_f64(v);
+                rec.push(Value::Real(if i % 2 == 1 {
+                    round_min_f32(x)
+                } else {
+                    round_max_f32(x)
+                }));
             } else {
-                round_max_f32(x)
-            }));
+                // Auxiliary column: stored as-is (not a coordinate).
+                rec.push(v.clone());
+            }
         }
         let mut k = 1;
-        while k + 1 < rec.len() {
+        while k < n_coords && k + 1 < rec.len() {
             if let (Value::Real(lo), Value::Real(hi)) = (&rec[k], &rec[k + 1]) {
                 if lo > hi {
                     return Err(Error::Error(alloc::string::String::from(
@@ -1042,18 +1060,30 @@ impl VTabModule for RTreeModule {
     type Cursor = RTreeCursor;
 
     fn connect(&self, args: &[&str]) -> Result<VTabSchema> {
-        // One id column + an even number (≥ 2) of coordinate columns.
-        if args.len() < 3 || args.len().is_multiple_of(2) {
+        // One id column + an even number (≥ 2) of coordinate columns, optionally
+        // followed by `+name [type]` auxiliary columns.
+        let n_coords = RTreeModule::n_coords(args);
+        if n_coords < 2 || !n_coords.is_multiple_of(2) {
             return Err(Error::Error(alloc::string::String::from(
                 "rtree requires an odd number of columns (id + 2N coordinates), \
                  at least 3",
             )));
         }
-        // The id column is an integer; every coordinate is a 32-bit float (REAL),
-        // matching sqlite's declared rtree column types.
+        // The id column is an integer; every coordinate is a 32-bit float (REAL);
+        // an auxiliary `+name [type]` column keeps its declared type (or none).
         Ok(VTabSchema::typed(args.iter().enumerate().map(|(i, s)| {
-            let ty = if i == 0 { "INT" } else { "REAL" };
-            (String::from(*s), ty)
+            if i == 0 {
+                (String::from(*s), String::from("INT"))
+            } else if i <= n_coords {
+                (String::from(*s), String::from("REAL"))
+            } else {
+                // An auxiliary `+name [type]` column: SQLite reports an empty type
+                // for it (the declared type is not retained), and stores values
+                // verbatim with no affinity.
+                let a = s.trim_start().strip_prefix('+').unwrap_or(s).trim();
+                let name = a.split_once(char::is_whitespace).map_or(a, |(n, _)| n);
+                (String::from(name), String::new())
+            }
         })))
     }
 
@@ -1121,10 +1151,11 @@ impl VTabModule for RTreeModule {
         })
     }
 
-    fn update(&self, _args: &[&str], change: VTabChange, store: &mut dyn VTabStore) -> Result<i64> {
+    fn update(&self, args: &[&str], change: VTabChange, store: &mut dyn VTabStore) -> Result<i64> {
+        let n_coords = RTreeModule::n_coords(args);
         match change {
             VTabChange::Insert { values, .. } => {
-                let mut rec = RTreeModule::record(values)?;
+                let mut rec = RTreeModule::record(values, n_coords)?;
                 // The id column is the rowid; a NULL id auto-assigns max+1.
                 let id = if matches!(values.first(), Some(Value::Null) | None) {
                     store.rows()?.iter().map(|(r, _)| *r).max().unwrap_or(0) + 1
@@ -1140,7 +1171,7 @@ impl VTabModule for RTreeModule {
                 Ok(rowid)
             }
             VTabChange::Update { rowid, values, .. } => {
-                let mut rec = RTreeModule::record(values)?;
+                let mut rec = RTreeModule::record(values, n_coords)?;
                 let id = rtree_i64(&values[0]);
                 rec[0] = Value::Integer(id);
                 if id != rowid {

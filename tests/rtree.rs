@@ -255,3 +255,45 @@ fn table_info_reports_rtree_column_types() {
     assert_eq!(ty(1), "REAL");
     assert_eq!(ty(2), "REAL");
 }
+
+#[test]
+fn auxiliary_columns_store_and_query() {
+    // A `+name` column declares auxiliary (non-spatial) data: stored verbatim,
+    // retrievable, and usable in WHERE (via the re-applied filter), byte-for-byte
+    // like sqlite3. Its declared type is dropped (empty type in table_info).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, minX, maxX, +label TEXT, +n)")
+        .unwrap();
+    c.execute("INSERT INTO r VALUES (1, 0,10, 'alpha', 42), (2, 20,30, 'beta', 7)")
+        .unwrap();
+    // Auxiliary values come back alongside coordinates.
+    assert_eq!(
+        rows(&c, "SELECT id, label, n FROM r ORDER BY id"),
+        [
+            vec![
+                Value::Integer(1),
+                Value::Text("alpha".into()),
+                Value::Integer(42)
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Text("beta".into()),
+                Value::Integer(7)
+            ],
+        ]
+    );
+    // A spatial filter still works with auxiliary columns present.
+    assert_eq!(
+        rows(&c, "SELECT label FROM r WHERE minX <= 5"),
+        [vec![Value::Text("alpha".into())]]
+    );
+    // An auxiliary column is filterable too.
+    assert_eq!(
+        rows(&c, "SELECT id FROM r WHERE n = 7"),
+        [vec![Value::Integer(2)]]
+    );
+    // The auxiliary column's declared type is not retained.
+    let info = c.query("PRAGMA table_info(r)").unwrap();
+    assert_eq!(info.rows[3][1], Value::Text("label".into()));
+    assert_eq!(info.rows[3][2], Value::Text("".into()));
+}
