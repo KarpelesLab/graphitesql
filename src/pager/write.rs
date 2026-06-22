@@ -80,6 +80,10 @@ pub struct WritePager {
     /// Open savepoints (innermost last); each snapshots the staged state so
     /// `ROLLBACK TO` can restore it.
     savepoints: Vec<Savepoint>,
+    /// `PRAGMA secure_delete`: when set, the content of a page handed to the
+    /// freelist is overwritten with zeros (so deleted data does not linger on
+    /// disk). A per-connection runtime setting, not persisted in the file.
+    secure_delete: bool,
 }
 
 /// A snapshot of the pager's staged state captured by `SAVEPOINT`.
@@ -163,6 +167,7 @@ impl WritePager {
             wal,
             held: crate::vfs::LockLevel::Unlocked,
             savepoints: Vec::new(),
+            secure_delete: false,
         })
     }
 
@@ -246,6 +251,7 @@ impl WritePager {
             wal: None,
             held: crate::vfs::LockLevel::Unlocked,
             savepoints: Vec::new(),
+            secure_delete: false,
         };
         // Page 1: db header (0..100) + an empty table-leaf b-tree at offset 100.
         let mut page1 = vec![0u8; page_size as usize];
@@ -414,6 +420,12 @@ impl WritePager {
         }
     }
 
+    /// Set `PRAGMA secure_delete`: when `on`, the content of a freed page is
+    /// zeroed before it joins the freelist.
+    pub fn set_secure_delete(&mut self, on: bool) {
+        self.secure_delete = on;
+    }
+
     /// Return `page` to the freelist (appending it as a leaf of the first trunk
     /// if there is room, else making it a new trunk page).
     pub fn free_page(&mut self, page: u32) -> Result<()> {
@@ -428,6 +440,12 @@ impl WritePager {
                 put32(&mut tbytes, idx, page);
                 put32(&mut tbytes, 4, leaf_count + 1);
                 self.write_page(trunk, tbytes)?;
+                // With secure_delete, overwrite the freed page's old content. As a
+                // freelist *leaf* it carries no required bytes, so a zero page is
+                // valid (integrity_check ignores freelist-leaf content).
+                if self.secure_delete {
+                    self.write_page(page, vec![0u8; self.page_size])?;
+                }
                 self.header.freelist_count += 1;
                 return Ok(());
             }

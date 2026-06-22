@@ -398,8 +398,15 @@ is C8b/C8c.
   recoverable by `sqlite3`. Pairs with the crash-recovery harness (§6). Split:
   **C7a** write the sqlite journal header + page records; **C7b** recover from a
   sqlite-format journal on open.
-- **C8a — `secure_delete`.** Zero freed cell/page content (`PRAGMA
-  secure_delete=ON`).
+- **C8a — `secure_delete`. ✅ DONE.** `PRAGMA secure_delete` round-trips its
+  value exactly like sqlite (0=off, 1=on, 2=`fast`; any other true/non-zero → 1)
+  instead of the old hard-coded 0. When non-zero the pager zeroes the content of
+  every page handed to the freelist (`WritePager::free_page`), so deleted data
+  does not linger on disk; freed cells were already cleared by graphite's
+  full-page reserialize. A per-connection runtime setting (not persisted), as in
+  sqlite. Verified vs sqlite3 + a raw-file test (`tests/secure_delete.rs`):
+  ON leaves no copy of a deleted multi-overflow-page blob, OFF does, and
+  `integrity_check` stays ok either way.
 - **C8b — honor `PRAGMA cache_size` / `mmap_size`. ✅ DONE.** `cache_size` round-
   trips its set value on the connection (default −2000); `mmap_size` returns no
   rows (the reference build disables mmap) instead of erroring. Both verified vs

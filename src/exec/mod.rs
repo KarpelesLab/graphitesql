@@ -151,6 +151,10 @@ pub struct Connection {
     /// page count, a negative value is KiB; default −2000). graphite keeps every
     /// page resident, so this is reported back but does not bound a real cache.
     cache_size: core::cell::Cell<i64>,
+    /// `PRAGMA secure_delete` (0=off, 1=on, 2=fast), round-tripped like sqlite.
+    /// When non-zero, freed pages are zeroed (the pager honors it); a
+    /// per-connection runtime setting, not persisted in the file.
+    secure_delete: core::cell::Cell<i64>,
     /// User-defined scalar functions registered via
     /// [`register_function`](Self::register_function), keyed by lowercased name.
     /// Built-in functions take precedence; these fill otherwise-unknown names.
@@ -282,6 +286,7 @@ impl Connection {
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
+            secure_delete: core::cell::Cell::new(0),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
@@ -317,6 +322,7 @@ impl Connection {
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
+            secure_delete: core::cell::Cell::new(0),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
@@ -780,7 +786,10 @@ impl Connection {
             }),
             "synchronous" => Ok(single("synchronous", Value::Integer(2))),
             "temp_store" => Ok(single("temp_store", Value::Integer(0))),
-            "secure_delete" => Ok(single("secure_delete", Value::Integer(0))),
+            "secure_delete" => Ok(single(
+                "secure_delete",
+                Value::Integer(self.secure_delete.get()),
+            )),
             "read_uncommitted" => Ok(single("read_uncommitted", Value::Integer(0))),
             "cell_size_check" => Ok(single("cell_size_check", Value::Integer(0))),
             "checkpoint_fullfsync" => Ok(single("checkpoint_fullfsync", Value::Integer(0))),
@@ -2918,6 +2927,21 @@ impl Connection {
             if let Some(e) = &p.value {
                 self.cache_size
                     .set(eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?));
+            }
+        } else if p.name.eq_ignore_ascii_case("secure_delete") {
+            // sqlite maps the argument to 0 (off), 2 (the `fast` keyword only), or
+            // 1 (any other true / non-zero value). The pager zeroes freed pages
+            // when the setting is non-zero.
+            if let Some(e) = &p.value {
+                let v = match pragma_text(e).to_ascii_lowercase().as_str() {
+                    "fast" => 2,
+                    _ if pragma_truth(e, params) => 1,
+                    _ => 0,
+                };
+                self.secure_delete.set(v);
+                if let Backend::Write(w) = &mut self.backend {
+                    w.set_secure_delete(v != 0);
+                }
             }
         } else if p.name.eq_ignore_ascii_case("journal_mode") {
             if let Some(e) = &p.value {
