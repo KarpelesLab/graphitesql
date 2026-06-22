@@ -66,6 +66,16 @@ fn vdbe_matches_tree_walker() {
         "SELECT 'b' IN ('a','b','c'), 9 IN ()",
         "SELECT '{\"a\":5}' -> '$.a', '{\"a\":5}' ->> '$.a'",
         "SELECT '[1,2,3]' -> 1, '[1,2,3]' ->> 2, '{\"x\":null}' ->> '$.x'",
+        // Pure scalar function calls (deferred to eval_scalar).
+        "SELECT abs(-7), abs(3.5), length('hello'), upper('abc'), lower('ABC')",
+        "SELECT substr('graphite', 2, 4), replace('a-b-c', '-', '+'), instr('abc','b')",
+        "SELECT hex('AB'), quote('it''s'), char(72, 105), unicode('A')",
+        "SELECT round(3.14159, 2), sign(-5), abs(length(trim('  x  ')))",
+        "SELECT typeof(1), typeof('a'), typeof(2.5), typeof(NULL), typeof(x'00')",
+        "SELECT coalesce(NULL, NULL, 3), ifnull(NULL, 'd'), nullif(5, 5), nullif(5, 6)",
+        "SELECT max(3, 1, 2), min(3, 1, 2), abs(-2) + length('ab')",
+        "SELECT json_type('[1,2]'), json_array_length('[1,2,3]'), json_valid('{')",
+        "SELECT upper(substr('hello world', 7)), length(quote('x'))",
     ];
     for q in queries {
         let walker = c.query(q).unwrap().rows;
@@ -91,6 +101,8 @@ fn vdbe_matches_sqlite3() {
         "SELECT 5 BETWEEN 1 AND 10, 5 NOT BETWEEN 6 AND 10",
         "SELECT 'abc' LIKE 'a%', 'abc' GLOB '?b?'",
         "SELECT 2 IN (1,2,3), 5 NOT IN (1,2,3)",
+        "SELECT abs(-7), length('hello'), upper('abc'), substr('graphite',2,4)",
+        "SELECT round(3.14159,2), coalesce(NULL,3), typeof(2.5), max(3,1,2)",
     ];
     for q in queries {
         let want = {
@@ -165,6 +177,11 @@ fn table_scan_matches_tree_walker() {
         "SELECT count(*), a FROM t GROUP BY a",
         "SELECT a, max(b), min(b) FROM t WHERE a >= 1 GROUP BY a",
         "SELECT a, group_concat(b) FROM t GROUP BY a",
+        // Pure scalar functions over column values run through Op::Func.
+        "SELECT upper(b), length(b), abs(a) FROM t",
+        "SELECT a, substr(b, 1, 1), typeof(a) FROM t",
+        "SELECT b FROM t WHERE length(b) = 1",
+        "SELECT coalesce(b, 'none'), round(a * 1.5, 1) FROM t",
     ] {
         let mut got = c.query_vdbe(q).unwrap().rows;
         let mut want = c.query(q).unwrap().rows;

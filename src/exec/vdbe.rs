@@ -72,6 +72,15 @@ pub enum Op {
         rhs: usize,
         dest: usize,
     },
+    /// `dest = name(reg[arg_start], …, reg[arg_start+arg_count-1])`: a pure,
+    /// context-free scalar function call, evaluated by re-using the tree-walker's
+    /// `func::eval_scalar` over literal-reconstructed argument values.
+    Func {
+        name: String,
+        arg_start: usize,
+        arg_count: usize,
+        dest: usize,
+    },
     /// `dest = lhs || rhs` (text concatenation).
     Concat { lhs: usize, rhs: usize, dest: usize },
     /// `dest = lhs <op> rhs` for a comparison `BinaryOp` (Eq/NotEq/Lt/…), with
@@ -255,6 +264,41 @@ pub struct Program {
     pub n_registers: usize,
     /// Output column labels (parallel to each `ResultRow`'s register span).
     pub columns: Vec<String>,
+}
+
+/// Whether `name`/`argc` is a pure, context-free scalar function the VDBE spike
+/// can evaluate by deferring to `func::eval_scalar` over literal argument values.
+///
+/// The list is deliberately conservative: it excludes every function that reads
+/// row or connection state (`random`, `randomblob`, `last_insert_rowid`,
+/// `changes`, the date/time family with its `'now'` source, FTS5 helpers, and
+/// user-defined functions), since those would silently misread the spike's empty
+/// context. Anything not listed falls back to the tree-walker. Each entry is
+/// covered by a differential test in `tests/vdbe.rs`.
+fn is_pure_scalar_fn(name: &str, argc: usize) -> bool {
+    let n = name.to_ascii_lowercase();
+    match n.as_str() {
+        // String functions.
+        "lower" | "upper" | "length" | "octet_length" | "trim" | "ltrim" | "rtrim" | "substr"
+        | "substring" | "replace" | "instr" | "hex" | "unhex" | "quote" | "char" | "unicode"
+        | "concat" | "concat_ws" | "soundex" => true,
+        // Numeric functions.
+        "abs" | "round" | "sign" | "ceil" | "ceiling" | "floor" | "trunc" | "exp" | "ln"
+        | "log" | "log2" | "log10" | "sqrt" | "pow" | "power" | "mod" | "sin" | "cos" | "tan"
+        | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "radians" | "degrees"
+        | "pi" => true,
+        // Type / null helpers.
+        "typeof" | "nullif" | "zeroblob" | "likelihood" | "likely" | "unlikely" => true,
+        "coalesce" | "ifnull" => argc >= 1,
+        // Pattern predicates in function form.
+        "glob" | "like" => argc == 2,
+        // JSON (operate purely on their value arguments).
+        "json" | "json_valid" | "json_type" | "json_quote" | "json_array_length"
+        | "json_extract" | "json_array" | "json_object" | "jsonb" => true,
+        // Variadic scalar min/max need at least two args (one arg is the aggregate).
+        "min" | "max" => argc >= 2,
+        _ => false,
+    }
 }
 
 /// Compile a constant-projection `SELECT` (no `FROM`/`WHERE`/aggregates) into a
@@ -1534,6 +1578,44 @@ impl Compiler {
                 }
                 Ok(())
             }
+            // A pure, context-free scalar function call: evaluate each argument
+            // into a contiguous register block and emit `Op::Func`, which defers
+            // to the tree-walker's `eval_scalar`. Restricted to the whitelist in
+            // `is_pure_scalar_fn` so functions that read row/connection state
+            // (random, last_insert_rowid, date('now'), UDFs, …) fall back.
+            Expr::Function {
+                name,
+                distinct,
+                args,
+                star,
+                filter,
+                order_by,
+                over,
+            } if !*distinct
+                && !*star
+                && filter.is_none()
+                && order_by.is_empty()
+                && over.is_none()
+                && is_pure_scalar_fn(name, args.len()) =>
+            {
+                // Reserve a contiguous block for the arguments, then compile each
+                // argument directly into its slot (sub-expressions may allocate
+                // further temps after the block, which is fine).
+                let arg_start = self.next_reg;
+                for _ in 0..args.len() {
+                    self.alloc();
+                }
+                for (i, a) in args.iter().enumerate() {
+                    self.compile_expr_into(a, arg_start + i)?;
+                }
+                self.ops.push(Op::Func {
+                    name: name.clone(),
+                    arg_start,
+                    arg_count: args.len(),
+                    dest,
+                });
+                Ok(())
+            }
             _ => Err(Error::Unsupported("VDBE spike: this expression")),
         }
     }
@@ -1733,6 +1815,34 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                 dest,
             } => {
                 regs[*dest] = crate::exec::json::arrow(&regs[*lhs], &regs[*rhs], *as_text);
+            }
+            Op::Func {
+                name,
+                arg_start,
+                arg_count,
+                dest,
+            } => {
+                // Reconstruct literal argument expressions from the evaluated
+                // registers and run them through the tree-walker's scalar-function
+                // evaluator with an empty (row-less) context. The compiler only
+                // emits this op for pure, context-free functions, so the missing
+                // row/connection state is never consulted.
+                use crate::sql::ast::{Expr, Literal};
+                let lit_args: Vec<Expr> = regs[*arg_start..*arg_start + *arg_count]
+                    .iter()
+                    .map(|v| {
+                        Expr::Literal(match v {
+                            Value::Null => Literal::Null,
+                            Value::Integer(i) => Literal::Integer(*i),
+                            Value::Real(r) => Literal::Real(*r),
+                            Value::Text(s) => Literal::Str(s.clone()),
+                            Value::Blob(b) => Literal::Blob(b.clone()),
+                        })
+                    })
+                    .collect();
+                let params = crate::exec::eval::Params::default();
+                let ctx = crate::exec::eval::EvalCtx::rowless(&params);
+                regs[*dest] = crate::exec::func::eval_scalar(name, &lit_args, false, &ctx)?;
             }
             Op::Concat { lhs, rhs, dest } => {
                 regs[*dest] =
