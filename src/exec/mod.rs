@@ -9606,6 +9606,7 @@ impl Connection {
         let arg_refs: Vec<&str> = vargs.iter().map(String::as_str).collect();
         let all = crate::vtab::fts5_indexed_columns(&arg_refs);
         let indexed = (all.len() != columns.len()).then_some(all);
+        let stem = crate::vtab::fts5_uses_porter(&arg_refs);
         let (query, operand) = self.fts5_match_query(sel.where_clause.as_ref()?, params)?;
         let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         // A `col MATCH …` operand scopes the query to that column; a table-wide
@@ -9626,6 +9627,7 @@ impl Connection {
                 &docs,
                 scope.as_deref(),
                 indexed.as_deref(),
+                stem,
             );
             let index = input_rows
                 .iter()
@@ -9639,6 +9641,7 @@ impl Connection {
             query,
             scope,
             indexed,
+            stem,
             bm25,
         })
     }
@@ -12804,6 +12807,7 @@ impl eval::Subqueries for Connection {
             ctx.scope.as_deref(),
             col,
             text,
+            ctx.stem,
             open,
             close,
         ))
@@ -12816,6 +12820,14 @@ impl eval::Subqueries for Connection {
         }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         Some(crate::vtab::fts5_indexed_columns(&refs))
+    }
+    #[cfg(feature = "fts5")]
+    fn fts5_porter(&self, table: &str) -> bool {
+        let Ok((module, args, _)) = self.vtab_meta(table) else {
+            return false;
+        };
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        module.eq_ignore_ascii_case("fts5") && crate::vtab::fts5_uses_porter(&refs)
     }
     #[cfg(feature = "fts5")]
     fn fts5_snippet(
@@ -12836,6 +12848,7 @@ impl eval::Subqueries for Connection {
             col,
             cols,
             ctx.indexed.as_deref(),
+            ctx.stem,
             open,
             close,
             ellipsis,
@@ -14683,6 +14696,8 @@ struct Fts5QueryCtx {
     /// The searchable (indexed) column names — every column except those declared
     /// `UNINDEXED`. `None` when all columns are indexed (the common case).
     indexed: Option<Vec<String>>,
+    /// Whether the table uses the `porter` tokenizer (tokens are Porter-stemmed).
+    stem: bool,
     /// The bm25 corpus + rowid→document-index map — present only when `rank` /
     /// `bm25()` is referenced (`highlight()` needs only the query, not the corpus).
     bm25: Option<(

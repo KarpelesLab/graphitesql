@@ -103,6 +103,11 @@ pub trait Subqueries {
     fn fts5_indexed_columns(&self, _table: &str) -> Option<Vec<String>> {
         None
     }
+    /// Whether the `fts5` table `table` uses the `porter` tokenizer (so its tokens
+    /// are Porter-stemmed at index and query time). `false` otherwise.
+    fn fts5_porter(&self, _table: &str) -> bool {
+        false
+    }
 }
 
 /// A column's type affinity (SQLite, `datatype3.html` §3).

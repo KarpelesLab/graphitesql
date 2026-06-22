@@ -154,6 +154,44 @@ fn match_queries_tokens() {
 }
 
 #[test]
+fn porter_tokenizer_stems_tokens() {
+    // `tokenize='porter'` Porter-stems every token at index and query time, so a
+    // query matches any inflected form, byte-for-byte like sqlite3.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(x, tokenize='porter')")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES('the runners were running quickly')")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES('a national connection')")
+        .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        rows(&c, sql)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("not a rowid"),
+            })
+            .collect::<Vec<_>>()
+    };
+    let one = |sql: &str| match &c.query(sql).unwrap().rows[0][0] {
+        Value::Text(s) => s.clone(),
+        o => panic!("not text: {o:?}"),
+    };
+    // Every inflected form of "run" stems to the same root and matches row 1.
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'run'"), [1]);
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'running'"), [1]);
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'runner'"), [1]);
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'nation'"), [2]);
+    assert_eq!(ids("SELECT rowid FROM t WHERE t MATCH 'connect'"), [2]);
+    // highlight() wraps the original (unstemmed) token text of a stemmed match
+    // (`running` stems to `run`; `runners` stems to `runner`, so it is not a match).
+    assert_eq!(
+        one("SELECT highlight(t, 0, '[', ']') FROM t WHERE t MATCH 'run'"),
+        "the runners were [running] quickly"
+    );
+}
+
+#[test]
 fn rebuild_and_optimize_commands_are_noops() {
     // FTS5's table-named hidden column accepts maintenance commands; for graphite's
     // scan-based index `rebuild`/`optimize` change nothing and insert no row,
