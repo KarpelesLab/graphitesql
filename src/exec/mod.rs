@@ -2335,12 +2335,17 @@ impl Connection {
             .map(|(_, n, _)| n.clone())
             .collect();
         let is_backing = |name: &str| {
-            name.strip_suffix("_data")
-                .is_some_and(|p| vtab_names.contains(p))
+            ["_data", "_node", "_rowid", "_parent"].iter().any(|sfx| {
+                name.strip_suffix(sfx)
+                    .is_some_and(|p| vtab_names.contains(p))
+            })
         };
-        // A vtab is persistent (has rows to copy) iff its backing table exists.
+        // A vtab is persistent (has rows to copy through it) iff a backing table
+        // exists — the generic `_data` or an R-Tree's `_node`.
         let persistent_vtab = |name: &str| {
-            vtab_names.contains(name) && table_names.contains(&alloc::format!("{name}_data"))
+            vtab_names.contains(name)
+                && (table_names.contains(&alloc::format!("{name}_data"))
+                    || table_names.contains(&alloc::format!("{name}_node")))
         };
 
         // Build a compact copy in a throwaway in-memory database.
@@ -5310,10 +5315,18 @@ impl Connection {
         let schema = module.dyn_connect(&arg_refs)?;
         let persistent = module.dyn_persistent();
         let cols = schema.columns;
-        // A persistent module keeps its rows in a backing `<name>_data` regular
-        // table (as SQLite's FTS5/R-Tree shadow tables do). Create it now, reusing
-        // the normal table machinery so it is transactional and integrity-checked.
-        if persistent {
+        // An R-Tree with no auxiliary columns uses SQLite's byte-compatible node
+        // format (`_node`/`_rowid`/`_parent`) so its file round-trips through
+        // sqlite3; an aux-column R-Tree and all other persistent modules keep the
+        // generic `<name>_data` backing table.
+        let rtree_n_coord = (cvt.module.eq_ignore_ascii_case("rtree")
+            || cvt.module.eq_ignore_ascii_case("rtree_i32"))
+        .then(|| crate::vtab::RTreeModule::n_coords(&arg_refs))
+        .filter(|n| cols.len() == 1 + n);
+        if let Some(n_coord) = rtree_n_coord {
+            let integer = cvt.module.eq_ignore_ascii_case("rtree_i32");
+            self.rtree_create_storage(&cvt.name, n_coord, integer)?;
+        } else if persistent {
             let coldefs = cols
                 .iter()
                 .map(|c| sql::print::ident(c))
@@ -5521,6 +5534,52 @@ impl Connection {
             .first()
             .cloned()
             .unwrap_or_else(|| String::from("rowid"));
+        // R-Tree with no aux columns: store in SQLite's byte-compatible node tree.
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let rtree_nc = (module_name.eq_ignore_ascii_case("rtree")
+            || module_name.eq_ignore_ascii_case("rtree_i32"))
+        .then(|| crate::vtab::RTreeModule::n_coords(&arg_refs))
+        .filter(|n| ncols == 1 + n);
+        if let Some(n_coord) = rtree_nc {
+            let integer = module_name.eq_ignore_ascii_case("rtree_i32");
+            let mut existing: alloc::collections::BTreeSet<i64> = self
+                .rtree_entries(&table, n_coord, integer)?
+                .iter()
+                .map(|c| c.key)
+                .collect();
+            let mut next_auto = existing.iter().max().copied().unwrap_or(0) + 1;
+            let mut cells: Vec<RtreeCell> = Vec::new();
+            let mut n = 0;
+            for (rowid, values) in &changes {
+                let rid = rowid
+                    .or(match values.first() {
+                        Some(Value::Integer(i)) => Some(*i),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        let r = next_auto;
+                        next_auto += 1;
+                        r
+                    });
+                if existing.contains(&rid) {
+                    match on_conflict {
+                        OnConflict::Replace => {}
+                        OnConflict::Ignore => continue,
+                        _ => {
+                            return Err(Error::Constraint(format!(
+                                "UNIQUE constraint failed: {table}.{id_col}"
+                            )))
+                        }
+                    }
+                }
+                existing.insert(rid);
+                cells.retain(|c| c.key != rid); // OR REPLACE within this batch
+                cells.push(rtree_cell_from_values(rid, values, n_coord, integer)?);
+                n += 1;
+            }
+            self.rtree_apply(&table, n_coord, integer, cells, &[])?;
+            return Ok(n);
+        }
         self.with_vtab_store(
             &module_name,
             &args,
@@ -5600,6 +5659,17 @@ impl Connection {
                     .ok_or_else(|| Error::Error("virtual-table row has no rowid".into()))?,
             );
         }
+        // R-Tree with no aux columns: rebuild the node tree without the victims.
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let rtree_nc = (module_name.eq_ignore_ascii_case("rtree")
+            || module_name.eq_ignore_ascii_case("rtree_i32"))
+        .then(|| crate::vtab::RTreeModule::n_coords(&arg_refs))
+        .filter(|n| columns.len() == 1 + n);
+        if let Some(n_coord) = rtree_nc {
+            let integer = module_name.eq_ignore_ascii_case("rtree_i32");
+            self.rtree_apply(&del.table, n_coord, integer, Vec::new(), &victims)?;
+            return Ok(victims.len());
+        }
         self.with_vtab_store(
             &module_name,
             &args,
@@ -5663,6 +5733,28 @@ impl Connection {
                 .rowid
                 .ok_or_else(|| Error::Error("virtual-table row has no rowid".into()))?;
             changes.push((rowid, values));
+        }
+        // R-Tree with no aux columns: rebuild the node tree (delete old + insert
+        // new; the `id` column may move the rowid).
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let rtree_nc = (module_name.eq_ignore_ascii_case("rtree")
+            || module_name.eq_ignore_ascii_case("rtree_i32"))
+        .then(|| crate::vtab::RTreeModule::n_coords(&arg_refs))
+        .filter(|n| columns.len() == 1 + n);
+        if let Some(n_coord) = rtree_nc {
+            let integer = module_name.eq_ignore_ascii_case("rtree_i32");
+            let mut deletes = Vec::with_capacity(changes.len());
+            let mut inserts = Vec::with_capacity(changes.len());
+            for (old_rowid, values) in &changes {
+                deletes.push(*old_rowid);
+                let new_rid = match values.first() {
+                    Some(Value::Null) | None => *old_rowid,
+                    Some(v) => eval::to_i64(v),
+                };
+                inserts.push(rtree_cell_from_values(new_rid, values, n_coord, integer)?);
+            }
+            self.rtree_apply(&upd.table, n_coord, integer, inserts, &deletes)?;
+            return Ok(changes.len());
         }
         self.with_vtab_store(
             &module_name,
@@ -6108,17 +6200,20 @@ impl Connection {
 
     fn exec_drop(&mut self, d: &Drop) -> Result<()> {
         use crate::schema::ObjectType;
-        // Dropping a persistent virtual table also drops its `<name>_data` backing
-        // table, as sqlite removes a vtab's shadow tables.
+        // Dropping a persistent virtual table also drops its shadow tables, as
+        // sqlite does: the generic `<name>_data` backing, or an R-Tree's
+        // `_node`/`_rowid`/`_parent` node tables.
         if matches!(d.kind, DropKind::Table) && self.is_virtual_table(&d.name) {
-            let backing = format!("{}_data", d.name);
-            if self.schema.table(&backing).is_some() {
-                self.exec_drop(&Drop {
-                    kind: DropKind::Table,
-                    if_exists: false,
-                    name: backing,
-                    schema: d.schema.clone(),
-                })?;
+            for suffix in ["_data", "_node", "_rowid", "_parent"] {
+                let backing = format!("{}{suffix}", d.name);
+                if self.schema.table(&backing).is_some() {
+                    self.exec_drop(&Drop {
+                        kind: DropKind::Table,
+                        if_exists: false,
+                        name: backing,
+                        schema: d.schema.clone(),
+                    })?;
+                }
             }
         }
         let want = match d.kind {
@@ -6577,14 +6672,17 @@ impl Connection {
                 "there is already another table or index with this name: {new}"
             )));
         }
-        // Rename the persistent backing table first (it is an ordinary table).
-        let backing_old = format!("{old}_data");
-        if self.schema.table(&backing_old).is_some() {
-            self.exec_alter(&Alter {
-                schema: None,
-                table: backing_old,
-                action: AlterAction::RenameTable(format!("{new}_data")),
-            })?;
+        // Rename the persistent shadow tables first (ordinary tables): the
+        // generic `<name>_data`, or an R-Tree's `_node`/`_rowid`/`_parent`.
+        for suffix in ["_data", "_node", "_rowid", "_parent"] {
+            let backing_old = format!("{old}{suffix}");
+            if self.schema.table(&backing_old).is_some() {
+                self.exec_alter(&Alter {
+                    schema: None,
+                    table: backing_old,
+                    action: AlterAction::RenameTable(format!("{new}{suffix}")),
+                })?;
+            }
         }
         let old_s = old.to_string();
         let new_s = new.to_string();
@@ -12622,6 +12720,120 @@ impl Connection {
         Ok(out)
     }
 
+    /// The fixed R-Tree node size for this database's page size.
+    fn rtree_node_size_for(&self, n_coord: usize) -> usize {
+        rtree_node_size(n_coord, self.backend.source().header().page_size as usize)
+    }
+
+    /// The current entries of an R-Tree as `(rowid, coords)` cells (via the M1
+    /// node reader; coords come back as the stored f32/i32 values widened to f64).
+    fn rtree_entries(&self, name: &str, n_coord: usize, integer: bool) -> Result<Vec<RtreeCell>> {
+        Ok(self
+            .scan_rtree_nodes(name, n_coord, integer)?
+            .into_iter()
+            .map(|r| {
+                let key = match r.values.first() {
+                    Some(Value::Integer(i)) => *i,
+                    _ => 0,
+                };
+                let coords = r.values[1..1 + n_coord]
+                    .iter()
+                    .map(|v| match v {
+                        Value::Integer(i) => *i as f64,
+                        Value::Real(f) => *f,
+                        _ => 0.0,
+                    })
+                    .collect();
+                RtreeCell { key, coords }
+            })
+            .collect())
+    }
+
+    /// Replace an R-Tree's three shadow tables with a freshly bulk-built tree.
+    fn rtree_write_build(&mut self, name: &str, build: &RtreeBuild) -> Result<()> {
+        let node_t = sql::print::ident(&format!("{name}_node"));
+        let rowid_t = sql::print::ident(&format!("{name}_rowid"));
+        let parent_t = sql::print::ident(&format!("{name}_parent"));
+        let pv = |vals: Vec<Value>| Params {
+            positional: vals,
+            named: Vec::new(),
+        };
+        self.execute(&format!("DELETE FROM {node_t}"))?;
+        self.execute(&format!("DELETE FROM {rowid_t}"))?;
+        self.execute(&format!("DELETE FROM {parent_t}"))?;
+        for (nodeno, blob) in &build.nodes {
+            self.execute_params(
+                &format!("INSERT INTO {node_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![
+                    Value::Integer(*nodeno),
+                    Value::Blob(blob.clone())
+                ]),
+            )?;
+        }
+        for (rowid, nodeno) in &build.rowids {
+            self.execute_params(
+                &format!("INSERT INTO {rowid_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![Value::Integer(*rowid), Value::Integer(*nodeno)]),
+            )?;
+        }
+        for (child, parent) in &build.parents {
+            self.execute_params(
+                &format!("INSERT INTO {parent_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![Value::Integer(*child), Value::Integer(*parent)]),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Create an R-Tree's storage: the `_node`/`_rowid`/`_parent` shadow tables
+    /// (byte-compatible with SQLite) plus an empty root node.
+    fn rtree_create_storage(&mut self, name: &str, n_coord: usize, integer: bool) -> Result<()> {
+        for (suffix, cols) in [
+            ("_node", "nodeno INTEGER PRIMARY KEY, data"),
+            ("_rowid", "rowid INTEGER PRIMARY KEY, nodeno"),
+            ("_parent", "nodeno INTEGER PRIMARY KEY, parentnode"),
+        ] {
+            let sql = format!(
+                "CREATE TABLE {}({cols})",
+                sql::print::ident(&format!("{name}{suffix}"))
+            );
+            let Statement::CreateTable(ct) = sql::parse_one(&sql)? else {
+                unreachable!("constructed a CREATE TABLE")
+            };
+            self.exec_create_table(&ct, &sql)?;
+        }
+        let build = rtree_bulk_build(
+            Vec::new(),
+            n_coord,
+            integer,
+            self.rtree_node_size_for(n_coord),
+        );
+        self.rtree_write_build(name, &build)
+    }
+
+    /// Apply inserts and/or a delete to an R-Tree by rebuilding its node tree
+    /// (read all entries, apply, bulk-build, rewrite). `inserts` carry coords
+    /// already rounded to the conservative f32/i32 form.
+    fn rtree_apply(
+        &mut self,
+        name: &str,
+        n_coord: usize,
+        integer: bool,
+        inserts: Vec<RtreeCell>,
+        deletes: &[i64],
+    ) -> Result<()> {
+        let mut entries = self.rtree_entries(name, n_coord, integer)?;
+        let removed: alloc::collections::BTreeSet<i64> = deletes
+            .iter()
+            .copied()
+            .chain(inserts.iter().map(|c| c.key))
+            .collect();
+        entries.retain(|c| !removed.contains(&c.key));
+        entries.extend(inserts);
+        let build = rtree_bulk_build(entries, n_coord, integer, self.rtree_node_size_for(n_coord));
+        self.rtree_write_build(name, &build)
+    }
+
     fn scan_table(&self, meta: &TableMeta) -> Result<Vec<(i64, Vec<Value>)>> {
         let encoding = self.backend.source().header().text_encoding;
         let mut rows = Vec::new();
@@ -15412,6 +15624,223 @@ fn find_in_constraint(
         }
         _ => None,
     }
+}
+
+// ─── R-Tree byte-compatible on-disk node format (D3c) ───────────────────────
+//
+// SQLite stores an R-Tree as a b-tree of fixed-size nodes in `<name>_node`
+// (`nodeno INTEGER PRIMARY KEY, data`), with `<name>_rowid` (rowid → leaf nodeno)
+// and `<name>_parent` (node → parent node) maps. A node blob is: 2-byte BE depth
+// (the tree height; meaningful only in the root, nodeno 1, else 0) + 2-byte BE
+// cell count, then cells, zero-padded to the node size. Each cell is an 8-byte BE
+// key (leaf: rowid; interior: child nodeno) followed by `n_coord` 4-byte BE
+// coordinates (f32 for `rtree`, i32 for `rtree_i32`), laid out per dimension as
+// (min, max).
+//
+// graphite reuses its M1 reader to get the current entries, applies the
+// insert/delete, then BULK-REBUILDS a valid tree and rewrites the three shadow
+// tables. SQLite reads any structurally-valid R-Tree (rtreecheck does not require
+// a particular shape), so a simple balanced bulk build is byte-readable without
+// reproducing SQLite's incremental quadratic-split tree shape.
+
+/// One R-Tree entry / cell: an 8-byte key (rowid or child nodeno) and `2*nDim`
+/// coordinates as f64 (exact for both the f32 and i32 on-disk forms).
+#[derive(Clone)]
+struct RtreeCell {
+    key: i64,
+    coords: Vec<f64>,
+}
+
+/// The fixed node size SQLite uses: `min(page_size - 64, 4 + 51*cell_size)`,
+/// `cell_size = 8 + n_coord*4`, `51 = RTREE_MAXCELLS`.
+fn rtree_node_size(n_coord: usize, page_size: usize) -> usize {
+    let cell = 8 + n_coord * 4;
+    page_size.saturating_sub(64).min(4 + 51 * cell)
+}
+
+/// Encode one node to its zero-padded blob. `is_root` puts the tree `depth` in
+/// the header; non-root nodes carry 0 there.
+fn rtree_encode_node(
+    cells: &[RtreeCell],
+    n_coord: usize,
+    is_root: bool,
+    depth: u16,
+    integer: bool,
+    node_size: usize,
+) -> Vec<u8> {
+    let mut b = alloc::vec![0u8; node_size];
+    b[0..2].copy_from_slice(&(if is_root { depth } else { 0 }).to_be_bytes());
+    b[2..4].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+    let cell_size = 8 + n_coord * 4;
+    for (i, c) in cells.iter().enumerate() {
+        let off = 4 + i * cell_size;
+        b[off..off + 8].copy_from_slice(&c.key.to_be_bytes());
+        for (d, &v) in c.coords.iter().enumerate() {
+            let p = off + 8 + d * 4;
+            let bytes = if integer {
+                (v as i32).to_be_bytes()
+            } else {
+                (v as f32).to_be_bytes()
+            };
+            b[p..p + 4].copy_from_slice(&bytes);
+        }
+    }
+    b
+}
+
+/// The bounding box (per-dimension min/max, in coordinate-column order) of a set
+/// of cells: union of their boxes.
+fn rtree_union(cells: &[RtreeCell], n_coord: usize) -> Vec<f64> {
+    let mut bb = alloc::vec![0.0f64; n_coord];
+    for (ci, c) in cells.iter().enumerate() {
+        for (d, slot) in bb.iter_mut().enumerate() {
+            let v = c.coords.get(d).copied().unwrap_or(0.0);
+            if ci == 0 {
+                *slot = v;
+            } else if d % 2 == 0 {
+                *slot = slot.min(v); // a `min` coordinate column
+            } else {
+                *slot = slot.max(v); // a `max` coordinate column
+            }
+        }
+    }
+    bb
+}
+
+/// A bulk-built R-Tree, ready to write to the shadow tables.
+struct RtreeBuild {
+    /// `(nodeno, encoded blob)` for every node.
+    nodes: Vec<(i64, Vec<u8>)>,
+    /// `(rowid, leaf nodeno)` for every entry.
+    rowids: Vec<(i64, i64)>,
+    /// `(child nodeno, parent nodeno)` for every non-root node.
+    parents: Vec<(i64, i64)>,
+}
+
+/// Bulk-build a balanced R-Tree from `entries`. The root is always nodeno 1.
+fn rtree_bulk_build(
+    entries: Vec<RtreeCell>,
+    n_coord: usize,
+    integer: bool,
+    node_size: usize,
+) -> RtreeBuild {
+    let max_cells = ((node_size - 4) / (8 + n_coord * 4)).max(1);
+    // Empty tree: a single empty leaf root.
+    if entries.is_empty() {
+        return RtreeBuild {
+            nodes: alloc::vec![(
+                1,
+                rtree_encode_node(&[], n_coord, true, 0, integer, node_size)
+            )],
+            rowids: Vec::new(),
+            parents: Vec::new(),
+        };
+    }
+    // Build levels bottom-up. A node is its list of cells; an interior cell's key
+    // is a placeholder index into the child level, resolved to a nodeno later.
+    // levels[0] = leaves; cells there carry the real rowid keys.
+    let mut levels: Vec<Vec<Vec<RtreeCell>>> = Vec::new();
+    levels.push(entries.chunks(max_cells).map(<[_]>::to_vec).collect());
+    while levels.last().map_or(0, Vec::len) > 1 {
+        let child_level = levels.len() - 1;
+        let children = &levels[child_level];
+        // Each parent cell summarizes one child: key = child index (placeholder).
+        let parent_cells: Vec<RtreeCell> = (0..children.len())
+            .map(|idx| RtreeCell {
+                key: idx as i64,
+                coords: rtree_union(&children[idx], n_coord),
+            })
+            .collect();
+        levels.push(parent_cells.chunks(max_cells).map(<[_]>::to_vec).collect());
+    }
+    let root_level = levels.len() - 1;
+    let depth = root_level as u16;
+
+    // Assign node numbers: the root (top level, node 0) is 1; everything else
+    // follows. Record nodeno for each (level, node-index).
+    let mut nodeno_of: alloc::collections::BTreeMap<(usize, usize), i64> =
+        alloc::collections::BTreeMap::new();
+    nodeno_of.insert((root_level, 0), 1);
+    let mut next = 2i64;
+    for level in (0..levels.len()).rev() {
+        for idx in 0..levels[level].len() {
+            nodeno_of.entry((level, idx)).or_insert_with(|| {
+                let n = next;
+                next += 1;
+                n
+            });
+        }
+    }
+
+    let mut nodes = Vec::new();
+    let mut rowids = Vec::new();
+    let mut parents = Vec::new();
+    for level in 0..levels.len() {
+        let is_leaf = level == 0;
+        for (idx, cells) in levels[level].iter().enumerate() {
+            let nodeno = nodeno_of[&(level, idx)];
+            let is_root = level == root_level;
+            // Resolve interior placeholder keys to child nodenos, and record the
+            // parent + rowid maps.
+            let resolved: Vec<RtreeCell> = cells
+                .iter()
+                .map(|c| {
+                    if is_leaf {
+                        rowids.push((c.key, nodeno));
+                        c.clone()
+                    } else {
+                        let child = nodeno_of[&(level - 1, c.key as usize)];
+                        parents.push((child, nodeno));
+                        RtreeCell {
+                            key: child,
+                            coords: c.coords.clone(),
+                        }
+                    }
+                })
+                .collect();
+            nodes.push((
+                nodeno,
+                rtree_encode_node(&resolved, n_coord, is_root, depth, integer, node_size),
+            ));
+        }
+    }
+    RtreeBuild {
+        nodes,
+        rowids,
+        parents,
+    }
+}
+
+/// Build a leaf cell from an R-Tree INSERT's column values `[id, c0, c1, …]`,
+/// rounding each coordinate to the conservative f32 form (min columns down, max
+/// columns up — SQLite's rtreeValueDown/Up) or clamping to i32 for `rtree_i32`.
+/// Rejects a coordinate pair with `min > max`, like SQLite.
+fn rtree_cell_from_values(
+    rowid: i64,
+    values: &[Value],
+    n_coord: usize,
+    integer: bool,
+) -> Result<RtreeCell> {
+    for d in 0..n_coord / 2 {
+        let mn = values.get(1 + 2 * d).map_or(0.0, crate::vtab::coord_f64);
+        let mx = values.get(2 + 2 * d).map_or(0.0, crate::vtab::coord_f64);
+        if mn > mx {
+            return Err(Error::Error("rtree constraint failed".into()));
+        }
+    }
+    let coords = (0..n_coord)
+        .map(|d| {
+            let v = values.get(1 + d).map_or(0.0, crate::vtab::coord_f64);
+            if integer {
+                (v as i64).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as f64
+            } else if d % 2 == 0 {
+                crate::vtab::round_min_f32(v)
+            } else {
+                crate::vtab::round_max_f32(v)
+            }
+        })
+        .collect();
+    Ok(RtreeCell { key: rowid, coords })
 }
 
 /// Whether `e` is a `rowid` / `_rowid_` / `oid` reference (case-insensitive,

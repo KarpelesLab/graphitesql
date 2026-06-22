@@ -90,16 +90,21 @@ fn rejects_min_greater_than_max_and_bad_arity() {
 }
 
 #[test]
-fn rows_persist_in_the_backing_table() {
+fn rows_persist_in_the_node_store() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE r USING rtree(id, a, b)")
         .unwrap();
     c.execute("INSERT INTO r VALUES (7, 1, 2)").unwrap();
-    // The persistent backing table really holds the row.
+    // The row round-trips through the persistent node store, and the storage is
+    // SQLite's byte-compatible `_node`/`_rowid`/`_parent` shadow tables (not the
+    // generic `_data` backing).
     assert_eq!(
-        rows(&c, "SELECT id, a, b FROM r_data"),
+        rows(&c, "SELECT id, a, b FROM r"),
         [vec![Value::Integer(7), Value::Real(1.0), Value::Real(2.0)]]
     );
+    assert!(c.query("SELECT data FROM r_node WHERE nodeno=1").is_ok());
+    assert!(c.query("SELECT nodeno FROM r_rowid WHERE rowid=7").is_ok());
+    assert!(c.query("SELECT * FROM r_data").is_err());
 }
 
 #[test]
@@ -115,8 +120,8 @@ fn alter_and_index_on_a_virtual_table() {
     assert!(c.execute("ALTER TABLE r ADD COLUMN z").is_err());
     assert!(c.execute("CREATE INDEX i ON r(a)").is_err());
 
-    // RENAME works: the vtab and its `<name>_data` backing table are both renamed,
-    // and the rows survive.
+    // RENAME works: the vtab and its node shadow tables are all renamed, and the
+    // rows survive.
     c.execute("ALTER TABLE r RENAME TO r2").unwrap();
     assert_eq!(
         c.query("SELECT id, a, b FROM r2 ORDER BY id").unwrap().rows,
@@ -125,9 +130,10 @@ fn alter_and_index_on_a_virtual_table() {
             vec![Value::Integer(2), Value::Real(10.0), Value::Real(15.0)],
         ]
     );
-    // The old name is gone; the backing table moved too.
+    // The old name is gone; the shadow tables moved too.
     assert!(c.query("SELECT * FROM r").is_err());
-    assert!(c.query("SELECT * FROM r2_data").is_ok());
+    assert!(c.query("SELECT * FROM r2_node").is_ok());
+    assert!(c.query("SELECT * FROM r_node").is_err());
 }
 
 #[test]
@@ -136,11 +142,12 @@ fn drop_removes_the_backing_table() {
     c.execute("CREATE VIRTUAL TABLE r USING rtree(id, a, b)")
         .unwrap();
     c.execute("INSERT INTO r VALUES (1, 0, 5)").unwrap();
-    assert!(c.query("SELECT * FROM r_data").is_ok());
+    assert!(c.query("SELECT * FROM r_node").is_ok());
     c.execute("DROP TABLE r").unwrap();
-    // Both the vtab and its backing table are gone.
+    // Both the vtab and its shadow tables are gone.
     assert!(c.query("SELECT * FROM r").is_err());
-    assert!(c.query("SELECT * FROM r_data").is_err());
+    assert!(c.query("SELECT * FROM r_node").is_err());
+    assert!(c.query("SELECT * FROM r_rowid").is_err());
     assert_eq!(
         c.query("SELECT count(*) FROM sqlite_master").unwrap().rows[0][0],
         Value::Integer(0)
@@ -477,6 +484,60 @@ fn reads_sqlite_written_rtree_i32_node_format() {
     assert_eq!(
         r.rows[1],
         vec![Value::Integer(2), Value::Integer(10), Value::Integer(20)]
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── D3c (M2): graphite WRITES the byte-compatible R-Tree node format ─────────
+
+/// A graphite-written R-Tree (no aux columns) now uses SQLite's node format, so
+/// sqlite3 reads it with `rtreecheck` / `integrity_check` ok and correct queries
+/// — across inserts that force a multi-level tree, plus delete and update.
+#[test]
+fn graphite_written_rtree_is_read_by_sqlite3() {
+    use std::process::Command;
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-rtree-m2-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE VIRTUAL TABLE rt USING rtree(id, minx, maxx, miny, maxy)")
+            .unwrap();
+        // A single multi-row INSERT of >51 entries (one rebuild) forces a
+        // multi-level node tree (interior root + several leaves).
+        let vals = (0..150)
+            .map(|i| format!("({i},{}.0,{}.0,{}.0,{}.0)", i, i + 1, i * 2, i * 2 + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        c.execute(&format!("INSERT INTO rt VALUES {vals}")).unwrap();
+        c.execute("DELETE FROM rt WHERE id=77").unwrap();
+        c.execute("UPDATE rt SET maxx=999 WHERE id=12").unwrap();
+    }
+    let chk = |q: &str| {
+        let o = Command::new("sqlite3").arg(&path).arg(q).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    assert_eq!(chk("SELECT rtreecheck('rt')"), "ok", "rtreecheck");
+    assert_eq!(chk("PRAGMA integrity_check"), "ok");
+    assert_eq!(chk("SELECT count(*) FROM rt"), "149");
+    assert_eq!(chk("SELECT id FROM rt WHERE id=77"), "");
+    assert_eq!(chk("SELECT maxx FROM rt WHERE id=12"), "999.0");
+    assert_eq!(
+        chk("SELECT group_concat(id) FROM (SELECT id FROM rt WHERE minx>=40 AND minx<=43 ORDER BY id)"),
+        "40,41,42,43"
+    );
+    // The file uses sqlite's three shadow tables, with no `_data`.
+    assert_eq!(
+        chk("SELECT count(*) FROM sqlite_master WHERE name IN('rt_node','rt_rowid','rt_parent')"),
+        "3"
+    );
+    assert_eq!(
+        chk("SELECT count(*) FROM sqlite_master WHERE name='rt_data'"),
+        "0"
     );
     let _ = std::fs::remove_file(&path);
 }

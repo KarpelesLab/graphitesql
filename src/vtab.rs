@@ -983,7 +983,7 @@ fn rtree_i64(v: &Value) -> i64 {
 }
 
 /// The raw numeric value of a coordinate expression.
-fn coord_f64(v: &Value) -> f64 {
+pub(crate) fn coord_f64(v: &Value) -> f64 {
     match v {
         Value::Integer(i) => *i as f64,
         Value::Real(r) => *r,
@@ -999,7 +999,7 @@ const RTREE_RND_AWAY: f64 = 1.0 + 1.0 / 8388608.0;
 /// A *minimum* coordinate, rounded to a 32-bit float **not greater** than it
 /// (toward −∞) so the stored box never excludes the true point — byte-for-byte
 /// SQLite's `rtreeValueDown` (nudge the magnitude before the f32 cast).
-fn round_min_f32(d: f64) -> f64 {
+pub(crate) fn round_min_f32(d: f64) -> f64 {
     let f = d as f32;
     let f = if f64::from(f) > d {
         (d * if d < 0.0 {
@@ -1015,7 +1015,7 @@ fn round_min_f32(d: f64) -> f64 {
 
 /// A *maximum* coordinate, rounded to a 32-bit float **not less** than it (toward
 /// +∞) — SQLite's `rtreeValueUp`.
-fn round_max_f32(d: f64) -> f64 {
+pub(crate) fn round_max_f32(d: f64) -> f64 {
     let f = d as f32;
     let f = if f64::from(f) < d {
         (d * if d < 0.0 {
