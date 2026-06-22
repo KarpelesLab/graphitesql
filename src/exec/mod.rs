@@ -5747,6 +5747,25 @@ impl Connection {
         // scan that directly (run_core re-applies the full WHERE, so the rows are
         // a valid superset). Computed modules go through the cursor path below.
         if module.dyn_persistent() {
+            // An R-Tree written by SQLite keeps its entries in the `<name>_node`
+            // b-tree of nodes (byte-compatible on-disk format), not graphite's
+            // generic `<name>_data` backing table. Read the node tree directly so
+            // graphite can query a sqlite-written R-Tree. (No-aux R-Trees only;
+            // aux columns live in `<name>_rowid` — handled when graphite also
+            // writes the node format.)
+            let rtree = cvt.module.eq_ignore_ascii_case("rtree")
+                || cvt.module.eq_ignore_ascii_case("rtree_i32");
+            if rtree
+                && self.schema.table(&format!("{name}_node")).is_some()
+                && self.schema.table(&format!("{name}_data")).is_none()
+            {
+                let n_coords = crate::vtab::RTreeModule::n_coords(&arg_refs);
+                if columns.len() == 1 + n_coords {
+                    let integer = cvt.module.eq_ignore_ascii_case("rtree_i32");
+                    let rows = self.scan_rtree_nodes(name, n_coords, integer)?;
+                    return Ok(Some((columns, rows)));
+                }
+            }
             let backing = format!("{name}_data");
             let bmeta = self.table_meta(&backing, None)?;
             let rows = self
@@ -12526,6 +12545,81 @@ impl Connection {
             }
         }
         Ok((columns, rows))
+    }
+
+    /// Read a SQLite-format R-Tree's entries by walking its `<name>_node` b-tree
+    /// of nodes. Each node blob is a 2-byte BE depth (meaningful in the root) +
+    /// 2-byte BE cell count, then cells of an 8-byte BE rowid (leaf) / child
+    /// node-number (interior) followed by `n_coords` 4-byte BE coordinates (f32
+    /// for `rtree`, i32 for `rtree_i32`). Yields one `InputRow` per leaf entry:
+    /// `[id, coord0, …]`. The traversal collects a superset; `run_core` re-applies
+    /// the full WHERE.
+    fn scan_rtree_nodes(
+        &self,
+        name: &str,
+        n_coords: usize,
+        integer: bool,
+    ) -> Result<Vec<InputRow>> {
+        use alloc::collections::BTreeMap;
+        let node_meta = self.table_meta(&format!("{name}_node"), None)?;
+        let mut nodes: BTreeMap<i64, Vec<u8>> = BTreeMap::new();
+        for (nodeno, vals) in self.scan_table(&node_meta)? {
+            // `<name>_node` is `(nodeno INTEGER PRIMARY KEY, data)`; the blob is
+            // the `data` column (the first value is the rowid/nodeno itself).
+            if let Some(Value::Blob(b)) = vals.into_iter().find(|v| matches!(v, Value::Blob(_))) {
+                nodes.insert(nodeno, b);
+            }
+        }
+        let cell_size = 8 + n_coords * 4;
+        let mut out = Vec::new();
+        let Some(root) = nodes.get(&1) else {
+            return Ok(out);
+        };
+        if root.len() < 4 {
+            return Ok(out);
+        }
+        // The root header's depth field is the tree height; descend that many
+        // levels to reach the leaves.
+        let depth = i64::from(u16::from_be_bytes([root[0], root[1]]));
+        let mut stack: Vec<(i64, i64)> = alloc::vec![(1, depth)];
+        while let Some((nodeno, level)) = stack.pop() {
+            let Some(blob) = nodes.get(&nodeno) else {
+                continue;
+            };
+            if blob.len() < 4 {
+                continue;
+            }
+            let ncell = u16::from_be_bytes([blob[2], blob[3]]) as usize;
+            for i in 0..ncell {
+                let off = 4 + i * cell_size;
+                if off + cell_size > blob.len() {
+                    break;
+                }
+                let key = i64::from_be_bytes(blob[off..off + 8].try_into().expect("8 bytes"));
+                if level > 0 {
+                    // Interior cell: the 8-byte field is a child node number.
+                    stack.push((key, level - 1));
+                    continue;
+                }
+                // Leaf cell: the 8-byte field is the entry's rowid.
+                let mut row = Vec::with_capacity(1 + n_coords);
+                row.push(Value::Integer(key));
+                for c in 0..n_coords {
+                    let p = off + 8 + c * 4;
+                    let b: [u8; 4] = blob[p..p + 4].try_into().expect("4 bytes");
+                    row.push(if integer {
+                        Value::Integer(i64::from(i32::from_be_bytes(b)))
+                    } else {
+                        Value::Real(f64::from(f32::from_be_bytes(b)))
+                    });
+                }
+                out.push(InputRow {
+                    values: row,
+                    rowid: Some(key),
+                });
+            }
+        }
+        Ok(out)
     }
 
     fn scan_table(&self, meta: &TableMeta) -> Result<Vec<(i64, Vec<Value>)>> {

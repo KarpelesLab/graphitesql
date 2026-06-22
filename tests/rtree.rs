@@ -352,3 +352,131 @@ fn duplicate_id_is_rejected() {
         [vec![Value::Integer(2)]]
     );
 }
+
+// ── D3c (M1): read SQLite's byte-compatible R-Tree on-disk format ────────────
+
+/// graphite reads an R-Tree written by `sqlite3` in its native `<name>_node` /
+/// `_rowid` / `_parent` shadow-table format (a b-tree of nodes), not graphite's
+/// own `<name>_data` storage — so a sqlite-written R-Tree queries correctly.
+#[test]
+fn reads_sqlite_written_rtree_node_format() {
+    use std::process::Command;
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-rtree-d3c-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+
+    // Enough rows to force a multi-level node tree (interior nodes).
+    let mut script =
+        String::from("CREATE VIRTUAL TABLE rt USING rtree(id, minx, maxx, miny, maxy);");
+    for i in 0..250 {
+        script.push_str(&format!(
+            "INSERT INTO rt VALUES({i},{}.5,{}.5,{}.0,{}.0);",
+            i,
+            i + 1,
+            i * 2,
+            i * 2 + 1
+        ));
+    }
+    let o = Command::new("sqlite3")
+        .arg(&path)
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "sqlite build failed: {o:?}");
+
+    let c = Connection::open(&path).unwrap();
+    // The shadow tables are sqlite's, not graphite's `_data`.
+    assert!(
+        c.query("SELECT 1 FROM sqlite_master WHERE name='rt_node'")
+            .unwrap()
+            .rows
+            .len()
+            == 1
+    );
+    assert!(c
+        .query("SELECT 1 FROM sqlite_master WHERE name='rt_data'")
+        .unwrap()
+        .rows
+        .is_empty());
+
+    let sqlite = |q: &str| {
+        let o = Command::new("sqlite3").arg(&path).arg(q).output().unwrap();
+        let mut v: Vec<String> = String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v.join("~")
+    };
+    let graph = |q: &str| {
+        let mut v: Vec<String> = c
+            .query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|x| match x {
+                        Value::Integer(i) => i.to_string(),
+                        Value::Real(f) => graphitesql::exec::eval::format_real(*f),
+                        Value::Null => String::new(),
+                        Value::Text(s) => s.clone(),
+                        Value::Blob(_) => "b".into(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        v.sort();
+        v.join("~")
+    };
+    for q in [
+        "SELECT count(*) FROM rt",
+        "SELECT id FROM rt WHERE minx>=100 AND minx<105 ORDER BY id",
+        "SELECT id, minx, maxx, miny, maxy FROM rt WHERE id=137",
+        "SELECT max(maxx), min(minx) FROM rt",
+        "SELECT id FROM rt WHERE minx<2 ORDER BY id",
+    ] {
+        assert_eq!(graph(q), sqlite(q), "diverged: {q}");
+    }
+    // graphite reads it as a valid database.
+    assert_eq!(
+        c.query("PRAGMA integrity_check").unwrap().rows[0][0],
+        Value::Text("ok".into())
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn reads_sqlite_written_rtree_i32_node_format() {
+    use std::process::Command;
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-rtreei32-d3c-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let o = Command::new("sqlite3")
+        .arg(&path)
+        .arg("CREATE VIRTUAL TABLE ri USING rtree_i32(id, x0, x1); INSERT INTO ri VALUES(1,-5,5),(2,10,20),(3,0,1);")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    let c = Connection::open(&path).unwrap();
+    let r = c.query("SELECT id, x0, x1 FROM ri ORDER BY id").unwrap();
+    assert_eq!(r.rows.len(), 3);
+    assert_eq!(
+        r.rows[0],
+        vec![Value::Integer(1), Value::Integer(-5), Value::Integer(5)]
+    );
+    assert_eq!(
+        r.rows[1],
+        vec![Value::Integer(2), Value::Integer(10), Value::Integer(20)]
+    );
+    let _ = std::fs::remove_file(&path);
+}

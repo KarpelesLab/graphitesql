@@ -1033,7 +1033,7 @@ impl RTreeModule {
     /// The number of coordinate columns declared by a `USING rtree(…)` arg list:
     /// the id is column 0, the coordinates follow, and any trailing `+name`
     /// columns are auxiliary (non-spatial) data. Returns the coordinate count.
-    fn n_coords(args: &[&str]) -> usize {
+    pub(crate) fn n_coords(args: &[&str]) -> usize {
         let aux_start = args
             .iter()
             .skip(1)
