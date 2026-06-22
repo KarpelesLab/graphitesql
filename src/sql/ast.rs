@@ -524,8 +524,8 @@ pub enum ColumnConstraint {
         /// The declared `ON CONFLICT <action>` for this key (default `Abort`).
         on_conflict: OnConflict,
     },
-    /// `NOT NULL`.
-    NotNull,
+    /// `NOT NULL [ON CONFLICT <action>]`; the action defaults to `Abort`.
+    NotNull(OnConflict),
     /// `UNIQUE [ON CONFLICT <action>]`; the action defaults to `Abort`.
     Unique(OnConflict),
     /// `DEFAULT <expr>`.

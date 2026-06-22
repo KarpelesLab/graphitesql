@@ -1517,8 +1517,8 @@ impl Parser {
                 });
             } else if self.eat_kw("not") {
                 self.expect_kw("null")?;
-                self.eat_conflict_clause();
-                constraints.push(ColumnConstraint::NotNull);
+                let on_conflict = self.eat_conflict_clause();
+                constraints.push(ColumnConstraint::NotNull(on_conflict));
             } else if self.eat_kw("null") {
                 // A bare NULL (explicitly nullable): no constraint to record.
             } else if self.eat_kw("unique") {
@@ -2865,7 +2865,7 @@ mod tests {
         assert!(ct.columns[2]
             .constraints
             .iter()
-            .any(|c| matches!(c, ColumnConstraint::NotNull)));
+            .any(|c| matches!(c, ColumnConstraint::NotNull(_))));
         // The column-level REFERENCES on `pid` is captured with its action.
         let pid_fk = ct.columns[1]
             .constraints

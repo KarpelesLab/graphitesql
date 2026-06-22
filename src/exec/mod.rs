@@ -833,7 +833,7 @@ impl Connection {
             let notnull = col
                 .constraints
                 .iter()
-                .any(|c| matches!(c, ColumnConstraint::NotNull));
+                .any(|c| matches!(c, ColumnConstraint::NotNull(_)));
             // `dflt_value` is the SQL text of the default expression (SQLite
             // preserves the literal as written — e.g. a string keeps its quotes,
             // `DEFAULT NULL` shows `NULL`), so reprint rather than evaluate it.
@@ -1805,6 +1805,56 @@ impl Connection {
             _ => {}
         }
         Error::Constraint(String::from(msg))
+    }
+
+    /// Resolve `NOT NULL` violations for an INSERT/UPDATE row under its conflict
+    /// mode, mutating `values` as needed. For each `NOT NULL` column that is NULL,
+    /// the effective action is the statement's `OR <action>` (when it wrote one)
+    /// else the column's declared `ON CONFLICT` action: `REPLACE` substitutes the
+    /// column's DEFAULT (erroring if there is none, like SQLite), `IGNORE` skips
+    /// the whole row (returns `Ok(false)`), and `ABORT`/`FAIL`/`ROLLBACK` error
+    /// with the action's rollback semantics. `Ok(true)` means the row may proceed.
+    fn resolve_not_null(
+        &self,
+        meta: &TableMeta,
+        values: &mut [Value],
+        stmt_oc: OnConflict,
+        stmt_explicit: bool,
+        params: &Params,
+    ) -> Result<bool> {
+        for (i, slot) in values.iter_mut().enumerate() {
+            if !matches!(slot, Value::Null) {
+                continue;
+            }
+            let Some(col_oc) = meta.not_null[i] else {
+                continue;
+            };
+            let oc = if stmt_explicit { stmt_oc } else { col_oc };
+            let fail = || {
+                let msg = format!(
+                    "NOT NULL constraint failed: {}.{}",
+                    meta.columns[i].table, meta.columns[i].name
+                );
+                self.conflict_error(oc, &msg)
+            };
+            match oc {
+                OnConflict::Ignore => return Ok(false),
+                OnConflict::Replace => {
+                    // Substitute the column's DEFAULT; a missing or NULL default
+                    // leaves the violation, which then errors.
+                    let v = match &meta.defaults[i] {
+                        Some(e) => eval::eval(e, &EvalCtx::rowless(params)).unwrap_or(Value::Null),
+                        None => Value::Null,
+                    };
+                    if matches!(v, Value::Null) {
+                        return Err(fail());
+                    }
+                    *slot = v;
+                }
+                _ => return Err(fail()),
+            }
+        }
+        Ok(true)
     }
 
     fn run_dml_atomic(&mut self, stmt: Statement, params: &Params) -> Result<usize> {
@@ -3577,8 +3627,20 @@ impl Connection {
             // skips a row that violates any of these (rather than failing the
             // statement); every other conflict policy lets the error propagate.
             {
-                let r = check_not_null(&meta, &values)
-                    .and_then(|()| self.check_strict_types(&meta, &values))
+                // NOT NULL honors the column's (or statement's) ON CONFLICT action;
+                // a skipped row (IGNORE) drops out here, a REPLACE substitutes the
+                // column default into `values`.
+                if !self.resolve_not_null(
+                    &meta,
+                    &mut values,
+                    ins.on_conflict,
+                    ins.on_conflict_explicit,
+                    params,
+                )? {
+                    continue;
+                }
+                let r = self
+                    .check_strict_types(&meta, &values)
                     .and_then(|()| self.check_constraints(&meta, &values, Some(rowid), params));
                 match r {
                     Ok(()) => {}
@@ -4457,8 +4519,17 @@ impl Connection {
             // NOT NULL / CHECK / STRICT-type constraints. `UPDATE OR IGNORE` skips
             // a row that violates one rather than failing the statement.
             {
-                let r = check_not_null(&meta, &values)
-                    .and_then(|()| self.check_strict_types(&meta, &values))
+                if !self.resolve_not_null(
+                    &meta,
+                    &mut values,
+                    upd.on_conflict,
+                    upd.on_conflict_explicit,
+                    params,
+                )? {
+                    continue;
+                }
+                let r = self
+                    .check_strict_types(&meta, &values)
                     .and_then(|()| self.check_constraints(&meta, &values, Some(rowid), params));
                 match r {
                     Ok(()) => {}
@@ -5665,7 +5736,7 @@ impl Connection {
                 let not_null = cd
                     .constraints
                     .iter()
-                    .any(|k| matches!(k, ColumnConstraint::NotNull));
+                    .any(|k| matches!(k, ColumnConstraint::NotNull(_)));
                 if not_null {
                     let default = cd.constraints.iter().find_map(|k| match k {
                         ColumnConstraint::Default(e) => Some(e),
@@ -12330,16 +12401,20 @@ impl Connection {
         } else {
             find_integer_primary_key(&ct)
         };
-        let not_null: Vec<bool> = ct
+        // `None` = nullable; `Some(action)` = NOT NULL with that conflict action.
+        let not_null: Vec<Option<OnConflict>> = ct
             .columns
             .iter()
             .enumerate()
             .map(|(i, c)| {
                 // The INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
-                Some(i) == ipk
-                    || c.constraints
-                        .iter()
-                        .any(|k| matches!(k, ColumnConstraint::NotNull))
+                if Some(i) == ipk {
+                    return Some(OnConflict::Abort);
+                }
+                c.constraints.iter().find_map(|k| match k {
+                    ColumnConstraint::NotNull(oc) => Some(*oc),
+                    _ => None,
+                })
             })
             .collect();
         // Generated columns: `… AS (expr) [STORED|VIRTUAL]`.
@@ -12500,7 +12575,8 @@ struct TableMeta {
     /// Per-column `DEFAULT` expression, if declared (aligned with `columns`).
     defaults: Vec<Option<Expr>>,
     /// Per-column `NOT NULL` flag (aligned with `columns`).
-    not_null: Vec<bool>,
+    /// `None` = nullable; `Some(action)` = `NOT NULL` with its `ON CONFLICT` action.
+    not_null: Vec<Option<OnConflict>>,
     /// CHECK constraint expressions (column-level and table-level).
     /// CHECK constraints with their error-message label (name or source text).
     checks: Vec<(Expr, Option<String>)>,
@@ -12686,7 +12762,7 @@ fn schema_table_meta(label: &str) -> TableMeta {
         root: crate::schema::SCHEMA_ROOT_PAGE,
         columns,
         defaults: alloc::vec![None; n],
-        not_null: alloc::vec![false; n],
+        not_null: alloc::vec![None; n],
         checks: Vec::new(),
         unique: Vec::new(),
         ipk: None,
@@ -14328,7 +14404,7 @@ fn apply_column_affinity(meta: &TableMeta, values: &mut [Value]) {
 /// Enforce declared `NOT NULL` column constraints over a fully-built row.
 fn check_not_null(meta: &TableMeta, values: &[Value]) -> Result<()> {
     for (i, v) in values.iter().enumerate() {
-        if meta.not_null[i] && matches!(v, Value::Null) {
+        if meta.not_null[i].is_some() && matches!(v, Value::Null) {
             return Err(Error::Constraint(format!(
                 "NOT NULL constraint failed: {}.{}",
                 meta.columns[i].table, meta.columns[i].name

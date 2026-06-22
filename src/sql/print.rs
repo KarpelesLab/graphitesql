@@ -109,7 +109,7 @@ fn column_constraint(c: &ColumnConstraint) -> String {
             }
             s
         }
-        ColumnConstraint::NotNull => "NOT NULL".to_string(),
+        ColumnConstraint::NotNull(oc) => format!("NOT NULL{}", conflict_suffix(oc)),
         ColumnConstraint::Unique(oc) => format!("UNIQUE{}", conflict_suffix(oc)),
         ColumnConstraint::Default(e) => format!("DEFAULT {}", expr(e)),
         ColumnConstraint::Collate(n) => format!("COLLATE {n}"),

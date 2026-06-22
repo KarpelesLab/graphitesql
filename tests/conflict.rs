@@ -49,3 +49,38 @@ fn constraint_level_on_conflict_action() {
         )]]
     );
 }
+
+#[test]
+fn not_null_on_conflict_action() {
+    // A NOT NULL column's `ON CONFLICT` action resolves a NULL write: IGNORE skips
+    // the row, REPLACE substitutes the column DEFAULT (erroring if there is none),
+    // byte-for-byte like sqlite3.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a NOT NULL ON CONFLICT IGNORE, b)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES(NULL,'x'),(1,'y')").unwrap(); // NULL row skipped
+    assert_eq!(
+        rows(&c, "SELECT a,b FROM t"),
+        [vec![Value::Integer(1), Value::Text("y".into())]]
+    );
+
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a NOT NULL ON CONFLICT REPLACE DEFAULT 9, b)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES(NULL,'x')").unwrap(); // NULL → DEFAULT 9
+    assert_eq!(rows(&c, "SELECT a FROM t"), [vec![Value::Integer(9)]]);
+    // UPDATE to NULL likewise substitutes the default.
+    c.execute("UPDATE t SET a=NULL").unwrap();
+    assert_eq!(rows(&c, "SELECT a FROM t"), [vec![Value::Integer(9)]]);
+
+    // REPLACE without a default still fails (NOT NULL cannot be satisfied).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a NOT NULL ON CONFLICT REPLACE, b)")
+        .unwrap();
+    assert!(c.execute("INSERT INTO t VALUES(NULL,'x')").is_err());
+    // A statement-level OR overrides the constraint's IGNORE.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a NOT NULL ON CONFLICT IGNORE)")
+        .unwrap();
+    assert!(c.execute("INSERT OR ABORT INTO t VALUES(NULL)").is_err());
+}
