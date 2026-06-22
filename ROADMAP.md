@@ -247,7 +247,14 @@ WHERE a.x=b.y` planned like an explicit `JOIN … ON`); **B0** index-driven
 covering index); and the VDBE spike (`exec::vdbe`) covering constant projections,
 single-table scan + `WHERE`/`ORDER BY`/`DISTINCT`/`LIMIT`, whole-table aggregates,
 single-table `GROUP BY`, and grouped `HAVING` + aggregate `ORDER BY` (**B6**) —
-all matching the tree-walker via `query_vdbe`.
+all matching the tree-walker via `query_vdbe`. The spike's scalar-expression
+compiler now spans literals (incl. blobs), arithmetic, concatenation,
+comparison + three-valued boolean logic, `IS`/`IS NOT`, the bitwise operators
+(`& | << >> ~`), unary `+`/`-`/`NOT`, `IS NULL`, `CASE`, `CAST`, `BETWEEN`,
+`LIKE`/`GLOB`, `IN (list)`, and the `->`/`->>` JSON operators (its binary-op
+match is now exhaustive); scalar **function calls** remain the next slice
+(blocked on a value-level dispatch — today's `eval_scalar` takes `Expr` + a row
+context).
 
 **Remaining optimizer pieces** *(perf-only — results already correct; acceptance:
 the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep):*
