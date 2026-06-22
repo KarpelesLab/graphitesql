@@ -154,6 +154,27 @@ fn match_queries_tokens() {
 }
 
 #[test]
+fn rebuild_and_optimize_commands_are_noops() {
+    // FTS5's table-named hidden column accepts maintenance commands; for graphite's
+    // scan-based index `rebuild`/`optimize` change nothing and insert no row,
+    // matching sqlite3's success-with-no-change.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(x)").unwrap();
+    c.execute("INSERT INTO t VALUES('alpha'),('beta')").unwrap();
+    c.execute("INSERT INTO t(t) VALUES('rebuild')").unwrap();
+    c.execute("INSERT INTO t(t) VALUES('optimize')").unwrap();
+    assert_eq!(
+        rows(&c, "SELECT count(*) FROM t"),
+        [vec![Value::Integer(2)]]
+    );
+    // The documents are still searchable after the no-op commands.
+    assert_eq!(
+        rows(&c, "SELECT rowid FROM t WHERE t MATCH 'alpha'"),
+        [vec![Value::Integer(1)]]
+    );
+}
+
+#[test]
 fn unindexed_columns_are_not_searched() {
     // A column declared `UNINDEXED` is stored and retrievable but excluded from
     // the full-text index — matching, `bm25()`, `highlight()`, and `snippet()` all

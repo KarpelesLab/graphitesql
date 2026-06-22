@@ -4862,6 +4862,32 @@ impl Connection {
         let (module_name, args, schema) = self.vtab_meta(&ins.table)?;
         let col_names = schema.columns;
         let ncols = col_names.len();
+        // FTS5 exposes a hidden column named after the table that accepts special
+        // commands: `INSERT INTO t(t) VALUES('rebuild'|'optimize')` issues a
+        // maintenance command rather than inserting a row. graphite's `fts5` index
+        // is scan-based, so `rebuild` and `optimize` are no-ops (there is no
+        // separate index to rebuild); other commands fall through to the usual
+        // column resolution (and its "no such column" error), matching SQLite,
+        // which rejects `delete`/`delete-all` on an ordinary content table.
+        #[cfg(feature = "fts5")]
+        if module_name.eq_ignore_ascii_case("fts5")
+            && ins.columns.len() == 1
+            && ins.columns[0].eq_ignore_ascii_case(&ins.table)
+        {
+            let commands = rows
+                .iter()
+                .map(|row| {
+                    let ctx = EvalCtx::rowless(params).with_subqueries(self);
+                    Ok(eval::to_text(&eval::eval(&row[0], &ctx)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if commands
+                .iter()
+                .all(|c| matches!(c.as_str(), "rebuild" | "optimize"))
+            {
+                return Ok(0);
+            }
+        }
         // Map the (possibly explicit) column list onto declared column positions.
         // `None` marks a `rowid`/`_rowid_`/`oid` term (a vtab's hidden rowid),
         // whose value becomes the inserted row's explicit rowid.
