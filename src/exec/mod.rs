@@ -1076,7 +1076,7 @@ impl Connection {
                     // KEY's, otherwise a plain UNIQUE (`u`).
                     let cols = autoindex_number(&obj.name, &table)
                         .and_then(|n| tmeta.as_ref().and_then(|m| m.unique.get(n - 1)))
-                        .cloned()
+                        .map(|s| s.0.clone())
                         .unwrap_or_default();
                     let origin = if !pk_set.is_empty() && cols == pk_set {
                         "pk"
@@ -1138,7 +1138,8 @@ impl Connection {
                 _ => Vec::new(),
             },
             None => autoindex_number(&obj.name, &obj.tbl_name)
-                .and_then(|n| tmeta.unique.get(n - 1).cloned())
+                .and_then(|n| tmeta.unique.get(n - 1))
+                .map(|s| s.0.clone())
                 .unwrap_or_default(),
         };
         let mut rows = Vec::new();
@@ -2327,7 +2328,7 @@ impl Connection {
             .count()
             + ct.constraints
                 .iter()
-                .filter(|tc| matches!(tc, TableConstraint::PrimaryKey(_)))
+                .filter(|tc| matches!(tc, TableConstraint::PrimaryKey(..)))
                 .count();
         if pk_count > 1 {
             return Err(Error::Error(alloc::format!(
@@ -2338,7 +2339,7 @@ impl Connection {
         // Table-level PRIMARY KEY/UNIQUE column lists must name real columns.
         for tc in &ct.constraints {
             let cols = match tc {
-                TableConstraint::PrimaryKey(cols) | TableConstraint::Unique(cols) => cols,
+                TableConstraint::PrimaryKey(cols, _) | TableConstraint::Unique(cols, _) => cols,
                 _ => continue,
             };
             for name in cols {
@@ -2417,7 +2418,7 @@ impl Connection {
             Vec::new()
         };
         let mut schema_rowid = next + 1;
-        for (n, set) in unique.iter().enumerate() {
+        for (n, (set, _)) in unique.iter().enumerate() {
             // The clustered PRIMARY KEY of a WITHOUT ROWID table gets no b-tree.
             if ct.without_rowid && *set == pk {
                 continue;
@@ -2494,6 +2495,8 @@ impl Connection {
                 columns: Vec::new(),
                 source: InsertSource::Values(value_rows),
                 on_conflict: OnConflict::Abort,
+                // A VACUUM re-insert of already-valid rows keeps the plain default.
+                on_conflict_explicit: true,
                 upsert: Vec::new(),
                 returning: Vec::new(),
             };
@@ -2638,7 +2641,7 @@ impl Connection {
             }
         }
         for c in &ct.constraints {
-            if let TableConstraint::PrimaryKey(cols) = c {
+            if let TableConstraint::PrimaryKey(cols, _) = c {
                 return Ok(cols.clone());
             }
         }
@@ -3589,7 +3592,15 @@ impl Connection {
             self.check_fk_child(&ins.table, &meta, &values)?;
 
             // Resolve UNIQUE / PRIMARY KEY (incl. rowid) conflicts.
-            let conflicts = self.find_conflicts(&ins.table, &meta, rowid, &values, None, params)?;
+            let (conflicts, constraint_oc) =
+                self.find_conflicts(&ins.table, &meta, rowid, &values, None, params)?;
+            // A statement-level `OR <action>` overrides the constraint's declared
+            // `ON CONFLICT <action>`; a plain `INSERT` uses the constraint's action.
+            let effective_oc = if ins.on_conflict_explicit {
+                ins.on_conflict
+            } else {
+                constraint_oc
+            };
             if !conflicts.is_empty() {
                 // An `ON CONFLICT … DO …` upsert clause intercepts the conflict,
                 // but only when the conflict is on the index it targets (a bare
@@ -3627,7 +3638,7 @@ impl Connection {
                         }
                     }
                 }
-                match ins.on_conflict {
+                match effective_oc {
                     oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
                         let m = self.unique_violation_message(
                             &ins.table, &meta, rowid, &values, None, params,
@@ -3789,6 +3800,7 @@ impl Connection {
                 Some(existing_rowid),
                 params,
             )?
+            .0
             .is_empty()
         {
             return Err(Error::Constraint(self.unique_violation_message(
@@ -3877,7 +3889,7 @@ impl Connection {
         values: &[Value],
         exclude: Option<i64>,
         params: &Params,
-    ) -> Result<Vec<i64>> {
+    ) -> Result<(Vec<i64>, OnConflict)> {
         // Unique standalone indexes (named `CREATE UNIQUE INDEX`, incl. partial
         // and expression indexes) are not represented in `meta.unique` — those
         // sets come only from inline CREATE TABLE constraints (whose automatic
@@ -3906,6 +3918,9 @@ impl Connection {
             .collect();
 
         let mut out = Vec::new();
+        // The declared `ON CONFLICT` action of the first inline UNIQUE/PRIMARY KEY
+        // set the new row collides on (used when the statement has no `OR <action>`).
+        let mut action: Option<OnConflict> = None;
         for (er, ev) in self.scan_table(meta)? {
             if Some(er) == exclude {
                 continue;
@@ -3915,7 +3930,7 @@ impl Connection {
                 continue;
             }
             let mut conflicted = false;
-            for set in &meta.unique {
+            for (set, set_oc) in &meta.unique {
                 let new_tuple: Vec<&Value> = set.iter().map(|&i| &values[i]).collect();
                 if new_tuple.iter().any(|v| matches!(v, Value::Null)) {
                     continue; // a NULL makes the key distinct
@@ -3926,6 +3941,7 @@ impl Connection {
                 });
                 if conflict {
                     out.push(er);
+                    action.get_or_insert(*set_oc);
                     conflicted = true;
                     break;
                 }
@@ -3953,7 +3969,7 @@ impl Connection {
                 }
             }
         }
-        Ok(out)
+        Ok((out, action.unwrap_or(OnConflict::Abort)))
     }
 
     /// SQLite's UNIQUE-violation message for the *first* unique constraint the new
@@ -3992,7 +4008,7 @@ impl Connection {
             }
         }
         // Inline UNIQUE / PRIMARY KEY constraint sets, in declaration order.
-        for set in &meta.unique {
+        for (set, _) in &meta.unique {
             if set.iter().any(|&i| matches!(values[i], Value::Null)) {
                 continue;
             }
@@ -4480,10 +4496,15 @@ impl Connection {
             }
             // UNIQUE/PK conflict against any other row. `UPDATE OR IGNORE` skips
             // this row; `UPDATE OR REPLACE` deletes the conflicting rows first.
-            let conflicts =
+            let (conflicts, constraint_oc) =
                 self.find_conflicts(&upd.table, &meta, new_rowid, &values, Some(rowid), params)?;
+            let effective_oc = if upd.on_conflict_explicit {
+                upd.on_conflict
+            } else {
+                constraint_oc
+            };
             if !conflicts.is_empty() {
-                match upd.on_conflict {
+                match effective_oc {
                     OnConflict::Ignore => continue,
                     OnConflict::Replace => {
                         for cr in conflicts {
@@ -5632,7 +5653,7 @@ impl Connection {
                 // rows (which would otherwise hold a NULL).
                 for k in &cd.constraints {
                     match k {
-                        ColumnConstraint::Unique => {
+                        ColumnConstraint::Unique(_) => {
                             return Err(Error::Error("Cannot add a UNIQUE column".into()));
                         }
                         ColumnConstraint::PrimaryKey { .. } => {
@@ -5779,7 +5800,7 @@ impl Connection {
                 }
                 for tc in &mut ct.constraints {
                     match tc {
-                        TableConstraint::PrimaryKey(n) | TableConstraint::Unique(n) => {
+                        TableConstraint::PrimaryKey(n, _) | TableConstraint::Unique(n, _) => {
                             for nm in n {
                                 if nm.eq_ignore_ascii_case(old) {
                                     *nm = new.clone();
@@ -5924,7 +5945,7 @@ impl Connection {
         for c in &ct.columns[pos].constraints {
             match c {
                 ColumnConstraint::PrimaryKey { .. } => return cannot("PRIMARY KEY"),
-                ColumnConstraint::Unique => return cannot("UNIQUE"),
+                ColumnConstraint::Unique(_) => return cannot("UNIQUE"),
                 ColumnConstraint::Check(..) => return cannot("CHECK"),
                 ColumnConstraint::References(_) => return cannot("FOREIGN KEY"),
                 ColumnConstraint::Generated { .. } => return cannot("generated"),
@@ -5935,7 +5956,7 @@ impl Connection {
         // (conservatively, any of these on the table that could reference it).
         for tc in &ct.constraints {
             match tc {
-                TableConstraint::PrimaryKey(n) | TableConstraint::Unique(n) => {
+                TableConstraint::PrimaryKey(n, _) | TableConstraint::Unique(n, _) => {
                     if n.iter().any(|x| x.eq_ignore_ascii_case(name)) {
                         return cannot("PRIMARY KEY or UNIQUE");
                     }
@@ -8248,7 +8269,7 @@ impl Connection {
                 // Automatic index: its columns are the n-th UNIQUE/PK set.
                 None => {
                     if let Some(n) = autoindex_number(&obj.name, table) {
-                        if let Some(cols) = tmeta.unique.get(n - 1) {
+                        if let Some((cols, _)) = tmeta.unique.get(n - 1) {
                             let collations = self.col_collations(&tmeta, cols);
                             out.push(IndexMeta {
                                 name: obj.name.clone(),
@@ -12483,8 +12504,9 @@ struct TableMeta {
     /// CHECK constraint expressions (column-level and table-level).
     /// CHECK constraints with their error-message label (name or source text).
     checks: Vec<(Expr, Option<String>)>,
-    /// Column-index sets that must be UNIQUE (excludes the rowid IPK).
-    unique: Vec<Vec<usize>>,
+    /// Column-index sets that must be UNIQUE (excludes the rowid IPK), each with
+    /// its declared `ON CONFLICT` action (default `Abort`).
+    unique: Vec<(Vec<usize>, OnConflict)>,
     ipk: Option<usize>,
     /// Per-column generated-column spec `(expr, stored)`, if the column is
     /// `… AS (expr) [STORED|VIRTUAL]`. `VIRTUAL` (stored = false) columns are not
@@ -14374,7 +14396,7 @@ fn stat_prefix_cmp(
 }
 
 fn unique_match(meta: &TableMeta, a: &[Value], b: &[Value]) -> bool {
-    meta.unique.iter().any(|set| {
+    meta.unique.iter().any(|(set, _)| {
         set.iter().all(|&c| {
             !matches!(a[c], Value::Null)
                 && !matches!(b[c], Value::Null)
@@ -14389,7 +14411,7 @@ fn unique_match(meta: &TableMeta, a: &[Value], b: &[Value]) -> bool {
 fn wr_unique_message(meta: &TableMeta, a: &[Value], b: &[Value]) -> String {
     meta.unique
         .iter()
-        .find(|set| {
+        .find(|(set, _)| {
             set.iter().all(|&c| {
                 !matches!(a[c], Value::Null)
                     && !matches!(b[c], Value::Null)
@@ -14397,7 +14419,7 @@ fn wr_unique_message(meta: &TableMeta, a: &[Value], b: &[Value]) -> String {
                         .is_eq()
             })
         })
-        .map(|set| {
+        .map(|(set, _)| {
             let cols = set
                 .iter()
                 .map(|&i| alloc::format!("{}.{}", meta.columns[i].table, meta.columns[i].name))
@@ -15493,34 +15515,36 @@ fn column_collation(col: &ColumnDef) -> crate::value::Collation {
 /// declaration order (column-level constraints first, in column order, then
 /// table-level constraints). This is exactly the order SQLite numbers its
 /// `sqlite_autoindex_<table>_<n>` automatic indexes.
-fn collect_unique_sets(ct: &CreateTable, ipk: Option<usize>) -> Vec<Vec<usize>> {
+fn collect_unique_sets(ct: &CreateTable, ipk: Option<usize>) -> Vec<(Vec<usize>, OnConflict)> {
     let col_pos = |name: &str| {
         ct.columns
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(name))
     };
-    let mut unique: Vec<Vec<usize>> = Vec::new();
+    // Each unique set carries its declared `ON CONFLICT` action (default `Abort`),
+    // applied when an INSERT/UPDATE without its own `OR <action>` violates it.
+    let mut unique: Vec<(Vec<usize>, OnConflict)> = Vec::new();
     for (i, c) in ct.columns.iter().enumerate() {
         for k in &c.constraints {
             match k {
-                ColumnConstraint::Unique => unique.push(alloc::vec![i]),
-                ColumnConstraint::PrimaryKey { .. } if Some(i) != ipk => {
-                    unique.push(alloc::vec![i])
+                ColumnConstraint::Unique(oc) => unique.push((alloc::vec![i], *oc)),
+                ColumnConstraint::PrimaryKey { on_conflict, .. } if Some(i) != ipk => {
+                    unique.push((alloc::vec![i], *on_conflict))
                 }
                 _ => {}
             }
         }
     }
     for tc in &ct.constraints {
-        let names = match tc {
-            TableConstraint::Unique(n) | TableConstraint::PrimaryKey(n) => n,
+        let (names, oc) = match tc {
+            TableConstraint::Unique(n, oc) | TableConstraint::PrimaryKey(n, oc) => (n, *oc),
             _ => continue,
         };
         let idxs: Option<Vec<usize>> = names.iter().map(|n| col_pos(n)).collect();
         if let Some(set) = idxs {
             // Skip a single-column PK that is the rowid alias.
             if !(set.len() == 1 && Some(set[0]) == ipk) {
-                unique.push(set);
+                unique.push((set, oc));
             }
         }
     }
@@ -15606,7 +15630,7 @@ fn primary_key_positions(ct: &CreateTable) -> Vec<usize> {
         }
     }
     for tc in &ct.constraints {
-        if let TableConstraint::PrimaryKey(names) = tc {
+        if let TableConstraint::PrimaryKey(names, _) = tc {
             let pos: Option<Vec<usize>> = names
                 .iter()
                 .map(|n| {
@@ -15646,7 +15670,7 @@ fn find_integer_primary_key(ct: &CreateTable) -> Option<usize> {
     }
     // Table-level single-column PRIMARY KEY over an INTEGER column.
     for tc in &ct.constraints {
-        if let TableConstraint::PrimaryKey(cols) = tc {
+        if let TableConstraint::PrimaryKey(cols, _) = tc {
             if cols.len() == 1 {
                 if let Some(i) = ct.columns.iter().position(|c| c.name == cols[0]) {
                     if ct.columns[i]

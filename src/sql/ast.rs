@@ -324,6 +324,10 @@ pub struct Insert {
     pub source: InsertSource,
     /// Conflict resolution (`INSERT OR …` / `REPLACE`).
     pub on_conflict: OnConflict,
+    /// Whether the statement wrote an explicit `OR <action>` (or `REPLACE`). When
+    /// false (a plain `INSERT`), a violated constraint's own `ON CONFLICT` action
+    /// applies instead of the default `Abort`.
+    pub on_conflict_explicit: bool,
     /// `ON CONFLICT … DO …` upsert clauses, in order. SQLite allows several
     /// chained clauses with distinct conflict targets; the one whose target the
     /// conflict matches wins (a final target-less clause is the catch-all).
@@ -400,6 +404,8 @@ pub struct Update {
     pub schema: Option<String>,
     /// `UPDATE OR <action>` conflict resolution (default `Abort`).
     pub on_conflict: OnConflict,
+    /// Whether an explicit `OR <action>` was written (see [`Insert::on_conflict_explicit`]).
+    pub on_conflict_explicit: bool,
     /// `SET col = expr` assignments.
     pub assignments: Vec<(String, Expr)>,
     /// `UPDATE … SET … FROM <sources>` — extra tables joined to the target so
@@ -509,17 +515,19 @@ pub struct ForeignKey {
 /// A column-level constraint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnConstraint {
-    /// `PRIMARY KEY [ASC|DESC] [AUTOINCREMENT]`.
+    /// `PRIMARY KEY [ASC|DESC] [ON CONFLICT …] [AUTOINCREMENT]`.
     PrimaryKey {
         /// Descending primary key?
         descending: bool,
         /// `AUTOINCREMENT` present (only valid on an `INTEGER PRIMARY KEY`).
         autoincrement: bool,
+        /// The declared `ON CONFLICT <action>` for this key (default `Abort`).
+        on_conflict: OnConflict,
     },
     /// `NOT NULL`.
     NotNull,
-    /// `UNIQUE`.
-    Unique,
+    /// `UNIQUE [ON CONFLICT <action>]`; the action defaults to `Abort`.
+    Unique(OnConflict),
     /// `DEFAULT <expr>`.
     Default(Expr),
     /// `COLLATE <name>`.
@@ -544,10 +552,10 @@ pub enum ColumnConstraint {
 /// A table-level constraint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableConstraint {
-    /// `PRIMARY KEY (cols…)`.
-    PrimaryKey(Vec<String>),
-    /// `UNIQUE (cols…)`.
-    Unique(Vec<String>),
+    /// `PRIMARY KEY (cols…) [ON CONFLICT <action>]`.
+    PrimaryKey(Vec<String>, OnConflict),
+    /// `UNIQUE (cols…) [ON CONFLICT <action>]`.
+    Unique(Vec<String>, OnConflict),
     /// `CHECK (<expr>)`. The second field is the constraint's *label* (see
     /// [`ColumnConstraint::Check`]).
     Check(Expr, Option<String>),

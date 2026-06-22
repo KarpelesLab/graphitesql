@@ -925,8 +925,10 @@ impl Parser {
     fn insert(&mut self) -> Result<Insert> {
         // INSERT [OR <action>] INTO  /  REPLACE INTO
         let mut on_conflict = OnConflict::Abort;
+        let mut on_conflict_explicit = false;
         if self.eat_kw("insert") {
             if self.eat_kw("or") {
+                on_conflict_explicit = true;
                 on_conflict = if self.eat_kw("replace") {
                     OnConflict::Replace
                 } else if self.eat_kw("ignore") {
@@ -942,6 +944,7 @@ impl Parser {
             }
         } else {
             self.expect_kw("replace")?;
+            on_conflict_explicit = true;
             on_conflict = OnConflict::Replace;
         }
         self.expect_kw("into")?;
@@ -977,6 +980,7 @@ impl Parser {
             columns,
             source,
             on_conflict,
+            on_conflict_explicit,
             upsert,
             returning,
         })
@@ -1065,7 +1069,8 @@ impl Parser {
         // `UPDATE OR <action>` conflict clause. REPLACE/IGNORE keep their own
         // resolution; ABORT (the default) rolls the statement back, FAIL keeps
         // partial changes, ROLLBACK unwinds the surrounding transaction.
-        let on_conflict = if self.eat_kw("or") {
+        let on_conflict_explicit = self.eat_kw("or");
+        let on_conflict = if on_conflict_explicit {
             if self.eat_kw("replace") {
                 OnConflict::Replace
             } else if self.eat_kw("ignore") {
@@ -1140,6 +1145,7 @@ impl Parser {
             table,
             schema,
             on_conflict,
+            on_conflict_explicit,
             assignments,
             from,
             where_clause,
@@ -1502,11 +1508,12 @@ impl Parser {
                     let _ = self.eat_kw("asc");
                     false
                 };
-                self.eat_conflict_clause();
+                let on_conflict = self.eat_conflict_clause();
                 let autoincrement = self.eat_kw("autoincrement");
                 constraints.push(ColumnConstraint::PrimaryKey {
                     descending,
                     autoincrement,
+                    on_conflict,
                 });
             } else if self.eat_kw("not") {
                 self.expect_kw("null")?;
@@ -1515,8 +1522,8 @@ impl Parser {
             } else if self.eat_kw("null") {
                 // A bare NULL (explicitly nullable): no constraint to record.
             } else if self.eat_kw("unique") {
-                self.eat_conflict_clause();
-                constraints.push(ColumnConstraint::Unique);
+                let on_conflict = self.eat_conflict_clause();
+                constraints.push(ColumnConstraint::Unique(on_conflict));
             } else if self.eat_kw("default") {
                 let e = if self.check(&Token::LParen) {
                     self.expect(&Token::LParen)?;
@@ -1609,12 +1616,12 @@ impl Parser {
         if self.eat_kw("primary") {
             self.expect_kw("key")?;
             let cols = self.paren_columns()?;
-            self.eat_conflict_clause();
-            Ok(Some(TableConstraint::PrimaryKey(cols)))
+            let oc = self.eat_conflict_clause();
+            Ok(Some(TableConstraint::PrimaryKey(cols, oc)))
         } else if self.eat_kw("unique") {
             let cols = self.paren_columns()?;
-            self.eat_conflict_clause();
-            Ok(Some(TableConstraint::Unique(cols)))
+            let oc = self.eat_conflict_clause();
+            Ok(Some(TableConstraint::Unique(cols, oc)))
         } else if self.eat_kw("check") {
             self.expect(&Token::LParen)?;
             let start = self.tokens.get(self.pos).map(|s| s.start);
@@ -1634,12 +1641,26 @@ impl Parser {
         }
     }
 
-    /// Consume an `ON CONFLICT <action>` clause if present.
-    fn eat_conflict_clause(&mut self) {
+    /// Parse an optional `ON CONFLICT <action>` clause, returning the action (or
+    /// `Abort`, the default, when absent).
+    fn eat_conflict_clause(&mut self) -> OnConflict {
         if self.eat_kw("on") {
             let _ = self.eat_kw("conflict");
-            let _ = self.advance(); // the action keyword
+            let action = if self.eat_kw("replace") {
+                OnConflict::Replace
+            } else if self.eat_kw("ignore") {
+                OnConflict::Ignore
+            } else if self.eat_kw("fail") {
+                OnConflict::Fail
+            } else if self.eat_kw("rollback") {
+                OnConflict::Rollback
+            } else {
+                let _ = self.eat_kw("abort");
+                OnConflict::Abort
+            };
+            return action;
         }
+        OnConflict::Abort
     }
 
     /// Parse the tail of a `REFERENCES` clause (target table, optional parent
@@ -2861,7 +2882,7 @@ mod tests {
         assert!(ct
             .constraints
             .iter()
-            .any(|c| matches!(c, TableConstraint::Unique(_))));
+            .any(|c| matches!(c, TableConstraint::Unique(..))));
         assert!(ct
             .constraints
             .iter()

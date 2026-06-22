@@ -80,23 +80,37 @@ fn column_def(cd: &ColumnDef) -> String {
     s
 }
 
+/// The ` ON CONFLICT <action>` suffix for a declared conflict action, or empty
+/// for the default `Abort`.
+fn conflict_suffix(oc: &OnConflict) -> &'static str {
+    match oc {
+        OnConflict::Abort => "",
+        OnConflict::Fail => " ON CONFLICT FAIL",
+        OnConflict::Rollback => " ON CONFLICT ROLLBACK",
+        OnConflict::Ignore => " ON CONFLICT IGNORE",
+        OnConflict::Replace => " ON CONFLICT REPLACE",
+    }
+}
+
 fn column_constraint(c: &ColumnConstraint) -> String {
     match c {
         ColumnConstraint::PrimaryKey {
             descending,
             autoincrement,
+            on_conflict,
         } => {
             let mut s = String::from("PRIMARY KEY");
             if *descending {
                 s.push_str(" DESC");
             }
+            s.push_str(conflict_suffix(on_conflict));
             if *autoincrement {
                 s.push_str(" AUTOINCREMENT");
             }
             s
         }
         ColumnConstraint::NotNull => "NOT NULL".to_string(),
-        ColumnConstraint::Unique => "UNIQUE".to_string(),
+        ColumnConstraint::Unique(oc) => format!("UNIQUE{}", conflict_suffix(oc)),
         ColumnConstraint::Default(e) => format!("DEFAULT {}", expr(e)),
         ColumnConstraint::Collate(n) => format!("COLLATE {n}"),
         ColumnConstraint::Check(e, _) => format!("CHECK ({})", expr(e)),
@@ -151,8 +165,12 @@ fn table_constraint(c: &TableConstraint) -> String {
             .join(", ")
     };
     match c {
-        TableConstraint::PrimaryKey(names) => format!("PRIMARY KEY({})", cols(names)),
-        TableConstraint::Unique(names) => format!("UNIQUE({})", cols(names)),
+        TableConstraint::PrimaryKey(names, oc) => {
+            format!("PRIMARY KEY({}){}", cols(names), conflict_suffix(oc))
+        }
+        TableConstraint::Unique(names, oc) => {
+            format!("UNIQUE({}){}", cols(names), conflict_suffix(oc))
+        }
         TableConstraint::Check(e, _) => format!("CHECK ({})", expr(e)),
         TableConstraint::ForeignKey(fk) => format!(
             "FOREIGN KEY({}) REFERENCES {}",
