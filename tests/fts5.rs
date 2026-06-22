@@ -526,6 +526,26 @@ fn snippet_selects_best_window() {
         ),
         "the quick [brown fox] jumps..."
     );
+    // A negative column auto-selects the highest-scoring column…
+    assert_eq!(
+        snip(
+            &mut c,
+            "the quick brown fox",
+            "lazy dog runs here today ok",
+            "SELECT snippet(t,-1,'[',']','...',3) FROM t WHERE t MATCH 'dog'"
+        ),
+        "lazy [dog] runs..."
+    );
+    // …and breaks score ties toward the first column.
+    assert_eq!(
+        snip(
+            &mut c,
+            "alpha red beta",
+            "gamma red delta",
+            "SELECT snippet(t,-1,'[',']','.',3) FROM t WHERE t MATCH 'red'"
+        ),
+        "alpha [red] beta"
+    );
 }
 
 #[test]

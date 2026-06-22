@@ -188,11 +188,13 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             let close = eval::to_text(&eval::eval(&args[3], ctx)?);
             let ellipsis = eval::to_text(&eval::eval(&args[4], ctx)?);
             let ntokens = eval::to_i64(&eval::eval(&args[5], ctx)?);
-            if let (Ok(col), Ok(ntokens)) = (usize::try_from(col), usize::try_from(ntokens)) {
-                let text = ctx.row.get(col).map(eval::to_text).unwrap_or_default();
+            // A negative `col` auto-selects the best column, so pass every column's
+            // text; the module bounds the slice by the table's declared columns.
+            if let Ok(ntokens) = usize::try_from(ntokens) {
+                let cols: Vec<alloc::string::String> = ctx.row.iter().map(eval::to_text).collect();
                 if let Some(s) = ctx
                     .subqueries
-                    .and_then(|s| s.fts5_snippet(col, &text, &open, &close, &ellipsis, ntokens))
+                    .and_then(|s| s.fts5_snippet(col, &cols, &open, &close, &ellipsis, ntokens))
                 {
                     return Ok(Value::Text(s));
                 }

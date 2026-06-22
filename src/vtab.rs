@@ -1331,90 +1331,65 @@ pub(crate) fn fts5_highlight(
 /// tokens from column `col` chosen to best cover the query's phrases, with the
 /// matched tokens wrapped in `open`…`close` and `ellipsis` prepended/appended when
 /// the window doesn't reach the column's start/end. The window is the candidate
-/// (centered on a phrase instance, or pinned to either end) maximizing distinct
-/// phrase coverage, earliest on a tie — matching fts5's `snippet` aux function.
+/// (centered on a phrase instance, or snapped to a sentence/column start) maximizing
+/// distinct phrase coverage — matching fts5's `snippet` aux function. A negative
+/// `col` auto-selects the highest-scoring column (`cols` holds every column's text).
 #[cfg(feature = "fts5")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fts5_snippet(
     query: &str,
     col_names: &[String],
     scope: Option<&str>,
-    col: usize,
-    text: &str,
+    col: i64,
+    cols: &[String],
     open: &str,
     close: &str,
     ellipsis: &str,
     ntokens: usize,
 ) -> String {
-    let spans = fts5_tokenize_spans(text);
-    let n = spans.len();
-    if n == 0 {
-        return String::from(text);
-    }
-    let col_tokens: Vec<String> = spans.iter().map(|(t, _, _)| t.clone()).collect();
-
-    // Phrase instances `(start, end, term)` in this column, when it is in scope.
-    let in_scope = scope.is_none_or(|s| {
-        col_names
-            .get(col)
-            .is_some_and(|n| n.eq_ignore_ascii_case(s))
-    });
+    let ntok = ntokens.max(1);
     let lexed = fts5_lex(query);
-    let parsed = if in_scope {
-        (Fts5Parser {
-            toks: &lexed,
-            pos: 0,
-        })
-        .parse()
-    } else {
-        None
-    };
+    let parsed = (Fts5Parser {
+        toks: &lexed,
+        pos: 0,
+    })
+    .parse();
     let mut terms = Vec::new();
     if let Some(p) = &parsed {
         fts5_collect_terms(p, &mut terms);
     }
-    let mut inst: Vec<(usize, usize, usize)> = Vec::new();
-    for (ti, term) in terms.iter().enumerate() {
-        if term.column.as_deref().is_some_and(|c| {
-            col_names
-                .get(col)
-                .is_none_or(|nm| !nm.eq_ignore_ascii_case(c))
-        }) {
-            continue;
-        }
-        for start in fts5_term_starts(term, &col_tokens) {
-            inst.push((start, (start + term.phrase.len()).min(n), ti));
-        }
-    }
 
-    let ntok = ntokens.max(1);
-    let (ws, we) = if n <= ntok {
-        (0, n)
-    } else if inst.is_empty() {
-        // No match in this column: SQLite returns the leading `ntok`-token window.
-        (0, ntok)
-    } else {
-        // SQLite's `snippet` aux (`fts5SnippetFunction`): for each phrase instance,
-        // score the window starting at it and consider two starts — the *centered*
-        // `iAdj`, and the enclosing *sentence boundary* (with a +120/+100 bonus that
-        // favors snapping to a sentence/column start). Best score wins, first anchor
-        // breaking ties. `iLast - iFirst` spans the cluster found inside the window;
-        // `score` weights distinct phrases (1000) far above repeats (1).
-        let max_start = (n - ntok) as isize;
-        inst.sort_unstable();
-        // Sentence starts (token indices): token 0, plus any token immediately
-        // preceded by whitespace whose nearest non-space byte before it is `.`/`:`.
-        let bytes = text.as_bytes();
-        let mut sentences = alloc::vec![0usize];
-        for (t, &(_, start_off, _)) in spans.iter().enumerate().skip(1) {
-            let mut i = start_off as isize - 1;
-            while i >= 0 && matches!(bytes[i as usize], b' ' | b'\t' | b'\n' | b'\r') {
-                i -= 1;
-            }
-            if i != start_off as isize - 1 && i >= 0 && matches!(bytes[i as usize], b'.' | b':') {
-                sentences.push(t);
+    // Per-column window selection → (score, ws, we, spans, instances).
+    type Spans = Vec<(String, usize, usize)>;
+    type Inst = Vec<(usize, usize, usize)>;
+    let select = |ci: usize| -> (i64, usize, usize, Spans, Inst) {
+        let text = cols.get(ci).map(String::as_str).unwrap_or("");
+        let spans = fts5_tokenize_spans(text);
+        let n = spans.len();
+        // Operand-level scope (`col MATCH …`) and per-term `col:token` filters both
+        // gate which instances count toward this column.
+        let in_scope = scope.is_none_or(|s| {
+            col_names
+                .get(ci)
+                .is_some_and(|nm| nm.eq_ignore_ascii_case(s))
+        });
+        let mut inst: Inst = Vec::new();
+        if in_scope {
+            let col_tokens: Vec<String> = spans.iter().map(|(t, _, _)| t.clone()).collect();
+            for (ti, term) in terms.iter().enumerate() {
+                if term.column.as_deref().is_some_and(|c| {
+                    col_names
+                        .get(ci)
+                        .is_none_or(|nm| !nm.eq_ignore_ascii_case(c))
+                }) {
+                    continue;
+                }
+                for start in fts5_term_starts(term, &col_tokens) {
+                    inst.push((start, (start + term.phrase.len()).min(n), ti));
+                }
             }
         }
+        inst.sort_unstable();
         // Score window `[a, a+ntok)`; return (score, iFirst, iLast) of its cluster.
         let win = |a: usize| -> (i64, Option<(usize, usize)>) {
             let e = a + ntok;
@@ -1429,10 +1404,34 @@ pub(crate) fn fts5_snippet(
             }
             (sc, first.map(|f| (f, last)))
         };
+        if n <= ntok {
+            // The whole column fits; its score still ranks it for auto-selection.
+            return (win(0).0, 0, n, spans, inst);
+        }
+        if inst.is_empty() {
+            return (0, 0, ntok, spans, inst);
+        }
+        // For each phrase instance, score the window starting at it and consider two
+        // starts — the *centered* `iAdj`, and the enclosing *sentence boundary* (with
+        // a +120/+100 bonus favoring a sentence/column start). Best score wins, first
+        // anchor breaking ties; `iLast - iFirst` spans the cluster inside the window.
+        let max_start = (n - ntok) as isize;
+        // Sentence starts (token indices): token 0, plus any token immediately
+        // preceded by whitespace whose nearest non-space byte before it is `.`/`:`.
+        let bytes = text.as_bytes();
+        let mut sentences = alloc::vec![0usize];
+        for (t, &(_, start_off, _)) in spans.iter().enumerate().skip(1) {
+            let mut i = start_off as isize - 1;
+            while i >= 0 && matches!(bytes[i as usize], b' ' | b'\t' | b'\n' | b'\r') {
+                i -= 1;
+            }
+            if i != start_off as isize - 1 && i >= 0 && matches!(bytes[i as usize], b'.' | b':') {
+                sentences.push(t);
+            }
+        }
         let mut best_score = 0;
         let mut best_start = 0;
         for &(io, _, _) in &inst {
-            // Centered candidate at the anchor.
             let (score, cluster) = win(io);
             if score > best_score {
                 best_score = score;
@@ -1440,7 +1439,6 @@ pub(crate) fn fts5_snippet(
                 let adj = (f as isize - (ntok as isize - (l - f) as isize) / 2).min(max_start);
                 best_start = adj.max(0) as usize;
             }
-            // Sentence-boundary candidate enclosing the anchor.
             let mut jj = 0;
             while jj + 1 < sentences.len() && sentences[jj + 1] <= io {
                 jj += 1;
@@ -1454,10 +1452,46 @@ pub(crate) fn fts5_snippet(
                 }
             }
         }
-        // A sentence-boundary start is not clamped to `max_start`, so the window may
-        // run to the column end (SQLite renders to the last token there).
-        (best_start, (best_start + ntok).min(n))
+        // A sentence-boundary start is not clamped, so the window may run to the end.
+        (
+            best_score,
+            best_start,
+            (best_start + ntok).min(n),
+            spans,
+            inst,
+        )
     };
+
+    // A negative `col` picks the highest-scoring column (first on a tie, matching
+    // SQLite's `nScore > nBestScore`); otherwise the requested column (out of range
+    // → empty result).
+    let ncol = col_names.len();
+    let (chosen, picked) = if col >= 0 {
+        let ci = col as usize;
+        if ci >= ncol {
+            return String::new();
+        }
+        (ci, select(ci))
+    } else if ncol == 0 {
+        return String::new();
+    } else {
+        let mut best_ci = 0;
+        let mut best = select(0);
+        for ci in 1..ncol {
+            let r = select(ci);
+            if r.0 > best.0 {
+                best = r;
+                best_ci = ci;
+            }
+        }
+        (best_ci, best)
+    };
+    let text = cols.get(chosen).map(String::as_str).unwrap_or("");
+    let (_, ws, we, spans, inst) = picked;
+    let n = spans.len();
+    if n == 0 {
+        return String::from(text);
+    }
 
     // Build the snippet: ellipsis, then the window's original text with matched
     // tokens wrapped (instances merged like `highlight`), then ellipsis.

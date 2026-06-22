@@ -12769,8 +12769,8 @@ impl eval::Subqueries for Connection {
     #[cfg(feature = "fts5")]
     fn fts5_snippet(
         &self,
-        col: usize,
-        text: &str,
+        col: i64,
+        cols: &[String],
         open: &str,
         close: &str,
         ellipsis: &str,
@@ -12783,7 +12783,7 @@ impl eval::Subqueries for Connection {
             &ctx.col_names,
             ctx.scope.as_deref(),
             col,
-            text,
+            cols,
             open,
             close,
             ellipsis,

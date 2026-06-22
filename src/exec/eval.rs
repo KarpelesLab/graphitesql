@@ -88,8 +88,8 @@ pub trait Subqueries {
     #[allow(clippy::too_many_arguments)]
     fn fts5_snippet(
         &self,
-        _col: usize,
-        _text: &str,
+        _col: i64,
+        _cols: &[String],
         _open: &str,
         _close: &str,
         _ellipsis: &str,
