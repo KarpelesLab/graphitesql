@@ -7241,10 +7241,11 @@ impl Connection {
         let Some(module) = self.vtab_registry.get(&cvt.module) else {
             return Ok(plain());
         };
-        // A persistent module bypasses best_index (it scans `<name>_data`).
-        if module.dyn_persistent() {
-            return Ok(plain());
-        }
+        // The module's `best_index` chooses the reported plan from the offered
+        // `WHERE` constraints — even for a persistent module, whose execution scans
+        // `<name>_data` but whose reported `idxNum:idxStr` should still match SQLite
+        // (e.g. rtree's spatial encoding). A module with no pushdown returns the
+        // default plan, rendering the plain `INDEX 0:`.
         let arg_refs: Vec<&str> = cvt.args.iter().map(String::as_str).collect();
         let schema = module.dyn_connect(&arg_refs)?;
         let columns: Vec<ColumnInfo> = schema

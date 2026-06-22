@@ -195,6 +195,39 @@ fn vacuum_preserves_a_persistent_virtual_table() {
 }
 
 #[test]
+fn explain_query_plan_matches_sqlite_rtree_index() {
+    // The reported `idxNum:idxStr` matches sqlite's rtree xBestIndex: a coordinate
+    // range is `INDEX 2:<op><col>…` (D=`>=`, B=`<=`, A=`=`, C=`<`, E=`>`; column
+    // digit is 0-based among the coordinates), an `id =` lookup is `INDEX 1:`, and
+    // a bare scan is `INDEX 2:`.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, minX, maxX, minY, maxY)")
+        .unwrap();
+    let plan = |sql: &str| match c.query(sql).unwrap().rows.last().unwrap().last() {
+        Some(Value::Text(s)) => s.clone(),
+        o => panic!("not text: {o:?}"),
+    };
+    assert_eq!(
+        plan("EXPLAIN QUERY PLAN SELECT id FROM r WHERE minX>=0 AND maxX<=3"),
+        "SCAN r VIRTUAL TABLE INDEX 2:D0B1"
+    );
+    assert_eq!(
+        plan(
+            "EXPLAIN QUERY PLAN SELECT id FROM r WHERE minX>=0 AND minY>=0 AND maxX<=3 AND maxY<=3"
+        ),
+        "SCAN r VIRTUAL TABLE INDEX 2:D0D2B1B3"
+    );
+    assert_eq!(
+        plan("EXPLAIN QUERY PLAN SELECT id FROM r WHERE id = 2"),
+        "SCAN r VIRTUAL TABLE INDEX 1:"
+    );
+    assert_eq!(
+        plan("EXPLAIN QUERY PLAN SELECT id FROM r"),
+        "SCAN r VIRTUAL TABLE INDEX 2:"
+    );
+}
+
+#[test]
 fn foreign_key_list_on_a_vtab_is_empty() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE r USING rtree(id, a, b)")

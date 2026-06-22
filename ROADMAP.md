@@ -398,7 +398,15 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     id is the integer rowid; rejects `min>max` and bad arity. Differentially clean
     vs sqlite3 (`tests/rtree.rs`). *(The shadow table is W2a's `<name>_data`, not
     sqlite's `_node`/`_rowid`/`_parent` — that byte-compat layout is D3c.)*
-  - **D3b — `best_index` spatial pushdown** of the coordinate constraints.
+  - **D3b — `best_index` spatial pushdown (EQP). ✅ DONE (plan reporting).**
+    `RTreeModule::best_index` mirrors sqlite's rtree `xBestIndex` so EXPLAIN QUERY
+    PLAN reads identically: an `id =` lookup is `INDEX 1:`, a coordinate range is
+    `INDEX 2:<op><col>…` (`A`=`=`,`B`=`<=`,`C`=`<`,`D`=`>=`,`E`=`>`; column digit
+    0-based among coords — e.g. `minX>=? AND maxX<=?` → `INDEX 2:D0B1`), a bare
+    scan `INDEX 2:`. `eqp_vtab_detail` now routes persistent modules through
+    `best_index` for the reported plan (fts5 keeps `INDEX 0:`). *(Execution still
+    scans the backing table + re-applies WHERE; narrowing the scan via the node
+    tree — true pushdown — would build on D3c's node format.)*
   - **D3c — byte-compatible node format.** Pack bounding boxes into the
     `<name>_node` blob layout sqlite uses, so a graphite-written R-Tree round-trips
     through sqlite3. *(Required for file compatibility; large.)*

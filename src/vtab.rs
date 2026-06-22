@@ -1064,6 +1064,62 @@ impl VTabModule for RTreeModule {
         true
     }
 
+    /// Choose a plan from the offered constraints, matching SQLite's rtree
+    /// `xBestIndex` so `EXPLAIN QUERY PLAN` reads identically. A usable `id =`
+    /// (rowid) equality is a single-row lookup (`idxNum` 1, no `idxStr`, the
+    /// coordinate constraints ignored). Otherwise (`idxNum` 2) each usable
+    /// coordinate comparison is encoded as a two-character pair: an op letter
+    /// (`A`=`=`, `B`=`<=`, `C`=`<`, `D`=`>=`, `E`=`>`) followed by the coordinate
+    /// column's 0-based digit (`minX`→`0`, `maxX`→`1`, …) — e.g. `minX>=? AND
+    /// maxX<=?` is `idxNum` 2, `idxStr` `D0B1`. (Execution still scans the backing
+    /// table and re-applies the `WHERE`, so this only drives the reported plan.)
+    fn best_index(&self, constraints: &[IndexConstraint]) -> Result<IndexPlan> {
+        let mut argv_index = alloc::vec![0u32; constraints.len()];
+        // A rowid (id, column 0) equality: a one-row lookup, coords dropped.
+        if let Some(i) = constraints
+            .iter()
+            .position(|c| c.usable && c.column == 0 && c.op == ConstraintOp::Eq)
+        {
+            argv_index[i] = 1;
+            return Ok(IndexPlan {
+                idx_num: 1,
+                idx_str: None,
+                estimated_cost: 1.0,
+                argv_index,
+                omit: Vec::new(),
+                order_by_consumed: false,
+            });
+        }
+        // Otherwise: encode each usable coordinate (column ≥ 1) comparison.
+        let mut idx_str = String::new();
+        let mut argc = 0u32;
+        for (i, c) in constraints.iter().enumerate() {
+            if !c.usable || c.column == 0 {
+                continue;
+            }
+            let op = match c.op {
+                ConstraintOp::Eq => 'A',
+                ConstraintOp::Le => 'B',
+                ConstraintOp::Lt => 'C',
+                ConstraintOp::Ge => 'D',
+                ConstraintOp::Gt => 'E',
+                _ => continue,
+            };
+            idx_str.push(op);
+            idx_str.push(char::from(b'0' + (c.column - 1) as u8));
+            argc += 1;
+            argv_index[i] = argc;
+        }
+        Ok(IndexPlan {
+            idx_num: 2,
+            idx_str: (!idx_str.is_empty()).then_some(idx_str),
+            estimated_cost: if argc > 0 { 10.0 } else { 1e9 },
+            argv_index,
+            omit: Vec::new(),
+            order_by_consumed: false,
+        })
+    }
+
     fn update(&self, _args: &[&str], change: VTabChange, store: &mut dyn VTabStore) -> Result<i64> {
         match change {
             VTabChange::Insert { values, .. } => {
