@@ -14659,6 +14659,17 @@ impl Connection {
         for t in &mut rsel.order_by {
             t.expr = self.extract_aggregates(&t.expr, &mut aggs);
         }
+        // Named WINDOW definitions (`WINDOW w AS (ORDER BY sum(v))`) referenced via
+        // `OVER w` carry their PARTITION/ORDER expressions here, not in the call's
+        // own spec, so rewrite their aggregates too.
+        for (_, ws) in &mut rsel.window_defs {
+            for p in &mut ws.partition_by {
+                *p = self.extract_aggregates(p, &mut aggs);
+            }
+            for t in &mut ws.order_by {
+                t.expr = self.extract_aggregates(&t.expr, &mut aggs);
+            }
+        }
 
         // --- Augment the column set with one synthetic column per aggregate. ---
         let mut cols: Vec<ColumnInfo> = columns.to_vec();

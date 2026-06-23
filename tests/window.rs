@@ -196,6 +196,9 @@ fn window_over_aggregate() {
         "SELECT g, sum(v) - sum(sum(v)) OVER () AS d FROM t GROUP BY g ORDER BY g",
         "SELECT g, sum(v), sum(sum(v)) OVER (ORDER BY g) AS running FROM t GROUP BY g ORDER BY g",
         "SELECT g, max(v), max(v) - min(min(v)) OVER () FROM t GROUP BY g ORDER BY g",
+        // A named window whose ORDER BY references a group aggregate.
+        "SELECT g, sum(v), rank() OVER w, sum(sum(v)) OVER w FROM t GROUP BY g \
+         WINDOW w AS (ORDER BY sum(v)) ORDER BY g",
     ];
     if std::process::Command::new("sqlite3")
         .arg("--version")
