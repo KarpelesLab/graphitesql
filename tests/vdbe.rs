@@ -790,3 +790,66 @@ fn left_join_matches_tree_walker_and_sqlite3() {
         assert_eq!(got, want, "LEFT JOIN vs sqlite3 diverged on {q}");
     }
 }
+
+#[test]
+fn right_and_full_join_match_tree_walker_and_sqlite3() {
+    // A single RIGHT/FULL outer join runs on the VDBE: the router emits the
+    // left-driven matched pairs, (FULL only) null-extends unmatched left rows, and
+    // appends every unmatched right row — matching sqlite's row order exactly.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(k INT, g TEXT)").unwrap();
+    c.execute("CREATE TABLE u(k INT, w INT)").unwrap();
+    c.execute("INSERT INTO t VALUES(1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    c.execute("INSERT INTO u VALUES(1,10),(2,20),(1,11),(9,90)")
+        .unwrap();
+    let qs = [
+        "SELECT t.g, u.w FROM t RIGHT JOIN u ON t.k=u.k",
+        "SELECT t.g, u.w FROM t FULL JOIN u ON t.k=u.k",
+        "SELECT t.g, u.w FROM t FULL OUTER JOIN u ON t.k=u.k",
+        "SELECT count(*) FROM t RIGHT JOIN u ON t.k=u.k",
+        "SELECT t.g, u.w FROM t RIGHT JOIN u ON t.k=u.k WHERE t.g IS NULL",
+        "SELECT t.g, count(u.w) FROM t FULL JOIN u ON t.k=u.k GROUP BY t.g ORDER BY t.g",
+    ];
+    for q in qs {
+        // No ORDER BY on most: the VDBE must reproduce sqlite's row order, so
+        // compare against the tree-walker (forced via query_vdbe) without sorting.
+        let got = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("expected VDBE to handle {q}: {e}"))
+            .rows;
+        let want = {
+            c.set_use_vdbe(false);
+            let r = c.query(q).unwrap().rows;
+            c.set_use_vdbe(true);
+            r
+        };
+        assert_eq!(got, want, "VDBE RIGHT/FULL vs tree-walker diverged on {q}");
+    }
+
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    let setup = "CREATE TABLE t(k INT, g TEXT); CREATE TABLE u(k INT, w INT);\
+                 INSERT INTO t VALUES(1,'a'),(2,'b'),(3,'c');\
+                 INSERT INTO u VALUES(1,10),(2,20),(1,11),(9,90);";
+    for q in qs {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(format!("{setup} {q};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = c
+            .query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.iter().map(render).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(got, want, "RIGHT/FULL JOIN vs sqlite3 diverged on {q}");
+    }
+}
