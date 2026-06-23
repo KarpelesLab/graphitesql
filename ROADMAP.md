@@ -348,15 +348,18 @@ each additive behind `query_vdbe` until B7:
   outermost, matching the tree-walker's and sqlite's nested-loop row order — raw
   unordered output verified identical) as one combined row set with every
   `ON`/join predicate folded into the `WHERE`, then reuse the single-cursor scan
-  compiler + interpreter unchanged (`query_vdbe`). Bails (→ tree-walker) on
-  RIGHT/FULL joins, `NATURAL`/`USING`, `t.*` over a join, and ambiguous shared
-  column names. (Extended from 2 tables to N on 2026-06-24; 3- and 4-table joins
-  are in `tests/vdbe.rs::two_table_join_matches_tree_walker`.) **LEFT joins also
-  run on the VDBE now (2026-06-24):** when any join is `LEFT`, the router builds
-  the joined rows by a real nested loop with NULL-extension of unmatched left rows
-  (`ON` evaluated per pair against the partial combined row), then the VDBE runs
-  projection/WHERE/aggregates over them; INNER steps in a mixed chain filter
-  normally. Test `tests/vdbe.rs::left_join_matches_tree_walker_and_sqlite3`.
+  compiler + interpreter unchanged (`query_vdbe`). Bails (→ tree-walker) only on
+  ambiguous shared *bare* column names now. (Extended from 2 tables to N on
+  2026-06-24; 3- and 4-table joins are in
+  `tests/vdbe.rs::two_table_join_matches_tree_walker`.) **The common-case join
+  family now runs on the VDBE (2026-06-24):** LEFT (nested-loop NULL-extension,
+  chains), single-join RIGHT/FULL (left-driven build + appended unmatched-right),
+  `t.*` (qualifier-aware expansion), and INNER NATURAL/USING (nested-loop with
+  column coalescing — common/USING columns appear once, right duplicate dropped).
+  The router builds the joined rows (evaluating each `ON`/coalesce-equality per
+  pair) and the VDBE runs projection/WHERE/aggregates over them. Tests:
+  `left_join_*`, `right_and_full_join_*`, `table_wildcard_over_join_*`,
+  `natural_using_join_*`. Remaining join bails: RIGHT/FULL in a multi-join *chain*.
 - **B5b — VDBE join: per-cursor nested loop, index/PK inner seek.** Replace the
   materialized cross-product / row build with cursor opcodes
   (`OpenRead`/`Rewind`/`Column`/`Next`) so the inner side isn't fully
