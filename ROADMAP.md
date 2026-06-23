@@ -351,18 +351,21 @@ each additive behind `query_vdbe` until B7:
   compiler + interpreter unchanged (`query_vdbe`). Bails (→ tree-walker) only on
   ambiguous shared *bare* column names now. (Extended from 2 tables to N on
   2026-06-24; 3- and 4-table joins are in
-  `tests/vdbe.rs::two_table_join_matches_tree_walker`.) **The common-case join
-  family now runs on the VDBE (2026-06-24):** LEFT/RIGHT/FULL in any chain or mix
-  share one **unified outer-join path** (process each join left-to-right like the
-  tree-walker: matched pairs; LEFT/FULL null-extends unmatched-left; RIGHT/FULL
-  appends unmatched-right), plus `t.*` (qualifier-aware expansion) and INNER
-  NATURAL/USING (nested-loop with column coalescing — common/USING columns appear
-  once, right duplicate dropped). The router builds the joined rows (evaluating
-  each `ON`/coalesce-equality per pair) and the VDBE runs projection/WHERE/
-  aggregates over them. Tests: `left_join_*`, `right_and_full_join_*`,
-  `chained_outer_joins_*`, `table_wildcard_over_join_*`, `natural_using_join_*`.
-  The VDBE join family is now complete for all chains; only NATURAL/USING *mixed
-  with an outer join* still defers.
+  `tests/vdbe.rs::two_table_join_matches_tree_walker`.) **The VDBE join family is
+  now COMPLETE (2026-06-24).** One **fully-unified join path** (gated on any
+  LEFT/RIGHT/FULL OR any NATURAL/USING) processes each join left-to-right exactly
+  like the tree-walker's `resolve_join_chain`: compute the NATURAL/USING coalesce
+  pairs (their equality is the match predicate when present, each under the left
+  column's collation; else the `ON`), build the rows with that step's
+  INNER/LEFT/RIGHT/FULL semantics (LEFT/FULL null-extends unmatched-left;
+  RIGHT/FULL appends unmatched-right), then coalesce each pair into its left
+  position (right value when left is NULL) and drop the right duplicate. Handles
+  **any chain of INNER/LEFT/RIGHT/FULL freely combined with NATURAL/USING**, plus
+  `t.*` (qualifier-aware expansion). Pure plain-INNER chains keep the
+  cross-product path; the VDBE runs projection/WHERE/aggregates over the joined
+  rows. Tests: `left_join_*`, `right_and_full_join_*`, `chained_outer_joins_*`,
+  `natural_using_join_*`, `table_wildcard_over_join_*`. Only remaining defers:
+  `t.*` over a *coalesced* join, and ambiguous bare column names.
 - **B5b — VDBE join: per-cursor nested loop, index/PK inner seek.** Replace the
   materialized cross-product / row build with cursor opcodes
   (`OpenRead`/`Rewind`/`Column`/`Next`) so the inner side isn't fully
