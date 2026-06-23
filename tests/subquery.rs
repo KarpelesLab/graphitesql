@@ -251,3 +251,29 @@ fn correlated_against_sqlite3() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn in_values_clause() {
+    // `x IN (VALUES …)` — a VALUES clause is a query body, like `IN (SELECT …)`.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("INSERT INTO t VALUES (2),(5),(9)").unwrap();
+
+    assert_eq!(
+        ints(&c, "SELECT a FROM t WHERE a IN (VALUES(2),(9)) ORDER BY a"),
+        vec![2, 9]
+    );
+    assert_eq!(
+        ints(
+            &c,
+            "SELECT a FROM t WHERE a NOT IN (VALUES(2),(9)) ORDER BY a"
+        ),
+        vec![5]
+    );
+    // Scalar membership in a constant VALUES set.
+    assert_eq!(ints(&c, "SELECT 1 IN (VALUES(1),(2),(3))"), vec![1]);
+    assert_eq!(ints(&c, "SELECT 5 IN (VALUES(1),(2))"), vec![0]);
+    // Row-value membership: the LHS tuple is matched against a multi-column VALUES.
+    assert_eq!(ints(&c, "SELECT (1,2) IN (VALUES(1,2),(3,4))"), vec![1]);
+    assert_eq!(ints(&c, "SELECT (1,2) IN (VALUES(5,6),(7,8))"), vec![0]);
+}
