@@ -11,3 +11,8 @@ Cargo.lock
 
 # Claude Code session worktrees
 .claude/worktrees/
+
+# stray files from probes that open ":memory:" as a path
+:memory:
+:memory:-journal
+:memory:-wal
