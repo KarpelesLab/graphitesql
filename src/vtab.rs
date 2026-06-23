@@ -1597,15 +1597,41 @@ pub struct Fts5Tok {
     pub stem: bool,
     /// `unicode61`'s `remove_diacritics` level: 0 (keep all), 1 (default), 2.
     pub diacritics: u8,
+    /// `tokenchars '…'`: extra ASCII characters that count as part of a token even
+    /// though they aren't alphanumeric. A bitmap over codepoints 0..128 (bit `c` =
+    /// char `c`). Non-ASCII `tokenchars` are not represented (rare in practice).
+    pub tokenchars: u128,
+    /// `separators '…'`: ASCII characters that split tokens even though they are
+    /// alphanumeric. Same bitmap layout; takes precedence over `tokenchars`.
+    pub separators: u128,
 }
 
 #[cfg(feature = "fts5")]
 impl Default for Fts5Tok {
     fn default() -> Self {
-        // The `unicode61` default: no stemming, `remove_diacritics=1`.
+        // The `unicode61` default: no stemming, `remove_diacritics=1`, no custom
+        // token/separator characters.
         Fts5Tok {
             stem: false,
             diacritics: 1,
+            tokenchars: 0,
+            separators: 0,
+        }
+    }
+}
+
+#[cfg(feature = "fts5")]
+impl Fts5Tok {
+    /// Whether `ch` is part of a token. `separators` win over `tokenchars`, which
+    /// win over the default classification (`unicode61`: any folded alphanumeric).
+    fn is_token_char(&self, ch: char) -> bool {
+        let bit = |map: u128, ch: char| (ch as u32) < 128 && (map >> (ch as u32)) & 1 == 1;
+        if bit(self.separators, ch) {
+            false
+        } else if bit(self.tokenchars, ch) {
+            true
+        } else {
+            fold_for(ch, self.diacritics).is_alphanumeric()
         }
     }
 }
@@ -1637,9 +1663,8 @@ pub(crate) fn fts5_tokenize(text: &str, tok: Fts5Tok) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     for ch in text.chars() {
-        let ch = fold_for(ch, tok.diacritics);
-        if ch.is_alphanumeric() {
-            cur.extend(ch.to_lowercase());
+        if tok.is_token_char(ch) {
+            cur.extend(fold_for(ch, tok.diacritics).to_lowercase());
         } else if !cur.is_empty() {
             let t = core::mem::take(&mut cur);
             tokens.push(if tok.stem { fts5_porter_stem(&t) } else { t });
@@ -1669,14 +1694,14 @@ fn fts5_tokenize_spans(text: &str, tok: Fts5Tok) -> Vec<(String, usize, usize)> 
         out.push((if tok.stem { fts5_porter_stem(&t) } else { t }, start, end));
     };
     for (i, ch) in text.char_indices() {
-        // Fold accents like `fts5_tokenize` so highlight tokens match; the span
-        // [start, i) stays over the ORIGINAL bytes (folding is 1:1 in byte count).
-        let ch = fold_for(ch, tok.diacritics);
-        if ch.is_alphanumeric() {
+        // Classify on the ORIGINAL char (so `tokenchars`/`separators` match), then
+        // fold accents for the token content like `fts5_tokenize`; the span
+        // [start, i) stays over the ORIGINAL bytes.
+        if tok.is_token_char(ch) {
             if cur.is_empty() {
                 start = i;
             }
-            cur.extend(ch.to_lowercase());
+            cur.extend(fold_for(ch, tok.diacritics).to_lowercase());
         } else if !cur.is_empty() {
             push(&mut cur, start, i, &mut out);
         }
@@ -2654,11 +2679,22 @@ pub(crate) fn fts5_indexed_columns(args: &[&str]) -> Vec<String> {
 /// 1`, no stemming) is returned when there is no `tokenize` option at all.
 #[cfg(feature = "fts5")]
 pub(crate) fn fts5_tok_config(args: &[&str]) -> Fts5Tok {
+    // Strip ONE matching pair of surrounding quotes (the value's own quotes),
+    // leaving any inner `tokenchars '…'` quotes intact for the per-option scan.
+    fn unquote(s: &str) -> &str {
+        let s = s.trim();
+        let b = s.as_bytes();
+        if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        }
+    }
     let value = args.iter().find_map(|a| {
         a.split_once('=').and_then(|(k, v)| {
             k.trim()
                 .eq_ignore_ascii_case("tokenize")
-                .then(|| v.trim().trim_matches(|c| c == '\'' || c == '"'))
+                .then(|| unquote(v))
         })
     });
     let value = match value {
@@ -2673,24 +2709,54 @@ pub(crate) fn fts5_tok_config(args: &[&str]) -> Fts5Tok {
     if stem {
         i += 1; // skip `porter`; what follows is the wrapped base tokenizer
     }
-    // The base tokenizer name (if present); default `unicode61`.
+    // The base tokenizer name (if present); default `unicode61`. The `ascii`
+    // tokenizer keeps all bytes verbatim ⇒ no diacritic fold (level 0).
     let base_ascii = words
         .get(i)
         .is_some_and(|w| w.eq_ignore_ascii_case("ascii"));
     let mut diacritics = if base_ascii { 0 } else { 1 };
-    if !base_ascii {
-        // Scan the option words for `remove_diacritics <N>`.
-        let mut j = i;
-        while j + 1 < words.len() {
-            if words[j].eq_ignore_ascii_case("remove_diacritics") {
-                if let Ok(n) = words[j + 1].parse::<u8>() {
-                    diacritics = n.min(2);
-                }
+    // The ASCII bitmap of a `tokenchars '…'` / `separators '…'` value word.
+    let bitmap = |word: &str| -> u128 {
+        let mut m = 0u128;
+        for ch in unquote(word).chars() {
+            if (ch as u32) < 128 {
+                m |= 1u128 << (ch as u32);
             }
+        }
+        m
+    };
+    let mut tokenchars = 0u128;
+    let mut separators = 0u128;
+    // Scan the base tokenizer's options: `remove_diacritics <N>` (unicode61 only),
+    // `tokenchars '…'`, `separators '…'`.
+    let mut j = i;
+    while j < words.len() {
+        let w = words[j];
+        if !base_ascii && w.eq_ignore_ascii_case("remove_diacritics") {
+            if let Some(n) = words.get(j + 1).and_then(|x| x.parse::<u8>().ok()) {
+                diacritics = n.min(2);
+            }
+            j += 2;
+        } else if w.eq_ignore_ascii_case("tokenchars") {
+            if let Some(x) = words.get(j + 1) {
+                tokenchars |= bitmap(x);
+            }
+            j += 2;
+        } else if w.eq_ignore_ascii_case("separators") {
+            if let Some(x) = words.get(j + 1) {
+                separators |= bitmap(x);
+            }
+            j += 2;
+        } else {
             j += 1;
         }
     }
-    Fts5Tok { stem, diacritics }
+    Fts5Tok {
+        stem,
+        diacritics,
+        tokenchars,
+        separators,
+    }
 }
 
 #[cfg(feature = "fts5")]
@@ -2951,6 +3017,23 @@ mod tests {
             cfg("tokenize='unicode61 remove_diacritics 9'").diacritics,
             2
         );
+
+        // tokenchars / separators: the nested-quoted value's ASCII chars set bits;
+        // the outer double-quotes are stripped without eating the inner quotes.
+        let tc = cfg("tokenize=\"unicode61 tokenchars '-_.'\"");
+        assert!(tc.is_token_char('-') && tc.is_token_char('_') && tc.is_token_char('.'));
+        assert!(!tc.is_token_char('@')); // not listed → default classification
+        assert!(tc.is_token_char('a')); // alphanumerics still tokens
+        let sp = cfg("tokenize=\"unicode61 separators 'x'\"");
+        assert!(!sp.is_token_char('x')); // alphanumeric, but a separator
+        assert!(sp.is_token_char('y'));
+        // separators win over tokenchars for the same char.
+        let both = cfg("tokenize=\"unicode61 tokenchars '-' separators '-'\"");
+        assert!(!both.is_token_char('-'));
+        // Combined with remove_diacritics, and on the ascii base tokenizer.
+        let combo = cfg("tokenize=\"unicode61 remove_diacritics 0 tokenchars '-'\"");
+        assert!(combo.diacritics == 0 && combo.is_token_char('-'));
+        assert!(cfg("tokenize=\"ascii tokenchars '-'\"").is_token_char('-'));
     }
 
     #[test]

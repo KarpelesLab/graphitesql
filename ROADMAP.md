@@ -664,20 +664,25 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     integrity-clean and MATCH correctly under sqlite (`tests/fts5_sqlite_read.rs::
     sqlite_matches_accented_graphite_fts5` + `::sqlite_matches_extended_latin_
     graphite_fts5`); this also aligns graphite's own `MATCH` with sqlite for that
-    text. **TOKENIZER OPTIONS (2026-06-23):** the `tokenize=` chain is now parsed
-    into an `Fts5Tok { stem, diacritics }` (`fts5_tok_config`) and threaded through
-    EVERY tokenization — indexing, query lexing, `MATCH`, `bm25`, `highlight`,
-    `snippet`, `fts5vocab` — so the doc and query sides always fold identically.
-    Honored: `remove_diacritics 0` (keep all — a second 112-entry table folds the
-    `=2` extras like `ệ`→`e`, `ố`→`o`, also probed byte-exactly from sqlite),
-    `porter` (wrapping a base tokenizer), and `ascii` (≡ level 0, no fold). A
-    graphite table with any of these levels is integrity-clean and MATCHes
-    identically to sqlite (`::sqlite_matches_remove_diacritics_levels_graphite_fts5`
-    + the `fts5_tok_config_parses_tokenize_option` unit test). *Remaining:* the
-    `ascii` tokenizer's exact high-byte token-char rule (we approximate via level 0
-    + Unicode alphanumerics — correct for typical text, diverges only on high-byte
-    punctuation inside a token), `tokenchars`/`separators`, and non-Latin scripts
-    (which `unicode61` passes through unchanged anyway, so graphite already matches).
+    text. **TOKENIZER OPTIONS (2026-06-23/24):** the `tokenize=` chain is parsed
+    into an `Fts5Tok { stem, diacritics, tokenchars, separators }` (`fts5_tok_config`)
+    and threaded through EVERY tokenization — indexing, query lexing, `MATCH`,
+    `bm25`, `highlight`, `snippet`, `fts5vocab` — so the doc and query sides always
+    classify/fold identically. Honored: `remove_diacritics 0|1|2` (`=2` adds a
+    second 112-entry table for `ệ`→`e`, `ố`→`o`, also probed byte-exactly from
+    sqlite), `porter` (wrapping a base tokenizer), `ascii` (≡ level 0, no fold),
+    and **`tokenchars '…'` / `separators '…'`** (2026-06-24) — extra token / forced
+    separator characters, stored as `u128` ASCII bitmaps so `Fts5Tok` stays `Copy`
+    (no threading churn); `separators` win over `tokenchars`, which win over the
+    default classification, applied to the original codepoint before folding. A
+    graphite table with any of these is integrity-clean and MATCHes identically to
+    sqlite (`::sqlite_matches_remove_diacritics_levels_graphite_fts5`,
+    `::sqlite_matches_tokenchars_separators_graphite_fts5`, + the
+    `fts5_tok_config_parses_tokenize_option` unit test). *Remaining (minor):* the
+    `ascii` tokenizer's exact high-byte token-char + ASCII-only case-fold rule (we
+    approximate via Unicode alphanumerics + `to_lowercase` — correct for typical
+    text), non-ASCII `tokenchars`/`separators` (rare), and non-Latin scripts (which
+    `unicode61` passes through unchanged anyway, so graphite already matches).
 - **D4 — User-defined functions from Rust.** Scalar ✅ DONE
   (`register_function`, via `Subqueries::call_udf`) and aggregate ✅ DONE
   (`register_aggregate_function` + an `AggregateFunction` step/finalize trait;

@@ -407,3 +407,63 @@ fn sqlite_matches_remove_diacritics_levels_graphite_fts5() {
     );
     let _ = std::fs::remove_file(&p2);
 }
+
+/// The `unicode61` `tokenchars`/`separators` tokenizer options: graphite keeps the
+/// listed characters in (or splits them out of) tokens exactly like sqlite, so a
+/// graphite-written table is integrity-clean and the de-tokenized `MATCH` finds
+/// the same rows under stock sqlite3.
+#[test]
+fn sqlite_matches_tokenchars_separators_graphite_fts5() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // tokenchars: `-` and `_` stay inside tokens (so `foo-bar`, `a_b` are single
+    // terms); `@` still splits.
+    let pc = tmp_path();
+    {
+        let mut c = Connection::create(&pc).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(b, tokenize=\"unicode61 tokenchars '-_'\")")
+            .unwrap();
+        c.execute("INSERT INTO t(rowid,b) VALUES (1,'foo-bar a_b'),(2,'x@y plain')")
+            .unwrap();
+    }
+    assert_eq!(sqlite_run(&pc, "PRAGMA integrity_check"), "ok");
+    // A token with `-`/`_` must be quoted in the MATCH query (fts5 query syntax).
+    assert_eq!(
+        sqlite_run(&pc, "SELECT rowid FROM t WHERE t MATCH '\"foo-bar\"'"),
+        "1"
+    );
+    assert_eq!(
+        sqlite_run(&pc, "SELECT rowid FROM t WHERE t MATCH '\"a_b\"'"),
+        "1"
+    );
+    // `@` split `x@y` into `x` and `y`.
+    assert_eq!(
+        sqlite_run(&pc, "SELECT rowid FROM t WHERE t MATCH 'x AND y'"),
+        "2"
+    );
+    let _ = std::fs::remove_file(&pc);
+
+    // separators: `x` splits tokens even though it is alphanumeric.
+    let ps = tmp_path();
+    {
+        let mut c = Connection::create(&ps).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(b, tokenize=\"unicode61 separators 'x'\")")
+            .unwrap();
+        c.execute("INSERT INTO t(rowid,b) VALUES (1,'axbxc hello')")
+            .unwrap();
+    }
+    assert_eq!(sqlite_run(&ps, "PRAGMA integrity_check"), "ok");
+    // A standalone `b`/`c` token exists only because `x` split the `axbxc` run —
+    // proof the separator took effect at index time.
+    assert_eq!(
+        sqlite_run(&ps, "SELECT rowid FROM t WHERE t MATCH 'b'"),
+        "1"
+    );
+    assert_eq!(
+        sqlite_run(&ps, "SELECT rowid FROM t WHERE t MATCH 'c'"),
+        "1"
+    );
+    let _ = std::fs::remove_file(&ps);
+}
