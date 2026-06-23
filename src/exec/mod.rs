@@ -5632,6 +5632,24 @@ impl Connection {
             return self.exec_view_update(upd, params);
         }
         let meta = self.table_meta(&upd.table, None)?;
+        // Validate the SET-target columns up front: sqlite rejects an unknown
+        // assignment column at prepare time, even when the table has no rows.
+        // graphite otherwise resolves them lazily in the per-row loop and so
+        // silently accepted a bogus column on an empty table.
+        for col in upd
+            .assignments
+            .iter()
+            .map(|(c, _)| c)
+            .chain(upd.row_assignments.iter().flat_map(|(cs, _)| cs))
+        {
+            if !meta
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(col))
+            {
+                return Err(Error::Error(alloc::format!("no such column: {col}")));
+            }
+        }
         if meta.without_rowid {
             if !upd.returning.is_empty() {
                 return Err(Error::Unsupported("RETURNING on WITHOUT ROWID tables"));

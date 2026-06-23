@@ -413,3 +413,31 @@ fn change_counters_match_sqlite_semantics() {
     let _ = c.query("SELECT count(*) FROM t").unwrap();
     assert_eq!(i(&c, "SELECT changes()"), 2);
 }
+
+#[test]
+fn update_set_unknown_column_errors_even_on_empty_table() {
+    // sqlite rejects an unknown SET-target column at prepare time, even when the
+    // table has no rows. graphite used to resolve SET columns lazily in the row
+    // loop, so a bogus column was silently accepted on an empty table.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    // Empty table: still an error.
+    let e = c.execute("UPDATE t SET nonexist = 1").unwrap_err();
+    assert!(format!("{e}").contains("no such column"), "{e}");
+    // Row-value assignment with a bogus column too.
+    let e = c.execute("UPDATE t SET (a, nope) = (1, 2)").unwrap_err();
+    assert!(format!("{e}").contains("no such column"), "{e}");
+    // WITHOUT ROWID table, empty.
+    c.execute("CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID")
+        .unwrap();
+    let e = c.execute("UPDATE w SET bogus = 1").unwrap_err();
+    assert!(format!("{e}").contains("no such column"), "{e}");
+    // Valid updates still work (including the INTEGER PRIMARY KEY alias).
+    c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, v)")
+        .unwrap();
+    c.execute("INSERT INTO p VALUES (1, 10), (2, 20)").unwrap();
+    c.execute("UPDATE p SET v = v + 1 WHERE id = 2").unwrap();
+    c.execute("UPDATE p SET id = 9 WHERE id = 1").unwrap();
+    let r = c.query("SELECT id, v FROM p ORDER BY id").unwrap();
+    assert_eq!(r.rows.len(), 2);
+}
