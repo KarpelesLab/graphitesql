@@ -151,6 +151,10 @@ pub struct Connection {
     /// page count, a negative value is KiB; default −2000). graphite keeps every
     /// page resident, so this is reported back but does not bound a real cache.
     cache_size: core::cell::Cell<i64>,
+    /// `PRAGMA analysis_limit` — the row sample cap `ANALYZE` would use (0 =
+    /// unlimited). graphite always analyzes fully, so this is advisory; it is
+    /// stored and reported back like sqlite (which clamps a negative value to 0).
+    analysis_limit: core::cell::Cell<i64>,
     /// `PRAGMA secure_delete` (0=off, 1=on, 2=fast), round-tripped like sqlite.
     /// When non-zero, freed pages are zeroed (the pager honors it); a
     /// per-connection runtime setting, not persisted in the file.
@@ -286,6 +290,7 @@ impl Connection {
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
+            analysis_limit: core::cell::Cell::new(0),
             secure_delete: core::cell::Cell::new(0),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
@@ -322,6 +327,7 @@ impl Connection {
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
+            analysis_limit: core::cell::Cell::new(0),
             secure_delete: core::cell::Cell::new(0),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
@@ -1232,6 +1238,26 @@ impl Connection {
             // normal connection. `legacy_file_format` and `case_sensitive_like`
             // (a setter-only spelling) yield no rows, as in SQLite.
             "legacy_file_format" | "case_sensitive_like" => Ok(QueryResult {
+                columns: alloc::vec![name.clone()],
+                rows: Vec::new(),
+            }),
+            // `analysis_limit` stores/reports the ANALYZE sample cap. The set form
+            // (`PRAGMA analysis_limit = N`) clamps a negative N to 0 and echoes the
+            // resulting value, exactly like sqlite; the plain form reads it back.
+            "analysis_limit" => {
+                if let Some(e) = &p.value {
+                    let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(&Params::default()))?);
+                    self.analysis_limit.set(v.max(0));
+                }
+                Ok(single(
+                    "analysis_limit",
+                    Value::Integer(self.analysis_limit.get()),
+                ))
+            }
+            // `optimize` runs recommended maintenance; graphite keeps its stats
+            // current, so there is nothing to do and — like sqlite in its default,
+            // non-verbose mode — it returns no rows.
+            "optimize" => Ok(QueryResult {
                 columns: alloc::vec![name.clone()],
                 rows: Vec::new(),
             }),
@@ -3418,6 +3444,13 @@ impl Connection {
             if let Some(e) = &p.value {
                 self.cache_size
                     .set(eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?));
+            }
+        } else if p.name.eq_ignore_ascii_case("analysis_limit") {
+            // The ANALYZE sample cap (advisory here); store it, clamping a negative
+            // value to 0 like sqlite, so a later `PRAGMA analysis_limit` reads back.
+            if let Some(e) = &p.value {
+                let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                self.analysis_limit.set(v.max(0));
             }
         } else if p.name.eq_ignore_ascii_case("secure_delete") {
             // sqlite maps the argument to 0 (off), 2 (the `fast` keyword only), or

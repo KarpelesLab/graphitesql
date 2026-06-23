@@ -255,3 +255,53 @@ fn table_info_default_value_is_sql_text() {
     let got = rows_str(&c, "SELECT name, dflt_value FROM pragma_table_info('t')");
     assert_eq!(got, want);
 }
+
+#[test]
+fn analysis_limit_and_optimize() {
+    // `PRAGMA analysis_limit` round-trips an advisory ANALYZE sample cap (graphite
+    // always analyzes fully), clamping a negative value to 0 and echoing the new
+    // value from the set form — exactly like sqlite. `PRAGMA optimize` is a no-op
+    // that returns no rows. Verified against the sqlite3 CLI where available.
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(
+        c.query("PRAGMA analysis_limit").unwrap().rows,
+        vec![vec![Value::Integer(0)]]
+    );
+    assert_eq!(
+        c.query("PRAGMA analysis_limit=100").unwrap().rows,
+        vec![vec![Value::Integer(100)]]
+    );
+    assert_eq!(
+        c.query("PRAGMA analysis_limit").unwrap().rows,
+        vec![vec![Value::Integer(100)]]
+    );
+    assert_eq!(
+        c.query("PRAGMA analysis_limit=-5").unwrap().rows,
+        vec![vec![Value::Integer(0)]]
+    );
+    assert!(c.query("PRAGMA optimize").unwrap().rows.is_empty());
+
+    if !sqlite3_available() {
+        return;
+    }
+    // The getter value and optimize's empty output match the sqlite3 CLI.
+    for (q, want) in [
+        ("PRAGMA analysis_limit", "0"),
+        (
+            "PRAGMA analysis_limit=250; PRAGMA analysis_limit",
+            "250\n250",
+        ),
+        ("PRAGMA analysis_limit=-1; PRAGMA analysis_limit", "0\n0"),
+        ("PRAGMA optimize", ""),
+    ] {
+        let got = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(q)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        assert_eq!(got, want, "sqlite baseline drift for {q}");
+    }
+}
