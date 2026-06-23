@@ -900,9 +900,12 @@ fn natural_using_join_matches_tree_walker_and_sqlite3() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a INT, b TEXT)").unwrap();
     c.execute("CREATE TABLE u(a INT, c TEXT)").unwrap();
+    c.execute("CREATE TABLE w(a INT, d TEXT)").unwrap();
     c.execute("INSERT INTO t VALUES(1,'x'),(2,'y'),(3,'z')")
         .unwrap();
     c.execute("INSERT INTO u VALUES(1,'p'),(2,'q'),(5,'r')")
+        .unwrap();
+    c.execute("INSERT INTO w VALUES(1,'m'),(2,'n'),(3,'o')")
         .unwrap();
     let qs = [
         "SELECT * FROM t NATURAL JOIN u ORDER BY a",
@@ -911,6 +914,10 @@ fn natural_using_join_matches_tree_walker_and_sqlite3() {
         "SELECT a FROM t JOIN u USING(a) ORDER BY a",
         "SELECT count(*) FROM t NATURAL JOIN u",
         "SELECT * FROM t JOIN u USING(a) WHERE a > 1 ORDER BY a",
+        // 3-table coalesced chains (every step coalesces the common `a`).
+        "SELECT * FROM t NATURAL JOIN u NATURAL JOIN w ORDER BY a",
+        "SELECT * FROM t JOIN u USING(a) JOIN w USING(a) ORDER BY a",
+        "SELECT a, b, c, d FROM t NATURAL JOIN u NATURAL JOIN w ORDER BY a",
     ];
     for q in qs {
         let r = c
@@ -927,8 +934,10 @@ fn natural_using_join_matches_tree_walker_and_sqlite3() {
         return;
     }
     let setup = "CREATE TABLE t(a INT, b TEXT); CREATE TABLE u(a INT, c TEXT);\
+                 CREATE TABLE w(a INT, d TEXT);\
                  INSERT INTO t VALUES(1,'x'),(2,'y'),(3,'z');\
-                 INSERT INTO u VALUES(1,'p'),(2,'q'),(5,'r');";
+                 INSERT INTO u VALUES(1,'p'),(2,'q'),(5,'r');\
+                 INSERT INTO w VALUES(1,'m'),(2,'n'),(3,'o');";
     for q in qs {
         let want = {
             let o = Command::new("sqlite3")
