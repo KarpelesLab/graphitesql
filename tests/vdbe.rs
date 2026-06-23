@@ -853,3 +853,37 @@ fn right_and_full_join_match_tree_walker_and_sqlite3() {
         assert_eq!(got, want, "RIGHT/FULL JOIN vs sqlite3 diverged on {q}");
     }
 }
+
+#[test]
+fn table_wildcard_over_join_matches_tree_walker() {
+    // `t.*` over a join expands to just that table's columns (by the per-column
+    // owning-table qualifier), so it now runs on the VDBE instead of bailing.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT)")
+        .unwrap();
+    c.execute("CREATE TABLE u(t_id INT, w INT)").unwrap();
+    c.execute("INSERT INTO t(g) VALUES('a'),('b')").unwrap();
+    c.execute("INSERT INTO u VALUES(1,10),(1,11),(2,20)")
+        .unwrap();
+    for q in [
+        "SELECT t.* FROM t JOIN u ON u.t_id=t.id ORDER BY t.id, u.w",
+        "SELECT u.* FROM t JOIN u ON u.t_id=t.id ORDER BY u.w",
+        "SELECT t.*, u.w FROM t LEFT JOIN u ON u.t_id=t.id ORDER BY t.id, u.w",
+        "SELECT u.*, t.g FROM t LEFT JOIN u ON u.t_id=t.id ORDER BY t.id, u.w",
+        "SELECT t.* FROM t, u WHERE u.t_id=t.id ORDER BY t.id, u.w",
+        "SELECT e.* FROM t e JOIN u ON u.t_id=e.id ORDER BY e.id, u.w",
+    ] {
+        let r = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("expected VDBE to handle {q}: {e}"));
+        c.set_use_vdbe(false);
+        let want = c.query(q).unwrap();
+        c.set_use_vdbe(true);
+        assert_eq!(r.columns, want.columns, "columns diverged on {q}");
+        assert_eq!(r.rows, want.rows, "rows diverged on {q}");
+    }
+    // An unknown qualifier still bails (the tree-walker rejects it identically).
+    assert!(c
+        .query_vdbe("SELECT x.* FROM t JOIN u ON u.t_id=t.id")
+        .is_err());
+}

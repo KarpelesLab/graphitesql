@@ -991,13 +991,7 @@ impl Connection {
             if j.natural || !j.using.is_empty() {
                 return Err(Error::Unsupported("VDBE: NATURAL/USING outer join"));
             }
-            if sel
-                .columns
-                .iter()
-                .any(|rc| matches!(rc, sql::ast::ResultColumn::TableWildcard(_)))
-            {
-                return Err(Error::Unsupported("VDBE: table.* over a join"));
-            }
+            // `t.*` over a join expands by qualifier inside `compile_table_select`.
             let is_full = matches!(j.kind, sql::ast::JoinKind::Full);
             let left = scan_one(&from.first)?;
             let right = scan_one(&j.table)?;
@@ -1088,13 +1082,7 @@ impl Connection {
             }) {
                 return Err(Error::Unsupported("VDBE: only INNER/LEFT joins"));
             }
-            if sel
-                .columns
-                .iter()
-                .any(|rc| matches!(rc, sql::ast::ResultColumn::TableWildcard(_)))
-            {
-                return Err(Error::Unsupported("VDBE: table.* over a join"));
-            }
+            // `t.*` over a join expands by qualifier inside `compile_table_select`.
             // The VDBE path is param-less (explicit params were substituted
             // upstream); evaluate each ON against an empty parameter set.
             let on_params = eval::Params::default();
@@ -1180,14 +1168,7 @@ impl Connection {
             {
                 return Err(Error::Unsupported("VDBE: only plain inner joins"));
             }
-            // `t.*` over a join would need per-table expansion; not yet handled.
-            if sel
-                .columns
-                .iter()
-                .any(|rc| matches!(rc, sql::ast::ResultColumn::TableWildcard(_)))
-            {
-                return Err(Error::Unsupported("VDBE: table.* over a join"));
-            }
+            // `t.*` over a join expands by qualifier inside `compile_table_select`.
             // Scan every source (the first table, then each joined table) in
             // declaration order.
             let mut sources = alloc::vec![scan_one(&from.first)?];
@@ -15420,8 +15401,16 @@ impl Connection {
         let mut labels = Vec::new();
         for col in &sel.columns {
             match col {
-                ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => {
+                ResultColumn::Wildcard => {
                     for c in columns {
+                        labels.push(c.name.clone());
+                    }
+                }
+                // `t.*` names only that table's columns (by owning-table qualifier),
+                // matching the projected data — over a join a bare `*` lists every
+                // column but `t.*` must not.
+                ResultColumn::TableWildcard(t) => {
+                    for c in columns.iter().filter(|c| c.table.eq_ignore_ascii_case(t)) {
                         labels.push(c.name.clone());
                     }
                 }

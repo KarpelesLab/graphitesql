@@ -1237,18 +1237,27 @@ pub fn compile_table_select(
                 let label = result_label(expr, alias, source, projections.len());
                 projections.push((expr.clone(), label));
             }
-            // In a single-table scan the only valid `t.*` qualifier is this
-            // table (the caller verifies the name matches before using the VDBE),
-            // so it expands to every column exactly like a bare `*`.
-            ResultColumn::TableWildcard(_) => {
-                for name in columns {
-                    projections.push((
-                        Expr::Column {
-                            table: None,
-                            column: name.clone(),
-                        },
-                        name.clone(),
-                    ));
+            // `t.*` expands to the columns whose owning-table qualifier matches
+            // `t` (the per-column qualifier in `tables`). For a single-table scan
+            // every qualifier matches, so this is the same as a bare `*`; over a
+            // join it selects just that table's columns. An unknown qualifier (no
+            // column matches) bails so the tree-walker resolves or rejects it.
+            ResultColumn::TableWildcard(q) => {
+                let mut any = false;
+                for (i, name) in columns.iter().enumerate() {
+                    if tables.get(i).is_some_and(|t| t.eq_ignore_ascii_case(q)) {
+                        projections.push((
+                            Expr::Column {
+                                table: Some(q.clone()),
+                                column: name.clone(),
+                            },
+                            name.clone(),
+                        ));
+                        any = true;
+                    }
+                }
+                if !any {
+                    return Err(Error::Unsupported("VDBE: unknown table.* qualifier"));
                 }
             }
         }

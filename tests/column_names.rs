@@ -42,3 +42,41 @@ fn column_references_and_aliases() {
     // A wildcard expands to the underlying column names.
     assert_eq!(names(&c, "SELECT * FROM t"), ["a", "b"]);
 }
+
+#[test]
+fn table_wildcard_over_join_names_only_that_table() {
+    // `t.*` over a join must name (and project) ONLY that table's columns, not
+    // every column of the join — a bare `*` lists all. (Regression: the column
+    // names previously listed all join columns while the data had only `t`'s.)
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT)")
+        .unwrap();
+    c.execute("CREATE TABLE u(t_id INT, w INT)").unwrap();
+    c.execute("INSERT INTO t(g) VALUES('a'),('b')").unwrap();
+    c.execute("INSERT INTO u VALUES(1,10),(2,20)").unwrap();
+    for &use_vdbe in &[true, false] {
+        c.set_use_vdbe(use_vdbe);
+        let r = c
+            .query("SELECT t.* FROM t JOIN u ON u.t_id = t.id")
+            .unwrap();
+        assert_eq!(r.columns, ["id", "g"], "use_vdbe={use_vdbe}");
+        assert!(
+            r.rows.iter().all(|row| row.len() == 2),
+            "use_vdbe={use_vdbe}"
+        );
+        // `u.*` likewise; a bare `*` lists everything.
+        assert_eq!(
+            c.query("SELECT u.* FROM t JOIN u ON u.t_id = t.id")
+                .unwrap()
+                .columns,
+            ["t_id", "w"]
+        );
+        assert_eq!(
+            c.query("SELECT * FROM t JOIN u ON u.t_id = t.id")
+                .unwrap()
+                .columns,
+            ["id", "g", "t_id", "w"]
+        );
+    }
+    c.set_use_vdbe(true);
+}
