@@ -393,6 +393,18 @@ impl Parser {
             }
             return Ok(Statement::Insert(ins));
         }
+        // `WITH … DELETE` / `WITH … UPDATE`: the CTEs ride on the statement and are
+        // visible to its WHERE/SET subqueries (SQLite extends WITH to all DML).
+        if self.check_kw("delete") {
+            let mut del = self.delete()?;
+            del.ctes = ctes;
+            return Ok(Statement::Delete(del));
+        }
+        if self.check_kw("update") {
+            let mut upd = self.update()?;
+            upd.ctes = ctes;
+            return Ok(Statement::Update(upd));
+        }
         // Otherwise it must be a SELECT / VALUES query: parse the body and
         // attach the CTEs to the resulting (possibly compound) select.
         let mut sel = self.select_body()?;
@@ -1172,6 +1184,7 @@ impl Parser {
         let returning = self.returning_clause()?;
         let (order_by, limit, offset) = self.order_limit_offset()?;
         Ok(Update {
+            ctes: Vec::new(),
             table,
             schema,
             on_conflict,
@@ -1199,6 +1212,7 @@ impl Parser {
         let returning = self.returning_clause()?;
         let (order_by, limit, offset) = self.order_limit_offset()?;
         Ok(Delete {
+            ctes: Vec::new(),
             table,
             schema,
             where_clause,

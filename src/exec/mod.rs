@@ -4747,6 +4747,19 @@ impl Connection {
     }
 
     fn exec_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
+        // A leading `WITH` makes its CTEs visible to the WHERE subqueries; push
+        // them for the duration of the statement, then restore the scope.
+        if del.ctes.is_empty() {
+            return self.exec_delete_inner(del, params);
+        }
+        let base = self.cte_env.borrow().len();
+        let pushed = self.push_ctes(&del.ctes, params);
+        let result = pushed.and_then(|()| self.exec_delete_inner(del, params));
+        self.cte_env.borrow_mut().truncate(base);
+        result
+    }
+
+    fn exec_delete_inner(&mut self, del: &Delete, params: &Params) -> Result<usize> {
         reject_schema_write(&del.table)?;
         if self.is_virtual_table(&del.table) {
             return self.exec_vtab_delete(del, params);
@@ -4851,6 +4864,18 @@ impl Connection {
     }
 
     fn exec_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
+        // A leading `WITH` exposes its CTEs to the SET/WHERE/FROM subqueries.
+        if upd.ctes.is_empty() {
+            return self.exec_update_inner(upd, params);
+        }
+        let base = self.cte_env.borrow().len();
+        let pushed = self.push_ctes(&upd.ctes, params);
+        let result = pushed.and_then(|()| self.exec_update_inner(upd, params));
+        self.cte_env.borrow_mut().truncate(base);
+        result
+    }
+
+    fn exec_update_inner(&mut self, upd: &Update, params: &Params) -> Result<usize> {
         reject_schema_write(&upd.table)?;
         if self.is_virtual_table(&upd.table) {
             return self.exec_vtab_update(upd, params);
@@ -6007,8 +6032,8 @@ impl Connection {
     /// Materialize each `WITH` CTE of `sel` into the environment, in declaration
     /// order (so a later CTE may reference an earlier one). Recursive CTEs are
     /// evaluated with the fixed-point loop.
-    fn push_ctes(&self, sel: &Select, params: &Params) -> Result<()> {
-        for cte in &sel.ctes {
+    fn push_ctes(&self, ctes: &[Cte], params: &Params) -> Result<()> {
+        for cte in ctes {
             let binding = if references_name(&cte.select, &cte.name) {
                 self.eval_recursive_cte(cte, params)?
             } else {
@@ -9557,7 +9582,7 @@ impl Connection {
         // VDBE fast path is attempted per query block inside `run_core`, so it
         // also covers each arm of a compound query.)
         let base = self.cte_env.borrow().len();
-        let pushed = self.push_ctes(sel, params);
+        let pushed = self.push_ctes(&sel.ctes, params);
         let result = pushed.and_then(|()| self.run_select_compound(sel, params));
         self.cte_env.borrow_mut().truncate(base);
         result

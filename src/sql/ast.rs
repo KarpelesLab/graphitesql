@@ -400,6 +400,9 @@ pub enum InsertSource {
 /// An `UPDATE` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Update {
+    /// `WITH` common table expressions prefixing the statement, in declaration
+    /// order; visible to the `SET`/`WHERE`/`FROM` subqueries.
+    pub ctes: Vec<Cte>,
     /// Target table.
     pub table: String,
     /// A `schema.` qualifier (`UPDATE aux.t`), if any.
@@ -432,6 +435,9 @@ pub struct Update {
 /// A `DELETE` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Delete {
+    /// `WITH` common table expressions prefixing the statement, in declaration
+    /// order; visible to the `WHERE` subqueries.
+    pub ctes: Vec<Cte>,
     /// Target table.
     pub table: String,
     /// A `schema.` qualifier (`DELETE FROM aux.t`), if any.

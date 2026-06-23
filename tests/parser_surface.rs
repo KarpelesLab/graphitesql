@@ -168,10 +168,8 @@ fn deferred_forms_still_rejected() {
     assert!(parse("SELECT * FROM (t JOIN u)").is_err());
     assert!(parse("SELECT * FROM (t, u)").is_err());
     assert!(parse("SELECT * FROM (t JOIN u) AS j").is_err());
-    // WITH prefixing UPDATE / DELETE / INSERT … VALUES needs executor-visible
-    // CTE scoping for those statements.
-    assert!(parse("WITH x AS (SELECT 1) UPDATE t SET a=1").is_err());
-    assert!(parse("WITH x AS (SELECT 1) DELETE FROM t").is_err());
+    // `WITH … INSERT … VALUES` is still rejected: a CTE may only prefix a query
+    // body, an `INSERT … SELECT`, or (now) an UPDATE/DELETE — not `VALUES`.
     assert!(parse("WITH x AS (SELECT 1) INSERT INTO t(a) VALUES (1)").is_err());
 }
 

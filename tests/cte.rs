@@ -228,3 +228,41 @@ fn cte_explicit_column_count_must_match() {
         vec![1]
     );
 }
+
+#[test]
+fn with_clause_prefixes_delete_and_update() {
+    // SQLite lets a `WITH` clause prefix DELETE/UPDATE (not just SELECT/INSERT);
+    // its CTEs are visible to the statement's WHERE/SET subqueries.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b INT)")
+        .unwrap();
+    c.execute("INSERT INTO t(id, b) VALUES (1,0),(2,0),(3,0),(4,0)")
+        .unwrap();
+
+    // WITH … UPDATE: rows whose id is produced by the CTE get b=9.
+    c.execute(
+        "WITH pick(x) AS (SELECT 1 UNION SELECT 3) \
+         UPDATE t SET b = 9 WHERE id IN (SELECT x FROM pick)",
+    )
+    .unwrap();
+    assert_eq!(ints(&c, "SELECT b FROM t ORDER BY id"), vec![9, 0, 9, 0]);
+
+    // WITH … UPDATE … RETURNING projects the changed rows (DML goes through the
+    // RETURNING entry point, not query()).
+    let r = c
+        .execute_returning(
+            "WITH pick(x) AS (SELECT 2) \
+             UPDATE t SET b = 7 WHERE id IN (SELECT x FROM pick) RETURNING id, b",
+            &graphitesql::exec::eval::Params::default(),
+        )
+        .unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Integer(2), Value::Integer(7)]]);
+
+    // WITH … DELETE, including a recursive CTE driving the predicate.
+    c.execute(
+        "WITH RECURSIVE small(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM small WHERE x<2) \
+         DELETE FROM t WHERE id IN (SELECT x FROM small)",
+    )
+    .unwrap();
+    assert_eq!(ints(&c, "SELECT id FROM t ORDER BY id"), vec![3, 4]);
+}

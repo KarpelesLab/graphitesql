@@ -156,7 +156,16 @@ impl Shell {
                 Ok(result) if is_explain_query_plan(sql) => self.print_eqp_tree(&result),
                 Ok(result) => self.print_result(&result),
                 Err(graphitesql::Error::Unsupported(m)) if m.contains("use execute()") => {
-                    conn.execute(sql)?;
+                    // A `WITH …`-prefixed DML statement was misrouted to query();
+                    // run it as a mutation. If it also has RETURNING, project the
+                    // rows via execute_returning rather than discarding them.
+                    if has_returning(sql) {
+                        let result = conn
+                            .execute_returning(sql, &graphitesql::exec::eval::Params::default())?;
+                        self.print_result(&result);
+                    } else {
+                        conn.execute(sql)?;
+                    }
                 }
                 Err(e) => return Err(e),
             }
