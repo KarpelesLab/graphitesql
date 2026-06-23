@@ -581,3 +581,39 @@ fn rowid_pseudo_column_matches_tree_walker() {
         .unwrap();
     assert!(c.query_vdbe("SELECT rowid FROM w").is_err());
 }
+
+#[test]
+fn subquery_from_matches_tree_walker() {
+    // A derived table (FROM subquery) over a single all-BINARY base table is
+    // materialized and compiled through the VDBE: each output column inherits its
+    // affinity from the resolved type and BINARY collation, so the outer query
+    // compares exactly like the tree-walker.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INT, b TEXT)").unwrap();
+    c.execute("INSERT INTO t VALUES (3,'x'),(1,'y'),(2,'z')")
+        .unwrap();
+    for q in [
+        "SELECT x FROM (SELECT a AS x FROM t WHERE a > 1) ORDER BY x",
+        "SELECT * FROM (SELECT a, b FROM t) ORDER BY a",
+        "SELECT sub.a, sub.b FROM (SELECT a, b FROM t WHERE a < 3) sub ORDER BY sub.a",
+        "SELECT x FROM (SELECT a + 10 AS x FROM t) ORDER BY x",
+        "SELECT a FROM (SELECT a FROM t) WHERE a = '2'", // INTEGER affinity inherited
+        "SELECT x FROM (SELECT a AS x FROM t ORDER BY a LIMIT 2) ORDER BY x",
+    ] {
+        let got = c.query_vdbe(q).unwrap().rows;
+        let want = c.query(q).unwrap().rows;
+        assert_eq!(
+            got, want,
+            "VDBE subquery-FROM vs tree-walker diverged on {q}"
+        );
+    }
+
+    // A subquery over a non-BINARY base column defers (its derived collation can't
+    // be safely inherited); the tree-walker handles it.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE u(a TEXT COLLATE NOCASE)").unwrap();
+    c.execute("INSERT INTO u VALUES ('A')").unwrap();
+    assert!(c
+        .query_vdbe("SELECT a FROM (SELECT a FROM u) WHERE a = 'a'")
+        .is_err());
+}

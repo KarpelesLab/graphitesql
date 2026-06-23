@@ -356,9 +356,13 @@ each additive behind `query_vdbe` until B7:
 - **B5c — VDBE: subqueries / compound / window** shapes still on the tree-walker.
   *Coverage audited 2026-06-23 (`query_vdbe` strict-mode probe):* the VDBE already
   compiles single-table scans with `WHERE`, `ORDER BY`, `GROUP BY`, `DISTINCT`,
-  constant `LIMIT`, and N-table inner joins; what defers is **compound
-  SELECT** (`UNION`/etc.), subqueries-in-`FROM`, correlated subqueries, and window
-  functions — each substantial. The param-less limit is now **partly lifted**:
+  constant `LIMIT`, the `COLLATE` operator, `rowid`, N-table inner joins, and —
+  newly (2026-06-24) — a **FROM subquery (derived table)** materialized over a
+  single all-BINARY base table (each output column inherits its affinity from the
+  resolved type, BINARY collation; a non-BINARY base or a join/nested subquery
+  defers). What still defers: **compound SELECT** (`UNION`/etc.), correlated
+  subqueries, subqueries over joins / non-BINARY columns, and window functions —
+  each substantial. The param-less limit is now **partly lifted**:
   EXPLICIT parameters (`?N`, `:name`/`$x`) are substituted into the VDBE-compiled
   expressions before compile (`substitute_params` in `exec`), so `WHERE a=?1`,
   `LIMIT ?1`, etc. run on the VDBE and match the tree-walker

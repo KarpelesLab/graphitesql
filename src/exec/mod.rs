@@ -550,7 +550,66 @@ impl Connection {
             Option<Vec<i64>>,
         );
         let scan_one = |tr: &sql::ast::TableRef| -> Result<ScanOut> {
-            if tr.subquery.is_some() || tr.tvf_args.is_some() {
+            // A derived table (FROM subquery), conservatively: a single-block
+            // subquery over a single all-BINARY base table. Then every output
+            // column has BINARY collation and its affinity comes from the resolved
+            // output type — so the materialized rows compare in the outer query
+            // exactly like the tree-walker. Anything else defers.
+            if let Some(sub) = &tr.subquery {
+                if tr.tvf_args.is_some() || !sub.compound.is_empty() {
+                    return Err(Error::Unsupported("VDBE: complex subquery source"));
+                }
+                let sfrom = sub
+                    .from
+                    .as_ref()
+                    .ok_or(Error::Unsupported("VDBE: subquery source without FROM"))?;
+                if !sfrom.joins.is_empty()
+                    || sfrom.first.subquery.is_some()
+                    || sfrom.first.tvf_args.is_some()
+                    || sfrom.first.index_hint.is_some()
+                    || sfrom.first.schema.is_some()
+                    || self.schema.table(&sfrom.first.name).is_none()
+                {
+                    return Err(Error::Unsupported("VDBE: complex subquery source"));
+                }
+                let base = self.table_meta(&sfrom.first.name, None)?;
+                if base
+                    .columns
+                    .iter()
+                    .any(|c| c.collation != crate::value::Collation::default())
+                {
+                    return Err(Error::Unsupported(
+                        "VDBE: subquery over a non-BINARY column",
+                    ));
+                }
+                let named = self
+                    .resolved_view_columns(sub)
+                    .ok_or(Error::Unsupported("VDBE: subquery columns unresolved"))?;
+                let result = self.run_select(sub, &eval::Params::default())?;
+                if result.columns.len() != named.len() {
+                    return Err(Error::Unsupported("VDBE: subquery column count mismatch"));
+                }
+                let qualifier = tr.alias.clone().unwrap_or_default();
+                let tables = result.columns.iter().map(|_| qualifier.clone()).collect();
+                let affinities = named
+                    .iter()
+                    .map(|(_, t)| eval::Affinity::from_type(t.as_deref()))
+                    .collect();
+                let collations = result
+                    .columns
+                    .iter()
+                    .map(|_| crate::value::Collation::default())
+                    .collect();
+                return Ok((
+                    result.columns,
+                    tables,
+                    affinities,
+                    collations,
+                    result.rows,
+                    None,
+                ));
+            }
+            if tr.tvf_args.is_some() {
                 return Err(Error::Unsupported("VDBE: only plain table sources"));
             }
             // The VDBE always full-scans and does not model `INDEXED BY`/`NOT
@@ -662,9 +721,10 @@ impl Connection {
             });
         }
 
-        // Single plain table.
-        if from.first.subquery.is_some() || from.first.tvf_args.is_some() {
-            return Err(Error::Unsupported("VDBE: only a single plain table"));
+        // Single source — a plain table or a derived table (`scan_one` materializes
+        // a safe FROM subquery; a table-valued function is out of scope).
+        if from.first.tvf_args.is_some() {
+            return Err(Error::Unsupported("VDBE: table-valued function source"));
         }
         let (col_names, col_tables, col_aff, col_coll, mut rows, rowids) = scan_one(&from.first)?;
         // Append each row's rowid as a hidden trailing value so a `rowid`/`_rowid_`/
