@@ -1481,45 +1481,83 @@ impl Connection {
             .index(&index)
             .ok_or_else(|| Error::Error(format!("no such index: {index}")))?;
         let tmeta = self.table_meta(&obj.tbl_name, None)?;
-        // Per-key-column descending flags (from the CREATE INDEX text).
-        let descs: Vec<bool> = match &obj.sql {
+        // Per key column: (cid, name, descending, collation). A bare column takes
+        // its position + name; an EXPRESSION column is `cid = -2` with a NULL name,
+        // as SQLite reports (its collation defaults to BINARY unless COLLATE-d).
+        type Key = (i64, Option<String>, bool, crate::value::Collation);
+        let keys: Vec<Key> = match &obj.sql {
             Some(sql) => match sql::parse_one(sql)? {
-                Statement::CreateIndex(ci) => ci.columns.iter().map(|c| c.descending).collect(),
-                _ => Vec::new(),
-            },
-            None => Vec::new(),
-        };
-        let cols: Vec<usize> = match &obj.sql {
-            Some(sql) => match sql::parse_one(sql)? {
-                Statement::CreateIndex(ci) => self.index_columns(&tmeta, &ci)?,
+                Statement::CreateIndex(ci) => ci
+                    .columns
+                    .iter()
+                    .map(|term| {
+                        let (inner, explicit) = match &term.expr {
+                            Expr::Collate { expr, collation } => {
+                                (expr.as_ref(), crate::value::Collation::parse(collation))
+                            }
+                            e => (e, None),
+                        };
+                        match inner {
+                            Expr::Column { column, .. } => {
+                                match tmeta
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(column))
+                                {
+                                    Some(p) => (
+                                        p as i64,
+                                        Some(tmeta.columns[p].name.clone()),
+                                        term.descending,
+                                        explicit.unwrap_or(tmeta.columns[p].collation),
+                                    ),
+                                    None => {
+                                        (-2, None, term.descending, explicit.unwrap_or_default())
+                                    }
+                                }
+                            }
+                            _ => (-2, None, term.descending, explicit.unwrap_or_default()),
+                        }
+                    })
+                    .collect(),
                 _ => Vec::new(),
             },
             None => autoindex_number(&obj.name, &obj.tbl_name)
                 .and_then(|n| tmeta.unique.get(n - 1))
                 .map(|s| s.0.clone())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .map(|cid| {
+                    (
+                        cid as i64,
+                        Some(tmeta.columns[cid].name.clone()),
+                        false,
+                        tmeta.columns[cid].collation,
+                    )
+                })
+                .collect(),
+        };
+        let coll_name = |c: crate::value::Collation| match c {
+            crate::value::Collation::NoCase => "NOCASE",
+            crate::value::Collation::RTrim => "RTRIM",
+            crate::value::Collation::Binary => "BINARY",
         };
         let mut rows = Vec::new();
-        for (seqno, &cid) in cols.iter().enumerate() {
+        for (seqno, (cid, name, desc, coll)) in keys.iter().enumerate() {
+            let name_val = name.clone().map_or(Value::Null, Value::Text);
             if extended {
-                let coll = match tmeta.columns[cid].collation {
-                    crate::value::Collation::NoCase => "NOCASE",
-                    crate::value::Collation::RTrim => "RTRIM",
-                    crate::value::Collation::Binary => "BINARY",
-                };
                 rows.push(alloc::vec![
                     Value::Integer(seqno as i64),
-                    Value::Integer(cid as i64),
-                    Value::Text(tmeta.columns[cid].name.clone()),
-                    Value::Integer(descs.get(seqno).copied().unwrap_or(false) as i64),
-                    Value::Text(coll.into()),
+                    Value::Integer(*cid),
+                    name_val,
+                    Value::Integer(*desc as i64),
+                    Value::Text(coll_name(*coll).into()),
                     Value::Integer(1), // key column
                 ]);
             } else {
                 rows.push(alloc::vec![
                     Value::Integer(seqno as i64),
-                    Value::Integer(cid as i64),
-                    Value::Text(tmeta.columns[cid].name.clone()),
+                    Value::Integer(*cid),
+                    name_val
                 ]);
             }
         }
@@ -1527,7 +1565,7 @@ impl Connection {
         // column) for an ordinary rowid table.
         if extended && !tmeta.without_rowid {
             rows.push(alloc::vec![
-                Value::Integer(cols.len() as i64),
+                Value::Integer(keys.len() as i64),
                 Value::Integer(-1),
                 Value::Null,
                 Value::Integer(0),
