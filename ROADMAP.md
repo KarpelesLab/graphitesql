@@ -362,9 +362,17 @@ each additive behind `query_vdbe` until B7:
   newly (2026-06-24) — a **FROM subquery (derived table)** materialized over a
   single all-BINARY base table (each output column inherits its affinity from the
   resolved type, BINARY collation; a non-BINARY base or a join/nested subquery
-  defers). What still defers: **compound SELECT** (`UNION`/etc.), correlated
-  subqueries, subqueries over joins / non-BINARY columns, and window functions —
-  each substantial. The param-less limit is now **partly lifted**:
+  defers). Also newly (2026-06-24): a **non-correlated scalar `(SELECT …)` or
+  `[NOT] EXISTS (SELECT …)`** in a top-level expression is *folded to a constant*
+  before compile (`fold_vdbe_subqueries`), so e.g. `WHERE v > (SELECT avg(v) FROM
+  t)` now runs on the VDBE. `vdbe_subquery_foldable` proves self-containedness
+  (own-source column refs only, no param/nested-subquery/compound/CTE); a scalar
+  fold also requires a *computed* (non-bare-column) result so the literal's
+  NONE/BINARY affinity matches the operand exactly. What still defers: **compound
+  SELECT** (`UNION`/etc.), *correlated* subqueries, `IN (SELECT)` (candidate-set
+  collation differs from `IN (list)`), subqueries over joins / non-BINARY
+  columns, and window functions — each substantial. The param-less limit is now
+  **partly lifted**:
   EXPLICIT parameters (`?N`, `:name`/`$x`) are substituted into the VDBE-compiled
   expressions before compile (`substitute_params` in `exec`), so `WHERE a=?1`,
   `LIMIT ?1`, etc. run on the VDBE and match the tree-walker
