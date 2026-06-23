@@ -214,6 +214,50 @@ fn rename_table_preserves_schema_text() {
 }
 
 #[test]
+fn rename_table_repoints_foreign_keys() {
+    // ALTER … RENAME TO updates `REFERENCES <old>` in OTHER tables' foreign keys
+    // (and any self-reference), repointing only the target token — references to
+    // other tables, and a like-named column, are left intact — exactly like sqlite.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(id INTEGER PRIMARY KEY)").unwrap();
+    c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, par REFERENCES p(id))")
+        .unwrap();
+    // `c` references both `a` and `p`; column `p` shares the old table's name.
+    c.execute("CREATE TABLE c(p TEXT, x REFERENCES a(id), y REFERENCES p(id))")
+        .unwrap();
+    c.execute("ALTER TABLE p RENAME TO p2").unwrap();
+
+    let sql = |name: &str| -> String {
+        match &c
+            .query(&format!(
+                "SELECT sql FROM sqlite_master WHERE name='{name}'"
+            ))
+            .unwrap()
+            .rows[0][0]
+        {
+            Value::Text(s) => s.clone(),
+            o => panic!("not text: {o:?}"),
+        }
+    };
+    // Self-reference repointed; the table name quoted.
+    assert_eq!(
+        sql("p2"),
+        "CREATE TABLE \"p2\"(id INTEGER PRIMARY KEY, par REFERENCES \"p2\"(id))"
+    );
+    // Only the `p` FK target is rewritten: the `a` reference and the `p` column stay.
+    assert_eq!(
+        sql("c"),
+        "CREATE TABLE c(p TEXT, x REFERENCES a(id), y REFERENCES \"p2\"(id))"
+    );
+
+    // The repointed foreign key is still enforced under the new name.
+    c.execute("PRAGMA foreign_keys=ON").unwrap();
+    c.execute("INSERT INTO p2(id) VALUES(1)").unwrap();
+    c.execute("INSERT INTO c(y) VALUES(1)").unwrap(); // valid parent
+    assert!(c.execute("INSERT INTO c(y) VALUES(99)").is_err()); // orphan rejected
+}
+
+#[test]
 fn rename_table_updates_catalog_and_indexes() {
     let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
     let path = temp_path("rename.db");

@@ -6510,8 +6510,10 @@ impl Connection {
                         // (preserving the body verbatim), like SQLite — rather than
                         // reprinting the whole definition from the AST.
                         if let Some(Value::Text(old_sql)) = cols.get(4).cloned() {
-                            cols[4] =
-                                Value::Text(rename_table_token_after(&old_sql, "table", &new_name));
+                            // Rename the table token itself, and any self-referential
+                            // foreign key (`REFERENCES <old>`) in its own body.
+                            let renamed = rename_table_token_after(&old_sql, "table", &new_name);
+                            cols[4] = Value::Text(rewrite_fk_references(&renamed, &old, &new_name));
                         }
                         true
                     } else if is_text(&cols[2], &old) {
@@ -6565,6 +6567,22 @@ impl Connection {
                                     &sql::print::ident(&new_name),
                                 ));
                                 true
+                            }
+                            _ => false,
+                        }
+                    } else if is_text(&cols[0], "table") {
+                        // Another table whose foreign key targets the renamed table:
+                        // repoint its `REFERENCES <old>` to the new name (leaving its
+                        // own name and any references to other tables untouched).
+                        match cols.get(4).cloned() {
+                            Some(Value::Text(tsql)) => {
+                                let rewritten = rewrite_fk_references(&tsql, &old, &new_name);
+                                if rewritten != tsql {
+                                    cols[4] = Value::Text(rewritten);
+                                    true
+                                } else {
+                                    false
+                                }
                             }
                             _ => false,
                         }
@@ -18058,6 +18076,40 @@ fn rename_table_token_after(sql: &str, anchor: &str, new: &str) -> String {
     out.push_str(&sql[..sp.start]);
     out.push_str(&sql::print::ident(new));
     out.push_str(&sql[sp.end..]);
+    out
+}
+
+/// Rewrite the target of every `REFERENCES <old>` clause in a `CREATE TABLE`
+/// text to `new` (double-quoted), preserving the rest verbatim — so an
+/// `ALTER TABLE … RENAME TO` updates the foreign keys of OTHER tables (and any
+/// self-reference) that point at the renamed table, as SQLite does. Only the
+/// table-name token immediately after `REFERENCES` is touched, so references to
+/// other tables — and a column that happens to share the old name — are left
+/// intact. (SQLite forbids a schema qualifier after `REFERENCES`, so the target
+/// is always a single bare/quoted name.)
+fn rewrite_fk_references(sql: &str, old: &str, new: &str) -> String {
+    use sql::token::Token;
+    let toks = match sql::token::tokenize(sql) {
+        Ok(t) => t,
+        Err(_) => return String::from(sql),
+    };
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for (i, sp) in toks.iter().enumerate() {
+        if !matches!(&sp.token, Token::Word(w) if w.eq_ignore_ascii_case("references")) {
+            continue;
+        }
+        let Some(target) = toks.get(i + 1) else {
+            continue;
+        };
+        if matches!(&target.token, Token::Word(w) | Token::Ident(w) if w.eq_ignore_ascii_case(old))
+        {
+            out.push_str(&sql[cursor..target.start]);
+            out.push_str(&sql::print::ident(new));
+            cursor = target.end;
+        }
+    }
+    out.push_str(&sql[cursor..]);
     out
 }
 

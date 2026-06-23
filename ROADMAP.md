@@ -210,7 +210,12 @@ with "no such table/column" after a rename). Build bottom-up:
   like-named column tail or function call is spared; the substituted name is
   double-quoted, matching sqlite byte-for-byte). `SELECT … FROM v` works after the
   rename; unrelated views are untouched. (Triggers already fire via the repointed
-  `tbl_name`.)
+  `tbl_name`.) **Also (2026-06-24): RENAME TABLE repoints foreign keys** — every
+  other table's `REFERENCES <old>` (and any self-reference) is rewritten to the new
+  name via `rewrite_fk_references`, which edits ONLY the target token after each
+  `REFERENCES` keyword, so a reference to a different table or a like-named column
+  is left intact, and the repointed FK is still enforced. Byte-exact vs sqlite
+  (`tests/alter.rs::rename_table_repoints_foreign_keys`).
 - **A-rn3 — RENAME COLUMN reaches dependent objects. ✅ DONE for the
   provably-safe cases.** RENAME COLUMN now propagates into: foreign keys in other
   tables (`REFERENCES parent(col)`), single- and multi-source VIEW bodies
