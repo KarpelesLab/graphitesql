@@ -872,6 +872,10 @@ fn table_wildcard_over_join_matches_tree_walker() {
         "SELECT u.*, t.g FROM t LEFT JOIN u ON u.t_id=t.id ORDER BY t.id, u.w",
         "SELECT t.* FROM t, u WHERE u.t_id=t.id ORDER BY t.id, u.w",
         "SELECT e.* FROM t e JOIN u ON u.t_id=e.id ORDER BY e.id, u.w",
+        // `t.*` over the outer-join paths too (RIGHT/FULL build their own rows).
+        "SELECT t.* FROM t RIGHT JOIN u ON u.t_id=t.id ORDER BY t.id, u.w",
+        "SELECT u.* FROM t FULL JOIN u ON u.t_id=t.id ORDER BY t.id, u.w",
+        "SELECT t.*, u.w FROM t FULL JOIN u ON u.t_id=t.id ORDER BY t.id, u.w",
     ] {
         let r = c
             .query_vdbe(q)
