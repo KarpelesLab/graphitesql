@@ -382,6 +382,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         collations: Vec::new(),
         bindings: Vec::new(),
         forbid_raw_columns: false,
+        rowid_index: None,
     };
     let mut columns = Vec::new();
     for (i, rc) in sel.columns.iter().enumerate() {
@@ -548,6 +549,7 @@ fn compile_aggregate_select(
         collations: collations.to_vec(),
         bindings: Vec::new(),
         forbid_raw_columns: false,
+        rowid_index: None,
     };
     let rewind = c.ops.len();
     c.ops.push(Op::Rewind { target: 0 });
@@ -731,6 +733,7 @@ fn compile_group_select(
         collations: collations.to_vec(),
         bindings: Vec::new(),
         forbid_raw_columns: false,
+        rowid_index: None,
     };
     // Contiguous key registers, loaded per row from the grouping columns.
     let key_start = c.next_reg;
@@ -1128,6 +1131,7 @@ fn compile_group_emit(
         collations: collations.to_vec(),
         bindings: Vec::new(),
         forbid_raw_columns: false,
+        rowid_index: None,
     };
     // Contiguous key registers, loaded per row from the grouping columns.
     let key_start = c.next_reg;
@@ -1205,6 +1209,7 @@ pub fn compile_table_select(
     tables: &[String],
     affinities: &[Affinity],
     collations: &[Collation],
+    rowid: bool,
 ) -> Result<Program> {
     if !sel.compound.is_empty() {
         return Err(Error::Unsupported("VDBE: only plain table projections"));
@@ -1282,15 +1287,28 @@ pub fn compile_table_select(
         return Err(Error::Unsupported("VDBE: HAVING without GROUP BY"));
     }
     let count = projections.len();
+    // When the caller appends a hidden rowid value to each row (single-table
+    // scans only), expose it as the slot after the visible columns with INTEGER
+    // affinity / BINARY collation, so a `rowid`/`_rowid_`/`oid` reference resolves.
+    let mut affinities = affinities.to_vec();
+    let mut collations = collations.to_vec();
+    let rowid_index = if rowid {
+        affinities.push(Affinity::Integer);
+        collations.push(Collation::Binary);
+        Some(columns.len())
+    } else {
+        None
+    };
     let mut c = Compiler {
         ops: Vec::new(),
         next_reg: count,
         columns: columns.to_vec(),
         tables: tables.to_vec(),
-        affinities: affinities.to_vec(),
-        collations: collations.to_vec(),
+        affinities,
+        collations,
         bindings: Vec::new(),
         forbid_raw_columns: false,
+        rowid_index,
     };
     // Optional LIMIT (constant integer only): a counter register decremented
     // after each emitted row, halting the loop at zero.
@@ -1560,6 +1578,11 @@ struct Compiler {
     /// column (e.g. `SELECT g, count(*), * FROM t GROUP BY g`, where SQLite takes
     /// the value from a representative row) must bail to the tree-walker.
     forbid_raw_columns: bool,
+    /// The row index of the hidden `rowid` value, when the single-table scan
+    /// appends it (a rowid alias — `rowid`/`_rowid_`/`oid` — resolves here). It
+    /// sits AFTER the visible columns, so `*` (which spans only `columns`) skips
+    /// it. `None` for constant selects, joins, and `WITHOUT ROWID` tables.
+    rowid_index: Option<usize>,
 }
 
 impl Compiler {
@@ -1593,6 +1616,24 @@ impl Compiler {
                 return Err(Error::Unsupported("VDBE: ambiguous column reference"));
             }
             found = Some(i);
+        }
+        // A rowid alias (`rowid`/`_rowid_`/`oid`) resolves to the hidden rowid slot
+        // of a single-table scan — unless a real column already shadows the name.
+        if found.is_none() {
+            if let Some(ri) = self.rowid_index {
+                let is_alias = matches!(
+                    column.to_ascii_lowercase().as_str(),
+                    "rowid" | "_rowid_" | "oid"
+                );
+                let table_ok = table.is_none_or(|t| {
+                    self.tables
+                        .first()
+                        .is_some_and(|tn| tn.eq_ignore_ascii_case(t))
+                });
+                if is_alias && table_ok {
+                    return Ok(ri);
+                }
+            }
         }
         found.ok_or(Error::Unsupported("VDBE: unresolved column reference"))
     }

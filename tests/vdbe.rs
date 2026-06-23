@@ -535,3 +535,49 @@ fn collate_operator_matches_tree_walker() {
         assert_eq!(got, want, "VDBE COLLATE vs tree-walker diverged on {q}");
     }
 }
+
+#[test]
+fn rowid_pseudo_column_matches_tree_walker() {
+    // `rowid`/`_rowid_`/`oid` resolve to a hidden trailing slot on a single-table
+    // scan, so they compile through the VDBE; `*` excludes the hidden slot. An
+    // INTEGER PRIMARY KEY aliases the rowid (same value). A WITHOUT ROWID table
+    // has no rowid, so such a reference falls back (the tree-walker errors).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a TEXT, b INT)").unwrap();
+    c.execute("INSERT INTO t VALUES ('x',5),('y',1),('z',3)")
+        .unwrap();
+    // NB: `ORDER BY rowid` is deferred to the tree-walker (the scan already
+    // satisfies it), so these order by a non-rowid column to stay on the VDBE.
+    for q in [
+        "SELECT rowid, a FROM t ORDER BY a",
+        "SELECT rowid FROM t WHERE b > 2 ORDER BY a",
+        "SELECT _rowid_, oid FROM t ORDER BY a",
+        "SELECT a FROM t WHERE rowid = 2",
+        "SELECT t.rowid, t.a FROM t ORDER BY t.a",
+        "SELECT * FROM t ORDER BY a", // `*` excludes the hidden rowid slot
+        "SELECT rowid * 2 AS r2 FROM t ORDER BY a",
+    ] {
+        let got = c.query_vdbe(q).unwrap().rows;
+        let want = c.query(q).unwrap().rows;
+        assert_eq!(got, want, "VDBE rowid vs tree-walker diverged on {q}");
+    }
+
+    // An INTEGER PRIMARY KEY column is the rowid alias (identical values).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, v)")
+        .unwrap();
+    c.execute("INSERT INTO u VALUES (10,'a'),(20,'b')").unwrap();
+    assert_eq!(
+        c.query_vdbe("SELECT rowid, id FROM u ORDER BY v")
+            .unwrap()
+            .rows,
+        c.query("SELECT rowid, id FROM u ORDER BY v").unwrap().rows
+    );
+
+    // A WITHOUT ROWID table has no rowid: the VDBE bails (no hidden slot), so the
+    // tree-walker handles it — and errors, like sqlite.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID")
+        .unwrap();
+    assert!(c.query_vdbe("SELECT rowid FROM w").is_err());
+}

@@ -459,7 +459,16 @@ impl Connection {
         let affinities: Vec<eval::Affinity> = meta.columns.iter().map(|c| c.affinity).collect();
         let collations: Vec<crate::value::Collation> =
             meta.columns.iter().map(|c| c.collation).collect();
-        vdbe::compile_table_select(sel, &cols, &tables, &affinities, &collations)
+        // A rowid table can carry `rowid`/`_rowid_`/`oid` references; expose the
+        // hidden rowid slot so EXPLAIN compiles the same program execution uses.
+        vdbe::compile_table_select(
+            sel,
+            &cols,
+            &tables,
+            &affinities,
+            &collations,
+            !meta.without_rowid,
+        )
     }
 
     /// Plain `EXPLAIN <select>` (Track B, B8): compile the query to graphite's
@@ -530,13 +539,15 @@ impl Connection {
         };
         // Materialize a plain table source's column names and rows. Subqueries
         // and table-valued functions are out of the spike's scope.
-        // (column names, owning-table qualifier, affinities, collations, rows).
+        // (column names, owning-table qualifier, affinities, collations, rows, and
+        // the per-row rowids — `None` for a `WITHOUT ROWID` table, which has none).
         type ScanOut = (
             Vec<String>,
             Vec<String>,
             Vec<eval::Affinity>,
             Vec<crate::value::Collation>,
             Vec<Vec<Value>>,
+            Option<Vec<i64>>,
         );
         let scan_one = |tr: &sql::ast::TableRef| -> Result<ScanOut> {
             if tr.subquery.is_some() || tr.tvf_args.is_some() {
@@ -556,15 +567,14 @@ impl Connection {
             let qualifier = tr.alias.clone().unwrap_or_else(|| tr.name.clone());
             let tables = meta.columns.iter().map(|_| qualifier.clone()).collect();
             let affinities = meta.columns.iter().map(|c| c.affinity).collect();
-            let rows: Vec<Vec<Value>> = if meta.without_rowid {
-                self.scan_without_rowid(&meta)?
+            let (rows, rowids): (Vec<Vec<Value>>, Option<Vec<i64>>) = if meta.without_rowid {
+                (self.scan_without_rowid(&meta)?, None)
             } else {
-                self.scan_table(&meta)?
-                    .into_iter()
-                    .map(|(_, v)| v)
-                    .collect()
+                let scanned = self.scan_table(&meta)?;
+                let ids = scanned.iter().map(|(r, _)| *r).collect();
+                (scanned.into_iter().map(|(_, v)| v).collect(), Some(ids))
             };
-            Ok((cols, tables, affinities, collations, rows))
+            Ok((cols, tables, affinities, collations, rows, rowids))
         };
 
         // Inner join(s) (B5a): an inner join is a filtered cross-product, so
@@ -601,7 +611,7 @@ impl Connection {
             let mut combined_tables: Vec<String> = Vec::new();
             let mut combined_aff: Vec<eval::Affinity> = Vec::new();
             let mut combined_coll: Vec<crate::value::Collation> = Vec::new();
-            for (c, t, a, l, _) in &sources {
+            for (c, t, a, l, _, _) in &sources {
                 combined.extend(c.iter().cloned());
                 combined_tables.extend(t.iter().cloned());
                 combined_aff.extend(a.iter().copied());
@@ -642,6 +652,8 @@ impl Connection {
                 &combined_tables,
                 &combined_aff,
                 &combined_coll,
+                // rowid over a join is ambiguous across tables; not modeled here.
+                false,
             )?;
             let result = vdbe::run_rows(&prog, &rows)?;
             return Ok(QueryResult {
@@ -654,7 +666,16 @@ impl Connection {
         if from.first.subquery.is_some() || from.first.tvf_args.is_some() {
             return Err(Error::Unsupported("VDBE: only a single plain table"));
         }
-        let (col_names, col_tables, col_aff, col_coll, rows) = scan_one(&from.first)?;
+        let (col_names, col_tables, col_aff, col_coll, mut rows, rowids) = scan_one(&from.first)?;
+        // Append each row's rowid as a hidden trailing value so a `rowid`/`_rowid_`/
+        // `oid` reference resolves (a `WITHOUT ROWID` table has none → `rowids` is
+        // `None`, and such references fall back to the tree-walker, which errors).
+        let has_rowid = rowids.is_some();
+        if let Some(ids) = rowids {
+            for (row, id) in rows.iter_mut().zip(ids) {
+                row.push(Value::Integer(id));
+            }
+        }
         // A `t.*` projection is only handled when its qualifier names this single
         // table (by name or alias); any other qualifier falls back so the
         // tree-walker can resolve or reject it.
@@ -671,7 +692,14 @@ impl Connection {
                 }
             }
         }
-        let prog = vdbe::compile_table_select(sel, &col_names, &col_tables, &col_aff, &col_coll)?;
+        let prog = vdbe::compile_table_select(
+            sel,
+            &col_names,
+            &col_tables,
+            &col_aff,
+            &col_coll,
+            has_rowid,
+        )?;
         let result = vdbe::run_rows(&prog, &rows)?;
         Ok(QueryResult {
             columns: prog.columns,
