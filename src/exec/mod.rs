@@ -11816,16 +11816,13 @@ impl Connection {
             return None;
         }
         let from = select.from.as_ref()?;
-        if !from.joins.is_empty()
-            || from.first.subquery.is_some()
-            || from.first.tvf_args.is_some()
-            || self.schema.table(&from.first.name).is_none()
-        {
+        if !from.joins.is_empty() {
             return None;
         }
-        let meta = self
-            .table_meta(&from.first.name, from.first.alias.as_deref())
-            .ok()?;
+        // The single source's named columns, each with its `(affinity, collation)`.
+        // A base table reads them from its meta; a nested subquery recurses, so a
+        // collation/affinity flows through any depth of single-source derived tables.
+        let src = self.named_source_origins(&from.first)?;
         let label = from
             .first
             .alias
@@ -11835,10 +11832,9 @@ impl Connection {
             if table.is_some_and(|t| !t.eq_ignore_ascii_case(&label)) {
                 return None;
             }
-            meta.columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(col))
-                .map(|c| (c.affinity, c.collation))
+            src.iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(col))
+                .map(|(_, o)| *o)
         };
         fn origin(e: &Expr, base: &dyn Fn(Option<&str>, &str) -> Option<ColOrigin>) -> ColOrigin {
             match e {
@@ -11855,19 +11851,52 @@ impl Connection {
                 _ => (eval::Affinity::Blob, crate::value::Collation::default()),
             }
         }
-        let all_cols = || meta.columns.iter().map(|c| (c.affinity, c.collation));
         let mut out = Vec::new();
         for rc in &select.columns {
             match rc {
-                ResultColumn::Wildcard => out.extend(all_cols()),
+                ResultColumn::Wildcard => out.extend(src.iter().map(|(_, o)| *o)),
                 ResultColumn::TableWildcard(t) if t.eq_ignore_ascii_case(&label) => {
-                    out.extend(all_cols())
+                    out.extend(src.iter().map(|(_, o)| *o))
                 }
                 ResultColumn::TableWildcard(_) => return None,
                 ResultColumn::Expr { expr, .. } => out.push(origin(expr, &base)),
             }
         }
         Some(out)
+    }
+
+    /// A single FROM source's `(name, (affinity, collation))` per column. A base
+    /// table reads its meta; a nested subquery recurses through
+    /// `subquery_column_origins` (its names from `resolved_view_columns`), so an
+    /// inherited affinity/collation flows through nested single-source derived
+    /// tables. A view / CTE / TVF / join-or-compound subquery returns `None`.
+    fn named_source_origins(&self, tref: &TableRef) -> Option<Vec<(String, ColOrigin)>> {
+        if tref.tvf_args.is_some() {
+            return None;
+        }
+        if let Some(sub) = &tref.subquery {
+            let names = self.resolved_view_columns(sub)?;
+            let origins = self.subquery_column_origins(sub)?;
+            if names.len() != origins.len() {
+                return None;
+            }
+            return Some(
+                names
+                    .into_iter()
+                    .zip(origins)
+                    .map(|((n, _), o)| (n, o))
+                    .collect(),
+            );
+        }
+        // A base table only — a view/CTE source defers to the conservative default.
+        self.schema.table(&tref.name)?;
+        let meta = self.table_meta(&tref.name, tref.alias.as_deref()).ok()?;
+        Some(
+            meta.columns
+                .iter()
+                .map(|c| (c.name.clone(), (c.affinity, c.collation)))
+                .collect(),
+        )
     }
 
     /// The single shared decision for the rowid-seek join optimization (roadmap

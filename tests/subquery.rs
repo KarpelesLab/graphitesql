@@ -321,6 +321,15 @@ fn derived_column_inherits_affinity_and_collation() {
     );
     // An explicit COLLATE in the subquery overrides: BINARY here → 'a' != 'A'.
     assert!(txt("SELECT a FROM (SELECT a COLLATE BINARY AS a FROM u) WHERE a = 'a'").is_empty());
+    // Collation flows through NESTED single-source derived tables, any depth.
+    assert_eq!(
+        txt("SELECT a FROM (SELECT a FROM (SELECT a FROM u)) WHERE a = 'a'"),
+        vec!["A"]
+    );
+    assert_eq!(
+        txt("SELECT x FROM (SELECT a AS x FROM (SELECT a FROM (SELECT a FROM u))) WHERE x = 'a'"),
+        vec!["A"]
+    );
 
     // INTEGER affinity inherited through a derived column: '2' coerces to 2.
     let mut c = Connection::open_memory().unwrap();
