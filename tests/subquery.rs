@@ -277,3 +277,60 @@ fn in_values_clause() {
     assert_eq!(ints(&c, "SELECT (1,2) IN (VALUES(1,2),(3,4))"), vec![1]);
     assert_eq!(ints(&c, "SELECT (1,2) IN (VALUES(5,6),(7,8))"), vec![0]);
 }
+
+#[test]
+fn derived_column_inherits_affinity_and_collation() {
+    // A derived-table column inherits its origin column's affinity and collation
+    // (a direct reference, through parens / an explicit COLLATE), matching sqlite;
+    // an expression column is BLOB affinity + BINARY collation.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE u(a TEXT COLLATE NOCASE, n INT)")
+        .unwrap();
+    c.execute("INSERT INTO u VALUES ('A',5),('b',1)").unwrap();
+
+    let txt = |sql: &str| -> Vec<String> {
+        c.query(sql)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Text(s) => s.clone(),
+                Value::Integer(i) => i.to_string(),
+                Value::Null => String::new(),
+                o => panic!("unexpected: {o:?}"),
+            })
+            .collect()
+    };
+    // NOCASE collation flows through the derived table → 'a' matches 'A'.
+    assert_eq!(
+        txt("SELECT a FROM (SELECT a FROM u) WHERE a = 'a'"),
+        vec!["A"]
+    );
+    assert_eq!(
+        txt("SELECT a FROM (SELECT a AS a FROM u) WHERE a IN ('a') ORDER BY a"),
+        vec!["A"]
+    );
+    assert_eq!(
+        txt("SELECT count(*) FROM (SELECT a FROM u) WHERE a = 'B'"),
+        vec!["1"]
+    );
+    // Through `*` and an aliased reference, too.
+    assert_eq!(
+        txt("SELECT x FROM (SELECT a AS x FROM u) WHERE x = 'a'"),
+        vec!["A"]
+    );
+    // An explicit COLLATE in the subquery overrides: BINARY here → 'a' != 'A'.
+    assert!(txt("SELECT a FROM (SELECT a COLLATE BINARY AS a FROM u) WHERE a = 'a'").is_empty());
+
+    // INTEGER affinity inherited through a derived column: '2' coerces to 2.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INT)").unwrap();
+    c.execute("INSERT INTO t VALUES (2),(10)").unwrap();
+    assert_eq!(
+        c.query("SELECT a FROM (SELECT a FROM t) WHERE a = '2'")
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+}

@@ -11779,17 +11779,95 @@ impl Connection {
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         let result = self.run_select(select, params)?;
         let label = alias.unwrap_or("").to_string();
+        // A derived column inherits the affinity AND collation of its origin (a
+        // direct column reference, transparent through parens / an explicit
+        // `COLLATE`), matching sqlite; an expression column has NONE affinity and
+        // BINARY collation. Resolved for a single-base-table subquery; a join /
+        // nested subquery / TVF source leaves the conservative NONE/BINARY default.
+        let origins = self.subquery_column_origins(select);
         let columns = result
             .columns
             .iter()
-            .map(|n| ColumnInfo {
-                name: n.clone(),
-                table: label.clone(),
-                affinity: eval::Affinity::Blob,
-                collation: crate::value::Collation::default(),
+            .enumerate()
+            .map(|(i, n)| {
+                let (affinity, collation) = origins
+                    .as_ref()
+                    .and_then(|o| o.get(i).copied())
+                    .unwrap_or((eval::Affinity::Blob, crate::value::Collation::default()));
+                ColumnInfo {
+                    name: n.clone(),
+                    table: label.clone(),
+                    affinity,
+                    collation,
+                }
             })
             .collect();
         Ok((columns, result.rows))
+    }
+
+    /// The `(affinity, collation)` each output column of a single-base-table
+    /// subquery inherits from its origin — a direct column reference (through
+    /// parens / `COLLATE`) takes its base column's affinity and collation (an
+    /// explicit `COLLATE` overrides the collation); any other expression is
+    /// `(BLOB, BINARY)`. Returns `None` (caller defaults all to `BLOB`/`BINARY`)
+    /// for a compound / join / nested / TVF subquery, or a count mismatch.
+    fn subquery_column_origins(&self, select: &Select) -> Option<Vec<ColOrigin>> {
+        if !select.compound.is_empty() {
+            return None;
+        }
+        let from = select.from.as_ref()?;
+        if !from.joins.is_empty()
+            || from.first.subquery.is_some()
+            || from.first.tvf_args.is_some()
+            || self.schema.table(&from.first.name).is_none()
+        {
+            return None;
+        }
+        let meta = self
+            .table_meta(&from.first.name, from.first.alias.as_deref())
+            .ok()?;
+        let label = from
+            .first
+            .alias
+            .clone()
+            .unwrap_or_else(|| from.first.name.clone());
+        let base = |table: Option<&str>, col: &str| -> Option<ColOrigin> {
+            if table.is_some_and(|t| !t.eq_ignore_ascii_case(&label)) {
+                return None;
+            }
+            meta.columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(col))
+                .map(|c| (c.affinity, c.collation))
+        };
+        fn origin(e: &Expr, base: &dyn Fn(Option<&str>, &str) -> Option<ColOrigin>) -> ColOrigin {
+            match e {
+                Expr::Paren(inner) => origin(inner, base),
+                Expr::Column { table, column } => base(table.as_deref(), column)
+                    .unwrap_or((eval::Affinity::Blob, crate::value::Collation::default())),
+                Expr::Collate { expr, collation } => {
+                    let (aff, base_coll) = origin(expr, base);
+                    (
+                        aff,
+                        crate::value::Collation::parse(collation).unwrap_or(base_coll),
+                    )
+                }
+                _ => (eval::Affinity::Blob, crate::value::Collation::default()),
+            }
+        }
+        let all_cols = || meta.columns.iter().map(|c| (c.affinity, c.collation));
+        let mut out = Vec::new();
+        for rc in &select.columns {
+            match rc {
+                ResultColumn::Wildcard => out.extend(all_cols()),
+                ResultColumn::TableWildcard(t) if t.eq_ignore_ascii_case(&label) => {
+                    out.extend(all_cols())
+                }
+                ResultColumn::TableWildcard(_) => return None,
+                ResultColumn::Expr { expr, .. } => out.push(origin(expr, &base)),
+            }
+        }
+        Some(out)
     }
 
     /// The single shared decision for the rowid-seek join optimization (roadmap
@@ -17421,6 +17499,10 @@ fn value_to_literal(v: Value) -> Literal {
 /// A list of `(column name, declared type)` pairs — a resolved column set for
 /// `view_table_info` (the type is `None` for an expression column).
 type NamedColumns = Vec<(String, Option<String>)>;
+
+/// A column's inherited `(affinity, collating sequence)` — what a derived-table
+/// column takes from its origin column (see `subquery_column_origins`).
+type ColOrigin = (eval::Affinity, crate::value::Collation);
 
 /// The column headers for `PRAGMA table_info` / `table_xinfo`.
 fn table_info_columns(extended: bool) -> Vec<String> {
