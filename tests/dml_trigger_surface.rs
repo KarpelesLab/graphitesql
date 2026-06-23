@@ -576,3 +576,55 @@ fn or_rollback_unwinds_transaction() {
     // A fresh COMMIT now errors because the transaction is already closed.
     assert!(c.execute("COMMIT").is_err());
 }
+
+#[test]
+fn multiple_triggers_fire_in_reverse_creation_order() {
+    // SQLite keeps a per-table trigger list that prepends on creation, so several
+    // triggers for the same event/timing fire most-recently-created first. The
+    // firing order is captured by the order rows land in `log` (no ORDER BY, so
+    // rowid = insertion = firing order). Checked against sqlite for INSERT (AFTER
+    // and BEFORE), UPDATE, and DELETE; the name vs creation-order cases
+    // disambiguate (newest-first, not alphabetical).
+    agree(
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE log(s)",
+            "CREATE TRIGGER aaa AFTER INSERT ON t BEGIN INSERT INTO log VALUES('A'); END",
+            "CREATE TRIGGER bbb AFTER INSERT ON t BEGIN INSERT INTO log VALUES('B'); END",
+        ],
+        "INSERT INTO t VALUES(1)",
+        "SELECT s FROM log",
+    );
+    agree(
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE log(s)",
+            "CREATE TRIGGER zzz BEFORE INSERT ON t BEGIN INSERT INTO log VALUES('Z'); END",
+            "CREATE TRIGGER aaa BEFORE INSERT ON t BEGIN INSERT INTO log VALUES('A'); END",
+        ],
+        "INSERT INTO t VALUES(1)",
+        "SELECT s FROM log",
+    );
+    agree(
+        &[
+            "CREATE TABLE t(a)",
+            "INSERT INTO t VALUES(1)",
+            "CREATE TABLE log(s)",
+            "CREATE TRIGGER u1 AFTER UPDATE ON t BEGIN INSERT INTO log VALUES('u1'); END",
+            "CREATE TRIGGER u2 AFTER UPDATE ON t BEGIN INSERT INTO log VALUES('u2'); END",
+        ],
+        "UPDATE t SET a=2",
+        "SELECT s FROM log",
+    );
+    agree(
+        &[
+            "CREATE TABLE t(a)",
+            "INSERT INTO t VALUES(1)",
+            "CREATE TABLE log(s)",
+            "CREATE TRIGGER d1 AFTER DELETE ON t BEGIN INSERT INTO log VALUES('d1'); END",
+            "CREATE TRIGGER d2 AFTER DELETE ON t BEGIN INSERT INTO log VALUES('d2'); END",
+        ],
+        "DELETE FROM t",
+        "SELECT s FROM log",
+    );
+}

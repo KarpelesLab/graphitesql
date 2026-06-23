@@ -3456,6 +3456,11 @@ impl Connection {
         if let Some(t) = &self.temp_db {
             self.collect_triggers(t.schema.objects(), table, kind, timing, &mut out);
         }
+        // SQLite keeps a per-table trigger list that prepends on creation, so
+        // triggers of the same event/timing fire in REVERSE creation order
+        // (most-recently-created first). `objects()` is in creation order, so
+        // reverse to match.
+        out.reverse();
         Ok(out)
     }
 
