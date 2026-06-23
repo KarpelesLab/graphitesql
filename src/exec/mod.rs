@@ -974,6 +974,105 @@ impl Connection {
             Ok((cols, tables, affinities, collations, rows, rowids))
         };
 
+        // LEFT join(s): a filtered cross-product cannot model the NULL-extension of
+        // unmatched left rows, so when any join is `LEFT` build the joined rows by a
+        // real nested loop — for each accumulated left row, emit a row per right
+        // match (`ON` evaluated against the partial combined row) and, if none
+        // matched, one row padded with NULLs for the right table. Only the *final*
+        // `WHERE` is then handed to the VDBE (the `ON`s are already applied). Pure
+        // INNER-join queries keep the proven cross-product path below. Bails (→
+        // tree-walker) on RIGHT/FULL/NATURAL/USING and `t.*`.
+        if from
+            .joins
+            .iter()
+            .any(|j| matches!(j.kind, sql::ast::JoinKind::Left))
+        {
+            if from.joins.iter().any(|j| {
+                !matches!(j.kind, sql::ast::JoinKind::Inner | sql::ast::JoinKind::Left)
+                    || j.natural
+                    || !j.using.is_empty()
+            }) {
+                return Err(Error::Unsupported("VDBE: only INNER/LEFT joins"));
+            }
+            if sel
+                .columns
+                .iter()
+                .any(|rc| matches!(rc, sql::ast::ResultColumn::TableWildcard(_)))
+            {
+                return Err(Error::Unsupported("VDBE: table.* over a join"));
+            }
+            // The VDBE path is param-less (explicit params were substituted
+            // upstream); evaluate each ON against an empty parameter set.
+            let on_params = eval::Params::default();
+            let first = scan_one(&from.first)?;
+            let mut names = first.0;
+            let mut tabs = first.1;
+            let mut affs = first.2;
+            let mut colls = first.3;
+            let mut rows: Vec<Vec<Value>> = first.4;
+            for j in &from.joins {
+                let src = scan_one(&j.table)?;
+                // Combined schema after adding this source (for ON resolution).
+                let mut n_names = names.clone();
+                n_names.extend(src.0.iter().cloned());
+                let mut n_tabs = tabs.clone();
+                n_tabs.extend(src.1.iter().cloned());
+                let mut n_affs = affs.clone();
+                n_affs.extend(src.2.iter().copied());
+                let mut n_colls = colls.clone();
+                n_colls.extend(src.3.iter().copied());
+                let cinfos: Vec<ColumnInfo> = (0..n_names.len())
+                    .map(|i| ColumnInfo {
+                        name: n_names[i].clone(),
+                        table: n_tabs[i].clone(),
+                        affinity: n_affs[i],
+                        collation: n_colls[i],
+                    })
+                    .collect();
+                let is_left = matches!(j.kind, sql::ast::JoinKind::Left);
+                let width = src.0.len();
+                let mut next: Vec<Vec<Value>> = Vec::new();
+                for a in &rows {
+                    let mut matched = false;
+                    for b in &src.4 {
+                        let mut row = a.clone();
+                        row.extend(b.iter().cloned());
+                        let keep = match &j.on {
+                            Some(p) => {
+                                let ir = InputRow {
+                                    values: row.clone(),
+                                    rowid: None,
+                                };
+                                let ctx = ir.ctx(&cinfos, &on_params).with_subqueries(self);
+                                eval::truth(&eval::eval(p, &ctx)?) == Some(true)
+                            }
+                            None => true,
+                        };
+                        if keep {
+                            next.push(row);
+                            matched = true;
+                        }
+                    }
+                    if is_left && !matched {
+                        let mut row = a.clone();
+                        row.extend(core::iter::repeat_n(Value::Null, width));
+                        next.push(row);
+                    }
+                }
+                rows = next;
+                names = n_names;
+                tabs = n_tabs;
+                affs = n_affs;
+                colls = n_colls;
+            }
+            let prog = vdbe::compile_table_select(sel, &names, &tabs, &affs, &colls, false)?;
+            let result = vdbe::run_rows(&prog, &rows)?;
+            return Ok(QueryResult {
+                columns: prog.columns,
+                rows: result,
+            });
+        }
+
         // Inner join(s) (B5a): an inner join is a filtered cross-product, so
         // materialize `t1 × t2 × … × tN` (leftmost source outermost, matching the
         // tree-walker's and sqlite's nested-loop row order), fold every `ON` into

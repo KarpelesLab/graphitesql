@@ -358,10 +358,16 @@ fn two_table_join_matches_tree_walker() {
     assert!(c
         .query_vdbe("SELECT id FROM p JOIN q ON p.id = q.id")
         .is_err());
-    // Outer joins are not handled by the spike (NULL-extension); they bail.
-    assert!(c
-        .query_vdbe("SELECT name, dname FROM emp LEFT JOIN dep ON dept = did")
-        .is_err());
+    // LEFT joins are now handled (the router NULL-extends unmatched left rows);
+    // the result matches the tree-walker. See `left_join_matches_tree_walker_and_sqlite3`
+    // for the fuller battery. A RIGHT/FULL join still bails (NULL-extension of the
+    // other side is not modeled).
+    let q = "SELECT name, dname FROM emp LEFT JOIN dep ON dept = did ORDER BY name";
+    assert_eq!(
+        c.query_vdbe(q).unwrap().rows,
+        c.query(q).unwrap().rows,
+        "VDBE LEFT JOIN diverged on {q}"
+    );
 }
 
 #[test]
@@ -710,5 +716,77 @@ fn folded_subqueries_match_sqlite3() {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(got, want, "folded-subquery vs sqlite3 diverged on {q}");
+    }
+}
+
+#[test]
+fn left_join_matches_tree_walker_and_sqlite3() {
+    // A LEFT JOIN cannot be modeled as a filtered cross-product (unmatched left
+    // rows must be NULL-extended), so the router builds the joined rows by a real
+    // nested loop and the VDBE runs projection/WHERE/aggregates over them. Results
+    // must match the tree-walker (forced via query_vdbe) and sqlite3.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT)")
+        .unwrap();
+    c.execute("CREATE TABLE u(t_id INT, w INT)").unwrap();
+    c.execute("CREATE TABLE x(w_id INT, n TEXT)").unwrap();
+    c.execute("INSERT INTO t(g) VALUES('a'),('b'),('c')")
+        .unwrap();
+    c.execute("INSERT INTO u VALUES(1,10),(1,11),(3,30)")
+        .unwrap();
+    c.execute("INSERT INTO x VALUES(10,'ten'),(30,'thirty')")
+        .unwrap();
+    let qs = [
+        "SELECT t.g, u.w FROM t LEFT JOIN u ON u.t_id=t.id ORDER BY t.id, u.w",
+        "SELECT t.g, u.w FROM t LEFT JOIN u ON u.t_id=t.id WHERE u.w IS NULL ORDER BY t.id",
+        "SELECT t.g, count(u.w) FROM t LEFT JOIN u ON u.t_id=t.id GROUP BY t.g ORDER BY t.g",
+        "SELECT t.g, u.w FROM t LEFT JOIN u ON u.t_id=t.id AND u.w>10 ORDER BY t.id, u.w",
+        "SELECT count(*) FROM t LEFT JOIN u ON u.t_id=t.id",
+        "SELECT t.g, u.w, x.n FROM t LEFT JOIN u ON u.t_id=t.id LEFT JOIN x ON x.w_id=u.w \
+         ORDER BY t.id, u.w",
+        "SELECT t.g, u.w, x.n FROM t LEFT JOIN u ON u.t_id=t.id INNER JOIN x ON x.w_id=u.w \
+         ORDER BY t.id",
+    ];
+    for q in qs {
+        // The VDBE must actually handle it (not silently fall back).
+        let got = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("expected VDBE to handle {q}: {e}"))
+            .rows;
+        let want = {
+            c.set_use_vdbe(false);
+            let r = c.query(q).unwrap().rows;
+            c.set_use_vdbe(true);
+            r
+        };
+        assert_eq!(got, want, "VDBE LEFT JOIN vs tree-walker diverged on {q}");
+    }
+
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    let setup = "CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT);\
+                 CREATE TABLE u(t_id INT, w INT); CREATE TABLE x(w_id INT, n TEXT);\
+                 INSERT INTO t(g) VALUES('a'),('b'),('c');\
+                 INSERT INTO u VALUES(1,10),(1,11),(3,30);\
+                 INSERT INTO x VALUES(10,'ten'),(30,'thirty');";
+    for q in qs {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(format!("{setup} {q};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = c
+            .query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.iter().map(render).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(got, want, "LEFT JOIN vs sqlite3 diverged on {q}");
     }
 }
