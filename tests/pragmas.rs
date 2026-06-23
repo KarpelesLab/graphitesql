@@ -305,3 +305,73 @@ fn analysis_limit_and_optimize() {
         assert_eq!(got, want, "sqlite baseline drift for {q}");
     }
 }
+
+#[test]
+fn busy_timeout_roundtrip_and_wal_checkpoint() {
+    // `PRAGMA busy_timeout` round-trips the lock-wait timeout (advisory — graphite
+    // never blocks), clamping negative to 0 and echoing from the set form, column
+    // named "timeout". `PRAGMA wal_checkpoint[(mode)]` returns the fixed
+    // `(busy, log, checkpointed)` = `0,-1,-1` of a non-WAL database.
+    let c = Connection::open_memory().unwrap();
+    let r = c.query("PRAGMA busy_timeout").unwrap();
+    assert_eq!(r.columns, vec!["timeout"]);
+    assert_eq!(r.rows, vec![vec![Value::Integer(0)]]);
+    assert_eq!(
+        c.query("PRAGMA busy_timeout=5000").unwrap().rows,
+        vec![vec![Value::Integer(5000)]]
+    );
+    assert_eq!(
+        c.query("PRAGMA busy_timeout").unwrap().rows,
+        vec![vec![Value::Integer(5000)]]
+    );
+    assert_eq!(
+        c.query("PRAGMA busy_timeout=-3").unwrap().rows,
+        vec![vec![Value::Integer(0)]]
+    );
+    // Set via execute() then read back.
+    let mut c2 = Connection::open_memory().unwrap();
+    c2.execute("PRAGMA busy_timeout=250").unwrap();
+    assert_eq!(
+        c2.query("PRAGMA busy_timeout").unwrap().rows,
+        vec![vec![Value::Integer(250)]]
+    );
+
+    let wc = c.query("PRAGMA wal_checkpoint").unwrap();
+    assert_eq!(wc.columns, vec!["busy", "log", "checkpointed"]);
+    assert_eq!(
+        wc.rows,
+        vec![vec![
+            Value::Integer(0),
+            Value::Integer(-1),
+            Value::Integer(-1)
+        ]]
+    );
+    // The argument form (mode) is accepted and yields the same non-WAL result.
+    assert_eq!(
+        c.query("PRAGMA wal_checkpoint(TRUNCATE)").unwrap().rows,
+        wc.rows
+    );
+
+    if !sqlite3_available() {
+        return;
+    }
+    for (q, want) in [
+        ("PRAGMA busy_timeout", "0"),
+        (
+            "PRAGMA busy_timeout=5000; PRAGMA busy_timeout",
+            "5000\n5000",
+        ),
+        ("PRAGMA wal_checkpoint", "0|-1|-1"),
+        ("PRAGMA wal_checkpoint(FULL)", "0|-1|-1"),
+    ] {
+        let got = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(q)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        assert_eq!(got, want, "sqlite baseline drift for {q}");
+    }
+}

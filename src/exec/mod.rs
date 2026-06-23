@@ -155,6 +155,10 @@ pub struct Connection {
     /// unlimited). graphite always analyzes fully, so this is advisory; it is
     /// stored and reported back like sqlite (which clamps a negative value to 0).
     analysis_limit: core::cell::Cell<i64>,
+    /// `PRAGMA busy_timeout` — the lock-wait timeout in ms (0 = no wait). graphite
+    /// has no cross-process lock manager, so this never blocks; it is stored and
+    /// reported back like sqlite (which clamps a negative value to 0).
+    busy_timeout: core::cell::Cell<i64>,
     /// `PRAGMA secure_delete` (0=off, 1=on, 2=fast), round-tripped like sqlite.
     /// When non-zero, freed pages are zeroed (the pager honors it); a
     /// per-connection runtime setting, not persisted in the file.
@@ -291,6 +295,7 @@ impl Connection {
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
             analysis_limit: core::cell::Cell::new(0),
+            busy_timeout: core::cell::Cell::new(0),
             secure_delete: core::cell::Cell::new(0),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
@@ -328,6 +333,7 @@ impl Connection {
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
             analysis_limit: core::cell::Cell::new(0),
+            busy_timeout: core::cell::Cell::new(0),
             secure_delete: core::cell::Cell::new(0),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
@@ -1229,7 +1235,33 @@ impl Connection {
             "cell_size_check" => Ok(single("cell_size_check", Value::Integer(0))),
             "checkpoint_fullfsync" => Ok(single("checkpoint_fullfsync", Value::Integer(0))),
             "fullfsync" => Ok(single("fullfsync", Value::Integer(0))),
-            "busy_timeout" => Ok(single("timeout", Value::Integer(0))),
+            // `busy_timeout` round-trips the lock-wait timeout (graphite never
+            // blocks, so it is advisory). The set form clamps a negative value to 0
+            // and echoes it; the plain form reads it back — like sqlite. The result
+            // column is named "timeout".
+            "busy_timeout" => {
+                if let Some(e) = &p.value {
+                    let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(&Params::default()))?);
+                    self.busy_timeout.set(v.max(0));
+                }
+                Ok(single("timeout", Value::Integer(self.busy_timeout.get())))
+            }
+            // `wal_checkpoint[(mode)]` — graphite never runs in WAL mode (its
+            // journal is delete/memory), so a checkpoint is a no-op. sqlite still
+            // returns one `(busy, log, checkpointed)` row; for a non-WAL database
+            // that is always `0, -1, -1`.
+            "wal_checkpoint" => Ok(QueryResult {
+                columns: alloc::vec![
+                    String::from("busy"),
+                    String::from("log"),
+                    String::from("checkpointed"),
+                ],
+                rows: alloc::vec![alloc::vec![
+                    Value::Integer(0),
+                    Value::Integer(-1),
+                    Value::Integer(-1),
+                ]],
+            }),
             "wal_autocheckpoint" => Ok(single("wal_autocheckpoint", Value::Integer(1000))),
             "max_page_count" => Ok(single("max_page_count", Value::Integer(4294967294))),
             "locking_mode" => Ok(single("locking_mode", Value::Text("normal".into()))),
@@ -3451,6 +3483,13 @@ impl Connection {
             if let Some(e) = &p.value {
                 let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
                 self.analysis_limit.set(v.max(0));
+            }
+        } else if p.name.eq_ignore_ascii_case("busy_timeout") {
+            // Advisory (graphite never blocks on a lock); store it, clamping a
+            // negative value to 0, so a later `PRAGMA busy_timeout` reads it back.
+            if let Some(e) = &p.value {
+                let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                self.busy_timeout.set(v.max(0));
             }
         } else if p.name.eq_ignore_ascii_case("secure_delete") {
             // sqlite maps the argument to 0 (off), 2 (the `fast` keyword only), or
