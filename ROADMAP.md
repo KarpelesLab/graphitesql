@@ -513,9 +513,21 @@ top. Build bottom-up (each step lands testable on `:memory:` first):
     `INDEX 2:<op><col>…` (`A`=`=`,`B`=`<=`,`C`=`<`,`D`=`>=`,`E`=`>`; column digit
     0-based among coords — e.g. `minX>=? AND maxX<=?` → `INDEX 2:D0B1`), a bare
     scan `INDEX 2:`. `eqp_vtab_detail` now routes persistent modules through
-    `best_index` for the reported plan (fts5 keeps `INDEX 0:`). *(Execution still
-    scans the backing table + re-applies WHERE; narrowing the scan via the node
-    tree — true pushdown — would build on D3c's node format.)*
+    `best_index` for the reported plan (fts5 keeps `INDEX 0:`).
+  - **D3b-exec — true spatial pushdown at execution. ✅ DONE (2026-06-24).** The
+    node walk (`scan_rtree_nodes`) now PRUNES: `try_virtual_table`'s rtree branch
+    turns the query's coordinate comparisons (via `collect_vtab_constraints`, the
+    same extractor `best_index` uses) into per-dimension bounds `(coord_idx, op,
+    value)`, and the descent skips any interior subtree whose stored MBR can't
+    satisfy them. Sound by construction: the on-disk MBR is a SUPERSET (f32 rounds
+    min down / max up), and `run_core` still re-applies the full WHERE, so the
+    visited rows are always a correct superset — pruning never drops a match, only
+    avoids visiting subtrees. Turns an O(n) spatial scan into a tree-pruned
+    descent. Both `rtree` and `rtree_i32`, sqlite- and graphite-written trees.
+    Tests: `rtree.rs::spatial_pushdown_prunes_but_keeps_every_match` (multi-level
+    tree, brute-force-checked) + the existing sqlite-differential multi-level
+    reads. *(The `id =` rowid fast path via `<name>_rowid` is a later refinement;
+    today an id-equality query still descends with WHERE re-applied.)*
   - **D3c — byte-compatible node format. ✅ DONE.** R-Trees (no aux columns) use
     sqlite's on-disk node format — the `<name>_node` b-tree of nodes + `_rowid` /
     `_parent` maps — so a graphite-written R-Tree round-trips through sqlite3

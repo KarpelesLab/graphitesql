@@ -43,10 +43,11 @@ format**.
 > `Dvořák`→`dvorak`, `mạ`→`ma`), with the `tokenize=` options `remove_diacritics
 > 0|1|2`, `porter`, and `ascii` all honored on both the index and query sides;
 > the fold tables are derived byte-for-byte from `sqlite3`; CJK and other scripts
-> pass through unfolded, as in sqlite.)* What remains is depth: the remaining
-> tokenizer options (`tokenchars`/`separators`), R-Tree spatial pushdown,
-> finishing the VDBE (per-cursor joins, more single-block shapes), and
-> concurrency — see the full plan in **[ROADMAP.md](ROADMAP.md)**.
+> pass through unfolded, as in sqlite.)* R-Tree queries **prune the node tree by
+> the query's coordinate bounds** rather than scanning every entry. What remains
+> is depth: the remaining tokenizer options (`tokenchars`/`separators`), finishing
+> the VDBE (per-cursor joins, more single-block shapes), and concurrency — see the
+> full plan in **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why
 

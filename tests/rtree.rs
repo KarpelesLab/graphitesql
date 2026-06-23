@@ -41,6 +41,75 @@ fn spatial_filter_and_rowid_alias() {
 }
 
 #[test]
+fn spatial_pushdown_prunes_but_keeps_every_match() {
+    // A multi-level node tree (hundreds of entries) exercises the spatial
+    // pushdown: the node walk prunes interior subtrees whose MBR can't satisfy
+    // the coordinate constraints. The pruned result must still equal the exact
+    // brute-force match set (pruning is an optimization, never a filter), across
+    // range, open-ended, equality, and empty queries — and combined with a
+    // non-spatial predicate that run_core re-applies.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, minX, maxX, minY, maxY)")
+        .unwrap();
+    // One bulk INSERT (a single rebuild) so building the tree is cheap; the box
+    // for id i is the point (i, i) in X with a spread-out Y so the tree branches.
+    let n = 300;
+    let mut sql = String::from("INSERT INTO r VALUES ");
+    for i in 1..=n {
+        if i > 1 {
+            sql.push(',');
+        }
+        let y = (i * 7) % 100;
+        sql.push_str(&format!("({i},{i},{i},{y},{y})"));
+    }
+    c.execute(&sql).unwrap();
+
+    let ids = |q: &str| -> Vec<i64> {
+        rows(&c, q)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(v) => v,
+                ref o => panic!("not int: {o:?}"),
+            })
+            .collect()
+    };
+    // Range on X: minX>=50 AND maxX<=60 → points 50..=60 (minX==maxX==i).
+    assert_eq!(
+        ids("SELECT id FROM r WHERE minX>=50 AND maxX<=60 ORDER BY id"),
+        (50..=60).collect::<Vec<_>>()
+    );
+    // Open-ended upper / lower bounds.
+    assert_eq!(
+        ids("SELECT id FROM r WHERE maxX<=5 ORDER BY id"),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(
+        ids("SELECT id FROM r WHERE minX>=296 ORDER BY id"),
+        vec![296, 297, 298, 299, 300]
+    );
+    // Equality on a coordinate.
+    assert_eq!(
+        ids("SELECT id FROM r WHERE minX=137 ORDER BY id"),
+        vec![137]
+    );
+    // A 2-D window combining X and Y constraints, checked against brute force.
+    let expect_xy: Vec<i64> = (1..=n)
+        .filter(|&i| (40..=60).contains(&i) && ((i * 7) % 100) <= 30)
+        .collect();
+    assert_eq!(
+        ids("SELECT id FROM r WHERE minX>=40 AND maxX<=60 AND maxY<=30 ORDER BY id"),
+        expect_xy
+    );
+    // A constraint that prunes everything returns nothing.
+    assert!(ids("SELECT id FROM r WHERE minX>=10000").is_empty());
+    // Pruning composes with a non-spatial predicate (re-applied by run_core).
+    assert_eq!(
+        ids("SELECT id FROM r WHERE minX>=50 AND maxX<=60 AND id%2=0 ORDER BY id"),
+        vec![50, 52, 54, 56, 58, 60]
+    );
+}
+
+#[test]
 fn coordinates_round_to_f32_like_sqlite() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE r USING rtree(id, lo, hi)")

@@ -5904,7 +5904,39 @@ impl Connection {
                 let n_coords = crate::vtab::RTreeModule::n_coords(&arg_refs);
                 if columns.len() == 1 + n_coords {
                     let integer = cvt.module.eq_ignore_ascii_case("rtree_i32");
-                    let rows = self.scan_rtree_nodes(name, n_coords, integer)?;
+                    // Spatial pushdown: turn the query's coordinate comparisons into
+                    // per-dimension bounds the node walk uses to prune subtrees.
+                    // Column 0 is the rowid/id; columns 1.. are the coordinates.
+                    let bbox: Vec<(usize, ConstraintOp, f64)> = match pushdown {
+                        Some((sel, params)) => {
+                            let (cs, vs) = collect_vtab_constraints(sel, &columns, params);
+                            cs.iter()
+                                .zip(vs)
+                                .filter_map(|(c, v)| {
+                                    let ci = c.column.checked_sub(1)?;
+                                    if ci >= n_coords {
+                                        return None;
+                                    }
+                                    let fv = match v {
+                                        Value::Integer(i) => i as f64,
+                                        Value::Real(r) => r,
+                                        _ => return None,
+                                    };
+                                    matches!(
+                                        c.op,
+                                        ConstraintOp::Eq
+                                            | ConstraintOp::Gt
+                                            | ConstraintOp::Le
+                                            | ConstraintOp::Lt
+                                            | ConstraintOp::Ge
+                                    )
+                                    .then_some((ci, c.op, fv))
+                                })
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    };
+                    let rows = self.scan_rtree_nodes(name, n_coords, integer, &bbox)?;
                     return Ok(Some((columns, rows)));
                 }
             }
@@ -12908,6 +12940,7 @@ impl Connection {
         name: &str,
         n_coords: usize,
         integer: bool,
+        bbox: &[(usize, ConstraintOp, f64)],
     ) -> Result<Vec<InputRow>> {
         use alloc::collections::BTreeMap;
         let node_meta = self.table_meta(&format!("{name}_node"), None)?;
@@ -12920,6 +12953,38 @@ impl Connection {
             }
         }
         let cell_size = 8 + n_coords * 4;
+        // Read coordinate `j` (0-based) of the cell whose 8-byte key starts at `off`.
+        let coord_at = |blob: &[u8], off: usize, j: usize| -> f64 {
+            let p = off + 8 + j * 4;
+            let b: [u8; 4] = blob[p..p + 4].try_into().expect("4 bytes");
+            if integer {
+                f64::from(i32::from_be_bytes(b))
+            } else {
+                f64::from(f32::from_be_bytes(b))
+            }
+        };
+        // Spatial pushdown: a subtree's stored cell is the MBR of its entries —
+        // `[lo, hi]` per dimension — so a constraint on either coordinate column of
+        // dimension `d` can be satisfied by some entry only if the MBR overlaps it.
+        // The on-disk MBR is a superset (f32 rounds min down / max up), so this
+        // prune never drops a matching entry; `run_core` re-applies the full WHERE,
+        // making the visited rows a correct superset. Constraints whose dimension
+        // can't possibly be satisfied prune the whole subtree.
+        let subtree_matches = |blob: &[u8], off: usize| -> bool {
+            bbox.iter().all(|&(ci, op, v)| {
+                let d = ci / 2;
+                let lo = coord_at(blob, off, 2 * d);
+                let hi = coord_at(blob, off, 2 * d + 1);
+                match op {
+                    ConstraintOp::Ge => hi >= v,
+                    ConstraintOp::Gt => hi > v,
+                    ConstraintOp::Le => lo <= v,
+                    ConstraintOp::Lt => lo < v,
+                    ConstraintOp::Eq => lo <= v && v <= hi,
+                    _ => true,
+                }
+            })
+        };
         let mut out = Vec::new();
         let Some(root) = nodes.get(&1) else {
             return Ok(out);
@@ -12946,7 +13011,11 @@ impl Connection {
                 }
                 let key = i64::from_be_bytes(blob[off..off + 8].try_into().expect("8 bytes"));
                 if level > 0 {
-                    // Interior cell: the 8-byte field is a child node number.
+                    // Interior cell: the 8-byte field is a child node number. Skip
+                    // the whole subtree when its MBR can't satisfy the constraints.
+                    if !bbox.is_empty() && !subtree_matches(blob, off) {
+                        continue;
+                    }
                     stack.push((key, level - 1));
                     continue;
                 }
@@ -12980,7 +13049,7 @@ impl Connection {
     /// node reader; coords come back as the stored f32/i32 values widened to f64).
     fn rtree_entries(&self, name: &str, n_coord: usize, integer: bool) -> Result<Vec<RtreeCell>> {
         Ok(self
-            .scan_rtree_nodes(name, n_coord, integer)?
+            .scan_rtree_nodes(name, n_coord, integer, &[])?
             .into_iter()
             .map(|r| {
                 let key = match r.values.first() {
