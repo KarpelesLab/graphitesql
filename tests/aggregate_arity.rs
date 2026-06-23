@@ -40,3 +40,45 @@ fn arity_errors_in_grouped_context() {
         graphitesql::Value::Integer(3)
     );
 }
+
+#[test]
+fn too_many_args_aggregates_and_window_funcs_error() {
+    // sqlite rejects extra arguments to a builtin aggregate or a ranking/value
+    // window function ("wrong number of arguments"); graphite used to ignore them.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(v)").unwrap();
+    c.execute("INSERT INTO t VALUES(1),(2),(3)").unwrap();
+    for sql in [
+        // Aggregates that take exactly one argument.
+        "SELECT sum(1, 2)",
+        "SELECT total(1, 2)",
+        "SELECT avg(1, 2)",
+        "SELECT count(1, 2)",
+        "SELECT sum(v, v) FROM t",
+        // Ranking window functions take no argument; value ones a fixed count.
+        "SELECT row_number(1) OVER () FROM t",
+        "SELECT rank(1) OVER () FROM t",
+        "SELECT dense_rank(1) OVER () FROM t",
+        "SELECT cume_dist(1) OVER () FROM t",
+        "SELECT ntile() OVER () FROM t",
+        "SELECT ntile(2, 3) OVER () FROM t",
+        "SELECT lag() OVER () FROM t",
+        "SELECT lag(v, 1, 0, 9) OVER () FROM t",
+        "SELECT first_value() OVER () FROM t",
+        "SELECT nth_value(v) OVER () FROM t",
+    ] {
+        assert!(
+            c.query(sql).is_err(),
+            "{sql} should error (wrong arg count)"
+        );
+    }
+    // The valid argument counts still work.
+    for sql in [
+        "SELECT sum(v), avg(v), count(*), count(v), group_concat(v), group_concat(v, '-') FROM t",
+        "SELECT row_number() OVER (ORDER BY v), ntile(2) OVER (ORDER BY v), \
+         lag(v) OVER (ORDER BY v), lag(v, 1, 0) OVER (ORDER BY v), \
+         nth_value(v, 2) OVER (ORDER BY v) FROM t",
+    ] {
+        assert!(c.query(sql).is_ok(), "{sql} should succeed");
+    }
+}

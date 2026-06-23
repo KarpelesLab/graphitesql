@@ -10618,6 +10618,25 @@ impl Connection {
         let lname = name.to_ascii_lowercase();
         let n = rows.len();
 
+        // Arity validation for the built-in ranking/value window functions (an
+        // aggregate used as a window function — `sum(x) OVER …` — falls through to
+        // the aggregate path). SQLite rejects a wrong count: `row_number(1)`,
+        // `lag()`, `ntile()`, `nth_value(1)` are all "wrong number of arguments".
+        let win_arity: Option<(usize, usize)> = match lname.as_str() {
+            "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" => Some((0, 0)),
+            "ntile" | "first_value" | "last_value" => Some((1, 1)),
+            "nth_value" => Some((2, 2)),
+            "lag" | "lead" => Some((1, 3)),
+            _ => None,
+        };
+        if let Some((lo, hi)) = win_arity {
+            if args.len() < lo || args.len() > hi {
+                return Err(Error::Error(alloc::format!(
+                    "wrong number of arguments to function {lname}()"
+                )));
+            }
+        }
+
         // Per-row partition keys, order keys, argument values, and FILTER mask.
         let mut part_keys: Vec<Vec<Value>> = Vec::with_capacity(n);
         let mut ord_keys: Vec<Vec<Value>> = Vec::with_capacity(n);
@@ -15220,6 +15239,22 @@ impl Connection {
             return Err(Error::Error(format!(
                 "wrong number of arguments to function {lname}()"
             )));
+        }
+        // Upper-bound arity for the builtin aggregates (a registered UDAF carries
+        // its own). SQLite rejects too many arguments ("wrong number of
+        // arguments"): `sum(1,2)`, `avg(1,2)`, `count(1,2)` are all errors. The
+        // two-argument forms are `group_concat`/`string_agg` and the
+        // `json[b]_group_object` pair; every other builtin aggregate takes one.
+        if !self.aggregates.contains_key(&lname) {
+            let max_args = match lname.as_str() {
+                "group_concat" | "string_agg" | "json_group_object" | "jsonb_group_object" => 2,
+                _ => 1,
+            };
+            if args.len() > max_args {
+                return Err(Error::Error(format!(
+                    "wrong number of arguments to function {lname}()"
+                )));
+            }
         }
 
         // An `ORDER BY` inside the aggregate (`group_concat(x ORDER BY y)`) sorts
