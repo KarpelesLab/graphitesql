@@ -103,7 +103,9 @@ aliases resolved in WHERE/GROUP BY/HAVING; `INNER`/`LEFT`/`RIGHT`/`FULL`/cross/
 comma **joins** plus **`NATURAL`** and **`USING`** (with column coalescing),
 nested-loop + a hash join for equi-joins; compound queries
 (`UNION`/`INTERSECT`/`EXCEPT`, collation-aware); (recursive) **CTEs** with
-`LIMIT`; correlated subqueries, `[NOT] EXISTS`, derived tables; views & CTEs as
+`LIMIT` (a definition `LIMIT`, and an unbounded recursion bounded lazily by the
+consuming query's `LIMIT`); correlated subqueries, `[NOT] EXISTS`, derived
+tables; views & CTEs as
 sources; **window functions** (`ROWS`/`RANGE`/`GROUPS`, `EXCLUDE`, `FILTER`,
 named windows); `INSERT … SELECT`, `UPDATE … FROM`, `UPDATE OR
 IGNORE/REPLACE/…`, UPSERT, `RETURNING`, row values, `STRICT` tables, generated
