@@ -339,21 +339,24 @@ spike covers single-table scans, aggregates, `GROUP BY`, and grouped `HAVING` +
 aggregate `ORDER BY` (**B6**), all parity-checked via `query_vdbe`. Remaining,
 each additive behind `query_vdbe` until B7:
 
-- **B5a — VDBE two-table inner join. ✅ DONE (cross-product form).** A single
-  INNER/CROSS/comma join materializes `t1 × t2` as one combined row set with the
-  `ON`/join predicate folded into the `WHERE`, then reuses the single-cursor
-  scan compiler + interpreter unchanged (`query_vdbe`). Bails (→ tree-walker) on
-  outer joins, `NATURAL`/`USING`, `t.*` over a join, 3+ tables, and ambiguous
-  shared column names. *Remaining for B5b:* a true per-cursor nested loop
-  (`OpenRead`/`Rewind`/`Column`/`Next`) so the inner side isn't fully
-  materialized, plus index/PK inner seeks.
+- **B5a — VDBE N-table inner join. ✅ DONE (cross-product form).** Any number of
+  INNER/CROSS/comma joins materialize `t1 × t2 × … × tN` (leftmost source
+  outermost, matching the tree-walker's and sqlite's nested-loop row order — raw
+  unordered output verified identical) as one combined row set with every
+  `ON`/join predicate folded into the `WHERE`, then reuse the single-cursor scan
+  compiler + interpreter unchanged (`query_vdbe`). Bails (→ tree-walker) on outer
+  joins, `NATURAL`/`USING`, `t.*` over a join, and ambiguous shared column names.
+  (Extended from 2 tables to N on 2026-06-24; 3- and 4-table joins are in
+  `tests/vdbe.rs::two_table_join_matches_tree_walker`.) *Remaining for B5b:* a
+  true per-cursor nested loop (`OpenRead`/`Rewind`/`Column`/`Next`) so the inner
+  side isn't fully materialized, plus index/PK inner seeks.
 - **B5b — VDBE join: per-cursor nested loop, index/PK inner seek + outer-join
   NULL-extend.** Replace the materialized cross-product with cursor opcodes; add
   the seek-driven inner cursor and LEFT NULL-extension.
 - **B5c — VDBE: subqueries / compound / window** shapes still on the tree-walker.
   *Coverage audited 2026-06-23 (`query_vdbe` strict-mode probe):* the VDBE already
   compiles single-table scans with `WHERE`, `ORDER BY`, `GROUP BY`, `DISTINCT`,
-  constant `LIMIT`, and the 2-table inner join; what defers is **compound
+  constant `LIMIT`, and N-table inner joins; what defers is **compound
   SELECT** (`UNION`/etc.), subqueries-in-`FROM`, correlated subqueries, and window
   functions — each substantial. The param-less limit is now **partly lifted**:
   EXPLICIT parameters (`?N`, `:name`/`$x`) are substituted into the VDBE-compiled

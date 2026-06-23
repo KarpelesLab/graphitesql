@@ -567,16 +567,18 @@ impl Connection {
             Ok((cols, tables, affinities, collations, rows))
         };
 
-        // Two-table inner join (B5a): an inner join is a filtered cross-product,
-        // so materialize `t1 × t2` as one combined row set, fold the `ON`/join
-        // predicate into the `WHERE`, and reuse the single-cursor scan compiler.
+        // Inner join(s) (B5a): an inner join is a filtered cross-product, so
+        // materialize `t1 × t2 × … × tN` (leftmost source outermost, matching the
+        // tree-walker's and sqlite's nested-loop row order), fold every `ON` into
+        // the `WHERE`, and reuse the single-cursor scan compiler. Every join must
+        // be a plain `INNER`/`CROSS`/comma join (no `NATURAL`/`USING`/outer).
         if !from.joins.is_empty() {
-            if from.joins.len() != 1 {
-                return Err(Error::Unsupported("VDBE: only a two-table join"));
-            }
-            let join = &from.joins[0];
-            if join.kind != sql::ast::JoinKind::Inner || join.natural || !join.using.is_empty() {
-                return Err(Error::Unsupported("VDBE: only a plain inner join"));
+            if from
+                .joins
+                .iter()
+                .any(|j| j.kind != sql::ast::JoinKind::Inner || j.natural || !j.using.is_empty())
+            {
+                return Err(Error::Unsupported("VDBE: only plain inner joins"));
             }
             // `t.*` over a join would need per-table expansion; not yet handled.
             if sel
@@ -586,39 +588,52 @@ impl Connection {
             {
                 return Err(Error::Unsupported("VDBE: table.* over a join"));
             }
-            let (c1, t1, a1, l1, r1) = scan_one(&from.first)?;
-            let (c2, t2, a2, l2, r2) = scan_one(&join.table)?;
-            // The combined schema is t1's columns then t2's. Shared bare names are
-            // allowed: a qualified `t.col` reference disambiguates them, and an
+            // Scan every source (the first table, then each joined table) in
+            // declaration order.
+            let mut sources = alloc::vec![scan_one(&from.first)?];
+            for j in &from.joins {
+                sources.push(scan_one(&j.table)?);
+            }
+            // Combined schema = each source's columns concatenated in order. Shared
+            // bare names are allowed: a qualified `t.col` disambiguates them, and an
             // ambiguous *bare* reference makes the compiler bail (→ tree-walker).
-            let mut combined: Vec<String> = c1.clone();
-            combined.extend(c2.iter().cloned());
-            let mut combined_tables: Vec<String> = t1.clone();
-            combined_tables.extend(t2.iter().cloned());
-            let mut combined_aff: Vec<eval::Affinity> = a1.clone();
-            combined_aff.extend(a2.iter().copied());
-            let mut combined_coll: Vec<crate::value::Collation> = l1.clone();
-            combined_coll.extend(l2.iter().copied());
-            // Cross-product rows, outer table first (matching sqlite's row order).
-            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(r1.len().saturating_mul(r2.len()));
-            for a in &r1 {
-                for b in &r2 {
-                    let mut row = a.clone();
-                    row.extend(b.iter().cloned());
-                    rows.push(row);
+            let mut combined: Vec<String> = Vec::new();
+            let mut combined_tables: Vec<String> = Vec::new();
+            let mut combined_aff: Vec<eval::Affinity> = Vec::new();
+            let mut combined_coll: Vec<crate::value::Collation> = Vec::new();
+            for (c, t, a, l, _) in &sources {
+                combined.extend(c.iter().cloned());
+                combined_tables.extend(t.iter().cloned());
+                combined_aff.extend(a.iter().copied());
+                combined_coll.extend(l.iter().copied());
+            }
+            // N-way cross-product, leftmost source outermost.
+            let mut rows: Vec<Vec<Value>> = sources[0].4.clone();
+            for src in &sources[1..] {
+                let mut next = Vec::with_capacity(rows.len().saturating_mul(src.4.len()));
+                for a in &rows {
+                    for b in &src.4 {
+                        let mut row = a.clone();
+                        row.extend(b.iter().cloned());
+                        next.push(row);
+                    }
+                }
+                rows = next;
+            }
+            // Merge the existing WHERE with every join's ON predicate (AND).
+            let mut merged = sel.where_clause.clone();
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    merged = Some(match merged {
+                        Some(w) => sql::ast::Expr::Binary {
+                            op: sql::ast::BinaryOp::And,
+                            left: alloc::boxed::Box::new(w),
+                            right: alloc::boxed::Box::new(on.clone()),
+                        },
+                        None => on.clone(),
+                    });
                 }
             }
-            // Merge the existing WHERE with the join's ON predicate.
-            let merged = match (sel.where_clause.clone(), join.on.clone()) {
-                (Some(w), Some(on)) => Some(sql::ast::Expr::Binary {
-                    op: sql::ast::BinaryOp::And,
-                    left: alloc::boxed::Box::new(w),
-                    right: alloc::boxed::Box::new(on),
-                }),
-                (Some(w), None) => Some(w),
-                (None, Some(on)) => Some(on),
-                (None, None) => None,
-            };
             let mut joined = sel.clone();
             joined.where_clause = merged;
             let prog = vdbe::compile_table_select(

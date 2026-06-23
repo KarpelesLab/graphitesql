@@ -236,9 +236,15 @@ fn two_table_join_matches_tree_walker() {
         .unwrap();
     c.execute("INSERT INTO dep(dname) VALUES ('eng'),('sales')")
         .unwrap();
+    // A third table so 3- and 4-way inner joins are exercised through the VDBE.
+    c.execute("CREATE TABLE loc(lid INTEGER PRIMARY KEY, dept INT, city TEXT)")
+        .unwrap();
+    c.execute("INSERT INTO loc(dept,city) VALUES (1,'NYC'),(2,'LA'),(1,'SF')")
+        .unwrap();
     // An inner join is a filtered cross-product; the VDBE path matches the
     // tree-walker for explicit JOIN ... ON, comma joins, CROSS, projections,
-    // WHERE, ORDER BY, LIMIT, and aggregates over the join.
+    // WHERE, ORDER BY, LIMIT, and aggregates over the join — for any number of
+    // tables (a single `query_vdbe` call would error if the VDBE fell back).
     for q in [
         "SELECT name, dname FROM emp JOIN dep ON dept = did",
         "SELECT name, dname FROM emp, dep WHERE dept = did",
@@ -251,6 +257,17 @@ fn two_table_join_matches_tree_walker() {
         "SELECT name || ':' || dname FROM emp JOIN dep ON dept = did",
         "SELECT * FROM emp JOIN dep ON dept = did",
         "SELECT name, dname FROM emp JOIN dep ON dept = did LIMIT 2",
+        // 3- and 4-table inner joins (explicit ON, comma, CROSS), raw and ordered.
+        "SELECT emp.name, dep.dname, loc.city FROM emp JOIN dep ON emp.dept = dep.did \
+         JOIN loc ON loc.dept = emp.dept",
+        "SELECT emp.name, dep.dname, loc.city FROM emp JOIN dep ON emp.dept = dep.did \
+         JOIN loc ON loc.dept = emp.dept ORDER BY emp.name, loc.city",
+        "SELECT emp.name, loc.city FROM emp, dep, loc \
+         WHERE emp.dept = dep.did AND loc.dept = emp.dept",
+        "SELECT count(*) FROM emp JOIN dep ON emp.dept = dep.did JOIN loc ON loc.dept = emp.dept",
+        "SELECT emp.name FROM emp CROSS JOIN dep CROSS JOIN loc ORDER BY emp.name LIMIT 5",
+        "SELECT emp.name, dep.dname, loc.city FROM emp JOIN dep ON emp.dept = dep.did \
+         JOIN loc ON loc.dept = emp.dept JOIN dep d2 ON d2.did = emp.dept",
     ] {
         let mut got = c.query_vdbe(q).unwrap().rows;
         let mut want = c.query(q).unwrap().rows;
