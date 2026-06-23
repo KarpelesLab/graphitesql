@@ -339,15 +339,30 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 1)?;
             str_map(&v[0], |s| s.to_uppercase())
         }
-        "trim" => trim_fn(&v, true, true),
-        "ltrim" => trim_fn(&v, true, false),
-        "rtrim" => trim_fn(&v, false, true),
+        "trim" | "ltrim" | "rtrim" => {
+            // SQLite's trim family takes 1 (string) or 2 (string, chars) arguments.
+            if args.is_empty() || args.len() > 2 {
+                return Err(Error::Error(alloc::format!(
+                    "wrong number of arguments to function {lname}() (want 1 or 2, got {})",
+                    args.len()
+                )));
+            }
+            let (left, right) = match lname.as_str() {
+                "ltrim" => (true, false),
+                "rtrim" => (false, true),
+                _ => (true, true),
+            };
+            trim_fn(&v, left, right)
+        }
         "soundex" => {
             arity(&lname, args, 1)?;
             // NULL/non-alpha input yields "?000" (SQLite does not propagate NULL).
             Value::Text(soundex(&c_text(&v[0])))
         }
-        "typeof" => Value::Text(String::from(type_name(&v[0]))),
+        "typeof" => {
+            arity(&lname, args, 1)?;
+            Value::Text(String::from(type_name(&v[0])))
+        }
         "nullif" => {
             arity(&lname, args, 2)?;
             // The comparison follows the standard binary-comparison collation
@@ -368,16 +383,22 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "round" => round(&v)?,
         "min" => scalar_min_max(&v, true)?,
         "max" => scalar_min_max(&v, false)?,
-        "hex" => Value::Text(hex_encode(&v[0])),
+        "hex" => {
+            arity(&lname, args, 1)?;
+            Value::Text(hex_encode(&v[0]))
+        }
         "char" => char_fn(&v),
-        "unicode" => match &v[0] {
-            Value::Null => Value::Null,
-            other => eval::to_text(other)
-                .chars()
-                .next()
-                .map(|c| Value::Integer(c as i64))
-                .unwrap_or(Value::Null),
-        },
+        "unicode" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => eval::to_text(other)
+                    .chars()
+                    .next()
+                    .map(|c| Value::Integer(c as i64))
+                    .unwrap_or(Value::Null),
+            }
+        }
         // `if` is SQLite's alias for `iif`. Both take 2 or 3 arguments: the
         // 2-argument form yields NULL when the condition is not true.
         "iif" | "if" => {

@@ -318,3 +318,70 @@ fn fixed_divergences_pinned() {
         );
     }
 }
+
+#[test]
+fn single_arg_functions_error_on_zero_args_without_panicking() {
+    // A zero-argument call to a one-argument scalar function must produce a clean
+    // error, never a panic (these used to index `v[0]` on an empty vec). Verified
+    // for every such builtin; sqlite likewise rejects them ("wrong number of
+    // arguments"), so the differential corpus stays consistent.
+    let c = Connection::open_memory().unwrap();
+    let fns = [
+        "typeof",
+        "hex",
+        "unicode",
+        "abs",
+        "length",
+        "lower",
+        "upper",
+        "round",
+        "sign",
+        "ceil",
+        "floor",
+        "sqrt",
+        "exp",
+        "ln",
+        "trim",
+        "ltrim",
+        "rtrim",
+        "quote",
+        "soundex",
+        "json",
+        "json_valid",
+        "json_type",
+        "json_quote",
+        "unhex",
+        "zeroblob",
+        "randomblob",
+        "likely",
+        "unlikely",
+        "octet_length",
+        "json_array_length",
+        "sin",
+        "cos",
+        "tan",
+        "degrees",
+        "radians",
+        "unistr",
+        "subtype",
+    ];
+    for f in fns {
+        let q = format!("SELECT {f}()");
+        // Must be an Err (not a panic, not Ok).
+        assert!(
+            c.query(&q).is_err(),
+            "{f}() should error on zero args, not succeed"
+        );
+    }
+    // The valid one-argument forms still work.
+    assert_eq!(
+        c.query("SELECT typeof(1), hex('AB'), unicode('Z')")
+            .unwrap()
+            .rows[0],
+        vec![
+            Value::Text("integer".into()),
+            Value::Text("4142".into()),
+            Value::Integer(90)
+        ]
+    );
+}
