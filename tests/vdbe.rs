@@ -891,3 +891,63 @@ fn table_wildcard_over_join_matches_tree_walker() {
         .query_vdbe("SELECT x.* FROM t JOIN u ON u.t_id=t.id")
         .is_err());
 }
+
+#[test]
+fn natural_using_join_matches_tree_walker_and_sqlite3() {
+    // INNER NATURAL/USING joins run on the VDBE: the router coalesces each
+    // common/USING column into one output column (dropping the right duplicate),
+    // matching the tree-walker and sqlite for both columns and rows.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INT, b TEXT)").unwrap();
+    c.execute("CREATE TABLE u(a INT, c TEXT)").unwrap();
+    c.execute("INSERT INTO t VALUES(1,'x'),(2,'y'),(3,'z')")
+        .unwrap();
+    c.execute("INSERT INTO u VALUES(1,'p'),(2,'q'),(5,'r')")
+        .unwrap();
+    let qs = [
+        "SELECT * FROM t NATURAL JOIN u ORDER BY a",
+        "SELECT a, b, c FROM t NATURAL JOIN u ORDER BY a",
+        "SELECT * FROM t JOIN u USING(a) ORDER BY a",
+        "SELECT a FROM t JOIN u USING(a) ORDER BY a",
+        "SELECT count(*) FROM t NATURAL JOIN u",
+        "SELECT * FROM t JOIN u USING(a) WHERE a > 1 ORDER BY a",
+    ];
+    for q in qs {
+        let r = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("expected VDBE to handle {q}: {e}"));
+        c.set_use_vdbe(false);
+        let want = c.query(q).unwrap();
+        c.set_use_vdbe(true);
+        assert_eq!(r.columns, want.columns, "columns diverged on {q}");
+        assert_eq!(r.rows, want.rows, "rows diverged on {q}");
+    }
+
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    let setup = "CREATE TABLE t(a INT, b TEXT); CREATE TABLE u(a INT, c TEXT);\
+                 INSERT INTO t VALUES(1,'x'),(2,'y'),(3,'z');\
+                 INSERT INTO u VALUES(1,'p'),(2,'q'),(5,'r');";
+    for q in qs {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(format!("{setup} {q};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = c
+            .query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.iter().map(render).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(got, want, "NATURAL/USING vs sqlite3 diverged on {q}");
+    }
+    // A USING column missing from one side errors (the tree-walker rejects it too).
+    assert!(c.query_vdbe("SELECT * FROM t JOIN u USING(b)").is_err());
+}

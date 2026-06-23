@@ -1155,6 +1155,151 @@ impl Connection {
             });
         }
 
+        // INNER `NATURAL` / `USING` join(s): a filtered cross-product can't model
+        // the column coalescing (each common / `USING` column appears once, the
+        // right duplicate dropped), so build the joined rows by a nested loop —
+        // matching on equality of the coalesced columns (each under the left
+        // column's collation), then dropping the right duplicate columns — exactly
+        // like the tree-walker. INNER only; an outer NATURAL/USING still bails.
+        if from.joins.iter().any(|j| j.natural || !j.using.is_empty())
+            && from
+                .joins
+                .iter()
+                .all(|j| matches!(j.kind, sql::ast::JoinKind::Inner))
+        {
+            // `t.*` over a coalesced join would need qualifier-aware expansion of
+            // the reduced column set; defer it.
+            if sel
+                .columns
+                .iter()
+                .any(|rc| matches!(rc, sql::ast::ResultColumn::TableWildcard(_)))
+            {
+                return Err(Error::Unsupported("VDBE: table.* over NATURAL/USING join"));
+            }
+            let on_params = eval::Params::default();
+            let first = scan_one(&from.first)?;
+            let mut names = first.0;
+            let mut tabs = first.1;
+            let mut affs = first.2;
+            let mut colls = first.3;
+            let mut rows: Vec<Vec<Value>> = first.4;
+            for j in &from.joins {
+                let src = scan_one(&j.table)?;
+                let lw = names.len();
+                let mut n_names = names.clone();
+                n_names.extend(src.0.iter().cloned());
+                let mut n_tabs = tabs.clone();
+                n_tabs.extend(src.1.iter().cloned());
+                let mut n_affs = affs.clone();
+                n_affs.extend(src.2.iter().copied());
+                let mut n_colls = colls.clone();
+                n_colls.extend(src.3.iter().copied());
+                // (left index, right local index) pairs: every commonly-named column
+                // for NATURAL, the named columns for USING (which must be in both).
+                let pairs: Vec<(usize, usize)> = if j.natural {
+                    src.0
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(rl, rn)| {
+                            names
+                                .iter()
+                                .position(|n| n.eq_ignore_ascii_case(rn))
+                                .map(|li| (li, rl))
+                        })
+                        .collect()
+                } else {
+                    let mut v = Vec::with_capacity(j.using.len());
+                    for name in &j.using {
+                        let li = names.iter().position(|n| n.eq_ignore_ascii_case(name));
+                        let rl = src.0.iter().position(|n| n.eq_ignore_ascii_case(name));
+                        match (li, rl) {
+                            (Some(li), Some(rl)) => v.push((li, rl)),
+                            _ => {
+                                return Err(Error::Error(format!(
+                                "cannot join using column {name} - column not present in both tables"
+                            )))
+                            }
+                        }
+                    }
+                    v
+                };
+                let cinfos: Vec<ColumnInfo> = (0..n_names.len())
+                    .map(|i| ColumnInfo {
+                        name: n_names[i].clone(),
+                        table: n_tabs[i].clone(),
+                        affinity: n_affs[i],
+                        collation: n_colls[i],
+                    })
+                    .collect();
+                let mut joined: Vec<Vec<Value>> = Vec::new();
+                for left in &rows {
+                    for right in &src.4 {
+                        let mut combined = left.clone();
+                        combined.extend(right.iter().cloned());
+                        let keep = if !pairs.is_empty() {
+                            pairs.iter().all(|&(li, rl)| {
+                                eval::truth(&eval::compare_op(
+                                    sql::ast::BinaryOp::Eq,
+                                    &combined[li],
+                                    &combined[lw + rl],
+                                    n_colls[li],
+                                )) == Some(true)
+                            })
+                        } else {
+                            match &j.on {
+                                Some(on) => {
+                                    let ir = InputRow {
+                                        values: combined.clone(),
+                                        rowid: None,
+                                    };
+                                    let ctx = ir.ctx(&cinfos, &on_params).with_subqueries(self);
+                                    eval::truth(&eval::eval(on, &ctx)?) == Some(true)
+                                }
+                                None => true,
+                            }
+                        };
+                        if keep {
+                            joined.push(combined);
+                        }
+                    }
+                }
+                // Coalesce each join column into its left position, then drop the
+                // right duplicates so it appears once (inner join → left == right).
+                if !pairs.is_empty() {
+                    let mut drop: Vec<usize> = pairs.iter().map(|&(_, rl)| lw + rl).collect();
+                    drop.sort_unstable();
+                    drop.dedup();
+                    for row in &mut joined {
+                        for &(li, rl) in &pairs {
+                            if matches!(row[li], Value::Null) {
+                                row[li] = row[lw + rl].clone();
+                            }
+                        }
+                        for &d in drop.iter().rev() {
+                            row.remove(d);
+                        }
+                    }
+                    for &d in drop.iter().rev() {
+                        n_names.remove(d);
+                        n_tabs.remove(d);
+                        n_affs.remove(d);
+                        n_colls.remove(d);
+                    }
+                }
+                rows = joined;
+                names = n_names;
+                tabs = n_tabs;
+                affs = n_affs;
+                colls = n_colls;
+            }
+            let prog = vdbe::compile_table_select(sel, &names, &tabs, &affs, &colls, false)?;
+            let result = vdbe::run_rows(&prog, &rows)?;
+            return Ok(QueryResult {
+                columns: prog.columns,
+                rows: result,
+            });
+        }
+
         // Inner join(s) (B5a): an inner join is a filtered cross-product, so
         // materialize `t1 × t2 × … × tN` (leftmost source outermost, matching the
         // tree-walker's and sqlite's nested-loop row order), fold every `ON` into
