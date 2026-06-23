@@ -361,8 +361,11 @@ each additive behind `query_vdbe` until B7:
   materialized cross-product / row build with cursor opcodes
   (`OpenRead`/`Rewind`/`Column`/`Next`) so the inner side isn't fully
   materialized, plus seek-driven inner cursors. (Results already correct via the
-  materialized forms above — this is the perf/streaming refinement.) RIGHT/FULL
-  outer joins still defer to the tree-walker.
+  materialized forms above — this is the perf/streaming refinement.) A single
+  two-table **RIGHT/FULL** outer join also runs on the VDBE now (2026-06-24,
+  left-driven build + appended unmatched-right rows, sqlite row order verified);
+  only RIGHT/FULL in a multi-join *chain* still defers to the tree-walker. Test
+  `tests/vdbe.rs::right_and_full_join_match_tree_walker_and_sqlite3`.
 - **B5c — VDBE: subqueries / compound / window** shapes still on the tree-walker.
   *Coverage audited 2026-06-23 (`query_vdbe` strict-mode probe):* the VDBE already
   compiles single-table scans with `WHERE`, `ORDER BY`, `GROUP BY`, `DISTINCT`,
