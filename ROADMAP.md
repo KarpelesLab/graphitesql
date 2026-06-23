@@ -107,7 +107,9 @@ nested-loop + a hash join for equi-joins; compound queries
 consuming query's `LIMIT`); correlated subqueries, `[NOT] EXISTS`, derived
 tables; views & CTEs as
 sources; **window functions** (`ROWS`/`RANGE`/`GROUPS`, `EXCLUDE`, `FILTER`,
-named windows); `INSERT … SELECT`, `UPDATE … FROM`, `UPDATE OR
+named windows, and **over `GROUP BY`/aggregates** — `sum(sum(v)) OVER ()`,
+`row_number() OVER (ORDER BY sum(v))`); `INSERT … SELECT`, `UPDATE … FROM`,
+`UPDATE OR
 IGNORE/REPLACE/…`, UPSERT, `RETURNING`, row values, `STRICT` tables, generated
 columns; a broad scalar/aggregate function library incl. **date/time**
 (+ `CURRENT_DATE`/`TIME`/`TIMESTAMP`, `timediff`), `printf`/`format` (16-sig-digit
