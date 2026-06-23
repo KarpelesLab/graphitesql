@@ -434,6 +434,32 @@ fn unparen(e: &Expr) -> &Expr {
     }
 }
 
+/// Fold a constant `LIMIT`/`OFFSET` expression — a bare literal, `-5`, `(3)`,
+/// `2 + 3`, `CAST('4' AS INT)`, … — to its integer value, or `None` when it
+/// references row/connection state (a column, parameter, subquery, or function)
+/// so the tree-walker must handle it. Only literal/paren/cast/unary/binary trees
+/// are folded; the rowless tree-walker `eval` evaluates those deterministically.
+fn fold_const_int(e: &Expr) -> Option<i64> {
+    fn pure(e: &Expr) -> bool {
+        match e {
+            Expr::Literal(_) => true,
+            Expr::Paren(x) | Expr::Cast { expr: x, .. } => pure(x),
+            Expr::Unary { expr, .. } => pure(expr),
+            Expr::Binary { left, right, .. } => pure(left) && pure(right),
+            _ => false,
+        }
+    }
+    if !pure(e) {
+        return None;
+    }
+    let v = crate::exec::eval::eval(
+        e,
+        &crate::exec::eval::EvalCtx::rowless(&crate::exec::eval::Params::default()),
+    )
+    .ok()?;
+    Some(crate::exec::eval::to_i64(&v))
+}
+
 fn is_aggregate_expr(expr: &Expr) -> bool {
     matches!(
         expr,
@@ -809,21 +835,27 @@ fn compile_group_select(
     // Optional LIMIT/OFFSET counters (constant integers only).
     let limit_reg = match &sel.limit {
         None => None,
-        Some(Expr::Literal(Literal::Integer(n))) => {
-            let r = c.alloc();
-            c.ops.push(Op::Integer { value: *n, dest: r });
-            Some(r)
-        }
-        Some(_) => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
+        Some(e) => match fold_const_int(e) {
+            // A negative LIMIT means "unlimited" in SQLite.
+            Some(n) if n < 0 => None,
+            Some(n) => {
+                let r = c.alloc();
+                c.ops.push(Op::Integer { value: n, dest: r });
+                Some(r)
+            }
+            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
+        },
     };
     let offset_reg = match &sel.offset {
         None => None,
-        Some(Expr::Literal(Literal::Integer(n))) => {
-            let r = c.alloc();
-            c.ops.push(Op::Integer { value: *n, dest: r });
-            Some(r)
-        }
-        Some(_) => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
+        Some(e) => match fold_const_int(e) {
+            Some(n) => {
+                let r = c.alloc();
+                c.ops.push(Op::Integer { value: n, dest: r });
+                Some(r)
+            }
+            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
+        },
     };
 
     // Resolve each ORDER BY term to an output-column expression where it is a
@@ -1264,25 +1296,29 @@ pub fn compile_table_select(
     // after each emitted row, halting the loop at zero.
     let limit_reg = match &sel.limit {
         None => None,
-        // A negative LIMIT means "unlimited" in SQLite.
-        Some(Expr::Literal(Literal::Integer(n))) if *n < 0 => None,
-        Some(Expr::Literal(Literal::Integer(n))) => {
-            let r = c.alloc();
-            c.ops.push(Op::Integer { value: *n, dest: r });
-            Some(r)
-        }
-        Some(_) => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
+        Some(e) => match fold_const_int(e) {
+            // A negative LIMIT means "unlimited" in SQLite.
+            Some(n) if n < 0 => None,
+            Some(n) => {
+                let r = c.alloc();
+                c.ops.push(Op::Integer { value: n, dest: r });
+                Some(r)
+            }
+            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
+        },
     };
     // Optional OFFSET (constant integer only): a counter decremented while it is
     // positive, skipping that many qualifying rows before any are emitted.
     let offset_reg = match &sel.offset {
         None => None,
-        Some(Expr::Literal(Literal::Integer(n))) => {
-            let r = c.alloc();
-            c.ops.push(Op::Integer { value: *n, dest: r });
-            Some(r)
-        }
-        Some(_) => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
+        Some(e) => match fold_const_int(e) {
+            Some(n) => {
+                let r = c.alloc();
+                c.ops.push(Op::Integer { value: n, dest: r });
+                Some(r)
+            }
+            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
+        },
     };
     // With `ORDER BY`, the scan feeds a sorter and `LIMIT`/`OFFSET` apply to the
     // sorted emit loop instead of to the scan itself.

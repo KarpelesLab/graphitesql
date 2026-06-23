@@ -159,6 +159,14 @@ fn table_scan_matches_tree_walker() {
         "SELECT a, b FROM t ORDER BY b",
         "SELECT a FROM t ORDER BY a DESC LIMIT 2",
         "SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 1",
+        // Constant LIMIT/OFFSET *expressions* fold and compile (not just bare
+        // literals): negative LIMIT = unlimited, arithmetic, parens, CAST.
+        "SELECT a FROM t ORDER BY a LIMIT -1",
+        "SELECT a FROM t ORDER BY a LIMIT 1+1",
+        "SELECT a FROM t ORDER BY a LIMIT (3)",
+        "SELECT a FROM t ORDER BY a LIMIT 10/2 OFFSET 1+1",
+        "SELECT a FROM t ORDER BY a LIMIT 2 OFFSET (1)",
+        "SELECT a FROM t ORDER BY a LIMIT CAST('2' AS INT)",
         "SELECT a, b FROM t WHERE a >= 1 ORDER BY a DESC",
         "SELECT a * 2 AS d FROM t ORDER BY d",
         "SELECT a, b FROM t ORDER BY 1 DESC",
