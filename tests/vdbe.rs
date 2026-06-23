@@ -55,6 +55,12 @@ fn vdbe_matches_tree_walker() {
         "SELECT 6 & NULL, NULL | 1, ~NULL",
         "SELECT 1 IS 1, 1 IS 2, NULL IS NULL, 1 IS NULL, NULL IS 1",
         "SELECT 1 IS NOT 2, NULL IS NOT NULL, 'a' IS 'a', 'a' IS NOT 'b'",
+        // `x IS [NOT] TRUE|FALSE` is a truthiness test (now compiled, not a
+        // fallback): NULL is neither true nor false; text/real coerce numerically.
+        "SELECT 1 IS TRUE, 0 IS TRUE, NULL IS TRUE, 2 IS TRUE, 'x' IS TRUE, 2.5 IS TRUE",
+        "SELECT 1 IS FALSE, 0 IS FALSE, NULL IS FALSE, 0.0 IS FALSE, '' IS FALSE",
+        "SELECT 1 IS NOT TRUE, 0 IS NOT TRUE, NULL IS NOT TRUE, NULL IS NOT FALSE",
+        "SELECT TRUE IS 1, TRUE IS FALSE, (1 < 2) IS TRUE, (1 > 2) IS FALSE",
         "SELECT 5 BETWEEN 1 AND 10, 5 BETWEEN 6 AND 10, 5 BETWEEN 5 AND 5",
         "SELECT 5 NOT BETWEEN 1 AND 10, 5 NOT BETWEEN 6 AND 10",
         "SELECT 'm' BETWEEN 'a' AND 'z', NULL BETWEEN 1 AND 10",

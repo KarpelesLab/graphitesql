@@ -57,6 +57,15 @@ pub enum Op {
         rhs: usize,
         dest: usize,
     },
+    /// `dest = (truth(operand) == Some(want)) XOR not` as 0/1 — the `x IS [NOT]
+    /// TRUE|FALSE` truthiness test (a NULL operand is neither true nor false).
+    /// `want` is the boolean operand; `not` selects the `IS NOT` form.
+    Truthy {
+        want: bool,
+        not: bool,
+        operand: usize,
+        dest: usize,
+    },
     /// `dest = lhs LIKE rhs` (`glob` false) or `lhs GLOB rhs` (`glob` true);
     /// NULL on either side yields NULL.
     Like {
@@ -1758,20 +1767,25 @@ impl Compiler {
                         Ok(())
                     }
                     Is | IsNot => {
-                        // `x IS TRUE`/`IS FALSE` is a truthiness test, not value
-                        // equality (SQLite special-cases a boolean-literal operand);
-                        // bail so the tree-walker handles it.
-                        let is_bool =
-                            |e: &Expr| matches!(unparen(e), Expr::Literal(Literal::Boolean(_)));
-                        if is_bool(left) || is_bool(right) {
-                            return Err(Error::Unsupported("VDBE spike: IS TRUE/FALSE"));
+                        // A boolean literal on the RIGHT makes `x IS [NOT] TRUE|FALSE`
+                        // a truthiness test rather than value equality (matching the
+                        // tree-walker, which special-cases only the right operand);
+                        // `r` already holds the compiled literal but is unused here.
+                        if let Expr::Literal(Literal::Boolean(want)) = unparen(right) {
+                            self.ops.push(Op::Truthy {
+                                want: *want,
+                                not: matches!(op, IsNot),
+                                operand: l,
+                                dest,
+                            });
+                        } else {
+                            self.ops.push(Op::Is {
+                                is: matches!(op, Is),
+                                lhs: l,
+                                rhs: r,
+                                dest,
+                            });
                         }
-                        self.ops.push(Op::Is {
-                            is: matches!(op, Is),
-                            lhs: l,
-                            rhs: r,
-                            dest,
-                        });
                         Ok(())
                     }
                     Like | Glob => {
@@ -2103,6 +2117,15 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
             }
             Op::Is { is, lhs, rhs, dest } => {
                 regs[*dest] = crate::exec::eval::is_values(*is, &regs[*lhs], &regs[*rhs]);
+            }
+            Op::Truthy {
+                want,
+                not,
+                operand,
+                dest,
+            } => {
+                let t = crate::exec::eval::truth(&regs[*operand]) == Some(*want);
+                regs[*dest] = Value::Integer((t ^ *not) as i64);
             }
             Op::Like {
                 glob,
