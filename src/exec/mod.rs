@@ -1561,17 +1561,37 @@ impl Connection {
                 ]);
             }
         }
-        // index_xinfo appends the implicit trailing rowid (an auxiliary, non-key
-        // column) for an ordinary rowid table.
-        if extended && !tmeta.without_rowid {
-            rows.push(alloc::vec![
-                Value::Integer(keys.len() as i64),
-                Value::Integer(-1),
-                Value::Null,
-                Value::Integer(0),
-                Value::Text("BINARY".into()),
-                Value::Integer(0),
-            ]);
+        // index_xinfo appends the index's implicit trailing auxiliary (non-key)
+        // columns: the rowid for an ordinary table, or the PRIMARY KEY columns (in
+        // key order, those not already index keys) for a WITHOUT ROWID table.
+        if extended {
+            if tmeta.without_rowid {
+                let key_cids: Vec<i64> = keys.iter().map(|(cid, ..)| *cid).collect();
+                let mut seqno = keys.len();
+                for &pcid in &tmeta.storage_order[..tmeta.pk_len] {
+                    if key_cids.contains(&(pcid as i64)) {
+                        continue;
+                    }
+                    rows.push(alloc::vec![
+                        Value::Integer(seqno as i64),
+                        Value::Integer(pcid as i64),
+                        Value::Text(tmeta.columns[pcid].name.clone()),
+                        Value::Integer(0),
+                        Value::Text(coll_name(tmeta.columns[pcid].collation).into()),
+                        Value::Integer(0), // auxiliary, non-key
+                    ]);
+                    seqno += 1;
+                }
+            } else {
+                rows.push(alloc::vec![
+                    Value::Integer(keys.len() as i64),
+                    Value::Integer(-1),
+                    Value::Null,
+                    Value::Integer(0),
+                    Value::Text("BINARY".into()),
+                    Value::Integer(0),
+                ]);
+            }
         }
         let columns: Vec<String> = if extended {
             ["seqno", "cid", "name", "desc", "coll", "key"]

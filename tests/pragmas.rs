@@ -43,6 +43,10 @@ fn against_sqlite3() {
         // An expression index: index_info/xinfo report the expression column as
         // cid = -2 with a NULL name (the bare `c` keeps its real cid).
         "CREATE INDEX ixe ON t(a || c, c)",
+        // A WITHOUT ROWID table: index_xinfo appends the PRIMARY KEY columns (not
+        // already index keys) as trailing auxiliary columns instead of the rowid.
+        "CREATE TABLE wr(k TEXT PRIMARY KEY, v, w) WITHOUT ROWID",
+        "CREATE INDEX iwr ON wr(v)",
         "CREATE TABLE p(id INTEGER PRIMARY KEY, k)",
         "CREATE TABLE ch(x, y, FOREIGN KEY(x) REFERENCES p(id) ON DELETE CASCADE)",
         // Two FKs: foreign_key_list numbers them last-declared-first (id 0) and
@@ -65,6 +69,8 @@ fn against_sqlite3() {
         "PRAGMA index_xinfo(ix)",
         "PRAGMA index_xinfo(ixp)",
         "PRAGMA index_xinfo(ixe)",
+        "PRAGMA index_info(iwr)",
+        "PRAGMA index_xinfo(iwr)",
     ];
 
     let path = std::env::temp_dir().join(format!("gsql-prag-{}.db", std::process::id()));
