@@ -507,3 +507,31 @@ fn falls_back_for_non_constant() {
         );
     }
 }
+
+#[test]
+fn collate_operator_matches_tree_walker() {
+    // The explicit `COLLATE` operator now compiles through the VDBE (it used to
+    // bail). The collation precedence mirrors sqlite: an explicit COLLATE on
+    // either operand (left first) beats an implicit column collation (left first),
+    // else BINARY; ORDER BY honors an explicit COLLATE or the column's own.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT COLLATE NOCASE)")
+        .unwrap();
+    c.execute("INSERT INTO t(a,b) VALUES ('A','A'),('a','a'),('B','b')")
+        .unwrap();
+    for q in [
+        "SELECT a FROM t WHERE a = 'a' COLLATE NOCASE ORDER BY id",
+        "SELECT a FROM t WHERE a COLLATE NOCASE = 'B'",
+        "SELECT a FROM t WHERE b = 'a' ORDER BY id", // implicit NOCASE column
+        "SELECT a FROM t WHERE b = 'a' COLLATE BINARY", // explicit overrides implicit
+        "SELECT a FROM t WHERE b COLLATE BINARY = 'a'",
+        "SELECT a FROM t ORDER BY a COLLATE NOCASE, id",
+        "SELECT b FROM t ORDER BY b", // implicit NOCASE in ORDER BY
+        "SELECT b FROM t ORDER BY b COLLATE BINARY",
+        "SELECT a FROM t WHERE a < 'b' COLLATE NOCASE ORDER BY id",
+    ] {
+        let got = c.query_vdbe(q).unwrap().rows;
+        let want = c.query(q).unwrap().rows;
+        assert_eq!(got, want, "VDBE COLLATE vs tree-walker diverged on {q}");
+    }
+}

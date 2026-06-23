@@ -1609,29 +1609,53 @@ impl Compiler {
                 .and_then(|i| self.affinities.get(i).copied()),
             Expr::Cast { type_name, .. } => Some(Affinity::from_type(Some(type_name))),
             Expr::Paren(e) => self.expr_affinity(e),
+            // `COLLATE` changes only the collation, not the affinity.
+            Expr::Collate { expr, .. } => self.expr_affinity(expr),
             _ => None,
         }
     }
 
-    /// The declared collating sequence a column expression carries, if it resolves
-    /// to a column (transparent through parentheses), else `None`. (An explicit
-    /// `COLLATE` is not handled here — `Expr::Collate` bails in the compiler.)
-    fn col_collation(&self, expr: &Expr) -> Option<Collation> {
+    /// An EXPLICIT `COLLATE name` carried by this operand (through parentheses),
+    /// if any. An unknown name is ignored (falls back to the implicit collation).
+    fn explicit_collation(&self, expr: &Expr) -> Option<Collation> {
+        match expr {
+            Expr::Paren(e) => self.explicit_collation(e),
+            Expr::Collate { expr, collation } => {
+                Collation::parse(collation).or_else(|| self.explicit_collation(expr))
+            }
+            _ => None,
+        }
+    }
+
+    /// The IMPLICIT (declared) collation of the column this operand resolves to
+    /// (through parentheses / a `COLLATE`), if any.
+    fn implicit_collation(&self, expr: &Expr) -> Option<Collation> {
         match expr {
             Expr::Column { table, column } => self
                 .resolve_column(table.as_deref(), column)
                 .ok()
                 .and_then(|i| self.collations.get(i).copied()),
-            Expr::Paren(e) => self.col_collation(e),
+            Expr::Paren(e) | Expr::Collate { expr: e, .. } => self.implicit_collation(e),
             _ => None,
         }
     }
 
-    /// The collating sequence of a binary comparison, mirroring SQLite: a column
-    /// collation on the left wins, else the right, else `BINARY`.
+    /// The collating sequence a single ORDER BY operand carries: an explicit
+    /// `COLLATE` wins, else the column's declared collation, else `None`
+    /// (→ the caller defaults to `BINARY`).
+    fn col_collation(&self, expr: &Expr) -> Option<Collation> {
+        self.explicit_collation(expr)
+            .or_else(|| self.implicit_collation(expr))
+    }
+
+    /// The collating sequence of a binary comparison, mirroring SQLite's
+    /// precedence: an EXPLICIT `COLLATE` on either operand (left first) beats an
+    /// IMPLICIT column collation on either operand (left first), else `BINARY`.
     fn compare_collation(&self, left: &Expr, right: &Expr) -> Collation {
-        self.col_collation(left)
-            .or_else(|| self.col_collation(right))
+        self.explicit_collation(left)
+            .or_else(|| self.explicit_collation(right))
+            .or_else(|| self.implicit_collation(left))
+            .or_else(|| self.implicit_collation(right))
             .unwrap_or_default()
     }
 
@@ -1646,9 +1670,26 @@ impl Compiler {
         right: &Expr,
         dest: usize,
     ) {
+        let coll = self.compare_collation(left, right);
+        self.push_compare_coll(op, lhs, left, rhs, right, dest, coll);
+    }
+
+    /// Like [`push_compare`](Self::push_compare) but with an explicit collation —
+    /// used by `IN`, where a multi-element list ignores per-element `COLLATE` and
+    /// applies the left operand's collation to every element comparison.
+    #[allow(clippy::too_many_arguments)]
+    fn push_compare_coll(
+        &mut self,
+        op: BinaryOp,
+        lhs: usize,
+        left: &Expr,
+        rhs: usize,
+        right: &Expr,
+        dest: usize,
+        coll: Collation,
+    ) {
         let la = self.expr_affinity(left);
         let ra = self.expr_affinity(right);
-        let coll = self.compare_collation(left, right);
         self.ops.push(Op::Compare {
             op,
             lhs,
@@ -1856,6 +1897,10 @@ impl Compiler {
                 });
                 Ok(())
             }
+            // `expr COLLATE name` carries the same VALUE as `expr`; the collation
+            // only changes which sequence an enclosing comparison / ORDER BY uses,
+            // and that is read off the source expr by `col_collation`.
+            Expr::Collate { expr: inner, .. } => self.compile_expr_into(inner, dest),
             Expr::Case {
                 operand,
                 when_then,
@@ -1902,6 +1947,15 @@ impl Compiler {
                 negated,
             } => {
                 let x = self.compile_expr(inner)?;
+                // SQLite's `IN` collation rule: a single-element list behaves like
+                // `x = elem` (the element's `COLLATE` applies); a multi-element list
+                // uses the LEFT operand's collation for every comparison, ignoring
+                // any per-element `COLLATE`.
+                let in_coll = if list.len() == 1 {
+                    self.compare_collation(inner, &list[0])
+                } else {
+                    self.col_collation(inner).unwrap_or_default()
+                };
                 // Accumulate the running OR into `acc`, seeded with 0 (false) so an
                 // empty list yields 0.
                 let acc = self.alloc();
@@ -1912,7 +1966,7 @@ impl Compiler {
                 for elem in list {
                     let e = self.compile_expr(elem)?;
                     let eq = self.alloc();
-                    self.push_compare(BinaryOp::Eq, x, inner, e, elem, eq);
+                    self.push_compare_coll(BinaryOp::Eq, x, inner, e, elem, eq, in_coll);
                     let next = self.alloc();
                     self.ops.push(Op::Or {
                         lhs: acc,
@@ -1951,6 +2005,14 @@ impl Compiler {
                 && over.is_none()
                 && is_pure_scalar_fn(name, args.len()) =>
             {
+                // An explicit `COLLATE` on a top-level argument changes the value's
+                // comparison semantics, which `Op::Func` (it round-trips each arg
+                // through a reconstructed literal into `eval_scalar`) cannot carry —
+                // a function that compares its args (`nullif`, `min`/`max`) would
+                // ignore it. Defer such calls to the tree-walker.
+                if args.iter().any(|a| self.explicit_collation(a).is_some()) {
+                    return Err(Error::Unsupported("VDBE: COLLATE in a function argument"));
+                }
                 // Reserve a contiguous block for the arguments, then compile each
                 // argument directly into its slot (sub-expressions may allocate
                 // further temps after the block, which is fine).
