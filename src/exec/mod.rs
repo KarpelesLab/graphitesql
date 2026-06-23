@@ -18466,11 +18466,20 @@ fn find_integer_primary_key(ct: &CreateTable) -> Option<usize> {
             .type_name
             .as_deref()
             .is_some_and(|t| t.eq_ignore_ascii_case("integer"));
-        let is_pk = c
-            .constraints
-            .iter()
-            .any(|k| matches!(k, ColumnConstraint::PrimaryKey { .. }));
-        if is_integer && is_pk {
+        // A column-level `INTEGER PRIMARY KEY` is the rowid alias — EXCEPT when it
+        // carries the `DESC` keyword, which sqlite treats as an ordinary table
+        // (the column gets its own index and the rowid is auto-assigned). `ASC`
+        // and the table-level `PRIMARY KEY(col)` form remain aliases.
+        let is_pk_alias = c.constraints.iter().any(|k| {
+            matches!(
+                k,
+                ColumnConstraint::PrimaryKey {
+                    descending: false,
+                    ..
+                }
+            )
+        });
+        if is_integer && is_pk_alias {
             return Some(i);
         }
     }

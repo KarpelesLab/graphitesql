@@ -108,6 +108,49 @@ fn not_null_constraint_enforced() {
 }
 
 #[test]
+fn integer_primary_key_desc_is_not_a_rowid_alias() {
+    // sqlite quirk: a column-level `INTEGER PRIMARY KEY DESC` is NOT an alias for
+    // the rowid (the `DESC` makes it an ordinary table) — the rowid is
+    // auto-assigned and the column gets its own unique index. `ASC` and plain
+    // `INTEGER PRIMARY KEY` remain aliases.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY DESC)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES (5)").unwrap();
+    // rowid is 1 (auto), distinct from a == 5 — proof it is not the alias.
+    assert_eq!(
+        c.query("SELECT rowid, a FROM t").unwrap().rows[0],
+        vec![Value::Integer(1), Value::Integer(5)]
+    );
+    // The PRIMARY KEY is still enforced (its own index), so a dup `a` is rejected.
+    assert!(c.execute("INSERT INTO t VALUES (5)").is_err());
+    // A NULL `a` is allowed (it is no longer the rowid) and gets its own rowid.
+    c.execute("INSERT INTO t(a) VALUES (NULL)").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM t WHERE a IS NULL")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(1)
+    );
+    assert_eq!(
+        c.query("PRAGMA integrity_check").unwrap().rows[0][0],
+        Value::Text("ok".into())
+    );
+
+    // ASC and plain forms ARE the rowid alias (rowid tracks the column).
+    for decl in ["a INTEGER PRIMARY KEY ASC", "a INTEGER PRIMARY KEY"] {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(&format!("CREATE TABLE t({decl})")).unwrap();
+        c.execute("INSERT INTO t VALUES (5)").unwrap();
+        assert_eq!(
+            c.query("SELECT rowid, a FROM t").unwrap().rows[0],
+            vec![Value::Integer(5), Value::Integer(5)],
+            "decl: {decl}"
+        );
+    }
+}
+
+#[test]
 fn additional_scalar_functions() {
     let c = Connection::open_memory().unwrap();
     let r = c
