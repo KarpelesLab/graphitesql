@@ -914,6 +914,12 @@ fn natural_using_join_matches_tree_walker_and_sqlite3() {
         "SELECT a FROM t JOIN u USING(a) ORDER BY a",
         "SELECT count(*) FROM t NATURAL JOIN u",
         "SELECT * FROM t JOIN u USING(a) WHERE a > 1 ORDER BY a",
+        // NATURAL/USING combined with an outer join (coalesce + NULL-extend).
+        "SELECT a, b, c FROM t NATURAL LEFT JOIN u ORDER BY a",
+        "SELECT a, b, c FROM t LEFT JOIN u USING(a) ORDER BY a",
+        "SELECT a, b, c FROM t NATURAL FULL JOIN u ORDER BY a",
+        "SELECT a, b, c FROM t RIGHT JOIN u USING(a) ORDER BY a",
+        "SELECT a FROM t LEFT JOIN u USING(a) WHERE c IS NULL ORDER BY a",
         // 3-table coalesced chains (every step coalesces the common `a`).
         "SELECT * FROM t NATURAL JOIN u NATURAL JOIN w ORDER BY a",
         "SELECT * FROM t JOIN u USING(a) JOIN w USING(a) ORDER BY a",
