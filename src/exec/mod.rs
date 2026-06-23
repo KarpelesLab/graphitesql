@@ -1718,10 +1718,15 @@ impl Connection {
                 rows,
             });
         }
-        let obj = self
-            .schema
-            .table(&table)
-            .ok_or_else(|| Error::Error(format!("no such table: {table}")))?;
+        // `table_info` / `table_xinfo` of a non-existent table yields no rows (not
+        // an error), matching sqlite — both the `PRAGMA` form and the
+        // `pragma_table_info('x')` table-valued function.
+        let Some(obj) = self.schema.table(&table) else {
+            return Ok(QueryResult {
+                columns: table_info_columns(extended),
+                rows: Vec::new(),
+            });
+        };
         let sql = obj.sql.as_deref().unwrap_or("");
         let Statement::CreateTable(ct) = sql::parse_one(sql)? else {
             return Err(Error::Corrupt("schema sql is not CREATE TABLE".into()));
@@ -11885,6 +11890,26 @@ impl Connection {
                 }],
             ));
         };
+        // `INDEXED BY <name>` requires the named index to exist on the table —
+        // sqlite errors "no such index" otherwise, even though graphite may
+        // full-scan regardless of the hint. Accept an explicit index by name or an
+        // `sqlite_autoindex_<table>_*` implicit index (lenient on the exact number).
+        for tref in core::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.table)) {
+            if let Some(IndexHint::IndexedBy(name)) = &tref.index_hint {
+                if self.schema.table(&tref.name).is_some() {
+                    let auto_prefix =
+                        alloc::format!("sqlite_autoindex_{}_", tref.name.to_ascii_lowercase());
+                    let known = self
+                        .schema
+                        .indexes_on(&tref.name)
+                        .any(|o| o.name.eq_ignore_ascii_case(name))
+                        || name.to_ascii_lowercase().starts_with(&auto_prefix);
+                    if !known {
+                        return Err(Error::Error(alloc::format!("no such index: {name}")));
+                    }
+                }
+            }
+        }
         if from.joins.is_empty() && from.first.subquery.is_none() && from.first.tvf_args.is_none() {
             // An explicit qualifier picks the database; an unqualified name may be
             // shadowed by a temp table. A non-main database is read by

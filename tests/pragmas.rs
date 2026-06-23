@@ -375,3 +375,26 @@ fn busy_timeout_roundtrip_and_wal_checkpoint() {
         assert_eq!(got, want, "sqlite baseline drift for {q}");
     }
 }
+
+#[test]
+fn table_info_of_missing_table_is_empty() {
+    // `PRAGMA table_info` / `table_xinfo` (and the table-valued-function forms) of
+    // a non-existent table yield no rows — not an error — matching sqlite.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE real(x)").unwrap();
+    assert!(c.query("PRAGMA table_info(nope)").unwrap().rows.is_empty());
+    assert!(c.query("PRAGMA table_xinfo(nope)").unwrap().rows.is_empty());
+    assert_eq!(
+        c.query("SELECT count(*) FROM pragma_table_info('nope')")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(0)
+    );
+    // An existing table still reports its columns.
+    assert_eq!(
+        c.query("SELECT count(*) FROM pragma_table_info('real')")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(1)
+    );
+}

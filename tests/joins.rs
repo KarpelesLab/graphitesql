@@ -178,3 +178,27 @@ fn hash_join_matches_sqlite3() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn indexed_by_nonexistent_index_errors() {
+    // `INDEXED BY <name>` requires the index to exist on the table — sqlite errors
+    // "no such index" otherwise; graphite used to silently ignore the bogus hint.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INT, b INT)").unwrap();
+    c.execute("CREATE INDEX i ON t(a)").unwrap();
+    c.execute("INSERT INTO t VALUES (1,10),(2,20)").unwrap();
+    // A bogus index name is rejected.
+    let err = c
+        .query("SELECT a FROM t INDEXED BY nope WHERE a=1")
+        .unwrap_err();
+    assert!(format!("{err}").contains("no such index"), "{err}");
+    // A real index (and NOT INDEXED) still works.
+    assert!(c.query("SELECT a FROM t INDEXED BY i WHERE a=1").is_ok());
+    assert!(c.query("SELECT a FROM t NOT INDEXED WHERE a=1").is_ok());
+    // An implicit UNIQUE/PK auto-index name is accepted.
+    c.execute("CREATE TABLE u(k UNIQUE, v)").unwrap();
+    c.execute("INSERT INTO u VALUES (1,2)").unwrap();
+    assert!(c
+        .query("SELECT v FROM u INDEXED BY sqlite_autoindex_u_1 WHERE k=1")
+        .is_ok());
+}
