@@ -11561,15 +11561,20 @@ impl Connection {
             rows.push(r);
         }
 
-        // Window functions: compute over the post-WHERE rows, append the results
-        // as synthetic columns, and rewrite the projection to reference them.
+        // A window function combined with GROUP BY / aggregates: SQLite applies
+        // the window *after* grouping (it runs over the post-aggregation rows, and
+        // an aggregate inside a window argument or spec is the group's aggregate).
+        // `eval_windowed_aggregate` handles grouping, the windows, and projection,
+        // returning rows + sort keys just like the other eval paths — so it feeds
+        // the same DISTINCT / ORDER BY / LIMIT post-processing below.
+        let windowed_agg =
+            window::has_window(sel) && (!sel.group_by.is_empty() || self.has_aggregate(sel));
+
+        // Plain window functions (no GROUP BY/aggregate): compute over the
+        // post-WHERE rows, append the results as synthetic columns, and rewrite the
+        // projection to reference them.
         let rewritten;
-        let sel = if window::has_window(sel) {
-            if !sel.group_by.is_empty() || self.has_aggregate(sel) {
-                return Err(Error::Unsupported(
-                    "window functions combined with GROUP BY / aggregates",
-                ));
-            }
+        let sel = if window::has_window(sel) && !windowed_agg {
             rewritten = self.apply_windows(sel, &mut columns, &mut rows, params)?;
             &rewritten
         } else {
@@ -11584,7 +11589,9 @@ impl Connection {
                 "HAVING clause on a non-aggregate query".into(),
             ));
         }
-        let (out_labels, mut out) = if aggregated {
+        let (out_labels, mut out) = if windowed_agg {
+            self.eval_windowed_aggregate(sel, &columns, rows, params)?
+        } else if aggregated {
             self.eval_aggregated(sel, &columns, rows, params)?
         } else {
             self.eval_simple(sel, &columns, rows, params)?
@@ -14392,6 +14399,327 @@ impl Connection {
                     let s =
                         self.substitute_aggregates(&term.expr, columns, &rows, group, params)?;
                     sort_keys.push(eval::eval(&s, &repr_ctx)?);
+                }
+            }
+            out.push(OutRow { values, sort_keys });
+        }
+        Ok((labels, out))
+    }
+
+    /// Replace every aggregate call (an aggregate function with no `OVER`) inside
+    /// `e` — including ones nested in window-function arguments and in a window's
+    /// `PARTITION BY` / `ORDER BY` — with a reference to a synthetic `__aggN`
+    /// column, recording each original aggregate expression in `aggs` (its index
+    /// = N). The rewritten expression has no aggregates, only window functions and
+    /// column references, so it evaluates against the per-group rows that carry the
+    /// materialized aggregate values.
+    fn extract_aggregates(&self, e: &Expr, aggs: &mut Vec<Expr>) -> Expr {
+        let is_agg = matches!(e, Expr::Function { name, args, star, over: None, .. }
+            if func::is_aggregate_call(name, args.len(), *star)
+                || self.aggregates.contains_key(&name.to_ascii_lowercase()));
+        if is_agg {
+            let idx = aggs.len();
+            aggs.push(e.clone());
+            return Expr::Column {
+                table: None,
+                column: alloc::format!("__agg{idx}"),
+            };
+        }
+        match e {
+            Expr::Function {
+                name,
+                distinct,
+                args,
+                star,
+                filter,
+                order_by,
+                over,
+            } => {
+                let new_args = args
+                    .iter()
+                    .map(|a| self.extract_aggregates(a, aggs))
+                    .collect();
+                let new_filter = filter
+                    .as_ref()
+                    .map(|f| Box::new(self.extract_aggregates(f, aggs)));
+                // Recurse into the window spec's PARTITION/ORDER expressions, which
+                // may themselves contain aggregates (`row_number() OVER (ORDER BY
+                // sum(v))`).
+                let new_over = over.as_ref().map(|spec| {
+                    let mut s = spec.clone();
+                    s.partition_by = spec
+                        .partition_by
+                        .iter()
+                        .map(|p| self.extract_aggregates(p, aggs))
+                        .collect();
+                    s.order_by = spec
+                        .order_by
+                        .iter()
+                        .map(|t| OrderTerm {
+                            expr: self.extract_aggregates(&t.expr, aggs),
+                            descending: t.descending,
+                            nulls_first: t.nulls_first,
+                        })
+                        .collect();
+                    s
+                });
+                Expr::Function {
+                    name: name.clone(),
+                    distinct: *distinct,
+                    args: new_args,
+                    star: *star,
+                    filter: new_filter,
+                    order_by: order_by.clone(),
+                    over: new_over,
+                }
+            }
+            Expr::Binary { op, left, right } => Expr::Binary {
+                op: *op,
+                left: Box::new(self.extract_aggregates(left, aggs)),
+                right: Box::new(self.extract_aggregates(right, aggs)),
+            },
+            Expr::Unary { op, expr } => Expr::Unary {
+                op: *op,
+                expr: Box::new(self.extract_aggregates(expr, aggs)),
+            },
+            Expr::Paren(x) => Expr::Paren(Box::new(self.extract_aggregates(x, aggs))),
+            Expr::Cast { expr, type_name } => Expr::Cast {
+                expr: Box::new(self.extract_aggregates(expr, aggs)),
+                type_name: type_name.clone(),
+            },
+            Expr::Collate { expr, collation } => Expr::Collate {
+                expr: Box::new(self.extract_aggregates(expr, aggs)),
+                collation: collation.clone(),
+            },
+            Expr::IsNull { expr, negated } => Expr::IsNull {
+                expr: Box::new(self.extract_aggregates(expr, aggs)),
+                negated: *negated,
+            },
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(self.extract_aggregates(expr, aggs)),
+                low: Box::new(self.extract_aggregates(low, aggs)),
+                high: Box::new(self.extract_aggregates(high, aggs)),
+                negated: *negated,
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(self.extract_aggregates(expr, aggs)),
+                list: list
+                    .iter()
+                    .map(|x| self.extract_aggregates(x, aggs))
+                    .collect(),
+                negated: *negated,
+            },
+            Expr::Case {
+                operand,
+                when_then,
+                else_result,
+            } => Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|o| Box::new(self.extract_aggregates(o, aggs))),
+                when_then: when_then
+                    .iter()
+                    .map(|(w, t)| {
+                        (
+                            self.extract_aggregates(w, aggs),
+                            self.extract_aggregates(t, aggs),
+                        )
+                    })
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|x| Box::new(self.extract_aggregates(x, aggs))),
+            },
+            Expr::RowValue(items) => Expr::RowValue(
+                items
+                    .iter()
+                    .map(|x| self.extract_aggregates(x, aggs))
+                    .collect(),
+            ),
+            // Literals, columns, parameters, and subqueries pass through (a
+            // subquery's own aggregates belong to that subquery's scope).
+            other => other.clone(),
+        }
+    }
+
+    /// Evaluate a query that combines `GROUP BY`/aggregates with window functions.
+    /// SQLite applies window functions *after* grouping — each window operates on
+    /// the post-aggregation rows, and an aggregate inside a window argument or
+    /// spec is the group's aggregate. We materialize each group into one row
+    /// carrying its aggregate values (as `__aggN` columns), rewrite the query to
+    /// reference those columns, apply `HAVING`, run the windows over the grouped
+    /// rows, then project. Returns `(labels, rows)` like the other eval paths.
+    fn eval_windowed_aggregate(
+        &self,
+        sel: &Select,
+        columns: &[ColumnInfo],
+        rows: Vec<InputRow>,
+        params: &Params,
+    ) -> Result<(Vec<String>, Vec<OutRow>)> {
+        // `*` over a grouped+windowed query is rare and would need representative-
+        // row expansion alongside the synthetic columns; defer it (errors as
+        // before) rather than risk a wrong column set.
+        if sel
+            .columns
+            .iter()
+            .any(|c| matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_)))
+        {
+            return Err(Error::Unsupported(
+                "SELECT * with window functions over GROUP BY",
+            ));
+        }
+        // Output labels reflect the ORIGINAL expressions (e.g. the verbatim
+        // `sum(sum(v)) OVER ()`), so compute them before any rewrite.
+        let labels = self.output_labels(sel, columns);
+
+        // --- Partition rows into groups (mirrors eval_aggregated). ---
+        let group_by: Vec<Expr> = sel
+            .group_by
+            .iter()
+            .map(|g| {
+                if let Expr::Literal(Literal::Integer(n)) = g {
+                    if *n >= 1 {
+                        if let Some(ResultColumn::Expr { expr, .. }) =
+                            sel.columns.get((*n - 1) as usize)
+                        {
+                            return expr.clone();
+                        }
+                    }
+                }
+                g.clone()
+            })
+            .collect();
+        let group_colls: Vec<crate::value::Collation> = {
+            let cctx = row_ctx(&[], columns, None, params);
+            group_by
+                .iter()
+                .map(|g| eval::key_collation(g, &cctx))
+                .collect()
+        };
+        let mut group_keys: Vec<Vec<Value>> = Vec::new();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (i, r) in rows.iter().enumerate() {
+            let ctx = r.ctx(columns, params).with_subqueries(self);
+            let mut key = Vec::new();
+            for g in &group_by {
+                key.push(eval::eval(g, &ctx)?);
+            }
+            match group_keys
+                .iter()
+                .position(|k| rows_equal_coll(k, &key, &group_colls))
+            {
+                Some(idx) => groups[idx].push(i),
+                None => {
+                    group_keys.push(key);
+                    groups.push(alloc::vec![i]);
+                }
+            }
+        }
+        if sel.group_by.is_empty() {
+            groups = alloc::vec![(0..rows.len()).collect()];
+        } else {
+            let mut order: Vec<usize> = (0..groups.len()).collect();
+            order.sort_by(|&i, &j| {
+                for (k, coll) in group_colls.iter().enumerate() {
+                    let ord =
+                        crate::value::cmp_values_coll(&group_keys[i][k], &group_keys[j][k], *coll);
+                    if ord != core::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            let mut sorted = Vec::with_capacity(groups.len());
+            for i in order {
+                sorted.push(core::mem::take(&mut groups[i]));
+            }
+            groups = sorted;
+        }
+
+        // --- Rewrite the query so each aggregate becomes a `__aggN` column. ---
+        let mut aggs: Vec<Expr> = Vec::new();
+        let mut rsel = sel.clone();
+        for col in &mut rsel.columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                *expr = self.extract_aggregates(expr, &mut aggs);
+            }
+        }
+        if let Some(h) = rsel.having.take() {
+            rsel.having = Some(self.extract_aggregates(&h, &mut aggs));
+        }
+        for t in &mut rsel.order_by {
+            t.expr = self.extract_aggregates(&t.expr, &mut aggs);
+        }
+
+        // --- Augment the column set with one synthetic column per aggregate. ---
+        let mut cols: Vec<ColumnInfo> = columns.to_vec();
+        for i in 0..aggs.len() {
+            cols.push(ColumnInfo {
+                name: alloc::format!("__agg{i}"),
+                table: String::new(),
+                affinity: eval::Affinity::Blob,
+                collation: crate::value::Collation::default(),
+            });
+        }
+
+        // --- One grouped row per group: representative base values ++ aggregate
+        //     values (computed over the group via the existing machinery). ---
+        let empty = InputRow {
+            values: alloc::vec![Value::Null; columns.len()],
+            rowid: None,
+        };
+        let mut grows: Vec<InputRow> = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let repr_idx = group.first().copied();
+            let repr = repr_idx.map(|i| &rows[i]).unwrap_or(&empty);
+            let repr_ctx = repr.ctx(columns, params).with_subqueries(self);
+            let mut vals = repr.values.clone();
+            for agg in &aggs {
+                let sub = self.substitute_aggregates(agg, columns, &rows, group, params)?;
+                vals.push(eval::eval(&sub, &repr_ctx)?);
+            }
+            grows.push(InputRow {
+                values: vals,
+                rowid: repr_idx.and_then(|i| rows[i].rowid),
+            });
+        }
+
+        // --- HAVING (now over the grouped rows; references `__aggN`). ---
+        if let Some(having) = &rsel.having {
+            let mut kept = Vec::with_capacity(grows.len());
+            for r in grows {
+                let ctx = r.ctx(&cols, params).with_subqueries(self);
+                if eval::truth(&eval::eval(having, &ctx)?) == Some(true) {
+                    kept.push(r);
+                }
+            }
+            grows = kept;
+        }
+
+        // --- Window functions over the grouped rows, then project. ---
+        let mut wcols = cols;
+        let win_sel = self.apply_windows(&rsel, &mut wcols, &mut grows, params)?;
+        let mut out = Vec::with_capacity(grows.len());
+        for r in &grows {
+            let ctx = r.ctx(&wcols, params).with_subqueries(self);
+            let mut values = Vec::new();
+            for col in &win_sel.columns {
+                project_column(col, &wcols, &ctx, &mut values)?;
+            }
+            let mut sort_keys = Vec::new();
+            for term in &win_sel.order_by {
+                match resolve_order_index(&term.expr, &labels, values.len()) {
+                    Some(idx) => sort_keys.push(values[idx].clone()),
+                    None => sort_keys.push(eval::eval(&term.expr, &ctx)?),
                 }
             }
             out.push(OutRow { values, sort_keys });

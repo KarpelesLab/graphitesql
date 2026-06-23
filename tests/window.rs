@@ -177,3 +177,65 @@ fn window_against_sqlite3() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn window_over_aggregate() {
+    // SQLite applies window functions AFTER GROUP BY: a window operates on the
+    // grouped rows, and an aggregate inside a window argument/spec is the group's
+    // aggregate. Verified against the tree-walker invariants and sqlite3.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(g TEXT, v INT)").unwrap();
+    c.execute("INSERT INTO t VALUES ('a',1),('a',2),('b',3),('b',4),('c',10)")
+        .unwrap();
+    let cases = [
+        "SELECT g, sum(v), sum(sum(v)) OVER () FROM t GROUP BY g ORDER BY g",
+        "SELECT g, sum(v), avg(sum(v)) OVER () FROM t GROUP BY g ORDER BY g",
+        "SELECT g, count(*) OVER () FROM t GROUP BY g ORDER BY g",
+        "SELECT g, sum(v), row_number() OVER (ORDER BY sum(v) DESC) FROM t GROUP BY g ORDER BY g",
+        "SELECT g, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY g ORDER BY sum(v)",
+        "SELECT g, sum(v) - sum(sum(v)) OVER () AS d FROM t GROUP BY g ORDER BY g",
+        "SELECT g, sum(v), sum(sum(v)) OVER (ORDER BY g) AS running FROM t GROUP BY g ORDER BY g",
+        "SELECT g, max(v), max(v) - min(min(v)) OVER () FROM t GROUP BY g ORDER BY g",
+    ];
+    if std::process::Command::new("sqlite3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    for q in cases {
+        let want = {
+            let o = std::process::Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(format!(
+                    "CREATE TABLE t(g TEXT, v INT); \
+                     INSERT INTO t VALUES ('a',1),('a',2),('b',3),('b',4),('c',10); {q};"
+                ))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = c
+            .query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| match v {
+                        Value::Null => String::new(),
+                        Value::Integer(i) => i.to_string(),
+                        Value::Real(r) => graphitesql::exec::eval::format_real(*r),
+                        Value::Text(s) => s.clone(),
+                        Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(got, want, "window-over-aggregate diverged on {q}");
+    }
+}
