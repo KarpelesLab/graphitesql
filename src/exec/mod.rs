@@ -4195,8 +4195,13 @@ impl Connection {
                     }
                     OnConflict::Ignore => continue, // skip this row
                     OnConflict::Replace => {
+                        // Deleting the conflicting rows to make room fires their FK
+                        // `ON DELETE` actions (CASCADE / SET NULL / …) via
+                        // `delete_row_cascade`, exactly like sqlite — but NOT DELETE
+                        // triggers (sqlite gates those on `recursive_triggers`, off
+                        // by default, and `delete_row_cascade` fires none).
                         for cr in conflicts {
-                            delete_table(self.backend.writer()?, meta.root, cr)?;
+                            self.delete_row_cascade(&ins.table, &meta, cr, params)?;
                         }
                         replaced = true;
                     }

@@ -367,3 +367,55 @@ fn deferred_fk_disabled_when_pragma_off() {
         graphitesql::Value::Integer(1)
     );
 }
+
+#[test]
+fn insert_or_replace_fires_on_delete_actions() {
+    use graphitesql::Value;
+    // `INSERT OR REPLACE` deletes the conflicting parent row to make room; that
+    // delete runs the child FK `ON DELETE` actions, exactly like sqlite. (DELETE
+    // triggers do NOT fire — sqlite gates those on recursive_triggers.)
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)").unwrap();
+    c.execute("CREATE TABLE c(pid REFERENCES p(id) ON DELETE CASCADE)")
+        .unwrap();
+    c.execute("INSERT INTO p VALUES (1),(2)").unwrap();
+    c.execute("INSERT INTO c VALUES (1),(1),(2)").unwrap();
+    // Replacing p(1) cascade-deletes its two children; p(2)'s child survives.
+    c.execute("INSERT OR REPLACE INTO p VALUES (1)").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM c").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    assert_eq!(
+        c.query("PRAGMA integrity_check").unwrap().rows[0][0],
+        Value::Text("ok".into())
+    );
+
+    // SET NULL variant.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)").unwrap();
+    c.execute("CREATE TABLE c(pid REFERENCES p(id) ON DELETE SET NULL)")
+        .unwrap();
+    c.execute("INSERT INTO p VALUES (1)").unwrap();
+    c.execute("INSERT INTO c VALUES (1)").unwrap();
+    c.execute("INSERT OR REPLACE INTO p VALUES (1)").unwrap();
+    assert_eq!(
+        c.query("SELECT pid FROM c").unwrap().rows[0][0],
+        Value::Null
+    );
+
+    // RESTRICT blocks the replace (the child still references the row).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)").unwrap();
+    c.execute("CREATE TABLE c(pid REFERENCES p(id) ON DELETE RESTRICT)")
+        .unwrap();
+    c.execute("INSERT INTO p VALUES (1)").unwrap();
+    c.execute("INSERT INTO c VALUES (1)").unwrap();
+    assert!(matches!(
+        c.execute("INSERT OR REPLACE INTO p VALUES (1)"),
+        Err(Error::Constraint(_))
+    ));
+}
