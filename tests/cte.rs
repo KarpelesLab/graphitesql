@@ -266,3 +266,32 @@ fn with_clause_prefixes_delete_and_update() {
     .unwrap();
     assert_eq!(ints(&c, "SELECT id FROM t ORDER BY id"), vec![3, 4]);
 }
+
+#[test]
+fn infinite_recursive_cte_bounded_by_outer_limit() {
+    // An unterminated recursive CTE consumed by `… LIMIT k` yields k rows (sqlite
+    // evaluates the CTE lazily); graphite caps production by the outer LIMIT+OFFSET
+    // when the query streams the CTE 1:1 (no WHERE/ORDER BY/GROUP BY/join/agg).
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(
+        ints(
+            &c,
+            "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s) SELECT n FROM s LIMIT 5"
+        ),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(
+        ints(&c, "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s) SELECT n FROM s LIMIT 3 OFFSET 2"),
+        vec![3, 4, 5]
+    );
+    assert_eq!(
+        ints(&c, "WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+2 FROM s) SELECT n*10 FROM s LIMIT 3"),
+        vec![0, 20, 40]
+    );
+    // A WHERE on the outer query is NOT a 1:1 stream, so the cap doesn't apply —
+    // this recursion terminates via its own predicate and is unaffected.
+    assert_eq!(
+        ints(&c, "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<100) SELECT n FROM s WHERE n%2=0 LIMIT 3"),
+        vec![2, 4, 6]
+    );
+}

@@ -4919,7 +4919,7 @@ impl Connection {
             return self.exec_delete_inner(del, params);
         }
         let base = self.cte_env.borrow().len();
-        let pushed = self.push_ctes(&del.ctes, params);
+        let pushed = self.push_ctes(&del.ctes, params, None);
         let result = pushed.and_then(|()| self.exec_delete_inner(del, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -5035,7 +5035,7 @@ impl Connection {
             return self.exec_update_inner(upd, params);
         }
         let base = self.cte_env.borrow().len();
-        let pushed = self.push_ctes(&upd.ctes, params);
+        let pushed = self.push_ctes(&upd.ctes, params, None);
         let result = pushed.and_then(|()| self.exec_update_inner(upd, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -6198,10 +6198,15 @@ impl Connection {
     /// Materialize each `WITH` CTE of `sel` into the environment, in declaration
     /// order (so a later CTE may reference an earlier one). Recursive CTEs are
     /// evaluated with the fixed-point loop.
-    fn push_ctes(&self, ctes: &[Cte], params: &Params) -> Result<()> {
+    /// Materialize `ctes` into the environment. `outer_cap` (the consuming query's
+    /// `LIMIT`+`OFFSET`, set only when that query streams the CTE 1:1 — see
+    /// `recursive_cte_outer_cap`) bounds an otherwise-infinite recursive CTE so a
+    /// `SELECT … FROM rcte LIMIT k` over an unterminated recursion yields `k` rows
+    /// like sqlite instead of running to the runaway guard.
+    fn push_ctes(&self, ctes: &[Cte], params: &Params, outer_cap: Option<usize>) -> Result<()> {
         for cte in ctes {
             let binding = if references_name(&cte.select, &cte.name) {
-                self.eval_recursive_cte(cte, params)?
+                self.eval_recursive_cte(cte, params, outer_cap)?
             } else {
                 self.materialize_plain_cte(cte, params)?
             };
@@ -6287,7 +6292,12 @@ impl Connection {
     /// A recursive CTE: `anchor [UNION [ALL] recursive]`. Evaluate the anchor,
     /// then repeatedly evaluate the recursive term against the rows produced by
     /// the previous step (bound to the CTE's name) until no new rows appear.
-    fn eval_recursive_cte(&self, cte: &Cte, params: &Params) -> Result<CteBinding> {
+    fn eval_recursive_cte(
+        &self,
+        cte: &Cte,
+        params: &Params,
+        outer_cap: Option<usize>,
+    ) -> Result<CteBinding> {
         // Flatten the body into arms: (op-before-this-arm, select). The first
         // arm has no preceding op.
         let mut arms: Vec<(Option<CompoundOp>, Select)> = Vec::new();
@@ -6416,6 +6426,13 @@ impl Connection {
             // Stop once the CTE's LIMIT (after OFFSET) is satisfied.
             if let Some(lim) = rec_limit {
                 if all_rows.len() >= rec_offset.saturating_add(lim) {
+                    break Ok(());
+                }
+            }
+            // Stop once the consuming query's LIMIT (+OFFSET) is satisfied — this
+            // terminates an otherwise-infinite recursion `SELECT … FROM rcte LIMIT k`.
+            if let Some(cap) = outer_cap {
+                if all_rows.len() >= cap {
                     break Ok(());
                 }
             }
@@ -9742,13 +9759,55 @@ impl Connection {
 
     // ---- SELECT execution ---------------------------------------------------
 
+    /// The cap (`LIMIT`+`OFFSET`) to bound a recursive CTE by, when `sel` streams a
+    /// single recursive CTE 1:1 — `SELECT <cols> FROM <rcte> LIMIT k [OFFSET o]`
+    /// with no WHERE / ORDER BY / GROUP BY / DISTINCT / join / aggregate / compound.
+    /// Then an unterminated recursion still yields `k` rows, as sqlite (which
+    /// evaluates the CTE lazily) does; the outer LIMIT/OFFSET still slice as usual.
+    fn recursive_cte_outer_cap(&self, sel: &Select, params: &Params) -> Option<usize> {
+        if sel.ctes.len() != 1
+            || !sel.compound.is_empty()
+            || sel.distinct
+            || !sel.group_by.is_empty()
+            || !sel.order_by.is_empty()
+            || sel.where_clause.is_some()
+            || sel.having.is_some()
+            || self.has_aggregate(sel)
+        {
+            return None;
+        }
+        let cte = &sel.ctes[0];
+        if !references_name(&cte.select, &cte.name) {
+            return None; // not a recursive CTE
+        }
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty()
+            || from.first.subquery.is_some()
+            || from.first.tvf_args.is_some()
+            || !from.first.name.eq_ignore_ascii_case(&cte.name)
+        {
+            return None;
+        }
+        let ctx = EvalCtx::rowless(params).with_subqueries(self);
+        let n = must_be_int(eval::eval(sel.limit.as_ref()?, &ctx).ok()?).ok()?;
+        if n < 0 {
+            return None; // a negative LIMIT is unbounded — nothing to cap with
+        }
+        let offset = match &sel.offset {
+            Some(e) => must_be_int(eval::eval(e, &ctx).ok()?).ok()?.max(0) as usize,
+            None => 0,
+        };
+        Some((n as usize).saturating_add(offset))
+    }
+
     fn run_select(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
         // Materialize this query's `WITH` CTEs into the environment for the
         // duration of the query, then restore the previous scope. (The opt-in
         // VDBE fast path is attempted per query block inside `run_core`, so it
         // also covers each arm of a compound query.)
         let base = self.cte_env.borrow().len();
-        let pushed = self.push_ctes(&sel.ctes, params);
+        let outer_cap = self.recursive_cte_outer_cap(sel, params);
+        let pushed = self.push_ctes(&sel.ctes, params, outer_cap);
         let result = pushed.and_then(|()| self.run_select_compound(sel, params));
         self.cte_env.borrow_mut().truncate(base);
         result
