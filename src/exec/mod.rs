@@ -498,6 +498,317 @@ impl Connection {
         })
     }
 
+    /// Rewrite `sel`'s top-level expressions, replacing every provably
+    /// non-correlated scalar or `EXISTS` subquery with the constant it evaluates
+    /// to. Returns `Some(rewritten)` when at least one subquery was folded, or
+    /// `None` when there was nothing to fold (the caller keeps the original).
+    ///
+    /// Only the *top-level* expression positions are touched — a subquery that is
+    /// itself a `FROM` source is its own scope and is materialized separately. A
+    /// subquery is folded only when [`Self::vdbe_subquery_foldable`] proves it is
+    /// self-contained; everything else is left untouched, so the result is never
+    /// affected (the compiler simply falls back when an unfoldable subquery
+    /// remains).
+    fn fold_vdbe_subqueries(&self, sel: &Select) -> Option<Select> {
+        let mut changed = false;
+        let mut out = sel.clone();
+        for rc in &mut out.columns {
+            if let sql::ast::ResultColumn::Expr { expr, .. } = rc {
+                *expr = self.fold_subquery_expr(expr, &mut changed);
+            }
+        }
+        if let Some(w) = out.where_clause.take() {
+            out.where_clause = Some(self.fold_subquery_expr(&w, &mut changed));
+        }
+        if let Some(h) = out.having.take() {
+            out.having = Some(self.fold_subquery_expr(&h, &mut changed));
+        }
+        for g in &mut out.group_by {
+            *g = self.fold_subquery_expr(g, &mut changed);
+        }
+        for o in &mut out.order_by {
+            o.expr = self.fold_subquery_expr(&o.expr, &mut changed);
+        }
+        if let Some(from) = &mut out.from {
+            for j in &mut from.joins {
+                if let Some(on) = j.on.take() {
+                    j.on = Some(self.fold_subquery_expr(&on, &mut changed));
+                }
+            }
+        }
+        if changed {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Recursively rebuild `e`, folding any foldable scalar/`EXISTS` subquery into
+    /// a literal and otherwise descending into sub-expressions. A subquery that is
+    /// not foldable is left in place (so the VDBE compiler still falls back).
+    fn fold_subquery_expr(&self, e: &Expr, changed: &mut bool) -> Expr {
+        use sql::ast::Expr as E;
+        match e {
+            E::Subquery(sel2) => match self.eval_foldable_scalar(sel2) {
+                Some(v) => {
+                    *changed = true;
+                    E::Literal(value_to_literal(v))
+                }
+                None => e.clone(),
+            },
+            E::Exists { select, negated } => match self.eval_foldable_exists(select) {
+                Some(found) => {
+                    *changed = true;
+                    E::Literal(Literal::Integer((found ^ *negated) as i64))
+                }
+                None => e.clone(),
+            },
+            E::Unary { op, expr } => E::Unary {
+                op: *op,
+                expr: alloc::boxed::Box::new(self.fold_subquery_expr(expr, changed)),
+            },
+            E::Binary { op, left, right } => E::Binary {
+                op: *op,
+                left: alloc::boxed::Box::new(self.fold_subquery_expr(left, changed)),
+                right: alloc::boxed::Box::new(self.fold_subquery_expr(right, changed)),
+            },
+            E::IsNull { expr, negated } => E::IsNull {
+                expr: alloc::boxed::Box::new(self.fold_subquery_expr(expr, changed)),
+                negated: *negated,
+            },
+            E::InList {
+                expr,
+                list,
+                negated,
+            } => E::InList {
+                expr: alloc::boxed::Box::new(self.fold_subquery_expr(expr, changed)),
+                list: list
+                    .iter()
+                    .map(|x| self.fold_subquery_expr(x, changed))
+                    .collect(),
+                negated: *negated,
+            },
+            E::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => E::Between {
+                expr: alloc::boxed::Box::new(self.fold_subquery_expr(expr, changed)),
+                low: alloc::boxed::Box::new(self.fold_subquery_expr(low, changed)),
+                high: alloc::boxed::Box::new(self.fold_subquery_expr(high, changed)),
+                negated: *negated,
+            },
+            E::Case {
+                operand,
+                when_then,
+                else_result,
+            } => E::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|o| alloc::boxed::Box::new(self.fold_subquery_expr(o, changed))),
+                when_then: when_then
+                    .iter()
+                    .map(|(w, t)| {
+                        (
+                            self.fold_subquery_expr(w, changed),
+                            self.fold_subquery_expr(t, changed),
+                        )
+                    })
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|x| alloc::boxed::Box::new(self.fold_subquery_expr(x, changed))),
+            },
+            E::Cast { expr, type_name } => E::Cast {
+                expr: alloc::boxed::Box::new(self.fold_subquery_expr(expr, changed)),
+                type_name: type_name.clone(),
+            },
+            E::Paren(inner) => E::Paren(alloc::boxed::Box::new(
+                self.fold_subquery_expr(inner, changed),
+            )),
+            E::Collate { expr, collation } => E::Collate {
+                expr: alloc::boxed::Box::new(self.fold_subquery_expr(expr, changed)),
+                collation: collation.clone(),
+            },
+            E::RowValue(items) => E::RowValue(
+                items
+                    .iter()
+                    .map(|x| self.fold_subquery_expr(x, changed))
+                    .collect(),
+            ),
+            // A function call: fold within ordinary arguments and the `FILTER`
+            // predicate. A windowed call (`OVER (…)`) is left untouched (its frame
+            // exprs are not in the VDBE's grammar anyway).
+            E::Function {
+                name,
+                distinct,
+                args,
+                star,
+                filter,
+                order_by,
+                over,
+            } if over.is_none() => E::Function {
+                name: name.clone(),
+                distinct: *distinct,
+                args: args
+                    .iter()
+                    .map(|a| self.fold_subquery_expr(a, changed))
+                    .collect(),
+                star: *star,
+                filter: filter
+                    .as_ref()
+                    .map(|f| alloc::boxed::Box::new(self.fold_subquery_expr(f, changed))),
+                order_by: order_by.clone(),
+                over: None,
+            },
+            // Literals, parameters, columns, `IN (SELECT …)`, windowed calls: no
+            // top-level scalar/EXISTS subquery to fold here. (`IN (SELECT)` is
+            // deliberately not folded — its candidate-set comparison uses the
+            // subquery column's collation/affinity, which `IN (list)` would not.)
+            _ => e.clone(),
+        }
+    }
+
+    /// Evaluate a scalar subquery to its constant value when it is foldable, else
+    /// `None`. Foldable means [`Self::vdbe_subquery_foldable`] (self-contained) AND
+    /// the single result column is a *computed* expression, not a bare column
+    /// reference — so the resulting literal has the same NONE affinity / BINARY
+    /// collation the subquery operand would have had, making the substitution
+    /// exact for the enclosing comparison.
+    fn eval_foldable_scalar(&self, sel2: &Select) -> Option<Value> {
+        if !self.vdbe_subquery_foldable(sel2) {
+            return None;
+        }
+        if sel2.columns.len() != 1 {
+            return None;
+        }
+        let sql::ast::ResultColumn::Expr { expr, .. } = &sel2.columns[0] else {
+            return None;
+        };
+        if is_bare_column_expr(expr) {
+            return None;
+        }
+        let r = self.run_select(sel2, &Params::default()).ok()?;
+        Some(
+            r.rows
+                .first()
+                .and_then(|row| row.first())
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+    }
+
+    /// Evaluate `EXISTS (sel2)` to a constant truth value when `sel2` is
+    /// self-contained (non-correlated), else `None`.
+    fn eval_foldable_exists(&self, sel2: &Select) -> Option<bool> {
+        if !self.vdbe_subquery_foldable(sel2) {
+            return None;
+        }
+        let r = self.run_select(sel2, &Params::default()).ok()?;
+        Some(!r.rows.is_empty())
+    }
+
+    /// Conservatively decide whether `sel2` is self-contained — i.e. references no
+    /// column outside its own `FROM` sources (non-correlated), takes no bound
+    /// parameter, and contains no further nested subquery. Such a query yields the
+    /// same value evaluated in isolation as it would in any outer row, so its
+    /// result can be folded to a constant. Bails (returns `false`) on anything it
+    /// cannot prove: compound/CTE bodies, non-base-table sources, etc.
+    fn vdbe_subquery_foldable(&self, sel2: &Select) -> bool {
+        if !sel2.compound.is_empty() || !sel2.ctes.is_empty() {
+            return false;
+        }
+        let Some(from) = &sel2.from else {
+            // A `FROM`-less scalar (`(SELECT 1)`) is trivially constant, but only
+            // if it carries no column reference at all.
+            return self.expr_positions_internal(sel2, &[], &[]);
+        };
+        // Collect the source qualifiers and the union of their columns; every
+        // source must be a plain base table so the column set is known.
+        let mut quals: Vec<String> = Vec::new();
+        let mut cols: Vec<String> = Vec::new();
+        let mut collect = |tr: &sql::ast::TableRef| -> bool {
+            if tr.subquery.is_some()
+                || tr.tvf_args.is_some()
+                || tr.schema.is_some()
+                || tr.name.is_empty()
+            {
+                return false;
+            }
+            let Ok(meta) = self.table_meta(&tr.name, None) else {
+                return false;
+            };
+            quals.push(tr.name.clone());
+            if let Some(a) = &tr.alias {
+                quals.push(a.clone());
+            }
+            for c in &meta.columns {
+                cols.push(c.name.clone());
+            }
+            true
+        };
+        if !collect(&from.first) {
+            return false;
+        }
+        for j in &from.joins {
+            if !collect(&j.table) {
+                return false;
+            }
+        }
+        self.expr_positions_internal(sel2, &quals, &cols)
+    }
+
+    /// True when every column reference in every top-level expression of `sel2`
+    /// resolves to one of `quals`/`cols` (its own sources) and no expression
+    /// contains a parameter or a nested subquery — see [`expr_is_internal`].
+    fn expr_positions_internal(&self, sel2: &Select, quals: &[String], cols: &[String]) -> bool {
+        let ok = |e: &Expr| expr_is_internal(e, quals, cols);
+        for rc in &sel2.columns {
+            if let sql::ast::ResultColumn::Expr { expr, .. } = rc {
+                if !ok(expr) {
+                    return false;
+                }
+            }
+        }
+        if let Some(w) = &sel2.where_clause {
+            if !ok(w) {
+                return false;
+            }
+        }
+        if let Some(h) = &sel2.having {
+            if !ok(h) {
+                return false;
+            }
+        }
+        if !sel2.group_by.iter().all(&ok) {
+            return false;
+        }
+        if !sel2.order_by.iter().all(|t| ok(&t.expr)) {
+            return false;
+        }
+        if let Some(from) = &sel2.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    if !ok(on) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if let Some(l) = &sel2.limit {
+            if !ok(l) {
+                return false;
+            }
+        }
+        if let Some(o) = &sel2.offset {
+            if !ok(o) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Compile and run a parsed `SELECT` through the VDBE engine, or `Unsupported`
     /// when its shape is outside the spike's grammar (so callers fall back).
     fn run_select_vdbe(&self, sel: &Select) -> Result<QueryResult> {
@@ -528,6 +839,21 @@ impl Connection {
         {
             return Err(Error::Unsupported("VDBE: ORDER BY satisfied by a scan"));
         }
+        // Fold provably non-correlated scalar / `EXISTS` subqueries that appear in
+        // the top-level expressions to the constant they evaluate to, so the VDBE
+        // (which cannot open a cursor for a nested query) can run the rest. Only
+        // self-contained subqueries are folded; anything correlated, parameterized,
+        // or itself containing a nested subquery is left in place and the compiler
+        // falls back as before — so this only widens what the VDBE accepts, never
+        // changes a result.
+        let folded;
+        let sel = match self.fold_vdbe_subqueries(sel) {
+            Some(s) => {
+                folded = s;
+                &folded
+            }
+            None => sel,
+        };
         // Constant SELECT (no FROM): compile and run directly.
         let Some(from) = &sel.from else {
             let prog = vdbe::compile_const_select(sel)?;
@@ -15405,6 +15731,78 @@ fn references_name_select(select: &Select, name: &str) -> bool {
     from.joins
         .iter()
         .any(|j| j.table.name.eq_ignore_ascii_case(name))
+}
+
+/// Is `e` a bare column reference (ignoring transparent `(…)`/`COLLATE` wrappers)?
+/// A scalar subquery projecting one is only foldable with care — it would carry
+/// that column's affinity/collation, which a plain literal does not — so the
+/// scalar fold excludes this case.
+fn is_bare_column_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Column { .. } => true,
+        Expr::Paren(inner) | Expr::Collate { expr: inner, .. } => is_bare_column_expr(inner),
+        _ => false,
+    }
+}
+
+/// Does `e` reference only columns of `quals`/`cols` (its own query's sources),
+/// with no bound parameter and no nested subquery? Used to prove a subquery is
+/// non-correlated before folding it to a constant. Conservative: any nested
+/// subquery, parameter, or out-of-scope column makes it return `false`.
+fn expr_is_internal(e: &Expr, quals: &[String], cols: &[String]) -> bool {
+    let rec = |x: &Expr| expr_is_internal(x, quals, cols);
+    match e {
+        Expr::Literal(_) => true,
+        // A parameter would need the statement's bindings to evaluate; the fold
+        // runs with empty params, so bail and let the normal path handle it.
+        Expr::Parameter(_) => false,
+        // A nested subquery may itself reference our outer scope; without deeper
+        // scope tracking, refuse to prove non-correlation.
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. } => false,
+        Expr::Column { table, column } => match table {
+            Some(q) => quals.iter().any(|x| x.eq_ignore_ascii_case(q)),
+            None => {
+                cols.iter().any(|c| c.eq_ignore_ascii_case(column))
+                    || column.eq_ignore_ascii_case("rowid")
+                    || column.eq_ignore_ascii_case("_rowid_")
+                    || column.eq_ignore_ascii_case("oid")
+            }
+        },
+        Expr::Unary { expr, .. } => rec(expr),
+        Expr::Binary { left, right, .. } => rec(left) && rec(right),
+        Expr::IsNull { expr, .. } => rec(expr),
+        Expr::InList { expr, list, .. } => rec(expr) && list.iter().all(rec),
+        Expr::Between {
+            expr, low, high, ..
+        } => rec(expr) && rec(low) && rec(high),
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            operand.as_deref().map(rec).unwrap_or(true)
+                && when_then.iter().all(|(w, t)| rec(w) && rec(t))
+                && else_result.as_deref().map(rec).unwrap_or(true)
+        }
+        Expr::Cast { expr, .. } => rec(expr),
+        Expr::Paren(inner) => rec(inner),
+        Expr::Collate { expr, .. } => rec(expr),
+        Expr::RowValue(items) => items.iter().all(rec),
+        // A window function would not compile on the VDBE anyway; a non-windowed
+        // call is internal when its arguments and `FILTER` are.
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            over,
+            ..
+        } => {
+            over.is_none()
+                && args.iter().all(rec)
+                && filter.as_deref().map(rec).unwrap_or(true)
+                && order_by.iter().all(|t| rec(&t.expr))
+        }
+    }
 }
 
 /// Compare two ordering-key vectors with per-position `descending` flags

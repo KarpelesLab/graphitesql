@@ -617,3 +617,98 @@ fn subquery_from_matches_tree_walker() {
         .query_vdbe("SELECT a FROM (SELECT a FROM u) WHERE a = 'a'")
         .is_err());
 }
+
+#[test]
+fn noncorrelated_scalar_and_exists_subqueries_fold_on_vdbe() {
+    // A non-correlated scalar or EXISTS subquery in a top-level expression is
+    // folded to the constant it evaluates to, so the VDBE runs the rest of the
+    // query (it has no cursor for a nested query). Results match the tree-walker.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, v INT)")
+        .unwrap();
+    c.execute("INSERT INTO t(g,v) VALUES ('a',10),('a',20),('b',5),('b',15),('b',25)")
+        .unwrap();
+    c.execute("CREATE TABLE u(w INT)").unwrap();
+    c.execute("INSERT INTO u VALUES (100),(200),(300)").unwrap();
+    for q in [
+        "SELECT v FROM t WHERE v > (SELECT avg(v) FROM t) ORDER BY v",
+        // (no ORDER BY on the rowid/IPK — that defers via a separate, pre-existing
+        // "order satisfied by scan" rule, unrelated to subquery folding.)
+        "SELECT g, (SELECT sum(w) FROM u) AS tot FROM t",
+        "SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE w > 250) ORDER BY v",
+        "SELECT v FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE w > 9999) ORDER BY v",
+        "SELECT count(*) FROM t WHERE v <= (SELECT max(v) FROM t WHERE g='a')",
+        "SELECT v * (SELECT min(w) FROM u) FROM t",
+        "SELECT v FROM t WHERE v > (SELECT min(w) FROM u) - 95 ORDER BY v",
+    ] {
+        // The query must compile and run on the VDBE (the fold makes it foldable)…
+        let got = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("expected VDBE to handle {q}: {e}"))
+            .rows;
+        // …and match the tree-walker exactly.
+        let want = {
+            c.set_use_vdbe(false);
+            let r = c.query(q).unwrap().rows;
+            c.set_use_vdbe(true);
+            r
+        };
+        assert_eq!(
+            got, want,
+            "VDBE folded-subquery vs tree-walker diverged on {q}"
+        );
+    }
+
+    // A *correlated* subquery references the outer row, so it is NOT folded and
+    // the VDBE defers to the tree-walker (which is still correct). A scalar
+    // subquery projecting a bare column is likewise left alone (it would carry
+    // that column's affinity, which a plain literal would not).
+    assert!(c
+        .query_vdbe("SELECT v FROM t a WHERE v > (SELECT avg(v) FROM t b WHERE b.g = a.g)")
+        .is_err());
+    assert!(c
+        .query_vdbe("SELECT v FROM t WHERE g = (SELECT g FROM t WHERE v = 25)")
+        .is_err());
+}
+
+#[test]
+fn folded_subqueries_match_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let setup = "CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, v INT);\
+                 INSERT INTO t(g,v) VALUES ('a',10),('a',20),('b',5),('b',15),('b',25);\
+                 CREATE TABLE u(w INT); INSERT INTO u VALUES(100),(200),(300);";
+    let mut c = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            c.execute(s).unwrap();
+        }
+    }
+    for q in [
+        "SELECT v FROM t WHERE v > (SELECT avg(v) FROM t) ORDER BY v",
+        "SELECT g, (SELECT sum(w) FROM u) FROM t ORDER BY id",
+        "SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE w > 250) ORDER BY v",
+        "SELECT v FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE w > 9999) ORDER BY v",
+        "SELECT v * (SELECT min(w) FROM u) FROM t ORDER BY id",
+    ] {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(format!("{setup} {q};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = c
+            .query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.iter().map(render).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(got, want, "folded-subquery vs sqlite3 diverged on {q}");
+    }
+}
