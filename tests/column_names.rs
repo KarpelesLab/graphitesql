@@ -80,3 +80,30 @@ fn table_wildcard_over_join_names_only_that_table() {
     }
     c.set_use_vdbe(true);
 }
+
+#[test]
+fn window_function_column_uses_source_text() {
+    // A window-function output column is named after its verbatim source text
+    // (matching sqlite), not the internal `__winN` rewrite placeholder. An alias
+    // still wins.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT)")
+        .unwrap();
+    assert_eq!(
+        names(&c, "SELECT sum(a) OVER () FROM t"),
+        ["sum(a) OVER ()"]
+    );
+    assert_eq!(
+        names(&c, "SELECT row_number() OVER (ORDER BY a) FROM t"),
+        ["row_number() OVER (ORDER BY a)"]
+    );
+    assert_eq!(
+        names(&c, "SELECT a, rank() OVER (ORDER BY a) FROM t"),
+        ["a", "rank() OVER (ORDER BY a)"]
+    );
+    assert_eq!(names(&c, "SELECT sum(a) OVER () AS s FROM t"), ["s"]);
+    assert_eq!(
+        names(&c, "SELECT lag(a) OVER (ORDER BY a), a FROM t"),
+        ["lag(a) OVER (ORDER BY a)", "a"]
+    );
+}

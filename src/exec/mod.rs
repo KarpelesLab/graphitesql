@@ -11746,7 +11746,15 @@ impl Connection {
 
         // Plain window functions (no GROUP BY/aggregate): compute over the
         // post-WHERE rows, append the results as synthetic columns, and rewrite the
-        // projection to reference them.
+        // projection to reference them. Capture the output labels from the ORIGINAL
+        // projection first — `apply_windows` rewrites each window call to a `__winN`
+        // column reference, which would otherwise name the output column `__winN`
+        // instead of its source text (`sum(a) OVER ()`).
+        let window_labels = if window::has_window(sel) && !windowed_agg {
+            Some(self.output_labels(sel, &columns))
+        } else {
+            None
+        };
         let rewritten;
         let sel = if window::has_window(sel) && !windowed_agg {
             rewritten = self.apply_windows(sel, &mut columns, &mut rows, params)?;
@@ -11763,13 +11771,17 @@ impl Connection {
                 "HAVING clause on a non-aggregate query".into(),
             ));
         }
-        let (out_labels, mut out) = if windowed_agg {
+        let (mut out_labels, mut out) = if windowed_agg {
             self.eval_windowed_aggregate(sel, &columns, rows, params)?
         } else if aggregated {
             self.eval_aggregated(sel, &columns, rows, params)?
         } else {
             self.eval_simple(sel, &columns, rows, params)?
         };
+        // Restore the pre-rewrite labels for a plain windowed query (above).
+        if let Some(labels) = window_labels {
+            out_labels = labels;
+        }
 
         // DISTINCT (dedupe on output values, preserving first occurrence), each
         // output column compared under its collation.
