@@ -960,3 +960,74 @@ fn natural_using_join_matches_tree_walker_and_sqlite3() {
     // A USING column missing from one side errors (the tree-walker rejects it too).
     assert!(c.query_vdbe("SELECT * FROM t JOIN u USING(b)").is_err());
 }
+
+#[test]
+fn chained_outer_joins_match_tree_walker_and_sqlite3() {
+    // The unified outer-join path handles RIGHT/FULL in a multi-join chain (and
+    // any mix with INNER/LEFT), processing each join left-to-right exactly like
+    // the tree-walker. Results — including raw row order with no ORDER BY — match
+    // the tree-walker and sqlite3.
+    let mut c = Connection::open_memory().unwrap();
+    for s in [
+        "CREATE TABLE a(k INT, av TEXT)",
+        "CREATE TABLE b(k INT, bv TEXT)",
+        "CREATE TABLE cc(k INT, cv TEXT)",
+        "INSERT INTO a VALUES(1,'a1'),(2,'a2'),(3,'a3')",
+        "INSERT INTO b VALUES(1,'b1'),(2,'b2'),(4,'b4')",
+        "INSERT INTO cc VALUES(2,'c2'),(3,'c3'),(5,'c5')",
+    ] {
+        c.execute(s).unwrap();
+    }
+    let qs = [
+        "SELECT av, bv, cv FROM a LEFT JOIN b ON a.k=b.k RIGHT JOIN cc ON cc.k=a.k",
+        "SELECT av, bv, cv FROM a RIGHT JOIN b ON a.k=b.k LEFT JOIN cc ON cc.k=b.k",
+        "SELECT av, bv, cv FROM a FULL JOIN b ON a.k=b.k FULL JOIN cc ON cc.k=a.k",
+        "SELECT av, bv, cv FROM a RIGHT JOIN b ON a.k=b.k RIGHT JOIN cc ON cc.k=b.k",
+        "SELECT count(*) FROM a FULL JOIN b ON a.k=b.k FULL JOIN cc ON cc.k=a.k",
+        "SELECT av, bv, cv FROM a LEFT JOIN b ON a.k=b.k INNER JOIN cc ON cc.k=a.k",
+    ];
+    for q in qs {
+        let got = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("expected VDBE to handle {q}: {e}"))
+            .rows;
+        let want = {
+            c.set_use_vdbe(false);
+            let r = c.query(q).unwrap().rows;
+            c.set_use_vdbe(true);
+            r
+        };
+        assert_eq!(
+            got, want,
+            "VDBE chained outer join vs tree-walker diverged on {q}"
+        );
+    }
+
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    let setup = "CREATE TABLE a(k INT, av TEXT); CREATE TABLE b(k INT, bv TEXT);\
+                 CREATE TABLE cc(k INT, cv TEXT);\
+                 INSERT INTO a VALUES(1,'a1'),(2,'a2'),(3,'a3');\
+                 INSERT INTO b VALUES(1,'b1'),(2,'b2'),(4,'b4');\
+                 INSERT INTO cc VALUES(2,'c2'),(3,'c3'),(5,'c5');";
+    for q in qs {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(format!("{setup} {q};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = c
+            .query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.iter().map(render).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(got, want, "chained outer join vs sqlite3 diverged on {q}");
+    }
+}

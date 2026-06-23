@@ -974,113 +974,24 @@ impl Connection {
             Ok((cols, tables, affinities, collations, rows, rowids))
         };
 
-        // A single RIGHT / FULL outer join (two tables). SQLite drives both from the
-        // LEFT table: emit the matched pairs (left-table order, right matches in
-        // right order), for FULL also null-extend an unmatched left row, and then —
-        // for both RIGHT and FULL — append every right row that matched nothing as
-        // a null-left row. (RIGHT differs from FULL only in dropping unmatched-left
-        // rows.) Only the final WHERE is handed to the VDBE. Chains containing
-        // RIGHT/FULL, NATURAL/USING, and `t.*` bail (→ tree-walker).
-        if from.joins.len() == 1
-            && matches!(
-                from.joins[0].kind,
-                sql::ast::JoinKind::Right | sql::ast::JoinKind::Full
+        // Outer join(s) — LEFT / RIGHT / FULL, any chain, mixed with INNER. A
+        // filtered cross-product can't model the NULL-extension of unmatched rows,
+        // so build the joined rows by a real nested loop, processing each join
+        // left-to-right exactly like the tree-walker: for each accumulated left row
+        // emit a row per right match (`ON` evaluated against the partial combined
+        // row); a LEFT/FULL step also null-extends an unmatched left row, and a
+        // RIGHT/FULL step appends every unmatched right row with a null left. Only
+        // the final `WHERE` is handed to the VDBE. Pure INNER queries keep the
+        // cross-product path below; NATURAL/USING outer joins and `t.*` over them
+        // bail (→ tree-walker).
+        if from.joins.iter().any(|j| {
+            matches!(
+                j.kind,
+                sql::ast::JoinKind::Left | sql::ast::JoinKind::Right | sql::ast::JoinKind::Full
             )
-        {
-            let j = &from.joins[0];
-            if j.natural || !j.using.is_empty() {
+        }) {
+            if from.joins.iter().any(|j| j.natural || !j.using.is_empty()) {
                 return Err(Error::Unsupported("VDBE: NATURAL/USING outer join"));
-            }
-            // `t.*` over a join expands by qualifier inside `compile_table_select`.
-            let is_full = matches!(j.kind, sql::ast::JoinKind::Full);
-            let left = scan_one(&from.first)?;
-            let right = scan_one(&j.table)?;
-            // Combined schema: left columns then right columns.
-            let mut names = left.0.clone();
-            names.extend(right.0.iter().cloned());
-            let mut tabs = left.1.clone();
-            tabs.extend(right.1.iter().cloned());
-            let mut affs = left.2.clone();
-            affs.extend(right.2.iter().copied());
-            let mut colls = left.3.clone();
-            colls.extend(right.3.iter().copied());
-            let cinfos: Vec<ColumnInfo> = (0..names.len())
-                .map(|i| ColumnInfo {
-                    name: names[i].clone(),
-                    table: tabs[i].clone(),
-                    affinity: affs[i],
-                    collation: colls[i],
-                })
-                .collect();
-            let on_params = eval::Params::default();
-            let lw = left.0.len();
-            let rw = right.0.len();
-            let mut matched_right = alloc::vec![false; right.4.len()];
-            let mut rows: Vec<Vec<Value>> = Vec::new();
-            for a in &left.4 {
-                let mut any = false;
-                for (rj, b) in right.4.iter().enumerate() {
-                    let mut row = a.clone();
-                    row.extend(b.iter().cloned());
-                    let keep = match &j.on {
-                        Some(p) => {
-                            let ir = InputRow {
-                                values: row.clone(),
-                                rowid: None,
-                            };
-                            let ctx = ir.ctx(&cinfos, &on_params).with_subqueries(self);
-                            eval::truth(&eval::eval(p, &ctx)?) == Some(true)
-                        }
-                        None => true,
-                    };
-                    if keep {
-                        rows.push(row);
-                        matched_right[rj] = true;
-                        any = true;
-                    }
-                }
-                // FULL keeps an unmatched left row (null-extended); RIGHT drops it.
-                if is_full && !any {
-                    let mut row = a.clone();
-                    row.extend(core::iter::repeat_n(Value::Null, rw));
-                    rows.push(row);
-                }
-            }
-            // Both RIGHT and FULL: append every unmatched right row (null left).
-            for (rj, b) in right.4.iter().enumerate() {
-                if !matched_right[rj] {
-                    let mut row = alloc::vec![Value::Null; lw];
-                    row.extend(b.iter().cloned());
-                    rows.push(row);
-                }
-            }
-            let prog = vdbe::compile_table_select(sel, &names, &tabs, &affs, &colls, false)?;
-            let result = vdbe::run_rows(&prog, &rows)?;
-            return Ok(QueryResult {
-                columns: prog.columns,
-                rows: result,
-            });
-        }
-
-        // LEFT join(s): a filtered cross-product cannot model the NULL-extension of
-        // unmatched left rows, so when any join is `LEFT` build the joined rows by a
-        // real nested loop — for each accumulated left row, emit a row per right
-        // match (`ON` evaluated against the partial combined row) and, if none
-        // matched, one row padded with NULLs for the right table. Only the *final*
-        // `WHERE` is then handed to the VDBE (the `ON`s are already applied). Pure
-        // INNER-join queries keep the proven cross-product path below. Bails (→
-        // tree-walker) on RIGHT/FULL/NATURAL/USING and `t.*`.
-        if from
-            .joins
-            .iter()
-            .any(|j| matches!(j.kind, sql::ast::JoinKind::Left))
-        {
-            if from.joins.iter().any(|j| {
-                !matches!(j.kind, sql::ast::JoinKind::Inner | sql::ast::JoinKind::Left)
-                    || j.natural
-                    || !j.using.is_empty()
-            }) {
-                return Err(Error::Unsupported("VDBE: only INNER/LEFT joins"));
             }
             // `t.*` over a join expands by qualifier inside `compile_table_select`.
             // The VDBE path is param-less (explicit params were substituted
@@ -1094,6 +1005,8 @@ impl Connection {
             let mut rows: Vec<Vec<Value>> = first.4;
             for j in &from.joins {
                 let src = scan_one(&j.table)?;
+                let lw = names.len();
+                let rw = src.0.len();
                 // Combined schema after adding this source (for ON resolution).
                 let mut n_names = names.clone();
                 n_names.extend(src.0.iter().cloned());
@@ -1111,12 +1024,15 @@ impl Connection {
                         collation: n_colls[i],
                     })
                     .collect();
-                let is_left = matches!(j.kind, sql::ast::JoinKind::Left);
-                let width = src.0.len();
+                let keep_unmatched_left =
+                    matches!(j.kind, sql::ast::JoinKind::Left | sql::ast::JoinKind::Full);
+                let keep_unmatched_right =
+                    matches!(j.kind, sql::ast::JoinKind::Right | sql::ast::JoinKind::Full);
+                let mut matched_right = alloc::vec![false; src.4.len()];
                 let mut next: Vec<Vec<Value>> = Vec::new();
                 for a in &rows {
-                    let mut matched = false;
-                    for b in &src.4 {
+                    let mut any = false;
+                    for (rj, b) in src.4.iter().enumerate() {
                         let mut row = a.clone();
                         row.extend(b.iter().cloned());
                         let keep = match &j.on {
@@ -1132,13 +1048,25 @@ impl Connection {
                         };
                         if keep {
                             next.push(row);
-                            matched = true;
+                            matched_right[rj] = true;
+                            any = true;
                         }
                     }
-                    if is_left && !matched {
+                    // LEFT/FULL: emit the left row with NULLs when nothing matched.
+                    if keep_unmatched_left && !any {
                         let mut row = a.clone();
-                        row.extend(core::iter::repeat_n(Value::Null, width));
+                        row.extend(core::iter::repeat_n(Value::Null, rw));
                         next.push(row);
+                    }
+                }
+                // RIGHT/FULL: append each unmatched right row with a null left.
+                if keep_unmatched_right {
+                    for (rj, b) in src.4.iter().enumerate() {
+                        if !matched_right[rj] {
+                            let mut row = alloc::vec![Value::Null; lw];
+                            row.extend(b.iter().cloned());
+                            next.push(row);
+                        }
                     }
                 }
                 rows = next;
