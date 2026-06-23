@@ -39,6 +39,37 @@ fn unnamed_check_reports_verbatim_expression() {
 }
 
 #[test]
+fn constraint_message_has_no_redundant_prefix() {
+    // The error text matches sqlite's `errmsg` verbatim — the message names the
+    // specific constraint with no extra "constraint failed:" wrapper in front (so
+    // it reads `CHECK constraint failed: a>0`, not `constraint failed: CHECK …`).
+    let m = violation("CREATE TABLE t(a, CHECK(a>0))", "INSERT INTO t VALUES (-1)");
+    assert_eq!(m, "CHECK constraint failed: a>0", "got: {m}");
+    assert!(!m.starts_with("constraint failed:"), "got: {m}");
+
+    // NOT NULL, UNIQUE, and a `RAISE()` string each surface verbatim too.
+    assert_eq!(
+        violation("CREATE TABLE t(a NOT NULL)", "INSERT INTO t VALUES (NULL)"),
+        "NOT NULL constraint failed: t.a"
+    );
+    assert_eq!(
+        violation(
+            "CREATE TABLE t(a UNIQUE); INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (1)"
+        ),
+        "UNIQUE constraint failed: t.a"
+    );
+    assert_eq!(
+        violation(
+            "CREATE TABLE t(a); CREATE TRIGGER tr BEFORE INSERT ON t \
+             BEGIN SELECT RAISE(ABORT,'boom'); END",
+            "INSERT INTO t VALUES (1)"
+        ),
+        "boom"
+    );
+}
+
+#[test]
 fn named_check_reports_the_constraint_name() {
     assert!(violation(
         "CREATE TABLE t(a, CONSTRAINT ck CHECK(a>0))",

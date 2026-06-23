@@ -65,7 +65,11 @@ impl fmt::Display for Error {
             Error::Io(m) => write!(f, "disk I/O error: {m}"),
             Error::Busy => write!(f, "database is locked"),
             Error::CantOpen(m) => write!(f, "unable to open database file: {m}"),
-            Error::Constraint(m) => write!(f, "constraint failed: {m}"),
+            // The message already names the specific constraint (`UNIQUE
+            // constraint failed: t.a`, `CHECK constraint failed: …`, a `RAISE()`
+            // string, the STRICT `cannot store …` text), matching sqlite's
+            // `errmsg` verbatim — so no redundant outer prefix is added.
+            Error::Constraint(m) => write!(f, "{m}"),
             Error::Parse(m) => write!(f, "SQL error: {m}"),
             Error::Unsupported(m) => write!(f, "not yet implemented: {m}"),
         }
