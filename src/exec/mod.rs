@@ -3460,6 +3460,56 @@ impl Connection {
                 }
             }
         }
+        // Generated-column constraint rules SQLite rejects at CREATE: a generated
+        // column may not carry a second `AS (…)`, a `DEFAULT`, or be part of the
+        // PRIMARY KEY (whether declared column-level or in a table-level
+        // `PRIMARY KEY (…)`).
+        let table_pk_cols: Vec<&str> = ct
+            .constraints
+            .iter()
+            .filter_map(|tc| match tc {
+                TableConstraint::PrimaryKey(cols, _) => Some(cols),
+                _ => None,
+            })
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        for c in &ct.columns {
+            let generated = c
+                .constraints
+                .iter()
+                .filter(|k| matches!(k, ColumnConstraint::Generated { .. }))
+                .count();
+            if generated == 0 {
+                continue;
+            }
+            if generated > 1 {
+                return Err(Error::Error(alloc::format!(
+                    "error in generated column \"{}\"",
+                    c.name
+                )));
+            }
+            if c.constraints
+                .iter()
+                .any(|k| matches!(k, ColumnConstraint::Default(_)))
+            {
+                return Err(Error::Error(
+                    "cannot use DEFAULT on a generated column".into(),
+                ));
+            }
+            let in_primary_key = c
+                .constraints
+                .iter()
+                .any(|k| matches!(k, ColumnConstraint::PrimaryKey { .. }))
+                || table_pk_cols
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&c.name));
+            if in_primary_key {
+                return Err(Error::Error(
+                    "generated columns cannot be part of the PRIMARY KEY".into(),
+                ));
+            }
+        }
         for tc in &ct.constraints {
             if let TableConstraint::Check(e, _) = tc {
                 if expr_has_subquery(e) {
@@ -12109,7 +12159,8 @@ impl Connection {
         let mut subs: Vec<&Select> = Vec::new();
         vdbe_block_exprs(sel, &mut |e| collect_subselects(e, &mut subs));
         for sub in subs {
-            let mut child: Vec<Option<Vec<ColumnInfo>>> = alloc::vec![self.static_scope_columns(sub)];
+            let mut child: Vec<Option<Vec<ColumnInfo>>> =
+                alloc::vec![self.static_scope_columns(sub)];
             child.extend(scopes.iter().cloned());
             if let Some(msg) = first_ambiguous_in_scopes(sub, &child) {
                 return Err(Error::Error(msg));
