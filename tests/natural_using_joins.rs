@@ -21,6 +21,37 @@ fn rows(c: &Connection, sql: &str) -> Vec<Vec<Value>> {
 }
 
 #[test]
+fn using_natural_join_applies_key_affinity() {
+    // A NATURAL/USING join's coalesce-key equality applies each side's column
+    // affinity, like an `ON l = r` equality — so a cross-type key matches
+    // (INTEGER 1 = TEXT '1'), while a non-numeric text still does not.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(k INTEGER, x)").unwrap();
+    c.execute("INSERT INTO a VALUES(1, 10)").unwrap();
+    c.execute("CREATE TABLE b(k TEXT, y)").unwrap();
+    c.execute("INSERT INTO b VALUES('1', 20)").unwrap();
+    assert_eq!(
+        rows(&c, "SELECT count(*) FROM a JOIN b USING(k)")[0][0],
+        Value::Integer(1)
+    );
+    assert_eq!(
+        rows(&c, "SELECT count(*) FROM a NATURAL JOIN b")[0][0],
+        Value::Integer(1)
+    );
+    // The coalesced key takes the left value.
+    assert_eq!(
+        rows(&c, "SELECT k FROM a JOIN b USING(k)")[0][0],
+        Value::Integer(1)
+    );
+    // A non-numeric text key cannot match the INTEGER key.
+    c.execute("INSERT INTO b VALUES('z', 30)").unwrap();
+    assert_eq!(
+        rows(&c, "SELECT count(*) FROM a JOIN b USING(k)")[0][0],
+        Value::Integer(1)
+    );
+}
+
+#[test]
 fn natural_join_coalesces_common_column() {
     let c = setup();
     // SELECT * keeps the common column (dept) once, in its left position:

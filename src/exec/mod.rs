@@ -1079,10 +1079,19 @@ impl Connection {
                         row.extend(b.iter().cloned());
                         let keep = if !pairs.is_empty() {
                             pairs.iter().all(|&(li, rl)| {
+                                // Apply each side's affinity (cross-type USING/
+                                // NATURAL key: INTEGER 1 = TEXT '1'), as the
+                                // tree-walker join does.
+                                let (lv, rv) = eval::apply_comparison_affinity(
+                                    row[li].clone(),
+                                    Some(n_affs[li]),
+                                    row[lw + rl].clone(),
+                                    Some(n_affs[lw + rl]),
+                                );
                                 eval::truth(&eval::compare_op(
                                     sql::ast::BinaryOp::Eq,
-                                    &row[li],
-                                    &row[lw + rl],
+                                    &lv,
+                                    &rv,
                                     n_colls[li],
                                 )) == Some(true)
                             })
@@ -12637,12 +12646,17 @@ impl Connection {
                         // column's collation.
                         pairs.iter().all(|&(li, rl)| {
                             let coll = new_columns[li].collation;
-                            eval::truth(&eval::compare_op(
-                                BinaryOp::Eq,
-                                &combined[li],
-                                &combined[left_width + rl],
-                                coll,
-                            )) == Some(true)
+                            // Apply each side's column affinity, like an `ON l = r`
+                            // equality, so a cross-type USING/NATURAL key matches
+                            // (INTEGER 1 = TEXT '1').
+                            let (lv, rv) = eval::apply_comparison_affinity(
+                                combined[li].clone(),
+                                Some(new_columns[li].affinity),
+                                combined[left_width + rl].clone(),
+                                Some(new_columns[left_width + rl].affinity),
+                            );
+                            eval::truth(&eval::compare_op(BinaryOp::Eq, &lv, &rv, coll))
+                                == Some(true)
                         })
                     } else {
                         match &join.on {
