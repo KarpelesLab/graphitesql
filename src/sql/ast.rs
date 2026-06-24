@@ -58,8 +58,10 @@ pub enum Statement {
     /// expression evaluates to the target path).
     Vacuum(Option<Box<Expr>>),
     /// `REINDEX [name]` — accepted as a no-op: graphitesql rebuilds an index
-    /// whenever the underlying rows change, so indexes are always current.
-    Reindex,
+    /// whenever the underlying rows change, so indexes are always current. The
+    /// optional target (a collation, table, or index name) is kept only to
+    /// validate it, since SQLite rejects an unidentifiable one.
+    Reindex(Option<String>),
     /// `ANALYZE [name]`: gather statistics into `sqlite_stat1`. `None` analyzes
     /// the whole database; `Some(name)` a single table or index.
     Analyze(Option<String>),

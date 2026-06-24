@@ -2741,8 +2741,23 @@ impl Connection {
                 self.exec_vacuum(into.as_deref())?;
                 0
             }
-            // Indexes are kept current on every write, so REINDEX is a no-op.
-            Statement::Reindex => 0,
+            // Indexes are kept current on every write, so REINDEX is a no-op — but
+            // a named target must identify a collation, table, or index, else
+            // sqlite errors "unable to identify the object to be reindexed".
+            Statement::Reindex(target) => {
+                if let Some(name) = target {
+                    let name = name.as_str();
+                    let known = crate::value::Collation::parse(name).is_some()
+                        || self.schema.table(name).is_some()
+                        || self.schema.index(name).is_some();
+                    if !known {
+                        return Err(Error::Error(
+                            "unable to identify the object to be reindexed".into(),
+                        ));
+                    }
+                }
+                0
+            }
             Statement::Analyze(target) => {
                 self.exec_analyze(target.as_deref())?;
                 0

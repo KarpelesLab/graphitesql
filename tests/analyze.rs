@@ -199,3 +199,30 @@ fn analyze_unknown_object_errors() {
         "ANALYZE should have written stat rows"
     );
 }
+
+#[test]
+fn reindex_unknown_object_errors() {
+    // `REINDEX <name>` must identify a collation, table, or index — sqlite errors
+    // "unable to identify the object to be reindexed" otherwise (graphite used to
+    // drop the name and no-op). Bare REINDEX and a collation name are valid.
+    let mut c = Connection::open_memory().unwrap();
+    let e = c.execute("REINDEX nope").unwrap_err();
+    assert!(
+        format!("{e}").contains("unable to identify the object"),
+        "{e}"
+    );
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("CREATE INDEX i ON t(a)").unwrap();
+    for ok in [
+        "REINDEX",
+        "REINDEX NOCASE",
+        "REINDEX binary",
+        "REINDEX rtrim",
+        "REINDEX t",
+        "REINDEX i",
+        "REINDEX main.i",
+    ] {
+        assert!(c.execute(ok).is_ok(), "{ok} should succeed");
+    }
+    assert!(c.execute("REINDEX zzz").is_err());
+}

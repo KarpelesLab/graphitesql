@@ -333,14 +333,18 @@ impl Parser {
             return Ok(Statement::Vacuum(into));
         }
         if self.eat_kw("reindex") {
-            // `REINDEX` / `REINDEX name` / `REINDEX schema.name` (a no-op here).
+            // `REINDEX` / `REINDEX name` / `REINDEX schema.name` (a no-op here, but
+            // the executor validates the name). For a `schema.name` target keep the
+            // object name.
+            let mut target = None;
             if !self.check(&Token::Semicolon) && !self.at_end() {
-                let _ = self.ident()?;
+                let mut name = self.ident()?;
                 if self.eat(&Token::Dot) {
-                    let _ = self.ident()?;
+                    name = self.ident()?;
                 }
+                target = Some(name);
             }
-            return Ok(Statement::Reindex);
+            return Ok(Statement::Reindex(target));
         }
         if self.eat_kw("analyze") {
             // `ANALYZE` / `ANALYZE name` / `ANALYZE schema.name`.
