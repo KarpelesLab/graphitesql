@@ -7,6 +7,190 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/KarpelesLab/graphitesql/compare/v0.0.7...v0.0.8) - 2026-06-24
+
+### Added
+
+- *(create)* reject an aggregate function in a CHECK or generated column
+- *(create)* reject a foreign key naming an unknown local column
+- *(create)* reject invalid constraints on a generated column
+- *(select)* reject ambiguous column names that bind to an enclosing FROM
+- *(select)* reject ambiguous unqualified column names
+- *(subquery)* compare a row value against a row-returning subquery
+- *(vdbe)* run NATURAL/USING joins combined with outer joins
+- *(vdbe)* run chained RIGHT/FULL outer joins via a unified outer-join path
+- *(vdbe)* run INNER NATURAL/USING joins on the VDBE
+- *(vdbe)* run single RIGHT/FULL outer joins on the VDBE
+- *(vdbe)* run LEFT JOIN queries on the VDBE via nested-loop NULL-extension
+- *(window)* support window functions over GROUP BY / aggregates
+- *(pragma)* round-trip PRAGMA busy_timeout and implement wal_checkpoint
+- *(pragma)* implement PRAGMA analysis_limit and PRAGMA optimize
+- *(vdbe)* fold non-correlated scalar and EXISTS subqueries to constants
+- *(pragma)* index_xinfo lists a WITHOUT ROWID index's trailing PK columns
+- *(pragma)* index_info/index_xinfo report expression-index columns
+- *(vdbe)* compile a FROM subquery (derived table) over a BINARY base
+- *(vdbe)* resolve rowid/_rowid_/oid on a single-table scan
+- *(vdbe)* compile the COLLATE operator with sqlite's collation precedence
+- *(vdbe)* fold constant LIMIT/OFFSET expressions, not just literals
+- *(vdbe)* compile N-table inner joins (not just two)
+- *(sql)* accept a VALUES clause as the IN right-hand side
+- *(vdbe)* compile x IS TRUE / IS FALSE truthiness tests
+- *(sql)* support WITH on UPDATE and DELETE statements
+- *(fts5)* honor unicode61 tokenchars and separators options
+- *(rtree)* prune the node tree by query bounds (spatial pushdown)
+- *(fts5)* honor unicode61 remove_diacritics 0|1|2 and the ascii tokenizer
+- *(fts5)* fold the full Latin diacritic table to match unicode61
+- *(vdbe)* run explicit-parameter queries on the VDBE via substitution (B5/B7)
+- *(planner)* mixed-direction partial sort over a non-covering index (B0b-i)
+- *(planner)* partial-sort EQP for mixed-direction ORDER BY over a covering index (B0b-i)
+- *(alter)* RENAME COLUMN propagates into cross-object trigger bodies (A-rn3)
+- *(fts5)* store FTS5 in sqlite's shadow tables so sqlite can read it (D2e-M2b)
+- *(pragma)* honor PRAGMA secure_delete (round-trip + zero freed pages) (C8a)
+- *(alter)* RENAME COLUMN propagates into multi-source view bodies (A-rn3)
+- *(fts5)* read SQLite-written FTS5 documents (D2e M1) + accept quoted DDL names
+- *(rtree)* write SQLite's byte-compatible R-Tree node format (D3c M2)
+- *(rtree)* read SQLite's byte-compatible R-Tree on-disk node format (D3c M1)
+- *(pragma)* report SQLite defaults for legacy/no-op boolean pragmas
+- *(update)* UPDATE SET (cols) = (SELECT …) row-value-subquery assignment
+- *(vacuum)* VACUUM INTO writes a compact copy to a new file
+- *(fts5)* fts5vocab vocabulary tables (row/col/instance forms)
+- *(vtab)* dbstat eponymous read-only virtual table for per-page stats
+- *(json)* json_valid accepts the optional FLAGS argument
+- *(autoincrement)* persist the rowid high-water mark in sqlite_sequence
+- *(alter)* RENAME COLUMN propagates into single-source triggers (A-rn3)
+- *(alter)* RENAME COLUMN propagates into single-source views (A-rn3)
+- *(vdbe)* make the VDBE the default SELECT engine (B7b)
+- *(vdbe)* collation-aware comparison and ORDER BY (NOCASE/RTRIM columns)
+- *(vdbe)* plain EXPLAIN lists the compiled VDBE bytecode (B8)
+- *(vdbe)* route per query block so compound-query arms use the VDBE
+- *(vdbe)* qualified column resolution; shared-name joins work
+- *(vdbe)* route query() onto the VDBE behind an opt-in flag (B7a)
+- *(vdbe)* spike compiles two-table inner joins (B5a)
+- *(vdbe)* spike compiles table.* projection in a single-table scan
+- *(vdbe)* spike compiles pure scalar function calls
+- *(vdbe)* spike compiles the -> and ->> JSON extraction operators
+- *(vdbe)* spike compiles LIKE/GLOB and IN (list) expressions
+- *(vdbe)* spike compiles IS/IS NOT and BETWEEN expressions
+- *(vdbe)* spike compiles blob literals, bitwise & unary +/~ ops
+- *(constraints)* honor NOT NULL's ON CONFLICT action
+- *(constraints)* honor a constraint's ON CONFLICT action
+- *(alter)* RENAME COLUMN propagates into other tables' foreign keys
+- *(rtree)* add the rtree_i32 integer-coordinate variant
+- *(rtree)* support auxiliary (+) columns
+- *(fts5)* implement the porter tokenizer (stemming)
+- *(fts5)* accept the rebuild/optimize maintenance commands
+- *(fts5)* honor UNINDEXED columns
+- *(fts5)* snippet() supports the auto-column form snippet(t, -1, …)
+- *(fts5)* add snippet() aux function, byte-exact with sqlite
+- *(fts5)* gate FTS5 behind a default-on `fts5` feature
+- *(fts5)* EXPLAIN QUERY PLAN reports sqlite's MATCH idxNum:idxStr
+- *(rtree)* EXPLAIN QUERY PLAN reports sqlite's idxNum:idxStr (D3b)
+
+### Documentation
+
+- mark the aggregate-in-CHECK/generated error-parity item done in ROADMAP
+- mark the FK-unknown-local-column error-parity item done in ROADMAP
+- refresh ROADMAP — clear completed work, expand the remaining tracks
+- VDBE join family complete (NATURAL/USING + outer joins)
+- record unified outer-join path / chained RIGHT-FULL on the VDBE
+- record INNER NATURAL/USING joins on the VDBE (completes join family)
+- record single RIGHT/FULL outer joins on the VDBE in ROADMAP
+- record LEFT JOIN on the VDBE (B5a/B5b) in ROADMAP
+- note window-over-GROUP BY/aggregate support in ROADMAP
+- record VDBE non-correlated scalar/EXISTS subquery folding (B5c)
+- note lazy outer-LIMIT bounding of recursive CTEs in ROADMAP
+- scope D2e-M2 FTS5 sqlite-compat to unicode61-matching text (tokenizer gap)
+- *(roadmap)* audit VDBE (B5c) coverage and note the param-less foundation
+- *(roadmap)* B1b — graphite's join planner diverges from sqlite by design
+- *(roadmap)* B4 sqlite_stat4 is blocked by the differential oracle
+- README — FTS5 files are now byte-compatible with sqlite
+- mark D2e-M1 (read sqlite FTS5) done in ROADMAP
+- mark D3c (R-Tree on-disk node format) done in ROADMAP and README
+- README notes the VDBE is now the default SELECT engine
+- record VDBE pure scalar function support in ROADMAP
+- record VDBE spike scalar-expression coverage in ROADMAP
+- record snippet() auto-column + spaced-colon fix in ROADMAP
+
+### Fixed
+
+- *(view)* a view column inherits its base column's collation and affinity
+- *(window)* correct RANGE-offset frames around NULL ORDER BY values
+- *(fk)* compare under the parent key column's collation
+- *(join)* apply column affinity to NATURAL/USING coalesce-key equality
+- *(fk)* apply the parent key column's affinity when matching child values
+- *(eval)* apply per-element comparison affinity to row-value IN (SELECT …)
+- *(eval)* apply comparison affinity to IN (SELECT …)
+- *(select)* reject HAVING on a non-aggregate query in two missed cases
+- *(collation)* reject an unknown COLLATE name when it is consumed in a query
+- *(window)* reject an invalid frame specification
+- *(vacuum)* error on VACUUM of an unknown database
+- *(reindex)* error on REINDEX of an unidentifiable object
+- *(analyze)* error on ANALYZE of an unknown object instead of no-op
+- *(ddl)* reject an unknown COLLATE name at CREATE TABLE / CREATE INDEX
+- *(subquery)* a scalar subquery must return exactly one column
+- *(json)* -> / ->> treat a bare key as a literal label, not a nested path
+- *(ctas)* auto-rename duplicate output columns instead of erroring
+- *(json)* the -> / ->> operators error on a malformed explicit path
+- *(func)* reject too many arguments to aggregates and window functions
+- *(func)* panic on typeof()/hex()/unicode() with no args; validate trim arity
+- *(dml)* reject UPDATE with an unknown SET-target column on an empty table
+- validate INDEXED BY index exists; table_info(missing) returns empty
+- *(select)* name window-function columns after their source text
+- *(select)* t.* over a join names only that table's columns
+- *(window)* rewrite aggregates in named WINDOW defs for window-over-aggregate
+- *(cte)* bound an infinite recursive CTE by the consuming query's LIMIT
+- *(subquery)* inherit affinity/collation through nested derived tables
+- *(subquery)* derived-table columns inherit affinity and collation
+- *(fk)* INSERT OR REPLACE fires the replaced row's ON DELETE actions
+- *(schema)* INTEGER PRIMARY KEY DESC is not a rowid alias
+- *(trigger)* fire multiple triggers in reverse creation order like sqlite
+- *(error)* drop the redundant "constraint failed:" prefix to match sqlite
+- *(alter)* RENAME TABLE repoints foreign keys in other tables
+- *(fts5)* fold Latin-1 diacritics in the tokenizer to match unicode61
+- *(parser)* number anonymous ? parameters by parse position, not eval order
+- *(datetime)* unixepoch(X, 'subsec') returns fractional seconds
+- *(alter)* RENAME COLUMN propagates into multi-source trigger bodies
+- *(json)* propagate JSON subtype through aggregates, multi-path extract, and ->
+- *(parser)* allow OFFSET and END as bare column names
+- *(pragma)* journal_mode reports "memory" for an in-memory database
+- *(create)* reject CHECK/generated expressions referencing unknown columns
+- *(drop)* DROP … IF EXISTS still rejects a wrong-type object
+- *(alter)* RENAME TABLE rewrites dependent trigger bodies
+- *(vdbe)* harden opt-in routing (grouped bare columns, schema, collation, labels)
+- *(json)* json_quote returns a JSON-subtyped argument unquoted
+- *(pragma)* foreign_key_list lists foreign keys by id ascending
+- *(update)* SET subqueries see the pre-update snapshot
+- *(json)* json_set/json_insert create intermediate containers
+- *(parser)* reject a numeric literal followed by an identifier character
+- *(rtree)* reject a duplicate id, the rowid-alias column
+- *(vtab)* reject an explicit duplicate rowid on a persistent vtab INSERT
+- *(fts5)* accept whitespace around the `col : token` column filter
+- *(alter)* RENAME COLUMN preserves CREATE text — A-rn4 complete
+- *(alter)* DROP COLUMN preserves CREATE text like sqlite (A-rn4)
+- *(alter)* ADD COLUMN appends verbatim text to the schema (A-rn4)
+- *(alter)* RENAME TO preserves CREATE text like sqlite (A-rn4)
+- *(constraint)* CHECK violation names the constraint, like sqlite
+- *(constraint)* UNIQUE message names columns on WITHOUT ROWID too
+- *(constraint)* UNIQUE violation names the offending columns
+
+### Performance
+
+- *(planner)* seek by rowid for the rowid/_rowid_/oid keyword aliases
+
+### Testing
+
+- contain fuzz-corruption temp files in a per-PID directory
+- *(vdbe)* cover 3-table NATURAL/USING join chains
+- *(vdbe)* cover t.* over RIGHT/FULL outer joins
+- *(fts5)* harden sqlite-reads-graphite FTS5 — multi-leaf, porter, edits
+- *(fts5)* verify byte-exact multi-column poslists vs sqlite (D2e-M2)
+- *(fts5)* add varying-rowid pagination coverage; characterize pgsz edge
+- *(fts5)* unified streaming segment writer (terms + spanning) (D2e-M2c)
+- *(fts5)* verify byte-exact doclist-spanning leaf carry vs sqlite (D2e-M2c)
+- *(fts5)* verify byte-exact multi-leaf segment pagination vs sqlite (D2e-M2c)
+- *(fts5)* verify byte-exact %_data segment encoding vs sqlite (D2e-M2a)
+- *(vdbe)* lock in B7b default-engine parity and rejection regressions
+
 ## [0.0.7](https://github.com/KarpelesLab/graphitesql/compare/v0.0.6...v0.0.7) - 2026-06-22
 
 ### Added
