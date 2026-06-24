@@ -380,3 +380,35 @@ fn scalar_subquery_must_return_one_column() {
         Value::Integer(1)
     );
 }
+
+#[test]
+fn row_value_compared_to_row_subquery() {
+    // `(a, b) OP (SELECT x, y)` (and the swapped form) compares the row value
+    // against the subquery's first row, element-wise — sqlite supports it; graphite
+    // used to error. An empty subquery makes the comparison NULL; a width mismatch
+    // errors.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("INSERT INTO t VALUES (1, 2), (3, 4), (1, 9)")
+        .unwrap();
+    let n = |q: &str| c.query(q).unwrap().rows[0][0].clone();
+    assert_eq!(n("SELECT (1,2) = (SELECT 1, 2)"), Value::Integer(1));
+    assert_eq!(n("SELECT (1,2) <> (SELECT 3, 4)"), Value::Integer(1));
+    assert_eq!(n("SELECT (1,2) < (SELECT 1, 3)"), Value::Integer(1));
+    assert_eq!(n("SELECT (1,2) > (SELECT 1, 1)"), Value::Integer(1));
+    // Swapped (subquery on the left).
+    assert_eq!(n("SELECT (SELECT 1, 2) = (1, 2)"), Value::Integer(1));
+    assert_eq!(n("SELECT (SELECT 3, 4) > (1, 2)"), Value::Integer(1));
+    // Against table rows.
+    assert_eq!(
+        n("SELECT count(*) FROM t WHERE (a, b) = (SELECT a, b FROM t WHERE a = 3)"),
+        Value::Integer(1)
+    );
+    // An empty subquery → NULL; a NULL element → NULL.
+    assert_eq!(n("SELECT (1,2) = (SELECT 1, 2 WHERE 0)"), Value::Null);
+    assert_eq!(n("SELECT (1, NULL) = (SELECT 1, 2)"), Value::Null);
+    // A width mismatch is an error.
+    assert!(c.query("SELECT (1,2) = (SELECT 1)").is_err());
+    // A genuine scalar subquery (one value expected) still rejects >1 column.
+    assert!(c.query("SELECT (SELECT 1, 2)").is_err());
+}

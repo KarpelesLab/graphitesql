@@ -518,6 +518,23 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     if let (Some(ls), Some(rs)) = (as_row_value(left), as_row_value(right)) {
                         return compare_row_values(*op, ls, rs, ctx);
                     }
+                    // `(a,b) OP (SELECT x,y)` (and the swapped form): compare the row
+                    // value against the subquery's first row. The subquery's values
+                    // become literal exprs so the existing element-wise comparison
+                    // (operand affinity + the row side's collation) applies; an empty
+                    // subquery makes the whole comparison NULL.
+                    if let (Some(ls), Some(sub)) = (as_row_value(left), as_subquery(right)) {
+                        return match row_subquery_first(sub, ctx)? {
+                            Some(rs) => compare_row_values(*op, ls, &rs, ctx),
+                            None => Ok(Value::Null),
+                        };
+                    }
+                    if let (Some(sub), Some(rs)) = (as_subquery(left), as_row_value(right)) {
+                        return match row_subquery_first(sub, ctx)? {
+                            Some(ls) => compare_row_values(*op, &ls, rs, ctx),
+                            None => Ok(Value::Null),
+                        };
+                    }
                     let l = eval(left, ctx)?;
                     let r = eval(right, ctx)?;
                     let (l, r) = apply_comparison_affinity(
@@ -665,6 +682,38 @@ fn as_row_value(e: &Expr) -> Option<&[Expr]> {
         Expr::Paren(inner) => as_row_value(inner),
         _ => None,
     }
+}
+
+/// View an expression as a scalar subquery (`(SELECT …)`), through redundant
+/// parens — used to compare a row value against a row-returning subquery.
+fn as_subquery(e: &Expr) -> Option<&Select> {
+    match e {
+        Expr::Subquery(s) => Some(s),
+        Expr::Paren(inner) => as_subquery(inner),
+        _ => None,
+    }
+}
+
+/// The first row of a row-returning subquery as literal expressions (so the
+/// existing row-value comparison machinery can use it), or `None` when the
+/// subquery yields no rows (the comparison is then unknown / NULL).
+fn row_subquery_first(select: &Select, ctx: &EvalCtx) -> Result<Option<Vec<Expr>>> {
+    let Some(s) = ctx.subqueries else {
+        return Err(Error::Unsupported("subquery in this context"));
+    };
+    Ok(s.rows(select, ctx)?.into_iter().next().map(|vals| {
+        vals.into_iter()
+            .map(|v| {
+                Expr::Literal(match v {
+                    Value::Null => Literal::Null,
+                    Value::Integer(i) => Literal::Integer(i),
+                    Value::Real(r) => Literal::Real(r),
+                    Value::Text(t) => Literal::Str(t),
+                    Value::Blob(b) => Literal::Blob(b),
+                })
+            })
+            .collect()
+    }))
 }
 
 /// Per-element comparison of two row values: `Some(Ordering)` when both sides are
