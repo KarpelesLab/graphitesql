@@ -1057,7 +1057,16 @@ fn render_strftime(fmt: &str, p: &mut DateTime) -> Option<String> {
                 out.push_str(&alloc::format!("{:02}", h12));
             }
             Some('j') => out.push_str(&alloc::format!("{:03}", day_of_year(p))),
-            Some('J') => out.push_str(&eval::format_real(p.ijd as f64 / 86_400_000.0)),
+            // `%J` renders the Julian day with 16 significant digits (`%.16g`),
+            // higher precision than julianday()'s default real formatting — a
+            // SQLite quirk (e.g. `2460477.024259259`, but `2460477` at noon).
+            Some('J') => out.push_str(&fmt_general(
+                p.ijd as f64 / 86_400_000.0,
+                16,
+                false,
+                false,
+                false,
+            )),
             Some('k') => out.push_str(&alloc::format!("{:2}", p.h)),
             Some('l') => {
                 let h12 = ((p.h + 11) % 12) + 1;

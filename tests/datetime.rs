@@ -97,6 +97,13 @@ fn datetime_against_sqlite3() {
         "strftime('%H','2000-01-01 00:00:00')",
         "strftime('%M minutes','2000-01-01 12:30:00')",
         "strftime('%%literal%%','2000-01-01')",
+        // %J renders the Julian day at 16 significant digits (%.16g), more than
+        // julianday()'s default 15 — integer at noon, fractional otherwise.
+        "strftime('%J','2024-06-15 12:34:56')",
+        "strftime('%J','2024-06-15 12:34:56.789')",
+        "strftime('%J','2024-06-15 12:00:00')",
+        "strftime('%J','1999-12-31 23:59:59')",
+        "strftime('%J','2024-01-01')",
         // NULL / invalid
         "date(NULL)",
         "date('not a date')",
