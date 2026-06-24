@@ -274,3 +274,51 @@ fn invalid_window_frame_bounds_rejected() {
         assert!(c.query(&q(ok)).is_ok(), "{ok} should be accepted");
     }
 }
+
+#[test]
+fn ntile_and_nth_value_require_positive_integer_arg() {
+    // SQLite rejects a non-positive (or, for nth_value, non-integral/NULL)
+    // argument with a specific message; valid integral/text-numeric args work.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("INSERT INTO t VALUES(1),(2),(3)").unwrap();
+    let bad = |sql: &str, msg: &str| {
+        let e = c.query(sql).unwrap_err().to_string();
+        assert!(e.contains(msg), "expected `{msg}` in `{e}` for: {sql}");
+    };
+    bad(
+        "SELECT ntile(0) OVER (ORDER BY x) FROM t",
+        "argument of ntile must be a positive integer",
+    );
+    bad(
+        "SELECT ntile(-3) OVER (ORDER BY x) FROM t",
+        "argument of ntile must be a positive integer",
+    );
+    bad(
+        "SELECT ntile(NULL) OVER (ORDER BY x) FROM t",
+        "argument of ntile must be a positive integer",
+    );
+    bad(
+        "SELECT nth_value(x, 0) OVER (ORDER BY x) FROM t",
+        "second argument to nth_value must be a positive integer",
+    );
+    bad(
+        "SELECT nth_value(x, 1.5) OVER (ORDER BY x) FROM t",
+        "second argument to nth_value must be a positive integer",
+    );
+    bad(
+        "SELECT nth_value(x, NULL) OVER (ORDER BY x) FROM t",
+        "second argument to nth_value must be a positive integer",
+    );
+    // Valid: ntile truncates a real, nth_value accepts an integral real / text.
+    assert!(c.query("SELECT ntile(2) OVER (ORDER BY x) FROM t").is_ok());
+    assert!(c
+        .query("SELECT ntile(2.9) OVER (ORDER BY x) FROM t")
+        .is_ok());
+    assert!(c
+        .query("SELECT nth_value(x, 2.0) OVER (ORDER BY x) FROM t")
+        .is_ok());
+    assert!(c
+        .query("SELECT nth_value(x, '2') OVER (ORDER BY x) FROM t")
+        .is_ok());
+}

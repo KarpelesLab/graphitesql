@@ -11057,7 +11057,14 @@ impl Connection {
                     Value::Real((last + 1) as f64 / m as f64)
                 }
                 "ntile" => {
-                    let buckets = arg_vals[idx].first().map(eval::to_i64).unwrap_or(1).max(1);
+                    // SQLite takes the integer value (truncating a real, parsing
+                    // text) and requires it >= 1, else errors.
+                    let buckets = arg_vals[idx].first().map(eval::to_i64).unwrap_or(0);
+                    if buckets < 1 {
+                        return Err(Error::Error(
+                            "argument of ntile must be a positive integer".into(),
+                        ));
+                    }
                     Value::Integer(ntile_bucket(p, m, buckets))
                 }
                 "lag" | "lead" => {
@@ -11086,15 +11093,22 @@ impl Connection {
                     .and_then(|&k| arg_vals[ordered[k]].first().cloned())
                     .unwrap_or(Value::Null),
                 "nth_value" => {
-                    let nth = arg_vals[idx].get(1).map(eval::to_i64).unwrap_or(1);
+                    // SQLite requires the second argument to be a positive integer
+                    // under numeric affinity: 2.0 and '2' are accepted, but 1.5,
+                    // 0, a negative, or NULL error.
+                    let raw = arg_vals[idx].get(1).cloned().unwrap_or(Value::Null);
+                    let nth = match eval::Affinity::Numeric.coerce(raw) {
+                        Value::Integer(n) if n >= 1 => n,
+                        _ => {
+                            return Err(Error::Error(
+                                "second argument to nth_value must be a positive integer".into(),
+                            ))
+                        }
+                    };
                     // nth row within the (post-EXCLUDE) frame (1-based).
-                    if nth >= 1 {
-                        fpos.get((nth - 1) as usize)
-                            .and_then(|&k| arg_vals[ordered[k]].first().cloned())
-                            .unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
-                    }
+                    fpos.get((nth - 1) as usize)
+                        .and_then(|&k| arg_vals[ordered[k]].first().cloned())
+                        .unwrap_or(Value::Null)
                 }
                 // Aggregate windows over the frame (honoring any FILTER mask).
                 _ => {
