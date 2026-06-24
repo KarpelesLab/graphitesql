@@ -2289,7 +2289,7 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
                 rhs,
                 dest,
             } => {
-                regs[*dest] = crate::exec::json::arrow(&regs[*lhs], &regs[*rhs], *as_text);
+                regs[*dest] = crate::exec::json::arrow(&regs[*lhs], &regs[*rhs], *as_text)?;
             }
             Op::Func {
                 name,

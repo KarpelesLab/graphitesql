@@ -211,3 +211,32 @@ fn json_group_array_and_object() {
     // A json() argument is embedded as JSON, not quoted (subtype propagation).
     assert_eq!(one(&c, "SELECT json_group_array(json('[1,2]'))"), "[[1,2]]");
 }
+
+#[test]
+fn arrow_operator_rejects_malformed_explicit_path() {
+    // The `->` / `->>` operators evaluate an explicit `$`-rooted path argument and
+    // must raise sqlite's "bad JSON path" for a malformed one (they previously
+    // swallowed the error and returned NULL). A bare key/index operand is wrapped
+    // into `$.key` / `$[n]` and stays valid (it may contain spaces, dots, etc.).
+    let c = Connection::open_memory().unwrap();
+    for q in [
+        "SELECT '[1,2]' -> '$bad'",
+        "SELECT '[1,2]' ->> '$bad'",
+        "SELECT '{\"a\":1}' -> '$x'",
+    ] {
+        let e = c.query(q).unwrap_err();
+        assert!(format!("{e}").contains("bad JSON path"), "{q}: {e}");
+    }
+    for q in [
+        "SELECT '{\"a\":1}' -> 'a'",
+        "SELECT '{\"a b\":1}' -> 'a b'",
+        "SELECT '{\"a\":1}' -> '$.a'",
+        "SELECT '[1,2]' -> 0",
+        "SELECT '[1,2]' ->> 1",
+        "SELECT '[1,2,3]' -> '$[#-1]'",
+        "SELECT '{}' -> '$.missing'",
+        "SELECT null -> '$bad'",
+    ] {
+        assert!(c.query(q).is_ok(), "{q} should succeed");
+    }
+}

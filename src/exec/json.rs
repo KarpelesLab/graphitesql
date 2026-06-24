@@ -1126,16 +1126,25 @@ pub fn value_to_json(v: &Value) -> Json {
 /// `as_text` (the `->>` form) the result is the SQL value at the path; otherwise
 /// (`->`) it is that node re-rendered as JSON text. NULL doc or a missing path
 /// yields SQL NULL.
-pub fn arrow(doc: &Value, path_arg: &Value, as_text: bool) -> Value {
+pub fn arrow(doc: &Value, path_arg: &Value, as_text: bool) -> crate::Result<Value> {
     if matches!(doc, Value::Null) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
     let text = crate::exec::eval::to_text(doc);
     let Some(root) = parse(&text) else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
     let path = arrow_path(path_arg);
-    match navigate(&root, &path) {
+    // An explicit `$`-rooted path operand must be syntactically valid — sqlite
+    // raises "bad JSON path" for e.g. `-> '$bad'`. A bare key/index operand is
+    // always well-formed (it is wrapped into `$.key` / `$[n]`), so it is not
+    // validated (it may legitimately contain spaces or other characters).
+    if matches!(path_arg, Value::Text(s) if s.starts_with('$')) && !path_is_valid(&path) {
+        return Err(crate::error::Error::Error(alloc::format!(
+            "bad JSON path: '{path}'"
+        )));
+    }
+    Ok(match navigate(&root, &path) {
         None => Value::Null,
         Some(node) => {
             if as_text {
@@ -1144,7 +1153,7 @@ pub fn arrow(doc: &Value, path_arg: &Value, as_text: bool) -> Value {
                 Value::Text(node.serialize())
             }
         }
-    }
+    })
 }
 
 /// Normalize an `->`/`->>` right operand into a JSON path: an integer is an array
