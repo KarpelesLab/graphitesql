@@ -3601,9 +3601,27 @@ impl Connection {
             return Err(Error::Error(format!("table {} already exists", ct.name)));
         }
         let result = self.run_select(select, &Params::default())?;
-        // Build and create the resolved table `name(col1, col2, …)`.
-        let cols = result
+        // SQLite auto-renames duplicate output column names in CTAS — the second
+        // `a` becomes `a:1`, the third `a:2`, etc. — rather than erroring like an
+        // explicit `CREATE TABLE` column list. Names compare case-insensitively.
+        let mut counts: alloc::collections::BTreeMap<String, usize> =
+            alloc::collections::BTreeMap::new();
+        let deduped: Vec<String> = result
             .columns
+            .iter()
+            .map(|c| {
+                let n = counts.entry(c.to_ascii_lowercase()).or_insert(0);
+                let name = if *n == 0 {
+                    c.clone()
+                } else {
+                    alloc::format!("{c}:{n}")
+                };
+                *n += 1;
+                name
+            })
+            .collect();
+        // Build and create the resolved table `name(col1, col2, …)`.
+        let cols = deduped
             .iter()
             .map(|c| crate::sql::print::ident(c))
             .collect::<Vec<_>>()

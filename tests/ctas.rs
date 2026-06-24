@@ -106,3 +106,36 @@ fn against_sqlite3() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn ctas_auto_renames_duplicate_columns() {
+    // `CREATE TABLE … AS SELECT` auto-renames duplicate output column names (the
+    // 2nd `a` → `a:1`, 3rd → `a:2`) rather than erroring like an explicit column
+    // list — matching sqlite. Names compare case-insensitively (original case
+    // kept).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t AS SELECT 1 AS a, 2 AS a, 3 AS a, 4 AS b, 5 AS b")
+        .unwrap();
+    assert_eq!(
+        c.query("SELECT * FROM t").unwrap().columns,
+        ["a", "a:1", "a:2", "b", "b:1"]
+    );
+    let r = c.query("SELECT * FROM t").unwrap();
+    assert_eq!(
+        r.rows[0],
+        vec![
+            Value::Integer(1),
+            Value::Integer(2),
+            Value::Integer(3),
+            Value::Integer(4),
+            Value::Integer(5)
+        ]
+    );
+    // Case-insensitive: the second `A` (different case) is still a duplicate.
+    let mut c2 = Connection::open_memory().unwrap();
+    c2.execute("CREATE TABLE u AS SELECT 1 AS a, 2 AS A")
+        .unwrap();
+    assert_eq!(c2.query("SELECT * FROM u").unwrap().columns, ["a", "A:1"]);
+    // A plain (non-CTAS) duplicate column list is still rejected.
+    assert!(c2.execute("CREATE TABLE w(a, a)").is_err());
+}
