@@ -3551,6 +3551,19 @@ impl Connection {
                     return Err(Error::Error(format!("no such column: {col}")));
                 }
             }
+            // A table-level FOREIGN KEY's *local* columns must each be a declared
+            // column (a generated column counts; `rowid` does not), as SQLite
+            // rejects at CREATE. The referenced parent table/columns are not
+            // checked here — SQLite resolves those lazily.
+            if let TableConstraint::ForeignKey(fk) = tc {
+                for col in &fk.columns {
+                    if !known.iter().any(|k| k.eq_ignore_ascii_case(col)) {
+                        return Err(Error::Error(format!(
+                            "unknown column \"{col}\" in foreign key definition"
+                        )));
+                    }
+                }
+            }
         }
         // A table must have at least one non-generated (real) column, as in SQLite.
         if !ct.columns.is_empty()

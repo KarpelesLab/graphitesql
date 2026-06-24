@@ -53,6 +53,31 @@ fn rejected_definitions() {
 }
 
 #[test]
+fn foreign_key_local_columns_must_exist() {
+    // A table-level FOREIGN KEY's *local* columns must each be a declared column;
+    // SQLite rejects an unknown one at CREATE ("unknown column … in foreign key
+    // definition"). The referenced parent table/columns are resolved lazily, so a
+    // missing parent is NOT a CREATE-time error. A generated column counts as a
+    // valid local column; `rowid` does not.
+    for ddl in [
+        // rejected — unknown local column
+        "CREATE TABLE t(a, b, FOREIGN KEY(c) REFERENCES x)",
+        "CREATE TABLE t(a, b, FOREIGN KEY(c) REFERENCES x(y))",
+        "CREATE TABLE t(a, b, FOREIGN KEY(a, c) REFERENCES x(p, q))",
+        "CREATE TABLE t(a, b, FOREIGN KEY(rowid) REFERENCES x)",
+        // accepted
+        "CREATE TABLE t(a, b, FOREIGN KEY(a) REFERENCES x)",
+        "CREATE TABLE t(a, b, FOREIGN KEY(a, b) REFERENCES x(p, q))",
+        "CREATE TABLE t(a, b AS (a + 1), FOREIGN KEY(b) REFERENCES x)",
+        "CREATE TABLE t(a, FOREIGN KEY(a) REFERENCES nonexist(z))",
+        // column-level REFERENCES is about the defining column — always fine
+        "CREATE TABLE t(a, b REFERENCES x)",
+    ] {
+        agree(ddl);
+    }
+}
+
+#[test]
 fn accepted_definitions() {
     assert!(graphite_ok("CREATE TABLE t(a, b)"));
     assert!(graphite_ok("CREATE TABLE t(a PRIMARY KEY, b)"));
