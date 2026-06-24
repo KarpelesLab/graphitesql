@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/KarpelesLab/graphitesql/compare/v0.0.8...v0.0.9) - 2026-06-24
+
+### Fixed
+
+- *(attach)* resolve a VALUES subquery in main for a cross-db INSERT
+- *(attach)* resolve INSERT … SELECT source in main, not the target db
+- *(pragma)* run bare / (N) incremental_vacuum off the query path
+- *(datetime)* render strftime %J at 16 significant digits
+- *(datetime)* honor subsec modifier in strftime %s (millisecond epoch)
+- *(window)* reject a non-positive ntile / nth_value argument
+
+### Testing
+
+- *(like)* pin LIKE as ASCII-only case-insensitive (vs the alt1 oracle's Unicode fold)
+
 ## [0.0.8](https://github.com/KarpelesLab/graphitesql/compare/v0.0.7...v0.0.8) - 2026-06-24
 
 ### Added
