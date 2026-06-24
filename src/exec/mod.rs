@@ -1152,6 +1152,21 @@ impl Connection {
                 affs = n_affs;
                 colls = n_colls;
             }
+            // The VDBE resolves a bare column by name and would silently pick one
+            // side of an ambiguous reference; defer such a query to the tree-walker,
+            // which rejects it with "ambiguous column name" (reusing the exact same
+            // check over this join's resolved column list).
+            let join_cols: Vec<ColumnInfo> = (0..names.len())
+                .map(|i| ColumnInfo {
+                    name: names[i].clone(),
+                    table: tabs[i].clone(),
+                    affinity: affs[i],
+                    collation: colls[i],
+                })
+                .collect();
+            if validate_unambiguous_columns(sel, &join_cols).is_err() {
+                return Err(Error::Unsupported("VDBE: ambiguous column name"));
+            }
             let prog = vdbe::compile_table_select(sel, &names, &tabs, &affs, &colls, false)?;
             let result = vdbe::run_rows(&prog, &rows)?;
             return Ok(QueryResult {
@@ -1222,6 +1237,21 @@ impl Connection {
             }
             let mut joined = sel.clone();
             joined.where_clause = merged;
+            // Defer an ambiguous-column query to the tree-walker, which rejects it
+            // with "ambiguous column name" (the same check over this join's combined
+            // column list). `compile_table_select` bails on some ambiguous bare refs
+            // but not all (e.g. one consumed only by GROUP BY), so check here too.
+            let join_cols: Vec<ColumnInfo> = (0..combined.len())
+                .map(|i| ColumnInfo {
+                    name: combined[i].clone(),
+                    table: combined_tables[i].clone(),
+                    affinity: combined_aff[i],
+                    collation: combined_coll[i],
+                })
+                .collect();
+            if validate_unambiguous_columns(sel, &join_cols).is_err() {
+                return Err(Error::Unsupported("VDBE: ambiguous column name"));
+            }
             let prog = vdbe::compile_table_select(
                 &joined,
                 &combined,
@@ -11856,6 +11886,13 @@ impl Connection {
             None => sel,
         };
 
+        // An unqualified (or self-join-qualified) column reference that matches
+        // columns from two different FROM sources is ambiguous — SQLite rejects
+        // it. Checked after alias substitution so an ORDER BY/GROUP BY/HAVING
+        // reference to an unshadowed output alias is already rewritten to its
+        // defining expression and not mistaken for an ambiguous column.
+        validate_unambiguous_columns(sel, &columns)?;
+
         // A positional `GROUP BY` / `ORDER BY` term (an integer literal) must name
         // an output column (1..=ncols); SQLite rejects one out of range. The count
         // is taken after wildcard expansion.
@@ -16105,6 +16142,65 @@ fn validate_used_collations(sel: &Select) -> Result<()> {
                 top_collation(expr)?;
             }
             consumed_collations(expr)?;
+        }
+    }
+    Ok(())
+}
+
+/// SQLite rejects a column reference that matches columns from two different
+/// FROM sources — "ambiguous column name". `columns` is this query block's
+/// resolved column list; a NATURAL/USING join already coalesces its shared
+/// column to a single entry there, so a plain count over `columns` excludes
+/// them. A bare name matching 2+ entries, or a `t.col` whose qualifier matches
+/// 2+ entries (an unaliased self-join), is ambiguous. A result-set wildcard over
+/// an unaliased self-join is ambiguous too — two entries then share *both* name
+/// and qualifier, which even `*` cannot tell apart. Nested subqueries validate
+/// their own references when they run, so this neither descends into them nor
+/// considers the outer scope.
+fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<()> {
+    let mut ambiguous: Option<String> = None;
+    vdbe_block_exprs(sel, &mut |e| {
+        window::visit(e, &mut |sub| {
+            if ambiguous.is_some() {
+                return;
+            }
+            if let Expr::Column { table, column } = sub {
+                let n = columns
+                    .iter()
+                    .filter(|c| {
+                        c.name.eq_ignore_ascii_case(column)
+                            && table
+                                .as_deref()
+                                .is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+                    })
+                    .count();
+                if n >= 2 {
+                    ambiguous = Some(alloc::format!("ambiguous column name: {column}"));
+                }
+            }
+        });
+    });
+    if let Some(msg) = ambiguous {
+        return Err(Error::Error(msg));
+    }
+    // A result-set wildcard (`*` / `t.*`) over an unaliased self-join: two
+    // columns then carry the same name *and* qualifier, so even `*` cannot
+    // disambiguate them (`SELECT * FROM z, z`).
+    let has_wildcard = sel
+        .columns
+        .iter()
+        .any(|c| matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_)));
+    if has_wildcard {
+        for (i, a) in columns.iter().enumerate() {
+            if let Some(b) = columns[i + 1..].iter().find(|b| {
+                a.name.eq_ignore_ascii_case(&b.name) && a.table.eq_ignore_ascii_case(&b.table)
+            }) {
+                return Err(Error::Error(alloc::format!(
+                    "ambiguous column name: {}.{}",
+                    b.table,
+                    b.name
+                )));
+            }
         }
     }
     Ok(())
