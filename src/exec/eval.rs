@@ -34,6 +34,10 @@ pub trait Subqueries {
     /// `IN (SELECT …)` comparison affinity. `None` when it has no affinity (a
     /// computed expression) or cannot be determined.
     fn column_affinity(&self, select: &Select) -> Option<Affinity>;
+    /// The declared affinity of *each* of the subquery's output columns, for a
+    /// row-value `(a, b, …) IN (SELECT …)`. Same per-column rule as
+    /// [`Self::column_affinity`]; the vector may be empty if it cannot be determined.
+    fn row_column_affinities(&self, select: &Select) -> alloc::vec::Vec<Option<Affinity>>;
     /// Every row in full — the candidate set for a row-value `(a,b) IN (SELECT …)`.
     fn rows(&self, select: &Select, outer: &EvalCtx) -> Result<Vec<Vec<Value>>>;
     /// Whether the subquery returns at least one row — for `EXISTS`.
@@ -813,6 +817,14 @@ fn eval_row_in_select(
     ctx: &EvalCtx,
 ) -> Result<Value> {
     let lvals: Vec<Value> = lefts.iter().map(|e| eval(e, ctx)).collect::<Result<_>>()?;
+    // Each comparison applies the left element's affinity vs the subquery column's
+    // affinity (like the scalar `IN (SELECT …)` path) and the left's collation.
+    let lafs: Vec<Option<Affinity>> = lefts.iter().map(|e| expr_affinity(e, ctx)).collect();
+    let lcolls: Vec<Collation> = lefts.iter().map(|e| key_collation(e, ctx)).collect();
+    let rafs = ctx
+        .subqueries
+        .map(|s| s.row_column_affinities(select))
+        .unwrap_or_default();
     let rows = match ctx.subqueries {
         Some(s) => s.rows(select, ctx)?,
         None => return Err(Error::Unsupported("IN (SELECT …) in this context")),
@@ -829,11 +841,18 @@ fn eval_row_in_select(
         let cmps: Vec<Option<Ordering>> = lvals
             .iter()
             .zip(row)
-            .map(|(l, r)| {
+            .enumerate()
+            .map(|(i, (l, r))| {
                 if matches!(l, Value::Null) || matches!(r, Value::Null) {
                     None
                 } else {
-                    Some(compare(l, r))
+                    let (lv, rv) = apply_comparison_affinity(
+                        l.clone(),
+                        lafs[i],
+                        r.clone(),
+                        rafs.get(i).copied().flatten(),
+                    );
+                    Some(crate::value::cmp_values_coll(&lv, &rv, lcolls[i]))
                 }
             })
             .collect();

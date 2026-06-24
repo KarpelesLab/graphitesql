@@ -17032,22 +17032,35 @@ impl eval::Subqueries for Connection {
     }
 
     fn column_affinity(&self, select: &Select) -> Option<eval::Affinity> {
-        // The affinity of the subquery's first output column: a column inherits
-        // its declared affinity, a computed expression has none. Derived from the
-        // FROM sources' column metadata (no rows needed for the affinity itself).
+        self.row_column_affinities(select)
+            .into_iter()
+            .next()
+            .flatten()
+    }
+
+    fn row_column_affinities(&self, select: &Select) -> Vec<Option<eval::Affinity>> {
+        // Each output column's affinity: a column inherits its declared affinity,
+        // a computed expression has none. Derived from the FROM sources' column
+        // metadata (no rows needed for the affinity itself).
         let params = Params::default();
-        let (columns, _) = self.scan_source(select, &params).ok()?;
-        match select.columns.first()? {
-            ResultColumn::Expr { expr, .. } => {
-                eval::expr_affinity(expr, &row_ctx(&[], &columns, None, &params))
+        let Ok((columns, _)) = self.scan_source(select, &params) else {
+            return Vec::new();
+        };
+        let ctx = row_ctx(&[], &columns, None, &params);
+        let mut out = Vec::new();
+        for col in &select.columns {
+            match col {
+                ResultColumn::Expr { expr, .. } => out.push(eval::expr_affinity(expr, &ctx)),
+                ResultColumn::Wildcard => out.extend(columns.iter().map(|c| Some(c.affinity))),
+                ResultColumn::TableWildcard(t) => out.extend(
+                    columns
+                        .iter()
+                        .filter(|c| c.table.eq_ignore_ascii_case(t))
+                        .map(|c| Some(c.affinity)),
+                ),
             }
-            // `SELECT *` / `t.*` as the candidate column: the first source column.
-            ResultColumn::Wildcard => columns.first().map(|c| c.affinity),
-            ResultColumn::TableWildcard(t) => columns
-                .iter()
-                .find(|c| c.table.eq_ignore_ascii_case(t))
-                .map(|c| c.affinity),
         }
+        out
     }
 
     fn rows(&self, select: &Select, outer: &EvalCtx) -> Result<Vec<Vec<Value>>> {

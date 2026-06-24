@@ -94,6 +94,30 @@ fn in_select() {
 }
 
 #[test]
+fn in_select_applies_per_element_affinity() {
+    // A row-value `(a,b) IN (SELECT c,d)` applies each left element's affinity vs
+    // the subquery column's affinity, like the scalar IN(SELECT) path. INTEGER
+    // columns match TEXT-numeric candidates; typeless (NONE) columns do not.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE ti(a INTEGER, b INTEGER)").unwrap();
+    c.execute("INSERT INTO ti VALUES(1,2)").unwrap();
+    c.execute("CREATE TABLE tn(a, b)").unwrap();
+    c.execute("INSERT INTO tn VALUES(1,2)").unwrap();
+    c.execute("CREATE TABLE ut(c TEXT, d TEXT)").unwrap();
+    c.execute("INSERT INTO ut VALUES('1','2')").unwrap();
+    // INTEGER left, TEXT candidate → numeric affinity → match.
+    assert_eq!(
+        one(&c, "SELECT (a,b) IN (SELECT c,d FROM ut) FROM ti"),
+        Value::Integer(1)
+    );
+    // typeless (NONE) left, TEXT candidate → no conversion → no match.
+    assert_eq!(
+        one(&c, "SELECT (a,b) IN (SELECT c,d FROM ut) FROM tn"),
+        Value::Integer(0)
+    );
+}
+
+#[test]
 fn against_sqlite3() {
     if !sqlite3_available() {
         eprintln!("sqlite3 not found; skipping");
