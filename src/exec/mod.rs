@@ -3393,6 +3393,14 @@ impl Connection {
         let known: Vec<String> = ct.columns.iter().map(|c| c.name.clone()).collect();
         for c in &ct.columns {
             for k in &c.constraints {
+                // A column's `COLLATE <name>` must name a known collating sequence
+                // (BINARY/NOCASE/RTRIM); sqlite errors "no such collation sequence"
+                // at CREATE rather than silently falling back to BINARY.
+                if let ColumnConstraint::Collate(name) = k {
+                    if crate::value::Collation::parse(name).is_none() {
+                        return Err(Error::Error(format!("no such collation sequence: {name}")));
+                    }
+                }
                 let bad = match k {
                     ColumnConstraint::Check(e, _) => unknown_column_ref(e, &known, true),
                     ColumnConstraint::Generated { expr, .. } => {
@@ -5992,6 +6000,14 @@ impl Connection {
             return Err(Error::Error(
                 "non-deterministic functions prohibited in index expressions".into(),
             ));
+        }
+        // Each key's explicit `COLLATE <name>` must name a known collating
+        // sequence; sqlite errors "no such collation sequence" rather than
+        // silently using BINARY.
+        for term in &ci.columns {
+            if let Some(name) = unknown_collation(&term.expr) {
+                return Err(Error::Error(format!("no such collation sequence: {name}")));
+            }
         }
         let (cols, key_exprs, colls) = self.index_key_spec(&tmeta, ci)?;
         if key_exprs.is_some() && tmeta.without_rowid {
@@ -15979,6 +15995,30 @@ fn schema_table_meta(label: &str) -> TableMeta {
 }
 
 /// The first column reference in `e` that names neither a column in `known` nor
+/// The first explicit `COLLATE <name>` in `e` whose name is not a known
+/// collating sequence (BINARY/NOCASE/RTRIM) — for rejecting it at `CREATE INDEX`,
+/// where sqlite errors "no such collation sequence" rather than using BINARY.
+fn unknown_collation(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Collate { expr, collation } => {
+            if crate::value::Collation::parse(collation).is_none() {
+                Some(collation)
+            } else {
+                unknown_collation(expr)
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            unknown_collation(left).or_else(|| unknown_collation(right))
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. } => unknown_collation(expr),
+        Expr::Function { args, .. } => args.iter().find_map(unknown_collation),
+        _ => None,
+    }
+}
+
 /// (when `allow_rowid`) a rowid alias — the unknown column SQLite rejects at
 /// `CREATE` in a CHECK constraint or generated-column expression. Generated
 /// columns may not reference the rowid (`allow_rowid=false`); a CHECK may.

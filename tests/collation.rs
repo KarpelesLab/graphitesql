@@ -322,3 +322,34 @@ fn compound_set_ops_use_collation() {
         "A\nb"
     );
 }
+
+#[test]
+fn unknown_collation_rejected_at_create() {
+    // A `COLLATE <name>` naming an unknown collating sequence is rejected at
+    // CREATE (table column or index key) — sqlite errors "no such collation
+    // sequence" rather than silently falling back to BINARY.
+    let mut c = Connection::open_memory().unwrap();
+    let e = c
+        .execute("CREATE TABLE t(a TEXT COLLATE bogus)")
+        .unwrap_err();
+    assert!(format!("{e}").contains("no such collation sequence"), "{e}");
+
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    let e = c
+        .execute("CREATE INDEX i ON t(a COLLATE nope)")
+        .unwrap_err();
+    assert!(format!("{e}").contains("no such collation sequence"), "{e}");
+    // Also inside an expression index and a later key position.
+    assert!(c
+        .execute("CREATE INDEX j ON t((a || b) COLLATE zzz)")
+        .is_err());
+    assert!(c.execute("CREATE INDEX k ON t(a, b COLLATE qux)").is_err());
+
+    // The built-in collations (case-insensitive) are accepted and usable.
+    c.execute("CREATE TABLE u(a TEXT COLLATE nocase, b COLLATE rtrim, d COLLATE BINARY)")
+        .unwrap();
+    c.execute("CREATE INDEX iu ON u(a COLLATE NOCASE)").unwrap();
+    c.execute("INSERT INTO u(a) VALUES ('B'), ('a')").unwrap();
+    let r = c.query("SELECT a FROM u ORDER BY a").unwrap();
+    assert_eq!(r.rows[0][0], Value::Text("a".into()));
+}
