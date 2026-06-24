@@ -23,15 +23,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Every temp file this test process creates lives under a single per-PID
+/// directory (`<tmp>/gsql-fuzz-<pid>/`), so cleanup is one `rm -rf` and the
+/// `-journal`/`-wal` sidecars can never escape into the shared temp root. The
+/// directory is created on first use.
+fn fuzz_dir() -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("gsql-fuzz-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+/// Remove a database file together with its `-journal` / `-wal` / `-shm`
+/// sidecars (writing a corrupt file can leave a rollback journal or WAL behind).
+fn rm_db(p: &str) {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{p}{suffix}"));
+    }
+}
+
 /// Build one valid graphitesql database (with an index and an overflowing blob,
 /// so the corruption space touches index pages and overflow chains) and return
 /// its raw bytes.
 fn build_base() -> Vec<u8> {
     let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("gsql-fuzz-base-{}-{uniq}.db", std::process::id()));
+    let path = fuzz_dir().join(format!("base-{uniq}.db"));
     let p = path.to_string_lossy().into_owned();
-    let _ = std::fs::remove_file(&p);
+    rm_db(&p);
     {
         let mut c = Connection::create(&p).unwrap();
         c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INT, v TEXT)")
@@ -51,7 +68,7 @@ fn build_base() -> Vec<u8> {
             .unwrap();
     }
     let data = std::fs::read(&p).unwrap();
-    let _ = std::fs::remove_file(&p);
+    rm_db(&p);
     data
 }
 
@@ -61,13 +78,9 @@ fn build_base() -> Vec<u8> {
 /// panicked). Panics (failing the test) if any reader path unwinds.
 fn open_no_panic(bytes: &[u8], tag: &str) -> bool {
     let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "gsql-fuzz-{}-{uniq}-{}.db",
-        std::process::id(),
-        tag.replace(['/', ' '], "_")
-    ));
+    let path = fuzz_dir().join(format!("{uniq}-{}.db", tag.replace(['/', ' '], "_")));
     let p = path.to_string_lossy().into_owned();
-    let _ = std::fs::remove_file(&p);
+    rm_db(&p);
     {
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(bytes).unwrap();
@@ -88,7 +101,7 @@ fn open_no_panic(bytes: &[u8], tag: &str) -> bool {
             Err(_) => false,
         }
     }));
-    let _ = std::fs::remove_file(&p);
+    rm_db(&p);
     match r {
         Ok(opened) => opened,
         Err(_) => panic!("reader PANICKED on corrupted input (tag={tag})"),
@@ -333,14 +346,14 @@ fn forged_small_pages_and_overflow() {
 fn corrupted_wal_sidecar() {
     let base = build_base();
     let ps = page_size_of(&base);
-    let path = std::env::temp_dir().join(format!(
-        "gsql-fuzz-wal-{}-{}.db",
+    let path = fuzz_dir().join(format!(
+        "wal-{}-{}.db",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let p = path.to_string_lossy().into_owned();
     let wp = format!("{p}-wal");
-    let _ = std::fs::remove_file(&p);
+    rm_db(&p);
     let _ = std::fs::remove_file(&wp);
     std::fs::write(&p, &base).unwrap();
 
@@ -365,11 +378,11 @@ fn corrupted_wal_sidecar() {
             }
         }));
         if r.is_err() {
-            let _ = std::fs::remove_file(&p);
+            rm_db(&p);
             let _ = std::fs::remove_file(&wp);
             panic!("WAL reader PANICKED on corrupted sidecar (trial={trial})");
         }
     }
-    let _ = std::fs::remove_file(&p);
+    rm_db(&p);
     let _ = std::fs::remove_file(&wp);
 }
