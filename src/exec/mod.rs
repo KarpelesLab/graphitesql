@@ -4094,11 +4094,18 @@ impl Connection {
         let pmeta = self.table_meta(&fk.ref_table, None)?;
         let positions = self.column_positions(&pmeta, &fk.ref_columns)?;
         for (_, row) in self.scan_table(&pmeta)? {
-            if positions
-                .iter()
-                .zip(key)
-                .all(|(&p, k)| eval::compare(&row[p], k) == core::cmp::Ordering::Equal)
-            {
+            if positions.iter().zip(key).all(|(&p, k)| {
+                // SQLite applies the *parent* key column's affinity to the child
+                // value before the existence check, so e.g. a text child '1'
+                // matches an INTEGER parent key 1 (and 'x' still cannot).
+                let (pv, kv) = eval::apply_comparison_affinity(
+                    row[p].clone(),
+                    Some(pmeta.columns[p].affinity),
+                    k.clone(),
+                    None,
+                );
+                eval::compare(&pv, &kv) == core::cmp::Ordering::Equal
+            }) {
                 return Ok(true);
             }
         }
@@ -4199,13 +4206,26 @@ impl Connection {
     ) -> Result<()> {
         let cmeta = self.table_meta(child_table, None)?;
         let cpos = self.column_positions(&cmeta, &fk.columns)?;
+        // The parent key columns' affinities — applied to the child value when
+        // matching, the same rule as the child→parent existence check
+        // (`parent_has_key`): a text child '1' matches an INTEGER parent key 1.
+        let pmeta = self.table_meta(&fk.ref_table, None)?;
         // Find child rowids whose key matches old_key.
         let mut matches: Vec<i64> = Vec::new();
         for (rowid, row) in self.scan_table(&cmeta)? {
             if cpos
                 .iter()
                 .zip(old_key)
-                .all(|(&p, k)| eval::compare(&row[p], k) == core::cmp::Ordering::Equal)
+                .zip(parent_pos)
+                .all(|((&cp, k), &pp)| {
+                    let (pv, kv) = eval::apply_comparison_affinity(
+                        k.clone(),
+                        Some(pmeta.columns[pp].affinity),
+                        row[cp].clone(),
+                        None,
+                    );
+                    eval::compare(&pv, &kv) == core::cmp::Ordering::Equal
+                })
             {
                 matches.push(rowid);
             }

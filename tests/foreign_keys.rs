@@ -2,7 +2,53 @@
 
 #![cfg(feature = "std")]
 
-use graphitesql::{Connection, Error};
+use graphitesql::{Connection, Error, Value};
+
+#[test]
+fn fk_applies_parent_key_affinity() {
+    // SQLite applies the parent key column's affinity to the child value: a text
+    // child '1' satisfies an INTEGER parent key 1 (and a non-numeric 'x' does
+    // not). Both the child→parent existence check and the parent-change child
+    // matching honor it.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)").unwrap();
+    c.execute("INSERT INTO p VALUES (1)").unwrap();
+    c.execute("CREATE TABLE c(pid REFERENCES p ON DELETE CASCADE)")
+        .unwrap();
+    // text '1' satisfies the INTEGER parent key (existence check, child→parent).
+    c.execute("INSERT INTO c VALUES ('1')").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM c").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    // a non-numeric text value cannot match an INTEGER parent key.
+    assert!(matches!(
+        c.execute("INSERT INTO c VALUES ('x')"),
+        Err(Error::Constraint(_))
+    ));
+    // parent change matches the text child via the same affinity → CASCADE delete.
+    c.execute("DELETE FROM p WHERE id=1").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM c").unwrap().rows[0][0],
+        Value::Integer(0)
+    );
+}
+
+#[test]
+fn fk_text_parent_matches_integer_child() {
+    // The reverse affinity direction: a TEXT parent key, an integer child value.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute("CREATE TABLE p(id TEXT PRIMARY KEY)").unwrap();
+    c.execute("INSERT INTO p VALUES ('1')").unwrap();
+    c.execute("CREATE TABLE c(pid REFERENCES p)").unwrap();
+    c.execute("INSERT INTO c VALUES (1)").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM c").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+}
 
 fn parent_child() -> Connection {
     let mut c = Connection::open_memory().unwrap();
