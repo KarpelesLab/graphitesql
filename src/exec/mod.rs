@@ -16335,6 +16335,16 @@ impl eval::Subqueries for Connection {
     fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value> {
         self.with_outer_frame(outer, |params| {
             let r = self.run_select(select, params)?;
+            // A scalar subquery must yield exactly one column; sqlite rejects
+            // `(SELECT 1, 2)` ("sub-select returns 2 columns - expected 1") rather
+            // than silently taking the first. (Row-value / `IN` subqueries use the
+            // separate `rows`/`column` paths and may have several columns.)
+            if r.columns.len() > 1 {
+                return Err(Error::Error(alloc::format!(
+                    "sub-select returns {} columns - expected 1",
+                    r.columns.len()
+                )));
+            }
             Ok(r.rows
                 .first()
                 .and_then(|row| row.first())

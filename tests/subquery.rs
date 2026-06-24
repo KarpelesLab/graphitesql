@@ -343,3 +343,40 @@ fn derived_column_inherits_affinity_and_collation() {
         1
     );
 }
+
+#[test]
+fn scalar_subquery_must_return_one_column() {
+    // A scalar subquery used as a value must yield exactly one column; sqlite
+    // rejects `(SELECT 1, 2)` ("sub-select returns 2 columns - expected 1")
+    // rather than silently taking the first column.
+    let mut c = Connection::open_memory().unwrap();
+    let e = c.query("SELECT (SELECT 1, 2)").unwrap_err();
+    assert!(
+        format!("{e}").contains("sub-select returns 2 columns"),
+        "{e}"
+    );
+    // In a WHERE/comparison position too.
+    assert!(c
+        .query("SELECT * FROM (SELECT 1) WHERE (SELECT 1, 2)")
+        .is_err());
+    // `SELECT *` over a multi-column table in scalar position is rejected.
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("INSERT INTO t VALUES (1, 2)").unwrap();
+    assert!(c.query("SELECT (SELECT * FROM t)").is_err());
+    // A single-column scalar subquery still works.
+    assert_eq!(
+        c.query("SELECT (SELECT a FROM t)").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    assert_eq!(
+        c.query("SELECT (SELECT max(a) FROM t)").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    // Row-value / IN subqueries (a separate path) keep working with >1 column.
+    assert_eq!(
+        c.query("SELECT count(*) FROM t WHERE (a, b) IN (SELECT a, b FROM t)")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(1)
+    );
+}
