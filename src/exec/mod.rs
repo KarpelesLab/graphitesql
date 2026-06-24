@@ -11892,6 +11892,13 @@ impl Connection {
         // reference to an unshadowed output alias is already rewritten to its
         // defining expression and not mistaken for an ambiguous column.
         validate_unambiguous_columns(sel, &columns)?;
+        // SQLite also rejects an ambiguous reference *inside a subquery* that binds
+        // to an enclosing FROM, statically (whether or not the subquery executes).
+        // Run that scope-aware pass once, at the outermost query: `columns` here is
+        // the known top scope, and each nested level resolves against it.
+        if self.outer_scope.borrow().is_empty() {
+            self.validate_nested_ambiguity(sel, &columns)?;
+        }
 
         // A positional `GROUP BY` / `ORDER BY` term (an integer literal) must name
         // an output column (1..=ncols); SQLite rejects one out of range. The count
@@ -12040,6 +12047,76 @@ impl Connection {
             columns: out_labels,
             rows: final_rows,
         })
+    }
+
+    /// The column metadata visible to `sel`'s expressions (its `FROM` sources'
+    /// columns), derived *statically* — no rows are read — for the ambiguity
+    /// check. Returns `None` ("unknown") for anything but plain main-database
+    /// tables joined by comma/`ON` (a view, CTE, derived table, table-valued
+    /// function, schema-qualified name, or `NATURAL`/`USING` coalescing), so the
+    /// caller never guesses a binding it cannot prove. A `NATURAL`/`USING` join is
+    /// treated as unknown rather than approximated, since its coalescing changes
+    /// the column set.
+    fn static_scope_columns(&self, sel: &Select) -> Option<Vec<ColumnInfo>> {
+        let Some(from) = &sel.from else {
+            return Some(Vec::new());
+        };
+        if from.joins.iter().any(|j| j.natural || !j.using.is_empty()) {
+            return None;
+        }
+        let mut cols = Vec::new();
+        for tref in core::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.table)) {
+            // Only a plain, unqualified, main-database table is statically known.
+            if tref.subquery.is_some()
+                || tref.tvf_args.is_some()
+                || tref.schema.is_some()
+                || self.is_pragma_tvf(tref)
+                || self.is_view(&tref.name)
+                || self
+                    .cte_env
+                    .borrow()
+                    .iter()
+                    .any(|b| b.name.eq_ignore_ascii_case(&tref.name))
+            {
+                return None;
+            }
+            let meta = self.table_meta(&tref.name, tref.alias.as_deref()).ok()?;
+            cols.extend(meta.columns);
+        }
+        Some(cols)
+    }
+
+    /// Static, scope-aware ambiguity check for nested subqueries, run once at the
+    /// top level (`outer_scope` empty). SQLite rejects an ambiguous column
+    /// reference at prepare time — including one inside a subquery that binds to
+    /// an enclosing query's `FROM` — regardless of whether the subquery ever
+    /// executes. `top` is this query's own (known) column list. Each nested
+    /// subquery is resolved against [its own scope, … enclosing scopes]; an
+    /// undeterminable scope simply stops resolution for a reference (see
+    /// [`first_ambiguous_in_scopes`]), so the check never reports a false positive.
+    fn validate_nested_ambiguity(&self, sel: &Select, top: &[ColumnInfo]) -> Result<()> {
+        let scopes = alloc::vec![Some(top.to_vec())];
+        self.walk_nested_ambiguity(sel, &scopes)
+    }
+
+    fn walk_nested_ambiguity(
+        &self,
+        sel: &Select,
+        scopes: &[Option<Vec<ColumnInfo>>],
+    ) -> Result<()> {
+        // Gather this level's directly-nested subqueries (scalar, EXISTS, IN); each
+        // is recursed into below with its own scope pushed.
+        let mut subs: Vec<&Select> = Vec::new();
+        vdbe_block_exprs(sel, &mut |e| collect_subselects(e, &mut subs));
+        for sub in subs {
+            let mut child: Vec<Option<Vec<ColumnInfo>>> = alloc::vec![self.static_scope_columns(sub)];
+            child.extend(scopes.iter().cloned());
+            if let Some(msg) = first_ambiguous_in_scopes(sub, &child) {
+                return Err(Error::Error(msg));
+            }
+            self.walk_nested_ambiguity(sub, &child)?;
+        }
+        Ok(())
     }
 
     /// Scan the `FROM` source into column metadata and decoded input rows.
@@ -16204,6 +16281,111 @@ fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<
         }
     }
     Ok(())
+}
+
+/// Collect the immediately-nested subquery `SELECT`s of `e` (scalar `(SELECT …)`,
+/// `EXISTS`, and `IN (SELECT …)`), descending through ordinary sub-expressions but
+/// NOT into the collected subqueries' own bodies — each is recursed into
+/// separately, with its own scope. Lifetime-preserving (unlike `window::visit`) so
+/// the borrowed `&Select`s outlive the walk.
+fn collect_subselects<'a>(e: &'a Expr, out: &mut Vec<&'a Select>) {
+    match e {
+        Expr::Subquery(s) => out.push(s),
+        Expr::Exists { select, .. } => out.push(select),
+        Expr::InSelect { select, expr, .. } => {
+            out.push(select);
+            collect_subselects(expr, out);
+        }
+        Expr::Unary { expr, .. } => collect_subselects(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_subselects(left, out);
+            collect_subselects(right, out);
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_subselects(a, out);
+            }
+        }
+        Expr::IsNull { expr, .. } => collect_subselects(expr, out),
+        Expr::InList { expr, list, .. } => {
+            collect_subselects(expr, out);
+            for a in list {
+                collect_subselects(a, out);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_subselects(expr, out);
+            collect_subselects(low, out);
+            collect_subselects(high, out);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_subselects(o, out);
+            }
+            for (w, t) in when_then {
+                collect_subselects(w, out);
+                collect_subselects(t, out);
+            }
+            if let Some(el) = else_result {
+                collect_subselects(el, out);
+            }
+        }
+        Expr::Cast { expr, .. } => collect_subselects(expr, out),
+        Expr::Collate { expr, .. } => collect_subselects(expr, out),
+        Expr::Paren(inner) => collect_subselects(inner, out),
+        _ => {}
+    }
+}
+
+/// Resolve each direct column reference in `sel`'s own clauses against a stack of
+/// scopes (innermost first; `scopes[0]` is `sel`'s own FROM columns, the rest are
+/// enclosing queries) and return the first name that is ambiguous — i.e. matches
+/// 2+ columns in the *nearest* scope that resolves it, mirroring how SQLite binds
+/// a name to the innermost scope containing it. A `None` scope (columns that could
+/// not be determined statically) stops the walk for that reference: the name might
+/// bind there, so we never guess past it — this keeps the check free of false
+/// positives. Only this level's own expressions are inspected; nested subqueries
+/// are walked separately with their own scope pushed.
+fn first_ambiguous_in_scopes(sel: &Select, scopes: &[Option<Vec<ColumnInfo>>]) -> Option<String> {
+    let mut found: Option<String> = None;
+    vdbe_block_exprs(sel, &mut |e| {
+        window::visit(e, &mut |node| {
+            if found.is_some() {
+                return;
+            }
+            if let Expr::Column { table, column } = node {
+                for scope in scopes {
+                    let Some(cols) = scope else {
+                        // Unknown scope: the name may bind here — stop, don't guess.
+                        break;
+                    };
+                    let n = cols
+                        .iter()
+                        .filter(|c| {
+                            c.name.eq_ignore_ascii_case(column)
+                                && table
+                                    .as_deref()
+                                    .is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+                        })
+                        .count();
+                    if n >= 1 {
+                        // Resolved in this scope; ambiguous iff 2+ here.
+                        if n >= 2 {
+                            found = Some(alloc::format!("ambiguous column name: {column}"));
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    });
+    found
 }
 
 /// Validate the top-level explicit `COLLATE` (through redundant parens) of an

@@ -95,3 +95,49 @@ fn shared_name_with_distinct_qualifiers_over_a_join_is_fine() {
         .query("SELECT t1.id FROM a t1 JOIN a t2 ON t1.id = t2.id")
         .is_ok());
 }
+
+#[test]
+fn subquery_reference_to_ambiguous_outer_from_is_rejected() {
+    // A bare reference inside a subquery that binds to an enclosing FROM is
+    // ambiguous when that FROM has the name on two sources — SQLite rejects it
+    // statically, whether or not the subquery ever executes. `w(d, e)` does not
+    // shadow `a`, so the inner `a` reaches the ambiguous outer x/y.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE x(a, b)").unwrap();
+    c.execute("CREATE TABLE y(a, c)").unwrap();
+    c.execute("CREATE TABLE w(d, e)").unwrap();
+    assert!(c.query("SELECT (SELECT a) FROM x, y").is_err());
+    assert!(c.query("SELECT (SELECT a FROM w) FROM x, y").is_err());
+    assert!(c
+        .query("SELECT 1 FROM x, y WHERE EXISTS(SELECT 1 FROM w WHERE d = a)")
+        .is_err());
+    assert!(c
+        .query("SELECT 1 FROM x, y WHERE b IN (SELECT d FROM w WHERE e = a)")
+        .is_err());
+    // The inner SELECT's own FROM is ambiguous, caught even though the empty
+    // outer `w` means it would never execute.
+    assert!(c
+        .query("SELECT * FROM w WHERE d IN (SELECT a FROM x, y)")
+        .is_err());
+}
+
+#[test]
+fn subquery_reference_that_binds_locally_or_uniquely_is_fine() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE x(a, b)").unwrap();
+    c.execute("CREATE TABLE y(a, c)").unwrap();
+    c.execute("CREATE TABLE wa(a, f)").unwrap();
+    // The inner `a` binds to wa's own column — not the ambiguous outer.
+    assert!(c.query("SELECT (SELECT a FROM wa) FROM x, y").is_ok());
+    // A correlated reference to an outer column that is unique is fine.
+    c.execute("CREATE TABLE emp(id, dept_id, sal)").unwrap();
+    c.execute("CREATE TABLE dept(id, dname)").unwrap();
+    assert!(c
+        .query("SELECT (SELECT dname FROM dept WHERE id = e.dept_id) FROM emp e")
+        .is_ok());
+    assert!(c
+        .query(
+            "SELECT sal FROM emp e WHERE sal > (SELECT avg(sal) FROM emp WHERE dept_id = e.dept_id)"
+        )
+        .is_ok());
+}
