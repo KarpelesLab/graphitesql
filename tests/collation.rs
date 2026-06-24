@@ -353,3 +353,42 @@ fn unknown_collation_rejected_at_create() {
     let r = c.query("SELECT a FROM u ORDER BY a").unwrap();
     assert_eq!(r.rows[0][0], Value::Text("a".into()));
 }
+
+#[test]
+fn unknown_collation_rejected_when_consumed_in_a_query() {
+    // An explicit `COLLATE <name>` that is actually consumed (a comparison,
+    // ORDER BY/GROUP BY/DISTINCT key, IN/BETWEEN/CASE WHEN, or min/max) must name a
+    // known collating sequence — sqlite errors "no such collation sequence" there,
+    // but NOT on an unused projection COLLATE.
+    let c = Connection::open_memory().unwrap();
+    for q in [
+        "SELECT 'a' < 'b' COLLATE bogus",
+        "SELECT 1 ORDER BY 1 COLLATE bogus",
+        "SELECT 'a' COLLATE bogus = 'a'",
+        "SELECT 'a' GROUP BY 'a' COLLATE bogus",
+        "SELECT 'a' IN ('a' COLLATE bogus)",
+        "SELECT 'a' COLLATE bogus IN ('a')",
+        "SELECT DISTINCT 'a' COLLATE bogus",
+        "SELECT max('a' COLLATE bogus)",
+        "SELECT 1 WHERE 'a' BETWEEN 'a' COLLATE bogus AND 'z'",
+        "SELECT CASE 'a' WHEN 'b' COLLATE bogus THEN 1 END",
+    ] {
+        let e = c.query(q).unwrap_err();
+        assert!(
+            format!("{e}").contains("no such collation sequence"),
+            "{q}: {e}"
+        );
+    }
+    // An unused COLLATE (bare projection, ||, ordinary function arg) is not an
+    // error, matching sqlite.
+    for q in [
+        "SELECT 'a' COLLATE bogus",
+        "SELECT 'a' COLLATE bogus || 'b'",
+        "SELECT length('a' COLLATE bogus)",
+    ] {
+        assert!(c.query(q).is_ok(), "{q} should not error");
+    }
+    // The built-in collations are usable in consuming positions.
+    assert!(c.query("SELECT 'B' COLLATE NOCASE = 'b'").is_ok());
+    assert!(c.query("SELECT 1 ORDER BY 1 COLLATE RTRIM").is_ok());
+}

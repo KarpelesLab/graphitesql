@@ -10487,6 +10487,12 @@ impl Connection {
     }
 
     fn run_select(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
+        // An explicit `COLLATE <name>` that is actually consumed (a comparison,
+        // ORDER BY/GROUP BY/DISTINCT key, IN/BETWEEN, or min/max) must name a known
+        // collating sequence — sqlite errors "no such collation sequence" there
+        // (but not on an unused projection COLLATE). Nested subqueries validate
+        // themselves when they run.
+        validate_used_collations(sel)?;
         // Materialize this query's `WITH` CTEs into the environment for the
         // duration of the query, then restore the previous scope. (The opt-in
         // VDBE fast path is attempted per query block inside `run_core`, so it
@@ -16047,6 +16053,160 @@ fn schema_table_meta(label: &str) -> TableMeta {
 }
 
 /// The first column reference in `e` that names neither a column in `known` nor
+/// Validate the explicit `COLLATE <name>`s in `sel` that are actually CONSUMED
+/// for ordering/comparison (sqlite errors "no such collation sequence" there, but
+/// not on an unused projection COLLATE). Covers comparisons, `ORDER BY`/
+/// `GROUP BY`/`DISTINCT` keys, `IN`/`BETWEEN`, `CASE x WHEN`, and `min`/`max`.
+/// Nested subqueries are not walked here — they validate themselves when run.
+fn validate_used_collations(sel: &Select) -> Result<()> {
+    for (_, arm) in &sel.compound {
+        validate_used_collations(arm)?;
+    }
+    if let Some(w) = &sel.where_clause {
+        consumed_collations(w)?;
+    }
+    if let Some(h) = &sel.having {
+        consumed_collations(h)?;
+    }
+    if let Some(from) = &sel.from {
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                consumed_collations(on)?;
+            }
+        }
+    }
+    for t in &sel.order_by {
+        top_collation(&t.expr)?;
+        consumed_collations(&t.expr)?;
+    }
+    for g in &sel.group_by {
+        top_collation(g)?;
+        consumed_collations(g)?;
+    }
+    for c in &sel.columns {
+        if let ResultColumn::Expr { expr, .. } = c {
+            if sel.distinct {
+                top_collation(expr)?;
+            }
+            consumed_collations(expr)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate the top-level explicit `COLLATE` (through redundant parens) of an
+/// expression used directly as a comparison/ordering key.
+fn top_collation(e: &Expr) -> Result<()> {
+    match e {
+        Expr::Collate { collation, expr } => {
+            if crate::value::Collation::parse(collation).is_none() {
+                return Err(Error::Error(format!(
+                    "no such collation sequence: {collation}"
+                )));
+            }
+            top_collation(expr)
+        }
+        Expr::Paren(inner) => top_collation(inner),
+        _ => Ok(()),
+    }
+}
+
+/// Walk `e`, validating the `COLLATE` of each operand that lands in a
+/// collation-consuming position (comparison/`BETWEEN`/`IN`/`CASE x WHEN`/
+/// `min`/`max`). A `COLLATE` elsewhere (arithmetic, `||`, an ordinary function
+/// argument, a bare projection) is not consumed and so is left unvalidated, as in
+/// sqlite. Nested subqueries are not descended into.
+fn consumed_collations(e: &Expr) -> Result<()> {
+    match e {
+        Expr::Binary { op, left, right } => {
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) {
+                top_collation(left)?;
+                top_collation(right)?;
+            }
+            consumed_collations(left)?;
+            consumed_collations(right)?;
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            top_collation(expr)?;
+            top_collation(low)?;
+            top_collation(high)?;
+            consumed_collations(expr)?;
+            consumed_collations(low)?;
+            consumed_collations(high)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            top_collation(expr)?;
+            consumed_collations(expr)?;
+            for it in list {
+                top_collation(it)?;
+                consumed_collations(it)?;
+            }
+        }
+        Expr::InSelect { expr, .. } => {
+            top_collation(expr)?;
+            consumed_collations(expr)?;
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                // `CASE x WHEN y` compares x to each y.
+                top_collation(o)?;
+                consumed_collations(o)?;
+                for (w, t) in when_then {
+                    top_collation(w)?;
+                    consumed_collations(w)?;
+                    consumed_collations(t)?;
+                }
+            } else {
+                for (w, t) in when_then {
+                    consumed_collations(w)?;
+                    consumed_collations(t)?;
+                }
+            }
+            if let Some(er) = else_result {
+                consumed_collations(er)?;
+            }
+        }
+        Expr::Function { name, args, .. } => {
+            // min()/max() (scalar or aggregate) compare their arguments.
+            let lname = name.to_ascii_lowercase();
+            if matches!(lname.as_str(), "min" | "max") {
+                for a in args {
+                    top_collation(a)?;
+                }
+            }
+            for a in args {
+                consumed_collations(a)?;
+            }
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => consumed_collations(expr)?,
+        Expr::RowValue(items) => {
+            for it in items {
+                consumed_collations(it)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// The first explicit `COLLATE <name>` in `e` whose name is not a known
 /// collating sequence (BINARY/NOCASE/RTRIM) — for rejecting it at `CREATE INDEX`,
 /// where sqlite errors "no such collation sequence" rather than using BINARY.
