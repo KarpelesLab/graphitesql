@@ -358,6 +358,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
     if sel.from.is_some()
         || sel.where_clause.is_some()
         || !sel.group_by.is_empty()
+        || sel.having.is_some()
         || !sel.compound.is_empty()
         || !sel.order_by.is_empty()
         || sel.limit.is_some()

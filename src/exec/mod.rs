@@ -11903,9 +11903,11 @@ impl Connection {
         };
 
         let aggregated = !sel.group_by.is_empty() || self.has_aggregate(sel);
-        // A HAVING clause requires an aggregate context (a GROUP BY or any
-        // aggregate function); SQLite rejects it on a plain query.
-        if sel.having.is_some() && !aggregated {
+        // A HAVING clause requires an aggregate *context*: a GROUP BY, or an
+        // aggregate in the result columns. An aggregate that appears *only* inside
+        // HAVING does not make the query aggregate — SQLite rejects HAVING there
+        // ("HAVING clause on a non-aggregate query"), e.g. `SELECT 1 HAVING max(x)`.
+        if sel.having.is_some() && sel.group_by.is_empty() && !self.has_result_aggregate(sel) {
             return Err(Error::Error(
                 "HAVING clause on a non-aggregate query".into(),
             ));
@@ -15569,7 +15571,10 @@ impl Connection {
         })
     }
 
-    fn has_aggregate(&self, sel: &Select) -> bool {
+    /// An aggregate function in the *result columns* (not HAVING). This is what
+    /// makes a query an aggregate query for the purpose of permitting a HAVING
+    /// clause — an aggregate appearing only inside HAVING does not count.
+    fn has_result_aggregate(&self, sel: &Select) -> bool {
         // Recognize both built-in and user-registered aggregate names.
         let is_agg = |name: &str, n: usize, star: bool| {
             func::is_aggregate_call(name, n, star)
@@ -15578,8 +15583,19 @@ impl Connection {
         sel.columns.iter().any(|c| match c {
             ResultColumn::Expr { expr, .. } => expr_contains_agg(expr, &is_agg),
             _ => false,
-        }) || sel
-            .having
+        })
+    }
+
+    fn has_aggregate(&self, sel: &Select) -> bool {
+        if self.has_result_aggregate(sel) {
+            return true;
+        }
+        // Recognize both built-in and user-registered aggregate names.
+        let is_agg = |name: &str, n: usize, star: bool| {
+            func::is_aggregate_call(name, n, star)
+                || self.aggregates.contains_key(&name.to_ascii_lowercase())
+        };
+        sel.having
             .as_ref()
             .is_some_and(|h| expr_contains_agg(h, &is_agg))
     }
