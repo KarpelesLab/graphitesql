@@ -91,3 +91,56 @@ fn range_value_frames_match_sqlite3() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+/// A RANGE frame with a numeric offset and NULL ORDER BY values: NULLs form their
+/// own peer group, so a NULL current row's frame is exactly the NULL peers (the
+/// offset does not span into the value groups), and a value row's frame never
+/// includes the NULLs (which sort first under ASC, last under DESC). Checked
+/// against sqlite3.
+#[test]
+fn range_frames_with_nulls_match_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-wrn-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let setup = "CREATE TABLE t(id INTEGER PRIMARY KEY, v INT);\
+        INSERT INTO t(v) VALUES (NULL),(1),(2),(NULL),(5);";
+    {
+        let o = Command::new("sqlite3")
+            .arg(&path)
+            .arg(setup)
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+    }
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+    let queries = [
+        "SELECT id, count(*) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id",
+        "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id",
+        "SELECT id, count(*) OVER (ORDER BY v DESC RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id",
+        "SELECT id, sum(v) OVER (ORDER BY v DESC RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM t ORDER BY id",
+        "SELECT id, count(*) OVER (ORDER BY v RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+        "SELECT id, count(*) OVER (ORDER BY v RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t ORDER BY id",
+    ];
+    for qq in queries {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(&path)
+                .arg(format!("{qq};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = render(&g.query(qq).unwrap());
+        assert_eq!(got, want, "RANGE+NULL frame diverged: {qq}");
+    }
+    let _ = std::fs::remove_file(&path);
+}

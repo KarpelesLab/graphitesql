@@ -17574,13 +17574,16 @@ fn range_value_bound(
     desc: bool,
     is_start: bool,
 ) -> usize {
-    // Non-numeric/NULL current value: fall back to peer-group edges.
+    // A NULL current value has no numeric range: NULLs form their own peer group,
+    // so a PRECEDING/FOLLOWING offset collapses to the current (NULL) peer group
+    // rather than spanning into the adjacent value groups — matching sqlite.
+    // (UNBOUNDED bounds are handled below and stay unbounded.)
     if matches!(
         b,
         FrameBound::CurrentRow | FrameBound::Preceding(_) | FrameBound::Following(_)
     ) && matches!(ovals[p], Value::Null)
     {
-        return group_bound(b, p, m, gid, is_start);
+        return group_bound(&FrameBound::CurrentRow, p, m, gid, is_start);
     }
     let val = eval::to_f64(&ovals[p]);
     // The frame edge as an ORDER BY value. Under ASC, PRECEDING subtracts and
@@ -17622,14 +17625,18 @@ fn range_value_bound(
             })
             .unwrap_or(m)
     } else {
-        // One past the last row at/before the end edge.
-        let mut e = m;
+        // One past the last *non-NULL* row at/before the end edge. NULL rows are
+        // never in a numeric range frame, so trailing NULLs (which sort last under
+        // DESC) must not extend the end — track the last in-frame row instead of
+        // defaulting to `m`.
+        let mut e = 0;
         for (k, ov) in ovals.iter().enumerate().take(m) {
             if matches!(ov, Value::Null) {
                 continue;
             }
-            if !inside(eval::to_f64(ov), threshold) {
-                e = k;
+            if inside(eval::to_f64(ov), threshold) {
+                e = k + 1;
+            } else {
                 break;
             }
         }
