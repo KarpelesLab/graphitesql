@@ -2599,7 +2599,7 @@ impl Connection {
                 // swapping to the target — but only if they resolve in this
                 // (original) context; otherwise leave it unchanged so the swapped
                 // path still handles a source that lives in the target db.
-                let stmt = self.prematerialize_insert_select(stmt, params);
+                let stmt = self.prematerialize_insert_source(stmt, params);
                 self.swap_db(other);
                 let r = self.exec_parsed(stmt, sql, params);
                 self.swap_db(other);
@@ -2608,25 +2608,48 @@ impl Connection {
         }
     }
 
-    /// For `INSERT … SELECT`, try evaluating the SELECT in the current (pre-swap)
-    /// database context and replace the source with the resulting literal rows, so
-    /// a later swap to the target database does not re-resolve the SELECT's table
-    /// names there (matching SQLite's main-first resolution for a cross-database
-    /// `INSERT INTO aux.t SELECT … FROM main_table`). If the SELECT does not
-    /// resolve here — e.g. its source lives only in the target db — the statement
-    /// is returned unchanged so the swapped-context path handles it. The SELECT is
-    /// read-only, so the discarded attempt has no side effects.
-    fn prematerialize_insert_select(&self, stmt: Statement, params: &Params) -> Statement {
+    /// For an `INSERT` whose source reads the original database (a `SELECT`, or a
+    /// `VALUES` row with a subquery), evaluate it in the current (pre-swap) context
+    /// and replace the source with literal rows, so a later swap to the target
+    /// database does not re-resolve those table names there — matching SQLite's
+    /// main-first resolution for a cross-database `INSERT INTO aux.t SELECT … FROM
+    /// main_table` (or `… VALUES ((SELECT … FROM main_table))`). If it does not
+    /// resolve here — e.g. the source lives only in the target db — the statement
+    /// is returned unchanged so the swapped-context path handles it; the read is
+    /// side-effect-free, so the discarded attempt is safe. A plain literal `VALUES`
+    /// is left untouched (it needs no resolution).
+    fn prematerialize_insert_source(&self, stmt: Statement, params: &Params) -> Statement {
         if let Statement::Insert(mut ins) = stmt {
-            if let InsertSource::Select(sel) = &ins.source {
-                if let Ok(result) = self.run_select(sel, params) {
-                    let rows: Vec<Vec<Expr>> = result
-                        .rows
-                        .into_iter()
-                        .map(|row| row.into_iter().map(value_to_literal_expr).collect())
-                        .collect();
-                    ins.source = InsertSource::Values(rows);
+            match &ins.source {
+                InsertSource::Select(sel) => {
+                    if let Ok(result) = self.run_select(sel, params) {
+                        let rows: Vec<Vec<Expr>> = result
+                            .rows
+                            .into_iter()
+                            .map(|row| row.into_iter().map(value_to_literal_expr).collect())
+                            .collect();
+                        ins.source = InsertSource::Values(rows);
+                    }
                 }
+                // A `VALUES` row with a subquery (`VALUES ((SELECT … FROM m))`):
+                // evaluate every expression here so the subquery resolves
+                // main-first. Untouched when none has a subquery (plain literals).
+                InsertSource::Values(rows) if rows.iter().flatten().any(expr_has_subquery) => {
+                    let ctx = EvalCtx::rowless(params).with_subqueries(self);
+                    let mut out = Vec::with_capacity(rows.len());
+                    let materialized = rows.iter().try_for_each(|row| {
+                        let mut r = Vec::with_capacity(row.len());
+                        for e in row {
+                            r.push(value_to_literal_expr(eval::eval(e, &ctx)?));
+                        }
+                        out.push(r);
+                        Ok::<(), Error>(())
+                    });
+                    if materialized.is_ok() {
+                        ins.source = InsertSource::Values(out);
+                    }
+                }
+                _ => {}
             }
             return Statement::Insert(ins);
         }

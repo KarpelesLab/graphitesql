@@ -905,3 +905,30 @@ fn cross_database_insert_select_resolves_source_in_main() {
         Value::Integer(100)
     );
 }
+
+#[test]
+fn cross_database_insert_values_subquery_resolves_in_main() {
+    // `INSERT INTO aux.t VALUES ((SELECT … FROM m))` resolves the subquery's
+    // unqualified `m` in main (the original context), like INSERT … SELECT and
+    // matching sqlite — even though the INSERT writes to aux.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE m(v)").unwrap();
+    c.execute("INSERT INTO m VALUES(42)").unwrap();
+    c.execute("CREATE TABLE aux.t(a, b)").unwrap();
+    c.execute("INSERT INTO aux.t VALUES(1, (SELECT v FROM m)), (2, (SELECT v * 10 FROM m))")
+        .unwrap();
+    assert_eq!(
+        c.query("SELECT a, b FROM aux.t ORDER BY a").unwrap().rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(42)],
+            vec![Value::Integer(2), Value::Integer(420)],
+        ]
+    );
+    // A plain literal VALUES into aux still works (untouched path).
+    c.execute("INSERT INTO aux.t VALUES(3, 4)").unwrap();
+    assert_eq!(
+        c.query("SELECT b FROM aux.t WHERE a=3").unwrap().rows[0][0],
+        Value::Integer(4)
+    );
+}
