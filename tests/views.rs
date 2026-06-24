@@ -115,3 +115,51 @@ fn drop_if_exists_still_rejects_wrong_object_kind() {
     c.execute("DROP VIEW IF EXISTS v").unwrap();
     assert!(c.query("SELECT * FROM v").is_err());
 }
+
+#[test]
+fn view_column_inherits_base_collation_and_affinity() {
+    // A view column inherits its defining column's collation and affinity, so
+    // ORDER BY / WHERE / min/max over the view behave like the base column —
+    // matching sqlite. (Main-database views; temp/attached defer.)
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a TEXT COLLATE NOCASE, n INTEGER)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES('B',1),('a',2),('C',3)")
+        .unwrap();
+    c.execute("CREATE VIEW v AS SELECT a, n FROM t").unwrap();
+    // ORDER BY a uses NOCASE (a, B, C), not BINARY (B, C, a).
+    assert_eq!(
+        c.query("SELECT a FROM v ORDER BY a").unwrap().rows,
+        vec![
+            vec![Value::Text("a".into())],
+            vec![Value::Text("B".into())],
+            vec![Value::Text("C".into())],
+        ]
+    );
+    // WHERE matches case-insensitively.
+    assert_eq!(
+        c.query("SELECT count(*) FROM v WHERE a='A'").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    // min/max use NOCASE.
+    assert_eq!(
+        c.query("SELECT min(a), max(a) FROM v").unwrap().rows[0],
+        vec![Value::Text("a".into()), Value::Text("C".into())]
+    );
+    // Affinity also propagates: INTEGER column matches a text literal.
+    assert_eq!(
+        c.query("SELECT count(*) FROM v WHERE n='1'").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    // An expression column gets BINARY/NONE (no inheritance).
+    c.execute("CREATE VIEW w AS SELECT a||'' AS a FROM t")
+        .unwrap();
+    assert_eq!(
+        c.query("SELECT a FROM w ORDER BY a").unwrap().rows,
+        vec![
+            vec![Value::Text("B".into())],
+            vec![Value::Text("C".into())],
+            vec![Value::Text("a".into())],
+        ]
+    );
+}

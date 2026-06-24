@@ -7331,13 +7331,26 @@ impl Connection {
         } else {
             cv.columns.clone()
         };
+        // A view column inherits the affinity AND collation of its defining
+        // expression's origin (a direct column reference takes its base column's),
+        // exactly as a derived-table subquery does — so `ORDER BY`/`WHERE`/`min`/
+        // `max` over the view honor a NOCASE base column. Explicit `(col, …)` names
+        // only rename; the origin is positional from the body.
+        let origins = self.subquery_column_origins(&cv.select);
         let columns: Vec<ColumnInfo> = names
             .into_iter()
-            .map(|n| ColumnInfo {
-                name: n,
-                table: label.clone(),
-                affinity: eval::Affinity::Blob,
-                collation: crate::value::Collation::default(),
+            .enumerate()
+            .map(|(i, n)| {
+                let (affinity, collation) = origins
+                    .as_ref()
+                    .and_then(|o| o.get(i).copied())
+                    .unwrap_or((eval::Affinity::Blob, crate::value::Collation::default()));
+                ColumnInfo {
+                    name: n,
+                    table: label.clone(),
+                    affinity,
+                    collation,
+                }
             })
             .collect();
         let rows = result
@@ -13942,6 +13955,10 @@ impl Connection {
         } else {
             cv.columns.clone()
         };
+        // NOTE: a temp/attached view column's affinity/collation still defaults to
+        // BLOB/BINARY — `subquery_column_origins` resolves base columns through the
+        // main schema only, so it cannot see a temp/attached base table. The
+        // common main-database case is handled in `try_view`.
         let columns: Vec<ColumnInfo> = names
             .into_iter()
             .map(|n| ColumnInfo {
