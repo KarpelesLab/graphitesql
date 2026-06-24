@@ -1,8 +1,9 @@
 //! The `subsec` / `subsecond` modifier, matched to the `sqlite3` CLI (3.50.4).
 //!
 //! It makes `datetime()` and `time()` render seconds with three fractional
-//! digits (`SS.SSS`). It does not affect `date()` (no time part) nor explicit
-//! `strftime()` format strings.
+//! digits (`SS.SSS`), and `strftime('%s', …)` render the epoch with millisecond
+//! precision (`<secs>.mmm`). It does not affect `date()` (no time part) nor the
+//! field specifiers like `%H`/`%M`/`%S`.
 
 #![cfg(feature = "std")]
 
@@ -92,6 +93,23 @@ fn subsec_does_not_affect_date_or_strftime() {
             "SELECT strftime('%S','2024-01-01 12:30:45.678','subsec')"
         ),
         "45"
+    );
+    // ...but `%s` (epoch seconds) DOES render millisecond precision with subsec.
+    assert_eq!(
+        t(&c, "SELECT strftime('%s','2024-01-01 00:00:00','subsec')"),
+        "1704067200.000"
+    );
+    assert_eq!(
+        t(
+            &c,
+            "SELECT strftime('%s','2024-01-01 00:00:00.5','subsecond')"
+        ),
+        "1704067200.500"
+    );
+    // Without the modifier, `%s` is integer seconds (fraction truncated).
+    assert_eq!(
+        t(&c, "SELECT strftime('%s','2024-01-01 00:00:00.999')"),
+        "1704067200"
     );
     // Without the modifier, datetime() stays whole-second even with fractional input.
     assert_eq!(

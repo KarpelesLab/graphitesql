@@ -1069,8 +1069,15 @@ fn render_strftime(fmt: &str, p: &mut DateTime) -> Option<String> {
             Some('P') => out.push_str(if p.h >= 12 { "pm" } else { "am" }),
             Some('R') => out.push_str(&alloc::format!("{:02}:{:02}", p.h, p.min)),
             Some('s') => {
-                let secs = (p.ijd - 210_866_760_000_000) / 1000;
-                out.push_str(&alloc::format!("{}", secs));
+                let total_ms = p.ijd - 210_866_760_000_000;
+                let secs = total_ms / 1000;
+                if p.subsec {
+                    // The `subsec`/`subsecond` modifier renders %s with millisecond
+                    // precision (`<secs>.mmm`), as SQLite does.
+                    out.push_str(&alloc::format!("{}.{:03}", secs, (total_ms % 1000).abs()));
+                } else {
+                    out.push_str(&alloc::format!("{}", secs));
+                }
             }
             Some('S') => out.push_str(&alloc::format!("{:02}", p.s as i32)),
             Some('T') => out.push_str(&alloc::format!("{:02}:{:02}:{:02}", p.h, p.min, p.s as i32)),
