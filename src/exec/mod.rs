@@ -4104,16 +4104,17 @@ impl Connection {
         let positions = self.column_positions(&pmeta, &fk.ref_columns)?;
         for (_, row) in self.scan_table(&pmeta)? {
             if positions.iter().zip(key).all(|(&p, k)| {
-                // SQLite applies the *parent* key column's affinity to the child
-                // value before the existence check, so e.g. a text child '1'
-                // matches an INTEGER parent key 1 (and 'x' still cannot).
+                // SQLite compares under the *parent* key column's affinity and
+                // collation: a text child '1' matches an INTEGER parent key 1 (and
+                // 'x' cannot), and a NOCASE parent key matches case-insensitively.
                 let (pv, kv) = eval::apply_comparison_affinity(
                     row[p].clone(),
                     Some(pmeta.columns[p].affinity),
                     k.clone(),
                     None,
                 );
-                eval::compare(&pv, &kv) == core::cmp::Ordering::Equal
+                crate::value::cmp_values_coll(&pv, &kv, pmeta.columns[p].collation)
+                    == core::cmp::Ordering::Equal
             }) {
                 return Ok(true);
             }
@@ -4233,7 +4234,8 @@ impl Connection {
                         row[cp].clone(),
                         None,
                     );
-                    eval::compare(&pv, &kv) == core::cmp::Ordering::Equal
+                    crate::value::cmp_values_coll(&pv, &kv, pmeta.columns[pp].collation)
+                        == core::cmp::Ordering::Equal
                 })
             {
                 matches.push(rowid);

@@ -36,6 +36,37 @@ fn fk_applies_parent_key_affinity() {
 }
 
 #[test]
+fn fk_uses_parent_key_collation() {
+    // A foreign-key comparison uses the parent key column's collation: a NOCASE
+    // parent key matches the child case-insensitively (the child's own collation
+    // is not used). CASCADE on the parent honors it too.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA foreign_keys = ON").unwrap();
+    c.execute("CREATE TABLE p(id TEXT COLLATE NOCASE PRIMARY KEY)")
+        .unwrap();
+    c.execute("INSERT INTO p VALUES ('A')").unwrap();
+    c.execute("CREATE TABLE c(pid TEXT REFERENCES p ON DELETE CASCADE)")
+        .unwrap();
+    // 'a' matches the NOCASE parent key 'A'.
+    c.execute("INSERT INTO c VALUES ('a')").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM c").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    // a different letter still does not match.
+    assert!(matches!(
+        c.execute("INSERT INTO c VALUES ('b')"),
+        Err(Error::Constraint(_))
+    ));
+    // CASCADE matches the child under the parent collation.
+    c.execute("DELETE FROM p WHERE id='A'").unwrap();
+    assert_eq!(
+        c.query("SELECT count(*) FROM c").unwrap().rows[0][0],
+        Value::Integer(0)
+    );
+}
+
+#[test]
 fn fk_text_parent_matches_integer_child() {
     // The reverse affinity direction: a TEXT parent key, an integer child value.
     let mut c = Connection::open_memory().unwrap();
