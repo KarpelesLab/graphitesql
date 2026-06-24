@@ -168,3 +168,34 @@ fn planner_prefers_selective_index() {
         "5"
     );
 }
+
+#[test]
+fn analyze_unknown_object_errors() {
+    // `ANALYZE <name>` errors "no such table" when the name is not a table,
+    // index, or database — matching sqlite (which previously was a silent no-op).
+    let mut c = Connection::open_memory().unwrap();
+    let e = c.execute("ANALYZE nope").unwrap_err();
+    assert!(format!("{e}").contains("no such table"), "{e}");
+    // A real table / index, the `main` and `temp` schemas, the schema table, and
+    // the no-argument form are all accepted.
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("CREATE INDEX i ON t(a)").unwrap();
+    c.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    for ok in [
+        "ANALYZE t",
+        "ANALYZE i",
+        "ANALYZE main",
+        "ANALYZE temp",
+        "ANALYZE",
+    ] {
+        assert!(c.execute(ok).is_ok(), "{ok} should succeed");
+    }
+    // `ANALYZE` / `ANALYZE main` still populate sqlite_stat1.
+    assert!(
+        !c.query("SELECT * FROM sqlite_stat1")
+            .unwrap()
+            .rows
+            .is_empty(),
+        "ANALYZE should have written stat rows"
+    );
+}

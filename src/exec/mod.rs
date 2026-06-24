@@ -3243,8 +3243,30 @@ impl Connection {
                     alloc::vec![t.name.clone()]
                 } else if let Some(ix) = self.schema.index(name) {
                     alloc::vec![ix.tbl_name.clone()]
+                } else if name.eq_ignore_ascii_case("main") {
+                    // `ANALYZE <database>` analyzes that schema; for `main` that is
+                    // every main user table (the no-argument form's behavior).
+                    self.schema
+                        .objects()
+                        .iter()
+                        .filter(|o| {
+                            o.obj_type == ObjectType::Table && !o.name.starts_with("sqlite_")
+                        })
+                        .map(|o| o.name.clone())
+                        .collect()
+                } else if is_main_schema_table(name)
+                    || name.eq_ignore_ascii_case("temp")
+                    || self
+                        .attached
+                        .iter()
+                        .any(|a| a.name.eq_ignore_ascii_case(name))
+                {
+                    // A valid schema table or attached/temp database: graphite keeps
+                    // stats only for main, so this is a no-op — but not an error,
+                    // matching sqlite (which only errors on a genuinely unknown name).
+                    Vec::new()
                 } else {
-                    return Ok(()); // unknown object: no-op, like SQLite
+                    return Err(Error::Error(format!("no such table: {name}")));
                 }
             }
         };
