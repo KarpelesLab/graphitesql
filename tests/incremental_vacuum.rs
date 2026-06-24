@@ -430,3 +430,27 @@ fn incremental_vacuum_is_noop_for_none_and_full() {
         cleanup(&path);
     }
 }
+
+/// The bare and `(N)` forms run as a *write*, so on the read-only `query()` path
+/// they return an `Unsupported("…use execute()")` signal — the CLI retries on it
+/// to route `PRAGMA incremental_vacuum` / `(N)` to the mutating path. (The `= N`
+/// form already routes to execute() directly.) `execute()` runs every form.
+#[test]
+fn incremental_vacuum_query_path_signals_use_execute() {
+    let c = Connection::open_memory().unwrap();
+    for form in ["PRAGMA incremental_vacuum", "PRAGMA incremental_vacuum(5)"] {
+        match c.query(form) {
+            Err(graphitesql::Error::Unsupported(m)) => {
+                assert!(m.contains("use execute()"), "unexpected message: {m}");
+            }
+            other => panic!("expected Unsupported(use execute()) for {form}, got {other:?}"),
+        }
+    }
+    // execute() accepts all three forms on an INCREMENTAL database.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("PRAGMA auto_vacuum=INCREMENTAL").unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("PRAGMA incremental_vacuum").unwrap();
+    c.execute("PRAGMA incremental_vacuum(3)").unwrap();
+    c.execute("PRAGMA incremental_vacuum = 3").unwrap();
+}

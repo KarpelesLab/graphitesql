@@ -1524,6 +1524,13 @@ impl Connection {
             | "threads"
             | "soft_heap_limit"
             | "hard_heap_limit" => Ok(single(&name, Value::Integer(0))),
+            // `incremental_vacuum` (bare or `(N)`) performs a write, so it cannot
+            // run on the read-only query path. Signal the caller to re-run it via
+            // execute() (the CLI retries on this message); the `= N` form already
+            // routes to execute() directly.
+            "incremental_vacuum" => Err(Error::Unsupported(
+                "PRAGMA incremental_vacuum modifies the database; use execute()",
+            )),
             _ => Err(Error::Unsupported("this PRAGMA")),
         }
     }
