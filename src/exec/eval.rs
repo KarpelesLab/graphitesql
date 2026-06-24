@@ -30,6 +30,10 @@ pub trait Subqueries {
     fn scalar(&self, select: &Select, outer: &EvalCtx) -> Result<Value>;
     /// First column of every row — the candidate set for `IN (SELECT …)`.
     fn column(&self, select: &Select, outer: &EvalCtx) -> Result<Vec<Value>>;
+    /// The declared affinity of the subquery's first output column, for applying
+    /// `IN (SELECT …)` comparison affinity. `None` when it has no affinity (a
+    /// computed expression) or cannot be determined.
+    fn column_affinity(&self, select: &Select) -> Option<Affinity>;
     /// Every row in full — the candidate set for a row-value `(a,b) IN (SELECT …)`.
     fn rows(&self, select: &Select, outer: &EvalCtx) -> Result<Vec<Vec<Value>>>;
     /// Whether the subquery returns at least one row — for `EXISTS`.
@@ -363,7 +367,7 @@ impl<'a> EvalCtx<'a> {
 /// has BLOB/NONE affinity) from a literal or computed expression (which has no
 /// affinity at all): the difference decides whether text coercion applies (see
 /// [`apply_comparison_affinity`]).
-fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Option<Affinity> {
+pub(crate) fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Option<Affinity> {
     match expr {
         Expr::Column { table, column } => {
             for col in ctx.columns {
@@ -646,11 +650,20 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             };
             // Membership uses the left operand's collation, as in SQLite.
             let coll = key_collation(expr, ctx);
+            // SQLite applies a comparison affinity to each `x IN (SELECT y)` test,
+            // derived from x's affinity and the subquery column y's affinity (no
+            // conversion if either side has NONE affinity — that is why this is not
+            // the same as `IN (list)`, where each literal item has no affinity).
+            let la = expr_affinity(expr, ctx);
+            let ra = ctx.subqueries.and_then(|s| s.column_affinity(select));
             let mut saw_null = false;
             for iv in &set {
                 if matches!(iv, Value::Null) {
                     saw_null = true;
-                } else if crate::value::cmp_values_coll(&v, iv, coll) == Ordering::Equal {
+                    continue;
+                }
+                let (lv, rv) = apply_comparison_affinity(v.clone(), la, iv.clone(), ra);
+                if crate::value::cmp_values_coll(&lv, &rv, coll) == Ordering::Equal {
                     return Ok(bool_value(!negated));
                 }
             }

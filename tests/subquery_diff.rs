@@ -81,3 +81,65 @@ fn subqueries_match_sqlite3() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+/// `x IN (SELECT y)` applies a comparison affinity derived from x's affinity and
+/// the subquery column y's affinity — unlike `IN (list)`. SQLite converts when
+/// both sides carry affinity (numeric if either is numeric, else text) and does
+/// NOT convert when either side has NONE affinity. Verify against sqlite3.
+#[test]
+fn in_select_affinity_matches_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-insel-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    // Each row pairs a left column affinity with a candidate column affinity.
+    let setup = "CREATE TABLE li(x INTEGER); INSERT INTO li VALUES(1);\
+        CREATE TABLE lt(x TEXT); INSERT INTO lt VALUES('1');\
+        CREATE TABLE ln(x); INSERT INTO ln VALUES(1);\
+        CREATE TABLE lr(x REAL); INSERT INTO lr VALUES(1);\
+        CREATE TABLE ct(y TEXT); INSERT INTO ct VALUES('1');\
+        CREATE TABLE ci(y INTEGER); INSERT INTO ci VALUES(1);\
+        CREATE TABLE cn(y); INSERT INTO cn VALUES(1);\
+        CREATE TABLE cf(y TEXT); INSERT INTO cf VALUES('1.0');";
+    {
+        let o = Command::new("sqlite3")
+            .arg(&path)
+            .arg(setup)
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+    }
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+    let queries = [
+        "SELECT count(*) FROM ln WHERE x IN (SELECT y FROM ct)", // none/text → 0
+        "SELECT count(*) FROM lt WHERE x IN (SELECT y FROM cn)", // text/none → 0
+        "SELECT count(*) FROM li WHERE x IN (SELECT y FROM ct)", // int/text  → 1
+        "SELECT count(*) FROM ln WHERE x IN (SELECT y FROM cn)", // none/none → 0
+        "SELECT count(*) FROM lt WHERE x IN (SELECT y FROM ci)", // text/int  → 1
+        "SELECT count(*) FROM li WHERE x IN (SELECT y FROM ci)", // int/int   → 1
+        "SELECT count(*) FROM lr WHERE x IN (SELECT y FROM ct)", // real/text → 1
+        "SELECT count(*) FROM li WHERE x IN (SELECT y FROM cf)", // int/'1.0' → 1
+        "SELECT count(*) FROM li WHERE x NOT IN (SELECT y FROM ct)", // NOT IN
+    ];
+    for q in queries {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(&path)
+                .arg(format!("{q};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = render(&g.query(q).unwrap());
+        assert_eq!(got, want, "IN(SELECT) affinity diverged: {q}");
+    }
+    let _ = std::fs::remove_file(&path);
+}

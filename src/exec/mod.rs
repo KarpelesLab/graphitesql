@@ -17031,6 +17031,25 @@ impl eval::Subqueries for Connection {
         })
     }
 
+    fn column_affinity(&self, select: &Select) -> Option<eval::Affinity> {
+        // The affinity of the subquery's first output column: a column inherits
+        // its declared affinity, a computed expression has none. Derived from the
+        // FROM sources' column metadata (no rows needed for the affinity itself).
+        let params = Params::default();
+        let (columns, _) = self.scan_source(select, &params).ok()?;
+        match select.columns.first()? {
+            ResultColumn::Expr { expr, .. } => {
+                eval::expr_affinity(expr, &row_ctx(&[], &columns, None, &params))
+            }
+            // `SELECT *` / `t.*` as the candidate column: the first source column.
+            ResultColumn::Wildcard => columns.first().map(|c| c.affinity),
+            ResultColumn::TableWildcard(t) => columns
+                .iter()
+                .find(|c| c.table.eq_ignore_ascii_case(t))
+                .map(|c| c.affinity),
+        }
+    }
+
     fn rows(&self, select: &Select, outer: &EvalCtx) -> Result<Vec<Vec<Value>>> {
         self.with_outer_frame(outer, |params| Ok(self.run_select(select, params)?.rows))
     }
