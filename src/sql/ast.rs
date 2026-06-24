@@ -55,8 +55,14 @@ pub enum Statement {
     Pragma(Pragma),
     /// A `VACUUM` statement. Plain `VACUUM [schema]` compacts in place; `VACUUM
     /// [schema] INTO <file>` writes a compact copy to a new database file (the
-    /// expression evaluates to the target path).
-    Vacuum(Option<Box<Expr>>),
+    /// expression evaluates to the target path). The optional `schema` (a database
+    /// name) is kept to validate it — SQLite rejects an unknown one.
+    Vacuum {
+        /// The optional database name (`main`/`temp`/an attached schema).
+        schema: Option<String>,
+        /// The optional `INTO <file>` target path expression.
+        into: Option<Box<Expr>>,
+    },
     /// `REINDEX [name]` — accepted as a no-op: graphitesql rebuilds an index
     /// whenever the underlying rows change, so indexes are always current. The
     /// optional target (a collation, table, or index name) is kept only to

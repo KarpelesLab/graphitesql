@@ -319,18 +319,21 @@ impl Parser {
             return Ok(Statement::Pragma(self.pragma()?));
         }
         if self.eat_kw("vacuum") {
-            // `VACUUM [schema] [INTO <file>]`. A bare token before INTO is the
-            // optional schema name (ignored — single-schema). INTO captures the
+            // `VACUUM [schema] [INTO <file>]`. The optional database name before
+            // INTO is captured so the executor can validate it. INTO captures the
             // target-file expression.
-            if !self.check(&Token::Semicolon) && !self.at_end() && !self.check_kw("into") {
-                let _ = self.advance(); // optional schema name
-            }
+            let schema =
+                if !self.check(&Token::Semicolon) && !self.at_end() && !self.check_kw("into") {
+                    Some(self.ident()?)
+                } else {
+                    None
+                };
             let into = if self.eat_kw("into") {
                 Some(Box::new(self.expr()?))
             } else {
                 None
             };
-            return Ok(Statement::Vacuum(into));
+            return Ok(Statement::Vacuum { schema, into });
         }
         if self.eat_kw("reindex") {
             // `REINDEX` / `REINDEX name` / `REINDEX schema.name` (a no-op here, but

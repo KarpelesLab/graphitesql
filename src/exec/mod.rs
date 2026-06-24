@@ -2737,7 +2737,22 @@ impl Connection {
                 self.exec_pragma(&p, params)?;
                 0
             }
-            Statement::Vacuum(into) => {
+            Statement::Vacuum { schema, into } => {
+                // A named database must exist (main/temp/an attached schema);
+                // sqlite errors "unknown database <name>" otherwise. VACUUM itself
+                // operates on the whole connection regardless of the named schema.
+                if let Some(name) = schema {
+                    let name = name.as_str();
+                    let known = name.eq_ignore_ascii_case("main")
+                        || name.eq_ignore_ascii_case("temp")
+                        || self
+                            .attached
+                            .iter()
+                            .any(|a| a.name.eq_ignore_ascii_case(name));
+                    if !known {
+                        return Err(Error::Error(format!("unknown database {name}")));
+                    }
+                }
                 self.exec_vacuum(into.as_deref())?;
                 0
             }

@@ -133,3 +133,22 @@ fn vacuum_preserves_triggers_and_user_version() {
     );
     cleanup(&path);
 }
+
+#[test]
+fn vacuum_unknown_database_errors() {
+    // `VACUUM <name>` must name a known database (main/temp/an attached schema);
+    // sqlite errors "unknown database <name>" otherwise (graphite used to drop the
+    // name and no-op).
+    let mut c = Connection::open_memory().unwrap();
+    let e = c.execute("VACUUM nope").unwrap_err();
+    assert!(format!("{e}").contains("unknown database"), "{e}");
+    // Bare VACUUM, `VACUUM main`, and `VACUUM temp` are accepted.
+    c.execute("CREATE TABLE t(a)").unwrap();
+    for ok in ["VACUUM", "VACUUM main", "VACUUM temp"] {
+        assert!(c.execute(ok).is_ok(), "{ok} should succeed");
+    }
+    // An attached database name is accepted; an unknown one is rejected.
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    assert!(c.execute("VACUUM aux").is_ok());
+    assert!(c.execute("VACUUM auxx").is_err());
+}
