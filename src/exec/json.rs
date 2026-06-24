@@ -1165,8 +1165,11 @@ fn arrow_path(v: &Value) -> String {
         Value::Integer(i) if *i < 0 => alloc::format!("$[#-{}]", i.unsigned_abs()),
         Value::Integer(i) => alloc::format!("$[{i}]"),
         Value::Text(s) if s.starts_with('$') => s.clone(),
-        Value::Text(s) => alloc::format!("$.{s}"),
-        other => alloc::format!("$.{}", crate::exec::eval::to_text(other)),
+        // A bare key is a single object label, even when it contains `.`/`[`
+        // (sqlite's `-> 'a.b'` is the literal key "a.b", not the nested path
+        // `$.a.b`). Wrap it as a quoted label so the dots are taken literally.
+        Value::Text(s) => alloc::format!("$.\"{s}\""),
+        other => alloc::format!("$.\"{}\"", crate::exec::eval::to_text(other)),
     }
 }
 

@@ -239,4 +239,21 @@ fn arrow_operator_rejects_malformed_explicit_path() {
     ] {
         assert!(c.query(q).is_ok(), "{q} should succeed");
     }
+    // A bare key is a single object label even when it contains `.` or `[` —
+    // sqlite's `-> 'a.b'` is the literal key "a.b", not the nested path `$.a.b`.
+    assert_eq!(
+        c.query("SELECT '{\"a.b\":1}' -> 'a.b'").unwrap().rows[0][0],
+        Value::Text("1".into())
+    );
+    assert_eq!(
+        c.query("SELECT '{\"a[0]\":7}' ->> 'a[0]'").unwrap().rows[0][0],
+        Value::Integer(7)
+    );
+    // Chained arrows each take a single key.
+    assert_eq!(
+        c.query("SELECT '{\"a\":{\"b\":5}}' -> 'a' ->> 'b'")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(5)
+    );
 }
