@@ -242,3 +242,35 @@ fn window_over_aggregate() {
         assert_eq!(got, want, "window-over-aggregate diverged on {q}");
     }
 }
+
+#[test]
+fn invalid_window_frame_bounds_rejected() {
+    // sqlite rejects a frame whose start category comes after its end category, a
+    // start of UNBOUNDED FOLLOWING, or an end of UNBOUNDED PRECEDING. The numeric
+    // offset is NOT part of the ordering, so `1 PRECEDING AND 2 PRECEDING` is a
+    // valid (empty) frame.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    let q = |f: &str| format!("SELECT sum(x) OVER (ORDER BY x {f}) FROM t");
+    for bad in [
+        "ROWS BETWEEN 2 FOLLOWING AND 1 PRECEDING",
+        "ROWS BETWEEN CURRENT ROW AND 1 PRECEDING",
+        "ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW",
+        "ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING",
+        "ROWS UNBOUNDED FOLLOWING",
+    ] {
+        assert!(c.query(&q(bad)).is_err(), "{bad} should be rejected");
+    }
+    for ok in [
+        "ROWS BETWEEN 1 PRECEDING AND 2 PRECEDING", // valid empty frame
+        "ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING",
+        "ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING",
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+        "ROWS UNBOUNDED PRECEDING",
+        "RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+        "GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW",
+    ] {
+        assert!(c.query(&q(ok)).is_ok(), "{ok} should be accepted");
+    }
+}

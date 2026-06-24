@@ -2231,6 +2231,28 @@ impl Parser {
         } else {
             FrameExclude::NoOthers
         };
+        // Validate the bounds: a start may not be UNBOUNDED FOLLOWING and an end
+        // may not be UNBOUNDED PRECEDING, and the start's bound *category* must not
+        // come after the end's — sqlite rejects all of these ("unsupported frame
+        // specification"). The comparison is by category only (UNBOUNDED PRECEDING
+        // < PRECEDING < CURRENT ROW < FOLLOWING < UNBOUNDED FOLLOWING); the numeric
+        // offset is NOT compared, so `1 PRECEDING AND 2 PRECEDING` is a valid
+        // (empty) frame.
+        let rank = |b: &FrameBound| -> u8 {
+            match b {
+                FrameBound::UnboundedPreceding => 0,
+                FrameBound::Preceding(_) => 1,
+                FrameBound::CurrentRow => 2,
+                FrameBound::Following(_) => 3,
+                FrameBound::UnboundedFollowing => 4,
+            }
+        };
+        if matches!(start, FrameBound::UnboundedFollowing)
+            || matches!(end, FrameBound::UnboundedPreceding)
+            || rank(&start) > rank(&end)
+        {
+            return Err(self.err("unsupported frame specification"));
+        }
         Ok(Some(WindowFrame {
             mode,
             start,
