@@ -53,6 +53,41 @@ fn rejected_definitions() {
 }
 
 #[test]
+fn aggregate_in_generated_or_check_is_rejected() {
+    // SQLite rejects an aggregate function in a CHECK or generated-column
+    // expression at CREATE ("misuse of aggregate function NAME()"). `min`/`max`
+    // are aggregates only at arity one — the two-arg forms are scalar and fine.
+    for ddl in [
+        // rejected — aggregate in a generated column
+        "CREATE TABLE t(a, b AS (sum(a)))",
+        "CREATE TABLE t(a, b AS (count(*)))",
+        "CREATE TABLE t(a, b AS (max(a) + 1))",
+        "CREATE TABLE t(a, b AS (group_concat(a)))",
+        // rejected — aggregate in a CHECK (column- and table-level)
+        "CREATE TABLE t(a CHECK(sum(a) > 0))",
+        "CREATE TABLE t(a, b, CHECK(min(a) > 0))",
+        // accepted — scalar functions, incl. the two-arg min/max forms
+        "CREATE TABLE t(a, b AS (abs(a)))",
+        "CREATE TABLE t(a, b AS (max(a, 1)))",
+        "CREATE TABLE t(a, b AS (min(a, 2)))",
+        "CREATE TABLE t(a, b AS (length(a)))",
+        "CREATE TABLE t(a CHECK(abs(a) > 0))",
+    ] {
+        agree(ddl);
+    }
+    // The single-aggregate message is byte-exact (case preserved as written).
+    let err = Connection::open_memory()
+        .unwrap()
+        .execute("CREATE TABLE t(a, b AS (SUM(a)))")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("misuse of aggregate function SUM()"),
+        "unexpected message: {err}"
+    );
+}
+
+#[test]
 fn foreign_key_local_columns_must_exist() {
     // A table-level FOREIGN KEY's *local* columns must each be a declared column;
     // SQLite rejects an unknown one at CREATE ("unknown column … in foreign key

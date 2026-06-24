@@ -3510,12 +3510,34 @@ impl Connection {
                 ));
             }
         }
+        // SQLite rejects an aggregate function in a CHECK or generated-column
+        // expression at CREATE ("misuse of aggregate function NAME()").
+        for c in &ct.columns {
+            for k in &c.constraints {
+                let agg = match k {
+                    ColumnConstraint::Check(e, _) | ColumnConstraint::Generated { expr: e, .. } => {
+                        first_aggregate_call_name(e)
+                    }
+                    _ => None,
+                };
+                if let Some(name) = agg {
+                    return Err(Error::Error(format!(
+                        "misuse of aggregate function {name}()"
+                    )));
+                }
+            }
+        }
         for tc in &ct.constraints {
             if let TableConstraint::Check(e, _) = tc {
                 if expr_has_subquery(e) {
                     return Err(Error::Error(
                         "subqueries prohibited in CHECK constraints".into(),
                     ));
+                }
+                if let Some(name) = first_aggregate_call_name(e) {
+                    return Err(Error::Error(format!(
+                        "misuse of aggregate function {name}()"
+                    )));
                 }
             }
         }
@@ -16618,6 +16640,36 @@ fn expr_has_subquery(e: &Expr) -> bool {
             Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. }
         ) {
             found = true;
+        }
+    });
+    found
+}
+
+/// The verbatim name of the first built-in aggregate call in `e` (a plain
+/// aggregate, not a windowed `… OVER (…)`), or `None`. SQLite rejects an
+/// aggregate in a CHECK or generated-column expression at `CREATE` with "misuse
+/// of aggregate function NAME()", preserving the name's case as written.
+/// `min`/`max` count as aggregates only at arity one (the two-arg forms are
+/// scalar); `count(*)` carries `star`. (For an expression with several
+/// aggregates SQLite names one of them per its own resolver walk; reporting the
+/// first found here still rejects with the right message form.)
+fn first_aggregate_call_name(e: &Expr) -> Option<String> {
+    let mut found: Option<String> = None;
+    window::visit(e, &mut |n| {
+        if found.is_some() {
+            return;
+        }
+        if let Expr::Function {
+            name,
+            args,
+            star,
+            over,
+            ..
+        } = n
+        {
+            if over.is_none() && func::is_aggregate_call(name, args.len(), *star) {
+                found = Some(name.clone());
+            }
         }
     });
     found
