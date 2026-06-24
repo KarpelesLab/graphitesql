@@ -88,3 +88,33 @@ fn against_sqlite3() {
         failures.join("\n")
     );
 }
+
+/// graphite's `LIKE` is case-insensitive for ASCII only, matching *documented*
+/// SQLite (and most builds): a non-ASCII letter is compared case-sensitively, so
+/// `'É' LIKE 'é'` is false. (The pinned `sqlite3` 3.50.4 "alt1" oracle is a custom
+/// build whose `LIKE` folds full Unicode via the C library's `towlower` — a
+/// per-codepoint, locale/build-specific fold that is not replicable byte-for-byte
+/// and would diverge graphite from standard SQLite. We intentionally do NOT match
+/// it; this test pins the ASCII-only behavior so it is not "fixed" toward the
+/// alt1 build by accident. `upper()`/`lower()` are likewise ASCII-only here.)
+#[test]
+fn like_is_ascii_case_insensitive_only() {
+    let c = Connection::open_memory().unwrap();
+    let f = |sql: &str| match c.query(sql).unwrap().rows[0][0] {
+        Value::Integer(i) => i,
+        ref v => panic!("expected int from {sql}, got {v:?}"),
+    };
+    // ASCII folds (case-insensitive).
+    assert_eq!(f("SELECT 'ABC' LIKE 'abc'"), 1);
+    assert_eq!(f("SELECT 'abc' LIKE 'ABC'"), 1);
+    assert_eq!(f("SELECT 'File.TXT' LIKE 'file.txt'"), 1);
+    // Non-ASCII letters are NOT folded.
+    assert_eq!(f("SELECT 'É' LIKE 'é'"), 0);
+    assert_eq!(f("SELECT 'café' LIKE 'CAFÉ'"), 0);
+    assert_eq!(f("SELECT 'Ω' LIKE 'ω'"), 0);
+    assert_eq!(f("SELECT 'Ā' LIKE 'ā'"), 0);
+    // An exact non-ASCII match still works; wildcards span multibyte chars.
+    assert_eq!(f("SELECT 'café' LIKE 'café'"), 1);
+    assert_eq!(f("SELECT 'café' LIKE 'caf_'"), 1);
+    assert_eq!(f("SELECT 'résumé' LIKE 'r%é'"), 1);
+}
