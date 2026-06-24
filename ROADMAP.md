@@ -183,8 +183,9 @@ references inside a subquery that bind to an enclosing FROM (a static scope-stac
 pass); **invalid generated-column constraints** (in the PRIMARY KEY, with
 `DEFAULT`, or a second `AS (…)`); **query-time `COLLATE`** of an unknown sequence;
 **unknown REINDEX/VACUUM/ANALYZE targets**; **invalid window-frame** specs; and
-function **arity**. *(Two small known leftovers tracked in §7: an aggregate in a
-generated-column expression, and a foreign key naming an unknown local column.)*
+function **arity**; and a table-level **foreign key naming an unknown local
+column**. *(One small known leftover tracked in §7: an aggregate in a
+generated-column expression.)*
 
 **Remaining pieces** (small, each function/clause-scoped):
 
@@ -868,8 +869,10 @@ message known — see §4 Track A):
 
 - aggregate function in a generated-column expression →
   `"misuse of aggregate function …()"`.
-- foreign key naming an unknown local column →
-  `"unknown column \"c\" in foreign key definition"`.
+- ~~foreign key naming an unknown local column~~ ✅ **DONE** —
+  `"unknown column \"c\" in foreign key definition"`, validated in
+  `exec_create_table` against the table's declared columns (generated columns
+  count, `rowid` does not; the parent table/columns stay lazily resolved).
 
 **Deferred / blocked by design** (documented in the tracks, not scheduled):
 **B1b** join reordering and **B4** `sqlite_stat4` — both *diverge from*, or are
