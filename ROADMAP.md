@@ -173,6 +173,19 @@ type names keeping their `(len[,scale])`; and DDL validation incl. `DROP TABLE`
 cascading triggers and `RENAME COLUMN` propagating into the table's own
 expressions.
 
+**Error-parity validation (continuing).** A standing differential sweep makes
+graphite *reject* what sqlite rejects — not merely compute matching results — each
+with a byte-exact error message verified against the `sqlite3` CLI. Landed:
+**HAVING on a non-aggregate query** (only a GROUP BY or a result-column aggregate
+qualifies — an aggregate that appears *only* in HAVING does not); **ambiguous
+column names** in the query's own clauses, across joins/self-joins, *and*
+references inside a subquery that bind to an enclosing FROM (a static scope-stack
+pass); **invalid generated-column constraints** (in the PRIMARY KEY, with
+`DEFAULT`, or a second `AS (…)`); **query-time `COLLATE`** of an unknown sequence;
+**unknown REINDEX/VACUUM/ANALYZE targets**; **invalid window-frame** specs; and
+function **arity**. *(Two small known leftovers tracked in §7: an aggregate in a
+generated-column expression, and a foreign key naming an unknown local column.)*
+
 **Remaining pieces** (small, each function/clause-scoped):
 
 - **A2 — DESC index columns honored in seeks. ✅ DONE / verified.** A `DESC`
@@ -504,18 +517,18 @@ is C8b/C8c.
 
 ### Track D — Virtual tables & ecosystem extensions
 
-Done: the **read-only** virtual-table foundation — a table-valued-function
-mechanism (`generate_series`, `json_each`, `json_tree`); the `VTabModule` trait +
-`VTabRegistry` (**D1a**); `CREATE VIRTUAL TABLE … USING module[(args)]` parsing,
-persistence, and `FROM`-source integration incl. joins and `DROP` (**D1b**); and
-`best_index`/`filter` constraint pushdown (**D1b²**). Today a vtab is read-only
-(INSERT/UPDATE/DELETE rejected) and stateless (modules get no storage).
-
-**The blocker for FTS5/R-Tree is a *writable, persistent* vtab.** Both store data
-that must survive in the file, byte-compatibly. SQLite backs them with **shadow
-tables** (ordinary b-trees) — which graphite already writes byte-compatibly — so
-the path is: give modules writable shadow storage, then build the two modules on
-top. Build bottom-up (each step lands testable on `:memory:` first):
+Done: the read-only virtual-table foundation (TVFs `generate_series`/`json_each`/
+`json_tree`; the `VTabModule` + `VTabRegistry` trait — **D1a**; `CREATE VIRTUAL
+TABLE … USING module[(args)]` parsing/persistence/`FROM` integration incl. joins
+and `DROP` — **D1b**; `best_index`/`filter` constraint pushdown — **D1b²**); the
+**writable, persistent** vtab layer (**W1** DML routing + **W2** shadow-table
+storage); and **both headline modules built on top of it** — the full **R-Tree**
+(**D3a–D3c**, byte-compatible `_node`/`_rowid`/`_parent` layout) and the full
+**FTS5** (**D2a–D2e**, read *and* write). A graphite-written R-Tree and FTS5 are
+both read, queried, and `integrity_check`-ed by stock `sqlite3`. The per-step
+history is preserved in the bullets below; what *remains* on this track is
+scale/perf (a real FTS5 inverted index — **D2b**) and new ecosystem surfaces
+(**D5**/**D6**/**D7**).
 
 - **W1 — writable-vtab trait + DML routing. ✅ DONE.** `VTabModule::update`
   (the `xUpdate` analog) takes a `VTabChange::Insert`/`Delete`/`Update`; the
@@ -801,40 +814,70 @@ on contents**, not byte-identical independently-built databases.
 
 ## 7. Immediate next steps
 
-The bounded SQL-language, function, and planner correctness items are essentially
-closed (the whole `WITHOUT ROWID` seek family, comma-join promotion, automatic-
-index EQP, JSONB, JSON number-provenance, `random`/`randomblob`, `unistr`/
-`subtype`, view `table_info`, the `DROP`/`RENAME COLUMN` DDL fixes, etc.). What's
-left is **bigger, multi-step work** — each track above is now broken into the
-smaller pieces to ship it. Suggested order:
+The bounded correctness work and the headline features are **done**: the whole
+SQL-language / function / planner-correctness surface; the **writable, persistent
+vtab** layer (W1/W2) and both modules on it — the full **R-Tree** (D3a–D3c) and
+the full **FTS5** (D2a–D2e, read *and* write, sqlite-readable on disk); the
+**VDBE routing default-on** (B7a/B7b) with bytecode `EXPLAIN` (B8); the entire
+**multi-schema** (C1–C5) and **auto_vacuum** (C6) tracks; `VACUUM INTO`;
+`secure_delete`/`cache_size` reporting (C8a/C8b); the cross-object **ALTER**
+propagation incl. text-preserving schema edits (A-rn1–A-rn4); and a continuing
+**error-parity** pass (§4 Track A). What remains is **deeper, multi-step work**,
+grouped by track and broken into independently-shippable pieces.
 
-1. **W1 + W2 — writable, persistent vtabs.** The single unlock for the two
-   headline modules. Small, self-contained, and testable on its own (a trivial
-   writable module proves it before D2/D3).
-2. **D3 — R-Tree** on top of W1/W2 (D3a correct results → D3b pushdown → D3c
-   byte-compatible nodes). Smaller and more bounded than FTS5; do it first.
-3. **A-rn3 — cross-object RENAME COLUMN** (view/trigger/FK propagation), the one
-   remaining *functional* ALTER gap (A-rn1 + A-rn2 RENAME TABLE→views are done);
-   needs scope-aware column resolution, not the token rewrite A-rn2 used.
-4. **Planner leftovers** (perf-only, EQP-gated) — the mixed-direction partial
-   sort, **B1b** join reordering, **B4** `sqlite_stat4`, and **B0b-iii**'s
-   *multi-index* case (the single-seekable-index case is done; the ambiguous
-   multi-index case still needs a shared seek-index-choice helper to match
-   sqlite). (**A2** DESC seeks, the composite eq-prefix + trailing-range seek,
-   **A3b** partial/expr range·IN seeks, **B0b-i** multi-term ORDER BY, **B0b-ii**
-   covered-query covering scan, and **B0b-iii** single-index ORDER-BY-after-seek
-   are done.)
-5. **D2 — FTS5** (D2a–D2e) — the larger module, once W1/W2 and R-Tree have
-   exercised the writable-vtab path.
-6. **B5/B7/B8 — the executor→VDBE migration** — the largest internal refactor;
-   unblocks real bytecode `EXPLAIN`.
-7. **Smaller gaps** — **C8a/b/c** (secure_delete, cache honoring). (**A4**
-   `nullif` collation, **A7** `execute_batch`, and **A8** JSONB JSON5 numbers are
-   done.)
+**1. VDBE depth (Track B).** Routing is default-on (the VDBE answers ~93 % of the
+corpus); the rest transparently falls back to the tree-walker, which stays the
+oracle. Move each remaining shape onto the VDBE — additive, gated on
+VDBE-vs-tree-walker parity, results already correct:
 
-Deferred / blocked: **C7/C9** (SQLite-format journal + cross-process
-locks/concurrency — durability depth), **D5/D6** (sessions, async wasm VFS),
-**D7** (C-API — blocked by `#![forbid(unsafe_code)]`), **A-rn4** (cosmetic
-text-preserving schema edits). The **SQLite TCL suite** (§6) isn't runnable
-against a Rust crate — the differential corpus + `integrity_check` remain the
-green proxy.
+- **B5c-1 — `IN (SELECT …)`** (its candidate-set collation differs from `IN
+  (list)`, so it needs its own handling).
+- **B5c-2 — correlated subqueries** (`Subquery`/`Exists`/`InSelect` reading an
+  outer column — needs outer-row register threading; non-correlated ones already
+  fold to constants).
+- **B5c-3 — compound `SELECT`** (`UNION`/`INTERSECT`/`EXCEPT` compiled as one
+  program rather than per-arm with a tree-walker combine).
+- **B5c-4 — window functions** on the VDBE.
+- **B5b — per-cursor nested-loop join + inner seek** (stream the inner side with
+  `OpenRead`/`Rewind`/`Column`/`Next` instead of materializing the cross-product;
+  *perf-only*).
+
+**2. Storage durability & concurrency (Track C).**
+
+- **C7a/C7b — SQLite-format rollback journal**: write the sqlite journal header +
+  page records (C7a), then recover from one on open (C7b). Pairs with the
+  fault-injecting **crash-recovery harness** (§6), which should land alongside.
+- **C8c — bounded `pcache` with LRU eviction** (honor the C8b `cache_size`;
+  replaces the keep-everything page map). *Perf, not correctness.*
+- **C9a–C9d — concurrency**, each independent: reader `SHARED`-lock sharing
+  (C9a); OS-level cross-process file locks via `File::lock` (C9b, wants MSRV
+  1.89); the WAL `-shm` wal-index (C9c); the thread-safe `Connection`
+  `Send`/`Sync` story (C9d).
+
+**3. Ecosystem breadth (Track D).**
+
+- **D2b — a real inverted index** in the FTS5 shadow tables (today MATCH scans;
+  this scales it — the segment *format* is already byte-compatible, this is the
+  query path that reads it).
+- **`dbpage`** — the writable raw-page vtab (sibling of the done `dbstat`).
+- **D5 — `sqlite3_session`** changesets/patchsets; **D6 — async VFS for wasm**
+  (IndexedDB/OPFS).
+
+**4. Error-parity leftovers** (CREATE-time validation; each a few lines, byte-exact
+message known — see §4 Track A):
+
+- aggregate function in a generated-column expression →
+  `"misuse of aggregate function …()"`.
+- foreign key naming an unknown local column →
+  `"unknown column \"c\" in foreign key definition"`.
+
+**Deferred / blocked by design** (documented in the tracks, not scheduled):
+**B1b** join reordering and **B4** `sqlite_stat4` — both *diverge from*, or are
+*unverifiable against*, the pinned stat1-only `sqlite3` oracle, so pursuing them
+would break the differential corpus rather than extend it; **B1c** RIGHT/FULL
+inner-join seeks (correct via materialization today); **D7** the C-API shim
+(needs `extern "C"` + raw pointers — incompatible with `#![forbid(unsafe_code)]`;
+would be a sibling crate that opts out); and the rare ambiguous-bare-ref case of
+cross-object `RENAME COLUMN` (needs per-column-ref source spans the AST does not
+carry). The **SQLite TCL suite** (§6) cannot run against a Rust crate — the
+differential corpus + `integrity_check` remain the green proxy.
