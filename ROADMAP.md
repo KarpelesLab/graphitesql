@@ -183,9 +183,10 @@ references inside a subquery that bind to an enclosing FROM (a static scope-stac
 pass); **invalid generated-column constraints** (in the PRIMARY KEY, with
 `DEFAULT`, or a second `AS (…)`); **query-time `COLLATE`** of an unknown sequence;
 **unknown REINDEX/VACUUM/ANALYZE targets**; **invalid window-frame** specs; and
-function **arity**; and a table-level **foreign key naming an unknown local
-column**. *(One small known leftover tracked in §7: an aggregate in a
-generated-column expression.)*
+function **arity**; a table-level **foreign key naming an unknown local column**;
+and an **aggregate function in a CHECK or generated-column expression**
+("misuse of aggregate function …()"). *(No known leftovers as of this sweep; it
+continues against new construct families.)*
 
 **Remaining pieces** (small, each function/clause-scoped):
 
@@ -864,15 +865,13 @@ VDBE-vs-tree-walker parity, results already correct:
 - **D5 — `sqlite3_session`** changesets/patchsets; **D6 — async VFS for wasm**
   (IndexedDB/OPFS).
 
-**4. Error-parity leftovers** (CREATE-time validation; each a few lines, byte-exact
-message known — see §4 Track A):
-
-- aggregate function in a generated-column expression →
-  `"misuse of aggregate function …()"`.
-- ~~foreign key naming an unknown local column~~ ✅ **DONE** —
-  `"unknown column \"c\" in foreign key definition"`, validated in
-  `exec_create_table` against the table's declared columns (generated columns
-  count, `rowid` does not; the parent table/columns stay lazily resolved).
+**4. Error-parity leftovers — ✅ CLEARED.** The CREATE-time validation gaps found
+by the error-parity sweep are all closed: ~~aggregate function in a CHECK or
+generated-column expression~~ (`"misuse of aggregate function NAME()"`,
+arity-aware so the two-arg `min`/`max` scalar forms pass) and ~~a foreign key
+naming an unknown local column~~ (`"unknown column \"c\" in foreign key
+definition"`). The standing sweep continues against new construct families (§4
+Track A); when it surfaces the next divergence it is filed here.
 
 **Deferred / blocked by design** (documented in the tracks, not scheduled):
 **B1b** join reordering and **B4** `sqlite_stat4` — both *diverge from*, or are
