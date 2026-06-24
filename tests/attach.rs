@@ -867,3 +867,41 @@ fn attach_file_database_cross_engine() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}-journal"));
 }
+
+#[test]
+fn cross_database_insert_select_resolves_source_in_main() {
+    // `INSERT INTO aux.t SELECT … FROM m` resolves the SELECT's unqualified `m`
+    // in the normal (main-first) order, not the target (aux) database — matching
+    // sqlite. (Previously the whole statement ran in the target's context, so the
+    // main-resident source errored "no such table".)
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE m(a)").unwrap();
+    c.execute("INSERT INTO m VALUES(1),(2),(3)").unwrap();
+    c.execute("CREATE TABLE aux.t(a)").unwrap();
+    // source in main, target in aux
+    c.execute("INSERT INTO aux.t SELECT a*10 FROM m").unwrap();
+    assert_eq!(
+        c.query("SELECT sum(a) FROM aux.t").unwrap().rows[0][0],
+        Value::Integer(60)
+    );
+    // a source that lives only in aux still resolves (the swapped-context path).
+    c.execute("CREATE TABLE aux.s(x)").unwrap();
+    c.execute("INSERT INTO aux.s VALUES(7),(8)").unwrap();
+    c.execute("INSERT INTO aux.t SELECT x FROM s").unwrap();
+    assert_eq!(
+        c.query("SELECT sum(a) FROM aux.t").unwrap().rows[0][0],
+        Value::Integer(75)
+    );
+    // a name in both main and aux binds to main (main-first), like sqlite.
+    c.execute("CREATE TABLE both(v)").unwrap();
+    c.execute("INSERT INTO both VALUES(100)").unwrap();
+    c.execute("CREATE TABLE aux.both(v)").unwrap();
+    c.execute("INSERT INTO aux.both VALUES(1)").unwrap();
+    c.execute("CREATE TABLE aux.u(v)").unwrap();
+    c.execute("INSERT INTO aux.u SELECT v FROM both").unwrap();
+    assert_eq!(
+        c.query("SELECT v FROM aux.u").unwrap().rows[0][0],
+        Value::Integer(100)
+    );
+}

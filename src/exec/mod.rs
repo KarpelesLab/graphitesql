@@ -2593,12 +2593,44 @@ impl Connection {
         match target {
             DbRef::Main => self.exec_parsed(stmt, sql, params),
             other => {
+                // `INSERT INTO <non-main>.t SELECT … FROM s`: the SELECT's
+                // unqualified names resolve in the normal (main-first) order, not
+                // the target database. Materialize the source rows here, before
+                // swapping to the target — but only if they resolve in this
+                // (original) context; otherwise leave it unchanged so the swapped
+                // path still handles a source that lives in the target db.
+                let stmt = self.prematerialize_insert_select(stmt, params);
                 self.swap_db(other);
                 let r = self.exec_parsed(stmt, sql, params);
                 self.swap_db(other);
                 r
             }
         }
+    }
+
+    /// For `INSERT … SELECT`, try evaluating the SELECT in the current (pre-swap)
+    /// database context and replace the source with the resulting literal rows, so
+    /// a later swap to the target database does not re-resolve the SELECT's table
+    /// names there (matching SQLite's main-first resolution for a cross-database
+    /// `INSERT INTO aux.t SELECT … FROM main_table`). If the SELECT does not
+    /// resolve here — e.g. its source lives only in the target db — the statement
+    /// is returned unchanged so the swapped-context path handles it. The SELECT is
+    /// read-only, so the discarded attempt has no side effects.
+    fn prematerialize_insert_select(&self, stmt: Statement, params: &Params) -> Statement {
+        if let Statement::Insert(mut ins) = stmt {
+            if let InsertSource::Select(sel) = &ins.source {
+                if let Ok(result) = self.run_select(sel, params) {
+                    let rows: Vec<Vec<Expr>> = result
+                        .rows
+                        .into_iter()
+                        .map(|row| row.into_iter().map(value_to_literal_expr).collect())
+                        .collect();
+                    ins.source = InsertSource::Values(rows);
+                }
+            }
+            return Statement::Insert(ins);
+        }
+        stmt
     }
 
     /// The database a DDL/DML statement targets: an explicit `schema.` qualifier
