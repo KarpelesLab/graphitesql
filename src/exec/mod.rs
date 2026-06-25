@@ -694,8 +694,9 @@ impl Connection {
             // SQLite compares under `combine(left_aff, col_aff)`, which a plain
             // `IN (list)` would not reproduce — so the fold records that affinity in
             // `candidate_affinity`, and the VDBE/eval feed it as the right-operand
-            // comparison affinity (a non-BINARY candidate collation bails — see
-            // `eval_foldable_in_select`). `None` leaves the `IN (SELECT)` in place.
+            // comparison affinity. (The candidate column's collation is irrelevant
+            // — `IN (SELECT)` uses the left operand's collation.) `None` leaves the
+            // `IN (SELECT)` in place.
             E::InSelect {
                 expr,
                 select,
@@ -762,9 +763,10 @@ impl Connection {
     ///   column's affinity is returned as a canonical type name so the VDBE/eval
     ///   feed it as the element comparison's right-operand affinity.
     ///
-    /// **Collation safety:** a bare-column candidate whose origin collation is
-    /// non-default (not `BINARY`) is left for the tree-walker (`None`) — only the
-    /// affinity is reproduced here, not a non-BINARY candidate collation.
+    /// **Collation:** the candidate column's collation is NOT consulted — SQLite
+    /// resolves `x IN (SELECT col)` under the LEFT operand's collation (the
+    /// candidate's collation never affects the result, verified vs sqlite), and
+    /// the folded `IN (list)` comparison already applies the left's collation.
     /// `None` when not foldable, so the VDBE compiler simply falls back as before.
     fn eval_foldable_in_select(&self, sel2: &Select) -> Option<(Vec<Value>, Option<String>)> {
         if !self.vdbe_subquery_foldable(sel2) {
@@ -776,16 +778,16 @@ impl Connection {
         let sql::ast::ResultColumn::Expr { expr, .. } = &sel2.columns[0] else {
             return None;
         };
-        // A bare-column candidate must carry its column's affinity; resolve the
-        // single output column's origin `(affinity, collation)`. Bail when the
-        // origin is unknown (defaulted to BLOB/BINARY would be wrong here) or its
-        // collation is non-BINARY — those stay on the tree-walker.
+        // A bare-column candidate must carry its column's affinity into the
+        // comparison; resolve the single output column's origin affinity (bail
+        // only when the origin is unresolvable). The candidate column's COLLATION
+        // is irrelevant: `x IN (SELECT col)` always uses the LEFT operand's
+        // collation — the candidate column's collation never affects the result
+        // (verified vs sqlite) — and the folded IN-list comparison already applies
+        // the left's collation.
         let candidate_affinity = if is_bare_column_expr(expr) {
             let origins = self.subquery_column_origins(sel2)?;
-            let (aff, coll) = origins.first().copied()?;
-            if coll != crate::value::Collation::default() {
-                return None;
-            }
+            let (aff, _coll) = origins.first().copied()?;
             Some(affinity_type_name(aff))
         } else {
             None

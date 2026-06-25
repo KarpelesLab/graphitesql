@@ -192,10 +192,12 @@ is *perf/coverage*, not correctness.
   SQLite's `combine` — crucially an untyped candidate is `Some(Blob)`, NOT `None`,
   so `lt.x(TEXT) IN (SELECT cn.y)` → `combine(TEXT,Blob)` → no coercion → no match
   (matching sqlite), where a plain literal-list fold wrongly coerced. `NOT IN` and
-  NULL-in-set fall out of the existing OR-chain. Non-BINARY-collation candidates
-  still defer to the tree-walker (a remaining edge). Verified across every
-  left×candidate affinity combo vs sqlite3 (`tests/subquery_diff.rs`,
-  `tests/vdbe_in_select.rs`), tree-walker == VDBE == sqlite.
+  NULL-in-set fall out of the existing OR-chain. The candidate column's collation
+  is NOT consulted — `IN (SELECT)` uses the LEFT operand's collation (verified vs
+  sqlite: a NOCASE candidate never changes the result), so NOCASE/RTRIM candidate
+  columns route too. Verified across every left×candidate affinity combo vs
+  sqlite3 (`tests/subquery_diff.rs`, `tests/vdbe_in_select.rs`), tree-walker ==
+  VDBE == sqlite.
   - *Implementation note (investigated 2026-06-25):* a fold to `IN (list)` CANNOT
     work — list literals report NONE comparison-affinity, but the bare-column
     candidate must contribute its column affinity; and wrapping each value in
