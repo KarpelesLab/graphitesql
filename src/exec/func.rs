@@ -235,10 +235,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "coalesce" => {
             // SQLite requires at least two arguments.
             if args.len() < 2 {
-                return Err(Error::Error(alloc::format!(
-                    "wrong number of arguments to function coalesce() (want at least 2, got {})",
-                    args.len()
-                )));
+                return Err(wrong_arg_count("coalesce"));
             }
             for a in args {
                 let v = eval::eval(a, ctx)?;
@@ -342,10 +339,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "trim" | "ltrim" | "rtrim" => {
             // SQLite's trim family takes 1 (string) or 2 (string, chars) arguments.
             if args.is_empty() || args.len() > 2 {
-                return Err(Error::Error(alloc::format!(
-                    "wrong number of arguments to function {lname}() (want 1 or 2, got {})",
-                    args.len()
-                )));
+                return Err(wrong_arg_count(&lname));
             }
             let (left, right) = match lname.as_str() {
                 "ltrim" => (true, false),
@@ -403,10 +397,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         // 2-argument form yields NULL when the condition is not true.
         "iif" | "if" => {
             if args.len() != 2 && args.len() != 3 {
-                return Err(Error::Error(alloc::format!(
-                    "wrong number of arguments to function {lname}() (want 2 or 3, got {})",
-                    args.len()
-                )));
+                return Err(wrong_arg_count(&lname));
             }
             if eval::truth(&v[0]) == Some(true) {
                 v[1].clone()
@@ -484,10 +475,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             // SQLite 3.44+: concatenate all args, treating NULL as empty.
             // At least one argument is required.
             if v.is_empty() {
-                return Err(Error::Error(
-                    "wrong number of arguments to function concat() (want at least 1, got 0)"
-                        .into(),
-                ));
+                return Err(wrong_arg_count("concat"));
             }
             let mut s = String::new();
             for x in &v {
@@ -500,10 +488,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "concat_ws" => {
             // A separator plus at least one value argument are required.
             if v.len() < 2 {
-                return Err(Error::Error(alloc::format!(
-                    "wrong number of arguments to function concat_ws() (want at least 2, got {})",
-                    v.len()
-                )));
+                return Err(wrong_arg_count("concat_ws"));
             }
             if matches!(v[0], Value::Null) {
                 Value::Null
@@ -521,7 +506,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             // like(pattern, text[, escape]) — the function form of `text LIKE
             // pattern`. NULL operand → NULL.
             if v.len() < 2 || v.len() > 3 {
-                return Err(Error::Error("like() takes 2 or 3 arguments".into()));
+                return Err(wrong_arg_count("like"));
             }
             // A NULL escape, like a NULL pattern/text, yields NULL.
             if v.iter().any(|x| matches!(x, Value::Null)) {
@@ -561,7 +546,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "unhex" => {
             if v.is_empty() || v.len() > 2 {
-                return Err(Error::Error("unhex() takes 1 or 2 arguments".into()));
+                return Err(wrong_arg_count("unhex"));
             }
             // A NULL hex string or NULL ignore-set both yield NULL.
             let ignore = match v.get(1) {
@@ -725,7 +710,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         // spaces). Empty arrays/objects and scalars stay compact, like SQLite.
         "json_pretty" => {
             if v.is_empty() || v.len() > 2 {
-                return Err(Error::Error("json_pretty() takes 1 or 2 arguments".into()));
+                return Err(wrong_arg_count("json_pretty"));
             }
             match &v[0] {
                 Value::Null => Value::Null,
@@ -749,7 +734,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "json_type" => {
             if v.is_empty() || v.len() > 2 {
-                return Err(Error::Error("json_type() takes 1 or 2 arguments".into()));
+                return Err(wrong_arg_count("json_type"));
             }
             match json_root(&v[0])? {
                 None => Value::Null,
@@ -769,9 +754,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "json_array_length" => {
             if v.is_empty() || v.len() > 2 {
-                return Err(Error::Error(
-                    "json_array_length() takes 1 or 2 arguments".into(),
-                ));
+                return Err(wrong_arg_count("json_array_length"));
             }
             match json_root(&v[0])? {
                 None => Value::Null,
@@ -791,10 +774,11 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             }
         }
         "json_extract" | "jsonb_extract" => {
+            // SQLite's json_extract is variadic: with fewer than two arguments
+            // it returns NULL without even parsing the document (so an invalid
+            // or absent first argument is NOT an error here).
             if v.len() < 2 {
-                return Err(Error::Error(
-                    "json_extract() requires at least 2 arguments".into(),
-                ));
+                return Ok(Value::Null);
             }
             match json_root(&v[0])? {
                 None => Value::Null,
@@ -1049,11 +1033,16 @@ fn arity(name: &str, args: &[Expr], n: usize) -> Result<()> {
     if args.len() == n {
         Ok(())
     } else {
-        Err(Error::Error(alloc::format!(
-            "wrong number of arguments to function {name}() (want {n}, got {})",
-            args.len()
-        )))
+        Err(wrong_arg_count(name))
     }
+}
+
+/// SQLite's universal arity-error message: `wrong number of arguments to
+/// function NAME()` — no "(want N, got M)" suffix, for every built-in.
+fn wrong_arg_count(name: &str) -> Error {
+    Error::Error(alloc::format!(
+        "wrong number of arguments to function {name}()"
+    ))
 }
 
 /// SQLite's `soundex(X)`: the phonetic code of the first word in `X` — the first
@@ -1356,7 +1345,7 @@ fn trim_fn(v: &[Value], left: bool, right: bool) -> Value {
 
 fn substr(v: &[Value]) -> Result<Value> {
     if v.len() < 2 || v.len() > 3 {
-        return Err(Error::Error("substr() takes 2 or 3 arguments".into()));
+        return Err(wrong_arg_count("substr"));
     }
     if matches!(v[0], Value::Null) {
         return Ok(Value::Null);
@@ -1427,7 +1416,7 @@ fn substr(v: &[Value]) -> Result<Value> {
 
 fn instr(v: &[Value]) -> Result<Value> {
     if v.len() != 2 {
-        return Err(Error::Error("instr() takes 2 arguments".into()));
+        return Err(wrong_arg_count("instr"));
     }
     if matches!(v[0], Value::Null) || matches!(v[1], Value::Null) {
         return Ok(Value::Null);
@@ -1446,7 +1435,7 @@ fn instr(v: &[Value]) -> Result<Value> {
 
 fn replace(v: &[Value]) -> Result<Value> {
     if v.len() != 3 {
-        return Err(Error::Error("replace() takes 3 arguments".into()));
+        return Err(wrong_arg_count("replace"));
     }
     if v.iter().any(|x| matches!(x, Value::Null)) {
         return Ok(Value::Null);
@@ -1462,7 +1451,7 @@ fn replace(v: &[Value]) -> Result<Value> {
 
 fn round(v: &[Value]) -> Result<Value> {
     if v.is_empty() || v.len() > 2 {
-        return Err(Error::Error("round() takes 1 or 2 arguments".into()));
+        return Err(wrong_arg_count("round"));
     }
     // A NULL value or NULL precision both yield NULL.
     if matches!(v[0], Value::Null) || matches!(v.get(1), Some(Value::Null)) {

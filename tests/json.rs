@@ -257,3 +257,33 @@ fn arrow_operator_rejects_malformed_explicit_path() {
         Value::Integer(5)
     );
 }
+
+/// `json_extract` is variadic: SQLite returns NULL for any call with fewer than
+/// two arguments — including zero args and an invalid/NULL first argument, which
+/// it never parses. graphite previously errored ("requires at least 2 args").
+#[test]
+fn json_extract_under_two_args_is_null() {
+    let c = Connection::open_memory().unwrap();
+    for sql in [
+        "SELECT json_extract()",
+        "SELECT json_extract('{}')",
+        "SELECT json_extract('[1,2,3]')",
+        "SELECT json_extract('not json')",
+        "SELECT json_extract(NULL)",
+        "SELECT jsonb_extract('{}')",
+    ] {
+        assert_eq!(c.query(sql).unwrap().rows[0][0], Value::Null, "{sql}");
+    }
+    // typeof confirms it is SQL NULL, not an empty string.
+    assert_eq!(
+        c.query("SELECT typeof(json_extract('5'))").unwrap().rows[0][0],
+        Value::Text("null".into())
+    );
+    // Two-or-more arguments still extract normally.
+    assert_eq!(
+        c.query("SELECT json_extract('{\"a\":1}','$.a')")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(1)
+    );
+}
