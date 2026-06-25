@@ -209,6 +209,20 @@ is *perf/coverage*, not correctness.
     results, so no differential test distinguishes done from not-done) and touches
     the default VDBE path — do it deliberately in a focused turn, not as a quick
     win.
+  - *Confirmed 2026-06-26 (a fold attempt was tried and REVERTED — do NOT retry
+    it): bare-column `IN (SELECT col)` cannot be folded to `IN (list)` under ANY
+    affinity guard.* SQLite applies the LEFT operand's affinity to an `IN (list)`,
+    but for `x IN (SELECT y)` it uses `combine(left_aff, y_aff)` where `y_aff` is
+    the **subquery result column's** affinity — and these diverge precisely for a
+    bare column. Verified: `lt.x(TEXT) IN (SELECT y+0 FROM cn)` (computed
+    candidate, NONE aff) → 1 == folded `IN (list)` (SQLite uses left TEXT aff,
+    like the fold), but `lt.x(TEXT) IN (SELECT cn.y)` (bare untyped column) → 0
+    (SQLite uses `combine(TEXT, NONE)=BLOB`, no coercion) while a fold to
+    `IN (1)` wrongly applies TEXT and yields 1 (`tests/subquery_diff.rs::
+    in_select_affinity_matches_sqlite3`). So the existing `is_bare_column_expr`
+    bail is **correctness, not conservatism** — the bare-column candidate is
+    exactly the divergent case. Only the native candidate-affinity membership op
+    (B5c-1a/b above) can route it.
 - **B5c-2 — correlated subqueries on the VDBE.**
   - **B5c-2a** — thread the outer row into the subquery's register frame.
   - **B5c-2b** — compile `Subquery`/`Exists`/`InSelect` that read an outer column.
