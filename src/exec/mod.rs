@@ -13921,6 +13921,23 @@ impl Connection {
                 return def;
             }
         }
+        // The active `main` schema wins next — SQLite resolves an unqualified name
+        // main-first.
+        if self.schema.table(name).is_some() {
+            return DbRef::Main;
+        }
+        // Then attached databases, in attach order (SQLite's `main → temp →
+        // attached` search). This lets `SELECT … FROM s` find a table living only
+        // in an attached database; and, because a cross-database write swaps the
+        // original `main` into the target's attached slot, it also lets a subquery
+        // inside `UPDATE/DELETE aux.t …` resolve a `main` table while the write
+        // targets `aux` (ROADMAP Track E). A name present in *both* the active db
+        // and an attached one still binds to the active db, above.
+        for (i, d) in self.attached.iter().enumerate() {
+            if d.schema.table(name).is_some() {
+                return DbRef::Attached(i);
+            }
+        }
         DbRef::Main
     }
 

@@ -1,18 +1,24 @@
-//! Track E (ROADMAP §4) — cross-database write resolution: the regression oracle.
+//! Track E (ROADMAP §4) — cross-database write resolution.
 //!
 //! A write to an attached/`temp` database swaps that database in as the active
 //! `main` for the *whole* statement, so a subquery or source that reads the
-//! *original* main must still resolve there (main-first), as in sqlite. The
-//! INSERT forms are fixed (materialized in the original context before the swap —
-//! see `attach.rs`); the UPDATE/DELETE-with-subquery forms and the top-level
-//! "unqualified name lives only in an attached db" read are the remaining
-//! architectural work (**E1–E3**, **E-arch-a/b**).
+//! *original* main must still resolve there (main-first), as in sqlite. This is
+//! handled in two layers:
+//!   - `INSERT … SELECT` / `INSERT … VALUES ((SELECT …))` are materialized in the
+//!     original context before the swap (`prematerialize_insert_source`).
+//!   - For everything else, unqualified name resolution (`unqualified_db`) checks
+//!     the active db first, then **falls back to attached databases** — and a
+//!     cross-database write has swapped the original `main` into the target's
+//!     attached slot, so a correlated `UPDATE/DELETE aux.t …` subquery resolves a
+//!     `main` table there. This also fixes the top-level read of a name that lives
+//!     only in an attached db (`SELECT … FROM s`).
 //!
-//! This is the **E0** prerequisite: a self-contained oracle (in-memory ATTACH, so
-//! results are deterministic — no `sqlite3` needed) pinning the *target* behavior.
-//! The cases that already work are asserted live; the ones that need the refactor
-//! are `#[ignore]`d and assert the sqlite-matching result, so removing the
-//! `#[ignore]` is the acceptance check when E-arch lands.
+//! Self-contained oracle (in-memory ATTACH, deterministic — no `sqlite3` needed).
+//!
+//! *Known residual (E-arch-a, rare):* if a table name exists in **both** the
+//! active db and an attached one and is referenced *unqualified inside a
+//! cross-database write*, graphite binds the active db whereas sqlite binds main
+//! first. Realistic schemas qualify such references; not exercised here.
 
 #![cfg(feature = "std")]
 
@@ -29,10 +35,7 @@ fn scalar(c: &Connection, sql: &str) -> Value {
     c.query(sql).unwrap().rows[0][0].clone()
 }
 
-// ---------------------------------------------------------------------------
-// Already correct (asserted live) — these guard the shipped INSERT fixes and the
-// plain cross-database CRUD path.
-// ---------------------------------------------------------------------------
+// --- INSERT into an attached table, source reading main (prematerialized) ------
 
 #[test]
 fn insert_select_from_main_into_aux() {
@@ -69,14 +72,9 @@ fn plain_cross_db_crud() {
     assert_eq!(scalar(&c, "SELECT count(*) FROM aux.t"), Value::Integer(0));
 }
 
-// ---------------------------------------------------------------------------
-// Track E targets — currently broken (resolve in the swapped target db instead of
-// main, erroring "no such table"). `#[ignore]`d; removing the ignore is the
-// acceptance check for E-arch-a/b.
-// ---------------------------------------------------------------------------
+// --- UPDATE/DELETE on an attached table, subquery/source reading main ----------
 
 #[test]
-#[ignore = "Track E (E2): UPDATE SET=(subquery reading main) into an attached db"]
 fn update_set_subquery_reads_main() {
     let mut c = conn();
     c.execute("CREATE TABLE m(k, v)").unwrap();
@@ -89,7 +87,6 @@ fn update_set_subquery_reads_main() {
 }
 
 #[test]
-#[ignore = "Track E (E2): UPDATE WHERE IN (subquery reading main) into an attached db"]
 fn update_where_in_subquery_reads_main() {
     let mut c = conn();
     c.execute("CREATE TABLE m(k)").unwrap();
@@ -109,7 +106,6 @@ fn update_where_in_subquery_reads_main() {
 }
 
 #[test]
-#[ignore = "Track E (E1): UPDATE … FROM a main table into an attached db"]
 fn update_from_main_table() {
     let mut c = conn();
     c.execute("CREATE TABLE m(k, nv)").unwrap();
@@ -128,7 +124,6 @@ fn update_from_main_table() {
 }
 
 #[test]
-#[ignore = "Track E (E3): DELETE WHERE IN (subquery reading main) from an attached db"]
 fn delete_where_in_subquery_reads_main() {
     let mut c = conn();
     c.execute("CREATE TABLE m(k)").unwrap();
@@ -144,7 +139,6 @@ fn delete_where_in_subquery_reads_main() {
 }
 
 #[test]
-#[ignore = "Track E (E3): DELETE WHERE EXISTS (subquery reading main) from an attached db"]
 fn delete_where_exists_subquery_reads_main() {
     let mut c = conn();
     c.execute("CREATE TABLE m(k)").unwrap();
@@ -159,13 +153,29 @@ fn delete_where_exists_subquery_reads_main() {
     );
 }
 
+// --- top-level unqualified name that lives only in an attached db --------------
+
 #[test]
-#[ignore = "Track E (E-arch-a): unqualified name that lives only in an attached db"]
 fn top_level_unqualified_name_in_attached_db() {
-    // sqlite resolves an unqualified table by main→temp→attached; graphite only
-    // searches main/temp today, so a name living only in `aux` errors.
+    // sqlite resolves an unqualified table by main→temp→attached; a name living
+    // only in `aux` now resolves there.
     let mut c = conn();
     c.execute("CREATE TABLE aux.s(x)").unwrap();
     c.execute("INSERT INTO aux.s VALUES(7), (8)").unwrap();
     assert_eq!(scalar(&c, "SELECT sum(x) FROM s"), Value::Integer(15));
+}
+
+#[test]
+fn unqualified_name_in_main_wins_over_attached() {
+    // A name in both main and the attached db binds to main (main-first).
+    let mut c = conn();
+    c.execute("CREATE TABLE s(v)").unwrap();
+    c.execute("INSERT INTO s VALUES(100)").unwrap();
+    c.execute("CREATE TABLE aux.s(v)").unwrap();
+    c.execute("INSERT INTO aux.s VALUES(1)").unwrap();
+    assert_eq!(scalar(&c, "SELECT v FROM s"), Value::Integer(100));
+    // ...and an unqualified INSERT target that lives only in aux resolves there.
+    c.execute("CREATE TABLE aux.only(v)").unwrap();
+    c.execute("INSERT INTO only VALUES(5)").unwrap();
+    assert_eq!(scalar(&c, "SELECT v FROM aux.only"), Value::Integer(5));
 }
