@@ -171,7 +171,11 @@ text-preserving CREATE-text edits).
 index EQP; index-driven `ORDER BY` and covering reads (**B0/B0b**); the VDBE spike
 + its scalar-expression compiler; the **VDBE join family** (**B5a**); **VDBE
 routing default-on** (**B7a/B7b**, ~93 % of the corpus, tree-walker is the
-fallback oracle); bytecode `EXPLAIN` (**B8**).
+fallback oracle); bytecode `EXPLAIN` (**B8**); the router's **non-correlated
+scalar/`EXISTS` subquery fold** pre-pass (folds such subqueries — in the
+projection, `WHERE`/`HAVING`/`GROUP BY`/`ORDER BY`/join-`ON`, **and now
+`LIMIT`/`OFFSET`** — to constants so the VDBE runs the rest; never changes a
+result).
 
 **Remaining — move each remaining shape onto the VDBE.** Additive, gated on
 VDBE-vs-tree-walker parity; results are already correct via the fallback, so this

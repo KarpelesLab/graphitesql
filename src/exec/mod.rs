@@ -541,6 +541,16 @@ impl Connection {
         for o in &mut out.order_by {
             o.expr = self.fold_subquery_expr(&o.expr, &mut changed);
         }
+        // A non-correlated scalar subquery in `LIMIT`/`OFFSET` folds to its
+        // constant, which the VDBE's `fold_const_int` then accepts (it otherwise
+        // bails on any non-constant LIMIT/OFFSET). Parity-safe: the value comes
+        // from running the subquery, and a non-integer fold still falls back.
+        if let Some(l) = out.limit.take() {
+            out.limit = Some(self.fold_subquery_expr(&l, &mut changed));
+        }
+        if let Some(o) = out.offset.take() {
+            out.offset = Some(self.fold_subquery_expr(&o, &mut changed));
+        }
         if let Some(from) = &mut out.from {
             for j in &mut from.joins {
                 if let Some(on) = j.on.take() {
