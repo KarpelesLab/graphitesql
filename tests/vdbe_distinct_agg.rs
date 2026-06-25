@@ -94,6 +94,78 @@ fn distinct_aggregates_match_sqlite3() {
     }
 }
 
+// ── DISTINCT aggregates over GROUP BY ──────────────────────────────────────
+// A second table with WITHIN-group duplicate values so the per-group dedup is
+// actually exercised: group a=1 has b={10,10,20} and s={x,y,x}; a=2 has b={5,5}.
+const GSETUP: &str = "CREATE TABLE g(id INTEGER PRIMARY KEY, a INT, b INT, s TEXT);\n\
+     INSERT INTO g(a,b,s) VALUES (1,10,'x'),(1,10,'y'),(1,20,'x'),(2,5,'z'),(2,5,'z'),(3,7,'q');\n";
+
+const GROUPED: &[&str] = &[
+    // Plain (GroupEmit) path: DISTINCT aggregate, no HAVING/ORDER BY/LIMIT.
+    "SELECT a, count(DISTINCT b) FROM g GROUP BY a ORDER BY a",
+    // DISTINCT mixed with plain aggregates in one grouped row.
+    "SELECT a, count(DISTINCT b), count(*), group_concat(DISTINCT s) FROM g GROUP BY a ORDER BY a",
+    // sum/avg DISTINCT per group.
+    "SELECT a, sum(DISTINCT b), avg(DISTINCT b) FROM g GROUP BY a ORDER BY a",
+    // General path: a DISTINCT aggregate inside HAVING.
+    "SELECT a, sum(DISTINCT b) FROM g GROUP BY a HAVING count(DISTINCT b) >= 2 ORDER BY a",
+    // ORDER BY a DISTINCT aggregate, with LIMIT.
+    "SELECT a, count(DISTINCT b) AS n FROM g GROUP BY a ORDER BY n DESC, a LIMIT 2",
+];
+
+fn gconn() -> Connection {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE g(id INTEGER PRIMARY KEY, a INT, b INT, s TEXT)")
+        .unwrap();
+    c.execute(
+        "INSERT INTO g(a,b,s) VALUES (1,10,'x'),(1,10,'y'),(1,20,'x'),(2,5,'z'),(2,5,'z'),(3,7,'q')",
+    )
+    .unwrap();
+    c
+}
+
+#[test]
+fn distinct_aggregates_over_group_by_run_on_vdbe() {
+    let c = gconn();
+    for q in GROUPED {
+        let got = c.query_vdbe(q).unwrap().rows;
+        let want = c.query(q).unwrap().rows;
+        assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
+    }
+}
+
+#[test]
+fn distinct_aggregates_over_group_by_match_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let c = gconn();
+    for q in GROUPED {
+        let vdbe: Vec<Vec<String>> = c
+            .query_vdbe(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.iter().map(render).collect())
+            .collect();
+        let out = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg("-ascii")
+            .arg(format!("{GSETUP}{q};"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "sqlite3 failed on {q}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        let expected: Vec<Vec<String>> = text
+            .split('\u{1e}')
+            .filter(|r| !r.is_empty())
+            .map(|r| r.split('\u{1f}').map(|f| f.to_string()).collect())
+            .collect();
+        assert_eq!(vdbe, expected, "VDBE vs sqlite3 diverged on {q}");
+    }
+}
+
 /// A `DISTINCT` aggregate over a non-BINARY column collation must defer to the
 /// tree-walker (the VDBE aggregate path dedups under BINARY only). The
 /// tree-walker still produces the correct answer.

@@ -261,8 +261,15 @@ is *perf/coverage*, not correctness.
   folding over distinct values only. A non-BINARY column collation still defers to
   the tree-walker (that path already bailed on non-BINARY), so the NOCASE case is
   handled correctly by fallback. Differentially tested vs sqlite 3.50.4
-  (`tests/vdbe_distinct_agg.rs`). `DISTINCT` aggregates over a join, and
-  `FILTER`/`ORDER BY` aggregates, still fall back.
+  (`tests/vdbe_distinct_agg.rs`). `FILTER`/`ORDER BY` aggregates still fall back.
+  - *Also done — `DISTINCT` aggregates **over `GROUP BY`**.* `AggSpec`/`Op::GroupStep`
+    gained the same `distinct` flag, deduping each group's collected values at fold
+    time, so `SELECT a, count(DISTINCT b) … GROUP BY a` (and the `HAVING`/`ORDER BY`/
+    `LIMIT` general path, mixed with plain aggregates) runs on the VDBE — for both
+    the single-table and the nested-loop-join grouped compilers (they share
+    `emit_group_fold`). The grouped path already bailed on non-BINARY collations, so
+    the dedup is BINARY-safe. Tested in `tests/vdbe_distinct_agg.rs` with
+    within-group duplicate values.
 - **B5c-4 — window functions on the VDBE.**
 - **B5b — per-cursor nested-loop join + inner seek** (stream the inner side
   instead of materializing the cross-product; *perf-only*).

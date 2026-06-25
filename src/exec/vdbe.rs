@@ -258,6 +258,9 @@ pub struct AggSpec {
     pub kind: AggKind,
     /// Argument register, or `None` for `count(*)`.
     pub arg: Option<usize>,
+    /// When set, fold only over distinct argument values (BINARY equality), so
+    /// the slot computes e.g. `count(DISTINCT x)` per group.
+    pub distinct: bool,
 }
 
 /// One output column of a [`Op::GroupEmit`]: a group-key value (by key index) or
@@ -710,7 +713,7 @@ fn emit_group_fold(
     c: &mut Compiler,
     sel: &Select,
     group_cols: &[usize],
-    agg_specs: &[(AggKind, Option<Expr>)],
+    agg_specs: &[(AggKind, Option<Expr>, bool)],
 ) -> Result<()> {
     let bounds = c.cursor_boundaries.clone();
     // Contiguous key registers, loaded per row from the grouping columns.
@@ -771,7 +774,7 @@ fn emit_group_fold(
     }
     // Evaluate each aggregate argument into a register for this row.
     let mut aggs: Vec<AggSpec> = Vec::new();
-    for (kind, arg) in agg_specs {
+    for (kind, arg, distinct) in agg_specs {
         let arg_reg = match arg {
             Some(expr) => Some(c.compile_expr(expr)?),
             None => None,
@@ -779,6 +782,7 @@ fn emit_group_fold(
         aggs.push(AggSpec {
             kind: *kind,
             arg: arg_reg,
+            distinct: *distinct,
         });
     }
     c.ops.push(Op::GroupStep {
@@ -912,10 +916,12 @@ fn compile_group_select(
     for term in &sel.order_by {
         collect_aggregates(&term.expr, &mut agg_exprs);
     }
-    // Each aggregate must be a shape the VDBE can fold.
-    let mut agg_specs: Vec<(AggKind, Option<Expr>)> = Vec::new();
+    // Each aggregate must be a shape the VDBE can fold. DISTINCT is supported (the
+    // per-group collected values are deduped at fold time, BINARY only — a
+    // non-BINARY collation already bailed above).
+    let mut agg_specs: Vec<(AggKind, Option<Expr>, bool)> = Vec::new();
     for e in &agg_exprs {
-        match agg_kind(e) {
+        match agg_kind_distinct(e) {
             Some(spec) => agg_specs.push(spec),
             None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
         }
@@ -1050,7 +1056,7 @@ fn compile_group_select(
     // Finalize groups and position the group cursor; the emit loop body follows.
     let gfin = c.ops.len();
     c.ops.push(Op::GroupFinalize {
-        agg_kinds: agg_specs.iter().map(|(k, _)| *k).collect(),
+        agg_kinds: agg_specs.iter().map(|(k, _, _)| *k).collect(),
         target: 0,
     });
     let gbody = c.ops.len();
@@ -1249,10 +1255,10 @@ fn compile_group_emit(
     // Column refs resolve through `resolve_column` (qualifier-aware) so a join's
     // qualified `t.col` and ambiguous bare names are handled like the tree-walker.
     let mut outputs: Vec<GroupOut> = Vec::new();
-    let mut agg_specs: Vec<(AggKind, Option<Expr>)> = Vec::new();
+    let mut agg_specs: Vec<(AggKind, Option<Expr>, bool)> = Vec::new();
     for (e, _) in projections {
         if is_aggregate_expr(e) {
-            match agg_kind(e) {
+            match agg_kind_distinct(e) {
                 Some(spec) => {
                     outputs.push(GroupOut::Agg(agg_specs.len()));
                     agg_specs.push(spec);
@@ -1279,7 +1285,7 @@ fn compile_group_emit(
 
     c.ops.push(Op::GroupEmit {
         outputs,
-        agg_kinds: agg_specs.iter().map(|(k, _)| *k).collect(),
+        agg_kinds: agg_specs.iter().map(|(k, _, _)| *k).collect(),
     });
     c.ops.push(Op::Halt);
     Ok(Program {
@@ -3937,7 +3943,14 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
                     } else if let Some(r) = spec.arg {
                         if !matches!(regs[r], Value::Null) {
                             let v = regs[r].clone();
-                            groups[gi].1[j].0.push(v);
+                            // A DISTINCT aggregate folds each distinct argument
+                            // value once per group (BINARY equality; non-BINARY
+                            // bails before compilation).
+                            if !spec.distinct
+                                || !groups[gi].1[j].0.iter().any(|p| distinct_eq(p, &v))
+                            {
+                                groups[gi].1[j].0.push(v);
+                            }
                         }
                     }
                 }
