@@ -678,8 +678,139 @@ fn collect_aggregates(expr: &Expr, out: &mut Vec<Expr>) {
     }
 }
 
-/// Compile `SELECT <group cols / aggregates> FROM <table> [WHERE …] GROUP BY
-/// <cols> [HAVING …] [ORDER BY …] [LIMIT/OFFSET]`. Each grouping key must be a
+/// Emit the GROUP-BY fold loop into `c`: allocate the contiguous group-key
+/// registers (one per grouping column), scan the row source, apply `WHERE`, load
+/// each grouping key and aggregate argument, and `GroupStep`. The row source is a
+/// single cursor when `c.cursor_boundaries` is `None`, else an N-deep nested loop
+/// over the cursors (cursor 0 outermost, matching the cross-product fold order).
+/// All scan/exit edges are backpatched so control falls through to whatever emit
+/// phase the caller appends next. Shared by the single-table and nested-loop-join
+/// grouped compilers, so a `GROUP BY` join inherits the full grouped grammar.
+fn emit_group_fold(
+    c: &mut Compiler,
+    sel: &Select,
+    group_cols: &[usize],
+    agg_specs: &[(AggKind, Option<Expr>)],
+) -> Result<()> {
+    let bounds = c.cursor_boundaries.clone();
+    // Contiguous key registers, loaded per row from the grouping columns.
+    let key_start = c.next_reg;
+    for _ in group_cols {
+        c.alloc();
+    }
+    // Prologue: position the row source. A join opens N cursors (outermost first);
+    // a single table opens one.
+    let mut rewind_at: Vec<usize> = Vec::new();
+    let mut single_rewind: Option<usize> = None;
+    match &bounds {
+        Some(b) => {
+            rewind_at = alloc::vec![0usize; b.len()];
+            for (i, slot) in rewind_at.iter_mut().enumerate() {
+                *slot = c.ops.len();
+                c.ops.push(Op::RewindC {
+                    cursor: i,
+                    target: 0,
+                });
+            }
+        }
+        None => {
+            single_rewind = Some(c.ops.len());
+            c.ops.push(Op::Rewind { target: 0 });
+        }
+    }
+    let body = c.ops.len();
+    // WHERE (already merged with any join `ON`): skip the row when not true.
+    let skip = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    // Load each grouping key into its register (per-cursor `ColumnC` for a join).
+    for (k, &ci) in group_cols.iter().enumerate() {
+        match &bounds {
+            Some(b) => {
+                let (cursor, col) = Compiler::cursor_of(b, ci);
+                c.ops.push(Op::ColumnC {
+                    cursor,
+                    col,
+                    dest: key_start + k,
+                });
+            }
+            None => c.ops.push(Op::Column {
+                col: ci,
+                dest: key_start + k,
+            }),
+        }
+    }
+    // Evaluate each aggregate argument into a register for this row.
+    let mut aggs: Vec<AggSpec> = Vec::new();
+    for (kind, arg) in agg_specs {
+        let arg_reg = match arg {
+            Some(expr) => Some(c.compile_expr(expr)?),
+            None => None,
+        };
+        aggs.push(AggSpec {
+            kind: *kind,
+            arg: arg_reg,
+        });
+    }
+    c.ops.push(Op::GroupStep {
+        key_start,
+        key_count: group_cols.len(),
+        aggs,
+    });
+    // Epilogue: advance the loop(s) and backpatch the empty/exit edges so an empty
+    // source lands at `end` (no groups → the caller emits no rows).
+    match &bounds {
+        Some(b) => {
+            let n = b.len();
+            let mut next_at = alloc::vec![0usize; n];
+            for i in (0..n).rev() {
+                next_at[i] = c.ops.len();
+                let target = if i == n - 1 { body } else { rewind_at[i + 1] };
+                c.ops.push(Op::NextC { cursor: i, target });
+            }
+            let end = c.ops.len();
+            for i in 0..n {
+                let target = if i == 0 { end } else { next_at[i - 1] };
+                if let Op::RewindC { target: t, .. } = &mut c.ops[rewind_at[i]] {
+                    *t = target;
+                }
+            }
+            if let Some(at) = skip {
+                if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+                    *target = next_at[n - 1];
+                }
+            }
+        }
+        None => {
+            let next = c.ops.len();
+            c.ops.push(Op::Next { target: body });
+            if let Some(at) = skip {
+                if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+                    *target = next;
+                }
+            }
+            let end = c.ops.len();
+            if let Some(rw) = single_rewind {
+                if let Op::Rewind { target } = &mut c.ops[rw] {
+                    *target = end;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compile `SELECT <group cols / aggregates> FROM <table or join> [WHERE …] GROUP
+/// BY <cols> [HAVING …] [ORDER BY …] [LIMIT/OFFSET]`. Each grouping key must be a
 /// bare column. Output columns, the `HAVING` predicate, and `ORDER BY` keys may
 /// reference grouping columns and aggregate calls (in arbitrary scalar
 /// expressions, via the compiler's binding table). The scan folds per-group
@@ -693,6 +824,7 @@ fn compile_group_select(
     affinities: &[Affinity],
     collations: &[Collation],
     projections: &[(Expr, String)],
+    boundaries: Option<&[usize]>,
 ) -> Result<Program> {
     if sel.distinct {
         return Err(Error::Unsupported("VDBE: GROUP BY + DISTINCT"));
@@ -705,15 +837,30 @@ fn compile_group_select(
     let has_having = sel.having.is_some();
     let has_order = !sel.order_by.is_empty();
     let has_limit = sel.limit.is_some() || sel.offset.is_some();
-    // Resolve each grouping key to a table column index (bare columns only).
-    let col_index = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
+
+    // The compiler is created up front so grouping keys (and, on the plain path,
+    // outputs) resolve through `resolve_column` — qualifier-aware, so a join's
+    // ambiguous bare name bails while a qualified `t.col` picks the right table.
+    // `cursor_boundaries` drives single-cursor vs nested-loop emission downstream.
+    let mut c = Compiler {
+        ops: Vec::new(),
+        next_reg: 0,
+        columns: columns.to_vec(),
+        tables: tables.to_vec(),
+        affinities: affinities.to_vec(),
+        collations: collations.to_vec(),
+        bindings: Vec::new(),
+        forbid_raw_columns: false,
+        rowid_index: None,
+        cursor_boundaries: boundaries.map(|b| b.to_vec()),
+    };
+    // Resolve each grouping key to a (combined) column index (column refs only).
     let mut group_cols: Vec<usize> = Vec::new();
     for g in &sel.group_by {
         match g {
-            Expr::Column { column, .. } => match col_index(column) {
-                Some(i) => group_cols.push(i),
-                None => return Err(Error::Unsupported("VDBE: GROUP BY unknown column")),
-            },
+            Expr::Column { table, column } => {
+                group_cols.push(c.resolve_column(table.as_deref(), column)?)
+            }
             _ => return Err(Error::Unsupported("VDBE: GROUP BY column refs only")),
         }
     }
@@ -728,6 +875,7 @@ fn compile_group_select(
             collations,
             projections,
             &group_cols,
+            boundaries,
         );
     }
 
@@ -753,72 +901,9 @@ fn compile_group_select(
         }
     }
 
-    let mut c = Compiler {
-        ops: Vec::new(),
-        next_reg: 0,
-        columns: columns.to_vec(),
-        tables: tables.to_vec(),
-        affinities: affinities.to_vec(),
-        collations: collations.to_vec(),
-        bindings: Vec::new(),
-        forbid_raw_columns: false,
-        rowid_index: None,
-        cursor_boundaries: None,
-    };
-    // Contiguous key registers, loaded per row from the grouping columns.
-    let key_start = c.next_reg;
-    for _ in &group_cols {
-        c.alloc();
-    }
-    let rewind = c.ops.len();
-    c.ops.push(Op::Rewind { target: 0 });
-    let body = c.ops.len();
-    let skip = match &sel.where_clause {
-        Some(pred) => {
-            let preg = c.compile_expr(pred)?;
-            let at = c.ops.len();
-            c.ops.push(Op::IfFalse {
-                reg: preg,
-                target: 0,
-            });
-            Some(at)
-        }
-        None => None,
-    };
-    for (k, &ci) in group_cols.iter().enumerate() {
-        c.ops.push(Op::Column {
-            col: ci,
-            dest: key_start + k,
-        });
-    }
-    // Evaluate each aggregate argument into a register for this row.
-    let mut aggs: Vec<AggSpec> = Vec::new();
-    for (kind, arg) in &agg_specs {
-        let arg_reg = match arg {
-            Some(expr) => Some(c.compile_expr(expr)?),
-            None => None,
-        };
-        aggs.push(AggSpec {
-            kind: *kind,
-            arg: arg_reg,
-        });
-    }
-    c.ops.push(Op::GroupStep {
-        key_start,
-        key_count: group_cols.len(),
-        aggs,
-    });
-    let next = c.ops.len();
-    c.ops.push(Op::Next { target: body });
-    if let Some(at) = skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = next;
-        }
-    }
-    let end = c.ops.len();
-    if let Op::Rewind { target } = &mut c.ops[rewind] {
-        *target = end;
-    }
+    // Fold the row source (single cursor or nested-loop join) into per-group
+    // aggregates, allocating the grouping-key registers.
+    emit_group_fold(&mut c, sel, &group_cols, &agg_specs)?;
 
     // Per-group registers: one for each grouping key value, one for each
     // aggregate final. These feed the bindings so HAVING/projection/ORDER-BY
@@ -1117,6 +1202,7 @@ fn compile_group_select(
 /// The compact plain-GROUP-BY path: every output column is a grouping key or a
 /// bare aggregate, with no HAVING/ORDER BY/LIMIT. Folds the scan and emits one
 /// row per group via [`Op::GroupEmit`].
+#[allow(clippy::too_many_arguments)] // cohesive: the combined column space + boundaries
 fn compile_group_emit(
     sel: &Select,
     columns: &[String],
@@ -1125,9 +1211,23 @@ fn compile_group_emit(
     collations: &[Collation],
     projections: &[(Expr, String)],
     group_cols: &[usize],
+    boundaries: Option<&[usize]>,
 ) -> Result<Program> {
-    let col_index = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
+    let mut c = Compiler {
+        ops: Vec::new(),
+        next_reg: 0,
+        columns: columns.to_vec(),
+        tables: tables.to_vec(),
+        affinities: affinities.to_vec(),
+        collations: collations.to_vec(),
+        bindings: Vec::new(),
+        forbid_raw_columns: false,
+        rowid_index: None,
+        cursor_boundaries: boundaries.map(|b| b.to_vec()),
+    };
     // Classify each output column as a grouping-key reference or an aggregate.
+    // Column refs resolve through `resolve_column` (qualifier-aware) so a join's
+    // qualified `t.col` and ambiguous bare names are handled like the tree-walker.
     let mut outputs: Vec<GroupOut> = Vec::new();
     let mut agg_specs: Vec<(AggKind, Option<Expr>)> = Vec::new();
     for (e, _) in projections {
@@ -1139,9 +1239,10 @@ fn compile_group_emit(
                 }
                 None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
             }
-        } else if let Expr::Column { column, .. } = e {
-            // Must be one of the grouping columns (by table-column index).
-            match col_index(column).and_then(|ci| group_cols.iter().position(|&g| g == ci)) {
+        } else if let Expr::Column { table, column } = e {
+            // Must be one of the grouping columns (by combined column index).
+            let ci = c.resolve_column(table.as_deref(), column)?;
+            match group_cols.iter().position(|&g| g == ci) {
                 Some(k) => outputs.push(GroupOut::Key(k)),
                 None => return Err(Error::Unsupported("VDBE: non-grouped column")),
             }
@@ -1152,72 +1253,10 @@ fn compile_group_emit(
         }
     }
 
-    let mut c = Compiler {
-        ops: Vec::new(),
-        next_reg: 0,
-        columns: columns.to_vec(),
-        tables: tables.to_vec(),
-        affinities: affinities.to_vec(),
-        collations: collations.to_vec(),
-        bindings: Vec::new(),
-        forbid_raw_columns: false,
-        rowid_index: None,
-        cursor_boundaries: None,
-    };
-    // Contiguous key registers, loaded per row from the grouping columns.
-    let key_start = c.next_reg;
-    for _ in group_cols {
-        c.alloc();
-    }
-    let rewind = c.ops.len();
-    c.ops.push(Op::Rewind { target: 0 });
-    let body = c.ops.len();
-    let skip = match &sel.where_clause {
-        Some(pred) => {
-            let preg = c.compile_expr(pred)?;
-            let at = c.ops.len();
-            c.ops.push(Op::IfFalse {
-                reg: preg,
-                target: 0,
-            });
-            Some(at)
-        }
-        None => None,
-    };
-    for (k, &ci) in group_cols.iter().enumerate() {
-        c.ops.push(Op::Column {
-            col: ci,
-            dest: key_start + k,
-        });
-    }
-    // Evaluate each aggregate argument into a register for this row.
-    let mut aggs: Vec<AggSpec> = Vec::new();
-    for (kind, arg) in &agg_specs {
-        let arg_reg = match arg {
-            Some(expr) => Some(c.compile_expr(expr)?),
-            None => None,
-        };
-        aggs.push(AggSpec {
-            kind: *kind,
-            arg: arg_reg,
-        });
-    }
-    c.ops.push(Op::GroupStep {
-        key_start,
-        key_count: group_cols.len(),
-        aggs,
-    });
-    let next = c.ops.len();
-    c.ops.push(Op::Next { target: body });
-    if let Some(at) = skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = next;
-        }
-    }
-    let end = c.ops.len();
-    if let Op::Rewind { target } = &mut c.ops[rewind] {
-        *target = end;
-    }
+    // Fold the row source (single cursor or nested-loop join) into per-group
+    // aggregates, allocating the grouping-key registers.
+    emit_group_fold(&mut c, sel, group_cols, &agg_specs)?;
+
     c.ops.push(Op::GroupEmit {
         outputs,
         agg_kinds: agg_specs.iter().map(|(k, _)| *k).collect(),
@@ -1258,7 +1297,15 @@ pub fn compile_table_select(
     }
     // GROUP BY folds the scan into one row per group.
     if !sel.group_by.is_empty() {
-        return compile_group_select(sel, columns, tables, affinities, collations, &projections);
+        return compile_group_select(
+            sel,
+            columns,
+            tables,
+            affinities,
+            collations,
+            &projections,
+            None,
+        );
     }
     // An all-aggregate projection (no GROUP BY) folds the scan into one row.
     if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
@@ -2005,18 +2052,20 @@ pub fn compile_aggregate_join(
     })
 }
 
-/// Compile a plain `GROUP BY` N-table inner join (`SELECT <keys/aggregates> FROM t1
-/// JOIN … GROUP BY <cols>`, no HAVING / ORDER BY / LIMIT / DISTINCT) into an N-deep
-/// nested loop that folds each surviving combined row into its group, then emits one
-/// row per group via `Op::GroupEmit` — instead of materializing the `t1 × … × tN`
-/// cross-product and grouping *that* (B5b-1, perf-only: the fallback already gives
-/// the same answer). Mirrors the single-table `compile_group_emit` grammar: every
-/// grouping term is a (bare or qualified) column ref, every output column is a
-/// grouping key or a supported aggregate, BINARY collations only. The fold order
-/// (cursor 0 outermost) matches the cross-product, so the first-seen group order is
+/// Compile a `GROUP BY` over an N-table inner join (`SELECT <keys/aggregates> FROM
+/// t1 JOIN … GROUP BY <cols> [HAVING …] [ORDER BY …] [LIMIT/OFFSET]`) onto an N-deep
+/// nested loop that folds each surviving combined row into its group — instead of
+/// materializing the `t1 × … × tN` cross-product and grouping *that* (B5b-1,
+/// perf-only: the fallback already gives the same answer). This is a thin adapter:
+/// it expands the projection and hands the combined column space to the shared
+/// `compile_group_select`, which drives the row source from `cursor_boundaries`,
+/// so the join inherits the full single-table grouped grammar — plain `GroupEmit`,
+/// or the general `HAVING` / `ORDER BY` / `LIMIT` path. The fold order (cursor 0
+/// outermost) matches the cross-product, so the first-seen group order is
 /// byte-identical; an empty cursor yields no groups (no rows), as SQLite does.
-/// Anything richer (HAVING / ORDER BY / LIMIT / DISTINCT / a non-column key / a
-/// non-grouped output) returns `Unsupported` so the caller falls back.
+/// Grouping/output column refs are qualifier-aware. `DISTINCT`, a non-column key, a
+/// non-grouped output, or a non-BINARY collation return `Unsupported` (the caller
+/// falls back).
 pub fn compile_group_join(
     sel: &Select,
     columns: &[String],
@@ -2027,154 +2076,21 @@ pub fn compile_group_join(
 ) -> Result<Program> {
     let n = boundaries.len();
     debug_assert!(n >= 2 && boundaries[n - 1] == columns.len());
-    if !sel.compound.is_empty()
-        || sel.group_by.is_empty()
-        || sel.having.is_some()
-        || !sel.order_by.is_empty()
-        || sel.limit.is_some()
-        || sel.offset.is_some()
-        || sel.distinct
-    {
-        return Err(Error::Unsupported("VDBE: plain GROUP BY join only"));
-    }
-    // Group-key matching and min/max reduce under BINARY; a non-BINARY column
-    // collation would diverge, so defer to the tree-walker.
-    if collations.iter().any(|cl| *cl != Collation::Binary) {
-        return Err(Error::Unsupported("VDBE: non-BINARY collation in GROUP BY"));
+    // The compound case is handled per-arm elsewhere; a grouped *join* arm with a
+    // tail compound is out of scope here.
+    if !sel.compound.is_empty() || sel.group_by.is_empty() {
+        return Err(Error::Unsupported("VDBE: GROUP BY join requires GROUP BY"));
     }
     let projections = expand_projections(sel, columns, tables)?;
-    let mut c = Compiler {
-        ops: Vec::new(),
-        next_reg: 0,
-        columns: columns.to_vec(),
-        tables: tables.to_vec(),
-        affinities: affinities.to_vec(),
-        collations: collations.to_vec(),
-        bindings: Vec::new(),
-        forbid_raw_columns: false,
-        rowid_index: None,
-        cursor_boundaries: Some(boundaries.to_vec()),
-    };
-    // Resolve each grouping key to a combined column index (column refs only;
-    // qualifier-aware, so an ambiguous bare name bails like the tree-walker).
-    let mut group_cols: Vec<usize> = Vec::new();
-    for g in &sel.group_by {
-        match g {
-            Expr::Column { table, column } => {
-                group_cols.push(c.resolve_column(table.as_deref(), column)?)
-            }
-            _ => return Err(Error::Unsupported("VDBE: GROUP BY column refs only")),
-        }
-    }
-    // Classify each output column as a grouping-key reference or an aggregate.
-    let mut outputs: Vec<GroupOut> = Vec::new();
-    let mut agg_specs: Vec<(AggKind, Option<Expr>)> = Vec::new();
-    for (e, _) in &projections {
-        if is_aggregate_expr(e) {
-            match agg_kind(e) {
-                Some(spec) => {
-                    outputs.push(GroupOut::Agg(agg_specs.len()));
-                    agg_specs.push(spec);
-                }
-                None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
-            }
-        } else if let Expr::Column { table, column } = e {
-            let ci = c.resolve_column(table.as_deref(), column)?;
-            match group_cols.iter().position(|&g| g == ci) {
-                Some(k) => outputs.push(GroupOut::Key(k)),
-                None => return Err(Error::Unsupported("VDBE: non-grouped column")),
-            }
-        } else {
-            return Err(Error::Unsupported(
-                "VDBE: GROUP BY output must be key or aggregate",
-            ));
-        }
-    }
-    // Contiguous key registers, loaded per row from the grouping columns.
-    let key_start = c.next_reg;
-    for _ in &group_cols {
-        c.alloc();
-    }
-    // N-deep nested loop (cursor 0 outermost), as in `compile_join2`.
-    let mut rewind_at = alloc::vec![0usize; n];
-    for (i, slot) in rewind_at.iter_mut().enumerate() {
-        *slot = c.ops.len();
-        c.ops.push(Op::RewindC {
-            cursor: i,
-            target: 0,
-        });
-    }
-    let body = c.ops.len();
-    // WHERE (already merged with ON): skip to the innermost `NextC` when not true.
-    let skip = match &sel.where_clause {
-        Some(pred) => {
-            let preg = c.compile_expr(pred)?;
-            let at = c.ops.len();
-            c.ops.push(Op::IfFalse {
-                reg: preg,
-                target: 0,
-            });
-            Some(at)
-        }
-        None => None,
-    };
-    // Load each grouping key into its register via the per-cursor `ColumnC`.
-    for (k, &ci) in group_cols.iter().enumerate() {
-        let (cursor, col) = Compiler::cursor_of(boundaries, ci);
-        c.ops.push(Op::ColumnC {
-            cursor,
-            col,
-            dest: key_start + k,
-        });
-    }
-    // Evaluate each aggregate argument into a register for this row.
-    let mut aggs: Vec<AggSpec> = Vec::new();
-    for (kind, arg) in &agg_specs {
-        let arg_reg = match arg {
-            Some(expr) => Some(c.compile_expr(expr)?),
-            None => None,
-        };
-        aggs.push(AggSpec {
-            kind: *kind,
-            arg: arg_reg,
-        });
-    }
-    c.ops.push(Op::GroupStep {
-        key_start,
-        key_count: group_cols.len(),
-        aggs,
-    });
-    // `NextC` chain, innermost-first (as in `compile_join2`).
-    let mut next_at = alloc::vec![0usize; n];
-    for i in (0..n).rev() {
-        next_at[i] = c.ops.len();
-        let target = if i == n - 1 { body } else { rewind_at[i + 1] };
-        c.ops.push(Op::NextC { cursor: i, target });
-    }
-    // `end` is the emit point: an empty cursor 0 (or an exhausted outer loop) lands
-    // here with no groups → `GroupEmit` produces no rows.
-    let end = c.ops.len();
-    for i in 0..n {
-        let target = if i == 0 { end } else { next_at[i - 1] };
-        if let Op::RewindC { target: t, .. } = &mut c.ops[rewind_at[i]] {
-            *t = target;
-        }
-    }
-    if let Some(at) = skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = next_at[n - 1];
-        }
-    }
-    c.ops.push(Op::GroupEmit {
-        outputs,
-        agg_kinds: agg_specs.iter().map(|(k, _)| *k).collect(),
-    });
-    c.ops.push(Op::Halt);
-    Ok(Program {
-        ops: c.ops,
-        n_registers: c.next_reg,
-        columns: projections.into_iter().map(|(_, l)| l).collect(),
-    })
+    compile_group_select(
+        sel,
+        columns,
+        tables,
+        affinities,
+        collations,
+        &projections,
+        Some(boundaries),
+    )
 }
 
 /// Compile a two-table `LEFT JOIN` (`SELECT … FROM a LEFT JOIN b ON …`) into a
@@ -4189,11 +4105,17 @@ mod tests {
         let tabs = vec!["a".to_string(), "b".to_string()];
         let aff = vec![Affinity::Blob; 2];
         let coll = vec![Collation::Binary; 2];
-        // Plain GROUP BY (key + aggregate, no HAVING/ORDER BY/LIMIT) compiles.
+        // The full grouped grammar over a join compiles: plain (key + aggregate),
+        // plus the general HAVING / ORDER BY / LIMIT path (shared with the
+        // single-table scan compiler via `cursor_boundaries`).
         for sql in [
             "SELECT a.x, count(*) FROM a, b GROUP BY a.x",
             "SELECT x, sum(p) FROM a, b GROUP BY x",
             "SELECT a.x FROM a, b GROUP BY a.x",
+            "SELECT a.x, count(*) FROM a, b GROUP BY a.x HAVING count(*) > 1",
+            "SELECT a.x, count(*) FROM a, b GROUP BY a.x ORDER BY a.x",
+            "SELECT a.x, count(*) FROM a, b GROUP BY a.x LIMIT 1",
+            "SELECT a.x, count(*) AS n FROM a, b GROUP BY a.x ORDER BY n DESC LIMIT 2 OFFSET 1",
         ] {
             let Statement::Select(sel) = parse_one(sql).unwrap() else {
                 panic!()
@@ -4203,11 +4125,8 @@ mod tests {
                 "{sql} should compile as a GROUP BY join"
             );
         }
-        // HAVING / ORDER BY / LIMIT / DISTINCT / a non-grouped output bail.
+        // DISTINCT / a non-grouped output / no GROUP BY still bail.
         for sql in [
-            "SELECT a.x, count(*) FROM a, b GROUP BY a.x HAVING count(*) > 1",
-            "SELECT a.x, count(*) FROM a, b GROUP BY a.x ORDER BY a.x",
-            "SELECT a.x, count(*) FROM a, b GROUP BY a.x LIMIT 1",
             "SELECT DISTINCT a.x, count(*) FROM a, b GROUP BY a.x",
             "SELECT a.x, b.p FROM a, b GROUP BY a.x", // b.p not grouped/aggregated
             "SELECT count(*) FROM a, b",              // no GROUP BY

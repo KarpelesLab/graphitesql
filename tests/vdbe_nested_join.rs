@@ -322,6 +322,59 @@ fn group_by_over_join_runs_on_vdbe() {
 }
 
 #[test]
+fn general_group_by_over_join_runs_on_vdbe() {
+    // The full grouped grammar (HAVING / ORDER BY / LIMIT) over a join runs on the
+    // VDBE: each group is folded over the nested loop, then HAVING/ORDER BY/LIMIT
+    // apply in the shared grouped-emit phase — no `a × b` cross-product. Expected
+    // rows match the pinned sqlite3 oracle.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x, y)").unwrap();
+    c.execute("INSERT INTO a VALUES(1,'a'),(2,'b'),(2,'c')")
+        .unwrap();
+    c.execute("CREATE TABLE b(p, q)").unwrap();
+    c.execute("INSERT INTO b VALUES(1,'P'),(2,'Q'),(2,'R')")
+        .unwrap();
+    // HAVING drops group 1 (count 1); group 2 has 2×2 = 4 matched pairs.
+    let h = c
+        .query_vdbe(
+            "SELECT a.x, count(*) FROM a JOIN b ON a.x = b.p \
+             GROUP BY a.x HAVING count(*) > 1 ORDER BY a.x",
+        )
+        .unwrap();
+    assert_eq!(h.rows, vec![vec![Value::Integer(2), Value::Integer(4)]]);
+    // ORDER BY an aggregate, descending.
+    let o = c
+        .query_vdbe(
+            "SELECT a.x, count(*) FROM a JOIN b ON a.x = b.p GROUP BY a.x ORDER BY count(*) DESC",
+        )
+        .unwrap();
+    assert_eq!(
+        o.rows,
+        vec![
+            vec![Value::Integer(2), Value::Integer(4)],
+            vec![Value::Integer(1), Value::Integer(1)],
+        ]
+    );
+    // ORDER BY a key with LIMIT/OFFSET selects the second group.
+    let l = c
+        .query_vdbe("SELECT a.x, count(*) FROM a JOIN b ON a.x = b.p GROUP BY a.x ORDER BY a.x LIMIT 1 OFFSET 1")
+        .unwrap();
+    assert_eq!(l.rows, vec![vec![Value::Integer(2), Value::Integer(4)]]);
+    // group_concat (order-sensitive) under HAVING: the inner-loop fold order
+    // (left row outer, right row inner) gives "Q,R,Q,R", as in the plain path.
+    let g = c
+        .query_vdbe(
+            "SELECT a.x, group_concat(b.q) FROM a JOIN b ON a.x = b.p \
+             GROUP BY a.x HAVING count(*) > 1",
+        )
+        .unwrap();
+    assert_eq!(
+        g.rows,
+        vec![vec![Value::Integer(2), Value::Text("Q,R,Q,R".into())]]
+    );
+}
+
+#[test]
 fn nested_loop_join_empty_side_yields_no_rows() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x)").unwrap();

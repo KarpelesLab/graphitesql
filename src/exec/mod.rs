@@ -1442,9 +1442,9 @@ impl Connection {
                         rows: result,
                     });
                 }
-                // A plain `GROUP BY` join (keys + aggregates, no HAVING/ORDER BY/
-                // LIMIT) folds each group over the nested loop and emits one row
-                // per group — again with no cross-product materialized.
+                // A `GROUP BY` join (keys + aggregates, with optional HAVING /
+                // ORDER BY / LIMIT) folds each group over the nested loop and emits
+                // one row per group — again with no cross-product materialized.
                 if let Ok(prog) = vdbe::compile_group_join(
                     &joined,
                     &combined,

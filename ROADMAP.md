@@ -252,13 +252,19 @@ is *perf/coverage*, not correctness.
     loop via `compile_aggregate_join` (mirroring the single-table
     `compile_aggregate_select`) and emits one finalized row — again with no
     cross-product materialized; the fold order matches the cross-product so
-    order-sensitive `group_concat` is byte-identical. A **plain `GROUP BY`** join
-    (keys + aggregates, no HAVING/ORDER BY/LIMIT) likewise folds each group over the
-    nested loop via `compile_group_join` (mirroring `compile_group_emit`) and emits
-    one row per group with no cross-product — same first-seen group order. Only a
-    `GROUP BY` with HAVING / ORDER BY / LIMIT (the general grouped path) and
+    order-sensitive `group_concat` is byte-identical. A **`GROUP BY`** join folds
+    each surviving combined row into its group over the nested loop — *the full
+    grouped grammar*: keys + aggregates, optional **HAVING / ORDER BY / LIMIT /
+    OFFSET**, no cross-product, same first-seen group order. This came for free by
+    factoring the fold loop into `emit_group_fold` (single-cursor `Rewind`/`Column`
+    when `cursor_boundaries` is `None`, else the N-deep `RewindC`/`ColumnC`/`NextC`)
+    and generalizing `compile_group_select`/`compile_group_emit` over an optional
+    `boundaries` slice; `compile_group_join` is now a thin adapter that expands the
+    projection and delegates, so a join inherits the single-table compiler's plain
+    `GroupEmit` path *and* its general `GroupFinalize`/`GroupNext` emit (with the
+    HAVING skip and ORDER-BY sorter) unchanged. Only `GROUP BY DISTINCT` and
     aggregates needing DISTINCT/FILTER/ORDER BY still fall back to the cross-product
-    path. An ordered inner join is now
+    path. An ordered, grouped inner join is now
     feature-complete on the VDBE (parity with the single-table scan compiler). Row
     order matches the cross-product and sqlite. Verified by
     the differential join corpus (2-, 3-, 4-table) + direct unit tests
