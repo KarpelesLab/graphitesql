@@ -270,6 +270,13 @@ is *perf/coverage*, not correctness.
     `emit_group_fold`). The grouped path already bailed on non-BINARY collations, so
     the dedup is BINARY-safe. Tested in `tests/vdbe_distinct_agg.rs` with
     within-group duplicate values.
+  - *Also done — `DISTINCT` aggregates **over a bare two-table join**.* The
+    bare-aggregate join compiler (`compile_aggregate_join`, no GROUP BY) now
+    threads the same `distinct` flag into its `Op::AggStep` (previously hardcoded
+    non-distinct), so `SELECT count(DISTINCT a.v), sum(DISTINCT b.w) FROM a JOIN b
+    …` folds-and-dedups over the joined rows on the VDBE. BINARY-safe (the path
+    already bails on non-BINARY collation). Tested in `tests/vdbe_distinct_agg.rs`
+    with a join that replicates a value so the dedup is observable.
 - **B5c-4 — window functions on the VDBE.**
 - **B5b — per-cursor nested-loop join + inner seek** (stream the inner side
   instead of materializing the cross-product; *perf-only*).

@@ -1,9 +1,10 @@
-//! Track B: `DISTINCT` aggregates on the bare single-table aggregate path run on
-//! the VDBE (`count(DISTINCT x)`, `sum`/`avg`/`total`/`min`/`max`/`group_concat`
-//! with `DISTINCT`). The collected argument values are deduped at fold time under
-//! BINARY equality (a non-BINARY column collation still defers to the
-//! tree-walker). `query_vdbe` errors on any fallback, so these passing proves the
-//! VDBE compiled them; results match the tree-walker and sqlite 3.50.4.
+//! Track B: `DISTINCT` aggregates run on the VDBE (`count(DISTINCT x)`,
+//! `sum`/`avg`/`total`/`min`/`max`/`group_concat` with `DISTINCT`) — on the bare
+//! single-table path, over `GROUP BY`, and over a two-table join. The collected
+//! argument values are deduped at fold time under BINARY equality (a non-BINARY
+//! column collation still defers to the tree-walker). `query_vdbe` errors on any
+//! fallback, so these passing proves the VDBE compiled them; results match the
+//! tree-walker and sqlite 3.50.4.
 
 #![cfg(feature = "std")]
 
@@ -164,6 +165,45 @@ fn distinct_aggregates_over_group_by_match_sqlite3() {
             .collect();
         assert_eq!(vdbe, expected, "VDBE vs sqlite3 diverged on {q}");
     }
+}
+
+/// A bare `DISTINCT` aggregate over a two-table join runs on the VDBE join
+/// aggregate path. The join replicates `b.w=300` across the matched rows, so the
+/// dedup is meaningful; results match sqlite 3.50.4.
+#[test]
+fn distinct_aggregate_over_join_runs_on_vdbe() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, k INT, v INT)")
+        .unwrap();
+    c.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, w INT)")
+        .unwrap();
+    c.execute("INSERT INTO a(k,v) VALUES (1,10),(1,20),(2,30)")
+        .unwrap();
+    c.execute("INSERT INTO b(k,w) VALUES (1,100),(1,200),(2,300),(2,300)")
+        .unwrap();
+    for q in [
+        "SELECT count(DISTINCT a.v), count(DISTINCT b.w), count(*) FROM a JOIN b ON a.k=b.k",
+        "SELECT sum(DISTINCT b.w) FROM a JOIN b ON a.k=b.k",
+    ] {
+        let got = c.query_vdbe(q).unwrap().rows;
+        let want = c.query(q).unwrap().rows;
+        assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
+    }
+    // Spot-check the actual values: 3 distinct v, 3 distinct w (300 collapses), 6
+    // joined rows; sum of distinct w = 100+200+300 = 600.
+    let r = c
+        .query_vdbe(
+            "SELECT count(DISTINCT a.v), count(DISTINCT b.w), count(*) FROM a JOIN b ON a.k=b.k",
+        )
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Value::Integer(3),
+            Value::Integer(3),
+            Value::Integer(6)
+        ]]
+    );
 }
 
 /// A `DISTINCT` aggregate over a non-BINARY column collation must defer to the

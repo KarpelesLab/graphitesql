@@ -504,22 +504,10 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
 }
 
 /// Map a 1-arg-or-star aggregate call to its [`AggKind`] (binding the argument
-/// register expression). Returns `None` for unsupported call shapes, including
-/// any `DISTINCT` aggregate — use [`agg_kind_distinct`] where DISTINCT is
-/// handled.
-fn agg_kind(expr: &Expr) -> Option<(AggKind, Option<Expr>)> {
-    let (kind, arg, distinct) = agg_kind_distinct(expr)?;
-    if distinct {
-        return None;
-    }
-    Some((kind, arg))
-}
-
-/// Like [`agg_kind`] but also accepts a `DISTINCT` aggregate, reporting whether
-/// the call carried `DISTINCT` as the third tuple element. Only the bare
-/// single-table aggregate path (`compile_aggregate_select`) dedups the collected
-/// argument values, so other callers use [`agg_kind`] (which bails on DISTINCT).
-/// `FILTER`/`ORDER BY`/`OVER` still bail.
+/// register expression), reporting whether the call carried `DISTINCT` as the
+/// third tuple element. The aggregate compilers fold over the collected argument
+/// values and dedup them when `distinct` is set. Returns `None` for unsupported
+/// call shapes; `FILTER`/`ORDER BY`/`OVER` still bail.
 fn agg_kind_distinct(expr: &Expr) -> Option<(AggKind, Option<Expr>, bool)> {
     let Expr::Function {
         name,
@@ -1984,10 +1972,12 @@ pub fn compile_aggregate_join(
         ));
     }
     let projections = expand_projections(sel, columns, tables)?;
-    // Every projection must be exactly one supported aggregate call.
-    let mut slots: Vec<(AggKind, Option<Expr>)> = Vec::new();
+    // Every projection must be exactly one supported aggregate call. DISTINCT is
+    // supported (the collected values are deduped at fold time, BINARY only — a
+    // non-BINARY collation already bailed above).
+    let mut slots: Vec<(AggKind, Option<Expr>, bool)> = Vec::new();
     for (e, _) in &projections {
-        match agg_kind(e) {
+        match agg_kind_distinct(e) {
             Some(spec) => slots.push(spec),
             None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
         }
@@ -2028,9 +2018,8 @@ pub fn compile_aggregate_join(
         }
         None => None,
     };
-    // Fold the surviving combined row into every aggregate slot. The join path
-    // bails on DISTINCT aggregates (via `agg_kind`), so this is never distinct.
-    for (slot, (kind, arg)) in slots.iter().enumerate() {
+    // Fold the surviving combined row into every aggregate slot.
+    for (slot, (kind, arg, distinct)) in slots.iter().enumerate() {
         let arg_reg = match arg {
             Some(expr) => Some(c.compile_expr(expr)?),
             None => None,
@@ -2039,7 +2028,7 @@ pub fn compile_aggregate_join(
             slot,
             kind: *kind,
             arg: arg_reg,
-            distinct: false,
+            distinct: *distinct,
         });
     }
     // `NextC` chain, innermost-first (as in `compile_join2`).
@@ -2064,7 +2053,7 @@ pub fn compile_aggregate_join(
         }
     }
     // Finalize each slot into its output register, then emit the single row.
-    for (slot, (kind, _)) in slots.iter().enumerate() {
+    for (slot, (kind, _, _)) in slots.iter().enumerate() {
         c.ops.push(Op::AggFinal {
             slot,
             kind: *kind,
@@ -4360,6 +4349,9 @@ mod tests {
             "SELECT count(*) FROM a, b",
             "SELECT sum(a.x), max(b.p) FROM a, b",
             "SELECT group_concat(b.p) FROM a, b WHERE a.x = b.p",
+            // DISTINCT aggregates over a join now fold-and-dedup on this path.
+            "SELECT count(DISTINCT a.x) FROM a, b",
+            "SELECT sum(DISTINCT b.p) FROM a, b WHERE a.x = b.p",
         ] {
             let Statement::Select(sel) = parse_one(sql).unwrap() else {
                 panic!()
@@ -4375,7 +4367,6 @@ mod tests {
             "SELECT count(*) FROM a, b GROUP BY a.x", // GROUP BY
             "SELECT count(*) FROM a, b ORDER BY 1",   // ORDER BY
             "SELECT count(*) FROM a, b LIMIT 1",      // LIMIT
-            "SELECT count(DISTINCT a.x) FROM a, b",   // DISTINCT aggregate
         ] {
             let Statement::Select(sel) = parse_one(sql).unwrap() else {
                 panic!()
