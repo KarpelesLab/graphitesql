@@ -1442,6 +1442,25 @@ impl Connection {
                         rows: result,
                     });
                 }
+                // A plain `GROUP BY` join (keys + aggregates, no HAVING/ORDER BY/
+                // LIMIT) folds each group over the nested loop and emits one row
+                // per group — again with no cross-product materialized.
+                if let Ok(prog) = vdbe::compile_group_join(
+                    &joined,
+                    &combined,
+                    &combined_tables,
+                    &combined_aff,
+                    &combined_coll,
+                    &boundaries,
+                ) {
+                    let rowsets: Vec<&[Vec<Value>]> =
+                        sources.iter().map(|s| s.4.as_slice()).collect();
+                    let result = vdbe::run_rows_multi(&prog, &rowsets)?;
+                    return Ok(QueryResult {
+                        columns: prog.columns,
+                        rows: result,
+                    });
+                }
                 if let Ok(prog) = vdbe::compile_join2(
                     &joined,
                     &combined,

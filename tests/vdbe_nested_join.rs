@@ -284,6 +284,44 @@ fn bare_aggregate_over_join_runs_on_vdbe() {
 }
 
 #[test]
+fn group_by_over_join_runs_on_vdbe() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x, y)").unwrap();
+    c.execute("INSERT INTO a VALUES(1,'a'),(2,'b'),(2,'c')")
+        .unwrap();
+    c.execute("CREATE TABLE b(p, q)").unwrap();
+    c.execute("INSERT INTO b VALUES(1,'P'),(2,'Q'),(2,'R')")
+        .unwrap();
+    // GROUP BY the join key: group 1 has 1 matched pair, group 2 has 2×2 = 4.
+    let r = c
+        .query_vdbe("SELECT a.x, count(*) FROM a JOIN b ON a.x = b.p GROUP BY a.x")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(2), Value::Integer(4)],
+        ]
+    );
+    // Key + aggregate over the right column, grouped by a left column.
+    let g = c
+        .query_vdbe("SELECT a.x, group_concat(b.q) FROM a JOIN b ON a.x = b.p GROUP BY a.x")
+        .unwrap();
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("P".into())],
+            vec![Value::Integer(2), Value::Text("Q,R,Q,R".into())],
+        ]
+    );
+    // An empty join yields no groups (no rows).
+    let e = c
+        .query_vdbe("SELECT a.x, count(*) FROM a JOIN b ON a.x = b.p AND a.x = 99 GROUP BY a.x")
+        .unwrap();
+    assert!(e.rows.is_empty());
+}
+
+#[test]
 fn nested_loop_join_empty_side_yields_no_rows() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x)").unwrap();

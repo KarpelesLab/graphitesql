@@ -252,9 +252,13 @@ is *perf/coverage*, not correctness.
     loop via `compile_aggregate_join` (mirroring the single-table
     `compile_aggregate_select`) and emits one finalized row — again with no
     cross-product materialized; the fold order matches the cross-product so
-    order-sensitive `group_concat` is byte-identical. Only GROUP BY / HAVING (and
-    aggregates that need DISTINCT/FILTER/ORDER BY) still fall back to the
-    cross-product path. An ordered inner join is now
+    order-sensitive `group_concat` is byte-identical. A **plain `GROUP BY`** join
+    (keys + aggregates, no HAVING/ORDER BY/LIMIT) likewise folds each group over the
+    nested loop via `compile_group_join` (mirroring `compile_group_emit`) and emits
+    one row per group with no cross-product — same first-seen group order. Only a
+    `GROUP BY` with HAVING / ORDER BY / LIMIT (the general grouped path) and
+    aggregates needing DISTINCT/FILTER/ORDER BY still fall back to the cross-product
+    path. An ordered inner join is now
     feature-complete on the VDBE (parity with the single-table scan compiler). Row
     order matches the cross-product and sqlite. Verified by
     the differential join corpus (2-, 3-, 4-table) + direct unit tests
