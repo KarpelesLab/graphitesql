@@ -250,6 +250,40 @@ fn order_by_over_join_runs_on_vdbe() {
 }
 
 #[test]
+fn bare_aggregate_over_join_runs_on_vdbe() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x, y)").unwrap();
+    c.execute("INSERT INTO a VALUES(3,'c'),(1,'a'),(2,'b')")
+        .unwrap();
+    c.execute("CREATE TABLE b(p, q)").unwrap();
+    c.execute("INSERT INTO b VALUES(1,'P'),(2,'Q'),(2,'R')")
+        .unwrap();
+    // count(*)/sum/min/max over the inner join, folded through the nested loop.
+    let r = c
+        .query_vdbe("SELECT count(*), sum(a.x), min(b.q), max(b.q) FROM a JOIN b ON a.x = b.p")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Value::Integer(3),
+            Value::Integer(5), // 1 + 2 + 2
+            Value::Text("P".into()),
+            Value::Text("R".into()),
+        ]]
+    );
+    // group_concat is order-sensitive; the fold order matches the cross-product.
+    let g = c
+        .query_vdbe("SELECT group_concat(b.q) FROM a JOIN b ON a.x = b.p")
+        .unwrap();
+    assert_eq!(g.rows, vec![vec![Value::Text("P,Q,R".into())]]);
+    // An empty match still yields one row: count → 0, sum → NULL.
+    let e = c
+        .query_vdbe("SELECT count(*), sum(a.x) FROM a JOIN b ON a.x = b.p AND a.x = 99")
+        .unwrap();
+    assert_eq!(e.rows, vec![vec![Value::Integer(0), Value::Null]]);
+}
+
+#[test]
 fn nested_loop_join_empty_side_yields_no_rows() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x)").unwrap();

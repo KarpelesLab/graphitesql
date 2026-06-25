@@ -247,8 +247,14 @@ is *perf/coverage*, not correctness.
     the router runs a plain **N-table** inner join (projection + WHERE-merged-ON +
     `DISTINCT` (BINARY) + `ORDER BY` (staged through a sorter) + constant
     LIMIT/OFFSET) as an N-deep nested loop — *no `t1 × … × tN` cross-product is
-    materialized for any arity* — and falls back to the cross-product path on any
-    other shape (GROUP BY / aggregate / HAVING). An ordered inner join is now
+    materialized for any arity*. A **bare-aggregate** join (`count(*)`, `sum`,
+    `min`/`max`, `group_concat`, … with no GROUP BY) likewise folds over the nested
+    loop via `compile_aggregate_join` (mirroring the single-table
+    `compile_aggregate_select`) and emits one finalized row — again with no
+    cross-product materialized; the fold order matches the cross-product so
+    order-sensitive `group_concat` is byte-identical. Only GROUP BY / HAVING (and
+    aggregates that need DISTINCT/FILTER/ORDER BY) still fall back to the
+    cross-product path. An ordered inner join is now
     feature-complete on the VDBE (parity with the single-table scan compiler). Row
     order matches the cross-product and sqlite. Verified by
     the differential join corpus (2-, 3-, 4-table) + direct unit tests

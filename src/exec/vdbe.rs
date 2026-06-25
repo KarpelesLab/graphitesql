@@ -1872,6 +1872,139 @@ pub fn compile_join2(
     })
 }
 
+/// Compile a bare-aggregate N-table inner join (`SELECT <aggregates> FROM t1 JOIN
+/// … JOIN tN [WHERE …]`, no GROUP BY) into an N-deep nested loop that folds every
+/// surviving combined row into the aggregate slots, then emits one finalized row —
+/// instead of materializing the full `t1 × … × tN` cross-product and folding *that*
+/// (B5b-1, perf-only: the fallback path already produces the same answer). Mirrors
+/// `compile_aggregate_select`'s grammar — every projection is exactly one
+/// supported aggregate call, BINARY collations only, no ORDER BY / LIMIT / OFFSET /
+/// DISTINCT / HAVING (those defer to the caller). The fold order (cursor 0
+/// outermost, innermost fastest) is identical to the cross-product's row order, so
+/// order-sensitive `group_concat` matches too. An empty cursor still emits one row
+/// (`count` → 0, the rest NULL), as SQLite does. `columns`/`tables`/`affinities`/
+/// `collations`/`boundaries` are as for [`compile_join2`].
+pub fn compile_aggregate_join(
+    sel: &Select,
+    columns: &[String],
+    tables: &[String],
+    affinities: &[Affinity],
+    collations: &[Collation],
+    boundaries: &[usize],
+) -> Result<Program> {
+    let n = boundaries.len();
+    debug_assert!(n >= 2 && boundaries[n - 1] == columns.len());
+    if !sel.compound.is_empty()
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || !sel.order_by.is_empty()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+        || sel.distinct
+    {
+        return Err(Error::Unsupported("VDBE: bare aggregate join only"));
+    }
+    // min/max reduce under BINARY; a non-BINARY column collation would diverge.
+    if collations.iter().any(|cl| *cl != Collation::Binary) {
+        return Err(Error::Unsupported(
+            "VDBE: non-BINARY collation in aggregate",
+        ));
+    }
+    let projections = expand_projections(sel, columns, tables)?;
+    // Every projection must be exactly one supported aggregate call.
+    let mut slots: Vec<(AggKind, Option<Expr>)> = Vec::new();
+    for (e, _) in &projections {
+        match agg_kind(e) {
+            Some(spec) => slots.push(spec),
+            None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
+        }
+    }
+    let count = projections.len();
+    let mut c = Compiler {
+        ops: Vec::new(),
+        next_reg: count,
+        columns: columns.to_vec(),
+        tables: tables.to_vec(),
+        affinities: affinities.to_vec(),
+        collations: collations.to_vec(),
+        bindings: Vec::new(),
+        forbid_raw_columns: false,
+        rowid_index: None,
+        cursor_boundaries: Some(boundaries.to_vec()),
+    };
+    // N-deep nested loop (cursor 0 outermost), as in `compile_join2`.
+    let mut rewind_at = alloc::vec![0usize; n];
+    for (i, slot) in rewind_at.iter_mut().enumerate() {
+        *slot = c.ops.len();
+        c.ops.push(Op::RewindC {
+            cursor: i,
+            target: 0,
+        });
+    }
+    let body = c.ops.len();
+    // WHERE (already merged with ON): skip to the innermost `NextC` when not true.
+    let skip = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    // Fold the surviving combined row into every aggregate slot.
+    for (slot, (kind, arg)) in slots.iter().enumerate() {
+        let arg_reg = match arg {
+            Some(expr) => Some(c.compile_expr(expr)?),
+            None => None,
+        };
+        c.ops.push(Op::AggStep {
+            slot,
+            kind: *kind,
+            arg: arg_reg,
+        });
+    }
+    // `NextC` chain, innermost-first (as in `compile_join2`).
+    let mut next_at = alloc::vec![0usize; n];
+    for i in (0..n).rev() {
+        next_at[i] = c.ops.len();
+        let target = if i == n - 1 { body } else { rewind_at[i + 1] };
+        c.ops.push(Op::NextC { cursor: i, target });
+    }
+    // `end` is the finalize point: an empty cursor 0 (or an exhausted outer loop)
+    // lands here, still finalizing the slots (count → 0) and emitting one row.
+    let end = c.ops.len();
+    for i in 0..n {
+        let target = if i == 0 { end } else { next_at[i - 1] };
+        if let Op::RewindC { target: t, .. } = &mut c.ops[rewind_at[i]] {
+            *t = target;
+        }
+    }
+    if let Some(at) = skip {
+        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = next_at[n - 1];
+        }
+    }
+    // Finalize each slot into its output register, then emit the single row.
+    for (slot, (kind, _)) in slots.iter().enumerate() {
+        c.ops.push(Op::AggFinal {
+            slot,
+            kind: *kind,
+            dest: slot,
+        });
+    }
+    c.ops.push(Op::ResultRow { start: 0, count });
+    c.ops.push(Op::Halt);
+    Ok(Program {
+        ops: c.ops,
+        n_registers: c.next_reg,
+        columns: projections.into_iter().map(|(_, l)| l).collect(),
+    })
+}
+
 /// Compile a two-table `LEFT JOIN` (`SELECT … FROM a LEFT JOIN b ON …`) into a
 /// nested-loop program with null-padding (B5b-1). For each left (cursor 0) row,
 /// the inner cursor 1 is scanned: a row whose `on` predicate holds is a match and
@@ -3836,6 +3969,44 @@ mod tests {
             assert!(
                 compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_ok(),
                 "{sql} should compile on the VDBE"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_aggregate_join_compiles_and_bails_correctly() {
+        let cols = vec!["x".to_string(), "p".to_string()];
+        let tabs = vec!["a".to_string(), "b".to_string()];
+        let aff = vec![Affinity::Blob; 2];
+        let coll = vec![Collation::Binary; 2];
+        // Bare aggregates (no GROUP BY) compile through the nested-loop fold.
+        for sql in [
+            "SELECT count(*) FROM a, b",
+            "SELECT sum(a.x), max(b.p) FROM a, b",
+            "SELECT group_concat(b.p) FROM a, b WHERE a.x = b.p",
+        ] {
+            let Statement::Select(sel) = parse_one(sql).unwrap() else {
+                panic!()
+            };
+            assert!(
+                compile_aggregate_join(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_ok(),
+                "{sql} should compile as an aggregate join"
+            );
+        }
+        // Shapes outside the bare-aggregate grammar bail to the caller.
+        for sql in [
+            "SELECT a.x FROM a, b",                   // not an aggregate
+            "SELECT count(*) FROM a, b GROUP BY a.x", // GROUP BY
+            "SELECT count(*) FROM a, b ORDER BY 1",   // ORDER BY
+            "SELECT count(*) FROM a, b LIMIT 1",      // LIMIT
+            "SELECT count(DISTINCT a.x) FROM a, b",   // DISTINCT aggregate
+        ] {
+            let Statement::Select(sel) = parse_one(sql).unwrap() else {
+                panic!()
+            };
+            assert!(
+                compile_aggregate_join(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_err(),
+                "{sql} should bail from the aggregate-join path"
             );
         }
     }

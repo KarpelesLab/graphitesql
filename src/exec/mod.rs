@@ -1423,6 +1423,25 @@ impl Connection {
                     acc += src.0.len();
                     boundaries.push(acc);
                 }
+                // A bare-aggregate join (`count(*)`, `sum(a.x)`, … no GROUP BY)
+                // folds over the nested loop too, emitting one row — no
+                // cross-product is materialized. Same answer as the fallback.
+                if let Ok(prog) = vdbe::compile_aggregate_join(
+                    &joined,
+                    &combined,
+                    &combined_tables,
+                    &combined_aff,
+                    &combined_coll,
+                    &boundaries,
+                ) {
+                    let rowsets: Vec<&[Vec<Value>]> =
+                        sources.iter().map(|s| s.4.as_slice()).collect();
+                    let result = vdbe::run_rows_multi(&prog, &rowsets)?;
+                    return Ok(QueryResult {
+                        columns: prog.columns,
+                        rows: result,
+                    });
+                }
                 if let Ok(prog) = vdbe::compile_join2(
                     &joined,
                     &combined,
