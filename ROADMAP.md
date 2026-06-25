@@ -239,11 +239,15 @@ INTO`; `secure_delete` (C8a); `cache_size`/`mmap_size` reporting (C8b).
   vs `sqlite3` 3.50.4: graphite's hot journal recovered by sqlite, and a
   sqlite-authored hot journal (forced cache-spill + mid-transaction SIGKILL)
   recovered by graphite (`tests/journal_sqlite_format.rs`).
-  - **C7-harness** — a fault-injecting `Vfs` (truncate / fail at chosen fsync
-    points) asserting recovery to a consistent state (the §6 crash-recovery
-    harness; a `RetainVfs`/`RetainFile` foundation already lives in the C7 test
-    file). graphite's own writer still emits a single segment (it buffers the
-    whole overlay in memory and never spills mid-transaction); multi-segment
+  - **C7-harness** — *Done:* a fault-injecting `FaultVfs` (kills a chosen file at
+    the Nth `write`/`truncate`/`sync`, optionally a torn half-write, freezing the
+    on-disk bytes like a power loss) drives the §6 crash-recovery suite
+    (`tests/crash_recovery_harness.rs`). Recovery held at every injection point —
+    before/midway/torn db-page writes, on the db `sync`, on the finalizing
+    journal-clear, and a full ordinal×{clean,torn} sweep — each reopen
+    `integrity_check = ok`, never torn, cross-checked with `sqlite3`. No recovery
+    bug found. graphite's own writer still emits a single journal segment (it
+    buffers the whole overlay and never spills mid-transaction); multi-segment
     *writing* would land with the bounded pcache (C8c).
 - **C8c — bounded `pcache` with LRU eviction** (honor the C8b `cache_size`;
   replaces the keep-everything page map). *Perf, not correctness.*
