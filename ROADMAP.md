@@ -264,7 +264,16 @@ INTO`; `secure_delete` (C8a); `cache_size`/`mmap_size` reporting (C8b).
     direct (already-bounded) disk reads, since coherent caching there needs a
     statement-level change-counter revalidation hook from the exec layer.
 - **C9 — concurrency** (each independent):
-  - **C9a** — reader `SHARED`-lock sharing (multiple readers, writer excluded).
+  - **C9a** — reader `SHARED`-lock sharing. *Lock model done + verified:*
+    `LockState` (`src/vfs/mod.rs`) already counts `Shared` holders — many readers
+    coexist, `Reserved` is admitted under readers (single write-intent),
+    `Exclusive` BUSYs until every *other* reader drains — proven end-to-end over
+    both the std (per-path registry) and memory VFS (`tests/concurrency_readers.rs`,
+    6 tests). *Remaining (pager-owned):* the pager takes `Shared` only transiently
+    on the way to `Reserved` (pure reads hold no persistent read lock), so
+    "multiple readers across an open read txn block a writer" isn't yet observable
+    at the `Connection` layer — needs a persistent read-lock policy in
+    `src/pager/`.
   - **C9b** — OS-level cross-process file locks (`std::fs::File::lock`; wants MSRV
     1.89) behind the std VFS.
   - **C9c** — the WAL `-shm` wal-index for multi-connection WAL readers.
