@@ -59,6 +59,16 @@ const GROUPED: &[&str] = &[
     "SELECT a FROM t GROUP BY a HAVING sum(b) >= 5 ORDER BY a",
     "SELECT a, count(*) FROM t GROUP BY a ORDER BY sum(b) DESC, a",
     "SELECT a FROM t GROUP BY a HAVING max(b) > 3 ORDER BY min(b) DESC, a",
+    // Positional GROUP BY (a bare integer ordinal names an output column):
+    // `GROUP BY 1` groups by the first result column, like SQLite.
+    "SELECT a, count(*) FROM t GROUP BY 1",
+    "SELECT a, count(*) FROM t GROUP BY 1 ORDER BY 2 DESC, 1",
+    "SELECT a, count(*) FROM t GROUP BY 1 ORDER BY 1 DESC LIMIT 2",
+    "SELECT a, b, count(*) FROM t GROUP BY 1, 2 ORDER BY 1, 2",
+    "SELECT a, count(*) FROM t GROUP BY 1 HAVING count(*) >= 2 ORDER BY 1",
+    "SELECT a, count(*) AS n FROM t GROUP BY 1 ORDER BY n DESC, 1",
+    // A positional term repeated / mixed with a named grouping column.
+    "SELECT a, b, count(*) FROM t GROUP BY a, 2 ORDER BY 1, 2",
 ];
 
 #[test]

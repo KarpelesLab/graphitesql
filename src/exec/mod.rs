@@ -963,6 +963,54 @@ impl Connection {
             }
             None => sel,
         };
+        // Resolve a positional `GROUP BY N` (a bare integer literal) to the N-th
+        // output column's expression — `GROUP BY 1` groups by the first result
+        // column, not the constant `1` (SQLite). The VDBE group compiler bails on
+        // an integer group key, so without this rewrite the query would always
+        // fall back. Only a clean, wildcard-free projection is resolved here: a
+        // leading `*`/`t.*` would make the ordinal count post-expansion columns
+        // (which the bare projection list cannot index), and an out-of-range
+        // ordinal must be *rejected* — both defer to the tree-walker, which
+        // validates and errors them exactly like SQLite.
+        let regrouped;
+        let sel = if sel
+            .group_by
+            .iter()
+            .any(|g| matches!(g, Expr::Literal(Literal::Integer(_))))
+        {
+            if sel
+                .columns
+                .iter()
+                .any(|c| matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_)))
+            {
+                return Err(Error::Unsupported(
+                    "VDBE: positional GROUP BY with wildcard projection",
+                ));
+            }
+            let mut s = sel.clone();
+            for g in &mut s.group_by {
+                if let Expr::Literal(Literal::Integer(n)) = g {
+                    match usize::try_from(*n)
+                        .ok()
+                        .filter(|&n| n >= 1)
+                        .and_then(|n| sel.columns.get(n - 1))
+                    {
+                        Some(ResultColumn::Expr { expr, .. }) => *g = expr.clone(),
+                        // Out of range (or names a wildcard): the tree-walker
+                        // rejects/handles it.
+                        _ => {
+                            return Err(Error::Unsupported(
+                                "VDBE: positional GROUP BY out of range",
+                            ))
+                        }
+                    }
+                }
+            }
+            regrouped = s;
+            &regrouped
+        } else {
+            sel
+        };
         // Constant SELECT (no FROM): compile and run directly.
         let Some(from) = &sel.from else {
             let prog = vdbe::compile_const_select(sel)?;

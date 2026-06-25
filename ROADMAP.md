@@ -244,6 +244,15 @@ is *perf/coverage*, not correctness.
   column-count-mismatch error.
   - **B5c-3a** — *(folded into the above: each arm runs on the VDBE.)*
   - **B5c-3b** — *(folded into the above: collation-aware set-combine + sort.)*
+- **Positional `GROUP BY <ordinal>` on the VDBE — DONE.** A bare integer
+  `GROUP BY N` term names the N-th *output* column, not the constant N (SQLite's
+  rule). The router (`run_select_vdbe`) rewrites each such term to the referenced
+  result column's expression — mirroring the tree-walker's resolution — before the
+  grouped compiler runs, so `GROUP BY 1` / `GROUP BY 1, 2` / a positional term
+  mixed with a named one all run on the VDBE. A wildcard projection (`*`) or an
+  out-of-range ordinal defers to the tree-walker, which validates and emits the
+  exact `… GROUP BY term out of range …` error. Differentially tested
+  (`tests/vdbe_grouped.rs`, incl. positional + `HAVING`/`ORDER BY`/`LIMIT`).
 - **B5c-4 — window functions on the VDBE.**
 - **B5b — per-cursor nested-loop join + inner seek** (stream the inner side
   instead of materializing the cross-product; *perf-only*).
