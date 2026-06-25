@@ -195,6 +195,20 @@ is *perf/coverage*, not correctness.
   - **B5c-1b** — a membership op applying `apply_comparison_affinity(left_aff,
     candidate_col_aff)` under the left collation.
   - **B5c-1c** — `NOT IN` + NULL-in-set semantics (a NULL candidate → NULL result).
+  - *Implementation note (investigated 2026-06-25):* a fold to `IN (list)` CANNOT
+    work — list literals report NONE comparison-affinity, but the bare-column
+    candidate must contribute its column affinity; and wrapping each value in
+    `CAST(v AS coltype)` is wrong because CAST changes the *value* (a non-numeric
+    text in an INTEGER-affinity column → `0`), not just the comparison affinity.
+    The correct path: carry the candidate affinity into the VDBE's `Op::Compare.ra`
+    for the IN OR-chain (the chain is built in `vdbe.rs` `Expr::InList`, affinity
+    via `push_compare_coll`→`expr_affinity`). Cleanest minimal change is an
+    `InList { …, candidate_affinity: Option<Affinity> }` field the router sets when
+    folding a bare-column `IN (SELECT)` (then `expr_affinity` of each element
+    yields that). This is **perf-only** (the tree-walker already returns correct
+    results, so no differential test distinguishes done from not-done) and touches
+    the default VDBE path — do it deliberately in a focused turn, not as a quick
+    win.
 - **B5c-2 — correlated subqueries on the VDBE.**
   - **B5c-2a** — thread the outer row into the subquery's register frame.
   - **B5c-2b** — compile `Subquery`/`Exists`/`InSelect` that read an outer column.
