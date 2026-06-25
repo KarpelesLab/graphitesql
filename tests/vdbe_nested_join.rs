@@ -93,6 +93,52 @@ fn three_table_nested_loop_join_runs_on_vdbe() {
 }
 
 #[test]
+fn left_join_runs_on_vdbe_with_null_padding() {
+    let c = setup();
+    // x=3 has no match in b → null-padded; verified on the VDBE (query_vdbe).
+    let r = c
+        .query_vdbe("SELECT a.x, b.q FROM a LEFT JOIN b ON a.x = b.p")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("P".into())],
+            vec![Value::Integer(2), Value::Text("Q".into())],
+            vec![Value::Integer(2), Value::Text("R".into())],
+            vec![Value::Integer(3), Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn left_join_where_filters_after_null_padding() {
+    let c = setup();
+    // `b.q IS NULL` keeps only the null-padded (unmatched) left rows.
+    let r = c
+        .query_vdbe("SELECT a.x FROM a LEFT JOIN b ON a.x = b.p WHERE b.q IS NULL")
+        .unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Integer(3)]]);
+}
+
+#[test]
+fn left_join_empty_right_null_pads_every_left_row() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x)").unwrap();
+    c.execute("INSERT INTO a VALUES(1),(2)").unwrap();
+    c.execute("CREATE TABLE b(y)").unwrap();
+    let r = c
+        .query_vdbe("SELECT a.x, b.y FROM a LEFT JOIN b ON a.x = b.y")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::Null],
+        ]
+    );
+}
+
+#[test]
 fn nested_loop_join_empty_side_yields_no_rows() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x)").unwrap();

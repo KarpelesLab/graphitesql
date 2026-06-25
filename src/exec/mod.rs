@@ -1281,10 +1281,17 @@ impl Connection {
         // the `WHERE`, and reuse the single-cursor scan compiler. Every join must
         // be a plain `INNER`/`CROSS`/comma join (no `NATURAL`/`USING`/outer).
         if !from.joins.is_empty() {
-            if from
-                .joins
-                .iter()
-                .any(|j| j.kind != sql::ast::JoinKind::Inner || j.natural || !j.using.is_empty())
+            // A single two-table LEFT JOIN routes to the null-padding nested loop
+            // below; otherwise only plain INNER joins are handled here (RIGHT/FULL/
+            // NATURAL/USING fall back to the tree-walker).
+            let is_left_2 = from.joins.len() == 1
+                && from.joins[0].kind == sql::ast::JoinKind::Left
+                && !from.joins[0].natural
+                && from.joins[0].using.is_empty();
+            if !is_left_2
+                && from.joins.iter().any(|j| {
+                    j.kind != sql::ast::JoinKind::Inner || j.natural || !j.using.is_empty()
+                })
             {
                 return Err(Error::Unsupported("VDBE: only plain inner joins"));
             }
@@ -1307,6 +1314,40 @@ impl Connection {
                 combined_tables.extend(t.iter().cloned());
                 combined_aff.extend(a.iter().copied());
                 combined_coll.extend(l.iter().copied());
+            }
+            // A two-table LEFT JOIN: the ON predicate gates which inner rows match
+            // (an unmatched left row gets one null-padded output row), so it is NOT
+            // merged into WHERE — compile it via the null-padding nested loop. Any
+            // unsupported shape (or an ambiguous column) returns `Unsupported`, so
+            // the router falls back to the tree-walker (never the inner-join path,
+            // whose ON-into-WHERE merge would change LEFT-join semantics).
+            if is_left_2 {
+                let join_cols: Vec<ColumnInfo> = (0..combined.len())
+                    .map(|i| ColumnInfo {
+                        name: combined[i].clone(),
+                        table: combined_tables[i].clone(),
+                        affinity: combined_aff[i],
+                        collation: combined_coll[i],
+                    })
+                    .collect();
+                if validate_unambiguous_columns(sel, &join_cols).is_err() {
+                    return Err(Error::Unsupported("VDBE: ambiguous column name"));
+                }
+                let n_left = sources[0].0.len();
+                let prog = vdbe::compile_left_join2(
+                    sel,
+                    &combined,
+                    &combined_tables,
+                    &combined_aff,
+                    &combined_coll,
+                    n_left,
+                    &from.joins[0].on,
+                )?;
+                let result = vdbe::run_rows_multi(&prog, &[&sources[0].4, &sources[1].4])?;
+                return Ok(QueryResult {
+                    columns: prog.columns,
+                    rows: result,
+                });
             }
             // Merge the existing WHERE with every join's ON predicate (AND).
             let mut merged = sel.where_clause.clone();
