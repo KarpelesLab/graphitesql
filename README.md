@@ -22,7 +22,11 @@ format**.
 
 - **Storage** — rowid and `WITHOUT ROWID` tables; secondary/`UNIQUE`/partial/
   expression indexes; overflow pages; `VACUUM` (+ `VACUUM INTO`); the full
-  **`auto_vacuum`** track; and **WAL read *and* write**.
+  **`auto_vacuum`** track (incl. `incremental_vacuum`); **WAL read *and* write**;
+  a **SQLite-format rollback journal** so a crash mid-write is recoverable by
+  `sqlite3` (and vice-versa) — fault-injection crash-recovery tested across both
+  the rollback-journal and WAL paths; and a **bounded LRU page cache**
+  (`cache_size`).
 - **SQL** — `INNER`/`LEFT`/`RIGHT`/`FULL`/`NATURAL`/`USING` joins; aggregates,
   `GROUP BY`/`HAVING`, compound queries, (recursive) **CTEs**, correlated
   subqueries & `EXISTS`, **window functions**; UPSERT, `RETURNING`, `STRICT`
@@ -34,8 +38,11 @@ format**.
 - **Virtual tables** — built-in `series`, **`rtree`** (queries prune the node
   tree by coordinate bounds), and **`fts5`** (full-text `MATCH` with phrases/
   prefixes/column filters/`NEAR`/`^` anchors, `bm25()`/`rank` ordering,
-  `highlight()`, `fts5vocab`); the read-only `dbstat` and `sqlite_dbpage` (raw
-  page bytes) tables; and `register_module` / `register_function` for your own.
+  `highlight()`, `fts5vocab`) — common `MATCH` shapes (bare term, column-scoped,
+  two-term phrase, two-operand boolean) are now answered from the **inverted
+  index** instead of scanning every document; the read-only `dbstat` and
+  `sqlite_dbpage` (raw page bytes) tables; and `register_module` /
+  `register_function` for your own.
 - **Byte-compatible on disk** — R-Tree (`_node`) and FTS5 (sqlite's
   `_content`/`_data`/`_idx`/`_docsize`/`_config` shadow tables) round-trip through
   stock `sqlite3`, which opens, `MATCH`es, and integrity-checks them. FTS5 folds
