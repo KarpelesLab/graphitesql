@@ -440,6 +440,17 @@ pub(crate) struct DecodedPosting {
 /// positions (index = column number). The inverse of [`poslist`].
 fn decode_poslist(buf: &[u8], pos: &mut usize) -> Option<Vec<Vec<u32>>> {
     let size2 = read_varint(buf, pos)?;
+    // The poslist size varint is `(content_len << 1) | delete_flag`: its low bit is
+    // FTS5's per-doc DELETE marker (a tombstone shadowing an older segment's entry).
+    // The writer here never emits a tombstone (it always bulk-rebuilds from
+    // `_content`), so a set low bit means we are reading an `sqlite3`-written delete
+    // entry — reject it so every caller (single- and multi-segment) bails to the
+    // `_content` scan rather than silently treating a delete as a zero-position
+    // posting. The multi-segment merge ([`decode_term_strict`]) relies on this to
+    // honor segment-layering precedence (newest segment wins) by bailing.
+    if size2 & 1 != 0 {
+        return None;
+    }
     let content_len = (size2 / 2) as usize;
     let end = pos.checked_add(content_len)?;
     if end > buf.len() {
@@ -751,28 +762,32 @@ pub(crate) fn decode_term(leaves: &[&[u8]], term: &[u8]) -> Option<Vec<DecodedPo
     None
 }
 
-/// Decode EVERY term whose key begins with `prefix` from a set of segment leaf
-/// pages, returning their combined postings, or `None` if the segment is one the
-/// single-segment leaf reader cannot fully reconstruct (an interior or
-/// doclist-index page → caller falls back to the scan).
+/// Decode EVERY term whose key begins with `prefix` in ONE segment's leaf pages,
+/// distinguishing a SERVABLE result (the union of the matching terms' postings,
+/// possibly empty when no term matches) from a BAIL (unparseable leaf / interior
+/// page / tombstone). The prefix-query analogue of [`decode_term_strict`].
 ///
-/// This is the prefix-query analogue of [`decode_term`]: instead of one exact
-/// `'0'`-prefixed key it matches every term key that STARTS with the prefixed key
-/// (`MAIN_PREFIX` then `prefix` bytes), which — because the leaf term keys are
-/// stored in ascending sorted order — is exactly the contiguous run of indexed
-/// terms with that prefix. Each matching term's doclist (which may itself span
-/// leaves) is decoded and the postings are returned in term order (postings
-/// within one term are ascending by rowid, but two different terms may share a
-/// rowid, so the caller merges/dedups by rowid — see [`prefix_rowids`]).
+/// It matches every term key that STARTS with the prefixed key (`MAIN_PREFIX` then
+/// `prefix` bytes), which — because the leaf term keys are stored in ascending
+/// sorted order — is exactly the contiguous run of indexed terms with that prefix.
+/// Each matching term's doclist (which may itself span leaves) is decoded and the
+/// postings are concatenated in term order (postings within one term are ascending
+/// by rowid, but two different terms may share a rowid, so the caller merges/dedups
+/// by rowid — see [`prefix_rowids`]/[`merge_segments`]). Returning [`SegDecode`]
+/// (rather than `Option`) keeps "no prefix match in this segment" apart from "this
+/// segment is unservable", which the multi-segment merge needs.
 ///
 /// An empty `prefix` matches every term (every key starts with the lone
 /// `MAIN_PREFIX` byte); callers reject the empty-prefix shape upstream, matching
 /// sqlite (which rejects a bare `'*'`).
-fn decode_prefix(leaves: &[&[u8]], prefix: &[u8]) -> Option<Vec<DecodedPosting>> {
+fn decode_prefix_strict(leaves: &[&[u8]], prefix: &[u8]) -> SegDecode {
     let want = term_key(prefix);
     let mut views: Vec<LeafView> = Vec::with_capacity(leaves.len());
     for leaf in leaves {
-        views.push(parse_leaf(leaf)?);
+        match parse_leaf(leaf) {
+            Some(v) => views.push(v),
+            None => return SegDecode::Bail,
+        }
     }
     let mut out: Vec<DecodedPosting> = Vec::new();
     for (li, view) in views.iter().enumerate() {
@@ -780,11 +795,15 @@ fn decode_prefix(leaves: &[&[u8]], prefix: &[u8]) -> Option<Vec<DecodedPosting>>
             if !rec.key.starts_with(&want) {
                 continue;
             }
-            let runs = gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)?;
-            out.extend(decode_spanning_doclist(&runs)?);
+            match gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)
+                .and_then(|runs| decode_spanning_doclist(&runs))
+            {
+                Some(postings) => out.extend(postings),
+                None => return SegDecode::Bail, // tombstone / malformed doclist
+            }
         }
     }
-    Some(out)
+    SegDecode::Postings(out)
 }
 
 /// One segment's identity, parsed from the structure record: its `segid` and the
@@ -831,6 +850,175 @@ fn single_segment(structure: &[u8]) -> Option<SegmentLoc> {
         pgno_first,
         pgno_last,
     })
+}
+
+/// Parse the structure record (the inverse of [`structure`]) into the locations of
+/// EVERY height-0 segment, across all levels, or `None` for an empty index or a
+/// malformed record. Unlike [`single_segment`] this does not require a single
+/// segment: an `sqlite3`-written FTS5 table accumulates several segments per level
+/// (and several levels) after many inserts until an `'optimize'`/merge collapses
+/// them, so the multi-segment bare-term/boolean/prefix routes ([`decode_term_strict`])
+/// need every segment's leaf range.
+///
+/// Layout: 4-byte BE cookie, then varints `nLevel`, `nSegment`, `nWriteCounter`,
+/// then per level `nMerge`, `nSeg`, then per segment `segid`, `pgnoFirst`,
+/// `pgnoLast`. The `(segid, pgnoFirst, pgnoLast)` triples are returned in the order
+/// they appear in the record (newest level/segment first); the merge that consumes
+/// them is order-independent (it bails on any docid shared across segments), so the
+/// order only matters for the documentation of layering precedence. An empty index
+/// (`nLevel == 0`/`nSegment == 0`) yields `None` so the caller scans — there is
+/// nothing to index-route.
+fn all_segments(structure: &[u8]) -> Option<Vec<SegmentLoc>> {
+    let mut pos = 4usize; // skip the 4-byte config cookie
+    let n_level = read_varint(structure, &mut pos)?;
+    let n_segment = read_varint(structure, &mut pos)?;
+    let _n_write_counter = read_varint(structure, &mut pos)?;
+    if n_level == 0 || n_segment == 0 {
+        return None; // empty index: nothing to route
+    }
+    let mut segs: Vec<SegmentLoc> = Vec::new();
+    for _ in 0..n_level {
+        let _n_merge = read_varint(structure, &mut pos)?;
+        let n_seg = read_varint(structure, &mut pos)?;
+        for _ in 0..n_seg {
+            let segid = read_varint(structure, &mut pos)? as i64;
+            let pgno_first = read_varint(structure, &mut pos)? as i64;
+            let pgno_last = read_varint(structure, &mut pos)? as i64;
+            if segid <= 0 || pgno_first < 1 || pgno_last < pgno_first {
+                return None;
+            }
+            segs.push(SegmentLoc {
+                segid,
+                pgno_first,
+                pgno_last,
+            });
+        }
+    }
+    // The triple count must match the header's `nSegment` (a structurally sound
+    // record); a mismatch means a malformed/unsupported record → caller scans.
+    if segs.len() as u64 != n_segment {
+        return None;
+    }
+    Some(segs)
+}
+
+/// Gather the leaf blobs (in page order) of EVERY height-0 segment in a `%_data`
+/// index, as one leaf set per segment, or `None` if the shape is unservable
+/// (empty index, a missing leaf, or a malformed structure record). Shared by the
+/// multi-segment bare-term/boolean/prefix lookups; the per-segment grouping lets
+/// the merge enforce the "each docid in at most one segment" safety check.
+///
+/// Bumps the test-only [`INDEX_ROUTE_HITS`] counter once per servable call, so a
+/// multi-segment query that takes the index route counts as one hit regardless of
+/// how many segments (or terms) it decodes.
+fn segments_leaves(data: &[(i64, Vec<u8>)]) -> Option<Vec<Vec<&[u8]>>> {
+    let structure = &data.iter().find(|(id, _)| *id == STRUCTURE_ROWID)?.1;
+    let locs = all_segments(structure)?;
+    let mut out: Vec<Vec<&[u8]>> = Vec::with_capacity(locs.len());
+    for loc in &locs {
+        let mut leaves: Vec<&[u8]> = Vec::new();
+        for pgno in loc.pgno_first..=loc.pgno_last {
+            let rid = segment_leaf_rowid(loc.segid, pgno);
+            let blob = &data.iter().find(|(id, _)| *id == rid)?.1;
+            leaves.push(blob.as_slice());
+        }
+        out.push(leaves);
+    }
+    #[cfg(test)]
+    INDEX_ROUTE_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Some(out)
+}
+
+/// The outcome of decoding a term/prefix/tree in ONE segment of a multi-segment
+/// index. `Bail` means the segment is unservable for a safe merge — an
+/// interior/doclist-index page, a malformed leaf, OR a DELETE tombstone (a set
+/// poslist low bit; see [`decode_poslist`]) whose layering precedence this slice
+/// does not resolve — so the whole query must fall back to the `_content` scan.
+/// `Postings` is a servable result (possibly empty when the term is absent in this
+/// segment).
+enum SegDecode {
+    Bail,
+    Postings(Vec<DecodedPosting>),
+}
+
+/// Decode `term`'s doclist in one segment's `leaves`, distinguishing a SERVABLE
+/// result (term found → its postings; term absent → empty) from a BAIL
+/// (unparseable leaf / interior page / tombstone). This is the multi-segment
+/// analogue of [`decode_term`], which collapses "absent" and "unservable" into a
+/// single `None`; the merge needs them apart because an absent term in one segment
+/// is fine (union with the others) while an unservable segment forces a scan.
+fn decode_term_strict(leaves: &[&[u8]], term: &[u8]) -> SegDecode {
+    let key = term_key(term);
+    let mut views: Vec<LeafView> = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        match parse_leaf(leaf) {
+            Some(v) => views.push(v),
+            None => return SegDecode::Bail, // interior/dlidx/malformed leaf
+        }
+    }
+    for (li, view) in views.iter().enumerate() {
+        for (ti, rec) in view.terms.iter().enumerate() {
+            if rec.key != key {
+                continue;
+            }
+            return match gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)
+                .and_then(|runs| decode_spanning_doclist(&runs))
+            {
+                Some(postings) => SegDecode::Postings(postings),
+                // A tombstone (rejected poslist) or a malformed doclist: bail.
+                None => SegDecode::Bail,
+            };
+        }
+    }
+    SegDecode::Postings(Vec::new()) // servable: term absent in this segment
+}
+
+/// Merge the same `decode` over EVERY segment of `data` into one ascending,
+/// deduplicated posting list, or `None` if the merge is not provably correct (so
+/// the caller falls back to the `_content` scan). `decode` runs the per-segment
+/// term/prefix/tree decode (returning [`SegDecode`]).
+///
+/// SAFETY — this honors FTS5 segment layering WITHOUT a full
+/// tombstone/precedence merge by bailing whenever precedence could matter:
+///
+/// * any segment returns [`SegDecode::Bail`] (interior page / tombstone /
+///   malformed) → `None`;
+/// * a docid appears in MORE THAN ONE segment (an update wrote a newer, shadowing
+///   entry, so a naive union could keep a stale or duplicated doc) → `None`.
+///
+/// Otherwise the index is a pure-insert history: each docid lives in exactly one
+/// segment, no entry is a tombstone, so the UNION of the segments' postings is
+/// exactly the live document set — identical to the `_content` scan. The returned
+/// postings are sorted ascending by rowid and deduplicated (the no-overlap check
+/// guarantees there is nothing to dedup, but the sort makes the order canonical).
+fn merge_segments(
+    data: &[(i64, Vec<u8>)],
+    decode: impl Fn(&[&[u8]]) -> SegDecode,
+) -> Option<Vec<DecodedPosting>> {
+    let segments = segments_leaves(data)?;
+    let mut all: Vec<DecodedPosting> = Vec::new();
+    let mut seen_segidx: Vec<(i64, usize)> = Vec::new(); // (rowid, which segment)
+    for (si, leaves) in segments.iter().enumerate() {
+        match decode(leaves) {
+            SegDecode::Bail => return None,
+            SegDecode::Postings(postings) => {
+                for p in postings {
+                    seen_segidx.push((p.rowid, si));
+                    all.push(p);
+                }
+            }
+        }
+    }
+    // Bail if any docid appears in more than one segment (ambiguous precedence).
+    seen_segidx.sort_unstable();
+    for w in seen_segidx.windows(2) {
+        if w[0].0 == w[1].0 && w[0].1 != w[1].1 {
+            return None;
+        }
+    }
+    all.sort_by_key(|p| p.rowid);
+    all.dedup_by_key(|p| p.rowid);
+    Some(all)
 }
 
 /// Look up `term` in an FTS5 index given its `%_data` rows, returning the rowids
@@ -905,15 +1093,14 @@ fn prefix_rowids(
 ///
 /// The prefix sibling of [`lookup_term_rowids`]: it gathers the one height-0
 /// segment's leaves ONCE and decodes every term whose stored key begins with
-/// `prefix` ([`decode_prefix`]), then unions their docids. Because the index stores
+/// `prefix` ([`decode_prefix_strict`]), then unions their docids. Because the index stores
 /// the tokenized (and, under `porter`, stemmed) term forms and the scan's prefix
 /// predicate tests `doc_token.starts_with(query_prefix)` over those SAME forms (the
 /// query prefix is tokenized/stemmed identically by the recognizer), the set of
 /// documents with a term starting with `prefix` is exactly the scan's match set.
 /// A servable segment with no matching term yields `Some(vec![])`.
 pub(crate) fn lookup_prefix_rowids(data: &[(i64, Vec<u8>)], prefix: &[u8]) -> Option<Vec<i64>> {
-    let leaves = segment_leaves(data)?;
-    let postings = decode_prefix(&leaves, prefix)?;
+    let postings = merge_segments(data, |leaves| decode_prefix_strict(leaves, prefix))?;
     Some(prefix_rowids(postings, |_| true))
 }
 
@@ -926,8 +1113,7 @@ pub(crate) fn lookup_prefix_rowids_in_column(
     prefix: &[u8],
     column: usize,
 ) -> Option<Vec<i64>> {
-    let leaves = segment_leaves(data)?;
-    let postings = decode_prefix(&leaves, prefix)?;
+    let postings = merge_segments(data, |leaves| decode_prefix_strict(leaves, prefix))?;
     Some(prefix_rowids(postings, |p| {
         p.cols.get(column).is_some_and(|c| !c.is_empty())
     }))
@@ -956,15 +1142,17 @@ fn segment_leaves(data: &[(i64, Vec<u8>)]) -> Option<Vec<&[u8]>> {
     Some(leaves)
 }
 
-/// Resolve `term`'s postings from a single-segment `%_data` index, or `None` if the
-/// shape is unservable. Shared by [`lookup_term_rowids`] and
-/// [`lookup_term_rowids_in_column`]: it parses the structure record, gathers the
-/// single height-0 segment's leaves in page order, and decodes the term. A
-/// servable segment whose term is absent returns `Some(vec![])`.
+/// Resolve `term`'s postings from a `%_data` index — across ONE OR MORE height-0
+/// segments — or `None` if the shape is unservable. Shared by [`lookup_term_rowids`]
+/// and [`lookup_term_rowids_in_column`]: it parses the structure record, gathers
+/// every segment's leaves in page order, decodes the term in each, and UNIONs the
+/// postings via [`merge_segments`] (which bails — `None` → scan — on a tombstone or
+/// a docid shared across segments). A servable index whose term is absent
+/// everywhere returns `Some(vec![])`. For the common single-segment index this is
+/// exactly the old single-segment decode; for a multi-segment pure-insert index it
+/// returns the same set the `_content` scan would.
 fn decode_term_in_data(data: &[(i64, Vec<u8>)], term: &[u8]) -> Option<Vec<DecodedPosting>> {
-    let leaves = segment_leaves(data)?;
-    // A servable segment whose term is absent: definitively no matches.
-    Some(decode_term(&leaves, term).unwrap_or_default())
+    merge_segments(data, |leaves| decode_term_strict(leaves, term))
 }
 
 /// Whether columns `a` and `b` (the per-column position lists of two postings for
@@ -1204,59 +1392,68 @@ fn rowids_difference(a: &[i64], b: &[i64]) -> Vec<i64> {
     out
 }
 
-/// Evaluate an [`Fts5BoolTree`] over already-gathered single-segment `leaves` into
-/// the matching rowids, ascending and deduplicated at every level. A `Leaf` decodes
-/// its term's doclist (absent term → empty, ascending and unique by construction);
-/// an `Op` combines its two children's ascending rowid lists with the matching
-/// sorted-merge set-op (`And`→[`rowids_intersect`], `Or`→[`rowids_union`],
-/// `Not`→[`rowids_difference`]), each of which preserves ascending+unique, so the
-/// recursion's invariant holds all the way up. Walks the tree bottom-up exactly as
-/// the scan's `fts5_eval` walks the parse tree.
+/// Evaluate an [`Fts5BoolTree`] over the `%_data` index into the matching rowids,
+/// ascending and deduplicated at every level, or `None` if ANY leaf term's
+/// multi-segment merge bails (tombstone / docid shared across segments / interior
+/// page) — in which case the whole boolean query falls back to the scan.
+///
+/// A `Leaf` resolves its term's rowids via [`decode_term_in_data`], the
+/// multi-segment merge (so a term whose postings span several pure-insert segments
+/// is unioned correctly, and the leaf bails on the layered/deleted case). Because
+/// each leaf is resolved against the GLOBAL (across-segment) document set before the
+/// boolean ops run, `a AND b` matches a doc even when `a` and `b` were last written
+/// in different segments — the per-term sets are already merged. An `Op` combines
+/// its two children's ascending rowid lists with the matching sorted-merge set-op
+/// (`And`→[`rowids_intersect`], `Or`→[`rowids_union`], `Not`→[`rowids_difference`]),
+/// each of which preserves ascending+unique, so the recursion's invariant holds all
+/// the way up. Walks the tree bottom-up exactly as the scan's `fts5_eval` walks the
+/// parse tree.
 #[cfg(feature = "fts5")]
-fn eval_bool_tree(leaves: &[&[u8]], tree: &crate::vtab::Fts5BoolTree) -> Vec<i64> {
+fn eval_bool_tree(data: &[(i64, Vec<u8>)], tree: &crate::vtab::Fts5BoolTree) -> Option<Vec<i64>> {
     use crate::vtab::{Fts5BoolOp, Fts5BoolTree};
     match tree {
-        Fts5BoolTree::Leaf(term) => decode_term(leaves, term)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.rowid)
-            .collect(),
+        Fts5BoolTree::Leaf(term) => Some(
+            decode_term_in_data(data, term)?
+                .into_iter()
+                .map(|p| p.rowid)
+                .collect(),
+        ),
         Fts5BoolTree::Op(op, a, b) => {
-            let ra = eval_bool_tree(leaves, a);
-            let rb = eval_bool_tree(leaves, b);
-            match op {
+            let ra = eval_bool_tree(data, a)?;
+            let rb = eval_bool_tree(data, b)?;
+            Some(match op {
                 Fts5BoolOp::And => rowids_intersect(&ra, &rb),
                 Fts5BoolOp::Or => rowids_union(&ra, &rb),
                 Fts5BoolOp::Not => rowids_difference(&ra, &rb),
-            }
+            })
         }
     }
 }
 
-/// Look up an N-operand BOOLEAN TREE of bare terms ([`Fts5BoolTree`]) in a
-/// single-segment FTS5 index, returning the matching rowids ascending, or `None`
-/// if the index shape is unservable (so the caller falls back to the `%_content`
-/// scan).
+/// Look up an N-operand BOOLEAN TREE of bare terms ([`Fts5BoolTree`]) in an FTS5
+/// index — across ONE OR MORE height-0 segments — returning the matching rowids
+/// ascending, or `None` if any leaf term's multi-segment merge bails (tombstone /
+/// docid shared across segments / interior page → the caller falls back to the
+/// `%_content` scan).
 ///
-/// The boolean sibling of [`lookup_term_rowids`]: it gathers the one
-/// height-0 segment's leaves ONCE (so a routed boolean tree counts as a single
-/// index hit, no matter how many leaf terms it decodes) and evaluates the tree
-/// bottom-up with [`eval_bool_tree`] — each leaf's doclist set-combined per node
-/// (`And`→intersection, `Or`→union, `Not`→difference). Because the tree is the
-/// exact parse tree the scan's `fts5_eval` walks (built by the recognizer
+/// The boolean sibling of [`lookup_term_rowids`]: it evaluates the tree bottom-up
+/// with [`eval_bool_tree`], each leaf resolved through the multi-segment merge
+/// ([`decode_term_in_data`]) so a term's postings spread over several pure-insert
+/// segments are unioned before the boolean ops apply, and each node set-combines its
+/// children (`And`→intersection, `Or`→union, `Not`→difference). Because the tree is
+/// the exact parse tree the scan's `fts5_eval` walks (built by the recognizer
 /// [`crate::vtab::fts5_bare_term_bool_tree`], preserving FTS5's
 /// `NOT` > `AND` > `OR` precedence/associativity) and a table-wide bare term's
-/// any-column match set is precisely its doclist's rowids, the routed result is the
-/// identical SET — and identical ascending ORDER — the scan produces for the same
-/// query.
+/// any-column match set is precisely its (across-segment) doclist's rowids, the
+/// routed result is the identical SET — and identical ascending ORDER — the scan
+/// produces for the same query.
 ///
 /// [`Fts5BoolTree`]: crate::vtab::Fts5BoolTree
 pub(crate) fn lookup_bool_tree_rowids(
     data: &[(i64, Vec<u8>)],
     tree: &crate::vtab::Fts5BoolTree,
 ) -> Option<Vec<i64>> {
-    let leaves = segment_leaves(data)?;
-    Some(eval_bool_tree(&leaves, tree))
+    eval_bool_tree(data, tree)
 }
 
 #[cfg(test)]
@@ -2133,5 +2330,241 @@ mod tests {
     fn lookup_near_empty_index_falls_back() {
         let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
         assert_eq!(lookup_near_rowids(&seg.data, b"a", b"b", 10), None);
+    }
+
+    // ---- multi-segment merge (D2b multi-segment bare-term/boolean/prefix) -----
+
+    /// One segment's spec for [`multiseg_data`]: its `segid` and its terms (each a
+    /// `(term bytes, postings)` pair, the same shape [`build_segment`] takes).
+    type SegSpec = (i64, Vec<(Vec<u8>, Vec<Posting>)>);
+
+    /// Build a `%_data` row set holding SEVERAL height-0 segments. Each spec is
+    /// `(segid, terms)`; the term doclist for one segment is built via
+    /// [`build_segment`] (single-segment), then its leaves are re-keyed under the
+    /// spec's `segid`. The combined structure record (id 10) lists all segments at
+    /// one level so [`all_segments`] sees the full multi-segment shape. Only the
+    /// structure record and the leaf rows are produced — the lookups read nothing
+    /// else.
+    fn multiseg_data(specs: &[SegSpec]) -> Vec<(i64, Vec<u8>)> {
+        let mut data: Vec<(i64, Vec<u8>)> = Vec::new();
+        let mut struct_body: Vec<u8> = 0u32.to_be_bytes().to_vec(); // cookie 0
+        put_varint(&mut struct_body, 1); // nLevel
+        put_varint(&mut struct_body, specs.len() as u64); // nSegment
+        put_varint(&mut struct_body, 0); // nWriteCounter
+        put_varint(&mut struct_body, 0); // level 0: nMerge
+        put_varint(&mut struct_body, specs.len() as u64); // level 0: nSeg
+        for (segid, terms) in specs {
+            // Build this segment's leaves (build_segment uses segid 1 internally).
+            let n_docs = terms.iter().flat_map(|(_, ps)| ps.iter()).count() as u64;
+            let seg = build_segment(terms, n_docs.max(1), &[64], &[], 4096, 0);
+            // Extract its leaves in page order.
+            let mut pgno = 1i64;
+            let mut n_leaves = 0i64;
+            loop {
+                let rid = segment_leaf_rowid(1, pgno);
+                match seg.data.iter().find(|(id, _)| *id == rid) {
+                    Some((_, blob)) => {
+                        data.push((segment_leaf_rowid(*segid, pgno), blob.clone()));
+                        n_leaves += 1;
+                        pgno += 1;
+                    }
+                    None => break,
+                }
+            }
+            // Per-segment triple: segid, pgnoFirst=1, pgnoLast=n_leaves.
+            put_varint(&mut struct_body, *segid as u64);
+            put_varint(&mut struct_body, 1);
+            put_varint(&mut struct_body, n_leaves as u64);
+        }
+        data.push((STRUCTURE_ROWID, struct_body));
+        data
+    }
+
+    #[test]
+    fn multiseg_bare_term_unions_across_segments_and_routes() {
+        // "cat" lives in three pure-insert segments, each holding distinct docids;
+        // the merge UNIONs them ascending. No overlap, no tombstone → index-routed.
+        let specs = vec![
+            (
+                1i64,
+                vec![(b"cat".to_vec(), vec![p(1, &[&[0]]), p(4, &[&[0]])])],
+            ),
+            (
+                2i64,
+                vec![(b"cat".to_vec(), vec![p(2, &[&[0]]), p(7, &[&[0]])])],
+            ),
+            (
+                3i64,
+                vec![
+                    (b"cat".to_vec(), vec![p(5, &[&[0]])]),
+                    (b"dog".to_vec(), vec![p(9, &[&[0]])]),
+                ],
+            ),
+        ];
+        let data = multiseg_data(&specs);
+        let before = INDEX_ROUTE_HITS.load(core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(lookup_term_rowids(&data, b"cat"), Some(vec![1, 2, 4, 5, 7]));
+        assert!(
+            INDEX_ROUTE_HITS.load(core::sync::atomic::Ordering::Relaxed) > before,
+            "the multi-segment bare term must take the index route"
+        );
+        // "dog" only in segment 3.
+        assert_eq!(lookup_term_rowids(&data, b"dog"), Some(vec![9]));
+        // Absent everywhere → servable empty.
+        assert_eq!(lookup_term_rowids(&data, b"zzz"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn multiseg_overlapping_docid_bails_to_scan() {
+        // The SAME docid (4) appears in two segments for "cat" — an update wrote a
+        // newer, shadowing entry. The merge can't resolve precedence here, so it
+        // bails (None) and the caller falls back to the scan.
+        let specs = vec![
+            (1i64, vec![(b"cat".to_vec(), vec![p(4, &[&[0]])])]),
+            (2i64, vec![(b"cat".to_vec(), vec![p(4, &[&[1]])])]),
+        ];
+        let data = multiseg_data(&specs);
+        assert_eq!(lookup_term_rowids(&data, b"cat"), None);
+    }
+
+    #[test]
+    fn multiseg_boolean_tree_merges_across_segments() {
+        // a in seg1 {1,2,3}, b in seg2 {2,3,4}, c in seg3 {3,5}. A bool tree must
+        // resolve each leaf against the GLOBAL set (so `a AND b` = {2,3} even though
+        // a and b live in different segments).
+        use crate::vtab::{Fts5BoolOp, Fts5BoolTree};
+        use alloc::boxed::Box;
+        let specs = vec![
+            (
+                1i64,
+                vec![(
+                    b"a".to_vec(),
+                    vec![p(1, &[&[0]]), p(2, &[&[0]]), p(3, &[&[0]])],
+                )],
+            ),
+            (
+                2i64,
+                vec![(
+                    b"b".to_vec(),
+                    vec![p(2, &[&[0]]), p(3, &[&[0]]), p(4, &[&[0]])],
+                )],
+            ),
+            (
+                3i64,
+                vec![(b"c".to_vec(), vec![p(3, &[&[0]]), p(5, &[&[0]])])],
+            ),
+        ];
+        let data = multiseg_data(&specs);
+        let leaf = |t: &[u8]| Fts5BoolTree::Leaf(t.to_vec());
+        let op = |o, l, r| Fts5BoolTree::Op(o, Box::new(l), Box::new(r));
+        // a AND b = {2,3}.
+        let t = op(Fts5BoolOp::And, leaf(b"a"), leaf(b"b"));
+        assert_eq!(lookup_bool_tree_rowids(&data, &t), Some(vec![2, 3]));
+        // a OR c = {1,2,3,5}.
+        let t = op(Fts5BoolOp::Or, leaf(b"a"), leaf(b"c"));
+        assert_eq!(lookup_bool_tree_rowids(&data, &t), Some(vec![1, 2, 3, 5]));
+        // (a OR b) NOT c = {1,2,4}.
+        let t = op(
+            Fts5BoolOp::Not,
+            op(Fts5BoolOp::Or, leaf(b"a"), leaf(b"b")),
+            leaf(b"c"),
+        );
+        assert_eq!(lookup_bool_tree_rowids(&data, &t), Some(vec![1, 2, 4]));
+    }
+
+    #[test]
+    fn multiseg_boolean_tree_bails_when_a_leaf_overlaps() {
+        // If any leaf term overlaps across segments, that leaf's merge bails, so the
+        // whole boolean query bails (→ scan).
+        use crate::vtab::{Fts5BoolOp, Fts5BoolTree};
+        use alloc::boxed::Box;
+        let specs = vec![
+            (1i64, vec![(b"a".to_vec(), vec![p(1, &[&[0]])])]),
+            // "b" overlaps docid 1 across seg2 and seg3.
+            (2i64, vec![(b"b".to_vec(), vec![p(1, &[&[0]])])]),
+            (3i64, vec![(b"b".to_vec(), vec![p(1, &[&[1]])])]),
+        ];
+        let data = multiseg_data(&specs);
+        let t = Fts5BoolTree::Op(
+            Fts5BoolOp::And,
+            Box::new(Fts5BoolTree::Leaf(b"a".to_vec())),
+            Box::new(Fts5BoolTree::Leaf(b"b".to_vec())),
+        );
+        assert_eq!(lookup_bool_tree_rowids(&data, &t), None);
+    }
+
+    #[test]
+    fn multiseg_prefix_unions_across_segments() {
+        // "apple"(seg1 d1), "apply"(seg2 d2), "apex"(seg3 d3) — three prefix-"ap"
+        // terms in three segments. The prefix route unions their docids.
+        let specs = vec![
+            (1i64, vec![(b"apple".to_vec(), vec![p(1, &[&[0]])])]),
+            (2i64, vec![(b"apply".to_vec(), vec![p(2, &[&[0]])])]),
+            (
+                3i64,
+                vec![
+                    (b"apex".to_vec(), vec![p(3, &[&[0]])]),
+                    (b"banana".to_vec(), vec![p(4, &[&[0]])]),
+                ],
+            ),
+        ];
+        let data = multiseg_data(&specs);
+        assert_eq!(lookup_prefix_rowids(&data, b"ap"), Some(vec![1, 2, 3]));
+        assert_eq!(lookup_prefix_rowids(&data, b"appl"), Some(vec![1, 2]));
+        assert_eq!(lookup_prefix_rowids(&data, b"ban"), Some(vec![4]));
+        assert_eq!(lookup_prefix_rowids(&data, b"zzz"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn multiseg_prefix_same_doc_two_terms_one_segment_is_not_overlap() {
+        // A single document holding two prefix-matching terms in the SAME segment is
+        // legitimate (not a cross-segment overlap) — it dedups to one rowid and does
+        // NOT bail.
+        let specs = vec![
+            (
+                1i64,
+                vec![
+                    (b"apple".to_vec(), vec![p(1, &[&[0]])]),
+                    (b"apply".to_vec(), vec![p(1, &[&[1]])]),
+                ],
+            ),
+            (2i64, vec![(b"apex".to_vec(), vec![p(2, &[&[0]])])]),
+        ];
+        let data = multiseg_data(&specs);
+        assert_eq!(lookup_prefix_rowids(&data, b"ap"), Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn delete_tombstone_in_poslist_bails() {
+        // A doclist entry whose poslist size varint has the low bit set is a DELETE
+        // tombstone; decode_poslist rejects it, so the segment decode bails (→ scan).
+        // Hand-craft a one-leaf segment whose "cat" doclist is `[rowid 1][size2=1]`.
+        let mut body: Vec<u8> = Vec::new();
+        // term record: [keylen=4]["0cat"]
+        let key = term_key(b"cat");
+        put_varint(&mut body, key.len() as u64);
+        body.extend_from_slice(&key);
+        // doclist: rowid delta 1, then size2 = 1 (delete marker, low bit set).
+        let term_off = 4; // body starts at offset 4 in the leaf
+        put_varint(&mut body, 1); // rowid 1
+        put_varint(&mut body, 1); // size2 = 1 → DELETE
+        let footer_off = 4 + body.len();
+        let mut leaf: Vec<u8> = Vec::new();
+        leaf.extend_from_slice(&0u16.to_be_bytes()); // first_rowid_off = 0
+        leaf.extend_from_slice(&(footer_off as u16).to_be_bytes());
+        leaf.extend_from_slice(&body);
+        // pgidx footer: one term offset (absolute).
+        put_varint(&mut leaf, term_off as u64);
+
+        // Wrap it as a single-segment %_data; the tombstone forces a bail.
+        let mut struct_body: Vec<u8> = 0u32.to_be_bytes().to_vec();
+        for v in [1u64, 1, 0, 0, 1, 1, 1, 1] {
+            put_varint(&mut struct_body, v);
+        }
+        let data = vec![
+            (segment_leaf_rowid(1, 1), leaf),
+            (STRUCTURE_ROWID, struct_body),
+        ];
+        assert_eq!(lookup_term_rowids(&data, b"cat"), None);
     }
 }

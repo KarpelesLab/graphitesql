@@ -344,10 +344,17 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
     the two terms' doclists and keeps docs with a per-column position pair within
     the span; the distance inequality `|pa-pb| <= n+1` is derived from the scan's
     general `max_end - min_start < n + total_len` rule (two single tokens →
-    total_len 2) and pinned vs `sqlite3` at the boundary. *Remaining:* index-route
-    ≥3-term phrases / ≥3-phrase `NEAR` / multi-segment shapes, and dlidx/interior
-    decode (D2b-3 leftover). Single-segment single-/two-operand MATCH is now
-    comprehensively index-routed.
+    total_len 2) and pinned vs `sqlite3` at the boundary. **Multi-segment:**
+    bare-term / column / boolean / prefix routing now also works over the
+    **multiple segments** a real `sqlite3` index accumulates (`all_segments` +
+    `merge_segments` union the per-segment doclists), bailing to the scan on a
+    tombstone or an overlapping docid (update/delete history) — verified vs
+    `sqlite3` on a genuine >1-segment index incl. a deletes-present case
+    (`tests/fts5_index_multiseg.rs`). *Remaining:* index-route ≥3-term phrases /
+    ≥3-phrase `NEAR` / multi-segment **phrase+NEAR** (position-based, still
+    single-segment), and dlidx/interior decode (D2b-3 leftover). Single-/two-
+    operand MATCH is now comprehensively index-routed on single- and multi-segment
+    indexes.
   - **D2b-3** — *Done (multi-leaf):* `decode_term` now handles **multi-leaf term
     pagination** (terms across leaves, each with its own page-index footer) and
     **doclist spanning** (carried poslist tail + absolute first-rowid on the
