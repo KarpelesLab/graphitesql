@@ -381,6 +381,13 @@ standard, not the build:
   `read-only` runtime error (no `SQLITE_ENABLE_DBPAGE_VTAB` write path), so there
   is no oracle to diff a writable `sqlite_dbpage` against — `dbpage-2` is parked
   on this, not on implementation effort (read-side `dbpage-1` is done).
+- **`PRAGMA function_list` / `collation_list`.** The alt1 oracle enumerates *its
+  own* loaded extensions (functions like `sha3`/`geopoly`/`zipfile`/`decimal`,
+  collations `decimal`/`uint`), so neither result set is reproducible by a
+  zero-dependency engine. graphite reports only its built-in collations
+  (`BINARY`/`NOCASE`/`RTRIM`, reverse-registration order) and does not implement
+  `function_list`. Result-value semantics that *are* build-independent are pinned
+  in `tests/value_semantics_diff.rs`.
 
 ---
 
