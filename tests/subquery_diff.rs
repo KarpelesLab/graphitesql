@@ -201,3 +201,47 @@ fn scalar_subquery_affinity_matches_sqlite3() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+/// `x IN (list)` applies ONLY the left operand's affinity to each element — the
+/// element's own affinity is ignored (a subquery or column element does not
+/// contribute its affinity, unlike a direct `x op (SELECT)` or `IN (SELECT)`).
+/// Regression: a subquery element wrongly coerced (`'1' IN (2,(SELECT intcol))`
+/// matched). Verified against sqlite3.
+#[test]
+fn in_list_element_affinity_matches_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-inlistaff-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let setup = "CREATE TABLE ci(y INTEGER); INSERT INTO ci VALUES(1);\
+        CREATE TABLE lt(x TEXT); INSERT INTO lt VALUES('1');\
+        CREATE TABLE li(x INTEGER); INSERT INTO li VALUES(1);";
+    {
+        let o = Command::new("sqlite3").arg(&path).arg(setup).output().unwrap();
+        assert!(o.status.success());
+    }
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+    let queries = [
+        "SELECT '1' IN (2, (SELECT y FROM ci))",           // text-lit / int subquery element → 0
+        "SELECT 1 IN (2, (SELECT y FROM ci))",             // int-lit / int subquery element → 1
+        "SELECT count(*) FROM lt WHERE x IN ((SELECT y FROM ci))", // text-col / int subquery elem → 0
+        "SELECT count(*) FROM li WHERE x IN ('1','2')",    // int-col / text literals → 1
+        "SELECT count(*) FROM lt WHERE x IN (1, 2)",       // text-col / int literals → 1
+    ];
+    for q in queries {
+        let want = {
+            let o = Command::new("sqlite3").arg(&path).arg(format!("{q};")).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        assert_eq!(render(&g.query(q).unwrap()), want, "IN-list element affinity diverged: {q}");
+    }
+    let _ = std::fs::remove_file(&path);
+}

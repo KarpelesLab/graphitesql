@@ -2045,20 +2045,12 @@ impl Compiler {
                 for elem in list {
                     let e = self.compile_expr(elem)?;
                     let eq = self.alloc();
-                    match cand_ra {
-                        Some(ra) => self.push_compare_coll_ra(
-                            BinaryOp::Eq,
-                            x,
-                            inner,
-                            e,
-                            Some(ra),
-                            eq,
-                            in_coll,
-                        ),
-                        None => {
-                            self.push_compare_coll(BinaryOp::Eq, x, inner, e, elem, eq, in_coll)
-                        }
-                    }
+                    // `x IN (list)` applies ONLY the left operand's affinity to each
+                    // element (the element's own affinity is ignored), so the
+                    // right-operand affinity is `cand_ra` — the folded candidate
+                    // column's affinity, or `None` for an ordinary list. Mirrors the
+                    // tree-walker's `eval_in` and SQLite.
+                    self.push_compare_coll_ra(BinaryOp::Eq, x, inner, e, cand_ra, eq, in_coll);
                     let next = self.alloc();
                     self.ops.push(Op::Or {
                         lhs: acc,
