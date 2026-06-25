@@ -930,6 +930,12 @@ impl Connection {
                 return Err(Error::Unsupported("VDBE: schema-qualified source"));
             }
         }
+        // A compound query (UNION / UNION ALL / INTERSECT / EXCEPT) runs each
+        // constituent SELECT on the VDBE and combines the row-sets with the same
+        // set semantics the tree-walker uses (Track B, B5c-3).
+        if !sel.compound.is_empty() {
+            return self.run_compound_vdbe(sel);
+        }
         // When the tree-walker satisfies `ORDER BY` via an index/rowid/seek scan,
         // its tie/NULL order follows that (possibly reversed) scan; the VDBE
         // sorter would emit a different — valid, but SQL-unspecified — tie order.
@@ -1551,6 +1557,87 @@ impl Connection {
             columns: prog.columns,
             rows: result,
         })
+    }
+
+    /// Run a compound `SELECT` (`UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`)
+    /// on the VDBE (Track B, B5c-3). Each constituent SELECT is executed through
+    /// [`run_select_vdbe`](Self::run_select_vdbe); the set combination, the
+    /// post-dedup sort, and the overall `ORDER BY` / `LIMIT` / `OFFSET` reuse the
+    /// exact helpers the tree-walker uses ([`apply_compound`],
+    /// [`compound_order_limit`](Self::compound_order_limit)), so the result is
+    /// byte-identical. Returns `Unsupported` — falling back to the tree-walker —
+    /// if any arm is a shape the VDBE cannot run, or carries CTEs or its own
+    /// nested compound (e.g. a multi-row `VALUES`, which desugars to a nested
+    /// `UNION ALL` chain).
+    fn run_compound_vdbe(&self, sel: &Select) -> Result<QueryResult> {
+        if !sel.ctes.is_empty() {
+            return Err(Error::Unsupported("VDBE: compound with CTEs"));
+        }
+        // Each arm must be a flat (non-compound, CTE-free) SELECT so the
+        // left-associative fold matches SQLite without recursing into operand
+        // tails (a multi-row `VALUES` operand keeps its rows in its own compound
+        // tail — defer those to the tree-walker).
+        if sel
+            .compound
+            .iter()
+            .any(|(_, c)| !c.compound.is_empty() || !c.ctes.is_empty())
+        {
+            return Err(Error::Unsupported("VDBE: nested compound arm"));
+        }
+        // The first core, stripped of the compound tail and the whole-query
+        // ORDER BY / LIMIT / OFFSET.
+        let mut first = sel.clone();
+        first.compound = Vec::new();
+        first.order_by = Vec::new();
+        first.limit = None;
+        first.offset = None;
+        let mut result = self.run_select_vdbe(&first)?;
+        // Set comparison uses the left SELECT's per-column output collations.
+        let params = eval::Params::default();
+        let colls = {
+            let (cols, _) = self.scan_source(&first, &params)?;
+            self.output_collations(&first, &cols, &params)
+        };
+        for (op, operand) in &sel.compound {
+            let r = self.run_select_vdbe(operand)?;
+            // Every operand must project the same number of columns; SQLite names
+            // the operator at the mismatch.
+            if r.columns.len() != result.columns.len() {
+                let kw = match op {
+                    CompoundOp::Union => "UNION",
+                    CompoundOp::UnionAll => "UNION ALL",
+                    CompoundOp::Intersect => "INTERSECT",
+                    CompoundOp::Except => "EXCEPT",
+                };
+                return Err(Error::Error(alloc::format!(
+                    "SELECTs to the left and right of {kw} do not have the same \
+                     number of result columns"
+                )));
+            }
+            result.rows = apply_compound(*op, result.rows, r.rows, &colls);
+        }
+        // A dedup set operation (UNION / INTERSECT / EXCEPT) emits rows in sorted
+        // order in SQLite (its dedup is a sorter); with no explicit ORDER BY,
+        // sort the combined result by all output columns to match.
+        if sel.order_by.is_empty()
+            && sel
+                .compound
+                .iter()
+                .any(|(op, _)| *op != CompoundOp::UnionAll)
+        {
+            result.rows.sort_by(|a, b| {
+                for (i, va) in a.iter().enumerate() {
+                    let coll = colls.get(i).copied().unwrap_or_default();
+                    let ord = crate::value::cmp_values_coll(va, &b[i], coll);
+                    if ord != core::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+        }
+        self.compound_order_limit(&mut result, sel, &params, &colls)?;
+        Ok(result)
     }
 
     /// Like [`query`](Self::query) but with bound parameters.

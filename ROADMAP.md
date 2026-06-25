@@ -229,9 +229,21 @@ is *perf/coverage*, not correctness.
 - **B5c-2 — correlated subqueries on the VDBE.**
   - **B5c-2a** — thread the outer row into the subquery's register frame.
   - **B5c-2b** — compile `Subquery`/`Exists`/`InSelect` that read an outer column.
-- **B5c-3 — compound `SELECT` (`UNION`/`INTERSECT`/`EXCEPT`) as one program.**
-  - **B5c-3a** — compile each arm into the same program.
-  - **B5c-3b** — the set-combine + dedup/sort step (collation-aware).
+- **B5c-3 — compound `SELECT` (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) — DONE.**
+  `run_compound_vdbe` runs each constituent SELECT through the VDBE
+  (`run_select_vdbe`) and folds the row-sets left-associatively. The set-combine,
+  the post-dedup sort (rows in sorted order for `UNION`/`INTERSECT`/`EXCEPT`,
+  preserved for `UNION ALL`), and the whole-query `ORDER BY`/`LIMIT`/`OFFSET`
+  reuse the tree-walker's exact helpers (`apply_compound`, `compound_order_limit`,
+  collation-aware via the left SELECT's output collations), so the result is
+  byte-identical. A nested-compound arm (e.g. a multi-row `VALUES`, which
+  desugars to a `UNION ALL` chain), a CTE-bearing arm, or any arm the VDBE
+  cannot run defers the whole query to the tree-walker. Differentially tested
+  vs sqlite 3.50.4 (`tests/vdbe_compound.rs`), incl. `1`/`1.0` dedup keeping the
+  later representation, three-arm left-associativity, per-arm `WHERE`, and the
+  column-count-mismatch error.
+  - **B5c-3a** — *(folded into the above: each arm runs on the VDBE.)*
+  - **B5c-3b** — *(folded into the above: collation-aware set-combine + sort.)*
 - **B5c-4 — window functions on the VDBE.**
 - **B5b — per-cursor nested-loop join + inner seek** (stream the inner side
   instead of materializing the cross-product; *perf-only*).
