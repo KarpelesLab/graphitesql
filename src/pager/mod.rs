@@ -8,22 +8,26 @@
 //!
 //! This phase implements the **read side** only: an immutable, cached view of
 //! the file. Dirty-page tracking, the rollback journal, WAL, and atomic commit
-//! arrive in Phase 6/8. The cache here is intentionally simple (read-through,
-//! unbounded) and will be replaced by a bounded page cache then.
+//! arrive in Phase 6/8. The read-through cache here is **bounded** by a
+//! [`PageCache`]: it honors the `cache_size` PRAGMA and evicts
+//! least-recently-used pages under memory pressure (ROADMAP C8c). Every page in a
+//! read-only pager is clean, so eviction is transparent — an evicted page is
+//! simply re-read from disk on the next access.
 
 use crate::error::{Error, Result};
 use crate::format::DatabaseHeader;
 use crate::vfs::File;
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+pub mod pcache;
 pub mod wal;
 pub mod write;
+pub use pcache::PageCache;
 pub use wal::WalReader;
 pub use write::{AutoVacuum, WritePager};
 
@@ -99,12 +103,17 @@ impl PageSource for Pager {
 }
 
 /// Reads numbered pages from a database file.
+///
+/// Pages are served through a **bounded** [`PageCache`]: a long read-heavy
+/// workload evicts least-recently-used pages instead of growing the resident set
+/// without bound. Every page here is clean (this is the read side), so an evicted
+/// page is just re-read from disk — results never change.
 pub struct Pager {
     file: Box<dyn File>,
     header: DatabaseHeader,
     page_size: usize,
     page_count: u32,
-    cache: RefCell<BTreeMap<u32, Rc<Vec<u8>>>>,
+    cache: RefCell<PageCache>,
 }
 
 impl Pager {
@@ -137,8 +146,25 @@ impl Pager {
             header,
             page_size,
             page_count,
-            cache: RefCell::new(BTreeMap::new()),
+            cache: RefCell::new(PageCache::new(pcache::DEFAULT_CACHE_SIZE, page_size)),
         })
+    }
+
+    /// Reconfigure the bounded page cache from a `cache_size` value (the
+    /// `cache_size` PRAGMA convention: a positive value is a page count, a
+    /// negative value is KiB of memory). Lowering it evicts the
+    /// least-recently-used pages immediately.
+    pub fn set_cache_size(&self, cache_size: i64) {
+        self.cache
+            .borrow_mut()
+            .set_cache_size(cache_size, self.page_size);
+    }
+
+    /// The number of pages currently resident in the cache. Read-only accessor
+    /// used to assert the bound holds; not part of the stable API.
+    #[doc(hidden)]
+    pub fn resident_pages(&self) -> usize {
+        self.cache.borrow().len()
     }
 
     /// The parsed database header.
@@ -169,11 +195,8 @@ impl Pager {
                 self.page_count
             )));
         }
-        if let Some(data) = self.cache.borrow().get(&number) {
-            return Ok(Page {
-                number,
-                data: Rc::clone(data),
-            });
+        if let Some(data) = self.cache.borrow_mut().get(number) {
+            return Ok(Page { number, data });
         }
 
         let mut buf = vec![0u8; self.page_size];

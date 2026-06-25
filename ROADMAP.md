@@ -249,10 +249,20 @@ INTO`; `secure_delete` (C8a); `cache_size`/`mmap_size` reporting (C8b).
     bug found. graphite's own writer still emits a single journal segment (it
     buffers the whole overlay and never spills mid-transaction); multi-segment
     *writing* would land with the bounded pcache (C8c).
-- **C8c — bounded `pcache` with LRU eviction** (honor the C8b `cache_size`;
-  replaces the keep-everything page map). *Perf, not correctness.*
-  - **C8c-1** — a page-cache abstraction with a capacity + eviction hook.
-  - **C8c-2** — wire the pager through it; evict clean pages under pressure.
+- **C8c — bounded `pcache` with LRU eviction.** *Done:* a `PageCache`
+  (`src/pager/pcache.rs`, **C8c-1**) — fixed-capacity LRU over clean-page images,
+  capacity from `cache_size` (positive = pages, negative = KiB/page_size, default
+  `-2000`), evicting the LRU clean page when a new key would exceed it. The read
+  `Pager`'s keep-everything map is replaced by it (**C8c-2**); `WritePager` gets a
+  bounded clean read-cache that the overlay/WAL shadow, so a **dirty page is
+  structurally never evictable**, invalidated on lock acquire/release/commit for
+  cross-connection coherence. Eviction is transparent (re-read on miss) — verified
+  correct + bounded under tiny caches with writes/rollback, cross-checked vs
+  `sqlite3` and `tests/concurrency.rs` (`tests/pcache_bounded.rs`).
+  - *Leftover:* the `WritePager` read cache is active only inside a write txn
+    (sole-writer); a pure read-only connection over a read-write file falls back to
+    direct (already-bounded) disk reads, since coherent caching there needs a
+    statement-level change-counter revalidation hook from the exec layer.
 - **C9 — concurrency** (each independent):
   - **C9a** — reader `SHARED`-lock sharing (multiple readers, writer excluded).
   - **C9b** — OS-level cross-process file locks (`std::fs::File::lock`; wants MSRV

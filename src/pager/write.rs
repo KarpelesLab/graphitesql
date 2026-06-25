@@ -15,6 +15,7 @@
 //! read-your-writes consistent. It implements [`PageSource`], so the existing
 //! b-tree cursors and schema reader work over it unchanged.
 
+use super::pcache::{self, PageCache};
 use super::{Page, PageSource};
 use crate::btree::page::{BtreePage, PageType};
 use crate::btree::ptrmap::{self, PtrmapType};
@@ -25,9 +26,11 @@ use crate::vfs::File;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 /// The 8-byte magic that opens every SQLite-format rollback journal.
 ///
@@ -116,6 +119,14 @@ pub struct WritePager {
     /// freelist is overwritten with zeros (so deleted data does not linger on
     /// disk). A per-connection runtime setting, not persisted in the file.
     secure_delete: bool,
+    /// Bounded LRU cache of **clean** pages read from the main file (ROADMAP
+    /// C8c). It only ever holds pages served straight from disk — never an
+    /// overlay (dirty) or WAL page, both of which `read_page` consults first — so
+    /// no dirty page can be evicted from here. A long read-heavy scan evicts
+    /// least-recently-used clean pages instead of growing without bound; an
+    /// evicted page is simply re-read from disk. Wrapped in a `RefCell` because
+    /// `read_page` takes `&self`.
+    read_cache: RefCell<PageCache>,
 }
 
 /// A snapshot of the pager's staged state captured by `SAVEPOINT`.
@@ -200,6 +211,7 @@ impl WritePager {
             held: crate::vfs::LockLevel::Unlocked,
             savepoints: Vec::new(),
             secure_delete: false,
+            read_cache: RefCell::new(PageCache::new(pcache::DEFAULT_CACHE_SIZE, page_size)),
         })
     }
 
@@ -284,6 +296,10 @@ impl WritePager {
             held: crate::vfs::LockLevel::Unlocked,
             savepoints: Vec::new(),
             secure_delete: false,
+            read_cache: RefCell::new(PageCache::new(
+                pcache::DEFAULT_CACHE_SIZE,
+                page_size as usize,
+            )),
         };
         // Page 1: db header (0..100) + an empty table-leaf b-tree at offset 100.
         let mut page1 = vec![0u8; page_size as usize];
@@ -306,7 +322,20 @@ impl WritePager {
         &mut self.header
     }
 
-    /// Read the full bytes of page `number` (overlay first, then disk).
+    /// Read the full bytes of page `number` (overlay first, then WAL, then disk).
+    ///
+    /// Clean pages read from the main file are served through a bounded LRU cache
+    /// (the `read_cache` field) so a long scan does not grow the resident set
+    /// without bound. The overlay (dirty pages) and the WAL are consulted *before*
+    /// the cache, so the cache only ever holds — and only ever returns — clean
+    /// on-disk pages; a dirty page is therefore never evictable from it.
+    ///
+    /// The cache is only consulted while this connection holds a write lock on the
+    /// file (i.e. inside its own write transaction). With no lock held, a *foreign*
+    /// connection over the same VFS may have committed under us, so the cache could
+    /// be stale: we then read straight from disk and keep the cache cold. Within a
+    /// write transaction this connection is the only writer (it holds at least
+    /// `Reserved`), so the on-disk clean pages cannot change beneath the cache.
     pub fn read_page(&self, number: u32) -> Result<Vec<u8>> {
         if let Some(bytes) = self.overlay.get(&number) {
             return Ok(bytes.clone());
@@ -320,10 +349,52 @@ impl WritePager {
         if number == 0 || number > self.disk_pages {
             return Err(Error::Corrupt(format!("page {number} out of range")));
         }
+        // Only trust the cache while we hold a write lock; otherwise a foreign
+        // writer could have changed the file out from under it (see method docs).
+        let cacheable = self.held >= crate::vfs::LockLevel::Reserved;
+        if cacheable {
+            if let Some(bytes) = self.read_cache.borrow_mut().get(number) {
+                return Ok(bytes.as_ref().clone());
+            }
+        }
         let mut buf = vec![0u8; self.page_size];
         self.file
             .read_exact_at(&mut buf, (number as u64 - 1) * self.page_size as u64)?;
+        if cacheable {
+            let data = Rc::new(buf);
+            self.read_cache
+                .borrow_mut()
+                .insert(number, Rc::clone(&data));
+            return Ok(data.as_ref().clone());
+        }
         Ok(buf)
+    }
+
+    /// Reconfigure the bounded clean-page read cache from a `cache_size` value
+    /// (the `cache_size` PRAGMA convention: a positive value is a page count, a
+    /// negative value is KiB of memory). Lowering it evicts the
+    /// least-recently-used clean pages immediately. Dirty pages live in the
+    /// overlay and are unaffected.
+    pub fn set_cache_size(&self, cache_size: i64) {
+        self.read_cache
+            .borrow_mut()
+            .set_cache_size(cache_size, self.page_size);
+    }
+
+    /// The number of **clean** pages currently resident in the read cache.
+    /// Read-only accessor used to assert the LRU bound holds; not part of the
+    /// stable API. Dirty (overlay) pages are not counted here — they are tracked
+    /// separately and never evicted.
+    #[doc(hidden)]
+    pub fn resident_clean_pages(&self) -> usize {
+        self.read_cache.borrow().len()
+    }
+
+    /// The number of dirty (staged, not-yet-committed) pages held in the overlay.
+    /// These are never evictable. Read-only accessor for tests; not stable API.
+    #[doc(hidden)]
+    pub fn resident_dirty_pages(&self) -> usize {
+        self.overlay.len()
     }
 
     /// Stage a full page image into the overlay.
@@ -356,6 +427,11 @@ impl WritePager {
                 return Err(e);
             }
             self.held = LockLevel::Reserved;
+            // Entering a write transaction: a foreign connection over the same
+            // VFS may have committed since we last held a lock, so anything in
+            // the clean read cache could be stale. Drop it; pages are re-read
+            // from disk and re-cached fresh under the write lock.
+            self.read_cache.borrow_mut().clear();
         }
         Ok(())
     }
@@ -377,6 +453,9 @@ impl WritePager {
         if self.held != LockLevel::Unlocked {
             let _ = self.file.unlock(LockLevel::Unlocked);
             self.held = LockLevel::Unlocked;
+            // Once unlocked, a foreign writer may change the file, so anything
+            // we cached under the lock must not be served to a later read.
+            self.read_cache.borrow_mut().clear();
         }
     }
 
@@ -1093,6 +1172,9 @@ impl WritePager {
 
         self.disk_pages = self.page_count;
         self.overlay.clear();
+        // The main file's contents just changed under the clean read cache; drop
+        // it so subsequent reads re-fetch the committed bytes.
+        self.read_cache.borrow_mut().clear();
         self.savepoints.clear();
         self.release_locks();
         Ok(())
@@ -1275,6 +1357,8 @@ impl WritePager {
         self.file.truncate(db_size as u64 * page_size)?;
         self.file.sync()?;
         self.disk_pages = db_size;
+        // The checkpoint rewrote the main file; drop the clean read cache.
+        self.read_cache.borrow_mut().clear();
         // Reset the WAL: empty it and restart with a new salt.
         if let Some(w) = self.wal_file.as_mut() {
             w.truncate(0)?;
@@ -1315,6 +1399,8 @@ impl WritePager {
         self.disk_pages = count;
         self.page_count = count;
         self.overlay.clear();
+        // The whole file was rewritten; drop the clean read cache.
+        self.read_cache.borrow_mut().clear();
         // Reset any WAL: its frames now refer to the pre-VACUUM image.
         if self.wal.is_some() {
             if let Some(w) = self.wal_file.as_mut() {
