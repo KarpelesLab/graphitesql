@@ -56,6 +56,10 @@ pub enum Op {
         lhs: usize,
         rhs: usize,
         dest: usize,
+        /// Comparison affinities of the operands — `IS`/`IS NOT` apply the same
+        /// pre-comparison affinity as `=`, then compare with NULL as comparable.
+        la: Option<Affinity>,
+        ra: Option<Affinity>,
     },
     /// `dest = (truth(operand) == Some(want)) XOR not` as 0/1 — the `x IS [NOT]
     /// TRUE|FALSE` truthiness test (a NULL operand is neither true nor false).
@@ -1930,6 +1934,8 @@ impl Compiler {
                                 lhs: l,
                                 rhs: r,
                                 dest,
+                                la: self.expr_affinity(left),
+                                ra: self.expr_affinity(right),
                             });
                         }
                         Ok(())
@@ -2297,8 +2303,21 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
             Op::Bitwise { op, lhs, rhs, dest } => {
                 regs[*dest] = crate::exec::eval::bitwise_values(*op, &regs[*lhs], &regs[*rhs]);
             }
-            Op::Is { is, lhs, rhs, dest } => {
-                regs[*dest] = crate::exec::eval::is_values(*is, &regs[*lhs], &regs[*rhs]);
+            Op::Is {
+                is,
+                lhs,
+                rhs,
+                dest,
+                la,
+                ra,
+            } => {
+                let (l, r) = crate::exec::eval::apply_comparison_affinity(
+                    regs[*lhs].clone(),
+                    *la,
+                    regs[*rhs].clone(),
+                    *ra,
+                );
+                regs[*dest] = crate::exec::eval::is_values(*is, &l, &r);
             }
             Op::Truthy {
                 want,

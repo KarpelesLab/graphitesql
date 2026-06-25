@@ -575,6 +575,37 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     };
                     Ok(Value::Integer(res as i64))
                 }
+                // `x IS y` / `x IS NOT y` (non-boolean) behave like `=`/`<>` but
+                // treat NULL as a comparable value — and, like `=`, apply operand
+                // comparison affinity and the resolved collation (so
+                // `intcol IS textcol` numerically coerces, matching SQLite). Without
+                // this, IS compared raw storage classes and missed the coercion.
+                // Row-value `IS` keeps the existing value-level path.
+                Is | IsNot => {
+                    if as_row_value(left).is_some() || as_row_value(right).is_some() {
+                        return eval_binary(*op, eval(left, ctx)?, eval(right, ctx)?);
+                    }
+                    let l = eval(left, ctx)?;
+                    let r = eval(right, ctx)?;
+                    let (l, r) = apply_comparison_affinity(
+                        l,
+                        expr_affinity(left, ctx),
+                        r,
+                        expr_affinity(right, ctx),
+                    );
+                    let eq = match (&l, &r) {
+                        (Value::Null, Value::Null) => true,
+                        (Value::Null, _) | (_, Value::Null) => false,
+                        _ => {
+                            crate::value::cmp_values_coll(
+                                &l,
+                                &r,
+                                resolve_collation(left, right, ctx),
+                            ) == Ordering::Equal
+                        }
+                    };
+                    Ok(bool_value(eq == matches!(op, Is)))
+                }
                 _ => eval_binary(*op, eval(left, ctx)?, eval(right, ctx)?),
             }
         }
@@ -1038,9 +1069,21 @@ fn eval_case(
             (Some(b), Some(op_expr)) => {
                 let w = eval(when, ctx)?;
                 let coll = resolve_collation(op_expr, when, ctx);
-                !matches!(b, Value::Null)
-                    && !matches!(w, Value::Null)
-                    && crate::value::cmp_values_coll(b, &w, coll) == Ordering::Equal
+                // `CASE x WHEN y` is `x = y`, so apply comparison affinity to the
+                // pair just like a binary `=` — the operand's affinity is pushed
+                // onto a bare-literal WHEN value, and a column/subquery WHEN value
+                // contributes its own affinity (e.g. `CASE 5 WHEN (SELECT t)` over
+                // a TEXT column coerces 5→'5'). Without this, a numeric operand
+                // never matched a text WHEN value.
+                let (bv, wv) = apply_comparison_affinity(
+                    b.clone(),
+                    expr_affinity(op_expr, ctx),
+                    w,
+                    expr_affinity(when, ctx),
+                );
+                !matches!(bv, Value::Null)
+                    && !matches!(wv, Value::Null)
+                    && crate::value::cmp_values_coll(&bv, &wv, coll) == Ordering::Equal
             }
             // `CASE WHEN cond` (no base operand) matches when cond is true.
             _ => truth(&eval(when, ctx)?) == Some(true),
