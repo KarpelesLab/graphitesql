@@ -139,6 +139,45 @@ fn left_join_empty_right_null_pads_every_left_row() {
 }
 
 #[test]
+fn right_join_runs_on_vdbe_with_null_padding() {
+    let c = setup();
+    // b's row p=2 has two matches in a? No — a has x in {1,2,3}; b has p in
+    // {1,2,2}. Every b row matches some a row, so no null padding here; the point
+    // is RIGHT runs on the VDBE (preserved = right table b) with a's columns.
+    let r = c
+        .query_vdbe("SELECT a.x, b.q FROM a RIGHT JOIN b ON a.x = b.p")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("P".into())],
+            vec![Value::Integer(2), Value::Text("Q".into())],
+            vec![Value::Integer(2), Value::Text("R".into())],
+        ]
+    );
+}
+
+#[test]
+fn right_join_null_pads_unmatched_right_row() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x)").unwrap();
+    c.execute("INSERT INTO a VALUES(1)").unwrap();
+    c.execute("CREATE TABLE b(p)").unwrap();
+    c.execute("INSERT INTO b VALUES(1),(2)").unwrap();
+    // b.p=2 has no match in a → a.x is NULL for that preserved right row.
+    let r = c
+        .query_vdbe("SELECT a.x, b.p FROM a RIGHT JOIN b ON a.x = b.p")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Null, Value::Integer(2)],
+        ]
+    );
+}
+
+#[test]
 fn nested_loop_join_empty_side_yields_no_rows() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x)").unwrap();
