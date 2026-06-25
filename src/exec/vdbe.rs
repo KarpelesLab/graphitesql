@@ -1607,10 +1607,10 @@ fn expand_projections(
 /// counts (`boundaries[i]` = end of cursor `i`'s columns, `boundaries.last()` =
 /// total), so a combined column index resolves to its `(cursor, local col)`.
 /// `sel.where_clause` must already fold in the `ON` predicates (merged by the
-/// caller). Supports projection + WHERE + constant LIMIT/OFFSET; returns
-/// `Unsupported` for GROUP BY / aggregates / HAVING / ORDER BY / DISTINCT so the
-/// caller falls back to the cross-product (or tree-walker) path. The row order
-/// (innermost cursor advancing fastest, cursor 0 outermost) matches the
+/// caller). Supports projection + WHERE + DISTINCT (BINARY collation) + constant
+/// LIMIT/OFFSET; returns `Unsupported` for GROUP BY / aggregates / HAVING / ORDER
+/// BY so the caller falls back to the cross-product (or tree-walker) path. The row
+/// order (innermost cursor advancing fastest, cursor 0 outermost) matches the
 /// cross-product and SQLite's nested-loop order.
 pub fn compile_join2(
     sel: &Select,
@@ -1626,9 +1626,16 @@ pub fn compile_join2(
         || !sel.group_by.is_empty()
         || sel.having.is_some()
         || !sel.order_by.is_empty()
-        || sel.distinct
     {
         return Err(Error::Unsupported("VDBE: join shape not nested-loopable"));
+    }
+    // DISTINCT compares output rows under BINARY; a non-BINARY column collation
+    // would diverge, so defer those to the tree-walker (as the single-table path
+    // does).
+    if sel.distinct && collations.iter().any(|cl| *cl != Collation::Binary) {
+        return Err(Error::Unsupported(
+            "VDBE: non-BINARY collation with DISTINCT",
+        ));
     }
     let projections = expand_projections(sel, columns, tables)?;
     if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
@@ -1709,6 +1716,19 @@ pub fn compile_join2(
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
     }
+    // DISTINCT gates on the projected row and runs before OFFSET/LIMIT (a
+    // duplicate must not consume the OFFSET/LIMIT budget).
+    let distinct_skip = if sel.distinct {
+        let at = c.ops.len();
+        c.ops.push(Op::DistinctCheck {
+            start: 0,
+            count,
+            target: 0,
+        });
+        Some(at)
+    } else {
+        None
+    };
     let offset_skip = offset_reg.map(|r| {
         let at = c.ops.len();
         c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
@@ -1743,6 +1763,11 @@ pub fn compile_join2(
     if let Some(at) = skip {
         if let Op::IfFalse { target, .. } = &mut c.ops[at] {
             *target = inner_next;
+        }
+    }
+    if let Some(at) = distinct_skip {
+        if let Op::DistinctCheck { target, .. } = &mut c.ops[at] {
+            *target = inner_next; // a duplicate row advances the innermost cursor
         }
     }
     if let Some(at) = offset_skip {
@@ -3704,7 +3729,6 @@ mod tests {
         for sql in [
             "SELECT count(*) FROM a, b",
             "SELECT a.x FROM a, b ORDER BY a.x",
-            "SELECT DISTINCT a.x FROM a, b",
             "SELECT a.x FROM a, b GROUP BY a.x",
         ] {
             let Statement::Select(sel) = parse_one(sql).unwrap() else {
@@ -3715,5 +3739,10 @@ mod tests {
                 "{sql} should bail to the cross-product path"
             );
         }
+        // DISTINCT over a join IS supported (BINARY collation).
+        let Statement::Select(sel) = parse_one("SELECT DISTINCT a.x FROM a, b").unwrap() else {
+            panic!()
+        };
+        assert!(compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_ok());
     }
 }

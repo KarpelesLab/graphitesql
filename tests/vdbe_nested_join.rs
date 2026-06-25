@@ -205,6 +205,23 @@ fn full_join_runs_on_vdbe_with_both_sided_null_padding() {
 }
 
 #[test]
+fn distinct_over_join_runs_on_vdbe() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x)").unwrap();
+    c.execute("INSERT INTO a VALUES(1),(1),(2)").unwrap();
+    c.execute("CREATE TABLE b(p)").unwrap();
+    c.execute("INSERT INTO b VALUES(1),(1),(2)").unwrap();
+    // The join produces duplicate x values; DISTINCT collapses them, on the VDBE.
+    let r = c
+        .query_vdbe("SELECT DISTINCT a.x FROM a JOIN b ON a.x = b.p ORDER BY a.x")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+}
+
+#[test]
 fn nested_loop_join_empty_side_yields_no_rows() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x)").unwrap();
