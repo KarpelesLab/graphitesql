@@ -29,7 +29,39 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-const JOURNAL_MAGIC: &[u8; 8] = b"GSQLJRN1";
+/// The 8-byte magic that opens every SQLite-format rollback journal.
+///
+/// SQLite writes these exact bytes at offset 0; a journal is only "well-formed"
+/// (and therefore a candidate for hot-journal recovery) if they are present.
+const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+
+/// Bytes occupied by the fixed fields of the journal header (magic, record
+/// count, checksum nonce, initial page count, sector size, page size). The
+/// header is then zero-padded out to [`JOURNAL_SECTOR`].
+const JOURNAL_HDR_FIELDS: usize = 28;
+
+/// Sector size assumed for the rollback journal. SQLite hard-codes 512 bytes
+/// (there is no portable way to discover the true sector size), so we record the
+/// same value at header offset 20 and pad the header out to this boundary. Each
+/// page record begins on this boundary so a torn write of the header sector
+/// cannot damage the page records that follow.
+const JOURNAL_SECTOR: u64 = 512;
+
+/// Compute the 4-byte page checksum exactly as SQLite does: seed with the
+/// per-transaction `nonce`, then add the unsigned byte value at offsets
+/// `len-200, len-400, …` down to the first non-negative index. The sum wraps in
+/// `u32`. A sparse sample (every 200th byte) is intentional — it is what SQLite
+/// uses, so the value must match byte-for-byte for cross-recovery.
+fn journal_page_checksum(nonce: u32, page: &[u8]) -> u32 {
+    let mut cksum = nonce;
+    // X starts at len-200 and steps down by 200 while >= 0.
+    let mut x = page.len() as isize - 200;
+    while x >= 0 {
+        cksum = cksum.wrapping_add(page[x as usize] as u32);
+        x -= 200;
+    }
+    cksum
+}
 
 /// Fixed file offset of the SQLite "lock byte". The page that contains this byte
 /// is never used to store data; on databases larger than 1 GiB it falls on a
@@ -1379,6 +1411,25 @@ impl WritePager {
         }))
     }
 
+    /// Write the SQLite-format rollback journal: the originals of every page
+    /// this commit is about to overwrite, in the on-disk byte layout that the
+    /// real `sqlite3` (and our own [`recover`](Self::recover)) plays back to undo
+    /// an interrupted transaction.
+    ///
+    /// Layout (all integers big-endian), matching the file-format spec:
+    /// * **Header** (zero-padded out to one [`JOURNAL_SECTOR`]): the 8-byte
+    ///   [`JOURNAL_MAGIC`]; record count (offset 8); a per-transaction checksum
+    ///   nonce (offset 12); the initial database size in pages (offset 16); the
+    ///   sector size (offset 20); and the page size (offset 24).
+    /// * **Page records** (packed contiguously after the header sector): for each
+    ///   saved page, its 4-byte page number, its full original content, then the
+    ///   4-byte [`journal_page_checksum`].
+    ///
+    /// The record count at offset 8 is written *after* the page records, mirroring
+    /// SQLite's two-flush commit: the page bodies are durable before the header
+    /// advertises how many records to trust, so a crash before the final sync
+    /// leaves a count of 0 (an empty, ignorable journal) rather than a header that
+    /// promises records that were never written.
     fn write_journal(&mut self) -> Result<()> {
         // Collect originals of pages being overwritten (those already on disk).
         let mut originals: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -1390,51 +1441,154 @@ impl WritePager {
                 originals.push((n, buf));
             }
         }
+        // A per-transaction nonce: deterministic (no RNG dependency) but varying
+        // commit-to-commit via the change counter, so a stale page left over from
+        // a previous journal fails this transaction's checksum.
+        let nonce = (self.header.change_counter)
+            .wrapping_mul(0x9E37_79B1)
+            .wrapping_add(self.disk_pages.wrapping_mul(2_654_435_761));
+        let page_size = self.page_size as u64;
         let j = self.journal.as_mut().unwrap();
         j.truncate(0)?;
-        // Header: magic, original page count, page size.
-        let mut hdr = Vec::with_capacity(16);
-        hdr.extend_from_slice(JOURNAL_MAGIC);
-        hdr.extend_from_slice(&self.disk_pages.to_be_bytes());
-        hdr.extend_from_slice(&(self.page_size as u32).to_be_bytes());
+
+        // Header, padded with zeros out to a full sector.
+        let mut hdr = vec![0u8; JOURNAL_SECTOR as usize];
+        hdr[0..8].copy_from_slice(&JOURNAL_MAGIC);
+        // Record count is filled in after the records are synced (see below).
+        hdr[12..16].copy_from_slice(&nonce.to_be_bytes());
+        hdr[16..20].copy_from_slice(&self.disk_pages.to_be_bytes());
+        hdr[20..24].copy_from_slice(&(JOURNAL_SECTOR as u32).to_be_bytes());
+        hdr[24..28].copy_from_slice(&(page_size as u32).to_be_bytes());
+        debug_assert_eq!(JOURNAL_HDR_FIELDS, 28);
         j.write_all_at(&hdr, 0)?;
-        let mut off = hdr.len() as u64;
+
+        // Page records begin on the sector boundary.
+        let mut off = JOURNAL_SECTOR;
         for (n, bytes) in &originals {
             j.write_all_at(&n.to_be_bytes(), off)?;
             off += 4;
             j.write_all_at(bytes, off)?;
-            off += self.page_size as u64;
+            off += page_size;
+            let cksum = journal_page_checksum(nonce, bytes);
+            j.write_all_at(&cksum.to_be_bytes(), off)?;
+            off += 4;
         }
+        // Sync the records, then publish the count and sync the header sector.
+        j.sync()?;
+        let nrec = originals.len() as u32;
+        j.write_all_at(&nrec.to_be_bytes(), 8)?;
         j.sync()?;
         Ok(())
     }
 
-    /// Replay a non-empty journal onto `file`, restoring the pre-commit state.
+    /// Replay a hot SQLite-format journal onto `file`, restoring the pre-commit
+    /// state, then clear it.
+    ///
+    /// Mirrors SQLite's hot-journal recovery: validate the header magic, read the
+    /// initial page count / sector size / page size, then play back each page
+    /// record (page number, original content, checksum) into the database file.
+    /// Records whose checksum does not match the header nonce are treated as the
+    /// torn tail of an interrupted write and stop the replay — everything up to
+    /// that point is still rolled back. Finally the database is truncated to its
+    /// recorded initial size and the journal is truncated away.
+    ///
+    /// A journal whose record count is `0` (or whose magic is absent) is not hot
+    /// and is ignored. When a segment's count is `-1`/`0xFFFFFFFF` (SQLite's
+    /// cache-spill sentinel) or otherwise larger than the remaining file, recovery
+    /// reads records until the next segment header or end of file.
+    ///
+    /// SQLite may append **multiple journal segments** (each a sector-aligned
+    /// header followed by its records) when the page cache spills mid-transaction;
+    /// every segment shares the same page size and sector size, but carries its
+    /// own record count and checksum nonce. Recovery walks each segment in turn,
+    /// playing every valid record back, so a large interrupted transaction is
+    /// fully rolled back.
     fn recover(file: &mut dyn File, journal: &mut dyn File) -> Result<()> {
         let jsize = journal.size()?;
-        if jsize < 16 {
-            return Ok(()); // empty or absent journal: nothing to do
+        if jsize < JOURNAL_SECTOR {
+            return Ok(()); // too small to hold a header: nothing to do
         }
-        let mut hdr = [0u8; 16];
+        // Read the first header to learn the geometry and the original db size.
+        let mut hdr = [0u8; JOURNAL_HDR_FIELDS];
         journal.read_exact_at(&mut hdr, 0)?;
-        if &hdr[0..8] != JOURNAL_MAGIC {
-            return Ok(()); // not our journal; ignore
+        if hdr[0..8] != JOURNAL_MAGIC {
+            return Ok(()); // not a SQLite journal (or zeroed/persist-invalidated)
         }
-        let orig_pages = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
-        let page_size = u32::from_be_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]) as usize;
-        let mut off = 16u64;
-        while off + 4 + page_size as u64 <= jsize {
-            let mut nb = [0u8; 4];
-            journal.read_exact_at(&mut nb, off)?;
-            off += 4;
-            let n = u32::from_be_bytes(nb);
-            let mut buf = vec![0u8; page_size];
-            journal.read_exact_at(&mut buf, off)?;
-            off += page_size as u64;
-            file.write_all_at(&buf, (n as u64 - 1) * page_size as u64)?;
+        let orig_pages = be32(&hdr, 16);
+        let sector = be32(&hdr, 20) as u64;
+        let page_size = be32(&hdr, 24) as u64;
+        if page_size < 512 || !page_size.is_power_of_two() || sector == 0 {
+            return Ok(()); // bogus geometry: not a journal we can trust
+        }
+        // The first segment must carry at least one record to be hot.
+        if be32(&hdr, 8) == 0 {
+            return Ok(());
+        }
+
+        let rec_len = 4 + page_size + 4;
+        let mut seg_off = 0u64;
+        let mut played_any = false;
+        // Walk each journal segment (header + records), sector-aligned.
+        while seg_off + JOURNAL_HDR_FIELDS as u64 <= jsize {
+            let mut sh = [0u8; JOURNAL_HDR_FIELDS];
+            journal.read_exact_at(&mut sh, seg_off)?;
+            if sh[0..8] != JOURNAL_MAGIC {
+                break; // no further segment
+            }
+            let nrec = be32(&sh, 8);
+            let nonce = be32(&sh, 12);
+            // Records begin on the sector boundary after this segment's header.
+            let recs_start = seg_off + sector;
+            if recs_start > jsize {
+                break;
+            }
+            let avail = (jsize - recs_start) / rec_len;
+            // -1/over-large count ⇒ read all that fit before the next thing.
+            let want = if nrec as u64 > avail {
+                avail
+            } else {
+                nrec as u64
+            };
+            let mut off = recs_start;
+            let mut played = 0u64;
+            for _ in 0..want {
+                let mut nb = [0u8; 4];
+                journal.read_exact_at(&mut nb, off)?;
+                let n = u32::from_be_bytes(nb);
+                let mut buf = vec![0u8; page_size as usize];
+                journal.read_exact_at(&mut buf, off + 4)?;
+                let mut cb = [0u8; 4];
+                journal.read_exact_at(&mut cb, off + 4 + page_size)?;
+                // A mismatched checksum (or a zero page number) marks the torn
+                // tail of an interrupted write: stop here, having rolled back the
+                // valid prefix, exactly as SQLite does.
+                if n == 0 || u32::from_be_bytes(cb) != journal_page_checksum(nonce, &buf) {
+                    break;
+                }
+                file.write_all_at(&buf, (n as u64 - 1) * page_size)?;
+                played_any = true;
+                played += 1;
+                off += rec_len;
+            }
+            // Advance to the next segment: past the records, padded up to the
+            // next sector boundary. If this segment was truncated early (torn
+            // tail) there can be no further valid segment.
+            if played < want {
+                break;
+            }
+            let consumed = recs_start + played * rec_len;
+            let next = consumed.div_ceil(sector) * sector;
+            if next <= seg_off {
+                break; // no forward progress: avoid looping
+            }
+            seg_off = next;
+        }
+
+        if !played_any {
+            return Ok(());
         }
         // Restore the original length, discarding pages appended by the aborted tx.
-        file.truncate(orig_pages as u64 * page_size as u64)?;
+        file.truncate(orig_pages as u64 * page_size)?;
         file.sync()?;
         journal.truncate(0)?;
         journal.sync()?;
@@ -1571,7 +1725,8 @@ mod tests {
             let mut wp = WritePager::create(file, Some(jf), 4096).unwrap();
             wp.commit().unwrap(); // 1-page db on disk, journal cleared
         }
-        // Manually craft a journal as if a commit had begun: save page 1 original.
+        // Manually craft a SQLite-format journal as if a commit had begun: save
+        // page 1's original content with a valid header + checksum.
         let orig_p1 = {
             let f = vfs.open("db", OpenFlags::READ_ONLY).unwrap();
             let mut b = vec![0u8; 4096];
@@ -1580,13 +1735,22 @@ mod tests {
         };
         {
             let mut j = vfs.open("db-journal", OpenFlags::READ_WRITE).unwrap();
-            let mut hdr = Vec::new();
-            hdr.extend_from_slice(JOURNAL_MAGIC);
-            hdr.extend_from_slice(&1u32.to_be_bytes()); // orig pages
-            hdr.extend_from_slice(&4096u32.to_be_bytes());
+            let nonce = 0x1234_5678u32;
+            let mut hdr = vec![0u8; JOURNAL_SECTOR as usize];
+            hdr[0..8].copy_from_slice(&JOURNAL_MAGIC);
+            hdr[8..12].copy_from_slice(&1u32.to_be_bytes()); // nrec
+            hdr[12..16].copy_from_slice(&nonce.to_be_bytes());
+            hdr[16..20].copy_from_slice(&1u32.to_be_bytes()); // orig pages
+            hdr[20..24].copy_from_slice(&(JOURNAL_SECTOR as u32).to_be_bytes());
+            hdr[24..28].copy_from_slice(&4096u32.to_be_bytes());
             j.write_all_at(&hdr, 0).unwrap();
-            j.write_all_at(&1u32.to_be_bytes(), 16).unwrap();
-            j.write_all_at(&orig_p1, 20).unwrap();
+            let mut off = JOURNAL_SECTOR;
+            j.write_all_at(&1u32.to_be_bytes(), off).unwrap();
+            off += 4;
+            j.write_all_at(&orig_p1, off).unwrap();
+            off += 4096;
+            let cksum = journal_page_checksum(nonce, &orig_p1);
+            j.write_all_at(&cksum.to_be_bytes(), off).unwrap();
             j.sync().unwrap();
         }
         // Corrupt the live file.
@@ -1599,5 +1763,99 @@ mod tests {
         let jf = vfs.open("db-journal", OpenFlags::READ_WRITE).unwrap();
         let wp = WritePager::open(file, Some(jf)).unwrap();
         assert_eq!(wp.read_page(1).unwrap(), orig_p1);
+    }
+
+    /// A multi-segment journal (two sector-aligned headers, each with its own
+    /// records and nonce) is fully played back — covering SQLite's cache-spill
+    /// layout.
+    #[test]
+    fn multi_segment_journal_recovery() {
+        let vfs = MemoryVfs::new();
+        // Baseline 3-page db.
+        {
+            let file = vfs.open("db", OpenFlags::READ_WRITE_CREATE).unwrap();
+            let jf = vfs
+                .open("db-journal", OpenFlags::READ_WRITE_CREATE)
+                .unwrap();
+            let mut wp = WritePager::create(file, Some(jf), 4096).unwrap();
+            for _ in 0..2 {
+                let p = wp.allocate_page().unwrap();
+                let mut b = vec![0u8; 4096];
+                b[0] = 0x0d;
+                wp.write_page(p, b).unwrap();
+            }
+            wp.commit().unwrap();
+        }
+        // Originals to restore.
+        let originals: Vec<(u32, Vec<u8>)> = (1u32..=3)
+            .map(|n| {
+                let f = vfs.open("db", OpenFlags::READ_ONLY).unwrap();
+                let mut b = vec![0u8; 4096];
+                f.read_exact_at(&mut b, (n as u64 - 1) * 4096).unwrap();
+                (n, b)
+            })
+            .collect();
+        // Mutate the live file so recovery has something to undo.
+        {
+            let mut f = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
+            for n in 1u32..=3 {
+                f.write_all_at(&[0xAA; 64], (n as u64 - 1) * 4096).unwrap();
+            }
+        }
+        // Build a two-segment journal: segment A saves pages 1,2; segment B
+        // (its own header on the next sector boundary) saves page 3.
+        let write_seg =
+            |buf: &mut Vec<u8>, base: u64, nonce: u32, recs: &[(u32, &Vec<u8>)], orig: u32| {
+                let mut hdr = vec![0u8; JOURNAL_SECTOR as usize];
+                hdr[0..8].copy_from_slice(&JOURNAL_MAGIC);
+                hdr[8..12].copy_from_slice(&(recs.len() as u32).to_be_bytes());
+                hdr[12..16].copy_from_slice(&nonce.to_be_bytes());
+                hdr[16..20].copy_from_slice(&orig.to_be_bytes());
+                hdr[20..24].copy_from_slice(&(JOURNAL_SECTOR as u32).to_be_bytes());
+                hdr[24..28].copy_from_slice(&4096u32.to_be_bytes());
+                let need = (base + JOURNAL_SECTOR) as usize;
+                if buf.len() < need {
+                    buf.resize(need, 0);
+                }
+                buf[base as usize..need].copy_from_slice(&hdr);
+                for (n, data) in recs {
+                    buf.extend_from_slice(&n.to_be_bytes());
+                    buf.extend_from_slice(data);
+                    buf.extend_from_slice(&journal_page_checksum(nonce, data).to_be_bytes());
+                }
+                // Pad up to the next sector boundary so the next header is aligned.
+                while !(buf.len() as u64).is_multiple_of(JOURNAL_SECTOR) {
+                    buf.push(0);
+                }
+            };
+        let mut jbytes = Vec::new();
+        write_seg(
+            &mut jbytes,
+            0,
+            0x1111_1111,
+            &[(1, &originals[0].1), (2, &originals[1].1)],
+            3,
+        );
+        let seg_b_base = jbytes.len() as u64;
+        write_seg(
+            &mut jbytes,
+            seg_b_base,
+            0x2222_2222,
+            &[(3, &originals[2].1)],
+            3,
+        );
+        {
+            let mut j = vfs.open("db-journal", OpenFlags::READ_WRITE).unwrap();
+            j.truncate(0).unwrap();
+            j.write_all_at(&jbytes, 0).unwrap();
+            j.sync().unwrap();
+        }
+        // Recover and assert all three pages were restored.
+        let file = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
+        let jf = vfs.open("db-journal", OpenFlags::READ_WRITE).unwrap();
+        let wp = WritePager::open(file, Some(jf)).unwrap();
+        for (n, data) in &originals {
+            assert_eq!(&wp.read_page(*n).unwrap(), data, "page {n} restored");
+        }
     }
 }

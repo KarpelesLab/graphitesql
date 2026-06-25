@@ -228,14 +228,23 @@ INTO`; `secure_delete` (C8a); `cache_size`/`mmap_size` reporting (C8b).
 
 **Remaining:**
 
-- **C7 — SQLite-format rollback journal** (graphite's journal is a private,
-  recoverable format today; match the on-disk byte layout so a crash mid-write is
-  recoverable by `sqlite3`).
-  - **C7a** — write the sqlite journal header + page records.
-  - **C7b** — recover from a sqlite-format journal on open.
+- **C7 — SQLite-format rollback journal.** *Done (C7a + C7b):* `write_journal`
+  now emits SQLite's exact byte layout (8-byte magic `d9 d5 05 f9 20 a1 63 d7`,
+  record count, checksum nonce, initial page count, sector/page sizes, header
+  padded to one sector; then `(pgno, page, 4-byte sparse checksum)` records), with
+  the count published only after the records sync (sqlite's two-flush protocol).
+  `recover` detects a hot journal, validates the header, replays each
+  checksum-valid record, and truncates to the recorded size — stopping at a torn
+  tail and walking multiple sector-aligned segments. Cross-verified **both ways**
+  vs `sqlite3` 3.50.4: graphite's hot journal recovered by sqlite, and a
+  sqlite-authored hot journal (forced cache-spill + mid-transaction SIGKILL)
+  recovered by graphite (`tests/journal_sqlite_format.rs`).
   - **C7-harness** — a fault-injecting `Vfs` (truncate / fail at chosen fsync
     points) asserting recovery to a consistent state (the §6 crash-recovery
-    harness; lands with C7).
+    harness; a `RetainVfs`/`RetainFile` foundation already lives in the C7 test
+    file). graphite's own writer still emits a single segment (it buffers the
+    whole overlay in memory and never spills mid-transaction); multi-segment
+    *writing* would land with the bounded pcache (C8c).
 - **C8c — bounded `pcache` with LRU eviction** (honor the C8b `cache_size`;
   replaces the keep-everything page map). *Perf, not correctness.*
   - **C8c-1** — a page-cache abstraction with a capacity + eviction hook.
