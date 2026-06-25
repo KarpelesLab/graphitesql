@@ -1,8 +1,10 @@
-//! B5c (VDBE depth): a non-correlated `IN (SELECT <computed>)` candidate set is
+//! B5c (VDBE depth): a non-correlated `IN (SELECT col)` candidate set is
 //! materialized and folded to `IN (list)` by the router's fold pre-pass, so the
-//! query runs on the VDBE (`query_vdbe` errors on fallback). Only computed (NONE-
-//! affinity) candidate columns are folded — a bare-column candidate keeps its
-//! column affinity and is left for the tree-walker. Results match sqlite.
+//! query runs on the VDBE (`query_vdbe` errors on fallback). A *computed*
+//! (NONE-affinity) candidate folds to a plain list; a *bare-column* candidate
+//! additionally carries its column's affinity (`candidate_affinity`) so the VDBE
+//! reproduces SQLite's `combine(left_aff, col_aff)` comparison — without it the
+//! fold would wrongly apply the left operand's affinity. Results match sqlite.
 #![cfg(feature = "std")]
 use graphitesql::{Connection, Value};
 
@@ -50,17 +52,82 @@ fn computed_in_select_runs_on_vdbe() {
 }
 
 #[test]
-fn bare_column_in_select_still_defers() {
-    // A bare-column candidate (x, not computed) keeps its column affinity, so it
-    // must NOT be folded — query_vdbe should error (fall back to the tree-walker).
+fn bare_column_in_select_runs_on_vdbe() {
+    // A bare-column candidate (x, not computed) now folds WITH its column affinity
+    // carried in `candidate_affinity`, so it runs on the VDBE and matches query().
     let c = setup();
-    assert!(
-        c.query_vdbe("SELECT 2 IN (SELECT x FROM t)").is_err(),
-        "bare-column IN(SELECT) must defer from the VDBE, not fold"
+    // Untyped column x → NONE affinity; left literal 2 (NONE) → no coercion needed.
+    assert_eq!(
+        vdbe1(&c, "SELECT 2 IN (SELECT x FROM t)"),
+        Value::Integer(1)
     );
-    // ...but plain query() (tree-walker) still answers it correctly.
+    assert_eq!(
+        vdbe1(&c, "SELECT 9 IN (SELECT x FROM t)"),
+        Value::Integer(0)
+    );
+    assert_eq!(
+        vdbe1(&c, "SELECT 9 NOT IN (SELECT x FROM t)"),
+        Value::Integer(1)
+    );
+    // Tree-walker agrees (it never sees the fold, but must give the same answer).
     assert_eq!(
         c.query("SELECT 2 IN (SELECT x FROM t)").unwrap().rows[0][0],
         Value::Integer(1)
     );
+}
+
+/// The crux of B5c-1: `combine(left_aff, candidate_col_aff)` must hold on the
+/// VDBE. A bare-column candidate carries its column affinity, so the routed
+/// result is byte-identical to the tree-walker (and sqlite) for every affinity
+/// combo — including the cases where folding to a plain `IN (list)` would diverge
+/// (TEXT-left × untyped-candidate must NOT coerce → no match).
+#[test]
+fn bare_column_in_select_affinity_combos_match_tree_walker() {
+    let mut c = Connection::open_memory().unwrap();
+    for s in [
+        "CREATE TABLE li(x INTEGER)",
+        "INSERT INTO li VALUES(1)",
+        "CREATE TABLE lt(x TEXT)",
+        "INSERT INTO lt VALUES('1')",
+        "CREATE TABLE ln(x)",
+        "INSERT INTO ln VALUES(1)",
+        "CREATE TABLE lr(x REAL)",
+        "INSERT INTO lr VALUES(1)",
+        "CREATE TABLE ct(y TEXT)",
+        "INSERT INTO ct VALUES('1')",
+        "CREATE TABLE ci(y INTEGER)",
+        "INSERT INTO ci VALUES(1)",
+        "CREATE TABLE cn(y)",
+        "INSERT INTO cn VALUES(1)",
+        "CREATE TABLE cf(y TEXT)",
+        "INSERT INTO cf VALUES('1.0')",
+    ] {
+        c.execute(s).unwrap();
+    }
+    // (query, expected count) — the exact shapes the sqlite3 oracle pins down.
+    let cases = [
+        ("SELECT count(*) FROM ln WHERE x IN (SELECT y FROM ct)", 0), // none/text
+        ("SELECT count(*) FROM lt WHERE x IN (SELECT y FROM cn)", 0), // text/none
+        ("SELECT count(*) FROM li WHERE x IN (SELECT y FROM ct)", 1), // int/text
+        ("SELECT count(*) FROM ln WHERE x IN (SELECT y FROM cn)", 1), // none/none
+        ("SELECT count(*) FROM lt WHERE x IN (SELECT y FROM ci)", 1), // text/int
+        ("SELECT count(*) FROM li WHERE x IN (SELECT y FROM ci)", 1), // int/int
+        ("SELECT count(*) FROM lr WHERE x IN (SELECT y FROM ct)", 1), // real/text
+        ("SELECT count(*) FROM li WHERE x IN (SELECT y FROM cf)", 1), // int/'1.0'
+        (
+            "SELECT count(*) FROM li WHERE x NOT IN (SELECT y FROM ct)",
+            0,
+        ), // NOT IN
+    ];
+    for (q, want) in cases {
+        // Must RUN on the VDBE (the bare-column fold succeeded, no fallback).
+        let v = c.query_vdbe(q).unwrap().rows[0][0].clone();
+        assert_eq!(v, Value::Integer(want), "VDBE result diverged: {q}");
+        // ...and equal the tree-walker.
+        assert_eq!(
+            c.query(q).unwrap().rows[0][0],
+            Value::Integer(want),
+            "tree-walker diverged: {q}"
+        );
+    }
 }

@@ -216,6 +216,7 @@ pub fn expr(e: &Expr) -> String {
             expr: inner,
             list,
             negated,
+            ..
         } => {
             let items: Vec<String> = list.iter().map(expr).collect();
             format!(

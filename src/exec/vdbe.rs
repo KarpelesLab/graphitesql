@@ -1739,8 +1739,26 @@ impl Compiler {
         dest: usize,
         coll: Collation,
     ) {
-        let la = self.expr_affinity(left);
         let ra = self.expr_affinity(right);
+        self.push_compare_coll_ra(op, lhs, left, rhs, ra, dest, coll);
+    }
+
+    /// Like [`push_compare_coll`](Self::push_compare_coll) but with the
+    /// right-operand comparison affinity supplied explicitly — used by a folded
+    /// bare-column `IN (SELECT col)`, where the candidate side contributes the
+    /// SELECTed column's affinity rather than the literal element's own.
+    #[allow(clippy::too_many_arguments)]
+    fn push_compare_coll_ra(
+        &mut self,
+        op: BinaryOp,
+        lhs: usize,
+        left: &Expr,
+        rhs: usize,
+        ra: Option<Affinity>,
+        dest: usize,
+        coll: Collation,
+    ) {
+        let la = self.expr_affinity(left);
         self.ops.push(Op::Compare {
             op,
             lhs,
@@ -1996,6 +2014,7 @@ impl Compiler {
                 expr: inner,
                 list,
                 negated,
+                candidate_affinity,
             } => {
                 let x = self.compile_expr(inner)?;
                 // SQLite's `IN` collation rule: a single-element list behaves like
@@ -2007,6 +2026,15 @@ impl Compiler {
                 } else {
                     self.col_collation(inner).unwrap_or_default()
                 };
+                // When the router folded a bare-column `x IN (SELECT col)`, the
+                // candidate side contributes the SELECTed column's affinity (carried
+                // as a canonical type name). Use it as EVERY element's right-operand
+                // comparison affinity instead of the literal's own NONE affinity, so
+                // `Op::Compare` applies `combine(left_aff, col_aff)` — exactly the
+                // `IN (SELECT)` semantics, which a plain `IN (list)` would not get.
+                let cand_ra = candidate_affinity
+                    .as_deref()
+                    .map(|t| Affinity::from_type(Some(t)));
                 // Accumulate the running OR into `acc`, seeded with 0 (false) so an
                 // empty list yields 0.
                 let acc = self.alloc();
@@ -2017,7 +2045,20 @@ impl Compiler {
                 for elem in list {
                     let e = self.compile_expr(elem)?;
                     let eq = self.alloc();
-                    self.push_compare_coll(BinaryOp::Eq, x, inner, e, elem, eq, in_coll);
+                    match cand_ra {
+                        Some(ra) => self.push_compare_coll_ra(
+                            BinaryOp::Eq,
+                            x,
+                            inner,
+                            e,
+                            Some(ra),
+                            eq,
+                            in_coll,
+                        ),
+                        None => {
+                            self.push_compare_coll(BinaryOp::Eq, x, inner, e, elem, eq, in_coll)
+                        }
+                    }
                     let next = self.alloc();
                     self.ops.push(Op::Or {
                         lhs: acc,

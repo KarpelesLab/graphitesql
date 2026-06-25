@@ -181,20 +181,21 @@ result).
 VDBE-vs-tree-walker parity; results are already correct via the fallback, so this
 is *perf/coverage*, not correctness.
 
-- **B5c-1 — `IN (SELECT …)` on the VDBE** (it applies the candidate *column's*
-  affinity, unlike `IN (list)` — the tree-walker semantics are already shipped).
-  - *Done (fold subset):* a non-correlated `IN (SELECT <computed column>)` is
-    materialized and folded to `IN (list)` by the router pre-pass, so it runs on
-    the VDBE. Safe only because a *computed* candidate carries NONE affinity /
-    BINARY collation, making the two forms equivalent (verified vs sqlite). The
-    **bare-column** candidate is the remaining real work — it needs the VDBE to
-    apply the candidate column's affinity natively (it can't fold without
-    changing results):
-  - **B5c-1a** — evaluate the candidate set + its column affinity
-    (`Subqueries::column_affinity`) into registers.
-  - **B5c-1b** — a membership op applying `apply_comparison_affinity(left_aff,
-    candidate_col_aff)` under the left collation.
-  - **B5c-1c** — `NOT IN` + NULL-in-set semantics (a NULL candidate → NULL result).
+- **B5c-1 — `IN (SELECT …)` on the VDBE — DONE.** A non-correlated `IN (SELECT)`
+  now runs on the VDBE for both candidate kinds. *Computed candidate:* folded to
+  `IN (list)` (a computed result carries NONE affinity, so it's equivalent).
+  *Bare-column candidate (the hard case):* the router carries the candidate
+  column's affinity (resolved via `subquery_column_origins`, as a canonical type
+  name) into a new `Expr::InList.candidate_affinity` field; the VDBE's IN OR-chain
+  feeds it as each `Op::Compare.ra`, so the existing
+  `apply_comparison_affinity(left_aff, candidate_aff)` runtime step computes
+  SQLite's `combine` — crucially an untyped candidate is `Some(Blob)`, NOT `None`,
+  so `lt.x(TEXT) IN (SELECT cn.y)` → `combine(TEXT,Blob)` → no coercion → no match
+  (matching sqlite), where a plain literal-list fold wrongly coerced. `NOT IN` and
+  NULL-in-set fall out of the existing OR-chain. Non-BINARY-collation candidates
+  still defer to the tree-walker (a remaining edge). Verified across every
+  left×candidate affinity combo vs sqlite3 (`tests/subquery_diff.rs`,
+  `tests/vdbe_in_select.rs`), tree-walker == VDBE == sqlite.
   - *Implementation note (investigated 2026-06-25):* a fold to `IN (list)` CANNOT
     work — list literals report NONE comparison-affinity, but the bare-column
     candidate must contribute its column affinity; and wrapping each value in

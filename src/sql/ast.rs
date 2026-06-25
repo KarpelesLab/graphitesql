@@ -814,6 +814,20 @@ pub enum Expr {
         list: Vec<Expr>,
         /// `NOT IN`?
         negated: bool,
+        /// Comparison affinity contributed by the candidate side, as a canonical
+        /// type name (`"INTEGER"`/`"TEXT"`/`"REAL"`/`"NUMERIC"`/`"BLOB"`).
+        ///
+        /// `None` for an ordinary `IN (list)`: each element carries its own
+        /// (usually NONE) comparison affinity and the left operand's affinity
+        /// drives every comparison. `Some(t)` is set only by the router when it
+        /// folds a non-correlated bare-column `x IN (SELECT col)` — SQLite then
+        /// compares under `combine(left_aff, col_aff)`, where `col_aff` is the
+        /// candidate column's affinity (which a plain literal list would not
+        /// supply). The VDBE compiler feeds this as the right-operand affinity of
+        /// every element comparison so the existing `Op::Compare` reproduces the
+        /// `IN (SELECT)` semantics exactly. A type-name `String` (not an `eval`
+        /// type) keeps `ast.rs` free of an `exec` dependency, like `Expr::Cast`.
+        candidate_affinity: Option<String>,
     },
     /// `expr [NOT] BETWEEN low AND high`.
     Between {

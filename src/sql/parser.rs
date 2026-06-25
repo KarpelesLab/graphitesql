@@ -2616,6 +2616,7 @@ impl Parser {
             expr: Box::new(left),
             list,
             negated,
+            candidate_affinity: None,
         })
     }
 

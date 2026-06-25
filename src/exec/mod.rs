@@ -602,6 +602,7 @@ impl Connection {
                 expr,
                 list,
                 negated,
+                candidate_affinity,
             } => E::InList {
                 expr: alloc::boxed::Box::new(self.fold_subquery_expr(expr, changed)),
                 list: list
@@ -609,6 +610,7 @@ impl Connection {
                     .map(|x| self.fold_subquery_expr(x, changed))
                     .collect(),
                 negated: *negated,
+                candidate_affinity: candidate_affinity.clone(),
             },
             E::Between {
                 expr,
@@ -684,19 +686,22 @@ impl Connection {
                 order_by: order_by.clone(),
                 over: None,
             },
-            // `IN (SELECT …)`: fold to an `IN (list)` of the materialized
-            // candidate values when the subquery is self-contained and its single
-            // column is a computed (NONE-affinity) expression — then the candidate
-            // set carries no column affinity/collation of its own and the two
-            // forms are equivalent (see `eval_foldable_in_select`). A bare-column
-            // candidate is left in place (its affinity would matter), so the VDBE
-            // compiler still falls back for that case.
+            // `IN (SELECT …)`: fold to an `IN (list)` of the materialized candidate
+            // values when the subquery is self-contained (non-correlated). A
+            // *computed* candidate column carries NONE affinity / BINARY collation,
+            // so the list compares exactly like the original (no candidate affinity).
+            // A *bare-column* candidate instead contributes its column's affinity:
+            // SQLite compares under `combine(left_aff, col_aff)`, which a plain
+            // `IN (list)` would not reproduce — so the fold records that affinity in
+            // `candidate_affinity`, and the VDBE/eval feed it as the right-operand
+            // comparison affinity (a non-BINARY candidate collation bails — see
+            // `eval_foldable_in_select`). `None` leaves the `IN (SELECT)` in place.
             E::InSelect {
                 expr,
                 select,
                 negated,
             } => match self.eval_foldable_in_select(select) {
-                Some(values) => {
+                Some((values, candidate_affinity)) => {
                     *changed = true;
                     E::InList {
                         expr: alloc::boxed::Box::new(self.fold_subquery_expr(expr, changed)),
@@ -705,6 +710,7 @@ impl Connection {
                             .map(|v| E::Literal(value_to_literal(v)))
                             .collect(),
                         negated: *negated,
+                        candidate_affinity,
                     }
                 }
                 None => e.clone(),
@@ -743,16 +749,24 @@ impl Connection {
         )
     }
 
-    /// Materialize an `IN (SELECT …)` candidate set to its values when the
-    /// subquery is self-contained (non-correlated) AND its single result column
-    /// is a *computed* expression — not a bare column reference. The computed
-    /// candidate carries NONE affinity / BINARY collation, so `L IN (SELECT …)`
-    /// then compares exactly like `L IN (v1, v2, …)` (the comparison takes `L`'s
-    /// affinity and collation in both forms — verified against sqlite). A
-    /// bare-column candidate is deliberately NOT folded: `IN (SELECT col)` would
-    /// apply that column's affinity, which `IN (list)` does not. `None` when not
-    /// foldable, so the VDBE compiler simply falls back as before.
-    fn eval_foldable_in_select(&self, sel2: &Select) -> Option<Vec<Value>> {
+    /// Materialize an `IN (SELECT …)` candidate set to its values, with the
+    /// candidate side's comparison affinity, when the subquery is self-contained
+    /// (non-correlated). Returns `(values, candidate_affinity)`:
+    ///
+    /// - A *computed* candidate column carries NONE affinity / BINARY collation,
+    ///   so `L IN (SELECT …)` compares exactly like `L IN (v1, v2, …)` (the
+    ///   comparison takes `L`'s affinity in both forms — verified vs sqlite); the
+    ///   returned affinity is `None`.
+    /// - A *bare-column* candidate contributes its column's affinity: SQLite uses
+    ///   `combine(left_aff, col_aff)`, which a plain literal list lacks. The
+    ///   column's affinity is returned as a canonical type name so the VDBE/eval
+    ///   feed it as the element comparison's right-operand affinity.
+    ///
+    /// **Collation safety:** a bare-column candidate whose origin collation is
+    /// non-default (not `BINARY`) is left for the tree-walker (`None`) — only the
+    /// affinity is reproduced here, not a non-BINARY candidate collation.
+    /// `None` when not foldable, so the VDBE compiler simply falls back as before.
+    fn eval_foldable_in_select(&self, sel2: &Select) -> Option<(Vec<Value>, Option<String>)> {
         if !self.vdbe_subquery_foldable(sel2) {
             return None;
         }
@@ -762,16 +776,28 @@ impl Connection {
         let sql::ast::ResultColumn::Expr { expr, .. } = &sel2.columns[0] else {
             return None;
         };
-        if is_bare_column_expr(expr) {
-            return None;
-        }
+        // A bare-column candidate must carry its column's affinity; resolve the
+        // single output column's origin `(affinity, collation)`. Bail when the
+        // origin is unknown (defaulted to BLOB/BINARY would be wrong here) or its
+        // collation is non-BINARY — those stay on the tree-walker.
+        let candidate_affinity = if is_bare_column_expr(expr) {
+            let origins = self.subquery_column_origins(sel2)?;
+            let (aff, coll) = origins.first().copied()?;
+            if coll != crate::value::Collation::default() {
+                return None;
+            }
+            Some(affinity_type_name(aff))
+        } else {
+            None
+        };
         let r = self.run_select(sel2, &Params::default()).ok()?;
-        Some(
+        Some((
             r.rows
                 .into_iter()
                 .map(|row| row.into_iter().next().unwrap_or(Value::Null))
                 .collect(),
-        )
+            candidate_affinity,
+        ))
     }
 
     /// Evaluate `EXISTS (sel2)` to a constant truth value when `sel2` is
@@ -15622,6 +15648,7 @@ impl Connection {
                 expr,
                 list,
                 negated,
+                candidate_affinity,
             } => Expr::InList {
                 expr: Box::new(self.extract_aggregates(expr, aggs)),
                 list: list
@@ -15629,6 +15656,7 @@ impl Connection {
                     .map(|x| self.extract_aggregates(x, aggs))
                     .collect(),
                 negated: *negated,
+                candidate_affinity: candidate_affinity.clone(),
             },
             Expr::Case {
                 operand,
@@ -16002,6 +16030,7 @@ impl Connection {
                 expr,
                 list,
                 negated,
+                candidate_affinity,
             } => {
                 let mut new_list = Vec::with_capacity(list.len());
                 for e in list {
@@ -16011,6 +16040,7 @@ impl Connection {
                     expr: Box::new(self.substitute_aggregates(expr, columns, rows, group, params)?),
                     list: new_list,
                     negated: *negated,
+                    candidate_affinity: candidate_affinity.clone(),
                 }
             }
             Expr::Case {
@@ -17720,6 +17750,21 @@ fn is_bare_column_expr(e: &Expr) -> bool {
     }
 }
 
+/// The canonical SQL type name whose declared-type affinity rule
+/// (`Affinity::from_type`) round-trips back to `aff` — so a folded bare-column
+/// `IN (SELECT col)` can carry the candidate column's affinity through the AST as
+/// a type-name `String` (keeping `ast.rs` free of `eval` types).
+fn affinity_type_name(aff: eval::Affinity) -> alloc::string::String {
+    match aff {
+        eval::Affinity::Integer => "INTEGER",
+        eval::Affinity::Text => "TEXT",
+        eval::Affinity::Real => "REAL",
+        eval::Affinity::Numeric => "NUMERIC",
+        eval::Affinity::Blob => "BLOB",
+    }
+    .into()
+}
+
 /// Does `e` reference only columns of `quals`/`cols` (its own query's sources),
 /// with no bound parameter and no nested subquery? Used to prove a subquery is
 /// non-correlated before folding it to a constant. Conservative: any nested
@@ -18420,6 +18465,7 @@ fn find_expr_in_values(key_expr: &Expr, e: &Expr, params: &Params) -> Option<Vec
             expr,
             list,
             negated: false,
+            ..
         } => {
             if list.is_empty() || !expr_eq_modulo_parens(expr, key_expr) {
                 return None;
@@ -18966,6 +19012,7 @@ fn find_in_constraint(
             expr,
             list,
             negated: false,
+            ..
         } => {
             let ci = col_index(expr, columns)?;
             if list.is_empty() {
@@ -19243,6 +19290,7 @@ fn rowid_seek_constraint(
             expr,
             list,
             negated: false,
+            ..
         } if is_rowid_ref(expr, columns) && !list.is_empty() => {
             let mut out = Vec::with_capacity(list.len());
             for item in list {

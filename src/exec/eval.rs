@@ -579,11 +579,12 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             expr,
             list,
             negated,
+            candidate_affinity,
         } => {
             if let Some(ls) = as_row_value(expr) {
                 return eval_row_in(ls, list, *negated, ctx);
             }
-            eval_in(expr, list, *negated, ctx)
+            eval_in(expr, list, *negated, candidate_affinity.as_deref(), ctx)
         }
         Expr::Between {
             expr,
@@ -952,7 +953,13 @@ fn eval_or(left: &Expr, right: &Expr, ctx: &EvalCtx) -> Result<Value> {
     })
 }
 
-fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<Value> {
+fn eval_in(
+    expr: &Expr,
+    list: &[Expr],
+    negated: bool,
+    candidate_affinity: Option<&str>,
+    ctx: &EvalCtx,
+) -> Result<Value> {
     // An empty IN list is always false (`NOT IN`: always true) — SQLite
     // short-circuits before NULL semantics, so even `NULL IN ()` is 0, not NULL.
     if list.is_empty() {
@@ -976,6 +983,11 @@ fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<V
     // literal list element, so `i IN ('10','20')` numerically coerces the text
     // elements when `i` has numeric affinity (mirrors `=`).
     let ea = expr_affinity(expr, ctx);
+    // When this list was folded from a bare-column `x IN (SELECT col)`, the
+    // candidate side contributes the SELECTed column's affinity (carried as a
+    // canonical type name) instead of the literal element's own NONE affinity —
+    // so the comparison reproduces SQLite's `combine(left_aff, col_aff)` exactly.
+    let cand_aff = candidate_affinity.map(|t| Affinity::from_type(Some(t)));
     let mut saw_null = false;
     for item in list {
         let iv = eval(item, ctx)?;
@@ -983,7 +995,8 @@ fn eval_in(expr: &Expr, list: &[Expr], negated: bool, ctx: &EvalCtx) -> Result<V
             saw_null = true;
             continue;
         }
-        let (lv, iv) = apply_comparison_affinity(v.clone(), ea, iv, expr_affinity(item, ctx));
+        let ra = cand_aff.or_else(|| expr_affinity(item, ctx));
+        let (lv, iv) = apply_comparison_affinity(v.clone(), ea, iv, ra);
         if crate::value::cmp_values_coll(&lv, &iv, coll) == Ordering::Equal {
             return Ok(bool_value(!negated));
         }
