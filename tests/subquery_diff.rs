@@ -220,7 +220,11 @@ fn in_list_element_affinity_matches_sqlite3() {
         CREATE TABLE lt(x TEXT); INSERT INTO lt VALUES('1');\
         CREATE TABLE li(x INTEGER); INSERT INTO li VALUES(1);";
     {
-        let o = Command::new("sqlite3").arg(&path).arg(setup).output().unwrap();
+        let o = Command::new("sqlite3")
+            .arg(&path)
+            .arg(setup)
+            .output()
+            .unwrap();
         assert!(o.status.success());
     }
     let mut g = Connection::open_memory().unwrap();
@@ -230,18 +234,26 @@ fn in_list_element_affinity_matches_sqlite3() {
         }
     }
     let queries = [
-        "SELECT '1' IN (2, (SELECT y FROM ci))",           // text-lit / int subquery element → 0
-        "SELECT 1 IN (2, (SELECT y FROM ci))",             // int-lit / int subquery element → 1
+        "SELECT '1' IN (2, (SELECT y FROM ci))", // text-lit / int subquery element → 0
+        "SELECT 1 IN (2, (SELECT y FROM ci))",   // int-lit / int subquery element → 1
         "SELECT count(*) FROM lt WHERE x IN ((SELECT y FROM ci))", // text-col / int subquery elem → 0
-        "SELECT count(*) FROM li WHERE x IN ('1','2')",    // int-col / text literals → 1
-        "SELECT count(*) FROM lt WHERE x IN (1, 2)",       // text-col / int literals → 1
+        "SELECT count(*) FROM li WHERE x IN ('1','2')",            // int-col / text literals → 1
+        "SELECT count(*) FROM lt WHERE x IN (1, 2)",               // text-col / int literals → 1
     ];
     for q in queries {
         let want = {
-            let o = Command::new("sqlite3").arg(&path).arg(format!("{q};")).output().unwrap();
+            let o = Command::new("sqlite3")
+                .arg(&path)
+                .arg(format!("{q};"))
+                .output()
+                .unwrap();
             String::from_utf8_lossy(&o.stdout).trim_end().to_string()
         };
-        assert_eq!(render(&g.query(q).unwrap()), want, "IN-list element affinity diverged: {q}");
+        assert_eq!(
+            render(&g.query(q).unwrap()),
+            want,
+            "IN-list element affinity diverged: {q}"
+        );
     }
     let _ = std::fs::remove_file(&path);
 }
