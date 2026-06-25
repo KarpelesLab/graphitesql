@@ -286,8 +286,21 @@ is *perf/coverage*, not correctness.
   count bump nor the collected values for that aggregate (each aggregate's filter
   is independent). `agg_kind_distinct` now binds the `FILTER` predicate instead of
   bailing on it. Differentially tested vs sqlite 3.50.4 in
-  `tests/vdbe_filter_agg.rs`. Ordered aggregates (`group_concat(x ORDER BY y)`)
-  and windowed (`OVER`) calls still fall back.
+  `tests/vdbe_filter_agg.rs`.
+- **Ordered `group_concat(x ORDER BY …)` on the VDBE — DONE.** A
+  `group_concat` with an inner `ORDER BY` now runs on the VDBE across all
+  aggregate paths (bare single-table, over `GROUP BY`, and over a two-table
+  join). The accumulator (`AggAcc`, now a struct rather than a tuple) records
+  each collected value's `ORDER BY` key row alongside the value; finalization
+  sorts a stable index permutation under those keys (BINARY collation, SQLite
+  NULL placement — NULLs first under `ASC`, last under `DESC`, honoring explicit
+  `NULLS FIRST`/`LAST`) before joining. `Op::AggStep`/`AggSpec` carry an
+  `order: Vec<AggOrderKey>` of pre-compiled key registers; `agg_kind_distinct`
+  binds the `ORDER BY` terms. Tightly scoped: only single-arg `group_concat`
+  ordered — `DISTINCT` + `ORDER BY`, and an `ORDER BY` on any other aggregate,
+  still fall back (no regression — those bailed before). Differentially tested
+  vs sqlite 3.50.4 in `tests/vdbe_ordered_agg.rs`. Windowed (`OVER`) calls still
+  fall back.
 - **B5c-4 — window functions on the VDBE.**
 - **B5b — per-cursor nested-loop join + inner seek** (stream the inner side
   instead of materializing the cross-product; *perf-only*).
