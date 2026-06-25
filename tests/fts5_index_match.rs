@@ -192,6 +192,140 @@ fn sqlite_written_bare_term_match_read_by_graphite() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ---------------------------------------------------------------------------
+// Column-scoped single bare term (`tbl MATCH 'col : word'`) — D2b-2 extension.
+// A word appears in different columns in different rows; `col MATCH 'word'` must
+// return exactly the rows where the word is in THAT column, identical to sqlite3.
+// ---------------------------------------------------------------------------
+
+/// A two-column corpus where "fox"/"dog" appear in `title`, `body`, both, or
+/// neither across rows, so a column filter genuinely partitions the doclist.
+const MC_DOCS: &[(i64, &str, &str)] = &[
+    (1, "the fox sleeps", "a lazy dog rests"),
+    (2, "quiet night here", "a fox runs by"),
+    (3, "fox and hound", "dog chases fox"),
+    (4, "fox tracks found", "snow everywhere now"),
+    (5, "nothing notable", "nothing here either"),
+    (6, "dog day afternoon", "the fox returns home"),
+    (7, "brown fox leaps", "brown dog barks loud"),
+    (8, "henhouse raided", "by a sneaky fox tonight"),
+    (9, "the dog and fox", "play in the yard now"),
+    (10, "calm waters flow", "across the wide river"),
+];
+
+/// graphite's `SELECT rowid FROM t WHERE t MATCH 'col : term'`, sorted rowids.
+fn graphite_col_match(c: &Connection, col: &str, term: &str) -> String {
+    let sql = format!("SELECT rowid FROM t WHERE t MATCH '{col} : {term}' ORDER BY rowid");
+    let mut v: Vec<i64> = c
+        .query(&sql)
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| match r[0] {
+            Value::Integer(i) => i,
+            ref other => panic!("non-integer rowid: {other:?}"),
+        })
+        .collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// sqlite3's column-scoped MATCH over the same file, sorted rowids.
+fn sqlite_col_match(path: &str, col: &str, term: &str) -> String {
+    let q = format!("SELECT rowid FROM t WHERE t MATCH '{col} : {term}' ORDER BY rowid;");
+    let o = Command::new("sqlite3").arg(path).arg(&q).output().unwrap();
+    assert!(
+        o.status.success(),
+        "sqlite3 failed for {q:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mut v: Vec<i64> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.parse().unwrap())
+        .collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[test]
+fn graphite_written_column_scoped_match_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    let mut c = Connection::create(&path).unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+        .unwrap();
+    for (rowid, title, body) in MC_DOCS {
+        c.execute(&format!(
+            "INSERT INTO t(rowid, title, body) VALUES({rowid}, '{title}', '{body}')"
+        ))
+        .unwrap();
+    }
+    drop(c);
+    let c = Connection::open(&path).unwrap();
+    for col in ["title", "body"] {
+        for term in ["fox", "dog", "brown", "henhouse", "zebra"] {
+            let g = graphite_col_match(&c, col, term);
+            let s = sqlite_col_match(&path, col, term);
+            assert_eq!(g, s, "{col}:{term}: graphite {g:?} != sqlite {s:?}");
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn sqlite_written_column_scoped_match_read_by_graphite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Single-leaf (default pgsz) and multi-leaf (forced pgsz 64) sqlite-written
+    // indexes, both read by graphite's column-scoped index route.
+    for pgsz in [0u32, 64] {
+        let path = tmp_path();
+        if pgsz == 0 {
+            sqlite_exec(&path, "CREATE VIRTUAL TABLE t USING fts5(title, body);");
+        } else {
+            sqlite_exec(
+                &path,
+                "CREATE VIRTUAL TABLE t USING fts5(title, body);\
+                 INSERT INTO t(t, rank) VALUES('pgsz', 64);",
+            );
+        }
+        for (rowid, title, body) in MC_DOCS {
+            sqlite_exec(
+                &path,
+                &format!("INSERT INTO t(rowid, title, body) VALUES({rowid}, '{title}', '{body}');"),
+            );
+        }
+        if pgsz != 0 {
+            // Merge to a single segment graphite's reader serves, at pgsz 64.
+            sqlite_exec(&path, "INSERT INTO t(t) VALUES('optimize');");
+        }
+        let c = Connection::open(&path).unwrap();
+        for col in ["title", "body"] {
+            for term in ["fox", "dog", "brown", "henhouse", "zebra"] {
+                let g = graphite_col_match(&c, col, term);
+                let s = sqlite_col_match(&path, col, term);
+                assert_eq!(
+                    g, s,
+                    "pgsz {pgsz}, {col}:{term}: graphite {g:?} != sqlite {s:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 #[test]
 fn sqlite_written_multileaf_bare_term_match_read_by_graphite() {
     if !have_sqlite() {

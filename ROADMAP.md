@@ -301,17 +301,20 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
     segment returns `None` so the caller falls back to the `_content` scan.
     Verified by writer→decoder round-trips and against `sqlite3`-written leaves
     (`tests/fts5_decode.rs`).
-  - **D2b-2** — *Done (single bare term):* a table-wide single bare-term `MATCH`
-    (`tbl MATCH 'word'`, aliased too) over a fully-indexed single-segment table is
-    now answered via the index — `lookup_term_rowids` (`src/fts5_index.rs`) →
-    `fts5_try_index_match` (`src/exec/mod.rs`) seeks just the matching `_content`
-    rows by rowid instead of scanning + tokenizing every document. Everything else
-    (column-scoped, phrases, `NEAR`, prefixes, boolean, `^`, `UNINDEXED` columns,
-    multi-segment / interior / dlidx) stays on the `_content` scan. Results are a
-    guaranteed superset re-filtered by `run_core`, so rows/order/`bm25`/`highlight`
-    are identical — verified vs `sqlite3` (`tests/fts5_index_match.rs`) and a
-    test-only route counter. *Remaining:* index-route the column-scoped / phrase /
-    boolean / multi-segment shapes, and dlidx/interior decode (D2b-3 leftover).
+  - **D2b-2** — *Done (single bare term, table-wide + column-scoped):* a single
+    bare-term `MATCH` — both table-wide (`tbl MATCH 'word'`) and column-scoped
+    (`tbl MATCH 'col : word'` / `col:word`) — over a fully-indexed single-segment
+    table is answered via the index: `lookup_term_rowids` /
+    `lookup_term_rowids_in_column` (`src/fts5_index.rs`, filtering the term's
+    per-column positions to the named column) → `fts5_try_index_match`
+    (`src/exec/mod.rs`, `AnyColumn`/`InColumn` routes) seeks just the matching
+    `_content` rows by rowid. Everything else (phrases, `NEAR`, prefixes, boolean,
+    `^`, multi-column filters, `UNINDEXED` columns, multi-segment / interior /
+    dlidx) stays on the `_content` scan. Results are a guaranteed superset
+    re-filtered by `run_core`, so rows/order/`bm25`/`highlight` are identical —
+    verified vs `sqlite3` (`tests/fts5_index_match.rs`) + a route counter.
+    *Remaining:* index-route the phrase / boolean / multi-segment shapes, and
+    dlidx/interior decode (D2b-3 leftover).
   - **D2b-3** — *Done (multi-leaf):* `decode_term` now handles **multi-leaf term
     pagination** (terms across leaves, each with its own page-index footer) and
     **doclist spanning** (carried poslist tail + absolute first-rowid on the

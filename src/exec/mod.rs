@@ -7041,19 +7041,24 @@ impl Connection {
     /// D2b-2: try to answer a `MATCH` over the FTS5 table `name` from its segment
     /// index instead of scanning every `_content` document. Returns
     /// `Some(rows)` (the matching `_content` rows, leading `id` column dropped,
-    /// in ascending rowid order — exactly the scan's order) only for the one shape
-    /// proven to give identical results: a TABLE-WIDE, SINGLE BARE-TERM query
-    /// (`tbl MATCH 'word'`) over a fully-indexed table whose `_data` holds a single
-    /// height-0 segment. Returns `None` (the caller falls back to the document
-    /// scan) for every other case — a `col MATCH …` operand, an `UNINDEXED`
-    /// column, a phrase/prefix/boolean/`NEAR` query, a multi-segment or
-    /// interior/doclist-index index, or no `MATCH` at all.
+    /// in ascending rowid order — exactly the scan's order) for the shapes proven
+    /// to give identical results: a TABLE-WIDE, SINGLE BARE-TERM query
+    /// (`tbl MATCH 'word'`) — matched in any column — and a COLUMN-SCOPED single
+    /// bare term (`tbl MATCH 'col : word'`) — matched only in the named column —
+    /// both over a fully-indexed table whose `_data` holds a single height-0
+    /// segment. Returns `None` (the caller falls back to the document scan) for
+    /// every other case — a `col MATCH …` operand, an `UNINDEXED` column, a
+    /// phrase/prefix/boolean/`NEAR` query, multiple column filters, a multi-segment
+    /// or interior/doclist-index index, or no `MATCH` at all.
     ///
     /// Correctness: for a lone bare term over a fully-indexed table the scan's
     /// per-row predicate ([`crate::vtab::fts5_query_matches`]) is true iff the
-    /// token appears in some column — which is exactly the term's index doclist.
-    /// run_core re-applies the full WHERE to whatever this returns, so the result
-    /// is a superset and never wrong; the rowid-ascending order matches the scan.
+    /// token appears in some column — exactly the term's index doclist; for a
+    /// `col:word` filter it is true iff the token appears in that one column —
+    /// exactly the postings whose per-column position list for that column is
+    /// non-empty. run_core re-applies the full WHERE to whatever this returns, so
+    /// the result is a superset and never wrong; the rowid-ascending order matches
+    /// the scan.
     #[cfg(feature = "fts5")]
     fn fts5_try_index_match(
         &self,
@@ -7092,11 +7097,33 @@ impl Connection {
             return Ok(None);
         }
         let tok = crate::vtab::fts5_tok_config(arg_refs);
-        let term = match crate::vtab::fts5_single_bare_term(&query, tok) {
-            Some(t) => t,
-            None => return Ok(None),
+        // Two index-routable shapes over the term reader:
+        //   * a TABLE-WIDE single bare term (`'word'`) — matches in ANY column;
+        //   * a COLUMN-SCOPED single bare term (`'col : word'`) — matches only in
+        //     the named column. The per-column positions in the term's doclist let
+        //     us keep exactly the postings carrying a hit in that column.
+        // Resolve which (if either) applies; anything else stays on the scan.
+        enum Routed {
+            AnyColumn(Vec<u8>),
+            InColumn(Vec<u8>, usize),
+        }
+        let routed = if let Some(t) = crate::vtab::fts5_single_bare_term(&query, tok) {
+            Routed::AnyColumn(t)
+        } else if let Some((col, t)) = crate::vtab::fts5_single_bare_term_column(&query, tok) {
+            // Resolve the filtered column NAME to its position in the table's full
+            // column list (the same index the writer records positions under). A
+            // name that is not a column matches no document — but rather than build
+            // that empty result here, fall back to the scan (which yields the same
+            // empty set) so this path only ever handles a real column.
+            let columns = &self.vtab_meta(name)?.2.columns;
+            match columns.iter().position(|c| c.eq_ignore_ascii_case(&col)) {
+                Some(ci) => Routed::InColumn(t, ci),
+                None => return Ok(None),
+            }
+        } else {
+            return Ok(None);
         };
-        // Read the segment index (`_data`) and resolve the term's rowids. A `None`
+        // Read the segment index (`_data`) and resolve the matching rowids. A `None`
         // means the index shape isn't servable → fall back to the scan.
         let dmeta = self.table_meta(&format!("{name}_data"), None)?;
         let data: Vec<(i64, Vec<u8>)> = self
@@ -7111,7 +7138,13 @@ impl Connection {
                 }
             })
             .collect();
-        let rowids = match crate::fts5_index::lookup_term_rowids(&data, &term) {
+        let rowids_opt = match &routed {
+            Routed::AnyColumn(term) => crate::fts5_index::lookup_term_rowids(&data, term),
+            Routed::InColumn(term, ci) => {
+                crate::fts5_index::lookup_term_rowids_in_column(&data, term, *ci)
+            }
+        };
+        let rowids = match rowids_opt {
             Some(r) => r,
             None => return Ok(None),
         };
@@ -21230,5 +21263,83 @@ mod fts5_index_route_tests {
             let after = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
             assert_eq!(after, before, "query {q:?} must stay on the scan");
         }
+    }
+
+    /// A column-scoped single bare term (`tbl MATCH 'col : word'`) over a fully
+    /// indexed multi-column table is served by the segment index
+    /// (`INDEX_ROUTE_HITS` rises) and returns exactly the documents whose named
+    /// column contains the term — the same set the document scan produces.
+    #[test]
+    fn column_scoped_bare_term_match_takes_index_route() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = Connection::open_memory().unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+            .unwrap();
+        // "fox" lands in title for rows 1,4; in body for rows 2,3; in both for 5.
+        let docs = [
+            ("the fox", "sleeps soundly"),
+            ("a lazy dog", "chases a fox"),
+            ("quiet night", "fox runs past"),
+            ("fox tracks", "across the snow"),
+            ("fox tale", "the fox returns"),
+        ];
+        for (i, (title, body)) in docs.iter().enumerate() {
+            c.execute(&alloc::format!(
+                "INSERT INTO t(rowid, title, body) VALUES({}, '{}', '{}')",
+                i + 1,
+                title,
+                body
+            ))
+            .unwrap();
+        }
+
+        let ids = |c: &mut Connection, sql: &str| -> alloc::vec::Vec<i64> {
+            c.query(sql)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|r| match r[0] {
+                    Value::Integer(i) => i,
+                    ref o => panic!("non-integer rowid: {o:?}"),
+                })
+                .collect()
+        };
+
+        // title:fox → rows whose TITLE has fox = 1, 4, 5. Index-routed.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows = ids(
+            &mut c,
+            "SELECT rowid FROM t WHERE t MATCH 'title : fox' ORDER BY rowid",
+        );
+        let after = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "column-scoped MATCH must take the index route"
+        );
+        assert_eq!(rows, [1, 4, 5]);
+
+        // body:fox → rows whose BODY has fox = 2, 3, 5. Also index-routed.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows = ids(
+            &mut c,
+            "SELECT rowid FROM t WHERE t MATCH 'body:fox' ORDER BY rowid",
+        );
+        let after = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "compact `body:fox` must take the index route"
+        );
+        assert_eq!(rows, [2, 3, 5]);
+
+        // A column filter naming a non-existent column matches nothing and stays on
+        // the scan (which also yields nothing).
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows = ids(
+            &mut c,
+            "SELECT rowid FROM t WHERE t MATCH 'nope:fox' ORDER BY rowid",
+        );
+        let after = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        assert_eq!(after, before, "unknown-column filter must stay on the scan");
+        assert!(rows.is_empty());
     }
 }

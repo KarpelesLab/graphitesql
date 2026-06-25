@@ -810,6 +810,40 @@ fn single_segment(structure: &[u8]) -> Option<SegmentLoc> {
 /// caller to fall back to the `%_content` document scan. A present term that is
 /// genuinely absent from a servable single-segment index returns `Some(vec![])`.
 pub(crate) fn lookup_term_rowids(data: &[(i64, Vec<u8>)], term: &[u8]) -> Option<Vec<i64>> {
+    decode_term_in_data(data, term).map(|postings| postings.into_iter().map(|p| p.rowid).collect())
+}
+
+/// Look up `term` in a single-segment FTS5 index and return only the rowids of the
+/// documents in which it occurs in COLUMN `column` (the position of the column in
+/// the table's full column list, indexed from 0), ascending — or `None` if the
+/// index shape is one the single-segment leaf reader cannot serve.
+///
+/// This is the column-scoped sibling of [`lookup_term_rowids`]. The per-column
+/// token positions in each [`DecodedPosting`] (the writer records them per
+/// column) let it keep exactly the postings whose `cols[column]` is non-empty —
+/// the same set the scan's `col:term` predicate matches. A servable index whose
+/// term is absent (or never occurs in `column`) yields `Some(vec![])`; an
+/// unservable shape yields `None` (caller falls back to the document scan).
+pub(crate) fn lookup_term_rowids_in_column(
+    data: &[(i64, Vec<u8>)],
+    term: &[u8],
+    column: usize,
+) -> Option<Vec<i64>> {
+    decode_term_in_data(data, term).map(|postings| {
+        postings
+            .into_iter()
+            .filter(|p| p.cols.get(column).is_some_and(|c| !c.is_empty()))
+            .map(|p| p.rowid)
+            .collect()
+    })
+}
+
+/// Resolve `term`'s postings from a single-segment `%_data` index, or `None` if the
+/// shape is unservable. Shared by [`lookup_term_rowids`] and
+/// [`lookup_term_rowids_in_column`]: it parses the structure record, gathers the
+/// single height-0 segment's leaves in page order, and decodes the term. A
+/// servable segment whose term is absent returns `Some(vec![])`.
+fn decode_term_in_data(data: &[(i64, Vec<u8>)], term: &[u8]) -> Option<Vec<DecodedPosting>> {
     let structure = &data.iter().find(|(id, _)| *id == STRUCTURE_ROWID)?.1;
     let loc = single_segment(structure)?;
     // Gather the segment's leaves in page order; abort (→ scan) if any is missing.
@@ -821,11 +855,8 @@ pub(crate) fn lookup_term_rowids(data: &[(i64, Vec<u8>)], term: &[u8]) -> Option
     }
     #[cfg(test)]
     INDEX_ROUTE_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    match decode_term(&leaves, term) {
-        // A servable segment whose term is absent: definitively no matches.
-        None => Some(Vec::new()),
-        Some(postings) => Some(postings.into_iter().map(|p| p.rowid).collect()),
-    }
+    // A servable segment whose term is absent: definitively no matches.
+    Some(decode_term(&leaves, term).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -1156,5 +1187,74 @@ mod tests {
         let want: Vec<i64> = (1..=n).collect();
         assert_eq!(lookup_term_rowids(&seg.data, b"x"), Some(want));
         assert_eq!(lookup_term_rowids(&seg.data, b"y"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn lookup_rowids_in_column_filters_by_column() {
+        // "word" occurs in: doc1 col0, doc2 col1, doc3 col0+col1, doc4 col0.
+        let terms = vec![(
+            b"word".to_vec(),
+            vec![
+                p(1, &[&[0], &[]]),
+                p(2, &[&[], &[0]]),
+                p(3, &[&[0], &[1]]),
+                p(4, &[&[2], &[]]),
+            ],
+        )];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = vec![
+            (1, vec![1, 0]),
+            (2, vec![0, 1]),
+            (3, vec![1, 2]),
+            (4, vec![3, 0]),
+        ];
+        let seg = build_segment(&terms, 4, &[3, 2], &doc_sizes, 1000, 0);
+        // Column 0: docs 1, 3, 4. Column 1: docs 2, 3.
+        assert_eq!(
+            lookup_term_rowids_in_column(&seg.data, b"word", 0),
+            Some(vec![1, 3, 4])
+        );
+        assert_eq!(
+            lookup_term_rowids_in_column(&seg.data, b"word", 1),
+            Some(vec![2, 3])
+        );
+        // Any-column lookup is the union, in rowid order.
+        assert_eq!(
+            lookup_term_rowids(&seg.data, b"word"),
+            Some(vec![1, 2, 3, 4])
+        );
+        // Absent term in any column → empty (servable), and a column index past the
+        // table's column count never matches.
+        assert_eq!(
+            lookup_term_rowids_in_column(&seg.data, b"missing", 0),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            lookup_term_rowids_in_column(&seg.data, b"word", 9),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn lookup_rowids_in_column_multi_leaf() {
+        // A multi-leaf, multi-column segment: even-rowid docs carry "x" in col0,
+        // odd-rowid docs in col1, so the column filter splits the spanning doclist.
+        let n = 40i64;
+        let postings: Vec<Posting> = (1..=n)
+            .map(|r| {
+                if r % 2 == 0 {
+                    p(r, &[&[0], &[]])
+                } else {
+                    p(r, &[&[], &[0]])
+                }
+            })
+            .collect();
+        let terms = vec![(b"x".to_vec(), postings)];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![1, 1])).collect();
+        let seg = build_segment(&terms, n as u64, &[20, 20], &doc_sizes, 64, 0);
+        assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclist");
+        let even: Vec<i64> = (1..=n).filter(|r| r % 2 == 0).collect();
+        let odd: Vec<i64> = (1..=n).filter(|r| r % 2 == 1).collect();
+        assert_eq!(lookup_term_rowids_in_column(&seg.data, b"x", 0), Some(even));
+        assert_eq!(lookup_term_rowids_in_column(&seg.data, b"x", 1), Some(odd));
     }
 }

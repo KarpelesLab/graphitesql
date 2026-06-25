@@ -2493,6 +2493,46 @@ pub(crate) fn fts5_single_bare_term(pattern: &str, tok: Fts5Tok) -> Option<Vec<u
     }
 }
 
+/// If `pattern` is a SINGLE COLUMN-SCOPED BARE TERM (`colname : word`), return the
+/// `(column name, token bytes)` pair; otherwise `None`.
+///
+/// This is the column-filtered sibling of [`fts5_single_bare_term`]: a lone term
+/// scoped to ONE column (`col:word`), with no prefix/`^`-anchor, whose body is a
+/// single-token bare word. Its scan predicate ([`fts5_term_matches`]) is true for
+/// a document iff the token occurs in the named column — exactly the subset of the
+/// term's index doclist whose posting carries a position in that column. The
+/// caller resolves the column name to its index and keeps only those postings.
+///
+/// Anything else (any boolean/`NEAR`/phrase/prefix/anchor shape, more than one
+/// column filter, or a query word that does not tokenize to exactly one token)
+/// returns `None` and stays on the document scan. The column name is returned raw
+/// (case-insensitive resolution is the caller's job, matching the scan's
+/// `eq_ignore_ascii_case`).
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_single_bare_term_column(
+    pattern: &str,
+    tok: Fts5Tok,
+) -> Option<(String, Vec<u8>)> {
+    let toks = fts5_lex(pattern, tok);
+    let term = match toks.as_slice() {
+        [Fts5Lex::Term(t)] => t,
+        _ => return None,
+    };
+    // Must be column-scoped, and otherwise a plain single-token bare word.
+    let column = term.column.clone()?;
+    if term.prefix || term.anchored {
+        return None;
+    }
+    let [word] = term.phrase.as_slice() else {
+        return None;
+    };
+    let key = fts5_tokenize(word, tok);
+    match key.as_slice() {
+        [single] => Some((column, single.as_bytes().to_vec())),
+        _ => None,
+    }
+}
+
 /// Collect every phrase term of a parsed query (flattening the boolean tree),
 /// because bm25 sums each phrase's contribution regardless of `AND`/`OR`/`NOT`.
 #[cfg(feature = "fts5")]
