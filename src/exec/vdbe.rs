@@ -1589,16 +1589,18 @@ fn expand_projections(
     Ok(projections)
 }
 
-/// Compile a two-table inner join (`SELECT … FROM a JOIN b ON …`) into a
-/// nested-loop program over two cursors — outer = cursor 0 (left, outermost),
-/// inner = cursor 1 (right) — instead of materializing the full `a × b`
-/// cross-product (B5b-1). `columns`/`tables`/`affinities`/`collations` are the two
-/// tables' arrays concatenated (left then right); `n_left` is the left table's
-/// column count. `sel.where_clause` must already fold in the `ON` predicate
-/// (merged by the caller). Supports projection + WHERE + constant LIMIT/OFFSET;
-/// returns `Unsupported` for GROUP BY / aggregates / HAVING / ORDER BY / DISTINCT
-/// so the caller falls back to the cross-product (or tree-walker) path. The row
-/// order (every right row for each left row, left outermost) matches the
+/// Compile an N-table inner join (`SELECT … FROM t1 JOIN t2 … JOIN tN …`) into an
+/// N-deep nested-loop program — one cursor per table, cursor 0 outermost —
+/// instead of materializing the full `t1 × … × tN` cross-product (B5b-1).
+/// `columns`/`tables`/`affinities`/`collations` are the tables' arrays
+/// concatenated left-to-right; `boundaries` holds the cumulative per-cursor column
+/// counts (`boundaries[i]` = end of cursor `i`'s columns, `boundaries.last()` =
+/// total), so a combined column index resolves to its `(cursor, local col)`.
+/// `sel.where_clause` must already fold in the `ON` predicates (merged by the
+/// caller). Supports projection + WHERE + constant LIMIT/OFFSET; returns
+/// `Unsupported` for GROUP BY / aggregates / HAVING / ORDER BY / DISTINCT so the
+/// caller falls back to the cross-product (or tree-walker) path. The row order
+/// (innermost cursor advancing fastest, cursor 0 outermost) matches the
 /// cross-product and SQLite's nested-loop order.
 pub fn compile_join2(
     sel: &Select,
@@ -1606,8 +1608,10 @@ pub fn compile_join2(
     tables: &[String],
     affinities: &[Affinity],
     collations: &[Collation],
-    n_left: usize,
+    boundaries: &[usize],
 ) -> Result<Program> {
+    let n = boundaries.len();
+    debug_assert!(n >= 2 && boundaries[n - 1] == columns.len());
     if !sel.compound.is_empty()
         || !sel.group_by.is_empty()
         || sel.having.is_some()
@@ -1639,7 +1643,7 @@ pub fn compile_join2(
         bindings: Vec::new(),
         forbid_raw_columns: false,
         rowid_index: None,
-        cursor_boundaries: Some(alloc::vec![n_left, columns.len()]),
+        cursor_boundaries: Some(boundaries.to_vec()),
     };
     // LIMIT / OFFSET counters (constant integer only; negative LIMIT = unlimited,
     // non-positive OFFSET = none).
@@ -1667,20 +1671,19 @@ pub fn compile_join2(
             None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
         },
     };
-    // Nested loop: `RewindC 0` [ `RewindC 1` <body> `NextC 1` ] `NextC 0`.
-    let rewind0 = c.ops.len();
-    c.ops.push(Op::RewindC {
-        cursor: 0,
-        target: 0,
-    });
-    let loop0 = c.ops.len();
-    let rewind1 = c.ops.len();
-    c.ops.push(Op::RewindC {
-        cursor: 1,
-        target: 0,
-    });
+    // N-deep nested loop: `RewindC 0 [ RewindC 1 [ … [ RewindC n-1 <body>
+    // NextC n-1 ] … NextC 1 ] NextC 0` — cursor 0 outermost, matching the
+    // cross-product's leftmost-outermost row order.
+    let mut rewind_at = alloc::vec![0usize; n];
+    for (i, slot) in rewind_at.iter_mut().enumerate() {
+        *slot = c.ops.len();
+        c.ops.push(Op::RewindC {
+            cursor: i,
+            target: 0,
+        });
+    }
     let body = c.ops.len();
-    // WHERE (already merged with ON): skip to the inner Next when not true.
+    // WHERE (already merged with ON): skip to the innermost Next when not true.
     let skip = match &sel.where_clause {
         Some(pred) => {
             let preg = c.compile_expr(pred)?;
@@ -1707,33 +1710,34 @@ pub fn compile_join2(
         c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
         at
     });
-    let next1 = c.ops.len();
-    c.ops.push(Op::NextC {
-        cursor: 1,
-        target: body,
-    });
-    let next0 = c.ops.len();
-    c.ops.push(Op::NextC {
-        cursor: 0,
-        target: loop0,
-    });
+    // Emit the `NextC`s innermost-first; `next_at[i]` is the address of cursor
+    // `i`'s advance. The innermost re-runs the body; an outer one re-runs the
+    // next-inner cursor's `RewindC`.
+    let mut next_at = alloc::vec![0usize; n];
+    for i in (0..n).rev() {
+        next_at[i] = c.ops.len();
+        let target = if i == n - 1 { body } else { rewind_at[i + 1] };
+        c.ops.push(Op::NextC { cursor: i, target });
+    }
     let end = c.ops.len();
     c.ops.push(Op::Halt);
-    // Backpatch jump targets now that the labels are known.
-    if let Op::RewindC { target, .. } = &mut c.ops[rewind0] {
-        *target = end; // left empty → no rows
+    // Backpatch. An empty cursor `i` jumps to its parent's advance (cursor 0 to
+    // the end → no rows); the WHERE/OFFSET skip advances the innermost cursor.
+    for i in 0..n {
+        let target = if i == 0 { end } else { next_at[i - 1] };
+        if let Op::RewindC { target: t, .. } = &mut c.ops[rewind_at[i]] {
+            *t = target;
+        }
     }
-    if let Op::RewindC { target, .. } = &mut c.ops[rewind1] {
-        *target = next0; // right empty for this left row → advance left
-    }
+    let inner_next = next_at[n - 1];
     if let Some(at) = skip {
         if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = next1;
+            *target = inner_next;
         }
     }
     if let Some(at) = offset_skip {
         if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
-            *target = next1;
+            *target = inner_next;
         }
     }
     if let Some(at) = limit_done {
@@ -3012,7 +3016,7 @@ mod tests {
         ];
         let aff = vec![Affinity::Blob; 4];
         let coll = vec![Collation::Binary; 4];
-        let prog = compile_join2(&sel, &columns, &tables, &aff, &coll, 2).unwrap();
+        let prog = compile_join2(&sel, &columns, &tables, &aff, &coll, &[2, 4]).unwrap();
         let left: Vec<Vec<Value>> = vec![
             vec![Value::Integer(1), Value::Text("a".into())],
             vec![Value::Integer(2), Value::Text("b".into())],
@@ -3054,7 +3058,7 @@ mod tests {
                 panic!()
             };
             assert!(
-                compile_join2(&sel, &cols, &tabs, &aff, &coll, 1).is_err(),
+                compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_err(),
                 "{sql} should bail to the cross-product path"
             );
         }

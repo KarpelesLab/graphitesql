@@ -71,6 +71,28 @@ fn nested_loop_join_star_and_computed() {
 }
 
 #[test]
+fn three_table_nested_loop_join_runs_on_vdbe() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x)").unwrap();
+    c.execute("INSERT INTO a VALUES(1),(2)").unwrap();
+    c.execute("CREATE TABLE b(y)").unwrap();
+    c.execute("INSERT INTO b VALUES(10),(20)").unwrap();
+    c.execute("CREATE TABLE cc(z)").unwrap();
+    c.execute("INSERT INTO cc VALUES(100)").unwrap();
+    // A three-table comma join runs as a 3-deep nested loop (no cross-product).
+    let r = c
+        .query_vdbe("SELECT a.x, b.y, cc.z FROM a, b, cc WHERE a.x = 2")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(2), Value::Integer(10), Value::Integer(100)],
+            vec![Value::Integer(2), Value::Integer(20), Value::Integer(100)],
+        ]
+    );
+}
+
+#[test]
 fn nested_loop_join_empty_side_yields_no_rows() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x)").unwrap();

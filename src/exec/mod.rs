@@ -1339,22 +1339,32 @@ impl Connection {
             if validate_unambiguous_columns(sel, &join_cols).is_err() {
                 return Err(Error::Unsupported("VDBE: ambiguous column name"));
             }
-            // B5b-1: a plain two-table inner join with a nested-loopable shape
-            // (projection + WHERE + constant LIMIT/OFFSET) runs as a nested loop
-            // over two cursors — no `a × b` cross-product is materialized. The row
-            // order (every right row per left row) is identical, so the result
+            // B5b-1: a plain N-table inner join with a nested-loopable shape
+            // (projection + WHERE + constant LIMIT/OFFSET) runs as an N-deep
+            // nested loop over one cursor per table — no `t1 × … × tN`
+            // cross-product is materialized. The row order (each cursor advancing
+            // innermost-first, leftmost outermost) is identical, so the result
             // matches the cross-product path. Any other shape bails below.
-            if sources.len() == 2 {
-                let n_left = sources[0].0.len();
+            {
+                // Cumulative per-cursor column counts: boundaries[i] is the end of
+                // cursor i's columns in the combined row.
+                let mut boundaries = Vec::with_capacity(sources.len());
+                let mut acc = 0;
+                for src in &sources {
+                    acc += src.0.len();
+                    boundaries.push(acc);
+                }
                 if let Ok(prog) = vdbe::compile_join2(
                     &joined,
                     &combined,
                     &combined_tables,
                     &combined_aff,
                     &combined_coll,
-                    n_left,
+                    &boundaries,
                 ) {
-                    let result = vdbe::run_rows_multi(&prog, &[&sources[0].4, &sources[1].4])?;
+                    let rowsets: Vec<&[Vec<Value>]> =
+                        sources.iter().map(|s| s.4.as_slice()).collect();
+                    let result = vdbe::run_rows_multi(&prog, &rowsets)?;
                     return Ok(QueryResult {
                         columns: prog.columns,
                         rows: result,

@@ -243,11 +243,13 @@ is *perf/coverage*, not correctness.
     A new `compile_join2` emits a nested loop `RewindC 0 [ RewindC 1 <body>
     NextC 1 ] NextC 0` (outer = left, outermost), with a `Compiler.cursor_boundaries`
     map turning each combined column index into a `(cursor, local col)` `ColumnC`.
-    The router runs a plain two-table inner join (projection + WHERE-merged-ON +
-    constant LIMIT/OFFSET) this way — *no `a × b` cross-product is materialized* —
-    and falls back to the cross-product path on any other shape (GROUP BY /
-    aggregate / HAVING / ORDER BY / DISTINCT). Row order matches the cross-product
-    and sqlite. Verified by the differential join corpus + direct unit tests
+    The compiler is N-ary (`boundaries` = cumulative per-cursor column counts):
+    the router runs a plain **N-table** inner join (projection + WHERE-merged-ON +
+    constant LIMIT/OFFSET) as an N-deep nested loop — *no `t1 × … × tN`
+    cross-product is materialized for any arity* — and falls back to the
+    cross-product path on any other shape (GROUP BY / aggregate / HAVING / ORDER
+    BY / DISTINCT). Row order matches the cross-product and sqlite. Verified by
+    the differential join corpus (2-, 3-, 4-table) + direct unit tests
     (`exec::vdbe::tests`, `tests/vdbe_nested_join.rs`). This is the multi-cursor
     foundation the rest of B8 (storage cursors, correlated subqueries, windows)
     builds on.
