@@ -359,7 +359,12 @@ impl<'a> EvalCtx<'a> {
                 return Ok(Value::Real(score));
             }
         }
-        Err(Error::Error(alloc::format!("no such column: {name}")))
+        // SQLite reports a qualified reference with its qualifier intact
+        // (`no such column: t.c`), and a bare reference by name alone.
+        Err(Error::Error(match table {
+            Some(t) => alloc::format!("no such column: {t}.{name}"),
+            None => alloc::format!("no such column: {name}"),
+        }))
     }
 }
 

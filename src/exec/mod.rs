@@ -11199,11 +11199,17 @@ impl Connection {
             // A positional ORDER BY term must name an output column (SQLite).
             check_positional_terms(&[], &sel.order_by, result.columns.len())?;
             let mut keys = Vec::new();
-            for term in &sel.order_by {
+            for (i, term) in sel.order_by.iter().enumerate() {
                 let idx = resolve_order_index(&term.expr, &result.columns, result.columns.len())
-                    .ok_or(Error::Unsupported(
-                        "ORDER BY term must be an output column in a compound query",
-                    ))?;
+                    .ok_or_else(|| {
+                        // SQLite: a compound ORDER BY term must name an output
+                        // column (by position or alias); an arbitrary expression
+                        // is rejected with the term's 1-based ordinal.
+                        Error::Error(alloc::format!(
+                            "{} ORDER BY term does not match any column in the result set",
+                            ordinal(i + 1),
+                        ))
+                    })?;
                 // The output column's collation (from the left SELECT) applies.
                 let coll = colls.get(idx).copied().unwrap_or_default();
                 keys.push((idx, term.descending, term.nulls_first, coll));
