@@ -285,8 +285,17 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
   - **D2b-2** — route `MATCH` through the index (`decode_term`) instead of
     scanning every document; keep the `_content` scan as the fallback (and for the
     multi-leaf/interior cases `decode_term` returns `None` on).
-  - **D2b-3** — extend the decoder to spanning doclists + interior /
-    doclist-index pages (the multi-leaf cases `D2b-1` leaves on the scan).
+  - **D2b-3** — *Done (multi-leaf):* `decode_term` now handles **multi-leaf term
+    pagination** (terms across leaves, each with its own page-index footer) and
+    **doclist spanning** (carried poslist tail + absolute first-rowid on the
+    continuation leaf, via `gather_doclist_runs`/`decode_spanning_doclist`),
+    including the mixed case where a spill leaf also starts the next term. A
+    segment with **doclist-index (dlidx) or interior (`height > 0`) pages** —
+    reached only by a single term spanning ~16+ leaves — still returns `None` so
+    the caller falls back to the `_content` scan (never a truncated doclist).
+    Verified by writer→decoder round-trips and against real `sqlite3` multi-leaf
+    indexes at pgsz 64/80/128 (`tests/fts5_decode_multileaf.rs`). Remaining:
+    dlidx/interior decode (only for very-high-frequency terms).
 - **D2e-encoder — byte-identical FTS5 at large scale** (structural validity holds
   today; these only affect exact-byte parity past a few leaves, and each needs the
   fts5 writer source for the precise split heuristic): the combined

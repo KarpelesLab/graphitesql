@@ -1,5 +1,5 @@
 //! FTS5 `%_data`/`%_idx` segment-index encoder (roadmap D2e-M2) and the
-//! single-leaf doclist reader (roadmap D2b-1).
+//! multi-leaf doclist reader (roadmap D2b-1/D2b-3).
 //!
 //! graphite stores its FTS5 documents in the `<name>_content` shadow table and
 //! rebuilds the inverted index from them on each write — a bulk rebuild, like the
@@ -19,11 +19,13 @@
 //! the vtab store's backing table is `_content` for fts5, and `fts5_rebuild_index`
 //! re-derives the segment from the documents after every write.
 //!
-//! The read path (`decode_term`, D2b-1) is the exact inverse of the writer: given
-//! a segment's leaf blobs and a term, it walks the page-index, reconstructs the
-//! prefix-compressed term key, and decodes the matching doclist into postings
-//! (docids + per-column positions). It is scoped to single-leaf segments and is
-//! not yet wired into `MATCH` (that is D2b-2); see the section comment below.
+//! The read path (`decode_term`, D2b-1/D2b-3) is the exact inverse of the writer:
+//! given a segment's leaf blobs (in page order) and a term, it walks the
+//! page-index, reconstructs the prefix-compressed term key, and decodes the
+//! matching doclist into postings (docids + per-column positions). It covers
+//! multi-leaf height-0 segments — term pagination AND a doclist that spans
+//! leaves — and is not yet wired into `MATCH` (that is D2b-2); see the section
+//! comment below.
 
 use alloc::vec::Vec;
 
@@ -376,7 +378,7 @@ pub(crate) fn build_segment(
 }
 
 // ---------------------------------------------------------------------------
-// D2b-1: the read path — decode a single-term doclist from the `%_data` leaves.
+// D2b: the read path — decode a single-term doclist from the `%_data` leaves.
 //
 // This is the byte-for-byte inverse of the writer above. It reads the segment's
 // leaf pages (height-0 `%_data` rows), walks each leaf's term records (the
@@ -384,19 +386,30 @@ pub(crate) fn build_segment(
 // for a matching term decodes its doclist into postings (rowid + per-column
 // positions). It is the exact inverse of `add_term`/`doclist`/`poslist`.
 //
-// Scope: SINGLE-LEAF segments — a small index whose every term and its whole
-// doclist fit in one leaf (the common small-table case). Multi-leaf segments
-// (a term whose doclist spans leaves, or interior/doclist-index pages) are NOT
-// decoded here; that is the larger D2b reader (see the module doc and ROADMAP
-// D2b/D2e). `decode_term` returns `None` when it would need to cross a leaf
-// boundary, so a caller can fall back to the `_content` scan rather than read a
-// truncated doclist.
+// Scope: MULTI-LEAF height-0 segments (D2b-3). The decoder handles
+//   * a small index whose term and whole doclist fit in one leaf (D2b-1);
+//   * TERM PAGINATION — terms spread across several leaves, each leaf with its
+//     own term records and page-index footer (found by scanning leaves in page
+//     order, which is equivalent to the `%_idx`-guided seek the writer feeds);
+//   * DOCLIST SPANNING — a single term whose doclist overflows a leaf and
+//     continues on one or more CONTINUATION leaves (no term records of their
+//     own: the carried poslist tail leads, then the first WHOLE rowid is written
+//     as an ABSOLUTE varint at the leaf header's `first_rowid_off`, after which
+//     deltas resume). Postings accumulate across the spanned leaves up to the
+//     next term boundary.
 //
-// The reader is verified end-to-end here (writer→decoder round-trips) and in
-// `tests/fts5_decode.rs` (decode what `sqlite3` itself wrote). It is not wired
-// into `MATCH` yet — that is D2b-2, which lives in another module — so these
-// items have no non-test in-crate caller and carry `#[allow(dead_code)]` until
-// that wiring lands.
+// Still out of scope (→ `None`, caller falls back to the `_content` scan):
+// segment-b-tree INTERIOR pages (`height > 0`) and DOCLIST-INDEX (`dlidx`)
+// pages — only reached by a single term spanning ~16+ leaves. `decode_term`
+// returns `None` rather than a truncated/wrong doclist for anything it cannot
+// fully reconstruct.
+//
+// The reader is verified end-to-end here (writer→decoder round-trips, incl.
+// forced-small `pgsz` multi-leaf segments) and in `tests/fts5_decode.rs` /
+// `tests/fts5_decode_multileaf.rs` (decode what `sqlite3` itself wrote). It is
+// not wired into `MATCH` yet — that is D2b-2, which lives in another module — so
+// these items have no non-test in-crate caller and carry `#[allow(dead_code)]`
+// until that wiring lands.
 
 /// Read a varint at `buf[*pos..]`, advancing `pos`. `None` on a truncated/empty
 /// slice.
@@ -462,48 +475,47 @@ fn decode_poslist(buf: &[u8], pos: &mut usize) -> Option<Vec<Vec<u32>>> {
     Some(cols)
 }
 
-/// Decode a contiguous doclist occupying `buf[start..end]` into postings. The
-/// inverse of [`doclist`]: `[first rowid][ (rowid delta)(poslist) ]*` with rowid
-/// deltas accumulated from 0.
+/// One term record on a leaf: its full '0'-prefixed `key`, the byte offset where
+/// the record itself begins (= the doclist of the PREVIOUS term ends here), and
+/// the offset where this term's own doclist begins (just past the record bytes).
 #[allow(dead_code)]
-fn decode_doclist(buf: &[u8], start: usize, end: usize) -> Option<Vec<DecodedPosting>> {
-    let mut pos = start;
-    let mut out = Vec::new();
-    let mut rowid = 0i64;
-    let mut first = true;
-    while pos < end {
-        let d = read_varint(buf, &mut pos)? as i64;
-        rowid = if first { d } else { rowid.wrapping_add(d) };
-        first = false;
-        let cols = decode_poslist(buf, &mut pos)?;
-        if pos > end {
-            return None;
-        }
-        out.push(DecodedPosting { rowid, cols });
-    }
-    if pos != end {
-        return None;
-    }
-    Some(out)
+struct TermRec {
+    key: Vec<u8>,
+    rec_start: usize,
+    doclist_start: usize,
 }
 
-/// Decode a single leaf page into its `(term_key, doclist_start, doclist_end)`
-/// records, where `term_key` is the full '0'-prefixed key and the range is
-/// `[doclist_start, doclist_end)` within the leaf. Returns `None` if the leaf is
-/// malformed or a doclist runs off the end of the page (a doclist that spans into
-/// the next leaf — out of single-leaf scope).
-///
-/// Layout (inverse of [`SegWriter::finish_leaf`]):
-/// `[u16 first_rowid_off][u16 footer_off][body][pgidx]`; the body holds the term
-/// records, `pgidx` holds each record's absolute page offset (first absolute,
-/// then deltas).
+/// A parsed leaf page (inverse of [`SegWriter::finish_leaf`]). Layout:
+/// `[u16 first_rowid_off][u16 footer_off][body][pgidx]`; the body holds the
+/// doclist bytes and term records, `pgidx` (footer) holds each term record's
+/// absolute page offset (first absolute, then deltas).
 #[allow(dead_code)]
-fn decode_leaf_terms(leaf: &[u8]) -> Option<Vec<(Vec<u8>, usize, usize)>> {
+struct LeafView {
+    /// Offset of the first WHOLE rowid on the leaf (`0` = none; a leaf that opens
+    /// with a carried poslist tail and resumes the doclist points here).
+    first_rowid_off: usize,
+    /// Offset where the page-index footer begins (= end of body content).
+    footer_off: usize,
+    /// The term records on this leaf, in order. Empty ⇒ a CONTINUATION leaf that
+    /// only carries the spill of the previous leaf's last term's doclist.
+    terms: Vec<TermRec>,
+}
+
+/// Parse a leaf page into its header offsets and term records, or `None` if the
+/// leaf is structurally malformed. The inverse of [`SegWriter::finish_leaf`]:
+/// the two u16 header words, the page-index footer (absolute offset, then
+/// deltas), and the prefix-compressed term keys.
+#[allow(dead_code)]
+fn parse_leaf(leaf: &[u8]) -> Option<LeafView> {
     if leaf.len() < 4 {
         return None;
     }
+    let first_rowid_off = u16::from_be_bytes([leaf[0], leaf[1]]) as usize;
     let footer_off = u16::from_be_bytes([leaf[2], leaf[3]]) as usize;
     if footer_off < 4 || footer_off > leaf.len() {
+        return None;
+    }
+    if first_rowid_off != 0 && (first_rowid_off < 4 || first_rowid_off > footer_off) {
         return None;
     }
     // The page-index footer gives each term record's absolute offset.
@@ -523,11 +535,7 @@ fn decode_leaf_terms(leaf: &[u8]) -> Option<Vec<(Vec<u8>, usize, usize)>> {
             prev = off;
         }
     }
-    if term_offs.is_empty() {
-        // A continuation leaf (no terms of its own) — out of single-leaf scope.
-        return None;
-    }
-    let mut out = Vec::new();
+    let mut terms = Vec::with_capacity(term_offs.len());
     let mut prev_key: Vec<u8> = Vec::new();
     for (i, &off) in term_offs.iter().enumerate() {
         let mut p = off;
@@ -554,38 +562,191 @@ fn decode_leaf_terms(leaf: &[u8]) -> Option<Vec<(Vec<u8>, usize, usize)>> {
             p = end;
             key
         };
-        // The doclist runs from here to the next term's offset (or the footer).
-        let doclist_end = term_offs.get(i + 1).copied().unwrap_or(footer_off);
-        if doclist_end < p || doclist_end > footer_off {
+        if p > footer_off {
             return None;
         }
-        out.push((key.clone(), p, doclist_end));
+        terms.push(TermRec {
+            key: key.clone(),
+            rec_start: off,
+            doclist_start: p,
+        });
         prev_key = key;
     }
+    Some(LeafView {
+        first_rowid_off,
+        footer_off,
+        terms,
+    })
+}
+
+/// One contiguous run of doclist bytes drawn from a single leaf, plus whether the
+/// run BEGINS a fresh (absolute) rowid. A spanning term's doclist is a sequence
+/// of these: the originating-leaf tail (`abs_start = false`), then one per
+/// continuation leaf (`abs_start = true`, the leaf's first whole rowid is written
+/// absolute at `first_rowid_off`; the bytes before it are the carried poslist
+/// tail and belong to the *previous* run).
+#[allow(dead_code)]
+struct DoclistRun<'a> {
+    bytes: &'a [u8],
+    /// `true` if `bytes` starts at a leaf's `first_rowid_off` (an absolute rowid).
+    abs_start: bool,
+}
+
+/// Decode a doclist that may span several leaves into postings. `runs` is the
+/// ordered list of byte runs (see [`DoclistRun`]); the bytes are logically
+/// concatenated, but at the start of every `abs_start` run the rowid resets to
+/// absolute (the writer resets `prev_rowid` to 0 on each continuation leaf).
+///
+/// The inverse of the writer's streamed `doclist`: `[rowid][poslist]` repeated,
+/// rowids delta-coded within a run and absolute at each run boundary. A poslist
+/// (and even a single collist varint) may straddle a run boundary, so this
+/// flattens the runs into one buffer and tracks the byte offsets at which an
+/// absolute rowid begins.
+#[allow(dead_code)]
+fn decode_spanning_doclist(runs: &[DoclistRun]) -> Option<Vec<DecodedPosting>> {
+    // Flatten into one buffer, recording the offsets where a rowid is absolute.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut abs_at: Vec<usize> = Vec::new();
+    for run in runs {
+        // Only a non-empty absolute run marks a rowid reset; an empty resumed run
+        // (e.g. a leaf whose tail reached exactly the next term) carries nothing.
+        if run.abs_start && !run.bytes.is_empty() {
+            abs_at.push(buf.len());
+        }
+        buf.extend_from_slice(run.bytes);
+    }
+    let end = buf.len();
+    let mut pos = 0usize;
+    let mut out = Vec::new();
+    let mut rowid = 0i64;
+    let mut first = true;
+    while pos < end {
+        // A rowid is absolute on the first entry of the doclist or at any run
+        // boundary recorded in `abs_at`; otherwise it is a delta from the running
+        // rowid. (`abs_at` offsets always fall on an entry boundary because the
+        // writer only resets `prev_rowid` between whole entries.)
+        let absolute = first || abs_at.contains(&pos);
+        let d = read_varint(&buf, &mut pos)? as i64;
+        rowid = if absolute { d } else { rowid.wrapping_add(d) };
+        first = false;
+        let cols = decode_poslist(&buf, &mut pos)?;
+        if pos > end {
+            return None;
+        }
+        out.push(DecodedPosting { rowid, cols });
+    }
+    if pos != end {
+        return None;
+    }
     Some(out)
+}
+
+/// Gather the byte runs of the doclist for the term at (`start_leaf`, term index
+/// `start_ti`) whose doclist begins at `start_off`. The doclist runs forward —
+/// possibly spilling across several leaves — until the NEXT term record in the
+/// segment (or the end of the segment).
+///
+/// On the originating leaf the doclist runs from `start_off` to the next term
+/// record on that leaf (if any) else its footer. If it reaches the footer the
+/// doclist spills. Each spill leaf carries NO term until the boundary leaf:
+///
+/// * `[4 .. first_rowid_off]` continues the CURRENT entry (carried poslist tail,
+///   no new rowid). When `first_rowid_off == 0` the carried tail fills the whole
+///   leaf body and `first_rowid_off` is read as the footer.
+/// * `[first_rowid_off .. boundary]` resumes with an ABSOLUTE rowid, where
+///   `boundary` is the leaf's first term record offset (the spill ends there) or
+///   its footer (the spill continues).
+///
+/// The spill ends at the first term record after ours, anywhere in the segment.
+#[allow(dead_code)]
+fn gather_doclist_runs<'a>(
+    leaves: &'a [&'a [u8]],
+    start_leaf: usize,
+    start_ti: usize,
+    start_off: usize,
+    leaf_views: &[LeafView],
+) -> Option<Vec<DoclistRun<'a>>> {
+    let mut runs: Vec<DoclistRun<'a>> = Vec::new();
+    let first_view = &leaf_views[start_leaf];
+    // The originating run ends at the next term record on THIS leaf, if any.
+    let first_next_term = first_view.terms.get(start_ti + 1).map(|r| r.rec_start);
+    let first_end = first_next_term.unwrap_or(first_view.footer_off);
+    if first_end < start_off || first_end > first_view.footer_off {
+        return None;
+    }
+    runs.push(DoclistRun {
+        bytes: leaves[start_leaf].get(start_off..first_end)?,
+        abs_start: true, // first entry of a doclist is always absolute
+    });
+    if first_next_term.is_some() {
+        return Some(runs); // a later term on this leaf bounds the doclist
+    }
+    // Spill onto following leaves until a term record appears.
+    let mut li = start_leaf + 1;
+    while li < leaves.len() {
+        let view = &leaf_views[li];
+        // The carried poslist tail runs from 4 to `first_rowid_off`; when there is
+        // no resumed rowid on this leaf (`first_rowid_off == 0`) the tail occupies
+        // the whole body up to the boundary (a term record or the footer).
+        let next_term = view.terms.first().map(|r| r.rec_start);
+        let boundary = next_term.unwrap_or(view.footer_off);
+        let tail_end = if view.first_rowid_off == 0 {
+            boundary
+        } else {
+            view.first_rowid_off
+        };
+        if tail_end < 4 || tail_end > boundary || boundary > view.footer_off {
+            return None;
+        }
+        runs.push(DoclistRun {
+            bytes: leaves[li].get(4..tail_end)?,
+            abs_start: false,
+        });
+        if view.first_rowid_off != 0 {
+            // The resumed absolute-rowid run up to the boundary.
+            runs.push(DoclistRun {
+                bytes: leaves[li].get(view.first_rowid_off..boundary)?,
+                abs_start: true,
+            });
+        }
+        // A term record on this leaf ends the spill.
+        if next_term.is_some() {
+            break;
+        }
+        li += 1;
+    }
+    Some(runs)
 }
 
 /// Look up `term` in a set of segment leaf pages and return its decoded postings
 /// (docids with per-column positions), or `None` if the term is absent.
 ///
-/// `leaves` are the height-0 `%_data` leaf blobs of a single segment. This is the
-/// single-leaf reader: it decodes a term whose record and whole doclist live in
-/// one leaf. A term whose doclist spans leaves, or a segment with interior /
-/// doclist-index pages, is out of scope and yields `None` (the caller falls back
-/// to the document scan). The empty result `Some(vec![])` never occurs — a
-/// present term always has at least one posting.
+/// `leaves` are the height-0 `%_data` leaf blobs of a single segment, in page
+/// order. The reader decodes a term whether its doclist fits in one leaf or
+/// SPANS several (the originating leaf's tail plus continuation leaves; see
+/// [`gather_doclist_runs`]). It returns `None` for anything still out of scope —
+/// segment-b-tree interior pages or doclist-index pages — so the caller falls
+/// back to the document scan rather than reading a truncated doclist. The empty
+/// result `Some(vec![])` never occurs — a present term always has at least one
+/// posting.
 #[allow(dead_code)]
 pub(crate) fn decode_term(leaves: &[&[u8]], term: &[u8]) -> Option<Vec<DecodedPosting>> {
     let key = term_key(term);
+    // Parse every leaf once. A malformed/unsupported leaf (e.g. an interior page)
+    // aborts the whole decode → fall back to the scan.
+    let mut views: Vec<LeafView> = Vec::with_capacity(leaves.len());
     for leaf in leaves {
-        let records = match decode_leaf_terms(leaf) {
-            Some(r) => r,
-            None => continue,
-        };
-        for (k, start, end) in records {
-            if k == key {
-                return decode_doclist(leaf, start, end);
+        views.push(parse_leaf(leaf)?);
+    }
+    for (li, view) in views.iter().enumerate() {
+        for (ti, rec) in view.terms.iter().enumerate() {
+            if rec.key != key {
+                continue;
             }
+            // Gather the doclist (which may spill across leaves) up to the next
+            // term record in the segment.
+            let runs = gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)?;
+            return decode_spanning_doclist(&runs);
         }
     }
     None
@@ -594,7 +755,7 @@ pub(crate) fn decode_term(leaves: &[&[u8]], term: &[u8]) -> Option<Vec<DecodedPo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{string::ToString, vec};
+    use alloc::{format, string::ToString, vec};
 
     fn p(rowid: i64, cols: &[&[u32]]) -> Posting {
         Posting {
@@ -781,5 +942,98 @@ mod tests {
             );
         }
         assert_eq!(decode(&seg, b"missing"), None);
+    }
+
+    // ---- D2b-3 multi-leaf round-trips (writer → decoder) ------------------
+
+    /// Count the height-0 leaves a segment produced (page order).
+    fn leaf_count(seg: &Segment) -> usize {
+        leaves_of(seg).len()
+    }
+
+    #[test]
+    fn decode_multi_leaf_term_pagination() {
+        // Many distinct single-doc terms with a tiny pgsz force TERM pagination:
+        // the terms spread across several leaves, each with its own page-index.
+        let n = 40usize;
+        let words: Vec<Vec<u8>> = (0..n).map(|i| format!("term{i:03}").into_bytes()).collect();
+        let terms: Vec<(Vec<u8>, Vec<Posting>)> = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.clone(), vec![p(i as i64 + 1, &[&[0]])]))
+            .collect();
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n as i64).map(|r| (r, vec![1])).collect();
+        let seg = build_segment(&terms, n as u64, &[n as u64], &doc_sizes, 64, 0);
+        assert!(leaf_count(&seg) > 1, "pgsz 64 must split into many leaves");
+        for (i, w) in words.iter().enumerate() {
+            assert_eq!(
+                decode(&seg, w),
+                Some(vec![dp(i as i64 + 1, &[&[0]])]),
+                "term {w:?} on leaf pagination"
+            );
+        }
+        assert_eq!(decode(&seg, b"term999"), None);
+    }
+
+    #[test]
+    fn decode_doclist_spanning_leaves() {
+        // One term across many docs → its doclist overflows a leaf and spills onto
+        // continuation leaves (absolute first rowid on each). Decoder must stitch
+        // the spanned runs back into the full posting list.
+        let n = 40i64;
+        let postings: Vec<Posting> = (1..=n).map(|r| p(r, &[&[0]])).collect();
+        let terms = vec![(b"x".to_vec(), postings)];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![1])).collect();
+        let seg = build_segment(&terms, n as u64, &[n as u64], &doc_sizes, 64, 0);
+        assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclist");
+        let want: Vec<DecodedPosting> = (1..=n).map(|r| dp(r, &[&[0]])).collect();
+        assert_eq!(decode(&seg, b"x"), Some(want));
+        assert_eq!(decode(&seg, b"y"), None);
+    }
+
+    #[test]
+    fn decode_doclist_spanning_multi_position() {
+        // A spanning doclist where each doc has several positions (longer
+        // poslists → collist bytes straddle leaf boundaries mid-poslist).
+        let n = 30i64;
+        let postings: Vec<Posting> = (1..=n).map(|r| p(r, &[&[0, 3, 9, 15]])).collect();
+        let terms = vec![(b"w".to_vec(), postings)];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![16])).collect();
+        let seg = build_segment(&terms, n as u64, &[(16 * n) as u64], &doc_sizes, 48, 0);
+        assert!(leaf_count(&seg) > 1, "pgsz 48 must span the doclist");
+        let want: Vec<DecodedPosting> = (1..=n).map(|r| dp(r, &[&[0, 3, 9, 15]])).collect();
+        assert_eq!(decode(&seg, b"w"), Some(want));
+    }
+
+    #[test]
+    fn decode_mixed_pagination_and_spanning() {
+        // A segment mixing a heavy spanning term with several light terms, at a
+        // small pgsz: the heavy term spans, the light terms paginate. Every term
+        // must still decode to its exact posting list.
+        let mut terms: Vec<(Vec<u8>, Vec<Posting>)> = Vec::new();
+        // "heavy" occurs in docs 1..=25 (spans leaves).
+        terms.push((b"heavy".to_vec(), (1..=25).map(|r| p(r, &[&[0]])).collect()));
+        // A run of light terms after it, each one doc.
+        for i in 0..20 {
+            let w = format!("light{i:02}").into_bytes();
+            terms.push((w, vec![p(100 + i as i64, &[&[1]])]));
+        }
+        terms.sort_by(|a, b| a.0.cmp(&b.0));
+        // doc sizes are irrelevant to decode; supply a plausible set.
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=120).map(|r| (r, vec![1])).collect();
+        let seg = build_segment(&terms, 120, &[120], &doc_sizes, 56, 0);
+        assert!(leaf_count(&seg) > 2, "expected several leaves");
+        // Verify each term decodes to exactly what was written.
+        for (term, postings) in &terms {
+            let want: Vec<DecodedPosting> = postings
+                .iter()
+                .map(|p| DecodedPosting {
+                    rowid: p.rowid,
+                    cols: p.cols.clone(),
+                })
+                .collect();
+            assert_eq!(decode(&seg, term), Some(want), "term {term:?}");
+        }
+        assert_eq!(decode(&seg, b"absent"), None);
     }
 }
