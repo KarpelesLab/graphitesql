@@ -265,11 +265,17 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
   `sqlite3` on the same file (`tests/dbpage.rs`); both eponymous read-only vtabs
   (`dbstat`, `sqlite_dbpage`) also resolve a `main.`-qualifier, answer
   `PRAGMA table_info`/`table_xinfo` with their fixed column shape (incl. the
-  trailing hidden columns), and a `temp.`-qualified read with no temp database
-  now reports the name as missing instead of panicking.
-  - *Minor gap:* `temp.dbstat` / `temp.sqlite_dbpage` (the eponymous vtab over an
-    attached/`temp` schema) reports "no such table" rather than scanning that
-    database's pages — needs the scan to take a backend parameter.
+  trailing hidden columns). Any schema qualifier (`main.`/`temp.`/`<attached>.`)
+  resolves the eponymous tables and — matching SQLite's hidden `schema` column
+  default of `main` — reports the **main** database regardless of the qualifier
+  (so `aux.dbstat`/`temp.dbstat` report main, not the qualified db). A
+  `temp.`-qualified *non-eponymous* read with no temp database now reports the
+  name as missing instead of panicking.
+  - *Deferred:* a `WHERE schema='aux'` constraint to redirect the report to a
+    non-main database (SQLite drives this through the hidden `schema` column;
+    graphite has no hidden-column pushdown for it yet). Also unmatched: SQLite
+    quirkily reports `main` even for an *unknown* schema qualifier
+    (`nope.dbstat`), where graphite errors `unknown database nope`.
   - **dbpage-2** — write (raw page replacement). *Oracle-blocked:* the pinned
     `sqlite3 3.50.4` alt1 build was compiled without the writable-dbpage path —
     every real page write returns `read-only` (deterministically; see §6). With

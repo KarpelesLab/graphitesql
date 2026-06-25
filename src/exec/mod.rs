@@ -12435,29 +12435,39 @@ impl Connection {
                     )),
                 };
             }
-            // The eponymous read-only vtabs (`dbstat`, `sqlite_dbpage`) describe
-            // the `main` database, so an unqualified name or an explicit `main.`
-            // qualifier both reach them; an attached/`temp` qualifier does not.
-            // A real user table of the name wins.
-            let eponymous_main = from.first.schema.is_none()
-                || from
-                    .first
-                    .schema
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("main"));
-            // `dbstat`: per-page b-tree storage statistics.
-            if eponymous_main
-                && from.first.name.eq_ignore_ascii_case("dbstat")
-                && self.schema.table("dbstat").is_none()
-            {
-                return self.scan_dbstat(from.first.alias.as_deref());
-            }
-            // `sqlite_dbpage`: raw page access, one row per page (`pgno`, `data`).
-            if eponymous_main
-                && from.first.name.eq_ignore_ascii_case("sqlite_dbpage")
-                && self.schema.table("sqlite_dbpage").is_none()
-            {
-                return self.scan_dbpage(from.first.alias.as_deref());
+            // The eponymous read-only vtabs (`dbstat` — per-page storage stats;
+            // `sqlite_dbpage` — raw page bytes) exist in *every* schema, but the
+            // database they report is governed by their hidden `schema` column,
+            // which SQLite defaults to `main`. The table qualifier
+            // (`main.`/`temp.`/`<attached>.`) only selects which schema's table
+            // object is referenced — it does NOT change the reported database, so
+            // `aux.dbstat` and `temp.dbstat` both still report `main`. (Targeting
+            // another database needs a `WHERE schema='aux'` constraint — a hidden-
+            // column pushdown not yet implemented.) A real user table of the name
+            // in the *referenced* schema shadows the eponymous table.
+            let lname = from.first.name.to_ascii_lowercase();
+            if matches!(lname.as_str(), "dbstat" | "sqlite_dbpage") {
+                let qual_db = match from.first.schema.as_deref() {
+                    None => DbRef::Main,
+                    Some(s) => self.resolve_db(Some(s))?,
+                };
+                let shadowed = match qual_db {
+                    DbRef::Main => self.schema.table(&lname).is_some(),
+                    DbRef::Temp => self
+                        .temp_db
+                        .as_ref()
+                        .is_some_and(|t| t.schema.table(&lname).is_some()),
+                    DbRef::Attached(i) => self.attached[i].schema.table(&lname).is_some(),
+                };
+                if !shadowed {
+                    // Always report `main` (the default `schema` column value).
+                    let alias = from.first.alias.as_deref();
+                    let src = self.backend.source();
+                    return match lname.as_str() {
+                        "dbstat" => self.scan_dbstat(&self.schema, src, alias),
+                        _ => self.scan_dbpage(src, alias),
+                    };
+                }
             }
             let db = match from.first.schema.as_deref() {
                 Some(_) => self.resolve_db(from.first.schema.as_deref())?,
@@ -14174,8 +14184,13 @@ impl Connection {
     /// The `sqlite_dbpage` read-only virtual table: one row per database page,
     /// `(pgno INTEGER, data BLOB)`, where `data` is the page's raw bytes (page 1
     /// includes the 100-byte file header). Read access only (sqlite's `dbpage` is
-    /// also writable; that is `dbpage-2`).
-    fn scan_dbpage(&self, alias: Option<&str>) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
+    /// also writable; that is `dbpage-2`). `src` is the page source of the target
+    /// database (`main`, an attached, or `temp`).
+    fn scan_dbpage(
+        &self,
+        src: &dyn PageSource,
+        alias: Option<&str>,
+    ) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
         use eval::Affinity::{Blob, Integer};
         let label = alias.unwrap_or("sqlite_dbpage").to_string();
         let col = |name: &str, affinity| ColumnInfo {
@@ -14185,7 +14200,6 @@ impl Connection {
             collation: crate::value::Collation::default(),
         };
         let columns = alloc::vec![col("pgno", Integer), col("data", Blob)];
-        let src = self.backend.source();
         let count = src.page_count();
         let mut rows: Vec<InputRow> = Vec::with_capacity(count as usize);
         for pgno in 1..=count {
@@ -14201,7 +14215,12 @@ impl Connection {
         Ok((columns, rows))
     }
 
-    fn scan_dbstat(&self, alias: Option<&str>) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
+    fn scan_dbstat(
+        &self,
+        schema: &Schema,
+        src: &dyn PageSource,
+        alias: Option<&str>,
+    ) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
         use crate::btree::page::{BtreePage, PageType};
         use eval::Affinity::{Integer, Text};
 
@@ -14225,7 +14244,6 @@ impl Connection {
             col("pgsize", Integer),
         ];
 
-        let src = self.backend.source();
         let usable = src.usable_size();
         let page_size = src.header().page_size as i64;
         let be16 = |d: &[u8], off: usize| u16::from_be_bytes([d[off], d[off + 1]]) as usize;
@@ -14233,7 +14251,7 @@ impl Connection {
         // The b-trees to walk: `sqlite_schema` (page 1) first, then every object
         // that owns a root page (tables and indexes), in catalog order.
         let mut btrees: Vec<(String, u32)> = alloc::vec![(String::from("sqlite_schema"), 1)];
-        for obj in self.schema.objects() {
+        for obj in schema.objects() {
             if obj.rootpage != 0 {
                 btrees.push((obj.name.clone(), obj.rootpage));
             }

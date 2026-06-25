@@ -73,23 +73,30 @@ fn a_real_table_named_sqlite_dbpage_is_unreachable() {
 }
 
 #[test]
-fn main_qualifier_reaches_the_eponymous_vtabs() {
-    // `main.dbstat` / `main.sqlite_dbpage` resolve to the same eponymous tables
-    // as the unqualified names (they describe the `main` database).
+fn every_qualifier_reports_the_main_database() {
+    // The eponymous vtabs default their hidden `schema` column to `main`, so an
+    // unqualified name and any `main.`/`temp.`/`<attached>.` qualifier all report
+    // the main database (the qualifier picks the table object, not the data).
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("INSERT INTO t VALUES(1),(2),(3)").unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE aux.big(x)").unwrap();
+    c.execute("CREATE TEMP TABLE tt(y)").unwrap(); // materialize the temp db
     for name in ["sqlite_dbpage", "dbstat"] {
         let bare = c
             .query(&format!("SELECT count(*) FROM {name}"))
             .unwrap()
             .rows[0][0]
             .clone();
-        let qualified = c
-            .query(&format!("SELECT count(*) FROM main.{name}"))
-            .unwrap()
-            .rows[0][0]
-            .clone();
-        assert_eq!(bare, qualified, "main.{name} != {name}");
+        for q in ["main", "aux", "temp"] {
+            let qualified = c
+                .query(&format!("SELECT count(*) FROM {q}.{name}"))
+                .unwrap()
+                .rows[0][0]
+                .clone();
+            assert_eq!(bare, qualified, "{q}.{name} should report main like {name}");
+        }
     }
 }
 
