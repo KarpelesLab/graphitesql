@@ -838,12 +838,15 @@ pub(crate) fn lookup_term_rowids_in_column(
     })
 }
 
-/// Resolve `term`'s postings from a single-segment `%_data` index, or `None` if the
-/// shape is unservable. Shared by [`lookup_term_rowids`] and
-/// [`lookup_term_rowids_in_column`]: it parses the structure record, gathers the
-/// single height-0 segment's leaves in page order, and decodes the term. A
-/// servable segment whose term is absent returns `Some(vec![])`.
-fn decode_term_in_data(data: &[(i64, Vec<u8>)], term: &[u8]) -> Option<Vec<DecodedPosting>> {
+/// Gather the single height-0 segment's leaf blobs (in page order) from a `%_data`
+/// index, or `None` if the shape is unservable (multi-segment / interior / missing
+/// leaf / malformed structure record). Shared by the term and phrase lookups so a
+/// query reads the structure record and locates the leaves exactly once.
+///
+/// Bumps the test-only [`INDEX_ROUTE_HITS`] counter once per servable call, so a
+/// query that takes the index route (whether single-term or phrase) counts as one
+/// hit regardless of how many distinct terms it decodes from the gathered leaves.
+fn segment_leaves(data: &[(i64, Vec<u8>)]) -> Option<Vec<&[u8]>> {
     let structure = &data.iter().find(|(id, _)| *id == STRUCTURE_ROWID)?.1;
     let loc = single_segment(structure)?;
     // Gather the segment's leaves in page order; abort (→ scan) if any is missing.
@@ -855,8 +858,127 @@ fn decode_term_in_data(data: &[(i64, Vec<u8>)], term: &[u8]) -> Option<Vec<Decod
     }
     #[cfg(test)]
     INDEX_ROUTE_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Some(leaves)
+}
+
+/// Resolve `term`'s postings from a single-segment `%_data` index, or `None` if the
+/// shape is unservable. Shared by [`lookup_term_rowids`] and
+/// [`lookup_term_rowids_in_column`]: it parses the structure record, gathers the
+/// single height-0 segment's leaves in page order, and decodes the term. A
+/// servable segment whose term is absent returns `Some(vec![])`.
+fn decode_term_in_data(data: &[(i64, Vec<u8>)], term: &[u8]) -> Option<Vec<DecodedPosting>> {
+    let leaves = segment_leaves(data)?;
     // A servable segment whose term is absent: definitively no matches.
     Some(decode_term(&leaves, term).unwrap_or_default())
+}
+
+/// Whether columns `a` and `b` (the per-column position lists of two postings for
+/// the same document) form the adjacent phrase "a then b": some column `c` holds a
+/// position `p` in `a` with `p + 1` present in `b`. This is the index analogue of
+/// the scan's `fts5_phrase_starts` over a 2-token phrase: in that matcher a phrase
+/// matches a single column's token list at start `s` iff `doc[s] == a` and
+/// `doc[s + 1] == b`, i.e. term `a` at position `s` and term `b` at `s + 1` in THE
+/// SAME column. We require the shared column because positions are numbered per
+/// column (the writer records them per column, in the same order `_content` columns
+/// appear), exactly as the scan tokenizes one column at a time.
+fn phrase_adjacent(a: &DecodedPosting, b: &DecodedPosting) -> bool {
+    let ncols = a.cols.len().max(b.cols.len());
+    (0..ncols).any(|c| positions_adjacent(col(a, c), col(b, c)))
+}
+
+/// Restrict [`phrase_adjacent`] to a single column `c`: term `a` at position `p`
+/// with term `b` at `p + 1`, both in column `c`. Matches the scan's `col : "a b"`.
+fn phrase_adjacent_in_column(a: &DecodedPosting, b: &DecodedPosting, c: usize) -> bool {
+    positions_adjacent(col(a, c), col(b, c))
+}
+
+/// Column `c`'s position list of a posting (empty if the term never occurs there).
+fn col(p: &DecodedPosting, c: usize) -> &[u32] {
+    p.cols.get(c).map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Whether some position `p` in the ascending list `pa` has `p + 1` in the ascending
+/// list `pb` (a two-pointer merge). Empty inputs never match.
+fn positions_adjacent(pa: &[u32], pb: &[u32]) -> bool {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < pa.len() && j < pb.len() {
+        match pa[i].checked_add(1) {
+            None => return false,
+            Some(want) => match want.cmp(&pb[j]) {
+                core::cmp::Ordering::Equal => return true,
+                core::cmp::Ordering::Less => i += 1,
+                core::cmp::Ordering::Greater => j += 1,
+            },
+        }
+    }
+    false
+}
+
+/// Walk the docid-aligned intersection of two postings lists (each ascending by
+/// rowid, as the doclist is) and call `adj` on every shared document, collecting the
+/// rowids for which it returns `true`, ascending. Shared by the table-wide and
+/// column-scoped phrase lookups.
+fn phrase_intersect(
+    postings_a: &[DecodedPosting],
+    postings_b: &[DecodedPosting],
+    adj: impl Fn(&DecodedPosting, &DecodedPosting) -> bool,
+) -> Vec<i64> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < postings_a.len() && j < postings_b.len() {
+        let (a, b) = (&postings_a[i], &postings_b[j]);
+        match a.rowid.cmp(&b.rowid) {
+            core::cmp::Ordering::Less => i += 1,
+            core::cmp::Ordering::Greater => j += 1,
+            core::cmp::Ordering::Equal => {
+                if adj(a, b) {
+                    out.push(a.rowid);
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Look up the two-token phrase `"term_a term_b"` in a single-segment FTS5 index and
+/// return the rowids of the documents where the tokens occur at ADJACENT positions
+/// in the same column (`term_b` at position `p + 1` where `term_a` is at `p`),
+/// ascending — or `None` if the index shape is one the single-segment leaf reader
+/// cannot serve (so the caller falls back to the `%_content` scan).
+///
+/// This is the phrase sibling of [`lookup_term_rowids`]. It decodes BOTH terms'
+/// doclists from the one gathered segment, intersects them by docid, and keeps the
+/// shared docs whose per-column positions are adjacent — the exact set the scan's
+/// 2-token phrase predicate (`fts5_phrase_starts`) matches. Either term being absent
+/// yields `Some(vec![])` (servable, no match).
+pub(crate) fn lookup_phrase_rowids(
+    data: &[(i64, Vec<u8>)],
+    term_a: &[u8],
+    term_b: &[u8],
+) -> Option<Vec<i64>> {
+    let leaves = segment_leaves(data)?;
+    let pa = decode_term(&leaves, term_a).unwrap_or_default();
+    let pb = decode_term(&leaves, term_b).unwrap_or_default();
+    Some(phrase_intersect(&pa, &pb, phrase_adjacent))
+}
+
+/// Column-scoped sibling of [`lookup_phrase_rowids`]: keep only documents where the
+/// adjacent phrase occurs in COLUMN `column` (its position in the table's full
+/// column list, from 0) — exactly what the scan's `col : "a b"` predicate matches.
+pub(crate) fn lookup_phrase_rowids_in_column(
+    data: &[(i64, Vec<u8>)],
+    term_a: &[u8],
+    term_b: &[u8],
+    column: usize,
+) -> Option<Vec<i64>> {
+    let leaves = segment_leaves(data)?;
+    let pa = decode_term(&leaves, term_a).unwrap_or_default();
+    let pb = decode_term(&leaves, term_b).unwrap_or_default();
+    Some(phrase_intersect(&pa, &pb, |a, b| {
+        phrase_adjacent_in_column(a, b, column)
+    }))
 }
 
 #[cfg(test)]
@@ -1256,5 +1378,142 @@ mod tests {
         let odd: Vec<i64> = (1..=n).filter(|r| r % 2 == 1).collect();
         assert_eq!(lookup_term_rowids_in_column(&seg.data, b"x", 0), Some(even));
         assert_eq!(lookup_term_rowids_in_column(&seg.data, b"x", 1), Some(odd));
+    }
+
+    // ---- two-term phrase lookups (the adjacent-position intersection) -----
+
+    #[test]
+    fn lookup_phrase_rowids_adjacency() {
+        // Terms "a" and "b" across docs (one column each):
+        //   doc1: a@0, b@1            → adjacent ("a b")
+        //   doc2: a@0, b@2            → NOT adjacent (gap)
+        //   doc3: a@1, b@0            → "b a", not "a b"
+        //   doc4: a@0,3  b@1,5        → adjacent at 0/1
+        //   doc5: a@2 only            → b absent in doc
+        //   doc6: b@1 only            → a absent in doc
+        let terms = vec![
+            (
+                b"a".to_vec(),
+                vec![
+                    p(1, &[&[0]]),
+                    p(2, &[&[0]]),
+                    p(3, &[&[1]]),
+                    p(4, &[&[0, 3]]),
+                    p(5, &[&[2]]),
+                ],
+            ),
+            (
+                b"b".to_vec(),
+                vec![
+                    p(1, &[&[1]]),
+                    p(2, &[&[2]]),
+                    p(3, &[&[0]]),
+                    p(4, &[&[1, 5]]),
+                    p(6, &[&[1]]),
+                ],
+            ),
+        ];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=6).map(|r| (r, vec![8])).collect::<Vec<_>>();
+        let seg = build_segment(&terms, 6, &[40], &doc_sizes, 1000, 0);
+        // Only docs 1 and 4 have "a" immediately followed by "b".
+        assert_eq!(
+            lookup_phrase_rowids(&seg.data, b"a", b"b"),
+            Some(vec![1, 4])
+        );
+        // The reverse phrase "b a": doc3 (b@0, a@1).
+        assert_eq!(lookup_phrase_rowids(&seg.data, b"b", b"a"), Some(vec![3]));
+        // A term absent from the index → servable empty result.
+        assert_eq!(
+            lookup_phrase_rowids(&seg.data, b"a", b"zzz"),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn lookup_phrase_repeated_word() {
+        // The phrase "a a": doc1 has a@0,1 (adjacent self), doc2 has a@0,2 (not).
+        let terms = vec![(b"a".to_vec(), vec![p(1, &[&[0, 1]]), p(2, &[&[0, 2]])])];
+        let seg = build_segment(&terms, 2, &[4], &[(1, vec![2]), (2, vec![3])], 1000, 0);
+        assert_eq!(lookup_phrase_rowids(&seg.data, b"a", b"a"), Some(vec![1]));
+    }
+
+    #[test]
+    fn lookup_phrase_in_column_requires_same_column() {
+        // Two columns. The phrase "a b" must be adjacent WITHIN one column:
+        //   doc1: col0 a@0,b@1                 → col0 match
+        //   doc2: col0 a@0 ; col1 b@1          → split across columns, NO match
+        //   doc3: col1 a@2,b@3                 → col1 match
+        //   doc4: col0 a@0,b@1 ; col1 a@5,b@6  → both columns match
+        let terms = vec![
+            (
+                b"a".to_vec(),
+                vec![
+                    p(1, &[&[0], &[]]),
+                    p(2, &[&[0], &[]]),
+                    p(3, &[&[], &[2]]),
+                    p(4, &[&[0], &[5]]),
+                ],
+            ),
+            (
+                b"b".to_vec(),
+                vec![
+                    p(1, &[&[1], &[]]),
+                    p(2, &[&[], &[1]]),
+                    p(3, &[&[], &[3]]),
+                    p(4, &[&[1], &[6]]),
+                ],
+            ),
+        ];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=4).map(|r| (r, vec![8, 8])).collect::<Vec<_>>();
+        let seg = build_segment(&terms, 4, &[40, 40], &doc_sizes, 1000, 0);
+        // Table-wide: any column with the adjacent phrase → docs 1, 3, 4.
+        assert_eq!(
+            lookup_phrase_rowids(&seg.data, b"a", b"b"),
+            Some(vec![1, 3, 4])
+        );
+        // Column 0 only: docs 1 and 4.
+        assert_eq!(
+            lookup_phrase_rowids_in_column(&seg.data, b"a", b"b", 0),
+            Some(vec![1, 4])
+        );
+        // Column 1 only: docs 3 and 4.
+        assert_eq!(
+            lookup_phrase_rowids_in_column(&seg.data, b"a", b"b", 1),
+            Some(vec![3, 4])
+        );
+    }
+
+    #[test]
+    fn lookup_phrase_multi_leaf() {
+        // A small pgsz forces multi-leaf doclists for both terms; the phrase
+        // intersection must still find the adjacent docs. Even rowids have "a b"
+        // adjacent in col0; odd rowids have them non-adjacent.
+        let n = 40i64;
+        let a_post: Vec<Posting> = (1..=n).map(|r| p(r, &[&[0]])).collect();
+        let b_post: Vec<Posting> = (1..=n)
+            .map(|r| {
+                if r % 2 == 0 {
+                    p(r, &[&[1]])
+                } else {
+                    p(r, &[&[3]])
+                }
+            })
+            .collect();
+        let terms = vec![(b"a".to_vec(), a_post), (b"b".to_vec(), b_post)];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![8])).collect();
+        let seg = build_segment(&terms, n as u64, &[8 * n as u64], &doc_sizes, 64, 0);
+        assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclists");
+        let even: Vec<i64> = (1..=n).filter(|r| r % 2 == 0).collect();
+        assert_eq!(lookup_phrase_rowids(&seg.data, b"a", b"b"), Some(even));
+    }
+
+    #[test]
+    fn lookup_phrase_empty_index_falls_back() {
+        let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
+        assert_eq!(lookup_phrase_rowids(&seg.data, b"a", b"b"), None);
+        assert_eq!(
+            lookup_phrase_rowids_in_column(&seg.data, b"a", b"b", 0),
+            None
+        );
     }
 }

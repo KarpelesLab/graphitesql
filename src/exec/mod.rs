@@ -7043,13 +7043,16 @@ impl Connection {
     /// `Some(rows)` (the matching `_content` rows, leading `id` column dropped,
     /// in ascending rowid order — exactly the scan's order) for the shapes proven
     /// to give identical results: a TABLE-WIDE, SINGLE BARE-TERM query
-    /// (`tbl MATCH 'word'`) — matched in any column — and a COLUMN-SCOPED single
-    /// bare term (`tbl MATCH 'col : word'`) — matched only in the named column —
-    /// both over a fully-indexed table whose `_data` holds a single height-0
-    /// segment. Returns `None` (the caller falls back to the document scan) for
-    /// every other case — a `col MATCH …` operand, an `UNINDEXED` column, a
-    /// phrase/prefix/boolean/`NEAR` query, multiple column filters, a multi-segment
-    /// or interior/doclist-index index, or no `MATCH` at all.
+    /// (`tbl MATCH 'word'`) — matched in any column — a COLUMN-SCOPED single
+    /// bare term (`tbl MATCH 'col : word'`) — matched only in the named column — and
+    /// a TWO-TERM PHRASE, table-wide (`tbl MATCH '"a b"'`) or column-scoped
+    /// (`tbl MATCH 'col : "a b"'`) — the two tokens at adjacent positions in some /
+    /// the named column — all over a fully-indexed table whose `_data` holds a
+    /// single height-0 segment. Returns `None` (the caller falls back to the
+    /// document scan) for every other case — a `col MATCH …` operand, an `UNINDEXED`
+    /// column, a phrase of ≠2 terms, a prefix/anchor inside the phrase, a
+    /// prefix/boolean/`NEAR` query, multiple column filters, a multi-segment or
+    /// interior/doclist-index index, or no `MATCH` at all.
     ///
     /// Correctness: for a lone bare term over a fully-indexed table the scan's
     /// per-row predicate ([`crate::vtab::fts5_query_matches`]) is true iff the
@@ -7097,27 +7100,46 @@ impl Connection {
             return Ok(None);
         }
         let tok = crate::vtab::fts5_tok_config(arg_refs);
-        // Two index-routable shapes over the term reader:
+        // Index-routable shapes over the term reader:
         //   * a TABLE-WIDE single bare term (`'word'`) — matches in ANY column;
         //   * a COLUMN-SCOPED single bare term (`'col : word'`) — matches only in
         //     the named column. The per-column positions in the term's doclist let
-        //     us keep exactly the postings carrying a hit in that column.
-        // Resolve which (if either) applies; anything else stays on the scan.
+        //     us keep exactly the postings carrying a hit in that column;
+        //   * a TABLE-WIDE two-term phrase (`'"a b"'`) — the two tokens occur at
+        //     ADJACENT positions in some column;
+        //   * a COLUMN-SCOPED two-term phrase (`'col : "a b"'`) — adjacent in the
+        //     named column.
+        // Resolve which (if any) applies; anything else stays on the scan.
         enum Routed {
             AnyColumn(Vec<u8>),
             InColumn(Vec<u8>, usize),
+            Phrase(Vec<u8>, Vec<u8>),
+            PhraseInColumn(Vec<u8>, Vec<u8>, usize),
         }
+        // Resolve a column NAME to its position in the table's full column list (the
+        // same index the writer records positions under). A name that is not a
+        // column matches no document — but rather than build that empty result here,
+        // fall back to the scan (which yields the same empty set).
+        let resolve_col = |col: &str| -> Result<Option<usize>> {
+            Ok(self
+                .vtab_meta(name)?
+                .2
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(col)))
+        };
         let routed = if let Some(t) = crate::vtab::fts5_single_bare_term(&query, tok) {
             Routed::AnyColumn(t)
         } else if let Some((col, t)) = crate::vtab::fts5_single_bare_term_column(&query, tok) {
-            // Resolve the filtered column NAME to its position in the table's full
-            // column list (the same index the writer records positions under). A
-            // name that is not a column matches no document — but rather than build
-            // that empty result here, fall back to the scan (which yields the same
-            // empty set) so this path only ever handles a real column.
-            let columns = &self.vtab_meta(name)?.2.columns;
-            match columns.iter().position(|c| c.eq_ignore_ascii_case(&col)) {
+            match resolve_col(&col)? {
                 Some(ci) => Routed::InColumn(t, ci),
+                None => return Ok(None),
+            }
+        } else if let Some((a, b)) = crate::vtab::fts5_two_term_phrase(&query, tok) {
+            Routed::Phrase(a, b)
+        } else if let Some((col, (a, b))) = crate::vtab::fts5_two_term_phrase_column(&query, tok) {
+            match resolve_col(&col)? {
+                Some(ci) => Routed::PhraseInColumn(a, b, ci),
                 None => return Ok(None),
             }
         } else {
@@ -7142,6 +7164,10 @@ impl Connection {
             Routed::AnyColumn(term) => crate::fts5_index::lookup_term_rowids(&data, term),
             Routed::InColumn(term, ci) => {
                 crate::fts5_index::lookup_term_rowids_in_column(&data, term, *ci)
+            }
+            Routed::Phrase(a, b) => crate::fts5_index::lookup_phrase_rowids(&data, a, b),
+            Routed::PhraseInColumn(a, b, ci) => {
+                crate::fts5_index::lookup_phrase_rowids_in_column(&data, a, b, *ci)
             }
         };
         let rowids = match rowids_opt {
@@ -21236,8 +21262,8 @@ mod fts5_index_route_tests {
         assert!(texts(&mut c, "SELECT body FROM t WHERE t MATCH 'zebra'").is_empty());
     }
 
-    /// Shapes that are NOT a single bare term stay on the document scan
-    /// (`INDEX_ROUTE_HITS` unchanged), still returning correct results.
+    /// Shapes that are neither a single bare term nor a two-term phrase stay on the
+    /// document scan (`INDEX_ROUTE_HITS` unchanged), still returning correct results.
     #[test]
     fn non_bare_shapes_stay_on_scan() {
         let _guard = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
@@ -21255,14 +21281,89 @@ mod fts5_index_route_tests {
             ))
             .unwrap();
         }
-        // Phrase, prefix, and boolean queries must not be index-routed.
-        for q in ["\"quick brown\"", "qui*", "quick AND fox", "brown NOT bear"] {
+        // Prefix, boolean, a ≠2-term phrase, a prefixed/anchored phrase, and a NEAR
+        // group must not be index-routed (a bare two-term phrase IS — see
+        // `two_term_phrase_match_takes_index_route`).
+        for q in [
+            "qui*",
+            "quick AND fox",
+            "brown NOT bear",
+            "\"quick brown fox\"",
+            "\"quick brown\" OR fox",
+            "^\"quick brown\"",
+            "NEAR(quick fox, 3)",
+        ] {
             let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
             let sql = alloc::format!("SELECT body FROM t WHERE t MATCH '{q}'");
             let _ = c.query(&sql).unwrap();
             let after = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
             assert_eq!(after, before, "query {q:?} must stay on the scan");
         }
+    }
+
+    /// A two-term phrase (`tbl MATCH '"a b"'`, table-wide and column-scoped) over a
+    /// fully indexed table is served by the segment index (`INDEX_ROUTE_HITS` rises)
+    /// and returns exactly the documents whose tokens occur at adjacent positions —
+    /// the same set the document scan produces.
+    #[test]
+    fn two_term_phrase_match_takes_index_route() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = Connection::open_memory().unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+            .unwrap();
+        // "quick brown" is adjacent in row 1 (title) and row 4 (body); rows 2/3 have
+        // the words but not adjacent / not in order / split across columns.
+        let docs = [
+            ("the quick brown fox", "nothing here"),
+            ("quick red brown fox", "all separate words"),
+            ("brown then quick", "reversed order only"),
+            ("plain title text", "a quick brown hare"),
+            ("quick", "brown"), // split across columns: NOT a phrase match
+        ];
+        for (i, (title, body)) in docs.iter().enumerate() {
+            c.execute(&alloc::format!(
+                "INSERT INTO t(rowid, title, body) VALUES({}, '{}', '{}')",
+                i + 1,
+                title,
+                body
+            ))
+            .unwrap();
+        }
+        // Table-wide phrase: adjacent in some column → rows 1 and 4.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows: alloc::vec::Vec<i64> = c
+            .query("SELECT rowid FROM t WHERE t MATCH '\"quick brown\"' ORDER BY rowid")
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        assert!(
+            INDEX_ROUTE_HITS.load(Ordering::Relaxed) > before,
+            "table-wide phrase must take the index route"
+        );
+        assert_eq!(rows, [1, 4]);
+
+        // Column-scoped phrase: only the body column → row 4.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows: alloc::vec::Vec<i64> = c
+            .query("SELECT rowid FROM t WHERE t MATCH 'body : \"quick brown\"' ORDER BY rowid")
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        assert!(
+            INDEX_ROUTE_HITS.load(Ordering::Relaxed) > before,
+            "column-scoped phrase must take the index route"
+        );
+        assert_eq!(rows, [4]);
     }
 
     /// A column-scoped single bare term (`tbl MATCH 'col : word'`) over a fully

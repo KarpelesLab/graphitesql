@@ -369,3 +369,224 @@ fn sqlite_written_multileaf_bare_term_match_read_by_graphite() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// Two-term phrase (`tbl MATCH '"a b"'`) — D2b extension. A phrase matches a
+// document iff its two tokens occur at ADJACENT positions in the same column.
+// graphite now answers this from the segment index (intersect the two terms'
+// doclists, keep docs with adjacent per-column positions). The routed rows must
+// be byte-identical to stock sqlite3's MATCH on the same file.
+// ---------------------------------------------------------------------------
+
+/// A single-column corpus where "quick brown" appears adjacent in some rows, the
+/// same words non-adjacent / reversed in others, and a repeated-word phrase
+/// ("very very") and a never-adjacent pair exercise the edges.
+const PH_DOCS: &[(i64, &str)] = &[
+    (1, "the quick brown fox jumps"),         // quick brown adjacent
+    (2, "a quick red brown hare runs"),       // quick … brown NOT adjacent
+    (3, "brown then quick reversed order"),   // brown quick, not quick brown
+    (4, "nothing relevant in this row"),      // neither word
+    (5, "quick brown quick brown again"),     // adjacent twice
+    (6, "only quick here no other color"),    // quick only
+    (7, "only brown here no speed at all"),   // brown only
+    (8, "very very enthusiastic about cats"), // "very very" adjacent
+    (9, "very calm and very collected mind"), // "very … very" not adjacent
+    (10, "the brown quick fox is back"),      // brown quick (reversed) again
+];
+
+/// graphite's `SELECT rowid FROM t WHERE t MATCH '"<a> <b>"'`, sorted rowids.
+fn graphite_phrase(c: &Connection, a: &str, b: &str) -> String {
+    let sql = format!("SELECT rowid FROM t WHERE t MATCH '\"{a} {b}\"' ORDER BY rowid");
+    let mut v: Vec<i64> = c
+        .query(&sql)
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| match r[0] {
+            Value::Integer(i) => i,
+            ref other => panic!("non-integer rowid: {other:?}"),
+        })
+        .collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// sqlite3's phrase MATCH over the same file, sorted rowids.
+fn sqlite_phrase(path: &str, a: &str, b: &str) -> String {
+    let q = format!("SELECT rowid FROM t WHERE t MATCH '\"{a} {b}\"' ORDER BY rowid;");
+    let o = Command::new("sqlite3").arg(path).arg(&q).output().unwrap();
+    assert!(
+        o.status.success(),
+        "sqlite3 failed for {q:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mut v: Vec<i64> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.parse().unwrap())
+        .collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The phrase pairs exercised: adjacent, reversed, repeated word, and a pair that
+/// is never adjacent anywhere.
+const PHRASES: &[(&str, &str)] = &[
+    ("quick", "brown"),
+    ("brown", "quick"),
+    ("very", "very"),
+    ("brown", "fox"),
+    ("fox", "brown"),
+    ("zebra", "stripes"), // neither word present
+];
+
+#[test]
+fn graphite_written_two_term_phrase_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    let mut c = Connection::create(&path).unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+        .unwrap();
+    for (rowid, body) in PH_DOCS {
+        c.execute(&format!(
+            "INSERT INTO t(rowid, body) VALUES({rowid}, '{body}')"
+        ))
+        .unwrap();
+    }
+    drop(c);
+    let c = Connection::open(&path).unwrap();
+    for (a, b) in PHRASES {
+        let g = graphite_phrase(&c, a, b);
+        let s = sqlite_phrase(&path, a, b);
+        assert_eq!(g, s, "phrase \"{a} {b}\": graphite {g:?} != sqlite {s:?}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn sqlite_written_two_term_phrase_read_by_graphite_single_and_multi_leaf() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Single-leaf (default pgsz) and multi-leaf (forced pgsz 64, then optimized to
+    // a single segment) sqlite-written indexes, both read by graphite's phrase route.
+    for pgsz in [0u32, 64] {
+        let path = tmp_path();
+        if pgsz == 0 {
+            sqlite_exec(&path, "CREATE VIRTUAL TABLE t USING fts5(body);");
+        } else {
+            sqlite_exec(
+                &path,
+                "CREATE VIRTUAL TABLE t USING fts5(body);\
+                 INSERT INTO t(t, rank) VALUES('pgsz', 64);",
+            );
+        }
+        // A larger corpus so 64-byte pages genuinely split the doclists.
+        for i in 1..=60i64 {
+            let body = match i % 4 {
+                0 => format!("row {i} has quick brown adjacency here"),
+                1 => format!("row {i} keeps quick apart from brown words"),
+                2 => format!("row {i} only mentions brown not the speed"),
+                _ => format!("filler word{i:03} unrelated tokens around"),
+            };
+            sqlite_exec(
+                &path,
+                &format!("INSERT INTO t(rowid, body) VALUES({i}, '{body}');"),
+            );
+        }
+        if pgsz != 0 {
+            sqlite_exec(&path, "INSERT INTO t(t) VALUES('optimize');");
+        }
+        let c = Connection::open(&path).unwrap();
+        for (a, b) in [("quick", "brown"), ("brown", "quick"), ("quick", "apart")] {
+            let g = graphite_phrase(&c, a, b);
+            let s = sqlite_phrase(&path, a, b);
+            assert_eq!(
+                g, s,
+                "pgsz {pgsz}, phrase \"{a} {b}\": graphite {g:?} != sqlite {s:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn column_scoped_two_term_phrase_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    // Two columns: "quick brown" is adjacent in title for some rows, in body for
+    // others, split across columns in one (must NOT match a single-column phrase).
+    let docs: &[(i64, &str, &str)] = &[
+        (1, "the quick brown fox", "calm waters here"), // title
+        (2, "plain title only", "a quick brown hare runs"), // body
+        (3, "quick brown both ways", "quick brown twice"), // both
+        (4, "quick alone in title", "brown alone in body"), // split → no match
+        (5, "nothing notable now", "nothing here either"), // neither
+    ];
+    let mut c = Connection::create(&path).unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+        .unwrap();
+    for (rowid, title, body) in docs {
+        c.execute(&format!(
+            "INSERT INTO t(rowid, title, body) VALUES({rowid}, '{title}', '{body}')"
+        ))
+        .unwrap();
+    }
+    drop(c);
+    let c = Connection::open(&path).unwrap();
+    for col in ["title", "body"] {
+        // graphite column-scoped phrase.
+        let sql =
+            format!("SELECT rowid FROM t WHERE t MATCH '{col} : \"quick brown\"' ORDER BY rowid");
+        let mut g: Vec<i64> = c
+            .query(&sql)
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        g.sort_unstable();
+        let g = g
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        // sqlite column-scoped phrase.
+        let q =
+            format!("SELECT rowid FROM t WHERE t MATCH '{col} : \"quick brown\"' ORDER BY rowid;");
+        let o = Command::new("sqlite3").arg(&path).arg(&q).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let mut sv: Vec<i64> = String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.parse().unwrap())
+            .collect();
+        sv.sort_unstable();
+        let s = sv
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            g, s,
+            "{col}:\"quick brown\": graphite {g:?} != sqlite {s:?}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
