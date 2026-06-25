@@ -1270,3 +1270,157 @@ fn porter_prefix_match_equals_sqlite() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Two-single-token bare-term NEAR (`NEAR(a b, n)`, and the default-distance
+// `NEAR(a b)` = n=10) — D2b extension. graphite now answers this from the segment
+// index: intersect the two terms' doclists, then keep documents whose per-column
+// positions satisfy `|pa − pb| <= n + 1` in some column (the two-single-token
+// reduction of SQLite's `max_end − min_start < n + total_len` rule, verified
+// against sqlite3 3.50.4). The routed rows must be byte-identical to stock
+// sqlite3's MATCH on the same file, in both write directions and single- +
+// multi-leaf indexes, with the distance boundary pinned.
+
+/// Docs where two terms sit at controlled gaps, plus split-column and
+/// single-term cases. Token positions are 0-based within the (single) column.
+const NEAR_DOCS: &[(i64, &str)] = &[
+    (1, "alpha beta"),              // gap 1
+    (2, "alpha x beta"),            // gap 2
+    (3, "alpha x y beta"),          // gap 3
+    (4, "alpha x y z beta"),        // gap 4
+    (5, "alpha x y z w beta"),      // gap 5
+    (6, "beta alpha"),              // gap 1, reversed order
+    (7, "alpha but no second one"), // only alpha
+    (8, "no first only beta here"), // only beta
+    (9, "nothing relevant at all"), // neither
+    (10, "alpha alpha beta beta"),  // alpha@0,1 beta@2,3 → closest gap 1
+];
+
+/// The distances to probe, including the boundary around each gap and the
+/// default-distance form (rendered as `NEAR(alpha beta)`).
+const NEAR_QUERIES: &[&str] = &[
+    "NEAR(alpha beta, 0)",
+    "NEAR(alpha beta, 1)",
+    "NEAR(alpha beta, 2)",
+    "NEAR(alpha beta, 3)",
+    "NEAR(alpha beta, 4)",
+    "NEAR(alpha beta, 5)",
+    "NEAR(beta alpha, 1)", // symmetry: same set as NEAR(alpha beta, 1)
+    "NEAR(alpha beta)",    // default distance n=10
+    "NEAR(alpha zzz, 3)",  // a term absent → empty
+];
+
+#[test]
+fn graphite_written_two_term_near_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    let mut c = Connection::create(&path).unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+        .unwrap();
+    for (rowid, body) in NEAR_DOCS {
+        c.execute(&format!(
+            "INSERT INTO t(rowid, body) VALUES({rowid}, '{body}')"
+        ))
+        .unwrap();
+    }
+    drop(c);
+    let c = Connection::open(&path).unwrap();
+    for q in NEAR_QUERIES {
+        let g = graphite_match(&c, q);
+        let s = sqlite_match(&path, q);
+        assert_eq!(g, s, "{q}: graphite {g:?} != sqlite {s:?}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn sqlite_written_two_term_near_read_by_graphite_single_and_multi_leaf() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Single-leaf (default pgsz) and multi-leaf (forced pgsz 64, then optimized to
+    // a single segment) sqlite-written indexes, both read by graphite's NEAR route.
+    for pgsz in [0u32, 64] {
+        let path = tmp_path();
+        if pgsz == 0 {
+            sqlite_exec(&path, "CREATE VIRTUAL TABLE t USING fts5(body);");
+        } else {
+            sqlite_exec(
+                &path,
+                "CREATE VIRTUAL TABLE t USING fts5(body);\
+                 INSERT INTO t(t, rank) VALUES('pgsz', 64);",
+            );
+        }
+        // A larger corpus so 64-byte pages genuinely split the doclists, with the
+        // alpha/beta pair at varied gaps across many rows.
+        for i in 1..=60i64 {
+            let gap = (i % 6) as usize; // 0..=5 fillers between the pair
+            let mid = std::iter::repeat_n("mid", gap)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let body = if i % 7 == 0 {
+                format!("row {i} alpha but no second term word{i:03}")
+            } else {
+                format!("row {i} alpha {mid} beta tail word{i:03}")
+            };
+            sqlite_exec(
+                &path,
+                &format!("INSERT INTO t(rowid, body) VALUES({i}, '{body}');"),
+            );
+        }
+        if pgsz != 0 {
+            sqlite_exec(&path, "INSERT INTO t(t) VALUES('optimize');");
+        }
+        let c = Connection::open(&path).unwrap();
+        for q in NEAR_QUERIES {
+            let g = graphite_match(&c, q);
+            let s = sqlite_match(&path, q);
+            assert_eq!(g, s, "pgsz {pgsz}, {q}: graphite {g:?} != sqlite {s:?}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn two_term_near_multi_column_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Two columns: the pair must be close WITHIN one column. Row 4 splits the pair
+    // across columns (never a NEAR match); the table-wide NEAR considers each column
+    // independently, exactly as sqlite does.
+    let docs: &[(i64, &str, &str)] = &[
+        (1, "alpha beta here", "calm waters"),           // title gap 1
+        (2, "alpha x x beta there", "nothing notable"),  // title gap 3
+        (3, "plain title text", "alpha beta in body"),   // body gap 1
+        (4, "alpha only in title", "beta only in body"), // split across columns
+        (5, "nothing here", "nothing there either"),     // neither
+    ];
+    let path = tmp_path();
+    let mut c = Connection::create(&path).unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+        .unwrap();
+    for (rowid, title, body) in docs {
+        c.execute(&format!(
+            "INSERT INTO t(rowid, title, body) VALUES({rowid}, '{title}', '{body}')"
+        ))
+        .unwrap();
+    }
+    drop(c);
+    let c = Connection::open(&path).unwrap();
+    for q in [
+        "NEAR(alpha beta, 0)",
+        "NEAR(alpha beta, 2)",
+        "NEAR(alpha beta)",
+    ] {
+        let g = graphite_match(&c, q);
+        let s = sqlite_match(&path, q);
+        assert_eq!(g, s, "{q}: graphite {g:?} != sqlite {s:?}");
+    }
+    let _ = std::fs::remove_file(&path);
+}

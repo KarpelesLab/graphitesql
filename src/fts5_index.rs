@@ -1076,6 +1076,66 @@ pub(crate) fn lookup_phrase_rowids_in_column(
     }))
 }
 
+/// Whether some position `pa` of term `a` and `pb` of term `b` are within the NEAR
+/// window in THE SAME column: `|pa − pb| <= n + 1`. This is the two-single-token
+/// specialization of the scan's [`crate::vtab`] NEAR rule
+/// `max_end − min_start < n + total_len`: with two one-token phrases `total_len = 2`
+/// and `max_end − min_start = |pa − pb|`, so `|pa − pb| < n + 2`, i.e.
+/// `|pa − pb| <= n + 1` (verified against `sqlite3` 3.50.4: `NEAR(a b, 0)` matches a
+/// gap of exactly 1, `NEAR(a b, 1)` a gap of 2, …). Both lists are ascending; we
+/// sweep with two pointers, advancing whichever side is smaller — the closest pair
+/// straddles the pointers, so a single pass decides the window.
+fn near_within_in_column(pa: &[u32], pb: &[u32], n: u32) -> bool {
+    let limit = n.saturating_add(1);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < pa.len() && j < pb.len() {
+        let (a, b) = (pa[i], pb[j]);
+        let gap = a.abs_diff(b);
+        if gap <= limit {
+            return true;
+        }
+        if a < b {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    false
+}
+
+/// Whether term `a` and term `b` satisfy `NEAR(a b, n)` in SOME column of one
+/// document: a column with positions `pa` (of `a`) and `pb` (of `b`) such that
+/// `|pa − pb| <= n + 1` (see [`near_within_in_column`]). Positions are numbered per
+/// column, exactly as the scan tokenizes one column at a time.
+fn near_matches(a: &DecodedPosting, b: &DecodedPosting, n: u32) -> bool {
+    let ncols = a.cols.len().max(b.cols.len());
+    (0..ncols).any(|c| near_within_in_column(col(a, c), col(b, c), n))
+}
+
+/// Look up the two-single-token NEAR group `NEAR(term_a term_b, n)` in a
+/// single-segment FTS5 index and return the rowids of the documents where the two
+/// tokens occur within `n + 1` positions of each other in the same column,
+/// ascending — or `None` if the index shape is one the single-segment leaf reader
+/// cannot serve (so the caller falls back to the `%_content` scan).
+///
+/// This is the NEAR sibling of [`lookup_phrase_rowids`]. It decodes BOTH terms'
+/// doclists from the one gathered segment, intersects them by docid, and keeps the
+/// shared docs whose per-column positions fall inside the NEAR window — the exact
+/// set the scan's two-single-token `NEAR` predicate (`fts5_near_matches`) matches.
+/// Either term being absent yields `Some(vec![])` (servable, no match). `n` is the
+/// query distance (default 10); the inequality is `|pa − pb| <= n + 1`.
+pub(crate) fn lookup_near_rowids(
+    data: &[(i64, Vec<u8>)],
+    term_a: &[u8],
+    term_b: &[u8],
+    n: u32,
+) -> Option<Vec<i64>> {
+    let leaves = segment_leaves(data)?;
+    let pa = decode_term(&leaves, term_a).unwrap_or_default();
+    let pb = decode_term(&leaves, term_b).unwrap_or_default();
+    Some(phrase_intersect(&pa, &pb, |a, b| near_matches(a, b, n)))
+}
+
 /// Sorted-merge INTERSECTION of two ascending, deduplicated rowid lists.
 fn rowids_intersect(a: &[i64], b: &[i64]) -> Vec<i64> {
     let mut out = Vec::new();
@@ -1937,5 +1997,141 @@ mod tests {
             lookup_phrase_rowids_in_column(&seg.data, b"a", b"b", 0),
             None
         );
+    }
+
+    // ---- two-single-token NEAR lookups (|pa − pb| <= n + 1) ---------------
+
+    #[test]
+    fn lookup_near_rowids_distance_boundary() {
+        // Single column. a@0 in every doc; b at increasing gaps:
+        //   doc1: b@1 (gap 1)   doc2: b@2 (gap 2)   doc3: b@3 (gap 3)
+        //   doc4: b@4 (gap 4)   doc5: a only (b absent)   doc6: b@1 (gap 1)
+        let terms = vec![
+            (
+                b"a".to_vec(),
+                vec![
+                    p(1, &[&[0]]),
+                    p(2, &[&[0]]),
+                    p(3, &[&[0]]),
+                    p(4, &[&[0]]),
+                    p(5, &[&[0]]),
+                    p(6, &[&[0]]),
+                ],
+            ),
+            (
+                b"b".to_vec(),
+                vec![
+                    p(1, &[&[1]]),
+                    p(2, &[&[2]]),
+                    p(3, &[&[3]]),
+                    p(4, &[&[4]]),
+                    p(6, &[&[1]]),
+                ],
+            ),
+        ];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=6).map(|r| (r, vec![8])).collect();
+        let seg = build_segment(&terms, 6, &[40], &doc_sizes, 1000, 0);
+        // n=0 → |gap| <= 1: gap-1 docs only (1, 6).
+        assert_eq!(
+            lookup_near_rowids(&seg.data, b"a", b"b", 0),
+            Some(vec![1, 6])
+        );
+        // n=1 → |gap| <= 2: docs 1, 2, 6.
+        assert_eq!(
+            lookup_near_rowids(&seg.data, b"a", b"b", 1),
+            Some(vec![1, 2, 6])
+        );
+        // n=2 → |gap| <= 3: docs 1, 2, 3, 6. Pin the boundary: gap-3 doc3 IN, gap-4
+        // doc4 OUT.
+        assert_eq!(
+            lookup_near_rowids(&seg.data, b"a", b"b", 2),
+            Some(vec![1, 2, 3, 6])
+        );
+        // n=3 → |gap| <= 4: now doc4 (gap 4) joins.
+        assert_eq!(
+            lookup_near_rowids(&seg.data, b"a", b"b", 3),
+            Some(vec![1, 2, 3, 4, 6])
+        );
+        // The window is symmetric: "b a" (reversed) is the same set.
+        assert_eq!(
+            lookup_near_rowids(&seg.data, b"b", b"a", 0),
+            Some(vec![1, 6])
+        );
+        // A term absent from the index → servable empty result.
+        assert_eq!(
+            lookup_near_rowids(&seg.data, b"a", b"zzz", 10),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn lookup_near_rowids_requires_same_column() {
+        // Two columns. The NEAR pair must fall WITHIN one column:
+        //   doc1: col0 a@0, b@2          → col0 gap 2
+        //   doc2: col0 a@0 ; col1 b@0    → split across columns, NO match
+        //   doc3: col1 a@5, b@7          → col1 gap 2
+        //   doc4: col0 a@0 ; col1 b@9    → far + split, NO match at any n we test
+        let terms = vec![
+            (
+                b"a".to_vec(),
+                vec![
+                    p(1, &[&[0], &[]]),
+                    p(2, &[&[0], &[]]),
+                    p(3, &[&[], &[5]]),
+                    p(4, &[&[0], &[]]),
+                ],
+            ),
+            (
+                b"b".to_vec(),
+                vec![
+                    p(1, &[&[2], &[]]),
+                    p(2, &[&[], &[0]]),
+                    p(3, &[&[], &[7]]),
+                    p(4, &[&[], &[9]]),
+                ],
+            ),
+        ];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=4).map(|r| (r, vec![8, 12])).collect();
+        let seg = build_segment(&terms, 4, &[40, 60], &doc_sizes, 1000, 0);
+        // n=1 → |gap| <= 2 within one column: docs 1 and 3 (doc2/doc4 are split).
+        assert_eq!(
+            lookup_near_rowids(&seg.data, b"a", b"b", 1),
+            Some(vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn lookup_near_rowids_multi_leaf() {
+        // A small pgsz forces multi-leaf doclists. Even rowids have the pair within
+        // gap 1 in col0; odd rowids have them gap 5 apart.
+        let n = 40i64;
+        let a_post: Vec<Posting> = (1..=n).map(|r| p(r, &[&[0]])).collect();
+        let b_post: Vec<Posting> = (1..=n)
+            .map(|r| {
+                if r % 2 == 0 {
+                    p(r, &[&[1]])
+                } else {
+                    p(r, &[&[5]])
+                }
+            })
+            .collect();
+        let terms = vec![(b"a".to_vec(), a_post), (b"b".to_vec(), b_post)];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![8])).collect();
+        let seg = build_segment(&terms, n as u64, &[8 * n as u64], &doc_sizes, 64, 0);
+        assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclists");
+        // n=0 → |gap| <= 1: even rowids (gap 1) only.
+        let even: Vec<i64> = (1..=n).filter(|r| r % 2 == 0).collect();
+        assert_eq!(lookup_near_rowids(&seg.data, b"a", b"b", 0), Some(even));
+        // n=4 → |gap| <= 5: now odd rowids (gap 5) join → all docs.
+        assert_eq!(
+            lookup_near_rowids(&seg.data, b"a", b"b", 4),
+            Some((1..=n).collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
+    fn lookup_near_empty_index_falls_back() {
+        let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
+        assert_eq!(lookup_near_rowids(&seg.data, b"a", b"b", 10), None);
     }
 }

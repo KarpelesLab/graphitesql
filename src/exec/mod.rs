@@ -7050,9 +7050,10 @@ impl Connection {
     /// the named column — all over a fully-indexed table whose `_data` holds a
     /// single height-0 segment. Returns `None` (the caller falls back to the
     /// document scan) for every other case — a `col MATCH …` operand, an `UNINDEXED`
-    /// column, a phrase of ≠2 terms, a prefix/anchor inside the phrase, a
-    /// prefix/boolean/`NEAR` query, multiple column filters, a multi-segment or
-    /// interior/doclist-index index, or no `MATCH` at all.
+    /// column, a phrase of ≠2 terms, a prefix/anchor inside the phrase, a `NEAR`
+    /// group that is not exactly two single-token bare operands, multiple column
+    /// filters, a multi-segment or interior/doclist-index index, or no `MATCH` at
+    /// all.
     ///
     /// Correctness: for a lone bare term over a fully-indexed table the scan's
     /// per-row predicate ([`crate::vtab::fts5_query_matches`]) is true iff the
@@ -7109,12 +7110,19 @@ impl Connection {
         //     ADJACENT positions in some column;
         //   * a COLUMN-SCOPED two-term phrase (`'col : "a b"'`) — adjacent in the
         //     named column.
+        //   * a TABLE-WIDE two-single-token bare-term `NEAR` group
+        //     (`'NEAR(a b, n)'`, default `n = 10`) — the two tokens occur within
+        //     `n + 1` positions of each other in some column.
         // Resolve which (if any) applies; anything else stays on the scan.
         enum Routed {
             AnyColumn(Vec<u8>),
             InColumn(Vec<u8>, usize),
             Phrase(Vec<u8>, Vec<u8>),
             PhraseInColumn(Vec<u8>, Vec<u8>, usize),
+            /// A TABLE-WIDE two-single-token bare-term `NEAR` group
+            /// (`'NEAR(a b, n)'`, default `n = 10`) — the two tokens occur within
+            /// `n + 1` positions of each other in some column.
+            Near(Vec<u8>, Vec<u8>, u32),
             /// An N-operand bare-term boolean TREE (`a AND b AND c`,
             /// `(a OR b) AND NOT c`, the two-operand `a AND/OR/NOT b`, the
             /// implicit-AND `a b c`, …) served by bottom-up doclist set-ops over
@@ -7153,6 +7161,8 @@ impl Connection {
                 Some(ci) => Routed::PhraseInColumn(a, b, ci),
                 None => return Ok(None),
             }
+        } else if let Some((a, b, n)) = crate::vtab::fts5_two_term_near(&query, tok) {
+            Routed::Near(a, b, n as u32)
         } else if let Some(tree) = crate::vtab::fts5_bare_term_bool_tree(&query, tok) {
             // Any boolean tree of table-wide bare terms (2 operands or N, with
             // parentheses / mixed AND/OR/NOT). The single-bare-term shapes are
@@ -7192,6 +7202,7 @@ impl Connection {
             Routed::PhraseInColumn(a, b, ci) => {
                 crate::fts5_index::lookup_phrase_rowids_in_column(&data, a, b, *ci)
             }
+            Routed::Near(a, b, n) => crate::fts5_index::lookup_near_rowids(&data, a, b, *n),
             Routed::BoolTree(tree) => crate::fts5_index::lookup_bool_tree_rowids(&data, tree),
             Routed::PrefixAnyColumn(p) => crate::fts5_index::lookup_prefix_rowids(&data, p),
             Routed::PrefixInColumn(p, ci) => {
@@ -21309,25 +21320,31 @@ mod fts5_index_route_tests {
             ))
             .unwrap();
         }
-        // A ≠2-term phrase, a prefixed/anchored phrase, a NEAR group, and a boolean
-        // mixing a phrase/prefix/column-scoped operand must not be index-routed. (A
-        // bare two-term phrase IS — see `two_term_phrase_match_takes_index_route` —
-        // an N-operand bare-term boolean TREE IS — see
-        // `bare_term_boolean_tree_match_takes_index_route` — and a lone bare prefix
-        // term IS — see `prefix_term_match_takes_index_route`.) Every leaf of a
-        // routed boolean tree must be a plain table-wide bare term; a single
-        // non-bare leaf forces the whole query back to the scan.
+        // A ≠2-term phrase, a prefixed/anchored phrase, a NEAR group with the wrong
+        // shape, and a boolean mixing a phrase/prefix/column-scoped operand must not
+        // be index-routed. (A bare two-term phrase IS — see
+        // `two_term_phrase_match_takes_index_route` — an N-operand bare-term boolean
+        // TREE IS — see `bare_term_boolean_tree_match_takes_index_route` — a lone
+        // bare prefix term IS — see `prefix_term_match_takes_index_route` — and a
+        // lone two-single-token bare-term NEAR group IS — see
+        // `two_term_near_match_takes_index_route`.) Every leaf of a routed boolean
+        // tree must be a plain table-wide bare term; a single non-bare leaf forces
+        // the whole query back to the scan, and a NEAR group only routes when it is
+        // the entire query with exactly two bare single-token operands.
         for q in [
             "\"quick brown fox\"",
             "\"quick brown\" OR fox",
             "^\"quick brown\"",
-            "^qui*",        // anchored prefix → stays on scan
-            "qui* AND fox", // prefix operand in a boolean → stays on scan
-            "NEAR(quick fox, 3)",
-            "\"quick brown\" OR bear",   // phrase operand → stays on scan
-            "title : quick OR fox",      // column-scoped operand → stays on scan
-            "quick AND brown AND qui*",  // 3 operands, one a prefix → scan
-            "(quick OR brown) AND fox*", // parenthesized, one a prefix → scan
+            "^qui*",                        // anchored prefix → stays on scan
+            "qui* AND fox",                 // prefix operand in a boolean → stays on scan
+            "NEAR(quick brown fox, 3)",     // 3 NEAR operands → stays on scan
+            "NEAR(\"quick brown\" fox)",    // a phrase NEAR operand → stays on scan
+            "NEAR(quick fo*)",              // a prefix NEAR operand → stays on scan
+            "fox AND NEAR(quick brown)",    // NEAR inside a boolean → stays on scan
+            "\"quick brown\" OR bear",      // phrase operand → stays on scan
+            "title : quick OR fox",         // column-scoped operand → stays on scan
+            "quick AND brown AND qui*",     // 3 operands, one a prefix → scan
+            "(quick OR brown) AND fox*",    // parenthesized, one a prefix → scan
             "quick AND NEAR(brown fox, 2)", // a NEAR leaf in the tree → scan
         ] {
             let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
@@ -21401,6 +21418,93 @@ mod fts5_index_route_tests {
             "column-scoped phrase must take the index route"
         );
         assert_eq!(rows, [4]);
+    }
+
+    /// A lone two-single-token bare-term `NEAR` group (`tbl MATCH 'NEAR(a b, n)'`,
+    /// and the default-distance `NEAR(a b)` = n=10) over a fully indexed table is
+    /// served by the segment index (`INDEX_ROUTE_HITS` rises): it intersects the two
+    /// terms' doclists and keeps the documents with positions `|pa − pb| <= n + 1`
+    /// in some column — exactly the set the document scan's NEAR predicate matches.
+    #[test]
+    fn two_term_near_match_takes_index_route() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = Connection::open_memory().unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+            .unwrap();
+        // a@pos / b@pos per column. Gaps: row1 adjacent (1), row2 gap 2, row3 gap 3,
+        // row4 only `a`, row5 the pair split across columns (never a NEAR match),
+        // row6 the pair adjacent only in `body`.
+        let docs = [
+            ("alpha beta", "nothing here"),        // 1: gap 1 in title
+            ("alpha x beta", "irrelevant"),        // 2: gap 2 in title
+            ("alpha x y beta", "irrelevant"),      // 3: gap 3 in title
+            ("alpha only here", "no second term"), // 4: only alpha
+            ("alpha here", "beta there"),          // 5: split across columns
+            ("plain title", "alpha beta close"),   // 6: gap 1 in body
+        ];
+        for (i, (title, body)) in docs.iter().enumerate() {
+            c.execute(&alloc::format!(
+                "INSERT INTO t(rowid, title, body) VALUES({}, '{}', '{}')",
+                i + 1,
+                title,
+                body
+            ))
+            .unwrap();
+        }
+        // NEAR(alpha beta, 1) → |pa-pb| <= 2: gap-1 (rows 1, 6) and gap-2 (row 2).
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows: alloc::vec::Vec<i64> = c
+            .query("SELECT rowid FROM t WHERE t MATCH 'NEAR(alpha beta, 1)' ORDER BY rowid")
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        assert!(
+            INDEX_ROUTE_HITS.load(Ordering::Relaxed) > before,
+            "two-term NEAR must take the index route"
+        );
+        assert_eq!(rows, [1, 2, 6]);
+
+        // NEAR(alpha beta, 0) → |pa-pb| <= 1: only adjacent rows 1 and 6.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows: alloc::vec::Vec<i64> = c
+            .query("SELECT rowid FROM t WHERE t MATCH 'NEAR(alpha beta, 0)' ORDER BY rowid")
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        assert!(
+            INDEX_ROUTE_HITS.load(Ordering::Relaxed) > before,
+            "two-term NEAR(.,0) must take the index route"
+        );
+        assert_eq!(rows, [1, 6]);
+
+        // Default distance NEAR(alpha beta) = n=10 → all docs with both terms in
+        // some column within 11 positions: rows 1, 2, 3, 6 (row 5 is split columns).
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows: alloc::vec::Vec<i64> = c
+            .query("SELECT rowid FROM t WHERE t MATCH 'NEAR(alpha beta)' ORDER BY rowid")
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        assert!(
+            INDEX_ROUTE_HITS.load(Ordering::Relaxed) > before,
+            "default-distance NEAR must take the index route"
+        );
+        assert_eq!(rows, [1, 2, 3, 6]);
     }
 
     /// A lone bare PREFIX term (`tbl MATCH 'pre*'`, table-wide and column-scoped)

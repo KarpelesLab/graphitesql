@@ -2672,6 +2672,48 @@ pub(crate) fn fts5_two_term_phrase_column(
     Some((column, keys))
 }
 
+/// If `pattern` is a SINGLE TWO-SINGLE-TOKEN BARE-TERM `NEAR` GROUP
+/// (`NEAR(a b, n)`, or `NEAR(a b)` with the default distance 10), return
+/// `(token a key, token b key, n)`; otherwise `None`.
+///
+/// This is the `NEAR` sibling of [`fts5_two_term_phrase`], feeding
+/// [`crate::fts5_index::lookup_near_rowids`]. The shape it accepts is narrow on
+/// purpose, so the index result is provably identical to the
+/// [`fts5_query_matches`] scan: the whole query lexes to exactly ONE `NEAR` group
+/// (no surrounding boolean/term — `a AND NEAR(...)` and a trailing term stay on the
+/// scan), the group has exactly TWO operands, and EACH operand is a plain,
+/// uncolumned, unanchored, non-prefix, single-token bare word (via
+/// [`fts5_bare_term_key`]). The two tokens are re-tokenized through the table's
+/// tokenizer (matching the scan's [`fts5_term_starts`], which stems query tokens
+/// under `porter`) so the keys equal the indexed tokens; an operand that does not
+/// tokenize to exactly one token is rejected.
+///
+/// For two single tokens the scan's NEAR rule `max_end − min_start < n + total_len`
+/// (`total_len = 2`) reduces to `|pa − pb| <= n + 1`, which
+/// [`crate::fts5_index::lookup_near_rowids`] applies to the two terms' per-column
+/// positions — exactly what [`fts5_near_matches`] computes. Anything else (a column
+/// filter, anchor, prefix, multi-word phrase, ≠2 operands, or any boolean wrapper)
+/// returns `None` and stays on the scan.
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_two_term_near(pattern: &str, tok: Fts5Tok) -> Option<(Vec<u8>, Vec<u8>, usize)> {
+    let toks = fts5_lex(pattern, tok);
+    // The entire query must be exactly one NEAR group (no surrounding operators or
+    // juxtaposed terms — those are boolean shapes that stay on the scan).
+    let (phrases, dist) = match toks.as_slice() {
+        [Fts5Lex::Near(phrases, dist)] => (phrases, *dist),
+        _ => return None,
+    };
+    // Exactly two operands, each a plain single-token bare word.
+    let [a, b] = phrases.as_slice() else {
+        return None;
+    };
+    Some((
+        fts5_bare_term_key(a, tok)?,
+        fts5_bare_term_key(b, tok)?,
+        dist,
+    ))
+}
+
 /// The boolean connective of a bare-term `MATCH` node the index can serve via a
 /// sorted-merge set-op on its children's rowid lists ([`Fts5BoolTree`]).
 #[cfg(feature = "fts5")]

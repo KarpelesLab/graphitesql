@@ -339,10 +339,15 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
     (precedence pinned by differential tests). And a **prefix term**
     (`tbl MATCH 'wor*'`, table-wide and column-scoped) — `lookup_prefix_rowids`
     walks the sorted leaf term keys, unions the doclists of every term sharing the
-    prefix; matches the scan (prefix tokens are not Porter-stemmed). *Remaining:*
-    index-route ≥3-term phrases / `NEAR` / multi-segment shapes, and dlidx/interior
-    decode
-    (D2b-3 leftover).
+    prefix; matches the scan (prefix tokens are not Porter-stemmed). And a
+    **two-term `NEAR(a b, n)`** (default n=10) — `lookup_near_rowids` intersects
+    the two terms' doclists and keeps docs with a per-column position pair within
+    the span; the distance inequality `|pa-pb| <= n+1` is derived from the scan's
+    general `max_end - min_start < n + total_len` rule (two single tokens →
+    total_len 2) and pinned vs `sqlite3` at the boundary. *Remaining:* index-route
+    ≥3-term phrases / ≥3-phrase `NEAR` / multi-segment shapes, and dlidx/interior
+    decode (D2b-3 leftover). Single-segment single-/two-operand MATCH is now
+    comprehensively index-routed.
   - **D2b-3** — *Done (multi-leaf):* `decode_term` now handles **multi-leaf term
     pagination** (terms across leaves, each with its own page-index footer) and
     **doclist spanning** (carried poslist tail + absolute first-rowid on the
