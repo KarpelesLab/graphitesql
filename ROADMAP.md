@@ -287,14 +287,18 @@ is *perf/coverage*, not correctness.
       FULL-join order (left-driven rows, then unmatched-right). A single 2-table
       `LEFT`/`RIGHT`/`FULL JOIN` (no `NATURAL`/`USING`) routes here; `NATURAL`/
       `USING`, 3+-table or non-nested-loopable shapes fall back to the tree-walker.
-      `ORDER BY` over these outer joins is now supported too: every emission point
-      (matched, left-null, and — for FULL — right-null) stages its projected row +
-      sort keys into one sorter (the null-padded row's keys read NULL via the
-      `NullRow`-cleared `ColumnC`s), then a single sorted emit loop applies
-      OFFSET/LIMIT to the ordered output — mirroring the inner-join sorter path.
-      Verified vs the differential corpus + unit/integration tests (incl. `WHERE
-      …col IS NULL`, both empty sides, compound `ON`, `coalesce` over nulls,
-      LIMIT/OFFSET across passes, and `ORDER BY` with NULL-first/last keys).
+      `ORDER BY` and `DISTINCT` over these outer joins are now supported too, at
+      full parity with the inner-join path. Every emission point (matched, left-null,
+      and — for FULL — right-null) projects its row, then a `DistinctCheck` gates it
+      on uniqueness (when `DISTINCT`, BINARY collation only) and — under `ORDER BY` —
+      stages the row + sort keys into one sorter (the null-padded row's keys/columns
+      read NULL via the `NullRow`-cleared `ColumnC`s); a single sorted emit loop then
+      applies OFFSET/LIMIT to the ordered output. `DISTINCT` collapses duplicate
+      matched AND duplicate null-padded rows (two all-NULL right sides compare equal),
+      across both FULL passes. Verified vs the differential corpus + unit/integration
+      tests (incl. `WHERE …col IS NULL`, both empty sides, compound `ON`, `coalesce`
+      over nulls, LIMIT/OFFSET across passes, `ORDER BY` with NULL-first/last keys,
+      and `DISTINCT` over duplicate matched/null-padded rows).
   - **B5b-2** — seek-driven inner cursor (rowid/PK/index) over real storage
     (`OpenRead` + a b-tree `TableCursor`), mirroring the tree-walker's inner-join
     seeks. Needs the VDBE interpreter to hold live storage cursors (the larger B8

@@ -222,6 +222,69 @@ fn distinct_over_join_runs_on_vdbe() {
 }
 
 #[test]
+fn distinct_over_outer_join_runs_on_vdbe() {
+    // DISTINCT over a LEFT/FULL JOIN gates every emitted row (matched and
+    // null-padded) on uniqueness, on the VDBE (query_vdbe errors on any fallback).
+    // Matches sqlite 3.50.4. Duplicate matched rows AND duplicate null-padded rows
+    // collapse; an all-NULL right side compares equal across duplicates.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x, y)").unwrap();
+    c.execute("INSERT INTO a VALUES(1,'a'),(1,'a2'),(2,'b'),(3,'c')")
+        .unwrap();
+    c.execute("CREATE TABLE b(p, q)").unwrap();
+    c.execute("INSERT INTO b VALUES(1,'P'),(2,'Q'),(2,'R')")
+        .unwrap();
+    // x=1 matches twice (dup), x=2 matches twice (dup), x=3 null-pads → {1,2,3}.
+    let r = c
+        .query_vdbe("SELECT DISTINCT a.x FROM a LEFT JOIN b ON a.x = b.p ORDER BY a.x DESC")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(3)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(1)],
+        ]
+    );
+    // DISTINCT over both columns: the null-padded (3, NULL) row is its own distinct
+    // row and survives.
+    let r2 = c
+        .query_vdbe("SELECT DISTINCT a.x, b.q FROM a LEFT JOIN b ON a.x = b.p ORDER BY a.x, b.q")
+        .unwrap();
+    assert_eq!(
+        r2.rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("P".into())],
+            vec![Value::Integer(2), Value::Text("Q".into())],
+            vec![Value::Integer(2), Value::Text("R".into())],
+            vec![Value::Integer(3), Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn distinct_over_full_join_runs_on_vdbe() {
+    // DISTINCT over a FULL JOIN: duplicate matched, left-null, and right-null rows
+    // all collapse across the two passes. Matches sqlite 3.50.4.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x)").unwrap();
+    c.execute("INSERT INTO a VALUES(1),(2),(2)").unwrap();
+    c.execute("CREATE TABLE b(p)").unwrap();
+    c.execute("INSERT INTO b VALUES(2),(5),(5)").unwrap();
+    let r = c
+        .query_vdbe("SELECT DISTINCT a.x, b.p FROM a FULL JOIN b ON a.x = b.p ORDER BY a.x, b.p")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Null, Value::Integer(5)],
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::Integer(2)],
+        ]
+    );
+}
+
+#[test]
 fn order_by_over_join_runs_on_vdbe() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x, y)").unwrap();

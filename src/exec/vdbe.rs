@@ -2101,11 +2101,12 @@ pub fn compile_group_join(
 /// `WHERE`. Unlike an inner join the `on` predicate is NOT merged into `WHERE`
 /// (the two have different roles for the unmatched row), so the caller passes it
 /// separately and leaves `sel.where_clause` as the query's own `WHERE`. Supports
-/// projection + WHERE + ORDER BY (staged through a sorter) + constant LIMIT/OFFSET;
-/// returns `Unsupported` for GROUP BY / aggregates / HAVING / DISTINCT so the caller
-/// falls back. Without ORDER BY the row order matches SQLite (each left row's matches
-/// in inner-scan order, else its null row); with ORDER BY both the matched and the
-/// null-padded rows are staged into the sorter and emitted in key order.
+/// projection + WHERE + DISTINCT (BINARY) + ORDER BY (staged through a sorter) +
+/// constant LIMIT/OFFSET; returns `Unsupported` for GROUP BY / aggregates / HAVING
+/// so the caller falls back. Without ORDER BY the row order matches SQLite (each left
+/// row's matches in inner-scan order, else its null row); with ORDER BY both the
+/// matched and the null-padded rows are staged into the sorter and emitted in key
+/// order. DISTINCT gates each emitted row (matched and null-padded) on uniqueness.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_left_join2(
     sel: &Select,
@@ -2116,10 +2117,17 @@ pub fn compile_left_join2(
     n_left: usize,
     on: &Option<Expr>,
 ) -> Result<Program> {
-    if !sel.compound.is_empty() || !sel.group_by.is_empty() || sel.having.is_some() || sel.distinct
-    {
+    if !sel.compound.is_empty() || !sel.group_by.is_empty() || sel.having.is_some() {
         return Err(Error::Unsupported(
             "VDBE: left-join shape not nested-loopable",
+        ));
+    }
+    // DISTINCT compares output rows under BINARY; a non-BINARY column collation
+    // would diverge, so defer those to the tree-walker (as the inner-join and
+    // single-table paths do).
+    if sel.distinct && collations.iter().any(|cl| *cl != Collation::Binary) {
+        return Err(Error::Unsupported(
+            "VDBE: non-BINARY collation with DISTINCT",
         ));
     }
     let projections = expand_projections(sel, columns, tables)?;
@@ -2233,6 +2241,19 @@ pub fn compile_left_join2(
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
     }
+    // DISTINCT gates the projected row before OFFSET/LIMIT/sorter — a duplicate must
+    // not consume the budget nor enter the sorter (as in the inner-join path).
+    let distinct_skip_m = if sel.distinct {
+        let at = c.ops.len();
+        c.ops.push(Op::DistinctCheck {
+            start: 0,
+            count,
+            target: 0,
+        });
+        Some(at)
+    } else {
+        None
+    };
     let (offset_skip_m, limit_m) = if ordering {
         for (j, (expr, _)) in key_specs.iter().enumerate() {
             c.compile_expr_into(expr, key_start + j)?;
@@ -2289,6 +2310,17 @@ pub fn compile_left_join2(
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
     }
+    let distinct_skip_n = if sel.distinct {
+        let at = c.ops.len();
+        c.ops.push(Op::DistinctCheck {
+            start: 0,
+            count,
+            target: 0,
+        });
+        Some(at)
+    } else {
+        None
+    };
     let (offset_skip_n, limit_n) = if ordering {
         for (j, (expr, _)) in key_specs.iter().enumerate() {
             c.compile_expr_into(expr, key_start + j)?;
@@ -2364,6 +2396,7 @@ pub fn compile_left_join2(
         | Op::IfPosDecr { target, .. }
         | Op::DecrJumpZero { target, .. }
         | Op::Goto { target }
+        | Op::DistinctCheck { target, .. }
         | Op::RewindC { target, .. } => *target = tgt,
         _ => {}
     };
@@ -2375,6 +2408,9 @@ pub fn compile_left_join2(
     if let Some(at) = where_skip_m {
         set(&mut c.ops, at, next1); // matched row filtered → next inner row
     }
+    if let Some(at) = distinct_skip_m {
+        set(&mut c.ops, at, next1); // duplicate matched row → next inner row
+    }
     if let Some(at) = offset_skip_m {
         set(&mut c.ops, at, next1);
     }
@@ -2385,6 +2421,9 @@ pub fn compile_left_join2(
     set(&mut c.ops, goto_next0, next0); // matched → advance outer
     if let Some(at) = where_skip_n {
         set(&mut c.ops, at, next0); // null row filtered → advance outer
+    }
+    if let Some(at) = distinct_skip_n {
+        set(&mut c.ops, at, next0); // duplicate null-padded row → advance outer
     }
     if let Some(at) = offset_skip_n {
         set(&mut c.ops, at, next0);
@@ -2404,13 +2443,14 @@ pub fn compile_left_join2(
     })
 }
 
-/// Emit one output row: project into registers `[0, count)`. With ORDER BY
-/// (`sorter` is `Some((key_start, key_specs))`), evaluate the sort keys and stage
-/// the row + keys into the sorter, returning `(None, None)` (LIMIT/OFFSET apply to
-/// the sorted emit loop). Without it, apply the OFFSET skip, `ResultRow`, then the
-/// LIMIT decrement, returning the OFFSET-skip and LIMIT-done op indices (their jump
-/// targets are backpatched by the caller). Shared by the FULL-join compiler's three
-/// emission points.
+/// Emit one output row: project into registers `[0, count)`, then (when `distinct`)
+/// a `DistinctCheck` gating the row on uniqueness. With ORDER BY (`sorter` is
+/// `Some((key_start, key_specs))`), evaluate the sort keys and stage the row + keys
+/// into the sorter (LIMIT/OFFSET apply to the sorted emit loop); without it, apply
+/// the OFFSET skip, `ResultRow`, then the LIMIT decrement. Returns the OFFSET-skip,
+/// LIMIT-done, and DISTINCT-skip op indices (their jump targets are backpatched by
+/// the caller; the OFFSET/LIMIT pair is `(None, None)` under ORDER BY). Shared by
+/// the FULL-join compiler's three emission points.
 fn emit_output_row(
     c: &mut Compiler,
     projections: &[(Expr, String)],
@@ -2418,10 +2458,24 @@ fn emit_output_row(
     offset_reg: Option<usize>,
     limit_reg: Option<usize>,
     sorter: Option<(usize, &[(Expr, SortKey)])>,
-) -> Result<(Option<usize>, Option<usize>)> {
+    distinct: bool,
+) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
     }
+    // DISTINCT gates the projected row before OFFSET/LIMIT/sorter — a duplicate must
+    // not consume the budget nor enter the sorter.
+    let distinct_skip = if distinct {
+        let at = c.ops.len();
+        c.ops.push(Op::DistinctCheck {
+            start: 0,
+            count,
+            target: 0,
+        });
+        Some(at)
+    } else {
+        None
+    };
     if let Some((key_start, key_specs)) = sorter {
         for (j, (expr, _)) in key_specs.iter().enumerate() {
             c.compile_expr_into(expr, key_start + j)?;
@@ -2432,7 +2486,7 @@ fn emit_output_row(
             key_start,
             key_count: key_specs.len(),
         });
-        return Ok((None, None));
+        return Ok((None, None, distinct_skip));
     }
     let offset_skip = offset_reg.map(|r| {
         let at = c.ops.len();
@@ -2445,7 +2499,7 @@ fn emit_output_row(
         c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
         at
     });
-    Ok((offset_skip, limit_done))
+    Ok((offset_skip, limit_done, distinct_skip))
 }
 
 /// Compile a two-table `FULL JOIN` (`SELECT … FROM a FULL JOIN b ON …`) into a
@@ -2455,9 +2509,10 @@ fn emit_output_row(
 /// the right table and emits each row NOT matched in pass 1, with the left side
 /// NULL (`IfMatched` skips the matched ones). This yields SQLite's FULL-join order
 /// (all left-driven rows, then the unmatched-right rows). `ON` is kept separate
-/// from `WHERE`; supports projection + WHERE + ORDER BY (all three emission points
-/// stage through one sorter) + constant LIMIT/OFFSET; returns `Unsupported` for
-/// GROUP BY / aggregates / HAVING / DISTINCT.
+/// from `WHERE`; supports projection + WHERE + DISTINCT (BINARY) + ORDER BY (all
+/// three emission points stage through one sorter) + constant LIMIT/OFFSET; returns
+/// `Unsupported` for GROUP BY / aggregates / HAVING. DISTINCT gates every emitted row
+/// (matched, left-null, right-null) on uniqueness across both passes.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_full_join2(
     sel: &Select,
@@ -2468,10 +2523,16 @@ pub fn compile_full_join2(
     n_left: usize,
     on: &Option<Expr>,
 ) -> Result<Program> {
-    if !sel.compound.is_empty() || !sel.group_by.is_empty() || sel.having.is_some() || sel.distinct
-    {
+    if !sel.compound.is_empty() || !sel.group_by.is_empty() || sel.having.is_some() {
         return Err(Error::Unsupported(
             "VDBE: full-join shape not nested-loopable",
+        ));
+    }
+    // DISTINCT compares output rows under BINARY; a non-BINARY column collation
+    // would diverge, so defer those to the tree-walker.
+    if sel.distinct && collations.iter().any(|cl| *cl != Collation::Binary) {
+        return Err(Error::Unsupported(
+            "VDBE: non-BINARY collation with DISTINCT",
         ));
     }
     let projections = expand_projections(sel, columns, tables)?;
@@ -2546,6 +2607,7 @@ pub fn compile_full_join2(
         | Op::DecrJumpZero { target, .. }
         | Op::Goto { target }
         | Op::IfMatched { target, .. }
+        | Op::DistinctCheck { target, .. }
         | Op::RewindC { target, .. } => *target = tgt,
         _ => {}
     };
@@ -2595,8 +2657,15 @@ pub fn compile_full_join2(
         }
         None => None,
     };
-    let (offset_m, limit_m) =
-        emit_output_row(&mut c, &projections, count, offset_reg, limit_reg, sorter)?;
+    let (offset_m, limit_m, distinct_m) = emit_output_row(
+        &mut c,
+        &projections,
+        count,
+        offset_reg,
+        limit_reg,
+        sorter,
+        sel.distinct,
+    )?;
     let next1 = c.ops.len();
     c.ops.push(Op::NextC {
         cursor: 1,
@@ -2623,8 +2692,15 @@ pub fn compile_full_join2(
         }
         None => None,
     };
-    let (offset_lnull, limit_lnull) =
-        emit_output_row(&mut c, &projections, count, offset_reg, limit_reg, sorter)?;
+    let (offset_lnull, limit_lnull, distinct_lnull) = emit_output_row(
+        &mut c,
+        &projections,
+        count,
+        offset_reg,
+        limit_reg,
+        sorter,
+        sel.distinct,
+    )?;
     let next0 = c.ops.len();
     c.ops.push(Op::NextC {
         cursor: 0,
@@ -2656,8 +2732,15 @@ pub fn compile_full_join2(
         }
         None => None,
     };
-    let (offset_rnull, limit_rnull) =
-        emit_output_row(&mut c, &projections, count, offset_reg, limit_reg, sorter)?;
+    let (offset_rnull, limit_rnull, distinct_rnull) = emit_output_row(
+        &mut c,
+        &projections,
+        count,
+        offset_reg,
+        limit_reg,
+        sorter,
+        sel.distinct,
+    )?;
     let next2 = c.ops.len();
     c.ops.push(Op::NextC {
         cursor: 1,
@@ -2711,6 +2794,9 @@ pub fn compile_full_join2(
     if let Some(at) = where_m {
         set(&mut c.ops, at, next1);
     }
+    if let Some(at) = distinct_m {
+        set(&mut c.ops, at, next1); // duplicate matched row → next inner row
+    }
     if let Some(at) = offset_m {
         set(&mut c.ops, at, next1);
     }
@@ -2722,6 +2808,9 @@ pub fn compile_full_join2(
     if let Some(at) = where_lnull {
         set(&mut c.ops, at, next0);
     }
+    if let Some(at) = distinct_lnull {
+        set(&mut c.ops, at, next0); // duplicate left-null row → advance outer
+    }
     if let Some(at) = offset_lnull {
         set(&mut c.ops, at, next0);
     }
@@ -2732,6 +2821,9 @@ pub fn compile_full_join2(
     set(&mut c.ops, if_matched, next2); // already matched → skip
     if let Some(at) = where_rnull {
         set(&mut c.ops, at, next2);
+    }
+    if let Some(at) = distinct_rnull {
+        set(&mut c.ops, at, next2); // duplicate right-null row → next right row
     }
     if let Some(at) = offset_rnull {
         set(&mut c.ops, at, next2);
