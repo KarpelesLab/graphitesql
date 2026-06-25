@@ -740,6 +740,13 @@ fn gather_doclist_runs<'a>(
 /// back to the document scan rather than reading a truncated doclist. The empty
 /// result `Some(vec![])` never occurs — a present term always has at least one
 /// posting.
+///
+/// Now used only by the in-crate decoder unit tests: the live phrase/NEAR routes
+/// decode per-segment via [`decode_term_strict`] (which distinguishes an absent term
+/// from an unservable segment), and the bare-term/prefix/boolean routes go through
+/// [`merge_segments`]. It is retained as the readable single-segment reference the
+/// strict decoder mirrors.
+#[cfg(test)]
 pub(crate) fn decode_term(leaves: &[&[u8]], term: &[u8]) -> Option<Vec<DecodedPosting>> {
     let key = term_key(term);
     // Parse every leaf once. A malformed/unsupported leaf (e.g. an interior page)
@@ -814,47 +821,9 @@ struct SegmentLoc {
     pgno_last: i64,
 }
 
-/// Parse the structure record (the inverse of [`structure`]) and, IF the index
-/// holds exactly one height-0 segment, return its location. Returns `None` for
-/// the empty index, a multi-segment / multi-level index (a merged or
-/// incrementally-updated index that the single-segment leaf reader can't serve),
-/// or a malformed record — the caller then falls back to the `%_content` scan.
-///
-/// Layout: 4-byte BE cookie, then varints `nLevel`, `nSegment`, `nWriteCounter`,
-/// then per level `nMerge`, `nSeg`, then per segment `segid`, `pgnoFirst`,
-/// `pgnoLast`. graphite always writes a single fresh segment, so this recognizes
-/// exactly that shape (one level, one segment) and declines anything else.
-fn single_segment(structure: &[u8]) -> Option<SegmentLoc> {
-    // The 4-byte config cookie precedes the varint body.
-    let mut pos = 4usize;
-    let n_level = read_varint(structure, &mut pos)?;
-    let n_segment = read_varint(structure, &mut pos)?;
-    let _n_write_counter = read_varint(structure, &mut pos)?;
-    // Only the simple, single-segment shape is served from the leaf reader.
-    if n_level != 1 || n_segment != 1 {
-        return None;
-    }
-    let n_merge = read_varint(structure, &mut pos)?;
-    let n_seg = read_varint(structure, &mut pos)?;
-    if n_merge != 0 || n_seg != 1 {
-        return None;
-    }
-    let segid = read_varint(structure, &mut pos)? as i64;
-    let pgno_first = read_varint(structure, &mut pos)? as i64;
-    let pgno_last = read_varint(structure, &mut pos)? as i64;
-    if segid <= 0 || pgno_first < 1 || pgno_last < pgno_first {
-        return None;
-    }
-    Some(SegmentLoc {
-        segid,
-        pgno_first,
-        pgno_last,
-    })
-}
-
 /// Parse the structure record (the inverse of [`structure`]) into the locations of
 /// EVERY height-0 segment, across all levels, or `None` for an empty index or a
-/// malformed record. Unlike [`single_segment`] this does not require a single
+/// malformed record. This does not require a single
 /// segment: an `sqlite3`-written FTS5 table accumulates several segments per level
 /// (and several levels) after many inserts until an `'optimize'`/merge collapses
 /// them, so the multi-segment bare-term/boolean/prefix routes ([`decode_term_strict`])
@@ -1023,16 +992,17 @@ fn merge_segments(
 
 /// Look up `term` in an FTS5 index given its `%_data` rows, returning the rowids
 /// of the documents that contain the term (ascending), or `None` if the index
-/// shape is one the single-segment leaf reader cannot serve.
+/// shape is one the leaf reader cannot serve.
 ///
 /// `data` is the `(id, block)` rows of the `%_data` shadow table (the structure
 /// record at id 10 plus the height-0 leaves). This is the wiring used by `MATCH`:
-/// it parses the structure record, and only when the index is a single height-0
-/// segment ([`single_segment`]) does it gather that segment's leaves in page
-/// order and call [`decode_term`]. A `None` return (multi-segment index, an
-/// interior/doclist-index page, a missing leaf, or a malformed record) tells the
-/// caller to fall back to the `%_content` document scan. A present term that is
-/// genuinely absent from a servable single-segment index returns `Some(vec![])`.
+/// it parses the structure record, gathers EVERY height-0 segment's leaves in page
+/// order and decodes the term in each, UNIONing the postings via
+/// [`merge_segments`] ([`decode_term_in_data`]). A `None` return (an
+/// interior/doclist-index page, a missing leaf, a malformed record, a tombstone, or
+/// a docid shared across segments) tells the caller to fall back to the `%_content`
+/// document scan. A present term genuinely absent from a servable index returns
+/// `Some(vec![])`.
 pub(crate) fn lookup_term_rowids(data: &[(i64, Vec<u8>)], term: &[u8]) -> Option<Vec<i64>> {
     decode_term_in_data(data, term).map(|postings| postings.into_iter().map(|p| p.rowid).collect())
 }
@@ -1117,29 +1087,6 @@ pub(crate) fn lookup_prefix_rowids_in_column(
     Some(prefix_rowids(postings, |p| {
         p.cols.get(column).is_some_and(|c| !c.is_empty())
     }))
-}
-
-/// Gather the single height-0 segment's leaf blobs (in page order) from a `%_data`
-/// index, or `None` if the shape is unservable (multi-segment / interior / missing
-/// leaf / malformed structure record). Shared by the term and phrase lookups so a
-/// query reads the structure record and locates the leaves exactly once.
-///
-/// Bumps the test-only [`INDEX_ROUTE_HITS`] counter once per servable call, so a
-/// query that takes the index route (whether single-term or phrase) counts as one
-/// hit regardless of how many distinct terms it decodes from the gathered leaves.
-fn segment_leaves(data: &[(i64, Vec<u8>)]) -> Option<Vec<&[u8]>> {
-    let structure = &data.iter().find(|(id, _)| *id == STRUCTURE_ROWID)?.1;
-    let loc = single_segment(structure)?;
-    // Gather the segment's leaves in page order; abort (→ scan) if any is missing.
-    let mut leaves: Vec<&[u8]> = Vec::new();
-    for pgno in loc.pgno_first..=loc.pgno_last {
-        let rid = segment_leaf_rowid(loc.segid, pgno);
-        let blob = &data.iter().find(|(id, _)| *id == rid)?.1;
-        leaves.push(blob.as_slice());
-    }
-    #[cfg(test)]
-    INDEX_ROUTE_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    Some(leaves)
 }
 
 /// Resolve `term`'s postings from a `%_data` index — across ONE OR MORE height-0
@@ -1275,35 +1222,98 @@ fn phrase_intersect_k(postings: &[Vec<DecodedPosting>], column: Option<usize>) -
     }
 }
 
-/// Look up the K-token phrase `"t0 t1 … t(K-1)"` (K ≥ 2) in a single-segment FTS5
-/// index and return the rowids of the documents where the tokens occur at
-/// CONSECUTIVE positions in one column (`terms[i]` at position `p + i`), ascending
-/// — or `None` if the index shape is one the single-segment leaf reader cannot
+/// Decode each of `terms`' postings ACROSS EVERY height-0 segment of `data`, one
+/// unioned ascending-by-rowid posting list per term — or `None` if the position-based
+/// merge is not provably correct, in which case the caller falls back to the
+/// `%_content` scan. The position-based (phrase / NEAR) analogue of
+/// [`merge_segments`]: where that route only needs rowids, this preserves each
+/// posting's per-column positions so the existing adjacency/run/NEAR checks
+/// (`phrase_run_matches`/`near_matches`) can run unchanged on the merged set.
+///
+/// SAFETY — the same model as [`merge_segments`]. In a pure-insert history each
+/// docid lives in exactly ONE segment, so a doc's per-column POSITIONS for every
+/// term come wholly from that one segment — there is no cross-segment position
+/// merge to do. We enforce that this holds and bail otherwise:
+///
+/// * any term in any segment returns [`SegDecode::Bail`] (interior page /
+///   tombstone / malformed leaf) → `None`;
+/// * any docid appears in MORE THAN ONE segment, considering ALL `terms` together
+///   (an update/delete wrote a newer, shadowing entry whose layering precedence
+///   this slice does not resolve) → `None`.
+///
+/// Otherwise each docid is confined to a single segment for every term, so simply
+/// concatenating a term's per-segment postings and sorting by rowid yields exactly
+/// the positions the `_content` scan sees. The combined-overlap check is stricter
+/// than (and subsumes) `merge_segments`' per-term check: a docid posted by two
+/// different terms must come from the same segment, which is guaranteed in a
+/// pure-insert index, so a violation means the layered case — bail.
+fn decode_terms_multiseg(
+    data: &[(i64, Vec<u8>)],
+    terms: &[&[u8]],
+) -> Option<Vec<Vec<DecodedPosting>>> {
+    let segments = segments_leaves(data)?;
+    let mut per_term: Vec<Vec<DecodedPosting>> = alloc::vec![Vec::new(); terms.len()];
+    // (rowid, segment index) for every posting of every term, to detect a docid
+    // that straddles two segments (the ambiguous-precedence case → bail).
+    let mut seen_segidx: Vec<(i64, usize)> = Vec::new();
+    for (si, leaves) in segments.iter().enumerate() {
+        for (ti, term) in terms.iter().enumerate() {
+            match decode_term_strict(leaves, term) {
+                SegDecode::Bail => return None,
+                SegDecode::Postings(postings) => {
+                    for p in postings {
+                        seen_segidx.push((p.rowid, si));
+                        per_term[ti].push(p);
+                    }
+                }
+            }
+        }
+    }
+    // Bail if any docid appears in more than one segment (ambiguous precedence).
+    seen_segidx.sort_unstable();
+    for w in seen_segidx.windows(2) {
+        if w[0].0 == w[1].0 && w[0].1 != w[1].1 {
+            return None;
+        }
+    }
+    // Each term's postings, concatenated across segments, must be ascending by
+    // rowid for the docid-aligned intersections; the no-overlap check guarantees no
+    // duplicate rowid within a term, so sorting alone canonicalizes the order.
+    for postings in &mut per_term {
+        postings.sort_by_key(|p| p.rowid);
+    }
+    Some(per_term)
+}
+
+/// Look up the K-token phrase `"t0 t1 … t(K-1)"` (K ≥ 2) in an FTS5 index — across
+/// ONE OR MORE height-0 segments — and return the rowids of the documents where the
+/// tokens occur at CONSECUTIVE positions in one column (`terms[i]` at position
+/// `p + i`), ascending — or `None` if the index shape is one the leaf reader cannot
 /// serve (so the caller falls back to the `%_content` scan).
 ///
-/// The phrase sibling of [`lookup_term_rowids`]: it decodes EVERY term's
-/// doclist from the one gathered segment, intersects them by docid, and keeps the
-/// shared docs whose per-column positions form a consecutive run — the exact set
-/// the scan's K-token phrase predicate ([`crate::vtab`] `fts5_phrase_starts`)
-/// matches. Any term being absent yields `Some(vec![])` (servable, no match).
-/// Repeated-word phrases work because a repeated term decodes the same position
-/// list and the run check reads it at successive offsets.
+/// The phrase sibling of [`lookup_term_rowids`]: it decodes EVERY term's doclist
+/// across every segment ([`decode_terms_multiseg`], which bails on a tombstone or a
+/// docid shared across segments), intersects them by docid, and keeps the shared
+/// docs whose per-column positions form a consecutive run — the exact set the scan's
+/// K-token phrase predicate ([`crate::vtab`] `fts5_phrase_starts`) matches. Any term
+/// being absent yields `Some(vec![])` (servable, no match). Repeated-word phrases
+/// work because a repeated term decodes the same position list and the run check
+/// reads it at successive offsets. For a single-segment index this is exactly the old
+/// single-segment decode; for a multi-segment pure-insert index it returns the same
+/// set the `_content` scan would.
 pub(crate) fn lookup_phrase_rowids_k(data: &[(i64, Vec<u8>)], terms: &[&[u8]]) -> Option<Vec<i64>> {
     if terms.len() < 2 {
         return None;
     }
-    let leaves = segment_leaves(data)?;
-    let postings: Vec<Vec<DecodedPosting>> = terms
-        .iter()
-        .map(|t| decode_term(&leaves, t).unwrap_or_default())
-        .collect();
+    let postings = decode_terms_multiseg(data, terms)?;
     Some(phrase_intersect_k(&postings, None))
 }
 
 /// Column-scoped sibling of [`lookup_phrase_rowids_k`]: keep only documents where
 /// the consecutive K-token run occurs in COLUMN `column` (its position in the
 /// table's full column list, from 0) — exactly what the scan's `col : "t0 t1 …"`
-/// predicate matches.
+/// predicate matches. Multi-segment via [`decode_terms_multiseg`] (bailing to the
+/// scan on a tombstone or a docid shared across segments).
 pub(crate) fn lookup_phrase_rowids_in_column_k(
     data: &[(i64, Vec<u8>)],
     terms: &[&[u8]],
@@ -1312,11 +1322,7 @@ pub(crate) fn lookup_phrase_rowids_in_column_k(
     if terms.len() < 2 {
         return None;
     }
-    let leaves = segment_leaves(data)?;
-    let postings: Vec<Vec<DecodedPosting>> = terms
-        .iter()
-        .map(|t| decode_term(&leaves, t).unwrap_or_default())
-        .collect();
+    let postings = decode_terms_multiseg(data, terms)?;
     Some(phrase_intersect_k(&postings, Some(column)))
 }
 
@@ -1356,28 +1362,31 @@ fn near_matches(a: &DecodedPosting, b: &DecodedPosting, n: u32) -> bool {
     (0..ncols).any(|c| near_within_in_column(col(a, c), col(b, c), n))
 }
 
-/// Look up the two-single-token NEAR group `NEAR(term_a term_b, n)` in a
-/// single-segment FTS5 index and return the rowids of the documents where the two
-/// tokens occur within `n + 1` positions of each other in the same column,
-/// ascending — or `None` if the index shape is one the single-segment leaf reader
+/// Look up the two-single-token NEAR group `NEAR(term_a term_b, n)` in an FTS5
+/// index — across ONE OR MORE height-0 segments — and return the rowids of the
+/// documents where the two tokens occur within `n + 1` positions of each other in
+/// the same column, ascending — or `None` if the index shape is one the leaf reader
 /// cannot serve (so the caller falls back to the `%_content` scan).
 ///
 /// This is the NEAR sibling of [`lookup_phrase_rowids_k`]. It decodes BOTH terms'
-/// doclists from the one gathered segment, intersects them by docid, and keeps the
-/// shared docs whose per-column positions fall inside the NEAR window — the exact
+/// doclists across every segment ([`decode_terms_multiseg`], which bails on a
+/// tombstone or a docid shared across segments), intersects them by docid, and keeps
+/// the shared docs whose per-column positions fall inside the NEAR window — the exact
 /// set the scan's two-single-token `NEAR` predicate (`fts5_near_matches`) matches.
 /// Either term being absent yields `Some(vec![])` (servable, no match). `n` is the
-/// query distance (default 10); the inequality is `|pa − pb| <= n + 1`.
+/// query distance (default 10); the inequality is `|pa − pb| <= n + 1`. For a
+/// single-segment index this is exactly the old single-segment decode.
 pub(crate) fn lookup_near_rowids(
     data: &[(i64, Vec<u8>)],
     term_a: &[u8],
     term_b: &[u8],
     n: u32,
 ) -> Option<Vec<i64>> {
-    let leaves = segment_leaves(data)?;
-    let pa = decode_term(&leaves, term_a).unwrap_or_default();
-    let pb = decode_term(&leaves, term_b).unwrap_or_default();
-    Some(phrase_intersect(&pa, &pb, |a, b| near_matches(a, b, n)))
+    let terms: [&[u8]; 2] = [term_a, term_b];
+    let postings = decode_terms_multiseg(data, &terms)?;
+    Some(phrase_intersect(&postings[0], &postings[1], |a, b| {
+        near_matches(a, b, n)
+    }))
 }
 
 /// Sorted-merge INTERSECTION of two ascending, deduplicated rowid lists.
@@ -2748,5 +2757,256 @@ mod tests {
             (STRUCTURE_ROWID, struct_body),
         ];
         assert_eq!(lookup_term_rowids(&data, b"cat"), None);
+    }
+
+    // ---- multi-segment phrase / NEAR (D2b multi-segment position-based) -------
+
+    #[test]
+    fn multiseg_two_term_phrase_unions_across_segments_and_routes() {
+        // The phrase "a b" spread over three pure-insert segments (each docid in
+        // exactly one segment). Adjacency is decided per-doc from that doc's one
+        // segment; the route must fire and union the matches ascending.
+        //   seg1: d1 a@0,b@1 (match)   d2 a@0,b@2 (gap, no)
+        //   seg2: d4 a@0,b@1 (match)   d5 b@0,a@1 ("b a", no)
+        //   seg3: d7 a@0,3 b@1 (match) d9 a@5 only (b absent in doc, no)
+        let specs = vec![
+            (
+                1i64,
+                vec![
+                    (b"a".to_vec(), vec![p(1, &[&[0]]), p(2, &[&[0]])]),
+                    (b"b".to_vec(), vec![p(1, &[&[1]]), p(2, &[&[2]])]),
+                ],
+            ),
+            (
+                2i64,
+                vec![
+                    (b"a".to_vec(), vec![p(4, &[&[0]]), p(5, &[&[1]])]),
+                    (b"b".to_vec(), vec![p(4, &[&[1]]), p(5, &[&[0]])]),
+                ],
+            ),
+            (
+                3i64,
+                vec![
+                    (b"a".to_vec(), vec![p(7, &[&[0, 3]]), p(9, &[&[5]])]),
+                    (b"b".to_vec(), vec![p(7, &[&[1]])]),
+                ],
+            ),
+        ];
+        let data = multiseg_data(&specs);
+        let before = INDEX_ROUTE_HITS.load(core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            lookup_phrase_rowids_k(&data, &[b"a", b"b"]),
+            Some(vec![1, 4, 7])
+        );
+        assert!(
+            INDEX_ROUTE_HITS.load(core::sync::atomic::Ordering::Relaxed) > before,
+            "the multi-segment phrase must take the index route"
+        );
+        // Reverse phrase "b a": only d5 (b@0, a@1).
+        assert_eq!(lookup_phrase_rowids_k(&data, &[b"b", b"a"]), Some(vec![5]));
+        // A term absent everywhere → servable empty.
+        assert_eq!(
+            lookup_phrase_rowids_k(&data, &[b"a", b"zzz"]),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn multiseg_three_term_phrase_across_segments() {
+        // "a b c" consecutive run, docids split across two segments.
+        //   seg1: d1 a@0,b@1,c@2 (match)   d2 a@0,b@1,c@3 (c not consecutive, no)
+        //   seg2: d3 a@5,b@6,c@7 (match)   d4 a@0,b@2,c@3 (b gap, no)
+        let specs = vec![
+            (
+                1i64,
+                vec![
+                    (b"a".to_vec(), vec![p(1, &[&[0]]), p(2, &[&[0]])]),
+                    (b"b".to_vec(), vec![p(1, &[&[1]]), p(2, &[&[1]])]),
+                    (b"c".to_vec(), vec![p(1, &[&[2]]), p(2, &[&[3]])]),
+                ],
+            ),
+            (
+                2i64,
+                vec![
+                    (b"a".to_vec(), vec![p(3, &[&[5]]), p(4, &[&[0]])]),
+                    (b"b".to_vec(), vec![p(3, &[&[6]]), p(4, &[&[2]])]),
+                    (b"c".to_vec(), vec![p(3, &[&[7]]), p(4, &[&[3]])]),
+                ],
+            ),
+        ];
+        let data = multiseg_data(&specs);
+        assert_eq!(
+            lookup_phrase_rowids_k(&data, &[b"a", b"b", b"c"]),
+            Some(vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn multiseg_phrase_in_column_across_segments() {
+        // Two columns; the run "a b" must be adjacent WITHIN one column.
+        //   seg1: d1 col0 a@0,b@1 (col0 match)   d2 col0 a@0 ; col1 b@1 (split, no)
+        //   seg2: d3 col1 a@2,b@3 (col1 match)   d4 col0 a@0,b@1; col1 a@5,b@6 (both)
+        let specs = vec![
+            (
+                1i64,
+                vec![
+                    (b"a".to_vec(), vec![p(1, &[&[0], &[]]), p(2, &[&[0], &[]])]),
+                    (b"b".to_vec(), vec![p(1, &[&[1], &[]]), p(2, &[&[], &[1]])]),
+                ],
+            ),
+            (
+                2i64,
+                vec![
+                    (b"a".to_vec(), vec![p(3, &[&[], &[2]]), p(4, &[&[0], &[5]])]),
+                    (b"b".to_vec(), vec![p(3, &[&[], &[3]]), p(4, &[&[1], &[6]])]),
+                ],
+            ),
+        ];
+        let data = multiseg_data(&specs);
+        // Column 0 ("a b" in col0): d1 and d4.
+        assert_eq!(
+            lookup_phrase_rowids_in_column_k(&data, &[b"a", b"b"], 0),
+            Some(vec![1, 4])
+        );
+        // Column 1 ("a b" in col1): d3 and d4.
+        assert_eq!(
+            lookup_phrase_rowids_in_column_k(&data, &[b"a", b"b"], 1),
+            Some(vec![3, 4])
+        );
+    }
+
+    #[test]
+    fn multiseg_near_unions_across_segments_and_routes() {
+        // NEAR(a b, n): |pa - pb| <= n + 1 in the same column, per-doc from its one
+        // segment.
+        //   seg1: d1 a@0,b@1 (gap1)   d2 a@0,b@5 (gap5)
+        //   seg2: d3 a@4,b@2 (gap2)   d4 a@0,b@9 (gap9)
+        let specs = vec![
+            (
+                1i64,
+                vec![
+                    (b"a".to_vec(), vec![p(1, &[&[0]]), p(2, &[&[0]])]),
+                    (b"b".to_vec(), vec![p(1, &[&[1]]), p(2, &[&[5]])]),
+                ],
+            ),
+            (
+                2i64,
+                vec![
+                    (b"a".to_vec(), vec![p(3, &[&[4]]), p(4, &[&[0]])]),
+                    (b"b".to_vec(), vec![p(3, &[&[2]]), p(4, &[&[9]])]),
+                ],
+            ),
+        ];
+        let data = multiseg_data(&specs);
+        let before = INDEX_ROUTE_HITS.load(core::sync::atomic::Ordering::Relaxed);
+        // n=1 → window |pa-pb| <= 2: d1 (gap1), d3 (gap2). d2 (gap5), d4 (gap9) out.
+        assert_eq!(lookup_near_rowids(&data, b"a", b"b", 1), Some(vec![1, 3]));
+        assert!(
+            INDEX_ROUTE_HITS.load(core::sync::atomic::Ordering::Relaxed) > before,
+            "the multi-segment NEAR must take the index route"
+        );
+        // n=4 → window <= 5: adds d2 (gap5). d4 (gap9) still out.
+        assert_eq!(
+            lookup_near_rowids(&data, b"a", b"b", 4),
+            Some(vec![1, 2, 3])
+        );
+        // A term absent everywhere → servable empty.
+        assert_eq!(
+            lookup_near_rowids(&data, b"a", b"zzz", 10),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn multiseg_phrase_overlapping_docid_bails_to_scan() {
+        // Docid 4 appears in two segments (an update shadowed it). The phrase merge
+        // can't resolve precedence, so it bails (None) and the caller scans.
+        let specs = vec![
+            (
+                1i64,
+                vec![
+                    (b"a".to_vec(), vec![p(4, &[&[0]])]),
+                    (b"b".to_vec(), vec![p(4, &[&[1]])]),
+                ],
+            ),
+            (
+                2i64,
+                vec![
+                    (b"a".to_vec(), vec![p(4, &[&[0]])]),
+                    (b"b".to_vec(), vec![p(4, &[&[1]])]),
+                ],
+            ),
+        ];
+        let data = multiseg_data(&specs);
+        assert_eq!(lookup_phrase_rowids_k(&data, &[b"a", b"b"]), None);
+        assert_eq!(lookup_near_rowids(&data, b"a", b"b", 5), None);
+    }
+
+    #[test]
+    fn multiseg_phrase_cross_term_overlap_bails_to_scan() {
+        // Even when no single term overlaps itself, a docid shared by DIFFERENT terms
+        // across two segments is impossible in a pure-insert history (a doc lives in
+        // one segment), so it signals the layered case → bail. Here d4 carries "a" in
+        // seg1 and "b" in seg2.
+        let specs = vec![
+            (1i64, vec![(b"a".to_vec(), vec![p(4, &[&[0]])])]),
+            (2i64, vec![(b"b".to_vec(), vec![p(4, &[&[1]])])]),
+        ];
+        let data = multiseg_data(&specs);
+        assert_eq!(lookup_phrase_rowids_k(&data, &[b"a", b"b"]), None);
+        assert_eq!(lookup_near_rowids(&data, b"a", b"b", 5), None);
+    }
+
+    #[test]
+    fn multiseg_phrase_tombstone_bails_to_scan() {
+        // A DELETE tombstone in one segment's "a" doclist forces the phrase merge to
+        // bail (the strict per-segment decode returns Bail on the rejected poslist).
+        // Build seg1 normally, then a seg2 whose "a" doclist is a delete marker.
+        let mut tomb_leaf: Vec<u8> = Vec::new();
+        let mut body: Vec<u8> = Vec::new();
+        let key = term_key(b"a");
+        put_varint(&mut body, key.len() as u64);
+        body.extend_from_slice(&key);
+        let term_off = 4;
+        put_varint(&mut body, 1); // rowid 1
+        put_varint(&mut body, 1); // size2 = 1 → DELETE tombstone
+        let footer_off = 4 + body.len();
+        tomb_leaf.extend_from_slice(&0u16.to_be_bytes());
+        tomb_leaf.extend_from_slice(&(footer_off as u16).to_be_bytes());
+        tomb_leaf.extend_from_slice(&body);
+        put_varint(&mut tomb_leaf, term_off as u64);
+
+        // seg1: legitimate "a"/"b" leaves via build_segment.
+        let seg1 = build_segment(
+            &[
+                (b"a".to_vec(), vec![p(3, &[&[0]])]),
+                (b"b".to_vec(), vec![p(3, &[&[1]])]),
+            ],
+            1,
+            &[64],
+            &[],
+            4096,
+            0,
+        );
+        let leaf1 = seg1
+            .data
+            .iter()
+            .find(|(id, _)| *id == segment_leaf_rowid(1, 1))
+            .unwrap()
+            .1
+            .clone();
+
+        // Structure: two segments at one level, each one leaf.
+        let mut struct_body: Vec<u8> = 0u32.to_be_bytes().to_vec();
+        for v in [1u64, 2, 0, 0, 2, 1, 1, 1, 2, 1, 1] {
+            put_varint(&mut struct_body, v);
+        }
+        let data = vec![
+            (segment_leaf_rowid(1, 1), leaf1),
+            (segment_leaf_rowid(2, 1), tomb_leaf),
+            (STRUCTURE_ROWID, struct_body),
+        ];
+        assert_eq!(lookup_phrase_rowids_k(&data, &[b"a", b"b"]), None);
+        assert_eq!(lookup_near_rowids(&data, b"a", b"b", 5), None);
     }
 }

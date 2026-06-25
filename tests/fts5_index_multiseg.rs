@@ -1,5 +1,7 @@
-//! Roadmap D2b (multi-segment): the bare-term / boolean / prefix `MATCH` routes
-//! now read an FTS5 index with MORE THAN ONE height-0 segment, not just the single
+//! Roadmap D2b (multi-segment): the bare-term / boolean / prefix `MATCH` routes —
+//! and now the position-based phrase (2- and 3-word, table-wide and column-scoped)
+//! and two-term `NEAR` routes — read an FTS5 index with MORE THAN ONE height-0
+//! segment, not just the single
 //! bulk-rebuilt segment graphite's own writer produces. A stock `sqlite3` FTS5
 //! table accumulates several segments after many inserts (in separate
 //! transactions, until `'optimize'`/merge), so these tests build such a file with
@@ -264,6 +266,117 @@ fn multiseg_with_deletes_and_updates_still_correct() {
     cleanup(&path);
 }
 
+/// A corpus rich in adjacent and near token pairs so phrase / NEAR routes are
+/// genuinely exercised across many segments. "quick brown" / "brown fox" recur as
+/// 2- and 3-word phrases; "lazy"/"dog" appear within small NEAR windows.
+const PHRASE_DOCS: &[(i64, &str)] = &[
+    (1, "the quick brown fox"),
+    (2, "a quick brown dog"),
+    (3, "brown fox jumps high"),
+    (4, "lazy brown dog sleeps"),
+    (5, "quick red fox runs"),
+    (6, "the brown fox is quick"),
+    (7, "quick brown fox indeed"),
+    (8, "lazy dog and quick cat"),
+    (9, "brown brown brown wall"),
+    (10, "fox brown quick order"),
+    (11, "the quick brown fox jumps"),
+    (12, "dog lazy reversed words"),
+    (13, "quick quick brown brown"),
+    (14, "nothing matches in here"),
+    (15, "brown fox quick lazy dog"),
+];
+
+#[test]
+fn multiseg_phrase_and_near_match_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    build_multiseg(&path, PHRASE_DOCS);
+
+    let nseg = segment_count(&path);
+    assert!(
+        nseg > 1,
+        "expected a multi-segment index, sqlite left nSegment={nseg}"
+    );
+
+    let c = Connection::open(&path).unwrap();
+    let queries = [
+        // 2-word phrases
+        "\"quick brown\"",
+        "\"brown fox\"",
+        "\"lazy dog\"",
+        "\"brown brown\"",
+        "\"fox quick\"",
+        "\"absent words\"",
+        // 3-word phrases
+        "\"quick brown fox\"",
+        "\"the quick brown\"",
+        "\"brown fox jumps\"",
+        "\"quick brown brown\"",
+        // NEAR (two single tokens), default and explicit spans
+        "NEAR(quick fox)",
+        "NEAR(quick fox, 0)",
+        "NEAR(quick fox, 1)",
+        "NEAR(quick fox, 2)",
+        "NEAR(lazy dog, 1)",
+        "NEAR(brown lazy, 3)",
+        "NEAR(quick zebra, 5)",
+    ];
+    for q in queries {
+        let g = graphite_match(&c, q);
+        let s = sqlite_match(&path, q);
+        assert_eq!(g, s, "query {q:?}: graphite {g:?} != sqlite {s:?}");
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn multiseg_phrase_near_with_deletes_still_correct() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    build_multiseg(&path, PHRASE_DOCS);
+    // Deletes + an update in separate transactions add tombstones / shadowing
+    // segments. graphite's phrase/NEAR merge BAILS on those and falls back to the
+    // `_content` scan, which must still return sqlite's exact live set.
+    sqlite_exec(&path, "DELETE FROM t WHERE rowid = 1;"); // "the quick brown fox"
+    sqlite_exec(&path, "DELETE FROM t WHERE rowid = 7;"); // "quick brown fox indeed"
+    sqlite_exec(
+        &path,
+        "UPDATE t SET body = 'quick brown fox replaced' WHERE rowid = 11;",
+    );
+
+    let nseg = segment_count(&path);
+    assert!(
+        nseg > 1,
+        "expected a multi-segment index after edits, nSegment={nseg}"
+    );
+
+    let c = Connection::open(&path).unwrap();
+    let queries = [
+        "\"quick brown\"",
+        "\"brown fox\"",
+        "\"quick brown fox\"",
+        "NEAR(quick fox)",
+        "NEAR(quick fox, 1)",
+        "NEAR(lazy dog, 1)",
+    ];
+    for q in queries {
+        let g = graphite_match(&c, q);
+        let s = sqlite_match(&path, q);
+        assert_eq!(
+            g, s,
+            "deletes/updates phrase/near query {q:?}: graphite {g:?} != sqlite {s:?}"
+        );
+    }
+    cleanup(&path);
+}
+
 #[test]
 fn multiseg_column_scoped_match_equals_sqlite() {
     if !have_sqlite() {
@@ -301,6 +414,10 @@ fn multiseg_column_scoped_match_equals_sqlite() {
         "body : apple",
         "title : alph*",
         "body : app*",
+        // column-scoped phrases over the multi-segment index
+        "title : \"alpha title\"",
+        "body : \"alpha body\"",
+        "body : \"beta body\"",
     ];
     for q in queries {
         let g = graphite_match(&c, q);

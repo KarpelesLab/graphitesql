@@ -354,11 +354,15 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
     any length (`"a b c …"`, repeated-word, column-scoped) via a consecutive-run
     check (`phrase_run_matches`: binary-search each term[i] at start+i) + a K-way
     docid sweep (`phrase_intersect_k`) — the index analogue of the scan's
-    `fts5_phrase_starts`. *Remaining (all PERF-ONLY — the scan handles them):*
-    ≥3-phrase `NEAR`, multi-segment **phrase+NEAR** (position-based, still
-    single-segment), and dlidx/interior decode (D2b-3 leftover). MATCH is now
-    comprehensively index-routed: every shape on single-segment, and the
-    rowid-based shapes (term/column/boolean/prefix) on multi-segment too.
+    `fts5_phrase_starts`. **Multi-segment phrase+NEAR** (`decode_terms_multiseg`):
+    phrase and NEAR now route over multi-segment indexes too — each doc's
+    positions come from its owning segment, with the same tombstone +
+    combined-overlap bail-to-scan as the rowid merge (verified vs `sqlite3` incl.
+    deletes-present). **MATCH is now comprehensively index-routed: EVERY shape
+    (term/column/phrase/boolean/prefix/NEAR) on BOTH single- and multi-segment
+    indexes.** *Remaining (all PERF-ONLY — the scan handles them, results already
+    correct):* ≥3-phrase `NEAR`, and dlidx/interior segment decode (D2b-3 leftover,
+    only for a single term spanning ~16+ leaves).
   - **D2b-3** — *Done (multi-leaf):* `decode_term` now handles **multi-leaf term
     pagination** (terms across leaves, each with its own page-index footer) and
     **doclist spanning** (carried poslist tail + absolute first-rowid on the
