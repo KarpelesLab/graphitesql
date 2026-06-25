@@ -394,6 +394,14 @@ pub(crate) fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Option<Affinity> {
         }
         Expr::Cast { type_name, .. } => Some(Affinity::from_type(Some(type_name))),
         Expr::Paren(e) => expr_affinity(e, ctx),
+        // A scalar subquery contributes its single result column's affinity, so a
+        // comparison like `1 = (SELECT textcol)` applies `combine(left,
+        // candidate_col_aff)` exactly as SQLite does — the same rule `IN (SELECT)`
+        // uses. Without this the literal kept NONE affinity and the candidate
+        // column's affinity was lost (`1 = (SELECT '1'::text)` wrongly compared
+        // int-vs-text). Resolved via the subquery runner (it has schema access);
+        // `None` for a computed result column or when no runner is in scope.
+        Expr::Subquery(select) => ctx.subqueries.and_then(|sq| sq.column_affinity(select)),
         // Literals and computed expressions carry no affinity.
         _ => None,
     }

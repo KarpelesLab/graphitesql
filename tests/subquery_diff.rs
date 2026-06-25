@@ -143,3 +143,61 @@ fn in_select_affinity_matches_sqlite3() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+/// Scalar-subquery comparison affinity: `left op (SELECT col)` must use
+/// `combine(left_aff, candidate_col_aff)` exactly as SQLite — the candidate
+/// column's affinity is contributed by the subquery even when `left` is a literal
+/// (which carries none). Regression for `1 = (SELECT textcol)` wrongly comparing
+/// int-vs-text. Verified against sqlite3.
+#[test]
+fn scalar_subquery_affinity_matches_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-scalaff-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let setup = "CREATE TABLE ct(y TEXT); INSERT INTO ct VALUES('1');\
+        CREATE TABLE ci(y INTEGER); INSERT INTO ci VALUES(1);\
+        CREATE TABLE cn(y); INSERT INTO cn VALUES(1);";
+    {
+        let o = Command::new("sqlite3")
+            .arg(&path)
+            .arg(setup)
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+    }
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+    let queries = [
+        "SELECT 1 = (SELECT y FROM ct)",   // int-lit / text-col → coerce → 1
+        "SELECT '1' = (SELECT y FROM ci)", // text-lit / int-col → coerce → 1
+        "SELECT '1' = (SELECT y FROM cn)", // text-lit / none-col → no coerce → 0
+        "SELECT 1 = (SELECT y FROM cn)",   // int-lit / none-col → no coerce → 1 (int==int)
+        "SELECT 1 < (SELECT y FROM ct)",   // ordered comparison too
+        "SELECT 2 > (SELECT y FROM ct)",
+        "SELECT 1 = (SELECT y || '' FROM ct)", // computed candidate → NONE aff
+    ];
+    for q in queries {
+        let want = {
+            let o = Command::new("sqlite3")
+                .arg(&path)
+                .arg(format!("{q};"))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        assert_eq!(
+            render(&g.query(q).unwrap()),
+            want,
+            "scalar-subquery affinity diverged: {q}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
