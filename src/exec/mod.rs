@@ -11156,16 +11156,19 @@ impl Connection {
             self.output_collations(&first, &cols, params)
         };
         // A multi-row `VALUES (…),(…)` desugars to a `UNION ALL` chain whose
-        // operands are bare projections (no FROM); a real set operation joins
-        // genuine SELECTs. SQLite rejects a column-count mismatch in either case,
-        // but with different wording, so pick the message by which kind this is.
+        // operands are bare FROM-less projections auto-aliased `column1`,
+        // `column2`, … (see `values_core`); an explicit `SELECT … UNION ALL
+        // SELECT …` is also FROM-less but does not carry those aliases. SQLite
+        // rejects a column-count mismatch in either case but with different
+        // wording, so pick the message by which kind this is — matching only the
+        // VALUES alias shape avoids misreporting an explicit `UNION ALL`.
         let is_values = sel.from.is_none()
             && sel.where_clause.is_none()
             && sel.group_by.is_empty()
-            && sel
-                .compound
-                .iter()
-                .all(|(op, c)| *op == CompoundOp::UnionAll && c.from.is_none());
+            && is_values_projection(&sel.columns)
+            && sel.compound.iter().all(|(op, c)| {
+                *op == CompoundOp::UnionAll && c.from.is_none() && is_values_projection(&c.columns)
+            });
         for (op, operand) in &sel.compound {
             // Run the operand fully: a `VALUES (…),(…)` operand desugars to a
             // SELECT carrying its extra rows in its *own* compound tail, so it
@@ -11178,9 +11181,17 @@ impl Connection {
                 return Err(Error::Error(if is_values {
                     "all VALUES must have the same number of terms".into()
                 } else {
-                    "SELECTs to the left and right of the compound operator do not have the same \
-                     number of result columns"
-                        .into()
+                    // SQLite names the specific operator at the mismatch.
+                    let kw = match op {
+                        CompoundOp::Union => "UNION",
+                        CompoundOp::UnionAll => "UNION ALL",
+                        CompoundOp::Intersect => "INTERSECT",
+                        CompoundOp::Except => "EXCEPT",
+                    };
+                    alloc::format!(
+                        "SELECTs to the left and right of {kw} do not have the same \
+                         number of result columns"
+                    )
                 }));
             }
             result.rows = apply_compound(*op, result.rows, r.rows, &colls);
@@ -14090,7 +14101,10 @@ impl Connection {
                     // ROWID table.
                     for &c in pk {
                         if matches!(values[c], Value::Null) {
-                            return Err(Error::Constraint("NOT NULL constraint failed".into()));
+                            return Err(Error::Constraint(format!(
+                                "NOT NULL constraint failed: {}.{}",
+                                meta.columns[c].table, meta.columns[c].name
+                            )));
                         }
                     }
                     check_not_null(meta, &values)?;
@@ -19723,6 +19737,22 @@ fn positional_int(expr: &Expr) -> Option<i64> {
         Expr::Collate { expr, .. } | Expr::Paren(expr) => positional_int(expr),
         _ => None,
     }
+}
+
+/// Whether a projection has the exact shape `values_core` produces for a desugared
+/// multi-row `VALUES`: every column is a bare expression auto-aliased `column1`,
+/// `column2`, … in order, with no source span. Used to tell a real `VALUES` from
+/// an explicit FROM-less `SELECT … UNION ALL SELECT …` when reporting a
+/// column-count mismatch.
+fn is_values_projection(cols: &[ResultColumn]) -> bool {
+    !cols.is_empty()
+        && cols.iter().enumerate().all(|(i, c)| {
+            matches!(
+                c,
+                ResultColumn::Expr { alias: Some(a), source: None, .. }
+                    if *a == alloc::format!("column{}", i + 1)
+            )
+        })
 }
 
 /// SQLite's `%r` ordinal: `1`→`1st`, `2`→`2nd`, `3`→`3rd`, others `th`, with

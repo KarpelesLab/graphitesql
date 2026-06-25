@@ -893,6 +893,13 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             if let Some(result) = ctx.subqueries.and_then(|s| s.call_udf(&lname, &v)) {
                 return result;
             }
+            // A built-in window/ranking function used outside an `OVER` clause is
+            // "misuse of window function NAME()" in SQLite, not "no such function".
+            if is_window_function_name(&lname) {
+                return Err(Error::Error(alloc::format!(
+                    "misuse of window function {lname}()"
+                )));
+            }
             return Err(Error::Error(alloc::format!("no such function: {name}")));
         }
     })
@@ -1043,6 +1050,26 @@ fn wrong_arg_count(name: &str) -> Error {
     Error::Error(alloc::format!(
         "wrong number of arguments to function {name}()"
     ))
+}
+
+/// The built-in ranking/value window functions, which are only valid inside an
+/// `OVER` clause. Called as a plain scalar, SQLite reports "misuse of window
+/// function NAME()". `name` must already be lowercased.
+fn is_window_function_name(name: &str) -> bool {
+    matches!(
+        name,
+        "row_number"
+            | "rank"
+            | "dense_rank"
+            | "percent_rank"
+            | "cume_dist"
+            | "ntile"
+            | "first_value"
+            | "last_value"
+            | "nth_value"
+            | "lag"
+            | "lead"
+    )
 }
 
 /// SQLite's `soundex(X)`: the phonetic code of the first word in `X` — the first
