@@ -273,36 +273,26 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
   pointers, incompatible with `#![forbid(unsafe_code)]`; would live in a sibling
   crate that opts out.
 
-### Track E — Cross-database write resolution  *(new)*
+### Track E — Cross-database write resolution  *(essentially complete)*
 
-A write to an attached/`temp` database swaps that database in as the active `main`
-for the *whole* statement (`swap_db`), so any subquery or source that reads the
-*original* main fails to resolve ("no such table"). **`INSERT … SELECT`** and
-**`INSERT … VALUES ((SELECT …))`** are fixed — they are materialized in the
-original context before the swap (`prematerialize_insert_source`). The remaining
-cases cannot use that trick (their subqueries are correlated/mutating) and the
-swap cannot be undone mid-statement (it is `&mut`; the `Subqueries` trait is
-`&self`):
+**Done:** a write to an attached/`temp` database swaps that database in as the
+active `main` for the whole statement, so a subquery/source reading the *original*
+main must still resolve there. **E0** built the regression oracle
+(`tests/cross_db_writes.rs`, deterministic in-memory ATTACH). **`INSERT … SELECT`**
+and **`INSERT … VALUES ((SELECT …))`** are materialized in the original context
+before the swap (`prematerialize_insert_source`). **E1/E2/E3 + E-arch-a:**
+`unqualified_db` now resolves an unqualified name `main`-first and then falls back
+to attached databases (SQLite's `main → temp → attached` order) — which also lets
+a cross-db `UPDATE/DELETE aux.t …` subquery resolve a `main` table (the original
+`main` is in the target's swapped-out attached slot), and fixes a top-level
+`SELECT … FROM s` where `s` lives only in an attached database.
 
-- **E1 — `UPDATE aux.t … FROM m`** (the `FROM` source reads the original db).
-- **E2 — `UPDATE aux.t SET/WHERE …`** with a subquery reading the original db.
-- **E3 — `DELETE FROM aux.t WHERE …`** with a subquery reading the original db.
-
-The fix is architectural — pick one approach:
-- **E-arch-a** — implement a global unqualified-name resolution order
-  (`main`→`temp`→`attached`, main-first) in `table_meta`/`scan_source`, and drop
-  the read-side swap (resolve the write *target* by its schema qualifier
-  separately). This also closes a related top-level gap: `SELECT … FROM s` where
-  `s` lives only in an attached database currently errors.
-- **E-arch-b** — plumb the target database through the whole write path
-  (`exec_insert`/`update`/`delete` + the constraint/index/trigger/FK helpers)
-  instead of swapping.
-
-Prerequisite (the differential corpus does **not** exercise cross-db writes, so
-build the regression oracle first):
-- **E0 — extend `tests/attach.rs`** with cross-db UPDATE…FROM / UPDATE-subquery /
-  DELETE-subquery cases (and the top-level attached-only unqualified read) before
-  attempting E-arch-a/b.
+**Remaining (rare residual):** a table name present in **both** the active db and
+an attached one, referenced *unqualified inside a cross-database write*, binds to
+the active db (graphite) rather than `main` (sqlite). Realistic schemas qualify
+such references. A full fix would require dropping the read-side swap entirely
+(resolve the write target by qualifier, reads by the global order) — deferred
+until something needs byte-exact parity for that edge.
 
 ---
 
@@ -374,21 +364,19 @@ standard, not the build:
 
 ## 7. Suggested order
 
-The headline features are done (§3); what remains (§4) is bigger, multi-session
-work, each track independently shippable. A reasonable order:
+The headline features are done (§3), and **Track E is essentially complete**; what
+remains (§4) is bigger, multi-session work, each track independently shippable. A
+reasonable order:
 
-1. **E0 → E-arch-a** — cross-database write resolution (Track E): land the
-   attach-suite oracle, then the global-resolution refactor. A real correctness
-   gap, self-contained, and it also fixes the top-level attached-only read.
-2. **B5c-1 → B5c-4, then B5b** — VDBE depth (Track B): move `IN (SELECT)`,
+1. **B5c-1 → B5c-4, then B5b** — VDBE depth (Track B): move `IN (SELECT)`,
    correlated subqueries, compound, and windows onto the VDBE, then the
    per-cursor streaming join. Perf/coverage; parity-gated, low risk.
-3. **D2b** — the real FTS5 inverted index (Track D): the one scaling gap in an
+2. **D2b** — the real FTS5 inverted index (Track D): the one scaling gap in an
    otherwise-complete module.
-4. **C7a/C7b + crash-recovery harness** — the SQLite-format journal (Track C):
+3. **C7a/C7b + crash-recovery harness** — the SQLite-format journal (Track C):
    durability depth; pairs with the fault-injecting VFS.
-5. **C8c, then C9a–C9d** — bounded pcache, then the concurrency story (Track C).
-6. **dbpage, D5, D6** — ecosystem surfaces (Track D).
+4. **C8c, then C9a–C9d** — bounded pcache, then the concurrency story (Track C).
+5. **dbpage, D5, D6** — ecosystem surfaces (Track D).
 
 **Deferred / blocked** (documented in §4): **B1b** join reordering and **B4**
 `sqlite_stat4` (diverge from / unverifiable against the stat1-only oracle);
