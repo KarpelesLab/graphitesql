@@ -1281,19 +1281,17 @@ impl Connection {
         // the `WHERE`, and reuse the single-cursor scan compiler. Every join must
         // be a plain `INNER`/`CROSS`/comma join (no `NATURAL`/`USING`/outer).
         if !from.joins.is_empty() {
-            // A single two-table LEFT or RIGHT JOIN routes to the null-padding
+            // A single two-table LEFT/RIGHT/FULL JOIN routes to the null-padding
             // nested loop below; otherwise only plain INNER joins are handled here
-            // (FULL/NATURAL/USING fall back to the tree-walker).
-            let is_left_2 = from.joins.len() == 1
-                && from.joins[0].kind == sql::ast::JoinKind::Left
-                && !from.joins[0].natural
-                && from.joins[0].using.is_empty();
-            let is_right_2 = from.joins.len() == 1
-                && from.joins[0].kind == sql::ast::JoinKind::Right
-                && !from.joins[0].natural
-                && from.joins[0].using.is_empty();
+            // (NATURAL/USING fall back to the tree-walker).
+            let single =
+                from.joins.len() == 1 && !from.joins[0].natural && from.joins[0].using.is_empty();
+            let is_left_2 = single && from.joins[0].kind == sql::ast::JoinKind::Left;
+            let is_right_2 = single && from.joins[0].kind == sql::ast::JoinKind::Right;
+            let is_full_2 = single && from.joins[0].kind == sql::ast::JoinKind::Full;
             if !is_left_2
                 && !is_right_2
+                && !is_full_2
                 && from.joins.iter().any(|j| {
                     j.kind != sql::ast::JoinKind::Inner || j.natural || !j.using.is_empty()
                 })
@@ -1331,7 +1329,10 @@ impl Connection {
             // shape (or an ambiguous column) returns `Unsupported`, so the router
             // falls back to the tree-walker (never the inner-join path, whose
             // ON-into-WHERE merge would change outer-join semantics).
-            if is_left_2 || is_right_2 {
+            if is_left_2 || is_right_2 || is_full_2 {
+                // RIGHT preserves the right table, so it swaps the cursor order
+                // (cursor 0 = the preserved side); LEFT and FULL keep declaration
+                // order [a, b].
                 let (outer, inner) = if is_right_2 {
                     (1usize, 0usize)
                 } else {
@@ -1360,15 +1361,16 @@ impl Connection {
                     return Err(Error::Unsupported("VDBE: ambiguous column name"));
                 }
                 let n_outer = sources[outer].0.len();
-                let prog = vdbe::compile_left_join2(
-                    sel,
-                    &oj_cols,
-                    &oj_tables,
-                    &oj_aff,
-                    &oj_coll,
-                    n_outer,
-                    &from.joins[0].on,
-                )?;
+                let on = &from.joins[0].on;
+                let prog = if is_full_2 {
+                    vdbe::compile_full_join2(
+                        sel, &oj_cols, &oj_tables, &oj_aff, &oj_coll, n_outer, on,
+                    )?
+                } else {
+                    vdbe::compile_left_join2(
+                        sel, &oj_cols, &oj_tables, &oj_aff, &oj_coll, n_outer, on,
+                    )?
+                };
                 let result = vdbe::run_rows_multi(&prog, &[&sources[outer].4, &sources[inner].4])?;
                 return Ok(QueryResult {
                     columns: prog.columns,

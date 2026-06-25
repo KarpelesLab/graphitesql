@@ -253,20 +253,25 @@ is *perf/coverage*, not correctness.
     (`exec::vdbe::tests`, `tests/vdbe_nested_join.rs`). This is the multi-cursor
     foundation the rest of B8 (storage cursors, correlated subqueries, windows)
     builds on.
-    - *Also done — two-table `LEFT`/`RIGHT JOIN` on the VDBE.* `compile_left_join2`
-      emits a null-padding nested loop: for each preserved-side (cursor 0) row the
-      inner cursor is scanned, a `NullRow` opcode (cleared by `RewindC`, makes a
-      cursor's `ColumnC`s read NULL) pads the output when no inner row satisfied
-      `ON`. The `ON` is kept SEPARATE from `WHERE` (unlike the inner-join merge —
-      they differ for the unmatched row): `ON` gates the match, `WHERE` filters
-      every emitted row including the null-padded one. `RIGHT JOIN` reuses the same
-      compiler with the operands swapped (cursor 0 = the preserved right table,
-      cursor 1 = the null-padded left table; column refs resolve by name
-      regardless of cursor order). A single 2-table `LEFT`/`RIGHT JOIN` (no
-      `NATURAL`/`USING`) routes here; `FULL`/`NATURAL`/`USING`, 3+-table or
-      non-nested-loopable shapes fall back to the tree-walker. Verified vs the
-      differential corpus + unit/integration tests (incl. `WHERE …col IS NULL`,
-      empty padded side, compound `ON`, `coalesce` over nulls).
+    - *Also done — two-table `LEFT`/`RIGHT`/`FULL JOIN` on the VDBE.*
+      `compile_left_join2` emits a null-padding nested loop: for each preserved-side
+      (cursor 0) row the inner cursor is scanned, a `NullRow` opcode (cleared by
+      `RewindC`, makes a cursor's `ColumnC`s read NULL) pads the output when no
+      inner row satisfied `ON`. The `ON` is kept SEPARATE from `WHERE` (unlike the
+      inner-join merge — they differ for the unmatched row): `ON` gates the match,
+      `WHERE` filters every emitted row including the null-padded one. `RIGHT JOIN`
+      reuses the same compiler with the operands swapped (cursor 0 = the preserved
+      right table; column refs resolve by name regardless of cursor order). `FULL
+      JOIN` (`compile_full_join2`) is a two-pass nested loop: pass 1 is the LEFT
+      join, additionally recording matched right rows in a per-row bitmap
+      (`MarkMatched`); pass 2 scans the right table and emits each row NOT matched
+      (`IfMatched` skips the rest) with the left side NULL — yielding SQLite's
+      FULL-join order (left-driven rows, then unmatched-right). A single 2-table
+      `LEFT`/`RIGHT`/`FULL JOIN` (no `NATURAL`/`USING`) routes here; `NATURAL`/
+      `USING`, 3+-table or non-nested-loopable shapes fall back to the tree-walker.
+      Verified vs the differential corpus + unit/integration tests (incl. `WHERE
+      …col IS NULL`, both empty sides, compound `ON`, `coalesce` over nulls,
+      LIMIT/OFFSET across passes).
   - **B5b-2** — seek-driven inner cursor (rowid/PK/index) over real storage
     (`OpenRead` + a b-tree `TableCursor`), mirroring the tree-walker's inner-join
     seeks. Needs the VDBE interpreter to hold live storage cursors (the larger B8

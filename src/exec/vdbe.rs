@@ -159,6 +159,12 @@ pub enum Op {
     /// subsequent `ColumnC` on it reads NULL until the next `RewindC` on that
     /// cursor clears the mark.
     NullRow { cursor: usize },
+    /// FULL JOIN bookkeeping: record that cursor `cursor`'s current row has been
+    /// matched, in a per-row bitmap that survives `RewindC` (unlike the NULL flag).
+    MarkMatched { cursor: usize },
+    /// FULL JOIN anti-join pass: jump to `target` when cursor `cursor`'s current
+    /// row was already marked matched (so it is skipped in the second pass).
+    IfMatched { cursor: usize, target: usize },
     /// Decrement `reg`; jump to `target` once it reaches zero (a `LIMIT` counter).
     DecrJumpZero { reg: usize, target: usize },
     /// If `reg` is positive, decrement it and jump to `target` (an `OFFSET` skip).
@@ -1990,6 +1996,280 @@ pub fn compile_left_join2(
     })
 }
 
+/// Emit one output row: project into registers `[0, count)`, the OFFSET skip,
+/// `ResultRow`, then the LIMIT decrement. Returns the OFFSET-skip and LIMIT-done
+/// op indices (their jump targets are backpatched by the caller). Shared by the
+/// FULL-join compiler's three emission points.
+fn emit_output_row(
+    c: &mut Compiler,
+    projections: &[(Expr, String)],
+    count: usize,
+    offset_reg: Option<usize>,
+    limit_reg: Option<usize>,
+) -> Result<(Option<usize>, Option<usize>)> {
+    for (i, (expr, _)) in projections.iter().enumerate() {
+        c.compile_expr_into(expr, i)?;
+    }
+    let offset_skip = offset_reg.map(|r| {
+        let at = c.ops.len();
+        c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+        at
+    });
+    c.ops.push(Op::ResultRow { start: 0, count });
+    let limit_done = limit_reg.map(|r| {
+        let at = c.ops.len();
+        c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+        at
+    });
+    Ok((offset_skip, limit_done))
+}
+
+/// Compile a two-table `FULL JOIN` (`SELECT … FROM a FULL JOIN b ON …`) into a
+/// two-pass null-padding nested loop (B5b-1). Pass 1 is a LEFT join (every left
+/// row; matched rows, else a row with the right side NULL) that also records, in
+/// a per-row bitmap, which right rows matched (`MarkMatched`). Pass 2 then scans
+/// the right table and emits each row NOT matched in pass 1, with the left side
+/// NULL (`IfMatched` skips the matched ones). This yields SQLite's FULL-join order
+/// (all left-driven rows, then the unmatched-right rows). `ON` is kept separate
+/// from `WHERE`; supports projection + WHERE + constant LIMIT/OFFSET; returns
+/// `Unsupported` for GROUP BY / aggregates / HAVING / ORDER BY / DISTINCT.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_full_join2(
+    sel: &Select,
+    columns: &[String],
+    tables: &[String],
+    affinities: &[Affinity],
+    collations: &[Collation],
+    n_left: usize,
+    on: &Option<Expr>,
+) -> Result<Program> {
+    if !sel.compound.is_empty()
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || !sel.order_by.is_empty()
+        || sel.distinct
+    {
+        return Err(Error::Unsupported(
+            "VDBE: full-join shape not nested-loopable",
+        ));
+    }
+    let projections = expand_projections(sel, columns, tables)?;
+    if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
+        return Err(Error::Unsupported("VDBE: aggregate over a full join"));
+    }
+    let count = projections.len();
+    if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
+        return Ok(Program {
+            ops: alloc::vec![Op::Halt],
+            n_registers: count,
+            columns: projections.into_iter().map(|(_, l)| l).collect(),
+        });
+    }
+    let mut c = Compiler {
+        ops: Vec::new(),
+        next_reg: count,
+        columns: columns.to_vec(),
+        tables: tables.to_vec(),
+        affinities: affinities.to_vec(),
+        collations: collations.to_vec(),
+        bindings: Vec::new(),
+        forbid_raw_columns: false,
+        rowid_index: None,
+        cursor_boundaries: Some(alloc::vec![n_left, columns.len()]),
+    };
+    let limit_reg = match &sel.limit {
+        None => None,
+        Some(e) => match fold_const_int(e) {
+            Some(n) if n < 0 => None,
+            Some(n) => {
+                let r = c.alloc();
+                c.ops.push(Op::Integer { value: n, dest: r });
+                Some(r)
+            }
+            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
+        },
+    };
+    let offset_reg = match &sel.offset {
+        None => None,
+        Some(e) => match fold_const_int(e) {
+            Some(n) if n <= 0 => None,
+            Some(n) => {
+                let r = c.alloc();
+                c.ops.push(Op::Integer { value: n, dest: r });
+                Some(r)
+            }
+            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
+        },
+    };
+    let matched = c.alloc();
+    let set = |ops: &mut [Op], at: usize, tgt: usize| match &mut ops[at] {
+        Op::IfFalse { target, .. }
+        | Op::IfPosDecr { target, .. }
+        | Op::DecrJumpZero { target, .. }
+        | Op::Goto { target }
+        | Op::IfMatched { target, .. }
+        | Op::RewindC { target, .. } => *target = tgt,
+        _ => {}
+    };
+    // ---- Pass 1: LEFT join, marking matched right rows. ----
+    let rewind0 = c.ops.len();
+    c.ops.push(Op::RewindC {
+        cursor: 0,
+        target: 0,
+    });
+    let loop0 = c.ops.len();
+    c.ops.push(Op::Integer {
+        value: 0,
+        dest: matched,
+    });
+    let rewind1 = c.ops.len();
+    c.ops.push(Op::RewindC {
+        cursor: 1,
+        target: 0,
+    });
+    let body = c.ops.len();
+    let on_skip = match on {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    c.ops.push(Op::Integer {
+        value: 1,
+        dest: matched,
+    });
+    c.ops.push(Op::MarkMatched { cursor: 1 });
+    let where_m = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    let (offset_m, limit_m) = emit_output_row(&mut c, &projections, count, offset_reg, limit_reg)?;
+    let next1 = c.ops.len();
+    c.ops.push(Op::NextC {
+        cursor: 1,
+        target: body,
+    });
+    let after_inner = c.ops.len();
+    c.ops.push(Op::IfFalse {
+        reg: matched,
+        target: 0,
+    });
+    let goto_next0 = c.ops.len();
+    c.ops.push(Op::Goto { target: 0 });
+    let null_pad = c.ops.len();
+    c.ops.push(Op::NullRow { cursor: 1 });
+    let where_lnull = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    let (offset_lnull, limit_lnull) =
+        emit_output_row(&mut c, &projections, count, offset_reg, limit_reg)?;
+    let next0 = c.ops.len();
+    c.ops.push(Op::NextC {
+        cursor: 0,
+        target: loop0,
+    });
+    // ---- Pass 2: right rows not matched in pass 1, with the left side NULL. ----
+    let pass2 = c.ops.len();
+    c.ops.push(Op::NullRow { cursor: 0 });
+    let rewind1b = c.ops.len();
+    c.ops.push(Op::RewindC {
+        cursor: 1,
+        target: 0,
+    });
+    let loop2 = c.ops.len();
+    let if_matched = c.ops.len();
+    c.ops.push(Op::IfMatched {
+        cursor: 1,
+        target: 0,
+    });
+    let where_rnull = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    let (offset_rnull, limit_rnull) =
+        emit_output_row(&mut c, &projections, count, offset_reg, limit_reg)?;
+    let next2 = c.ops.len();
+    c.ops.push(Op::NextC {
+        cursor: 1,
+        target: loop2,
+    });
+    let end = c.ops.len();
+    c.ops.push(Op::Halt);
+    // ---- Backpatch. ----
+    set(&mut c.ops, rewind0, pass2); // left empty → straight to pass 2
+    set(&mut c.ops, rewind1, after_inner); // right empty → null-pad this left row
+    if let Some(at) = on_skip {
+        set(&mut c.ops, at, next1);
+    }
+    if let Some(at) = where_m {
+        set(&mut c.ops, at, next1);
+    }
+    if let Some(at) = offset_m {
+        set(&mut c.ops, at, next1);
+    }
+    if let Some(at) = limit_m {
+        set(&mut c.ops, at, end);
+    }
+    set(&mut c.ops, after_inner, null_pad);
+    set(&mut c.ops, goto_next0, next0);
+    if let Some(at) = where_lnull {
+        set(&mut c.ops, at, next0);
+    }
+    if let Some(at) = offset_lnull {
+        set(&mut c.ops, at, next0);
+    }
+    if let Some(at) = limit_lnull {
+        set(&mut c.ops, at, end);
+    }
+    set(&mut c.ops, rewind1b, end); // right empty in pass 2 → done
+    set(&mut c.ops, if_matched, next2); // already matched → skip
+    if let Some(at) = where_rnull {
+        set(&mut c.ops, at, next2);
+    }
+    if let Some(at) = offset_rnull {
+        set(&mut c.ops, at, next2);
+    }
+    if let Some(at) = limit_rnull {
+        set(&mut c.ops, at, end);
+    }
+    Ok(Program {
+        ops: c.ops,
+        n_registers: c.next_reg,
+        columns: projections.into_iter().map(|(_, l)| l).collect(),
+    })
+}
+
 struct Compiler {
     ops: Vec<Op>,
     next_reg: usize,
@@ -2673,6 +2953,16 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
     // Per-cursor "this is the NULL row" flags for LEFT JOIN null-padding; set by
     // `NullRow`, cleared by `RewindC`.
     let mut null_flags: Vec<bool> = alloc::vec![false; rowsets.len().max(1)];
+    // Per-cursor per-row "matched" bitmaps for the FULL JOIN anti-join pass; set
+    // by `MarkMatched`, tested by `IfMatched`, and NOT cleared by `RewindC` (they
+    // persist from the first pass into the second).
+    let mut matched_rows: Vec<Vec<bool>> = rowsets
+        .iter()
+        .map(|rs| alloc::vec![false; rs.len()])
+        .collect();
+    if matched_rows.is_empty() {
+        matched_rows.push(Vec::new());
+    }
     // The sorter holds `(keys, row)` pairs staged by `SorterInsert`, sorted in
     // place by `SorterSort`, then walked by `SorterRewind`/`SorterNext`.
     let mut sorter: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
@@ -2738,6 +3028,24 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
             }
             Op::NullRow { cursor: c } => {
                 null_flags[*c] = true;
+            }
+            Op::MarkMatched { cursor: c } => {
+                if let Some(row) = matched_rows
+                    .get_mut(*c)
+                    .and_then(|m| m.get_mut(positions[*c]))
+                {
+                    *row = true;
+                }
+            }
+            Op::IfMatched { cursor: c, target } => {
+                if matched_rows
+                    .get(*c)
+                    .and_then(|m| m.get(positions[*c]))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    pc = *target;
+                }
             }
             Op::NextC { cursor: c, target } => {
                 positions[*c] += 1;
@@ -3339,6 +3647,50 @@ mod tests {
                 vec![Value::Integer(1), Value::Null],
                 vec![Value::Integer(2), Value::Null],
                 vec![Value::Integer(3), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn full_join_two_pass_null_pads_both_sides() {
+        let Statement::Select(sel) =
+            parse_one("SELECT a.x, b.p FROM a FULL JOIN b ON a.x = b.p").unwrap()
+        else {
+            panic!()
+        };
+        let on = sel.from.as_ref().unwrap().joins[0].on.clone();
+        let columns = vec!["x".to_string(), "p".to_string()];
+        let tables = vec!["a".to_string(), "b".to_string()];
+        let aff = vec![Affinity::Blob; 2];
+        let coll = vec![Collation::Binary; 2];
+        let prog = compile_full_join2(&sel, &columns, &tables, &aff, &coll, 1, &on).unwrap();
+        let left: Vec<Vec<Value>> = vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ];
+        let right: Vec<Vec<Value>> = vec![
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+            vec![Value::Integer(4)],
+        ];
+        // Pass 1 (left order): 1→null, 2→2, 3→3. Pass 2 (unmatched right): 4.
+        assert_eq!(
+            run_rows_multi(&prog, &[&left, &right]).unwrap(),
+            vec![
+                vec![Value::Integer(1), Value::Null],
+                vec![Value::Integer(2), Value::Integer(2)],
+                vec![Value::Integer(3), Value::Integer(3)],
+                vec![Value::Null, Value::Integer(4)],
+            ]
+        );
+        // Empty left → every right row in pass 2 with left NULL.
+        assert_eq!(
+            run_rows_multi(&prog, &[&[], &right]).unwrap(),
+            vec![
+                vec![Value::Null, Value::Integer(2)],
+                vec![Value::Null, Value::Integer(3)],
+                vec![Value::Null, Value::Integer(4)],
             ]
         );
     }

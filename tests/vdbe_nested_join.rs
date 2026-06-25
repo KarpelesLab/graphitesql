@@ -178,6 +178,33 @@ fn right_join_null_pads_unmatched_right_row() {
 }
 
 #[test]
+fn full_join_runs_on_vdbe_with_both_sided_null_padding() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x)").unwrap();
+    c.execute("INSERT INTO a VALUES(1),(2),(3)").unwrap();
+    c.execute("CREATE TABLE b(p)").unwrap();
+    c.execute("INSERT INTO b VALUES(2),(3),(4)").unwrap();
+    // SQLite's FULL-join order: left-driven rows first, then unmatched-right.
+    let r = c
+        .query_vdbe("SELECT a.x, b.p FROM a FULL JOIN b ON a.x = b.p")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(3), Value::Integer(3)],
+            vec![Value::Null, Value::Integer(4)],
+        ]
+    );
+    // `WHERE a.x IS NULL` keeps only the unmatched-right (pass 2) rows.
+    let r2 = c
+        .query_vdbe("SELECT b.p FROM a FULL JOIN b ON a.x = b.p WHERE a.x IS NULL")
+        .unwrap();
+    assert_eq!(r2.rows, vec![vec![Value::Integer(4)]]);
+}
+
+#[test]
 fn nested_loop_join_empty_side_yields_no_rows() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x)").unwrap();
