@@ -19682,26 +19682,58 @@ fn positional_int(expr: &Expr) -> Option<i64> {
             Expr::Literal(Literal::Integer(n)) => Some(n.wrapping_neg()),
             _ => None,
         },
+        // Unary `+` is a SQLite no-op the parser folds away, so `+2` resolves to
+        // positional 2 (verified: `ORDER BY +2` errors with 1 output column).
+        Expr::Unary {
+            op: UnaryOp::Identity,
+            expr,
+        } => positional_int(expr),
         Expr::Collate { expr, .. } | Expr::Paren(expr) => positional_int(expr),
         _ => None,
     }
 }
 
+/// SQLite's `%r` ordinal: `1`→`1st`, `2`→`2nd`, `3`→`3rd`, others `th`, with
+/// `11`/`12`/`13` always `th`.
+fn ordinal(n: usize) -> alloc::string::String {
+    let suffix = if (11..=13).contains(&(n % 100)) {
+        "th"
+    } else {
+        match n % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        }
+    };
+    alloc::format!("{n}{suffix}")
+}
+
 /// Reject any `GROUP BY` / `ORDER BY` positional term that falls outside
-/// `1..=ncols`, matching SQLite's "Nth GROUP BY/ORDER BY term out of range".
-/// `ncols` is the query's output-column count.
+/// `1..=ncols`, byte-matching SQLite's
+/// `<ordinal> <clause> term out of range - should be between 1 and <ncols>`.
+/// The ordinal is the offending term's 1-based position *within its clause*
+/// (counting non-positional terms too). `ncols` is the output-column count.
+/// SQLite resolves `ORDER BY` before `GROUP BY`, so when both clauses have an
+/// out-of-range term the `ORDER BY` one is reported.
 fn check_positional_terms(group_by: &[Expr], order_by: &[OrderTerm], ncols: usize) -> Result<()> {
-    for g in group_by {
-        if let Some(n) = positional_int(g) {
+    for (i, t) in order_by.iter().enumerate() {
+        if let Some(n) = positional_int(&t.expr) {
             if n < 1 || (n as u64) > ncols as u64 {
-                return Err(Error::Error("GROUP BY term out of range".into()));
+                return Err(Error::Error(alloc::format!(
+                    "{} ORDER BY term out of range - should be between 1 and {ncols}",
+                    ordinal(i + 1),
+                )));
             }
         }
     }
-    for t in order_by {
-        if let Some(n) = positional_int(&t.expr) {
+    for (i, g) in group_by.iter().enumerate() {
+        if let Some(n) = positional_int(g) {
             if n < 1 || (n as u64) > ncols as u64 {
-                return Err(Error::Error("ORDER BY term out of range".into()));
+                return Err(Error::Error(alloc::format!(
+                    "{} GROUP BY term out of range - should be between 1 and {ncols}",
+                    ordinal(i + 1),
+                )));
             }
         }
     }

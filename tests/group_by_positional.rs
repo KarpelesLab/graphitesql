@@ -43,6 +43,82 @@ fn group_by_position_resolves_to_column() {
     );
 }
 
+/// An out-of-range positional `ORDER BY` / `GROUP BY` term reports SQLite's exact
+/// message body: `<ordinal> <clause> term out of range - should be between 1 and
+/// <ncols>`, with the ordinal being the offending term's 1-based position within
+/// its clause. SQLite resolves ORDER BY before GROUP BY, so a both-out-of-range
+/// query reports the ORDER BY term. (The CLI's "Parse error" / "Error:" wrapper
+/// differs and is normalized out by the differential corpus — the body matches.)
+#[test]
+fn positional_term_out_of_range_message_matches_sqlite() {
+    let c = Connection::open_memory().unwrap();
+    // Strip the generic `error: ` Display prefix; we assert on the message body,
+    // which is what the differential corpus compares against sqlite3.
+    let err = |sql: &str| {
+        c.query(sql)
+            .unwrap_err()
+            .to_string()
+            .trim_start_matches("error: ")
+            .to_string()
+    };
+
+    assert_eq!(
+        err("SELECT 1 ORDER BY 2"),
+        "1st ORDER BY term out of range - should be between 1 and 1"
+    );
+    assert_eq!(
+        err("SELECT 1,2,3 ORDER BY 5"),
+        "1st ORDER BY term out of range - should be between 1 and 3"
+    );
+    // The ordinal counts every term, positional or not: term 2 (`5`) is the bad one.
+    assert_eq!(
+        err("SELECT 1 AS a ORDER BY a, 5"),
+        "2nd ORDER BY term out of range - should be between 1 and 1"
+    );
+    assert_eq!(
+        err("SELECT 1 ORDER BY 1, 1, 4"),
+        "3rd ORDER BY term out of range - should be between 1 and 1"
+    );
+    // GROUP BY clause + its own ordinal numbering.
+    assert_eq!(
+        err("SELECT 1,2 GROUP BY 3"),
+        "1st GROUP BY term out of range - should be between 1 and 2"
+    );
+    assert_eq!(
+        err("SELECT 1,2 GROUP BY 1, 3"),
+        "2nd GROUP BY term out of range - should be between 1 and 2"
+    );
+    // ORDER BY is resolved before GROUP BY: both bad → ORDER BY reported.
+    assert_eq!(
+        err("SELECT 1 a, 2 b GROUP BY 9 ORDER BY 8"),
+        "1st ORDER BY term out of range - should be between 1 and 2"
+    );
+    // Only GROUP BY bad → GROUP BY reported.
+    assert_eq!(
+        err("SELECT 1 a, 2 b GROUP BY 9 ORDER BY 1"),
+        "1st GROUP BY term out of range - should be between 1 and 2"
+    );
+    // Unary `+` is a parser no-op, so `+2` is positional 2 (out of range).
+    assert_eq!(
+        err("SELECT 1 ORDER BY +2"),
+        "1st ORDER BY term out of range - should be between 1 and 1"
+    );
+    // Teen vs. twenty-first ordinal suffixes (`%r`: 13th, 21st).
+    let many = |n: usize| core::iter::repeat_n("1", n).collect::<Vec<_>>().join(",");
+    assert_eq!(
+        err(&format!("SELECT {} ORDER BY {},99", many(12), many(12))),
+        "13th ORDER BY term out of range - should be between 1 and 12"
+    );
+    assert_eq!(
+        err(&format!("SELECT {} ORDER BY {},99", many(21), many(20))),
+        "21st ORDER BY term out of range - should be between 1 and 21"
+    );
+
+    // A real / text constant is NOT positional (sorts by the constant; no error).
+    assert!(c.query("SELECT 1 ORDER BY 1.0").is_ok());
+    assert!(c.query("SELECT 1 ORDER BY '2'").is_ok());
+}
+
 #[test]
 fn generate_series_zero_step_is_one() {
     let c = Connection::open_memory().unwrap();
