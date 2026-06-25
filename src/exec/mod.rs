@@ -5291,7 +5291,15 @@ impl Connection {
             // Determine the rowid (explicit INTEGER PRIMARY KEY value or auto).
             let rowid = match meta.ipk {
                 Some(ipk) if !matches!(values[ipk], Value::Null) => {
-                    let r = eval::to_i64(&values[ipk]);
+                    // An INTEGER PRIMARY KEY *is* the rowid, so the supplied value
+                    // must be an integer. Column affinity has already coerced an
+                    // integer-valued real or numeric text (2.0, '5', '5.0') to
+                    // Integer; anything still non-integer (1.5, 'x', a blob) is a
+                    // datatype mismatch in SQLite, not a silent `to_i64` coercion.
+                    let r = match &values[ipk] {
+                        Value::Integer(i) => *i,
+                        _ => return Err(Error::Error("datatype mismatch".into())),
+                    };
                     next_auto = next_auto.max(r + 1);
                     r
                 }
@@ -5529,6 +5537,15 @@ impl Connection {
         }
         apply_column_affinity(meta, &mut values);
         self.materialize_generated(meta, &mut values, params)?;
+        // An UPDATE of the INTEGER PRIMARY KEY (the rowid) must leave it an
+        // integer: NULL or a non-integer value (after affinity) is a datatype
+        // mismatch in SQLite — checked before NOT NULL, which would otherwise
+        // mis-report a `SET ipk = NULL`.
+        if let Some(ipk) = meta.ipk {
+            if !matches!(values[ipk], Value::Integer(_)) {
+                return Err(Error::Error("datatype mismatch".into()));
+            }
+        }
         check_not_null(meta, &values)?;
         self.check_strict_types(meta, &values)?;
         self.check_constraints(meta, &values, Some(existing_rowid), params)?;
@@ -6289,6 +6306,15 @@ impl Connection {
 
         let mut affected = 0;
         for (rowid, old_row, mut values) in prepared {
+            // An UPDATE of the INTEGER PRIMARY KEY (the rowid) must leave it an
+            // integer; NULL or a non-integer (after affinity) is a datatype
+            // mismatch — a hard error checked before NOT NULL (which would else
+            // mis-report `SET ipk = NULL`) and not skipped by UPDATE OR IGNORE.
+            if let Some(ipk) = meta.ipk {
+                if !matches!(values[ipk], Value::Integer(_)) {
+                    return Err(Error::Error("datatype mismatch".into()));
+                }
+            }
             // NOT NULL / CHECK / STRICT-type constraints. `UPDATE OR IGNORE` skips
             // a row that violates one rather than failing the statement.
             {
