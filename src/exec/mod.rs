@@ -4591,7 +4591,13 @@ impl Connection {
             .as_ref()
             .is_some_and(|t| t.schema.table(&ct.table).is_some());
         if self.schema.table(&ct.table).is_none() && !table_in_other && !self.is_view(&ct.table) {
-            return Err(Error::Error(format!("no such table: {}", ct.table)));
+            // SQLite schema-qualifies the missing table in CREATE TRIGGER/INDEX
+            // (the object's target schema, `main` by default).
+            return Err(Error::Error(format!(
+                "no such table: {}.{}",
+                ct.schema.as_deref().unwrap_or("main"),
+                ct.table
+            )));
         }
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
@@ -6440,6 +6446,15 @@ impl Connection {
         }
         if self.is_virtual_table(&ci.table) {
             return Err(Error::Error("virtual tables may not be indexed".into()));
+        }
+        // A missing index target is schema-qualified by SQLite (`main` default),
+        // unlike the bare "no such table" of a DML/SELECT reference.
+        if self.schema.table(&ci.table).is_none() {
+            return Err(Error::Error(format!(
+                "no such table: {}.{}",
+                ci.schema.as_deref().unwrap_or("main"),
+                ci.table
+            )));
         }
         let tmeta = self.table_meta(&ci.table, None)?;
         // SQLite rejects non-deterministic functions in an index expression (or a

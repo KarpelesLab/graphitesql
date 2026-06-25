@@ -107,3 +107,31 @@ fn without_rowid_pk_null_names_column() {
         "NOT NULL constraint failed: t.b"
     );
 }
+
+#[test]
+fn create_index_and_trigger_schema_qualify_missing_table() {
+    // CREATE INDEX / CREATE TRIGGER schema-qualify a missing target table
+    // (`main` by default), unlike a bare DML/SELECT "no such table".
+    let mut c = Connection::open_memory().unwrap();
+    let ddl_err = |c: &mut Connection, sql: &str| {
+        c.execute(sql)
+            .unwrap_err()
+            .to_string()
+            .trim_start_matches("error: ")
+            .trim_start_matches("Error: ")
+            .to_string()
+    };
+    assert_eq!(
+        ddl_err(&mut c, "CREATE INDEX i ON nope(a)"),
+        "no such table: main.nope"
+    );
+    assert_eq!(
+        ddl_err(
+            &mut c,
+            "CREATE TRIGGER tr AFTER INSERT ON nope BEGIN SELECT 1; END"
+        ),
+        "no such table: main.nope"
+    );
+    // A DML reference to the same missing table stays bare.
+    assert_eq!(ddl_err(&mut c, "DROP TABLE nope"), "no such table: nope");
+}
