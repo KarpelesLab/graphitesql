@@ -2101,9 +2101,11 @@ pub fn compile_group_join(
 /// `WHERE`. Unlike an inner join the `on` predicate is NOT merged into `WHERE`
 /// (the two have different roles for the unmatched row), so the caller passes it
 /// separately and leaves `sel.where_clause` as the query's own `WHERE`. Supports
-/// projection + WHERE + constant LIMIT/OFFSET; returns `Unsupported` for GROUP BY
-/// / aggregates / HAVING / ORDER BY / DISTINCT so the caller falls back. Row order
-/// matches SQLite (each left row's matches in inner-scan order, else its null row).
+/// projection + WHERE + ORDER BY (staged through a sorter) + constant LIMIT/OFFSET;
+/// returns `Unsupported` for GROUP BY / aggregates / HAVING / DISTINCT so the caller
+/// falls back. Without ORDER BY the row order matches SQLite (each left row's matches
+/// in inner-scan order, else its null row); with ORDER BY both the matched and the
+/// null-padded rows are staged into the sorter and emitted in key order.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_left_join2(
     sel: &Select,
@@ -2114,11 +2116,7 @@ pub fn compile_left_join2(
     n_left: usize,
     on: &Option<Expr>,
 ) -> Result<Program> {
-    if !sel.compound.is_empty()
-        || !sel.group_by.is_empty()
-        || sel.having.is_some()
-        || !sel.order_by.is_empty()
-        || sel.distinct
+    if !sel.compound.is_empty() || !sel.group_by.is_empty() || sel.having.is_some() || sel.distinct
     {
         return Err(Error::Unsupported(
             "VDBE: left-join shape not nested-loopable",
@@ -2173,10 +2171,19 @@ pub fn compile_left_join2(
         },
     };
     let matched = c.alloc();
-    // Emit the projection + WHERE-gate + OFFSET/LIMIT for one output row; returns
-    // the fix-up sites whose jump target is "advance to the given label".
-    // (Closures can't borrow `c` mutably twice, so this is a plain helper run
-    // inline at each of the two emission points.)
+    // With ORDER BY, both emission points stage their row + sort keys into a
+    // sorter; LIMIT/OFFSET then apply to the sorted emit loop, not the scan.
+    // Reserve contiguous key registers (one per ORDER BY term).
+    let ordering = !sel.order_by.is_empty();
+    let key_specs = if ordering {
+        build_sort_keys(&c, sel, columns, &projections, count)?
+    } else {
+        Vec::new()
+    };
+    let key_start = c.next_reg;
+    for _ in &key_specs {
+        c.alloc();
+    }
     let rewind0 = c.ops.len();
     c.ops.push(Op::RewindC {
         cursor: 0,
@@ -2226,17 +2233,31 @@ pub fn compile_left_join2(
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
     }
-    let offset_skip_m = offset_reg.map(|r| {
-        let at = c.ops.len();
-        c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
-        at
-    });
-    c.ops.push(Op::ResultRow { start: 0, count });
-    let limit_m = limit_reg.map(|r| {
-        let at = c.ops.len();
-        c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
-        at
-    });
+    let (offset_skip_m, limit_m) = if ordering {
+        for (j, (expr, _)) in key_specs.iter().enumerate() {
+            c.compile_expr_into(expr, key_start + j)?;
+        }
+        c.ops.push(Op::SorterInsert {
+            row_start: 0,
+            row_count: count,
+            key_start,
+            key_count: key_specs.len(),
+        });
+        (None, None)
+    } else {
+        let offset_skip_m = offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        });
+        c.ops.push(Op::ResultRow { start: 0, count });
+        let limit_m = limit_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+            at
+        });
+        (offset_skip_m, limit_m)
+    };
     let next1 = c.ops.len();
     c.ops.push(Op::NextC {
         cursor: 1,
@@ -2268,22 +2289,73 @@ pub fn compile_left_join2(
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
     }
-    let offset_skip_n = offset_reg.map(|r| {
-        let at = c.ops.len();
-        c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
-        at
-    });
-    c.ops.push(Op::ResultRow { start: 0, count });
-    let limit_n = limit_reg.map(|r| {
-        let at = c.ops.len();
-        c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
-        at
-    });
+    let (offset_skip_n, limit_n) = if ordering {
+        for (j, (expr, _)) in key_specs.iter().enumerate() {
+            c.compile_expr_into(expr, key_start + j)?;
+        }
+        c.ops.push(Op::SorterInsert {
+            row_start: 0,
+            row_count: count,
+            key_start,
+            key_count: key_specs.len(),
+        });
+        (None, None)
+    } else {
+        let offset_skip_n = offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        });
+        c.ops.push(Op::ResultRow { start: 0, count });
+        let limit_n = limit_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+            at
+        });
+        (offset_skip_n, limit_n)
+    };
     let next0 = c.ops.len();
     c.ops.push(Op::NextC {
         cursor: 0,
         target: loop0,
     });
+    // After the scan: with ORDER BY, sort then walk the sorter applying OFFSET then
+    // LIMIT to the ordered output; without it, this is just the Halt point.
+    let scan_done = c.ops.len();
+    let elimit = if ordering {
+        c.ops.push(Op::SorterSort {
+            keys: key_specs.iter().map(|(_, k)| k.clone()).collect(),
+        });
+        let srewind = c.ops.len();
+        c.ops.push(Op::SorterRewind { target: 0 });
+        let ebody = c.ops.len();
+        let eoffset = offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        });
+        c.ops.push(Op::SorterRow { start: 0, count });
+        c.ops.push(Op::ResultRow { start: 0, count });
+        let elimit = limit_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+            at
+        });
+        let snext = c.ops.len();
+        c.ops.push(Op::SorterNext { target: ebody });
+        let eend = c.ops.len();
+        if let Op::SorterRewind { target } = &mut c.ops[srewind] {
+            *target = eend;
+        }
+        if let Some(at) = eoffset {
+            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
+                *target = snext;
+            }
+        }
+        elimit
+    } else {
+        None
+    };
     let end = c.ops.len();
     c.ops.push(Op::Halt);
     // Backpatch.
@@ -2295,7 +2367,7 @@ pub fn compile_left_join2(
         | Op::RewindC { target, .. } => *target = tgt,
         _ => {}
     };
-    set(&mut c.ops, rewind0, end); // left empty → no rows
+    set(&mut c.ops, rewind0, scan_done); // left empty → no rows (drains the sorter)
     set(&mut c.ops, rewind1, after_inner); // right empty → null-pad path
     if let Some(at) = on_skip {
         set(&mut c.ops, at, next1); // ON false → try next inner row
@@ -2320,6 +2392,11 @@ pub fn compile_left_join2(
     if let Some(at) = limit_n {
         set(&mut c.ops, at, end);
     }
+    // The sorted emit loop's LIMIT halts the whole program (its OFFSET was
+    // backpatched inline above).
+    if let Some(at) = elimit {
+        set(&mut c.ops, at, end);
+    }
     Ok(Program {
         ops: c.ops,
         n_registers: c.next_reg,
@@ -2327,19 +2404,35 @@ pub fn compile_left_join2(
     })
 }
 
-/// Emit one output row: project into registers `[0, count)`, the OFFSET skip,
-/// `ResultRow`, then the LIMIT decrement. Returns the OFFSET-skip and LIMIT-done
-/// op indices (their jump targets are backpatched by the caller). Shared by the
-/// FULL-join compiler's three emission points.
+/// Emit one output row: project into registers `[0, count)`. With ORDER BY
+/// (`sorter` is `Some((key_start, key_specs))`), evaluate the sort keys and stage
+/// the row + keys into the sorter, returning `(None, None)` (LIMIT/OFFSET apply to
+/// the sorted emit loop). Without it, apply the OFFSET skip, `ResultRow`, then the
+/// LIMIT decrement, returning the OFFSET-skip and LIMIT-done op indices (their jump
+/// targets are backpatched by the caller). Shared by the FULL-join compiler's three
+/// emission points.
 fn emit_output_row(
     c: &mut Compiler,
     projections: &[(Expr, String)],
     count: usize,
     offset_reg: Option<usize>,
     limit_reg: Option<usize>,
+    sorter: Option<(usize, &[(Expr, SortKey)])>,
 ) -> Result<(Option<usize>, Option<usize>)> {
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
+    }
+    if let Some((key_start, key_specs)) = sorter {
+        for (j, (expr, _)) in key_specs.iter().enumerate() {
+            c.compile_expr_into(expr, key_start + j)?;
+        }
+        c.ops.push(Op::SorterInsert {
+            row_start: 0,
+            row_count: count,
+            key_start,
+            key_count: key_specs.len(),
+        });
+        return Ok((None, None));
     }
     let offset_skip = offset_reg.map(|r| {
         let at = c.ops.len();
@@ -2362,8 +2455,9 @@ fn emit_output_row(
 /// the right table and emits each row NOT matched in pass 1, with the left side
 /// NULL (`IfMatched` skips the matched ones). This yields SQLite's FULL-join order
 /// (all left-driven rows, then the unmatched-right rows). `ON` is kept separate
-/// from `WHERE`; supports projection + WHERE + constant LIMIT/OFFSET; returns
-/// `Unsupported` for GROUP BY / aggregates / HAVING / ORDER BY / DISTINCT.
+/// from `WHERE`; supports projection + WHERE + ORDER BY (all three emission points
+/// stage through one sorter) + constant LIMIT/OFFSET; returns `Unsupported` for
+/// GROUP BY / aggregates / HAVING / DISTINCT.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_full_join2(
     sel: &Select,
@@ -2374,11 +2468,7 @@ pub fn compile_full_join2(
     n_left: usize,
     on: &Option<Expr>,
 ) -> Result<Program> {
-    if !sel.compound.is_empty()
-        || !sel.group_by.is_empty()
-        || sel.having.is_some()
-        || !sel.order_by.is_empty()
-        || sel.distinct
+    if !sel.compound.is_empty() || !sel.group_by.is_empty() || sel.having.is_some() || sel.distinct
     {
         return Err(Error::Unsupported(
             "VDBE: full-join shape not nested-loopable",
@@ -2433,6 +2523,23 @@ pub fn compile_full_join2(
         },
     };
     let matched = c.alloc();
+    // With ORDER BY, all three emission points stage their row + sort keys into one
+    // sorter; LIMIT/OFFSET then apply to the sorted emit loop, not the two passes.
+    let ordering = !sel.order_by.is_empty();
+    let key_specs = if ordering {
+        build_sort_keys(&c, sel, columns, &projections, count)?
+    } else {
+        Vec::new()
+    };
+    let key_start = c.next_reg;
+    for _ in &key_specs {
+        c.alloc();
+    }
+    let sorter = if ordering {
+        Some((key_start, key_specs.as_slice()))
+    } else {
+        None
+    };
     let set = |ops: &mut [Op], at: usize, tgt: usize| match &mut ops[at] {
         Op::IfFalse { target, .. }
         | Op::IfPosDecr { target, .. }
@@ -2488,7 +2595,8 @@ pub fn compile_full_join2(
         }
         None => None,
     };
-    let (offset_m, limit_m) = emit_output_row(&mut c, &projections, count, offset_reg, limit_reg)?;
+    let (offset_m, limit_m) =
+        emit_output_row(&mut c, &projections, count, offset_reg, limit_reg, sorter)?;
     let next1 = c.ops.len();
     c.ops.push(Op::NextC {
         cursor: 1,
@@ -2516,7 +2624,7 @@ pub fn compile_full_join2(
         None => None,
     };
     let (offset_lnull, limit_lnull) =
-        emit_output_row(&mut c, &projections, count, offset_reg, limit_reg)?;
+        emit_output_row(&mut c, &projections, count, offset_reg, limit_reg, sorter)?;
     let next0 = c.ops.len();
     c.ops.push(Op::NextC {
         cursor: 0,
@@ -2549,12 +2657,49 @@ pub fn compile_full_join2(
         None => None,
     };
     let (offset_rnull, limit_rnull) =
-        emit_output_row(&mut c, &projections, count, offset_reg, limit_reg)?;
+        emit_output_row(&mut c, &projections, count, offset_reg, limit_reg, sorter)?;
     let next2 = c.ops.len();
     c.ops.push(Op::NextC {
         cursor: 1,
         target: loop2,
     });
+    // After both passes: with ORDER BY, sort then walk the sorter applying OFFSET
+    // then LIMIT to the ordered output; without it, this is just the Halt point.
+    let scan_done = c.ops.len();
+    let elimit = if ordering {
+        c.ops.push(Op::SorterSort {
+            keys: key_specs.iter().map(|(_, k)| k.clone()).collect(),
+        });
+        let srewind = c.ops.len();
+        c.ops.push(Op::SorterRewind { target: 0 });
+        let ebody = c.ops.len();
+        let eoffset = offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        });
+        c.ops.push(Op::SorterRow { start: 0, count });
+        c.ops.push(Op::ResultRow { start: 0, count });
+        let elimit = limit_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+            at
+        });
+        let snext = c.ops.len();
+        c.ops.push(Op::SorterNext { target: ebody });
+        let eend = c.ops.len();
+        if let Op::SorterRewind { target } = &mut c.ops[srewind] {
+            *target = eend;
+        }
+        if let Some(at) = eoffset {
+            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
+                *target = snext;
+            }
+        }
+        elimit
+    } else {
+        None
+    };
     let end = c.ops.len();
     c.ops.push(Op::Halt);
     // ---- Backpatch. ----
@@ -2583,7 +2728,7 @@ pub fn compile_full_join2(
     if let Some(at) = limit_lnull {
         set(&mut c.ops, at, end);
     }
-    set(&mut c.ops, rewind1b, end); // right empty in pass 2 → done
+    set(&mut c.ops, rewind1b, scan_done); // right empty in pass 2 → drain the sorter
     set(&mut c.ops, if_matched, next2); // already matched → skip
     if let Some(at) = where_rnull {
         set(&mut c.ops, at, next2);
@@ -2592,6 +2737,11 @@ pub fn compile_full_join2(
         set(&mut c.ops, at, next2);
     }
     if let Some(at) = limit_rnull {
+        set(&mut c.ops, at, end);
+    }
+    // The sorted emit loop's LIMIT halts the whole program (its OFFSET was
+    // backpatched inline above).
+    if let Some(at) = elimit {
         set(&mut c.ops, at, end);
     }
     Ok(Program {

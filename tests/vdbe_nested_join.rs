@@ -250,6 +250,109 @@ fn order_by_over_join_runs_on_vdbe() {
 }
 
 #[test]
+fn order_by_over_outer_join_runs_on_vdbe() {
+    // ORDER BY over a two-table LEFT/RIGHT JOIN stages both the matched and the
+    // null-padded rows through the sorter, on the VDBE (query_vdbe errors on any
+    // fallback). Results match sqlite 3.50.4. a: x=3 has no match in b → null row.
+    let c = setup();
+    // LEFT JOIN, multi-key ORDER BY DESC then ASC; the null-padded (3, NULL) row
+    // sorts first under DESC on a.x.
+    let r = c
+        .query_vdbe("SELECT a.x, b.q FROM a LEFT JOIN b ON a.x = b.p ORDER BY a.x DESC, b.q")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(3), Value::Null],
+            vec![Value::Integer(2), Value::Text("Q".into())],
+            vec![Value::Integer(2), Value::Text("R".into())],
+            vec![Value::Integer(1), Value::Text("P".into())],
+        ]
+    );
+    // ORDER BY on a column that is NULL for the unmatched row: NULLs sort first.
+    let r2 = c
+        .query_vdbe("SELECT a.x, b.q FROM a LEFT JOIN b ON a.x = b.p ORDER BY b.q")
+        .unwrap();
+    assert_eq!(
+        r2.rows,
+        vec![
+            vec![Value::Integer(3), Value::Null],
+            vec![Value::Integer(1), Value::Text("P".into())],
+            vec![Value::Integer(2), Value::Text("Q".into())],
+            vec![Value::Integer(2), Value::Text("R".into())],
+        ]
+    );
+    // ORDER BY + LIMIT/OFFSET over the sorted output.
+    let r3 = c
+        .query_vdbe(
+            "SELECT a.x, b.q FROM a LEFT JOIN b ON a.x = b.p ORDER BY a.x, b.q LIMIT 2 OFFSET 1",
+        )
+        .unwrap();
+    assert_eq!(
+        r3.rows,
+        vec![
+            vec![Value::Integer(2), Value::Text("Q".into())],
+            vec![Value::Integer(2), Value::Text("R".into())],
+        ]
+    );
+    // RIGHT JOIN (router swaps the cursors into compile_left_join2) with ORDER BY.
+    let r4 = c
+        .query_vdbe("SELECT a.x, b.p FROM a RIGHT JOIN b ON a.x = b.p ORDER BY b.p DESC, a.x")
+        .unwrap();
+    assert_eq!(
+        r4.rows,
+        vec![
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(1), Value::Integer(1)],
+        ]
+    );
+}
+
+#[test]
+fn order_by_over_full_join_runs_on_vdbe() {
+    // ORDER BY over a two-table FULL JOIN: all three emission points (matched,
+    // left-null, right-null) stage through one sorter. b has an unmatched row (5)
+    // so the pass-2 null-left path is exercised under ORDER BY. Matches sqlite.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x, y)").unwrap();
+    c.execute("INSERT INTO a VALUES(1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    c.execute("CREATE TABLE b(p, q)").unwrap();
+    c.execute("INSERT INTO b VALUES(1,'P'),(2,'Q'),(2,'R'),(5,'Z')")
+        .unwrap();
+    // a.x DESC, b.p: a.x=3 is left-null (b.p NULL); b.p=5 is right-null (a.x NULL,
+    // sorts last under a.x DESC).
+    let r = c
+        .query_vdbe("SELECT a.x, b.p FROM a FULL JOIN b ON a.x = b.p ORDER BY a.x DESC, b.p")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(3), Value::Null],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Null, Value::Integer(5)],
+        ]
+    );
+    // ORDER BY + LIMIT/OFFSET over the sorted FULL-join output.
+    let r2 = c
+        .query_vdbe(
+            "SELECT a.x, b.p FROM a FULL JOIN b ON a.x = b.p ORDER BY b.p, a.x LIMIT 3 OFFSET 1",
+        )
+        .unwrap();
+    assert_eq!(
+        r2.rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Integer(2)],
+        ]
+    );
+}
+
+#[test]
 fn bare_aggregate_over_join_runs_on_vdbe() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x, y)").unwrap();
