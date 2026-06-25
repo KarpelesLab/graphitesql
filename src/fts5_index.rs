@@ -1155,46 +1155,9 @@ fn decode_term_in_data(data: &[(i64, Vec<u8>)], term: &[u8]) -> Option<Vec<Decod
     merge_segments(data, |leaves| decode_term_strict(leaves, term))
 }
 
-/// Whether columns `a` and `b` (the per-column position lists of two postings for
-/// the same document) form the adjacent phrase "a then b": some column `c` holds a
-/// position `p` in `a` with `p + 1` present in `b`. This is the index analogue of
-/// the scan's `fts5_phrase_starts` over a 2-token phrase: in that matcher a phrase
-/// matches a single column's token list at start `s` iff `doc[s] == a` and
-/// `doc[s + 1] == b`, i.e. term `a` at position `s` and term `b` at `s + 1` in THE
-/// SAME column. We require the shared column because positions are numbered per
-/// column (the writer records them per column, in the same order `_content` columns
-/// appear), exactly as the scan tokenizes one column at a time.
-fn phrase_adjacent(a: &DecodedPosting, b: &DecodedPosting) -> bool {
-    let ncols = a.cols.len().max(b.cols.len());
-    (0..ncols).any(|c| positions_adjacent(col(a, c), col(b, c)))
-}
-
-/// Restrict [`phrase_adjacent`] to a single column `c`: term `a` at position `p`
-/// with term `b` at `p + 1`, both in column `c`. Matches the scan's `col : "a b"`.
-fn phrase_adjacent_in_column(a: &DecodedPosting, b: &DecodedPosting, c: usize) -> bool {
-    positions_adjacent(col(a, c), col(b, c))
-}
-
 /// Column `c`'s position list of a posting (empty if the term never occurs there).
 fn col(p: &DecodedPosting, c: usize) -> &[u32] {
     p.cols.get(c).map(Vec::as_slice).unwrap_or(&[])
-}
-
-/// Whether some position `p` in the ascending list `pa` has `p + 1` in the ascending
-/// list `pb` (a two-pointer merge). Empty inputs never match.
-fn positions_adjacent(pa: &[u32], pb: &[u32]) -> bool {
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < pa.len() && j < pb.len() {
-        match pa[i].checked_add(1) {
-            None => return false,
-            Some(want) => match want.cmp(&pb[j]) {
-                core::cmp::Ordering::Equal => return true,
-                core::cmp::Ordering::Less => i += 1,
-                core::cmp::Ordering::Greater => j += 1,
-            },
-        }
-    }
-    false
 }
 
 /// Walk the docid-aligned intersection of two postings lists (each ascending by
@@ -1225,43 +1188,136 @@ fn phrase_intersect(
     out
 }
 
-/// Look up the two-token phrase `"term_a term_b"` in a single-segment FTS5 index and
-/// return the rowids of the documents where the tokens occur at ADJACENT positions
-/// in the same column (`term_b` at position `p + 1` where `term_a` is at `p`),
-/// ascending — or `None` if the index shape is one the single-segment leaf reader
-/// cannot serve (so the caller falls back to the `%_content` scan).
+/// Whether some column `c` of a document holds a consecutive run `p, p+1, …,
+/// p+K-1` whose positions belong to `terms[0], terms[1], …, terms[K-1]`
+/// respectively. `cols[i][c]` is
+/// term `i`'s ascending (possibly empty) position list in column `c`. When `column`
+/// is `Some(c)` only that column is examined (column-scoped phrase); when `None`
+/// any column may carry the run (table-wide).
 ///
-/// This is the phrase sibling of [`lookup_term_rowids`]. It decodes BOTH terms'
-/// doclists from the one gathered segment, intersects them by docid, and keeps the
-/// shared docs whose per-column positions are adjacent — the exact set the scan's
-/// 2-token phrase predicate (`fts5_phrase_starts`) matches. Either term being absent
-/// yields `Some(vec![])` (servable, no match).
-pub(crate) fn lookup_phrase_rowids(
-    data: &[(i64, Vec<u8>)],
-    term_a: &[u8],
-    term_b: &[u8],
-) -> Option<Vec<i64>> {
-    let leaves = segment_leaves(data)?;
-    let pa = decode_term(&leaves, term_a).unwrap_or_default();
-    let pb = decode_term(&leaves, term_b).unwrap_or_default();
-    Some(phrase_intersect(&pa, &pb, phrase_adjacent))
+/// This is the index analogue of the scan's [`crate::vtab`] `fts5_phrase_starts`
+/// over a K-token phrase: a phrase matches a single column's token list at start
+/// `s` iff `doc[s + i] == terms[i]` for every `i`, i.e. term `i` at position
+/// `s + i` in THE SAME column. We walk each candidate start `p` (a position of
+/// `terms[0]`) and verify, by binary search on each later term's ascending
+/// position list, that `p + i` is present — O(P · K log P) over the document's
+/// positions. Repeated words (`terms[i] == terms[j]`) just check the same position
+/// list at different offsets, so `"a a a"` matches positions `p, p+1, p+2` of the
+/// one term's list, exactly as the scan would.
+fn phrase_run_matches(cols: &[Vec<&[u32]>], column: Option<usize>) -> bool {
+    debug_assert!(!cols.is_empty());
+    let k = cols.len();
+    // The number of columns is the max any term's posting carries (absent columns
+    // are empty and never start a run).
+    let ncols = cols.iter().map(Vec::len).max().unwrap_or(0);
+    let in_col = |c: usize| -> bool {
+        // term[0]'s positions in this column are the candidate run starts.
+        let first = cols[0].get(c).copied().unwrap_or(&[]);
+        first.iter().any(|&p| {
+            (1..k).all(|i| {
+                let want = match p.checked_add(i as u32) {
+                    Some(w) => w,
+                    None => return false,
+                };
+                let list = cols[i].get(c).copied().unwrap_or(&[]);
+                list.binary_search(&want).is_ok()
+            })
+        })
+    };
+    match column {
+        Some(c) => in_col(c),
+        None => (0..ncols).any(in_col),
+    }
 }
 
-/// Column-scoped sibling of [`lookup_phrase_rowids`]: keep only documents where the
-/// adjacent phrase occurs in COLUMN `column` (its position in the table's full
-/// column list, from 0) — exactly what the scan's `col : "a b"` predicate matches.
-pub(crate) fn lookup_phrase_rowids_in_column(
+/// Walk the docid-aligned intersection of K postings lists (each ascending by
+/// rowid) and keep the rowids whose per-column positions hold a consecutive run of
+/// the K terms (see [`phrase_run_matches`]), ascending. The K-term generalization
+/// of [`phrase_intersect`]: it advances every list whose head rowid equals the
+/// running minimum, so a document survives only when ALL K terms post it.
+fn phrase_intersect_k(postings: &[Vec<DecodedPosting>], column: Option<usize>) -> Vec<i64> {
+    let k = postings.len();
+    if k == 0 || postings.iter().any(Vec::is_empty) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut idx = alloc::vec![0usize; k];
+    loop {
+        // The smallest head rowid across the K lists; stop when any list is drained.
+        let mut min_rowid = i64::MAX;
+        for (i, p) in postings.iter().enumerate() {
+            if idx[i] >= p.len() {
+                return out;
+            }
+            min_rowid = min_rowid.min(p[idx[i]].rowid);
+        }
+        // Do all K lists agree on this rowid? If so it is a shared document.
+        let all_equal = postings
+            .iter()
+            .zip(&idx)
+            .all(|(p, &j)| p[j].rowid == min_rowid);
+        if all_equal {
+            let cols: Vec<Vec<&[u32]>> = postings
+                .iter()
+                .zip(&idx)
+                .map(|(p, &j)| p[j].cols.iter().map(Vec::as_slice).collect())
+                .collect();
+            if phrase_run_matches(&cols, column) {
+                out.push(min_rowid);
+            }
+        }
+        // Advance every list still sitting on the minimum rowid.
+        for (i, p) in postings.iter().enumerate() {
+            if p[idx[i]].rowid == min_rowid {
+                idx[i] += 1;
+            }
+        }
+    }
+}
+
+/// Look up the K-token phrase `"t0 t1 … t(K-1)"` (K ≥ 2) in a single-segment FTS5
+/// index and return the rowids of the documents where the tokens occur at
+/// CONSECUTIVE positions in one column (`terms[i]` at position `p + i`), ascending
+/// — or `None` if the index shape is one the single-segment leaf reader cannot
+/// serve (so the caller falls back to the `%_content` scan).
+///
+/// The phrase sibling of [`lookup_term_rowids`]: it decodes EVERY term's
+/// doclist from the one gathered segment, intersects them by docid, and keeps the
+/// shared docs whose per-column positions form a consecutive run — the exact set
+/// the scan's K-token phrase predicate ([`crate::vtab`] `fts5_phrase_starts`)
+/// matches. Any term being absent yields `Some(vec![])` (servable, no match).
+/// Repeated-word phrases work because a repeated term decodes the same position
+/// list and the run check reads it at successive offsets.
+pub(crate) fn lookup_phrase_rowids_k(data: &[(i64, Vec<u8>)], terms: &[&[u8]]) -> Option<Vec<i64>> {
+    if terms.len() < 2 {
+        return None;
+    }
+    let leaves = segment_leaves(data)?;
+    let postings: Vec<Vec<DecodedPosting>> = terms
+        .iter()
+        .map(|t| decode_term(&leaves, t).unwrap_or_default())
+        .collect();
+    Some(phrase_intersect_k(&postings, None))
+}
+
+/// Column-scoped sibling of [`lookup_phrase_rowids_k`]: keep only documents where
+/// the consecutive K-token run occurs in COLUMN `column` (its position in the
+/// table's full column list, from 0) — exactly what the scan's `col : "t0 t1 …"`
+/// predicate matches.
+pub(crate) fn lookup_phrase_rowids_in_column_k(
     data: &[(i64, Vec<u8>)],
-    term_a: &[u8],
-    term_b: &[u8],
+    terms: &[&[u8]],
     column: usize,
 ) -> Option<Vec<i64>> {
+    if terms.len() < 2 {
+        return None;
+    }
     let leaves = segment_leaves(data)?;
-    let pa = decode_term(&leaves, term_a).unwrap_or_default();
-    let pb = decode_term(&leaves, term_b).unwrap_or_default();
-    Some(phrase_intersect(&pa, &pb, |a, b| {
-        phrase_adjacent_in_column(a, b, column)
-    }))
+    let postings: Vec<Vec<DecodedPosting>> = terms
+        .iter()
+        .map(|t| decode_term(&leaves, t).unwrap_or_default())
+        .collect();
+    Some(phrase_intersect_k(&postings, Some(column)))
 }
 
 /// Whether some position `pa` of term `a` and `pb` of term `b` are within the NEAR
@@ -1306,7 +1362,7 @@ fn near_matches(a: &DecodedPosting, b: &DecodedPosting, n: u32) -> bool {
 /// ascending — or `None` if the index shape is one the single-segment leaf reader
 /// cannot serve (so the caller falls back to the `%_content` scan).
 ///
-/// This is the NEAR sibling of [`lookup_phrase_rowids`]. It decodes BOTH terms'
+/// This is the NEAR sibling of [`lookup_phrase_rowids_k`]. It decodes BOTH terms'
 /// doclists from the one gathered segment, intersects them by docid, and keeps the
 /// shared docs whose per-column positions fall inside the NEAR window — the exact
 /// set the scan's two-single-token `NEAR` predicate (`fts5_near_matches`) matches.
@@ -2096,14 +2152,17 @@ mod tests {
         let seg = build_segment(&terms, 6, &[40], &doc_sizes, 1000, 0);
         // Only docs 1 and 4 have "a" immediately followed by "b".
         assert_eq!(
-            lookup_phrase_rowids(&seg.data, b"a", b"b"),
+            lookup_phrase_rowids_k(&seg.data, &[b"a", b"b"]),
             Some(vec![1, 4])
         );
         // The reverse phrase "b a": doc3 (b@0, a@1).
-        assert_eq!(lookup_phrase_rowids(&seg.data, b"b", b"a"), Some(vec![3]));
+        assert_eq!(
+            lookup_phrase_rowids_k(&seg.data, &[b"b", b"a"]),
+            Some(vec![3])
+        );
         // A term absent from the index → servable empty result.
         assert_eq!(
-            lookup_phrase_rowids(&seg.data, b"a", b"zzz"),
+            lookup_phrase_rowids_k(&seg.data, &[b"a", b"zzz"]),
             Some(Vec::new())
         );
     }
@@ -2113,7 +2172,10 @@ mod tests {
         // The phrase "a a": doc1 has a@0,1 (adjacent self), doc2 has a@0,2 (not).
         let terms = vec![(b"a".to_vec(), vec![p(1, &[&[0, 1]]), p(2, &[&[0, 2]])])];
         let seg = build_segment(&terms, 2, &[4], &[(1, vec![2]), (2, vec![3])], 1000, 0);
-        assert_eq!(lookup_phrase_rowids(&seg.data, b"a", b"a"), Some(vec![1]));
+        assert_eq!(
+            lookup_phrase_rowids_k(&seg.data, &[b"a", b"a"]),
+            Some(vec![1])
+        );
     }
 
     #[test]
@@ -2147,17 +2209,17 @@ mod tests {
         let seg = build_segment(&terms, 4, &[40, 40], &doc_sizes, 1000, 0);
         // Table-wide: any column with the adjacent phrase → docs 1, 3, 4.
         assert_eq!(
-            lookup_phrase_rowids(&seg.data, b"a", b"b"),
+            lookup_phrase_rowids_k(&seg.data, &[b"a", b"b"]),
             Some(vec![1, 3, 4])
         );
         // Column 0 only: docs 1 and 4.
         assert_eq!(
-            lookup_phrase_rowids_in_column(&seg.data, b"a", b"b", 0),
+            lookup_phrase_rowids_in_column_k(&seg.data, &[b"a", b"b"], 0),
             Some(vec![1, 4])
         );
         // Column 1 only: docs 3 and 4.
         assert_eq!(
-            lookup_phrase_rowids_in_column(&seg.data, b"a", b"b", 1),
+            lookup_phrase_rowids_in_column_k(&seg.data, &[b"a", b"b"], 1),
             Some(vec![3, 4])
         );
     }
@@ -2183,16 +2245,136 @@ mod tests {
         let seg = build_segment(&terms, n as u64, &[8 * n as u64], &doc_sizes, 64, 0);
         assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclists");
         let even: Vec<i64> = (1..=n).filter(|r| r % 2 == 0).collect();
-        assert_eq!(lookup_phrase_rowids(&seg.data, b"a", b"b"), Some(even));
+        assert_eq!(lookup_phrase_rowids_k(&seg.data, &[b"a", b"b"]), Some(even));
     }
 
     #[test]
     fn lookup_phrase_empty_index_falls_back() {
         let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
-        assert_eq!(lookup_phrase_rowids(&seg.data, b"a", b"b"), None);
+        assert_eq!(lookup_phrase_rowids_k(&seg.data, &[b"a", b"b"]), None);
         assert_eq!(
-            lookup_phrase_rowids_in_column(&seg.data, b"a", b"b", 0),
+            lookup_phrase_rowids_in_column_k(&seg.data, &[b"a", b"b"], 0),
             None
+        );
+    }
+
+    #[test]
+    fn lookup_phrase_k_consecutive_run() {
+        // Terms a, b, c (one column). A 3-term phrase "a b c" matches iff some
+        // column holds positions p, p+1, p+2 of a, b, c respectively.
+        //   doc1: a@0 b@1 c@2         → consecutive "a b c"
+        //   doc2: a@0 b@1 c@3         → c not at 2, NO match
+        //   doc3: a@0 b@2 c@1         → out of order, NO match
+        //   doc4: a@0,3 b@1,4 c@2,5   → two runs, matches
+        //   doc5: a@0 b@1             → c absent in doc, NO match
+        let terms = vec![
+            (
+                b"a".to_vec(),
+                vec![
+                    p(1, &[&[0]]),
+                    p(2, &[&[0]]),
+                    p(3, &[&[0]]),
+                    p(4, &[&[0, 3]]),
+                    p(5, &[&[0]]),
+                ],
+            ),
+            (
+                b"b".to_vec(),
+                vec![
+                    p(1, &[&[1]]),
+                    p(2, &[&[1]]),
+                    p(3, &[&[2]]),
+                    p(4, &[&[1, 4]]),
+                    p(5, &[&[1]]),
+                ],
+            ),
+            (
+                b"c".to_vec(),
+                vec![
+                    p(1, &[&[2]]),
+                    p(2, &[&[3]]),
+                    p(3, &[&[1]]),
+                    p(4, &[&[2, 5]]),
+                ],
+            ),
+        ];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=5).map(|r| (r, vec![8])).collect();
+        let seg = build_segment(&terms, 5, &[40], &doc_sizes, 1000, 0);
+        assert_eq!(
+            lookup_phrase_rowids_k(&seg.data, &[b"a", b"b", b"c"]),
+            Some(vec![1, 4])
+        );
+        // The 2-term prefix "a b" matches every doc with a@p, b@p+1: docs 1,2,4,5.
+        assert_eq!(
+            lookup_phrase_rowids_k(&seg.data, &[b"a", b"b"]),
+            Some(vec![1, 2, 4, 5])
+        );
+        // A term absent from the index → servable empty result.
+        assert_eq!(
+            lookup_phrase_rowids_k(&seg.data, &[b"a", b"b", b"zzz"]),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn lookup_phrase_k_repeated_word() {
+        // The phrase "a a a": doc1 has a@0,1,2 (run of 3), doc2 has a@0,1 only
+        // (run of 2, not 3), doc3 has a@0,2,4 (no consecutive run).
+        let terms = vec![(
+            b"a".to_vec(),
+            vec![p(1, &[&[0, 1, 2]]), p(2, &[&[0, 1]]), p(3, &[&[0, 2, 4]])],
+        )];
+        let doc_sizes = [(1, vec![3]), (2, vec![2]), (3, vec![5])];
+        let seg = build_segment(&terms, 3, &[10], &doc_sizes, 1000, 0);
+        // "a a" (K=2): doc1 (0,1) and doc2 (0,1). doc3 has no adjacent pair.
+        assert_eq!(
+            lookup_phrase_rowids_k(&seg.data, &[b"a", b"a"]),
+            Some(vec![1, 2])
+        );
+        // "a a a" (K=3): only doc1.
+        assert_eq!(
+            lookup_phrase_rowids_k(&seg.data, &[b"a", b"a", b"a"]),
+            Some(vec![1])
+        );
+    }
+
+    #[test]
+    fn lookup_phrase_k_column_boundary() {
+        // Two columns. The 3-term phrase "a b c" must be consecutive WITHIN one
+        // column; a run split across the column boundary must NOT match.
+        //   doc1: col0 a@0 b@1 c@2                  → col0 match
+        //   doc2: col0 a@0 b@1 ; col1 c@0           → split across columns, NO match
+        //   doc3: col1 a@3 b@4 c@5                  → col1 match
+        let terms = vec![
+            (
+                b"a".to_vec(),
+                vec![p(1, &[&[0], &[]]), p(2, &[&[0], &[]]), p(3, &[&[], &[3]])],
+            ),
+            (
+                b"b".to_vec(),
+                vec![p(1, &[&[1], &[]]), p(2, &[&[1], &[]]), p(3, &[&[], &[4]])],
+            ),
+            (
+                b"c".to_vec(),
+                vec![p(1, &[&[2], &[]]), p(2, &[&[], &[0]]), p(3, &[&[], &[5]])],
+            ),
+        ];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=3).map(|r| (r, vec![8, 8])).collect();
+        let seg = build_segment(&terms, 3, &[40, 40], &doc_sizes, 1000, 0);
+        // Table-wide: any column with the consecutive run → docs 1 and 3 (NOT 2).
+        assert_eq!(
+            lookup_phrase_rowids_k(&seg.data, &[b"a", b"b", b"c"]),
+            Some(vec![1, 3])
+        );
+        // Column 0 only: doc 1.
+        assert_eq!(
+            lookup_phrase_rowids_in_column_k(&seg.data, &[b"a", b"b", b"c"], 0),
+            Some(vec![1])
+        );
+        // Column 1 only: doc 3.
+        assert_eq!(
+            lookup_phrase_rowids_in_column_k(&seg.data, &[b"a", b"b", b"c"], 1),
+            Some(vec![3])
         );
     }
 

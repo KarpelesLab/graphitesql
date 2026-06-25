@@ -2604,43 +2604,50 @@ pub(crate) fn fts5_single_prefix_term_column(
     Some((column, key))
 }
 
-/// The two index keys of a [`Fts5Term`] iff it is a TWO-TOKEN PHRASE that the
+/// The K index keys (K ≥ 2) of a [`Fts5Term`] iff it is a K-TOKEN PHRASE that the
 /// segment reader can serve identically to the scan: uncolumned (the caller decides
-/// table-wide vs column-scoped), unanchored, non-prefix, and lexing to exactly two
-/// query tokens. Returns the two tokens stemmed exactly as the scan stems them at
-/// match time ([`fts5_term_starts`]), so the keys equal the indexed tokens.
+/// table-wide vs column-scoped), unanchored, non-prefix, and lexing to at least two
+/// query tokens. Returns each token stemmed exactly as the scan stems it at match
+/// time ([`fts5_term_starts`]), so the keys equal the indexed tokens.
 ///
-/// A phrase matches a document iff its two tokens occur at adjacent positions in one
-/// column — the index reader checks exactly that over the two terms' per-column
-/// positions, so the routed result is identical to the scan. Anything else (an
-/// anchor, a `tok*` prefix on the last token, or a phrase that does not lex to
-/// exactly two tokens) returns `None` and stays on the scan.
+/// A phrase matches a
+/// document iff its tokens occur at CONSECUTIVE positions in one column — the index
+/// reader checks exactly that over the K terms' per-column positions, so the routed
+/// result is identical to the scan. Anything else (an anchor, a `tok*` prefix on
+/// the last token, or a phrase of fewer than two tokens) returns `None` and stays
+/// on the scan. The anchor/prefix flags come from the lexer; a `^` or `*` *inside*
+/// the quotes is folded by the tokenizer exactly as the scan folds it, so the same
+/// `Fts5Term` drives both paths.
 #[cfg(feature = "fts5")]
-fn fts5_two_token_phrase_keys(term: &Fts5Term, tok: Fts5Tok) -> Option<(Vec<u8>, Vec<u8>)> {
+fn fts5_phrase_keys(term: &Fts5Term, tok: Fts5Tok) -> Option<Vec<Vec<u8>>> {
     if term.prefix || term.anchored {
         return None;
     }
-    let [a, b] = term.phrase.as_slice() else {
+    if term.phrase.len() < 2 {
         return None;
-    };
+    }
     // The phrase tokens are stored unstemmed; the scan stems them at match time, so
     // the index key is the stemmed form (identity when the table isn't `porter`).
-    let key = |w: &String| -> Vec<u8> {
-        if tok.stem {
-            fts5_porter_stem(w).into_bytes()
-        } else {
-            w.clone().into_bytes()
-        }
-    };
-    Some((key(a), key(b)))
+    let keys = term
+        .phrase
+        .iter()
+        .map(|w| {
+            if tok.stem {
+                fts5_porter_stem(w).into_bytes()
+            } else {
+                w.clone().into_bytes()
+            }
+        })
+        .collect();
+    Some(keys)
 }
 
-/// If `pattern` is a SINGLE TABLE-WIDE TWO-TERM PHRASE (`"a b"`), return the two
-/// tokens' index keys; otherwise `None`. The phrase sibling of
-/// [`fts5_single_bare_term`] — see [`fts5_two_token_phrase_keys`] for the exact
-/// shape — feeding [`crate::fts5_index::lookup_phrase_rowids`].
+/// If `pattern` is a SINGLE TABLE-WIDE K-TERM PHRASE (`"t0 t1 …"`, K ≥ 2), return
+/// the tokens' index keys; otherwise `None`. The phrase sibling of
+/// [`fts5_single_bare_term`] — see [`fts5_phrase_keys`] for the exact shape —
+/// feeding [`crate::fts5_index::lookup_phrase_rowids_k`].
 #[cfg(feature = "fts5")]
-pub(crate) fn fts5_two_term_phrase(pattern: &str, tok: Fts5Tok) -> Option<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn fts5_phrase_terms(pattern: &str, tok: Fts5Tok) -> Option<Vec<Vec<u8>>> {
     let toks = fts5_lex(pattern, tok);
     let term = match toks.as_slice() {
         [Fts5Lex::Term(t)] => t,
@@ -2649,26 +2656,25 @@ pub(crate) fn fts5_two_term_phrase(pattern: &str, tok: Fts5Tok) -> Option<(Vec<u
     if term.column.is_some() {
         return None;
     }
-    fts5_two_token_phrase_keys(term, tok)
+    fts5_phrase_keys(term, tok)
 }
 
-/// If `pattern` is a SINGLE COLUMN-SCOPED TWO-TERM PHRASE (`col : "a b"`), return the
-/// `(column name, (token a key, token b key))`; otherwise `None`. The column-scoped
-/// sibling of [`fts5_two_term_phrase`], feeding
-/// [`crate::fts5_index::lookup_phrase_rowids_in_column`].
+/// If `pattern` is a SINGLE COLUMN-SCOPED K-TERM PHRASE (`col : "t0 t1 …"`, K ≥ 2),
+/// return the `(column name, token keys)`; otherwise `None`. The column-scoped
+/// sibling of [`fts5_phrase_terms`], feeding
+/// [`crate::fts5_index::lookup_phrase_rowids_in_column_k`].
 #[cfg(feature = "fts5")]
-#[allow(clippy::type_complexity)]
-pub(crate) fn fts5_two_term_phrase_column(
+pub(crate) fn fts5_phrase_terms_column(
     pattern: &str,
     tok: Fts5Tok,
-) -> Option<(String, (Vec<u8>, Vec<u8>))> {
+) -> Option<(String, Vec<Vec<u8>>)> {
     let toks = fts5_lex(pattern, tok);
     let term = match toks.as_slice() {
         [Fts5Lex::Term(t)] => t,
         _ => return None,
     };
     let column = term.column.clone()?;
-    let keys = fts5_two_token_phrase_keys(term, tok)?;
+    let keys = fts5_phrase_keys(term, tok)?;
     Some((column, keys))
 }
 
@@ -2676,7 +2682,7 @@ pub(crate) fn fts5_two_term_phrase_column(
 /// (`NEAR(a b, n)`, or `NEAR(a b)` with the default distance 10), return
 /// `(token a key, token b key, n)`; otherwise `None`.
 ///
-/// This is the `NEAR` sibling of [`fts5_two_term_phrase`], feeding
+/// This is the `NEAR` sibling of [`fts5_phrase_terms`], feeding
 /// [`crate::fts5_index::lookup_near_rowids`]. The shape it accepts is narrow on
 /// purpose, so the index result is provably identical to the
 /// [`fts5_query_matches`] scan: the whole query lexes to exactly ONE `NEAR` group
@@ -3484,47 +3490,66 @@ mod tests {
 
     #[test]
     #[cfg(feature = "fts5")]
-    fn fts5_two_term_phrase_recognizer_shapes() {
+    fn fts5_phrase_recognizer_shapes() {
         let tok = Fts5Tok::default();
-        // A bare two-word phrase is recognized, table-wide.
+        let v = |ws: &[&[u8]]| ws.iter().map(|w| w.to_vec()).collect::<Vec<Vec<u8>>>();
+        // A bare two-word phrase is recognized, table-wide (the K = 2 case).
         assert_eq!(
-            fts5_two_term_phrase("\"quick brown\"", tok),
-            Some((b"quick".to_vec(), b"brown".to_vec()))
+            fts5_phrase_terms("\"quick brown\"", tok),
+            Some(v(&[b"quick", b"brown"]))
         );
-        // Column-scoped two-word phrase.
+        // A K-word phrase (K = 3, 4) is recognized, table-wide.
         assert_eq!(
-            fts5_two_term_phrase_column("body : \"quick brown\"", tok),
-            Some((String::from("body"), (b"quick".to_vec(), b"brown".to_vec())))
+            fts5_phrase_terms("\"one two three\"", tok),
+            Some(v(&[b"one", b"two", b"three"]))
+        );
+        assert_eq!(
+            fts5_phrase_terms("\"a b c d\"", tok),
+            Some(v(&[b"a", b"b", b"c", b"d"]))
+        );
+        // Column-scoped K-word phrase.
+        assert_eq!(
+            fts5_phrase_terms_column("body : \"quick brown fox\"", tok),
+            Some((String::from("body"), v(&[b"quick", b"brown", b"fox"])))
         );
         // A column-scoped phrase is NOT a table-wide phrase, and vice versa.
-        assert_eq!(fts5_two_term_phrase("body:\"quick brown\"", tok), None);
-        assert_eq!(fts5_two_term_phrase_column("\"quick brown\"", tok), None);
-        // Repeated word still recognizes (the index check handles self-adjacency).
+        assert_eq!(fts5_phrase_terms("body:\"quick brown\"", tok), None);
+        assert_eq!(fts5_phrase_terms_column("\"quick brown\"", tok), None);
+        // Repeated words still recognize (the index check handles self-adjacency).
         assert_eq!(
-            fts5_two_term_phrase("\"go go\"", tok),
-            Some((b"go".to_vec(), b"go".to_vec()))
+            fts5_phrase_terms("\"go go\"", tok),
+            Some(v(&[b"go", b"go"]))
         );
-        // Rejected shapes: not 2 tokens, anchor, boolean, NEAR, bare term.
-        assert_eq!(fts5_two_term_phrase("\"one two three\"", tok), None);
-        assert_eq!(fts5_two_term_phrase("\"only\"", tok), None);
-        assert_eq!(fts5_two_term_phrase("^\"quick brown\"", tok), None);
-        assert_eq!(fts5_two_term_phrase("quick brown", tok), None); // implicit AND, not a phrase
-        assert_eq!(fts5_two_term_phrase("word", tok), None);
-        assert_eq!(fts5_two_term_phrase("\"a b\" OR \"c d\"", tok), None);
+        assert_eq!(
+            fts5_phrase_terms("\"go go go\"", tok),
+            Some(v(&[b"go", b"go", b"go"]))
+        );
+        // Rejected shapes: a single token, anchor, boolean, NEAR, bare terms.
+        assert_eq!(fts5_phrase_terms("\"only\"", tok), None);
+        assert_eq!(fts5_phrase_terms("^\"quick brown\"", tok), None);
+        assert_eq!(fts5_phrase_terms("quick brown", tok), None); // implicit AND, not a phrase
+        assert_eq!(fts5_phrase_terms("word", tok), None);
+        assert_eq!(fts5_phrase_terms("\"a b\" OR \"c d\"", tok), None);
     }
 
     #[test]
     #[cfg(feature = "fts5")]
-    fn fts5_two_term_phrase_recognizer_stems() {
+    fn fts5_phrase_recognizer_stems() {
         // Under the porter tokenizer the phrase tokens are stemmed to their index
         // keys (matching what the writer stored and the scan re-stems at match).
         let tok = Fts5Tok {
             stem: true,
             ..Fts5Tok::default()
         };
+        let v = |ws: &[&[u8]]| ws.iter().map(|w| w.to_vec()).collect::<Vec<Vec<u8>>>();
         assert_eq!(
-            fts5_two_term_phrase("\"running shoes\"", tok),
-            Some((b"run".to_vec(), b"shoe".to_vec()))
+            fts5_phrase_terms("\"running shoes\"", tok),
+            Some(v(&[b"run", b"shoe"]))
+        );
+        // K = 3 stems every token.
+        assert_eq!(
+            fts5_phrase_terms("\"running shoes quickly\"", tok),
+            Some(v(&[b"run", b"shoe", b"quickli"]))
         );
     }
 

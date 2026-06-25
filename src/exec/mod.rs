@@ -7106,10 +7106,10 @@ impl Connection {
         //   * a COLUMN-SCOPED single bare term (`'col : word'`) — matches only in
         //     the named column. The per-column positions in the term's doclist let
         //     us keep exactly the postings carrying a hit in that column;
-        //   * a TABLE-WIDE two-term phrase (`'"a b"'`) — the two tokens occur at
-        //     ADJACENT positions in some column;
-        //   * a COLUMN-SCOPED two-term phrase (`'col : "a b"'`) — adjacent in the
-        //     named column.
+        //   * a TABLE-WIDE K-term phrase (`'"t0 t1 …"'`, K ≥ 2) — the tokens occur
+        //     at CONSECUTIVE positions in some column;
+        //   * a COLUMN-SCOPED K-term phrase (`'col : "t0 t1 …"'`) — consecutive in
+        //     the named column.
         //   * a TABLE-WIDE two-single-token bare-term `NEAR` group
         //     (`'NEAR(a b, n)'`, default `n = 10`) — the two tokens occur within
         //     `n + 1` positions of each other in some column.
@@ -7117,8 +7117,13 @@ impl Connection {
         enum Routed {
             AnyColumn(Vec<u8>),
             InColumn(Vec<u8>, usize),
-            Phrase(Vec<u8>, Vec<u8>),
-            PhraseInColumn(Vec<u8>, Vec<u8>, usize),
+            /// A TABLE-WIDE K-term phrase (`'"t0 t1 …"'`, K ≥ 2) — the tokens occur
+            /// at CONSECUTIVE positions in some column. The 2-term `'"a b"'` is the
+            /// K = 2 instance.
+            Phrase(Vec<Vec<u8>>),
+            /// A COLUMN-SCOPED K-term phrase (`'col : "t0 t1 …"'`) — consecutive in
+            /// the named column.
+            PhraseInColumn(Vec<Vec<u8>>, usize),
             /// A TABLE-WIDE two-single-token bare-term `NEAR` group
             /// (`'NEAR(a b, n)'`, default `n = 10`) — the two tokens occur within
             /// `n + 1` positions of each other in some column.
@@ -7154,11 +7159,11 @@ impl Connection {
                 Some(ci) => Routed::InColumn(t, ci),
                 None => return Ok(None),
             }
-        } else if let Some((a, b)) = crate::vtab::fts5_two_term_phrase(&query, tok) {
-            Routed::Phrase(a, b)
-        } else if let Some((col, (a, b))) = crate::vtab::fts5_two_term_phrase_column(&query, tok) {
+        } else if let Some(terms) = crate::vtab::fts5_phrase_terms(&query, tok) {
+            Routed::Phrase(terms)
+        } else if let Some((col, terms)) = crate::vtab::fts5_phrase_terms_column(&query, tok) {
             match resolve_col(&col)? {
-                Some(ci) => Routed::PhraseInColumn(a, b, ci),
+                Some(ci) => Routed::PhraseInColumn(terms, ci),
                 None => return Ok(None),
             }
         } else if let Some((a, b, n)) = crate::vtab::fts5_two_term_near(&query, tok) {
@@ -7198,9 +7203,13 @@ impl Connection {
             Routed::InColumn(term, ci) => {
                 crate::fts5_index::lookup_term_rowids_in_column(&data, term, *ci)
             }
-            Routed::Phrase(a, b) => crate::fts5_index::lookup_phrase_rowids(&data, a, b),
-            Routed::PhraseInColumn(a, b, ci) => {
-                crate::fts5_index::lookup_phrase_rowids_in_column(&data, a, b, *ci)
+            Routed::Phrase(terms) => {
+                let refs: Vec<&[u8]> = terms.iter().map(Vec::as_slice).collect();
+                crate::fts5_index::lookup_phrase_rowids_k(&data, &refs)
+            }
+            Routed::PhraseInColumn(terms, ci) => {
+                let refs: Vec<&[u8]> = terms.iter().map(Vec::as_slice).collect();
+                crate::fts5_index::lookup_phrase_rowids_in_column_k(&data, &refs, *ci)
             }
             Routed::Near(a, b, n) => crate::fts5_index::lookup_near_rowids(&data, a, b, *n),
             Routed::BoolTree(tree) => crate::fts5_index::lookup_bool_tree_rowids(&data, tree),
@@ -21320,10 +21329,11 @@ mod fts5_index_route_tests {
             ))
             .unwrap();
         }
-        // A ≠2-term phrase, a prefixed/anchored phrase, a NEAR group with the wrong
-        // shape, and a boolean mixing a phrase/prefix/column-scoped operand must not
-        // be index-routed. (A bare two-term phrase IS — see
-        // `two_term_phrase_match_takes_index_route` — an N-operand bare-term boolean
+        // A prefixed/anchored phrase, a NEAR group with the wrong shape, and a
+        // boolean mixing a phrase/prefix/column-scoped operand must not be
+        // index-routed. (A bare K-term phrase IS, for any K ≥ 2 — see
+        // `two_term_phrase_match_takes_index_route` /
+        // `k_term_phrase_match_takes_index_route` — an N-operand bare-term boolean
         // TREE IS — see `bare_term_boolean_tree_match_takes_index_route` — a lone
         // bare prefix term IS — see `prefix_term_match_takes_index_route` — and a
         // lone two-single-token bare-term NEAR group IS — see
@@ -21332,7 +21342,6 @@ mod fts5_index_route_tests {
         // the whole query back to the scan, and a NEAR group only routes when it is
         // the entire query with exactly two bare single-token operands.
         for q in [
-            "\"quick brown fox\"",
             "\"quick brown\" OR fox",
             "^\"quick brown\"",
             "^qui*",                        // anchored prefix → stays on scan
@@ -21418,6 +21427,94 @@ mod fts5_index_route_tests {
             "column-scoped phrase must take the index route"
         );
         assert_eq!(rows, [4]);
+    }
+
+    /// A K-term phrase (K ≥ 3, `tbl MATCH '"a b c"'`, table-wide and column-scoped,
+    /// including a repeated-word phrase) over a fully indexed table is served by the
+    /// segment index (`INDEX_ROUTE_HITS` rises) and returns exactly the documents
+    /// whose tokens occur at CONSECUTIVE positions in one column — the same set the
+    /// document scan produces. A run that straddles a column boundary must NOT match.
+    #[test]
+    fn k_term_phrase_match_takes_index_route() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = Connection::open_memory().unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+            .unwrap();
+        // "quick brown fox" is consecutive in row 1 (title) and row 4 (body); row 2
+        // has the words non-consecutive, row 3 reversed, row 5 splits the run across
+        // the column boundary (title ends "quick brown", body starts "fox") so it
+        // must NOT match. Row 6 carries the repeated-word run "na na na" in title.
+        let docs = [
+            ("the quick brown fox runs", "nothing here at all"),
+            ("quick red brown gray fox", "all separate words here"),
+            ("fox brown quick reversed", "still reversed only here"),
+            ("plain title text here", "a quick brown fox hops"),
+            ("ends with quick brown", "fox starts the body now"),
+            ("na na na batman here", "plain body without it now"),
+        ];
+        for (i, (title, body)) in docs.iter().enumerate() {
+            c.execute(&alloc::format!(
+                "INSERT INTO t(rowid, title, body) VALUES({}, '{}', '{}')",
+                i + 1,
+                title,
+                body
+            ))
+            .unwrap();
+        }
+        // Table-wide 3-word phrase: consecutive in some column → rows 1 and 4. Row 5
+        // (split across columns) must NOT appear.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows: alloc::vec::Vec<i64> = c
+            .query("SELECT rowid FROM t WHERE t MATCH '\"quick brown fox\"' ORDER BY rowid")
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        assert!(
+            INDEX_ROUTE_HITS.load(Ordering::Relaxed) > before,
+            "table-wide K-term phrase must take the index route"
+        );
+        assert_eq!(rows, [1, 4]);
+
+        // Column-scoped K-term phrase: only the body column → row 4.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows: alloc::vec::Vec<i64> = c
+            .query("SELECT rowid FROM t WHERE t MATCH 'body : \"quick brown fox\"' ORDER BY rowid")
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        assert!(
+            INDEX_ROUTE_HITS.load(Ordering::Relaxed) > before,
+            "column-scoped K-term phrase must take the index route"
+        );
+        assert_eq!(rows, [4]);
+
+        // Repeated-word 3-term phrase: "na na na" consecutive in title → row 6.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows: alloc::vec::Vec<i64> = c
+            .query("SELECT rowid FROM t WHERE t MATCH '\"na na na\"' ORDER BY rowid")
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        assert!(
+            INDEX_ROUTE_HITS.load(Ordering::Relaxed) > before,
+            "repeated-word K-term phrase must take the index route"
+        );
+        assert_eq!(rows, [6]);
     }
 
     /// A lone two-single-token bare-term `NEAR` group (`tbl MATCH 'NEAR(a b, n)'`,

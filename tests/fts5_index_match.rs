@@ -1424,3 +1424,173 @@ fn two_term_near_multi_column_equals_sqlite() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// K-term phrase (`tbl MATCH '"a b c"'`, K >= 2) — D2b extension. A phrase
+// matches a document iff its K tokens occur at CONSECUTIVE positions in the same
+// column (`terms[i]` at position `p + i`). graphite answers this from the segment
+// index (intersect every term's doclist, keep docs with a consecutive per-column
+// run). The routed rows must be byte-identical to stock sqlite3's MATCH on the
+// same file — table-wide and column-scoped, single- and multi-leaf, including
+// 3-/4-word phrases, non-consecutive / out-of-order words, repeated-word phrases
+// ("a a", "a a a"), and a phrase that spans a column boundary (must NOT match).
+// ---------------------------------------------------------------------------
+
+/// A single-column corpus exercising the K-term phrase edges: an exact 3- and
+/// 4-word consecutive run, the same words non-consecutive, the same words out of
+/// order, and repeated-word runs of length 2 and 3.
+const KPH_DOCS: &[(i64, &str)] = &[
+    (1, "the quick brown fox jumps high"), // "quick brown fox" + "brown fox jumps"
+    (2, "a quick brown fox jumps over walls"), // "quick brown fox jumps" (4-word)
+    (3, "quick brown then fox much later here"), // words present, NOT consecutive
+    (4, "fox brown quick reversed all around"), // reversed order
+    (5, "nothing relevant whatsoever in this"), // none of the words
+    (6, "brown fox without the leading speed"), // "brown fox" but no "quick brown fox"
+    (7, "na na na batman returns again now"), // "na na" and "na na na"
+    (8, "na pause na pause na not consecutive"), // na present but never consecutive
+    (9, "quick brown fox quick brown fox twice"), // two disjoint 3-word runs
+    (10, "ba ba black sheep have you wool"), // "ba ba" consecutive
+];
+
+/// The K-term phrases exercised against `KPH_DOCS` (each rendered as `"<words>"`).
+const KPHRASES: &[&str] = &[
+    "quick brown fox",       // 3-word: rows 1,2,9
+    "quick brown fox jumps", // 4-word: row 2
+    "brown fox jumps",       // 3-word: row 1
+    "quick brown then",      // 3-word straddling a non-phrase word: row 3
+    "fox brown quick",       // reversed order: row 4
+    "na na",                 // repeated word, K=2: rows 7
+    "na na na",              // repeated word, K=3: row 7
+    "ba ba",                 // repeated word, K=2: row 10
+    "quick brown elephant",  // last word absent → empty
+    "alpha beta gamma",      // all absent → empty
+];
+
+#[test]
+fn graphite_written_k_term_phrase_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    let mut c = Connection::create(&path).unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+        .unwrap();
+    for (rowid, body) in KPH_DOCS {
+        c.execute(&format!(
+            "INSERT INTO t(rowid, body) VALUES({rowid}, '{body}')"
+        ))
+        .unwrap();
+    }
+    drop(c);
+    let c = Connection::open(&path).unwrap();
+    for words in KPHRASES {
+        let expr = format!("\"{words}\"");
+        let g = graphite_match_expr(&c, &expr);
+        let s = sqlite_match_expr(&path, &expr);
+        assert_eq!(g, s, "phrase {expr:?}: graphite {g:?} != sqlite {s:?}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn sqlite_written_k_term_phrase_read_by_graphite_single_and_multi_leaf() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Single-leaf (default pgsz) and multi-leaf (forced pgsz 64, then optimized to
+    // a single segment) sqlite-written indexes, both read by graphite's K-term route.
+    for pgsz in [0u32, 64] {
+        let path = tmp_path();
+        if pgsz == 0 {
+            sqlite_exec(&path, "CREATE VIRTUAL TABLE t USING fts5(body);");
+        } else {
+            sqlite_exec(
+                &path,
+                "CREATE VIRTUAL TABLE t USING fts5(body);\
+                 INSERT INTO t(t, rank) VALUES('pgsz', 64);",
+            );
+        }
+        // A larger corpus so 64-byte pages genuinely split the doclists.
+        for i in 1..=60i64 {
+            let body = match i % 5 {
+                0 => format!("row {i} the quick brown fox jumps far"),
+                1 => format!("row {i} a quick brown then a fox later"),
+                2 => format!("row {i} brown fox with no leading speed"),
+                3 => format!("row {i} na na na repeated tokens here"),
+                _ => format!("row {i} filler word{i:03} unrelated chatter"),
+            };
+            sqlite_exec(
+                &path,
+                &format!("INSERT INTO t(rowid, body) VALUES({i}, '{body}');"),
+            );
+        }
+        if pgsz != 0 {
+            sqlite_exec(&path, "INSERT INTO t(t) VALUES('optimize');");
+        }
+        let c = Connection::open(&path).unwrap();
+        for words in [
+            "quick brown fox",
+            "quick brown fox jumps",
+            "brown fox with",
+            "na na na",
+            "na na",
+            "quick brown then",
+        ] {
+            let expr = format!("\"{words}\"");
+            let g = graphite_match_expr(&c, &expr);
+            let s = sqlite_match_expr(&path, &expr);
+            assert_eq!(
+                g, s,
+                "pgsz {pgsz}, phrase {expr:?}: graphite {g:?} != sqlite {s:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn k_term_phrase_column_boundary_and_scope_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    // Two columns. A K-term phrase must be consecutive WITHIN one column; a run
+    // that straddles the column boundary must NOT match.
+    let docs: &[(i64, &str, &str)] = &[
+        (1, "the quick brown fox", "calm steady waters here"), // title has "quick brown fox"
+        (2, "plain title only here", "a quick brown fox runs"), // body has it
+        (3, "quick brown fox both", "quick brown fox again now"), // both columns
+        (4, "alpha beta gamma here", "delta epsilon zeta now"), // disjoint words
+        (5, "ends with quick brown", "fox starts the body text"), // SPLIT across cols → no match
+        (6, "na na na in title", "plain body without it now"), // repeated-word in title
+    ];
+    let mut c = Connection::create(&path).unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+        .unwrap();
+    for (rowid, title, body) in docs {
+        c.execute(&format!(
+            "INSERT INTO t(rowid, title, body) VALUES({rowid}, '{title}', '{body}')"
+        ))
+        .unwrap();
+    }
+    drop(c);
+    let c = Connection::open(&path).unwrap();
+    // Table-wide (must NOT match the column-split row 5), and column-scoped both ways.
+    let exprs = [
+        "\"quick brown fox\"".to_string(),
+        "\"na na na\"".to_string(),
+        "title : \"quick brown fox\"".to_string(),
+        "body : \"quick brown fox\"".to_string(),
+        "title : \"na na na\"".to_string(),
+        "body : \"na na na\"".to_string(),
+    ];
+    for expr in exprs {
+        let g = graphite_match_expr(&c, &expr);
+        let s = sqlite_match_expr(&path, &expr);
+        assert_eq!(g, s, "{expr}: graphite {g:?} != sqlite {s:?}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
