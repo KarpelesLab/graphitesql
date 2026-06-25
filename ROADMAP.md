@@ -245,10 +245,12 @@ is *perf/coverage*, not correctness.
     map turning each combined column index into a `(cursor, local col)` `ColumnC`.
     The compiler is N-ary (`boundaries` = cumulative per-cursor column counts):
     the router runs a plain **N-table** inner join (projection + WHERE-merged-ON +
-    `DISTINCT` (BINARY) + constant LIMIT/OFFSET) as an N-deep nested loop — *no
-    `t1 × … × tN` cross-product is materialized for any arity* — and falls back to
-    the cross-product path on any other shape (GROUP BY / aggregate / HAVING /
-    ORDER BY). Row order matches the cross-product and sqlite. Verified by
+    `DISTINCT` (BINARY) + `ORDER BY` (staged through a sorter) + constant
+    LIMIT/OFFSET) as an N-deep nested loop — *no `t1 × … × tN` cross-product is
+    materialized for any arity* — and falls back to the cross-product path on any
+    other shape (GROUP BY / aggregate / HAVING). An ordered inner join is now
+    feature-complete on the VDBE (parity with the single-table scan compiler). Row
+    order matches the cross-product and sqlite. Verified by
     the differential join corpus (2-, 3-, 4-table) + direct unit tests
     (`exec::vdbe::tests`, `tests/vdbe_nested_join.rs`). This is the multi-cursor
     foundation the rest of B8 (storage cursors, correlated subqueries, windows)

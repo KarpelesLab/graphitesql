@@ -1333,49 +1333,12 @@ pub fn compile_table_select(
     // With `ORDER BY`, the scan feeds a sorter and `LIMIT`/`OFFSET` apply to the
     // sorted emit loop instead of to the scan itself.
     let ordering = !sel.order_by.is_empty();
-    // Reserve contiguous sort-key registers (one per `ORDER BY` term). A bare
-    // positive integer term is an output-column ordinal (1-based).
-    let mut key_specs: Vec<(Expr, SortKey)> = Vec::new();
-    if ordering {
-        for term in &sel.order_by {
-            let expr = match &term.expr {
-                // A bare positive integer is a 1-based output-column ordinal.
-                Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count => {
-                    projections[*k as usize - 1].0.clone()
-                }
-                // An out-of-range positional ORDER BY term is an error in SQLite.
-                Expr::Literal(Literal::Integer(_)) => {
-                    return Err(Error::Unsupported("VDBE: ORDER BY ordinal out of range"))
-                }
-                // A bare name that is an output alias (and not a table column)
-                // refers to that projection.
-                Expr::Column {
-                    table: None,
-                    column,
-                } if !columns.iter().any(|c| c.eq_ignore_ascii_case(column))
-                    && projections
-                        .iter()
-                        .any(|(_, l)| l.eq_ignore_ascii_case(column)) =>
-                {
-                    projections
-                        .iter()
-                        .find(|(_, l)| l.eq_ignore_ascii_case(column))
-                        .map(|(e, _)| e.clone())
-                        .unwrap()
-                }
-                other => other.clone(),
-            };
-            let collation = c.col_collation(&expr).unwrap_or_default();
-            key_specs.push((
-                expr,
-                SortKey {
-                    descending: term.descending,
-                    nulls_first: term.nulls_first,
-                    collation,
-                },
-            ));
-        }
-    }
+    // Reserve contiguous sort-key registers (one per `ORDER BY` term).
+    let key_specs = if ordering {
+        build_sort_keys(&c, sel, columns, &projections, count)?
+    } else {
+        Vec::new()
+    };
     let key_start = c.next_reg;
     for _ in &key_specs {
         c.alloc();
@@ -1599,6 +1562,57 @@ fn expand_projections(
     Ok(projections)
 }
 
+/// Resolve a query's `ORDER BY` terms to `(key expression, SortKey)` pairs: a bare
+/// positive integer is a 1-based output-column ordinal, a bare name matching an
+/// output alias (and not a table column) is that projection, anything else is the
+/// term itself. Each key's collation comes from the column it resolves to (via the
+/// compiler `c`). Shared by the single-table scan compiler and the nested-loop
+/// join compiler. An out-of-range ordinal returns `Unsupported`.
+fn build_sort_keys(
+    c: &Compiler,
+    sel: &Select,
+    columns: &[String],
+    projections: &[(Expr, String)],
+    count: usize,
+) -> Result<Vec<(Expr, SortKey)>> {
+    let mut key_specs: Vec<(Expr, SortKey)> = Vec::new();
+    for term in &sel.order_by {
+        let expr = match &term.expr {
+            Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count => {
+                projections[*k as usize - 1].0.clone()
+            }
+            Expr::Literal(Literal::Integer(_)) => {
+                return Err(Error::Unsupported("VDBE: ORDER BY ordinal out of range"))
+            }
+            Expr::Column {
+                table: None,
+                column,
+            } if !columns.iter().any(|c| c.eq_ignore_ascii_case(column))
+                && projections
+                    .iter()
+                    .any(|(_, l)| l.eq_ignore_ascii_case(column)) =>
+            {
+                projections
+                    .iter()
+                    .find(|(_, l)| l.eq_ignore_ascii_case(column))
+                    .map(|(e, _)| e.clone())
+                    .unwrap()
+            }
+            other => other.clone(),
+        };
+        let collation = c.col_collation(&expr).unwrap_or_default();
+        key_specs.push((
+            expr,
+            SortKey {
+                descending: term.descending,
+                nulls_first: term.nulls_first,
+                collation,
+            },
+        ));
+    }
+    Ok(key_specs)
+}
+
 /// Compile an N-table inner join (`SELECT … FROM t1 JOIN t2 … JOIN tN …`) into an
 /// N-deep nested-loop program — one cursor per table, cursor 0 outermost —
 /// instead of materializing the full `t1 × … × tN` cross-product (B5b-1).
@@ -1607,11 +1621,12 @@ fn expand_projections(
 /// counts (`boundaries[i]` = end of cursor `i`'s columns, `boundaries.last()` =
 /// total), so a combined column index resolves to its `(cursor, local col)`.
 /// `sel.where_clause` must already fold in the `ON` predicates (merged by the
-/// caller). Supports projection + WHERE + DISTINCT (BINARY collation) + constant
-/// LIMIT/OFFSET; returns `Unsupported` for GROUP BY / aggregates / HAVING / ORDER
-/// BY so the caller falls back to the cross-product (or tree-walker) path. The row
-/// order (innermost cursor advancing fastest, cursor 0 outermost) matches the
-/// cross-product and SQLite's nested-loop order.
+/// caller). Supports projection + WHERE + DISTINCT (BINARY collation) + ORDER BY
+/// (staged through a sorter) + constant LIMIT/OFFSET; returns `Unsupported` for
+/// GROUP BY / aggregates / HAVING so the caller falls back to the cross-product
+/// (or tree-walker) path. Without ORDER BY the row order (innermost cursor
+/// advancing fastest, cursor 0 outermost) matches the cross-product and SQLite's
+/// nested-loop order.
 pub fn compile_join2(
     sel: &Select,
     columns: &[String],
@@ -1622,11 +1637,7 @@ pub fn compile_join2(
 ) -> Result<Program> {
     let n = boundaries.len();
     debug_assert!(n >= 2 && boundaries[n - 1] == columns.len());
-    if !sel.compound.is_empty()
-        || !sel.group_by.is_empty()
-        || sel.having.is_some()
-        || !sel.order_by.is_empty()
-    {
+    if !sel.compound.is_empty() || !sel.group_by.is_empty() || sel.having.is_some() {
         return Err(Error::Unsupported("VDBE: join shape not nested-loopable"));
     }
     // DISTINCT compares output rows under BINARY; a non-BINARY column collation
@@ -1688,6 +1699,19 @@ pub fn compile_join2(
             None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
         },
     };
+    // With ORDER BY, the nested loop stages each surviving row + its sort keys
+    // into a sorter; LIMIT/OFFSET then apply to the sorted emit loop, not the
+    // scan. Reserve contiguous key registers (one per ORDER BY term).
+    let ordering = !sel.order_by.is_empty();
+    let key_specs = if ordering {
+        build_sort_keys(&c, sel, columns, &projections, count)?
+    } else {
+        Vec::new()
+    };
+    let key_start = c.next_reg;
+    for _ in &key_specs {
+        c.alloc();
+    }
     // N-deep nested loop: `RewindC 0 [ RewindC 1 [ … [ RewindC n-1 <body>
     // NextC n-1 ] … NextC 1 ] NextC 0` — cursor 0 outermost, matching the
     // cross-product's leftmost-outermost row order.
@@ -1716,8 +1740,8 @@ pub fn compile_join2(
     for (i, (expr, _)) in projections.iter().enumerate() {
         c.compile_expr_into(expr, i)?;
     }
-    // DISTINCT gates on the projected row and runs before OFFSET/LIMIT (a
-    // duplicate must not consume the OFFSET/LIMIT budget).
+    // DISTINCT gates on the projected row and runs before OFFSET/LIMIT/sorter (a
+    // duplicate must not consume the budget nor enter the sorter).
     let distinct_skip = if sel.distinct {
         let at = c.ops.len();
         c.ops.push(Op::DistinctCheck {
@@ -1729,17 +1753,33 @@ pub fn compile_join2(
     } else {
         None
     };
-    let offset_skip = offset_reg.map(|r| {
-        let at = c.ops.len();
-        c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
-        at
-    });
-    c.ops.push(Op::ResultRow { start: 0, count });
-    let limit_done = limit_reg.map(|r| {
-        let at = c.ops.len();
-        c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
-        at
-    });
+    // Body tail: with ORDER BY, stage into the sorter; otherwise emit directly,
+    // applying OFFSET then LIMIT inline.
+    let (offset_skip, limit_done) = if ordering {
+        for (j, (expr, _)) in key_specs.iter().enumerate() {
+            c.compile_expr_into(expr, key_start + j)?;
+        }
+        c.ops.push(Op::SorterInsert {
+            row_start: 0,
+            row_count: count,
+            key_start,
+            key_count: key_specs.len(),
+        });
+        (None, None)
+    } else {
+        let offset_skip = offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        });
+        c.ops.push(Op::ResultRow { start: 0, count });
+        let limit_done = limit_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+            at
+        });
+        (offset_skip, limit_done)
+    };
     // Emit the `NextC`s innermost-first; `next_at[i]` is the address of cursor
     // `i`'s advance. The innermost re-runs the body; an outer one re-runs the
     // next-inner cursor's `RewindC`.
@@ -1749,10 +1789,48 @@ pub fn compile_join2(
         let target = if i == n - 1 { body } else { rewind_at[i + 1] };
         c.ops.push(Op::NextC { cursor: i, target });
     }
+    // Sorted emit loop (ORDER BY): sort, then walk the sorter applying OFFSET then
+    // LIMIT to the ordered output.
+    let elimit = if ordering {
+        c.ops.push(Op::SorterSort {
+            keys: key_specs.iter().map(|(_, k)| k.clone()).collect(),
+        });
+        let srewind = c.ops.len();
+        c.ops.push(Op::SorterRewind { target: 0 });
+        let ebody = c.ops.len();
+        let eoffset = offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        });
+        c.ops.push(Op::SorterRow { start: 0, count });
+        c.ops.push(Op::ResultRow { start: 0, count });
+        let elimit = limit_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+            at
+        });
+        let snext = c.ops.len();
+        c.ops.push(Op::SorterNext { target: ebody });
+        let eend = c.ops.len();
+        if let Op::SorterRewind { target } = &mut c.ops[srewind] {
+            *target = eend;
+        }
+        // A skipped (OFFSET) ordered row advances to the next sorter row.
+        if let Some(at) = eoffset {
+            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
+                *target = snext;
+            }
+        }
+        elimit
+    } else {
+        None
+    };
     let end = c.ops.len();
     c.ops.push(Op::Halt);
     // Backpatch. An empty cursor `i` jumps to its parent's advance (cursor 0 to
-    // the end → no rows); the WHERE/OFFSET skip advances the innermost cursor.
+    // the end → no rows); the WHERE/DISTINCT/OFFSET skip advances the innermost
+    // cursor.
     for i in 0..n {
         let target = if i == 0 { end } else { next_at[i - 1] };
         if let Op::RewindC { target: t, .. } = &mut c.ops[rewind_at[i]] {
@@ -1776,6 +1854,13 @@ pub fn compile_join2(
         }
     }
     if let Some(at) = limit_done {
+        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
+            *target = end;
+        }
+    }
+    // The sorted emit loop's LIMIT halts the whole program (its OFFSET was
+    // backpatched inline above).
+    if let Some(at) = elimit {
         if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
             *target = end;
         }
@@ -3728,8 +3813,8 @@ mod tests {
         let coll = vec![Collation::Binary; 2];
         for sql in [
             "SELECT count(*) FROM a, b",
-            "SELECT a.x FROM a, b ORDER BY a.x",
             "SELECT a.x FROM a, b GROUP BY a.x",
+            "SELECT a.x, count(*) FROM a, b GROUP BY a.x HAVING count(*) > 1",
         ] {
             let Statement::Select(sel) = parse_one(sql).unwrap() else {
                 panic!()
@@ -3739,10 +3824,19 @@ mod tests {
                 "{sql} should bail to the cross-product path"
             );
         }
-        // DISTINCT over a join IS supported (BINARY collation).
-        let Statement::Select(sel) = parse_one("SELECT DISTINCT a.x FROM a, b").unwrap() else {
-            panic!()
-        };
-        assert!(compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_ok());
+        // DISTINCT and ORDER BY over a join ARE supported now.
+        for sql in [
+            "SELECT DISTINCT a.x FROM a, b",
+            "SELECT a.x FROM a, b ORDER BY a.x",
+            "SELECT DISTINCT a.x FROM a, b ORDER BY a.x DESC LIMIT 2",
+        ] {
+            let Statement::Select(sel) = parse_one(sql).unwrap() else {
+                panic!()
+            };
+            assert!(
+                compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_ok(),
+                "{sql} should compile on the VDBE"
+            );
+        }
     }
 }

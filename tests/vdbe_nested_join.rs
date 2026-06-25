@@ -222,6 +222,34 @@ fn distinct_over_join_runs_on_vdbe() {
 }
 
 #[test]
+fn order_by_over_join_runs_on_vdbe() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x, y)").unwrap();
+    c.execute("INSERT INTO a VALUES(3,'c'),(1,'a'),(2,'b')")
+        .unwrap();
+    c.execute("CREATE TABLE b(p, q)").unwrap();
+    c.execute("INSERT INTO b VALUES(1,'P'),(2,'Q'),(2,'R')")
+        .unwrap();
+    // Multi-key ORDER BY (DESC then ASC) staged through the sorter, on the VDBE.
+    let r = c
+        .query_vdbe("SELECT a.x, b.q FROM a JOIN b ON a.x = b.p ORDER BY a.x DESC, b.q")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Integer(2), Value::Text("Q".into())],
+            vec![Value::Integer(2), Value::Text("R".into())],
+            vec![Value::Integer(1), Value::Text("P".into())],
+        ]
+    );
+    // ORDER BY + LIMIT/OFFSET applies to the sorted output.
+    let r2 = c
+        .query_vdbe("SELECT a.x FROM a JOIN b ON a.x = b.p ORDER BY a.x LIMIT 1 OFFSET 1")
+        .unwrap();
+    assert_eq!(r2.rows, vec![vec![Value::Integer(2)]]);
+}
+
+#[test]
 fn nested_loop_join_empty_side_yields_no_rows() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE a(x)").unwrap();
