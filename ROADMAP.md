@@ -320,9 +320,12 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
     And a **two-operand bare-term boolean** (`a AND b` / `a OR b` / `a NOT b` /
     implicit-AND `a b`) via sorted-merge rowid intersect/union/difference
     (`lookup_bool_rowids`) — exactly the scan's `fts5_eval` set for two bare terms.
-    *Remaining:* index-route ≥3-operand boolean / parenthesized / ≥3-term phrases /
-    `NEAR` / prefix / multi-segment shapes, and dlidx/interior decode (D2b-3
-    leftover).
+    And a **prefix term** (`tbl MATCH 'wor*'`, table-wide and column-scoped) —
+    `lookup_prefix_rowids` walks the sorted leaf term keys, unions the doclists of
+    every term sharing the prefix; matches the scan (prefix tokens are not
+    Porter-stemmed). *Remaining:* index-route ≥3-operand boolean / parenthesized /
+    ≥3-term phrases / `NEAR` / multi-segment shapes, and dlidx/interior decode
+    (D2b-3 leftover).
   - **D2b-3** — *Done (multi-leaf):* `decode_term` now handles **multi-leaf term
     pagination** (terms across leaves, each with its own page-index footer) and
     **doclist spanning** (carried poslist tail + absolute first-rowid on the

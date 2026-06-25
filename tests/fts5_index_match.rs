@@ -770,3 +770,380 @@ fn boolean_unsupported_shapes_still_match_sqlite() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// Single bare PREFIX term (`tbl MATCH 'word*'`, and column-scoped `'col : word*'`)
+// — D2b extension. A prefix matches a document iff some indexed term BEGINS with
+// the prefix; graphite now answers this from the segment index by enumerating
+// every leaf term with that prefix (terms are stored sorted) and unioning their
+// doclists. The routed rows must be byte-identical to stock sqlite3's MATCH on the
+// same file — single-leaf and multi-leaf, a prefix matching many terms across
+// leaves, and a prefix matching none.
+// ---------------------------------------------------------------------------
+
+/// graphite's `SELECT rowid FROM t WHERE t MATCH '<prefix>*'`, sorted rowids.
+fn graphite_prefix(c: &Connection, prefix: &str) -> String {
+    let sql = format!("SELECT rowid FROM t WHERE t MATCH '{prefix}*' ORDER BY rowid");
+    let mut v: Vec<i64> = c
+        .query(&sql)
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| match r[0] {
+            Value::Integer(i) => i,
+            ref other => panic!("non-integer rowid: {other:?}"),
+        })
+        .collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// sqlite3's prefix MATCH over the same file, sorted rowids.
+fn sqlite_prefix(path: &str, prefix: &str) -> String {
+    let q = format!("SELECT rowid FROM t WHERE t MATCH '{prefix}*' ORDER BY rowid;");
+    let o = Command::new("sqlite3").arg(path).arg(&q).output().unwrap();
+    assert!(
+        o.status.success(),
+        "sqlite3 failed for {q:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mut v: Vec<i64> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.parse().unwrap())
+        .collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// graphite's `SELECT rowid FROM t WHERE t MATCH 'col : <prefix>*'`, sorted rowids.
+fn graphite_col_prefix(c: &Connection, col: &str, prefix: &str) -> String {
+    let sql = format!("SELECT rowid FROM t WHERE t MATCH '{col} : {prefix}*' ORDER BY rowid");
+    let mut v: Vec<i64> = c
+        .query(&sql)
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| match r[0] {
+            Value::Integer(i) => i,
+            ref other => panic!("non-integer rowid: {other:?}"),
+        })
+        .collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// sqlite3's column-scoped prefix MATCH over the same file, sorted rowids.
+fn sqlite_col_prefix(path: &str, col: &str, prefix: &str) -> String {
+    let q = format!("SELECT rowid FROM t WHERE t MATCH '{col} : {prefix}*' ORDER BY rowid;");
+    let o = Command::new("sqlite3").arg(path).arg(&q).output().unwrap();
+    assert!(
+        o.status.success(),
+        "sqlite3 failed for {q:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mut v: Vec<i64> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.parse().unwrap())
+        .collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Prefixes exercised over `DOCS`: matching many terms (`f*`, `b*`), a single term
+/// (`henhouse*`, `quick*`), a prefix that is also a whole term (`fox*`), and a
+/// prefix matching NOTHING (`zzz*`, `xq*`).
+const PREFIXES: &[&str] = &[
+    "f", "b", "qu", "fox", "quick", "henhouse", "the", "zzz", "xq",
+];
+
+#[test]
+fn graphite_written_prefix_match_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    build_graphite(&path);
+    let c = Connection::open(&path).unwrap();
+    for prefix in PREFIXES {
+        let g = graphite_prefix(&c, prefix);
+        let s = sqlite_prefix(&path, prefix);
+        assert_eq!(g, s, "prefix {prefix:?}*: graphite {g:?} != sqlite {s:?}");
+    }
+    // A FROM alias is still table-wide and index-routed.
+    for prefix in PREFIXES {
+        let sql = format!("SELECT rowid FROM t AS x WHERE x MATCH '{prefix}*' ORDER BY rowid");
+        let mut g: Vec<i64> = c
+            .query(&sql)
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        g.sort_unstable();
+        let g = g
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let s = sqlite_prefix(&path, prefix);
+        assert_eq!(g, s, "aliased prefix {prefix:?}*: {g:?} != {s:?}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn sqlite_written_prefix_match_read_by_graphite_single_and_multi_leaf() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Single-leaf (default pgsz) and multi-leaf (forced pgsz 64) sqlite-written
+    // indexes, both read by graphite's prefix index route.
+    for pgsz in [0u32, 64] {
+        let path = tmp_path();
+        if pgsz == 0 {
+            sqlite_exec(&path, "CREATE VIRTUAL TABLE t USING fts5(body);");
+        } else {
+            sqlite_exec(
+                &path,
+                "CREATE VIRTUAL TABLE t USING fts5(body);\
+                 INSERT INTO t(t, rank) VALUES('pgsz', 64);",
+            );
+        }
+        for (rowid, body) in DOCS {
+            sqlite_exec(
+                &path,
+                &format!("INSERT INTO t(rowid, body) VALUES({rowid}, '{body}');"),
+            );
+        }
+        if pgsz != 0 {
+            sqlite_exec(&path, "INSERT INTO t(t) VALUES('optimize');");
+        }
+        let c = Connection::open(&path).unwrap();
+        for prefix in PREFIXES {
+            let g = graphite_prefix(&c, prefix);
+            let s = sqlite_prefix(&path, prefix);
+            assert_eq!(
+                g, s,
+                "sqlite pgsz {pgsz}, prefix {prefix:?}*: graphite {g:?} != sqlite {s:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn prefix_match_many_terms_across_leaves_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // A larger corpus whose terms with a shared prefix (`word000`..`word059`) span
+    // MANY leaves at pgsz 64, so the prefix route must enumerate matching terms
+    // across leaf boundaries and union their doclists. sqlite writes the index.
+    let path = tmp_path();
+    sqlite_exec(
+        &path,
+        "CREATE VIRTUAL TABLE t USING fts5(body);\
+         INSERT INTO t(t, rank) VALUES('pgsz', 64);",
+    );
+    for i in 1..=60i64 {
+        // Every row has a `word{i}` token (all share the prefix `word`), plus some
+        // shared tokens so prefixes like `wo`, `word0`, `word01` match subsets.
+        let body = format!("word{i:03} alpha{i} shared filler content");
+        sqlite_exec(
+            &path,
+            &format!("INSERT INTO t(rowid, body) VALUES({i}, '{body}');"),
+        );
+    }
+    sqlite_exec(&path, "INSERT INTO t(t) VALUES('optimize');");
+    let c = Connection::open(&path).unwrap();
+    for prefix in [
+        "word",   // every row
+        "word0",  // word000..word099 → all 60
+        "word01", // word010..word019 → rows 10..19
+        "word05", // word050..word059 → rows 50..59
+        "wo",     // every row (only `word*` tokens start with `wo`)
+        "shared", // a token in every row
+        "alpha1", // alpha1, alpha10..alpha19 (string prefix on the token)
+        "zzz",    // none
+    ] {
+        let g = graphite_prefix(&c, prefix);
+        let s = sqlite_prefix(&path, prefix);
+        assert_eq!(
+            g, s,
+            "multi-leaf prefix {prefix:?}*: graphite {g:?} != sqlite {s:?}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn column_scoped_prefix_match_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Single-leaf and multi-leaf, both write directions, over the two-column corpus
+    // so a column filter genuinely partitions which prefix terms count.
+    let col_prefixes = &["fo", "do", "bro", "hen", "fox", "zzz"];
+    // graphite-written.
+    {
+        let path = tmp_path();
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+            .unwrap();
+        for (rowid, title, body) in MC_DOCS {
+            c.execute(&format!(
+                "INSERT INTO t(rowid, title, body) VALUES({rowid}, '{title}', '{body}')"
+            ))
+            .unwrap();
+        }
+        drop(c);
+        let c = Connection::open(&path).unwrap();
+        for col in ["title", "body"] {
+            for prefix in col_prefixes {
+                let g = graphite_col_prefix(&c, col, prefix);
+                let s = sqlite_col_prefix(&path, col, prefix);
+                assert_eq!(
+                    g, s,
+                    "graphite-written {col}:{prefix}*: graphite {g:?} != sqlite {s:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    // sqlite-written, single- and multi-leaf.
+    for pgsz in [0u32, 64] {
+        let path = tmp_path();
+        if pgsz == 0 {
+            sqlite_exec(&path, "CREATE VIRTUAL TABLE t USING fts5(title, body);");
+        } else {
+            sqlite_exec(
+                &path,
+                "CREATE VIRTUAL TABLE t USING fts5(title, body);\
+                 INSERT INTO t(t, rank) VALUES('pgsz', 64);",
+            );
+        }
+        for (rowid, title, body) in MC_DOCS {
+            sqlite_exec(
+                &path,
+                &format!("INSERT INTO t(rowid, title, body) VALUES({rowid}, '{title}', '{body}');"),
+            );
+        }
+        if pgsz != 0 {
+            sqlite_exec(&path, "INSERT INTO t(t) VALUES('optimize');");
+        }
+        let c = Connection::open(&path).unwrap();
+        for col in ["title", "body"] {
+            for prefix in col_prefixes {
+                let g = graphite_col_prefix(&c, col, prefix);
+                let s = sqlite_col_prefix(&path, col, prefix);
+                assert_eq!(
+                    g, s,
+                    "sqlite pgsz {pgsz} {col}:{prefix}*: graphite {g:?} != sqlite {s:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn porter_prefix_match_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Under `porter` the index stores STEMMED terms and sqlite stems the prefix
+    // token too: `running*`→stem `run`, matches indexed `run`/`runner`; `connecti*`
+    // →stem `connecti`, no indexed term. graphite's prefix route must stem the
+    // query prefix identically (it routes through the same `fts5_porter_stem` the
+    // scan uses), so the routed set equals sqlite's. Verified both write directions.
+    const PDOCS: &[(i64, &str)] = &[
+        (1, "running runner runs quickly"),
+        (2, "jump jumped jumping high"),
+        (3, "connection connecting connected"),
+        (4, "cats running and resting"),
+        (5, "nothing notable happens here"),
+        (6, "runner up in the race"),
+    ];
+    let porter_prefixes = &[
+        "run",        // stem run → run, runner
+        "runn",       // stem runn → runner only
+        "running",    // stem run → run, runner
+        "connect",    // stem connect → connect
+        "connecting", // stem connect → connect
+        "connecti",   // stem connecti → none
+        "jump",       // stem jump → jump
+        "jumped",     // stem jump → jump
+        "rest",       // stem rest → rest
+        "zzz",        // none
+    ];
+    // graphite-written.
+    {
+        let path = tmp_path();
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(body, tokenize='porter')")
+            .unwrap();
+        for (rowid, body) in PDOCS {
+            c.execute(&format!(
+                "INSERT INTO t(rowid, body) VALUES({rowid}, '{body}')"
+            ))
+            .unwrap();
+        }
+        drop(c);
+        let c = Connection::open(&path).unwrap();
+        for prefix in porter_prefixes {
+            let g = graphite_prefix(&c, prefix);
+            let s = sqlite_prefix(&path, prefix);
+            assert_eq!(
+                g, s,
+                "graphite-written porter prefix {prefix:?}*: graphite {g:?} != sqlite {s:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    // sqlite-written.
+    {
+        let path = tmp_path();
+        sqlite_exec(
+            &path,
+            "CREATE VIRTUAL TABLE t USING fts5(body, tokenize='porter');",
+        );
+        for (rowid, body) in PDOCS {
+            sqlite_exec(
+                &path,
+                &format!("INSERT INTO t(rowid, body) VALUES({rowid}, '{body}');"),
+            );
+        }
+        let c = Connection::open(&path).unwrap();
+        for prefix in porter_prefixes {
+            let g = graphite_prefix(&c, prefix);
+            let s = sqlite_prefix(&path, prefix);
+            assert_eq!(
+                g, s,
+                "sqlite-written porter prefix {prefix:?}*: graphite {g:?} != sqlite {s:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}

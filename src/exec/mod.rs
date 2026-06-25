@@ -7118,6 +7118,12 @@ impl Connection {
             /// A two-operand bare-term boolean (`a AND/OR/NOT b`, or implicit `a b`)
             /// served by a doclist set-op on the two terms' rowid lists.
             Bool(Vec<u8>, crate::vtab::Fts5BoolOp, Vec<u8>),
+            /// A TABLE-WIDE single bare prefix term (`'word*'`) — matches in ANY
+            /// column any document with an indexed term starting with the prefix.
+            PrefixAnyColumn(Vec<u8>),
+            /// A COLUMN-SCOPED single bare prefix term (`'col : word*'`) — restricted
+            /// to a prefix hit in the named column.
+            PrefixInColumn(Vec<u8>, usize),
         }
         // Resolve a column NAME to its position in the table's full column list (the
         // same index the writer records positions under). A name that is not a
@@ -7147,6 +7153,13 @@ impl Connection {
             }
         } else if let Some((a, op, b)) = crate::vtab::fts5_two_bare_term_bool(&query, tok) {
             Routed::Bool(a, op, b)
+        } else if let Some(p) = crate::vtab::fts5_single_prefix_term(&query, tok) {
+            Routed::PrefixAnyColumn(p)
+        } else if let Some((col, p)) = crate::vtab::fts5_single_prefix_term_column(&query, tok) {
+            match resolve_col(&col)? {
+                Some(ci) => Routed::PrefixInColumn(p, ci),
+                None => return Ok(None),
+            }
         } else {
             return Ok(None);
         };
@@ -7175,6 +7188,10 @@ impl Connection {
                 crate::fts5_index::lookup_phrase_rowids_in_column(&data, a, b, *ci)
             }
             Routed::Bool(a, op, b) => crate::fts5_index::lookup_bool_rowids(&data, a, *op, b),
+            Routed::PrefixAnyColumn(p) => crate::fts5_index::lookup_prefix_rowids(&data, p),
+            Routed::PrefixInColumn(p, ci) => {
+                crate::fts5_index::lookup_prefix_rowids_in_column(&data, p, *ci)
+            }
         };
         let rowids = match rowids_opt {
             Some(r) => r,
@@ -21287,16 +21304,18 @@ mod fts5_index_route_tests {
             ))
             .unwrap();
         }
-        // Prefix, a ≠2-term phrase, a prefixed/anchored phrase, a NEAR group, a
-        // 3-operand boolean, and a boolean mixing a phrase operand must not be
+        // A ≠2-term phrase, a prefixed/anchored phrase, a NEAR group, a 3-operand
+        // boolean, and a boolean mixing a phrase/prefix operand must not be
         // index-routed. (A bare two-term phrase IS — see
-        // `two_term_phrase_match_takes_index_route` — and a TWO-operand bare-term
-        // boolean IS — see `two_term_boolean_match_takes_index_route`.)
+        // `two_term_phrase_match_takes_index_route` — a TWO-operand bare-term
+        // boolean IS — see `two_term_boolean_match_takes_index_route` — and a lone
+        // bare prefix term IS — see `prefix_term_match_takes_index_route`.)
         for q in [
-            "qui*",
             "\"quick brown fox\"",
             "\"quick brown\" OR fox",
             "^\"quick brown\"",
+            "^qui*",        // anchored prefix → stays on scan
+            "qui* AND fox", // prefix operand in a boolean → stays on scan
             "NEAR(quick fox, 3)",
             "quick AND brown AND fox", // 3 operands → nested tree, stays on scan
             "quick OR brown OR fox",   // 3 operands → stays on scan
@@ -21374,6 +21393,70 @@ mod fts5_index_route_tests {
             "column-scoped phrase must take the index route"
         );
         assert_eq!(rows, [4]);
+    }
+
+    /// A lone bare PREFIX term (`tbl MATCH 'pre*'`, table-wide and column-scoped)
+    /// over a fully indexed table is served by the segment index
+    /// (`INDEX_ROUTE_HITS` rises): it unions the doclists of every indexed term that
+    /// begins with the prefix, returning exactly the documents the scan's
+    /// `doc_token.starts_with(prefix)` predicate matches, in rowid order.
+    #[test]
+    fn prefix_term_match_takes_index_route() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = Connection::open_memory().unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(title, body)")
+            .unwrap();
+        // terms beginning with "qu": quick(1,3 title), quiet(2 body); "fo": fox.
+        let docs = [
+            ("quick brown fox", "nothing here"),
+            ("calm title", "quiet body now"),
+            ("quick red fox", "all separate"),
+            ("plain title", "no match in body"),
+        ];
+        for (i, (title, body)) in docs.iter().enumerate() {
+            c.execute(&alloc::format!(
+                "INSERT INTO t(rowid, title, body) VALUES({}, '{}', '{}')",
+                i + 1,
+                title,
+                body
+            ))
+            .unwrap();
+        }
+        // Table-wide prefix: any term starting "qu" → rows 1, 2, 3.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows: alloc::vec::Vec<i64> = c
+            .query("SELECT rowid FROM t WHERE t MATCH 'qu*' ORDER BY rowid")
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        assert!(
+            INDEX_ROUTE_HITS.load(Ordering::Relaxed) > before,
+            "table-wide prefix must take the index route"
+        );
+        assert_eq!(rows, [1, 2, 3]);
+
+        // Column-scoped prefix: only the title column → quick in rows 1, 3.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows: alloc::vec::Vec<i64> = c
+            .query("SELECT rowid FROM t WHERE t MATCH 'title : qu*' ORDER BY rowid")
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref o => panic!("non-integer rowid: {o:?}"),
+            })
+            .collect();
+        assert!(
+            INDEX_ROUTE_HITS.load(Ordering::Relaxed) > before,
+            "column-scoped prefix must take the index route"
+        );
+        assert_eq!(rows, [1, 3]);
     }
 
     /// A two-operand bare-term boolean (`a AND b`, `a OR b`, `a NOT b`, and the

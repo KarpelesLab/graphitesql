@@ -751,6 +751,42 @@ pub(crate) fn decode_term(leaves: &[&[u8]], term: &[u8]) -> Option<Vec<DecodedPo
     None
 }
 
+/// Decode EVERY term whose key begins with `prefix` from a set of segment leaf
+/// pages, returning their combined postings, or `None` if the segment is one the
+/// single-segment leaf reader cannot fully reconstruct (an interior or
+/// doclist-index page → caller falls back to the scan).
+///
+/// This is the prefix-query analogue of [`decode_term`]: instead of one exact
+/// `'0'`-prefixed key it matches every term key that STARTS with the prefixed key
+/// (`MAIN_PREFIX` then `prefix` bytes), which — because the leaf term keys are
+/// stored in ascending sorted order — is exactly the contiguous run of indexed
+/// terms with that prefix. Each matching term's doclist (which may itself span
+/// leaves) is decoded and the postings are returned in term order (postings
+/// within one term are ascending by rowid, but two different terms may share a
+/// rowid, so the caller merges/dedups by rowid — see [`prefix_rowids`]).
+///
+/// An empty `prefix` matches every term (every key starts with the lone
+/// `MAIN_PREFIX` byte); callers reject the empty-prefix shape upstream, matching
+/// sqlite (which rejects a bare `'*'`).
+fn decode_prefix(leaves: &[&[u8]], prefix: &[u8]) -> Option<Vec<DecodedPosting>> {
+    let want = term_key(prefix);
+    let mut views: Vec<LeafView> = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        views.push(parse_leaf(leaf)?);
+    }
+    let mut out: Vec<DecodedPosting> = Vec::new();
+    for (li, view) in views.iter().enumerate() {
+        for (ti, rec) in view.terms.iter().enumerate() {
+            if !rec.key.starts_with(&want) {
+                continue;
+            }
+            let runs = gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)?;
+            out.extend(decode_spanning_doclist(&runs)?);
+        }
+    }
+    Some(out)
+}
+
 /// One segment's identity, parsed from the structure record: its `segid` and the
 /// inclusive range of height-0 leaf page numbers (`pgno_first..=pgno_last`).
 struct SegmentLoc {
@@ -836,6 +872,65 @@ pub(crate) fn lookup_term_rowids_in_column(
             .map(|p| p.rowid)
             .collect()
     })
+}
+
+/// Reduce a bag of prefix-matched postings (the union of several terms' doclists,
+/// possibly sharing rowids and NOT globally sorted) to the deduplicated, ascending
+/// rowid list a prefix `MATCH` returns. `keep` filters which postings count (the
+/// whole posting for a table-wide prefix; only those with a hit in the scoped
+/// column for `col : pre*`).
+///
+/// Sorting + dedup here, rather than an incremental sorted-merge per term, keeps
+/// the result correct regardless of term enumeration order: a document with two
+/// distinct prefix-matching terms appears once, and the final order matches the
+/// ascending order the `_content` scan (and `decode_term`-based routes) produce.
+fn prefix_rowids(
+    mut postings: Vec<DecodedPosting>,
+    keep: impl Fn(&DecodedPosting) -> bool,
+) -> Vec<i64> {
+    let mut rowids: Vec<i64> = postings
+        .drain(..)
+        .filter(|p| keep(p))
+        .map(|p| p.rowid)
+        .collect();
+    rowids.sort_unstable();
+    rowids.dedup();
+    rowids
+}
+
+/// Look up a single bare PREFIX term `prefix*` in a single-segment FTS5 index and
+/// return the rowids of the documents that contain ANY indexed term beginning with
+/// `prefix` (ascending, deduplicated), or `None` if the index shape is one the
+/// single-segment leaf reader cannot serve (so the caller falls back to the scan).
+///
+/// The prefix sibling of [`lookup_term_rowids`]: it gathers the one height-0
+/// segment's leaves ONCE and decodes every term whose stored key begins with
+/// `prefix` ([`decode_prefix`]), then unions their docids. Because the index stores
+/// the tokenized (and, under `porter`, stemmed) term forms and the scan's prefix
+/// predicate tests `doc_token.starts_with(query_prefix)` over those SAME forms (the
+/// query prefix is tokenized/stemmed identically by the recognizer), the set of
+/// documents with a term starting with `prefix` is exactly the scan's match set.
+/// A servable segment with no matching term yields `Some(vec![])`.
+pub(crate) fn lookup_prefix_rowids(data: &[(i64, Vec<u8>)], prefix: &[u8]) -> Option<Vec<i64>> {
+    let leaves = segment_leaves(data)?;
+    let postings = decode_prefix(&leaves, prefix)?;
+    Some(prefix_rowids(postings, |_| true))
+}
+
+/// Column-scoped sibling of [`lookup_prefix_rowids`]: keep only documents where a
+/// term beginning with `prefix` occurs in COLUMN `column` (its position in the
+/// table's full column list, from 0) — exactly the scan's `col : pre*` set. A
+/// posting counts iff its per-column position list for `column` is non-empty.
+pub(crate) fn lookup_prefix_rowids_in_column(
+    data: &[(i64, Vec<u8>)],
+    prefix: &[u8],
+    column: usize,
+) -> Option<Vec<i64>> {
+    let leaves = segment_leaves(data)?;
+    let postings = decode_prefix(&leaves, prefix)?;
+    Some(prefix_rowids(postings, |p| {
+        p.cols.get(column).is_some_and(|c| !c.is_empty())
+    }))
 }
 
 /// Gather the single height-0 segment's leaf blobs (in page order) from a `%_data`
@@ -1493,6 +1588,119 @@ mod tests {
         let odd: Vec<i64> = (1..=n).filter(|r| r % 2 == 1).collect();
         assert_eq!(lookup_term_rowids_in_column(&seg.data, b"x", 0), Some(even));
         assert_eq!(lookup_term_rowids_in_column(&seg.data, b"x", 1), Some(odd));
+    }
+
+    // ---- prefix lookups (union the doclists of every term with the prefix) -
+
+    #[test]
+    fn lookup_prefix_rowids_unions_matching_terms() {
+        // Terms sorted ascending: "apex"(d3), "apple"(d1), "apply"(d4),
+        // "banana"(d2,d5). A prefix unions exactly the matching terms' docids and
+        // dedups a doc that holds two prefix-matching terms.
+        let terms = vec![
+            (b"apex".to_vec(), vec![p(3, &[&[1]])]),
+            (b"apple".to_vec(), vec![p(1, &[&[0]]), p(6, &[&[0]])]),
+            (b"apply".to_vec(), vec![p(4, &[&[0]]), p(6, &[&[1]])]),
+            (b"banana".to_vec(), vec![p(2, &[&[0]]), p(5, &[&[0]])]),
+        ];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = vec![
+            (1, vec![1]),
+            (2, vec![1]),
+            (3, vec![2]),
+            (4, vec![1]),
+            (5, vec![1]),
+            (6, vec![2]),
+        ];
+        let seg = build_segment(&terms, 6, &[8], &doc_sizes, 1000, 0);
+        // "ap" → apex, apple, apply → docs {1,3,4,6} (6 appears via both apple+apply,
+        // deduped to one).
+        assert_eq!(
+            lookup_prefix_rowids(&seg.data, b"ap"),
+            Some(vec![1, 3, 4, 6])
+        );
+        // "appl" → apple, apply → {1,4,6}.
+        assert_eq!(
+            lookup_prefix_rowids(&seg.data, b"appl"),
+            Some(vec![1, 4, 6])
+        );
+        // "apple" → exactly that term → {1,6}.
+        assert_eq!(lookup_prefix_rowids(&seg.data, b"apple"), Some(vec![1, 6]));
+        // "ban" → banana → {2,5}.
+        assert_eq!(lookup_prefix_rowids(&seg.data, b"ban"), Some(vec![2, 5]));
+        // A prefix matching nothing → empty (servable), not None.
+        assert_eq!(lookup_prefix_rowids(&seg.data, b"zzz"), Some(Vec::new()));
+        // An empty index is not servable → None.
+        let empty = build_segment(&[], 0, &[0], &[], 1000, 0);
+        assert_eq!(lookup_prefix_rowids(&empty.data, b"ap"), None);
+    }
+
+    #[test]
+    fn lookup_prefix_rowids_multi_leaf() {
+        // Many distinct terms `word000`..`word039` (each one doc) at a tiny pgsz, so
+        // the matching terms span several leaves; the prefix must enumerate across
+        // leaf boundaries and union their docids.
+        let n = 40usize;
+        let terms: Vec<(Vec<u8>, Vec<Posting>)> = (0..n)
+            .map(|i| {
+                (
+                    format!("word{i:03}").into_bytes(),
+                    vec![p(i as i64 + 1, &[&[0]])],
+                )
+            })
+            .collect();
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n as i64).map(|r| (r, vec![1])).collect();
+        let seg = build_segment(&terms, n as u64, &[n as u64], &doc_sizes, 64, 0);
+        assert!(leaf_count(&seg) > 1, "pgsz 64 must split into many leaves");
+        // "word" → every doc.
+        assert_eq!(
+            lookup_prefix_rowids(&seg.data, b"word"),
+            Some((1..=n as i64).collect::<Vec<_>>())
+        );
+        // "word01" → word010..word019 → docs 11..=20.
+        assert_eq!(
+            lookup_prefix_rowids(&seg.data, b"word01"),
+            Some((11..=20).collect::<Vec<_>>())
+        );
+        assert_eq!(lookup_prefix_rowids(&seg.data, b"zzz"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn lookup_prefix_rowids_in_column_filters() {
+        // "fox"(d1 col0, d2 col1), "fort"(d3 col0), "fox" also in d4 col1.
+        let terms = vec![
+            (b"fort".to_vec(), vec![p(3, &[&[0], &[]])]),
+            (
+                b"fox".to_vec(),
+                vec![p(1, &[&[0], &[]]), p(2, &[&[], &[0]]), p(4, &[&[], &[1]])],
+            ),
+        ];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = vec![
+            (1, vec![1, 0]),
+            (2, vec![0, 1]),
+            (3, vec![1, 0]),
+            (4, vec![0, 2]),
+        ];
+        let seg = build_segment(&terms, 4, &[2, 3], &doc_sizes, 1000, 0);
+        // "fo" any column → {1,2,3,4}.
+        assert_eq!(
+            lookup_prefix_rowids(&seg.data, b"fo"),
+            Some(vec![1, 2, 3, 4])
+        );
+        // "fo" in col0 → fort(d3) + fox(d1) → {1,3}.
+        assert_eq!(
+            lookup_prefix_rowids_in_column(&seg.data, b"fo", 0),
+            Some(vec![1, 3])
+        );
+        // "fo" in col1 → fox(d2,d4) → {2,4}.
+        assert_eq!(
+            lookup_prefix_rowids_in_column(&seg.data, b"fo", 1),
+            Some(vec![2, 4])
+        );
+        // A column index past the table never matches.
+        assert_eq!(
+            lookup_prefix_rowids_in_column(&seg.data, b"fo", 9),
+            Some(Vec::new())
+        );
     }
 
     // ---- two-term phrase lookups (the adjacent-position intersection) -----

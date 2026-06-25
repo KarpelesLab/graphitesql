@@ -2533,6 +2533,77 @@ pub(crate) fn fts5_single_bare_term_column(
     }
 }
 
+/// The index key of a [`Fts5Term`] iff it is a SINGLE BARE PREFIX TERM the segment
+/// reader can serve identically to the scan: a one-token `tok*` body that is
+/// unanchored (the caller decides table-wide vs column-scoped). Returns the token
+/// stemmed EXACTLY as the scan stems a prefix token at match time
+/// ([`fts5_term_starts`] stems the phrase, including the prefix token, before the
+/// `starts_with` test), so the key equals the prefix of the indexed token forms.
+///
+/// A prefix term matches a document iff some indexed token starts with this key —
+/// the index reader enumerates exactly those terms and unions their doclists, the
+/// same set the scan's `doc_token.starts_with(key)` predicate matches. An empty
+/// key (a bare `*`) returns `None` — sqlite rejects that query and the scan yields
+/// nothing, so there is nothing to route. Anything not a one-token unanchored
+/// prefix body returns `None` and stays on the scan.
+#[cfg(feature = "fts5")]
+fn fts5_prefix_term_key(term: &Fts5Term, tok: Fts5Tok) -> Option<Vec<u8>> {
+    if !term.prefix || term.anchored {
+        return None;
+    }
+    let [word] = term.phrase.as_slice() else {
+        return None;
+    };
+    // The prefix token is stored unstemmed by the lexer; the scan stems it at match
+    // time (under `porter`), so the index key is the stemmed form (identity when the
+    // table isn't `porter`). Match `fts5_term_starts` exactly.
+    let key = if tok.stem {
+        fts5_porter_stem(word).into_bytes()
+    } else {
+        word.clone().into_bytes()
+    };
+    if key.is_empty() {
+        return None;
+    }
+    Some(key)
+}
+
+/// If `pattern` is a SINGLE TABLE-WIDE BARE PREFIX TERM (`'word*'`), return the
+/// prefix's index key; otherwise `None`. The prefix sibling of
+/// [`fts5_single_bare_term`] — uncolumned, unanchored, one-token `tok*` — feeding
+/// [`crate::fts5_index::lookup_prefix_rowids`].
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_single_prefix_term(pattern: &str, tok: Fts5Tok) -> Option<Vec<u8>> {
+    let toks = fts5_lex(pattern, tok);
+    let term = match toks.as_slice() {
+        [Fts5Lex::Term(t)] => t,
+        _ => return None,
+    };
+    if term.column.is_some() {
+        return None;
+    }
+    fts5_prefix_term_key(term, tok)
+}
+
+/// If `pattern` is a SINGLE COLUMN-SCOPED BARE PREFIX TERM (`'col : word*'`),
+/// return `(column name, prefix key)`; otherwise `None`. The column-scoped sibling
+/// of [`fts5_single_prefix_term`], feeding
+/// [`crate::fts5_index::lookup_prefix_rowids_in_column`].
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_single_prefix_term_column(
+    pattern: &str,
+    tok: Fts5Tok,
+) -> Option<(String, Vec<u8>)> {
+    let toks = fts5_lex(pattern, tok);
+    let term = match toks.as_slice() {
+        [Fts5Lex::Term(t)] => t,
+        _ => return None,
+    };
+    let column = term.column.clone()?;
+    let key = fts5_prefix_term_key(term, tok)?;
+    Some((column, key))
+}
+
 /// The two index keys of a [`Fts5Term`] iff it is a TWO-TOKEN PHRASE that the
 /// segment reader can serve identically to the scan: uncolumned (the caller decides
 /// table-wide vs column-scoped), unanchored, non-prefix, and lexing to exactly two
@@ -3371,6 +3442,60 @@ mod tests {
             fts5_two_term_phrase("\"running shoes\"", tok),
             Some((b"run".to_vec(), b"shoe".to_vec()))
         );
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn fts5_prefix_term_recognizer_shapes() {
+        let tok = Fts5Tok::default();
+        // A bare single prefix term is recognized table-wide.
+        assert_eq!(fts5_single_prefix_term("wor*", tok), Some(b"wor".to_vec()));
+        // Case folds to the indexed (lowercase) form under unicode61.
+        assert_eq!(fts5_single_prefix_term("WoR*", tok), Some(b"wor".to_vec()));
+        // Column-scoped prefix.
+        assert_eq!(
+            fts5_single_prefix_term_column("body : wor*", tok),
+            Some((String::from("body"), b"wor".to_vec()))
+        );
+        assert_eq!(
+            fts5_single_prefix_term_column("body:wor*", tok),
+            Some((String::from("body"), b"wor".to_vec()))
+        );
+        // Table-wide and column-scoped are mutually exclusive.
+        assert_eq!(fts5_single_prefix_term("body:wor*", tok), None);
+        assert_eq!(fts5_single_prefix_term_column("wor*", tok), None);
+        // Rejected: a non-prefix bare term, an anchored prefix, a phrase, a boolean,
+        // a bare `*` (empty prefix), and a multi-token body.
+        assert_eq!(fts5_single_prefix_term("word", tok), None);
+        assert_eq!(fts5_single_prefix_term("^wor*", tok), None);
+        assert_eq!(fts5_single_prefix_term("\"a b\"*", tok), None);
+        assert_eq!(fts5_single_prefix_term("a* OR b*", tok), None);
+        assert_eq!(fts5_single_prefix_term("*", tok), None);
+        // A bare term is NOT a prefix term, and vice versa.
+        assert_eq!(fts5_single_bare_term("wor*", tok), None);
+        assert_eq!(fts5_single_prefix_term("word", tok), None);
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn fts5_prefix_term_recognizer_stems() {
+        // Under porter, the prefix token is stemmed to its index-key form — exactly
+        // what the scan does at match time (`fts5_term_starts` stems the prefix
+        // token before `starts_with`). `running` → `run`, `connecting` → `connect`.
+        let tok = Fts5Tok {
+            stem: true,
+            ..Fts5Tok::default()
+        };
+        assert_eq!(
+            fts5_single_prefix_term("running*", tok),
+            Some(b"run".to_vec())
+        );
+        assert_eq!(
+            fts5_single_prefix_term("connecting*", tok),
+            Some(b"connect".to_vec())
+        );
+        // `run*` already stems to `run`.
+        assert_eq!(fts5_single_prefix_term("run*", tok), Some(b"run".to_vec()));
     }
 
     #[test]
