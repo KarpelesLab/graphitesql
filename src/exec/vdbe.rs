@@ -201,11 +201,14 @@ pub enum Op {
     /// Advance the sorter cursor; jump back to `target` if a row remains.
     SorterNext { target: usize },
     /// Fold the current row into aggregate `slot`: for `CountStar` bump the row
-    /// counter, otherwise collect `arg` (when non-NULL).
+    /// counter, otherwise collect `arg` (when non-NULL). When `distinct`, a value
+    /// equal (BINARY) to one already collected for this slot is skipped, so the
+    /// slot folds only over distinct argument values.
     AggStep {
         slot: usize,
         kind: AggKind,
         arg: Option<usize>,
+        distinct: bool,
     },
     /// Finalize aggregate `slot` into `dest`.
     AggFinal {
@@ -498,8 +501,23 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
 }
 
 /// Map a 1-arg-or-star aggregate call to its [`AggKind`] (binding the argument
-/// register expression). Returns `None` for unsupported call shapes.
+/// register expression). Returns `None` for unsupported call shapes, including
+/// any `DISTINCT` aggregate — use [`agg_kind_distinct`] where DISTINCT is
+/// handled.
 fn agg_kind(expr: &Expr) -> Option<(AggKind, Option<Expr>)> {
+    let (kind, arg, distinct) = agg_kind_distinct(expr)?;
+    if distinct {
+        return None;
+    }
+    Some((kind, arg))
+}
+
+/// Like [`agg_kind`] but also accepts a `DISTINCT` aggregate, reporting whether
+/// the call carried `DISTINCT` as the third tuple element. Only the bare
+/// single-table aggregate path (`compile_aggregate_select`) dedups the collected
+/// argument values, so other callers use [`agg_kind`] (which bails on DISTINCT).
+/// `FILTER`/`ORDER BY`/`OVER` still bail.
+fn agg_kind_distinct(expr: &Expr) -> Option<(AggKind, Option<Expr>, bool)> {
     let Expr::Function {
         name,
         distinct,
@@ -512,13 +530,13 @@ fn agg_kind(expr: &Expr) -> Option<(AggKind, Option<Expr>)> {
     else {
         return None;
     };
-    // Plain aggregates only: no DISTINCT/FILTER/ORDER BY/OVER in the VDBE path.
-    if *distinct || filter.is_some() || !order_by.is_empty() || over.is_some() {
+    if filter.is_some() || !order_by.is_empty() || over.is_some() {
         return None;
     }
     let arg = args.first().cloned();
     let kind = match name.to_ascii_lowercase().as_str() {
-        "count" if *star => return Some((AggKind::CountStar, None)),
+        // `count(DISTINCT *)` is not valid SQL; a DISTINCT star bails.
+        "count" if *star => return (!*distinct).then_some((AggKind::CountStar, None, false)),
         "count" if args.len() == 1 => AggKind::Count,
         "sum" if args.len() == 1 => AggKind::Sum,
         "total" if args.len() == 1 => AggKind::Total,
@@ -528,7 +546,7 @@ fn agg_kind(expr: &Expr) -> Option<(AggKind, Option<Expr>)> {
         "group_concat" if args.len() == 1 => AggKind::GroupConcat,
         _ => return None,
     };
-    Some((kind, arg))
+    Some((kind, arg, *distinct))
 }
 
 /// Compile `SELECT <aggregates> FROM <table> [WHERE …]` (no GROUP BY): the scan
@@ -559,10 +577,11 @@ fn compile_aggregate_select(
             "VDBE: non-BINARY collation in aggregate",
         ));
     }
-    // Every projection must be exactly one supported aggregate call.
-    let mut slots: Vec<(AggKind, Option<Expr>)> = Vec::new();
+    // Every projection must be exactly one supported aggregate call. DISTINCT is
+    // supported here (the collected values are deduped at fold time).
+    let mut slots: Vec<(AggKind, Option<Expr>, bool)> = Vec::new();
     for (e, _) in projections {
-        match agg_kind(e) {
+        match agg_kind_distinct(e) {
             Some(spec) => slots.push(spec),
             None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
         }
@@ -595,7 +614,7 @@ fn compile_aggregate_select(
         }
         None => None,
     };
-    for (slot, (kind, arg)) in slots.iter().enumerate() {
+    for (slot, (kind, arg, distinct)) in slots.iter().enumerate() {
         let arg_reg = match arg {
             Some(expr) => Some(c.compile_expr(expr)?),
             None => None,
@@ -604,6 +623,7 @@ fn compile_aggregate_select(
             slot,
             kind: *kind,
             arg: arg_reg,
+            distinct: *distinct,
         });
     }
     let next = c.ops.len();
@@ -618,7 +638,7 @@ fn compile_aggregate_select(
         *target = end;
     }
     // Finalize each slot into its output register, then emit the single row.
-    for (slot, (kind, _)) in slots.iter().enumerate() {
+    for (slot, (kind, _, _)) in slots.iter().enumerate() {
         c.ops.push(Op::AggFinal {
             slot,
             kind: *kind,
@@ -2002,7 +2022,8 @@ pub fn compile_aggregate_join(
         }
         None => None,
     };
-    // Fold the surviving combined row into every aggregate slot.
+    // Fold the surviving combined row into every aggregate slot. The join path
+    // bails on DISTINCT aggregates (via `agg_kind`), so this is never distinct.
     for (slot, (kind, arg)) in slots.iter().enumerate() {
         let arg_reg = match arg {
             Some(expr) => Some(c.compile_expr(expr)?),
@@ -2012,6 +2033,7 @@ pub fn compile_aggregate_join(
             slot,
             kind: *kind,
             arg: arg_reg,
+            distinct: false,
         });
     }
     // `NextC` chain, innermost-first (as in `compile_join2`).
@@ -3863,7 +3885,12 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
                     pc = *target;
                 }
             }
-            Op::AggStep { slot, kind, arg } => {
+            Op::AggStep {
+                slot,
+                kind,
+                arg,
+                distinct,
+            } => {
                 if *slot >= agg.len() {
                     agg.resize(*slot + 1, (Vec::new(), 0));
                 }
@@ -3872,7 +3899,13 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
                 } else if let Some(r) = arg {
                     if !matches!(regs[*r], Value::Null) {
                         let v = regs[*r].clone();
-                        agg[*slot].0.push(v);
+                        // A DISTINCT aggregate folds each distinct argument value
+                        // once: skip a value already collected for this slot
+                        // (BINARY equality — the non-BINARY case bails to the
+                        // tree-walker before compilation).
+                        if !*distinct || !agg[*slot].0.iter().any(|p| distinct_eq(p, &v)) {
+                            agg[*slot].0.push(v);
+                        }
                     }
                 }
             }

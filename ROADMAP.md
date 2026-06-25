@@ -253,6 +253,16 @@ is *perf/coverage*, not correctness.
   out-of-range ordinal defers to the tree-walker, which validates and emits the
   exact `… GROUP BY term out of range …` error. Differentially tested
   (`tests/vdbe_grouped.rs`, incl. positional + `HAVING`/`ORDER BY`/`LIMIT`).
+- **`DISTINCT` aggregates on the bare aggregate path — DONE.** `count(DISTINCT x)`,
+  `sum`/`avg`/`total`/`min`/`max`/`group_concat` with `DISTINCT` now run on the
+  single-table aggregate path (no GROUP BY). The interpreter already collects each
+  aggregate's non-NULL arguments into a `Vec<Value>`, so `DISTINCT` simply skips a
+  value equal (BINARY) to one already collected (`Op::AggStep { distinct }`),
+  folding over distinct values only. A non-BINARY column collation still defers to
+  the tree-walker (that path already bailed on non-BINARY), so the NOCASE case is
+  handled correctly by fallback. Differentially tested vs sqlite 3.50.4
+  (`tests/vdbe_distinct_agg.rs`). `DISTINCT` aggregates over a join, and
+  `FILTER`/`ORDER BY` aggregates, still fall back.
 - **B5c-4 — window functions on the VDBE.**
 - **B5b — per-cursor nested-loop join + inner seek** (stream the inner side
   instead of materializing the cross-product; *perf-only*).
