@@ -277,6 +277,17 @@ is *perf/coverage*, not correctness.
     …` folds-and-dedups over the joined rows on the VDBE. BINARY-safe (the path
     already bails on non-BINARY collation). Tested in `tests/vdbe_distinct_agg.rs`
     with a join that replicates a value so the dedup is observable.
+- **Aggregate `FILTER (WHERE …)` on the VDBE — DONE.** `count(*) FILTER (WHERE
+  …)`, `sum`/`avg`/`min`/`max`/`group_concat`/… with a per-aggregate `FILTER`
+  clause now run on the VDBE across all aggregate paths (bare single-table, over
+  `GROUP BY`, and over a two-table join), composing with `DISTINCT`. `Op::AggStep`
+  and `AggSpec` each gained a `filter: Option<usize>` register; the fold evaluates
+  the predicate per row and a row that is not *true* contributes to neither the
+  count bump nor the collected values for that aggregate (each aggregate's filter
+  is independent). `agg_kind_distinct` now binds the `FILTER` predicate instead of
+  bailing on it. Differentially tested vs sqlite 3.50.4 in
+  `tests/vdbe_filter_agg.rs`. Ordered aggregates (`group_concat(x ORDER BY y)`)
+  and windowed (`OVER`) calls still fall back.
 - **B5c-4 — window functions on the VDBE.**
 - **B5b — per-cursor nested-loop join + inner seek** (stream the inner side
   instead of materializing the cross-product; *perf-only*).
