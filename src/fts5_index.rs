@@ -981,6 +981,121 @@ pub(crate) fn lookup_phrase_rowids_in_column(
     }))
 }
 
+/// Sorted-merge INTERSECTION of two ascending, deduplicated rowid lists.
+fn rowids_intersect(a: &[i64], b: &[i64]) -> Vec<i64> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            core::cmp::Ordering::Less => i += 1,
+            core::cmp::Ordering::Greater => j += 1,
+            core::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Sorted-merge UNION of two ascending, deduplicated rowid lists.
+fn rowids_union(a: &[i64], b: &[i64]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            core::cmp::Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            core::cmp::Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            core::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
+}
+
+/// Sorted-merge DIFFERENCE `a − b` of two ascending, deduplicated rowid lists.
+fn rowids_difference(a: &[i64], b: &[i64]) -> Vec<i64> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() {
+        if j >= b.len() {
+            out.extend_from_slice(&a[i..]);
+            break;
+        }
+        match a[i].cmp(&b[j]) {
+            core::cmp::Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            core::cmp::Ordering::Greater => j += 1,
+            core::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Look up a two-operand BOOLEAN of bare terms — `term_a <op> term_b` — in a
+/// single-segment FTS5 index, returning the matching rowids ascending, or `None`
+/// if the index shape is unservable (so the caller falls back to the `%_content`
+/// scan).
+///
+/// The boolean sibling of [`lookup_term_rowids`]: it gathers the one height-0
+/// segment's leaves ONCE (so a routed boolean counts as a single index hit) and
+/// decodes both terms' doclists into per-term rowid lists — each already ascending
+/// and duplicate-free (one posting per docid) — then combines them with a
+/// sorted-merge set-op matching the connective:
+///   * [`Fts5BoolOp::And`] → INTERSECTION (documents containing both terms),
+///   * [`Fts5BoolOp::Or`] → UNION (either term),
+///   * [`Fts5BoolOp::Not`] → DIFFERENCE `a − b` (term `a` but not `b`).
+///
+/// This is exactly the set the scan's `fts5_eval` computes for the same query
+/// (`And`/`Or`/`Not` of the two terms' any-column match sets), so the routed rows
+/// are identical. Either term being absent yields the empty list for that operand
+/// (a servable "no postings" result), and the set-op still holds.
+///
+/// [`Fts5BoolOp::And`]: crate::vtab::Fts5BoolOp::And
+/// [`Fts5BoolOp::Or`]: crate::vtab::Fts5BoolOp::Or
+/// [`Fts5BoolOp::Not`]: crate::vtab::Fts5BoolOp::Not
+pub(crate) fn lookup_bool_rowids(
+    data: &[(i64, Vec<u8>)],
+    term_a: &[u8],
+    op: crate::vtab::Fts5BoolOp,
+    term_b: &[u8],
+) -> Option<Vec<i64>> {
+    use crate::vtab::Fts5BoolOp;
+    let leaves = segment_leaves(data)?;
+    let ra: Vec<i64> = decode_term(&leaves, term_a)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.rowid)
+        .collect();
+    let rb: Vec<i64> = decode_term(&leaves, term_b)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.rowid)
+        .collect();
+    Some(match op {
+        Fts5BoolOp::And => rowids_intersect(&ra, &rb),
+        Fts5BoolOp::Or => rowids_union(&ra, &rb),
+        Fts5BoolOp::Not => rowids_difference(&ra, &rb),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

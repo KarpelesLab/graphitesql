@@ -590,3 +590,183 @@ fn column_scoped_two_term_phrase_equals_sqlite() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// Two-operand bare-term boolean (`a AND b`, `a OR b`, `a NOT b`, implicit `a b`)
+// — D2b extension. graphite now answers these from the segment index via a
+// doclist set-op (intersection / union / difference) on the two terms' rowid
+// lists. The routed rows must be byte-identical to stock sqlite3's MATCH on the
+// same file, in both write directions and single- + multi-leaf indexes.
+// ---------------------------------------------------------------------------
+
+/// graphite's `SELECT rowid FROM t WHERE t MATCH '<expr>'`, sorted rowids.
+fn graphite_match_expr(c: &Connection, expr: &str) -> String {
+    let sql = format!("SELECT rowid FROM t WHERE t MATCH '{expr}' ORDER BY rowid");
+    let mut v: Vec<i64> = c
+        .query(&sql)
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| match r[0] {
+            Value::Integer(i) => i,
+            ref other => panic!("non-integer rowid: {other:?}"),
+        })
+        .collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// sqlite3's MATCH of an arbitrary expression over the same file, sorted rowids.
+fn sqlite_match_expr(path: &str, expr: &str) -> String {
+    let q = format!("SELECT rowid FROM t WHERE t MATCH '{expr}' ORDER BY rowid;");
+    let o = Command::new("sqlite3").arg(path).arg(&q).output().unwrap();
+    assert!(
+        o.status.success(),
+        "sqlite3 failed for {q:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mut v: Vec<i64> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.parse().unwrap())
+        .collect();
+    v.sort_unstable();
+    v.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The boolean expressions exercised against the shared `DOCS` corpus: terms that
+/// co-occur, that never co-occur, the implicit-AND form, an asymmetric `NOT` both
+/// ways, and an absent operand on each side of each operator.
+const BOOL_EXPRS: &[&str] = &[
+    "fox AND quick", // co-occur in some rows
+    "fox AND dog",   // co-occur in some rows
+    "fox OR dog",
+    "fox NOT dog",
+    "dog NOT fox",
+    "fox quick",         // implicit AND
+    "brown dog",         // implicit AND, disjoint-ish
+    "zebra AND fox",     // absent left → empty
+    "fox AND zebra",     // absent right → empty
+    "zebra OR fox",      // absent OR present
+    "fox OR zebra",      // present OR absent
+    "fox NOT zebra",     // difference with absent → all of fox
+    "zebra NOT fox",     // empty minus present → empty
+    "henhouse OR quick", // single-doc term OR a multi-doc term
+];
+
+#[test]
+fn graphite_written_two_term_boolean_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    build_graphite(&path);
+    let c = Connection::open(&path).unwrap();
+    for expr in BOOL_EXPRS {
+        let g = graphite_match_expr(&c, expr);
+        let s = sqlite_match_expr(&path, expr);
+        assert_eq!(g, s, "bool {expr:?}: graphite {g:?} != sqlite {s:?}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn sqlite_written_two_term_boolean_read_by_graphite_single_and_multi_leaf() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Single-leaf (default pgsz) and multi-leaf (forced pgsz 64, then optimized to
+    // a single segment) sqlite-written indexes, both read by graphite's boolean
+    // set-op route over a larger corpus so 64-byte pages genuinely split.
+    for pgsz in [0u32, 64] {
+        let path = tmp_path();
+        if pgsz == 0 {
+            sqlite_exec(&path, "CREATE VIRTUAL TABLE t USING fts5(body);");
+        } else {
+            sqlite_exec(
+                &path,
+                "CREATE VIRTUAL TABLE t USING fts5(body);\
+                 INSERT INTO t(t, rank) VALUES('pgsz', 64);",
+            );
+        }
+        for i in 1..=60i64 {
+            // Sprinkle "fox", "dog", and "quick" so each appears in an overlapping
+            // but distinct set of rows, exercising real intersect/union/difference.
+            let mut words = vec![format!("word{i:03}")];
+            if i % 2 == 0 {
+                words.push("fox".to_string());
+            }
+            if i % 3 == 0 {
+                words.push("dog".to_string());
+            }
+            if i % 5 == 0 {
+                words.push("quick".to_string());
+            }
+            let body = words.join(" ");
+            sqlite_exec(
+                &path,
+                &format!("INSERT INTO t(rowid, body) VALUES({i}, '{body}');"),
+            );
+        }
+        if pgsz != 0 {
+            sqlite_exec(&path, "INSERT INTO t(t) VALUES('optimize');");
+        }
+        let c = Connection::open(&path).unwrap();
+        for expr in [
+            "fox AND dog",
+            "fox OR dog",
+            "fox NOT dog",
+            "dog NOT fox",
+            "fox quick",
+            "quick OR dog",
+            "fox NOT missing",
+            "missing AND fox",
+        ] {
+            let g = graphite_match_expr(&c, expr);
+            let s = sqlite_match_expr(&path, expr);
+            assert_eq!(
+                g, s,
+                "pgsz {pgsz}, bool {expr:?}: graphite {g:?} != sqlite {s:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Shapes the boolean route must NOT take (3+ operands, a phrase/prefix/anchor/
+/// column-scoped operand, NEAR) still return exactly sqlite3's set — they fall
+/// back to the document scan, which graphite already answers correctly.
+#[test]
+fn boolean_unsupported_shapes_still_match_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    build_graphite(&path);
+    let c = Connection::open(&path).unwrap();
+    for expr in [
+        "fox AND quick AND dog",  // 3 operands
+        "fox OR quick OR dog",    // 3 operands
+        "fox OR quick NOT dog",   // 3 operands, mixed
+        "(fox OR dog) AND quick", // parenthesized
+        "fox* AND dog",           // prefix operand
+        "fox NOT quic*",          // prefix operand on the right
+    ] {
+        let g = graphite_match_expr(&c, expr);
+        let s = sqlite_match_expr(&path, expr);
+        assert_eq!(
+            g, s,
+            "unsupported bool {expr:?}: graphite {g:?} != sqlite {s:?}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}

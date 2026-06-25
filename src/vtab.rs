@@ -2601,6 +2601,85 @@ pub(crate) fn fts5_two_term_phrase_column(
     Some((column, keys))
 }
 
+/// The boolean connective of a two-operand bare-term `MATCH` the index can serve
+/// via doclist set-ops on the operands' rowid lists ([`fts5_two_bare_term_bool`]).
+#[cfg(feature = "fts5")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Fts5BoolOp {
+    /// `a AND b` (also the implicit-AND `a b`): documents containing BOTH terms.
+    And,
+    /// `a OR b`: documents containing EITHER term.
+    Or,
+    /// `a NOT b`: documents containing `a` but NOT `b`.
+    Not,
+}
+
+/// The index key of an [`Fts5Term`] iff it is a TABLE-WIDE SINGLE-TOKEN BARE WORD —
+/// the exact shape [`fts5_single_bare_term`] routes (uncolumned, unanchored,
+/// non-prefix, one query token), tokenized through the table's tokenizer so the key
+/// equals the indexed token. `None` for anything else.
+#[cfg(feature = "fts5")]
+fn fts5_bare_term_key(term: &Fts5Term, tok: Fts5Tok) -> Option<Vec<u8>> {
+    if term.column.is_some() || term.prefix || term.anchored {
+        return None;
+    }
+    let [word] = term.phrase.as_slice() else {
+        return None;
+    };
+    match fts5_tokenize(word, tok).as_slice() {
+        [single] => Some(single.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+/// If `pattern` is exactly TWO TABLE-WIDE BARE TERMS joined by a SINGLE boolean
+/// operator — `a AND b`, `a OR b`, `a NOT b`, or the implicit-AND `a b` — return
+/// `(key_a, op, key_b)` where each key is the operand's indexed token. Otherwise
+/// `None` (the query stays on the document scan).
+///
+/// The match set of each shape is provably the set-op of the two operands' doclists,
+/// which equals what the scan's [`fts5_eval`] computes — `And`/`Or`/`Not` map to
+/// docid INTERSECTION/UNION/DIFFERENCE of the per-term rowid lists (each ascending),
+/// fed to [`crate::fts5_index::lookup_bool_rowids`]:
+///   * `a AND b` and the bare `a b` (implicit AND, *not* a phrase — a quoted
+///     `"a b"` lexes to one two-token phrase term and is rejected here) both parse
+///     to `And(Term a, Term b)`;
+///   * `a OR b` parses to `Or(Term a, Term b)`; `a NOT b` to `Not(Term a, Term b)`.
+///
+/// Scoped to EXACTLY two operands with one operator: any deeper boolean tree (3+
+/// operands, parentheses, `NEAR`) parses to a NESTED node whose children are not
+/// both plain `Term`s, so it does not match here and stays on the scan — keeping the
+/// FTS5 precedence/associativity question off the index path entirely. Each operand
+/// must be a plain table-wide single-token bare word ([`fts5_bare_term_key`]); a
+/// column filter, `^` anchor, `tok*` prefix, or multi-word phrase operand also
+/// falls back. The keys are returned in left-to-right order, which matters only for
+/// `Not` (the asymmetric difference `a − b`).
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_two_bare_term_bool(
+    pattern: &str,
+    tok: Fts5Tok,
+) -> Option<(Vec<u8>, Fts5BoolOp, Vec<u8>)> {
+    let toks = fts5_lex(pattern, tok);
+    let query = (Fts5Parser {
+        toks: &toks,
+        pos: 0,
+    })
+    .parse()?;
+    // The whole query must be a SINGLE binary boolean node over two plain terms.
+    let (a, op, b) = match &query {
+        Fts5Query::And(a, b) => (a, Fts5BoolOp::And, b),
+        Fts5Query::Or(a, b) => (a, Fts5BoolOp::Or, b),
+        Fts5Query::Not(a, b) => (a, Fts5BoolOp::Not, b),
+        _ => return None,
+    };
+    let (Fts5Query::Term(ta), Fts5Query::Term(tb)) = (a.as_ref(), b.as_ref()) else {
+        return None;
+    };
+    let ka = fts5_bare_term_key(ta, tok)?;
+    let kb = fts5_bare_term_key(tb, tok)?;
+    Some((ka, op, kb))
+}
+
 /// Collect every phrase term of a parsed query (flattening the boolean tree),
 /// because bm25 sums each phrase's contribution regardless of `AND`/`OR`/`NOT`.
 #[cfg(feature = "fts5")]

@@ -7115,6 +7115,9 @@ impl Connection {
             InColumn(Vec<u8>, usize),
             Phrase(Vec<u8>, Vec<u8>),
             PhraseInColumn(Vec<u8>, Vec<u8>, usize),
+            /// A two-operand bare-term boolean (`a AND/OR/NOT b`, or implicit `a b`)
+            /// served by a doclist set-op on the two terms' rowid lists.
+            Bool(Vec<u8>, crate::vtab::Fts5BoolOp, Vec<u8>),
         }
         // Resolve a column NAME to its position in the table's full column list (the
         // same index the writer records positions under). A name that is not a
@@ -7142,6 +7145,8 @@ impl Connection {
                 Some(ci) => Routed::PhraseInColumn(a, b, ci),
                 None => return Ok(None),
             }
+        } else if let Some((a, op, b)) = crate::vtab::fts5_two_bare_term_bool(&query, tok) {
+            Routed::Bool(a, op, b)
         } else {
             return Ok(None);
         };
@@ -7169,6 +7174,7 @@ impl Connection {
             Routed::PhraseInColumn(a, b, ci) => {
                 crate::fts5_index::lookup_phrase_rowids_in_column(&data, a, b, *ci)
             }
+            Routed::Bool(a, op, b) => crate::fts5_index::lookup_bool_rowids(&data, a, *op, b),
         };
         let rowids = match rowids_opt {
             Some(r) => r,
@@ -21281,17 +21287,21 @@ mod fts5_index_route_tests {
             ))
             .unwrap();
         }
-        // Prefix, boolean, a ≠2-term phrase, a prefixed/anchored phrase, and a NEAR
-        // group must not be index-routed (a bare two-term phrase IS — see
-        // `two_term_phrase_match_takes_index_route`).
+        // Prefix, a ≠2-term phrase, a prefixed/anchored phrase, a NEAR group, a
+        // 3-operand boolean, and a boolean mixing a phrase operand must not be
+        // index-routed. (A bare two-term phrase IS — see
+        // `two_term_phrase_match_takes_index_route` — and a TWO-operand bare-term
+        // boolean IS — see `two_term_boolean_match_takes_index_route`.)
         for q in [
             "qui*",
-            "quick AND fox",
-            "brown NOT bear",
             "\"quick brown fox\"",
             "\"quick brown\" OR fox",
             "^\"quick brown\"",
             "NEAR(quick fox, 3)",
+            "quick AND brown AND fox", // 3 operands → nested tree, stays on scan
+            "quick OR brown OR fox",   // 3 operands → stays on scan
+            "\"quick brown\" OR bear", // phrase operand → stays on scan
+            "title : quick OR fox",    // column-scoped operand → stays on scan
         ] {
             let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
             let sql = alloc::format!("SELECT body FROM t WHERE t MATCH '{q}'");
@@ -21364,6 +21374,66 @@ mod fts5_index_route_tests {
             "column-scoped phrase must take the index route"
         );
         assert_eq!(rows, [4]);
+    }
+
+    /// A two-operand bare-term boolean (`a AND b`, `a OR b`, `a NOT b`, and the
+    /// implicit-AND `a b`) over a fully indexed table is served by the segment index
+    /// (`INDEX_ROUTE_HITS` rises) via a doclist set-op, returning exactly the same
+    /// documents — in the same rowid order — as the document scan.
+    #[test]
+    fn two_term_boolean_match_takes_index_route() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = Connection::open_memory().unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+            .unwrap();
+        // term presence by rowid:
+        //   fox:   1, 3, 4, 5      brown: 1, 2, 4      dog: 2, 5
+        let docs = [
+            "the quick brown fox", // 1: fox brown
+            "lazy brown dog",      // 2: brown dog
+            "fox in the henhouse", // 3: fox
+            "brown fox runs",      // 4: fox brown
+            "a fox and a dog",     // 5: fox dog
+        ];
+        for (i, body) in docs.iter().enumerate() {
+            c.execute(&alloc::format!(
+                "INSERT INTO t(rowid, body) VALUES({}, '{}')",
+                i + 1,
+                body
+            ))
+            .unwrap();
+        }
+        let ids = |c: &mut Connection, sql: &str| -> alloc::vec::Vec<i64> {
+            c.query(sql)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|r| match r[0] {
+                    Value::Integer(i) => i,
+                    ref o => panic!("non-integer rowid: {o:?}"),
+                })
+                .collect()
+        };
+        // (query, expected rowids) — AND=intersection, OR=union, NOT=difference,
+        // and the bare juxtaposition is implicit AND.
+        for (q, want) in [
+            ("fox AND brown", alloc::vec![1i64, 4]),
+            ("fox OR dog", alloc::vec![1, 2, 3, 4, 5]),
+            ("fox NOT brown", alloc::vec![3, 5]),
+            ("brown NOT fox", alloc::vec![2]),
+            ("fox brown", alloc::vec![1, 4]), // implicit AND
+            ("zebra AND fox", alloc::vec![]), // absent operand → empty
+            ("zebra OR dog", alloc::vec![2, 5]),
+        ] {
+            let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+            let rows = ids(
+                &mut c,
+                &alloc::format!("SELECT rowid FROM t WHERE t MATCH '{q}' ORDER BY rowid"),
+            );
+            let after = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+            assert!(after > before, "boolean {q:?} must take the index route");
+            assert_eq!(rows, want, "boolean {q:?}");
+        }
     }
 
     /// A column-scoped single bare term (`tbl MATCH 'col : word'`) over a fully
