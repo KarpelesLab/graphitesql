@@ -5213,7 +5213,12 @@ impl Connection {
 
         // Map the provided column list (or all columns) to table positions.
         let target: Vec<usize> = if ins.columns.is_empty() {
-            (0..n_cols).collect()
+            // A bare `INSERT … VALUES`/`SELECT` (no column list) targets the
+            // NON-GENERATED columns, in order — SQLite excludes generated columns
+            // from the implicit list (they are always computed), so the value
+            // count must match the non-generated columns and an `INSERT INTO t
+            // VALUES(…)` works on a table that has generated columns.
+            (0..n_cols).filter(|&i| !meta.is_generated(i)).collect()
         } else {
             let mut t = Vec::new();
             for name in &ins.columns {
@@ -14009,7 +14014,10 @@ impl Connection {
     ) -> Result<usize> {
         let n_cols = meta.columns.len();
         let target: Vec<usize> = if ins.columns.is_empty() {
-            (0..n_cols).collect()
+            // Non-generated columns only (see exec_insert): a bare INSERT into a
+            // WITHOUT ROWID table with generated columns must not expect a value
+            // for the computed columns.
+            (0..n_cols).filter(|&i| !meta.is_generated(i)).collect()
         } else {
             ins.columns
                 .iter()

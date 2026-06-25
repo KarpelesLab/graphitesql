@@ -185,3 +185,50 @@ fn generated_column_rejects_default_and_double_as() {
         .execute("CREATE TABLE t(a DEFAULT 5, b AS (a + 1))")
         .is_ok());
 }
+
+/// A bare `INSERT … VALUES`/`SELECT` (no column list) targets only the
+/// non-generated columns — SQLite excludes generated columns from the implicit
+/// list. Regression: graphite required a value for the generated column and
+/// rejected `INSERT INTO t VALUES(5)` as a count mismatch.
+#[test]
+fn bare_insert_skips_generated_columns() {
+    let mut c = Connection::open_memory().unwrap();
+    // rowid table, generated column last
+    c.execute("CREATE TABLE t1(a, b GENERATED ALWAYS AS (a+1))")
+        .unwrap();
+    c.execute("INSERT INTO t1 VALUES(5)").unwrap();
+    assert_eq!(
+        c.query("SELECT a, b FROM t1").unwrap().rows,
+        vec![vec![Value::Integer(5), Value::Integer(6)]]
+    );
+    // generated column in the MIDDLE (STORED), bare VALUES supplies a and c
+    c.execute("CREATE TABLE t2(a, b AS (a+1) STORED, c)")
+        .unwrap();
+    c.execute("INSERT INTO t2 VALUES(5, 9)").unwrap();
+    assert_eq!(
+        c.query("SELECT a, b, c FROM t2").unwrap().rows,
+        vec![vec![
+            Value::Integer(5),
+            Value::Integer(6),
+            Value::Integer(9)
+        ]]
+    );
+    // INSERT … SELECT (bare) also skips the generated column
+    c.execute("INSERT INTO t1 SELECT 10").unwrap();
+    assert_eq!(
+        c.query("SELECT b FROM t1 WHERE a=10").unwrap().rows[0][0],
+        Value::Integer(11)
+    );
+    // WITHOUT ROWID table with a generated column
+    c.execute("CREATE TABLE t3(k TEXT PRIMARY KEY, d AS (k||'!')) WITHOUT ROWID")
+        .unwrap();
+    c.execute("INSERT INTO t3 VALUES('x')").unwrap();
+    assert_eq!(
+        c.query("SELECT d FROM t3").unwrap().rows[0][0],
+        Value::Text("x!".into())
+    );
+    // supplying a value for the generated column (count too high) still errors
+    assert!(c.execute("INSERT INTO t1 VALUES(1, 2)").is_err());
+    // explicit column list naming the generated column still rejected
+    assert!(c.execute("INSERT INTO t1(a, b) VALUES(1, 2)").is_err());
+}
