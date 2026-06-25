@@ -12385,6 +12385,14 @@ impl Connection {
             {
                 return self.scan_dbstat(from.first.alias.as_deref());
             }
+            // `sqlite_dbpage`: read-only raw page access, one row per page
+            // (`pgno`, `data`). A real table of that name wins.
+            if from.first.schema.is_none()
+                && from.first.name.eq_ignore_ascii_case("sqlite_dbpage")
+                && self.schema.table("sqlite_dbpage").is_none()
+            {
+                return self.scan_dbpage(from.first.alias.as_deref());
+            }
             let db = match from.first.schema.as_deref() {
                 Some(_) => self.resolve_db(from.first.schema.as_deref())?,
                 // Don't let a temp table shadow a CTE or view of the same name.
@@ -14080,6 +14088,36 @@ impl Connection {
     /// fragmented-bytes count, and freeblock chain; `payload` sums the locally
     /// stored cell bytes; `mx_payload` is the largest total cell payload. The
     /// `path` strings use SQLite's `/<hex-child>/` and `+<hex-overflow>` format.
+    /// The `sqlite_dbpage` read-only virtual table: one row per database page,
+    /// `(pgno INTEGER, data BLOB)`, where `data` is the page's raw bytes (page 1
+    /// includes the 100-byte file header). Read access only (sqlite's `dbpage` is
+    /// also writable; that is `dbpage-2`).
+    fn scan_dbpage(&self, alias: Option<&str>) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
+        use eval::Affinity::{Blob, Integer};
+        let label = alias.unwrap_or("sqlite_dbpage").to_string();
+        let col = |name: &str, affinity| ColumnInfo {
+            name: String::from(name),
+            table: label.clone(),
+            affinity,
+            collation: crate::value::Collation::default(),
+        };
+        let columns = alloc::vec![col("pgno", Integer), col("data", Blob)];
+        let src = self.backend.source();
+        let count = src.page_count();
+        let mut rows: Vec<InputRow> = Vec::with_capacity(count as usize);
+        for pgno in 1..=count {
+            let page = src.page(pgno)?;
+            rows.push(InputRow {
+                values: alloc::vec![
+                    Value::Integer(pgno as i64),
+                    Value::Blob(page.data().to_vec()),
+                ],
+                rowid: Some(pgno as i64),
+            });
+        }
+        Ok((columns, rows))
+    }
+
     fn scan_dbstat(&self, alias: Option<&str>) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
         use crate::btree::page::{BtreePage, PageType};
         use eval::Affinity::{Integer, Text};

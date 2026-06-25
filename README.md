@@ -34,8 +34,8 @@ format**.
 - **Virtual tables** — built-in `series`, **`rtree`** (queries prune the node
   tree by coordinate bounds), and **`fts5`** (full-text `MATCH` with phrases/
   prefixes/column filters/`NEAR`/`^` anchors, `bm25()`/`rank` ordering,
-  `highlight()`, `fts5vocab`); the read-only `dbstat` table; and `register_module`
-  / `register_function` for your own.
+  `highlight()`, `fts5vocab`); the read-only `dbstat` and `sqlite_dbpage` (raw
+  page bytes) tables; and `register_module` / `register_function` for your own.
 - **Byte-compatible on disk** — R-Tree (`_node`) and FTS5 (sqlite's
   `_content`/`_data`/`_idx`/`_docsize`/`_config` shadow tables) round-trip through
   stock `sqlite3`, which opens, `MATCH`es, and integrity-checks them. FTS5 folds

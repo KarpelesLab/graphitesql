@@ -261,7 +261,8 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
   spanning-doclist-then-paginated-terms leaf-fill boundary; doclist-index (`dli`)
   pages; segment-b-tree interior (`height > 0`) `_data` pages.
 - **dbpage — the writable raw-page vtab** (`sqlite_dbpage`, sibling of `dbstat`).
-  - **dbpage-1** — read (one row per page: `pgno`, `data`).
+  Done: **dbpage-1** — read (one row per page: `pgno`, `data`), byte-exact vs
+  `sqlite3` on the same file (`tests/dbpage.rs`).
   - **dbpage-2** — write (raw page replacement; integrity-gated).
 - **D4-leftover — window UDFs + custom collations** (the latter needs a user
   variant on the `Collation` enum — invasive).
