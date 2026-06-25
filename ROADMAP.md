@@ -419,9 +419,13 @@ This is the project's whole reason to exist, so it gets first-class testing.
   (`tests/fuzz_corruption.rs`, ~50k malformed-file variants; `tests/fuzz_sql.rs`,
   ~3.3k malformed/deeply-nested SQL) asserts the readers return an error and never
   panic. *(Expand toward a coverage-guided fuzzer when a no-dep path exists.)*
-- **Crash-recovery** *(planned, pairs with C7)* — a fault-injecting `Vfs` that
-  truncates / fails at chosen fsync points, asserting recovery to a consistent
-  state.
+- **Crash-recovery** *(Done)* — a fault-injecting `FaultVfs` that kills a chosen
+  file at a chosen write/truncate/sync (optionally a torn half-write) drives two
+  suites asserting recovery to a consistent, `integrity_check = ok` state at every
+  injection point: rollback-journal mode (`tests/crash_recovery_harness.rs`) and
+  **WAL mode** (`tests/wal_crash_recovery_harness.rs`, 12 tests — crashes during
+  frame append, post-commit-frame, mid-checkpoint db writeback, WAL reset, and
+  torn writes; recovery held everywhere, cross-checked with `sqlite3`).
 - **SQLite's own suite** *(planned)* — run a curated slice of SQLite's `test/`
   TCL assertions (the SQL-level ones) as an additional oracle.
 
