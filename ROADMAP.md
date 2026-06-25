@@ -183,6 +183,13 @@ is *perf/coverage*, not correctness.
 
 - **B5c-1 — `IN (SELECT …)` on the VDBE** (it applies the candidate *column's*
   affinity, unlike `IN (list)` — the tree-walker semantics are already shipped).
+  - *Done (fold subset):* a non-correlated `IN (SELECT <computed column>)` is
+    materialized and folded to `IN (list)` by the router pre-pass, so it runs on
+    the VDBE. Safe only because a *computed* candidate carries NONE affinity /
+    BINARY collation, making the two forms equivalent (verified vs sqlite). The
+    **bare-column** candidate is the remaining real work — it needs the VDBE to
+    apply the candidate column's affinity natively (it can't fold without
+    changing results):
   - **B5c-1a** — evaluate the candidate set + its column affinity
     (`Subqueries::column_affinity`) into registers.
   - **B5c-1b** — a membership op applying `apply_comparison_affinity(left_aff,

@@ -684,10 +684,32 @@ impl Connection {
                 order_by: order_by.clone(),
                 over: None,
             },
-            // Literals, parameters, columns, `IN (SELECT …)`, windowed calls: no
-            // top-level scalar/EXISTS subquery to fold here. (`IN (SELECT)` is
-            // deliberately not folded — its candidate-set comparison uses the
-            // subquery column's collation/affinity, which `IN (list)` would not.)
+            // `IN (SELECT …)`: fold to an `IN (list)` of the materialized
+            // candidate values when the subquery is self-contained and its single
+            // column is a computed (NONE-affinity) expression — then the candidate
+            // set carries no column affinity/collation of its own and the two
+            // forms are equivalent (see `eval_foldable_in_select`). A bare-column
+            // candidate is left in place (its affinity would matter), so the VDBE
+            // compiler still falls back for that case.
+            E::InSelect {
+                expr,
+                select,
+                negated,
+            } => match self.eval_foldable_in_select(select) {
+                Some(values) => {
+                    *changed = true;
+                    E::InList {
+                        expr: alloc::boxed::Box::new(self.fold_subquery_expr(expr, changed)),
+                        list: values
+                            .into_iter()
+                            .map(|v| E::Literal(value_to_literal(v)))
+                            .collect(),
+                        negated: *negated,
+                    }
+                }
+                None => e.clone(),
+            },
+            // Literals, parameters, columns, windowed calls: nothing to fold.
             _ => e.clone(),
         }
     }
@@ -718,6 +740,37 @@ impl Connection {
                 .and_then(|row| row.first())
                 .cloned()
                 .unwrap_or(Value::Null),
+        )
+    }
+
+    /// Materialize an `IN (SELECT …)` candidate set to its values when the
+    /// subquery is self-contained (non-correlated) AND its single result column
+    /// is a *computed* expression — not a bare column reference. The computed
+    /// candidate carries NONE affinity / BINARY collation, so `L IN (SELECT …)`
+    /// then compares exactly like `L IN (v1, v2, …)` (the comparison takes `L`'s
+    /// affinity and collation in both forms — verified against sqlite). A
+    /// bare-column candidate is deliberately NOT folded: `IN (SELECT col)` would
+    /// apply that column's affinity, which `IN (list)` does not. `None` when not
+    /// foldable, so the VDBE compiler simply falls back as before.
+    fn eval_foldable_in_select(&self, sel2: &Select) -> Option<Vec<Value>> {
+        if !self.vdbe_subquery_foldable(sel2) {
+            return None;
+        }
+        if sel2.columns.len() != 1 {
+            return None;
+        }
+        let sql::ast::ResultColumn::Expr { expr, .. } = &sel2.columns[0] else {
+            return None;
+        };
+        if is_bare_column_expr(expr) {
+            return None;
+        }
+        let r = self.run_select(sel2, &Params::default()).ok()?;
+        Some(
+            r.rows
+                .into_iter()
+                .map(|row| row.into_iter().next().unwrap_or(Value::Null))
+                .collect(),
         )
     }
 
