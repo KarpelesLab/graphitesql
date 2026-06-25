@@ -2454,6 +2454,45 @@ pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)], tok: 
     fts5_eval(&query, &tokenized, tok)
 }
 
+/// If `pattern` is a SINGLE BARE TERM whose match set is exactly "the documents
+/// in which one indexed token appears in any column", return that token's bytes
+/// (the index key, including Porter stemming when configured). Otherwise `None`.
+///
+/// This is the only shape `MATCH` index-routes through the segment reader, because
+/// only here is the index doclist provably identical to the [`fts5_query_matches`]
+/// scan: a lone, uncolumned, unanchored, non-prefix one-word term ANDs to itself
+/// and is present in a document iff the token appears in some column — which is
+/// exactly the term's doclist. Anything else (a column filter, `^` anchor, `tok*`
+/// prefix, a multi-word `"phrase"`, `NEAR`, or any boolean combination) stays on
+/// the document scan. An empty/no-token query returns `None` (it matches nothing;
+/// the scan already yields no rows). The returned bytes feed
+/// [`crate::fts5_index::lookup_term_rowids`].
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_single_bare_term(pattern: &str, tok: Fts5Tok) -> Option<Vec<u8>> {
+    let toks = fts5_lex(pattern, tok);
+    // Exactly one lexed item, and it must be a plain Term (no operators/parens,
+    // no NEAR group).
+    let term = match toks.as_slice() {
+        [Fts5Lex::Term(t)] => t,
+        _ => return None,
+    };
+    if term.column.is_some() || term.prefix || term.anchored {
+        return None;
+    }
+    // A bare word lexes to a one-token phrase; a quoted multi-word phrase does not.
+    let [word] = term.phrase.as_slice() else {
+        return None;
+    };
+    // The index stores the fully tokenized (and, under `porter`, stemmed) form.
+    // Re-tokenize the query word through the table's tokenizer so the lookup key
+    // matches the indexed token exactly; it must yield exactly one token.
+    let key = fts5_tokenize(word, tok);
+    match key.as_slice() {
+        [single] => Some(single.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
 /// Collect every phrase term of a parsed query (flattening the boolean tree),
 /// because bm25 sums each phrase's contribution regardless of `AND`/`OR`/`NOT`.
 #[cfg(feature = "fts5")]

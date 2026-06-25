@@ -24,12 +24,20 @@
 //! page-index, reconstructs the prefix-compressed term key, and decodes the
 //! matching doclist into postings (docids + per-column positions). It covers
 //! multi-leaf height-0 segments — term pagination AND a doclist that spans
-//! leaves — and is not yet wired into `MATCH` (that is D2b-2); see the section
+//! leaves — and is wired into `MATCH` (D2b-2) via `lookup_term_rowids`, which the
+//! executor calls to index-route a single bare-term query; see the section
 //! comment below.
 
 use alloc::vec::Vec;
 
 use crate::util::varint;
+
+/// Test-only counter of how many times [`lookup_term_rowids`] actually SERVED a
+/// query from the index (returned `Some`). In-crate unit tests read it to prove a
+/// bare-term `MATCH` took the index route rather than the document scan.
+#[cfg(test)]
+pub(crate) static INDEX_ROUTE_HITS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// `FTS5_MAIN_PREFIX` — every term in the main index is stored prefixed with '0'.
 const MAIN_PREFIX: u8 = b'0';
@@ -407,13 +415,12 @@ pub(crate) fn build_segment(
 // The reader is verified end-to-end here (writer→decoder round-trips, incl.
 // forced-small `pgsz` multi-leaf segments) and in `tests/fts5_decode.rs` /
 // `tests/fts5_decode_multileaf.rs` (decode what `sqlite3` itself wrote). It is
-// not wired into `MATCH` yet — that is D2b-2, which lives in another module — so
-// these items have no non-test in-crate caller and carry `#[allow(dead_code)]`
-// until that wiring lands.
+// wired into `MATCH` (D2b-2) via `lookup_term_rowids` below, which the executor
+// calls to index-route a single bare-term query (see `fts5_try_index_match` in
+// `src/exec/mod.rs`).
 
 /// Read a varint at `buf[*pos..]`, advancing `pos`. `None` on a truncated/empty
 /// slice.
-#[allow(dead_code)]
 fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
     let (v, n) = varint::decode(buf.get(*pos..)?)?;
     *pos += n;
@@ -431,7 +438,6 @@ pub(crate) struct DecodedPosting {
 /// Decode one position list (`[size][col0 collist]([0x01][col][collist])*`)
 /// starting at `buf[*pos..]`, advancing `pos` past it. Returns the per-column
 /// positions (index = column number). The inverse of [`poslist`].
-#[allow(dead_code)]
 fn decode_poslist(buf: &[u8], pos: &mut usize) -> Option<Vec<Vec<u32>>> {
     let size2 = read_varint(buf, pos)?;
     let content_len = (size2 / 2) as usize;
@@ -478,7 +484,6 @@ fn decode_poslist(buf: &[u8], pos: &mut usize) -> Option<Vec<Vec<u32>>> {
 /// One term record on a leaf: its full '0'-prefixed `key`, the byte offset where
 /// the record itself begins (= the doclist of the PREVIOUS term ends here), and
 /// the offset where this term's own doclist begins (just past the record bytes).
-#[allow(dead_code)]
 struct TermRec {
     key: Vec<u8>,
     rec_start: usize,
@@ -489,7 +494,6 @@ struct TermRec {
 /// `[u16 first_rowid_off][u16 footer_off][body][pgidx]`; the body holds the
 /// doclist bytes and term records, `pgidx` (footer) holds each term record's
 /// absolute page offset (first absolute, then deltas).
-#[allow(dead_code)]
 struct LeafView {
     /// Offset of the first WHOLE rowid on the leaf (`0` = none; a leaf that opens
     /// with a carried poslist tail and resumes the doclist points here).
@@ -505,7 +509,6 @@ struct LeafView {
 /// leaf is structurally malformed. The inverse of [`SegWriter::finish_leaf`]:
 /// the two u16 header words, the page-index footer (absolute offset, then
 /// deltas), and the prefix-compressed term keys.
-#[allow(dead_code)]
 fn parse_leaf(leaf: &[u8]) -> Option<LeafView> {
     if leaf.len() < 4 {
         return None;
@@ -585,7 +588,6 @@ fn parse_leaf(leaf: &[u8]) -> Option<LeafView> {
 /// continuation leaf (`abs_start = true`, the leaf's first whole rowid is written
 /// absolute at `first_rowid_off`; the bytes before it are the carried poslist
 /// tail and belong to the *previous* run).
-#[allow(dead_code)]
 struct DoclistRun<'a> {
     bytes: &'a [u8],
     /// `true` if `bytes` starts at a leaf's `first_rowid_off` (an absolute rowid).
@@ -602,7 +604,6 @@ struct DoclistRun<'a> {
 /// (and even a single collist varint) may straddle a run boundary, so this
 /// flattens the runs into one buffer and tracks the byte offsets at which an
 /// absolute rowid begins.
-#[allow(dead_code)]
 fn decode_spanning_doclist(runs: &[DoclistRun]) -> Option<Vec<DecodedPosting>> {
     // Flatten into one buffer, recording the offsets where a rowid is absolute.
     let mut buf: Vec<u8> = Vec::new();
@@ -658,7 +659,6 @@ fn decode_spanning_doclist(runs: &[DoclistRun]) -> Option<Vec<DecodedPosting>> {
 ///   its footer (the spill continues).
 ///
 /// The spill ends at the first term record after ours, anywhere in the segment.
-#[allow(dead_code)]
 fn gather_doclist_runs<'a>(
     leaves: &'a [&'a [u8]],
     start_leaf: usize,
@@ -729,7 +729,6 @@ fn gather_doclist_runs<'a>(
 /// back to the document scan rather than reading a truncated doclist. The empty
 /// result `Some(vec![])` never occurs — a present term always has at least one
 /// posting.
-#[allow(dead_code)]
 pub(crate) fn decode_term(leaves: &[&[u8]], term: &[u8]) -> Option<Vec<DecodedPosting>> {
     let key = term_key(term);
     // Parse every leaf once. A malformed/unsupported leaf (e.g. an interior page)
@@ -750,6 +749,83 @@ pub(crate) fn decode_term(leaves: &[&[u8]], term: &[u8]) -> Option<Vec<DecodedPo
         }
     }
     None
+}
+
+/// One segment's identity, parsed from the structure record: its `segid` and the
+/// inclusive range of height-0 leaf page numbers (`pgno_first..=pgno_last`).
+struct SegmentLoc {
+    segid: i64,
+    pgno_first: i64,
+    pgno_last: i64,
+}
+
+/// Parse the structure record (the inverse of [`structure`]) and, IF the index
+/// holds exactly one height-0 segment, return its location. Returns `None` for
+/// the empty index, a multi-segment / multi-level index (a merged or
+/// incrementally-updated index that the single-segment leaf reader can't serve),
+/// or a malformed record — the caller then falls back to the `%_content` scan.
+///
+/// Layout: 4-byte BE cookie, then varints `nLevel`, `nSegment`, `nWriteCounter`,
+/// then per level `nMerge`, `nSeg`, then per segment `segid`, `pgnoFirst`,
+/// `pgnoLast`. graphite always writes a single fresh segment, so this recognizes
+/// exactly that shape (one level, one segment) and declines anything else.
+fn single_segment(structure: &[u8]) -> Option<SegmentLoc> {
+    // The 4-byte config cookie precedes the varint body.
+    let mut pos = 4usize;
+    let n_level = read_varint(structure, &mut pos)?;
+    let n_segment = read_varint(structure, &mut pos)?;
+    let _n_write_counter = read_varint(structure, &mut pos)?;
+    // Only the simple, single-segment shape is served from the leaf reader.
+    if n_level != 1 || n_segment != 1 {
+        return None;
+    }
+    let n_merge = read_varint(structure, &mut pos)?;
+    let n_seg = read_varint(structure, &mut pos)?;
+    if n_merge != 0 || n_seg != 1 {
+        return None;
+    }
+    let segid = read_varint(structure, &mut pos)? as i64;
+    let pgno_first = read_varint(structure, &mut pos)? as i64;
+    let pgno_last = read_varint(structure, &mut pos)? as i64;
+    if segid <= 0 || pgno_first < 1 || pgno_last < pgno_first {
+        return None;
+    }
+    Some(SegmentLoc {
+        segid,
+        pgno_first,
+        pgno_last,
+    })
+}
+
+/// Look up `term` in an FTS5 index given its `%_data` rows, returning the rowids
+/// of the documents that contain the term (ascending), or `None` if the index
+/// shape is one the single-segment leaf reader cannot serve.
+///
+/// `data` is the `(id, block)` rows of the `%_data` shadow table (the structure
+/// record at id 10 plus the height-0 leaves). This is the wiring used by `MATCH`:
+/// it parses the structure record, and only when the index is a single height-0
+/// segment ([`single_segment`]) does it gather that segment's leaves in page
+/// order and call [`decode_term`]. A `None` return (multi-segment index, an
+/// interior/doclist-index page, a missing leaf, or a malformed record) tells the
+/// caller to fall back to the `%_content` document scan. A present term that is
+/// genuinely absent from a servable single-segment index returns `Some(vec![])`.
+pub(crate) fn lookup_term_rowids(data: &[(i64, Vec<u8>)], term: &[u8]) -> Option<Vec<i64>> {
+    let structure = &data.iter().find(|(id, _)| *id == STRUCTURE_ROWID)?.1;
+    let loc = single_segment(structure)?;
+    // Gather the segment's leaves in page order; abort (→ scan) if any is missing.
+    let mut leaves: Vec<&[u8]> = Vec::new();
+    for pgno in loc.pgno_first..=loc.pgno_last {
+        let rid = segment_leaf_rowid(loc.segid, pgno);
+        let blob = &data.iter().find(|(id, _)| *id == rid)?.1;
+        leaves.push(blob.as_slice());
+    }
+    #[cfg(test)]
+    INDEX_ROUTE_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    match decode_term(&leaves, term) {
+        // A servable segment whose term is absent: definitively no matches.
+        None => Some(Vec::new()),
+        Some(postings) => Some(postings.into_iter().map(|p| p.rowid).collect()),
+    }
 }
 
 #[cfg(test)]
@@ -1035,5 +1111,50 @@ mod tests {
             assert_eq!(decode(&seg, term), Some(want), "term {term:?}");
         }
         assert_eq!(decode(&seg, b"absent"), None);
+    }
+
+    // ---- D2b-2 lookup_term_rowids (structure-aware top-level lookup) ------
+
+    #[test]
+    fn lookup_rowids_single_segment_present_and_absent() {
+        // "cat" in docs 1,3,7; the lookup parses the structure record, gathers the
+        // single segment's leaves, and returns the rowids ascending.
+        let terms = vec![(
+            b"cat".to_vec(),
+            vec![p(1, &[&[0]]), p(3, &[&[2]]), p(7, &[&[1]])],
+        )];
+        let seg = build_segment(
+            &terms,
+            3,
+            &[3],
+            &[(1, vec![1]), (3, vec![3]), (7, vec![2])],
+            1000,
+            0,
+        );
+        assert_eq!(lookup_term_rowids(&seg.data, b"cat"), Some(vec![1, 3, 7]));
+        // A servable segment whose term is absent → an empty rowid list (no match),
+        // distinct from `None` (the index couldn't be served).
+        assert_eq!(lookup_term_rowids(&seg.data, b"dog"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn lookup_rowids_empty_index_falls_back() {
+        // An empty index has no leaves and `nLevel == 0`: not servable → `None`.
+        let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
+        assert_eq!(lookup_term_rowids(&seg.data, b"anything"), None);
+    }
+
+    #[test]
+    fn lookup_rowids_multi_leaf_segment() {
+        // A doclist that spans several leaves still resolves via the leaf reader.
+        let n = 40i64;
+        let postings: Vec<Posting> = (1..=n).map(|r| p(r, &[&[0]])).collect();
+        let terms = vec![(b"x".to_vec(), postings)];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![1])).collect();
+        let seg = build_segment(&terms, n as u64, &[n as u64], &doc_sizes, 64, 0);
+        assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclist");
+        let want: Vec<i64> = (1..=n).collect();
+        assert_eq!(lookup_term_rowids(&seg.data, b"x"), Some(want));
+        assert_eq!(lookup_term_rowids(&seg.data, b"y"), Some(Vec::new()));
     }
 }

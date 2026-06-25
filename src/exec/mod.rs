@@ -7038,6 +7038,107 @@ impl Connection {
         Ok(updated)
     }
 
+    /// D2b-2: try to answer a `MATCH` over the FTS5 table `name` from its segment
+    /// index instead of scanning every `_content` document. Returns
+    /// `Some(rows)` (the matching `_content` rows, leading `id` column dropped,
+    /// in ascending rowid order — exactly the scan's order) only for the one shape
+    /// proven to give identical results: a TABLE-WIDE, SINGLE BARE-TERM query
+    /// (`tbl MATCH 'word'`) over a fully-indexed table whose `_data` holds a single
+    /// height-0 segment. Returns `None` (the caller falls back to the document
+    /// scan) for every other case — a `col MATCH …` operand, an `UNINDEXED`
+    /// column, a phrase/prefix/boolean/`NEAR` query, a multi-segment or
+    /// interior/doclist-index index, or no `MATCH` at all.
+    ///
+    /// Correctness: for a lone bare term over a fully-indexed table the scan's
+    /// per-row predicate ([`crate::vtab::fts5_query_matches`]) is true iff the
+    /// token appears in some column — which is exactly the term's index doclist.
+    /// run_core re-applies the full WHERE to whatever this returns, so the result
+    /// is a superset and never wrong; the rowid-ascending order matches the scan.
+    #[cfg(feature = "fts5")]
+    fn fts5_try_index_match(
+        &self,
+        name: &str,
+        alias: Option<&str>,
+        arg_refs: &[&str],
+        pushdown: Option<(&Select, &Params)>,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let (sel, params) = match pushdown {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let where_expr = match sel.where_clause.as_ref() {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        // The query must be a MATCH whose operand names the TABLE (a table-wide
+        // search) — its name or its FROM alias — not a single `col MATCH …` (which
+        // scopes to one column and so does not equal the term's any-column
+        // doclist).
+        let (query, operand) = match self.fts5_match_query(where_expr, params) {
+            Some(qo) => qo,
+            None => return Ok(None),
+        };
+        let names_table = operand.eq_ignore_ascii_case(name)
+            || alias.is_some_and(|a| operand.eq_ignore_ascii_case(a));
+        if !names_table {
+            return Ok(None);
+        }
+        // Only fully-indexed tables: an `UNINDEXED` column is stored but excluded
+        // from the scan's any-column match, while graphite indexes every column —
+        // so the doclist would over-match. Leave those on the scan.
+        let indexed = crate::vtab::fts5_indexed_columns(arg_refs);
+        let ncols = self.vtab_meta(name)?.2.columns.len();
+        if indexed.len() != ncols {
+            return Ok(None);
+        }
+        let tok = crate::vtab::fts5_tok_config(arg_refs);
+        let term = match crate::vtab::fts5_single_bare_term(&query, tok) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        // Read the segment index (`_data`) and resolve the term's rowids. A `None`
+        // means the index shape isn't servable → fall back to the scan.
+        let dmeta = self.table_meta(&format!("{name}_data"), None)?;
+        let data: Vec<(i64, Vec<u8>)> = self
+            .scan_table(&dmeta)?
+            .into_iter()
+            .filter_map(|(rowid, mut values)| {
+                // `_data` is `(id INTEGER PRIMARY KEY, block BLOB)`; the id is the
+                // rowid, the block is the second column.
+                match values.drain(..).nth(1) {
+                    Some(Value::Blob(b)) => Some((rowid, b)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let rowids = match crate::fts5_index::lookup_term_rowids(&data, &term) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        // Fetch exactly the matching `_content` rows, by rowid, ascending (the
+        // doclist is already ascending). Drop the leading `id` column.
+        let cmeta = self.table_meta(&format!("{name}_content"), None)?;
+        let encoding = self.backend.source().header().text_encoding;
+        let mut rows = Vec::with_capacity(rowids.len());
+        let mut cur = TableCursor::new(self.backend.source(), cmeta.root);
+        for rid in rowids {
+            if cur.seek(rid)? {
+                let mut values = self.decode_full_row(&cmeta, rid, &cur.payload()?, encoding)?;
+                if !values.is_empty() {
+                    values.remove(0);
+                }
+                rows.push(InputRow {
+                    values,
+                    rowid: Some(rid),
+                });
+            }
+            // A doclist rowid with no `_content` row can't happen for a consistent
+            // index; if it ever did, omitting it is still a valid superset (the
+            // scan wouldn't have produced it either).
+        }
+        Ok(Some(rows))
+    }
+
     /// Produce the columns and rows of a virtual table used as a `FROM` source:
     /// reparse its stored `CREATE VIRTUAL TABLE`, look the module up in the
     /// registry, `connect` for its column schema, then `open` a cursor and drain
@@ -7160,6 +7261,15 @@ impl Connection {
             if cvt.module.eq_ignore_ascii_case("fts5")
                 && self.schema.table(&format!("{name}_content")).is_some()
             {
+                // D2b-2: a single bare-term `MATCH` (`tbl MATCH 'word'`) reads the
+                // term's doclist from the segment index and fetches only those
+                // `_content` rows by rowid, instead of scanning + tokenizing every
+                // document. Falls back to the full scan for any shape the index
+                // can't serve identically. run_core re-applies the full WHERE, so
+                // the rows (rowid-ascending, like the scan) stay a valid superset.
+                if let Some(rows) = self.fts5_try_index_match(name, alias, &arg_refs, pushdown)? {
+                    return Ok(Some((columns, rows)));
+                }
                 let cmeta = self.table_meta(&format!("{name}_content"), None)?;
                 let rows = self
                     .scan_table(&cmeta)?
@@ -21024,4 +21134,101 @@ fn find_integer_primary_key(ct: &CreateTable) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(all(test, feature = "fts5", feature = "std"))]
+mod fts5_index_route_tests {
+    use super::Connection;
+    use crate::fts5_index::INDEX_ROUTE_HITS;
+    use crate::value::Value;
+    use core::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// The global [`INDEX_ROUTE_HITS`] counter is shared across the whole test
+    /// binary, so these two tests — which assert on its DELTA — must not run
+    /// concurrently. Serialize them through this lock.
+    static SERIALIZE: Mutex<()> = Mutex::new(());
+
+    fn texts(c: &mut Connection, sql: &str) -> alloc::vec::Vec<alloc::string::String> {
+        c.query(sql)
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| match &r[0] {
+                Value::Text(s) => s.clone(),
+                other => alloc::format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A single bare-term, table-wide `MATCH` is served by the segment index
+    /// (`INDEX_ROUTE_HITS` rises), and returns exactly the same rows — in the same
+    /// rowid order — as the documents that contain the term.
+    #[test]
+    fn bare_term_match_takes_index_route() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = Connection::open_memory().unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+            .unwrap();
+        for (i, body) in [
+            "the quick brown fox",
+            "lazy dog sleeps",
+            "fox and hound",
+            "nothing relevant here",
+            "a quick test",
+        ]
+        .iter()
+        .enumerate()
+        {
+            c.execute(&alloc::format!(
+                "INSERT INTO t(rowid, body) VALUES({}, '{}')",
+                i + 1,
+                body
+            ))
+            .unwrap();
+        }
+
+        // Bare single term → index route.
+        let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        let rows = texts(&mut c, "SELECT body FROM t WHERE t MATCH 'fox'");
+        let after = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+        assert!(after > before, "bare-term MATCH must take the index route");
+        assert_eq!(rows, ["the quick brown fox", "fox and hound"]);
+
+        // Repeated-in-one-doc, multi-doc, and absent terms.
+        assert_eq!(
+            texts(&mut c, "SELECT body FROM t WHERE t MATCH 'quick'"),
+            ["the quick brown fox", "a quick test"]
+        );
+        assert!(texts(&mut c, "SELECT body FROM t WHERE t MATCH 'zebra'").is_empty());
+    }
+
+    /// Shapes that are NOT a single bare term stay on the document scan
+    /// (`INDEX_ROUTE_HITS` unchanged), still returning correct results.
+    #[test]
+    fn non_bare_shapes_stay_on_scan() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = Connection::open_memory().unwrap();
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+            .unwrap();
+        for (i, body) in ["quick brown fox", "slow brown bear", "quick red fox"]
+            .iter()
+            .enumerate()
+        {
+            c.execute(&alloc::format!(
+                "INSERT INTO t(rowid, body) VALUES({}, '{}')",
+                i + 1,
+                body
+            ))
+            .unwrap();
+        }
+        // Phrase, prefix, and boolean queries must not be index-routed.
+        for q in ["\"quick brown\"", "qui*", "quick AND fox", "brown NOT bear"] {
+            let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+            let sql = alloc::format!("SELECT body FROM t WHERE t MATCH '{q}'");
+            let _ = c.query(&sql).unwrap();
+            let after = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
+            assert_eq!(after, before, "query {q:?} must stay on the scan");
+        }
+    }
 }
