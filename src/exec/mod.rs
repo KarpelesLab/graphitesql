@@ -7115,9 +7115,11 @@ impl Connection {
             InColumn(Vec<u8>, usize),
             Phrase(Vec<u8>, Vec<u8>),
             PhraseInColumn(Vec<u8>, Vec<u8>, usize),
-            /// A two-operand bare-term boolean (`a AND/OR/NOT b`, or implicit `a b`)
-            /// served by a doclist set-op on the two terms' rowid lists.
-            Bool(Vec<u8>, crate::vtab::Fts5BoolOp, Vec<u8>),
+            /// An N-operand bare-term boolean TREE (`a AND b AND c`,
+            /// `(a OR b) AND NOT c`, the two-operand `a AND/OR/NOT b`, the
+            /// implicit-AND `a b c`, …) served by bottom-up doclist set-ops over
+            /// the leaves' rowid lists, exactly as the scan's `fts5_eval` walks it.
+            BoolTree(crate::vtab::Fts5BoolTree),
             /// A TABLE-WIDE single bare prefix term (`'word*'`) — matches in ANY
             /// column any document with an indexed term starting with the prefix.
             PrefixAnyColumn(Vec<u8>),
@@ -7151,8 +7153,11 @@ impl Connection {
                 Some(ci) => Routed::PhraseInColumn(a, b, ci),
                 None => return Ok(None),
             }
-        } else if let Some((a, op, b)) = crate::vtab::fts5_two_bare_term_bool(&query, tok) {
-            Routed::Bool(a, op, b)
+        } else if let Some(tree) = crate::vtab::fts5_bare_term_bool_tree(&query, tok) {
+            // Any boolean tree of table-wide bare terms (2 operands or N, with
+            // parentheses / mixed AND/OR/NOT). The single-bare-term shapes are
+            // already handled above, so this fires only for genuine boolean trees.
+            Routed::BoolTree(tree)
         } else if let Some(p) = crate::vtab::fts5_single_prefix_term(&query, tok) {
             Routed::PrefixAnyColumn(p)
         } else if let Some((col, p)) = crate::vtab::fts5_single_prefix_term_column(&query, tok) {
@@ -7187,7 +7192,7 @@ impl Connection {
             Routed::PhraseInColumn(a, b, ci) => {
                 crate::fts5_index::lookup_phrase_rowids_in_column(&data, a, b, *ci)
             }
-            Routed::Bool(a, op, b) => crate::fts5_index::lookup_bool_rowids(&data, a, *op, b),
+            Routed::BoolTree(tree) => crate::fts5_index::lookup_bool_tree_rowids(&data, tree),
             Routed::PrefixAnyColumn(p) => crate::fts5_index::lookup_prefix_rowids(&data, p),
             Routed::PrefixInColumn(p, ci) => {
                 crate::fts5_index::lookup_prefix_rowids_in_column(&data, p, *ci)
@@ -21304,12 +21309,14 @@ mod fts5_index_route_tests {
             ))
             .unwrap();
         }
-        // A ≠2-term phrase, a prefixed/anchored phrase, a NEAR group, a 3-operand
-        // boolean, and a boolean mixing a phrase/prefix operand must not be
-        // index-routed. (A bare two-term phrase IS — see
-        // `two_term_phrase_match_takes_index_route` — a TWO-operand bare-term
-        // boolean IS — see `two_term_boolean_match_takes_index_route` — and a lone
-        // bare prefix term IS — see `prefix_term_match_takes_index_route`.)
+        // A ≠2-term phrase, a prefixed/anchored phrase, a NEAR group, and a boolean
+        // mixing a phrase/prefix/column-scoped operand must not be index-routed. (A
+        // bare two-term phrase IS — see `two_term_phrase_match_takes_index_route` —
+        // an N-operand bare-term boolean TREE IS — see
+        // `bare_term_boolean_tree_match_takes_index_route` — and a lone bare prefix
+        // term IS — see `prefix_term_match_takes_index_route`.) Every leaf of a
+        // routed boolean tree must be a plain table-wide bare term; a single
+        // non-bare leaf forces the whole query back to the scan.
         for q in [
             "\"quick brown fox\"",
             "\"quick brown\" OR fox",
@@ -21317,10 +21324,11 @@ mod fts5_index_route_tests {
             "^qui*",        // anchored prefix → stays on scan
             "qui* AND fox", // prefix operand in a boolean → stays on scan
             "NEAR(quick fox, 3)",
-            "quick AND brown AND fox", // 3 operands → nested tree, stays on scan
-            "quick OR brown OR fox",   // 3 operands → stays on scan
-            "\"quick brown\" OR bear", // phrase operand → stays on scan
-            "title : quick OR fox",    // column-scoped operand → stays on scan
+            "\"quick brown\" OR bear",   // phrase operand → stays on scan
+            "title : quick OR fox",      // column-scoped operand → stays on scan
+            "quick AND brown AND qui*",  // 3 operands, one a prefix → scan
+            "(quick OR brown) AND fox*", // parenthesized, one a prefix → scan
+            "quick AND NEAR(brown fox, 2)", // a NEAR leaf in the tree → scan
         ] {
             let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
             let sql = alloc::format!("SELECT body FROM t WHERE t MATCH '{q}'");
@@ -21459,12 +21467,14 @@ mod fts5_index_route_tests {
         assert_eq!(rows, [1, 3]);
     }
 
-    /// A two-operand bare-term boolean (`a AND b`, `a OR b`, `a NOT b`, and the
-    /// implicit-AND `a b`) over a fully indexed table is served by the segment index
-    /// (`INDEX_ROUTE_HITS` rises) via a doclist set-op, returning exactly the same
-    /// documents — in the same rowid order — as the document scan.
+    /// An N-operand bare-term boolean TREE — two operands (`a AND b`, `a OR b`,
+    /// `a NOT b`, the implicit-AND `a b`) AND 3+ operands with mixed AND/OR/NOT and
+    /// parentheses — over a fully indexed table is served by the segment index
+    /// (`INDEX_ROUTE_HITS` rises) via bottom-up doclist set-ops, returning exactly
+    /// the same documents — in the same rowid order — as the document scan, with
+    /// FTS5's `NOT` > `AND` > `OR` precedence honored.
     #[test]
-    fn two_term_boolean_match_takes_index_route() {
+    fn bare_term_boolean_tree_match_takes_index_route() {
         let _guard = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
         let mut c = Connection::open_memory().unwrap();
         c.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
@@ -21507,6 +21517,23 @@ mod fts5_index_route_tests {
             ("fox brown", alloc::vec![1, 4]), // implicit AND
             ("zebra AND fox", alloc::vec![]), // absent operand → empty
             ("zebra OR dog", alloc::vec![2, 5]),
+            // 3+ operands and parentheses (term presence by rowid above):
+            //   fox{1,3,4,5} brown{1,2,4} dog{2,5}
+            ("fox AND brown AND dog", alloc::vec![]), // ∩ = {}
+            ("fox OR brown OR dog", alloc::vec![1, 2, 3, 4, 5]), // ∪ = all
+            ("fox brown dog", alloc::vec![]),         // implicit AND of three
+            // Precedence: `fox OR brown AND dog` = `fox OR (brown AND dog)`.
+            //   brown∩dog = {2}; fox{1,3,4,5} ∪ {2} = {1,2,3,4,5}.
+            ("fox OR brown AND dog", alloc::vec![1, 2, 3, 4, 5]),
+            // Parentheses override: `(fox OR brown) AND dog`.
+            //   fox∪brown = {1,2,3,4,5}; ∩ dog{2,5} = {2,5}.
+            ("(fox OR brown) AND dog", alloc::vec![2, 5]),
+            // A NOT inside a parenthesized tree: `(fox OR brown) NOT dog`.
+            //   {1,2,3,4,5} − dog{2,5} = {1,3,4}.
+            ("(fox OR brown) NOT dog", alloc::vec![1, 3, 4]),
+            // NOT binds tighter than AND: `fox AND brown NOT dog`
+            //   = `fox AND (brown NOT dog)`; brown−dog = {1,4}; ∩ fox = {1,4}.
+            ("fox AND brown NOT dog", alloc::vec![1, 4]),
         ] {
             let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
             let rows = ids(

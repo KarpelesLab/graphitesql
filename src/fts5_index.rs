@@ -1144,51 +1144,59 @@ fn rowids_difference(a: &[i64], b: &[i64]) -> Vec<i64> {
     out
 }
 
-/// Look up a two-operand BOOLEAN of bare terms — `term_a <op> term_b` — in a
+/// Evaluate an [`Fts5BoolTree`] over already-gathered single-segment `leaves` into
+/// the matching rowids, ascending and deduplicated at every level. A `Leaf` decodes
+/// its term's doclist (absent term → empty, ascending and unique by construction);
+/// an `Op` combines its two children's ascending rowid lists with the matching
+/// sorted-merge set-op (`And`→[`rowids_intersect`], `Or`→[`rowids_union`],
+/// `Not`→[`rowids_difference`]), each of which preserves ascending+unique, so the
+/// recursion's invariant holds all the way up. Walks the tree bottom-up exactly as
+/// the scan's `fts5_eval` walks the parse tree.
+#[cfg(feature = "fts5")]
+fn eval_bool_tree(leaves: &[&[u8]], tree: &crate::vtab::Fts5BoolTree) -> Vec<i64> {
+    use crate::vtab::{Fts5BoolOp, Fts5BoolTree};
+    match tree {
+        Fts5BoolTree::Leaf(term) => decode_term(leaves, term)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.rowid)
+            .collect(),
+        Fts5BoolTree::Op(op, a, b) => {
+            let ra = eval_bool_tree(leaves, a);
+            let rb = eval_bool_tree(leaves, b);
+            match op {
+                Fts5BoolOp::And => rowids_intersect(&ra, &rb),
+                Fts5BoolOp::Or => rowids_union(&ra, &rb),
+                Fts5BoolOp::Not => rowids_difference(&ra, &rb),
+            }
+        }
+    }
+}
+
+/// Look up an N-operand BOOLEAN TREE of bare terms ([`Fts5BoolTree`]) in a
 /// single-segment FTS5 index, returning the matching rowids ascending, or `None`
 /// if the index shape is unservable (so the caller falls back to the `%_content`
 /// scan).
 ///
-/// The boolean sibling of [`lookup_term_rowids`]: it gathers the one height-0
-/// segment's leaves ONCE (so a routed boolean counts as a single index hit) and
-/// decodes both terms' doclists into per-term rowid lists — each already ascending
-/// and duplicate-free (one posting per docid) — then combines them with a
-/// sorted-merge set-op matching the connective:
-///   * [`Fts5BoolOp::And`] → INTERSECTION (documents containing both terms),
-///   * [`Fts5BoolOp::Or`] → UNION (either term),
-///   * [`Fts5BoolOp::Not`] → DIFFERENCE `a − b` (term `a` but not `b`).
+/// The boolean sibling of [`lookup_term_rowids`]: it gathers the one
+/// height-0 segment's leaves ONCE (so a routed boolean tree counts as a single
+/// index hit, no matter how many leaf terms it decodes) and evaluates the tree
+/// bottom-up with [`eval_bool_tree`] — each leaf's doclist set-combined per node
+/// (`And`→intersection, `Or`→union, `Not`→difference). Because the tree is the
+/// exact parse tree the scan's `fts5_eval` walks (built by the recognizer
+/// [`crate::vtab::fts5_bare_term_bool_tree`], preserving FTS5's
+/// `NOT` > `AND` > `OR` precedence/associativity) and a table-wide bare term's
+/// any-column match set is precisely its doclist's rowids, the routed result is the
+/// identical SET — and identical ascending ORDER — the scan produces for the same
+/// query.
 ///
-/// This is exactly the set the scan's `fts5_eval` computes for the same query
-/// (`And`/`Or`/`Not` of the two terms' any-column match sets), so the routed rows
-/// are identical. Either term being absent yields the empty list for that operand
-/// (a servable "no postings" result), and the set-op still holds.
-///
-/// [`Fts5BoolOp::And`]: crate::vtab::Fts5BoolOp::And
-/// [`Fts5BoolOp::Or`]: crate::vtab::Fts5BoolOp::Or
-/// [`Fts5BoolOp::Not`]: crate::vtab::Fts5BoolOp::Not
-pub(crate) fn lookup_bool_rowids(
+/// [`Fts5BoolTree`]: crate::vtab::Fts5BoolTree
+pub(crate) fn lookup_bool_tree_rowids(
     data: &[(i64, Vec<u8>)],
-    term_a: &[u8],
-    op: crate::vtab::Fts5BoolOp,
-    term_b: &[u8],
+    tree: &crate::vtab::Fts5BoolTree,
 ) -> Option<Vec<i64>> {
-    use crate::vtab::Fts5BoolOp;
     let leaves = segment_leaves(data)?;
-    let ra: Vec<i64> = decode_term(&leaves, term_a)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| p.rowid)
-        .collect();
-    let rb: Vec<i64> = decode_term(&leaves, term_b)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| p.rowid)
-        .collect();
-    Some(match op {
-        Fts5BoolOp::And => rowids_intersect(&ra, &rb),
-        Fts5BoolOp::Or => rowids_union(&ra, &rb),
-        Fts5BoolOp::Not => rowids_difference(&ra, &rb),
-    })
+    Some(eval_bool_tree(&leaves, tree))
 }
 
 #[cfg(test)]
@@ -1519,6 +1527,97 @@ mod tests {
         let want: Vec<i64> = (1..=n).collect();
         assert_eq!(lookup_term_rowids(&seg.data, b"x"), Some(want));
         assert_eq!(lookup_term_rowids(&seg.data, b"y"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn lookup_bool_tree_n_operand_set_ops() {
+        use crate::vtab::{Fts5BoolOp, Fts5BoolTree};
+        use alloc::boxed::Box;
+        // Three terms over docs 1..=8:
+        //   a in {1,2,3,4,5}, b in {2,4,6,8}, c in {3,4,5,6}.
+        let terms = vec![
+            (
+                b"a".to_vec(),
+                (1..=5).map(|r| p(r, &[&[0]])).collect::<Vec<_>>(),
+            ),
+            (
+                b"b".to_vec(),
+                vec![2, 4, 6, 8]
+                    .into_iter()
+                    .map(|r| p(r, &[&[1]]))
+                    .collect(),
+            ),
+            (
+                b"c".to_vec(),
+                vec![3, 4, 5, 6]
+                    .into_iter()
+                    .map(|r| p(r, &[&[2]]))
+                    .collect(),
+            ),
+        ];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=8).map(|r| (r, vec![3])).collect();
+        let seg = build_segment(&terms, 8, &[8], &doc_sizes, 1000, 0);
+        let leaf = |t: &[u8]| Fts5BoolTree::Leaf(t.to_vec());
+        let op = |o, l, r| Fts5BoolTree::Op(o, Box::new(l), Box::new(r));
+
+        // a AND b AND c (left-assoc) → {4}.
+        let t = op(
+            Fts5BoolOp::And,
+            op(Fts5BoolOp::And, leaf(b"a"), leaf(b"b")),
+            leaf(b"c"),
+        );
+        assert_eq!(lookup_bool_tree_rowids(&seg.data, &t), Some(vec![4]));
+
+        // a OR b OR c → {1,2,3,4,5,6,8}.
+        let t = op(
+            Fts5BoolOp::Or,
+            op(Fts5BoolOp::Or, leaf(b"a"), leaf(b"b")),
+            leaf(b"c"),
+        );
+        assert_eq!(
+            lookup_bool_tree_rowids(&seg.data, &t),
+            Some(vec![1, 2, 3, 4, 5, 6, 8])
+        );
+
+        // Precedence: `a OR b AND c` parses to `a OR (b AND c)`.
+        // b AND c = {4,6}; a OR {4,6} = {1,2,3,4,5,6}.
+        let t = op(
+            Fts5BoolOp::Or,
+            leaf(b"a"),
+            op(Fts5BoolOp::And, leaf(b"b"), leaf(b"c")),
+        );
+        assert_eq!(
+            lookup_bool_tree_rowids(&seg.data, &t),
+            Some(vec![1, 2, 3, 4, 5, 6])
+        );
+
+        // A NOT in the tree: `(a OR b) NOT c`.
+        // a OR b = {1,2,3,4,5,6,8}; minus c {3,4,5,6} = {1,2,8}.
+        let t = op(
+            Fts5BoolOp::Not,
+            op(Fts5BoolOp::Or, leaf(b"a"), leaf(b"b")),
+            leaf(b"c"),
+        );
+        assert_eq!(lookup_bool_tree_rowids(&seg.data, &t), Some(vec![1, 2, 8]));
+
+        // An absent leaf is a servable empty operand: `a AND missing` = {}.
+        let t = op(Fts5BoolOp::And, leaf(b"a"), leaf(b"missing"));
+        assert_eq!(lookup_bool_tree_rowids(&seg.data, &t), Some(Vec::new()));
+
+        // A lone leaf evaluates to that term's doclist.
+        assert_eq!(
+            lookup_bool_tree_rowids(&seg.data, &leaf(b"c")),
+            Some(vec![3, 4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn lookup_bool_tree_empty_index_falls_back() {
+        use crate::vtab::Fts5BoolTree;
+        // An unservable (empty) index returns None so the caller scans.
+        let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
+        let t = Fts5BoolTree::Leaf(b"x".to_vec());
+        assert_eq!(lookup_bool_tree_rowids(&seg.data, &t), None);
     }
 
     #[test]

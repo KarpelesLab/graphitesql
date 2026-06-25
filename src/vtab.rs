@@ -2672,8 +2672,8 @@ pub(crate) fn fts5_two_term_phrase_column(
     Some((column, keys))
 }
 
-/// The boolean connective of a two-operand bare-term `MATCH` the index can serve
-/// via doclist set-ops on the operands' rowid lists ([`fts5_two_bare_term_bool`]).
+/// The boolean connective of a bare-term `MATCH` node the index can serve via a
+/// sorted-merge set-op on its children's rowid lists ([`Fts5BoolTree`]).
 #[cfg(feature = "fts5")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Fts5BoolOp {
@@ -2703,52 +2703,94 @@ fn fts5_bare_term_key(term: &Fts5Term, tok: Fts5Tok) -> Option<Vec<u8>> {
     }
 }
 
-/// If `pattern` is exactly TWO TABLE-WIDE BARE TERMS joined by a SINGLE boolean
-/// operator — `a AND b`, `a OR b`, `a NOT b`, or the implicit-AND `a b` — return
-/// `(key_a, op, key_b)` where each key is the operand's indexed token. Otherwise
-/// `None` (the query stays on the document scan).
+/// An N-operand boolean TREE of table-wide bare terms the index can serve via
+/// sorted-merge doclist set-ops — the general form of [`Fts5BoolOp`], recognized
+/// by [`fts5_bare_term_bool_tree`] and evaluated by
+/// [`crate::fts5_index::lookup_bool_tree_rowids`].
 ///
-/// The match set of each shape is provably the set-op of the two operands' doclists,
-/// which equals what the scan's [`fts5_eval`] computes — `And`/`Or`/`Not` map to
-/// docid INTERSECTION/UNION/DIFFERENCE of the per-term rowid lists (each ascending),
-/// fed to [`crate::fts5_index::lookup_bool_rowids`]:
-///   * `a AND b` and the bare `a b` (implicit AND, *not* a phrase — a quoted
-///     `"a b"` lexes to one two-token phrase term and is rejected here) both parse
-///     to `And(Term a, Term b)`;
-///   * `a OR b` parses to `Or(Term a, Term b)`; `a NOT b` to `Not(Term a, Term b)`.
-///
-/// Scoped to EXACTLY two operands with one operator: any deeper boolean tree (3+
-/// operands, parentheses, `NEAR`) parses to a NESTED node whose children are not
-/// both plain `Term`s, so it does not match here and stays on the scan — keeping the
-/// FTS5 precedence/associativity question off the index path entirely. Each operand
-/// must be a plain table-wide single-token bare word ([`fts5_bare_term_key`]); a
-/// column filter, `^` anchor, `tok*` prefix, or multi-word phrase operand also
-/// falls back. The keys are returned in left-to-right order, which matters only for
-/// `Not` (the asymmetric difference `a − b`).
+/// A `Leaf` is one operand's indexed token bytes (a table-wide single-token bare
+/// word); an `Op` node combines its two children with the matching set-op
+/// (`And`→intersection, `Or`→union, `Not`→difference). The tree's *shape* mirrors
+/// the parsed [`Fts5Query`] exactly — same operator nodes, same nesting — so its
+/// precedence/associativity is whatever [`Fts5Parser`] produced (FTS5's
+/// `NOT` > `AND` > `OR`), and a bottom-up rowid evaluation matches the scan's
+/// [`fts5_eval`] node-for-node.
 #[cfg(feature = "fts5")]
-pub(crate) fn fts5_two_bare_term_bool(
-    pattern: &str,
-    tok: Fts5Tok,
-) -> Option<(Vec<u8>, Fts5BoolOp, Vec<u8>)> {
+pub(crate) enum Fts5BoolTree {
+    /// One operand: the indexed token bytes of a table-wide bare term.
+    Leaf(Vec<u8>),
+    /// A binary boolean node combining its two children with `op`.
+    Op(Fts5BoolOp, Box<Fts5BoolTree>, Box<Fts5BoolTree>),
+}
+
+/// Walk a parsed [`Fts5Query`] into an [`Fts5BoolTree`] of table-wide bare-term
+/// leaves, or `None` if ANY leaf is not a plain table-wide single-token bare word
+/// (a phrase, `tok*` prefix, `^` anchor, `col:` filter, or a `NEAR` group). This
+/// is the recursive bare-term check used by [`fts5_bare_term_bool_tree`]:
+/// each `Term` must pass [`fts5_bare_term_key`]; each `And`/`Or`/`Not` recurses
+/// into both children, preserving the node and its position so the resulting tree
+/// is structurally identical to the query AST the scan's [`fts5_eval`] walks.
+///
+/// Because the tree mirrors the AST exactly, evaluating it bottom-up with the
+/// per-node set-op ([`And`]→intersection, [`Or`]→union, [`Not`]→difference of the
+/// children's ascending rowid lists) yields exactly the documents `fts5_eval`
+/// accepts — `fts5_eval` itself is `&&`/`||`/`&& !` of the children's any-column
+/// match sets, and a table-wide bare term's any-column match set is precisely its
+/// doclist's rowids. Whenever every leaf is index-servable the route is therefore
+/// provably identical to the scan; any non-bare leaf forces the whole query back
+/// to the document scan (a partial route could change the set).
+///
+/// [`And`]: Fts5BoolOp::And
+/// [`Or`]: Fts5BoolOp::Or
+/// [`Not`]: Fts5BoolOp::Not
+#[cfg(feature = "fts5")]
+fn fts5_query_to_bool_tree(query: &Fts5Query, tok: Fts5Tok) -> Option<Fts5BoolTree> {
+    match query {
+        Fts5Query::Term(t) => Some(Fts5BoolTree::Leaf(fts5_bare_term_key(t, tok)?)),
+        Fts5Query::Near(..) => None,
+        Fts5Query::And(a, b) => Some(Fts5BoolTree::Op(
+            Fts5BoolOp::And,
+            Box::new(fts5_query_to_bool_tree(a, tok)?),
+            Box::new(fts5_query_to_bool_tree(b, tok)?),
+        )),
+        Fts5Query::Or(a, b) => Some(Fts5BoolTree::Op(
+            Fts5BoolOp::Or,
+            Box::new(fts5_query_to_bool_tree(a, tok)?),
+            Box::new(fts5_query_to_bool_tree(b, tok)?),
+        )),
+        Fts5Query::Not(a, b) => Some(Fts5BoolTree::Op(
+            Fts5BoolOp::Not,
+            Box::new(fts5_query_to_bool_tree(a, tok)?),
+            Box::new(fts5_query_to_bool_tree(b, tok)?),
+        )),
+    }
+}
+
+/// If `pattern` is a BOOLEAN TREE whose every leaf is a table-wide single-token
+/// bare word — `a AND b AND c`, `a OR b OR c`, `a AND b OR c`,
+/// `(a OR b) AND NOT c`, the implicit-AND `a b c`, and any nesting thereof —
+/// return the [`Fts5BoolTree`] for [`crate::fts5_index::lookup_bool_tree_rowids`].
+/// Otherwise `None` (the query stays on the document scan).
+///
+/// This subsumes the former two-operand `a <op> b` recognizer (a two-leaf tree is
+/// just the smallest such tree) and generalizes it to an arbitrary boolean tree —
+/// the two-operand fast path is now this tree walker. The result is the
+/// parse tree built by [`Fts5Parser`] — so FTS5's `NOT` > `AND` > `OR`
+/// precedence and associativity are exactly the scan's — with every `Term`
+/// replaced by its index key. A degenerate query with no operator yields a lone
+/// `Leaf`; the dedicated [`fts5_single_bare_term`] path already covers that shape,
+/// so the executor tries this recognizer only after the single-term ones. Any
+/// non-bare leaf (phrase / prefix / anchor / column filter / `NEAR`) anywhere in
+/// the tree returns `None`.
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_bare_term_bool_tree(pattern: &str, tok: Fts5Tok) -> Option<Fts5BoolTree> {
     let toks = fts5_lex(pattern, tok);
     let query = (Fts5Parser {
         toks: &toks,
         pos: 0,
     })
     .parse()?;
-    // The whole query must be a SINGLE binary boolean node over two plain terms.
-    let (a, op, b) = match &query {
-        Fts5Query::And(a, b) => (a, Fts5BoolOp::And, b),
-        Fts5Query::Or(a, b) => (a, Fts5BoolOp::Or, b),
-        Fts5Query::Not(a, b) => (a, Fts5BoolOp::Not, b),
-        _ => return None,
-    };
-    let (Fts5Query::Term(ta), Fts5Query::Term(tb)) = (a.as_ref(), b.as_ref()) else {
-        return None;
-    };
-    let ka = fts5_bare_term_key(ta, tok)?;
-    let kb = fts5_bare_term_key(tb, tok)?;
-    Some((ka, op, kb))
+    fts5_query_to_bool_tree(&query, tok)
 }
 
 /// Collect every phrase term of a parsed query (flattening the boolean tree),

@@ -741,9 +741,132 @@ fn sqlite_written_two_term_boolean_read_by_graphite_single_and_multi_leaf() {
     }
 }
 
-/// Shapes the boolean route must NOT take (3+ operands, a phrase/prefix/anchor/
-/// column-scoped operand, NEAR) still return exactly sqlite3's set — they fall
-/// back to the document scan, which graphite already answers correctly.
+/// N-operand bare-term boolean TREES — `a AND b AND c`, `a OR b OR c`, mixed
+/// AND/OR/NOT, parentheses, and an implicit-AND of three — are now index-routed via
+/// a bottom-up doclist set-op over the parse tree (graphite's
+/// `fts5_bare_term_bool_tree` → `lookup_bool_tree_rowids`). The routed rowid set
+/// must be byte-identical to stock sqlite3, INCLUDING precedence: with no
+/// parentheses FTS5 binds `NOT` > `AND` > `OR`, so `a OR b AND c` must equal
+/// `a OR (b AND c)` (asserted explicitly), and a `NOT` anywhere in the tree must
+/// match sqlite's asymmetric difference.
+const BOOL_TREE_EXPRS: &[&str] = &[
+    "fox AND quick AND dog",               // 3-way AND (left-assoc)
+    "fox OR quick OR dog",                 // 3-way OR
+    "fox quick dog",                       // implicit AND of three
+    "fox OR quick AND dog",                // precedence: = fox OR (quick AND dog)
+    "fox AND quick OR dog",                // precedence: = (fox AND quick) OR dog
+    "(fox OR dog) AND quick",              // parens override precedence
+    "(fox OR quick) NOT dog",              // a NOT applied to a parenthesized OR
+    "fox AND quick NOT dog",               // NOT binds tighter: fox AND (quick NOT dog)
+    "fox OR brown OR dog OR quick",        // 4-way OR
+    "(brown OR henhouse) AND fox NOT dog", // deeper mixed tree
+    "zebra OR fox AND quick",              // absent leaf in an OR/AND tree
+    "fox NOT (dog OR brown)",              // NOT of a parenthesized OR
+];
+
+#[test]
+fn graphite_written_boolean_tree_equals_sqlite() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = tmp_path();
+    build_graphite(&path);
+    let c = Connection::open(&path).unwrap();
+    for expr in BOOL_TREE_EXPRS {
+        let g = graphite_match_expr(&c, expr);
+        let s = sqlite_match_expr(&path, expr);
+        assert_eq!(g, s, "bool tree {expr:?}: graphite {g:?} != sqlite {s:?}");
+    }
+    // Precedence pinned: the unparenthesized form must equal the explicitly
+    // parenthesized form FTS5's `AND > OR` (and `NOT > AND`) implies — both in
+    // graphite and in sqlite.
+    for (bare, parens) in [
+        ("fox OR quick AND dog", "fox OR (quick AND dog)"),
+        ("fox AND quick OR dog", "(fox AND quick) OR dog"),
+        ("fox AND quick NOT dog", "fox AND (quick NOT dog)"),
+    ] {
+        let gb = graphite_match_expr(&c, bare);
+        let gp = graphite_match_expr(&c, parens);
+        let sb = sqlite_match_expr(&path, bare);
+        assert_eq!(gb, gp, "graphite precedence {bare:?} != {parens:?}");
+        assert_eq!(gb, sb, "graphite {bare:?} != sqlite {bare:?}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn sqlite_written_boolean_tree_read_by_graphite_single_and_multi_leaf() {
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    // Single-leaf (default pgsz) and multi-leaf (forced pgsz 64, then optimized to a
+    // single segment) sqlite-written indexes over a larger corpus so the boolean
+    // tree route exercises real multi-leaf doclists.
+    for pgsz in [0u32, 64] {
+        let path = tmp_path();
+        if pgsz == 0 {
+            sqlite_exec(&path, "CREATE VIRTUAL TABLE t USING fts5(body);");
+        } else {
+            sqlite_exec(
+                &path,
+                "CREATE VIRTUAL TABLE t USING fts5(body);\
+                 INSERT INTO t(t, rank) VALUES('pgsz', 64);",
+            );
+        }
+        for i in 1..=60i64 {
+            let mut words = vec![format!("word{i:03}")];
+            if i % 2 == 0 {
+                words.push("fox".to_string());
+            }
+            if i % 3 == 0 {
+                words.push("dog".to_string());
+            }
+            if i % 5 == 0 {
+                words.push("quick".to_string());
+            }
+            if i % 7 == 0 {
+                words.push("brown".to_string());
+            }
+            sqlite_exec(
+                &path,
+                &format!(
+                    "INSERT INTO t(rowid, body) VALUES({i}, '{}');",
+                    words.join(" ")
+                ),
+            );
+        }
+        if pgsz != 0 {
+            sqlite_exec(&path, "INSERT INTO t(t) VALUES('optimize');");
+        }
+        let c = Connection::open(&path).unwrap();
+        for expr in [
+            "fox AND dog AND quick",
+            "fox OR dog OR quick",
+            "fox dog brown",
+            "fox OR dog AND quick",
+            "(fox OR dog) AND quick",
+            "(fox OR dog) NOT quick",
+            "fox AND dog NOT brown",
+            "fox NOT (dog OR quick)",
+            "missing OR fox AND dog",
+        ] {
+            let g = graphite_match_expr(&c, expr);
+            let s = sqlite_match_expr(&path, expr);
+            assert_eq!(
+                g, s,
+                "pgsz {pgsz}, bool tree {expr:?}: graphite {g:?} != sqlite {s:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Shapes the boolean route must NOT take — a boolean tree with a NON-bare leaf
+/// (a phrase, `tok*` prefix, `^` anchor, `col:` filter, or `NEAR`) anywhere falls
+/// back to the document scan, which graphite already answers correctly. The set
+/// must still equal sqlite3's.
 #[test]
 fn boolean_unsupported_shapes_still_match_sqlite() {
     if !have_sqlite() {
@@ -754,12 +877,12 @@ fn boolean_unsupported_shapes_still_match_sqlite() {
     build_graphite(&path);
     let c = Connection::open(&path).unwrap();
     for expr in [
-        "fox AND quick AND dog",  // 3 operands
-        "fox OR quick OR dog",    // 3 operands
-        "fox OR quick NOT dog",   // 3 operands, mixed
-        "(fox OR dog) AND quick", // parenthesized
-        "fox* AND dog",           // prefix operand
-        "fox NOT quic*",          // prefix operand on the right
+        "fox* AND dog",             // prefix operand
+        "fox NOT quic*",            // prefix operand on the right
+        "fox AND quick AND dog*",   // 3 operands, one a prefix → scan
+        "(fox OR dog) AND quic*",   // parenthesized, one a prefix → scan
+        "\"quick brown\" OR dog",   // phrase operand → scan
+        "fox AND \"the henhouse\"", // phrase operand → scan
     ] {
         let g = graphite_match_expr(&c, expr);
         let s = sqlite_match_expr(&path, expr);
