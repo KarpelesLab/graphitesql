@@ -1308,19 +1308,6 @@ impl Connection {
                 combined_aff.extend(a.iter().copied());
                 combined_coll.extend(l.iter().copied());
             }
-            // N-way cross-product, leftmost source outermost.
-            let mut rows: Vec<Vec<Value>> = sources[0].4.clone();
-            for src in &sources[1..] {
-                let mut next = Vec::with_capacity(rows.len().saturating_mul(src.4.len()));
-                for a in &rows {
-                    for b in &src.4 {
-                        let mut row = a.clone();
-                        row.extend(b.iter().cloned());
-                        next.push(row);
-                    }
-                }
-                rows = next;
-            }
             // Merge the existing WHERE with every join's ON predicate (AND).
             let mut merged = sel.where_clause.clone();
             for j in &from.joins {
@@ -1351,6 +1338,41 @@ impl Connection {
                 .collect();
             if validate_unambiguous_columns(sel, &join_cols).is_err() {
                 return Err(Error::Unsupported("VDBE: ambiguous column name"));
+            }
+            // B5b-1: a plain two-table inner join with a nested-loopable shape
+            // (projection + WHERE + constant LIMIT/OFFSET) runs as a nested loop
+            // over two cursors — no `a × b` cross-product is materialized. The row
+            // order (every right row per left row) is identical, so the result
+            // matches the cross-product path. Any other shape bails below.
+            if sources.len() == 2 {
+                let n_left = sources[0].0.len();
+                if let Ok(prog) = vdbe::compile_join2(
+                    &joined,
+                    &combined,
+                    &combined_tables,
+                    &combined_aff,
+                    &combined_coll,
+                    n_left,
+                ) {
+                    let result = vdbe::run_rows_multi(&prog, &[&sources[0].4, &sources[1].4])?;
+                    return Ok(QueryResult {
+                        columns: prog.columns,
+                        rows: result,
+                    });
+                }
+            }
+            // N-way cross-product, leftmost source outermost.
+            let mut rows: Vec<Vec<Value>> = sources[0].4.clone();
+            for src in &sources[1..] {
+                let mut next = Vec::with_capacity(rows.len().saturating_mul(src.4.len()));
+                for a in &rows {
+                    for b in &src.4 {
+                        let mut row = a.clone();
+                        row.extend(b.iter().cloned());
+                        next.push(row);
+                    }
+                }
+                rows = next;
             }
             let prog = vdbe::compile_table_select(
                 &joined,

@@ -143,6 +143,18 @@ pub enum Op {
     /// Advance the cursor; jump back to `target` (the loop body) if a row remains,
     /// else fall through.
     Next { target: usize },
+    /// Multi-cursor `Rewind` (B5b nested-loop join): position cursor `cursor` at
+    /// its first row; jump to `target` when that cursor's row-set is empty.
+    RewindC { cursor: usize, target: usize },
+    /// Multi-cursor `Column`: load column `col` of cursor `cursor`'s current row.
+    ColumnC {
+        cursor: usize,
+        col: usize,
+        dest: usize,
+    },
+    /// Multi-cursor `Next`: advance cursor `cursor`; jump back to `target` if a row
+    /// remains, else fall through.
+    NextC { cursor: usize, target: usize },
     /// Decrement `reg`; jump to `target` once it reaches zero (a `LIMIT` counter).
     DecrJumpZero { reg: usize, target: usize },
     /// If `reg` is positive, decrement it and jump to `target` (an `OFFSET` skip).
@@ -388,6 +400,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         bindings: Vec::new(),
         forbid_raw_columns: false,
         rowid_index: None,
+        cursor_boundaries: None,
     };
     let mut columns = Vec::new();
     for (i, rc) in sel.columns.iter().enumerate() {
@@ -555,6 +568,7 @@ fn compile_aggregate_select(
         bindings: Vec::new(),
         forbid_raw_columns: false,
         rowid_index: None,
+        cursor_boundaries: None,
     };
     let rewind = c.ops.len();
     c.ops.push(Op::Rewind { target: 0 });
@@ -739,6 +753,7 @@ fn compile_group_select(
         bindings: Vec::new(),
         forbid_raw_columns: false,
         rowid_index: None,
+        cursor_boundaries: None,
     };
     // Contiguous key registers, loaded per row from the grouping columns.
     let key_start = c.next_reg;
@@ -1137,6 +1152,7 @@ fn compile_group_emit(
         bindings: Vec::new(),
         forbid_raw_columns: false,
         rowid_index: None,
+        cursor_boundaries: None,
     };
     // Contiguous key registers, loaded per row from the grouping columns.
     let key_start = c.next_reg;
@@ -1220,56 +1236,7 @@ pub fn compile_table_select(
         return Err(Error::Unsupported("VDBE: only plain table projections"));
     }
     // Expand the projection list to concrete expressions/labels (supporting `*`).
-    let mut projections: Vec<(Expr, String)> = Vec::new();
-    for rc in &sel.columns {
-        match rc {
-            ResultColumn::Wildcard => {
-                for name in columns {
-                    projections.push((
-                        Expr::Column {
-                            table: None,
-                            column: name.clone(),
-                        },
-                        name.clone(),
-                    ));
-                }
-            }
-            ResultColumn::Expr {
-                expr,
-                alias,
-                source,
-            } => {
-                let label = result_label(expr, alias, source, projections.len());
-                projections.push((expr.clone(), label));
-            }
-            // `t.*` expands to the columns whose owning-table qualifier matches
-            // `t` (the per-column qualifier in `tables`). For a single-table scan
-            // every qualifier matches, so this is the same as a bare `*`; over a
-            // join it selects just that table's columns. An unknown qualifier (no
-            // column matches) bails so the tree-walker resolves or rejects it.
-            ResultColumn::TableWildcard(q) => {
-                let mut any = false;
-                for (i, name) in columns.iter().enumerate() {
-                    if tables.get(i).is_some_and(|t| t.eq_ignore_ascii_case(q)) {
-                        projections.push((
-                            Expr::Column {
-                                table: Some(q.clone()),
-                                column: name.clone(),
-                            },
-                            name.clone(),
-                        ));
-                        any = true;
-                    }
-                }
-                if !any {
-                    return Err(Error::Unsupported("VDBE: unknown table.* qualifier"));
-                }
-            }
-        }
-    }
-    if projections.is_empty() {
-        return Err(Error::Unsupported("VDBE: empty projection"));
-    }
+    let projections = expand_projections(sel, columns, tables)?;
     // A constant `LIMIT 0` yields no rows for any query shape: emit a program
     // that halts immediately (the column labels are still reported).
     if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
@@ -1323,6 +1290,7 @@ pub fn compile_table_select(
         bindings: Vec::new(),
         forbid_raw_columns: false,
         rowid_index,
+        cursor_boundaries: None,
     };
     // Optional LIMIT (constant integer only): a counter register decremented
     // after each emitted row, halting the loop at zero.
@@ -1564,6 +1532,222 @@ pub fn compile_table_select(
     })
 }
 
+/// Expand a `SELECT` projection list to concrete `(expr, label)` pairs: `*`
+/// becomes every column, `t.*` the columns whose owning-table qualifier matches
+/// `t`. Shared by the single-table scan compiler and the nested-loop join
+/// compiler. Returns `Unsupported` on an unknown `t.*` qualifier or an empty list.
+fn expand_projections(
+    sel: &Select,
+    columns: &[String],
+    tables: &[String],
+) -> Result<Vec<(Expr, String)>> {
+    let mut projections: Vec<(Expr, String)> = Vec::new();
+    for rc in &sel.columns {
+        match rc {
+            ResultColumn::Wildcard => {
+                for name in columns {
+                    projections.push((
+                        Expr::Column {
+                            table: None,
+                            column: name.clone(),
+                        },
+                        name.clone(),
+                    ));
+                }
+            }
+            ResultColumn::Expr {
+                expr,
+                alias,
+                source,
+            } => {
+                let label = result_label(expr, alias, source, projections.len());
+                projections.push((expr.clone(), label));
+            }
+            ResultColumn::TableWildcard(q) => {
+                let mut any = false;
+                for (i, name) in columns.iter().enumerate() {
+                    if tables.get(i).is_some_and(|t| t.eq_ignore_ascii_case(q)) {
+                        projections.push((
+                            Expr::Column {
+                                table: Some(q.clone()),
+                                column: name.clone(),
+                            },
+                            name.clone(),
+                        ));
+                        any = true;
+                    }
+                }
+                if !any {
+                    return Err(Error::Unsupported("VDBE: unknown table.* qualifier"));
+                }
+            }
+        }
+    }
+    if projections.is_empty() {
+        return Err(Error::Unsupported("VDBE: empty projection"));
+    }
+    Ok(projections)
+}
+
+/// Compile a two-table inner join (`SELECT … FROM a JOIN b ON …`) into a
+/// nested-loop program over two cursors — outer = cursor 0 (left, outermost),
+/// inner = cursor 1 (right) — instead of materializing the full `a × b`
+/// cross-product (B5b-1). `columns`/`tables`/`affinities`/`collations` are the two
+/// tables' arrays concatenated (left then right); `n_left` is the left table's
+/// column count. `sel.where_clause` must already fold in the `ON` predicate
+/// (merged by the caller). Supports projection + WHERE + constant LIMIT/OFFSET;
+/// returns `Unsupported` for GROUP BY / aggregates / HAVING / ORDER BY / DISTINCT
+/// so the caller falls back to the cross-product (or tree-walker) path. The row
+/// order (every right row for each left row, left outermost) matches the
+/// cross-product and SQLite's nested-loop order.
+pub fn compile_join2(
+    sel: &Select,
+    columns: &[String],
+    tables: &[String],
+    affinities: &[Affinity],
+    collations: &[Collation],
+    n_left: usize,
+) -> Result<Program> {
+    if !sel.compound.is_empty()
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || !sel.order_by.is_empty()
+        || sel.distinct
+    {
+        return Err(Error::Unsupported("VDBE: join shape not nested-loopable"));
+    }
+    let projections = expand_projections(sel, columns, tables)?;
+    if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
+        return Err(Error::Unsupported("VDBE: aggregate over a join"));
+    }
+    let count = projections.len();
+    // A constant `LIMIT 0` yields nothing (labels still reported).
+    if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
+        return Ok(Program {
+            ops: alloc::vec![Op::Halt],
+            n_registers: count,
+            columns: projections.into_iter().map(|(_, l)| l).collect(),
+        });
+    }
+    let mut c = Compiler {
+        ops: Vec::new(),
+        next_reg: count,
+        columns: columns.to_vec(),
+        tables: tables.to_vec(),
+        affinities: affinities.to_vec(),
+        collations: collations.to_vec(),
+        bindings: Vec::new(),
+        forbid_raw_columns: false,
+        rowid_index: None,
+        cursor_boundaries: Some(alloc::vec![n_left, columns.len()]),
+    };
+    // LIMIT / OFFSET counters (constant integer only; negative LIMIT = unlimited,
+    // non-positive OFFSET = none).
+    let limit_reg = match &sel.limit {
+        None => None,
+        Some(e) => match fold_const_int(e) {
+            Some(n) if n < 0 => None,
+            Some(n) => {
+                let r = c.alloc();
+                c.ops.push(Op::Integer { value: n, dest: r });
+                Some(r)
+            }
+            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
+        },
+    };
+    let offset_reg = match &sel.offset {
+        None => None,
+        Some(e) => match fold_const_int(e) {
+            Some(n) if n <= 0 => None,
+            Some(n) => {
+                let r = c.alloc();
+                c.ops.push(Op::Integer { value: n, dest: r });
+                Some(r)
+            }
+            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
+        },
+    };
+    // Nested loop: `RewindC 0` [ `RewindC 1` <body> `NextC 1` ] `NextC 0`.
+    let rewind0 = c.ops.len();
+    c.ops.push(Op::RewindC {
+        cursor: 0,
+        target: 0,
+    });
+    let loop0 = c.ops.len();
+    let rewind1 = c.ops.len();
+    c.ops.push(Op::RewindC {
+        cursor: 1,
+        target: 0,
+    });
+    let body = c.ops.len();
+    // WHERE (already merged with ON): skip to the inner Next when not true.
+    let skip = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
+    for (i, (expr, _)) in projections.iter().enumerate() {
+        c.compile_expr_into(expr, i)?;
+    }
+    let offset_skip = offset_reg.map(|r| {
+        let at = c.ops.len();
+        c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+        at
+    });
+    c.ops.push(Op::ResultRow { start: 0, count });
+    let limit_done = limit_reg.map(|r| {
+        let at = c.ops.len();
+        c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+        at
+    });
+    let next1 = c.ops.len();
+    c.ops.push(Op::NextC {
+        cursor: 1,
+        target: body,
+    });
+    let next0 = c.ops.len();
+    c.ops.push(Op::NextC {
+        cursor: 0,
+        target: loop0,
+    });
+    let end = c.ops.len();
+    c.ops.push(Op::Halt);
+    // Backpatch jump targets now that the labels are known.
+    if let Op::RewindC { target, .. } = &mut c.ops[rewind0] {
+        *target = end; // left empty → no rows
+    }
+    if let Op::RewindC { target, .. } = &mut c.ops[rewind1] {
+        *target = next0; // right empty for this left row → advance left
+    }
+    if let Some(at) = skip {
+        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = next1;
+        }
+    }
+    if let Some(at) = offset_skip {
+        if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
+            *target = next1;
+        }
+    }
+    if let Some(at) = limit_done {
+        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
+            *target = end;
+        }
+    }
+    Ok(Program {
+        ops: c.ops,
+        n_registers: c.next_reg,
+        columns: projections.into_iter().map(|(_, l)| l).collect(),
+    })
+}
+
 struct Compiler {
     ops: Vec<Op>,
     next_reg: usize,
@@ -1597,6 +1781,34 @@ struct Compiler {
     /// sits AFTER the visible columns, so `*` (which spans only `columns`) skips
     /// it. `None` for constant selects, joins, and `WITHOUT ROWID` tables.
     rowid_index: Option<usize>,
+    /// Cumulative column counts per cursor for the nested-loop join path (B5b),
+    /// e.g. `[n_left, n_left + n_right]`. When `Some`, an `Expr::Column` resolves
+    /// its combined index to a `(cursor, local column)` pair and emits a
+    /// multi-cursor `Op::ColumnC`; when `None` (every single-cursor path) it emits
+    /// the plain `Op::Column` against cursor 0.
+    cursor_boundaries: Option<Vec<usize>>,
+}
+
+impl Compiler {
+    /// Map a combined column index to `(cursor, local column)` using
+    /// `cursor_boundaries` (cumulative per-cursor counts). Only called when
+    /// `cursor_boundaries` is `Some`.
+    fn cursor_of(boundaries: &[usize], idx: usize) -> (usize, usize) {
+        let mut prev = 0;
+        for (cur, &end) in boundaries.iter().enumerate() {
+            if idx < end {
+                return (cur, idx - prev);
+            }
+            prev = end;
+        }
+        // Past the last boundary: clamp to the final cursor (defensive; the
+        // resolver only yields in-range indices for a join with no rowid slot).
+        let last = boundaries.len().saturating_sub(1);
+        (
+            last,
+            idx - boundaries.get(last.wrapping_sub(1)).copied().unwrap_or(0),
+        )
+    }
 }
 
 impl Compiler {
@@ -1820,7 +2032,13 @@ impl Compiler {
                     return Err(Error::Unsupported("VDBE: bare column in grouped output"));
                 }
                 let idx = self.resolve_column(table.as_deref(), column)?;
-                self.ops.push(Op::Column { col: idx, dest });
+                match &self.cursor_boundaries {
+                    Some(bounds) => {
+                        let (cursor, col) = Self::cursor_of(bounds, idx);
+                        self.ops.push(Op::ColumnC { cursor, col, dest });
+                    }
+                    None => self.ops.push(Op::Column { col: idx, dest }),
+                }
                 Ok(())
             }
             Expr::Paren(inner) => self.compile_expr_into(inner, dest),
@@ -2195,11 +2413,23 @@ pub fn run(program: &Program) -> Result<Vec<Vec<Value>>> {
 /// array so jumps and the `Rewind`/`Next` loop can branch; `Column` reads from
 /// the cursor's current row.
 pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<Value>>> {
+    run_rows_multi(program, &[table_rows])
+}
+
+/// Run a compiled program over several cursors' materialized row-sets (the
+/// nested-loop join path, B5b): `rowsets[i]` is cursor `i`'s rows. Cursor 0 also
+/// backs the single-cursor `Rewind`/`Column`/`Next` opcodes, so the single-table
+/// entry point [`run_rows`] is just this with one row-set.
+pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Vec<Vec<Value>>> {
     let mut regs: Vec<Value> = alloc::vec![Value::Null; program.n_registers];
     let mut out = Vec::new();
-    let mut cursor: usize = 0; // index of the current row
-                               // The sorter holds `(keys, row)` pairs staged by `SorterInsert`, sorted in
-                               // place by `SorterSort`, then walked by `SorterRewind`/`SorterNext`.
+    let table_rows: &[Vec<Value>] = rowsets.first().copied().unwrap_or(&[]);
+    let mut cursor: usize = 0; // index of the current row (single-cursor ops)
+                               // Per-cursor positions for the multi-cursor (nested-loop join) ops. A program
+                               // uses either the single-cursor ops or the multi-cursor ops, never both.
+    let mut positions: Vec<usize> = alloc::vec![0; rowsets.len().max(1)];
+    // The sorter holds `(keys, row)` pairs staged by `SorterInsert`, sorted in
+    // place by `SorterSort`, then walked by `SorterRewind`/`SorterNext`.
     let mut sorter: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     let mut scursor: usize = 0;
     // Rows already emitted under DISTINCT (NULLs compare equal here).
@@ -2235,6 +2465,30 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
             Op::Next { target } => {
                 cursor += 1;
                 if cursor < table_rows.len() {
+                    pc = *target;
+                }
+            }
+            Op::RewindC { cursor: c, target } => {
+                positions[*c] = 0;
+                if rowsets.get(*c).is_none_or(|rs| rs.is_empty()) {
+                    pc = *target;
+                }
+            }
+            Op::ColumnC {
+                cursor: c,
+                col,
+                dest,
+            } => {
+                regs[*dest] = rowsets
+                    .get(*c)
+                    .and_then(|rs| rs.get(positions[*c]))
+                    .and_then(|r| r.get(*col))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            Op::NextC { cursor: c, target } => {
+                positions[*c] += 1;
+                if positions[*c] < rowsets.get(*c).map_or(0, |rs| rs.len()) {
                     pc = *target;
                 }
             }
@@ -2732,5 +2986,77 @@ mod tests {
             panic!()
         };
         assert!(compile_const_select(&sel).is_err());
+    }
+
+    #[test]
+    fn nested_loop_join_two_cursors() {
+        // `compile_join2` reads the predicate from WHERE (the caller merges ON into
+        // it) and ignores the FROM clause, using the passed column metadata. Two
+        // cursors, left outermost.
+        let Statement::Select(sel) =
+            parse_one("SELECT a.x, b.q FROM a, b WHERE a.x = b.p").unwrap()
+        else {
+            panic!()
+        };
+        let columns = vec![
+            "x".to_string(),
+            "y".to_string(),
+            "p".to_string(),
+            "q".to_string(),
+        ];
+        let tables = vec![
+            "a".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "b".to_string(),
+        ];
+        let aff = vec![Affinity::Blob; 4];
+        let coll = vec![Collation::Binary; 4];
+        let prog = compile_join2(&sel, &columns, &tables, &aff, &coll, 2).unwrap();
+        let left: Vec<Vec<Value>> = vec![
+            vec![Value::Integer(1), Value::Text("a".into())],
+            vec![Value::Integer(2), Value::Text("b".into())],
+        ];
+        let right: Vec<Vec<Value>> = vec![
+            vec![Value::Integer(1), Value::Text("P".into())],
+            vec![Value::Integer(2), Value::Text("Q".into())],
+            vec![Value::Integer(2), Value::Text("R".into())],
+        ];
+        // Every right row per left row, left outermost — same order as the
+        // cross-product, filtered by `a.x = b.p`.
+        assert_eq!(
+            run_rows_multi(&prog, &[&left, &right]).unwrap(),
+            vec![
+                vec![Value::Integer(1), Value::Text("P".into())],
+                vec![Value::Integer(2), Value::Text("Q".into())],
+                vec![Value::Integer(2), Value::Text("R".into())],
+            ]
+        );
+        assert_eq!(prog.columns.len(), 2);
+        // An empty inner or outer table yields no rows (and does not panic).
+        assert!(run_rows_multi(&prog, &[&left, &[]]).unwrap().is_empty());
+        assert!(run_rows_multi(&prog, &[&[], &right]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn nested_loop_join_bails_on_aggregate_and_order_by() {
+        let cols = vec!["x".to_string(), "p".to_string()];
+        let tabs = vec!["a".to_string(), "b".to_string()];
+        let aff = vec![Affinity::Blob; 2];
+        let coll = vec![Collation::Binary; 2];
+        for sql in [
+            "SELECT count(*) FROM a, b",
+            "SELECT a.x FROM a, b ORDER BY a.x",
+            "SELECT DISTINCT a.x FROM a, b",
+            "SELECT a.x FROM a, b GROUP BY a.x",
+        ] {
+            let Statement::Select(sel) = parse_one(sql).unwrap() else {
+                panic!()
+            };
+            assert!(
+                compile_join2(&sel, &cols, &tabs, &aff, &coll, 1).is_err(),
+                "{sql} should bail to the cross-product path"
+            );
+        }
     }
 }

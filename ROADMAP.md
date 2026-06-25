@@ -233,12 +233,28 @@ is *perf/coverage*, not correctness.
   - **B5c-3a** — compile each arm into the same program.
   - **B5c-3b** — the set-combine + dedup/sort step (collation-aware).
 - **B5c-4 — window functions on the VDBE.**
-- **B5b — per-cursor nested-loop join + inner seek** (stream the inner side with
-  `OpenRead`/`Rewind`/`Column`/`Next` instead of materializing the cross-product;
-  *perf-only*).
-  - **B5b-1** — cursor opcodes for the inner table.
-  - **B5b-2** — seek-driven inner cursor (rowid/PK/index), mirroring the
-    tree-walker's inner-join seeks.
+- **B5b — per-cursor nested-loop join + inner seek** (stream the inner side
+  instead of materializing the cross-product; *perf-only*).
+  - **B5b-1** — *Done (multi-cursor opcodes + nested-loop join over materialized
+    per-table rows).* The VDBE gained multi-cursor opcodes `RewindC`/`ColumnC`/
+    `NextC` (each carrying a `cursor` id) and a `run_rows_multi` interpreter that
+    threads one position per cursor; the single-cursor `Rewind`/`Column`/`Next`
+    and the whole default path are byte-for-byte unchanged (cursor 0 backs them).
+    A new `compile_join2` emits a nested loop `RewindC 0 [ RewindC 1 <body>
+    NextC 1 ] NextC 0` (outer = left, outermost), with a `Compiler.cursor_boundaries`
+    map turning each combined column index into a `(cursor, local col)` `ColumnC`.
+    The router runs a plain two-table inner join (projection + WHERE-merged-ON +
+    constant LIMIT/OFFSET) this way — *no `a × b` cross-product is materialized* —
+    and falls back to the cross-product path on any other shape (GROUP BY /
+    aggregate / HAVING / ORDER BY / DISTINCT). Row order matches the cross-product
+    and sqlite. Verified by the differential join corpus + direct unit tests
+    (`exec::vdbe::tests`, `tests/vdbe_nested_join.rs`). This is the multi-cursor
+    foundation the rest of B8 (storage cursors, correlated subqueries, windows)
+    builds on.
+  - **B5b-2** — seek-driven inner cursor (rowid/PK/index) over real storage
+    (`OpenRead` + a b-tree `TableCursor`), mirroring the tree-walker's inner-join
+    seeks. Needs the VDBE interpreter to hold live storage cursors (the larger B8
+    step); today both cursors are materialized per-table row-sets.
 - **B1c — RIGHT/FULL join inner seeks** (INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table).
 
