@@ -11,43 +11,36 @@ A pure, safe, `no_std`-capable Rust re-implementation of **SQLite**, as a single
 crate, aiming for **byte-for-byte compatibility with the SQLite 3 database file
 format**.
 
-> **Status: read + write working, with a broad SQL engine.** graphitesql opens
-> real SQLite files and **creates databases** that the real `sqlite3` CLI opens
-> with `PRAGMA integrity_check = ok`. Storage covers rowid **and `WITHOUT ROWID`**
-> tables, secondary/`UNIQUE`/partial/expression indexes, overflow pages, `VACUUM`,
-> the full **`auto_vacuum`** track, and the **WAL read *and* write** path. The SQL
-> surface covers `INNER`/`LEFT`/`RIGHT`/`FULL`/`NATURAL`/`USING` **joins**,
-> aggregates, `GROUP BY`/`HAVING`, compound queries, (recursive) **CTEs**,
-> correlated subqueries & `EXISTS`, **window functions**, UPSERT, `RETURNING`,
-> `STRICT` tables, generated columns, **triggers**, **foreign keys**, **ATTACH /
-> TEMP** multi-schema, **virtual tables** (built-in `series`, `rtree`, and
-> `fts5` modules — full-text `MATCH` with phrases, prefixes, column filters,
-> `AND`/`OR`/`NOT`, `NEAR`, `^` anchors, `bm25()`/`rank` relevance ordering, and
-> `highlight()`, and `fts5vocab` vocabulary tables — the read-only `dbstat`
-> per-page storage introspection table,
-> plus `register_module` / `register_function` for your own), and
-> a wide function
-> library — date/time,
-> `printf`, math, **JSON + JSONB**, and more — with an index-driven planner and
-> **`EXPLAIN QUERY PLAN`** matching sqlite. `SELECT` now executes through a
-> **register-machine VDBE engine by default** (it falls back to the tree-walker
-> for shapes it does not yet compile), with plain `EXPLAIN` listing the compiled
-> bytecode. Everything is verified differentially against `sqlite3` (a 1,600+
-> query corpus plus 140+ focused suites). R-Tree **and FTS5** files are now
-> byte-compatible with sqlite: an FTS5 table written by graphite (stored in
-> sqlite's `_content`/`_data`/`_idx`/`_docsize`/`_config` shadow tables) is
-> opened, full-text-`MATCH`ed, and integrity-checked by stock `sqlite3`, and an
-> R-Tree round-trips through its `_node` on-disk format. *(FTS5 sqlite-readability
-> covers ASCII, Latin-1, Latin Extended-A/B, and Latin Extended Additional text —
-> graphite folds diacritics exactly like `unicode61` (`café`→`cafe`,
-> `Dvořák`→`dvorak`, `mạ`→`ma`), and honors the full `tokenize=` option set —
-> `remove_diacritics 0|1|2`, `porter`, `ascii`, and `tokenchars`/`separators` — on
-> both the index and query sides; the fold tables are derived byte-for-byte from
-> `sqlite3`; CJK and other scripts pass through unfolded, as in sqlite.)* R-Tree
-> queries **prune the node tree by the query's coordinate bounds** rather than
-> scanning every entry. What remains is depth: finishing the VDBE (per-cursor
-> joins, more single-block shapes) and concurrency — see the full plan in
-> **[ROADMAP.md](ROADMAP.md)**.
+> **Status: read + write working, with a broad SQL engine**, verified
+> differentially against the real `sqlite3` CLI (a 1,600+ query corpus plus 170+
+> focused suites). graphitesql opens real SQLite files and **creates databases**
+> that `sqlite3` opens with `PRAGMA integrity_check = ok`. `SELECT` executes
+> through a register-machine **VDBE engine by default**, falling back to the
+> tree-walker for shapes it does not yet compile.
+
+**What works** (full capability list and forward plan in **[ROADMAP.md](ROADMAP.md)**):
+
+- **Storage** — rowid and `WITHOUT ROWID` tables; secondary/`UNIQUE`/partial/
+  expression indexes; overflow pages; `VACUUM` (+ `VACUUM INTO`); the full
+  **`auto_vacuum`** track; and **WAL read *and* write**.
+- **SQL** — `INNER`/`LEFT`/`RIGHT`/`FULL`/`NATURAL`/`USING` joins; aggregates,
+  `GROUP BY`/`HAVING`, compound queries, (recursive) **CTEs**, correlated
+  subqueries & `EXISTS`, **window functions**; UPSERT, `RETURNING`, `STRICT`
+  tables, generated columns; **triggers**, **foreign keys**, and **ATTACH / TEMP**
+  multi-schema.
+- **Functions & planning** — date/time, `printf`, math, and **JSON + JSONB**; an
+  index-driven planner with **`EXPLAIN QUERY PLAN`** matching sqlite (plain
+  `EXPLAIN` lists the compiled bytecode).
+- **Virtual tables** — built-in `series`, **`rtree`** (queries prune the node
+  tree by coordinate bounds), and **`fts5`** (full-text `MATCH` with phrases/
+  prefixes/column filters/`NEAR`/`^` anchors, `bm25()`/`rank` ordering,
+  `highlight()`, `fts5vocab`); the read-only `dbstat` table; and `register_module`
+  / `register_function` for your own.
+- **Byte-compatible on disk** — R-Tree (`_node`) and FTS5 (sqlite's
+  `_content`/`_data`/`_idx`/`_docsize`/`_config` shadow tables) round-trip through
+  stock `sqlite3`, which opens, `MATCH`es, and integrity-checks them. FTS5 folds
+  diacritics exactly like `unicode61` and honors the full `tokenize=` option set
+  (`remove_diacritics 0|1|2`, `porter`, `ascii`, `tokenchars`/`separators`).
 
 ## Why
 

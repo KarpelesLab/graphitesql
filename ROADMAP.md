@@ -7,7 +7,9 @@ SQLite 3 file format.
 The foundation (the file format, the storage/btree/pager stack, and a broad SQL
 engine) is **done** — see §3 for a capability summary. The rest of this document
 is the forward plan for closing the remaining gap with SQLite: §4 the work
-tracks, §5 the cross-cutting concerns, §6 the testing strategy.
+tracks, §5 the cross-cutting concerns, §6 the testing strategy, §7 a suggested
+order. **Completed work lives in `CHANGELOG.md` and git history; this file tracks
+only what remains.**
 
 ---
 
@@ -58,7 +60,7 @@ independently. Data flows top-to-bottom on writes and bottom-to-top on reads:
 executor* with the same observable semantics as SQLite, not a VDBE bytecode VM.
 That was the pragmatic path to a correct, testable engine. Adopting a VDBE IR is
 now an internal refactor (it changes how queries are represented, not their
-results) and is scheduled in Track B — it unblocks real `EXPLAIN` output and a
+results) and is the bulk of Track B — it unblocks real `EXPLAIN` output and a
 cost-based planner.
 
 ---
@@ -85,694 +87,235 @@ cost-based planner.
 ## 3. Foundation ✅ *(done)*
 
 The layered foundation and a broad SQL engine are complete and differentially
-verified against `sqlite3` (a 1,600+ query corpus plus 140+ focused test suites).
+verified against `sqlite3` (a 1,600+ query corpus plus 170+ focused test suites).
 Detailed history lives in `CHANGELOG.md`; in summary, graphitesql today:
 
 **Reads & writes real SQLite files.** Opens `sqlite3`-written databases
 (including WAL-mode) and **creates** databases whose files `sqlite3` opens with
 `PRAGMA integrity_check = ok`. Storage covers rowid and **`WITHOUT ROWID`**
 tables, automatic/secondary/`UNIQUE` indexes (incl. `sqlite_autoindex_*`),
-overflow pages, the freelist with **page merging on delete**, real **`VACUUM`**,
-the full **`auto_vacuum`** track (read, write, FULL auto-truncate, INCREMENTAL
-reclaim), and the **WAL read *and* write** path (`journal_mode=WAL`,
-`wal_checkpoint`).
+overflow pages, the freelist with **page merging on delete**, real **`VACUUM`**
+(+ `VACUUM … INTO`), the full **`auto_vacuum`** track (read, write, FULL
+auto-truncate, INCREMENTAL reclaim), and the **WAL read *and* write** path
+(`journal_mode=WAL`, `wal_checkpoint`).
 
-**Runs a broad SQL dialect.** `SELECT` with `WHERE`/`GROUP BY`/`HAVING` (incl.
-without `GROUP BY`)/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT` and SELECT-list
-aliases resolved in WHERE/GROUP BY/HAVING; `INNER`/`LEFT`/`RIGHT`/`FULL`/cross/
-comma **joins** plus **`NATURAL`** and **`USING`** (with column coalescing),
-nested-loop + a hash join for equi-joins; compound queries
-(`UNION`/`INTERSECT`/`EXCEPT`, collation-aware); (recursive) **CTEs** with
-`LIMIT` (a definition `LIMIT`, and an unbounded recursion bounded lazily by the
-consuming query's `LIMIT`); correlated subqueries, `[NOT] EXISTS`, derived
-tables; views & CTEs as
-sources; **window functions** (`ROWS`/`RANGE`/`GROUPS`, `EXCLUDE`, `FILTER`,
-named windows, and **over `GROUP BY`/aggregates** — `sum(sum(v)) OVER ()`,
-`row_number() OVER (ORDER BY sum(v))`); `INSERT … SELECT`, `UPDATE … FROM`,
-`UPDATE OR
-IGNORE/REPLACE/…`, UPSERT, `RETURNING`, row values, `STRICT` tables, generated
-columns; a broad scalar/aggregate function library incl. **date/time**
-(+ `CURRENT_DATE`/`TIME`/`TIMESTAMP`, `timediff`), `printf`/`format` (16-sig-digit
-float cap like sqlite), `random`/`randomblob`, `unistr`/`unistr_quote`,
-`subtype`, **JSON** (`json_*`, `json_group_array`/`object`, `json_pretty`,
-`json_each`/`json_tree`, **JSON5 input** with strict `json_valid`, verbatim
-number-text preservation) and the **JSONB binary family** (`jsonb`,
-`jsonb_array`/`object`/`extract`/`set`/`insert`/`replace`/`remove`/`patch`,
-`jsonb_group_array`/`object`, and JSONB-blob input to every `json_*`), **virtual
-tables** (`CREATE VIRTUAL TABLE … USING module`), `iif`/`if`,
-`sqlite_version`, math (pure-`core`); **type affinity** and SQLite-exact real
-formatting; column names matching sqlite's verbatim source spans; collation
-(`BINARY`/`NOCASE`/`RTRIM`) honored across comparisons,
-`IN`/`BETWEEN`/`CASE`, `min`/`max`, set ops,
-`ORDER BY`/`GROUP BY`/`DISTINCT`/`UNIQUE`/index keys; `EXPLAIN QUERY PLAN` with
-an index-driven planner (equality/range/`IN`/OR-union seeks, **inner-join seeks**
-incl. the full **`WITHOUT ROWID`** PK/secondary-index seek family, **comma-join**
-`WHERE`-equality promotion, **automatic-index** reporting for unindexed
-equi-joins, **index-driven `ORDER BY`** with **covering-index reads**,
-stats-driven choice via `ANALYZE`/`sqlite_stat1`); constraint enforcement
-(`NOT NULL`, `CHECK`,
-`UNIQUE`/`PK`, standalone/partial/expression UNIQUE indexes; **foreign keys**
-enforced at runtime under `PRAGMA foreign_keys=ON` — child INSERT/UPDATE parent
-checks and parent DELETE/UPDATE actions NO ACTION/RESTRICT/CASCADE/SET NULL/SET
-DEFAULT, composite + self-referential; *deferred:* DEFERRABLE/INITIALLY DEFERRED);
-**triggers** (`BEFORE`/`AFTER`/`INSTEAD OF`, `UPDATE OF`,
-`WHEN`, recursive, `NEW`/`OLD` incl. rowid); `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`;
-**`ATTACH`/`DETACH`/`TEMP`** multi-schema (cross-database reads, writes, joins,
-qualified DDL, view reads, transactions & savepoints); DDL with full CREATE-time
-and ALTER validation (incl. `DROP TABLE` cascading the table's triggers, and
-`RENAME COLUMN` propagating into the table's own CHECK/generated/DEFAULT
-expressions); the schema catalog queryable as `sqlite_schema`/`sqlite_master`
-(incl. `table_info` over a view and over the catalog itself, the composite-PK
-`pk` ordinal, and `index_list` `pk`/`u` origins), with
-`table_list`/`collation_list`/`database_list` and bare `pragma_*` table-valued
-functions.
+**Runs a broad SQL dialect.** `SELECT` with `WHERE`/`GROUP BY`/`HAVING`/`ORDER
+BY`/`LIMIT`/`OFFSET`/`DISTINCT` and SELECT-list aliases; `INNER`/`LEFT`/`RIGHT`/
+`FULL`/cross/comma **joins** plus **`NATURAL`**/**`USING`** (column coalescing,
+affinity- and collation-aware keys), nested-loop + hash join; compound queries
+(`UNION`/`INTERSECT`/`EXCEPT`, collation-aware); (recursive) **CTEs**; correlated
+subqueries, `[NOT] EXISTS`, `IN (SELECT)` with sqlite's candidate-column-affinity
+rule, derived tables; views & CTEs as sources (a view column inheriting its base
+column's affinity/collation); **window functions** (`ROWS`/`RANGE`/`GROUPS`,
+`EXCLUDE`, `FILTER`, named windows, over `GROUP BY`/aggregates, NULL-correct RANGE
+frames); `INSERT … SELECT`, `UPDATE … FROM`, `UPDATE OR …`, UPSERT, `RETURNING`,
+row values, `STRICT` tables, generated columns; a broad scalar/aggregate library
+incl. **date/time** (`strftime` incl. `subsec`/`%J`), `printf`/`format`,
+`random`/`randomblob`, `unistr`/`subtype`, **JSON** + the **JSONB binary family**,
+math (pure-`core`); **type affinity** and SQLite-exact real formatting; column
+names matching sqlite's verbatim source spans; collation (`BINARY`/`NOCASE`/
+`RTRIM`) honored across comparisons/`IN`/`BETWEEN`/`CASE`/`min`/`max`/set ops/
+ordering keys; `EXPLAIN QUERY PLAN` with an index-driven planner (equality/range/
+`IN`/OR-union seeks, the full inner-join + `WITHOUT ROWID` seek family,
+automatic-index reporting, index-driven `ORDER BY` + covering reads, stats-driven
+choice via `ANALYZE`/`sqlite_stat1`); constraint enforcement (`NOT NULL`, `CHECK`,
+`UNIQUE`/`PK`, partial/expression UNIQUE indexes; **foreign keys** with affinity-
+and collation-correct parent matching and the full referential-action set;
+*deferred:* DEFERRABLE/INITIALLY DEFERRED); **triggers** (`BEFORE`/`AFTER`/
+`INSTEAD OF`, `UPDATE OF`, `WHEN`, recursive, `NEW`/`OLD`); `SAVEPOINT` family;
+**`ATTACH`/`DETACH`/`TEMP`** multi-schema; DDL with full CREATE-time + ALTER
+validation (incl. error-parity rejection of what sqlite rejects, byte-exact
+messages, and text-preserving schema edits); a writable/persistent **virtual
+table** layer with the built-in **R-Tree**, **FTS5** (read + write, sqlite-
+readable on disk), `dbstat`, and Rust scalar/aggregate **UDFs**; the schema
+catalog queryable as `sqlite_schema`/`sqlite_master`, with the introspection
+PRAGMAs and `pragma_*` TVFs.
 
 What remains is breadth and depth toward full SQLite parity, below.
 
 ---
 
-## 4. Forward plan — closing the gap with SQLite
+## 4. Forward plan — remaining work
 
-Four tracks. Completed work is summarized; **remaining work is broken into
-numbered, independently-shippable pieces** (each one lands with a differential
-test and keeps `master` green). Tracks can progress in parallel.
+Five tracks. Each lists a one-line "Done" pointer (detail in `CHANGELOG.md`) and
+then **only the open pieces, broken into small, independently-shippable chunks**.
+Every chunk lands with a differential test and keeps `master` green. Tracks can
+progress in parallel.
 
-### Track A — SQL language & functions breadth  *(substantially complete)*
+### Track A — SQL language & functions  *(substantially complete)*
 
-Done: outer joins + `NATURAL`/`USING` (coalescing), generated columns,
-collations, UPSERT, `UPDATE OR …`, `RETURNING`, row values, `ORDER BY` modifiers,
-`STRICT` tables, `CREATE TABLE … AS SELECT`, `INSERT … SELECT`, `UPDATE … FROM`,
-HAVING without GROUP BY, SELECT-list aliases in WHERE/GROUP BY/HAVING,
-`CURRENT_DATE`/`TIME`/`TIMESTAMP`, `iif`/`if`, `sqlite_version`, the
-window-function suite; the math + `printf`/`format` (16-sig-digit float cap) +
-JSON libraries incl. JSON5 input, `timediff` (A5), `json_error_position` (A6),
-`random`/`randomblob`, `unistr`/`unistr_quote`/`subtype`, the **JSONB binary
-family**, and JSON verbatim-number preservation; partial/expression index
-*equality* seeks (A3); column names matching sqlite's verbatim source spans;
-type names keeping their `(len[,scale])`; and DDL validation incl. `DROP TABLE`
-cascading triggers and `RENAME COLUMN` propagating into the table's own
-expressions.
+**Done:** the full SELECT/join/CTE/window/subquery surface; UPSERT/`RETURNING`/
+row values/`STRICT`/generated columns/`UPDATE … FROM`/`INSERT … SELECT`; the
+scalar/aggregate/date-time/`printf`/JSON/JSONB libraries; type affinity,
+collation, column-name spans; the standing **error-parity** sweep (reject what
+sqlite rejects, byte-exact messages); and cross-object **ALTER** propagation
+(**A-rn1…A-rn4**: RENAME TABLE→views/FKs, RENAME COLUMN→FKs/views/triggers,
+text-preserving CREATE-text edits).
 
-**Error-parity validation (continuing).** A standing differential sweep makes
-graphite *reject* what sqlite rejects — not merely compute matching results — each
-with a byte-exact error message verified against the `sqlite3` CLI. Landed:
-**HAVING on a non-aggregate query** (only a GROUP BY or a result-column aggregate
-qualifies — an aggregate that appears *only* in HAVING does not); **ambiguous
-column names** in the query's own clauses, across joins/self-joins, *and*
-references inside a subquery that bind to an enclosing FROM (a static scope-stack
-pass); **invalid generated-column constraints** (in the PRIMARY KEY, with
-`DEFAULT`, or a second `AS (…)`); **query-time `COLLATE`** of an unknown sequence;
-**unknown REINDEX/VACUUM/ANALYZE targets**; **invalid window-frame** specs; and
-function **arity**; a table-level **foreign key naming an unknown local column**;
-and an **aggregate function in a CHECK or generated-column expression**
-("misuse of aggregate function …()"). *(No known leftovers as of this sweep; it
-continues against new construct families.)*
+**Remaining:**
 
-**Remaining pieces** (small, each function/clause-scoped):
-
-- **A2 — DESC index columns honored in seeks. ✅ DONE / verified.** A `DESC`
-  single-column index seeks equality / range / `IN` with correct results and the
-  `SEARCH … USING INDEX` plan; a `DESC` second column in a composite eq-prefix +
-  range seek is handled too. Differentially identical to sqlite.
-- **A3b — partial/expression index for range/IN seeks. ✅ DONE.** Both
-  `try_index_range` (via `partial_expr_range`) and `try_index_in` (via
-  `partial_pred_guaranteed` + `find_expr_in_values`) now seek a partial index's
-  leading column (predicate proven by the WHERE) or an expression index's keyed
-  expression, for `<`/`<=`/`>`/`>=` and `IN (…)`. `eqp_access` in lockstep —
-  `SEARCH … USING INDEX i (b>?)`, `(<expr>>?)`, `(b=?)`, `(<expr>=?)`.
-- **A4 — `NULLIF` collation in `func.rs`. ✅ DONE / verified.** `nullif(x, y)`
-  already resolves the comparison collation via `resolve_collation` (explicit
-  `COLLATE` on either operand, then a column's declared collation, then BINARY);
-  differentially identical to sqlite, including column-declared collations.
-- **A7 — multi-statement `execute_batch(sql)` API. ✅ DONE.** `Connection::
-  execute_batch` runs a `;`-separated script like `sqlite3_exec` via a
-  tokenizer-based `split_sql_script` (string/comment/`BEGIN…END`/`CASE…END`
-  aware), each slice through `execute_params` (a `SELECT` runs and is discarded);
-  stops at the first error. `execute()` stays single-statement.
-- **A8 — JSONB of JSON5-form numbers. ✅ DONE.** `jsonb('0xFF')` →
-  `INT5 "0xFF"`, `jsonb('.5')`/`jsonb('5.')` → `FLOAT5 ".5"/"5."`, byte-identical
-  to sqlite (`Json::Int` carries the hex raw text; `Json::Real` keeps the
-  leading/trailing-`.` text, dropping only a leading-`+` form which normalizes).
-  `json()` still renders them canonically.
-
-*ALTER rename — cross-object propagation* (a column/table rename must reach
-*other* schema objects, not just the table's own definition; today those break
-with "no such table/column" after a rename). Build bottom-up:
-
-- **A-rn1 — table-rename AST walker. ✅ DONE.** `rename_table_in_select` walks a
-  `Select` renaming every `FROM`/`JOIN` `TableRef.name == old`, `old.*`, and
-  qualified `old.col`, recursing subqueries / CTEs / windows / compound parts and
-  respecting a same-level CTE that shadows the name.
-- **A-rn2 — RENAME TABLE rewrites dependent view bodies. ✅ DONE.** On
-  `ALTER TABLE t RENAME TO t2`, every view whose body references `t` is rewritten
-  with a text-preserving token rewrite (only genuine table references — a
-  like-named column tail or function call is spared; the substituted name is
-  double-quoted, matching sqlite byte-for-byte). `SELECT … FROM v` works after the
-  rename; unrelated views are untouched. (Triggers already fire via the repointed
-  `tbl_name`.) **Also (2026-06-24): RENAME TABLE repoints foreign keys** — every
-  other table's `REFERENCES <old>` (and any self-reference) is rewritten to the new
-  name via `rewrite_fk_references`, which edits ONLY the target token after each
-  `REFERENCES` keyword, so a reference to a different table or a like-named column
-  is left intact, and the repointed FK is still enforced. Byte-exact vs sqlite
-  (`tests/alter.rs::rename_table_repoints_foreign_keys`).
-- **A-rn3 — RENAME COLUMN reaches dependent objects. ✅ DONE for the
-  provably-safe cases.** RENAME COLUMN now propagates into: foreign keys in other
-  tables (`REFERENCES parent(col)`), single- and multi-source VIEW bodies
-  (qualified always; bare only where the column is unique across the join's base
-  sources), triggers ON the renamed table (single-source: all refs; multi-source:
-  `NEW`/`OLD`), and — newly — triggers on ANOTHER table whose body reads/writes
-  ONLY the renamed table (`trigger_body_single_source_over` → bare + `table.`-
-  qualified refs). All differentially byte-exact vs sqlite (`tests/alter.rs`).
-  *The token rewrite is scope-aware by bailing conservatively*: any construct it
-  cannot prove safe (subqueries, aliases, a body spanning a second table, bare
-  refs ambiguous across multiple sources) is left UNCHANGED — never corrupted.
-  *Remaining (rare): bare/ambiguous refs in genuinely multi-table view/trigger
-  bodies, which need full per-ref name resolution (graphite's AST has no
-  per-column-ref spans).*
-- **A-rn4 — text-preserving schema edits. ✅ DONE.** Every `ALTER TABLE` now edits
-  the stored CREATE text in place rather than reprinting the (quoted/canonical) AST,
-  so `SELECT sql FROM sqlite_master` is byte-identical to sqlite: **`RENAME TO`**
-  (`rename_table_token_after` edits just the table-name token in the table's own
-  CREATE and each dependent index's `ON` clause); **`ADD COLUMN`**
-  (`append_column_to_create` splices the column's verbatim source before the
-  closing paren); **`DROP COLUMN`** (`drop_column_from_create` removes the column
-  segment + one adjacent comma); **`RENAME COLUMN`** (`rewrite_ident_tokens`
-  repoints the column identifier in the CREATE — inside CHECK/generated exprs and
-  dependent index defs too — reproducing the new name bare or double-quoted exactly
-  as the user wrote it, captured as `AlterAction::RenameColumn::new_text`; no
-  keyword list needed since SQLite preserves the user's quoting, not a re-decision).
+- **A-rn3-edge — RENAME COLUMN in genuinely multi-table view/trigger bodies.**
+  The token rewrite bails (leaves the body unchanged — never corrupts) on a bare
+  column ref that is ambiguous across multiple base sources, because the AST has
+  no per-column-ref source span.
+  - **A-rn3-edge-1** — add a source span (byte range) to `Expr::Column`.
+  - **A-rn3-edge-2** — use the span for scope-aware rename (resolve each bare ref
+    to its owning table, rewrite only the matching ones).
+- **Error-parity (standing).** No known leftovers; the sweep continues against new
+  construct families and files any new divergence here.
 
 ### Track B — Query planner, statistics & the VDBE
 
-Done: `ANALYZE` + `sqlite_stat1` (byte-compatible) with stats-driven index
-choice; equality/range/`IN`/OR-union seeks (including a **composite equality
-prefix + a trailing range** on the next index column, `x=? AND y>?`, seeked as one
-bounded range and rendered the same way in EQP); **inner-join seeks** — rowid/IPK
-(**B1a**), secondary-index (**B1a²**), and the **complete `WITHOUT ROWID` seek
-family** (PK equality + range, PK joins, secondary-index equality + range, with
-the named-index-vs-autoindex covering rule); a **hash join** for unindexed
-equi-joins with **B3 automatic-index** EQP (`BLOOM FILTER` + `SEARCH … USING
-AUTOMATIC COVERING INDEX`); **comma-join `WHERE`-equality promotion** (`FROM a, b
-WHERE a.x=b.y` planned like an explicit `JOIN … ON`); **B0** index-driven
-`ORDER BY` (rowid + secondary, ASC+DESC); **B2/B2b covering reads** (ordered scan,
-`count(*)` via index, and equality/range/`IN` seeks reading straight from a
-covering index); and the VDBE spike (`exec::vdbe`) covering constant projections,
-single-table scan + `WHERE`/`ORDER BY`/`DISTINCT`/`LIMIT`, whole-table aggregates,
-single-table `GROUP BY`, and grouped `HAVING` + aggregate `ORDER BY` (**B6**) —
-all matching the tree-walker via `query_vdbe`. The spike's scalar-expression
-compiler now spans literals (incl. blobs), arithmetic, concatenation,
-comparison + three-valued boolean logic, `IS`/`IS NOT`, the bitwise operators
-(`& | << >> ~`), unary `+`/`-`/`NOT`, `IS NULL`, `CASE`, `CAST`, `BETWEEN`,
-`LIKE`/`GLOB`, `IN (list)`, the `->`/`->>` JSON operators (its binary-op match
-is now exhaustive), and **pure scalar function calls** (`Op::Func` defers to
-`eval_scalar` over literal-reconstructed argument values, whitelisted to
-context-free functions so `random`/`last_insert_rowid`/date-time/FTS5/UDFs fall
-back). Remaining VDBE expression gaps are the context-dependent shapes
-(`Collate` threading, `Parameter` binding, correlated `Subquery`/`Exists`/
-`InSelect`) — these belong with the executor-integration steps (**B5c**/**B7**),
-not the standalone spike.
+**Done:** `ANALYZE`/`sqlite_stat1` stats-driven planning; the full equality/range/
+`IN`/OR-union + inner-join + `WITHOUT ROWID` seek family; hash join + automatic-
+index EQP; index-driven `ORDER BY` and covering reads (**B0/B0b**); the VDBE spike
++ its scalar-expression compiler; the **VDBE join family** (**B5a**); **VDBE
+routing default-on** (**B7a/B7b**, ~93 % of the corpus, tree-walker is the
+fallback oracle); bytecode `EXPLAIN` (**B8**).
 
-**Remaining optimizer pieces** *(perf-only — results already correct; acceptance:
-the plan matches sqlite3's `EXPLAIN QUERY PLAN` and execution stays in lockstep):*
+**Remaining — move each remaining shape onto the VDBE.** Additive, gated on
+VDBE-vs-tree-walker parity; results are already correct via the fallback, so this
+is *perf/coverage*, not correctness.
 
-- **B0b-i — multi-term `ORDER BY` via a multi-column index prefix. ✅ DONE.**
-  `order_index_scan` now matches an `ORDER BY (c1, c2, …)` against an index whose
-  leading columns are those columns (uniform direction, matching collations,
-  default NULLs) and walks the index instead of sorting. The **mixed-direction
-  partial sort** over a `WHERE` seek is now reported like sqlite too: when the
-  seek walks a leading prefix of the `ORDER BY` in order but a later term breaks
-  (e.g. `WHERE a>? ORDER BY a, b DESC`), EXPLAIN reads `USE TEMP B-TREE FOR LAST
-  n TERM[S] OF ORDER BY` (via `seek_order_prefix`, shared with B0b-iii). *(A
-  mixed-direction partial sort over a no-`WHERE` full-index scan still full-sorts;
-  results are correct in every case — only that EQP label differs.)*
-- **B0b-ii — covered query over an index. ✅ DONE (EQP/read side).** A no-`WHERE`
-  query whose every referenced column is held by exactly one full index now reads
-  from that index (`covering_scan` + `query_cols_covered`), reporting `SCAN …
-  USING COVERING INDEX` like sqlite — covering plain projections, `DISTINCT`, and
-  `GROUP BY`/aggregates over covered columns. *(Still hash-grouped, not stream-
-  grouped in index order; results identical.)*
-- **B0b-iii — `ORDER BY` from a `WHERE`-chosen index. ✅ DONE.** A `WHERE` seek
-  walks its index in key order, so the rows already arrive ordered and the sort is
-  skipped. Two cases, both recognized by `order_satisfied_by_scan` (so EQP and
-  execution stay in lockstep): an **equality** seek satisfies an `ORDER BY` on the
-  index columns following the equality prefix (`WHERE a=? ORDER BY b`, via
-  `order_satisfied_by_seek`); a leading-column **range** seek satisfies an `ORDER
-  BY` over the index columns themselves (`WHERE a>? ORDER BY a, b`, via
-  `order_satisfied_by_range_seek`). Both are conservative — they fire only when
-  exactly one plain secondary index can seek (no equality, no partial/expression
-  index, no rowid range for the range case), so the executor's choice is
-  unambiguous; otherwise the always-correct sort stands. Byte-identical EQP and
-  row order vs sqlite3 (`tests/order_by_after_seek.rs`). **B0b-i mixed-direction
-  partial sort ✅ DONE** — a no-`WHERE` `ORDER BY a, b DESC` whose index yields a
-  uniform leading prefix now walks that index and sorts only the trailing terms,
-  reported like sqlite (`SCAN … USING [COVERING] INDEX i` + `USE TEMP B-TREE FOR
-  LAST n TERM[S] OF ORDER BY`, identical rows): the COVERING case via
-  `scan_order_prefix`, and the NON-covering case via `order_index_scan`'s
-  `sorted_suffix` (the walk orders the prefix, `order_satisfied_by_scan` reports
-  not-fully-satisfied so the caller sorts the suffix). `tests/order_by_partial_sort.rs`.
-- **B1b — Join reordering.** ⚠ *Larger than "reorder by cost" — graphite's join
-  planner diverges from sqlite by DESIGN.* For a 2-table join graphite keeps
-  textual order and picks per-cursor seeks/automatic covering indexes/**bloom
-  filters** (`SCAN big / SEARCH small USING INTEGER PRIMARY KEY`), whereas the
-  oracle here cost-reorders to the small table and plain-scans both (`SCAN small
-  / SCAN big`). Matching sqlite's join EQP would require both a faithful
-  cost-model reorder AND abandoning graphite's (often cheaper) access choices to
-  mimic sqlite's scans — a large planner-alignment effort, and results are already
-  correct. Verified 2026-06-23 this is a design divergence, not a bug. *Ref:*
-  `where.c`.
-- **B1c — RIGHT/FULL join inner seeks.** B1a/B1a²/WITHOUT-ROWID seeks cover
-  INNER/LEFT; RIGHT/FULL joins still materialize the inner table.
-- **B4 — `sqlite_stat4` histograms. ⛔ BLOCKED by the differential oracle.** The
-  pinned `sqlite3 3.50.4` used as the test oracle is NOT built with
-  `SQLITE_ENABLE_STAT4` — `ANALYZE` writes only `sqlite_stat1`, never
-  `sqlite_stat4` (verified 2026-06-23). So there is no oracle to diff
-  byte-compatible `sqlite_stat4` rows against, and worse: a graphite planner that
-  consulted stat4 would make *different* index/seek choices than the stat1-only
-  reference, **diverging the `EXPLAIN QUERY PLAN` corpus**. Implementing B4 is
-  therefore actively harmful under the current methodology; it would only become
-  viable against a STAT4-enabled oracle. Left out of scope. *Ref:* `analyze.c`.
+- **B5c-1 — `IN (SELECT …)` on the VDBE** (it applies the candidate *column's*
+  affinity, unlike `IN (list)` — the tree-walker semantics are already shipped).
+  - **B5c-1a** — evaluate the candidate set + its column affinity
+    (`Subqueries::column_affinity`) into registers.
+  - **B5c-1b** — a membership op applying `apply_comparison_affinity(left_aff,
+    candidate_col_aff)` under the left collation.
+  - **B5c-1c** — `NOT IN` + NULL-in-set semantics (a NULL candidate → NULL result).
+- **B5c-2 — correlated subqueries on the VDBE.**
+  - **B5c-2a** — thread the outer row into the subquery's register frame.
+  - **B5c-2b** — compile `Subquery`/`Exists`/`InSelect` that read an outer column.
+- **B5c-3 — compound `SELECT` (`UNION`/`INTERSECT`/`EXCEPT`) as one program.**
+  - **B5c-3a** — compile each arm into the same program.
+  - **B5c-3b** — the set-combine + dedup/sort step (collation-aware).
+- **B5c-4 — window functions on the VDBE.**
+- **B5b — per-cursor nested-loop join + inner seek** (stream the inner side with
+  `OpenRead`/`Rewind`/`Column`/`Next` instead of materializing the cross-product;
+  *perf-only*).
+  - **B5b-1** — cursor opcodes for the inner table.
+  - **B5b-2** — seek-driven inner cursor (rowid/PK/index), mirroring the
+    tree-walker's inner-join seeks.
+- **B1c — RIGHT/FULL join inner seeks** (INNER/LEFT seek; RIGHT/FULL still
+  materialize the inner table).
 
-*VDBE migration* (the largest internal refactor — changes representation, not
-results; keep the differential corpus green at every step). Done so far: the
-spike covers single-table scans, aggregates, `GROUP BY`, and grouped `HAVING` +
-aggregate `ORDER BY` (**B6**), all parity-checked via `query_vdbe`. Remaining,
-each additive behind `query_vdbe` until B7:
+**Blocked / deferred by design:**
+- **B1b — cost-based join reordering.** graphite's per-cursor seek/bloom-filter
+  choices diverge from sqlite's cost-reordered plain scans *by design*; matching
+  the EQP would mean abandoning often-cheaper access paths. Results already correct.
+- **B4 — `sqlite_stat4` histograms.** The pinned `sqlite3 3.50.4` oracle is built
+  without `SQLITE_ENABLE_STAT4`, so there is nothing to diff against and a
+  stat4-driven planner would *diverge* the EQP corpus. Needs a stat4-enabled oracle.
 
-- **B5a — VDBE N-table inner join. ✅ DONE (cross-product form).** Any number of
-  INNER/CROSS/comma joins materialize `t1 × t2 × … × tN` (leftmost source
-  outermost, matching the tree-walker's and sqlite's nested-loop row order — raw
-  unordered output verified identical) as one combined row set with every
-  `ON`/join predicate folded into the `WHERE`, then reuse the single-cursor scan
-  compiler + interpreter unchanged (`query_vdbe`). Bails (→ tree-walker) only on
-  ambiguous shared *bare* column names now. (Extended from 2 tables to N on
-  2026-06-24; 3- and 4-table joins are in
-  `tests/vdbe.rs::two_table_join_matches_tree_walker`.) **The VDBE join family is
-  now COMPLETE (2026-06-24).** One **fully-unified join path** (gated on any
-  LEFT/RIGHT/FULL OR any NATURAL/USING) processes each join left-to-right exactly
-  like the tree-walker's `resolve_join_chain`: compute the NATURAL/USING coalesce
-  pairs (their equality is the match predicate when present, each under the left
-  column's collation; else the `ON`), build the rows with that step's
-  INNER/LEFT/RIGHT/FULL semantics (LEFT/FULL null-extends unmatched-left;
-  RIGHT/FULL appends unmatched-right), then coalesce each pair into its left
-  position (right value when left is NULL) and drop the right duplicate. Handles
-  **any chain of INNER/LEFT/RIGHT/FULL freely combined with NATURAL/USING**, plus
-  `t.*` (qualifier-aware expansion). Pure plain-INNER chains keep the
-  cross-product path; the VDBE runs projection/WHERE/aggregates over the joined
-  rows. Tests: `left_join_*`, `right_and_full_join_*`, `chained_outer_joins_*`,
-  `natural_using_join_*`, `table_wildcard_over_join_*`. Only remaining defers:
-  `t.*` over a *coalesced* join, and ambiguous bare column names.
-- **B5b — VDBE join: per-cursor nested loop, index/PK inner seek.** Replace the
-  materialized cross-product / row build with cursor opcodes
-  (`OpenRead`/`Rewind`/`Column`/`Next`) so the inner side isn't fully
-  materialized, plus seek-driven inner cursors. (Results already correct via the
-  materialized forms above — this is the perf/streaming refinement.) A single
-  two-table **RIGHT/FULL** outer join also runs on the VDBE now (2026-06-24,
-  left-driven build + appended unmatched-right rows, sqlite row order verified);
-  only RIGHT/FULL in a multi-join *chain* still defers to the tree-walker. Test
-  `tests/vdbe.rs::right_and_full_join_match_tree_walker_and_sqlite3`.
-- **B5c — VDBE: subqueries / compound / window** shapes still on the tree-walker.
-  *Coverage audited 2026-06-23 (`query_vdbe` strict-mode probe):* the VDBE already
-  compiles single-table scans with `WHERE`, `ORDER BY`, `GROUP BY`, `DISTINCT`,
-  constant `LIMIT`, the `COLLATE` operator, `rowid`, N-table inner joins, and —
-  newly (2026-06-24) — a **FROM subquery (derived table)** materialized over a
-  single all-BINARY base table (each output column inherits its affinity from the
-  resolved type, BINARY collation; a non-BINARY base or a join/nested subquery
-  defers). Also newly (2026-06-24): a **non-correlated scalar `(SELECT …)` or
-  `[NOT] EXISTS (SELECT …)`** in a top-level expression is *folded to a constant*
-  before compile (`fold_vdbe_subqueries`), so e.g. `WHERE v > (SELECT avg(v) FROM
-  t)` now runs on the VDBE. `vdbe_subquery_foldable` proves self-containedness
-  (own-source column refs only, no param/nested-subquery/compound/CTE); a scalar
-  fold also requires a *computed* (non-bare-column) result so the literal's
-  NONE/BINARY affinity matches the operand exactly. What still defers: **compound
-  SELECT** (`UNION`/etc.), *correlated* subqueries, `IN (SELECT)` (candidate-set
-  collation differs from `IN (list)`), subqueries over joins / non-BINARY
-  columns, and window functions — each substantial. The param-less limit is now
-  **partly lifted**:
-  EXPLICIT parameters (`?N`, `:name`/`$x`) are substituted into the VDBE-compiled
-  expressions before compile (`substitute_params` in `exec`), so `WHERE a=?1`,
-  `LIMIT ?1`, etc. run on the VDBE and match the tree-walker
-  (`tests/vdbe_params.rs`; the whole param suite stays green now that those route
-  through the VDBE). **Anonymous `?` still falls back** — its index is assigned at
-  eval time (`anon_counter`, affected by AND/OR short-circuit), so a static
-  substitution could diverge. All perf-neutral (fallback already correct);
-  acceptance is VDBE-vs-tree-walker parity.
-- **B7a — route `query()` onto the VDBE behind a flag. ✅ DONE.**
-  `Connection::set_use_vdbe(true)` makes `query()` try the VDBE engine first and
-  fall back transparently (on any unsupported shape *or* error) to the
-  tree-walker, which stays the source of truth. Off by default. A corpus-parity
-  test (`vdbe_routing_matches_tree_walker_on_corpus`) runs the full differential
-  corpus with routing on and asserts byte-identical output: **1773 / 1898
-  queries (93 %) are answered by the VDBE**, the rest fall back. Validating this
-  flushed out and fixed several real VDBE bugs — comparison **affinity**
-  (`g <= '1'`), `IS TRUE`/`IS FALSE` truthiness, `LIMIT 0`/negative, and unsafe
-  routing of correlated-subquery inner scans (gated off via `outer_scope`).
-- **B7b — flip the default to the VDBE. ✅ DONE.** `use_vdbe` now defaults to
-  **on**: `query()` runs `SELECT` through the VDBE first and falls back
-  transparently to the tree-walker for any shape it does not handle (every
-  unsupported shape, and every error, defers — the tree-walker stays the source
-  of truth). Validated by running the **entire test suite** with the default on
-  (not just the differential corpus): byte-identical throughout. Getting there
-  flushed out and fixed a series of real VDBE gaps — comparison/ORDER BY
-  **collation**, `IS TRUE`/`LIMIT 0`, qualified-column resolution, the
-  grouped-bare-column / attached-schema / column-label cases, plus (this step)
-  an ORDER-BY-satisfied-by-index-scan bail (tie/NULL order follows the scan),
-  `HAVING`-without-GROUP-BY and index-hint bails, JSON-subtype-aware functions
-  excluded from the scalar whitelist, blob `||` concatenation, and `-(i64::MIN)`
-  overflow promotion. The compiler also does qualified `(table, column)`
-  resolution, and routing is per query block (`run_core`) so compound-query arms
-  are accelerated while the tree-walker combines.
-- **B8 — `EXPLAIN` (bytecode). ✅ DONE.** Plain `EXPLAIN <select>` compiles the
-  query to graphite's VDBE program and returns the listing as `(addr, opcode,
-  detail)` rows (`Program::explain_rows` + `Connection::explain_bytecode`, via a
-  no-row `compile_select_program`). This is graphite's own register-machine IR;
-  it intentionally does **not** mirror SQLite's `vdbe.c` opcode set (documented
-  as unstable, and never compared in the differential corpus). Covers the
-  constant and single-table cases; joins/other shapes report `Unsupported`
-  (EXPLAIN QUERY PLAN remains the full-coverage path). *Ref:* `vdbe.c`.
+### Track C — Storage engine, transactions, concurrency
 
-### Track C — Storage engine, transactions, concurrency & multi-schema
+**Done:** the `Vfs` locking contract; rollback-journal writer serialization;
+`SAVEPOINT`; the introspection PRAGMAs; the **entire multi-schema track** (C1–C5,
+`ATTACH`/`DETACH`/`TEMP`); the **whole `auto_vacuum` track** (C6); `VACUUM …
+INTO`; `secure_delete` (C8a); `cache_size`/`mmap_size` reporting (C8b).
 
-Done: the `Vfs` locking contract (`SHARED`/`RESERVED`/`PENDING`/`EXCLUSIVE`,
-process-local), rollback-journal writer serialization, `SAVEPOINT` family,
-transaction-state validation, the introspection PRAGMAs (`index_list`,
-`index_info`, `foreign_key_list`/`_check`, `integrity_check`/`quick_check`,
-`freelist_count`, `application_id`, `data_version`, `table_list`,
-`collation_list`, the `pragma_*` TVFs incl. the no-paren form), and the **entire
-`ATTACH`/`DETACH`/`TEMP` multi-schema track** (C1–C5): the multi-database
-registry + `PRAGMA database_list`, in-memory and file attachments (cross-engine
-both directions), schema-qualified reads/writes/`DROP`, cross-database joins
-(+ 3-part `aux.t.c` names, `WITHOUT ROWID` sources), qualified DDL
-(`ALTER`/`CREATE INDEX|TRIGGER|VIEW`, stored bare-named), cross-database view
-reads (via a `read_default` context cell), `TEMP` tables, and cross-database
-transactions + savepoints. **`auto_vacuum`** is fully read/write now (C6a read +
-C6b-1 empty-db header + C6b-2 ptrmap maintenance): graphite reads and **writes**
-auto_vacuum databases that sqlite3 reads with `integrity_check = ok` (only the
-optional space-reclaim — FULL truncate C6b-3, `incremental_vacuum` C6b-4 —
-remains).
+**Remaining:**
 
-**`VACUUM … INTO <file>` ✅ DONE** — writes a compact copy of the database to a
-new file (the in-place `VACUUM` reuses the same compact-rebuild; `vacuum_write_into`
-evaluates the target path, refuses an existing file like sqlite, and stamps the
-preserved `user_version`). `std`-only (needs the OS VFS). The output is read by
-`sqlite3` with `integrity_check = ok` and matches sqlite's own `VACUUM INTO`
-logical content (`tests/vacuum_into.rs`).
-
-The **multi-schema track is complete** (C1–C5 + C-ms1 `CREATE TEMP
-VIEW/TRIGGER` catalog placement), and the **whole `auto_vacuum` track is complete**
-(C6a read; C6b-1 empty-db header; C6b-2 commit-time `rebuild_ptrmap`; C6b-3 FULL
-auto-truncate; C6b-4 `incremental_vacuum(N)` on-demand reclaim — all cross-checked
-with sqlite3 `integrity_check = ok`). Tuning PRAGMAs (`cache_size`, `synchronous`,
-`busy_timeout`, `locking_mode`, …) now *report* sqlite's defaults; honoring them
-is C8b/C8c.
-
-**Remaining pieces** *(storage / durability / concurrency — each independent):*
-
-- **C7 — SQLite-format rollback journal.** Match the on-disk journal byte layout
-  (ours is a private, recoverable format today) so a crash mid-write is
-  recoverable by `sqlite3`. Pairs with the crash-recovery harness (§6). Split:
-  **C7a** write the sqlite journal header + page records; **C7b** recover from a
-  sqlite-format journal on open.
-- **C8a — `secure_delete`. ✅ DONE.** `PRAGMA secure_delete` round-trips its
-  value exactly like sqlite (0=off, 1=on, 2=`fast`; any other true/non-zero → 1)
-  instead of the old hard-coded 0. When non-zero the pager zeroes the content of
-  every page handed to the freelist (`WritePager::free_page`), so deleted data
-  does not linger on disk; freed cells were already cleared by graphite's
-  full-page reserialize. A per-connection runtime setting (not persisted), as in
-  sqlite. Verified vs sqlite3 + a raw-file test (`tests/secure_delete.rs`):
-  ON leaves no copy of a deleted multi-overflow-page blob, OFF does, and
-  `integrity_check` stays ok either way.
-- **C8b — honor `PRAGMA cache_size` / `mmap_size`. ✅ DONE.** `cache_size` round-
-  trips its set value on the connection (default −2000); `mmap_size` returns no
-  rows (the reference build disables mmap) instead of erroring. Both verified vs
-  sqlite. The set `cache_size` is stored but does not yet bound a real cache —
-  that is C8c.
-- **C8c — a real `pcache` with LRU eviction.** Replace the keep-everything page
-  map with a bounded cache (depends on C8b's size). *Perf, not correctness.*
-- **C9a — reader `SHARED`-lock enforcement / multi-reader.** Let multiple readers
-  share while a writer is excluded, per the locking contract.
-- **C9b — OS-level file locks.** Cross-process locking via `std::fs::File::lock`
-  (needs MSRV 1.89) behind the std VFS, or a host-provided VFS.
-- **C9c — WAL `-shm` wal-index.** The shared-memory index for multi-connection
-  WAL readers.
-- **C9d — thread-safe `Connection`.** `Send`/`Sync` story for sharing a
-  connection (or a documented per-thread model).
+- **C7 — SQLite-format rollback journal** (graphite's journal is a private,
+  recoverable format today; match the on-disk byte layout so a crash mid-write is
+  recoverable by `sqlite3`).
+  - **C7a** — write the sqlite journal header + page records.
+  - **C7b** — recover from a sqlite-format journal on open.
+  - **C7-harness** — a fault-injecting `Vfs` (truncate / fail at chosen fsync
+    points) asserting recovery to a consistent state (the §6 crash-recovery
+    harness; lands with C7).
+- **C8c — bounded `pcache` with LRU eviction** (honor the C8b `cache_size`;
+  replaces the keep-everything page map). *Perf, not correctness.*
+  - **C8c-1** — a page-cache abstraction with a capacity + eviction hook.
+  - **C8c-2** — wire the pager through it; evict clean pages under pressure.
+- **C9 — concurrency** (each independent):
+  - **C9a** — reader `SHARED`-lock sharing (multiple readers, writer excluded).
+  - **C9b** — OS-level cross-process file locks (`std::fs::File::lock`; wants MSRV
+    1.89) behind the std VFS.
+  - **C9c** — the WAL `-shm` wal-index for multi-connection WAL readers.
+  - **C9d** — a thread-safe `Connection` (`Send`/`Sync`, or a documented
+    per-thread model).
 
 ### Track D — Virtual tables & ecosystem extensions
 
-Done: the read-only virtual-table foundation (TVFs `generate_series`/`json_each`/
-`json_tree`; the `VTabModule` + `VTabRegistry` trait — **D1a**; `CREATE VIRTUAL
-TABLE … USING module[(args)]` parsing/persistence/`FROM` integration incl. joins
-and `DROP` — **D1b**; `best_index`/`filter` constraint pushdown — **D1b²**); the
-**writable, persistent** vtab layer (**W1** DML routing + **W2** shadow-table
-storage); and **both headline modules built on top of it** — the full **R-Tree**
-(**D3a–D3c**, byte-compatible `_node`/`_rowid`/`_parent` layout) and the full
-**FTS5** (**D2a–D2e**, read *and* write). A graphite-written R-Tree and FTS5 are
-both read, queried, and `integrity_check`-ed by stock `sqlite3`. The per-step
-history is preserved in the bullets below; what *remains* on this track is
-scale/perf (a real FTS5 inverted index — **D2b**) and new ecosystem surfaces
-(**D5**/**D6**/**D7**).
+**Done:** the read-only vtab foundation (TVFs, the `VTabModule`/`VTabRegistry`
+trait, `best_index`/`filter` pushdown — **D1**); the **writable, persistent** vtab
+layer (**W1/W2**); both headline modules — the full **R-Tree** (**D3a–D3c**,
+byte-compatible nodes) and the full **FTS5** (**D2a–D2e**, read + write,
+sqlite-readable on disk, with the `tokenize=` option chain + diacritic folding);
+Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
 
-- **W1 — writable-vtab trait + DML routing. ✅ DONE.** `VTabModule::update`
-  (the `xUpdate` analog) takes a `VTabChange::Insert`/`Delete`/`Update`; the
-  default keeps a table read-only. `Connection::register_module` registers a
-  custom module. The executor routes all three DML verbs to it
-  (`exec_vtab_insert`/`exec_vtab_delete`/`exec_vtab_update`): INSERT maps the
-  column list and evaluates values; UPDATE/DELETE scan via the cursor, filter by
-  `WHERE`, and call `update` per matching row. Explicit-rowid INSERT (W1c) too.
-  Tests: `tests/writable_vtab.rs`. *(Remaining: hidden columns, RETURNING /
-  `UPDATE … FROM` on a vtab.)*
-- **W2 — shadow-table storage for modules. ✅ DONE.** A `persistent()` module
-  keeps its rows in a real `<vtab>_data` regular table (created at CREATE VIRTUAL
-  TABLE, reusing the normal table machinery → transactional + integrity-checked).
-  Reads scan it; `update` gets a `VTabStore` (rows/put/delete) over it. The
-  re-entrancy (executor `&mut self` while the module is registry-borrowed) is
-  solved by `with_vtab_store`, which takes the module out of the registry for the
-  write phase. Data survives reopening the file (tested). *(W2a: the backing table
-  holds the vtab's own columns; FTS5/R-Tree will declare module-specific shadow
-  schemas on top of the same `VTabStore` mechanism.)*
-- **D3 — R-Tree** (smaller of the two; build on W1/W2). *Ref:* `rtree.c`.
-  - **D3a — module + correct results. ✅ DONE.** Built-in `rtree` module
-    (`vtab.rs`, registered on every connection) on top of W1/W2: parses
-    `rtree(id, minX, maxX[, …])`, persists rows in `<name>_data`, answers spatial
-    queries by scan + the re-applied WHERE. Coordinates use sqlite's exact f32
-    directional rounding (`rtreeValueDown`/`Up`'s `1 ∓ 2⁻²³` nudge — min↓, max↑);
-    id is the integer rowid; rejects `min>max` and bad arity. Differentially clean
-    vs sqlite3 (`tests/rtree.rs`). *(The shadow table is W2a's `<name>_data`, not
-    sqlite's `_node`/`_rowid`/`_parent` — that byte-compat layout is D3c.)*
-  - **D3b — `best_index` spatial pushdown (EQP). ✅ DONE (plan reporting).**
-    `RTreeModule::best_index` mirrors sqlite's rtree `xBestIndex` so EXPLAIN QUERY
-    PLAN reads identically: an `id =` lookup is `INDEX 1:`, a coordinate range is
-    `INDEX 2:<op><col>…` (`A`=`=`,`B`=`<=`,`C`=`<`,`D`=`>=`,`E`=`>`; column digit
-    0-based among coords — e.g. `minX>=? AND maxX<=?` → `INDEX 2:D0B1`), a bare
-    scan `INDEX 2:`. `eqp_vtab_detail` now routes persistent modules through
-    `best_index` for the reported plan (fts5 keeps `INDEX 0:`).
-  - **D3b-exec — true spatial pushdown at execution. ✅ DONE (2026-06-24).** The
-    node walk (`scan_rtree_nodes`) now PRUNES: `try_virtual_table`'s rtree branch
-    turns the query's coordinate comparisons (via `collect_vtab_constraints`, the
-    same extractor `best_index` uses) into per-dimension bounds `(coord_idx, op,
-    value)`, and the descent skips any interior subtree whose stored MBR can't
-    satisfy them. Sound by construction: the on-disk MBR is a SUPERSET (f32 rounds
-    min down / max up), and `run_core` still re-applies the full WHERE, so the
-    visited rows are always a correct superset — pruning never drops a match, only
-    avoids visiting subtrees. Turns an O(n) spatial scan into a tree-pruned
-    descent. Both `rtree` and `rtree_i32`, sqlite- and graphite-written trees.
-    Tests: `rtree.rs::spatial_pushdown_prunes_but_keeps_every_match` (multi-level
-    tree, brute-force-checked) + the existing sqlite-differential multi-level
-    reads. *(The `id =` rowid fast path via `<name>_rowid` is a later refinement;
-    today an id-equality query still descends with WHERE re-applied.)*
-  - **D3c — byte-compatible node format. ✅ DONE.** R-Trees (no aux columns) use
-    sqlite's on-disk node format — the `<name>_node` b-tree of nodes + `_rowid` /
-    `_parent` maps — so a graphite-written R-Tree round-trips through sqlite3
-    (`rtreecheck` + `integrity_check` ok, queries identical), and graphite reads a
-    sqlite-written one. A node blob is a 2-byte BE depth (root) + 2-byte BE cell
-    count + cells (8-byte BE rowid/child + n_coord 4-byte BE f32/i32 coords),
-    padded to `min(page_size-64, 4+51*cell_size)`. Each write reads the current
-    entries, applies the change, and BULK-REBUILDS a balanced tree (sqlite reads
-    any valid tree, so the incremental quadratic-split shape need not be
-    reproduced). Wired through CREATE/INSERT/DELETE/UPDATE/DROP/RENAME/VACUUM;
-    conservative f32 rounding + min>max rejection preserved. `tests/rtree.rs`.
-    *(A write rebuilds the whole tree — O(n)/statement; incremental insert/split
-    is a later perf optimization. Aux-column R-Trees keep `_data`.)*
-- **D2 — FTS5** full-text search (build on W1/W2; the larger module). *Ref:*
-  `fts5*.c`. Break out: **D2a** tokenizer (unicode61/ascii); **D2b** inverted
-  index in shadow tables + `INSERT`; **D2c** `MATCH` query; **D2d** `bm25()`
-  ranking; **D2e** byte-compatible on-disk segment format.
-  - **D2a — tokenizer. ✅ DONE.** `fts5_tokenize` in `vtab.rs`: maximal
-    alphanumeric runs, case-folded — a faithful unicode61 approximation for
-    ASCII/basic text (diacritic folding + full Unicode category tables deferred).
-  - **D2b — document store. ✅ DONE (correct-results; inverted index deferred).**
-    The built-in `fts5` module (registered on every connection alongside
-    `series`/`rtree`) declares one untyped column per `USING fts5(col, …)` name
-    (ignoring `key = value` options and `col UNINDEXED` modifiers) and stores
-    documents in the persistent `<name>_data` backing table keyed by an implicit
-    rowid. CREATE/INSERT/UPDATE/DELETE/SELECT and `PRAGMA table_info` are
-    byte-identical to sqlite3. *(A real inverted index in shadow tables — for
-    scaling beyond a scan — is the remaining D2b work.)*
-  - **D2c — `MATCH` query. ✅ DONE (correct-results, full core query language).**
-    `t MATCH …` searches all columns, `col MATCH …` one column (scan + the
-    re-applied WHERE, like rtree D3a). A recursive-descent parser in `vtab.rs`
-    handles the full FTS5 query grammar: bare tokens, `token*` prefixes,
-    `"quoted phrases"` (consecutive/ordered), `col:…` column filters, and the
-    boolean operators `AND` (explicit or implicit), `OR`, `NOT` with SQLite's
-    precedence (`NOT`>`AND`>`OR`) and parentheses, and the `NEAR(p1 p2 …, n)`
-    proximity group. Byte-identical to sqlite3 across all these forms — the core
-    FTS5 query language is complete.
-  - **D2d — `bm25()` ranking + the `rank` column. ✅ DONE (correct-results).**
-    `ORDER BY rank` / `ORDER BY bm25(t)` sorts most-relevant-first and `bm25(t)`
-    / `rank` expose the score, byte-for-byte sqlite's Okapi BM25 (`k1=1.2`,
-    `b=0.75`, idf clamped up to `1e-6`, sum negated). `fts5_bm25_scores`
-    (`vtab.rs`) scores the corpus honoring `col:` filters and a `col MATCH …`
-    scope; `run_core` computes the per-rowid scores for a single-`fts5`-table
-    MATCH query into a connection-scoped `Fts5QueryCtx` cell that the `bm25()`
-    special form and the `rank` column read during projection / `ORDER BY`.
-    Outside an fts5 MATCH, `rank`/`bm25()` stay ordinary unknown names.
-  - **D2 EXPLAIN QUERY PLAN. ✅ DONE.** `EXPLAIN QUERY PLAN` over an `fts5` table
-    reports sqlite's `idxNum:idxStr`: a table-wide `MATCH` is `INDEX 0:M<ncols>`,
-    a column `MATCH` is `M<colidx>`, a rowid lookup is `=`, and `ORDER BY rank` /
-    `ORDER BY rowid` set the order-consumed bit (32 / 64) — byte-identical to
-    sqlite3 (`eqp_vtab_detail`'s fts5 branch).
-  - **D2-aux — `highlight()`. ✅ DONE (correct-results).** `highlight(t, col,
-    open, close)` wraps each matched-phrase token in the markers (one pair per
-    phrase instance; original inter-token text preserved; case-insensitive,
-    case-preserving), byte-identical to sqlite3. Reuses the `Fts5QueryCtx` cell
-    (the MATCH query; no corpus needed) via a position-aware tokenizer
-    (`fts5_tokenize_spans`).
-  - **D2-aux — `snippet()`. ✅ DONE (correct-results).** `snippet(t, col, open,
-    close, ellipsis, n)` reproduces `fts5SnippetFunction` byte-for-byte: per
-    phrase instance it scores the anchor window (`1000`/distinct phrase + `1`/
-    repeat) and considers two starts — the centered `iAdj`, and the enclosing
-    sentence boundary (token 0 or after a `.`/`:` + space) with a `+120`/`+100`
-    bonus; best score wins, earliest start on ties; a window reaching the column
-    end appends the trailing text (so a final `.` survives) instead of an
-    ellipsis. The auto-column form `snippet(t, -1, …)` scores every column and
-    renders the best (ties → first column). Validated at 0 mismatches over ~17k
-    random differential cases (terms/OR/phrase, 1–3 columns, explicit and `-1`
-    columns, every `n`, punctuated sentences, spaced/unspaced `col:token`).
-  - **D2-fts5-feature.** The whole module is behind a default-on `fts5` Cargo
-    feature; `--no-default-features` (or any build without `fts5`) drops it and
-    `USING fts5` then reports `no such module: fts5`, as SQLite does uncompiled.
-  - **D2-vocab — `fts5vocab`. ✅ DONE (correct-results).** The `fts5vocab`
-    module (`Fts5VocabModule` in `vtab.rs`, registered when `fts5` is enabled)
-    presents another FTS5 table's vocabulary in all three forms: `row` (term,
-    doc, cnt), `col` (term, col, doc, cnt), and `instance` (term, doc, col,
-    offset). `connect` validates `(table, type)` and declares the form's columns;
-    the executor's `scan_fts5vocab` tokenizes the referenced table's documents
-    (same `fts5_tokenize` as indexing) and aggregates, byte-identical to sqlite3
-    (`tests/fts5vocab.rs`). *(The `instance` form's `offset` column must be
-    quoted in graphite — `offset` is a reserved word in its parser, an orthogonal
-    gap.)*
-  - **D2e — byte-compatible on-disk format. READ ✅ DONE (M1); WRITE ✅ DONE
-    (M2).** **M1:** graphite reads a sqlite-written FTS5 — its parser now accepts
-    sqlite's single-quoted shadow-table names (`CREATE TABLE 'ft_data'(…)`), and
-    `try_virtual_table` reads the documents from `<name>_content`, answering
-    queries (incl. `MATCH`) with the scan-based matcher (the segment index need
-    not be decoded). `tests/fts5.rs`. **M2 (in progress):** for graphite's *own*
-    FTS5 files to be sqlite-readable, write the `%_data`/`%_idx` inverted-index
-    segment layout (doclists, varint postings, segment b-tree) — sqlite's `MATCH`
-    + FTS5 integrity-check need a valid index, so (unlike the R-Tree) a scan-based
-    store is not enough. **M2a — segment-byte encoder verified ✅:** the structure
-    record, averages record, and single-leaf page (term prefix-compression with
-    the `FTS5_MAIN_PREFIX` '0', doclists with rowid deltas, position lists with
-    collist deltas) are reproduced byte-for-byte vs sqlite 3.50.4 across every
-    doclist shape — `tests/fts5_segment.rs` (a differential reference encoder).
-    **M2c — multi-leaf pagination encoder verified ✅:** by lowering FTS5's
-    logical `pgsz`, the differential test also reproduces multi-leaf segments
-    byte-for-byte — the leaf-packing split threshold (flush before a term would
-    take the encoded leaf `>= pgsz`), each leaf re-stating its first term in full
-    form, the structure record's config cookie + write counter (= leaf count),
-    and the `%_idx` separator rows (each the shortest prefix of a leaf's first
-    term that exceeds the previous leaf's last term). `tests/fts5_segment.rs`.
-    The doclist-spanning carry is also verified now: a single term whose doclist
-    crosses leaves reproduces byte-for-byte (entry header may overshoot `pgsz`,
-    the collist carries to the next leaf, the continuation leaf's first rowid is
-    absolute with a non-zero first-rowid header offset, one `%_idx` row).
-    A UNIFIED streaming writer (`encode_segment`) now reproduces both pure term
-    pagination and pure doclist-spanning through one code path (the logic the lib
-    will port). *Remaining encoder sub-cases:* the leaf-fill boundary right after
-    a spanning doclist in the COMBINED case (a spanning term followed by many
-    paginated terms — off by one term vs sqlite; needs the fts5 writer source),
-    doclist-index pages (dli flag), and segment b-tree interior `_data` pages
-    (height > 0), which appear only at large scale. **M2b — storage wiring ✅
-    DONE:** graphite's own FTS5 now uses sqlite's five shadow tables
-    (`_content`/`_data`/`_idx`/`_docsize`/`_config`) instead of the generic
-    `<name>_data` store. `src/fts5_index.rs` ports the verified encoder (multi-
-    column poslists); `fts5_create_storage` builds the shadow tables and
-    `fts5_rebuild_index` re-derives the segment from `_content` after each write
-    (a bulk rebuild, like the R-Tree). A graphite-written FTS5 table is now read,
-    full-text-`MATCH`ed, and integrity-checked by stock sqlite3 3.50.4
-    (`tests/fts5_sqlite_read.rs`). *Not byte-identical to sqlite at every page
-    size (the pgsz fill heuristic and large-scale doclist-index pages differ) —
-    only structural validity is needed for sqlite to read it, and that holds.*
-    **TOKENIZER diacritic folding (found+fixed 2026-06-23):** sqlite-readability
-    requires graphite's tokens to match `unicode61`, whose DEFAULT removes
-    diacritics (`café`→`cafe`). `fts5_tokenize` folds accented Latin via
-    `fold_diacritic`, a **376-entry table covering the Latin-1 Supplement, Latin
-    Extended-A, the accented part of Latin Extended-B, and Latin Extended
-    Additional (U+1E00–U+1EFF)** — derived byte-exactly from `sqlite3` 3.50.4 by
-    probing `fts5vocab`, so it reproduces `remove_diacritics=1` precisely,
-    including the chars it deliberately keeps (the stroke letter `ł`→`ł`, the
-    double-accented `ệ`→`ệ`, `×`/`÷` as non-tokens). Accented Latin docs
-    (French, Polish, Czech, Romanian, Vietnamese single-mark) are now
-    integrity-clean and MATCH correctly under sqlite (`tests/fts5_sqlite_read.rs::
-    sqlite_matches_accented_graphite_fts5` + `::sqlite_matches_extended_latin_
-    graphite_fts5`); this also aligns graphite's own `MATCH` with sqlite for that
-    text. **TOKENIZER OPTIONS (2026-06-23/24):** the `tokenize=` chain is parsed
-    into an `Fts5Tok { stem, diacritics, tokenchars, separators }` (`fts5_tok_config`)
-    and threaded through EVERY tokenization — indexing, query lexing, `MATCH`,
-    `bm25`, `highlight`, `snippet`, `fts5vocab` — so the doc and query sides always
-    classify/fold identically. Honored: `remove_diacritics 0|1|2` (`=2` adds a
-    second 112-entry table for `ệ`→`e`, `ố`→`o`, also probed byte-exactly from
-    sqlite), `porter` (wrapping a base tokenizer), `ascii` (≡ level 0, no fold),
-    and **`tokenchars '…'` / `separators '…'`** (2026-06-24) — extra token / forced
-    separator characters, stored as `u128` ASCII bitmaps so `Fts5Tok` stays `Copy`
-    (no threading churn); `separators` win over `tokenchars`, which win over the
-    default classification, applied to the original codepoint before folding. A
-    graphite table with any of these is integrity-clean and MATCHes identically to
-    sqlite (`::sqlite_matches_remove_diacritics_levels_graphite_fts5`,
-    `::sqlite_matches_tokenchars_separators_graphite_fts5`, + the
-    `fts5_tok_config_parses_tokenize_option` unit test). *Remaining (minor):* the
-    `ascii` tokenizer's exact high-byte token-char + ASCII-only case-fold rule (we
-    approximate via Unicode alphanumerics + `to_lowercase` — correct for typical
-    text), non-ASCII `tokenchars`/`separators` (rare), and non-Latin scripts (which
-    `unicode61` passes through unchanged anyway, so graphite already matches).
-- **D4 — User-defined functions from Rust.** Scalar ✅ DONE
-  (`register_function`, via `Subqueries::call_udf`) and aggregate ✅ DONE
-  (`register_aggregate_function` + an `AggregateFunction` step/finalize trait;
-  detection via a predicate-parameterized `expr_contains_agg`, honoring GROUP
-  BY/HAVING/DISTINCT). Built-ins win. *Remaining: window UDFs and custom
-  collations (the `Collation` enum would need a user variant — invasive).* Pairs
-  with `register_module`.
-- **D-introspect — `dbstat`. ✅ DONE.** The eponymous read-only `dbstat` virtual
-  table reports per-page b-tree storage stats (`name, path, pageno, pagetype,
-  ncell, payload, unused, mx_payload, pgoffset, pgsize`), one row per page plus
-  one per overflow page. `scan_dbstat` (`exec/mod.rs`) DFS-walks every b-tree
-  (`sqlite_schema` at page 1, then each table/index root) and computes, byte-for-
-  byte like SQLite's dbstat.c: `unused` from the page header's cell-content
-  pointer, fragmented-bytes count, and freeblock chain; `payload` as the summed
-  local cell bytes; `mx_payload` as the largest total cell payload; SQLite's
-  `/<hex-child>/` + `+<hex-overflow>` path strings; and even reproduces dbstat's
-  off-by-one overflow `pgoffset` (the lagged previous-page offset). A real user
-  table named `dbstat` shadows it. Differentially clean vs sqlite3 over small,
-  indexed, multi-level, and overflow-chain databases (`tests/dbstat.rs`).
-  *(Sibling `dbpage` — writable raw page access — not yet built.)*
-- **D5 — `sqlite3_session`** — changesets/patchsets for replication.
-- **D6 — Async VFS for wasm** — non-blocking I/O over IndexedDB/OPFS.
-- **D7 — C-API shim** — a `libsqlite3`-compatible surface as a *separate* crate.
-  **Blocked:** requires `extern "C"` + raw pointers, incompatible with this
-  crate's `#![forbid(unsafe_code)]`; would live in a sibling crate that opts out.
+**Remaining:**
+
+- **D2b — a real FTS5 inverted index.** Today `MATCH` scans `_content`; the
+  on-disk segment *format* is already byte-compatible (written by
+  `fts5_rebuild_index`), so this is the *read* path that uses the index for scale.
+  - **D2b-1** — decode the `%_data` segment index (leaf pages, doclists, position
+    lists) for a single-term lookup.
+  - **D2b-2** — route `MATCH` through the index (term → doclist) instead of
+    scanning every document; keep the scan as the fallback.
+- **D2e-encoder — byte-identical FTS5 at large scale** (structural validity holds
+  today; these only affect exact-byte parity past a few leaves, and each needs the
+  fts5 writer source for the precise split heuristic): the combined
+  spanning-doclist-then-paginated-terms leaf-fill boundary; doclist-index (`dli`)
+  pages; segment-b-tree interior (`height > 0`) `_data` pages.
+- **dbpage — the writable raw-page vtab** (`sqlite_dbpage`, sibling of `dbstat`).
+  - **dbpage-1** — read (one row per page: `pgno`, `data`).
+  - **dbpage-2** — write (raw page replacement; integrity-gated).
+- **D4-leftover — window UDFs + custom collations** (the latter needs a user
+  variant on the `Collation` enum — invasive).
+- **D5 — `sqlite3_session`** changesets/patchsets for replication.
+- **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
+
+**Blocked by design:**
+- **D7 — C-API shim** (`libsqlite3`-compatible surface). Needs `extern "C"` + raw
+  pointers, incompatible with `#![forbid(unsafe_code)]`; would live in a sibling
+  crate that opts out.
+
+### Track E — Cross-database write resolution  *(new)*
+
+A write to an attached/`temp` database swaps that database in as the active `main`
+for the *whole* statement (`swap_db`), so any subquery or source that reads the
+*original* main fails to resolve ("no such table"). **`INSERT … SELECT`** and
+**`INSERT … VALUES ((SELECT …))`** are fixed — they are materialized in the
+original context before the swap (`prematerialize_insert_source`). The remaining
+cases cannot use that trick (their subqueries are correlated/mutating) and the
+swap cannot be undone mid-statement (it is `&mut`; the `Subqueries` trait is
+`&self`):
+
+- **E1 — `UPDATE aux.t … FROM m`** (the `FROM` source reads the original db).
+- **E2 — `UPDATE aux.t SET/WHERE …`** with a subquery reading the original db.
+- **E3 — `DELETE FROM aux.t WHERE …`** with a subquery reading the original db.
+
+The fix is architectural — pick one approach:
+- **E-arch-a** — implement a global unqualified-name resolution order
+  (`main`→`temp`→`attached`, main-first) in `table_meta`/`scan_source`, and drop
+  the read-side swap (resolve the write *target* by its schema qualifier
+  separately). This also closes a related top-level gap: `SELECT … FROM s` where
+  `s` lives only in an attached database currently errors.
+- **E-arch-b** — plumb the target database through the whole write path
+  (`exec_insert`/`update`/`delete` + the constraint/index/trigger/FK helpers)
+  instead of swapping.
+
+Prerequisite (the differential corpus does **not** exercise cross-db writes, so
+build the regression oracle first):
+- **E0 — extend `tests/attach.rs`** with cross-db UPDATE…FROM / UPDATE-subquery /
+  DELETE-subquery cases (and the top-level attached-only unqualified read) before
+  attempting E-arch-a/b.
 
 ---
 
 ## 5. Cross-cutting concerns
 
-- **MSRV** is pinned at **1.88** (`Cargo.toml`); revisit before 1.0 (C9 wants 1.89
-  for `File::lock`).
+- **MSRV** is pinned at **1.88** (`Cargo.toml`); revisit before 1.0 (C9b wants
+  1.89 for `File::lock`).
 - **Numeric model** — reals are `f64` to match SQLite; no extended decimal/bignum.
 - **Parser** stays hand-written (no build-time codegen, friendlier errors);
   `parse.y` remains the source of truth for precedence and accepted forms.
 - **Performance** is deliberately secondary to correctness until the VDBE +
-  planner land; the iterator executor is `O(n)` in places (some constraint and
-  `WITHOUT ROWID` paths rebuild on write) that the planner work will revisit.
+  planner work lands; the iterator executor is `O(n)` in places (some constraint
+  and `WITHOUT ROWID` paths rebuild on write) that Track B/C will revisit.
 
 ---
 
@@ -786,17 +329,17 @@ This is the project's whole reason to exist, so it gets first-class testing.
 - **`integrity_check` as a gate.** Any database graphitesql writes must pass
   `sqlite3`'s `PRAGMA integrity_check` (and, with FKs on, `foreign_key_check`).
 - **Round-trip & cross-engine.** graphitesql reads what `sqlite3` writes and vice
-  versa, for every storage feature (rowid, `WITHOUT ROWID`, WAL, post-VACUUM).
+  versa, for every storage feature (rowid, `WITHOUT ROWID`, WAL, post-VACUUM,
+  attached, R-Tree, FTS5).
 - **Probing the corpus blind spots.** The result-diff corpus is blind to
   rejection-based behavior, boundary values, `Error::Unsupported` gaps, and
   introspection/error-message detail; these are covered by targeted suites driven
-  by probing each semantic dimension against the `sqlite3` CLI.
+  by probing each semantic dimension against the `sqlite3` CLI. *(Note: the corpus
+  does NOT exercise cross-database writes — see Track E's E0.)*
 - **Fuzzing** — a deterministic corruption-robustness harness
-  (`tests/fuzz_corruption.rs`, ~50k malformed-file variants;
-  `tests/fuzz_sql.rs`, ~3.3k malformed/deeply-nested SQL) asserts the readers
-  return an error and never panic. It already caught real reader panics
-  (`btree/page.rs` assert/bounds/arithmetic, `sql/parser.rs` recursion depth),
-  now fixed. *(Expand toward a coverage-guided fuzzer when a no-dep path exists.)*
+  (`tests/fuzz_corruption.rs`, ~50k malformed-file variants; `tests/fuzz_sql.rs`,
+  ~3.3k malformed/deeply-nested SQL) asserts the readers return an error and never
+  panic. *(Expand toward a coverage-guided fuzzer when a no-dep path exists.)*
 - **Crash-recovery** *(planned, pairs with C7)* — a fault-injecting `Vfs` that
   truncates / fails at chosen fsync points, asserting recovery to a consistent
   state.
@@ -812,74 +355,45 @@ the embedded `SQLITE_VERSION_NUMBER`, and unused/reserved bytes left from
 deletions. **Compatibility means both engines read each other's files and agree
 on contents**, not byte-identical independently-built databases.
 
+### Build-specific oracle behaviors we intentionally do NOT match
+
+The pinned `sqlite3 3.50.4` oracle is a custom (`alt1`) build whose behavior
+differs from *documented* / standard SQLite in two places; graphite matches the
+standard, not the build:
+
+- **`LIKE` case folding.** The oracle folds full Unicode in `LIKE` (`'É' LIKE
+  'é'` → true) via the C library's locale-specific `towlower` — per-codepoint and
+  not replicable byte-for-byte (`ẞ`→`ß` not `ss`, `Σ` matches both `σ`/`ς`).
+  graphite's `LIKE` is ASCII-only case-insensitive, like documented SQLite, and
+  this is pinned (`tests/like_escape.rs`).
+- **`utc`/`localtime` date modifiers** are timezone-dependent (the host/build TZ)
+  and graphite's TZ support is feature-gated, so their results are environment-,
+  not graphite-, specific.
+
 ---
 
-## 7. Immediate next steps
+## 7. Suggested order
 
-The bounded correctness work and the headline features are **done**: the whole
-SQL-language / function / planner-correctness surface; the **writable, persistent
-vtab** layer (W1/W2) and both modules on it — the full **R-Tree** (D3a–D3c) and
-the full **FTS5** (D2a–D2e, read *and* write, sqlite-readable on disk); the
-**VDBE routing default-on** (B7a/B7b) with bytecode `EXPLAIN` (B8); the entire
-**multi-schema** (C1–C5) and **auto_vacuum** (C6) tracks; `VACUUM INTO`;
-`secure_delete`/`cache_size` reporting (C8a/C8b); the cross-object **ALTER**
-propagation incl. text-preserving schema edits (A-rn1–A-rn4); and a continuing
-**error-parity** pass (§4 Track A). What remains is **deeper, multi-step work**,
-grouped by track and broken into independently-shippable pieces.
+The headline features are done (§3); what remains (§4) is bigger, multi-session
+work, each track independently shippable. A reasonable order:
 
-**1. VDBE depth (Track B).** Routing is default-on (the VDBE answers ~93 % of the
-corpus); the rest transparently falls back to the tree-walker, which stays the
-oracle. Move each remaining shape onto the VDBE — additive, gated on
-VDBE-vs-tree-walker parity, results already correct:
+1. **E0 → E-arch-a** — cross-database write resolution (Track E): land the
+   attach-suite oracle, then the global-resolution refactor. A real correctness
+   gap, self-contained, and it also fixes the top-level attached-only read.
+2. **B5c-1 → B5c-4, then B5b** — VDBE depth (Track B): move `IN (SELECT)`,
+   correlated subqueries, compound, and windows onto the VDBE, then the
+   per-cursor streaming join. Perf/coverage; parity-gated, low risk.
+3. **D2b** — the real FTS5 inverted index (Track D): the one scaling gap in an
+   otherwise-complete module.
+4. **C7a/C7b + crash-recovery harness** — the SQLite-format journal (Track C):
+   durability depth; pairs with the fault-injecting VFS.
+5. **C8c, then C9a–C9d** — bounded pcache, then the concurrency story (Track C).
+6. **dbpage, D5, D6** — ecosystem surfaces (Track D).
 
-- **B5c-1 — `IN (SELECT …)`** (its candidate-set collation differs from `IN
-  (list)`, so it needs its own handling).
-- **B5c-2 — correlated subqueries** (`Subquery`/`Exists`/`InSelect` reading an
-  outer column — needs outer-row register threading; non-correlated ones already
-  fold to constants).
-- **B5c-3 — compound `SELECT`** (`UNION`/`INTERSECT`/`EXCEPT` compiled as one
-  program rather than per-arm with a tree-walker combine).
-- **B5c-4 — window functions** on the VDBE.
-- **B5b — per-cursor nested-loop join + inner seek** (stream the inner side with
-  `OpenRead`/`Rewind`/`Column`/`Next` instead of materializing the cross-product;
-  *perf-only*).
-
-**2. Storage durability & concurrency (Track C).**
-
-- **C7a/C7b — SQLite-format rollback journal**: write the sqlite journal header +
-  page records (C7a), then recover from one on open (C7b). Pairs with the
-  fault-injecting **crash-recovery harness** (§6), which should land alongside.
-- **C8c — bounded `pcache` with LRU eviction** (honor the C8b `cache_size`;
-  replaces the keep-everything page map). *Perf, not correctness.*
-- **C9a–C9d — concurrency**, each independent: reader `SHARED`-lock sharing
-  (C9a); OS-level cross-process file locks via `File::lock` (C9b, wants MSRV
-  1.89); the WAL `-shm` wal-index (C9c); the thread-safe `Connection`
-  `Send`/`Sync` story (C9d).
-
-**3. Ecosystem breadth (Track D).**
-
-- **D2b — a real inverted index** in the FTS5 shadow tables (today MATCH scans;
-  this scales it — the segment *format* is already byte-compatible, this is the
-  query path that reads it).
-- **`dbpage`** — the writable raw-page vtab (sibling of the done `dbstat`).
-- **D5 — `sqlite3_session`** changesets/patchsets; **D6 — async VFS for wasm**
-  (IndexedDB/OPFS).
-
-**4. Error-parity leftovers — ✅ CLEARED.** The CREATE-time validation gaps found
-by the error-parity sweep are all closed: ~~aggregate function in a CHECK or
-generated-column expression~~ (`"misuse of aggregate function NAME()"`,
-arity-aware so the two-arg `min`/`max` scalar forms pass) and ~~a foreign key
-naming an unknown local column~~ (`"unknown column \"c\" in foreign key
-definition"`). The standing sweep continues against new construct families (§4
-Track A); when it surfaces the next divergence it is filed here.
-
-**Deferred / blocked by design** (documented in the tracks, not scheduled):
-**B1b** join reordering and **B4** `sqlite_stat4` — both *diverge from*, or are
-*unverifiable against*, the pinned stat1-only `sqlite3` oracle, so pursuing them
-would break the differential corpus rather than extend it; **B1c** RIGHT/FULL
-inner-join seeks (correct via materialization today); **D7** the C-API shim
-(needs `extern "C"` + raw pointers — incompatible with `#![forbid(unsafe_code)]`;
-would be a sibling crate that opts out); and the rare ambiguous-bare-ref case of
-cross-object `RENAME COLUMN` (needs per-column-ref source spans the AST does not
-carry). The **SQLite TCL suite** (§6) cannot run against a Rust crate — the
-differential corpus + `integrity_check` remain the green proxy.
+**Deferred / blocked** (documented in §4): **B1b** join reordering and **B4**
+`sqlite_stat4` (diverge from / unverifiable against the stat1-only oracle);
+**B1c** RIGHT/FULL inner seeks (correct via materialization); **D7** the C-API
+shim (needs `unsafe`; a sibling crate); the **A-rn3-edge** ambiguous-ref case
+(needs per-column-ref spans); and the FTS5 large-scale encoder sub-cases (need the
+fts5 writer source). Build-specific oracle quirks we intentionally do NOT match
+are recorded in §6.
