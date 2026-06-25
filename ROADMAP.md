@@ -260,10 +260,21 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
   fts5 writer source for the precise split heuristic): the combined
   spanning-doclist-then-paginated-terms leaf-fill boundary; doclist-index (`dli`)
   pages; segment-b-tree interior (`height > 0`) `_data` pages.
-- **dbpage — the writable raw-page vtab** (`sqlite_dbpage`, sibling of `dbstat`).
+- **dbpage — the raw-page vtab** (`sqlite_dbpage`, sibling of `dbstat`).
   Done: **dbpage-1** — read (one row per page: `pgno`, `data`), byte-exact vs
-  `sqlite3` on the same file (`tests/dbpage.rs`).
-  - **dbpage-2** — write (raw page replacement; integrity-gated).
+  `sqlite3` on the same file (`tests/dbpage.rs`); both eponymous read-only vtabs
+  (`dbstat`, `sqlite_dbpage`) also resolve a `main.`-qualifier, answer
+  `PRAGMA table_info`/`table_xinfo` with their fixed column shape (incl. the
+  trailing hidden columns), and a `temp.`-qualified read with no temp database
+  now reports the name as missing instead of panicking.
+  - *Minor gap:* `temp.dbstat` / `temp.sqlite_dbpage` (the eponymous vtab over an
+    attached/`temp` schema) reports "no such table" rather than scanning that
+    database's pages — needs the scan to take a backend parameter.
+  - **dbpage-2** — write (raw page replacement). *Oracle-blocked:* the pinned
+    `sqlite3 3.50.4` alt1 build was compiled without the writable-dbpage path —
+    every real page write returns `read-only` (deterministically; see §6). With
+    no engine to diff against, a writable `sqlite_dbpage` can't satisfy the
+    differential-test rule; deferred until a writable-dbpage oracle is available.
 - **D4-leftover — window UDFs + custom collations** (the latter needs a user
   variant on the `Collation` enum — invasive).
 - **D5 — `sqlite3_session`** changesets/patchsets for replication.
@@ -360,6 +371,10 @@ standard, not the build:
 - **`utc`/`localtime` date modifiers** are timezone-dependent (the host/build TZ)
   and graphite's TZ support is feature-gated, so their results are environment-,
   not graphite-, specific.
+- **Writable `sqlite_dbpage`.** The alt1 build refuses every page write with a
+  `read-only` runtime error (no `SQLITE_ENABLE_DBPAGE_VTAB` write path), so there
+  is no oracle to diff a writable `sqlite_dbpage` against — `dbpage-2` is parked
+  on this, not on implementation effort (read-side `dbpage-1` is done).
 
 ---
 

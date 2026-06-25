@@ -71,3 +71,64 @@ fn a_real_table_named_sqlite_dbpage_is_unreachable() {
     };
     assert!(pages >= 1, "expected at least the header page, got {pages}");
 }
+
+#[test]
+fn main_qualifier_reaches_the_eponymous_vtabs() {
+    // `main.dbstat` / `main.sqlite_dbpage` resolve to the same eponymous tables
+    // as the unqualified names (they describe the `main` database).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    for name in ["sqlite_dbpage", "dbstat"] {
+        let bare = c
+            .query(&format!("SELECT count(*) FROM {name}"))
+            .unwrap()
+            .rows[0][0]
+            .clone();
+        let qualified = c
+            .query(&format!("SELECT count(*) FROM main.{name}"))
+            .unwrap()
+            .rows[0][0]
+            .clone();
+        assert_eq!(bare, qualified, "main.{name} != {name}");
+    }
+}
+
+#[test]
+fn table_info_reports_the_fixed_column_shape() {
+    // table_info: pgno (declared PRIMARY KEY → pk=1) then data BLOB.
+    let c = Connection::open_memory().unwrap();
+    let info = c.query("PRAGMA table_info(sqlite_dbpage)").unwrap().rows;
+    assert_eq!(info.len(), 2);
+    assert_eq!(info[0][1], Value::Text("pgno".into()));
+    assert_eq!(info[0][2], Value::Text("INTEGER".into()));
+    assert_eq!(info[0][5], Value::Integer(1)); // pk
+    assert_eq!(info[1][1], Value::Text("data".into()));
+    assert_eq!(info[1][5], Value::Integer(0));
+
+    // table_xinfo adds the trailing hidden `schema` column (hidden flag = 1).
+    let xinfo = c.query("PRAGMA table_xinfo(sqlite_dbpage)").unwrap().rows;
+    assert_eq!(xinfo.len(), 3);
+    assert_eq!(xinfo[2][1], Value::Text("schema".into()));
+    assert_eq!(xinfo[2][6], Value::Integer(1)); // hidden
+
+    // dbstat's xinfo carries two hidden columns (schema, aggregate).
+    let dbstat = c.query("PRAGMA table_xinfo(dbstat)").unwrap().rows;
+    assert_eq!(dbstat.len(), 12);
+    assert_eq!(dbstat[10][1], Value::Text("schema".into()));
+    assert_eq!(dbstat[11][1], Value::Text("aggregate".into()));
+    // table_info (non-extended) hides them: 10 visible columns only.
+    let dbstat_info = c.query("PRAGMA table_info(dbstat)").unwrap().rows;
+    assert_eq!(dbstat_info.len(), 10);
+}
+
+#[test]
+fn temp_qualifier_without_temp_db_errors_not_panics() {
+    // A `temp.`-qualified read before any temp database exists must report the
+    // name as missing (as sqlite does), not panic resolving the temp backend.
+    let c = Connection::open_memory().unwrap();
+    let err = c.query("SELECT * FROM temp.foo").unwrap_err();
+    assert!(
+        err.to_string().contains("no such table: temp.foo"),
+        "unexpected error: {err}"
+    );
+}

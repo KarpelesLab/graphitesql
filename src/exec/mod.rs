@@ -1723,6 +1723,64 @@ impl Connection {
             let columns = table_info_columns(extended);
             return Ok(QueryResult { columns, rows });
         }
+        // The eponymous read-only vtabs (`dbstat`, `sqlite_dbpage`) answer
+        // table_info with their fixed column shape, unless a real table of the
+        // name shadows them. Each entry is `(name, type, pk, hidden)`:
+        // `sqlite_dbpage.pgno` is PRIMARY KEY, and both carry trailing hidden
+        // columns that only `table_xinfo` (the extended form) reports.
+        if self.schema.table(&table).is_none() {
+            let lower = table.to_ascii_lowercase();
+            let fixed: &[(&str, &str, i64, bool)] = match lower.as_str() {
+                "sqlite_dbpage" => &[
+                    ("pgno", "INTEGER", 1, false),
+                    ("data", "BLOB", 0, false),
+                    ("schema", "", 0, true),
+                ],
+                "dbstat" => &[
+                    ("name", "TEXT", 0, false),
+                    ("path", "TEXT", 0, false),
+                    ("pageno", "INTEGER", 0, false),
+                    ("pagetype", "TEXT", 0, false),
+                    ("ncell", "INTEGER", 0, false),
+                    ("payload", "INTEGER", 0, false),
+                    ("unused", "INTEGER", 0, false),
+                    ("mx_payload", "INTEGER", 0, false),
+                    ("pgoffset", "INTEGER", 0, false),
+                    ("pgsize", "INTEGER", 0, false),
+                    ("schema", "TEXT", 0, true),
+                    ("aggregate", "BOOLEAN", 0, true),
+                ],
+                _ => &[],
+            };
+            if !fixed.is_empty() {
+                // Non-extended `table_info` omits hidden columns entirely; the
+                // `cid` is the position in the emitted sequence (hidden columns
+                // always trail, so visible indices are unaffected).
+                let rows = fixed
+                    .iter()
+                    .filter(|(_, _, _, hidden)| extended || !hidden)
+                    .enumerate()
+                    .map(|(i, (name, ty, pk, hidden))| {
+                        let mut row = alloc::vec![
+                            Value::Integer(i as i64),
+                            Value::Text((*name).into()),
+                            Value::Text((*ty).into()),
+                            Value::Integer(0),
+                            Value::Null,
+                            Value::Integer(*pk),
+                        ];
+                        if extended {
+                            row.push(Value::Integer(*hidden as i64));
+                        }
+                        row
+                    })
+                    .collect();
+                return Ok(QueryResult {
+                    columns: table_info_columns(extended),
+                    rows,
+                });
+            }
+        }
         // A VIEW also answers table_info: its columns with their resolved types
         // (notnull/dflt/pk are always 0/empty for a view).
         if let Some(vobj) = self.schema.objects().iter().find(|o| {
@@ -12377,17 +12435,25 @@ impl Connection {
                     )),
                 };
             }
-            // `dbstat`: an eponymous read-only virtual table reporting per-page
-            // b-tree storage statistics. A real user table named `dbstat` wins.
-            if from.first.schema.is_none()
+            // The eponymous read-only vtabs (`dbstat`, `sqlite_dbpage`) describe
+            // the `main` database, so an unqualified name or an explicit `main.`
+            // qualifier both reach them; an attached/`temp` qualifier does not.
+            // A real user table of the name wins.
+            let eponymous_main = from.first.schema.is_none()
+                || from
+                    .first
+                    .schema
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("main"));
+            // `dbstat`: per-page b-tree storage statistics.
+            if eponymous_main
                 && from.first.name.eq_ignore_ascii_case("dbstat")
                 && self.schema.table("dbstat").is_none()
             {
                 return self.scan_dbstat(from.first.alias.as_deref());
             }
-            // `sqlite_dbpage`: read-only raw page access, one row per page
-            // (`pgno`, `data`). A real table of that name wins.
-            if from.first.schema.is_none()
+            // `sqlite_dbpage`: raw page access, one row per page (`pgno`, `data`).
+            if eponymous_main
                 && from.first.name.eq_ignore_ascii_case("sqlite_dbpage")
                 && self.schema.table("sqlite_dbpage").is_none()
             {
@@ -12404,6 +12470,7 @@ impl Connection {
                 None => DbRef::Main,
             };
             if db != DbRef::Main {
+                self.guard_qualified_temp(db, from.first.schema.as_deref(), &from.first.name)?;
                 let alias = from.first.alias.as_deref();
                 if let Some(r) = self.scan_db_view(db, &from.first.name, alias, params)? {
                     return Ok(r);
@@ -13544,6 +13611,7 @@ impl Connection {
             None => self.unqualified_db(&tref.name),
         };
         if db != DbRef::Main {
+            self.guard_qualified_temp(db, tref.schema.as_deref(), &tref.name)?;
             if let Some((cols, input)) =
                 self.scan_db_view(db, &tref.name, tref.alias.as_deref(), params)?
             {
@@ -13896,6 +13964,21 @@ impl Connection {
                 .map(DbRef::Attached)
                 .ok_or_else(|| Error::Error(alloc::format!("unknown database {s}"))),
         }
+    }
+
+    /// A `temp.`-qualified read is only resolvable once the temp database has
+    /// been materialized (by a temp write). Until then SQLite reports the name
+    /// as missing (the temp schema simply holds no such table) — without this
+    /// guard a read would reach [`db_parts`](Self::db_parts) and panic.
+    fn guard_qualified_temp(&self, db: DbRef, qualifier: Option<&str>, name: &str) -> Result<()> {
+        if db == DbRef::Temp && self.temp_db.is_none() {
+            return Err(Error::Error(alloc::format!(
+                "no such table: {}.{}",
+                qualifier.unwrap_or("temp"),
+                name
+            )));
+        }
+        Ok(())
     }
 
     /// The schema catalog and backend for a resolved database. `Temp` requires
