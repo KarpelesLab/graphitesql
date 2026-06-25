@@ -411,3 +411,41 @@ fn dropping_a_table_drops_its_triggers() {
         .collect();
     assert_eq!(names, ["tu"]); // only u's trigger survives
 }
+
+/// A trigger-body `SELECT RAISE(…) WHERE cond` (no FROM) must reach the RAISE
+/// only when the WHERE condition is true — `SELECT RAISE(IGNORE) WHERE NEW.a<0`
+/// ignores a row only when `NEW.a<0`. Regression: graphite evaluated the RAISE
+/// projection regardless of the WHERE, so it ignored/aborted every row.
+#[test]
+fn conditional_raise_in_trigger_respects_where() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute(
+        "CREATE TRIGGER tr BEFORE INSERT ON t \
+         BEGIN SELECT RAISE(IGNORE) WHERE NEW.a < 0; END",
+    )
+    .unwrap();
+    // a>=0 inserts; a<0 is ignored (RAISE(IGNORE) fired only for that row).
+    c.execute("INSERT INTO t VALUES(5)").unwrap();
+    c.execute("INSERT INTO t VALUES(-1)").unwrap();
+    c.execute("INSERT INTO t VALUES(3)").unwrap();
+    assert_eq!(
+        c.query("SELECT group_concat(a) FROM t").unwrap().rows[0][0],
+        Value::Text("5,3".into())
+    );
+
+    // RAISE(ABORT) WHERE cond: a passing-condition row aborts, others succeed.
+    let mut c2 = Connection::open_memory().unwrap();
+    c2.execute("CREATE TABLE t(a)").unwrap();
+    c2.execute(
+        "CREATE TRIGGER tr BEFORE INSERT ON t \
+         BEGIN SELECT RAISE(ABORT,'neg') WHERE NEW.a < 0; END",
+    )
+    .unwrap();
+    c2.execute("INSERT INTO t VALUES(7)").unwrap(); // condition false -> no abort
+    assert!(c2.execute("INSERT INTO t VALUES(-2)").is_err()); // condition true -> abort
+    assert_eq!(
+        c2.query("SELECT count(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+}

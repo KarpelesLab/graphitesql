@@ -5023,6 +5023,20 @@ impl Connection {
     /// error (arming the statement-atomicity flags); `RAISE(IGNORE)` sets
     /// `raise_ignore` so the firing row operation is silently skipped.
     fn run_trigger_select(&self, sel: &Select, params: &Params) -> Result<()> {
+        // A bare `SELECT RAISE(…) [WHERE cond]` (no FROM) reaches the RAISE only
+        // for the single row that passes WHERE — `SELECT RAISE(IGNORE) WHERE
+        // NEW.a<0` must NOT raise when the condition is false. Evaluate the WHERE
+        // in the trigger's row context (NEW/OLD via the subquery runner) and skip
+        // the projection when it is not true. (A trigger-body SELECT with a FROM
+        // is not a RAISE form handled here; leave it to the projection scan.)
+        if sel.from.is_none() {
+            if let Some(w) = &sel.where_clause {
+                let ctx = EvalCtx::rowless(params).with_subqueries(self);
+                if eval::truth(&eval::eval(w, &ctx)?) != Some(true) {
+                    return Ok(());
+                }
+            }
+        }
         for col in &sel.columns {
             if let ResultColumn::Expr { expr, .. } = col {
                 self.eval_raise_expr(expr, params)?;
