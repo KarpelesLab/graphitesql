@@ -262,10 +262,18 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
 - **D2b — a real FTS5 inverted index.** Today `MATCH` scans `_content`; the
   on-disk segment *format* is already byte-compatible (written by
   `fts5_rebuild_index`), so this is the *read* path that uses the index for scale.
-  - **D2b-1** — decode the `%_data` segment index (leaf pages, doclists, position
-    lists) for a single-term lookup.
-  - **D2b-2** — route `MATCH` through the index (term → doclist) instead of
-    scanning every document; keep the scan as the fallback.
+  - **D2b-1** — *Done:* decode the `%_data` segment index (leaf header, page-index
+    footer, prefix-compressed term keys, doclists, position lists) for a
+    single-term lookup — `decode_term` in `src/fts5_index.rs`, the byte-inverse of
+    the writer. Single-leaf segments only; a spanning/interior/doclist-index
+    segment returns `None` so the caller falls back to the `_content` scan.
+    Verified by writer→decoder round-trips and against `sqlite3`-written leaves
+    (`tests/fts5_decode.rs`).
+  - **D2b-2** — route `MATCH` through the index (`decode_term`) instead of
+    scanning every document; keep the `_content` scan as the fallback (and for the
+    multi-leaf/interior cases `decode_term` returns `None` on).
+  - **D2b-3** — extend the decoder to spanning doclists + interior /
+    doclist-index pages (the multi-leaf cases `D2b-1` leaves on the scan).
 - **D2e-encoder — byte-identical FTS5 at large scale** (structural validity holds
   today; these only affect exact-byte parity past a few leaves, and each needs the
   fts5 writer source for the precise split heuristic): the combined
