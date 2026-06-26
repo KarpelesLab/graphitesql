@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/KarpelesLab/graphitesql/compare/v0.0.10...v0.0.11) - 2026-06-26
+
+### Added
+
+- *(exec)* reserve the sqlite_ object-name prefix for internal use
+- *(vdbe)* run N-table LEFT/INNER join chains on the VDBE
+
+### Documentation
+
+- note DELETE/UPDATE eager column resolution in ROADMAP
+- record eager-resolution coverage (ON, star qualifier, qualified GROUP/ORDER refs)
+
+### Fixed
+
+- *(func)* substr(X, NULL [, ...]) returns NULL for a NULL start
+- *(func)* trim/ltrim/rtrim return NULL for a NULL trim-set
+- *(exec)* don't panic on rowid overflow at the i64::MAX boundary
+- *(exec)* silently ignore an unrecognized PRAGMA name
+- *(exec)* reject duplicate CTE names within one WITH clause
+- *(exec)* a row value in a scalar context reports "row value misused"
+- *(exec)* window function in WHERE/HAVING reports "misuse of window function"
+- *(exec)* reject aggregate functions in the GROUP BY clause
+- *(exec)* string_agg requires its separator; recognize JSON group aggregates
+- *(exec)* count() with no arguments behaves as count(*)
+- *(exec)* report "DISTINCT aggregates must have exactly one argument"
+- *(func)* validate the likelihood() probability argument
+- *(datetime)* strftime defaults to 'now' and coerces a non-text format
+- *(json)* json_remove with a NULL path returns NULL
+- *(json)* coerce non-text JSON paths to text and short-circuit NULL paths
+- *(exec)* quote the table name in the multiple-primary-key error
+- *(parser)* UPDATE SET tuple-width mismatch uses sqlite's wording
+- *(exec)* match sqlite's INSERT column-resolution error messages
+- *(exec)* resolve DELETE/UPDATE WHERE and SET-value columns eagerly
+- *(exec)* eagerly resolve qualified refs in GROUP BY / HAVING / ORDER BY
+- *(exec)* reject a star whose table qualifier names no FROM source
+- *(exec)* extend eager column resolution to join ON predicates
+- *(exec)* resolve column references eagerly so a missing column errors on an empty result
+
 ## [0.0.10](https://github.com/KarpelesLab/graphitesql/compare/v0.0.9...v0.0.10) - 2026-06-26
 
 ### Added
