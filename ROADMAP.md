@@ -388,6 +388,25 @@ is *perf/coverage*, not correctness.
       tests (incl. `WHERE …col IS NULL`, both empty sides, compound `ON`, `coalesce`
       over nulls, LIMIT/OFFSET across passes, `ORDER BY` with NULL-first/last keys,
       and `DISTINCT` over duplicate matched/null-padded rows).
+    - *Also done — N-table `LEFT`/`INNER` join chains on the VDBE.*
+      `compile_left_join_n` generalizes the two-table null-padding loop to a
+      left-deep chain of 2–4 joins, all `LEFT` or `INNER` with at least one `LEFT`
+      (no `NATURAL`/`USING`). A recursive emitter (`emit_join_level`) nests one
+      cursor per table — cursor 0 the always-preserved base — and at each level
+      keeps a per-outer-row "matched" flag: a `LEFT` level whose `ON` matched no
+      inner row null-pads that cursor (`NullRow`) and *still* recurses into the
+      deeper cursors (whose `ON`s may reference the now-NULL columns), while an
+      `INNER` level simply yields nothing. Each join's `ON` gates matches at its own
+      level (kept separate from `WHERE`); `WHERE` filters the fully-assembled row at
+      the innermost leaf, where projection + `DISTINCT` (BINARY) + `ORDER BY` (one
+      sorter) + constant `LIMIT`/`OFFSET` reuse the same emit helpers as the
+      two-table path. The fold order (outermost cursor slowest, each level's matches
+      in scan order then its null-padded row) matches SQLite's left-deep join order.
+      A `RIGHT`/`FULL` join anywhere, `NATURAL`/`USING`, a depth > 4, or a
+      GROUP-BY/aggregate/HAVING shape falls back. Differentially tested vs sqlite
+      3.50.4 in `tests/vdbe_outer_join_chain.rs` (3- and 4-table `LEFT`/`INNER`
+      mixes, mid-chain and tail null-padding, fully-null tails, `WHERE …IS NULL`,
+      `DISTINCT`, `coalesce`, and `LIMIT`/`OFFSET`).
   - **B5b-2** — seek-driven inner cursor (rowid/PK/index) over real storage
     (`OpenRead` + a b-tree `TableCursor`), mirroring the tree-walker's inner-join
     seeks. Needs the VDBE interpreter to hold live storage cursors (the larger B8

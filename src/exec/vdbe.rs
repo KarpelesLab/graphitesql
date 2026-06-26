@@ -15,7 +15,7 @@
 
 use crate::error::{Error, Result};
 use crate::exec::eval::Affinity;
-use crate::sql::ast::{BinaryOp, Expr, Literal, OrderTerm, ResultColumn, Select};
+use crate::sql::ast::{BinaryOp, Expr, JoinKind, Literal, OrderTerm, ResultColumn, Select};
 use crate::value::{Collation, Value};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -2954,6 +2954,341 @@ pub fn compile_full_join2(
     // backpatched inline above).
     if let Some(at) = elimit {
         set(&mut c.ops, at, end);
+    }
+    Ok(Program {
+        ops: c.ops,
+        n_registers: c.next_reg,
+        columns: projections.into_iter().map(|(_, l)| l).collect(),
+    })
+}
+
+/// Shared context for the recursive [`emit_join_level`] emitter of an N-table
+/// outer-join chain. The per-cursor `kinds`/`ons`/`matched_regs` are indexed by
+/// `k - 1` for cursor `k` (cursor 0 is the always-preserved base table, so it has
+/// no join kind, `ON`, or matched flag).
+struct LeftJoinNCtx<'a> {
+    sel: &'a Select,
+    projections: &'a [(Expr, String)],
+    count: usize,
+    distinct: bool,
+    offset_reg: Option<usize>,
+    limit_reg: Option<usize>,
+    key_start: usize,
+    key_specs: &'a [(Expr, SortKey)],
+    ordering: bool,
+    /// `kinds[k - 1]` is the join (`Left` or `Inner`) that brings in cursor `k`.
+    kinds: &'a [JoinKind],
+    /// `ons[k - 1]` is cursor `k`'s `ON` predicate (`None` ⇒ always matches).
+    ons: &'a [Option<Expr>],
+    /// `matched_regs[k - 1]` is cursor `k`'s per-outer-row "any inner row matched"
+    /// flag register; reset to 0 on each entry, set to 1 by a matching inner row.
+    matched_regs: &'a [usize],
+    n_cursors: usize,
+}
+
+/// Recursively emit the nested loop for cursor `k` (1-based) of a left-deep
+/// outer-join chain, then — at `k == n_cursors` — the leaf row emit (WHERE gate +
+/// projection + DISTINCT + sorter/OFFSET/LIMIT). For a `Left` level a fully
+/// unmatched outer row null-pads cursor `k` (`NullRow`) and still recurses into the
+/// inner cursors (whose `ON`s may reference the now-NULL columns); an `Inner` level
+/// simply yields nothing when no inner row matches. The fold order (cursor 0
+/// outermost, innermost advancing fastest, each level's matches in scan order then
+/// its null-padded row) matches SQLite's left-deep join row order. `limit_fixups`
+/// collects the leaf `DecrJumpZero` op indices, which the caller backpatches to the
+/// program's `Halt`.
+fn emit_join_level(
+    c: &mut Compiler,
+    k: usize,
+    ctx: &LeftJoinNCtx,
+    limit_fixups: &mut Vec<usize>,
+) -> Result<()> {
+    fn bp(ops: &mut [Op], at: usize, tgt: usize) {
+        match &mut ops[at] {
+            Op::IfFalse { target, .. }
+            | Op::IfPosDecr { target, .. }
+            | Op::DecrJumpZero { target, .. }
+            | Op::Goto { target }
+            | Op::DistinctCheck { target, .. }
+            | Op::RewindC { target, .. }
+            | Op::NextC { target, .. } => *target = tgt,
+            _ => {}
+        }
+    }
+    if k == ctx.n_cursors {
+        // Leaf: gate the fully-assembled row on WHERE, then emit it.
+        let where_skip = match &ctx.sel.where_clause {
+            Some(pred) => {
+                let r = c.compile_expr(pred)?;
+                let at = c.ops.len();
+                c.ops.push(Op::IfFalse { reg: r, target: 0 });
+                Some(at)
+            }
+            None => None,
+        };
+        let sorter = if ctx.ordering {
+            Some((ctx.key_start, ctx.key_specs))
+        } else {
+            None
+        };
+        let (offset_skip, limit_done, distinct_skip) = emit_output_row(
+            c,
+            ctx.projections,
+            ctx.count,
+            ctx.offset_reg,
+            ctx.limit_reg,
+            sorter,
+            ctx.distinct,
+        )?;
+        let cont = c.ops.len();
+        if let Some(at) = where_skip {
+            bp(&mut c.ops, at, cont);
+        }
+        if let Some(at) = offset_skip {
+            bp(&mut c.ops, at, cont);
+        }
+        if let Some(at) = distinct_skip {
+            bp(&mut c.ops, at, cont);
+        }
+        if let Some(at) = limit_done {
+            limit_fixups.push(at);
+        }
+        return Ok(());
+    }
+    let mreg = ctx.matched_regs[k - 1];
+    let kind = ctx.kinds[k - 1];
+    let on = &ctx.ons[k - 1];
+    c.ops.push(Op::Integer {
+        value: 0,
+        dest: mreg,
+    });
+    let rewind = c.ops.len();
+    c.ops.push(Op::RewindC {
+        cursor: k,
+        target: 0,
+    }); // empty cursor → null-check
+    let loopk = c.ops.len();
+    // ON gate: a non-matching inner row advances without recursing.
+    let on_skip = match on {
+        Some(pred) => {
+            let r = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse { reg: r, target: 0 });
+            Some(at)
+        }
+        None => None,
+    };
+    c.ops.push(Op::Integer {
+        value: 1,
+        dest: mreg,
+    });
+    emit_join_level(c, k + 1, ctx, limit_fixups)?;
+    let nextk = c.ops.len();
+    c.ops.push(Op::NextC {
+        cursor: k,
+        target: loopk,
+    });
+    if let Some(at) = on_skip {
+        bp(&mut c.ops, at, nextk);
+    }
+    // Null-check (also the empty-cursor target).
+    let nullcheck = c.ops.len();
+    bp(&mut c.ops, rewind, nullcheck);
+    if matches!(kind, JoinKind::Left) {
+        let if_unmatched = c.ops.len();
+        c.ops.push(Op::IfFalse {
+            reg: mreg,
+            target: 0,
+        }); // not matched → null-pad
+        let goto_after = c.ops.len();
+        c.ops.push(Op::Goto { target: 0 }); // matched → after
+        let null_body = c.ops.len();
+        bp(&mut c.ops, if_unmatched, null_body);
+        c.ops.push(Op::NullRow { cursor: k });
+        emit_join_level(c, k + 1, ctx, limit_fixups)?;
+        let after = c.ops.len();
+        bp(&mut c.ops, goto_after, after);
+    }
+    // An `Inner` level needs no null-pad: an unmatched outer combination simply
+    // produces no row (control falls through to the caller).
+    Ok(())
+}
+
+/// Compile an N-table left-deep chain of `LEFT`/`INNER` joins
+/// (`SELECT … FROM a LEFT JOIN b ON … [LEFT|INNER] JOIN c ON … …`) into a single
+/// null-padding nested-loop program (B5b-1, N-table generalization of
+/// [`compile_left_join2`]). `columns`/`tables`/`affinities`/`collations` are the
+/// tables' arrays concatenated left-to-right; `boundaries` holds the cumulative
+/// per-cursor column counts. `kinds[i]`/`ons[i]` describe the join that brings in
+/// cursor `i + 1` (cursor 0 is the always-preserved base). Each join's `ON` gates
+/// matches at its own level (it is NOT merged into `WHERE`, since a `LEFT` level's
+/// unmatched row must still be null-padded); `WHERE` filters the fully-assembled
+/// row at the leaf. Supports projection + WHERE + DISTINCT (BINARY) + ORDER BY
+/// (staged through one sorter) + constant LIMIT/OFFSET; returns `Unsupported` for
+/// GROUP BY / aggregates / HAVING. The caller routes a chain of ≥ 2 joins, all
+/// `LEFT`/`INNER` with at least one `LEFT`, no `NATURAL`/`USING`, here; any other
+/// shape (or a too-deep chain) falls back to the tree-walker.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_left_join_n(
+    sel: &Select,
+    columns: &[String],
+    tables: &[String],
+    affinities: &[Affinity],
+    collations: &[Collation],
+    boundaries: &[usize],
+    kinds: &[JoinKind],
+    ons: &[Option<Expr>],
+) -> Result<Program> {
+    let n_cursors = boundaries.len();
+    debug_assert!(n_cursors >= 2 && boundaries[n_cursors - 1] == columns.len());
+    debug_assert!(kinds.len() == n_cursors - 1 && ons.len() == n_cursors - 1);
+    if !sel.compound.is_empty() || !sel.group_by.is_empty() || sel.having.is_some() {
+        return Err(Error::Unsupported(
+            "VDBE: outer-join shape not nested-loopable",
+        ));
+    }
+    if sel.distinct && collations.iter().any(|cl| *cl != Collation::Binary) {
+        return Err(Error::Unsupported(
+            "VDBE: non-BINARY collation with DISTINCT",
+        ));
+    }
+    let projections = expand_projections(sel, columns, tables)?;
+    if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
+        return Err(Error::Unsupported("VDBE: aggregate over an outer join"));
+    }
+    let count = projections.len();
+    if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
+        return Ok(Program {
+            ops: alloc::vec![Op::Halt],
+            n_registers: count,
+            columns: projections.into_iter().map(|(_, l)| l).collect(),
+        });
+    }
+    let mut c = Compiler {
+        ops: Vec::new(),
+        next_reg: count,
+        columns: columns.to_vec(),
+        tables: tables.to_vec(),
+        affinities: affinities.to_vec(),
+        collations: collations.to_vec(),
+        bindings: Vec::new(),
+        forbid_raw_columns: false,
+        rowid_index: None,
+        cursor_boundaries: Some(boundaries.to_vec()),
+    };
+    let limit_reg = match &sel.limit {
+        None => None,
+        Some(e) => match fold_const_int(e) {
+            Some(n) if n < 0 => None,
+            Some(n) => {
+                let r = c.alloc();
+                c.ops.push(Op::Integer { value: n, dest: r });
+                Some(r)
+            }
+            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
+        },
+    };
+    let offset_reg = match &sel.offset {
+        None => None,
+        Some(e) => match fold_const_int(e) {
+            Some(n) if n <= 0 => None,
+            Some(n) => {
+                let r = c.alloc();
+                c.ops.push(Op::Integer { value: n, dest: r });
+                Some(r)
+            }
+            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
+        },
+    };
+    let matched_regs: Vec<usize> = (0..n_cursors - 1).map(|_| c.alloc()).collect();
+    let ordering = !sel.order_by.is_empty();
+    let key_specs = if ordering {
+        build_sort_keys(&c, sel, columns, &projections, count)?
+    } else {
+        Vec::new()
+    };
+    let key_start = c.next_reg;
+    for _ in &key_specs {
+        c.alloc();
+    }
+    let mut limit_fixups: Vec<usize> = Vec::new();
+    let ctx = LeftJoinNCtx {
+        sel,
+        projections: &projections,
+        count,
+        distinct: sel.distinct,
+        offset_reg,
+        limit_reg,
+        key_start,
+        key_specs: &key_specs,
+        ordering,
+        kinds,
+        ons,
+        matched_regs: &matched_regs,
+        n_cursors,
+    };
+    // Outermost cursor 0 loop (the always-preserved base table).
+    let rewind0 = c.ops.len();
+    c.ops.push(Op::RewindC {
+        cursor: 0,
+        target: 0,
+    });
+    let loop0 = c.ops.len();
+    emit_join_level(&mut c, 1, &ctx, &mut limit_fixups)?;
+    c.ops.push(Op::NextC {
+        cursor: 0,
+        target: loop0,
+    });
+    let scan_done = c.ops.len();
+    // With ORDER BY, sort then walk the sorter applying OFFSET then LIMIT to the
+    // ordered output; without it, `scan_done` is just the Halt point.
+    let elimit = if ordering {
+        c.ops.push(Op::SorterSort {
+            keys: key_specs.iter().map(|(_, k)| k.clone()).collect(),
+        });
+        let srewind = c.ops.len();
+        c.ops.push(Op::SorterRewind { target: 0 });
+        let ebody = c.ops.len();
+        let eoffset = offset_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::IfPosDecr { reg: r, target: 0 });
+            at
+        });
+        c.ops.push(Op::SorterRow { start: 0, count });
+        c.ops.push(Op::ResultRow { start: 0, count });
+        let elimit = limit_reg.map(|r| {
+            let at = c.ops.len();
+            c.ops.push(Op::DecrJumpZero { reg: r, target: 0 });
+            at
+        });
+        let snext = c.ops.len();
+        c.ops.push(Op::SorterNext { target: ebody });
+        let eend = c.ops.len();
+        if let Op::SorterRewind { target } = &mut c.ops[srewind] {
+            *target = eend;
+        }
+        if let Some(at) = eoffset {
+            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
+                *target = snext;
+            }
+        }
+        elimit
+    } else {
+        None
+    };
+    let end = c.ops.len();
+    c.ops.push(Op::Halt);
+    if let Op::RewindC { target, .. } = &mut c.ops[rewind0] {
+        *target = scan_done; // empty base table → no rows (drains the empty sorter)
+    }
+    for at in limit_fixups {
+        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
+            *target = end;
+        }
+    }
+    if let Some(at) = elimit {
+        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
+            *target = end;
+        }
     }
     Ok(Program {
         ops: c.ops,

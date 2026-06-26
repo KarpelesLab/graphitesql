@@ -1350,9 +1350,26 @@ impl Connection {
             let is_left_2 = single && from.joins[0].kind == sql::ast::JoinKind::Left;
             let is_right_2 = single && from.joins[0].kind == sql::ast::JoinKind::Right;
             let is_full_2 = single && from.joins[0].kind == sql::ast::JoinKind::Full;
+            // A left-deep chain of ≥ 2 LEFT/INNER joins (at least one LEFT, no
+            // NATURAL/USING, bounded depth) runs as one N-table null-padding nested
+            // loop (`compile_left_join_n`). A pure-INNER chain stays on the inner
+            // path below; RIGHT/FULL or NATURAL/USING anywhere falls back.
+            let left_inner_chain = from.joins.len() >= 2
+                && from.joins.len() <= 4
+                && from.joins.iter().all(|j| {
+                    matches!(j.kind, sql::ast::JoinKind::Left | sql::ast::JoinKind::Inner)
+                        && !j.natural
+                        && j.using.is_empty()
+                });
+            let is_left_chain = left_inner_chain
+                && from
+                    .joins
+                    .iter()
+                    .any(|j| j.kind == sql::ast::JoinKind::Left);
             if !is_left_2
                 && !is_right_2
                 && !is_full_2
+                && !is_left_chain
                 && from.joins.iter().any(|j| {
                     j.kind != sql::ast::JoinKind::Inner || j.natural || !j.using.is_empty()
                 })
@@ -1378,6 +1395,50 @@ impl Connection {
                 combined_tables.extend(t.iter().cloned());
                 combined_aff.extend(a.iter().copied());
                 combined_coll.extend(l.iter().copied());
+            }
+            // A left-deep chain of ≥ 2 LEFT/INNER joins (cursor 0 = the base table,
+            // each join bringing one more cursor in declaration order) runs as one
+            // N-table null-padding nested loop. Each join's ON gates matches at its
+            // own level (kept separate from WHERE, since a LEFT level's unmatched
+            // outer row must still be null-padded); WHERE filters the assembled row.
+            if is_left_chain {
+                let join_cols: Vec<ColumnInfo> = (0..combined.len())
+                    .map(|i| ColumnInfo {
+                        name: combined[i].clone(),
+                        table: combined_tables[i].clone(),
+                        affinity: combined_aff[i],
+                        collation: combined_coll[i],
+                    })
+                    .collect();
+                if validate_unambiguous_columns(sel, &join_cols).is_err() {
+                    return Err(Error::Unsupported("VDBE: ambiguous column name"));
+                }
+                // boundaries[i] = end of cursor i's columns in the combined row.
+                let mut boundaries = Vec::with_capacity(sources.len());
+                let mut acc = 0;
+                for src in &sources {
+                    acc += src.0.len();
+                    boundaries.push(acc);
+                }
+                let kinds: Vec<sql::ast::JoinKind> = from.joins.iter().map(|j| j.kind).collect();
+                let ons: Vec<Option<sql::ast::Expr>> =
+                    from.joins.iter().map(|j| j.on.clone()).collect();
+                let prog = vdbe::compile_left_join_n(
+                    sel,
+                    &combined,
+                    &combined_tables,
+                    &combined_aff,
+                    &combined_coll,
+                    &boundaries,
+                    &kinds,
+                    &ons,
+                )?;
+                let rowsets: Vec<&[Vec<Value>]> = sources.iter().map(|s| s.4.as_slice()).collect();
+                let result = vdbe::run_rows_multi(&prog, &rowsets)?;
+                return Ok(QueryResult {
+                    columns: prog.columns,
+                    rows: result,
+                });
             }
             // A two-table LEFT/RIGHT JOIN: the ON predicate gates which inner rows
             // match (an unmatched preserved-side row gets one null-padded output
