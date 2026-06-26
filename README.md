@@ -128,12 +128,14 @@ SQLite's default `|`-separated list mode.
 
 | feature | default | effect |
 |---------|---------|--------|
-| `std`   | on      | std-file `Vfs`, `std::error::Error` impl |
-| `fts5`  | on      | built-in FTS5 full-text search (`MATCH`, `bm25()`/`rank`, `highlight()`) |
+| `std`     | on  | std-file `Vfs`, `std::error::Error` impl |
+| `fts5`    | on  | built-in FTS5 full-text search (`MATCH`, `bm25()`/`rank`, `highlight()`) |
+| `unicode` | off | `upper()`/`lower()` fold the full Unicode range (`café` → `CAFÉ`); the default folds ASCII only, exactly like stock `sqlite3` |
 
 Disable default features for `no_std`. An in-memory VFS (`:memory:`) is always
 available, including on wasm. Drop `fts5` (e.g. `--no-default-features --features
-std`) to build without full-text search.
+std`) to build without full-text search. Enable `unicode` for full-Unicode
+case-folding (the default matches stock `sqlite3`'s ASCII-only `upper()`/`lower()`).
 
 ## Building & testing
 
