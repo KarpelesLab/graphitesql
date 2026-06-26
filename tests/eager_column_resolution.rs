@@ -55,6 +55,24 @@ fn have_sqlite() -> bool {
     Command::new("sqlite3").arg("--version").output().is_ok()
 }
 
+/// The exact error text sqlite3 prints for `sql` (without the `Error: ` prefix
+/// or the `in prepare, ` location note), or `None` if it accepts the statement.
+fn sqlite_error_text(sql: &str) -> Option<String> {
+    let out = Command::new("sqlite3")
+        .arg(":memory:")
+        .arg(sql)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let err = err.trim();
+    if err.is_empty() {
+        return None;
+    }
+    let msg = err.strip_prefix("Error: ").unwrap_or(err);
+    let msg = msg.strip_prefix("in prepare, ").unwrap_or(msg);
+    Some(msg.to_string())
+}
+
 #[test]
 fn missing_column_errors_match_sqlite() {
     let queries = &[
@@ -211,6 +229,61 @@ fn valid_queries_over_empty_or_filtered_data_still_succeed() {
             c.query(q).is_ok(),
             "graphite wrongly rejected the valid query `{q}`"
         );
+    }
+}
+
+#[test]
+fn insert_column_resolution_messages_match_sqlite() {
+    // SQLite rejects a bad INSERT at prepare time with one of three messages:
+    //   * unknown column        → `table T has no column named C`
+    //   * explicit-list count   → `M values for N columns`
+    //   * implicit/SELECT count → `table T has N columns but M values were supplied`
+    // graphite must produce the byte-identical text (not just *an* error).
+    let cases: &[(&str, &str)] = &[
+        // Unknown column in an explicit column list (rowid table).
+        ("CREATE TABLE t(a,b);", "INSERT INTO t(zz) VALUES(1)"),
+        // Count mismatch with an explicit column list.
+        ("CREATE TABLE t(a,b);", "INSERT INTO t(a) VALUES(1,2)"),
+        // Count mismatch, bare INSERT (implicit column list).
+        ("CREATE TABLE t(a,b);", "INSERT INTO t VALUES(1)"),
+        // Count mismatch via INSERT … SELECT (implicit).
+        ("CREATE TABLE t(a,b);", "INSERT INTO t SELECT 1"),
+        // Generated column: the implicit list counts only the 2 stored columns.
+        ("CREATE TABLE g(a,b,c AS (a+b));", "INSERT INTO g VALUES(1)"),
+        // Same three shapes for a WITHOUT ROWID table.
+        (
+            "CREATE TABLE w(a,b,PRIMARY KEY(a)) WITHOUT ROWID;",
+            "INSERT INTO w(zz) VALUES(1)",
+        ),
+        (
+            "CREATE TABLE w(a,b,PRIMARY KEY(a)) WITHOUT ROWID;",
+            "INSERT INTO w(a) VALUES(1,2)",
+        ),
+        (
+            "CREATE TABLE w(a,b,PRIMARY KEY(a)) WITHOUT ROWID;",
+            "INSERT INTO w VALUES(1)",
+        ),
+        (
+            "CREATE TABLE w(a,b,PRIMARY KEY(a)) WITHOUT ROWID;",
+            "INSERT INTO w SELECT 1",
+        ),
+    ];
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    for (setup, stmt) in cases {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(setup).unwrap();
+        let graphite = c
+            .execute(stmt)
+            .expect_err(&format!("graphite accepted `{stmt}` but it is invalid"))
+            .to_string()
+            .trim_start_matches("error: ")
+            .to_string();
+        let sqlite = sqlite_error_text(&format!("{setup} {stmt};"))
+            .unwrap_or_else(|| panic!("test bug: sqlite accepted `{stmt}`"));
+        assert_eq!(graphite, sqlite, "INSERT error text diverges for `{stmt}`");
     }
 }
 

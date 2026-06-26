@@ -5569,7 +5569,7 @@ impl Connection {
                     "UPSERT / RETURNING on WITHOUT ROWID tables",
                 ));
             }
-            return self.exec_insert_without_rowid(ins, &meta, &rows, params);
+            return self.exec_insert_without_rowid(ins, &meta, &rows, is_default_values, params);
         }
         let n_cols = meta.columns.len();
 
@@ -5588,7 +5588,9 @@ impl Connection {
                     .columns
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(name))
-                    .ok_or_else(|| Error::Error(format!("no such column: {name}")))?;
+                    .ok_or_else(|| {
+                        Error::Error(format!("table {} has no column named {name}", ins.table))
+                    })?;
                 t.push(pos);
             }
             t
@@ -5610,7 +5612,12 @@ impl Connection {
             // VALUES is the one exception — it supplies an empty row meaning
             // "all defaults").
             if !is_default_values && row_exprs.len() != target.len() {
-                return Err(Error::Error("INSERT column/value count mismatch".into()));
+                return Err(insert_count_mismatch(
+                    &ins.table,
+                    !ins.columns.is_empty(),
+                    target.len(),
+                    row_exprs.len(),
+                ));
             }
             // Start every column at its DEFAULT (or NULL), then apply provided.
             // Subqueries are attached so INSERT … VALUES can use scalar subqueries
@@ -14805,6 +14812,7 @@ impl Connection {
         ins: &Insert,
         meta: &TableMeta,
         rows: &[Vec<Expr>],
+        is_default_values: bool,
         params: &Params,
     ) -> Result<usize> {
         let n_cols = meta.columns.len();
@@ -14820,15 +14828,22 @@ impl Connection {
                     meta.columns
                         .iter()
                         .position(|c| c.name.eq_ignore_ascii_case(name))
-                        .ok_or_else(|| Error::Error(format!("no such column: {name}")))
+                        .ok_or_else(|| {
+                            Error::Error(format!("table {} has no column named {name}", ins.table))
+                        })
                 })
                 .collect::<Result<_>>()?
         };
         let pk = &meta.storage_order[..meta.pk_len];
         let mut affected = 0;
         for row_exprs in rows {
-            if !ins.columns.is_empty() && row_exprs.len() != target.len() {
-                return Err(Error::Error("INSERT column/value count mismatch".into()));
+            if !is_default_values && row_exprs.len() != target.len() {
+                return Err(insert_count_mismatch(
+                    &ins.table,
+                    !ins.columns.is_empty(),
+                    target.len(),
+                    row_exprs.len(),
+                ));
             }
             let values = self.build_insert_row(meta, &target, row_exprs, params)?;
             // PRIMARY KEY / NOT NULL / CHECK constraints. `INSERT OR IGNORE`
@@ -17602,6 +17617,26 @@ fn alias_substituted(sel: &Select, columns: &[ColumnInfo]) -> Option<Select> {
 
 /// Wrap a runtime [`Value`] as a literal [`Expr`], so rows produced by an
 /// `INSERT … SELECT` can flow through the ordinary VALUES insert path.
+/// SQLite's two distinct INSERT value-count error messages. With an explicit
+/// column list it reports `{n_vals} values for {n_cols} columns`; for a bare
+/// `INSERT` (implicit column list, including `INSERT … SELECT`) it reports
+/// `table {table} has {n_cols} columns but {n_vals} values were supplied`, where
+/// `n_cols` is the number of (non-generated) target columns.
+fn insert_count_mismatch(
+    table: &str,
+    explicit_columns: bool,
+    n_cols: usize,
+    n_vals: usize,
+) -> Error {
+    if explicit_columns {
+        Error::Error(alloc::format!("{n_vals} values for {n_cols} columns"))
+    } else {
+        Error::Error(alloc::format!(
+            "table {table} has {n_cols} columns but {n_vals} values were supplied"
+        ))
+    }
+}
+
 fn value_to_literal_expr(v: Value) -> Expr {
     Expr::Literal(match v {
         Value::Null => Literal::Null,

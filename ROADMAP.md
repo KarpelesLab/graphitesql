@@ -176,6 +176,15 @@ text-preserving CREATE-text edits).
     `DELETE`/`UPDATE` resolve their `WHERE` and `SET`-value columns eagerly too
     (`validate_dml_refs`, no-`FROM` updates only). Matches sqlite for that surface
     (`tests/eager_column_resolution.rs`).
+  - **INSERT column-resolution messages (done).** A bad `INSERT` now reports
+    sqlite's exact wording rather than graphite's old generic text: an unknown
+    column in the list → `table T has no column named C`; a value-count mismatch
+    with an explicit list → `M values for N columns`; and a bare/`SELECT` insert
+    → `table T has N columns but M values were supplied` (where `N` counts the
+    non-generated target columns). The `WITHOUT ROWID` path now also catches the
+    implicit-list count mismatch it previously let slide. Both rowid and
+    `WITHOUT ROWID` paths share `insert_count_mismatch`; verified against sqlite3
+    in `tests/eager_column_resolution.rs`.
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy
