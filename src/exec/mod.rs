@@ -16938,25 +16938,13 @@ impl Connection {
     ) -> Result<Value> {
         let lname = name.to_ascii_lowercase();
 
-        // Arity guards: every aggregate but `count(*)` needs at least one
-        // argument, and `json_group_object` needs two. SQLite rejects a short
-        // call ("wrong number of arguments"); without this we would index
-        // `args[…]` out of bounds and panic (e.g. `group_concat()`).
-        if !star && args.is_empty() {
-            return Err(Error::Error(format!(
-                "wrong number of arguments to function {lname}()"
-            )));
-        }
-        if (lname == "json_group_object" || lname == "jsonb_group_object") && args.len() < 2 {
-            return Err(Error::Error(format!(
-                "wrong number of arguments to function {lname}()"
-            )));
-        }
-        // Upper-bound arity for the builtin aggregates (a registered UDAF carries
-        // its own). SQLite rejects too many arguments ("wrong number of
-        // arguments"): `sum(1,2)`, `avg(1,2)`, `count(1,2)` are all errors. The
-        // two-argument forms are `group_concat`/`string_agg` and the
-        // `json[b]_group_object` pair; every other builtin aggregate takes one.
+        // Arity guards, ordered to match SQLite's error precedence.
+        //
+        // 1. Upper bound first, for the builtin aggregates (a registered UDAF
+        //    carries its own). SQLite rejects too many arguments ("wrong number
+        //    of arguments"): `sum(1,2)`, `avg(1,2)`, `count(1,2)` are all errors.
+        //    The two-argument forms are `group_concat`/`string_agg` and the
+        //    `json[b]_group_object` pair; every other builtin aggregate takes one.
         if !self.aggregates.contains_key(&lname) {
             let max_args = match lname.as_str() {
                 "group_concat" | "string_agg" | "json_group_object" | "jsonb_group_object" => 2,
@@ -16967,6 +16955,31 @@ impl Connection {
                     "wrong number of arguments to function {lname}()"
                 )));
             }
+        }
+        // 2. A DISTINCT aggregate must have exactly one argument. This is checked
+        //    *after* the upper bound (so `count(DISTINCT 1,2)`/`sum(DISTINCT 1,2)`
+        //    still report the arity error) but *before* the lower-bound guards
+        //    below (so `count(DISTINCT)`, whose 0-arg form is otherwise valid as
+        //    `count(*)`, reports this rather than "wrong number of arguments").
+        //    `group_concat(DISTINCT a,b)` — within its 2-arg upper bound — lands
+        //    here too. The scalar 2-arg `min`/`max` never reach this path.
+        if distinct && !star && args.len() != 1 {
+            return Err(Error::Error(
+                "DISTINCT aggregates must have exactly one argument".into(),
+            ));
+        }
+        // 3. Lower bound: every aggregate but `count(*)` needs at least one
+        //    argument, and `json_group_object` needs two. Without this we would
+        //    index `args[…]` out of bounds and panic (e.g. `group_concat()`).
+        if !star && args.is_empty() {
+            return Err(Error::Error(format!(
+                "wrong number of arguments to function {lname}()"
+            )));
+        }
+        if (lname == "json_group_object" || lname == "jsonb_group_object") && args.len() < 2 {
+            return Err(Error::Error(format!(
+                "wrong number of arguments to function {lname}()"
+            )));
         }
 
         // An `ORDER BY` inside the aggregate (`group_concat(x ORDER BY y)`) sorts

@@ -98,9 +98,21 @@ fn string_agg_is_group_concat_alias() {
         .unwrap();
     assert_eq!(r.rows[0][1], Value::Text("x-y".into()));
     assert_eq!(r.rows[1][1], Value::Text("z".into()));
-    // DISTINCT works like group_concat.
+    // DISTINCT works like group_concat — but, exactly like group_concat, a
+    // separator cannot be combined with DISTINCT: SQLite rejects the two-argument
+    // DISTINCT form with "DISTINCT aggregates must have exactly one argument".
+    let err = c
+        .query("SELECT string_agg(DISTINCT v, ',') FROM (SELECT 'a' v UNION ALL SELECT 'a' UNION ALL SELECT 'b')")
+        .unwrap_err()
+        .to_string();
     assert_eq!(
-        c.query("SELECT string_agg(DISTINCT v, ',') FROM (SELECT 'a' v UNION ALL SELECT 'a' UNION ALL SELECT 'b')")
+        err.trim_start_matches("error: "),
+        "DISTINCT aggregates must have exactly one argument"
+    );
+    // The single-argument DISTINCT form (default ',' separator) is the allowed
+    // one — shown with `group_concat`, whose separator is optional.
+    assert_eq!(
+        c.query("SELECT group_concat(DISTINCT v) FROM (SELECT 'a' v UNION ALL SELECT 'a' UNION ALL SELECT 'b')")
             .unwrap()
             .rows[0][0],
         Value::Text("a,b".into())

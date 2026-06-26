@@ -219,6 +219,17 @@ text-preserving CREATE-text edits).
     *Remaining (both cases):* graphite validates lazily, so an unreached row
     (`SELECT likelihood(a,2) FROM empty`) is not rejected at prepare time as
     sqlite would; a statement-level prepare pass would be needed.
+  - **DISTINCT-aggregate arity message (done).** A `DISTINCT` aggregate with a
+    number of arguments other than one now reports sqlite's `DISTINCT aggregates
+    must have exactly one argument`, checked after the function's upper arity
+    bound (so `count(DISTINCT 1,2)`/`sum(DISTINCT 1,2)` still report "wrong number
+    of arguments") but before the lower bound (so `count(DISTINCT)`, whose 0-arg
+    form is valid as `count(*)`, and `group_concat(DISTINCT a,b)` report the
+    DISTINCT message) (`tests/distinct_aggregate_arity.rs`).
+    *Remaining (separate divergences):* `count()` with no arguments should behave
+    as `count(*)` (graphite rejects it); `json_group_array` is not yet recognized
+    as an aggregate name; `string_agg` requires its separator (min 2 args) in
+    sqlite, whereas graphite treats it as a 1-or-2-arg `group_concat` alias.
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy
