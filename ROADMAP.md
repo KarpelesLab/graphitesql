@@ -169,13 +169,17 @@ text-preserving CREATE-text edits).
     The tree-walker resolves lazily (per row), so a result that reached no row
     used to swallow the error. `validate_columns_exist` now runs an eager check on
     a top-level, window-free block whose every `FROM` source is a plain base
-    table/view joined by `ON`/cross joins (no `NATURAL`/`USING`), matching sqlite
-    for that surface (`tests/eager_column_resolution.rs`). *Remaining:* extend it
-    past the conservative scope — derived-table/subquery scopes, `NATURAL`/`USING`
-    coalesced names, and `GROUP BY`/`HAVING`/`ORDER BY` alias/ordinal refs are
-    still left to lazy resolution; and ALTER-time re-validation that *rejects* an
-    ALTER making a dependent view/trigger unresolvable needs statement-level DDL
-    rollback (a writer savepoint around `exec_alter`, like `run_dml_atomic`).
+    table/view joined by `ON`/cross joins (no `NATURAL`/`USING`): it resolves every
+    column ref in the projection/`WHERE`/join-`ON`, a `table.*` whose qualifier
+    names no source (`no such table: x`), and any *qualified* ref in
+    `GROUP BY`/`HAVING`/`ORDER BY` (a `t.col` there is never an alias or ordinal).
+    Matches sqlite for that surface (`tests/eager_column_resolution.rs`).
+    *Remaining:* extend it past the conservative scope — derived-table/subquery
+    scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
+    `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy
+    resolution; and ALTER-time re-validation that *rejects* an ALTER making a
+    dependent view/trigger unresolvable needs statement-level DDL rollback (a
+    writer savepoint around `exec_alter`, like `run_dml_atomic`).
 
 ### Track B — Query planner, statistics & the VDBE
 
