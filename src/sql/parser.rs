@@ -1157,9 +1157,14 @@ impl Parser {
                     }
                     self.expect(&Token::RParen)?;
                     if cols.len() != exprs.len() {
-                        return Err(
-                            self.err("number of columns and values differ in UPDATE SET (…)=(…)")
-                        );
+                        // SQLite reports this as a semantic error (no parse
+                        // location), with the same wording it uses when a
+                        // `(c1,…) = (SELECT …)` row value has the wrong width.
+                        return Err(Error::Error(alloc::format!(
+                            "{} columns assigned {} values",
+                            cols.len(),
+                            exprs.len()
+                        )));
                     }
                     for (c, e) in cols.into_iter().zip(exprs) {
                         assignments.push((c, e));

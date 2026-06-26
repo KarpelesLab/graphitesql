@@ -152,3 +152,31 @@ fn row_subquery_with_where() {
         "SELECT id,a,b FROM t ORDER BY id",
     );
 }
+
+#[test]
+fn parallel_tuple_width_mismatch_matches_sqlite() {
+    // `UPDATE t SET (a,b) = (1)` — a parallel-expression tuple whose width does
+    // not match the column list. SQLite reports `N columns assigned M values`
+    // (a semantic error, no parse location); graphite must match that body.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a,b,c)").unwrap();
+    let body = c
+        .execute("UPDATE t SET (a,b) = (1)")
+        .unwrap_err()
+        .to_string();
+    let body = body.trim_start_matches("error: ");
+    assert_eq!(body, "2 columns assigned 1 values");
+
+    if sqlite3_available() {
+        let out = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg("CREATE TABLE t(a,b,c); UPDATE t SET (a,b) = (1);")
+            .output()
+            .unwrap();
+        let sq = String::from_utf8_lossy(&out.stderr);
+        let mut sq = sq.trim();
+        sq = sq.strip_prefix("Error: ").unwrap_or(sq);
+        sq = sq.strip_prefix("in prepare, ").unwrap_or(sq);
+        assert_eq!(body, sq);
+    }
+}

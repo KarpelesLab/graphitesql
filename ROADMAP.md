@@ -185,6 +185,11 @@ text-preserving CREATE-text edits).
     implicit-list count mismatch it previously let slide. Both rowid and
     `WITHOUT ROWID` paths share `insert_count_mismatch`; verified against sqlite3
     in `tests/eager_column_resolution.rs`.
+  - **UPDATE SET tuple-width message (done).** `UPDATE t SET (a,b) = (1)` (a
+    parallel-expression tuple narrower/wider than the column list) reported a
+    graphite-specific parse error with a byte location; it now raises sqlite's
+    semantic `N columns assigned M values` — the same wording the row-value
+    `(c1,…) = (SELECT …)` path already used (`tests/update_row_subquery.rs`).
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy
