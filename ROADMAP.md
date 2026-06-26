@@ -249,6 +249,14 @@ text-preserving CREATE-text edits).
     evaluation previously accepted silently. The check runs after alias/positional
     resolution; aggregates remain legal in `HAVING`/`ORDER BY`
     (`tests/group_by_aggregate.rs`).
+  - **Window function in `WHERE`/`HAVING` is "misuse" (done).** A call carrying
+    an `OVER` clause — including an aggregate such as `sum(x) OVER ()`, not just
+    the ranking functions — now reports `misuse of window function NAME()` when
+    it appears in `WHERE`/`HAVING`, matching sqlite, instead of falling through
+    to the generic "aggregate … used outside an aggregate context". The per-row
+    evaluator only ever sees an `OVER` call in a disallowed position, since valid
+    window calls are pre-computed and substituted out first
+    (`tests/window_misuse.rs`).
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy

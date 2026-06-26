@@ -671,8 +671,27 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         // COLLATE only affects comparisons; the value itself is the operand's.
         Expr::Collate { expr, .. } => eval(expr, ctx),
         Expr::Function {
-            name, args, star, ..
-        } => super::func::eval_scalar(name, args, *star, ctx),
+            name,
+            args,
+            star,
+            over,
+            ..
+        } => {
+            // A window function — any call carrying an `OVER` clause, including an
+            // aggregate like `sum(x) OVER ()` — is only valid in the SELECT list /
+            // ORDER BY of a windowed query, where it is pre-computed and
+            // substituted out before this per-row evaluator runs. Reaching it here
+            // means it sits in a disallowed position (e.g. `WHERE`), which SQLite
+            // reports as "misuse of window function NAME()" rather than the generic
+            // aggregate-context error.
+            if over.is_some() {
+                return Err(Error::Error(alloc::format!(
+                    "misuse of window function {}()",
+                    name.to_ascii_lowercase()
+                )));
+            }
+            super::func::eval_scalar(name, args, *star, ctx)
+        }
         Expr::Subquery(select) => match ctx.subqueries {
             Some(s) => s.scalar(select, ctx),
             None => Err(Error::Unsupported("subquery in this context")),
