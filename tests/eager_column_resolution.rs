@@ -114,6 +114,75 @@ fn missing_column_errors_match_sqlite() {
 }
 
 #[test]
+fn missing_column_in_dml_matches_sqlite() {
+    // DELETE/UPDATE resolve their WHERE and SET-value columns eagerly too — a
+    // bogus column errors over an empty table, instead of silently affecting 0
+    // rows. (`t` here has rows, but `WHERE 0`/`a > 100` filters them all out, so
+    // lazy resolution would never reach the bad name.)
+    let stmts = &[
+        "DELETE FROM t WHERE nope = 1",
+        "DELETE FROM t WHERE t.nope = 1",
+        "DELETE FROM e WHERE nope = 1",
+        "UPDATE t SET a = 1 WHERE nope = 2",
+        "UPDATE t SET a = nope WHERE a > 100",
+        "UPDATE t SET a = 1 WHERE 0 AND b = upper(nope)",
+        "UPDATE t SET nope = 1",
+        "UPDATE e SET a = nope",
+    ];
+    if !have_sqlite() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let mut c = conn();
+    for q in stmts {
+        let graphite_err = c.execute(q).is_err();
+        let sqlite_err = sqlite_errors(q);
+        assert!(
+            sqlite_err,
+            "test bug: expected sqlite3 to reject `{q}` but it did not"
+        );
+        assert!(
+            graphite_err,
+            "graphite accepted `{q}` but sqlite3 rejects it (missing-column not caught eagerly)"
+        );
+    }
+}
+
+#[test]
+fn valid_dml_over_empty_or_filtered_data_still_succeeds() {
+    // The DML eager check must never reject a real column: valid DELETE/UPDATE
+    // over an empty table, a fully-filtered result, qualified refs, rowid, and a
+    // SET value reading another real column must all still run.
+    let setup = "\
+        CREATE TABLE e(a INT, b TEXT);\n\
+        CREATE TABLE t(a INT, b TEXT);\n\
+        INSERT INTO t VALUES (1,'x'),(2,'y');\n";
+    let mut c = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        let s = s.trim();
+        if !s.is_empty() {
+            c.execute(s).unwrap();
+        }
+    }
+    let ok = &[
+        "DELETE FROM e WHERE a = 1",
+        "DELETE FROM t WHERE 0",
+        "DELETE FROM t WHERE t.a > 100",
+        "DELETE FROM t WHERE rowid = 999",
+        "UPDATE e SET a = 1",
+        "UPDATE t SET a = b WHERE 0",
+        "UPDATE t SET a = a + 1 WHERE t.b = 'nope'",
+        "UPDATE t SET a = 1 WHERE rowid < 0",
+    ];
+    for q in ok {
+        assert!(
+            c.execute(q).is_ok(),
+            "graphite wrongly rejected the valid statement `{q}`"
+        );
+    }
+}
+
+#[test]
 fn valid_queries_over_empty_or_filtered_data_still_succeed() {
     // The eager check must never reject a *real* column, including over an empty
     // table, a fully-filtered result, a view's renamed outputs, rowid aliases,

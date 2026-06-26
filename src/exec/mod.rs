@@ -6335,6 +6335,14 @@ impl Connection {
             return self.exec_view_delete(del, params);
         }
         let meta = self.table_meta(&del.table, None)?;
+        // Resolve the WHERE columns eagerly (top-level only — a trigger body's
+        // DML may bind a bare name to NEW/OLD), so a bogus column errors even when
+        // the table has no rows, matching sqlite. See `validate_dml_refs`.
+        if self.outer_scope.borrow().is_empty() {
+            if let Some(w) = &del.where_clause {
+                self.validate_dml_refs(&del.table, &meta.columns, &[w])?;
+            }
+        }
         if meta.without_rowid {
             if !del.returning.is_empty() {
                 return Err(Error::Unsupported("RETURNING on WITHOUT ROWID tables"));
@@ -6468,6 +6476,17 @@ impl Connection {
             {
                 return Err(Error::Error(alloc::format!("no such column: {col}")));
             }
+        }
+        // Resolve the WHERE and SET-value columns eagerly too (no `FROM`, so every
+        // reference resolves to the target; top-level only, like DELETE). A bogus
+        // column then errors over an empty table, matching sqlite. `FROM` puts
+        // other tables in scope, so that shape is left to lazy resolution.
+        if upd.from.is_none() && self.outer_scope.borrow().is_empty() {
+            let mut refs: Vec<&Expr> = upd.assignments.iter().map(|(_, e)| e).collect();
+            if let Some(w) = &upd.where_clause {
+                refs.push(w);
+            }
+            self.validate_dml_refs(&upd.table, &meta.columns, &refs)?;
         }
         if meta.without_rowid {
             if !upd.returning.is_empty() {
@@ -13380,6 +13399,63 @@ impl Connection {
                 // output alias or a positional ordinal).
                 if missing.is_none() && table.is_some() {
                     missing = column_missing(table, column);
+                }
+            });
+        }
+        match missing {
+            Some(m) => Err(Error::Error(m)),
+            None => Ok(()),
+        }
+    }
+
+    /// Eager "no such column" check for a `DELETE`/`UPDATE` `WHERE` predicate and
+    /// `SET`-value expressions, the DML counterpart of [`Self::validate_columns_exist`].
+    /// SQLite resolves these at prepare time, so a bogus column errors even over an
+    /// empty table; the tree-walker resolved them per row, so a statement that
+    /// matched no row silently accepted the bad name. A `DELETE`/`UPDATE` target
+    /// takes no alias and (for the cases the caller admits) has no `FROM`, so every
+    /// reference resolves to `table` — a bare name must be one of its columns, and
+    /// a qualified ref is judged only when its qualifier *is* the target table (an
+    /// `OLD`/`NEW`/other-source qualifier is left alone). Nested-subquery bodies are
+    /// walked shallowly (not entered), so this only rejects what per-row evaluation
+    /// would have rejected too.
+    fn validate_dml_refs(
+        &self,
+        table: &str,
+        columns: &[ColumnInfo],
+        exprs: &[&Expr],
+    ) -> Result<()> {
+        let mut missing: Option<String> = None;
+        for e in exprs {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |tbl, col| {
+                if missing.is_some() {
+                    return;
+                }
+                if matches!(
+                    col.to_ascii_lowercase().as_str(),
+                    "rowid"
+                        | "oid"
+                        | "_rowid_"
+                        | "current_date"
+                        | "current_time"
+                        | "current_timestamp"
+                ) {
+                    return;
+                }
+                // A qualified ref is only ours to judge when it names the target.
+                if let Some(q) = tbl {
+                    if !q.eq_ignore_ascii_case(table) {
+                        return;
+                    }
+                }
+                if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
+                    missing = Some(match tbl {
+                        Some(t) => alloc::format!("no such column: {t}.{col}"),
+                        None => alloc::format!("no such column: {col}"),
+                    });
                 }
             });
         }
