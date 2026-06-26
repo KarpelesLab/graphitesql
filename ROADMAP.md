@@ -190,6 +190,10 @@ text-preserving CREATE-text edits).
     graphite-specific parse error with a byte location; it now raises sqlite's
     semantic `N columns assigned M values` — the same wording the row-value
     `(c1,…) = (SELECT …)` path already used (`tests/update_row_subquery.rs`).
+  - **Multiple-PRIMARY-KEY message (done).** `CREATE TABLE` with two primary keys
+    now quotes the table name like sqlite — `table "t" has more than one primary
+    key` — for both the column-level and table-level forms
+    (`tests/create_validation.rs`).
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy

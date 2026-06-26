@@ -4186,7 +4186,7 @@ impl Connection {
                 .count();
         if pk_count > 1 {
             return Err(Error::Error(alloc::format!(
-                "table {} has more than one primary key",
+                "table \"{}\" has more than one primary key",
                 ct.name
             )));
         }

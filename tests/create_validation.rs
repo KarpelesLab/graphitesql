@@ -88,6 +88,25 @@ fn aggregate_in_generated_or_check_is_rejected() {
 }
 
 #[test]
+fn multiple_primary_key_message_is_byte_exact() {
+    // SQLite quotes the table name in this prepare-time error:
+    // `table "T" has more than one primary key`. graphite dropped the quotes.
+    // Covers both the column-level and table-level PRIMARY KEY forms.
+    for ddl in [
+        "CREATE TABLE t(a PRIMARY KEY, b PRIMARY KEY)",
+        "CREATE TABLE t(a, b, PRIMARY KEY(a), PRIMARY KEY(b))",
+    ] {
+        let err = Connection::open_memory()
+            .unwrap()
+            .execute(ddl)
+            .unwrap_err()
+            .to_string();
+        let body = err.trim_start_matches("error: ");
+        assert_eq!(body, "table \"t\" has more than one primary key");
+    }
+}
+
+#[test]
 fn foreign_key_local_columns_must_exist() {
     // A table-level FOREIGN KEY's *local* columns must each be a declared column;
     // SQLite rejects an unknown one at CREATE ("unknown column … in foreign key
