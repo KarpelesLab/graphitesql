@@ -330,11 +330,30 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "lower" => {
             arity(&lname, args, 1)?;
-            str_map(&v[0], |s| s.to_lowercase())
+            // Stock sqlite3's lower()/upper() fold ASCII A–Z/a–z only; the optional
+            // `unicode` feature switches to full Unicode case-folding
+            // (`CAFÉ` → `café`), like a sqlite3 built with the ICU extension.
+            // `str::to_lowercase` provides it in core+alloc, so no dependency is
+            // needed. Default (feature off) stays byte-for-byte stock-sqlite3.
+            #[cfg(feature = "unicode")]
+            {
+                str_map(&v[0], |s| s.to_lowercase())
+            }
+            #[cfg(not(feature = "unicode"))]
+            {
+                str_map(&v[0], |s| s.to_ascii_lowercase())
+            }
         }
         "upper" => {
             arity(&lname, args, 1)?;
-            str_map(&v[0], |s| s.to_uppercase())
+            #[cfg(feature = "unicode")]
+            {
+                str_map(&v[0], |s| s.to_uppercase())
+            }
+            #[cfg(not(feature = "unicode"))]
+            {
+                str_map(&v[0], |s| s.to_ascii_uppercase())
+            }
         }
         "trim" | "ltrim" | "rtrim" => {
             // SQLite's trim family takes 1 (string) or 2 (string, chars) arguments.

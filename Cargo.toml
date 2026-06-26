@@ -29,6 +29,11 @@ std = []
 # `MATCH` query language, `bm25()`/`rank` ranking, and `highlight()`). On by
 # default; disable it to drop full-text search and shrink the build.
 fts5 = []
+# `unicode` switches the case-folding functions (`upper()` / `lower()`) from
+# stock sqlite3's ASCII-only fold to full Unicode case-folding (`café` → `CAFÉ`),
+# like a sqlite3 built with the ICU extension. Off by default so the default
+# build stays behavior-identical to stock sqlite3; turn it on for Unicode text.
+unicode = []
 
 [dependencies]
 # Intentionally none. graphitesql is pure Rust over `core` + `alloc` only.

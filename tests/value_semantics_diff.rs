@@ -119,8 +119,26 @@ fn string_functions() {
         "SELECT unicode('\u{1F600}'), length('\u{1F600}'), length(cast('\u{1F600}' as blob))",
         "SELECT hex(zeroblob(3)), typeof(zeroblob(0))",
         "SELECT ltrim('xxabc','x'), rtrim('abcyy','y')",
-        "SELECT upper('caf\u{e9}'), lower('CAF\u{c9}')",
+        // upper()/lower() over ASCII — folds identically on every sqlite3 build.
+        "SELECT upper('abc-1'), lower('ABC-1')",
     ]);
+}
+
+/// `upper()`/`lower()` on non-ASCII letters is pinned directly rather than
+/// differentially: stock sqlite3 folds ASCII only, while a sqlite3 built with the
+/// ICU extension folds Unicode, so the right answer depends on the *oracle's*
+/// build — not something the standard-build corpus can assert. Graphite picks via
+/// the `unicode` feature (off by default = stock ASCII fold).
+#[test]
+fn upper_lower_non_ascii_fold() {
+    let got = graphite("SELECT upper('caf\u{e9}'), lower('CAF\u{c9}')");
+    #[cfg(feature = "unicode")]
+    assert_eq!(
+        got, "CAF\u{c9}|caf\u{e9}",
+        "unicode feature: full Unicode fold"
+    );
+    #[cfg(not(feature = "unicode"))]
+    assert_eq!(got, "CAF\u{e9}|caf\u{c9}", "default: ASCII-only fold");
 }
 
 #[test]
