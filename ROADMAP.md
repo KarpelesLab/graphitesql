@@ -289,6 +289,14 @@ text-preserving CREATE-text edits).
     "not yet implemented: this PRAGMA". The `run_pragma` catch-all now returns an
     empty result instead, so a probing tool/ORM that reads an unsupported pragma
     sees sqlite's behaviour (`tests/unknown_pragma_ignored.rs`).
+  - **Rowid allocation no longer panics at the `i64::MAX` boundary (done).**
+    Inserting a row whose auto-assigned rowid would exceed `i64::MAX` used to
+    panic with "attempt to add with overflow". It now matches sqlite: an
+    `AUTOINCREMENT` table fails with `SQLITE_FULL` ("database or disk is full")
+    since AUTOINCREMENT never reuses a rowid, while a plain rowid / `INTEGER
+    PRIMARY KEY` table picks a random free rowid and succeeds. `next_rowid`
+    saturates and the new `auto_rowid` helper detects the exhausted range; the
+    result still passes `PRAGMA integrity_check` (`tests/rowid_overflow.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

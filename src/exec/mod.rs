@@ -5664,12 +5664,22 @@ impl Connection {
                         Value::Integer(i) => *i,
                         _ => return Err(Error::Error("datatype mismatch".into())),
                     };
-                    next_auto = next_auto.max(r + 1);
+                    // Advance the auto counter past an explicit rowid, saturating
+                    // so a row at `i64::MAX` does not overflow.
+                    next_auto = next_auto.max(r.saturating_add(1));
                     r
                 }
                 _ => {
-                    let r = next_auto;
-                    next_auto += 1;
+                    let r = self.auto_rowid(meta.root, meta.autoincrement, next_auto)?;
+                    // Advance sequentially when we stayed in range; if `auto_rowid`
+                    // left the exhausted range (a random pick below the candidate),
+                    // keep the counter saturated so each further row re-enters that
+                    // path instead of trusting a stale sequential value.
+                    next_auto = if r >= next_auto {
+                        r.saturating_add(1)
+                    } else {
+                        i64::MAX
+                    };
                     r
                 }
             };
@@ -11476,9 +11486,40 @@ impl Connection {
     fn next_rowid(&self, root: u32) -> Result<i64> {
         let mut cur = TableCursor::new(self.backend.source(), root);
         if cur.last()? {
-            Ok(cur.rowid()? + 1)
+            // Saturate so a table whose largest rowid is already `i64::MAX` does
+            // not overflow here; `auto_rowid` then detects the exhausted range
+            // (the saturated candidate is itself occupied) and either fails an
+            // AUTOINCREMENT table or picks a random free rowid, like sqlite.
+            Ok(cur.rowid()?.saturating_add(1))
         } else {
             Ok(1)
+        }
+    }
+
+    /// Allocate the rowid for an auto-assigned `INTEGER PRIMARY KEY` (or implicit
+    /// rowid) row. `cand` is the sequential candidate (largest existing rowid + 1,
+    /// saturated at `i64::MAX`). In the common case the candidate is free and is
+    /// returned as-is. When the sequential range is exhausted — `cand` has
+    /// saturated to an already-occupied `i64::MAX` — sqlite either fails an
+    /// `AUTOINCREMENT` table with `SQLITE_FULL` ("database or disk is full") or,
+    /// for a plain rowid table, picks a random free rowid. We mirror both.
+    fn auto_rowid(&self, root: u32, autoincrement: bool, cand: i64) -> Result<i64> {
+        let occupied = |r: i64| -> Result<bool> {
+            let mut cur = TableCursor::new(self.backend.source(), root);
+            cur.seek(r)
+        };
+        if cand < i64::MAX || !occupied(cand)? {
+            return Ok(cand);
+        }
+        if autoincrement {
+            return Err(Error::Error("database or disk is full".into()));
+        }
+        loop {
+            // A positive, non-zero rowid (sqlite never auto-assigns rowid <= 0).
+            let r = (eval::Subqueries::next_random(self) & i64::MAX).max(1);
+            if !occupied(r)? {
+                return Ok(r);
+            }
         }
     }
 
