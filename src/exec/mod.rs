@@ -1964,7 +1964,16 @@ impl Connection {
             "incremental_vacuum" => Err(Error::Unsupported(
                 "PRAGMA incremental_vacuum modifies the database; use execute()",
             )),
-            _ => Err(Error::Unsupported("this PRAGMA")),
+            // An unrecognized pragma name is silently ignored by sqlite — it
+            // raises no error and returns no rows ("If the pragma name is not
+            // recognized ... no error is raised, the pragma is simply
+            // ignored"). The write path (`exec_pragma`) already no-ops unknown
+            // names; mirror that on the read path so `PRAGMA made_up` and
+            // `PRAGMA made_up(1)` return an empty result instead of erroring.
+            _ => Ok(QueryResult {
+                columns: alloc::vec![name.clone()],
+                rows: Vec::new(),
+            }),
         }
     }
 

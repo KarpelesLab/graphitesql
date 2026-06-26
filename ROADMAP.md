@@ -282,6 +282,13 @@ text-preserving CREATE-text edits).
     `SELECT`/`UPDATE`/`DELETE` and with `RECURSIVE`. A same name re-used in a
     *nested* `WITH` is a separate scope and stays legal
     (`tests/duplicate_cte_name.rs`).
+  - **An unrecognized `PRAGMA` name is silently ignored (done).** sqlite raises
+    no error for an unknown pragma — it returns no rows and moves on. graphite's
+    write path already no-oped unknown setters (`PRAGMA made_up = 1`), but the
+    read/function forms (`PRAGMA made_up`, `PRAGMA made_up(1)`) errored with
+    "not yet implemented: this PRAGMA". The `run_pragma` catch-all now returns an
+    empty result instead, so a probing tool/ORM that reads an unsupported pragma
+    sees sqlite's behaviour (`tests/unknown_pragma_ignored.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
