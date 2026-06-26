@@ -2008,7 +2008,7 @@ impl Parser {
                 Ok(Expr::Parameter(p))
             }
             Some(Token::LParen) => {
-                if self.check_kw("select") || self.check_kw("with") {
+                if self.check_kw("select") || self.check_kw("with") || self.check_kw("values") {
                     let sel = self.select()?;
                     self.expect(&Token::RParen)?;
                     Ok(Expr::Subquery(Box::new(sel)))
