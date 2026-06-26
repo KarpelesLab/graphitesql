@@ -343,6 +343,12 @@ text-preserving CREATE-text edits).
     remain valid, and the bad reference is found even nested in a function call);
     graphite previously built the index silently, leaving a predicate that could
     never be evaluated (`tests/partial_index_unknown_column.rs`).
+  - **Two DDL error messages aligned verbatim (done).** A `WITHOUT ROWID` table
+    declared with no PRIMARY KEY now reports `PRIMARY KEY missing on table NAME`
+    (was `WITHOUT ROWID table must have a PRIMARY KEY`), and
+    `ALTER TABLE … RENAME COLUMN <missing> …` quotes the unknown column,
+    `no such column: "NAME"`, like the DROP COLUMN variant already did
+    (`tests/ddl_error_wording.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

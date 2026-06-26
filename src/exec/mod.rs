@@ -4276,9 +4276,10 @@ impl Connection {
         let root = if ct.without_rowid {
             // A WITHOUT ROWID table must have a PRIMARY KEY (it is the b-tree key).
             if primary_key_positions(ct).is_empty() {
-                return Err(Error::Error(
-                    "WITHOUT ROWID table must have a PRIMARY KEY".into(),
-                ));
+                return Err(Error::Error(format!(
+                    "PRIMARY KEY missing on table {}",
+                    ct.name
+                )));
             }
             create_index_root(self.backend.writer()?)?
         } else {
@@ -8643,7 +8644,7 @@ impl Connection {
                     .columns
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(old))
-                    .ok_or_else(|| Error::Error(format!("no such column: {old}")))?;
+                    .ok_or_else(|| Error::Error(format!("no such column: \"{old}\"")))?;
                 // Renaming onto an existing column name is rejected, like SQLite.
                 if ct
                     .columns
@@ -17527,9 +17528,10 @@ impl Connection {
         let (without_rowid, storage_order, pk_len) = if ct.without_rowid {
             let pk = primary_key_positions(&ct);
             if pk.is_empty() {
-                return Err(Error::Error(
-                    "WITHOUT ROWID table must have a PRIMARY KEY".into(),
-                ));
+                return Err(Error::Error(format!(
+                    "PRIMARY KEY missing on table {}",
+                    ct.name
+                )));
             }
             // Storage order: PK columns first, then the remaining *stored*
             // columns (VIRTUAL generated columns are never written).
