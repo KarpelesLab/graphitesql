@@ -241,6 +241,14 @@ text-preserving CREATE-text edits).
     as aggregates at *any* arity, so a wrong count reports `wrong number of
     arguments` from the aggregate guard instead of falling through to
     `no such function` (`tests/agg_name_arity.rs`).
+  - **Aggregate in `GROUP BY` is rejected (done).** An aggregate function
+    anywhere inside a `GROUP BY` term now reports sqlite's dedicated `aggregate
+    functions are not allowed in the GROUP BY clause` — including the nested
+    (`1 + count(*)`) and output-alias-rewritten (`SELECT count(*) AS c … GROUP BY
+    c`) forms, and the `GROUP BY max(a)` over a real table that lazy per-row
+    evaluation previously accepted silently. The check runs after alias/positional
+    resolution; aggregates remain legal in `HAVING`/`ORDER BY`
+    (`tests/group_by_aggregate.rs`).
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy

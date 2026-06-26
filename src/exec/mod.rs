@@ -12932,6 +12932,23 @@ impl Connection {
         let ncols = self.output_labels(sel, &columns).len();
         check_positional_terms(&sel.group_by, &sel.order_by, ncols)?;
 
+        // SQLite forbids an aggregate function anywhere inside a GROUP BY term
+        // (even nested, e.g. `1 + count(*)`), reporting a dedicated error rather
+        // than the generic "aggregate … used outside an aggregate context" — and
+        // catching the case (`GROUP BY max(a)` over a real table) that lazy
+        // per-row evaluation would otherwise accept silently.
+        {
+            let is_agg = |name: &str, n: usize, star: bool| {
+                func::is_aggregate_call(name, n, star)
+                    || self.aggregates.contains_key(&name.to_ascii_lowercase())
+            };
+            if sel.group_by.iter().any(|g| expr_contains_agg(g, &is_agg)) {
+                return Err(Error::Error(
+                    "aggregate functions are not allowed in the GROUP BY clause".into(),
+                ));
+            }
+        }
+
         // Apply WHERE.
         let mut rows: Vec<InputRow> = Vec::new();
         for r in input_rows {
