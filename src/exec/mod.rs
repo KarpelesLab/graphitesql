@@ -6923,6 +6923,15 @@ impl Connection {
                 return Err(Error::Error(format!("no such collation sequence: {name}")));
             }
         }
+        // A partial-index predicate (`CREATE INDEX … WHERE p`) may reference only
+        // the target table's own columns (plus its rowid); sqlite rejects an
+        // unknown column at CREATE rather than silently building the index.
+        if let Some(p) = &ci.where_clause {
+            let known: Vec<String> = tmeta.columns.iter().map(|c| c.name.clone()).collect();
+            if let Some(col) = unknown_column_ref(p, &known, true) {
+                return Err(Error::Error(format!("no such column: {col}")));
+            }
+        }
         let (cols, key_exprs, colls) = self.index_key_spec(&tmeta, ci)?;
         if key_exprs.is_some() && tmeta.without_rowid {
             return Err(Error::Unsupported(

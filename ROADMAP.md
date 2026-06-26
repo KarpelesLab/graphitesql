@@ -337,6 +337,12 @@ text-preserving CREATE-text edits).
     An empty parent list (`REFERENCES x`) still defers to the parent's PRIMARY
     KEY. graphite previously accepted every malformed form silently
     (`tests/fk_arity_validation.rs`).
+  - **A partial-index predicate may reference only the table's columns (done).**
+    `CREATE INDEX … WHERE p` whose predicate names an unknown column is now
+    rejected at CREATE with `no such column: NAME` (own columns and the rowid
+    remain valid, and the bad reference is found even nested in a function call);
+    graphite previously built the index silently, leaving a predicate that could
+    never be evaluated (`tests/partial_index_unknown_column.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
