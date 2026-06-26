@@ -241,6 +241,38 @@ fn json_extract_null_path_short_circuits_to_null() {
 }
 
 #[test]
+fn json_remove_null_path_short_circuits_to_null() {
+    // json_remove shares json_extract's NULL-path rule: a NULL path collapses the
+    // whole result to NULL (left to right), discarding any removals already made,
+    // while a malformed path before the NULL still errors first.
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(
+        val(&c, "SELECT json_remove('{\"a\":1}', NULL)"),
+        Value::Null
+    );
+    assert_eq!(
+        val(&c, "SELECT json_remove('{\"a\":1}', NULL, 5)"),
+        Value::Null
+    );
+    // A NULL after a real removal discards the partial result -> NULL.
+    assert_eq!(
+        val(&c, "SELECT json_remove('{\"a\":1,\"b\":2}', '$.a', NULL)"),
+        Value::Null
+    );
+    // Bad path before the NULL still errors.
+    err_contains(
+        &c,
+        "SELECT json_remove('{\"a\":1}', 5, NULL)",
+        "bad JSON path: '5'",
+    );
+    // A real removal with no NULL is unaffected.
+    assert_eq!(
+        text(&c, "SELECT json_remove('{\"a\":1,\"b\":2}', '$.a')"),
+        "{\"b\":2}"
+    );
+}
+
+#[test]
 fn missing_path_is_null_not_error() {
     let c = Connection::open_memory().unwrap();
     // A well-formed path that just does not resolve yields NULL.

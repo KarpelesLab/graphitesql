@@ -868,6 +868,14 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 Some(mut root) => {
                     let mut removed = Value::Text(String::new());
                     for p in &v[1..] {
+                        // A NULL path collapses the whole call to NULL (scanning
+                        // left to right, so a malformed path *before* it still
+                        // errors via check_path first), discarding any removals
+                        // already applied — matching sqlite's json_remove.
+                        if matches!(p, Value::Null) {
+                            removed = Value::Null;
+                            break;
+                        }
                         check_path(p)?;
                         // Removing the whole document (`$`) yields SQL NULL.
                         if matches!(p, Value::Text(s) if s == "$") {

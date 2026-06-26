@@ -199,10 +199,10 @@ text-preserving CREATE-text edits).
     `INTEGER`/`REAL`/`BLOB` path that does not spell a `$`-rooted path raises
     `bad JSON path: '<text>'` instead of silently resolving to NULL —
     `json_extract(j, 1)`, `json_set(j, 5, …)`, etc. And a NULL path in
-    `json_extract` now short-circuits the whole call to NULL, scanning left to
-    right (a malformed path *before* the NULL still errors first)
-    (`tests/json_surface.rs`). *Remaining:* `json_remove(j, NULL)` should also
-    return NULL (it currently returns the document unchanged).
+    `json_extract` and `json_remove` now short-circuit the whole call to NULL,
+    scanning left to right (a malformed path *before* the NULL still errors
+    first; for `json_remove`, removals already applied are discarded)
+    (`tests/json_surface.rs`).
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy
