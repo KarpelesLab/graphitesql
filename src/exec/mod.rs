@@ -11819,7 +11819,9 @@ impl Connection {
             ordered.sort_by(|&a, &b| cmp_keys(&ord_keys[a], &ord_keys[b], &descending));
             self.fill_window_partition(
                 &lname,
-                *star,
+                // `count()` (no arguments) tallies every row, exactly like
+                // `count(*)`, so the frame counter must treat it as a star call.
+                *star || (lname == "count" && args.is_empty()),
                 &ordered,
                 &ord_keys,
                 &arg_vals,
@@ -16968,10 +16970,12 @@ impl Connection {
                 "DISTINCT aggregates must have exactly one argument".into(),
             ));
         }
-        // 3. Lower bound: every aggregate but `count(*)` needs at least one
+        // 3. Lower bound: every aggregate but `count` needs at least one
         //    argument, and `json_group_object` needs two. Without this we would
         //    index `args[…]` out of bounds and panic (e.g. `group_concat()`).
-        if !star && args.is_empty() {
+        //    `count()` with no arguments is accepted as a synonym for `count(*)`,
+        //    matching SQLite (it counts every row).
+        if !star && args.is_empty() && lname != "count" {
             return Err(Error::Error(format!(
                 "wrong number of arguments to function {lname}()"
             )));
@@ -17063,7 +17067,9 @@ impl Connection {
         let mut count_rows = 0usize; // for count(*)
         for &i in group {
             count_rows += 1;
-            if star {
+            // `count(*)` and the no-argument `count()` only tally rows; there is
+            // no argument expression to evaluate.
+            if star || args.is_empty() {
                 continue;
             }
             let ctx = rows[i].ctx(columns, params).with_subqueries(self);
@@ -17093,7 +17099,9 @@ impl Connection {
 
         Ok(match lname.as_str() {
             "count" => {
-                if star {
+                // `count(*)` and the no-argument `count()` count every row; the
+                // one-argument `count(X)` counts the non-NULL values.
+                if star || args.is_empty() {
                     Value::Integer(count_rows as i64)
                 } else {
                     Value::Integer(vals.len() as i64)

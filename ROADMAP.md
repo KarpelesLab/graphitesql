@@ -226,8 +226,12 @@ text-preserving CREATE-text edits).
     of arguments") but before the lower bound (so `count(DISTINCT)`, whose 0-arg
     form is valid as `count(*)`, and `group_concat(DISTINCT a,b)` report the
     DISTINCT message) (`tests/distinct_aggregate_arity.rs`).
-    *Remaining (separate divergences):* `count()` with no arguments should behave
-    as `count(*)` (graphite rejects it); `json_group_array` is not yet recognized
+  - **`count()` with no arguments behaves as `count(*)` (done).** The bare
+    no-argument `count()` now tallies every row of the group (NULLs included),
+    matching sqlite, in scalar, `GROUP BY`, and windowed (`count() OVER (…)`)
+    positions — previously graphite rejected it with "wrong number of arguments"
+    (`tests/count_no_args.rs`).
+    *Remaining (separate divergences):* `json_group_array` is not yet recognized
     as an aggregate name; `string_agg` requires its separator (min 2 args) in
     sqlite, whereas graphite treats it as a 1-or-2-arg `group_concat` alias.
     *Remaining:* extend it past the conservative scope — derived-table/subquery

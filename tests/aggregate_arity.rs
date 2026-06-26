@@ -11,7 +11,6 @@ fn zero_arg_aggregates_error_not_panic() {
     // Each of these is "wrong number of arguments" in sqlite — and must not panic.
     for sql in [
         "SELECT group_concat()",
-        "SELECT count()",
         "SELECT sum()",
         "SELECT avg()",
         "SELECT max()",
@@ -20,6 +19,9 @@ fn zero_arg_aggregates_error_not_panic() {
     ] {
         assert!(c.query(sql).is_err(), "{sql} should error");
     }
+    // `count()` with no arguments is the exception: sqlite accepts it as a
+    // synonym for `count(*)` (see `tests/count_no_args.rs`).
+    assert!(c.query("SELECT count()").is_ok(), "count() should succeed");
 }
 
 #[test]
