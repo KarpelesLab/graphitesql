@@ -275,6 +275,13 @@ text-preserving CREATE-text edits).
     resolution; and ALTER-time re-validation that *rejects* an ALTER making a
     dependent view/trigger unresolvable needs statement-level DDL rollback (a
     writer savepoint around `exec_alter`, like `run_dml_atomic`).
+  - **Duplicate CTE name within one `WITH` clause is rejected (done).** Two CTEs
+    sharing a name in the same `WITH` list (`WITH x AS (…), x AS (…) …`) now
+    report sqlite's `duplicate WITH table name: NAME` (case-insensitive, naming
+    the duplicate occurrence) instead of being silently accepted, across
+    `SELECT`/`UPDATE`/`DELETE` and with `RECURSIVE`. A same name re-used in a
+    *nested* `WITH` is a separate scope and stays legal
+    (`tests/duplicate_cte_name.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

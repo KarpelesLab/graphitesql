@@ -7892,6 +7892,21 @@ impl Connection {
     /// `SELECT … FROM rcte LIMIT k` over an unterminated recursion yields `k` rows
     /// like sqlite instead of running to the runaway guard.
     fn push_ctes(&self, ctes: &[Cte], params: &Params, outer_cap: Option<usize>) -> Result<()> {
+        // SQLite rejects two CTEs that share a name (case-insensitive) within one
+        // WITH clause, naming the duplicate (second) occurrence. A same name in a
+        // nested WITH is a separate scope (a separate `push_ctes` call) and stays
+        // legal. Checked before materializing, as SQLite rejects it at prepare time.
+        for (i, cte) in ctes.iter().enumerate() {
+            if ctes[..i]
+                .iter()
+                .any(|prev| prev.name.eq_ignore_ascii_case(&cte.name))
+            {
+                return Err(Error::Error(alloc::format!(
+                    "duplicate WITH table name: {}",
+                    cte.name
+                )));
+            }
+        }
         for cte in ctes {
             let binding = if references_name(&cte.select, &cte.name) {
                 self.eval_recursive_cte(cte, params, outer_cap)?
