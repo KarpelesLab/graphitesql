@@ -4150,6 +4150,17 @@ impl Connection {
                 if let Some(col) = bad {
                     return Err(Error::Error(format!("no such column: {col}")));
                 }
+                // A column `DEFAULT` must be constant: SQLite allows literals,
+                // `CURRENT_*`, and (deterministic or not) function calls, but not a
+                // reference to any column. Reject at CREATE like sqlite.
+                if let ColumnConstraint::Default(e) = k {
+                    if unknown_column_ref(e, &[], false).is_some() {
+                        return Err(Error::Error(format!(
+                            "default value of column [{}] is not constant",
+                            c.name
+                        )));
+                    }
+                }
                 // A column-level FOREIGN KEY references exactly its own column, so
                 // it may name at most one parent column. SQLite rejects more at
                 // CREATE with this specific message.
@@ -8486,6 +8497,16 @@ impl Connection {
                         }
                         ColumnConstraint::PrimaryKey { .. } => {
                             return Err(Error::Error("Cannot add a PRIMARY KEY column".into()));
+                        }
+                        // A column `DEFAULT` must be constant — no column reference —
+                        // exactly as on `CREATE TABLE`.
+                        ColumnConstraint::Default(e)
+                            if unknown_column_ref(e, &[], false).is_some() =>
+                        {
+                            return Err(Error::Error(format!(
+                                "default value of column [{}] is not constant",
+                                cd.name
+                            )));
                         }
                         _ => {}
                     }

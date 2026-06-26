@@ -349,6 +349,13 @@ text-preserving CREATE-text edits).
     `ALTER TABLE … RENAME COLUMN <missing> …` quotes the unknown column,
     `no such column: "NAME"`, like the DROP COLUMN variant already did
     (`tests/ddl_error_wording.rs`).
+  - **A column `DEFAULT` must be constant (done).** A default that references any
+    column — `b DEFAULT (a)`, `DEFAULT (a + 1)`, `DEFAULT (max(a, 1))` — is now
+    rejected at CREATE and `ALTER TABLE … ADD COLUMN` with `default value of
+    column [NAME] is not constant`, while literals, constant arithmetic,
+    `CURRENT_*`, and function calls (including non-deterministic `random()`)
+    stay valid, exactly as sqlite classifies them. graphite previously stored
+    the column-referencing default silently (`tests/default_constant.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
