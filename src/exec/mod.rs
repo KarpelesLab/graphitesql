@@ -13009,6 +13009,42 @@ impl Connection {
     /// cannot run (a join, a derived/virtual/view source, a non-`main` schema, …)
     /// returns `Unsupported`, falling the whole query back to the tree-walker.
     fn run_window_vdbe(&self, sel: &Select) -> Result<QueryResult> {
+        // Whether `sel` references a `rowid`/`_rowid_`/`oid` pseudo-column anywhere
+        // in its expressions (projection, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
+        // or any window's `PARTITION BY`/`ORDER BY`, including a nested `OVER`).
+        // The join path below supplies no per-row rowid (a joined row has none), so
+        // it must defer whenever a `None` rowid could become observable.
+        fn is_rowid_name(n: &str) -> bool {
+            n.eq_ignore_ascii_case("rowid")
+                || n.eq_ignore_ascii_case("_rowid_")
+                || n.eq_ignore_ascii_case("oid")
+        }
+        fn spec_has_rowid(spec: &WindowSpec) -> bool {
+            spec.partition_by.iter().any(expr_has_rowid)
+                || spec.order_by.iter().any(|t| expr_has_rowid(&t.expr))
+        }
+        fn expr_has_rowid(e: &Expr) -> bool {
+            let mut found = false;
+            window::visit(e, &mut |node| match node {
+                Expr::Column { column, .. } if is_rowid_name(column) => found = true,
+                Expr::Function {
+                    over: Some(spec), ..
+                } if spec_has_rowid(spec) => found = true,
+                _ => {}
+            });
+            found
+        }
+        fn select_mentions_rowid(sel: &Select) -> bool {
+            sel.columns
+                .iter()
+                .any(|c| matches!(c, ResultColumn::Expr { expr, .. } if expr_has_rowid(expr)))
+                || sel.where_clause.as_ref().is_some_and(expr_has_rowid)
+                || sel.group_by.iter().any(expr_has_rowid)
+                || sel.having.as_ref().is_some_and(expr_has_rowid)
+                || sel.order_by.iter().any(|t| expr_has_rowid(&t.expr))
+                || sel.window_defs.iter().any(|(_, spec)| spec_has_rowid(spec))
+        }
+
         // A `WITH` of its own could shadow the base table with a CTE the VDBE
         // scan cannot open — defer.
         if !sel.ctes.is_empty() {
@@ -13017,32 +13053,46 @@ impl Connection {
         let Some(from) = &sel.from else {
             return Err(Error::Unsupported("VDBE window: no FROM"));
         };
-        // A single, plain, ordinary main-database table only.
-        if !from.joins.is_empty() {
-            return Err(Error::Unsupported("VDBE window: join source"));
-        }
-        let tref = &from.first;
-        if tref.subquery.is_some()
-            || tref.tvf_args.is_some()
-            || tref.index_hint.is_some()
-            || tref.schema.is_some()
-            || self.is_pragma_tvf(tref)
-            || self.is_view(&tref.name)
-            || self.is_virtual_table(&tref.name)
-            || self
-                .cte_env
-                .borrow()
-                .iter()
-                .any(|b| b.name.eq_ignore_ascii_case(&tref.name))
-        {
-            return Err(Error::Unsupported("VDBE window: non-plain source"));
-        }
-        let columns = self.table_meta(&tref.name, tref.alias.as_deref())?.columns;
+        // The source is either a single plain rowid table (rowid is appended so a
+        // `rowid` reference resolves) or a plain N-table join (a joined row has no
+        // single rowid, so the path is only taken when no rowid is referenced).
+        let is_join = !from.joins.is_empty();
+        let columns = if is_join {
+            if select_mentions_rowid(sel) {
+                return Err(Error::Unsupported("VDBE window: join references rowid"));
+            }
+            // `static_scope_columns` yields the `SELECT *` column set in expansion
+            // order, and returns `None` for exactly the join shapes whose column set
+            // the VDBE scan can't reproduce (`NATURAL`/`USING` coalescing, a view,
+            // CTE, derived table, table-valued function, or schema-qualified name).
+            let Some(cols) = self.static_scope_columns(sel) else {
+                return Err(Error::Unsupported("VDBE window: non-plain join source"));
+            };
+            cols
+        } else {
+            let tref = &from.first;
+            if tref.subquery.is_some()
+                || tref.tvf_args.is_some()
+                || tref.index_hint.is_some()
+                || tref.schema.is_some()
+                || self.is_pragma_tvf(tref)
+                || self.is_view(&tref.name)
+                || self.is_virtual_table(&tref.name)
+                || self
+                    .cte_env
+                    .borrow()
+                    .iter()
+                    .any(|b| b.name.eq_ignore_ascii_case(&tref.name))
+            {
+                return Err(Error::Unsupported("VDBE window: non-plain source"));
+            }
+            self.table_meta(&tref.name, tref.alias.as_deref())?.columns
+        };
         let ncols = columns.len();
-        // Scan the base table with `WHERE` applied, appending each row's rowid as a
-        // trailing column. Everything else (`GROUP BY`, `HAVING`, `ORDER BY`,
-        // `LIMIT`, `DISTINCT`, the windows) is stripped — `finish_from_rows` re-runs
-        // it over the scanned rows.
+        // Scan the base source with `WHERE` applied; for a single table append each
+        // row's rowid as a trailing column. Everything else (`GROUP BY`, `HAVING`,
+        // `ORDER BY`, `LIMIT`, `DISTINCT`, the windows) is stripped — the shared
+        // `finish_from_rows` tail re-runs it over the scanned rows.
         let mut base = sel.clone();
         base.distinct = false;
         base.group_by = Vec::new();
@@ -13051,27 +13101,38 @@ impl Connection {
         base.order_by = Vec::new();
         base.limit = None;
         base.offset = None;
-        base.columns = alloc::vec![
-            ResultColumn::Wildcard,
-            ResultColumn::Expr {
-                expr: Expr::Column {
-                    table: None,
-                    column: "rowid".into(),
+        base.columns = if is_join {
+            alloc::vec![ResultColumn::Wildcard]
+        } else {
+            alloc::vec![
+                ResultColumn::Wildcard,
+                ResultColumn::Expr {
+                    expr: Expr::Column {
+                        table: None,
+                        column: "rowid".into(),
+                    },
+                    alias: Some("__winrowid__".into()),
+                    source: None,
                 },
-                alias: Some("__winrowid__".into()),
-                source: None,
-            },
-        ];
+            ]
+        };
         let scanned = self.run_select_vdbe(&base)?;
         let mut rows: Vec<InputRow> = Vec::with_capacity(scanned.rows.len());
         for mut values in scanned.rows {
-            // [base columns…, rowid]: split the trailing rowid back off.
-            if values.len() != ncols + 1 {
-                return Err(Error::Unsupported("VDBE window: column count mismatch"));
-            }
-            let rowid = match values.pop() {
-                Some(Value::Integer(id)) => Some(id),
-                _ => None,
+            let rowid = if is_join {
+                if values.len() != ncols {
+                    return Err(Error::Unsupported("VDBE window: column count mismatch"));
+                }
+                None
+            } else {
+                // [base columns…, rowid]: split the trailing rowid back off.
+                if values.len() != ncols + 1 {
+                    return Err(Error::Unsupported("VDBE window: column count mismatch"));
+                }
+                match values.pop() {
+                    Some(Value::Integer(id)) => Some(id),
+                    _ => None,
+                }
             };
             rows.push(InputRow { values, rowid });
         }

@@ -301,22 +301,27 @@ is *perf/coverage*, not correctness.
   still fall back (no regression — those bailed before). Differentially tested
   vs sqlite 3.50.4 in `tests/vdbe_ordered_agg.rs`. Windowed (`OVER`) calls still
   fall back.
-- **B5c-4 — window functions over a single table on the VDBE — DONE.** A
-  window-function `SELECT` (`row_number`/`rank`/`dense_rank`/`ntile`, aggregate
-  `OVER` with `PARTITION BY`/`ORDER BY`/explicit frames, `lag`/`lead`/
+- **B5c-4 — window functions over a single table *or a plain join* on the VDBE —
+  DONE.** A window-function `SELECT` (`row_number`/`rank`/`dense_rank`/`ntile`,
+  aggregate `OVER` with `PARTITION BY`/`ORDER BY`/explicit frames, `lag`/`lead`/
   `first_value`, named `WINDOW` definitions, and windows *over* `GROUP BY`/
-  aggregates) over one plain main-database table now runs on the VDBE. The window
-  evaluation itself is not bytecode: `run_window_vdbe` scans the base table on the
-  VDBE — `SELECT *, rowid` with the query's `WHERE` applied, so the scan/filter run
-  as compiled opcodes and each row carries its rowid — then feeds the rows to
+  aggregates) over one plain main-database table — or over a plain N-table join —
+  now runs on the VDBE. The window evaluation itself is not bytecode:
+  `run_window_vdbe` scans the source on the VDBE (a single table as `SELECT *,
+  rowid`, a join as `SELECT *`) with the query's `WHERE` applied, so the
+  scan/filter/join run as compiled opcodes, then feeds the rows to
   `finish_from_rows`, the post-`WHERE` tail extracted from `run_core` (windows,
   aggregation, projection, `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`) that the
-  tree-walker already used, so the result is identical by construction. Scoped to a
-  single plain table: a join, derived/virtual/view source, `WITHOUT ROWID` table
-  (its rowid projection bails), CTE, or non-`main` schema falls back. An outer
-  `ORDER BY` satisfied by the scan also defers (the existing guard), so window
-  queries use a non-rowid/ multi-term `ORDER BY`. Differentially tested vs
-  sqlite 3.50.4 in `tests/vdbe_window.rs`. Windows over joins remain future work.
+  tree-walker already used, so the result is identical by construction. A single
+  table appends its rowid so a `rowid` reference resolves; a joined row has no
+  single rowid, so the join path supplies `None` and *defers whenever the query
+  references a rowid* anywhere (projection, `WHERE`, `GROUP BY`, `HAVING`, `ORDER
+  BY`, or any window's `PARTITION BY`/`ORDER BY`). A derived/virtual/view source,
+  `WITHOUT ROWID` table (its rowid projection bails), `NATURAL`/`USING` join, CTE,
+  non-`main` schema, or any join shape the VDBE join engine can't scan (e.g. tables
+  sharing a column name) falls back. An outer `ORDER BY` satisfied by the scan also
+  defers (the existing guard), so window queries use a non-rowid/multi-term `ORDER
+  BY`. Differentially tested vs sqlite 3.50.4 in `tests/vdbe_window.rs`.
 - **B5b — per-cursor nested-loop join + inner seek** (stream the inner side
   instead of materializing the cross-product; *perf-only*).
   - **B5b-1** — *Done (multi-cursor opcodes + nested-loop join over materialized
