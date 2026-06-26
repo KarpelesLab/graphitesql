@@ -303,6 +303,10 @@ text-preserving CREATE-text edits).
     subject unchanged. The one-arg forms and a NULL subject were already NULL,
     and a non-NULL or empty-string set still trims as before
     (`tests/trim_null_set.rs`).
+  - **`substr(X, NULL [, …])` returns NULL (done).** A NULL start position now
+    propagates like any other NULL argument; graphite previously coerced it to 0
+    and returned the whole string. The NULL *length* argument already yielded
+    NULL, and a real start still slices (`tests/substr_null_start.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

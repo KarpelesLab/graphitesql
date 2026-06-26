@@ -1461,6 +1461,11 @@ fn substr(v: &[Value]) -> Result<Value> {
     } else {
         eval::to_text(&v[0]).chars().collect()
     };
+    // `substr(x, NULL [, …])` returns NULL — a NULL start position propagates
+    // like any other NULL argument (the length already does, below).
+    if matches!(v[1], Value::Null) {
+        return Ok(Value::Null);
+    }
     let len = units.len() as i64;
     // Faithful port of SQLite's `substrFunc` (src/func.c): `p1` is a 1-based
     // start (negative counts from the end), `p2` a signed length (negative
