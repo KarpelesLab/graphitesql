@@ -3304,6 +3304,20 @@ impl Connection {
             self.stmt_rollback_tx.set(false);
             return self.run_dml_atomic(stmt, params);
         }
+        // A user-created object may not borrow the reserved `sqlite_` prefix.
+        match &stmt {
+            Statement::CreateTable(ct) => reject_reserved_name(&ct.name)?,
+            Statement::CreateIndex(ci) => reject_reserved_name(&ci.name)?,
+            Statement::CreateView(cv) => reject_reserved_name(&cv.name)?,
+            Statement::CreateTrigger(ct) => reject_reserved_name(&ct.name)?,
+            Statement::CreateVirtualTable(cvt) => reject_reserved_name(&cvt.name)?,
+            Statement::Alter(a) => {
+                if let AlterAction::RenameTable(new) = &a.action {
+                    reject_reserved_name(new)?;
+                }
+            }
+            _ => {}
+        }
         let affected = match stmt {
             Statement::CreateTable(ct) => {
                 self.exec_create_table(&ct, ddl_text(sql))?;
@@ -21404,6 +21418,22 @@ fn ddl_text(sql: &str) -> &str {
         Ok(toks) if !toks.is_empty() => sql[toks[0].start..].trim_end(),
         _ => sql.trim(),
     }
+}
+
+/// The `sqlite_` name prefix is reserved for SQLite's own catalog objects
+/// (`sqlite_sequence`, `sqlite_stat1`, the implicit `sqlite_autoindex_*`, …).
+/// A user `CREATE TABLE/INDEX/VIEW/TRIGGER/VIRTUAL TABLE` — or an
+/// `ALTER … RENAME TO` — that names a new object with this prefix is rejected
+/// (case-insensitively), preserving the name exactly as the user wrote it.
+/// Internal catalog creations call the `exec_create_*` helpers directly and so
+/// bypass this check, which only guards the user statement-dispatch path.
+fn reject_reserved_name(name: &str) -> Result<()> {
+    if name.len() >= 7 && name[..7].eq_ignore_ascii_case("sqlite_") {
+        return Err(Error::Error(format!(
+            "object name reserved for internal use: {name}"
+        )));
+    }
+    Ok(())
 }
 
 /// Does this stored `CREATE VIEW` body reference table `name`? Used to decide

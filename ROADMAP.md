@@ -307,6 +307,14 @@ text-preserving CREATE-text edits).
     propagates like any other NULL argument; graphite previously coerced it to 0
     and returned the whole string. The NULL *length* argument already yielded
     NULL, and a real start still slices (`tests/substr_null_start.rs`).
+  - **The `sqlite_` object-name prefix is reserved (done).** A user
+    `CREATE TABLE/INDEX/VIEW/TRIGGER/VIRTUAL TABLE` — or an `ALTER … RENAME TO` —
+    naming a new object with the `sqlite_` prefix is now rejected with
+    `object name reserved for internal use: NAME` (case-insensitive on the prefix,
+    the name echoed as written), like sqlite; graphite previously created such
+    objects silently. The check guards only the user statement-dispatch path, so
+    the internal catalogs (`sqlite_sequence` via AUTOINCREMENT, `sqlite_stat1` via
+    ANALYZE) are still created on demand (`tests/reserved_object_name.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
