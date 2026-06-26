@@ -12886,8 +12886,16 @@ impl Connection {
         // to an enclosing FROM, statically (whether or not the subquery executes).
         // Run that scope-aware pass once, at the outermost query: `columns` here is
         // the known top scope, and each nested level resolves against it.
+        // SQLite resolves every column reference at prepare time, so a missing
+        // column errors even when the table is empty (or every row is filtered
+        // out). The tree-walker resolves lazily, per row, so it would otherwise
+        // miss that error for a result that never reaches projection evaluation.
+        // Both passes are scope-sensitive, so run them only at the outermost
+        // query: a nested/correlated body (a non-empty `outer_scope`) may bind a
+        // reference to an enclosing FROM that this query's `columns` cannot see.
         if self.outer_scope.borrow().is_empty() {
             self.validate_nested_ambiguity(sel, &columns)?;
+            self.validate_columns_exist(sel, &columns)?;
         }
 
         // A positional `GROUP BY` / `ORDER BY` term (an integer literal) must name
@@ -13245,6 +13253,95 @@ impl Connection {
     /// subquery is resolved against [its own scope, … enclosing scopes]; an
     /// undeterminable scope simply stops resolution for a reference (see
     /// [`first_ambiguous_in_scopes`]), so the check never reports a false positive.
+    /// Re-create SQLite's eager "no such column" check for the cases that can be
+    /// resolved here without any chance of a false positive: a bare or qualified
+    /// column reference in the projection or `WHERE` of a top-level, window-free
+    /// block whose every `FROM` source is a plain (non-virtual, non-subquery,
+    /// non-TVF) base table or view, joined only by `INNER`/`LEFT`/… `ON` (no
+    /// `NATURAL`/`USING` column coalescing). A reference matching no source column
+    /// is the error SQLite reports at prepare time; the tree-walker would only hit
+    /// it once a row reaches evaluation, so an empty or fully-filtered result
+    /// silently swallowed it.
+    ///
+    /// Deliberately narrow. It inspects only this query's own projection/`WHERE`
+    /// (never a nested subquery body, which may bind a name to *this* query as its
+    /// outer scope), skips `GROUP BY`/`HAVING`/`ORDER BY` (which may name an output
+    /// alias or a positional ordinal), and never flags a rowid alias or a date/time
+    /// keyword pseudo-column. So it only ever rejects a name that per-row
+    /// evaluation would have rejected too — it just does so eagerly, like SQLite.
+    fn validate_columns_exist(&self, sel: &Select, columns: &[ColumnInfo]) -> Result<()> {
+        let Some(from) = &sel.from else { return Ok(()) };
+        if window::has_window(sel) {
+            return Ok(());
+        }
+        // Every FROM source must be a plain, non-virtual base table/view, and every
+        // join an ordinary `ON`/cross join (a `NATURAL`/`USING` join coalesces
+        // columns, so `columns` would not list a name the body legitimately uses).
+        let mut srcs = alloc::vec![&from.first];
+        for j in &from.joins {
+            if j.natural || !j.using.is_empty() {
+                return Ok(());
+            }
+            srcs.push(&j.table);
+        }
+        for s in srcs {
+            let plain = s.subquery.is_none() && s.tvf_args.is_none() && !s.name.is_empty();
+            if !plain || self.is_virtual_table(&s.name) {
+                return Ok(());
+            }
+        }
+        let mut targets: Vec<&Expr> = Vec::new();
+        for c in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = c {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            targets.push(w);
+        }
+        let mut missing: Option<String> = None;
+        for e in targets {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |table, column| {
+                if missing.is_some() {
+                    return;
+                }
+                // rowid aliases and date/time keyword pseudo-columns resolve
+                // without appearing in the table's declared column list.
+                if matches!(
+                    column.to_ascii_lowercase().as_str(),
+                    "rowid"
+                        | "oid"
+                        | "_rowid_"
+                        | "current_date"
+                        | "current_time"
+                        | "current_timestamp"
+                ) {
+                    return;
+                }
+                let n = columns
+                    .iter()
+                    .filter(|c| {
+                        c.name.eq_ignore_ascii_case(column)
+                            && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+                    })
+                    .count();
+                if n == 0 {
+                    missing = Some(match table {
+                        Some(t) => alloc::format!("no such column: {t}.{column}"),
+                        None => alloc::format!("no such column: {column}"),
+                    });
+                }
+            });
+        }
+        match missing {
+            Some(m) => Err(Error::Error(m)),
+            None => Ok(()),
+        }
+    }
+
     fn validate_nested_ambiguity(&self, sel: &Select, top: &[ColumnInfo]) -> Result<()> {
         let scopes = alloc::vec![Some(top.to_vec())];
         self.walk_nested_ambiguity(sel, &scopes)
@@ -17557,6 +17654,78 @@ fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<
 /// NOT into the collected subqueries' own bodies — each is recursed into
 /// separately, with its own scope. Lifetime-preserving (unlike `window::visit`) so
 /// the borrowed `&Select`s outlive the walk.
+/// Visit every column reference in `e` that resolves in this query's own `FROM`
+/// scope, calling `f(table_qualifier, column_name)` for each. Deliberately does
+/// not descend into a `Subquery`/`Exists`/`InSelect` body: a name there binds in
+/// that subquery's scope (with this query merely an outer fallback), so it must
+/// not be checked against this query's column list. Used by
+/// [`Executor::validate_columns_exist`] for an eager "no such column" check.
+fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, &str)) {
+    match e {
+        Expr::Column { table, column } => f(table.as_deref(), column),
+        Expr::Unary { expr, .. } => walk_shallow_columns(expr, f),
+        Expr::Binary { left, right, .. } => {
+            walk_shallow_columns(left, f);
+            walk_shallow_columns(right, f);
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                walk_shallow_columns(a, f);
+            }
+            if let Some(flt) = filter {
+                walk_shallow_columns(flt, f);
+            }
+            for t in order_by {
+                walk_shallow_columns(&t.expr, f);
+            }
+        }
+        Expr::IsNull { expr, .. } => walk_shallow_columns(expr, f),
+        Expr::InList { expr, list, .. } => {
+            walk_shallow_columns(expr, f);
+            for a in list {
+                walk_shallow_columns(a, f);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            walk_shallow_columns(expr, f);
+            walk_shallow_columns(low, f);
+            walk_shallow_columns(high, f);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                walk_shallow_columns(o, f);
+            }
+            for (w, t) in when_then {
+                walk_shallow_columns(w, f);
+                walk_shallow_columns(t, f);
+            }
+            if let Some(el) = else_result {
+                walk_shallow_columns(el, f);
+            }
+        }
+        Expr::Cast { expr, .. } => walk_shallow_columns(expr, f),
+        Expr::Collate { expr, .. } => walk_shallow_columns(expr, f),
+        Expr::Paren(inner) => walk_shallow_columns(inner, f),
+        Expr::RowValue(items) => {
+            for it in items {
+                walk_shallow_columns(it, f);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_subselects<'a>(e: &'a Expr, out: &mut Vec<&'a Select>) {
     match e {
         Expr::Subquery(s) => out.push(s),

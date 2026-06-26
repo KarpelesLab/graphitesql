@@ -163,6 +163,19 @@ text-preserving CREATE-text edits).
     to its owning table, rewrite only the matching ones).
 - **Error-parity (standing).** No known leftovers; the sweep continues against new
   construct families and files any new divergence here.
+  - **Eager column resolution (done for the common case).** SQLite resolves every
+    column reference at prepare time, so `SELECT nope FROM t` errors `no such
+    column: nope` even when the table is empty or `WHERE` filters out every row.
+    The tree-walker resolves lazily (per row), so a result that reached no row
+    used to swallow the error. `validate_columns_exist` now runs an eager check on
+    a top-level, window-free block whose every `FROM` source is a plain base
+    table/view joined by `ON`/cross joins (no `NATURAL`/`USING`), matching sqlite
+    for that surface (`tests/eager_column_resolution.rs`). *Remaining:* extend it
+    past the conservative scope — derived-table/subquery scopes, `NATURAL`/`USING`
+    coalesced names, and `GROUP BY`/`HAVING`/`ORDER BY` alias/ordinal refs are
+    still left to lazy resolution; and ALTER-time re-validation that *rejects* an
+    ALTER making a dependent view/trigger unresolvable needs statement-level DDL
+    rollback (a writer savepoint around `exec_alter`, like `run_dml_atomic`).
 
 ### Track B — Query planner, statistics & the VDBE
 
