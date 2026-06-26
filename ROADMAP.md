@@ -173,7 +173,9 @@ text-preserving CREATE-text edits).
     column ref in the projection/`WHERE`/join-`ON`, a `table.*` whose qualifier
     names no source (`no such table: x`), and any *qualified* ref in
     `GROUP BY`/`HAVING`/`ORDER BY` (a `t.col` there is never an alias or ordinal).
-    Matches sqlite for that surface (`tests/eager_column_resolution.rs`).
+    `DELETE`/`UPDATE` resolve their `WHERE` and `SET`-value columns eagerly too
+    (`validate_dml_refs`, no-`FROM` updates only). Matches sqlite for that surface
+    (`tests/eager_column_resolution.rs`).
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy
