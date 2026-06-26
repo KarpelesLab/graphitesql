@@ -13317,40 +13317,69 @@ impl Connection {
                 targets.push(on);
             }
         }
+        // `GROUP BY`/`HAVING`/`ORDER BY` may name an output alias or (for
+        // GROUP/ORDER) a positional ordinal, neither of which appears in
+        // `columns` — so only a *qualified* ref there is safe to check: a
+        // `t.col` qualifier is never an alias or an ordinal, so it must resolve
+        // to a base column. Bare names in these clauses are left to lazy
+        // resolution. Projection/`WHERE`/`ON` (the `targets` above) check every
+        // ref, qualified or not.
+        let mut qualified_only: Vec<&Expr> = Vec::new();
+        for g in &sel.group_by {
+            qualified_only.push(g);
+        }
+        if let Some(h) = &sel.having {
+            qualified_only.push(h);
+        }
+        for o in &sel.order_by {
+            qualified_only.push(&o.expr);
+        }
+
+        // Resolve one reference against `columns`; `None` if it resolves (or is a
+        // pseudo-column), else the `no such column` message. Borrows only
+        // `columns`, so the accumulator below can read `missing` between walks.
+        let column_missing = |table: Option<&str>, column: &str| -> Option<String> {
+            // rowid aliases and date/time keyword pseudo-columns resolve without
+            // appearing in the table's declared column list.
+            if matches!(
+                column.to_ascii_lowercase().as_str(),
+                "rowid" | "oid" | "_rowid_" | "current_date" | "current_time" | "current_timestamp"
+            ) {
+                return None;
+            }
+            let n = columns
+                .iter()
+                .filter(|c| {
+                    c.name.eq_ignore_ascii_case(column)
+                        && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+                })
+                .count();
+            (n == 0).then(|| match table {
+                Some(t) => alloc::format!("no such column: {t}.{column}"),
+                None => alloc::format!("no such column: {column}"),
+            })
+        };
+
         let mut missing: Option<String> = None;
         for e in targets {
             if missing.is_some() {
                 break;
             }
             walk_shallow_columns(e, &mut |table, column| {
-                if missing.is_some() {
-                    return;
+                if missing.is_none() {
+                    missing = column_missing(table, column);
                 }
-                // rowid aliases and date/time keyword pseudo-columns resolve
-                // without appearing in the table's declared column list.
-                if matches!(
-                    column.to_ascii_lowercase().as_str(),
-                    "rowid"
-                        | "oid"
-                        | "_rowid_"
-                        | "current_date"
-                        | "current_time"
-                        | "current_timestamp"
-                ) {
-                    return;
-                }
-                let n = columns
-                    .iter()
-                    .filter(|c| {
-                        c.name.eq_ignore_ascii_case(column)
-                            && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
-                    })
-                    .count();
-                if n == 0 {
-                    missing = Some(match table {
-                        Some(t) => alloc::format!("no such column: {t}.{column}"),
-                        None => alloc::format!("no such column: {column}"),
-                    });
+            });
+        }
+        for e in qualified_only {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |table, column| {
+                // Only qualified refs are unambiguous here (a bare name may be an
+                // output alias or a positional ordinal).
+                if missing.is_none() && table.is_some() {
+                    missing = column_missing(table, column);
                 }
             });
         }

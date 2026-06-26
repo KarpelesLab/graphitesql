@@ -88,6 +88,11 @@ fn missing_column_errors_match_sqlite() {
         // `table.*` whose qualifier names no FROM source → `no such table: x`.
         "SELECT x.* FROM t",
         "SELECT t.a, z.* FROM t JOIN u ON t.a = u.c",
+        // A *qualified* missing ref in GROUP BY / HAVING / ORDER BY (never an
+        // output alias or ordinal, so it must resolve to a base column).
+        "SELECT a FROM t GROUP BY t.nope",
+        "SELECT a FROM t GROUP BY a HAVING t.nope > 0",
+        "SELECT a FROM t ORDER BY t.nope",
     ];
     if !have_sqlite() {
         eprintln!("sqlite3 not found; skipping");
