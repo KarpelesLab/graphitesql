@@ -741,9 +741,9 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 Ok(bool_value(*negated))
             }
         }
-        Expr::RowValue(_) => Err(Error::Error(
-            "row value used where a single value is expected".into(),
-        )),
+        // A row value (`(a, b, …)`) reaching the scalar evaluator sits in a
+        // context that does not permit one — SQLite reports "row value misused".
+        Expr::RowValue(_) => Err(Error::Error("row value misused".into())),
     }
 }
 

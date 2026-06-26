@@ -257,6 +257,18 @@ text-preserving CREATE-text edits).
     evaluator only ever sees an `OVER` call in a disallowed position, since valid
     window calls are pre-computed and substituted out first
     (`tests/window_misuse.rs`).
+  - **Row value in a scalar context is "row value misused" (done).** A row value
+    `(a, b, …)` used where a single scalar is expected — bare in the SELECT list,
+    as an arithmetic operand, a function argument, or a bare `WHERE` predicate —
+    now reports sqlite's `row value misused` instead of graphite's own wording
+    ("row value used where a single value is expected"). The legal row contexts
+    (`(a,b) = (c,d)`, `(a,b) < (c,d)`, `(a,b) IN (…)`) are unaffected
+    (`tests/row_value_misused.rs`).
+    *Remaining:* a *multi-column subquery* in a comparison (`(SELECT 1,2) = 1`)
+    should likewise report `row value misused`, but graphite still reports
+    `sub-select returns 2 columns - expected 1` there — the column-count message
+    is correct in the SELECT-list scalar context (`SELECT (SELECT 1,2)`) but the
+    comparison operand needs context-aware detection to switch wording.
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy
