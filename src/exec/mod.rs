@@ -4964,6 +4964,29 @@ impl Connection {
                 ct.table
             )));
         }
+        // `INSTEAD OF` triggers may only attach to a view, and `BEFORE`/`AFTER`
+        // triggers only to a real table — sqlite rejects the mismatch at CREATE.
+        let target_is_view = self.is_view(&ct.table);
+        match ct.timing {
+            TriggerTiming::InsteadOf if !target_is_view => {
+                return Err(Error::Error(format!(
+                    "cannot create INSTEAD OF trigger on table: {}",
+                    ct.table
+                )));
+            }
+            TriggerTiming::Before | TriggerTiming::After if target_is_view => {
+                let kind = if ct.timing == TriggerTiming::Before {
+                    "BEFORE"
+                } else {
+                    "AFTER"
+                };
+                return Err(Error::Error(format!(
+                    "cannot create {kind} trigger on view: {}",
+                    ct.table
+                )));
+            }
+            _ => {}
+        }
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
             Value::Text("trigger".into()),
@@ -5154,7 +5177,7 @@ impl Connection {
             .is_empty()
         {
             return Err(Error::Error(format!(
-                "cannot modify {} — it is a view",
+                "cannot modify {} because it is a view",
                 ins.table
             )));
         }
@@ -5206,7 +5229,7 @@ impl Connection {
             .is_empty()
         {
             return Err(Error::Error(format!(
-                "cannot modify {} — it is a view",
+                "cannot modify {} because it is a view",
                 del.table
             )));
         }
@@ -5293,7 +5316,7 @@ impl Connection {
             .is_empty()
         {
             return Err(Error::Error(format!(
-                "cannot modify {} — it is a view",
+                "cannot modify {} because it is a view",
                 upd.table
             )));
         }

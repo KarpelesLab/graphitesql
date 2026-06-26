@@ -315,6 +315,13 @@ text-preserving CREATE-text edits).
     objects silently. The check guards only the user statement-dispatch path, so
     the internal catalogs (`sqlite_sequence` via AUTOINCREMENT, `sqlite_stat1` via
     ANALYZE) are still created on demand (`tests/reserved_object_name.rs`).
+  - **Trigger-target kind is enforced (done).** `INSTEAD OF` triggers may attach
+    only to a view, and `BEFORE`/`AFTER` triggers only to a real table; sqlite
+    rejects the mismatch at CREATE (`cannot create INSTEAD OF trigger on table:
+    NAME` / `cannot create BEFORE|AFTER trigger on view: NAME`). graphite
+    previously created the trigger silently. The same change matches sqlite's
+    exact wording for a direct write to a view, `cannot modify NAME because it is
+    a view` (was `… — it is a view`) (`tests/trigger_target_kind.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
