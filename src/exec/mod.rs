@@ -13284,10 +13284,21 @@ impl Connection {
             }
             srcs.push(&j.table);
         }
-        for s in srcs {
+        let mut labels: Vec<&str> = Vec::new();
+        for s in &srcs {
             let plain = s.subquery.is_none() && s.tvf_args.is_none() && !s.name.is_empty();
             if !plain || self.is_virtual_table(&s.name) {
                 return Ok(());
+            }
+            labels.push(s.alias.as_deref().unwrap_or(&s.name));
+        }
+        // A `table.*` whose qualifier names no FROM source is `no such table: X`
+        // in SQLite, statically — a star qualifier is never an alias or ordinal.
+        for c in &sel.columns {
+            if let ResultColumn::TableWildcard(q) = c {
+                if !labels.iter().any(|l| l.eq_ignore_ascii_case(q)) {
+                    return Err(Error::Error(alloc::format!("no such table: {q}")));
+                }
             }
         }
         let mut targets: Vec<&Expr> = Vec::new();

@@ -85,6 +85,9 @@ fn missing_column_errors_match_sqlite() {
         "SELECT t.a FROM t JOIN u ON t.a = u.nope",
         // Missing column referencing a view's (renamed) output.
         "SELECT b FROM v",
+        // `table.*` whose qualifier names no FROM source → `no such table: x`.
+        "SELECT x.* FROM t",
+        "SELECT t.a, z.* FROM t JOIN u ON t.a = u.c",
     ];
     if !have_sqlite() {
         eprintln!("sqlite3 not found; skipping");
@@ -123,6 +126,10 @@ fn valid_queries_over_empty_or_filtered_data_still_succeed() {
         "SELECT v.va FROM v WHERE 0",
         "SELECT t.a, u.d FROM t JOIN u ON t.a = u.c WHERE 0",
         "SELECT CURRENT_DATE FROM e",
+        // `table.*` qualified by a real source (incl. an alias) still resolves.
+        "SELECT t.* FROM t WHERE 0",
+        "SELECT t.*, u.* FROM t JOIN u ON t.a = u.c WHERE 0",
+        "SELECT x.* FROM t AS x WHERE 0",
     ];
     let c = conn();
     for q in queries {
