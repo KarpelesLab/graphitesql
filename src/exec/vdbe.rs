@@ -408,7 +408,12 @@ fn is_pure_scalar_fn(name: &str, argc: usize) -> bool {
         | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "radians" | "degrees"
         | "pi" => true,
         // Type / null helpers.
-        "typeof" | "nullif" | "zeroblob" | "likelihood" | "likely" | "unlikely" => true,
+        // `likelihood` is excluded (unlike the no-op `likely`/`unlikely`): its
+        // prepare-time check that the second argument is a floating-point literal
+        // in 0.0..=1.0 needs the source expression, which the VDBE has already
+        // reduced to a value here. It falls back to the tree-walker, which sees
+        // the real AST.
+        "typeof" | "nullif" | "zeroblob" | "likely" | "unlikely" => true,
         "coalesce" | "ifnull" => argc >= 1,
         // Pattern predicates in function form.
         "glob" | "like" => argc == 2,

@@ -208,6 +208,17 @@ text-preserving CREATE-text edits).
     instead of returning NULL, and a non-text format is coerced to text before
     rendering (`strftime(123)` → `123`, `strftime(x'41')` → `A`); only a NULL
     format yields NULL (`tests/strftime_null.rs`).
+  - **`likelihood()` probability validation (done).** The second argument to
+    `likelihood(X, Y)` must be a floating-point *literal* in `0.0..=1.0`, checked
+    against the parsed AST like sqlite's `exprProbability`: an integer literal
+    (even `0`/`1`), a negative, a string, a compound expression (`0.5+0.1`), or a
+    column reference is now rejected with `second argument to likelihood() must
+    be a constant between 0.0 and 1.0`, while `0.5`/`.5`/`1e0`/`(0.5)` are
+    accepted. `likelihood` was dropped from the VDBE pure-function list so the
+    all-constant case still sees the source expression (`tests/likelihood_probability.rs`).
+    *Remaining (both cases):* graphite validates lazily, so an unreached row
+    (`SELECT likelihood(a,2) FROM empty`) is not rejected at prepare time as
+    sqlite would; a statement-level prepare pass would be needed.
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy

@@ -6,7 +6,7 @@
 
 use super::eval::{self, EvalCtx};
 use crate::error::{Error, Result};
-use crate::sql::ast::Expr;
+use crate::sql::ast::{Expr, Literal};
 use crate::value::Value;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -561,6 +561,17 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "likelihood" => {
             arity(&lname, args, 2)?;
+            // SQLite requires the second argument to be a floating-point *literal*
+            // in the range 0.0..=1.0, checked against the parsed AST rather than
+            // the runtime value: an integer literal (`0`, `1`, `2`), a negative,
+            // a string, an expression (`0.5+0.1`), or a column reference are all
+            // rejected, while `0.5`, `.5`, `1e0` and a parenthesized `(0.5)` are
+            // accepted (`exprProbability` in SQLite's `expr.c`).
+            if !likelihood_prob_is_valid(&args[1]) {
+                return Err(Error::Error(
+                    "second argument to likelihood() must be a constant between 0.0 and 1.0".into(),
+                ));
+            }
             v[0].clone()
         }
         "unhex" => {
@@ -1060,6 +1071,18 @@ fn unhex(s: &str, ignore: Option<&str>) -> Option<alloc::vec::Vec<u8>> {
         // The second nibble must immediately follow the first.
         let lo = it.next()?;
         out.push((hexval(hi)? << 4) | hexval(lo)?);
+    }
+}
+
+/// Whether `e` is an acceptable `likelihood()` probability: a floating-point
+/// literal in `0.0..=1.0`, after peeling any redundant parentheses. SQLite's
+/// `exprProbability` only accepts a bare `TK_FLOAT` token in range, so an
+/// integer literal, a negated float, or any compound expression is rejected.
+fn likelihood_prob_is_valid(e: &Expr) -> bool {
+    match e {
+        Expr::Paren(inner) => likelihood_prob_is_valid(inner),
+        Expr::Literal(Literal::Real(r)) => (0.0..=1.0).contains(r),
+        _ => false,
     }
 }
 
