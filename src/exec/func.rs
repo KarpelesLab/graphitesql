@@ -1415,6 +1415,11 @@ fn trim_fn(v: &[Value], left: bool, right: bool) -> Value {
     if v.is_empty() || matches!(v[0], Value::Null) {
         return Value::Null;
     }
+    // A NULL trim-set yields NULL, like any other NULL argument (sqlite:
+    // `trim(X, NULL)` / `ltrim` / `rtrim` are all NULL).
+    if v.len() >= 2 && matches!(v[1], Value::Null) {
+        return Value::Null;
+    }
     let s = c_text(&v[0]);
     let trim_chars: Vec<char> = if v.len() >= 2 {
         c_text(&v[1]).chars().collect()

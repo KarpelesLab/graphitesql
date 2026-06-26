@@ -297,6 +297,12 @@ text-preserving CREATE-text edits).
     PRIMARY KEY` table picks a random free rowid and succeeds. `next_rowid`
     saturates and the new `auto_rowid` helper detects the exhausted range; the
     result still passes `PRAGMA integrity_check` (`tests/rowid_overflow.rs`).
+  - **`trim`/`ltrim`/`rtrim` with a NULL trim-set return NULL (done).** sqlite
+    propagates a NULL second argument like any other NULL (`trim(X, NULL)` is
+    NULL); graphite previously treated it as an empty trim-set and returned the
+    subject unchanged. The one-arg forms and a NULL subject were already NULL,
+    and a non-NULL or empty-string set still trims as before
+    (`tests/trim_null_set.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
