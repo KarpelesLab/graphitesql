@@ -231,9 +231,16 @@ text-preserving CREATE-text edits).
     matching sqlite, in scalar, `GROUP BY`, and windowed (`count() OVER (…)`)
     positions — previously graphite rejected it with "wrong number of arguments"
     (`tests/count_no_args.rs`).
-    *Remaining (separate divergences):* `json_group_array` is not yet recognized
-    as an aggregate name; `string_agg` requires its separator (min 2 args) in
-    sqlite, whereas graphite treats it as a 1-or-2-arg `group_concat` alias.
+  - **`string_agg` arity and JSON-group-aggregate recognition (done).**
+    `string_agg(X)` now requires its separator (exactly two arguments, the
+    one-argument form reporting `wrong number of arguments to function
+    string_agg()` — even with `DISTINCT`, since the arity check precedes the
+    DISTINCT one), matching sqlite rather than treating it as a `group_concat`
+    alias. And the JSON group aggregates (`json_group_array`/`json_group_object`
+    and their `jsonb_` variants), which have no scalar form, are now recognized
+    as aggregates at *any* arity, so a wrong count reports `wrong number of
+    arguments` from the aggregate guard instead of falling through to
+    `no such function` (`tests/agg_name_arity.rs`).
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy

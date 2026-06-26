@@ -29,8 +29,13 @@ pub fn is_aggregate(name: &str) -> bool {
 pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "count" | "sum" | "total" | "avg" | "group_concat" | "string_agg" => true,
-        "json_group_array" | "jsonb_group_array" => nargs == 1,
-        "json_group_object" | "jsonb_group_object" => nargs == 2,
+        // The JSON group aggregates have no scalar counterpart, so they are
+        // aggregates at any argument count — a wrong count must reach the
+        // aggregate arity guard ("wrong number of arguments"), not fall through
+        // to scalar dispatch ("no such function").
+        "json_group_array" | "jsonb_group_array" | "json_group_object" | "jsonb_group_object" => {
+            true
+        }
         "min" | "max" => star || nargs == 1,
         _ => false,
     }

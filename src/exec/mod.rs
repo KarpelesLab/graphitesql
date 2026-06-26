@@ -16957,6 +16957,16 @@ impl Connection {
                     "wrong number of arguments to function {lname}()"
                 )));
             }
+            // `string_agg` requires its separator — exactly two arguments —
+            // unlike its `group_concat` alias whose separator is optional. This
+            // lower bound sits with the upper one (before the DISTINCT guard) so
+            // that `string_agg(DISTINCT x)` reports "wrong number of arguments"
+            // rather than the DISTINCT message, matching sqlite.
+            if lname == "string_agg" && args.len() < 2 {
+                return Err(Error::Error(format!(
+                    "wrong number of arguments to function {lname}()"
+                )));
+            }
         }
         // 2. A DISTINCT aggregate must have exactly one argument. This is checked
         //    *after* the upper bound (so `count(DISTINCT 1,2)`/`sum(DISTINCT 1,2)`
