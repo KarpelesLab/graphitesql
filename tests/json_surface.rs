@@ -175,6 +175,72 @@ fn bad_json_path_errors() {
 }
 
 #[test]
+fn non_text_path_is_coerced_to_text_then_validated() {
+    // SQLite applies its usual text conversion to a path argument before parsing
+    // it, so an INTEGER/REAL path that does not spell a `$`-rooted path is a
+    // `bad JSON path` (showing the coerced text), not a silently-missing lookup.
+    // A BLOB path is likewise read as text — `x'24'` is the byte `$`, the whole
+    // document. This holds across every path-taking function.
+    let c = Connection::open_memory().unwrap();
+    err_contains(
+        &c,
+        "SELECT json_extract('{\"a\":5}', 1)",
+        "bad JSON path: '1'",
+    );
+    err_contains(
+        &c,
+        "SELECT json_extract('{\"a\":5}', 1.5)",
+        "bad JSON path: '1.5'",
+    );
+    err_contains(&c, "SELECT json_set('{}', 5, 9)", "bad JSON path: '5'");
+    err_contains(
+        &c,
+        "SELECT json_replace('{\"a\":1}', 2, 9)",
+        "bad JSON path: '2'",
+    );
+    err_contains(&c, "SELECT json_type('{\"a\":1}', 7)", "bad JSON path: '7'");
+    err_contains(
+        &c,
+        "SELECT json_remove('{\"a\":1}', 3)",
+        "bad JSON path: '3'",
+    );
+    // A BLOB that decodes to a valid path text addresses the document.
+    assert_eq!(
+        text(&c, "SELECT json_extract('{\"a\":5}', x'24')"),
+        "{\"a\":5}"
+    );
+}
+
+#[test]
+fn json_extract_null_path_short_circuits_to_null() {
+    // In `json_extract`, a NULL among the paths collapses the whole result to
+    // NULL — scanning left to right, so a NULL reached before any malformed path
+    // wins, but a malformed path that comes first still errors.
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(val(&c, "SELECT json_extract('[1,2]', NULL)"), Value::Null);
+    assert_eq!(
+        val(&c, "SELECT json_extract('[1,2]', '$[0]', NULL)"),
+        Value::Null
+    );
+    // NULL first → NULL even though the later `5` is a bad path.
+    assert_eq!(
+        val(&c, "SELECT json_extract('[1,2]', NULL, 5)"),
+        Value::Null
+    );
+    // Bad path first → it errors before the trailing NULL is seen.
+    err_contains(
+        &c,
+        "SELECT json_extract('[1,2]', 5, NULL)",
+        "bad JSON path: '5'",
+    );
+    // No NULL: two valid paths still build the usual JSON array.
+    assert_eq!(
+        text(&c, "SELECT json_extract('{\"a\":5}', '$.a', '$.a')"),
+        "[5,5]"
+    );
+}
+
+#[test]
 fn missing_path_is_null_not_error() {
     let c = Connection::open_memory().unwrap();
     // A well-formed path that just does not resolve yields NULL.

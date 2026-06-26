@@ -1237,10 +1237,17 @@ fn json_root(v: &Value) -> Result<Option<super::json::Json>> {
 /// error if it is malformed. A `NULL` path is left for the caller to treat as a
 /// missing lookup (SQLite returns NULL rather than erroring on a NULL path).
 fn check_path(p: &Value) -> Result<()> {
-    if let Value::Text(s) = p {
-        if !super::json::path_is_valid(s) {
-            return Err(Error::Error(alloc::format!("bad JSON path: '{s}'")));
-        }
+    // A NULL path is not validated — callers treat it as a missing lookup
+    // (SQLite returns NULL rather than erroring). Every other type is coerced to
+    // text first (SQLite applies its usual text conversion before parsing the
+    // path), so an integer/real/blob argument is validated as the path it spells
+    // — e.g. `json_extract(j, 1)` raises `bad JSON path: '1'`, just like sqlite.
+    if matches!(p, Value::Null) {
+        return Ok(());
+    }
+    let s = eval::to_text(p);
+    if !super::json::path_is_valid(&s) {
+        return Err(Error::Error(alloc::format!("bad JSON path: '{s}'")));
     }
     Ok(())
 }
@@ -1271,7 +1278,13 @@ fn json_value_arg(val: &Value, expr: Option<&Expr>) -> Result<super::json::Json>
 /// elements (missing paths become JSON `null`). `jsonb_extract` is the same but
 /// returns object/array results (and the multi-path array) as JSONB blobs.
 fn json_extract(root: &super::json::Json, paths: &[Value], jsonb: bool) -> Result<Value> {
+    // SQLite scans the paths left to right: a NULL path collapses the whole
+    // result to NULL (even when a *later* path is malformed), but a malformed
+    // non-NULL path that comes *first* still errors before the NULL is reached.
     for p in paths {
+        if matches!(p, Value::Null) {
+            return Ok(Value::Null);
+        }
         check_path(p)?;
     }
     // A non-scalar single-path result is JSONB under jsonb_extract; scalars are

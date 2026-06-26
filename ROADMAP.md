@@ -194,6 +194,15 @@ text-preserving CREATE-text edits).
     now quotes the table name like sqlite — `table "t" has more than one primary
     key` — for both the column-level and table-level forms
     (`tests/create_validation.rs`).
+  - **JSON non-text / NULL paths (done).** A path argument to any json1 path
+    function is now coerced to text before validation (matching sqlite), so an
+    `INTEGER`/`REAL`/`BLOB` path that does not spell a `$`-rooted path raises
+    `bad JSON path: '<text>'` instead of silently resolving to NULL —
+    `json_extract(j, 1)`, `json_set(j, 5, …)`, etc. And a NULL path in
+    `json_extract` now short-circuits the whole call to NULL, scanning left to
+    right (a malformed path *before* the NULL still errors first)
+    (`tests/json_surface.rs`). *Remaining:* `json_remove(j, NULL)` should also
+    return NULL (it currently returns the document unchanged).
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy
