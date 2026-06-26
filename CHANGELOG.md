@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/KarpelesLab/graphitesql/compare/v0.0.9...v0.0.10) - 2026-06-26
+
+### Added
+
+- *(vdbe)* run window functions over a plain join on the VDBE
+- *(vdbe)* run window functions over a single table on the VDBE
+- *(vdbe)* run ordered group_concat(x ORDER BY …) on the VDBE
+- *(vdbe)* run aggregate FILTER (WHERE …) on the VDBE
+- *(vdbe)* run DISTINCT aggregates over a bare two-table join
+- *(vdbe)* run DISTINCT aggregates over GROUP BY on the VDBE
+- *(vdbe)* run DISTINCT aggregates on the bare aggregate path
+- *(vdbe)* resolve positional GROUP BY ordinals on the VDBE
+- *(vdbe)* run compound SELECT (UNION/INTERSECT/EXCEPT) on the VDBE (B5c-3)
+- *(vdbe)* run DISTINCT over two-table outer joins on the VDBE (B5b-1)
+- *(vdbe)* run ORDER BY over two-table outer joins on the VDBE (B5b-1)
+- *(vdbe)* run GROUP BY over a join with the full grouped grammar (B5b-1)
+- *(vdbe)* fold a plain GROUP BY inner join over the nested loop (B5b-1)
+- *(vdbe)* fold a bare-aggregate inner join over the nested loop (B5b-1)
+- *(vdbe)* run an ORDER BY inner nested-loop join through the sorter (B5b-1)
+- *(vdbe)* support DISTINCT over an inner nested-loop join (B5b-1)
+- *(vdbe)* run two-table FULL JOIN on the VDBE (B5b-1)
+- *(vdbe)* run two-table RIGHT JOIN on the VDBE (B5b-1)
+- *(vdbe)* run two-table LEFT JOIN on the VDBE with null-padding (B5b-1)
+- *(vdbe)* generalize the nested-loop join to N tables (B5b-1)
+- *(vdbe)* run two-table inner joins as a nested loop over two cursors (B5b-1)
+- *(vdbe)* route bare-column IN (SELECT col) on the VDBE via candidate affinity (B5c-1)
+- *(vfs)* verify reader SHARED-lock sharing end-to-end (C9a)
+- *(fts5)* decode multi-leaf segments — term pagination + doclist spanning (D2b-3)
+- *(pager)* write and recover SQLite-format rollback journals (C7a/C7b)
+- *(fts5)* decode the %_data segment index for a single-term doclist lookup (D2b-1)
+- *(vdbe)* fold a non-correlated IN (SELECT computed) to IN (list) for the VDBE
+- *(vdbe)* fold a non-correlated subquery in LIMIT/OFFSET so it runs on the VDBE
+- *(vtab)* report main for any-schema-qualified dbstat/sqlite_dbpage
+- *(vtab)* resolve + introspect the eponymous dbstat/sqlite_dbpage tables
+- *(vtab)* add the read-only sqlite_dbpage virtual table
+- *(attach)* resolve unqualified names against attached databases (Track E)
+
+### Documentation
+
+- document the opt-in unicode case-folding feature
+- ROADMAP — bare-column IN (SELECT) cannot be folded (attempt reverted)
+- ROADMAP — concrete implementation path for B5c-1 bare-column IN (SELECT)
+- README — index-driven FTS5 MATCH, SQLite-format journal + crash recovery, bounded cache
+- mark ROADMAP Track E essentially complete (E0/E1/E2/E3/E-arch-a done)
+- trim ROADMAP to remaining work; condense the README status block
+
+### Fixed
+
+- *(func)* fold ASCII-only by default, add opt-in unicode feature
+- *(exec)* schema-qualify a missing table in CREATE INDEX / CREATE TRIGGER
+- *(exec)* SQLite-exact compound, window, and WITHOUT ROWID error messages
+- *(insert)* reject a non-integer INTEGER PRIMARY KEY value as datatype mismatch
+- *(exec)* SQLite-exact "no such column" qualifier and compound ORDER BY error
+- *(func)* match SQLite's scalar-function arity and json_extract(<2-arg)
+- *(exec)* match SQLite's out-of-range ORDER BY/GROUP BY message
+- *(trigger)* SELECT RAISE(...) WHERE cond honors the WHERE clause
+- *(insert)* a bare INSERT targets only non-generated columns
+- *(eval)* apply comparison affinity to IS / IS NOT and CASE x WHEN y
+- *(eval)* IN (list) applies only the left operand's affinity to each element
+- *(eval)* apply a scalar subquery's column affinity in comparisons
+
+### Performance
+
+- *(vdbe)* route bare-column IN (SELECT col) regardless of the candidate's collation
+- *(fts5)* route phrase + NEAR MATCH over multi-segment indexes (D2b-2)
+- *(fts5)* index-route K-term phrases (K>=2), not just two-term (D2b-2)
+- *(fts5)* index-route bare-term/boolean/prefix MATCH over multi-segment indexes (D2b-2)
+- *(fts5)* index-route a two-term NEAR(a b, n) MATCH (D2b-2)
+- *(fts5)* index-route N-operand bare-term boolean trees (D2b-2)
+- *(fts5)* index-route a single prefix-term MATCH (D2b-2)
+- *(fts5)* index-route two-operand bare-term boolean MATCH (D2b-2)
+- *(fts5)* index-route a two-term phrase MATCH (D2b-2)
+- *(fts5)* index-route column-scoped single bare-term MATCH (D2b-2)
+- *(pager)* bound the page cache with LRU eviction (C8c)
+- *(fts5)* route single bare-term MATCH through the segment index (D2b-2)
+
+### Testing
+
+- *(pager)* add a WAL-mode crash-recovery harness (§6)
+- *(pager)* add a fault-injecting VFS crash-recovery harness (C7)
+- pin build-independent value semantics against sqlite3
+- *(attach)* add E0 cross-database write regression oracle (Track E)
+
 ## [0.0.9](https://github.com/KarpelesLab/graphitesql/compare/v0.0.8...v0.0.9) - 2026-06-24
 
 ### Fixed
