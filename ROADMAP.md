@@ -356,6 +356,17 @@ text-preserving CREATE-text edits).
     `CURRENT_*`, and function calls (including non-deterministic `random()`)
     stay valid, exactly as sqlite classifies them. graphite previously stored
     the column-referencing default silently (`tests/default_constant.rs`).
+  - **Qualified (`table.col`) references in DDL expressions are validated (done).**
+    A reference whose qualifier names the object being defined and whose column
+    exists *resolves*, but a generated-column or index-*key* expression then
+    rejects the dotted form — `the "." operator prohibited in generated columns`
+    / `… in index expressions` — exactly as sqlite does even though the bare
+    column would be valid; a CHECK constraint and a partial-index `WHERE` accept
+    the same dotted reference. Any other qualifier, or a correctly-qualified but
+    unknown column, is reported `no such column: q.c` (the prohibition fires only
+    when the ref actually resolves). graphite previously matched on the bare
+    column name alone, so it silently accepted `b AS (t.a)` / `INDEX … (t.a)` and
+    mis-reported `t.nope` as `no such column: nope` (`tests/dotted_column_refs.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

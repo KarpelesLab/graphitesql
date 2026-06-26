@@ -4141,20 +4141,32 @@ impl Connection {
                     }
                 }
                 let bad = match k {
-                    ColumnConstraint::Check(e, _) => unknown_column_ref(e, &known, true),
+                    ColumnConstraint::Check(e, _) => {
+                        unknown_column_ref(e, &known, true, Some(&ct.name))
+                    }
                     ColumnConstraint::Generated { expr, .. } => {
-                        unknown_column_ref(expr, &known, false)
+                        unknown_column_ref(expr, &known, false, Some(&ct.name))
                     }
                     _ => None,
                 };
                 if let Some(col) = bad {
                     return Err(Error::Error(format!("no such column: {col}")));
                 }
+                // A generated column may *reference* its table's columns but not via
+                // a `table.col` qualifier; SQLite rejects the dotted form even though
+                // it resolves. (A CHECK accepts the same dotted reference.)
+                if let ColumnConstraint::Generated { expr, .. } = k {
+                    if has_resolved_dotted_ref(expr, &known, false, &ct.name) {
+                        return Err(Error::Error(
+                            "the \".\" operator prohibited in generated columns".into(),
+                        ));
+                    }
+                }
                 // A column `DEFAULT` must be constant: SQLite allows literals,
                 // `CURRENT_*`, and (deterministic or not) function calls, but not a
                 // reference to any column. Reject at CREATE like sqlite.
                 if let ColumnConstraint::Default(e) = k {
-                    if unknown_column_ref(e, &[], false).is_some() {
+                    if unknown_column_ref(e, &[], false, None).is_some() {
                         return Err(Error::Error(format!(
                             "default value of column [{}] is not constant",
                             c.name
@@ -4176,7 +4188,7 @@ impl Connection {
         }
         for tc in &ct.constraints {
             if let TableConstraint::Check(e, _) = tc {
-                if let Some(col) = unknown_column_ref(e, &known, true) {
+                if let Some(col) = unknown_column_ref(e, &known, true, Some(&ct.name)) {
                     return Err(Error::Error(format!("no such column: {col}")));
                 }
             }
@@ -6940,8 +6952,29 @@ impl Connection {
         // unknown column at CREATE rather than silently building the index.
         if let Some(p) = &ci.where_clause {
             let known: Vec<String> = tmeta.columns.iter().map(|c| c.name.clone()).collect();
-            if let Some(col) = unknown_column_ref(p, &known, true) {
+            if let Some(col) = unknown_column_ref(p, &known, true, Some(&ci.table)) {
                 return Err(Error::Error(format!("no such column: {col}")));
+            }
+        }
+        // Each index *key* expression may reference only the table's own columns
+        // (rowid is not allowed in a key). A `table.col` qualifier naming the
+        // indexed table resolves but, like SQLite, is rejected as a dotted
+        // reference; any other qualifier is an unknown column.
+        {
+            let known: Vec<String> = tmeta.columns.iter().map(|c| c.name.clone()).collect();
+            for term in &ci.columns {
+                let key = match &term.expr {
+                    Expr::Collate { expr, .. } => expr.as_ref(),
+                    other => other,
+                };
+                if let Some(col) = unknown_column_ref(key, &known, false, Some(&ci.table)) {
+                    return Err(Error::Error(format!("no such column: {col}")));
+                }
+                if has_resolved_dotted_ref(key, &known, false, &ci.table) {
+                    return Err(Error::Error(
+                        "the \".\" operator prohibited in index expressions".into(),
+                    ));
+                }
             }
         }
         let (cols, key_exprs, colls) = self.index_key_spec(&tmeta, ci)?;
@@ -8501,7 +8534,7 @@ impl Connection {
                         // A column `DEFAULT` must be constant — no column reference —
                         // exactly as on `CREATE TABLE`.
                         ColumnConstraint::Default(e)
-                            if unknown_column_ref(e, &[], false).is_some() =>
+                            if unknown_column_ref(e, &[], false, None).is_some() =>
                         {
                             return Err(Error::Error(format!(
                                 "default value of column [{}] is not constant",
@@ -18327,19 +18360,69 @@ fn unknown_collation(e: &Expr) -> Option<&str> {
 /// (when `allow_rowid`) a rowid alias — the unknown column SQLite rejects at
 /// `CREATE` in a CHECK constraint or generated-column expression. Generated
 /// columns may not reference the rowid (`allow_rowid=false`); a CHECK may.
-fn unknown_column_ref(e: &Expr, known: &[String], allow_rowid: bool) -> Option<String> {
+/// The first column reference in `e` that is *not* resolvable against `known`,
+/// or `None` if every reference resolves. A `table.` qualifier must name
+/// `self_table` (the object being defined); a qualifier that names anything else
+/// makes the whole `qualifier.column` an unknown column even when a bare column
+/// of that name exists — matching SQLite, which reports the qualified name. A
+/// correctly-qualified-but-unknown column is likewise reported qualified
+/// (`self_table.nope`). With `self_table = None` every qualifier is foreign, so
+/// any reference is "unknown" (used to reject a column inside a constant
+/// `DEFAULT`).
+fn unknown_column_ref(
+    e: &Expr,
+    known: &[String],
+    allow_rowid: bool,
+    self_table: Option<&str>,
+) -> Option<String> {
     let mut bad: Option<String> = None;
     window::visit(e, &mut |n| {
-        if let Expr::Column { column, .. } = n {
-            if bad.is_none()
-                && !known.iter().any(|c| c.eq_ignore_ascii_case(column))
-                && !(allow_rowid && eval::is_rowid_alias(column))
-            {
-                bad = Some(column.clone());
+        if let Expr::Column { table, column } = n {
+            if bad.is_some() {
+                return;
+            }
+            let foreign_qualifier = table
+                .as_ref()
+                .is_some_and(|q| self_table.is_none_or(|t| !t.eq_ignore_ascii_case(q)));
+            let resolves = !foreign_qualifier
+                && (known.iter().any(|c| c.eq_ignore_ascii_case(column))
+                    || (allow_rowid && eval::is_rowid_alias(column)));
+            if !resolves {
+                bad = Some(match table {
+                    Some(q) => alloc::format!("{q}.{column}"),
+                    None => column.clone(),
+                });
             }
         }
     });
     bad
+}
+
+/// Whether `e` contains a `table.column` reference whose qualifier names
+/// `self_table` and whose column resolves — the form SQLite forbids in a
+/// generated-column or index expression with `the "." operator prohibited …`.
+fn has_resolved_dotted_ref(
+    e: &Expr,
+    known: &[String],
+    allow_rowid: bool,
+    self_table: &str,
+) -> bool {
+    let mut found = false;
+    window::visit(e, &mut |n| {
+        if let Expr::Column {
+            table: Some(q),
+            column,
+        } = n
+        {
+            if q.eq_ignore_ascii_case(self_table)
+                && (known.iter().any(|c| c.eq_ignore_ascii_case(column))
+                    || (allow_rowid && eval::is_rowid_alias(column)))
+            {
+                found = true;
+            }
+        }
+    });
+    found
 }
 
 /// Whether `e` contains a subquery (scalar `(SELECT …)`, `EXISTS`, or `IN
