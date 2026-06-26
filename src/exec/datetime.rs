@@ -1016,16 +1016,22 @@ pub fn timediff(a: &Value, b: &Value) -> Value {
 
 /// `strftime(format, timevalue, modifier, ...)`.
 pub fn strftime(args: &[Value]) -> Value {
-    if args.len() < 2 {
-        return Value::Null;
-    }
-    let Value::Text(fmt) = &args[0] else {
+    // Only the format is required: `strftime('%Y')` defaults the time-value to
+    // 'now', exactly like `date()`/`time()`/`datetime()`. `is_date(&[])` (the
+    // empty modifier slice when a single arg is given) supplies the "now" default.
+    let Some(fmt) = args.first() else {
         return Value::Null;
     };
+    // SQLite coerces a non-text format to text (`strftime(123)` -> "123",
+    // `strftime(x'41')` -> "A"); only a NULL format yields NULL.
+    if matches!(fmt, Value::Null) {
+        return Value::Null;
+    }
+    let fmt = eval::to_text(fmt);
     let Some(mut p) = is_date(&args[1..]) else {
         return Value::Null;
     };
-    match render_strftime(fmt, &mut p) {
+    match render_strftime(&fmt, &mut p) {
         Some(s) => Value::Text(s),
         None => Value::Null,
     }

@@ -203,6 +203,11 @@ text-preserving CREATE-text edits).
     scanning left to right (a malformed path *before* the NULL still errors
     first; for `json_remove`, removals already applied are discarded)
     (`tests/json_surface.rs`).
+  - **`strftime` defaults & format coercion (done).** `strftime(FORMAT)` with no
+    time-value now defaults to 'now' (like `date()`/`time()`/`datetime()`)
+    instead of returning NULL, and a non-text format is coerced to text before
+    rendering (`strftime(123)` → `123`, `strftime(x'41')` → `A`); only a NULL
+    format yields NULL (`tests/strftime_null.rs`).
     *Remaining:* extend it past the conservative scope — derived-table/subquery
     scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
     `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy

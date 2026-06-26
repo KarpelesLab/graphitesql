@@ -67,6 +67,41 @@ fn sunday_week_number_u() {
 }
 
 #[test]
+fn no_time_value_defaults_to_now() {
+    let c = Connection::open_memory().unwrap();
+    // Like `date()`/`time()`/`datetime()`, a `strftime` with only a format
+    // argument defaults the time-value to 'now' rather than yielding NULL.
+    // We can't pin the exact instant, but it must be non-NULL and shaped right.
+    let y = text(&c, "SELECT strftime('%Y')");
+    assert_eq!(y.len(), 4, "year should be 4 digits, got {y}");
+    assert!(y.chars().all(|ch| ch.is_ascii_digit()), "got {y}");
+    let hm = text(&c, "SELECT strftime('%H:%M')");
+    assert_eq!(hm.len(), 5, "HH:MM, got {hm}");
+    // Agreement with `strftime(fmt,'now')` (computed in the same statement so the
+    // clock can't drift across the comparison) at minute granularity.
+    assert_eq!(
+        q(
+            &c,
+            "SELECT strftime('%Y-%m-%d %H:%M') = strftime('%Y-%m-%d %H:%M','now')"
+        ),
+        Value::Integer(1)
+    );
+}
+
+#[test]
+fn non_text_format_is_coerced_to_text() {
+    let c = Connection::open_memory().unwrap();
+    // SQLite coerces a non-text format argument to text before rendering, so a
+    // format with no `%` specifiers prints literally. Only a NULL format -> NULL.
+    assert_eq!(text(&c, "SELECT strftime(123)"), "123");
+    assert_eq!(text(&c, "SELECT strftime(12.5)"), "12.5");
+    assert_eq!(text(&c, "SELECT strftime(123,'2020-01-01')"), "123");
+    assert_eq!(text(&c, "SELECT strftime(x'41')"), "A");
+    assert_eq!(q(&c, "SELECT strftime(NULL)"), Value::Null);
+    assert_eq!(q(&c, "SELECT strftime(NULL,'now')"), Value::Null);
+}
+
+#[test]
 fn year_past_9999_is_null() {
     let c = Connection::open_memory().unwrap();
     // Running past the end of year 9999 yields NULL across every date function.
