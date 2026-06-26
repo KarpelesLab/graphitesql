@@ -80,6 +80,9 @@ fn missing_column_errors_match_sqlite() {
         "SELECT t.a, nope FROM t JOIN u ON t.a = u.c WHERE 0",
         // Wrong qualifier on an otherwise-real column name.
         "SELECT u.a FROM t JOIN u ON t.a = u.c",
+        // Missing column in the join `ON` predicate itself.
+        "SELECT t.a FROM t JOIN u ON t.nope = u.c",
+        "SELECT t.a FROM t JOIN u ON t.a = u.nope",
         // Missing column referencing a view's (renamed) output.
         "SELECT b FROM v",
     ];

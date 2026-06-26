@@ -13299,6 +13299,13 @@ impl Connection {
         if let Some(w) = &sel.where_clause {
             targets.push(w);
         }
+        // An `ON` predicate can only reference the FROM sources' base columns —
+        // never an output alias or ordinal — so it is as safe to check as `WHERE`.
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                targets.push(on);
+            }
+        }
         let mut missing: Option<String> = None;
         for e in targets {
             if missing.is_some() {
