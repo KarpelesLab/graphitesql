@@ -948,6 +948,13 @@ impl Connection {
         {
             return Err(Error::Unsupported("VDBE: ORDER BY satisfied by a scan"));
         }
+        // A window-function query (Track B5c-4): scan the single base table on the
+        // VDBE (with `WHERE` applied and the rowid appended), then evaluate the
+        // windows, projection, DISTINCT, `ORDER BY` and `LIMIT`/`OFFSET` through the
+        // shared `finish_from_rows` tail — the same code the tree-walker runs.
+        if window::has_window(sel) {
+            return self.run_window_vdbe(sel);
+        }
         // Fold provably non-correlated scalar / `EXISTS` subqueries that appear in
         // the top-level expressions to the constant they evaluate to, so the VDBE
         // (which cannot open a cursor for a nested query) can run the rest. Only
@@ -12780,7 +12787,7 @@ impl Connection {
             });
         }
 
-        let (mut columns, input_rows) = self.scan_source(sel, params)?;
+        let (columns, input_rows) = self.scan_source(sel, params)?;
 
         // FTS5 relevance: if this query references `rank` / `bm25()` over an `fts5`
         // table, build its query context (and bm25 corpus, if ranked) now and
@@ -12840,6 +12847,26 @@ impl Connection {
             rows.push(r);
         }
 
+        // Windows, aggregation/grouping, projection, DISTINCT, ORDER BY and
+        // LIMIT/OFFSET all run over these post-WHERE rows. Factored into
+        // `finish_from_rows` so the VDBE window dispatcher can reuse the exact same
+        // tail after producing the base rows itself.
+        self.finish_from_rows(sel, columns, rows, params)
+    }
+
+    /// Finish a query block from its post-`WHERE` rows: apply window functions,
+    /// aggregation/grouping and projection, then `DISTINCT`, `ORDER BY` and
+    /// `LIMIT`/`OFFSET`. `columns` is the input rows' column metadata (windows
+    /// append synthetic columns to it). This is the second half of `run_core`,
+    /// extracted so the VDBE window path ([`run_window_vdbe`]) can drive it over
+    /// rows it scanned itself.
+    fn finish_from_rows(
+        &self,
+        sel: &Select,
+        mut columns: Vec<ColumnInfo>,
+        mut rows: Vec<InputRow>,
+        params: &Params,
+    ) -> Result<QueryResult> {
         // A window function combined with GROUP BY / aggregates: SQLite applies
         // the window *after* grouping (it runs over the post-aggregation rows, and
         // an aggregate inside a window argument or spec is the group's aggregate).
@@ -12969,6 +12996,86 @@ impl Connection {
             columns: out_labels,
             rows: final_rows,
         })
+    }
+
+    /// Run a window-function `SELECT` over a single plain table on the VDBE
+    /// (Track B5c-4). The window evaluation itself is not bytecode; instead the
+    /// base table is scanned (with `WHERE` applied) by the VDBE, and the rows are
+    /// fed to the shared `finish_from_rows` tail — analogous to how
+    /// `run_compound_vdbe` reuses the set-combine helpers. The base scan appends
+    /// each row's rowid as a trailing column so a `rowid`/`_rowid_`/`oid`
+    /// reference anywhere in the query resolves; a `WITHOUT ROWID` table makes
+    /// that projection bail, so such queries fall back. Any shape the base scan
+    /// cannot run (a join, a derived/virtual/view source, a non-`main` schema, …)
+    /// returns `Unsupported`, falling the whole query back to the tree-walker.
+    fn run_window_vdbe(&self, sel: &Select) -> Result<QueryResult> {
+        // A `WITH` of its own could shadow the base table with a CTE the VDBE
+        // scan cannot open — defer.
+        if !sel.ctes.is_empty() {
+            return Err(Error::Unsupported("VDBE window: query carries CTEs"));
+        }
+        let Some(from) = &sel.from else {
+            return Err(Error::Unsupported("VDBE window: no FROM"));
+        };
+        // A single, plain, ordinary main-database table only.
+        if !from.joins.is_empty() {
+            return Err(Error::Unsupported("VDBE window: join source"));
+        }
+        let tref = &from.first;
+        if tref.subquery.is_some()
+            || tref.tvf_args.is_some()
+            || tref.index_hint.is_some()
+            || tref.schema.is_some()
+            || self.is_pragma_tvf(tref)
+            || self.is_view(&tref.name)
+            || self.is_virtual_table(&tref.name)
+            || self
+                .cte_env
+                .borrow()
+                .iter()
+                .any(|b| b.name.eq_ignore_ascii_case(&tref.name))
+        {
+            return Err(Error::Unsupported("VDBE window: non-plain source"));
+        }
+        let columns = self.table_meta(&tref.name, tref.alias.as_deref())?.columns;
+        let ncols = columns.len();
+        // Scan the base table with `WHERE` applied, appending each row's rowid as a
+        // trailing column. Everything else (`GROUP BY`, `HAVING`, `ORDER BY`,
+        // `LIMIT`, `DISTINCT`, the windows) is stripped — `finish_from_rows` re-runs
+        // it over the scanned rows.
+        let mut base = sel.clone();
+        base.distinct = false;
+        base.group_by = Vec::new();
+        base.having = None;
+        base.window_defs = Vec::new();
+        base.order_by = Vec::new();
+        base.limit = None;
+        base.offset = None;
+        base.columns = alloc::vec![
+            ResultColumn::Wildcard,
+            ResultColumn::Expr {
+                expr: Expr::Column {
+                    table: None,
+                    column: "rowid".into(),
+                },
+                alias: Some("__winrowid__".into()),
+                source: None,
+            },
+        ];
+        let scanned = self.run_select_vdbe(&base)?;
+        let mut rows: Vec<InputRow> = Vec::with_capacity(scanned.rows.len());
+        for mut values in scanned.rows {
+            // [base columns…, rowid]: split the trailing rowid back off.
+            if values.len() != ncols + 1 {
+                return Err(Error::Unsupported("VDBE window: column count mismatch"));
+            }
+            let rowid = match values.pop() {
+                Some(Value::Integer(id)) => Some(id),
+                _ => None,
+            };
+            rows.push(InputRow { values, rowid });
+        }
+        self.finish_from_rows(sel, columns, rows, &Params::default())
     }
 
     /// The column metadata visible to `sel`'s expressions (its `FROM` sources'
