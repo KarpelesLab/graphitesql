@@ -322,6 +322,21 @@ text-preserving CREATE-text edits).
     previously created the trigger silently. The same change matches sqlite's
     exact wording for a direct write to a view, `cannot modify NAME because it is
     a view` (was `… — it is a view`) (`tests/trigger_target_kind.rs`).
+  - **A parenthesized `VALUES` clause is a subquery expression (done).**
+    `(VALUES(1),(2))` is now accepted as a scalar subquery (yielding the first
+    row's first column), exactly like a parenthesized `SELECT`; the expression
+    parser previously rejected `VALUES` after `(`
+    (`tests/values_scalar_subquery.rs`).
+  - **`FOREIGN KEY` column-count arity is validated at CREATE (done).** A
+    table-level `FOREIGN KEY(a,b) REFERENCES x(y)` whose explicit parent-column
+    list differs in length from the child list is rejected with `number of
+    columns in foreign key does not match the number of columns in the referenced
+    table`, and a column-level `a REFERENCES x(y,z)` naming more than one parent
+    column with `foreign key on a should reference only one column of table x` —
+    both structural checks sqlite makes before the parent table need even exist.
+    An empty parent list (`REFERENCES x`) still defers to the parent's PRIMARY
+    KEY. graphite previously accepted every malformed form silently
+    (`tests/fk_arity_validation.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

@@ -4150,6 +4150,17 @@ impl Connection {
                 if let Some(col) = bad {
                     return Err(Error::Error(format!("no such column: {col}")));
                 }
+                // A column-level FOREIGN KEY references exactly its own column, so
+                // it may name at most one parent column. SQLite rejects more at
+                // CREATE with this specific message.
+                if let ColumnConstraint::References(fk) = k {
+                    if fk.ref_columns.len() > 1 {
+                        return Err(Error::Error(format!(
+                            "foreign key on {} should reference only one column of table {}",
+                            c.name, fk.ref_table
+                        )));
+                    }
+                }
             }
         }
         for tc in &ct.constraints {
@@ -4169,6 +4180,16 @@ impl Connection {
                             "unknown column \"{col}\" in foreign key definition"
                         )));
                     }
+                }
+                // The number of child columns must match the number of explicitly
+                // named parent columns (an empty parent list defers to the parent's
+                // PRIMARY KEY, resolved lazily). SQLite rejects a mismatch at CREATE.
+                if !fk.ref_columns.is_empty() && fk.ref_columns.len() != fk.columns.len() {
+                    return Err(Error::Error(
+                        "number of columns in foreign key does not match the number of \
+                         columns in the referenced table"
+                            .into(),
+                    ));
                 }
             }
         }
