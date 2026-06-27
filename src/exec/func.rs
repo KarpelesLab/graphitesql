@@ -456,6 +456,12 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 0)?;
             Value::Text(crate::TARGET_SQLITE_VERSION.into())
         }
+        // Independent reimplementation: this is graphitesql's own identifier in
+        // SQLite's `YYYY-MM-DD HH:MM:SS <hash>` shape, not a C build's id.
+        "sqlite_source_id" => {
+            arity(&lname, args, 0)?;
+            Value::Text(crate::TARGET_SQLITE_SOURCE_ID.into())
+        }
         "zeroblob" => {
             arity(&lname, args, 1)?;
             match &v[0] {

@@ -80,3 +80,15 @@ pub const SQLITE_FILE_FORMAT: u32 = 3;
 /// The SQLite release whose documented behavior graphitesql tracks as its
 /// compatibility target. See `ATTRIBUTION.md`.
 pub const TARGET_SQLITE_VERSION: &str = "3.53.2";
+
+/// The value returned by the `sqlite_source_id()` SQL function.
+///
+/// SQLite reports the exact source-control identifier of its C build here, in a
+/// `YYYY-MM-DD HH:MM:SS <hash>` shape. graphitesql is an independent
+/// reimplementation with no SQLite source compiled in, so — like
+/// [`TARGET_SQLITE_VERSION`] — this is graphitesql's own identifier in that
+/// shape rather than an impersonation of a particular C build. Callers that log
+/// or display the source id (many drivers fetch it at startup beside
+/// `sqlite_version()`) get a well-formed string instead of an error.
+pub const TARGET_SQLITE_SOURCE_ID: &str =
+    "2025-01-01 00:00:00 graphitesql00000000000000000000000000000000000000";

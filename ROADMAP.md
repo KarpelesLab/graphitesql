@@ -208,7 +208,13 @@ character is only ever the escape introducer, and a trailing escape matches just
 the empty remainder (`'ab' LIKE 'a_' ESCAPE '_'` is now false); and a hex
 literal wider than 64 bits is now a *recognized* token rejected with SQLite's
 dedicated `hex literal too big: 0x…` (echoing the literal verbatim) rather than a
-generic `unrecognized token` — all byte-exact vs `sqlite3` 3.50.4.
+generic `unrecognized token`; and the `sqlite_source_id()` scalar is now
+implemented (it returned `no such function`) — an independent reimplementation
+can't carry a C build's id, so it returns graphitesql's own identifier in
+SQLite's `YYYY-MM-DD HH:MM:SS <hash>` shape (the build-invariant contract —
+non-NULL `text` with a timestamp-shaped leading field, and an arity error for
+any argument — is what the differential test checks) — all byte-exact vs
+`sqlite3` 3.50.4.
 
 **Remaining:**
 
