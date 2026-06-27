@@ -2590,10 +2590,24 @@ impl Connection {
     /// `PRAGMA index_info(index)` → `(seqno, cid, name)` for each indexed column.
     fn pragma_index_info(&self, p: &Pragma, extended: bool) -> Result<QueryResult> {
         let index = Self::pragma_arg_name(p)?;
-        let obj = self
-            .schema
-            .index(&index)
-            .ok_or_else(|| Error::Error(format!("no such index: {index}")))?;
+        let columns: Vec<String> = if extended {
+            ["seqno", "cid", "name", "desc", "coll", "key"]
+                .iter()
+                .map(|s| String::from(*s))
+                .collect()
+        } else {
+            ["seqno", "cid", "name"]
+                .iter()
+                .map(|s| String::from(*s))
+                .collect()
+        };
+        // SQLite reports an unknown index name as an empty result, not an error.
+        let Some(obj) = self.schema.index(&index) else {
+            return Ok(QueryResult {
+                columns,
+                rows: Vec::new(),
+            });
+        };
         let tmeta = self.table_meta(&obj.tbl_name, None)?;
         // Per key column: (cid, name, descending, collation). A bare column takes
         // its position + name; an EXPRESSION column is `cid = -2` with a NULL name,
@@ -2707,17 +2721,6 @@ impl Connection {
                 ]);
             }
         }
-        let columns: Vec<String> = if extended {
-            ["seqno", "cid", "name", "desc", "coll", "key"]
-                .iter()
-                .map(|s| String::from(*s))
-                .collect()
-        } else {
-            ["seqno", "cid", "name"]
-                .iter()
-                .map(|s| String::from(*s))
-                .collect()
-        };
         Ok(QueryResult { columns, rows })
     }
 
@@ -2725,26 +2728,31 @@ impl Connection {
     /// `(id, seq, table, from, to, on_update, on_delete, match)`.
     fn pragma_foreign_key_list(&self, p: &Pragma) -> Result<QueryResult> {
         let table = Self::pragma_arg_name(p)?;
-        let obj = self
-            .schema
-            .table(&table)
-            .ok_or_else(|| Error::Error(format!("no such table: {table}")))?;
+        let columns: Vec<String> = [
+            "id",
+            "seq",
+            "table",
+            "from",
+            "to",
+            "on_update",
+            "on_delete",
+            "match",
+        ]
+        .iter()
+        .map(|s| String::from(*s))
+        .collect();
+        // An unknown table — like a virtual table — yields an empty list, not an
+        // error, matching SQLite.
+        let Some(obj) = self.schema.table(&table) else {
+            return Ok(QueryResult {
+                columns,
+                rows: Vec::new(),
+            });
+        };
         let Statement::CreateTable(ct) = sql::parse_one(obj.sql.as_deref().unwrap_or(""))? else {
             // A virtual table (non-CREATE-TABLE schema) has no foreign keys.
             return Ok(QueryResult {
-                columns: [
-                    "id",
-                    "seq",
-                    "table",
-                    "from",
-                    "to",
-                    "on_update",
-                    "on_delete",
-                    "match",
-                ]
-                .iter()
-                .map(|s| String::from(*s))
-                .collect(),
+                columns,
                 rows: Vec::new(),
             });
         };

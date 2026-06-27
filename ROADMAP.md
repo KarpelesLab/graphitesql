@@ -575,6 +575,12 @@ text-preserving CREATE-text edits).
     subquery, or join). graphite silently ignored the mismatch and returned the
     body's columns unrenamed. The check now fires at view expansion in both the
     main and temp/attached paths (`tests/view_column_count.rs`).
+  - **Introspection PRAGMAs return empty for an unknown object (done).**
+    `PRAGMA index_info`/`index_xinfo` on a nonexistent index, and
+    `PRAGMA foreign_key_list` on a nonexistent table, now yield zero rows with
+    the usual headers instead of raising `no such index`/`no such table` — the
+    way sqlite (and graphite's own `table_info`/`index_list`) already behaves
+    (`tests/pragma_unknown_object_empty.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
