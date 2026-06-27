@@ -12,7 +12,7 @@ crate, aiming for **byte-for-byte compatibility with the SQLite 3 database file
 format**.
 
 > **Status: read + write working, with a broad SQL engine**, verified
-> differentially against the real `sqlite3` CLI (a 1,600+ query corpus plus 240+
+> differentially against the real `sqlite3` CLI (a 1,600+ query corpus plus 260+
 > focused suites). graphitesql opens real SQLite files and **creates databases**
 > that `sqlite3` opens with `PRAGMA integrity_check = ok`. `SELECT` executes
 > through a register-machine **VDBE engine by default**, falling back to the
