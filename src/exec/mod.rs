@@ -13191,6 +13191,42 @@ impl Connection {
             }
         }
 
+        // A `FILTER (WHERE …)` clause restricts which rows an aggregate consumes,
+        // so it is meaningful only on an aggregate call. SQLite rejects it on a
+        // plain scalar function (`abs(x) FILTER(WHERE …)`) at prepare time, in
+        // every position; graphite's evaluator silently ignored the clause and
+        // returned the bare value. Check each scalar-expression position here.
+        {
+            let is_agg = |name: &str, n: usize, star: bool| {
+                func::is_aggregate_call(name, n, star)
+                    || self.aggregates.contains_key(&name.to_ascii_lowercase())
+            };
+            for rc in &sel.columns {
+                if let ResultColumn::Expr { expr, .. } = rc {
+                    reject_filter_on_non_aggregate(expr, &is_agg)?;
+                }
+            }
+            if let Some(w) = &sel.where_clause {
+                reject_filter_on_non_aggregate(w, &is_agg)?;
+            }
+            if let Some(h) = &sel.having {
+                reject_filter_on_non_aggregate(h, &is_agg)?;
+            }
+            for g in &sel.group_by {
+                reject_filter_on_non_aggregate(g, &is_agg)?;
+            }
+            for t in &sel.order_by {
+                reject_filter_on_non_aggregate(&t.expr, &is_agg)?;
+            }
+            if let Some(from) = &sel.from {
+                for j in &from.joins {
+                    if let Some(on) = &j.on {
+                        reject_filter_on_non_aggregate(on, &is_agg)?;
+                    }
+                }
+            }
+        }
+
         // Apply WHERE.
         let mut rows: Vec<InputRow> = Vec::new();
         for r in input_rows {
@@ -13735,9 +13771,14 @@ impl Connection {
         // queries, and have no result-column/ORDER BY context where a window is
         // valid). SQLite rejects it at prepare time; graphite otherwise evaluated
         // it lazily and so silently accepted it over an empty/filtered table.
+        let is_agg = |name: &str, n: usize, star: bool| {
+            func::is_aggregate_call(name, n, star)
+                || self.aggregates.contains_key(&name.to_ascii_lowercase())
+        };
         for e in exprs {
             reject_misused_window(e)?;
             reject_misused_aggregate(e, false)?;
+            reject_filter_on_non_aggregate(e, &is_agg)?;
         }
         Ok(())
     }
@@ -18680,6 +18721,45 @@ fn reject_misused_window(e: &Expr) -> Result<()> {
     match first_window_call_name(e) {
         Some(name) => Err(Error::Error(alloc::format!(
             "misuse of window function {name}()"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Reject a `FILTER (WHERE …)` clause attached to a non-aggregate function.
+/// `FILTER` restricts which rows an aggregate consumes, so it is meaningful only
+/// on an aggregate (or aggregate window) call; SQLite rejects it on a plain
+/// scalar function — `abs(x) FILTER(WHERE …)` — at prepare time, in every
+/// position, naming the function as written. `is_agg` decides aggregate-ness
+/// (builtins plus any registered user aggregate), so a `FILTER` on a user
+/// aggregate stays legal. Window calls (`over.is_some()`) are left to the
+/// window-validation path. The walk stops at subquery boundaries.
+fn reject_filter_on_non_aggregate(
+    e: &Expr,
+    is_agg: &dyn Fn(&str, usize, bool) -> bool,
+) -> Result<()> {
+    let mut found: Option<String> = None;
+    window::visit(e, &mut |n| {
+        if found.is_some() {
+            return;
+        }
+        if let Expr::Function {
+            name,
+            args,
+            star,
+            filter,
+            over,
+            ..
+        } = n
+        {
+            if filter.is_some() && over.is_none() && !is_agg(name, args.len(), *star) {
+                found = Some(name.clone());
+            }
+        }
+    });
+    match found {
+        Some(name) => Err(Error::Error(alloc::format!(
+            "FILTER may not be used with non-aggregate {name}()"
         ))),
         None => Ok(()),
     }

@@ -418,6 +418,27 @@ text-preserving CREATE-text edits).
     NAME used outside an aggregate context`; it now reports sqlite's `misuse of
     aggregate function NAME()`, naming the inner call. (sqlite never produced the
     old wording, so this only tightens parity.) `tests/nested_aggregate_misuse.rs`.
+  - **`FILTER` on a non-aggregate function is rejected at prepare time (done).** A
+    `FILTER (WHERE …)` clause restricts which rows feed an aggregation, so it is
+    only meaningful on an aggregate (or window-aggregate) call. Attached to an
+    ordinary scalar function (`abs(a) FILTER(WHERE …)`) it is a misuse: sqlite
+    reports `FILTER may not be used with non-aggregate NAME()` (the name echoed
+    exactly as written). graphite parsed the clause and silently ignored it,
+    returning the bare function value. It is now caught up front in every
+    position — result columns, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, join
+    `ON`, and `UPDATE`/`DELETE` expressions — while `FILTER` on a real aggregate
+    or a window-aggregate (`sum(a) FILTER(…) OVER ()`) stays legal
+    (`tests/filter_non_aggregate.rs`).
+  - **Non-integer `LIMIT`/`OFFSET` errors on the VDBE scan path too (done).** A
+    `LIMIT`/`OFFSET` value carries `OP_MustBeInt` semantics: it must be an
+    integer, an integer-valued real, or text that parses as one, else a
+    `datatype mismatch`. The interpreter path already enforced this, but the VDBE
+    single-table scan path folded the constant with a lossy `to_i64` (truncating
+    `1.9` → 1, parsing `'2abc'` → 2, treating NULL/blob as 0), so `SELECT a FROM t
+    LIMIT 1.9` silently succeeded where `SELECT 1 LIMIT 1.9` already errored. The
+    constant folder now returns "not an integer" for a fractional real,
+    non-numeric text, NULL, or blob, bailing to the interpreter which raises the
+    same `datatype mismatch` (`tests/limit_must_be_int.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
