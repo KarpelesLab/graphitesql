@@ -248,14 +248,26 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
     is now just the span.)
   - **A-rn3-edge-2** — use the span for scope-aware rename: resolve each bare ref
     to its owning table, rewrite only the matching ones.
-- **Reserved keywords accepted as bare identifiers.** ~37 reserved words
-  (`SELECT`, `WHERE`, `FROM`, …) are still accepted where SQLite rejects them —
-  e.g. `CREATE TABLE t(select)`. The fix is to apply SQLite's exact reserved-
-  keyword set in `ident()` (an `is_reserved_keyword` helper already exists in
-  `src/sql/parser.rs`, ~line 460, used by `pragma_value`). High regression risk —
-  every accidental-keyword identifier in the test corpus must keep working — so it
-  wants a dedicated pass with a full differential sweep over the keyword list, not
-  a quick edit.
+- **Reserved keywords accepted as bare identifiers — DONE.** SQLite's exact
+  58-word reserved set (the keywords *not* in its `%fallback` set for the `nm`
+  rule) is now rejected in every name position — column, table, index, trigger,
+  view, and alias — via an `is_reserved_name` helper applied in both `ident()`
+  and `object_name()`, so `CREATE TABLE t(select)` / `SELECT 1 AS from` /
+  `CREATE INDEX join ON t(a)` all give `near "KW": syntax error`, while a quoted
+  `"select"` / `[select]` form stays a valid name. The reserved set was derived
+  empirically against the sqlite3 3.50.4 CLI over all 146 keywords and verified
+  position-independent. As part of the same pass, the CREATE-TABLE column list
+  now requires its **first** entry to be a column definition (SQLite rejects a
+  constraint-only table such as `CREATE TABLE t(check(1>0))` with `near "check"`;
+  graphite used to accept it). Covered by `tests/reserved_keyword_names.rs`
+  (per-position rejection + quoted/fallback acceptance + a full CLI sweep over
+  every keyword). The two speculative lookaheads that read a name before knowing
+  it is one — the `table.*` probe in `result_column` and the `table.*`-style
+  reset paths — were made tolerant so a leading reserved word (e.g. `SELECT
+  CASE …`) still falls through to expression parsing.
+  - *Residual (cosmetic, library-clean):* the CLI renders these as `Error: in
+    prepare, near …` vs graphite's `SQL error: near …`; the message body is
+    byte-identical and the differential tests normalize the prefix away.
 - **3-part `schema.table.column` qualifier — DONE** (top-level scope). `after_name`
   now *keeps* the schema part in a new `schema: Option<String>` field on
   `Expr::Column`, threaded through `no_such_column`/`resolve_column`/

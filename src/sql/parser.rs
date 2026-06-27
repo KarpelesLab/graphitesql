@@ -257,7 +257,15 @@ impl Parser {
     /// Parse an identifier (a bare word or a quoted identifier).
     fn ident(&mut self) -> Result<String> {
         match self.advance() {
-            Some(Token::Word(w)) => Ok(w),
+            Some(Token::Word(w)) => {
+                // A bare word that is one of SQLite's reserved keywords cannot be
+                // used as a name (`CREATE TABLE t(select)` → `near "select":
+                // syntax error`); a quoted identifier (`"select"`) still can.
+                if is_reserved_name(&w.to_ascii_lowercase()) {
+                    return Err(self.syntax_error(self.pos - 1));
+                }
+                Ok(w)
+            }
             Some(Token::Ident(i)) => Ok(i),
             None => Err(Error::Parse("incomplete input".into())),
             _ => Err(self.syntax_error(self.pos - 1)),
@@ -759,18 +767,17 @@ impl Parser {
         if self.eat(&Token::Star) {
             return Ok(ResultColumn::Wildcard);
         }
-        // `table.*` ?
+        // `table.*` ?  This is a speculative lookahead: a leading reserved word
+        // (e.g. `CASE`) makes `ident()` fail, in which case it is not a `table.*`
+        // and we fall through to parse the expression normally.
         if let Some(Token::Word(_)) | Some(Token::Ident(_)) = self.peek() {
             let save = self.pos;
-            let name = self.ident()?;
-            if self.eat(&Token::Dot) {
-                if self.eat(&Token::Star) {
+            if let Ok(name) = self.ident() {
+                if self.eat(&Token::Dot) && self.eat(&Token::Star) {
                     return Ok(ResultColumn::TableWildcard(name));
                 }
-                self.pos = save; // not a table.* ; reparse as expression
-            } else {
-                self.pos = save;
             }
+            self.pos = save; // not a table.* ; reparse as expression
         }
         // Record the byte span of the expression so an unaliased result column
         // can be named after its verbatim source text, as SQLite does.
@@ -1018,7 +1025,15 @@ impl Parser {
     /// `CREATE TABLE 'fts_data'(…)` — so a `Str` token is taken as the name too.
     fn object_name(&mut self) -> Result<String> {
         match self.advance() {
-            Some(Token::Word(w)) => Ok(w),
+            Some(Token::Word(w)) => {
+                // A reserved keyword cannot name a schema object (`CREATE TABLE
+                // select(…)` → `near "select": syntax error`); a quoted or string
+                // form still can.
+                if is_reserved_name(&w.to_ascii_lowercase()) {
+                    return Err(self.syntax_error(self.pos - 1));
+                }
+                Ok(w)
+            }
             Some(Token::Ident(i)) => Ok(i),
             Some(Token::Str(s)) => Ok(s),
             None => Err(Error::Parse("incomplete input".into())),
@@ -1534,7 +1549,11 @@ impl Parser {
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
         loop {
-            if self.starts_table_constraint() {
+            // SQLite requires the list to begin with a column definition: a table
+            // constraint may only follow at least one column, so a leading
+            // constraint keyword (`CREATE TABLE t(check(…))`) is a `near "KW"`
+            // syntax error rather than a constraint-only table.
+            if self.starts_table_constraint() && !columns.is_empty() {
                 if let Some(tc) = self.table_constraint()? {
                     constraints.push(tc);
                 }
@@ -2904,6 +2923,76 @@ fn is_reserved_keyword(lower: &str) -> bool {
             | "union"
             | "intersect"
             | "except"
+    )
+}
+
+/// SQLite's exact set of reserved keywords that cannot be used as a *name*
+/// (table / column / index / trigger / alias …) without quoting, regardless of
+/// position. These are precisely the keywords NOT in SQLite's `%fallback` set
+/// for the `nm` grammar rule, so `CREATE TABLE t(select)` and `SELECT 1 AS from`
+/// both fail with `near "KW": syntax error`, while a quoted `"select"` is fine.
+/// Derived empirically against the sqlite3 3.50.4 CLI over all 146 keywords.
+fn is_reserved_name(lower: &str) -> bool {
+    matches!(
+        lower,
+        "add"
+            | "all"
+            | "alter"
+            | "and"
+            | "as"
+            | "autoincrement"
+            | "between"
+            | "case"
+            | "check"
+            | "collate"
+            | "commit"
+            | "constraint"
+            | "create"
+            | "default"
+            | "deferrable"
+            | "delete"
+            | "distinct"
+            | "drop"
+            | "else"
+            | "escape"
+            | "except"
+            | "exists"
+            | "foreign"
+            | "from"
+            | "group"
+            | "having"
+            | "in"
+            | "index"
+            | "insert"
+            | "intersect"
+            | "into"
+            | "is"
+            | "isnull"
+            | "join"
+            | "limit"
+            | "not"
+            | "nothing"
+            | "notnull"
+            | "null"
+            | "on"
+            | "or"
+            | "order"
+            | "primary"
+            | "references"
+            | "returning"
+            | "select"
+            | "set"
+            | "table"
+            | "then"
+            | "to"
+            | "transaction"
+            | "union"
+            | "unique"
+            | "update"
+            | "using"
+            | "values"
+            | "when"
+            | "where"
     )
 }
 
