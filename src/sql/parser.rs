@@ -2663,15 +2663,16 @@ impl Parser {
             self.expect_kw("row")?;
             return Ok(FrameBound::CurrentRow);
         }
-        // `<n> PRECEDING|FOLLOWING`
-        let n = match self.expr()? {
-            Expr::Literal(Literal::Integer(i)) => i,
-            _ => return Err(self.err("expected an integer frame offset")),
-        };
+        // `<offset> PRECEDING|FOLLOWING`. SQLite accepts any constant expression
+        // here (e.g. `(1+1)`, `2.0`), not just an integer literal; the offset is
+        // validated at run time (a non-negative integer for `ROWS`/`GROUPS`, a
+        // non-negative number for `RANGE`). We keep the whole expression and defer
+        // that check to evaluation.
+        let off = Box::new(self.expr()?);
         if self.eat_kw("preceding") {
-            Ok(FrameBound::Preceding(n))
+            Ok(FrameBound::Preceding(off))
         } else if self.eat_kw("following") {
-            Ok(FrameBound::Following(n))
+            Ok(FrameBound::Following(off))
         } else {
             Err(self.err("expected PRECEDING or FOLLOWING"))
         }

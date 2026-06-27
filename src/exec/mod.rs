@@ -12836,10 +12836,19 @@ impl Connection {
             .as_ref()
             .map(|f| f.exclude)
             .unwrap_or(FrameExclude::NoOthers);
+        // Resolve the (constant) frame offsets once. SQLite validates them at run
+        // time and defers the check over an empty partition, so only resolve when
+        // there is at least one row.
+        let rframe = match (&spec.frame, m > 0) {
+            (Some(f), true) => Some(resolve_frame(f)?),
+            _ => None,
+        };
+        let order_by_empty = spec.order_by.is_empty();
         // Ranking values per ordered position.
         for p in 0..m {
             let idx = ordered[p];
-            let (fstart, fend) = frame_bounds(p, m, &gid, spec, &ovals, desc);
+            let (fstart, fend) =
+                frame_bounds(p, m, &gid, rframe.as_ref(), order_by_empty, &ovals, desc);
             // Positions of the frame after applying EXCLUDE.
             let fpos: Vec<usize> = (fstart..fend)
                 .filter(|&k| match exclude {
@@ -21871,16 +21880,109 @@ fn json_tree_walk(
     }
 }
 
+/// A window frame whose `<offset> PRECEDING/FOLLOWING` bounds have been evaluated
+/// to numbers. SQLite accepts any constant expression as a frame offset and
+/// validates it at run time (once the partition has a row); this is the resolved
+/// form, computed once per partition by [`resolve_frame`].
+struct ResolvedFrame {
+    mode: FrameMode,
+    start: ResolvedBound,
+    end: ResolvedBound,
+}
+
+/// A frame bound with its offset already evaluated (see [`ResolvedFrame`]).
+enum ResolvedBound {
+    UnboundedPreceding,
+    Preceding(f64),
+    CurrentRow,
+    Following(f64),
+    UnboundedFollowing,
+}
+
+/// Whether `e` is a constant offset expression: a literal, or operators applied
+/// to constants. SQLite allows arbitrary constants as frame offsets (`(1+1)`,
+/// `2.0`) but rejects anything that reads a row — a column, a function call, a
+/// subquery — with the same "must be a non-negative integer/number" message.
+fn is_const_offset_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) => true,
+        Expr::Unary { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => is_const_offset_expr(expr),
+        Expr::Binary { left, right, .. } => {
+            is_const_offset_expr(left) && is_const_offset_expr(right)
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate a constant frame offset to a non-negative number. `ROWS`/`GROUPS`
+/// require a non-negative integer; `RANGE` allows a non-negative number. SQLite
+/// applies numeric affinity, so `'2'` and `'2.0'` work but `'2x'`, a blob, or
+/// NULL error.
+fn eval_frame_offset(e: &Expr, mode: FrameMode, is_start: bool) -> Result<f64> {
+    let bad = || {
+        let pos = if is_start { "starting" } else { "ending" };
+        let kind = if mode == FrameMode::Range {
+            "number"
+        } else {
+            "integer"
+        };
+        Error::Error(alloc::format!(
+            "frame {pos} offset must be a non-negative {kind}"
+        ))
+    };
+    if !is_const_offset_expr(e) {
+        return Err(bad());
+    }
+    let raw = const_value(e, &Params::default()).ok_or_else(bad)?;
+    match (mode, eval::Affinity::Numeric.coerce(raw)) {
+        // RANGE: any non-negative number (fractions allowed).
+        (FrameMode::Range, Value::Integer(n)) if n >= 0 => Ok(n as f64),
+        (FrameMode::Range, Value::Real(r)) if r.is_finite() && r >= 0.0 => Ok(r),
+        // ROWS/GROUPS: a non-negative integer (an integral real is accepted too).
+        (_, Value::Integer(n)) if n >= 0 => Ok(n as f64),
+        (_, Value::Real(r)) if r.is_finite() && r >= 0.0 && r == crate::util::float::trunc(r) => {
+            Ok(r)
+        }
+        _ => Err(bad()),
+    }
+}
+
+/// Evaluate every offset in `frame` once, validating it (see [`eval_frame_offset`]).
+fn resolve_frame(frame: &WindowFrame) -> Result<ResolvedFrame> {
+    let resolve = |b: &FrameBound, is_start: bool| -> Result<ResolvedBound> {
+        Ok(match b {
+            FrameBound::UnboundedPreceding => ResolvedBound::UnboundedPreceding,
+            FrameBound::CurrentRow => ResolvedBound::CurrentRow,
+            FrameBound::UnboundedFollowing => ResolvedBound::UnboundedFollowing,
+            FrameBound::Preceding(e) => {
+                ResolvedBound::Preceding(eval_frame_offset(e, frame.mode, is_start)?)
+            }
+            FrameBound::Following(e) => {
+                ResolvedBound::Following(eval_frame_offset(e, frame.mode, is_start)?)
+            }
+        })
+    };
+    Ok(ResolvedFrame {
+        mode: frame.mode,
+        start: resolve(&frame.start, true)?,
+        end: resolve(&frame.end, false)?,
+    })
+}
+
 fn frame_bounds(
     p: usize,
     m: usize,
     gid: &[usize],
-    spec: &WindowSpec,
+    frame: Option<&ResolvedFrame>,
+    order_by_empty: bool,
     ovals: &[Value],
     desc: bool,
 ) -> (usize, usize) {
-    let Some(frame) = &spec.frame else {
-        if spec.order_by.is_empty() {
+    let Some(frame) = frame else {
+        if order_by_empty {
             return (0, m);
         }
         // Default: UNBOUNDED PRECEDING .. CURRENT ROW (peers included).
@@ -21901,10 +22003,10 @@ fn frame_bounds(
             if !ovals.is_empty()
                 && (matches!(
                     frame.start,
-                    FrameBound::Preceding(_) | FrameBound::Following(_)
+                    ResolvedBound::Preceding(_) | ResolvedBound::Following(_)
                 ) || matches!(
                     frame.end,
-                    FrameBound::Preceding(_) | FrameBound::Following(_)
+                    ResolvedBound::Preceding(_) | ResolvedBound::Following(_)
                 )) =>
         {
             (
@@ -21926,7 +22028,7 @@ fn frame_bounds(
 /// `DESC` ordering). `CURRENT ROW` and `UNBOUNDED` fall back to peer-group edges.
 /// Falls back to peer-group edges if the current value is not numeric.
 fn range_value_bound(
-    b: &FrameBound,
+    b: &ResolvedBound,
     p: usize,
     m: usize,
     gid: &[usize],
@@ -21940,30 +22042,30 @@ fn range_value_bound(
     // (UNBOUNDED bounds are handled below and stay unbounded.)
     if matches!(
         b,
-        FrameBound::CurrentRow | FrameBound::Preceding(_) | FrameBound::Following(_)
+        ResolvedBound::CurrentRow | ResolvedBound::Preceding(_) | ResolvedBound::Following(_)
     ) && matches!(ovals[p], Value::Null)
     {
-        return group_bound(&FrameBound::CurrentRow, p, m, gid, is_start);
+        return group_bound(&ResolvedBound::CurrentRow, p, m, gid, is_start);
     }
     let val = eval::to_f64(&ovals[p]);
     // The frame edge as an ORDER BY value. Under ASC, PRECEDING subtracts and
     // FOLLOWING adds; under DESC the sequence decreases so the signs flip.
     let threshold = match b {
-        FrameBound::UnboundedPreceding => return 0,
-        FrameBound::UnboundedFollowing => return m,
-        FrameBound::CurrentRow => val,
-        FrameBound::Preceding(n) => {
+        ResolvedBound::UnboundedPreceding => return 0,
+        ResolvedBound::UnboundedFollowing => return m,
+        ResolvedBound::CurrentRow => val,
+        ResolvedBound::Preceding(n) => {
             if desc {
-                val + *n as f64
+                val + *n
             } else {
-                val - *n as f64
+                val - *n
             }
         }
-        FrameBound::Following(n) => {
+        ResolvedBound::Following(n) => {
             if desc {
-                val - *n as f64
+                val - *n
             } else {
-                val + *n as f64
+                val + *n
             }
         }
     };
@@ -22006,21 +22108,21 @@ fn range_value_bound(
 
 /// A `ROWS` frame bound as an index; `is_start` selects inclusive-start vs
 /// exclusive-end semantics.
-fn row_bound(b: &FrameBound, p: usize, m: usize, is_start: bool) -> usize {
+fn row_bound(b: &ResolvedBound, p: usize, m: usize, is_start: bool) -> usize {
     match (b, is_start) {
-        (FrameBound::UnboundedPreceding, _) => 0,
-        (FrameBound::UnboundedFollowing, _) => m,
-        (FrameBound::CurrentRow, true) => p,
-        (FrameBound::CurrentRow, false) => p + 1,
-        (FrameBound::Preceding(n), true) => p.saturating_sub(*n as usize),
-        (FrameBound::Preceding(n), false) => (p + 1).saturating_sub(*n as usize),
-        (FrameBound::Following(n), true) => (p + *n as usize).min(m),
-        (FrameBound::Following(n), false) => (p + 1 + *n as usize).min(m),
+        (ResolvedBound::UnboundedPreceding, _) => 0,
+        (ResolvedBound::UnboundedFollowing, _) => m,
+        (ResolvedBound::CurrentRow, true) => p,
+        (ResolvedBound::CurrentRow, false) => p + 1,
+        (ResolvedBound::Preceding(n), true) => p.saturating_sub(*n as usize),
+        (ResolvedBound::Preceding(n), false) => (p + 1).saturating_sub(*n as usize),
+        (ResolvedBound::Following(n), true) => (p + *n as usize).min(m),
+        (ResolvedBound::Following(n), false) => (p + 1 + *n as usize).min(m),
     }
 }
 
 /// A `RANGE`/`GROUPS` frame bound, measured in peer groups.
-fn group_bound(b: &FrameBound, p: usize, m: usize, gid: &[usize], is_start: bool) -> usize {
+fn group_bound(b: &ResolvedBound, p: usize, m: usize, gid: &[usize], is_start: bool) -> usize {
     let maxg = if m == 0 { 0 } else { gid[m - 1] as i64 };
     let target = |g: i64| -> i64 { gid[p] as i64 + g };
     // First ordered index of peer-group `g` (clamped: below 0 -> 0, above max -> m).
@@ -22047,14 +22149,14 @@ fn group_bound(b: &FrameBound, p: usize, m: usize, gid: &[usize], is_start: bool
         }
     };
     match (b, is_start) {
-        (FrameBound::UnboundedPreceding, _) => 0,
-        (FrameBound::UnboundedFollowing, _) => m,
-        (FrameBound::CurrentRow, true) => first_of(target(0)),
-        (FrameBound::CurrentRow, false) => after_last_of(target(0)),
-        (FrameBound::Preceding(n), true) => first_of(target(-(*n))),
-        (FrameBound::Preceding(n), false) => after_last_of(target(-(*n))),
-        (FrameBound::Following(n), true) => first_of(target(*n)),
-        (FrameBound::Following(n), false) => after_last_of(target(*n)),
+        (ResolvedBound::UnboundedPreceding, _) => 0,
+        (ResolvedBound::UnboundedFollowing, _) => m,
+        (ResolvedBound::CurrentRow, true) => first_of(target(0)),
+        (ResolvedBound::CurrentRow, false) => after_last_of(target(0)),
+        (ResolvedBound::Preceding(n), true) => first_of(target(-(*n as i64))),
+        (ResolvedBound::Preceding(n), false) => after_last_of(target(-(*n as i64))),
+        (ResolvedBound::Following(n), true) => first_of(target(*n as i64)),
+        (ResolvedBound::Following(n), false) => after_last_of(target(*n as i64)),
     }
 }
 

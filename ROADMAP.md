@@ -647,6 +647,27 @@ best-effort path, so a missing aliased column there is reported against the real
 name rather than the alias — a minor message-only divergence on an already-erroring
 query.)*
 
+A **window frame offset may be any constant expression**, not just an integer
+literal. SQLite accepts `ROWS (1+1) PRECEDING`, `RANGE (2.5-0.5) FOLLOWING`,
+`CAST(2 AS INT)`, `2 COLLATE NOCASE`, `1<<1`, and so on — anything built from
+literals and operators (including `CAST`/`COLLATE`/parentheses) — and validates
+the offset at *run time*, once the partition has a row: it folds the expression,
+applies **numeric affinity** (so a text `'2'`/`'2.0'`/`' 2 '` coerces and works,
+but `'2x'`, a blob, or `NULL` fail), then requires a non-negative integer for
+`ROWS`/`GROUPS` or a non-negative number for `RANGE`. A row-dependent offset (a
+column, a function call like `abs(2)`, or a subquery) is rejected with the same
+`frame {starting,ending} offset must be a non-negative {integer,number}` message,
+and the whole check is **deferred over an empty input** (no rows ⇒ no
+evaluation ⇒ no error), exactly as SQLite's stepping-time validation. graphite
+used to reject every non-integer-literal offset at *parse* time with a bogus
+`near "PRECEDING": syntax error`. The parser now keeps the offset as a full
+`Expr` (`FrameBound::Preceding/Following(Box<Expr>)`); `resolve_frame` evaluates
+and validates each offset once per non-empty partition into a numeric
+`ResolvedFrame`, which the `row_bound`/`group_bound`/`range_value_bound` helpers
+consume. Byte-exact vs `sqlite3` 3.50.4 (`tests/window_frame_offset_expr.rs`),
+covering the value cases, the affinity edges, the run-time rejections, and the
+empty-input deferral.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

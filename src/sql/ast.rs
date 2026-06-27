@@ -163,12 +163,15 @@ pub enum FrameMode {
 pub enum FrameBound {
     /// `UNBOUNDED PRECEDING`.
     UnboundedPreceding,
-    /// `<n> PRECEDING`.
-    Preceding(i64),
+    /// `<expr> PRECEDING`. The offset is a constant expression — SQLite accepts
+    /// any constant (e.g. `(1+1)`, `2.0`), not just an integer literal, and
+    /// validates it at run time (a non-negative integer for `ROWS`/`GROUPS`, a
+    /// non-negative number for `RANGE`).
+    Preceding(Box<Expr>),
     /// `CURRENT ROW`.
     CurrentRow,
-    /// `<n> FOLLOWING`.
-    Following(i64),
+    /// `<expr> FOLLOWING`.
+    Following(Box<Expr>),
     /// `UNBOUNDED FOLLOWING`.
     UnboundedFollowing,
 }
