@@ -700,6 +700,20 @@ aggregate-call path eats an optional `ALL` after the `DISTINCT` check, and
 `primary()` rejects a bare `all`/`distinct` operand. Byte-exact vs `sqlite3`
 3.50.4 (`tests/all_distinct_operand_syntax.rs`).
 
+The **"ambiguous column name" message now echoes the reference as written.**
+SQLite names the offending column with the exact qualifier the user typed — a
+bare `column`, a `table.column`, or a three-part `schema.table.column` — so
+`SELECT t.a FROM t, t` reports `ambiguous column name: t.a` and
+`SELECT main.t.a FROM t, t` reports `main.t.a`. graphite used to strip the
+qualifier and always print the bare `a`. The fix reconstructs the written form
+from the `Expr::Column { schema, table, column }` fields in
+`validate_unambiguous_columns`. Byte-exact vs `sqlite3` 3.50.4
+(`tests/ambiguous_column_qualifier.rs`). One sub-case is deferred: a `*`/`t.*`
+wildcard over an *unaliased self-join* is ambiguous on the database-qualified
+expansion (`SELECT * FROM t, t` → `main.t.a`, `temp.t.a` for a temp table),
+which needs the owning database name threaded onto `ColumnInfo` (it currently
+carries only the table/alias); graphite reports `t.a` there for now.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

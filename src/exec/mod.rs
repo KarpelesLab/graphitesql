@@ -19576,7 +19576,13 @@ fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<
             if ambiguous.is_some() {
                 return;
             }
-            if let Expr::Column { table, column, .. } = sub {
+            if let Expr::Column {
+                schema,
+                table,
+                column,
+                ..
+            } = sub
+            {
                 let n = columns
                     .iter()
                     .filter(|c| {
@@ -19587,7 +19593,15 @@ fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<
                     })
                     .count();
                 if n >= 2 {
-                    ambiguous = Some(alloc::format!("ambiguous column name: {column}"));
+                    // SQLite names the offending column exactly as written: a
+                    // three-part `schema.table.column`, a `table.column`, or a
+                    // bare `column`.
+                    let name = match (schema, table) {
+                        (Some(s), Some(t)) => alloc::format!("{s}.{t}.{column}"),
+                        (_, Some(t)) => alloc::format!("{t}.{column}"),
+                        _ => column.clone(),
+                    };
+                    ambiguous = Some(alloc::format!("ambiguous column name: {name}"));
                 }
             }
         });
