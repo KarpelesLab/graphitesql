@@ -218,8 +218,14 @@ table_info`/`table_xinfo` now reports `notnull=1` for the PRIMARY KEY columns of
 a **WITHOUT ROWID** table (they are implicitly NOT NULL — a table-level
 composite key and an INTEGER PRIMARY KEY included), while a rowid table's PK
 columns stay `notnull=0`; the *enforcement* already matched sqlite (a NULL-PK
-insert was rejected), only the introspection column was out of sync — all
-byte-exact vs `sqlite3` 3.50.4.
+insert was rejected), only the introspection column was out of sync; and a
+strict JSON number whose magnitude overflows `f64` to ±infinity now round-trips
+its verbatim source text in JSON *text* output (`json('1e1000')` → `1e1000`,
+`json('[1e1000]')` → `[1e1000]`) instead of collapsing to the `9e999` infinity
+literal — the serializer checked `is_infinite()` before the text-preserving
+arm, so the parsed source text was dropped; the extracted SQL value is still
+`f64` infinity, and a *computed* infinity (no source text) still renders as
+`9e999` — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 

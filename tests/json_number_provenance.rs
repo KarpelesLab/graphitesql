@@ -37,6 +37,32 @@ fn json_text_keeps_the_source_number_form() {
 }
 
 #[test]
+fn json_text_keeps_overflowing_number_text() {
+    // A strict JSON number whose magnitude overflows f64 to ±infinity still
+    // round-trips its verbatim text in JSON *text* output — `json('1e1000')` is
+    // `1e1000`, not the `9e999` infinity literal that a *computed* infinity
+    // renders as. (graphite checked `is_infinite()` before the text-preserving
+    // arm, dropping the source text; now the text wins.)
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(text(&c, "SELECT json('1e1000')"), "1e1000");
+    assert_eq!(text(&c, "SELECT json('-1e1000')"), "-1e1000");
+    assert_eq!(text(&c, "SELECT json('9.9e999')"), "9.9e999");
+    assert_eq!(text(&c, "SELECT json('[1e1000]')"), "[1e1000]");
+    assert_eq!(
+        text(&c, "SELECT json('{\"x\":1e1000}')"),
+        r#"{"x":1e1000}"#
+    );
+    // A bare `9e999` in the input (which *is* the infinity literal) is preserved
+    // verbatim too, since it is itself a strict number.
+    assert_eq!(text(&c, "SELECT json('9e999')"), "9e999");
+    // The extracted SQL value of an overflowing number is f64 infinity.
+    assert_eq!(
+        one(&c, "SELECT json_extract('[1e1000]', '$[0]')"),
+        Value::Real(f64::INFINITY)
+    );
+}
+
+#[test]
 fn extracted_scalar_is_the_canonical_value() {
     let c = Connection::open_memory().unwrap();
     // The SQL value of a JSON number is the f64, not its text.

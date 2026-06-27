@@ -274,15 +274,19 @@ impl Json {
             Json::Bool(true) => out.push_str("true"),
             Json::Bool(false) => out.push_str("false"),
             Json::Int(i, _) => out.push_str(&i.to_string()),
-            Json::Real(r, _) if r.is_infinite() => {
-                // JSON has no infinity literal; sqlite renders it as `±9e999`
-                // (a value that round-trips to f64 infinity).
-                out.push_str(if *r < 0.0 { "-9e999" } else { "9e999" });
-            }
             // Preserve a *strict* number's verbatim source text (`1e2`, `1.50`,
             // `-0.0`); a JSON5-only form (`.5`, `5.`) and a computed value render
-            // in canonical form (`.5` → `0.5`), matching sqlite's `json()`.
+            // in canonical form (`.5` → `0.5`), matching sqlite's `json()`. This
+            // precedes the infinity fallback so a parsed-from-text number that
+            // overflows f64 (`1e1000`, `9.9e999`) still round-trips verbatim,
+            // exactly as `json('1e1000')` → `1e1000` in sqlite.
             Json::Real(_, Some(src)) if is_strict_json_number(src) => out.push_str(src),
+            Json::Real(r, _) if r.is_infinite() => {
+                // A *computed* infinity (no source text) has no JSON literal;
+                // sqlite renders it as `±9e999` (a value that round-trips to f64
+                // infinity).
+                out.push_str(if *r < 0.0 { "-9e999" } else { "9e999" });
+            }
             Json::Real(r, _) => out.push_str(&crate::exec::eval::format_real(*r)),
             Json::Str(s) => write_json_string(s, out),
             Json::Array(items) => {
