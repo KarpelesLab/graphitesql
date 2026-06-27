@@ -4427,6 +4427,11 @@ impl Connection {
                 }
             }
         }
+        // A cycle among the table's generated columns is rejected at CREATE,
+        // like SQLite (which validates this before any row is inserted).
+        if let Some(col) = generated_column_loop(&ct.columns) {
+            return Err(Error::Error(format!("generated column loop on \"{col}\"")));
+        }
         for tc in &ct.constraints {
             if let TableConstraint::Check(e, _) = tc {
                 if let Some(col) = unknown_column_ref(e, &known, true, Some(&ct.name)) {
@@ -17650,16 +17655,7 @@ impl Connection {
         if meta.generated.iter().all(|g| g.is_none()) {
             return Ok(());
         }
-        for i in 0..meta.columns.len() {
-            if let Some((expr, stored)) = &meta.generated[i] {
-                if !stored {
-                    let ctx = row_ctx(values, &meta.columns, None, params).with_subqueries(self);
-                    let v = eval::eval(expr, &ctx)?;
-                    values[i] = meta.columns[i].affinity.coerce(v);
-                }
-            }
-        }
-        Ok(())
+        self.eval_generated_in_order(meta, values, params, false)
     }
 
     /// Materialize all generated columns (STORED and VIRTUAL) into `values`,
@@ -17673,13 +17669,99 @@ impl Connection {
         if meta.generated.iter().all(|g| g.is_none()) {
             return Ok(());
         }
-        for i in 0..meta.columns.len() {
-            if let Some((expr, _)) = &meta.generated[i] {
-                let ctx = row_ctx(values, &meta.columns, None, params).with_subqueries(self);
-                let v = eval::eval(expr, &ctx)?;
-                values[i] = meta.columns[i].affinity.coerce(v);
+        self.eval_generated_in_order(meta, values, params, true)
+    }
+
+    /// Evaluate generated columns in dependency order, so a generated column may
+    /// reference another declared *later* in the table (SQLite resolves these
+    /// forward references). `recompute_stored` distinguishes the write path
+    /// (all generated columns) from the read path (VIRTUAL only — STORED values
+    /// are already materialized in `values` from the record). Cycles are rejected
+    /// at CREATE (see `generated_column_loop`); the busy check here is a guard.
+    fn eval_generated_in_order(
+        &self,
+        meta: &TableMeta,
+        values: &mut [Value],
+        params: &Params,
+        recompute_stored: bool,
+    ) -> Result<()> {
+        let n = meta.columns.len();
+        // Which generated columns this pass evaluates.
+        let eval_set: Vec<bool> = (0..n)
+            .map(|i| match &meta.generated[i] {
+                Some((_, stored)) => recompute_stored || !*stored,
+                None => false,
+            })
+            .collect();
+        // Edges to the generated columns each expression references, in source
+        // order (so cycle naming matches SQLite — the column whose expression
+        // closes the cycle is the one reported).
+        let mut deps: Vec<Vec<usize>> = alloc::vec![Vec::new(); n];
+        for i in 0..n {
+            if !eval_set[i] {
+                continue;
+            }
+            let (expr, _) = meta.generated[i].as_ref().expect("eval_set => generated");
+            window::visit(expr, &mut |node| {
+                if let Expr::Column {
+                    table: None,
+                    schema: None,
+                    column,
+                    ..
+                } = node
+                {
+                    if let Some(j) = meta
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(column))
+                    {
+                        if eval_set[j] {
+                            deps[i].push(j);
+                        }
+                    }
+                }
+            });
+        }
+        // Post-order DFS: 0 = unvisited, 1 = in-progress, 2 = done.
+        let mut state = alloc::vec![0u8; n];
+        for i in 0..n {
+            if eval_set[i] && state[i] == 0 {
+                self.eval_generated_dfs(i, meta, values, params, &deps, &mut state)?;
             }
         }
+        Ok(())
+    }
+
+    /// One node of the generated-column dependency DFS: evaluate every
+    /// referenced generated column first, then this one.
+    fn eval_generated_dfs(
+        &self,
+        i: usize,
+        meta: &TableMeta,
+        values: &mut [Value],
+        params: &Params,
+        deps: &[Vec<usize>],
+        state: &mut [u8],
+    ) -> Result<()> {
+        state[i] = 1;
+        for k in 0..deps[i].len() {
+            let j = deps[i][k];
+            match state[j] {
+                1 => {
+                    return Err(Error::Error(format!(
+                        "generated column loop on \"{}\"",
+                        meta.columns[i].name
+                    )));
+                }
+                0 => self.eval_generated_dfs(j, meta, values, params, deps, state)?,
+                _ => {}
+            }
+        }
+        let (expr, _) = meta.generated[i].as_ref().expect("eval_set => generated");
+        let ctx = row_ctx(values, &meta.columns, None, params).with_subqueries(self);
+        let v = eval::eval(expr, &ctx)?;
+        values[i] = meta.columns[i].affinity.coerce(v);
+        state[i] = 2;
         Ok(())
     }
 
@@ -19828,6 +19910,78 @@ fn unknown_collation(e: &Expr) -> Option<&str> {
 }
 
 /// (when `allow_rowid`) a rowid alias — the unknown column SQLite rejects at
+/// A generated column may reference other (generated or plain) columns of its
+/// table; a *cycle* among the generated columns is rejected at CREATE with
+/// `generated column loop on "X"`. The named column is the one whose expression
+/// closes the cycle (references an already in-progress generated column), with
+/// generated columns visited in declaration order — matching SQLite. Returns the
+/// looping column's name, or `None` when the generated columns are acyclic.
+fn generated_column_loop(columns: &[ColumnDef]) -> Option<String> {
+    let n = columns.len();
+    // Per column: the generated expression (if any) and the indices of the
+    // generated columns it references, in source order.
+    let gen_expr: Vec<Option<&Expr>> = columns
+        .iter()
+        .map(|c| {
+            c.constraints.iter().find_map(|k| match k {
+                ColumnConstraint::Generated { expr, .. } => Some(expr),
+                _ => None,
+            })
+        })
+        .collect();
+    let mut deps: Vec<Vec<usize>> = alloc::vec![Vec::new(); n];
+    for (i, expr) in gen_expr.iter().enumerate() {
+        let Some(expr) = expr else { continue };
+        window::visit(expr, &mut |node| {
+            if let Expr::Column {
+                table: None,
+                schema: None,
+                column,
+                ..
+            } = node
+            {
+                if let Some(j) = columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(column))
+                {
+                    if gen_expr[j].is_some() {
+                        deps[i].push(j);
+                    }
+                }
+            }
+        });
+    }
+    // Post-order DFS over the generated columns: 0 = unvisited, 1 = in-progress,
+    // 2 = done. A reference to an in-progress column closes a cycle, named for
+    // the column being visited.
+    fn dfs(i: usize, names: &[ColumnDef], deps: &[Vec<usize>], state: &mut [u8]) -> Option<String> {
+        state[i] = 1;
+        for k in 0..deps[i].len() {
+            let j = deps[i][k];
+            match state[j] {
+                1 => return Some(names[i].name.clone()),
+                0 => {
+                    if let Some(name) = dfs(j, names, deps, state) {
+                        return Some(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        state[i] = 2;
+        None
+    }
+    let mut state = alloc::vec![0u8; n];
+    for i in 0..n {
+        if gen_expr[i].is_some() && state[i] == 0 {
+            if let Some(name) = dfs(i, columns, &deps, &mut state) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
 /// `CREATE` in a CHECK constraint or generated-column expression. Generated
 /// columns may not reference the rowid (`allow_rowid=false`); a CHECK may.
 /// The first column reference in `e` that is *not* resolvable against `known`,

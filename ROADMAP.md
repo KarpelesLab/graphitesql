@@ -359,6 +359,22 @@ rather than `no such column: a`, and `t(a, b AS (1))` (whose generated expressio
 no longer mentions the dropped column) is now rejected instead of silently
 building an all-generated table.
 
+A **generated column may reference another column declared later in the table**,
+including another generated column. SQLite resolves these forward references
+topologically (`b AS (c+1), c AS (a+1)` yields the same values whichever order
+the two generated columns appear in); graphite used to evaluate generated columns
+strictly in declaration order, so a forward-referenced generated column was still
+`NULL` when its dependant was computed. Both the read path (VIRTUAL columns) and
+the write path (STORED columns, which must be byte-exact on disk for
+`integrity_check`) now evaluate generated columns in dependency order via a
+post-order DFS. A **cycle among the generated columns** is rejected at CREATE —
+before any row is inserted, exactly as SQLite does — with `generated column loop
+on "X"`, where `X` is the column whose expression *closes* the cycle (the
+generated columns being visited in declaration order); graphite used to accept
+the cyclic table and silently emit `NULL`s. Byte-exact vs `sqlite3` 3.50.4 across
+self-loops, 2- and 3-cycles in both declaration orders, and cycle references
+buried inside larger expressions.
+
 A **trigger body that targets a missing table** is now reported with the same
 schema qualifier SQLite uses. SQLite compiles a trigger program in the trigger's
 own database, so an unqualified DML target (`INSERT`/`UPDATE`/`DELETE`) that
