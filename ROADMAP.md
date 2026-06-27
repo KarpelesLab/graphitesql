@@ -331,6 +331,21 @@ aggregate used as a **window function** (`sum(a, b) OVER ()`, `sum() OVER ()`),
 which graphite previously ran silently; the eleven built-in window functions
 keep their own arity. All byte-exact vs `sqlite3` 3.50.4.
 
+And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
+builds a schema, so a statement with several faults reports the same one SQLite
+does. The per-column "add column" checks run first, left to right — a duplicate
+name, then the structural generated-column rules (a second `AS`, a `DEFAULT`, or
+membership in the PRIMARY KEY), then the `COLLATE` sequence — *ahead of* the
+end-of-table checks, including STRICT's missing/unknown-datatype check. The first
+end-of-table check is "must have at least one non-generated column", which
+therefore outranks an unknown table option, a prohibited subquery/aggregate, and
+any `no such column` resolution of a CHECK / generated expression. graphite used
+to resolve a generated column's expression before noticing the table was
+all-generated (so `CREATE TABLE t(a AS (b))` wrongly said `no such column: b`
+instead of `must have at least one non-generated column`) and ran the
+duplicate-name / `COLLATE` checks after the STRICT datatype check; both are fixed,
+byte-exact vs `sqlite3` 3.50.4 across ~35 multi-fault permutations.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

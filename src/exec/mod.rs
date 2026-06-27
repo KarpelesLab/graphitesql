@@ -4186,6 +4186,74 @@ impl Connection {
             }
             return Err(e);
         }
+        // SQLite applies these per-column checks as it parses (adds) each column,
+        // left to right, ahead of the end-of-table validation — so they outrank
+        // even the STRICT missing/unknown-datatype check below. They interleave
+        // positionally: an earlier column's violation wins over a later column's,
+        // but within a single column the duplicate name is caught first, then the
+        // structural generated-column rules (no second `AS`, no `DEFAULT`, not
+        // part of the PRIMARY KEY), then the `COLLATE` sequence.
+        let table_pk_cols: Vec<&str> = ct
+            .constraints
+            .iter()
+            .filter_map(|tc| match tc {
+                TableConstraint::PrimaryKey(cols, _) => Some(cols),
+                _ => None,
+            })
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        for (i, c) in ct.columns.iter().enumerate() {
+            if ct.columns[..i]
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case(&c.name))
+            {
+                return Err(Error::Error(alloc::format!(
+                    "duplicate column name: {}",
+                    c.name
+                )));
+            }
+            let generated = c
+                .constraints
+                .iter()
+                .filter(|k| matches!(k, ColumnConstraint::Generated { .. }))
+                .count();
+            if generated > 1 {
+                return Err(Error::Error(alloc::format!(
+                    "error in generated column \"{}\"",
+                    c.name
+                )));
+            }
+            if generated == 1 {
+                if c.constraints
+                    .iter()
+                    .any(|k| matches!(k, ColumnConstraint::Default(_)))
+                {
+                    return Err(Error::Error(
+                        "cannot use DEFAULT on a generated column".into(),
+                    ));
+                }
+                let in_primary_key = c
+                    .constraints
+                    .iter()
+                    .any(|k| matches!(k, ColumnConstraint::PrimaryKey { .. }))
+                    || table_pk_cols
+                        .iter()
+                        .any(|p| p.eq_ignore_ascii_case(&c.name));
+                if in_primary_key {
+                    return Err(Error::Error(
+                        "generated columns cannot be part of the PRIMARY KEY".into(),
+                    ));
+                }
+            }
+            for k in &c.constraints {
+                if let ColumnConstraint::Collate(name) = k {
+                    if crate::value::Collation::parse(name).is_none() {
+                        return Err(Error::Error(format!("no such collation sequence: {name}")));
+                    }
+                }
+            }
+        }
         // STRICT tables restrict column types to the six rigid types; reject any
         // other (or missing) declared type at CREATE, like SQLite.
         if ct.strict {
@@ -4202,6 +4270,22 @@ impl Connection {
                     });
                 }
             }
+        }
+        // A table must have at least one non-generated (real) column. SQLite
+        // reports this right after the per-column parse checks above and before
+        // it resolves any CHECK / generated expression or flags an unknown table
+        // option, so it outranks "no such column", aggregate-misuse,
+        // subquery-prohibited and "unknown table option" errors.
+        if !ct.columns.is_empty()
+            && ct.columns.iter().all(|c| {
+                c.constraints
+                    .iter()
+                    .any(|k| matches!(k, ColumnConstraint::Generated { .. }))
+            })
+        {
+            return Err(Error::Error(
+                "must have at least one non-generated column".into(),
+            ));
         }
         // An unrecognized table option (`CREATE TABLE t(a) FOO`) is surfaced
         // here, *after* the STRICT datatype check above — matching SQLite's
@@ -4231,56 +4315,6 @@ impl Connection {
                     }
                     _ => {}
                 }
-            }
-        }
-        // Generated-column constraint rules SQLite rejects at CREATE: a generated
-        // column may not carry a second `AS (…)`, a `DEFAULT`, or be part of the
-        // PRIMARY KEY (whether declared column-level or in a table-level
-        // `PRIMARY KEY (…)`).
-        let table_pk_cols: Vec<&str> = ct
-            .constraints
-            .iter()
-            .filter_map(|tc| match tc {
-                TableConstraint::PrimaryKey(cols, _) => Some(cols),
-                _ => None,
-            })
-            .flatten()
-            .map(String::as_str)
-            .collect();
-        for c in &ct.columns {
-            let generated = c
-                .constraints
-                .iter()
-                .filter(|k| matches!(k, ColumnConstraint::Generated { .. }))
-                .count();
-            if generated == 0 {
-                continue;
-            }
-            if generated > 1 {
-                return Err(Error::Error(alloc::format!(
-                    "error in generated column \"{}\"",
-                    c.name
-                )));
-            }
-            if c.constraints
-                .iter()
-                .any(|k| matches!(k, ColumnConstraint::Default(_)))
-            {
-                return Err(Error::Error(
-                    "cannot use DEFAULT on a generated column".into(),
-                ));
-            }
-            let in_primary_key = c
-                .constraints
-                .iter()
-                .any(|k| matches!(k, ColumnConstraint::PrimaryKey { .. }))
-                || table_pk_cols
-                    .iter()
-                    .any(|p| p.eq_ignore_ascii_case(&c.name));
-            if in_primary_key {
-                return Err(Error::Error(
-                    "generated columns cannot be part of the PRIMARY KEY".into(),
-                ));
             }
         }
         // SQLite rejects an aggregate function in a CHECK or generated-column
@@ -4320,14 +4354,6 @@ impl Connection {
         let known: Vec<String> = ct.columns.iter().map(|c| c.name.clone()).collect();
         for c in &ct.columns {
             for k in &c.constraints {
-                // A column's `COLLATE <name>` must name a known collating sequence
-                // (BINARY/NOCASE/RTRIM); sqlite errors "no such collation sequence"
-                // at CREATE rather than silently falling back to BINARY.
-                if let ColumnConstraint::Collate(name) = k {
-                    if crate::value::Collation::parse(name).is_none() {
-                        return Err(Error::Error(format!("no such collation sequence: {name}")));
-                    }
-                }
                 let bad = match k {
                     ColumnConstraint::Check(e, _) => {
                         unknown_column_ref(e, &known, true, Some(&ct.name))
@@ -4411,30 +4437,6 @@ impl Connection {
                             .into(),
                     ));
                 }
-            }
-        }
-        // A table must have at least one non-generated (real) column, as in SQLite.
-        if !ct.columns.is_empty()
-            && ct.columns.iter().all(|c| {
-                c.constraints
-                    .iter()
-                    .any(|k| matches!(k, ColumnConstraint::Generated { .. }))
-            })
-        {
-            return Err(Error::Error(
-                "must have at least one non-generated column".into(),
-            ));
-        }
-        // Duplicate column names are rejected.
-        for (i, c) in ct.columns.iter().enumerate() {
-            if ct.columns[..i]
-                .iter()
-                .any(|p| p.name.eq_ignore_ascii_case(&c.name))
-            {
-                return Err(Error::Error(alloc::format!(
-                    "duplicate column name: {}",
-                    c.name
-                )));
             }
         }
         // At most one PRIMARY KEY (column-level + table-level).
