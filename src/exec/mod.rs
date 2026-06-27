@@ -11931,6 +11931,27 @@ impl Connection {
                 "DISTINCT is not supported for window functions".into(),
             ));
         }
+        // A RANGE frame with a value offset bound (`<n> PRECEDING`/`<n>
+        // FOLLOWING`, as opposed to UNBOUNDED or CURRENT ROW) compares the
+        // ORDER BY value plus/minus the offset, so SQLite requires exactly one
+        // ORDER BY expression — neither zero nor several. ROWS/GROUPS offsets
+        // are positional and carry no such requirement.
+        if let Some(frame) = &spec.frame {
+            if frame.mode == FrameMode::Range
+                && (matches!(
+                    frame.start,
+                    FrameBound::Preceding(_) | FrameBound::Following(_)
+                ) || matches!(
+                    frame.end,
+                    FrameBound::Preceding(_) | FrameBound::Following(_)
+                ))
+                && spec.order_by.len() != 1
+            {
+                return Err(Error::Error(
+                    "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression".into(),
+                ));
+            }
+        }
         let lname = name.to_ascii_lowercase();
         let n = rows.len();
 

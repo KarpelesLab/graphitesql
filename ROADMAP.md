@@ -488,6 +488,16 @@ text-preserving CREATE-text edits).
     empty walk (no rows, no error). Both now match: `> 2` args is the structural
     error before any evaluation, and zero-args / `NULL` yields no rows
     (`tests/json_each_arg_count.rs`).
+  - **`RANGE`-offset window frame requires one `ORDER BY` (done).** A `RANGE`
+    frame with a value offset bound (`<n> PRECEDING`/`<n> FOLLOWING`, not
+    `UNBOUNDED` or `CURRENT ROW`) compares the `ORDER BY` value ± the offset, so
+    sqlite requires exactly one `ORDER BY` expression — zero or several both
+    raise `RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY
+    expression`. graphite ignored the constraint and produced rows. The guard
+    sits in `compute_window` (covering both the VDBE and tree-walker window
+    paths) and only fires for `FrameMode::Range` with a `Preceding`/`Following`
+    bound; `ROWS`/`GROUPS` offsets are positional and stay exempt
+    (`tests/window_range_offset_order_by.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
