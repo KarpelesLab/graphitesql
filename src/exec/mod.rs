@@ -5354,35 +5354,16 @@ impl Connection {
             }
             _ => {}
         }
-        // A trigger body's INSERT/UPDATE/DELETE may not schema-qualify its target —
-        // the body runs in the trigger's own database, so a qualifier there is
-        // forbidden (a qualified table in a *subquery* inside the body is fine; only
-        // the DML target is checked). Fires at CREATE time, regardless of whether
-        // the qualified schema/table exists. The trigger's own target/timing/dup
-        // errors above still win.
-        for stmt in &ct.body {
-            let qualified = match stmt {
-                Statement::Insert(i) => i.schema.is_some(),
-                Statement::Update(u) => u.schema.is_some(),
-                Statement::Delete(d) => d.schema.is_some(),
-                _ => false,
-            };
-            if qualified {
-                return Err(Error::Error(
-                    "qualified table names are not allowed on INSERT, UPDATE, and \
-                     DELETE statements within triggers"
-                        .into(),
-                ));
-            }
-        }
-        // A body UPDATE/DELETE row-limit extension (ORDER BY/LIMIT) is a
-        // trigger-step grammar error the parser recorded rather than threw, so
-        // that the target checks above (missing-table/system-table/timing) and
-        // the qualified-DML check still outrank it — matching SQLite, which
-        // resolves the trigger target before parsing the body steps. (In the
-        // rare case where an earlier body step's row-limit coexists with a later
-        // step's qualified target, SQLite reports the earlier row-limit and we
-        // report the qualified-DML; an accepted corner.)
+        // SQLite parses a trigger's body steps only after resolving its target, so
+        // the dup-name / missing-table / system-table / timing-mismatch errors
+        // above all outrank any body-step grammar error. The parser records the
+        // first such body violation (in source order) rather than throwing it, so
+        // it surfaces here — last. This covers a disallowed leading keyword
+        // (`near "PRAGMA"`), a `WITH`-prefixed body DML (`near "INSERT"`), a
+        // schema-qualified DML target (the body runs in the trigger's own
+        // database), a body `UPDATE`/`DELETE` row-limit extension or `RETURNING`
+        // (`near "ORDER"`/`near "RETURNING"`), and a body `INSERT … RETURNING`
+        // (`cannot use RETURNING in a trigger`).
         if let Some(msg) = &ct.body_error {
             return Err(Error::Error(msg.clone()));
         }

@@ -311,6 +311,19 @@ impl Parser {
     // ---- statements ---------------------------------------------------------
 
     fn statement(&mut self) -> Result<Statement> {
+        // Inside a CREATE TRIGGER body, only SELECT/VALUES/INSERT/REPLACE/UPDATE/
+        // DELETE/WITH (and a parenthesised SELECT) are valid trigger steps; any
+        // other leading keyword (PRAGMA, VACUUM, CREATE, EXPLAIN, …) is a
+        // `near "KW": syntax error`. Record it (deferred, first-wins) rather than
+        // throw — graphite otherwise parses these and would silently accept the
+        // trigger — so a missing-table/system-table/timing error still outranks
+        // it. The recursive EXPLAIN parse below re-enters with the flag still set,
+        // but first-wins keeps this outer keyword.
+        if self.in_trigger_body && self.trigger_body_err.is_none() && !self.at_trigger_step_start()
+        {
+            let msg = self.near_msg(self.pos);
+            self.trigger_body_err = Some(msg);
+        }
         if self.eat_kw("explain") {
             let query_plan = if self.eat_kw("query") {
                 if !self.eat_kw("plan") {
@@ -456,6 +469,18 @@ impl Parser {
         let _guard = self.enter()?;
         self.expect_kw("with")?;
         let ctes = self.parse_cte_list()?;
+        // In a trigger body, `WITH` may only prefix a SELECT/VALUES; a
+        // WITH-prefixed INSERT/REPLACE/UPDATE/DELETE is a `near "<kw>": syntax
+        // error` echoing the DML keyword (not `WITH`). Recorded, first-wins.
+        if self.in_trigger_body
+            && (self.check_kw("insert")
+                || self.check_kw("replace")
+                || self.check_kw("update")
+                || self.check_kw("delete"))
+        {
+            let msg = self.near_msg(self.pos);
+            self.record_trigger_body_err(msg);
+        }
         if self.check_kw("insert") || self.check_kw("replace") {
             let mut ins = self.insert()?;
             match &mut ins.source {
@@ -647,22 +672,67 @@ impl Parser {
         Ok(outer)
     }
 
+    /// Record a deferred `CREATE TRIGGER` body grammar violation, first-wins.
+    /// SQLite parses a trigger's body steps only after resolving its target, so a
+    /// missing-table / system-table / timing-mismatch error must outrank any body
+    /// syntax error; recording the violation here (instead of throwing it at parse
+    /// time) lets [`exec`](crate::exec) surface it at the right precedence. The
+    /// first violation in body source order wins. Outside a body this is a no-op.
+    fn record_trigger_body_err(&mut self, msg: String) {
+        if self.in_trigger_body && self.trigger_body_err.is_none() {
+            self.trigger_body_err = Some(msg);
+        }
+    }
+
+    /// The `near "TOKEN": syntax error` message for the token at `idx`, echoing
+    /// the source text verbatim (or `incomplete input` past the end).
+    fn near_msg(&self, idx: usize) -> String {
+        match self.syntax_error(idx) {
+            Error::Parse(m) => m,
+            _ => String::new(),
+        }
+    }
+
+    /// True when the cursor is at a token that can begin a trigger step: a
+    /// `SELECT`/`VALUES`/`INSERT`/`REPLACE`/`UPDATE`/`DELETE`/`WITH` statement, or
+    /// a parenthesised `SELECT`. Any other leading token in a body is rejected.
+    fn at_trigger_step_start(&self) -> bool {
+        self.check(&Token::LParen)
+            || self.check_kw("with")
+            || self.check_kw("select")
+            || self.check_kw("values")
+            || self.check_kw("insert")
+            || self.check_kw("replace")
+            || self.check_kw("update")
+            || self.check_kw("delete")
+    }
+
     /// Inside a `CREATE TRIGGER` body, the trigger-step grammar has no room for
     /// the `UPDATE`/`DELETE` row-limit extension, so a leading `ORDER BY`/`LIMIT`
-    /// there is a syntax error (`near "ORDER"`/`near "LIMIT"`), echoing the
-    /// keyword verbatim. Rather than throw here — which would pre-empt the
-    /// executor's target-resolution checks (missing-table / system-table /
-    /// timing all outrank a body syntax error in SQLite) — record the would-be
-    /// error so it can be surfaced after the target is resolved. First-wins;
-    /// outside a body this is a no-op.
+    /// there is a `near "ORDER"`/`near "LIMIT": syntax error` (keyword echoed
+    /// verbatim). Recorded — not thrown — so target-resolution errors still win.
     fn note_trigger_body_row_limit(&mut self) {
         if self.in_trigger_body
             && self.trigger_body_err.is_none()
             && (self.check_kw("order") || self.check_kw("limit"))
         {
-            if let Error::Parse(msg) = self.syntax_error(self.pos) {
-                self.trigger_body_err = Some(msg);
-            }
+            let msg = self.near_msg(self.pos);
+            self.record_trigger_body_err(msg);
+        }
+    }
+
+    /// A trigger body's `INSERT`/`UPDATE`/`DELETE` may not schema-qualify its
+    /// target (the body runs in the trigger's own database). SQLite rejects it
+    /// with a fixed message; recorded for deferred surfacing, first-wins. A
+    /// qualified table in a *subquery* inside the body stays legal — only the DML
+    /// target passes through here.
+    fn note_trigger_body_qualified_target(&mut self, schema: &Option<String>) {
+        if schema.is_some() {
+            self.record_trigger_body_err(
+                "qualified table names are not allowed on INSERT, UPDATE, and \
+                 DELETE statements within triggers"
+                    .into(),
+            );
         }
     }
 
@@ -1144,6 +1214,7 @@ impl Parser {
         }
         self.expect_kw("into")?;
         let (schema, table) = self.qualified_name()?;
+        self.note_trigger_body_qualified_target(&schema);
         let mut columns = Vec::new();
         if self.eat(&Token::LParen) {
             columns.push(self.ident()?);
@@ -1168,6 +1239,12 @@ impl Parser {
             InsertSource::Values(rows)
         };
         let upsert = self.upsert_clause()?;
+        // A trigger body's INSERT may not use RETURNING — `cannot use RETURNING in
+        // a trigger` (a fixed message, unlike the `near "RETURNING"` that a body
+        // UPDATE/DELETE RETURNING gives). Recorded for deferred surfacing.
+        if self.check_kw("returning") {
+            self.record_trigger_body_err("cannot use RETURNING in a trigger".into());
+        }
         let returning = self.returning_clause()?;
         Ok(Insert {
             table,
@@ -1293,6 +1370,7 @@ impl Parser {
             OnConflict::Abort
         };
         let (schema, table) = self.qualified_name()?;
+        self.note_trigger_body_qualified_target(&schema);
         // Target-table alias `UPDATE t AS x SET …`. SQLite requires the explicit
         // `AS` keyword (a bare `UPDATE t x …` is a syntax error), so only consume
         // an alias when `AS` is present.
@@ -1365,8 +1443,15 @@ impl Parser {
         } else {
             None
         };
-        // RETURNING comes before any ORDER BY/LIMIT extension.
+        // RETURNING comes before any ORDER BY/LIMIT extension. In a trigger body
+        // a `UPDATE … RETURNING` is a `near "RETURNING": syntax error` (recorded,
+        // first-wins), preceding the row-limit check.
+        let returning_idx = self.check_kw("returning").then_some(self.pos);
         let returning = self.returning_clause()?;
+        if let Some(idx) = returning_idx {
+            let msg = self.near_msg(idx);
+            self.record_trigger_body_err(msg);
+        }
         self.note_trigger_body_row_limit();
         let (order_by, limit, offset) = self.order_limit_offset()?;
         Ok(Update {
@@ -1392,6 +1477,7 @@ impl Parser {
         self.expect_kw("delete")?;
         self.expect_kw("from")?;
         let (schema, table) = self.qualified_name()?;
+        self.note_trigger_body_qualified_target(&schema);
         // Target-table alias `DELETE FROM t AS x WHERE …`. SQLite requires the
         // explicit `AS` keyword (a bare `DELETE FROM t x …` is a syntax error).
         let alias = if self.eat_kw("as") {
@@ -1406,7 +1492,14 @@ impl Parser {
         } else {
             None
         };
+        // A trigger body's `DELETE … RETURNING` is `near "RETURNING": syntax
+        // error` (recorded, first-wins), preceding the row-limit check.
+        let returning_idx = self.check_kw("returning").then_some(self.pos);
         let returning = self.returning_clause()?;
+        if let Some(idx) = returning_idx {
+            let msg = self.near_msg(idx);
+            self.record_trigger_body_err(msg);
+        }
         self.note_trigger_body_row_limit();
         let (order_by, limit, offset) = self.order_limit_offset()?;
         Ok(Delete {
@@ -1521,16 +1614,18 @@ impl Parser {
         // syntax error: SQLite resolves the trigger target before parsing the
         // body steps, so a missing-table/system-table/timing error must outrank
         // the body syntax error. Triggers do not nest, so set/clear suffices.
+        let prev_in_body = self.in_trigger_body;
+        let prev_body_err = self.trigger_body_err.take();
         self.in_trigger_body = true;
-        self.trigger_body_err = None;
         while !self.check_kw("end") && !self.at_end() {
             let stmt = self.statement()?;
             body.push(stmt);
             // Each body statement is terminated by a semicolon.
             let _ = self.eat(&Token::Semicolon);
         }
-        self.in_trigger_body = false;
+        self.in_trigger_body = prev_in_body;
         let body_error = self.trigger_body_err.take();
+        self.trigger_body_err = prev_body_err;
         self.expect_kw("end")?;
         Ok(CreateTrigger {
             if_not_exists,

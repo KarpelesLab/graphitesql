@@ -360,6 +360,24 @@ fn is_explain_query_plan(sql: &str) -> bool {
 /// literals) — a CLI heuristic to route INSERT/UPDATE/DELETE … RETURNING to
 /// `execute_returning` so the projected rows are printed.
 fn has_returning(sql: &str) -> bool {
+    // A statement-level RETURNING only rides on INSERT/UPDATE/DELETE/REPLACE
+    // (optionally WITH-prefixed). A RETURNING token anywhere else — most notably
+    // inside a `CREATE TRIGGER … BEGIN … END` body — is not a statement-level
+    // RETURNING; routing such a statement to `execute_returning` would wrongly
+    // surface `execute_returning expects INSERT/UPDATE/DELETE` instead of letting
+    // the executor reject the body construct with SQLite's own message.
+    let lead = sql
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if !matches!(
+        lead.as_str(),
+        "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "WITH"
+    ) {
+        return false;
+    }
     let mut in_str = false;
     let mut word = String::new();
     let mut chars = sql.chars().peekable();

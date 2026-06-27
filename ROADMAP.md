@@ -416,23 +416,40 @@ resolution, matching SQLite's diagnostic precedence: a missing table and a
 modify-a-view error still win, but a bogus `ORDER BY` or `SET` column reports the
 limit error first. Byte-exact vs `sqlite3` 3.50.4 across ~17 permutations.
 
-The companion case — **`ORDER BY`/`LIMIT` on an UPDATE/DELETE *inside a trigger
-body*** — is now rejected too. SQLite's trigger-step grammar omits the row-limit
-extension entirely, so a body `UPDATE … ORDER BY` / `… LIMIT` is a
-`near "ORDER"`/`near "LIMIT": syntax error` (keyword echoed verbatim) rather than
-the prepare-time message above; graphite used to parse it and silently no-op. The
-parser carries an `in_trigger_body` flag (set only while consuming a `CREATE
-TRIGGER … BEGIN … END` body) and the UPDATE/DELETE parsers *record* (rather than
-throw) the would-be `near "…"` error the moment they see a body `ORDER`/`LIMIT`,
-stashing it on the `CreateTrigger` node. The executor surfaces it only **after**
-resolving the trigger target — because SQLite parses the body steps only once the
-target is resolved, a missing-table (`no such table: main.nope`), system-table
-(`cannot create trigger on system table`), or timing-mismatch (`cannot create
-BEFORE trigger on view: v`) error must outrank the body syntax error, and a
-schema-qualified body DML target is reported in preference to a same-statement
-row-limit. The extension still parses at top level and an `ORDER BY` inside a body
-subquery's `SELECT` stays legal. Byte-exact vs `sqlite3` 3.50.4 across ~18
-permutations including the full target-resolution precedence matrix.
+The companion family — **the whole trigger-step grammar inside a `BEGIN … END`
+body** — is now policed to match SQLite. SQLite admits only
+`SELECT`/`VALUES`/`INSERT`/`REPLACE`/`UPDATE`/`DELETE`/`WITH`-then-`SELECT|VALUES`
+steps and rejects everything else at prepare time; graphite used to parse a wider
+grammar and silently accept or no-op several constructs. Now matched byte-for-byte:
+a **disallowed leading keyword** (`PRAGMA`, `VACUUM`, `CREATE`, `DROP`, `ALTER`,
+`EXPLAIN`, `SAVEPOINT`, `BEGIN`, `COMMIT`, `ATTACH`, …) → `near "KW": syntax
+error`; a **`WITH`-prefixed body DML** (`WITH … INSERT|UPDATE|DELETE|REPLACE`) →
+`near "<dmlkw>": syntax error` (the DML keyword, not `WITH`); a **schema-qualified
+DML target** (`UPDATE main.t …`) → `qualified table names are not allowed on
+INSERT, UPDATE, and DELETE statements within triggers`; **`UPDATE`/`DELETE …
+RETURNING`** → `near "RETURNING": syntax error`; **`INSERT`/`REPLACE … RETURNING`**
+→ `cannot use RETURNING in a trigger`; and the prior **`UPDATE/DELETE … ORDER
+BY`/`LIMIT`** → `near "ORDER"`/`near "LIMIT": syntax error` (the row-limit
+extension SQLite omits from the trigger grammar entirely).
+
+The mechanism is *record-not-throw*: the parser carries an `in_trigger_body` flag
+(set only while consuming a `CREATE TRIGGER … BEGIN … END` body, saved/restored so
+a nested CREATE-TRIGGER-in-body is safe) and the body-step parsers record the
+would-be `near "…"` / semantic message — **first in source order wins** — onto a
+`body_error: Option<String>` field of the `CreateTrigger` node rather than throwing
+on the spot. The executor surfaces it only **after** resolving the trigger target:
+because SQLite parses the body steps only once the target resolves, a
+duplicate-name (`trigger tr already exists`), missing-table (`no such table:
+main.nope`), system-table (`cannot create trigger on system table`), or
+timing-mismatch (`cannot create BEFORE trigger on view: v`) error outranks every
+body error. `WITH`-then-`SELECT|VALUES`, a parenthesised `SELECT`, a qualified
+table inside a body *subquery*, and a top-level `RETURNING`/`ORDER BY`/`LIMIT` all
+stay legal. A leading-keyword guard in the CLI's `has_returning()` keeps a
+`CREATE TRIGGER` whose body contains `RETURNING` from being misrouted to the
+RETURNING execution path (so the recorded body message wins). Byte-exact vs
+`sqlite3` 3.50.4 across the disallowed-keyword set, the `WITH`-DML / qualified /
+RETURNING / row-limit cases, the full target-resolution precedence matrix, and
+source-order first-wins in both directions.
 
 A misplaced **`ORDER BY` / `LIMIT` before a compound operator** now reports the
 same message SQLite does. These clauses bind to the *whole* compound, so
