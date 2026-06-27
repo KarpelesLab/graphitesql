@@ -19660,7 +19660,7 @@ fn json_each_children(
             for (k, v) in members {
                 let key_off = at;
                 let klen = crate::exec::json::str_jsonb_len(k) as i64;
-                let fullkey = alloc::format!("{root_path}.{k}");
+                let fullkey = crate::exec::json::push_path_key(root_path, k);
                 json_emit_node(
                     v,
                     Some(Value::Text(k.clone())),
@@ -19747,7 +19747,7 @@ fn json_tree_walk(
             for (k, v) in members {
                 let key_off = at;
                 let val_off = at + crate::exec::json::str_jsonb_len(k) as i64;
-                let child = alloc::format!("{fullkey}.{k}");
+                let child = crate::exec::json::push_path_key(fullkey, k);
                 json_tree_walk(
                     v,
                     Some(Value::Text(k.clone())),

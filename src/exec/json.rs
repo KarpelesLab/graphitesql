@@ -485,6 +485,24 @@ fn json_escape_body(s: &str) -> String {
     q[1..q.len() - 1].to_string()
 }
 
+/// Append object key `k` to a `json_each`/`json_tree` path. SQLite renders a
+/// "simple" label — non-empty, an ASCII letter followed by ASCII alphanumerics —
+/// bare as `.k`; anything else (a leading digit or `_`, spaces, dots, non-ASCII,
+/// …) is double-quoted with its JSON-escaped body, e.g. `."a b"`, `."_x"`,
+/// `."a\"b"`.
+pub(crate) fn push_path_key(path: &str, k: &str) -> String {
+    let mut chars = k.chars();
+    let simple = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => chars.all(|c| c.is_ascii_alphanumeric()),
+        _ => false,
+    };
+    if simple {
+        alloc::format!("{path}.{k}")
+    } else {
+        alloc::format!("{path}.\"{}\"", json_escape_body(k))
+    }
+}
+
 /// Append a JSON-escaped string literal (with surrounding quotes).
 fn write_json_string(s: &str, out: &mut String) {
     out.push('"');

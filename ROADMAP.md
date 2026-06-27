@@ -153,7 +153,8 @@ edits); and a broad **error-parity** sweep — prepare-time column/aggregate/
 window/row-value resolution, DDL/DML/JSON/PRAGMA/`printf` message wording,
 lexer/parser error framing (`near "TOKEN"`, `incomplete input`, `unrecognized
 token: "X"`), and the `json_each`/`json_tree` `id`/`parent` columns (each row's
-JSONB *byte offset*, not a row counter) — all byte-exact vs `sqlite3` 3.50.4.
+JSONB *byte offset*, not a row counter) and `fullkey`/`path` label quoting
+(`$."a b"` for any non-simple key) — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 
