@@ -166,6 +166,50 @@ impl Json {
         }
     }
 
+    /// Number of bytes this value occupies in its JSONB encoding (the header
+    /// byte(s) plus the payload). Must mirror [`Json::write_jsonb`] byte-for-byte:
+    /// the `json_each`/`json_tree` `id` (and `parent`) columns report each node's
+    /// byte offset within the document's JSONB blob, and those offsets are
+    /// accumulated from these lengths.
+    pub(crate) fn jsonb_len(&self) -> usize {
+        let payload = self.jsonb_payload_len();
+        jsonb_header_len(payload) + payload
+    }
+
+    /// The number of header bytes preceding this value's JSONB payload — i.e. the
+    /// offset of a container's first child relative to the container's own start.
+    pub(crate) fn jsonb_header_bytes(&self) -> usize {
+        jsonb_header_len(self.jsonb_payload_len())
+    }
+
+    /// The JSONB payload length (excluding the header) for this value.
+    fn jsonb_payload_len(&self) -> usize {
+        match self {
+            Json::Null | Json::Bool(_) => 0,
+            Json::Int(_, Some(raw)) => raw.len(),
+            Json::Int(i, None) => i.to_string().len(),
+            // A float's payload is its source/canonical text (FLOAT or FLOAT5);
+            // the tag differs but the byte length does not.
+            Json::Real(r, src) => match src {
+                Some(t) => t.len(),
+                None if r.is_infinite() => {
+                    if *r < 0.0 {
+                        "-9e999".len()
+                    } else {
+                        "9e999".len()
+                    }
+                }
+                None => crate::exec::eval::format_real(*r).len(),
+            },
+            Json::Str(s) => str_jsonb_payload_len(s),
+            Json::Array(items) => items.iter().map(Json::jsonb_len).sum(),
+            Json::Object(members) => members
+                .iter()
+                .map(|(k, v)| str_jsonb_len(k) + v.jsonb_len())
+                .sum(),
+        }
+    }
+
     /// Decode a complete JSONB value, returning `None` on malformed input or
     /// trailing bytes.
     pub fn from_jsonb(bytes: &[u8]) -> Option<Json> {
@@ -281,6 +325,40 @@ const JSONB_TEXT5: u8 = 9;
 const JSONB_TEXTRAW: u8 = 10;
 const JSONB_ARRAY: u8 = 11;
 const JSONB_OBJECT: u8 = 12;
+
+/// Header byte count for a JSONB element whose payload is `n` bytes. Mirrors the
+/// size-class thresholds in [`push_jsonb`]: 1 byte for sizes 0–11, then +1/2/4/8
+/// big-endian size bytes as the payload grows.
+fn jsonb_header_len(n: usize) -> usize {
+    if n <= 11 {
+        1
+    } else if n <= 0xFF {
+        2
+    } else if n <= 0xFFFF {
+        3
+    } else if n <= 0xFFFF_FFFF {
+        5
+    } else {
+        9
+    }
+}
+
+/// The JSONB payload length of `s` encoded as a string (TEXT/TEXTJ) — its raw
+/// bytes, or its JSON-escaped body when any character needs escaping.
+fn str_jsonb_payload_len(s: &str) -> usize {
+    if json_needs_escape(s) {
+        json_escape_body(s).len()
+    } else {
+        s.len()
+    }
+}
+
+/// Total JSONB length of `s` encoded as a string element. Object keys are
+/// encoded exactly like string values, so this also sizes a key node.
+pub(crate) fn str_jsonb_len(s: &str) -> usize {
+    let payload = str_jsonb_payload_len(s);
+    jsonb_header_len(payload) + payload
+}
 
 /// Append one JSONB element: the header byte (type in the low nibble, payload-
 /// size class in the high nibble) plus any size bytes, then the payload. Sizes
@@ -1106,6 +1184,55 @@ pub fn navigate<'a>(root: &'a Json, path: &str) -> Option<&'a Json> {
         }
     }
     Some(cur)
+}
+
+/// Like [`navigate`], but also returns where the resolved node sits in the
+/// document's JSONB encoding: `value_offset` is the byte offset of the node's
+/// own element, and `id` is the offset `json_each`/`json_tree` reports for it —
+/// the *key* node's offset when the node is an object member, otherwise the
+/// value node's own offset. Both are relative to the whole document, so a
+/// path-rooted walk numbers its rows exactly as SQLite does.
+pub(crate) fn navigate_with_offset<'a>(
+    root: &'a Json,
+    path: &str,
+) -> Option<(&'a Json, usize, usize)> {
+    let segs = parse_path(path)?;
+    let mut cur = root;
+    let mut value_offset = 0usize;
+    let mut id = 0usize;
+    for seg in &segs {
+        let body = value_offset + jsonb_header_len(cur.jsonb_payload_len());
+        match (cur, seg) {
+            (Json::Object(members), Seg::Key(k)) => {
+                let mut at = body;
+                let mut found = None;
+                for (kk, vv) in members {
+                    let klen = str_jsonb_len(kk);
+                    if kk == k {
+                        found = Some((vv, at, at + klen));
+                        break;
+                    }
+                    at += klen + vv.jsonb_len();
+                }
+                let (vv, key_off, val_off) = found?;
+                cur = vv;
+                value_offset = val_off;
+                id = key_off;
+            }
+            (Json::Array(items), Seg::Index(idx)) => {
+                let n = idx.resolve_read(items.len())?;
+                let mut at = body;
+                for vv in &items[..n] {
+                    at += vv.jsonb_len();
+                }
+                cur = items.get(n)?;
+                value_offset = at;
+                id = at;
+            }
+            _ => return None,
+        }
+    }
+    Some((cur, value_offset, id))
 }
 
 /// Convert a SQL [`Value`] to a [`Json`] for `json_array`/`json_object`. A text

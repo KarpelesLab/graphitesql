@@ -14577,18 +14577,17 @@ impl Connection {
                 // walk is then rooted at that element (e.g. `json_each(x, '$.a')`
                 // iterates `$.a`'s children, with `$.a…` paths). A path that does
                 // not resolve yields no rows.
-                let (target, root_path) = match args.get(1) {
+                let (target, root_path, base_off, base_id) = match args.get(1) {
                     Some(path_arg) => {
                         let p = eval::to_text(&eval::eval(path_arg, &ctx)?);
-                        match crate::exec::json::navigate(&root, &p) {
-                            Some(sub) => (sub, p),
+                        match crate::exec::json::navigate_with_offset(&root, &p) {
+                            Some((sub, voff, id)) => (sub, p, voff, id),
                             None => return Ok((columns, Vec::new())),
                         }
                     }
-                    None => (&root, String::from("$")),
+                    None => (&root, String::from("$"), 0usize, 0usize),
                 };
                 let mut rows = Vec::new();
-                let mut next_id = 0i64;
                 if lname == "json_tree" {
                     // The root row carries the path's final component as its key and
                     // its parent path in the `path` column.
@@ -14598,12 +14597,21 @@ impl Connection {
                         key,
                         &root_path,
                         &parent_path,
+                        JsonbPos {
+                            value_off: base_off as i64,
+                            id: base_id as i64,
+                        },
                         None,
-                        &mut next_id,
                         &mut rows,
                     );
                 } else {
-                    json_each_children(target, &root_path, &mut next_id, &mut rows);
+                    json_each_children(
+                        target,
+                        &root_path,
+                        base_off as i64,
+                        base_id as i64,
+                        &mut rows,
+                    );
                 }
                 Ok((columns, rows))
             }
@@ -19596,21 +19604,21 @@ fn resolve_window_ref(wexpr: &Expr, defs: &[(String, WindowSpec)]) -> Result<Exp
     })
 }
 
-/// Emit one `json_each`/`json_tree` row for `node` and return its assigned id.
-/// `key` is the member name / array index (None for a top-level scalar or the
-/// `json_tree` root); `fullkey`/`path` are the element's path and its parent's.
+/// Emit one `json_each`/`json_tree` row for `node`. `key` is the member name /
+/// array index (None for a top-level scalar or the `json_tree` root);
+/// `fullkey`/`path` are the element's path and its parent's. `id` is the node's
+/// byte offset within the document's JSONB encoding (an object member is
+/// numbered by its *key* node, matching SQLite).
 fn json_emit_node(
     node: &crate::exec::json::Json,
     key: Option<Value>,
     fullkey: &str,
     path: &str,
+    id: i64,
     parent: Option<i64>,
-    next_id: &mut i64,
     rows: &mut Vec<Vec<Value>>,
-) -> i64 {
+) {
     use crate::exec::json::Json;
-    let id = *next_id;
-    *next_id += 1;
     let is_container = matches!(node, Json::Object(_) | Json::Array(_));
     let value = node.to_sql();
     let atom = if is_container {
@@ -19628,35 +19636,45 @@ fn json_emit_node(
         Value::Text(String::from(fullkey)),
         Value::Text(String::from(path)),
     ]);
-    id
 }
 
 /// `json_each`: emit a row for each *direct* child of `root` (or a single row for
 /// a scalar root). `root_path` is the document path `root` sits at (`"$"`, or the
 /// `json_each(x, path)` argument), used as the prefix of each child's `fullkey`.
+/// `base_off` is `root`'s byte offset within the document's JSONB and `base_id`
+/// the id `root` itself would carry; each child's id is its own JSONB byte
+/// offset (an object member's *key* node). `json_each` never recurses, so every
+/// row's `parent` is NULL.
 fn json_each_children(
     root: &crate::exec::json::Json,
     root_path: &str,
-    next_id: &mut i64,
+    base_off: i64,
+    base_id: i64,
     rows: &mut Vec<Vec<Value>>,
 ) {
     use crate::exec::json::Json;
+    let body = base_off + root.jsonb_header_bytes() as i64;
     match root {
         Json::Object(members) => {
+            let mut at = body;
             for (k, v) in members {
+                let key_off = at;
+                let klen = crate::exec::json::str_jsonb_len(k) as i64;
                 let fullkey = alloc::format!("{root_path}.{k}");
                 json_emit_node(
                     v,
                     Some(Value::Text(k.clone())),
                     &fullkey,
                     root_path,
+                    key_off,
                     None,
-                    next_id,
                     rows,
                 );
+                at += klen + v.jsonb_len() as i64;
             }
         }
         Json::Array(items) => {
+            let mut at = body;
             for (i, v) in items.iter().enumerate() {
                 let fullkey = alloc::format!("{root_path}[{i}]");
                 json_emit_node(
@@ -19664,14 +19682,15 @@ fn json_each_children(
                     Some(Value::Integer(i as i64)),
                     &fullkey,
                     root_path,
+                    at,
                     None,
-                    next_id,
                     rows,
                 );
+                at += v.jsonb_len() as i64;
             }
         }
         scalar => {
-            json_emit_node(scalar, None, root_path, root_path, None, next_id, rows);
+            json_emit_node(scalar, None, root_path, root_path, base_id, None, rows);
         }
     }
 }
@@ -19697,34 +19716,55 @@ fn split_json_path(path: &str) -> (alloc::string::String, Option<Value>) {
     (String::from(path), None)
 }
 
-/// `json_tree`: emit `node` then recurse depth-first into its children.
+/// A node's location in the document's JSONB blob, threaded through the
+/// `json_tree` walk: `value_off` is the node's own element offset, and `id` is
+/// the offset SQLite reports for it — its *key* node when the node is an object
+/// member, else `value_off` itself.
+#[derive(Clone, Copy)]
+struct JsonbPos {
+    value_off: i64,
+    id: i64,
+}
+
+/// `json_tree`: emit `node` then recurse depth-first into its children. Each
+/// child's id is its own JSONB byte offset (computed via [`JsonbPos`]), and its
+/// `parent` is this node's id.
 fn json_tree_walk(
     node: &crate::exec::json::Json,
     key: Option<Value>,
     fullkey: &str,
     path: &str,
+    pos: JsonbPos,
     parent: Option<i64>,
-    next_id: &mut i64,
     rows: &mut Vec<Vec<Value>>,
 ) {
     use crate::exec::json::Json;
-    let id = json_emit_node(node, key, fullkey, path, parent, next_id, rows);
+    json_emit_node(node, key, fullkey, path, pos.id, parent, rows);
+    let body = pos.value_off + node.jsonb_header_bytes() as i64;
     match node {
         Json::Object(members) => {
+            let mut at = body;
             for (k, v) in members {
+                let key_off = at;
+                let val_off = at + crate::exec::json::str_jsonb_len(k) as i64;
                 let child = alloc::format!("{fullkey}.{k}");
                 json_tree_walk(
                     v,
                     Some(Value::Text(k.clone())),
                     &child,
                     fullkey,
-                    Some(id),
-                    next_id,
+                    JsonbPos {
+                        value_off: val_off,
+                        id: key_off,
+                    },
+                    Some(pos.id),
                     rows,
                 );
+                at = val_off + v.jsonb_len() as i64;
             }
         }
         Json::Array(items) => {
+            let mut at = body;
             for (i, v) in items.iter().enumerate() {
                 let child = alloc::format!("{fullkey}[{i}]");
                 json_tree_walk(
@@ -19732,10 +19772,14 @@ fn json_tree_walk(
                     Some(Value::Integer(i as i64)),
                     &child,
                     fullkey,
-                    Some(id),
-                    next_id,
+                    JsonbPos {
+                        value_off: at,
+                        id: at,
+                    },
+                    Some(pos.id),
                     rows,
                 );
+                at += v.jsonb_len() as i64;
             }
         }
         _ => {}

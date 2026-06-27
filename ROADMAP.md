@@ -150,9 +150,10 @@ scalar/aggregate/date-time/`printf`/JSON/JSONB libraries; type affinity,
 collation, column-name spans; cross-object **ALTER** propagation (RENAME
 TABLE→views/FKs, RENAME COLUMN→FKs/views/triggers, text-preserving CREATE-text
 edits); and a broad **error-parity** sweep — prepare-time column/aggregate/
-window/row-value resolution, DDL/DML/JSON/PRAGMA/`printf` message wording, and
+window/row-value resolution, DDL/DML/JSON/PRAGMA/`printf` message wording,
 lexer/parser error framing (`near "TOKEN"`, `incomplete input`, `unrecognized
-token: "X"`) — all byte-exact vs `sqlite3` 3.50.4.
+token: "X"`), and the `json_each`/`json_tree` `id`/`parent` columns (each row's
+JSONB *byte offset*, not a row counter) — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 
