@@ -367,6 +367,16 @@ text-preserving CREATE-text edits).
     when the ref actually resolves). graphite previously matched on the bare
     column name alone, so it silently accepted `b AS (t.a)` / `INDEX … (t.a)` and
     mis-reported `t.nope` as `no such column: nope` (`tests/dotted_column_refs.rs`).
+  - **UPSERT column references are validated at prepare time (done).** An
+    `INSERT … ON CONFLICT … DO …` clause now rejects an unknown column with
+    `no such column: …` (qualified when written `q.c`), in sqlite's resolution
+    order: per clause, the conflict-target columns, then the target `WHERE` (a
+    partial-index predicate — table columns + rowid only), then for a `DO UPDATE`
+    the assignment value expressions, the assigned target columns, and the update
+    `WHERE`. The value/`WHERE` expressions additionally resolve the `excluded`
+    pseudo-table (`excluded.<col>`, incl. `excluded.rowid`) and `table.`-qualified
+    refs. graphite previously ignored every bad reference and ran the statement
+    (`tests/upsert_unknown_column.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

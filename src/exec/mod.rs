@@ -5654,6 +5654,11 @@ impl Connection {
             return self.exec_view_insert(ins, &rows, params);
         }
         let meta = self.table_meta(&ins.table, None)?;
+        // An `ON CONFLICT … DO …` clause may reference only the target table's
+        // columns (the conflict target and its `WHERE`) plus the `excluded`
+        // pseudo-table (in a `DO UPDATE`). Reject an unknown column up front, in
+        // sqlite's resolution order, rather than silently ignoring it.
+        validate_upsert_columns(&meta, &ins.table, &ins.upsert)?;
         if meta.without_rowid {
             if !ins.upsert.is_empty() || !ins.returning.is_empty() {
                 return Err(Error::Unsupported(
@@ -18423,6 +18428,88 @@ fn has_resolved_dotted_ref(
         }
     });
     found
+}
+
+/// The first column reference in an `ON CONFLICT … DO UPDATE` value or `WHERE`
+/// expression that resolves to neither the target table (bare or
+/// `table.`-qualified) nor the `excluded` pseudo-table, or `None` if all
+/// resolve. The rowid aliases are accepted under every valid qualifier, matching
+/// sqlite. The bad reference is reported qualified when it was written that way.
+fn upsert_expr_unknown_column(e: &Expr, known: &[String], table: &str) -> Option<String> {
+    let mut bad: Option<String> = None;
+    window::visit(e, &mut |n| {
+        if let Expr::Column { table: q, column } = n {
+            if bad.is_some() {
+                return;
+            }
+            let known_col = known.iter().any(|c| c.eq_ignore_ascii_case(column))
+                || eval::is_rowid_alias(column);
+            let resolves = match q {
+                None => known_col,
+                Some(qual) => {
+                    (qual.eq_ignore_ascii_case(table) || qual.eq_ignore_ascii_case("excluded"))
+                        && known_col
+                }
+            };
+            if !resolves {
+                bad = Some(match q {
+                    Some(qq) => alloc::format!("{qq}.{column}"),
+                    None => column.clone(),
+                });
+            }
+        }
+    });
+    bad
+}
+
+/// Validate every column reference in an `INSERT … ON CONFLICT … DO …` clause
+/// against the target table, in sqlite's resolution order, so an unknown column
+/// is rejected (`no such column: …`) rather than silently ignored. Per clause:
+/// (1) the conflict-target columns, (2) the conflict-target `WHERE` (a partial-
+/// index predicate — table columns + rowid only, no `excluded`), then for a
+/// `DO UPDATE` (3) the assignment value expressions, (4) the assigned (target)
+/// columns, and (5) the update `WHERE`; (3)–(5) may also use `excluded`.
+fn validate_upsert_columns(meta: &TableMeta, table: &str, upserts: &[Upsert]) -> Result<()> {
+    if upserts.is_empty() {
+        return Ok(());
+    }
+    let known: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+    let is_known =
+        |c: &str| known.iter().any(|k| k.eq_ignore_ascii_case(c)) || eval::is_rowid_alias(c);
+    for up in upserts {
+        for col in &up.target {
+            if !is_known(col) {
+                return Err(Error::Error(alloc::format!("no such column: {col}")));
+            }
+        }
+        if let Some(w) = &up.target_where {
+            if let Some(c) = unknown_column_ref(w, &known, true, Some(table)) {
+                return Err(Error::Error(alloc::format!("no such column: {c}")));
+            }
+        }
+        if let UpsertAction::Update {
+            assignments,
+            where_clause,
+        } = &up.action
+        {
+            for (_, val) in assignments {
+                if let Some(c) = upsert_expr_unknown_column(val, &known, table) {
+                    return Err(Error::Error(alloc::format!("no such column: {c}")));
+                }
+            }
+            for (col, _) in assignments {
+                if !is_known(col) {
+                    return Err(Error::Error(alloc::format!("no such column: {col}")));
+                }
+            }
+            if let Some(w) = where_clause {
+                if let Some(c) = upsert_expr_unknown_column(w, &known, table) {
+                    return Err(Error::Error(alloc::format!("no such column: {c}")));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether `e` contains a subquery (scalar `(SELECT …)`, `EXISTS`, or `IN
