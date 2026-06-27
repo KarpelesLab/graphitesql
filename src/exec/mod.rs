@@ -137,6 +137,13 @@ pub struct Connection {
     /// tables). `Main` at all other times; nested subqueries inherit it. Set and
     /// restored around [`scan_db_view`](Self::scan_db_view).
     read_default: core::cell::Cell<DbRef>,
+    /// The database the in-flight top-level `INSERT`/`UPDATE`/`DELETE` writes to,
+    /// resolved *before* the write target is swapped into the active `main` slot
+    /// (a temp table shadows main; an attached target keeps its name). `Main` at
+    /// all other times. Read by [`dml_target_db`](Self::dml_target_db) so a
+    /// three-part column qualifier is validated against the target's real
+    /// database name, not the swap-relative one `unqualified_db` would report.
+    write_target: core::cell::Cell<DbRef>,
     /// Virtual-table modules registered on this connection, keyed by the name
     /// that follows `USING` in `CREATE VIRTUAL TABLE`. Seeded with the built-in
     /// `series` module; a public registration API is roadmap D4.
@@ -291,6 +298,7 @@ impl Connection {
             changes: core::cell::Cell::new(0),
             total_changes: core::cell::Cell::new(0),
             read_default: core::cell::Cell::new(DbRef::Main),
+            write_target: core::cell::Cell::new(DbRef::Main),
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
@@ -329,6 +337,7 @@ impl Connection {
             changes: core::cell::Cell::new(0),
             total_changes: core::cell::Cell::new(0),
             read_default: core::cell::Cell::new(DbRef::Main),
+            write_target: core::cell::Cell::new(DbRef::Main),
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
@@ -3124,6 +3133,10 @@ impl Connection {
             Statement::Drop(s) => s.schema.clone().map(|q| (q, s.name.clone())),
             _ => None,
         };
+        // Record the target's real database for the duration of the write, so a
+        // three-part column qualifier in its WHERE/SET is validated against the
+        // right name even after the target is swapped into the active `main` slot.
+        let prev_write = self.write_target.replace(target);
         let r = match target {
             DbRef::Main => self.exec_parsed(stmt, sql, params),
             other => {
@@ -3140,6 +3153,7 @@ impl Connection {
                 r
             }
         };
+        self.write_target.set(prev_write);
         match missing_qual {
             Some((q, name)) => r.map_err(|e| Self::qualify_missing(Some(&q), &name, e)),
             None => r,
@@ -6572,8 +6586,10 @@ impl Connection {
                 refs.push(w);
             }
             refs.extend(del.order_by.iter().map(|o| &o.expr));
-            if !refs.is_empty() {
-                self.validate_dml_refs(&del.table, &meta.columns, &refs)?;
+            let returning = returning_exprs(&del.returning);
+            if !refs.is_empty() || !returning.is_empty() {
+                let target_db = self.dml_target_db(del.schema.as_deref(), &del.table);
+                self.validate_dml_refs(&del.table, &target_db, &meta.columns, &refs, &returning)?;
             }
         }
         if meta.without_rowid {
@@ -6722,7 +6738,9 @@ impl Connection {
             // `ORDER BY` (with the LIMIT extension) names only the target's
             // columns — no alias scope — so it resolves like `WHERE`.
             refs.extend(upd.order_by.iter().map(|o| &o.expr));
-            self.validate_dml_refs(&upd.table, &meta.columns, &refs)?;
+            let returning = returning_exprs(&upd.returning);
+            let target_db = self.dml_target_db(upd.schema.as_deref(), &upd.table);
+            self.validate_dml_refs(&upd.table, &target_db, &meta.columns, &refs, &returning)?;
         }
         if meta.without_rowid {
             if !upd.returning.is_empty() {
@@ -13990,31 +14008,55 @@ impl Connection {
         }
     }
 
-    /// Eager "no such column" check for a `DELETE`/`UPDATE` `WHERE` predicate and
-    /// `SET`-value expressions, the DML counterpart of [`Self::validate_columns_exist`].
-    /// SQLite resolves these at prepare time, so a bogus column errors even over an
-    /// empty table; the tree-walker resolved them per row, so a statement that
-    /// matched no row silently accepted the bad name. A `DELETE`/`UPDATE` target
-    /// takes no alias and (for the cases the caller admits) has no `FROM`, so every
-    /// reference resolves to `table` — a bare name must be one of its columns, and
-    /// a qualified ref is judged only when its qualifier *is* the target table (an
-    /// `OLD`/`NEW`/other-source qualifier is left alone). Nested-subquery bodies are
-    /// walked shallowly (not entered), so this only rejects what per-row evaluation
-    /// would have rejected too.
+    /// Eager "no such column" check for a `DELETE`/`UPDATE` `WHERE` predicate,
+    /// `SET`-value and `RETURNING` expressions, the DML counterpart of
+    /// [`Self::validate_columns_exist`]. SQLite resolves these at prepare time, so a
+    /// bogus column errors even over an empty table; the tree-walker resolved them
+    /// per row, so a statement that matched no row silently accepted the bad name. A
+    /// `DELETE`/`UPDATE` target takes no alias and (for the cases the caller admits)
+    /// has no `FROM`, so every reference resolves to `table` — a bare name must be
+    /// one of its columns, and a qualified ref is judged only when its qualifier *is*
+    /// the target table (an `OLD`/`NEW`/other-source qualifier is left alone).
+    ///
+    /// A three-part `schema.table.column` qualifier is also validated against
+    /// `target_db` (the database the target resolves to). In `WHERE`/`SET` a correct
+    /// qualifier (`main.t.a` for a `main` target) resolves like the bare column; a
+    /// mismatch is `no such column: schema.table.column`. In `RETURNING`, SQLite
+    /// rejects *any* schema-qualified reference — even a correct one — so the
+    /// `returning` exprs are checked with `allow_schema = false`. Nested-subquery
+    /// bodies are walked shallowly (not entered), so this only rejects what per-row
+    /// evaluation would have rejected too.
     fn validate_dml_refs(
         &self,
         table: &str,
+        target_db: &str,
         columns: &[ColumnInfo],
         exprs: &[&Expr],
+        returning: &[&Expr],
     ) -> Result<()> {
         let mut missing: Option<Error> = None;
-        for e in exprs {
-            if missing.is_some() {
-                break;
-            }
+        let check = |e: &Expr, allow_schema: bool, missing: &mut Option<Error>| {
             walk_shallow_columns(e, &mut |schema, tbl, col, quoted| {
                 if missing.is_some() {
                     return;
+                }
+                // A qualified ref is only ours to judge when it names the target; a
+                // qualifier naming another `FROM` source / `OLD` / `NEW` is resolved
+                // elsewhere.
+                if let Some(q) = tbl {
+                    if !q.eq_ignore_ascii_case(table) {
+                        return;
+                    }
+                }
+                // The database qualifier is checked before the rowid/pseudo-column
+                // shortcut (`bad.t.rowid` is just as wrong as `bad.t.col`): in
+                // `WHERE`/`SET` it must name the target's database; in `RETURNING`
+                // it is never allowed.
+                if let Some(sch) = schema {
+                    if !(allow_schema && sch.eq_ignore_ascii_case(target_db)) {
+                        *missing = Some(eval::no_such_column(schema, tbl, col, quoted));
+                        return;
+                    }
                 }
                 if matches!(
                     col.to_ascii_lowercase().as_str(),
@@ -14027,16 +14069,22 @@ impl Connection {
                 ) {
                     return;
                 }
-                // A qualified ref is only ours to judge when it names the target.
-                if let Some(q) = tbl {
-                    if !q.eq_ignore_ascii_case(table) {
-                        return;
-                    }
-                }
                 if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
-                    missing = Some(eval::no_such_column(schema, tbl, col, quoted));
+                    *missing = Some(eval::no_such_column(schema, tbl, col, quoted));
                 }
             });
+        };
+        for e in exprs {
+            if missing.is_some() {
+                break;
+            }
+            check(e, true, &mut missing);
+        }
+        for e in returning {
+            if missing.is_some() {
+                break;
+            }
+            check(e, false, &mut missing);
         }
         if let Some(e) = missing {
             return Err(e);
@@ -15859,6 +15907,31 @@ impl Connection {
             }
         }
         DbRef::Main
+    }
+
+    /// The database name (`main`/`temp`/an attached name) a [`DbRef`] denotes —
+    /// the spelling a three-part `schema.table.column` qualifier must match.
+    fn db_label(&self, r: DbRef) -> alloc::string::String {
+        match r {
+            DbRef::Main => "main".into(),
+            DbRef::Temp => "temp".into(),
+            DbRef::Attached(i) => self.attached[i].name.clone(),
+        }
+    }
+
+    /// The database a `DELETE`/`UPDATE` target resolves to: the explicit `schema.`
+    /// qualifier verbatim, else the database an unqualified name binds to (a temp
+    /// table shadows main). Used to validate a three-part column qualifier in the
+    /// statement's `WHERE`/`SET`.
+    fn dml_target_db(&self, schema: Option<&str>, _table: &str) -> alloc::string::String {
+        match schema {
+            Some(s) => alloc::string::String::from(s),
+            // `write_target` was resolved before any swap, so its label is the
+            // target's real database even while the target sits in the active
+            // `main` slot (where `unqualified_db` would mislabel a temp/attached
+            // target as `main`).
+            None => self.db_label(self.write_target.get()),
+        }
     }
 
     /// Create the `temp` database if it does not yet exist (a fresh in-memory
@@ -18561,6 +18634,18 @@ fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<
 /// NOT into the collected subqueries' own bodies — each is recursed into
 /// separately, with its own scope. Lifetime-preserving (unlike `window::visit`) so
 /// the borrowed `&Select`s outlive the walk.
+/// The expression of each `RETURNING` result column (skipping `*` / `tbl.*`
+/// wildcards, which carry no `Expr`). Borrowed, so the refs outlive the call.
+fn returning_exprs(returning: &[ResultColumn]) -> Vec<&Expr> {
+    returning
+        .iter()
+        .filter_map(|c| match c {
+            ResultColumn::Expr { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Visit every column reference in `e` that resolves in this query's own `FROM`
 /// scope, calling `f(table_qualifier, column_name)` for each. Deliberately does
 /// not descend into a `Subquery`/`Exists`/`InSelect` body: a name there binds in

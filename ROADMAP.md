@@ -270,6 +270,12 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   by table/name only, so `run_select_vdbe` now defers any query carrying a
   schema-qualified column (`select_has_schema_qualified_column`) to the tree-walker,
   which runs the validation. Differential tests in `tests/column_qualifier_errors.rs`.
+  The same check covers `UPDATE`/`DELETE` `WHERE`/`SET`/`RETURNING` via
+  `validate_dml_refs`, resolving the target's database from `write_target` (recorded
+  before the write target is swapped into the active `main` slot, so an unqualified
+  write to a temp table validates against `temp`, not `main`); `RETURNING` rejects
+  *any* schema-qualified column, even a correct one, as sqlite does. Differential
+  tests in `tests/dml_column_qualifier_errors.rs`.
   Residual: a three-part ref inside a *correlated subquery body* binding to an
   enclosing FROM is still resolved lazily (the nested-scope gap below).
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
