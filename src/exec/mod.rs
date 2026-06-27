@@ -1185,6 +1185,7 @@ impl Connection {
                         table: n_tabs[i].clone(),
                         affinity: n_affs[i],
                         collation: n_colls[i],
+                        hidden: false,
                     })
                     .collect();
                 // NATURAL/USING coalesce pairs (left index, right local index): the
@@ -1323,6 +1324,7 @@ impl Connection {
                     table: tabs[i].clone(),
                     affinity: affs[i],
                     collation: colls[i],
+                    hidden: false,
                 })
                 .collect();
             if validate_unambiguous_columns(sel, &join_cols).is_err() {
@@ -1408,6 +1410,7 @@ impl Connection {
                         table: combined_tables[i].clone(),
                         affinity: combined_aff[i],
                         collation: combined_coll[i],
+                        hidden: false,
                     })
                     .collect();
                 if validate_unambiguous_columns(sel, &join_cols).is_err() {
@@ -1477,6 +1480,7 @@ impl Connection {
                         table: oj_tables[i].clone(),
                         affinity: oj_aff[i],
                         collation: oj_coll[i],
+                        hidden: false,
                     })
                     .collect();
                 if validate_unambiguous_columns(sel, &join_cols).is_err() {
@@ -1525,6 +1529,7 @@ impl Connection {
                     table: combined_tables[i].clone(),
                     affinity: combined_aff[i],
                     collation: combined_coll[i],
+                    hidden: false,
                 })
                 .collect();
             if validate_unambiguous_columns(sel, &join_cols).is_err() {
@@ -5206,6 +5211,7 @@ impl Connection {
                 table: String::from(label),
                 affinity: c.affinity,
                 collation: c.collation,
+                hidden: false,
             })
             .collect();
         self.outer_scope.borrow_mut().push(OuterFrame {
@@ -6029,6 +6035,7 @@ impl Connection {
             table: String::from("excluded"),
             affinity: c.affinity,
             collation: c.collation,
+            hidden: false,
         }));
         // Evaluate the DO UPDATE WHERE and SET right-hand sides against the
         // combined (existing row + excluded) scope, then drop the borrow.
@@ -7983,6 +7990,7 @@ impl Connection {
                 table: label.clone(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                hidden: false,
             })
             .collect();
         // A persistent module keeps its rows in the `<vtab>_data` backing table;
@@ -8164,6 +8172,7 @@ impl Connection {
                 table: label.to_string(),
                 affinity: c.affinity,
                 collation: c.collation,
+                hidden: false,
             })
             .collect();
         Some((columns, b.rows.clone()))
@@ -8194,6 +8203,7 @@ impl Connection {
                 table: cte.name.clone(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                hidden: false,
             })
             .collect())
     }
@@ -8455,6 +8465,7 @@ impl Connection {
                     table: label.clone(),
                     affinity,
                     collation,
+                    hidden: false,
                 }
             })
             .collect();
@@ -10697,6 +10708,7 @@ impl Connection {
                 table: label.to_string(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                hidden: false,
             })
             .collect();
         // FTS5's plan is driven by `MATCH` (a desugared `match()` function the
@@ -12050,6 +12062,7 @@ impl Connection {
                 table: String::new(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                hidden: false,
             });
             for (row, v) in rows.iter_mut().zip(values) {
                 row.values.push(v);
@@ -12402,12 +12415,12 @@ impl Connection {
             match col {
                 ResultColumn::Expr { expr, .. } => out.push(eval::key_collation(expr, &ctx)),
                 ResultColumn::Wildcard => {
-                    out.extend(columns.iter().map(|c| c.collation));
+                    out.extend(columns.iter().filter(|c| !c.hidden).map(|c| c.collation));
                 }
                 ResultColumn::TableWildcard(t) => out.extend(
                     columns
                         .iter()
-                        .filter(|c| c.table.eq_ignore_ascii_case(t))
+                        .filter(|c| !c.hidden && c.table.eq_ignore_ascii_case(t))
                         .map(|c| c.collation),
                 ),
             }
@@ -14554,6 +14567,16 @@ impl Connection {
             table: label.clone(),
             affinity,
             collation: crate::value::Collation::default(),
+            hidden: false,
+        };
+        // A hidden column (`json_each`/`json_tree`'s `json`/`root` input columns)
+        // is resolvable by name but omitted from `*` / `tbl.*` expansion.
+        let hcol = |name: &str, affinity| ColumnInfo {
+            name: String::from(name),
+            table: label.clone(),
+            affinity,
+            collation: crate::value::Collation::default(),
+            hidden: true,
         };
         match lname.as_str() {
             "generate_series" => {
@@ -14598,6 +14621,11 @@ impl Connection {
                     col("parent", eval::Affinity::Integer),
                     col("fullkey", eval::Affinity::Text),
                     col("path", eval::Affinity::Text),
+                    // Hidden input columns: `json` echoes the document argument
+                    // verbatim (constant per row), `root` the path argument
+                    // (default `$`). Both are excluded from `*` expansion.
+                    hcol("json", eval::Affinity::Blob),
+                    hcol("root", eval::Affinity::Text),
                 ];
                 // SQLite caps these table-valued functions at two arguments —
                 // the JSON document and an optional path — and rejects more as a
@@ -14659,6 +14687,15 @@ impl Connection {
                         &mut rows,
                     );
                 }
+                // Append the hidden `json`/`root` values to every emitted row,
+                // matching the two trailing hidden columns. `json` echoes the
+                // document argument as-is (a JSONB blob stays a blob); `root`
+                // is the path argument text (default `$`).
+                let root_val = Value::Text(root_path);
+                for row in &mut rows {
+                    row.push(doc.clone());
+                    row.push(root_val.clone());
+                }
                 Ok((columns, rows))
             }
             // `pragma_<name>(arg)` is the table-valued form of a PRAGMA, usable in
@@ -14711,6 +14748,7 @@ impl Connection {
                     table: label.clone(),
                     affinity,
                     collation,
+                    hidden: false,
                 }
             })
             .collect();
@@ -15816,6 +15854,7 @@ impl Connection {
                 table: label.clone(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                hidden: false,
             })
             .collect();
         let rows = result
@@ -15854,6 +15893,7 @@ impl Connection {
             table: label.clone(),
             affinity,
             collation: crate::value::Collation::default(),
+            hidden: false,
         };
         let columns = alloc::vec![col("pgno", Integer), col("data", Blob)];
         let count = src.page_count();
@@ -15886,6 +15926,7 @@ impl Connection {
             table: label.clone(),
             affinity,
             collation: crate::value::Collation::default(),
+            hidden: false,
         };
         let columns = alloc::vec![
             col("name", Text),
@@ -16059,6 +16100,7 @@ impl Connection {
                 table: label.clone(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                hidden: false,
             })
             .collect();
 
@@ -16864,6 +16906,7 @@ impl Connection {
                         table: String::new(),
                         affinity: eval::Affinity::Blob,
                         collation: crate::value::Collation::Binary,
+                        hidden: false,
                     });
                 }
                 let mut aug_vals = repr.unwrap_or(&empty).values.clone();
@@ -17170,6 +17213,7 @@ impl Connection {
                 table: String::new(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                hidden: false,
             });
         }
 
@@ -17780,7 +17824,7 @@ impl Connection {
         for col in &sel.columns {
             match col {
                 ResultColumn::Wildcard => {
-                    for c in columns {
+                    for c in columns.iter().filter(|c| !c.hidden) {
                         labels.push(c.name.clone());
                     }
                 }
@@ -17788,7 +17832,10 @@ impl Connection {
                 // matching the projected data — over a join a bare `*` lists every
                 // column but `t.*` must not.
                 ResultColumn::TableWildcard(t) => {
-                    for c in columns.iter().filter(|c| c.table.eq_ignore_ascii_case(t)) {
+                    for c in columns
+                        .iter()
+                        .filter(|c| !c.hidden && c.table.eq_ignore_ascii_case(t))
+                    {
                         labels.push(c.name.clone());
                     }
                 }
@@ -17835,6 +17882,7 @@ impl Connection {
                 table: table_label.clone(),
                 affinity: eval::Affinity::from_type(c.type_name.as_deref()),
                 collation: column_collation(c),
+                hidden: false,
             })
             .collect();
         let defaults: Vec<Option<Expr>> = ct
@@ -18088,11 +18136,13 @@ fn expand_agg_wildcards(sel: &Select, columns: &[ColumnInfo]) -> Select {
     let mut new_cols = Vec::new();
     for col in &sel.columns {
         match col {
-            ResultColumn::Wildcard => new_cols.extend(columns.iter().map(&col_ref)),
+            ResultColumn::Wildcard => {
+                new_cols.extend(columns.iter().filter(|c| !c.hidden).map(&col_ref))
+            }
             ResultColumn::TableWildcard(t) => new_cols.extend(
                 columns
                     .iter()
-                    .filter(|c| c.table.eq_ignore_ascii_case(t))
+                    .filter(|c| !c.hidden && c.table.eq_ignore_ascii_case(t))
                     .map(&col_ref),
             ),
             other => new_cols.push(other.clone()),
@@ -18241,6 +18291,7 @@ fn schema_table_meta(label: &str) -> TableMeta {
         table: label.to_string(),
         affinity: aff,
         collation: crate::value::Collation::default(),
+        hidden: false,
     };
     let columns = alloc::vec![
         col("type", eval::Affinity::Text),
@@ -19443,11 +19494,16 @@ impl eval::Subqueries for Connection {
         for col in &select.columns {
             match col {
                 ResultColumn::Expr { expr, .. } => out.push(eval::expr_affinity(expr, &ctx)),
-                ResultColumn::Wildcard => out.extend(columns.iter().map(|c| Some(c.affinity))),
+                ResultColumn::Wildcard => out.extend(
+                    columns
+                        .iter()
+                        .filter(|c| !c.hidden)
+                        .map(|c| Some(c.affinity)),
+                ),
                 ResultColumn::TableWildcard(t) => out.extend(
                     columns
                         .iter()
-                        .filter(|c| c.table.eq_ignore_ascii_case(t))
+                        .filter(|c| !c.hidden && c.table.eq_ignore_ascii_case(t))
                         .map(|c| Some(c.affinity)),
                 ),
             }
@@ -21525,13 +21581,17 @@ fn project_column(
 ) -> Result<()> {
     match col {
         ResultColumn::Wildcard => {
-            for v in ctx.row {
-                out.push(v.clone());
+            // Hidden columns (e.g. `json_each`'s `json`/`root`) are resolvable
+            // by name but excluded from `*`; the row carries a value per column.
+            for (i, c) in columns.iter().enumerate() {
+                if !c.hidden {
+                    out.push(ctx.row[i].clone());
+                }
             }
         }
         ResultColumn::TableWildcard(table) => {
             for (i, c) in columns.iter().enumerate() {
-                if c.table.eq_ignore_ascii_case(table) {
+                if !c.hidden && c.table.eq_ignore_ascii_case(table) {
                     out.push(ctx.row[i].clone());
                 }
             }

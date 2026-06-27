@@ -297,6 +297,18 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   *value* is codepoint 0x0B but its *text* renders `\u0009` — a genuine sqlite
   internal inconsistency that cannot be matched coherently; graphite decodes
   `\v`→0x09 and is excluded from preservation).
+- **`json_each`/`json_tree` hidden `json`/`root` input columns — DONE.** Both
+  table-valued functions now expose the two hidden columns that echo their
+  arguments: `json` is the document (constant per row, the argument verbatim —
+  a text doc stays text), `root` is the path (default `$`). They are resolvable
+  by name (`SELECT json,root …`, `WHERE json=…`) but excluded from `*` / `tbl.*`,
+  matching sqlite. Implemented with a new `hidden: bool` on `ColumnInfo`
+  (false everywhere but these two columns); every `*`/`tbl.*` expansion site
+  (`output_labels`, `project_column`, result affinities, key collation,
+  aggregate-wildcard expansion) filters `!hidden`, and the walker appends the
+  two values to each emitted row. Residual: `json_each`/`json_tree` still reject
+  a **JSONB blob** document (`json_each(jsonb('[1]'))` → `malformed JSON`,
+  because the doc is parsed via `to_text`) — a separate, pre-existing gap.
 - **Two residual parse-path non-issues (not worth chasing):** `UPDATE SET a=1`
   flags `a` where SQLite flags `SET` (reserved-word leniency), and `BEGIN
   TRANSACTION FOO` silently accepts the trailing name.

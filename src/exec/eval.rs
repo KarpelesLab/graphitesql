@@ -236,6 +236,9 @@ pub struct ColumnInfo {
     pub affinity: Affinity,
     /// The column's declared collating sequence (`BINARY` by default).
     pub collation: crate::value::Collation,
+    /// A hidden column (e.g. `json_each`'s `json`/`root` input columns) is
+    /// resolvable by name but excluded from `*` / `tbl.*` expansion.
+    pub hidden: bool,
 }
 
 /// Bound parameter values, by position (1-based) and by name.
