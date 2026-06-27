@@ -354,6 +354,18 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   reported `output file already exists: <path>`; SQLite's message is exactly
   `output file already exists` with no path appended. Dropped the suffix in
   `vacuum_write_into` (`src/exec/mod.rs`). `tests/vacuum_into.rs`.
+- **`RAISE()` outside a trigger — DONE.** `RAISE(ABORT|FAIL|ROLLBACK, msg)` /
+  `RAISE(IGNORE)` parses everywhere but is only meaningful in a trigger program.
+  Used in a plain `SELECT`/`WHERE`, graphite fell through to `no such function:
+  raise`; SQLite rejects it with `RAISE() may only be used within a
+  trigger-program`. graphite canonicalizes `RAISE(...)` to a `raise(...)` call
+  that the trigger executor intercepts (`fire_raise`); scalar dispatch now emits
+  the dedicated message when that interception didn't happen. `src/exec/func.rs`.
+  `tests/raise_outside_trigger.rs`. *(Separate residual, NOT fixed: a trigger
+  `RAISE(FAIL)`/`RAISE(IGNORE)` does not roll back the firing DML statement's
+  own row through the in-process `execute` path — graphite keeps the row where
+  SQLite rolls back the statement. Statement-level atomicity on trigger abort is
+  a larger, separate change.)*
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a

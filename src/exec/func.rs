@@ -971,6 +971,16 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     "misuse of window function {lname}()"
                 )));
             }
+            // `RAISE(...)` parses into a canonical `raise(...)` call. A real
+            // trigger program intercepts it before evaluation (see `fire_raise`);
+            // reaching scalar dispatch means it was used outside a trigger, which
+            // SQLite rejects with this dedicated message rather than "no such
+            // function".
+            if lname == "raise" {
+                return Err(Error::Error(alloc::string::String::from(
+                    "RAISE() may only be used within a trigger-program",
+                )));
+            }
             return Err(Error::Error(alloc::format!("no such function: {name}")));
         }
     })
