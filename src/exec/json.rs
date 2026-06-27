@@ -40,20 +40,43 @@ pub enum Json {
     Real(f64, Option<String>),
     /// A string. The first field is the decoded (unescaped) value used for all
     /// SQL value semantics. The optional second field carries the verbatim
-    /// *escaped* source body (without the surrounding quotes) when the string
-    /// was parsed from a double-quoted JSON literal that contained only
-    /// standard-JSON escapes (`\n`, `\"`, `\/`, `\uXXXX`, …). SQLite stores such
-    /// a string under the JSONB `TEXTJ` tag and re-emits the escaped body
-    /// verbatim in `json()` text output (`json('"A"')` → `"A"`) while
-    /// still yielding the decoded value (`A`) as a SQL value. `None` means no
-    /// provenance: a plain unescaped string (`TEXT`), a string built
-    /// programmatically, or one whose source used JSON5-only escapes (`\x41`,
-    /// `\'`, `\v`, `\0`), which are rendered from the decoded value.
-    Str(String, Option<String>),
+    /// *escaped* source body (without the surrounding quotes) for provenance,
+    /// when the string was parsed from a double-quoted JSON literal — see
+    /// [`StrSrc`]. `None` means no provenance: a plain unescaped string
+    /// (`TEXT`), a single-quoted string, a string built programmatically, or one
+    /// whose source contained a non-reproducible feature (a `\v` escape or a
+    /// literal control byte), all of which are rendered from the decoded value.
+    Str(String, Option<StrSrc>),
     /// An array.
     Array(Vec<Json>),
     /// An object, preserving member order.
     Object(Vec<(String, Json)>),
+}
+
+/// The verbatim *escaped* source body of a parsed JSON string (without quotes),
+/// retained so `json()` text and JSONB output byte-match SQLite. SQLite tags a
+/// string by escape class: `TEXTJ` when every escape is standard JSON, `TEXT5`
+/// when a JSON5-only escape is present. Both store the body verbatim in JSONB;
+/// they differ only in `json()` *text* rendering — `TEXTJ` is emitted verbatim,
+/// while `TEXT5` converts its JSON5-only escapes to standard JSON
+/// (`\xHH`→`\u00HH`, `\0`→`\u0000`, `\'`→`'`, a `\`-newline continuation is
+/// dropped) at render time.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StrSrc {
+    /// `TEXTJ`: standard-JSON escapes only; body emitted verbatim in text.
+    TextJ(String),
+    /// `TEXT5`: at least one JSON5-only escape; body converted on text render.
+    Text5(String),
+}
+
+impl StrSrc {
+    /// The verbatim escaped body, regardless of escape class. This is the JSONB
+    /// payload for both `TEXTJ` and `TEXT5`.
+    fn body(&self) -> &str {
+        match self {
+            StrSrc::TextJ(b) | StrSrc::Text5(b) => b,
+        }
+    }
 }
 
 impl Json {
@@ -146,15 +169,16 @@ impl Json {
                 }
             }
             Json::Str(s, raw) => {
-                // A string parsed with standard-JSON escapes keeps its verbatim
-                // escaped body under TEXTJ. Otherwise: no escapes needed → raw
-                // bytes (TEXT); else the freshly JSON-escaped body (TEXTJ).
-                if let Some(raw) = raw {
-                    push_jsonb(out, JSONB_TEXTJ, raw.as_bytes());
-                } else if json_needs_escape(s) {
-                    push_jsonb(out, JSONB_TEXTJ, json_escape_body(s).as_bytes());
-                } else {
-                    push_jsonb(out, JSONB_TEXT, s.as_bytes());
+                // A string with a retained source body stores it verbatim under
+                // its escape-class tag (TEXTJ / TEXT5). Otherwise: no escapes
+                // needed → raw bytes (TEXT); else a freshly escaped body (TEXTJ).
+                match raw {
+                    Some(StrSrc::TextJ(body)) => push_jsonb(out, JSONB_TEXTJ, body.as_bytes()),
+                    Some(StrSrc::Text5(body)) => push_jsonb(out, JSONB_TEXT5, body.as_bytes()),
+                    None if json_needs_escape(s) => {
+                        push_jsonb(out, JSONB_TEXTJ, json_escape_body(s).as_bytes());
+                    }
+                    None => push_jsonb(out, JSONB_TEXT, s.as_bytes()),
                 }
             }
             Json::Array(items) => {
@@ -215,7 +239,7 @@ impl Json {
                 None => crate::exec::eval::format_real(*r).len(),
             },
             Json::Str(s, raw) => match raw {
-                Some(raw) => raw.len(),
+                Some(src) => src.body().len(),
                 None => str_jsonb_payload_len(s),
             },
             Json::Array(items) => items.iter().map(Json::jsonb_len).sum(),
@@ -310,11 +334,17 @@ impl Json {
                 out.push_str(if *r < 0.0 { "-9e999" } else { "9e999" });
             }
             Json::Real(r, _) => out.push_str(&crate::exec::eval::format_real(*r)),
-            // A preserved escaped body is re-emitted verbatim between quotes;
-            // otherwise the decoded value is freshly escaped.
-            Json::Str(_, Some(raw)) => {
+            // A retained source body is re-emitted between quotes: TEXTJ
+            // verbatim, TEXT5 with its JSON5-only escapes converted to standard
+            // JSON. Otherwise the decoded value is freshly escaped.
+            Json::Str(_, Some(StrSrc::TextJ(body))) => {
                 out.push('"');
-                out.push_str(raw);
+                out.push_str(body);
+                out.push('"');
+            }
+            Json::Str(_, Some(StrSrc::Text5(body))) => {
+                out.push('"');
+                out.push_str(&json5_to_json_text(body));
                 out.push('"');
             }
             Json::Str(s, None) => write_json_string(s, out),
@@ -470,11 +500,17 @@ fn decode_jsonb(b: &[u8]) -> Option<(Json, &[u8])> {
             quoted.push_str(body);
             quoted.push('"');
             match parse(&quoted)? {
-                // A TEXTJ body (standard escapes only) is preserved verbatim so
-                // it round-trips to the same bytes; TEXT5 keeps its existing
-                // (decoded-value) rendering.
+                // Preserve the verbatim body so it round-trips to the same JSONB
+                // bytes, tagged by the stored escape class. (A re-encode of a
+                // `\v`/control-byte TEXT5 body that the parser would otherwise
+                // refuse to retain still round-trips, since the body came from
+                // valid JSONB.)
                 Json::Str(s, _) => {
-                    let raw = (ty == JSONB_TEXTJ).then(|| String::from(body));
+                    let raw = if ty == JSONB_TEXTJ {
+                        Some(StrSrc::TextJ(String::from(body)))
+                    } else {
+                        Some(StrSrc::Text5(String::from(body)))
+                    };
                     Json::Str(s, raw)
                 }
                 _ => return None,
@@ -952,20 +988,25 @@ impl Parser<'_> {
 
     /// Parse a string literal opened by `quote` (`"` or, in JSON5, `'`). Both
     /// quote styles share the same escapes; `\'` and `\"` are always accepted.
-    /// Parse a quoted string, returning the decoded value and — when the source
-    /// was a double-quoted literal using only standard-JSON escapes — its
-    /// verbatim escaped body (between the quotes) for `TEXTJ` provenance. The
-    /// raw body is `None` for a plain unescaped string, a single-quoted string,
-    /// or any string using a JSON5-only escape (`\x`, `\'`, `\v`, `\0`, a line
-    /// continuation) or carrying a literal control byte.
-    fn string(&mut self, quote: u8) -> Result<(String, Option<String>), usize> {
+    /// Parse a quoted string, returning the decoded value and — for a
+    /// double-quoted literal containing escapes — its verbatim escaped body
+    /// (between the quotes) tagged by escape class for provenance: [`StrSrc`]
+    /// `TextJ` when every escape is standard JSON, `Text5` when a JSON5-only
+    /// escape (`\x`, `\'`, `\0`, a line continuation) is present. The body is
+    /// `None` for a plain unescaped string, a single-quoted string, or one
+    /// carrying a feature that can't be faithfully re-rendered from the body
+    /// alone (a `\v` escape — sqlite maps it to U+0009 — or a literal control
+    /// byte); those render from the decoded value.
+    fn string(&mut self, quote: u8) -> Result<(String, Option<StrSrc>), usize> {
         self.pos += 1; // opening quote
         let body_start = self.pos;
         let mut s = String::new();
-        // Whether any escape was seen, and whether a non-standard-JSON feature
-        // (a JSON5-only escape or a literal control byte) was seen.
+        // Whether any escape was seen, whether a JSON5-only escape was seen
+        // (→ TEXT5), and whether a feature we can't reproduce from the body was
+        // seen (→ don't retain provenance at all).
         let mut had_escape = false;
         let mut json5 = false;
+        let mut block_raw = false;
         loop {
             let Some(c) = self.peek() else {
                 return self.err();
@@ -973,13 +1014,20 @@ impl Parser<'_> {
             if c == quote {
                 let body_end = self.pos;
                 self.pos += 1;
-                // Preserve the verbatim escaped body only for a double-quoted
-                // string whose escapes are all standard JSON (TEXTJ). By
+                // Retain the verbatim body only for a double-quoted string with
+                // escapes and no unreproducible feature; tag by escape class. By
                 // construction it round-trips to the same decoded value.
-                let raw = if quote == b'"' && had_escape && !json5 {
+                let raw = if quote == b'"' && had_escape && !block_raw {
                     core::str::from_utf8(&self.bytes[body_start..body_end])
                         .ok()
-                        .map(String::from)
+                        .map(|body| {
+                            let body = String::from(body);
+                            if json5 {
+                                StrSrc::Text5(body)
+                            } else {
+                                StrSrc::TextJ(body)
+                            }
+                        })
                 } else {
                     None
                 };
@@ -1006,9 +1054,11 @@ impl Parser<'_> {
                         b'/' => s.push('/'),
                         b'n' => s.push('\n'),
                         b't' => s.push('\t'),
-                        // JSON5: `\v` maps to U+0009 in sqlite (not U+000B).
+                        // JSON5: `\v` maps to U+0009 in sqlite (not U+000B). Its
+                        // text re-rendering (`\u0009`) isn't locally verifiable
+                        // against stock sqlite, so don't retain the body.
                         b'v' => {
-                            json5 = true;
+                            block_raw = true;
                             s.push('\t');
                         }
                         b'r' => s.push('\r'),
@@ -1079,10 +1129,10 @@ impl Parser<'_> {
                     }
                 }
                 c => {
-                    // A literal control byte makes the body non-TEXTJ (sqlite
-                    // stores it as TEXT5), so don't preserve it verbatim.
+                    // A literal control byte can't be reproduced from the
+                    // escaped body alone, so don't retain provenance.
                     if c < 0x20 {
-                        json5 = true;
+                        block_raw = true;
                     }
                     s.push(c as char);
                 }
@@ -1281,6 +1331,59 @@ fn json5_fixup_number(src: &str) -> String {
         out.push('0'); // a trailing `.` (before `e`/end) becomes `.0`
     }
     out.push_str(&src[dot + 1..]);
+    out
+}
+
+/// Convert a `TEXT5` (JSON5) escaped string body to its standard-JSON text form,
+/// matching how sqlite renders such a string in `json()`: the JSON5-only escapes
+/// are rewritten — `\xHH` → `\u00HH`, `\0` → `\u0000`, `\'` → `'`, and a
+/// backslash-before-newline line continuation is dropped — while every
+/// standard-JSON escape and all literal text pass through verbatim. Verbatim
+/// runs are copied as whole `&str` slices, so multi-byte UTF-8 is preserved.
+fn json5_to_json_text(body: &str) -> String {
+    let b = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    let mut run = 0; // start of the current verbatim (uncopied) run
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            out.push_str(&body[run..i]); // flush the run before this escape
+            match b[i + 1] {
+                // `\xHH` → `\u00HH` (the two hex digits were validated on parse).
+                b'x' => {
+                    out.push_str("\\u00");
+                    out.push_str(&body[i + 2..i + 4]);
+                    i += 4;
+                }
+                b'0' => {
+                    out.push_str("\\u0000");
+                    i += 2;
+                }
+                b'\'' => {
+                    out.push('\'');
+                    i += 2;
+                }
+                // A line continuation: drop the backslash and the terminator
+                // (`\r\n` counts as one).
+                b'\n' => i += 2,
+                b'\r' => {
+                    i += 2;
+                    if b.get(i) == Some(&b'\n') {
+                        i += 1;
+                    }
+                }
+                // A standard-JSON escape (incl. `\uXXXX`): copy it verbatim.
+                _ => {
+                    out.push_str(&body[i..i + 2]);
+                    i += 2;
+                }
+            }
+            run = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&body[run..]);
     out
 }
 

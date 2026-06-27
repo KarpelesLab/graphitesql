@@ -74,8 +74,41 @@ fn plain_and_json5_strings_render_from_value() {
     // A string needing no escapes is unaffected (stored TEXT).
     assert_eq!(text(&c, r#"SELECT json('"hello"')"#), r#""hello""#);
     assert_eq!(text(&c, r#"SELECT hex(jsonb('"hello"'))"#), "5768656C6C6F");
-    // A JSON5-only `\x` escape is (still) rendered from the decoded value.
-    assert_eq!(text(&c, r#"SELECT json('"\x41"')"#), r#""A""#);
     // A string built programmatically (from a SQL TEXT) escapes canonically.
     assert_eq!(text(&c, "SELECT json_quote('a\tb')"), r#""a\tb""#);
+}
+
+#[test]
+fn json5_only_escapes_convert_on_text_render() {
+    // A JSON5-only `\xHH` escape is kept verbatim in JSONB (TEXT5 tag) but
+    // rewritten to `\u00HH` when rendered to json() text, matching sqlite. The
+    // SQL value is the decoded character.
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(text(&c, r#"SELECT json('"\x41"')"#), r#""\u0041""#);
+    assert_eq!(
+        text(&c, r#"SELECT json('"\x4f\x4b"')"#),
+        r#""\u004f\u004b""#
+    );
+    // A standard escape mixed in stays verbatim; only the JSON5 one converts.
+    assert_eq!(text(&c, r#"SELECT json('"a\x41\nb"')"#), r#""a\u0041\nb""#);
+    // `\0` (JSON5 NUL escape) is kept under TEXT5, rendered as a space.
+    assert_eq!(text(&c, r#"SELECT json('"\0"')"#), r#""\u0000""#);
+    // Decoded value is the character (`\x41` -> "A", length 1).
+    assert_eq!(
+        one(&c, r#"SELECT json_extract('"\x41"','$')"#),
+        Value::Text("A".into())
+    );
+}
+
+#[test]
+fn text5_jsonb_stores_body_verbatim_and_round_trips() {
+    let c = Connection::open_memory().unwrap();
+    // `"\x41"` -> header 0x49 (size 4, TEXT5) + verbatim body `\x41`.
+    assert_eq!(text(&c, r#"SELECT hex(jsonb('"\x41"'))"#), "495C783431");
+    // Round-trips JSONB -> json() text with the conversion applied.
+    assert_eq!(text(&c, r#"SELECT json(jsonb('"\x41"'))"#), r#""\u0041""#);
+    assert_eq!(
+        text(&c, r#"SELECT json(jsonb('"a\x41\nb"'))"#),
+        r#""a\u0041\nb""#
+    );
 }
