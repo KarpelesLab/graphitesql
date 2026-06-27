@@ -336,6 +336,22 @@ aggregate used as a **window function** (`sum(a, b) OVER ()`, `sum() OVER ()`),
 which graphite previously ran silently; the eleven built-in window functions
 keep their own arity. All byte-exact vs `sqlite3` 3.50.4.
 
+And an **aggregate inside a window function's `OVER` spec** (`PARTITION BY` /
+`ORDER BY`) now classifies the query as a single aggregate group, matching
+SQLite: `SELECT row_number() OVER (ORDER BY sum(a)) FROM t` computes `sum(a)`
+over the whole table first (one group), then runs the window over that single
+row — graphite used to take the plain-window path over the raw rows and emit one
+result row per input row. Routing is decided by `has_over_spec_aggregate` (a walk
+of each result column's window-function nodes, testing their `PARTITION BY` /
+`ORDER BY` exprs for an aggregate), which is OR-ed into the `windowed_agg`
+condition in `finish_from_rows`, so the over-spec case flows through
+`eval_windowed_aggregate` and composes with `GROUP BY`, `DISTINCT`, `ORDER BY`
+and `LIMIT`. Crucially the over-spec aggregate is **not** counted by
+`has_result_aggregate`, so it does not make a `HAVING` legal: `… OVER (ORDER BY
+sum(a)) … HAVING sum(a)>0` still reports `HAVING clause on a non-aggregate query`
+(even `HAVING 1`/`HAVING 0`) unless a *real* non-windowed result aggregate is
+present, exactly as SQLite. Byte-exact vs `sqlite3` 3.50.4.
+
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite
 does. The per-column "add column" checks run first, left to right — a duplicate
@@ -666,15 +682,6 @@ open work:
     depends on the same correlated-scope column resolution above. Derived tables in
     `FROM`, CTE bodies, and compound (`UNION`) arms are already covered (they
     materialize, which resolves them).
-  - an aggregate inside a window's `OVER` spec (`PARTITION BY`/`ORDER BY`) makes
-    the query an aggregate one in SQLite: `SELECT row_number() OVER (ORDER BY
-    sum(a)) FROM t` is valid (a single group → one row), but graphite reports
-    `misuse of aggregate function sum()`. This is not a lazy-validation gap but a
-    missing window-over-aggregate *semantic*: the over-spec aggregate must be
-    exempted from the misuse check, classify the query as aggregate, **and** be
-    computed over the frame — suppressing the error alone would turn a wrong error
-    into a wrong result. (A window *function* nested in the over spec, `OVER
-    (ORDER BY sum(a) OVER ())`, already matches.)
 - **ALTER-time rejection of an ALTER that breaks a dependent.** An `ALTER` that
   makes a dependent view/trigger unresolvable should be rejected and rolled back;
   graphite leaves the now-broken object. Needs statement-level DDL rollback — a

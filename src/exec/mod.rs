@@ -14271,8 +14271,10 @@ impl Connection {
         // `eval_windowed_aggregate` handles grouping, the windows, and projection,
         // returning rows + sort keys just like the other eval paths — so it feeds
         // the same DISTINCT / ORDER BY / LIMIT post-processing below.
-        let windowed_agg =
-            window::has_window(sel) && (!sel.group_by.is_empty() || self.has_aggregate(sel));
+        let windowed_agg = window::has_window(sel)
+            && (!sel.group_by.is_empty()
+                || self.has_aggregate(sel)
+                || self.has_over_spec_aggregate(sel));
 
         // Plain window functions (no GROUP BY/aggregate): compute over the
         // post-WHERE rows, append the results as synthetic columns, and rewrite the
@@ -18879,6 +18881,45 @@ impl Connection {
         sel.having
             .as_ref()
             .is_some_and(|h| expr_contains_agg(h, &is_agg))
+    }
+
+    /// An aggregate appearing inside a result-column window function's `OVER`
+    /// spec (`PARTITION BY` / `ORDER BY`), e.g. `row_number() OVER (ORDER BY
+    /// sum(a))`. SQLite computes such a query as a single aggregate group that
+    /// feeds the window, so it must route through the windowed-aggregate path
+    /// even without a GROUP BY or a plain result aggregate. It is deliberately
+    /// *not* counted by [`Self::has_result_aggregate`]: an over-spec aggregate
+    /// does not make the query an aggregate one for HAVING-validity.
+    fn has_over_spec_aggregate(&self, sel: &Select) -> bool {
+        let is_agg = |name: &str, n: usize, star: bool| {
+            func::is_aggregate_call(name, n, star)
+                || self.aggregates.contains_key(&name.to_ascii_lowercase())
+        };
+        let mut found = false;
+        for c in &sel.columns {
+            let ResultColumn::Expr { expr, .. } = c else {
+                continue;
+            };
+            window::visit(expr, &mut |n| {
+                if let Expr::Function {
+                    over: Some(spec), ..
+                } = n
+                {
+                    if spec
+                        .partition_by
+                        .iter()
+                        .any(|e| expr_contains_agg(e, &is_agg))
+                        || spec
+                            .order_by
+                            .iter()
+                            .any(|o| expr_contains_agg(&o.expr, &is_agg))
+                    {
+                        found = true;
+                    }
+                }
+            });
+        }
+        found
     }
 
     fn output_labels(&self, sel: &Select, columns: &[ColumnInfo]) -> Vec<String> {
@@ -23820,6 +23861,10 @@ fn expr_contains_agg(expr: &Expr, is_agg: &dyn Fn(&str, usize, bool) -> bool) ->
     match expr {
         // A window function (`f(…) OVER (…)`) is not a plain aggregate, even when
         // `f` is an aggregate name; only its arguments might contain aggregates.
+        // (An aggregate in the `OVER` spec routes through the windowed-aggregate
+        // path via `has_over_spec_aggregate`, but does *not* make the query an
+        // aggregate one for HAVING-validity — so it is deliberately not counted
+        // here, matching SQLite.)
         Expr::Function {
             over: Some(_),
             args,
