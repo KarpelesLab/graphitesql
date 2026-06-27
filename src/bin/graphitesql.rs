@@ -461,6 +461,14 @@ fn split_statements(sql: &str) -> Vec<String> {
                 cur.push(c);
             }
             ';' if depth == 0 => {
+                // Re-attach the terminating `;` so the engine can tell a
+                // `;`-truncated statement (`SELECT;` → `near ";": syntax error`)
+                // apart from a genuine end-of-input truncation (`SELECT` at EOF →
+                // `incomplete input`), exactly as SQLite's CLI does. A bare/blank
+                // `;` stays empty so `run_sql_batch` skips it as a no-op.
+                if !cur.trim().is_empty() {
+                    cur.push(';');
+                }
                 out.push(std::mem::take(&mut cur));
             }
             _ => cur.push(c),

@@ -595,6 +595,22 @@ text-preserving CREATE-text edits).
     type word, where sqlite raises `near "AUTOINCREMENT": syntax error`. The
     parser now stops the type-name scan at the keyword so the same error fires
     (`tests/create_table_autoincrement.rs`).
+  - **A `;`-truncated statement is a syntax error, not "incomplete input" (done).**
+    The CLI splits a batch on `;` before handing each piece to the engine; it used
+    to strip the terminating `;`, so a truncated statement like `SELECT;` reached
+    the parser as `SELECT` and was misreported as `incomplete input`. The `;` is
+    now re-attached to non-empty pieces, so sqlite's distinction holds — `SELECT;`
+    → `near ";": syntax error`, while a genuine end-of-input `SELECT` (no `;`)
+    still yields `incomplete input` (`tests/cli_semicolon_truncation.rs`). The
+    library parser was already correct; this was a CLI statement-splitting bug.
+  - **Remaining error-parity gaps (architectural, tracked).** Two known
+    divergences are deferred as they need broader surgery rather than a localized
+    fix: (1) ~37 reserved keywords (`SELECT`, `WHERE`, …) are still accepted as
+    bare identifiers in DDL (e.g. `CREATE TABLE t(select)`), needing sqlite's exact
+    reserved set applied globally in `ident()`; (2) a 3-part `schema.table.column`
+    qualifier silently drops the schema name instead of validating it, since
+    `Expr::Column` has no schema field (adding one touches ~74 sites). Neither is a
+    quick win; they wait for a dedicated pass.
 
 ### Track B — Query planner, statistics & the VDBE
 
