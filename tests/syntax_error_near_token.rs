@@ -39,6 +39,16 @@ fn syntax_errors_point_at_the_offending_token() {
         ("CREATE FOO", "FOO"),
         ("DROP FOObar", "FOObar"),
         ("SELECT * FROM t t2 t3", "t3"),
+        // A bare `VALUES` core takes no trailing ORDER BY / LIMIT (SQLite's
+        // grammar attaches those only to the SELECT form of a query core).
+        ("VALUES (1),(2) ORDER BY 1", "ORDER"),
+        ("VALUES (1),(2) LIMIT 1", "LIMIT"),
+        ("VALUES (1) UNION ALL VALUES (2) ORDER BY 1", "ORDER"),
+        ("SELECT 1 UNION VALUES (2) ORDER BY 1", "ORDER"),
+        (
+            "WITH t AS (VALUES (1),(2) ORDER BY 1) SELECT * FROM t",
+            "ORDER",
+        ),
     ] {
         assert_eq!(
             parse_msg(&c, sql),
@@ -101,6 +111,18 @@ fn matches_sqlite_cli() {
         "EXPLAIN QUERY x",
         "ALTER TABLE t FOO",
         "SELECT * FROM t t2 t3",
+        // `VALUES` core rejects a trailing ORDER BY / LIMIT, including after a
+        // compound whose last core is `VALUES`.
+        "VALUES (1),(2) ORDER BY 1",
+        "VALUES (1),(2) LIMIT 1",
+        "VALUES (1) UNION ALL VALUES (2) ORDER BY 1",
+        "SELECT 1 UNION VALUES (2) ORDER BY 1",
+        "WITH t AS (VALUES (1),(2) ORDER BY 1) SELECT * FROM t",
+        // …but these remain valid (last core is a SELECT, or the ORDER BY binds
+        // to an outer SELECT) — no false syntax error.
+        "VALUES (3),(1),(2) UNION SELECT 4 ORDER BY 1",
+        "SELECT * FROM (VALUES (3),(1),(2)) ORDER BY 1",
+        "VALUES (1),(2)",
         // a complete statement still parses (no false syntax error)
         "SELECT 1",
     ] {

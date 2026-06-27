@@ -170,7 +170,12 @@ operand now reports `row value misused` (the `sub-select returns N columns`
 column-count message is kept for genuinely scalar contexts — bare SELECT list,
 `IN`, function arguments), while two equal-arity vectors row-compare
 lexicographically (`(SELECT 1,2) = (SELECT 3,4)` → `0`, and likewise for
-subquery-vs-subquery `BETWEEN`) — all byte-exact vs `sqlite3` 3.50.4.
+subquery-vs-subquery `BETWEEN`); and a trailing `ORDER BY`/`LIMIT` after a
+`VALUES` query core is now a `near "ORDER"/"LIMIT": syntax error` (SQLite's
+grammar attaches them only to the `SELECT` form of a core, so `VALUES (1),(2)
+ORDER BY 1` — and the same after a compound whose last core is `VALUES` — is
+rejected, while a compound ending in a `SELECT` or an outer `SELECT … FROM
+(VALUES …) ORDER BY` still parses) — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 

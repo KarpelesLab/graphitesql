@@ -524,10 +524,22 @@ impl Parser {
     /// leading `WITH` clause (the caller attaches CTEs to the returned select).
     fn select_body(&mut self) -> Result<Select> {
         // First query core, then any compound continuations (left-associative).
+        // Track whether the *last* core parsed is a `VALUES` clause: SQLite's
+        // grammar attaches `ORDER BY`/`LIMIT` only to the `SELECT` form of a query
+        // core, never the `VALUES` form, so a trailing `VALUES` core leaves no slot
+        // for them (`VALUES (1),(2) ORDER BY 1` is `near "ORDER": syntax error`).
+        let mut last_is_values = self.check_kw("values");
         let mut outer = self.select_core()?;
         while let Some(op) = self.compound_op() {
+            last_is_values = self.check_kw("values");
             let right = self.select_core()?;
             outer.compound.push((op, right));
+        }
+
+        // A trailing `ORDER BY`/`LIMIT` after a `VALUES` core is a syntax error,
+        // matching SQLite (and graphite's own `INSERT … VALUES … ORDER BY` path).
+        if last_is_values && (self.check_kw("order") || self.check_kw("limit")) {
+            return Err(self.err("ORDER BY / LIMIT not allowed after VALUES"));
         }
 
         // Trailing ORDER BY / LIMIT / OFFSET apply to the whole (compound) query.
