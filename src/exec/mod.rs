@@ -9621,6 +9621,29 @@ impl Connection {
             hit
         };
         let in_table = format!("error in table {} after drop column: ", a.table);
+        // SQLite re-validates the regenerated table, and a table must keep at least
+        // one non-generated column. Dropping the last ordinary column (leaving only
+        // GENERATED ALWAYS columns) is rejected with this rule *before* the
+        // generated-expression re-resolution below — so `DROP COLUMN a` from
+        // `t(a, b AS (a+1))` reports the non-generated-column rule, not the
+        // `no such column: a` that resolving `b`'s now-dangling expression yields.
+        let non_generated = ct
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| {
+                *i != pos
+                    && !c
+                        .constraints
+                        .iter()
+                        .any(|cc| matches!(cc, ColumnConstraint::Generated { .. }))
+            })
+            .count();
+        if non_generated == 0 {
+            return Err(Error::Error(format!(
+                "{in_table}must have at least one non-generated column"
+            )));
+        }
         // A generated column or a CHECK on *another* column that mentions the
         // dropped column makes the regenerated table text un-reparseable. The
         // dropped column's own constraints go away with it, so skip `pos`.

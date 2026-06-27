@@ -349,7 +349,15 @@ to resolve a generated column's expression before noticing the table was
 all-generated (so `CREATE TABLE t(a AS (b))` wrongly said `no such column: b`
 instead of `must have at least one non-generated column`) and ran the
 duplicate-name / `COLLATE` checks after the STRICT datatype check; both are fixed,
-byte-exact vs `sqlite3` 3.50.4 across ~35 multi-fault permutations.
+byte-exact vs `sqlite3` 3.50.4 across ~35 multi-fault permutations. The same
+"must have at least one non-generated column" rule is now also re-applied after
+an **`ALTER TABLE … DROP COLUMN`**: dropping the last ordinary column (leaving
+only generated columns) is rejected with `error in table T after drop column:
+must have at least one non-generated column`, ahead of the generated-expression
+re-resolution — so `DROP COLUMN a` from `t(a, b AS (a+1))` reports that rule
+rather than `no such column: a`, and `t(a, b AS (1))` (whose generated expression
+no longer mentions the dropped column) is now rejected instead of silently
+building an all-generated table.
 
 A **trigger body that targets a missing table** is now reported with the same
 schema qualifier SQLite uses. SQLite compiles a trigger program in the trigger's

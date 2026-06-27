@@ -142,6 +142,38 @@ fn a_constraint_not_referencing_the_column_drops_cleanly() {
 }
 
 #[test]
+fn dropping_the_last_non_generated_column_is_refused() {
+    // A table must keep at least one non-generated column. Dropping the last
+    // ordinary column (leaving only GENERATED ALWAYS columns) is rejected with
+    // that rule — and it outranks the generated-expression re-resolution, so the
+    // error is the non-generated-column rule even when the surviving generated
+    // expression now references the dropped column.
+    let cases: &[&str] = &[
+        "CREATE TABLE t(a, b AS (a + 1))",
+        "CREATE TABLE t(a, b AS (a + 1) STORED)",
+        "CREATE TABLE t(a, b AS (1))", // generated expr does not name `a`
+        "CREATE TABLE t(a, b AS (a), c AS (a))",
+        "CREATE TABLE t(a, b AS (a) CHECK(b > 0))",
+    ];
+    for ddl in cases {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute(ddl).unwrap();
+        assert_eq!(
+            err(&mut c, "ALTER TABLE t DROP COLUMN a"),
+            "error in table t after drop column: must have at least one non-generated column",
+            "for {ddl}"
+        );
+    }
+
+    // But dropping an ordinary column while another ordinary one survives is fine
+    // even when a generated column references the *kept* column.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b, c AS (b + 1))").unwrap();
+    c.execute("ALTER TABLE t DROP COLUMN a").unwrap();
+    c.query("SELECT b, c FROM t").unwrap();
+}
+
+#[test]
 fn matches_sqlite_cli() {
     if !sqlite3_available() {
         eprintln!("sqlite3 CLI not found; skipping");
@@ -186,6 +218,12 @@ fn matches_sqlite_cli() {
         "CREATE TABLE t(a CHECK(a>0), b); ALTER TABLE t DROP COLUMN a; SELECT 'ok';",
         "CREATE TABLE t(a REFERENCES p, b); ALTER TABLE t DROP COLUMN a; SELECT 'ok';",
         "CREATE TABLE t(a COLLATE NOCASE, b); ALTER TABLE t DROP COLUMN a; SELECT 'ok';",
+        "CREATE TABLE t(a, b AS (a+1)); ALTER TABLE t DROP COLUMN a;",
+        "CREATE TABLE t(a, b AS (a+1) STORED); ALTER TABLE t DROP COLUMN a;",
+        "CREATE TABLE t(a, b AS (1)); ALTER TABLE t DROP COLUMN a;",
+        "CREATE TABLE t(a, b AS (a), c AS (a)); ALTER TABLE t DROP COLUMN a;",
+        "CREATE TABLE t(a, b, c AS (a+1)); ALTER TABLE t DROP COLUMN a;",
+        "CREATE TABLE t(a, b, c AS (b+1)); ALTER TABLE t DROP COLUMN a; SELECT 'ok';",
     ] {
         let full = format!("{p}{sql}");
         assert_eq!(run("sqlite3", &full), run(g, &full), "for {sql}");
