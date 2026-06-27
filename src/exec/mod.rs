@@ -13141,12 +13141,24 @@ impl Connection {
             }
         }
 
+        // A window function is valid only in the result columns and ORDER BY of
+        // its query; in a GROUP BY, HAVING, or WHERE it is a misuse. SQLite
+        // rejects these at prepare time (so they error even over an empty/filtered
+        // table, which lazy per-row evaluation would otherwise silently accept).
+        for g in &sel.group_by {
+            reject_misused_window(g)?;
+        }
+        if let Some(h) = &sel.having {
+            reject_misused_window(h)?;
+        }
+
         // An aggregate function in the WHERE clause is a misuse: WHERE filters
         // individual rows, before any grouping. SQLite rejects it at prepare time
         // (so it errors even over an empty/fully-filtered table, which lazy
         // per-row evaluation would otherwise silently accept). The wording depends
         // on whether this is an aggregate query — see `reject_misused_aggregate`.
         if let Some(w) = &sel.where_clause {
+            reject_misused_window(w)?;
             reject_misused_aggregate(w, select_is_aggregate_query(sel))?;
         }
 
@@ -13689,11 +13701,13 @@ impl Connection {
         if let Some(m) = missing {
             return Err(Error::Error(m));
         }
-        // An aggregate in an UPDATE/DELETE WHERE or an UPDATE assignment value is
-        // a misuse (these statements are never aggregate queries). SQLite rejects
-        // it at prepare time; graphite otherwise evaluated it lazily and so
-        // silently accepted it over an empty/filtered table.
+        // An aggregate or window function in an UPDATE/DELETE WHERE or an UPDATE
+        // assignment value is a misuse (these statements are never aggregate
+        // queries, and have no result-column/ORDER BY context where a window is
+        // valid). SQLite rejects it at prepare time; graphite otherwise evaluated
+        // it lazily and so silently accepted it over an empty/filtered table.
         for e in exprs {
+            reject_misused_window(e)?;
             reject_misused_aggregate(e, false)?;
         }
         Ok(())
@@ -18603,6 +18617,40 @@ fn reject_misused_aggregate(e: &Expr, aggregate_query: bool) -> Result<()> {
         ))),
         Some(name) => Err(Error::Error(alloc::format!(
             "misuse of aggregate function {name}()"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The lowercased name of the first window function call (any call carrying an
+/// `OVER` clause) in `e`, or `None`. Like the aggregate walk, this stops at
+/// subquery boundaries, so a window function inside a nested `SELECT` belongs to
+/// that query level and is not reported here.
+fn first_window_call_name(e: &Expr) -> Option<String> {
+    let mut found: Option<String> = None;
+    window::visit(e, &mut |n| {
+        if found.is_some() {
+            return;
+        }
+        if let Expr::Function { name, over, .. } = n {
+            if over.is_some() {
+                found = Some(name.to_ascii_lowercase());
+            }
+        }
+    });
+    found
+}
+
+/// Reject a window function used in a clause that forbids it. Window functions
+/// are valid only in the result columns and `ORDER BY` of their query; in a
+/// `WHERE`, `GROUP BY`, `HAVING`, or any `UPDATE`/`DELETE` expression they are a
+/// misuse. SQLite rejects this at prepare time (so it errors even over an
+/// empty/fully-filtered table, which graphite's lazy per-row evaluator would
+/// otherwise silently accept) with a single wording, unlike the aggregate case.
+fn reject_misused_window(e: &Expr) -> Result<()> {
+    match first_window_call_name(e) {
+        Some(name) => Err(Error::Error(alloc::format!(
+            "misuse of window function {name}()"
         ))),
         None => Ok(()),
     }

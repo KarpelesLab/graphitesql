@@ -63,6 +63,107 @@ fn window_aggregate_in_where_or_having_is_misuse() {
         .is_ok());
 }
 
+/// Run a statement through the method that accepts it (`query` for `SELECT`,
+/// `execute` otherwise) and return the resulting error string.
+fn err_of(c: &mut Connection, sql: &str) -> String {
+    let r = if sql.trim_start()[..6].eq_ignore_ascii_case("select") {
+        c.query(sql).map(|_| ())
+    } else {
+        c.execute(sql).map(|_| ())
+    };
+    r.unwrap_err()
+        .to_string()
+        .trim_start_matches("error: ")
+        .to_string()
+}
+
+#[test]
+fn window_misuse_is_rejected_even_on_empty_table() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    // The table is empty, so lazy per-row evaluation would never fire — these
+    // must still be rejected at prepare time (a GROUP BY/HAVING/WHERE position,
+    // and an UPDATE/DELETE expression, all forbid a window function).
+    for (sql, name) in [
+        (
+            "SELECT a FROM t WHERE row_number() OVER () > 0",
+            "row_number",
+        ),
+        (
+            "SELECT a FROM t GROUP BY a HAVING rank() OVER (ORDER BY a) > 0",
+            "rank",
+        ),
+        (
+            "SELECT a FROM t WHERE a > 0 GROUP BY row_number() OVER ()",
+            "row_number",
+        ),
+        ("DELETE FROM t WHERE rank() OVER (ORDER BY a) > 0", "rank"),
+        ("UPDATE t SET a = row_number() OVER ()", "row_number"),
+        (
+            "UPDATE t SET a = 1 WHERE dense_rank() OVER (ORDER BY a) > 0",
+            "dense_rank",
+        ),
+    ] {
+        assert_eq!(
+            err_of(&mut c, sql),
+            format!("misuse of window function {name}()"),
+            "for {sql}"
+        );
+    }
+    // A window function in a subquery belongs to that level — not a misuse here.
+    c.query("SELECT a FROM t WHERE a IN (SELECT row_number() OVER () FROM t)")
+        .unwrap();
+}
+
+#[test]
+fn matches_sqlite_cli_empty_table_and_dml() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    // The table is left empty: the point is that the rejection is at prepare
+    // time, identical between graphite and the CLI even when no row is scanned.
+    let g_bin = env!("CARGO_BIN_EXE_graphitesql");
+    let run = |bin: &str, sql: &str| -> String {
+        let full = format!("CREATE TABLE t(a, b); {sql}");
+        let out = Command::new(bin)
+            .arg(":memory:")
+            .arg(&full)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if !stdout.trim().is_empty() {
+            return stdout.trim_end().to_string();
+        }
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .find(|l| !l.trim_start().starts_with('^'))
+            .unwrap_or("")
+            .trim_start_matches("Error: in prepare, ")
+            .trim_start_matches("Error: stepping, ")
+            .trim_start_matches("Error: ")
+            .trim_start_matches("error: ")
+            .trim_end()
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .trim_end_matches('(')
+            .trim_end()
+            .to_string()
+    };
+    for sql in [
+        "SELECT a FROM t WHERE row_number() OVER () > 0",
+        "SELECT a FROM t GROUP BY a HAVING rank() OVER (ORDER BY a) > 0",
+        "SELECT a FROM t WHERE a > 0 GROUP BY row_number() OVER ()",
+        "DELETE FROM t WHERE rank() OVER (ORDER BY a) > 0",
+        "UPDATE t SET a = row_number() OVER ()",
+        "UPDATE t SET a = 1 WHERE dense_rank() OVER (ORDER BY a) > 0",
+        // legitimate — runs (no output) in both
+        "SELECT a, row_number() OVER (ORDER BY a) FROM t",
+        "SELECT a FROM t ORDER BY row_number() OVER ()",
+    ] {
+        assert_eq!(run("sqlite3", sql), run(g_bin, sql), "for {sql}");
+    }
+}
+
 #[test]
 fn matches_sqlite_cli() {
     if !sqlite3_available() {

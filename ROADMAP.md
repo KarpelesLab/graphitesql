@@ -388,6 +388,17 @@ text-preserving CREATE-text edits).
     `misuse of aggregate function f()` otherwise (plain SELECT WHERE, UPDATE,
     DELETE). An aggregate nested in a subquery (`WHERE x IN (SELECT sum(y) …)`) is
     untouched (`tests/aggregate_misuse.rs`).
+  - **Window-function misuse is rejected at prepare time (done).** A window
+    function (any call with an `OVER` clause) is valid only in the result columns
+    and `ORDER BY` of its query; in a `WHERE`, `GROUP BY`, `HAVING`, or any
+    `UPDATE`/`DELETE` expression it is a misuse. graphite's per-row evaluator
+    produced the right `misuse of window function f()` message only once a row
+    reached evaluation, so over an empty/fully-filtered table it *silently
+    accepted* the statement. It is now caught up front in all those positions,
+    matching sqlite's single wording; a window nested in a subquery is untouched
+    (`tests/window_misuse.rs`). Follow-up: a window nested in an aggregate
+    *argument* in a result column (`sum(row_number() OVER ())`) is still accepted
+    over an empty table — a distinct rule not yet hoisted.
 
 ### Track B — Query planner, statistics & the VDBE
 
