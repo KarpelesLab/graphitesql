@@ -254,7 +254,14 @@ specification` when the start category comes after the end's (`CURRENT ROW AND
 1 PRECEDING`, `1 FOLLOWING AND 1 PRECEDING`, `1 FOLLOWING AND CURRENT ROW`) —
 the offset is not compared, so `2 FOLLOWING AND 1 FOLLOWING` stays a valid empty
 frame; the old code built the right message text but routed it through `err()`,
-which discards the string and emits a positional `near` error — all byte-exact
+which discards the string and emits a positional `near` error; and a **scalar
+function used as a window function** (`abs(a) OVER ()`, `upper(a) OVER ()`, or a
+two-argument `min`/`max` like `max(a,b) OVER ()`, which is scalar) is now
+rejected at prepare time with `NAME() may not be used as a window function` —
+covering *both* the VDBE window path (a real base table) and the tree-walker
+path (a subquery source), in the projection and in `ORDER BY`; only the eleven
+built-in window functions and the true aggregates (which double as window
+functions, including single-arg `min`/`max`) stay legal there — all byte-exact
 vs `sqlite3` 3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier

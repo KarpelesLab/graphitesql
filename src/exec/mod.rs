@@ -976,6 +976,24 @@ impl Connection {
         // windows, projection, DISTINCT, `ORDER BY` and `LIMIT`/`OFFSET` through the
         // shared `finish_from_rows` tail — the same code the tree-walker runs.
         if window::has_window(sel) {
+            // A scalar (or multi-arg min/max) function used with `OVER (…)` is not
+            // a window function — SQLite rejects it at prepare time. The VDBE window
+            // path bypasses `run_core`'s validation, so re-check here before the
+            // dispatch (else such a query would run and return rows silently).
+            {
+                let is_agg = |name: &str, n: usize, star: bool| {
+                    func::is_aggregate_call(name, n, star)
+                        || self.aggregates.contains_key(&name.to_ascii_lowercase())
+                };
+                for rc in &sel.columns {
+                    if let ResultColumn::Expr { expr, .. } = rc {
+                        reject_invalid_window_function(expr, &is_agg)?;
+                    }
+                }
+                for t in &sel.order_by {
+                    reject_invalid_window_function(&t.expr, &is_agg)?;
+                }
+            }
             return self.run_window_vdbe(sel);
         }
         // Fold provably non-correlated scalar / `EXISTS` subqueries that appear in
@@ -13772,6 +13790,7 @@ impl Connection {
             for rc in &sel.columns {
                 if let ResultColumn::Expr { expr, .. } = rc {
                     reject_filter_on_non_aggregate(expr, &is_agg)?;
+                    reject_invalid_window_function(expr, &is_agg)?;
                 }
             }
             if let Some(w) = &sel.where_clause {
@@ -13785,6 +13804,7 @@ impl Connection {
             }
             for t in &sel.order_by {
                 reject_filter_on_non_aggregate(&t.expr, &is_agg)?;
+                reject_invalid_window_function(&t.expr, &is_agg)?;
             }
             if let Some(from) = &sel.from {
                 for j in &from.joins {
@@ -19700,6 +19720,64 @@ fn reject_misused_window(e: &Expr) -> Result<()> {
     match first_window_call_name(e) {
         Some(name) => Err(Error::Error(alloc::format!(
             "misuse of window function {name}()"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The built-in window-only functions (ranking + value functions). These exist
+/// solely as window functions, so `OVER` is mandatory; everything else that may
+/// carry `OVER` must be an aggregate.
+fn is_builtin_window_function(lname: &str) -> bool {
+    matches!(
+        lname,
+        "row_number"
+            | "rank"
+            | "dense_rank"
+            | "percent_rank"
+            | "cume_dist"
+            | "ntile"
+            | "first_value"
+            | "last_value"
+            | "nth_value"
+            | "lag"
+            | "lead"
+    )
+}
+
+/// Reject a function call carrying `OVER` that is neither a built-in window
+/// function nor an aggregate. SQLite allows `OVER` only on those two kinds; a
+/// plain scalar (`abs(x) OVER ()`, `coalesce(a,b) OVER ()`) — and the *scalar*
+/// multi-argument forms of `min`/`max` (`max(a,b) OVER ()`, where the one-arg
+/// form is the aggregate) — are rejected at prepare time as `NAME() may not be
+/// used as a window function`. `is_agg` decides aggregate-ness (builtins plus
+/// any registered user aggregate). The walk stops at subquery boundaries.
+fn reject_invalid_window_function(
+    e: &Expr,
+    is_agg: &dyn Fn(&str, usize, bool) -> bool,
+) -> Result<()> {
+    let mut found: Option<String> = None;
+    window::visit(e, &mut |n| {
+        if found.is_some() {
+            return;
+        }
+        if let Expr::Function {
+            name,
+            args,
+            star,
+            over: Some(_),
+            ..
+        } = n
+        {
+            let lname = name.to_ascii_lowercase();
+            if !is_builtin_window_function(&lname) && !is_agg(name, args.len(), *star) {
+                found = Some(name.clone());
+            }
+        }
+    });
+    match found {
+        Some(name) => Err(Error::Error(alloc::format!(
+            "{name}() may not be used as a window function"
         ))),
         None => Ok(()),
     }
