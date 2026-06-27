@@ -6830,7 +6830,7 @@ impl Connection {
             return self.exec_delete_inner(del, params);
         }
         let base = self.cte_env.borrow().len();
-        let pushed = self.push_ctes(&del.ctes, params, None);
+        let pushed = self.push_ctes(&del.ctes, params, None, None);
         let result = pushed.and_then(|()| self.exec_delete_inner(del, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -6964,7 +6964,7 @@ impl Connection {
             return self.exec_update_inner(upd, params);
         }
         let base = self.cte_env.borrow().len();
-        let pushed = self.push_ctes(&upd.ctes, params, None);
+        let pushed = self.push_ctes(&upd.ctes, params, None, None);
         let result = pushed.and_then(|()| self.exec_update_inner(upd, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -8472,11 +8472,19 @@ impl Connection {
     /// `recursive_cte_outer_cap`) bounds an otherwise-infinite recursive CTE so a
     /// `SELECT … FROM rcte LIMIT k` over an unterminated recursion yields `k` rows
     /// like sqlite instead of running to the runaway guard.
-    fn push_ctes(&self, ctes: &[Cte], params: &Params, outer_cap: Option<usize>) -> Result<()> {
+    fn push_ctes(
+        &self,
+        ctes: &[Cte],
+        params: &Params,
+        outer_cap: Option<usize>,
+        used: Option<&[bool]>,
+    ) -> Result<()> {
         // SQLite rejects two CTEs that share a name (case-insensitive) within one
         // WITH clause, naming the duplicate (second) occurrence. A same name in a
         // nested WITH is a separate scope (a separate `push_ctes` call) and stays
         // legal. Checked before materializing, as SQLite rejects it at prepare time.
+        // This runs for every CTE, used or not — a duplicate name is an error even
+        // when neither is referenced.
         for (i, cte) in ctes.iter().enumerate() {
             if ctes[..i]
                 .iter()
@@ -8488,7 +8496,14 @@ impl Connection {
                 )));
             }
         }
-        for cte in ctes {
+        for (i, cte) in ctes.iter().enumerate() {
+            // An unreferenced CTE is never analyzed by SQLite, so a bad column or
+            // table inside it is not an error — skip materializing it entirely.
+            // (`used == None` keeps the legacy "materialize all" path for callers
+            // without a reachability mask, e.g. the DML `WITH` paths.)
+            if used.is_some_and(|u| !u[i]) {
+                continue;
+            }
             let binding = if references_name(&cte.select, &cte.name) {
                 self.eval_recursive_cte(cte, params, outer_cap)?
             } else {
@@ -12268,7 +12283,10 @@ impl Connection {
         // also covers each arm of a compound query.)
         let base = self.cte_env.borrow().len();
         let outer_cap = self.recursive_cte_outer_cap(sel, params);
-        let pushed = self.push_ctes(&sel.ctes, params, outer_cap);
+        // Only materialize the CTEs the body actually reaches: SQLite leaves an
+        // unreferenced CTE unanalyzed, so a bad column/table in it is not an error.
+        let used = used_cte_mask(sel, &sel.ctes);
+        let pushed = self.push_ctes(&sel.ctes, params, outer_cap, Some(&used));
         let result = pushed.and_then(|()| self.run_select_compound(sel, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -20333,6 +20351,209 @@ fn references_name_select(select: &Select, name: &str) -> bool {
     from.joins
         .iter()
         .any(|j| j.table.name.eq_ignore_ascii_case(name))
+}
+
+/// Collect (lowercased) every source name referenced anywhere in `select` — its
+/// `FROM`/joins (descending into derived subqueries, join `ON` predicates and
+/// TVF arguments), every clause expression's nested subqueries, and each compound
+/// arm — but **not** its own `WITH` definitions (a nested `WITH` is a separate
+/// scope). Used to decide which of an outer `WITH`'s CTEs are actually reachable:
+/// SQLite never semantically analyzes an unused CTE, so a bad column/table inside
+/// one is not an error, and graphite must skip materializing it likewise. The walk
+/// over-approximates (it does not model alias shadowing), which is safe here — it
+/// can only keep a CTE that could have been dropped, never drop a referenced one.
+fn collect_source_names(select: &Select, out: &mut alloc::vec::Vec<alloc::string::String>) {
+    collect_source_names_arm(select, out);
+    for (_, s) in &select.compound {
+        collect_source_names_arm(s, out);
+    }
+}
+
+/// Like [`collect_source_names`], but for a nested subquery that opens its own
+/// scope: any name it binds in its own `WITH` shadows an outer CTE of the same
+/// name, so a reference to it does not reach our scope and is dropped. (The
+/// compound arms of `select` share `select`'s `WITH`, so they are not a new scope
+/// — that splitting is already handled inside `collect_source_names`.)
+fn collect_scoped(select: &Select, out: &mut alloc::vec::Vec<alloc::string::String>) {
+    let mut inner = alloc::vec::Vec::new();
+    collect_source_names(select, &mut inner);
+    out.extend(
+        inner
+            .into_iter()
+            .filter(|n| !select.ctes.iter().any(|c| c.name.eq_ignore_ascii_case(n))),
+    );
+}
+
+fn collect_source_names_arm(select: &Select, out: &mut alloc::vec::Vec<alloc::string::String>) {
+    if let Some(from) = &select.from {
+        collect_tableref_sources(&from.first, out);
+        for j in &from.joins {
+            collect_tableref_sources(&j.table, out);
+            if let Some(on) = &j.on {
+                collect_expr_sources(on, out);
+            }
+        }
+    }
+    for c in &select.columns {
+        if let ResultColumn::Expr { expr, .. } = c {
+            collect_expr_sources(expr, out);
+        }
+    }
+    if let Some(w) = &select.where_clause {
+        collect_expr_sources(w, out);
+    }
+    for g in &select.group_by {
+        collect_expr_sources(g, out);
+    }
+    if let Some(h) = &select.having {
+        collect_expr_sources(h, out);
+    }
+    for (_, spec) in &select.window_defs {
+        collect_windowspec_sources(spec, out);
+    }
+    for t in &select.order_by {
+        collect_expr_sources(&t.expr, out);
+    }
+    if let Some(l) = &select.limit {
+        collect_expr_sources(l, out);
+    }
+    if let Some(o) = &select.offset {
+        collect_expr_sources(o, out);
+    }
+}
+
+fn collect_tableref_sources(tr: &TableRef, out: &mut alloc::vec::Vec<alloc::string::String>) {
+    if !tr.name.is_empty() {
+        out.push(tr.name.to_ascii_lowercase());
+    }
+    if let Some(sub) = &tr.subquery {
+        collect_scoped(sub, out);
+    }
+    if let Some(args) = &tr.tvf_args {
+        for a in args {
+            collect_expr_sources(a, out);
+        }
+    }
+}
+
+fn collect_windowspec_sources(spec: &WindowSpec, out: &mut alloc::vec::Vec<alloc::string::String>) {
+    for p in &spec.partition_by {
+        collect_expr_sources(p, out);
+    }
+    for t in &spec.order_by {
+        collect_expr_sources(&t.expr, out);
+    }
+}
+
+/// Walk `e` exhaustively, collecting source names from every nested `SELECT`
+/// (scalar subquery, `EXISTS`, `IN (SELECT …)`). Exhaustive over `Expr` so a CTE
+/// referenced only inside an obscure position (a `FILTER`, a window `ORDER BY`, a
+/// row value) is still detected — missing one would wrongly drop a used CTE.
+fn collect_expr_sources(e: &Expr, out: &mut alloc::vec::Vec<alloc::string::String>) {
+    match e {
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Column { .. } => {}
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::Collate { expr, .. } => collect_expr_sources(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_expr_sources(left, out);
+            collect_expr_sources(right, out);
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            over,
+            ..
+        } => {
+            for a in args {
+                collect_expr_sources(a, out);
+            }
+            if let Some(f) = filter {
+                collect_expr_sources(f, out);
+            }
+            for t in order_by {
+                collect_expr_sources(&t.expr, out);
+            }
+            if let Some(spec) = over {
+                collect_windowspec_sources(spec, out);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_expr_sources(expr, out);
+            for a in list {
+                collect_expr_sources(a, out);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_sources(expr, out);
+            collect_expr_sources(low, out);
+            collect_expr_sources(high, out);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_expr_sources(o, out);
+            }
+            for (w, t) in when_then {
+                collect_expr_sources(w, out);
+                collect_expr_sources(t, out);
+            }
+            if let Some(el) = else_result {
+                collect_expr_sources(el, out);
+            }
+        }
+        Expr::RowValue(items) => {
+            for it in items {
+                collect_expr_sources(it, out);
+            }
+        }
+        Expr::Subquery(s) | Expr::Exists { select: s, .. } => collect_scoped(s, out),
+        Expr::InSelect { expr, select, .. } => {
+            collect_expr_sources(expr, out);
+            collect_scoped(select, out);
+        }
+    }
+}
+
+/// Which entries of `ctes` are reachable (transitively) from `body`'s source
+/// references — the CTEs SQLite actually resolves. `body` is the consuming query
+/// (its own `WITH` list is ignored by [`collect_source_names`]); a used CTE pulls
+/// in any sibling it names, walked to a fixpoint. Returns a `used[i]` mask.
+fn used_cte_mask(body: &Select, ctes: &[Cte]) -> alloc::vec::Vec<bool> {
+    let names: alloc::vec::Vec<alloc::string::String> =
+        ctes.iter().map(|c| c.name.to_ascii_lowercase()).collect();
+    let mut used = alloc::vec![false; ctes.len()];
+    let mut stack: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    let mark =
+        |refs: &[alloc::string::String], used: &mut [bool], stack: &mut alloc::vec::Vec<usize>| {
+            for r in refs {
+                if let Some(i) = names.iter().position(|n| n == r) {
+                    if !used[i] {
+                        used[i] = true;
+                        stack.push(i);
+                    }
+                }
+            }
+        };
+    let mut seeds = alloc::vec::Vec::new();
+    collect_source_names(body, &mut seeds);
+    mark(&seeds, &mut used, &mut stack);
+    while let Some(i) = stack.pop() {
+        // A CTE body opens its own scope: a nested `WITH` inside it shadows an outer
+        // sibling of the same name, so use the scope-aware collector here too.
+        let mut refs = alloc::vec::Vec::new();
+        collect_scoped(&ctes[i].select, &mut refs);
+        mark(&refs, &mut used, &mut stack);
+    }
+    used
 }
 
 /// Count the FROM-clause references (the leading table plus every joined table)

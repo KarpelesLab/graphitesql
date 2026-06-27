@@ -279,7 +279,22 @@ variants) now follows SQLite's varargs arity exactly — zero arguments yield
 *even* argument count is the hard error `json_NAME() needs an odd number of
 arguments` (the message always names the text-output `json_*` form, even for a
 `jsonb_*` call), replacing graphite's old over-strict "requires a document and
-(path, value) pairs" rejection — all byte-exact vs `sqlite3` 3.50.4.
+(path, value) pairs" rejection; and an **unreferenced `WITH` CTE** is no longer
+semantically analyzed — SQLite never validates a common table expression that the
+consuming query does not reach, so a bad column or missing table inside an unused
+CTE (`WITH r AS (SELECT nope) SELECT 1`) is not an error and an otherwise-infinite
+unused recursive CTE is simply never run; graphite used to eagerly materialize
+*every* CTE in a `WITH` clause. Reachability is computed by an exhaustive
+source-name walker over the query (FROM/joins/ON, every projection and predicate
+`Expr`, subqueries, `EXISTS`/`IN (SELECT …)`, `FILTER`, window specs, `ORDER
+BY`/`LIMIT`) seeded from the outer query and closed transitively (a used CTE pulls
+in the siblings it names), and is scope-aware — a derived subquery's own nested
+`WITH` shadows an outer CTE of the same name, so `WITH a AS (SELECT bad) SELECT *
+FROM (WITH a AS (SELECT 7 x) SELECT x FROM a)` binds the inner `a` and leaves the
+outer one unanalyzed; duplicate `WITH` names and syntax errors still fire
+regardless of use. (DML `WITH` — `WITH … UPDATE`/`DELETE` — still materializes
+all of its CTEs; the unused-skip is wired only on the SELECT path so far.) All
+byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
