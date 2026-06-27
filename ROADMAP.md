@@ -175,7 +175,15 @@ subquery-vs-subquery `BETWEEN`); and a trailing `ORDER BY`/`LIMIT` after a
 grammar attaches them only to the `SELECT` form of a core, so `VALUES (1),(2)
 ORDER BY 1` — and the same after a compound whose last core is `VALUES` — is
 rejected, while a compound ending in a `SELECT` or an outer `SELECT … FROM
-(VALUES …) ORDER BY` still parses) — all byte-exact vs `sqlite3` 3.50.4.
+(VALUES …) ORDER BY` still parses); and an unresolved column written as a
+*double-quoted* identifier (`SELECT "foo"`) now carries SQLite's
+string-literal hint — `no such column: "foo" - should this be a string literal
+in single-quotes?` — re-quoting the name, while a bare word, a `[bracket]`/
+`` `backtick` `` identifier, and any table-qualified reference keep the plain
+`no such column: NAME` wording (the hint reaches the result-list, `WHERE`,
+`GROUP BY`/`ORDER BY`, and `UPDATE`/`DELETE` paths via a `quoted` flag on
+`Expr::Column` threaded through the resolvers and the eager prepare-time
+validators) — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 

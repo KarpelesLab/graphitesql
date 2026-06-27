@@ -369,7 +369,7 @@ pub fn expr(e: &Expr) -> String {
     match e {
         Expr::Literal(l) => literal(l),
         Expr::Parameter(_) => "?".to_string(),
-        Expr::Column { table, column } => match table {
+        Expr::Column { table, column, .. } => match table {
             Some(t) => format!("{}.{}", ident(t), ident(column)),
             None => ident(column),
         },

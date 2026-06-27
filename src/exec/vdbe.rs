@@ -994,7 +994,7 @@ fn compile_group_select(
     let mut group_cols: Vec<usize> = Vec::new();
     for g in &sel.group_by {
         match g {
-            Expr::Column { table, column } => {
+            Expr::Column { table, column, .. } => {
                 group_cols.push(c.resolve_column(table.as_deref(), column)?)
             }
             _ => return Err(Error::Unsupported("VDBE: GROUP BY column refs only")),
@@ -1063,6 +1063,7 @@ fn compile_group_select(
             Expr::Column {
                 table: None,
                 column: columns[ci].clone(),
+                quoted: false,
             },
             gkey_start + k,
         ));
@@ -1071,6 +1072,7 @@ fn compile_group_select(
                 Expr::Column {
                     table: Some(t.clone()),
                     column: columns[ci].clone(),
+                    quoted: false,
                 },
                 gkey_start + k,
             ));
@@ -1129,6 +1131,7 @@ fn compile_group_select(
             Expr::Column {
                 table: None,
                 column,
+                ..
             } if !columns.iter().any(|c| c.eq_ignore_ascii_case(column))
                 && projections
                     .iter()
@@ -1208,6 +1211,7 @@ fn compile_group_select(
                 Expr::Column {
                     table: None,
                     column: label.clone(),
+                    quoted: false,
                 },
                 out_start + i,
             ));
@@ -1377,7 +1381,7 @@ fn compile_group_emit(
                 }
                 None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
             }
-        } else if let Expr::Column { table, column } = e {
+        } else if let Expr::Column { table, column, .. } = e {
             // Must be one of the grouping columns (by combined column index).
             let ci = c.resolve_column(table.as_deref(), column)?;
             match group_cols.iter().position(|&g| g == ci) {
@@ -1708,6 +1712,7 @@ fn expand_projections(
                         Expr::Column {
                             table: None,
                             column: name.clone(),
+                            quoted: false,
                         },
                         name.clone(),
                     ));
@@ -1729,6 +1734,7 @@ fn expand_projections(
                             Expr::Column {
                                 table: Some(q.clone()),
                                 column: name.clone(),
+                                quoted: false,
                             },
                             name.clone(),
                         ));
@@ -1772,6 +1778,7 @@ fn build_sort_keys(
             Expr::Column {
                 table: None,
                 column,
+                ..
             } if !columns.iter().any(|c| c.eq_ignore_ascii_case(column))
                 && projections
                     .iter()
@@ -3448,7 +3455,7 @@ impl Compiler {
     /// or computed value has no affinity).
     fn expr_affinity(&self, expr: &Expr) -> Option<Affinity> {
         match expr {
-            Expr::Column { table, column } => self
+            Expr::Column { table, column, .. } => self
                 .resolve_column(table.as_deref(), column)
                 .ok()
                 .and_then(|i| self.affinities.get(i).copied()),
@@ -3476,7 +3483,7 @@ impl Compiler {
     /// (through parentheses / a `COLLATE`), if any.
     fn implicit_collation(&self, expr: &Expr) -> Option<Collation> {
         match expr {
-            Expr::Column { table, column } => self
+            Expr::Column { table, column, .. } => self
                 .resolve_column(table.as_deref(), column)
                 .ok()
                 .and_then(|i| self.collations.get(i).copied()),
@@ -3603,7 +3610,7 @@ impl Compiler {
                 self.ops.push(op);
                 Ok(())
             }
-            Expr::Column { table, column } => {
+            Expr::Column { table, column, .. } => {
                 // In the grouped emit phase there is no scan row; a column that
                 // was not bound to a key/aggregate register cannot be read.
                 if self.forbid_raw_columns {

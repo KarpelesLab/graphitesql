@@ -764,6 +764,13 @@ pub enum Expr {
         table: Option<String>,
         /// Column name.
         column: String,
+        /// Whether the (unqualified) column name was written as a double-quoted
+        /// identifier (`"foo"`), which SQLite treats as a possible string-literal
+        /// typo: an unresolved such name is reported as
+        /// `no such column: "foo" - should this be a string literal in
+        /// single-quotes?`. Bare words, `[bracketed]`, `` `backtick` ``, and any
+        /// table-qualified reference set this to `false`.
+        quoted: bool,
     },
     /// A unary operation.
     Unary {

@@ -2446,7 +2446,7 @@ impl Connection {
                     let name = result_column_label(expr, alias, source);
                     // Only a bare column reference carries a type through.
                     let ty = match expr {
-                        Expr::Column { table, column } => lookup(table.as_deref(), column),
+                        Expr::Column { table, column, .. } => lookup(table.as_deref(), column),
                         _ => None,
                     };
                     out.push((name, ty));
@@ -9050,7 +9050,7 @@ impl Connection {
         // Whether `e` references the dropped column by name (qualified or not).
         let refs_dropped = |e: &Expr| {
             let mut hit = false;
-            walk_shallow_columns(e, &mut |_t, col| {
+            walk_shallow_columns(e, &mut |_t, col, _q| {
                 if col.eq_ignore_ascii_case(name) {
                     hit = true;
                 }
@@ -10683,10 +10683,12 @@ impl Connection {
                     Expr::Column {
                         table: None,
                         column,
+                        ..
                     } if column.eq_ignore_ascii_case("rank") => 32,
                     Expr::Column {
                         table: None,
                         column,
+                        ..
                     } if matches!(
                         column.to_ascii_lowercase().as_str(),
                         "rowid" | "_rowid_" | "oid"
@@ -12009,6 +12011,7 @@ impl Connection {
             let repl = Expr::Column {
                 table: None,
                 column: col_name,
+                quoted: false,
             };
             window::replace_window_expr(&mut new_sel, wexpr, &repl);
         }
@@ -12396,7 +12399,7 @@ impl Connection {
         // rowid or the INTEGER PRIMARY KEY column of this table.
         let term = &sel.order_by[0];
         let (tbl, col) = match &term.expr {
-            Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+            Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
             _ => return None,
         };
         // A CTE/view of the same name is not a rowid table scan.
@@ -12481,7 +12484,7 @@ impl Connection {
                 return None;
             }
             let (tbl, col_name) = match &term.expr {
-                Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+                Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => return None,
             };
             if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
@@ -12582,7 +12585,7 @@ impl Connection {
                 break;
             }
             let (tbl, col_name) = match &term.expr {
-                Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+                Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => break,
             };
             if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
@@ -13016,7 +13019,7 @@ impl Connection {
                 break;
             }
             let (tbl, col_name) = match &term.expr {
-                Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+                Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => break,
             };
             if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
@@ -13634,6 +13637,7 @@ impl Connection {
                     expr: Expr::Column {
                         table: None,
                         column: "rowid".into(),
+                        quoted: false,
                     },
                     alias: Some("__winrowid__".into()),
                     source: None,
@@ -13801,7 +13805,7 @@ impl Connection {
         // Resolve one reference against `columns`; `None` if it resolves (or is a
         // pseudo-column), else the `no such column` message. Borrows only
         // `columns`, so the accumulator below can read `missing` between walks.
-        let column_missing = |table: Option<&str>, column: &str| -> Option<String> {
+        let column_missing = |table: Option<&str>, column: &str, quoted: bool| -> Option<Error> {
             // rowid aliases and date/time keyword pseudo-columns resolve without
             // appearing in the table's declared column list.
             if matches!(
@@ -13817,20 +13821,17 @@ impl Connection {
                         && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
                 })
                 .count();
-            (n == 0).then(|| match table {
-                Some(t) => alloc::format!("no such column: {t}.{column}"),
-                None => alloc::format!("no such column: {column}"),
-            })
+            (n == 0).then(|| eval::no_such_column(table, column, quoted))
         };
 
-        let mut missing: Option<String> = None;
+        let mut missing: Option<Error> = None;
         for e in targets {
             if missing.is_some() {
                 break;
             }
-            walk_shallow_columns(e, &mut |table, column| {
+            walk_shallow_columns(e, &mut |table, column, quoted| {
                 if missing.is_none() {
-                    missing = column_missing(table, column);
+                    missing = column_missing(table, column, quoted);
                 }
             });
         }
@@ -13838,21 +13839,21 @@ impl Connection {
             if missing.is_some() {
                 break;
             }
-            walk_shallow_columns(e, &mut |table, column| {
+            walk_shallow_columns(e, &mut |table, column, quoted| {
                 if missing.is_some() {
                     return;
                 }
                 // A qualified ref is always a base column. A bare name is too,
                 // unless it matches an output alias (which takes precedence).
                 if table.is_some() {
-                    missing = column_missing(table, column);
+                    missing = column_missing(table, column, quoted);
                 } else if !aliases.iter().any(|a| a.eq_ignore_ascii_case(column)) {
-                    missing = column_missing(None, column);
+                    missing = column_missing(None, column, quoted);
                 }
             });
         }
         match missing {
-            Some(m) => Err(Error::Error(m)),
+            Some(e) => Err(e),
             None => Ok(()),
         }
     }
@@ -13874,12 +13875,12 @@ impl Connection {
         columns: &[ColumnInfo],
         exprs: &[&Expr],
     ) -> Result<()> {
-        let mut missing: Option<String> = None;
+        let mut missing: Option<Error> = None;
         for e in exprs {
             if missing.is_some() {
                 break;
             }
-            walk_shallow_columns(e, &mut |tbl, col| {
+            walk_shallow_columns(e, &mut |tbl, col, quoted| {
                 if missing.is_some() {
                     return;
                 }
@@ -13901,15 +13902,12 @@ impl Connection {
                     }
                 }
                 if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
-                    missing = Some(match tbl {
-                        Some(t) => alloc::format!("no such column: {t}.{col}"),
-                        None => alloc::format!("no such column: {col}"),
-                    });
+                    missing = Some(eval::no_such_column(tbl, col, quoted));
                 }
             });
         }
-        if let Some(m) = missing {
-            return Err(Error::Error(m));
+        if let Some(e) = missing {
+            return Err(e);
         }
         // An aggregate or window function in an UPDATE/DELETE WHERE or an UPDATE
         // assignment value is a misuse (these statements are never aggregate
@@ -14707,7 +14705,7 @@ impl Connection {
         fn origin(e: &Expr, base: &dyn Fn(Option<&str>, &str) -> Option<ColOrigin>) -> ColOrigin {
             match e {
                 Expr::Paren(inner) => origin(inner, base),
-                Expr::Column { table, column } => base(table.as_deref(), column)
+                Expr::Column { table, column, .. } => base(table.as_deref(), column)
                     .unwrap_or((eval::Affinity::Blob, crate::value::Collation::default())),
                 Expr::Collate { expr, collation } => {
                     let (aff, base_coll) = origin(expr, base);
@@ -16867,6 +16865,7 @@ impl Connection {
             return Expr::Column {
                 table: None,
                 column: alloc::format!("__agg{idx}"),
+                quoted: false,
             };
         }
         match e {
@@ -18035,6 +18034,7 @@ fn expand_agg_wildcards(sel: &Select, columns: &[ColumnInfo]) -> Select {
         expr: Expr::Column {
             table: Some(c.table.clone()),
             column: c.name.clone(),
+            quoted: false,
         },
         alias: None,
         source: None,
@@ -18091,6 +18091,7 @@ fn alias_substituted(sel: &Select, columns: &[ColumnInfo]) -> Option<Select> {
             if let Expr::Column {
                 table: None,
                 column,
+                ..
             } = n
             {
                 if aliases.iter().any(|(a, _)| a.eq_ignore_ascii_case(column)) {
@@ -18112,6 +18113,7 @@ fn alias_substituted(sel: &Select, columns: &[ColumnInfo]) -> Option<Select> {
             let target = Expr::Column {
                 table: None,
                 column: name.clone(),
+                quoted: false,
             };
             window::replace_expr(e, &target, repl);
         }
@@ -18278,7 +18280,7 @@ fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<
             if ambiguous.is_some() {
                 return;
             }
-            if let Expr::Column { table, column } = sub {
+            if let Expr::Column { table, column, .. } = sub {
                 let n = columns
                     .iter()
                     .filter(|c| {
@@ -18331,9 +18333,13 @@ fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<
 /// that subquery's scope (with this query merely an outer fallback), so it must
 /// not be checked against this query's column list. Used by
 /// [`Executor::validate_columns_exist`] for an eager "no such column" check.
-fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, &str)) {
+fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, &str, bool)) {
     match e {
-        Expr::Column { table, column } => f(table.as_deref(), column),
+        Expr::Column {
+            table,
+            column,
+            quoted,
+        } => f(table.as_deref(), column, *quoted),
         Expr::Unary { expr, .. } => walk_shallow_columns(expr, f),
         Expr::Binary { left, right, .. } => {
             walk_shallow_columns(left, f);
@@ -18468,7 +18474,7 @@ fn first_ambiguous_in_scopes(sel: &Select, scopes: &[Option<Vec<ColumnInfo>>]) -
             if found.is_some() {
                 return;
             }
-            if let Expr::Column { table, column } = node {
+            if let Expr::Column { table, column, .. } = node {
                 for scope in scopes {
                     let Some(cols) = scope else {
                         // Unknown scope: the name may bind here — stop, don't guess.
@@ -18654,7 +18660,7 @@ fn unknown_column_ref(
 ) -> Option<String> {
     let mut bad: Option<String> = None;
     window::visit(e, &mut |n| {
-        if let Expr::Column { table, column } = n {
+        if let Expr::Column { table, column, .. } = n {
             if bad.is_some() {
                 return;
             }
@@ -18689,6 +18695,7 @@ fn has_resolved_dotted_ref(
         if let Expr::Column {
             table: Some(q),
             column,
+            ..
         } = n
         {
             if q.eq_ignore_ascii_case(self_table)
@@ -18710,7 +18717,10 @@ fn has_resolved_dotted_ref(
 fn upsert_expr_unknown_column(e: &Expr, known: &[String], table: &str) -> Option<String> {
     let mut bad: Option<String> = None;
     window::visit(e, &mut |n| {
-        if let Expr::Column { table: q, column } = n {
+        if let Expr::Column {
+            table: q, column, ..
+        } = n
+        {
             if bad.is_some() {
                 return;
             }
@@ -19520,7 +19530,7 @@ fn expr_is_internal(e: &Expr, quals: &[String], cols: &[String]) -> bool {
         // A nested subquery may itself reference our outer scope; without deeper
         // scope tracking, refuse to prove non-correlation.
         Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. } => false,
-        Expr::Column { table, column } => match table {
+        Expr::Column { table, column, .. } => match table {
             Some(q) => quals.iter().any(|x| x.eq_ignore_ascii_case(q)),
             None => {
                 cols.iter().any(|c| c.eq_ignore_ascii_case(column))
@@ -21227,7 +21237,7 @@ fn collect_range_constraints(
 
 /// The column index a bare/qualified column expression resolves to, if any.
 fn col_index(e: &Expr, columns: &[ColumnInfo]) -> Option<usize> {
-    if let Expr::Column { table, column } = e {
+    if let Expr::Column { table, column, .. } = e {
         columns.iter().position(|c| {
             c.name.eq_ignore_ascii_case(column)
                 && table
@@ -21624,6 +21634,7 @@ fn resolve_order_index(expr: &Expr, labels: &[String], ncols: usize) -> Option<u
         Expr::Column {
             table: None,
             column,
+            ..
         } => labels.iter().position(|l| l.eq_ignore_ascii_case(column)),
         // `ORDER BY <alias> COLLATE …` (or a parenthesized term) still resolves to
         // the output column; the explicit collation is applied by the sort
@@ -21799,6 +21810,7 @@ fn expr_mentions_any(expr: &Expr, names: &[&str]) -> bool {
         Expr::Column {
             table: None,
             column,
+            ..
         } => names.iter().any(|n| column.eq_ignore_ascii_case(n)),
         Expr::Function { name, args, .. } => {
             names.iter().any(|n| name.eq_ignore_ascii_case(n)) || args.iter().any(rec)
@@ -21994,10 +22006,12 @@ fn rename_column_ref(e: &mut Expr, table: &str, old: &str, new: &str) {
         &Expr::Column {
             table: None,
             column: String::from(old),
+            quoted: false,
         },
         &Expr::Column {
             table: None,
             column: String::from(new),
+            quoted: false,
         },
     );
     window::replace_expr(
@@ -22005,10 +22019,12 @@ fn rename_column_ref(e: &mut Expr, table: &str, old: &str, new: &str) {
         &Expr::Column {
             table: Some(String::from(table)),
             column: String::from(old),
+            quoted: false,
         },
         &Expr::Column {
             table: Some(String::from(table)),
             column: String::from(new),
+            quoted: false,
         },
     );
 }

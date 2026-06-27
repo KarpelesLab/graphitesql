@@ -319,7 +319,7 @@ impl<'a> EvalCtx<'a> {
         })
     }
 
-    fn resolve_column(&self, table: Option<&str>, name: &str) -> Result<Value> {
+    fn resolve_column(&self, table: Option<&str>, name: &str, quoted: bool) -> Result<Value> {
         // Special rowid aliases (`rowid`/`_rowid_`/`oid`), optionally qualified
         // by a table name in scope (`t.rowid`). A real column always wins, so
         // only fall back to the rowid when no column matches.
@@ -359,13 +359,27 @@ impl<'a> EvalCtx<'a> {
                 return Ok(Value::Real(score));
             }
         }
-        // SQLite reports a qualified reference with its qualifier intact
-        // (`no such column: t.c`), and a bare reference by name alone.
-        Err(Error::Error(match table {
-            Some(t) => alloc::format!("no such column: {t}.{name}"),
-            None => alloc::format!("no such column: {name}"),
-        }))
+        Err(no_such_column(table, name, quoted))
     }
+}
+
+/// Build SQLite's `no such column` error for an unresolved column reference.
+///
+/// SQLite reports a qualified reference with its qualifier intact
+/// (`no such column: t.c`) and a bare reference by name alone
+/// (`no such column: c`). When the bare name was written as a *double-quoted*
+/// identifier (`"c"`) — which is ambiguous with a string literal — it adds a
+/// hint and re-quotes the name: `no such column: "c" - should this be a string
+/// literal in single-quotes?`. The hint never appears for a qualified
+/// reference, a bare word, or a `[bracket]`/`` `backtick` `` identifier.
+pub(crate) fn no_such_column(table: Option<&str>, name: &str, quoted: bool) -> Error {
+    Error::Error(match table {
+        Some(t) => alloc::format!("no such column: {t}.{name}"),
+        None if quoted => alloc::format!(
+            "no such column: \"{name}\" - should this be a string literal in single-quotes?"
+        ),
+        None => alloc::format!("no such column: {name}"),
+    })
 }
 
 /// The affinity of an expression for comparison purposes: a column's declared
@@ -378,7 +392,7 @@ impl<'a> EvalCtx<'a> {
 /// [`apply_comparison_affinity`]).
 pub(crate) fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Option<Affinity> {
     match expr {
-        Expr::Column { table, column } => {
+        Expr::Column { table, column, .. } => {
             for col in ctx.columns {
                 let name_ok = col.name.eq_ignore_ascii_case(column);
                 let table_ok = table
@@ -499,7 +513,7 @@ fn explicit_collation(e: &Expr) -> Option<Collation> {
 
 fn column_collation_of(e: &Expr, ctx: &EvalCtx) -> Option<Collation> {
     match e {
-        Expr::Column { table, column } => ctx.column_collation(table.as_deref(), column),
+        Expr::Column { table, column, .. } => ctx.column_collation(table.as_deref(), column),
         Expr::Paren(inner) | Expr::Collate { expr: inner, .. } => column_collation_of(inner, ctx),
         _ => None,
     }
@@ -524,7 +538,11 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             }
             ctx.params.get(p, idx)
         }
-        Expr::Column { table, column } => ctx.resolve_column(table.as_deref(), column),
+        Expr::Column {
+            table,
+            column,
+            quoted,
+        } => ctx.resolve_column(table.as_deref(), column, *quoted),
         Expr::Paren(e) => eval(e, ctx),
         Expr::Unary { op, expr } => eval_unary(*op, eval(expr, ctx)?),
         Expr::Binary { op, left, right } => {

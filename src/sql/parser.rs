@@ -179,6 +179,18 @@ impl Parser {
         self.peek() == Some(t)
     }
 
+    /// Whether the most-recently-consumed token (at `pos - 1`) was written as a
+    /// double-quoted identifier (`"x"`), as opposed to a bare word, a
+    /// `[bracketed]`, or a `` `backtick` `` one. SQLite's "did you mean a string
+    /// literal in single-quotes?" hint for an unresolved column fires only for
+    /// the double-quote form (the one ambiguous with a string literal).
+    fn prev_is_double_quoted(&self) -> bool {
+        self.pos
+            .checked_sub(1)
+            .and_then(|i| self.tokens.get(i))
+            .is_some_and(|s| self.source.as_bytes().get(s.start) == Some(&b'"'))
+    }
+
     fn eat(&mut self, t: &Token) -> bool {
         if self.check(t) {
             self.pos += 1;
@@ -462,6 +474,7 @@ impl Parser {
                 return Ok(Expr::Column {
                     table: None,
                     column: w,
+                    quoted: false,
                 });
             }
         }
@@ -2061,7 +2074,10 @@ impl Parser {
                     }
                 }
             }
-            Some(Token::Ident(name)) => self.after_name(name, true),
+            Some(Token::Ident(name)) => {
+                let dq = self.prev_is_double_quoted();
+                self.after_name(name, true, dq)
+            }
             Some(Token::Word(w)) => {
                 let lw = w.to_ascii_lowercase();
                 match lw.as_str() {
@@ -2086,7 +2102,7 @@ impl Parser {
                         })
                     }
                     _ if is_reserved_keyword(&lw) => Err(self.syntax_error(self.pos - 1)),
-                    _ => self.after_name(w, false),
+                    _ => self.after_name(w, false, false),
                 }
             }
             None => Err(Error::Parse("incomplete input".into())),
@@ -2095,7 +2111,12 @@ impl Parser {
     }
 
     /// Continue parsing after a name: `name`, `tbl.col`, or `func(args)`.
-    fn after_name(&mut self, name: String, quoted: bool) -> Result<Expr> {
+    ///
+    /// `quoted` is true for any quoted identifier (it suppresses function-call
+    /// parsing — a quoted name is never a function). `dq` narrows that to the
+    /// *double-quote* form specifically, which is the only one SQLite flags as a
+    /// possible string-literal typo when the bare name fails to resolve.
+    fn after_name(&mut self, name: String, quoted: bool, dq: bool) -> Result<Expr> {
         if !quoted && self.eat(&Token::LParen) {
             return self.function_call(name);
         }
@@ -2109,14 +2130,17 @@ impl Parser {
                 table = column;
                 column = self.ident()?;
             }
+            // A table-qualified reference never gets the string-literal hint.
             return Ok(Expr::Column {
                 table: Some(table),
                 column,
+                quoted: false,
             });
         }
         Ok(Expr::Column {
             table: None,
             column: name,
+            quoted: dq,
         })
     }
 

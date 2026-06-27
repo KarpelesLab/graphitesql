@@ -53,7 +53,7 @@ fn fts5_match_columns(
     ctx: &EvalCtx,
 ) -> Option<(Vec<(String, String)>, crate::vtab::Fts5Tok)> {
     let (table, column) = match operand {
-        Expr::Column { table, column } => (table.as_deref(), column.as_str()),
+        Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
         Expr::Paren(e) => return fts5_match_columns(e, ctx),
         _ => return None,
     };
