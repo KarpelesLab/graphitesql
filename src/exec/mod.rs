@@ -930,6 +930,13 @@ impl Connection {
                 return Err(Error::Unsupported("VDBE: schema-qualified source"));
             }
         }
+        // A three-part `schema.table.column` reference needs the qualifier validated
+        // against the source's actual database — the VDBE resolves by table/name
+        // only and would accept a wrong qualifier. Defer to the tree-walker, which
+        // reports `no such column: schema.table.column` on a mismatch.
+        if select_has_schema_qualified_column(sel) {
+            return Err(Error::Unsupported("VDBE: schema-qualified column"));
+        }
         // A compound query (UNION / UNION ALL / INTERSECT / EXCEPT) runs each
         // constituent SELECT on the VDBE and combines the row-sets with the same
         // set semantics the tree-walker uses (Track B, B5c-3).
@@ -9138,7 +9145,7 @@ impl Connection {
         // Whether `e` references the dropped column by name (qualified or not).
         let refs_dropped = |e: &Expr| {
             let mut hit = false;
-            walk_shallow_columns(e, &mut |_t, col, _q| {
+            walk_shallow_columns(e, &mut |_s, _t, col, _q| {
                 if col.eq_ignore_ascii_case(name) {
                     hit = true;
                 }
@@ -12099,6 +12106,7 @@ impl Connection {
                 row.values.push(v);
             }
             let repl = Expr::Column {
+                schema: None,
                 table: None,
                 column: col_name,
                 quoted: false,
@@ -13725,6 +13733,7 @@ impl Connection {
                 ResultColumn::Wildcard,
                 ResultColumn::Expr {
                     expr: Expr::Column {
+                        schema: None,
                         table: None,
                         column: "rowid".into(),
                         quoted: false,
@@ -13892,10 +13901,43 @@ impl Connection {
             clause_refs.push(&o.expr);
         }
 
+        // The database each source resolves to (`main`/`temp`/an attached name),
+        // aligned with `labels`. A three-part `schema.table.column` reference must
+        // name this database for the matched source; SQLite validates the
+        // qualifier even when the named database exists elsewhere.
+        let src_dbs: Vec<alloc::string::String> = srcs
+            .iter()
+            .map(|s| match s.schema.as_deref() {
+                Some(q) => q.to_ascii_lowercase(),
+                None => match self.unqualified_db(&s.name) {
+                    DbRef::Temp => alloc::string::String::from("temp"),
+                    _ => alloc::string::String::from("main"),
+                },
+            })
+            .collect();
+
         // Resolve one reference against `columns`; `None` if it resolves (or is a
         // pseudo-column), else the `no such column` message. Borrows only
-        // `columns`, so the accumulator below can read `missing` between walks.
-        let column_missing = |table: Option<&str>, column: &str, quoted: bool| -> Option<Error> {
+        // `columns`/`labels`/`src_dbs`, so the accumulator below can read
+        // `missing` between walks.
+        let column_missing = |schema: Option<&str>,
+                              table: Option<&str>,
+                              column: &str,
+                              quoted: bool|
+         -> Option<Error> {
+            // A three-part qualifier must match the matched source's database
+            // (checked before the pseudo-column shortcut, since `bad.t.rowid`
+            // is just as wrong as `bad.t.col`).
+            if let Some(sch) = schema {
+                let t = table.unwrap_or_default();
+                let ok = labels
+                    .iter()
+                    .position(|l| l.eq_ignore_ascii_case(t))
+                    .is_some_and(|i| src_dbs[i].eq_ignore_ascii_case(sch));
+                if !ok {
+                    return Some(eval::no_such_column(schema, table, column, quoted));
+                }
+            }
             // rowid aliases and date/time keyword pseudo-columns resolve without
             // appearing in the table's declared column list.
             if matches!(
@@ -13911,7 +13953,7 @@ impl Connection {
                         && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
                 })
                 .count();
-            (n == 0).then(|| eval::no_such_column(table, column, quoted))
+            (n == 0).then(|| eval::no_such_column(schema, table, column, quoted))
         };
 
         let mut missing: Option<Error> = None;
@@ -13919,9 +13961,9 @@ impl Connection {
             if missing.is_some() {
                 break;
             }
-            walk_shallow_columns(e, &mut |table, column, quoted| {
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
                 if missing.is_none() {
-                    missing = column_missing(table, column, quoted);
+                    missing = column_missing(schema, table, column, quoted);
                 }
             });
         }
@@ -13929,16 +13971,16 @@ impl Connection {
             if missing.is_some() {
                 break;
             }
-            walk_shallow_columns(e, &mut |table, column, quoted| {
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
                 if missing.is_some() {
                     return;
                 }
                 // A qualified ref is always a base column. A bare name is too,
                 // unless it matches an output alias (which takes precedence).
                 if table.is_some() {
-                    missing = column_missing(table, column, quoted);
+                    missing = column_missing(schema, table, column, quoted);
                 } else if !aliases.iter().any(|a| a.eq_ignore_ascii_case(column)) {
-                    missing = column_missing(None, column, quoted);
+                    missing = column_missing(None, None, column, quoted);
                 }
             });
         }
@@ -13970,7 +14012,7 @@ impl Connection {
             if missing.is_some() {
                 break;
             }
-            walk_shallow_columns(e, &mut |tbl, col, quoted| {
+            walk_shallow_columns(e, &mut |schema, tbl, col, quoted| {
                 if missing.is_some() {
                     return;
                 }
@@ -13992,7 +14034,7 @@ impl Connection {
                     }
                 }
                 if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
-                    missing = Some(eval::no_such_column(tbl, col, quoted));
+                    missing = Some(eval::no_such_column(schema, tbl, col, quoted));
                 }
             });
         }
@@ -17044,6 +17086,7 @@ impl Connection {
             let idx = aggs.len();
             aggs.push(e.clone());
             return Expr::Column {
+                schema: None,
                 table: None,
                 column: alloc::format!("__agg{idx}"),
                 quoted: false,
@@ -18218,6 +18261,7 @@ struct TableMeta {
 fn expand_agg_wildcards(sel: &Select, columns: &[ColumnInfo]) -> Select {
     let col_ref = |c: &ColumnInfo| ResultColumn::Expr {
         expr: Expr::Column {
+            schema: None,
             table: Some(c.table.clone()),
             column: c.name.clone(),
             quoted: false,
@@ -18299,6 +18343,7 @@ fn alias_substituted(sel: &Select, columns: &[ColumnInfo]) -> Option<Select> {
     let apply = |e: &mut Expr| {
         for (name, repl) in &aliases {
             let target = Expr::Column {
+                schema: None,
                 table: None,
                 column: name.clone(),
                 quoted: false,
@@ -18522,13 +18567,14 @@ fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<
 /// that subquery's scope (with this query merely an outer fallback), so it must
 /// not be checked against this query's column list. Used by
 /// [`Executor::validate_columns_exist`] for an eager "no such column" check.
-fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, &str, bool)) {
+fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, Option<&str>, &str, bool)) {
     match e {
         Expr::Column {
+            schema,
             table,
             column,
             quoted,
-        } => f(table.as_deref(), column, *quoted),
+        } => f(schema.as_deref(), table.as_deref(), column, *quoted),
         Expr::Unary { expr, .. } => walk_shallow_columns(expr, f),
         Expr::Binary { left, right, .. } => {
             walk_shallow_columns(left, f);
@@ -18645,6 +18691,61 @@ fn collect_subselects<'a>(e: &'a Expr, out: &mut Vec<&'a Select>) {
         Expr::Paren(inner) => collect_subselects(inner, out),
         _ => {}
     }
+}
+
+/// True if any column reference anywhere in `sel` carries a `schema.` qualifier (a
+/// three-part `schema.table.column`). The VDBE fast path resolves columns by
+/// table/name only and ignores the database qualifier, so it would silently accept
+/// a *wrong* qualifier (`bad.t.col` reading `t.col`). Such a query must defer to
+/// the tree-walker, which validates the qualifier against the source's actual
+/// database (`no such column: schema.table.column` on a mismatch).
+fn select_has_schema_qualified_column(sel: &Select) -> bool {
+    fn gather<'a>(e: &'a Expr, hit: &mut bool, subs: &mut Vec<&'a Select>) {
+        walk_shallow_columns(e, &mut |schema, _t, _c, _q| {
+            if schema.is_some() {
+                *hit = true;
+            }
+        });
+        collect_subselects(e, subs);
+    }
+    let mut hit = false;
+    let mut subs: Vec<&Select> = Vec::new();
+    for c in &sel.columns {
+        if let ResultColumn::Expr { expr, .. } = c {
+            gather(expr, &mut hit, &mut subs);
+        }
+    }
+    if let Some(from) = &sel.from {
+        for src in core::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.table)) {
+            if let Some(sub) = &src.subquery {
+                subs.push(sub);
+            }
+        }
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                gather(on, &mut hit, &mut subs);
+            }
+        }
+    }
+    if let Some(w) = &sel.where_clause {
+        gather(w, &mut hit, &mut subs);
+    }
+    for g in &sel.group_by {
+        gather(g, &mut hit, &mut subs);
+    }
+    if let Some(h) = &sel.having {
+        gather(h, &mut hit, &mut subs);
+    }
+    for o in &sel.order_by {
+        gather(&o.expr, &mut hit, &mut subs);
+    }
+    for cte in &sel.ctes {
+        subs.push(&cte.select);
+    }
+    for (_, operand) in &sel.compound {
+        subs.push(operand);
+    }
+    hit || subs.into_iter().any(select_has_schema_qualified_column)
 }
 
 /// Resolve each direct column reference in `sel`'s own clauses against a stack of
@@ -22202,11 +22303,13 @@ fn rename_column_ref(e: &mut Expr, table: &str, old: &str, new: &str) {
     window::replace_expr(
         e,
         &Expr::Column {
+            schema: None,
             table: None,
             column: String::from(old),
             quoted: false,
         },
         &Expr::Column {
+            schema: None,
             table: None,
             column: String::from(new),
             quoted: false,
@@ -22215,11 +22318,13 @@ fn rename_column_ref(e: &mut Expr, table: &str, old: &str, new: &str) {
     window::replace_expr(
         e,
         &Expr::Column {
+            schema: None,
             table: Some(String::from(table)),
             column: String::from(old),
             quoted: false,
         },
         &Expr::Column {
+            schema: None,
             table: Some(String::from(table)),
             column: String::from(new),
             quoted: false,

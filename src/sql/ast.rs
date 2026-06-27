@@ -767,6 +767,12 @@ pub enum Expr {
     Parameter(Param),
     /// A column reference, optionally table-qualified.
     Column {
+        /// `schema.` qualifier of a three-part `schema.table.column` reference,
+        /// if any. Only ever set together with [`table`](Self::Column::table);
+        /// it must name the database the table actually lives in, otherwise the
+        /// reference is `no such column: schema.table.column` (SQLite validates
+        /// the qualifier even when the named database exists).
+        schema: Option<String>,
         /// `table.` qualifier, if any.
         table: Option<String>,
         /// Column name.

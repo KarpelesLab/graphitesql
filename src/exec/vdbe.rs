@@ -1061,6 +1061,7 @@ fn compile_group_select(
     for (k, &ci) in group_cols.iter().enumerate() {
         c.bindings.push((
             Expr::Column {
+                schema: None,
                 table: None,
                 column: columns[ci].clone(),
                 quoted: false,
@@ -1070,6 +1071,7 @@ fn compile_group_select(
         if let Some(t) = tables.get(ci) {
             c.bindings.push((
                 Expr::Column {
+                    schema: None,
                     table: Some(t.clone()),
                     column: columns[ci].clone(),
                     quoted: false,
@@ -1209,6 +1211,7 @@ fn compile_group_select(
         if !is_bare_col && !columns.iter().any(|c| c.eq_ignore_ascii_case(label)) {
             c.bindings.push((
                 Expr::Column {
+                    schema: None,
                     table: None,
                     column: label.clone(),
                     quoted: false,
@@ -1710,6 +1713,7 @@ fn expand_projections(
                 for name in columns {
                     projections.push((
                         Expr::Column {
+                            schema: None,
                             table: None,
                             column: name.clone(),
                             quoted: false,
@@ -1732,6 +1736,7 @@ fn expand_projections(
                     if tables.get(i).is_some_and(|t| t.eq_ignore_ascii_case(q)) {
                         projections.push((
                             Expr::Column {
+                                schema: None,
                                 table: Some(q.clone()),
                                 column: name.clone(),
                                 quoted: false,

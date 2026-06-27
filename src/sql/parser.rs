@@ -488,6 +488,7 @@ impl Parser {
             if is_reserved_keyword(&w.to_ascii_lowercase()) {
                 self.pos += 1;
                 return Ok(Expr::Column {
+                    schema: None,
                     table: None,
                     column: w,
                     quoted: false,
@@ -2168,23 +2169,28 @@ impl Parser {
             return self.function_call(name);
         }
         if self.eat(&Token::Dot) {
+            let mut schema = None;
             let mut table = name;
             let mut column = self.ident()?;
-            // A third dotted part means `schema.table.column`: the database
-            // qualifier is redundant for name resolution (a table/alias name is
-            // unique within a query's scope), so keep the table + column.
+            // A third dotted part means `schema.table.column`: keep the database
+            // qualifier so resolution can verify it names the table's actual
+            // database (SQLite rejects a mismatched qualifier even when the named
+            // database exists).
             if self.eat(&Token::Dot) {
+                schema = Some(table);
                 table = column;
                 column = self.ident()?;
             }
             // A table-qualified reference never gets the string-literal hint.
             return Ok(Expr::Column {
+                schema,
                 table: Some(table),
                 column,
                 quoted: false,
             });
         }
         Ok(Expr::Column {
+            schema: None,
             table: None,
             column: name,
             quoted: dq,

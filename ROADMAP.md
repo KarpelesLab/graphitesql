@@ -243,8 +243,9 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   column ref that is ambiguous across multiple base sources, because the AST has
   no per-column-ref source span.
   - **A-rn3-edge-1** — add a source span (byte range) to `Expr::Column`. This is
-    the enabling refactor; it *also* unblocks the 3-part-qualifier check below,
-    which wants the same enriched `Expr::Column`. Do them together.
+    the enabling refactor. (The sibling `schema` field this once shared with the
+    3-part-qualifier check below has already landed — see its DONE entry — so this
+    is now just the span.)
   - **A-rn3-edge-2** — use the span for scope-aware rename: resolve each bare ref
     to its owning table, rewrite only the matching ones.
 - **Reserved keywords accepted as bare identifiers.** ~37 reserved words
@@ -255,13 +256,22 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   every accidental-keyword identifier in the test corpus must keep working — so it
   wants a dedicated pass with a full differential sweep over the keyword list, not
   a quick edit.
-- **3-part `schema.table.column` qualifier not validated.** `after_name` in
-  `src/sql/parser.rs` (~line 2090) parses a 3-part ref but *drops* the schema part
-  (`table = column; column = self.ident()?`), so a bogus `nope.t.a` is silently
-  accepted instead of erroring. Needs a `schema` field on `Expr::Column` (~74 call
-  sites across `src/exec/func.rs`, `src/exec/mod.rs`, `src/sql/parser.rs`,
-  `src/exec/vdbe.rs`, `src/exec/eval.rs`, `src/sql/print.rs`). Shares the
-  `Expr::Column` enrichment with A-rn3-edge-1.
+- **3-part `schema.table.column` qualifier — DONE** (top-level scope). `after_name`
+  now *keeps* the schema part in a new `schema: Option<String>` field on
+  `Expr::Column`, threaded through `no_such_column`/`resolve_column`/
+  `walk_shallow_columns`/`print.rs`. `validate_columns_exist` maps each FROM source
+  to its actual database (`main`/`temp`/attached) in a `src_dbs` vector aligned with
+  the source labels, and rejects a three-part ref whose qualifier does not name that
+  database — `no such column: schema.table.column`, echoing the full written name,
+  *even when the named database exists elsewhere* (matching sqlite, which validates
+  the qualifier regardless). Fires statically for the projection / `WHERE` / `ON` /
+  `GROUP BY` / `HAVING` / `ORDER BY` of the common single-table / simple-join shape,
+  so it errors on an empty or fully-filtered table too. The VDBE fast path resolves
+  by table/name only, so `run_select_vdbe` now defers any query carrying a
+  schema-qualified column (`select_has_schema_qualified_column`) to the tree-walker,
+  which runs the validation. Differential tests in `tests/column_qualifier_errors.rs`.
+  Residual: a three-part ref inside a *correlated subquery body* binding to an
+  enclosing FROM is still resolved lazily (the nested-scope gap below).
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a
@@ -273,7 +283,10 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
     (`sum(row_number() OVER ())`) over an empty table.
   - bare (unqualified) refs in derived-table/subquery scopes and `NATURAL`/`USING`
     coalesced names — `validate_columns_exist` only covers the top-level
-    plain-table / `ON`-join scope.
+    plain-table / `ON`-join scope. The same gap leaves a three-part
+    `schema.table.column` ref inside a *correlated subquery body* (binding to an
+    enclosing FROM) unvalidated: `SELECT (SELECT bad.t.a) FROM t` is accepted where
+    sqlite reports `no such column: bad.t.a`.
 - **ALTER-time rejection of an ALTER that breaks a dependent.** An `ALTER` that
   makes a dependent view/trigger unresolvable should be rejected and rolled back;
   graphite leaves the now-broken object. Needs statement-level DDL rollback — a
