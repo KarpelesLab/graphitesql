@@ -8886,13 +8886,28 @@ impl Connection {
                     .position(|c| c.name.eq_ignore_ascii_case(old))
                     .ok_or_else(|| Error::Error(format!("no such column: \"{old}\"")))?;
                 // Renaming onto an existing column name is rejected, like SQLite.
-                if ct
+                // SQLite reports this as a *post-rename* validation failure: it
+                // applies the rename, re-parses the table, and the duplicate-column
+                // check fires while re-adding the later of the two colliding
+                // columns — so the reported name is whichever sits at the higher
+                // index after the rename (the renamed column when it moved onto an
+                // earlier name's slot, else the pre-existing column). The whole
+                // thing is wrapped in `error in table <T> after rename: …`.
+                if let Some((j, other)) = ct
                     .columns
                     .iter()
                     .enumerate()
-                    .any(|(i, c)| i != pos && c.name.eq_ignore_ascii_case(new))
+                    .find(|(i, c)| *i != pos && c.name.eq_ignore_ascii_case(new))
                 {
-                    return Err(Error::Error(format!("duplicate column name: {new}")));
+                    let dup = if pos > j {
+                        new.clone()
+                    } else {
+                        other.name.clone()
+                    };
+                    return Err(Error::Error(format!(
+                        "error in table {} after rename: duplicate column name: {dup}",
+                        a.table
+                    )));
                 }
                 ct.columns[pos].name = new.clone();
                 // Propagate the rename into the table's own expressions and

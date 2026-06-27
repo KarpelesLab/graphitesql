@@ -963,3 +963,86 @@ fn rename_column_does_not_corrupt_multi_table_view() {
     // `u.a` (the other table's column) is never touched.
     assert!(got.contains("u.a AS ua"), "corrupted u.a: {got}");
 }
+
+#[test]
+fn rename_column_onto_existing_name_is_wrapped() {
+    // SQLite reports a RENAME COLUMN that collides with another column as a
+    // *post-rename* failure: `error in table <T> after rename: duplicate column
+    // name: <name>`, where <name> is whichever colliding column lands at the
+    // higher index after the rename (the renamed column if it moved onto an
+    // earlier name's slot, else the pre-existing column). graphite used to emit
+    // the bare inner `duplicate column name: <new>`.
+    // The library's Error::Error Display prepends `error: `; strip it.
+    let msg = |c: &mut Connection, sql: &str| -> String {
+        c.execute(sql)
+            .unwrap_err()
+            .to_string()
+            .trim_start_matches("error: ")
+            .to_string()
+    };
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b, c)").unwrap();
+    // a(0) -> B collides with b(1); b is later, so its spelling (`b`) is reported.
+    let mut d = Connection::open_memory().unwrap();
+    d.execute("CREATE TABLE t(a, b)").unwrap();
+    assert_eq!(
+        msg(&mut d, "ALTER TABLE t RENAME COLUMN a TO B"),
+        "error in table t after rename: duplicate column name: b"
+    );
+    // c(2) -> A collides with a(0); the renamed column is later, so the new
+    // spelling (`A`) is reported.
+    assert_eq!(
+        msg(&mut c, "ALTER TABLE t RENAME COLUMN c TO A"),
+        "error in table t after rename: duplicate column name: A"
+    );
+    // Renaming a missing column is NOT a post-rename error (no wrapper).
+    assert_eq!(
+        msg(&mut c, "ALTER TABLE t RENAME COLUMN nope TO x"),
+        "no such column: \"nope\""
+    );
+}
+
+#[test]
+fn rename_column_collision_matches_sqlite_cli() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let run = |bin: &str, sql: &str| -> String {
+        let out = Command::new(bin).arg(":memory:").arg(sql).output().unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        if !s.trim().is_empty() {
+            return s.trim_end().to_string();
+        }
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .find(|l| !l.trim_start().starts_with('^'))
+            .unwrap_or("")
+            .trim_start_matches("Error: in prepare, ")
+            .trim_start_matches("Error: stepping, ")
+            .trim_start_matches("Error: ")
+            .trim_start_matches("error: ")
+            .to_string()
+    };
+    for (setup, alter) in [
+        ("CREATE TABLE t(a,b);", "ALTER TABLE t RENAME COLUMN a TO b"),
+        ("CREATE TABLE t(a,b);", "ALTER TABLE t RENAME COLUMN a TO B"),
+        (
+            "CREATE TABLE t(a,b,c);",
+            "ALTER TABLE t RENAME COLUMN c TO A",
+        ),
+        ("CREATE TABLE t(a,b);", "ALTER TABLE t RENAME COLUMN b TO A"),
+        (
+            "CREATE TABLE t(a,b,c);",
+            "ALTER TABLE t RENAME COLUMN c TO a",
+        ),
+        (
+            "CREATE TABLE t(a,b);",
+            "ALTER TABLE t RENAME COLUMN nope TO x",
+        ),
+    ] {
+        let sql = format!("{setup} {alter}");
+        assert_eq!(run("sqlite3", &sql), run(g, &sql), "for {sql}");
+    }
+}

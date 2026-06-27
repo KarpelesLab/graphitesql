@@ -304,6 +304,17 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   *separate* `multiple recursive references` error — recursive table named once in
   FROM **and** again inside a subquery — is not yet emitted; those cases need a deeper
   walk and several loop forever under the differential oracle, so left for later.)
+- **RENAME COLUMN onto an existing name — `after rename` wrapper — DONE.** A
+  `RENAME COLUMN` that collides with another column now reports SQLite's
+  *post-rename* form `error in table <T> after rename: duplicate column name:
+  <name>` (graphite emitted the bare inner `duplicate column name: <new>`). The
+  reported `<name>` is whichever colliding column lands at the higher index after
+  the rename — the renamed column's new spelling when it moved onto an earlier
+  name's slot, else the pre-existing column's spelling (sqlite reports the *later*
+  of the two as it re-adds columns). `exec_alter`'s `RenameColumn` arm now `find`s
+  the collision and picks `new` vs the existing name by index. A missing old column
+  stays the unwrapped `no such column: "old"`; `ADD COLUMN` duplicates keep their
+  own unwrapped message. `tests/alter.rs`.
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a
