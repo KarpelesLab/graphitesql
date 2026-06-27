@@ -73,6 +73,38 @@ fn without_rowid_pk_index_is_listed_last_with_pk_origin() {
 }
 
 #[test]
+fn without_rowid_pk_columns_report_notnull() {
+    let mut c = Connection::open_memory().unwrap();
+    // In a WITHOUT ROWID table every PRIMARY KEY column is implicitly NOT NULL,
+    // so table_info shows notnull=1 (column index 3) — even a table-level
+    // composite key and even an INTEGER PRIMARY KEY. The non-PK column stays 0.
+    c.execute("CREATE TABLE t(a INT, b, c TEXT, PRIMARY KEY(a, b)) WITHOUT ROWID")
+        .unwrap();
+    let r = rows(&c, "PRAGMA table_info(t)");
+    assert_eq!((r[0][1].clone(), r[0][3].clone()), (t("a"), i(1)));
+    assert_eq!((r[1][1].clone(), r[1][3].clone()), (t("b"), i(1)));
+    assert_eq!((r[2][1].clone(), r[2][3].clone()), (t("c"), i(0)));
+
+    // INTEGER PRIMARY KEY in a WITHOUT ROWID table is also NOT NULL (unlike a
+    // rowid table, where it stays 0).
+    c.execute("CREATE TABLE k(id INTEGER PRIMARY KEY, v) WITHOUT ROWID")
+        .unwrap();
+    let r = rows(&c, "PRAGMA table_info(k)");
+    assert_eq!(r[0][3], i(1));
+    assert_eq!(r[1][3], i(0));
+
+    // A rowid table's PK columns remain nullable (notnull=0) — the historical
+    // SQLite behavior this fix must not regress.
+    c.execute("CREATE TABLE r(a, b, PRIMARY KEY(a, b))")
+        .unwrap();
+    let r = rows(&c, "PRAGMA table_info(r)");
+    assert_eq!(r[0][3], i(0));
+    assert_eq!(r[1][3], i(0));
+    c.execute("CREATE TABLE r2(a INTEGER PRIMARY KEY)").unwrap();
+    assert_eq!(rows(&c, "PRAGMA table_info(r2)")[0][3], i(0));
+}
+
+#[test]
 fn table_info_over_the_schema_catalog() {
     let c = Connection::open_memory().unwrap();
     for name in ["sqlite_master", "sqlite_schema"] {

@@ -213,8 +213,13 @@ implemented (it returned `no such function`) — an independent reimplementation
 can't carry a C build's id, so it returns graphitesql's own identifier in
 SQLite's `YYYY-MM-DD HH:MM:SS <hash>` shape (the build-invariant contract —
 non-NULL `text` with a timestamp-shaped leading field, and an arity error for
-any argument — is what the differential test checks) — all byte-exact vs
-`sqlite3` 3.50.4.
+any argument — is what the differential test checks); and `PRAGMA
+table_info`/`table_xinfo` now reports `notnull=1` for the PRIMARY KEY columns of
+a **WITHOUT ROWID** table (they are implicitly NOT NULL — a table-level
+composite key and an INTEGER PRIMARY KEY included), while a rowid table's PK
+columns stay `notnull=0`; the *enforcement* already matched sqlite (a NULL-PK
+insert was rejected), only the introspection column was out of sync — all
+byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 

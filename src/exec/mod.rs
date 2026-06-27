@@ -2299,12 +2299,15 @@ impl Connection {
                 Some(false) => 2,
                 Some(true) => 3,
             };
-            // SQLite reports `notnull` from an explicit `NOT NULL` only — an
-            // INTEGER PRIMARY KEY (the rowid) is shown as notnull=0.
+            // SQLite reports `notnull` from an explicit `NOT NULL` — and, in a
+            // WITHOUT ROWID table, every PRIMARY KEY column is *implicitly* NOT
+            // NULL and shown as notnull=1. (In a rowid table the PK may be NULL,
+            // even an INTEGER PRIMARY KEY, so those stay notnull=0.)
             let notnull = col
                 .constraints
                 .iter()
-                .any(|c| matches!(c, ColumnConstraint::NotNull(_)));
+                .any(|c| matches!(c, ColumnConstraint::NotNull(_)))
+                || (ct.without_rowid && pk_positions.contains(&i));
             // `dflt_value` is the SQL text of the default expression (SQLite
             // preserves the literal as written — e.g. a string keeps its quotes,
             // `DEFAULT NULL` shows `NULL`), so reprint rather than evaluate it.
