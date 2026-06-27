@@ -435,6 +435,23 @@ column: zzz`), and the windowed carrier `count(*) FILTER (…) OVER ()` — whic
 SQLite accepts — is left untouched. Byte-exact vs `sqlite3` 3.50.4 across ~15
 permutations.
 
+**Unknown or wrong-arity scalar functions are now resolved at prepare time.**
+SQLite rejects an unknown name (`no such function: NAME`) and a wrong argument
+count (`wrong number of arguments to function NAME()`) before the query runs;
+graphite noticed only at row-evaluation time — i.e. never over an empty (or fully
+filtered) table, where it silently returned no rows — and the experimental VDBE
+fast path compiled a *known* call without re-checking its arity, so even
+`SELECT abs(a,b) FROM t` over an empty table slipped through. A new
+`reject_unresolved_functions_in_select` runs the existing
+`reject_unresolved_functions` dry-resolve (the same one CHECK/generated-column
+expressions already used) across every clause, on both the VDBE-success path
+(where a success guarantees the columns resolved, so a function fault is the sole
+remaining error) and the tree-walker path. A missing column still wins (`no such
+column: c`). Byte-exact vs `sqlite3` 3.50.4 across ~24 permutations; functions
+whose arity differs only under a locally ICU-enabled sqlite (`lower`/`upper`/
+`substr` take an optional locale argument there) are out of scope, matching the
+ASCII-only CI oracle.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

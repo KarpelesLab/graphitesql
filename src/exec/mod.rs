@@ -4160,8 +4160,23 @@ impl Connection {
             {
                 // Window calls and aggregate calls are handled by their own
                 // dedicated checks/wordings; only plain scalar positions resolve
-                // here.
-                if over.is_some() || func::is_aggregate_call(name, args.len(), *star) {
+                // here. A *registered* aggregate (UDAF) is not a `func::eval_scalar`
+                // builtin, so it must be excluded explicitly or the dry-resolve
+                // below would mistake it for an unknown name.
+                let lname = name.to_ascii_lowercase();
+                if over.is_some()
+                    || func::is_aggregate_call(name, args.len(), *star)
+                    || self.aggregates.contains_key(&lname)
+                {
+                    return;
+                }
+                // The `MATCH` operator and the FTS5 auxiliary functions resolve
+                // against the *structure* of their arguments (a column/table
+                // reference, the current row's score), not just their count — the
+                // NULL stand-ins below would defeat that and make them look like an
+                // unknown name. They are validated in the virtual-table path
+                // instead, so skip them here.
+                if matches!(lname.as_str(), "match" | "bm25" | "highlight" | "snippet") {
                     return;
                 }
                 let null_args: Vec<Expr> = core::iter::repeat_with(|| Expr::Literal(Literal::Null))
@@ -13684,6 +13699,49 @@ impl Connection {
         Ok(())
     }
 
+    /// Resolve and arity-check every scalar function call in `sel`'s own clauses
+    /// at prepare time, matching SQLite — an unknown name is `no such function:
+    /// NAME` and a wrong argument count is `wrong number of arguments to function
+    /// NAME()`, raised before the query runs (so a `SELECT abs(a,b) FROM t` over
+    /// an *empty* table is still rejected, where the row-evaluated tree-walker
+    /// would silently produce nothing). Mirrors `reject_aggregate_arity_in_select`'s
+    /// clause coverage; `reject_unresolved_functions` skips aggregate and window
+    /// calls (they have their own checks). Column resolution runs first on every
+    /// path that reaches this — the tree-walker's own resolver, or, on the VDBE
+    /// fast path, the VDBE compiler (which only succeeds when all columns resolve)
+    /// — so a missing column still wins for the common single-fault expression.
+    fn reject_unresolved_functions_in_select(&self, sel: &Select) -> Result<()> {
+        for rc in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                self.reject_unresolved_functions(expr)?;
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            self.reject_unresolved_functions(w)?;
+        }
+        // As with the arity check, HAVING in a non-aggregate query is rejected by
+        // its own placement error first, so only resolve it in an aggregate context.
+        if let Some(h) = &sel.having {
+            if !sel.group_by.is_empty() || self.has_result_aggregate(sel) {
+                self.reject_unresolved_functions(h)?;
+            }
+        }
+        for g in &sel.group_by {
+            self.reject_unresolved_functions(g)?;
+        }
+        for t in &sel.order_by {
+            self.reject_unresolved_functions(&t.expr)?;
+        }
+        if let Some(from) = &sel.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    self.reject_unresolved_functions(on)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The arity guard for one expression — see `reject_aggregate_arity_in_select`.
     /// Walks `e` (stopping at subquery boundaries, which validate themselves) for
     /// each aggregate call, whether plain or used as a window function (`agg(…)
@@ -13788,6 +13846,14 @@ impl Connection {
             };
             if let Some(vsel) = vsel {
                 if let Ok(result) = self.run_select_vdbe(vsel) {
+                    // The VDBE compiles a *known* scalar call without re-checking
+                    // its arity, and never evaluates it over zero rows — so a
+                    // wrong-arity call (`abs(a,b)`) would slip through silently
+                    // where SQLite rejects it at prepare time. A VDBE success means
+                    // every column resolved, so an unresolved-function fault is now
+                    // the sole possible error and is safe to surface here without
+                    // masking a missing column.
+                    self.reject_unresolved_functions_in_select(sel)?;
                     return Ok(result);
                 }
             }
@@ -13959,6 +14025,10 @@ impl Connection {
         // plain scalar function (`abs(x) FILTER(WHERE …)`) at prepare time, in
         // every position; graphite's evaluator silently ignored the clause and
         // returned the bare value. Check each scalar-expression position here.
+        // Unknown / wrong-arity scalar function calls are caught by
+        // `reject_unresolved_functions_in_select` (run ahead of this block, on
+        // both the VDBE-success and tree-walker paths).
+        self.reject_unresolved_functions_in_select(sel)?;
         {
             let is_agg = |name: &str, n: usize, star: bool| {
                 func::is_aggregate_call(name, n, star)
