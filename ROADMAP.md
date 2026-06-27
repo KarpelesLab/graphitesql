@@ -266,8 +266,14 @@ wildcard **argument** is now accepted only for `count(*)` — every other call,
 aggregate or scalar (`sum(*)`, `min(*)`, `group_concat(*)`, `abs(*)`,
 `length(*)`), is rejected at prepare time with `wrong number of arguments to
 function NAME()` in every clause position, while in a non-aggregate query the
-`HAVING clause on a non-aggregate query` check still outranks the arity error —
-all byte-exact vs `sqlite3` 3.50.4.
+`HAVING clause on a non-aggregate query` check still outranks the arity error;
+and a **reserved keyword in table-option position** (after the column list) is
+now a `near "KW"` syntax error rather than being mis-parsed — most importantly
+`CREATE TABLE t(a) AS SELECT …` now errors at `AS` (the CTAS form is illegal
+once a column list is present), matching SQLite, instead of pointing at the
+later `SELECT`; a non-reserved word there is still `unknown table option: NAME`
+and a column-less `CREATE TABLE t AS SELECT …` still parses — all byte-exact vs
+`sqlite3` 3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the

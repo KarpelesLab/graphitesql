@@ -277,12 +277,21 @@ impl Parser {
     /// verbatim source text (including any quotes); otherwise leave the cursor
     /// put and return `None`. Used for table-option parsing, where an
     /// unrecognized name is reported as `unknown table option: NAME`.
+    ///
+    /// A *reserved* keyword (the non-fallback set) is **not** a name here: SQLite
+    /// reports it as a `near "KW"` syntax error, not an unknown table option, so
+    /// `CREATE TABLE t(a) AS SELECT …` errors at `AS` (the CTAS form is illegal
+    /// once a column list is present). Such a word is left unconsumed for the
+    /// caller's trailing-token check. A quoted identifier or string is always a
+    /// name, even when it spells a keyword.
     fn option_name(&mut self) -> Option<String> {
         let (start, end) = match self.tokens.get(self.pos) {
-            Some(s) if matches!(s.token, Token::Word(_) | Token::Ident(_) | Token::Str(_)) => {
-                (s.start, s.end)
-            }
-            _ => return None,
+            Some(s) if matches!(s.token, Token::Ident(_) | Token::Str(_)) => (s.start, s.end),
+            Some(s) => match &s.token {
+                Token::Word(w) if !is_reserved_name(&w.to_ascii_lowercase()) => (s.start, s.end),
+                _ => return None,
+            },
+            None => return None,
         };
         self.pos += 1;
         Some(String::from(&self.source[start..end]))

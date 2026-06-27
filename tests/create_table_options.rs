@@ -105,6 +105,41 @@ fn valid_option_lists_still_parse() {
 }
 
 #[test]
+fn a_reserved_keyword_in_option_position_is_a_near_syntax_error() {
+    // A reserved keyword is not a table-option *name*: SQLite reports it as a
+    // `near "KW"` syntax error, not `unknown table option`. The most important
+    // case is `AS` — the `CREATE TABLE … AS SELECT` form is illegal once a
+    // column list is present, so the error lands on `AS`, not the later `SELECT`.
+    assert_eq!(
+        err_msg("CREATE TABLE t(a) AS SELECT 1"),
+        "near \"AS\": syntax error"
+    );
+    assert_eq!(
+        err_msg("CREATE TABLE t(a, b) AS SELECT 1, 2"),
+        "near \"AS\": syntax error"
+    );
+    assert_eq!(
+        err_msg("CREATE TABLE t(a) AS VALUES(1)"),
+        "near \"AS\": syntax error"
+    );
+    for kw in ["SELECT", "WHERE", "FROM", "PRIMARY", "ORDER", "JOIN", "NOT"] {
+        assert_eq!(
+            err_msg(&format!("CREATE TABLE t(a) {kw}")),
+            format!("near \"{kw}\": syntax error"),
+            "{kw}"
+        );
+    }
+    // A column-less CTAS is still valid, and so is a non-reserved word as an
+    // (unknown) option — the keyword check must not catch those.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE ok AS SELECT 1").unwrap();
+    assert_eq!(
+        err_msg("CREATE TABLE t(a) ABORT"),
+        "unknown table option: ABORT"
+    );
+}
+
+#[test]
 fn matches_sqlite_cli() {
     if !sqlite3_available() {
         eprintln!("sqlite3 CLI not found; skipping");
@@ -134,6 +169,10 @@ fn matches_sqlite_cli() {
         "CREATE TABLE t(a) STRICT, FOO",
         "CREATE TABLE t(a INT) STRICT, FOO",
         "CREATE TABLE t(a) STRICT,",
+        "CREATE TABLE t(a) AS SELECT 1",
+        "CREATE TABLE t(a, b) AS SELECT 1, 2",
+        "CREATE TABLE t(a) SELECT",
+        "CREATE TABLE t(a) ABORT",
     ] {
         assert_eq!(run("sqlite3", sql), run(g, sql), "for {sql}");
     }
