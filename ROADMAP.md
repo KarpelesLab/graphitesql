@@ -400,6 +400,30 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   `query` path does echo. (2) `PRAGMA trusted_schema` still returns no row;
   its default is the build-time `SQLITE_TRUSTED_SCHEMA` option, so it isn't
   safely differential against CI's pinned build.)*
+- **`INSERT … ON CONFLICT(target…)` target validation — DONE.** SQLite rejects a
+  conflict target whose columns do not name an actual PRIMARY KEY / UNIQUE
+  constraint or unique index before the INSERT runs (`ON CONFLICT clause does not
+  match any PRIMARY KEY or UNIQUE constraint`). graphite used to accept any target
+  silently. `validate_upsert_conflict_targets` (called right after the existing
+  `validate_upsert_columns` column-existence check) builds the table's unique
+  candidate column-sets — the INTEGER PRIMARY KEY, each inline PRIMARY KEY /
+  UNIQUE constraint from `meta.unique` (covers composite and WITHOUT ROWID PKs),
+  and each unique standalone index from `indexes_of` — and requires the target's
+  column set to equal one of them order-independently. A *partial* unique index
+  matches only when the conflict target itself carries a `WHERE`; a full
+  constraint matches regardless. Rejected: no constraint on the target, a partial
+  composite match (`ON CONFLICT(a)` for `UNIQUE(a,b)`), a non-unique index, a
+  partial unique index targeted without a `WHERE`. Accepted: PK (incl. the rowid
+  alias), single/composite UNIQUE in any column order, a unique index, a partial
+  unique index with a `WHERE`, and a bare no-target `ON CONFLICT`.
+  `tests/upsert_conflict_target.rs`. *(Residuals, NOT fixed: (1) the exact
+  partial-index predicate text is not compared, so a target `WHERE` that differs
+  from the matching partial index's predicate is leniently accepted rather than
+  rejected; (2) `ON CONFLICT(a COLLATE nocase)` — a collation in the target —
+  still fails to parse with `near "COLLATE": syntax error`, a separate parser
+  gap; (3) UPSERT on a WITHOUT ROWID table remains `not yet implemented`, so a
+  valid target there is correctly matched but then hits that pre-existing
+  limitation.)*
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a

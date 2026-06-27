@@ -5917,6 +5917,7 @@ impl Connection {
         // sqlite's resolution order, rather than silently ignoring it.
         let upsert_target_db = self.dml_target_db(ins.schema.as_deref(), &ins.table);
         validate_upsert_columns(&meta, &ins.table, &upsert_target_db, &ins.upsert)?;
+        self.validate_upsert_conflict_targets(&meta, &ins.table, &ins.upsert)?;
         if meta.without_rowid {
             if !ins.upsert.is_empty() || !ins.returning.is_empty() {
                 return Err(Error::Unsupported(
@@ -6600,6 +6601,89 @@ impl Connection {
             }
         }
         bare
+    }
+
+    /// Reject an `ON CONFLICT (target…)` whose target columns do not name an
+    /// actual PRIMARY KEY / UNIQUE constraint or unique index, exactly as sqlite
+    /// does before the INSERT runs (`ON CONFLICT clause does not match any
+    /// PRIMARY KEY or UNIQUE constraint`). A bare `ON CONFLICT` with no target
+    /// (already validated for column existence) absorbs any unique conflict and
+    /// is always accepted.
+    ///
+    /// The target matches when its column set equals — order-independently — a
+    /// unique candidate's column set: the INTEGER PRIMARY KEY, an inline
+    /// PRIMARY KEY / UNIQUE constraint (covers WITHOUT ROWID and composite PKs),
+    /// or a unique standalone index. A *partial* unique index only matches when
+    /// the conflict target itself carries a `WHERE` (sqlite requires the
+    /// predicates to correspond); a full constraint matches regardless of the
+    /// target `WHERE`. The exact partial-index predicate text is not compared —
+    /// a target `WHERE` that differs from the index's is leniently accepted.
+    fn validate_upsert_conflict_targets(
+        &self,
+        meta: &TableMeta,
+        table: &str,
+        upserts: &[Upsert],
+    ) -> Result<()> {
+        // Resolve a target column name to a column index (or the rowid alias's
+        // INTEGER PRIMARY KEY). Returns `None` for an unresolvable name, in which
+        // case we skip the check rather than risk a false rejection.
+        let resolve = |name: &str| -> Option<usize> {
+            if let Some(p) = meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+            {
+                return Some(p);
+            }
+            if eval::is_rowid_alias(name) {
+                return meta.ipk; // matches the IPK; `None` if there is no IPK
+            }
+            None
+        };
+        // Unique candidates as sorted column-index sets, each tagged `partial`.
+        let mut candidates: Vec<(Vec<usize>, bool)> = Vec::new();
+        if let Some(ipk) = meta.ipk {
+            candidates.push((alloc::vec![ipk], false));
+        }
+        for (set, _) in &meta.unique {
+            let mut s = set.clone();
+            s.sort_unstable();
+            candidates.push((s, false));
+        }
+        for idx in self.indexes_of(table)? {
+            if !idx.unique || idx.cols.is_empty() {
+                continue; // non-unique, or an expression index (no plain columns)
+            }
+            let mut s = idx.cols.clone();
+            s.sort_unstable();
+            candidates.push((s, idx.partial.is_some()));
+        }
+        for up in upserts {
+            if up.target.is_empty() {
+                continue; // bare ON CONFLICT — matches any unique conflict
+            }
+            let Some(mut tset) = up
+                .target
+                .iter()
+                .map(|n| resolve(n))
+                .collect::<Option<Vec<usize>>>()
+            else {
+                continue; // unresolvable target column — leave it to runtime
+            };
+            tset.sort_unstable();
+            let has_where = up.target_where.is_some();
+            // A full candidate matches regardless of the target WHERE; a partial
+            // one matches only when the target itself carries a WHERE.
+            let matched = candidates
+                .iter()
+                .any(|(cset, partial)| *cset == tset && (!*partial || has_where));
+            if !matched {
+                return Err(Error::Error(
+                    "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Does an `ON CONFLICT (target…) DO …` upsert clause apply to the conflict
