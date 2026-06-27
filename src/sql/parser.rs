@@ -196,17 +196,27 @@ impl Parser {
         }
     }
 
-    fn err(&self, msg: &str) -> Error {
-        match self.tokens.get(self.pos) {
+    /// SQLite renders a syntax error as `near "TOKEN": syntax error`, where
+    /// `TOKEN` is the verbatim source text of the offending token. Past the last
+    /// token it instead says `incomplete input` (the SQL is a valid prefix that
+    /// ended prematurely). `idx` is the token index to point at: a failed
+    /// `expect`/`peek` points at `self.pos`; a site that already `advance()`d
+    /// past the bad token points at `self.pos - 1`.
+    fn syntax_error(&self, idx: usize) -> Error {
+        match self.tokens.get(idx) {
             Some(s) => Error::Parse(format!(
-                "{msg} (near byte {}, found {:?})",
-                s.start, s.token
+                "near \"{}\": syntax error",
+                &self.source[s.start..s.end]
             )),
-            // Running out of tokens mid-statement is SQLite's `incomplete input`
-            // (the SQL is a valid prefix that ends prematurely), distinct from a
-            // syntax error at a real token.
             None => Error::Parse("incomplete input".into()),
         }
+    }
+
+    /// A syntax error at the current token. The `_msg` describes the parser's
+    /// internal expectation but is not surfaced — SQLite does not expose it, so
+    /// for parity every such site renders as `near "TOKEN": syntax error`.
+    fn err(&self, _msg: &str) -> Error {
+        self.syntax_error(self.pos)
     }
 
     /// Is the current token the keyword `kw` (case-insensitive bare word)?
@@ -238,9 +248,7 @@ impl Parser {
             Some(Token::Word(w)) => Ok(w),
             Some(Token::Ident(i)) => Ok(i),
             None => Err(Error::Parse("incomplete input".into())),
-            other => Err(Error::Parse(format!(
-                "expected identifier, found {other:?}"
-            ))),
+            _ => Err(self.syntax_error(self.pos - 1)),
         }
     }
 
@@ -805,7 +813,10 @@ impl Parser {
             } else if self.eat_kw("join") {
                 JoinKind::Inner
             } else if natural {
-                return Err(self.err("expected JOIN after NATURAL"));
+                // SQLite's grammar treats `NATURAL <non-join>` as a premature
+                // end of the join clause rather than a syntax error at the
+                // stray token.
+                return Err(Error::Parse("incomplete input".into()));
             } else {
                 break;
             };
@@ -816,12 +827,16 @@ impl Parser {
             let mut using = Vec::new();
             if self.eat_kw("on") {
                 if natural {
-                    return Err(self.err("NATURAL join may not have an ON clause"));
+                    return Err(Error::Parse(
+                        "a NATURAL join may not have an ON or USING clause".into(),
+                    ));
                 }
                 on = Some(self.expr()?);
             } else if self.eat_kw("using") {
                 if natural {
-                    return Err(self.err("NATURAL join may not have a USING clause"));
+                    return Err(Error::Parse(
+                        "a NATURAL join may not have an ON or USING clause".into(),
+                    ));
                 }
                 self.expect(&Token::LParen)?;
                 using.push(self.ident()?);
@@ -965,7 +980,7 @@ impl Parser {
             Some(Token::Ident(i)) => Ok(i),
             Some(Token::Str(s)) => Ok(s),
             None => Err(Error::Parse("incomplete input".into())),
-            other => Err(Error::Parse(format!("expected a name, found {other:?}"))),
+            _ => Err(self.syntax_error(self.pos - 1)),
         }
     }
 
@@ -2058,16 +2073,12 @@ impl Parser {
                             negated: false,
                         })
                     }
-                    _ if is_reserved_keyword(&lw) => Err(Error::Parse(format!(
-                        "unexpected keyword {w:?} in expression"
-                    ))),
+                    _ if is_reserved_keyword(&lw) => Err(self.syntax_error(self.pos - 1)),
                     _ => self.after_name(w, false),
                 }
             }
             None => Err(Error::Parse("incomplete input".into())),
-            other => Err(Error::Parse(format!(
-                "expected an expression, found {other:?}"
-            ))),
+            _ => Err(self.syntax_error(self.pos - 1)),
         }
     }
 
