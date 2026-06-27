@@ -4019,6 +4019,13 @@ impl Connection {
                 }
             }
         }
+        // An unrecognized table option (`CREATE TABLE t(a) FOO`) is surfaced
+        // here, *after* the STRICT datatype check above — matching SQLite's
+        // order, where e.g. `CREATE TABLE t(a) STRICT, FOO` reports the missing
+        // datatype on `a` rather than the bad option.
+        if let Some(opt) = &ct.bad_table_option {
+            return Err(Error::Error(format!("unknown table option: {opt}")));
+        }
         // SQLite forbids subqueries in CHECK constraints and generated columns.
         for c in &ct.columns {
             for k in &c.constraints {

@@ -183,7 +183,15 @@ in single-quotes?` — re-quoting the name, while a bare word, a `[bracket]`/
 `no such column: NAME` wording (the hint reaches the result-list, `WHERE`,
 `GROUP BY`/`ORDER BY`, and `UPDATE`/`DELETE` paths via a `quoted` flag on
 `Expr::Column` threaded through the resolvers and the eager prepare-time
-validators) — all byte-exact vs `sqlite3` 3.50.4.
+validators); and an unrecognized table option after the column list
+(`CREATE TABLE t(a) FOO`) is now `unknown table option: FOO` — the name echoed
+verbatim (a bare word, a `"quoted"` identifier or a `'string'` are all option
+names; a number/operator there stays a `near "TOKEN"` syntax error), the
+option list parsed as a possibly-empty comma-separated set so the first bad
+option wins (`FOO, STRICT` reports `FOO` and never enters STRICT mode) and is
+surfaced only *after* a STRICT table's missing-datatype check (`STRICT, FOO`
+over an untyped column still reports `missing datatype for t.a`), with a
+trailing comma now `incomplete input` — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 

@@ -481,6 +481,13 @@ pub struct CreateTable {
     /// (`INT`/`INTEGER`/`REAL`/`TEXT`/`BLOB`/`ANY`) and type-checks every stored
     /// value against its column's declared type.
     pub strict: bool,
+    /// An unrecognized name found in table-option position after the column
+    /// list, e.g. the `FOO` in `CREATE TABLE t(a) FOO`. Recorded verbatim (with
+    /// any quotes) rather than rejected at parse time so the executor can apply
+    /// SQLite's check order: a `STRICT` table's missing/invalid-datatype error
+    /// takes precedence, and only then is this surfaced as
+    /// `unknown table option: NAME`.
+    pub bad_table_option: Option<String>,
     /// `CREATE TABLE … AS SELECT …` — the table's columns and rows come from the
     /// query. When present, `columns`/`constraints` are empty until materialized.
     pub as_select: Option<Box<Select>>,

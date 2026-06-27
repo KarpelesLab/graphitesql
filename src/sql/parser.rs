@@ -264,6 +264,22 @@ impl Parser {
         }
     }
 
+    /// If the current token is a *name* — a bare word, a quoted identifier, or a
+    /// string literal (the `nm` of SQLite's grammar) — consume it and return its
+    /// verbatim source text (including any quotes); otherwise leave the cursor
+    /// put and return `None`. Used for table-option parsing, where an
+    /// unrecognized name is reported as `unknown table option: NAME`.
+    fn option_name(&mut self) -> Option<String> {
+        let (start, end) = match self.tokens.get(self.pos) {
+            Some(s) if matches!(s.token, Token::Word(_) | Token::Ident(_) | Token::Str(_)) => {
+                (s.start, s.end)
+            }
+            _ => return None,
+        };
+        self.pos += 1;
+        Some(String::from(&self.source[start..end]))
+    }
+
     // ---- statements ---------------------------------------------------------
 
     fn statement(&mut self) -> Result<Statement> {
@@ -1501,6 +1517,7 @@ impl Parser {
                 schema,
                 columns: Vec::new(),
                 constraints: Vec::new(),
+                bad_table_option: None,
                 without_rowid: false,
                 strict: false,
                 as_select: Some(Box::new(select)),
@@ -1522,21 +1539,50 @@ impl Parser {
             }
         }
         self.expect(&Token::RParen)?;
-        // Table options after the column list: `WITHOUT ROWID` and/or `STRICT`,
-        // comma-separated in any order.
+        // Table options after the column list: a possibly-empty, comma-separated
+        // list of `WITHOUT ROWID` and/or `STRICT`, in any order. SQLite reports
+        // any *other* name in option position (a bare word, a quoted identifier,
+        // or a string literal) as `unknown table option: NAME` — rendered
+        // verbatim, including quotes — while a non-name token there is a plain
+        // `near "TOKEN"` syntax error left to the caller. The unknown name is
+        // recorded rather than rejected here so the executor can apply SQLite's
+        // check order (the STRICT datatype check wins; see `exec_create_table`).
         let mut without_rowid = false;
         let mut strict = false;
+        let mut bad_table_option = None;
         loop {
+            // The first unrecognized option wins: once recorded, the rest of the
+            // list is still consumed (so the statement parses to a clean end) but
+            // sets no further flags — matching SQLite, where `FOO, STRICT`
+            // reports the bad `FOO` and never enters STRICT mode.
+            let ok = bad_table_option.is_none();
             if self.eat_kw("without") {
-                self.expect_kw("rowid")?;
-                without_rowid = true;
+                // The partner name must be ROWID; anything else is unknown.
+                if self.eat_kw("rowid") {
+                    without_rowid |= ok;
+                } else if let Some(name) = self.option_name() {
+                    if ok {
+                        bad_table_option = Some(name);
+                    }
+                } else {
+                    return Err(self.err("expected ROWID"));
+                }
             } else if self.eat_kw("strict") {
-                strict = true;
+                strict |= ok;
+            } else if let Some(name) = self.option_name() {
+                if ok {
+                    bad_table_option = Some(name);
+                }
             } else {
                 break;
             }
             if !self.eat(&Token::Comma) {
                 break;
+            }
+            // A comma must be followed by another option; at end-of-input the
+            // statement is an incomplete prefix (matches SQLite).
+            if self.at_end() {
+                return Err(Error::Parse("incomplete input".into()));
             }
         }
         Ok(CreateTable {
@@ -1547,6 +1593,7 @@ impl Parser {
             constraints,
             without_rowid,
             strict,
+            bad_table_option,
             as_select: None,
         })
     }
