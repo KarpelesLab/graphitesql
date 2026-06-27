@@ -1091,6 +1091,17 @@ impl Parser<'_> {
                 .map(String::from);
             return Ok(Json::Int(if neg { i.wrapping_neg() } else { i }, raw));
         }
+        // A JSON number's integer part may not carry a leading zero: `0` must
+        // stand alone (`0`, `0.5`, `0e1`, `-0`). `00`, `007`, `01`, `00.5` and
+        // `-01` are malformed, exactly as sqlite's parser rejects them. (The
+        // `0x…` hex form was already handled above.) sqlite points
+        // `json_error_position` at the number token's *second* character (`start
+        // + 1`), whether or not the token opened with a sign — `-01` reports the
+        // same offset as `01`.
+        if self.peek() == Some(b'0') && self.bytes.get(self.pos + 1).is_some_and(u8::is_ascii_digit)
+        {
+            return Err(start + 1);
+        }
         let mut is_real = false;
         while let Some(c) = self.peek() {
             match c {

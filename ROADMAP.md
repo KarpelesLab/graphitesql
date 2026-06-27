@@ -225,7 +225,12 @@ its verbatim source text in JSON *text* output (`json('1e1000')` → `1e1000`,
 literal — the serializer checked `is_infinite()` before the text-preserving
 arm, so the parsed source text was dropped; the extracted SQL value is still
 `f64` infinity, and a *computed* infinity (no source text) still renders as
-`9e999` — all byte-exact vs `sqlite3` 3.50.4.
+`9e999`; and a JSON number with a **leading zero** on its integer part
+(`00`, `007`, `00.5`, `-01`) is now rejected as `malformed JSON` instead of being
+silently accepted as `0`/`7`/… — a lone `0` and a `0` followed by `.`/`e`
+(`0.5`, `0e1`) stay valid, and `json_error_position` points at the token's
+second character (`00` → 2, `[01]` → 3) to match sqlite — all byte-exact vs
+`sqlite3` 3.50.4.
 
 **Remaining:**
 

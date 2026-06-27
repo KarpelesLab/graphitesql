@@ -65,6 +65,16 @@ fn malformed_positions_match_sqlite3() {
     assert_eq!(n(&c, "   "), 1);
     assert_eq!(n(&c, "abc"), 1);
     assert_eq!(n(&c, "tru"), 1);
+    // A leading zero on an integer part is malformed; sqlite points at the
+    // token's second character (`start + 1`), sign or not.
+    assert_eq!(n(&c, "00"), 2);
+    assert_eq!(n(&c, "007"), 2);
+    assert_eq!(n(&c, "000"), 2);
+    assert_eq!(n(&c, "00.5"), 2);
+    assert_eq!(n(&c, "-01"), 2);
+    assert_eq!(n(&c, "[01]"), 3);
+    assert_eq!(n(&c, "[1,00]"), 5);
+    assert_eq!(n(&c, r#"{"a":01}"#), 7);
 }
 
 #[test]

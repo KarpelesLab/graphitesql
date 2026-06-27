@@ -48,10 +48,7 @@ fn json_text_keeps_overflowing_number_text() {
     assert_eq!(text(&c, "SELECT json('-1e1000')"), "-1e1000");
     assert_eq!(text(&c, "SELECT json('9.9e999')"), "9.9e999");
     assert_eq!(text(&c, "SELECT json('[1e1000]')"), "[1e1000]");
-    assert_eq!(
-        text(&c, "SELECT json('{\"x\":1e1000}')"),
-        r#"{"x":1e1000}"#
-    );
+    assert_eq!(text(&c, "SELECT json('{\"x\":1e1000}')"), r#"{"x":1e1000}"#);
     // A bare `9e999` in the input (which *is* the infinity literal) is preserved
     // verbatim too, since it is itself a strict number.
     assert_eq!(text(&c, "SELECT json('9e999')"), "9e999");
@@ -60,6 +57,26 @@ fn json_text_keeps_overflowing_number_text() {
         one(&c, "SELECT json_extract('[1e1000]', '$[0]')"),
         Value::Real(f64::INFINITY)
     );
+}
+
+#[test]
+fn leading_zero_integer_is_malformed() {
+    // A `0` immediately followed by a digit is an invalid JSON number — `00`,
+    // `007`, `00.5`, `-01` are rejected (sqlite: `malformed JSON`), while a lone
+    // `0` and a `0` followed by `.`/`e` stay valid. graphite used to silently
+    // accept `00` as `0`.
+    let c = Connection::open_memory().unwrap();
+    for bad in ["00", "007", "000", "00.5", "-00", "-01", "[01]", "[1,00]"] {
+        assert!(
+            c.query(&format!("SELECT json('{bad}')")).is_err(),
+            "expected {bad} to be malformed JSON"
+        );
+    }
+    // Genuinely-valid leading-`0` forms still parse.
+    assert_eq!(text(&c, "SELECT json('0')"), "0");
+    assert_eq!(text(&c, "SELECT json('0.5')"), "0.5");
+    assert_eq!(text(&c, "SELECT json('0e1')"), "0e1");
+    assert_eq!(text(&c, "SELECT json('[0,1,2]')"), "[0,1,2]");
 }
 
 #[test]
