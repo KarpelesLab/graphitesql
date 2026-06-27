@@ -6876,6 +6876,7 @@ impl Connection {
             return self.exec_view_delete(del, params);
         }
         let meta = self.table_meta(&del.table, None)?;
+        reject_order_by_without_limit(&del.order_by, del.limit.as_ref(), "DELETE")?;
         self.validate_index_hint(&del.table, del.index_hint.as_ref())?;
         // Resolve the WHERE columns eagerly (top-level only — a trigger body's
         // DML may bind a bare name to NEW/OLD), so a bogus column errors even when
@@ -7010,6 +7011,7 @@ impl Connection {
             return self.exec_view_update(upd, params);
         }
         let meta = self.table_meta(&upd.table, None)?;
+        reject_order_by_without_limit(&upd.order_by, upd.limit.as_ref(), "UPDATE")?;
         self.validate_index_hint(&upd.table, upd.index_hint.as_ref())?;
         // Validate the SET-target columns up front: sqlite rejects an unknown
         // assignment column at prepare time, even when the table has no rows.
@@ -18992,6 +18994,26 @@ fn reject_schema_write(table: &str) -> Result<()> {
     if is_main_schema_table(table) {
         return Err(Error::Error(alloc::format!(
             "table {table} may not be modified"
+        )));
+    }
+    Ok(())
+}
+
+/// SQLite accepts `ORDER BY` on an UPDATE/DELETE only as a companion to `LIMIT`
+/// (the update/delete-limit extension): the order picks *which* rows the limit
+/// keeps. An `ORDER BY` with no `LIMIT` is therefore meaningless and rejected at
+/// prepare time with `ORDER BY without LIMIT on <VERB>`. This fires after the
+/// target's existence / view / vtab checks but before column resolution, so a
+/// bogus `ORDER BY` or `SET` column never shadows it. `verb` is `"UPDATE"` or
+/// `"DELETE"`.
+fn reject_order_by_without_limit(
+    order_by: &[OrderTerm],
+    limit: Option<&Expr>,
+    verb: &str,
+) -> Result<()> {
+    if !order_by.is_empty() && limit.is_none() {
+        return Err(Error::Error(alloc::format!(
+            "ORDER BY without LIMIT on {verb}"
         )));
     }
     Ok(())

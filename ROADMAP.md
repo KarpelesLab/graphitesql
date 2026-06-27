@@ -356,6 +356,16 @@ bare name in both cases; the fix tags each fired trigger with its origin catalog
 (swap-aware, so a temp trigger on a main table is still labelled `temp`) and
 qualifies the error only for non-temp triggers. Byte-exact vs `sqlite3` 3.50.4.
 
+An **`ORDER BY` on an UPDATE/DELETE with no `LIMIT`** is now rejected at prepare
+time. SQLite only allows the ordering as a companion to the update/delete-`LIMIT`
+extension — the order decides *which* rows the cap keeps — so a bare `ORDER BY`
+is meaningless and errors with `ORDER BY without LIMIT on UPDATE` / `... on
+DELETE`. graphite used to accept it silently and update/delete nothing. The guard
+sits after the target's existence / view / vtab checks but ahead of column
+resolution, matching SQLite's diagnostic precedence: a missing table and a
+modify-a-view error still win, but a bogus `ORDER BY` or `SET` column reports the
+limit error first. Byte-exact vs `sqlite3` 3.50.4 across ~17 permutations.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely
