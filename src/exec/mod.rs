@@ -13051,6 +13051,22 @@ impl Connection {
             }
             None => sel,
         };
+
+        // A join `ON` predicate is evaluated per candidate row pair, before any
+        // grouping — an aggregate or window function there is a misuse, never an
+        // aggregate-legit context. Checked here, before `scan_source` materializes
+        // the join: a non-empty table would otherwise hit the lazy per-row error
+        // (with the wrong wording) first, and an empty one would silently accept.
+        // SQLite uses the function-form aggregate wording and rejects at prepare.
+        if let Some(from) = &sel.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    reject_misused_window(on)?;
+                    reject_misused_aggregate(on, false)?;
+                }
+            }
+        }
+
         // `SELECT count(*) FROM t` over a single rowid table with exactly one full
         // secondary index counts that index's entries instead of scanning the
         // table (B2b). Kept in lockstep with `eqp_select` via the shared
@@ -13160,6 +13176,19 @@ impl Connection {
         if let Some(w) = &sel.where_clause {
             reject_misused_window(w)?;
             reject_misused_aggregate(w, select_is_aggregate_query(sel))?;
+        }
+
+        // An aggregate in the ORDER BY of a *non-aggregate* query is a misuse
+        // (ORDER BY of a query that has GROUP BY/HAVING or an aggregate result
+        // column may legitimately use one). SQLite resolves ORDER BY in a context
+        // where aggregates are otherwise allowed, so the misuse here always reads
+        // with the colon wording (`misuse of aggregate: f()`), unlike WHERE. It is
+        // rejected at prepare time. (A window function in ORDER BY is valid, so it
+        // is not checked here.)
+        if sel.compound.is_empty() && !select_is_aggregate_query(sel) {
+            for t in &sel.order_by {
+                reject_misused_aggregate(&t.expr, true)?;
+            }
         }
 
         // Apply WHERE.
