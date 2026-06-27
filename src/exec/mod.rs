@@ -988,10 +988,15 @@ impl Connection {
                 for rc in &sel.columns {
                     if let ResultColumn::Expr { expr, .. } = rc {
                         reject_invalid_window_function(expr, &is_agg)?;
+                        // A window nested inside an aggregate's argument
+                        // (`sum(row_number() OVER ())`) is a misuse SQLite rejects
+                        // at prepare time; this path bypasses `run_core` too.
+                        reject_nested_aggregate_arg(expr)?;
                     }
                 }
                 for t in &sel.order_by {
                     reject_invalid_window_function(&t.expr, &is_agg)?;
+                    reject_nested_aggregate_arg(&t.expr)?;
                 }
             }
             return self.run_window_vdbe(sel);
@@ -13791,6 +13796,10 @@ impl Connection {
         // is not checked here.)
         if sel.compound.is_empty() && !select_is_aggregate_query(sel) {
             for t in &sel.order_by {
+                // A window nested in the aggregate's argument is named ahead of the
+                // outer aggregate's own misuse — SQLite resolves the inner call
+                // first (`sum(row_number() OVER ())` → the window, not `sum`).
+                reject_nested_aggregate_arg(&t.expr)?;
                 reject_misused_aggregate(&t.expr, true)?;
             }
         }
@@ -13811,6 +13820,7 @@ impl Connection {
                     reject_invalid_window_function(expr, &is_agg)?;
                     reject_star_argument(expr)?;
                     reject_invalid_likelihood(expr)?;
+                    reject_nested_aggregate_arg(expr)?;
                 }
             }
             if let Some(w) = &sel.where_clause {
@@ -13827,6 +13837,7 @@ impl Connection {
                 if !sel.group_by.is_empty() || self.has_result_aggregate(sel) {
                     reject_star_argument(h)?;
                     reject_invalid_likelihood(h)?;
+                    reject_nested_aggregate_arg(h)?;
                 }
             }
             for g in &sel.group_by {
@@ -13839,6 +13850,7 @@ impl Connection {
                 reject_invalid_window_function(&t.expr, &is_agg)?;
                 reject_star_argument(&t.expr)?;
                 reject_invalid_likelihood(&t.expr)?;
+                reject_nested_aggregate_arg(&t.expr)?;
             }
             if let Some(from) = &sel.from {
                 for j in &from.joins {
@@ -19879,6 +19891,72 @@ fn reject_invalid_likelihood(e: &Expr) -> Result<()> {
                 err = Some(Error::Error(
                     "second argument to likelihood() must be a constant between 0.0 and 1.0".into(),
                 ));
+            }
+        }
+    });
+    err.map_or(Ok(()), Err)
+}
+
+/// Reject an aggregate function whose argument contains another aggregate or a
+/// window function. SQLite forbids nesting aggregates: the argument of an
+/// aggregate is resolved with `NC_InAggFunc` set, so a nested aggregate is a
+/// `misuse of aggregate function NAME()` and a nested window is a `misuse of
+/// window function NAME()`. It rejects both during analysis, so they fire even
+/// over an empty/fully-filtered table (where graphite's lazy evaluator used to
+/// silently produce a value — `count(sum(a))` returned 0 instead of erroring).
+///
+/// Only the *plain* aggregate form establishes this context: a `sum(a) OVER (…)`
+/// is a window, not a nesting site, and a scalar wrapper (`abs(count(*))`,
+/// `max(sum(a), 1)`) is fine — the nesting must be inside an aggregate's own
+/// argument. When an argument holds both a nested aggregate and a nested window,
+/// SQLite names whichever its resolver reaches last in source order, so the
+/// inner scan keeps the last hit it sees. The walk stops at subquery boundaries
+/// (a nested `SELECT` is a separate query level with its own aggregate context).
+fn reject_nested_aggregate_arg(e: &Expr) -> Result<()> {
+    let mut err: Option<Error> = None;
+    window::visit(e, &mut |n| {
+        if err.is_some() {
+            return;
+        }
+        if let Expr::Function {
+            name,
+            args,
+            star,
+            over: None,
+            ..
+        } = n
+        {
+            if !func::is_aggregate_call(name, args.len(), *star) {
+                return;
+            }
+            // Scan this aggregate's arguments for a nested aggregate or window
+            // call; the last one seen in source order is the one SQLite names.
+            let mut hit: Option<(bool, String)> = None;
+            for a in args {
+                window::visit(a, &mut |m| {
+                    if let Expr::Function {
+                        name: inner_name,
+                        args: inner_args,
+                        star: inner_star,
+                        over: inner_over,
+                        ..
+                    } = m
+                    {
+                        if inner_over.is_some() {
+                            hit = Some((true, inner_name.to_ascii_lowercase()));
+                        } else if func::is_aggregate_call(inner_name, inner_args.len(), *inner_star)
+                        {
+                            hit = Some((false, inner_name.clone()));
+                        }
+                    }
+                });
+            }
+            if let Some((is_window, inner_name)) = hit {
+                err = Some(Error::Error(if is_window {
+                    alloc::format!("misuse of window function {inner_name}()")
+                } else {
+                    alloc::format!("misuse of aggregate function {inner_name}()")
+                }));
             }
         }
     });

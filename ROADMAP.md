@@ -303,8 +303,20 @@ yields no rows — over an empty or fully-filtered table — where graphite used
 defer the check to the evaluator and silently accept the bad call; the new
 `reject_invalid_likelihood` walker runs in every scalar-expression position
 (result list / WHERE / GROUP BY / ORDER BY / join `ON`, and nested function
-arguments), leaving a `likelihood(…) OVER (…)` to the window-misuse path. All
-byte-exact vs `sqlite3` 3.50.4.
+arguments), leaving a `likelihood(…) OVER (…)` to the window-misuse path. And
+**nested aggregates** are now rejected at prepare time: SQLite forbids an
+aggregate (or window function) inside another aggregate's argument — the argument
+is resolved with `NC_InAggFunc` set — so `sum(count(*))` is `misuse of aggregate
+function count()` and `sum(row_number() OVER ())` is `misuse of window function
+row_number()`, both fired during analysis (even over an empty/fully-filtered
+table, where graphite's lazy evaluator used to accept the nesting and even
+mis-evaluate it — `count(sum(a))` returned `0`). The `reject_nested_aggregate_arg`
+walker scans each plain-aggregate call's arguments, names the last nested
+aggregate/window in source order (matching SQLite's resolver), and runs in the
+result list, `HAVING`, and `ORDER BY` — plus the VDBE window-dispatch path, which
+bypasses `run_core` — while leaving scalar wrappers (`abs(count(*))`,
+`max(sum(a), 1)`), an aggregate-as-window (`sum(a) OVER ()`), and subquery-level
+aggregates untouched. All byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
@@ -326,8 +338,6 @@ open work:
   is accepted where SQLite rejects at prepare time. All want the same fix — a
   statement-level prepare pass that walks every expression once, independent of
   row production:
-  - a window nested in an aggregate *argument* in a result column
-    (`sum(row_number() OVER ())`) over an empty table.
   - bare (unqualified) refs in derived-table/subquery scopes and `NATURAL`/`USING`
     coalesced names — `validate_columns_exist` only covers the top-level
     plain-table / `ON`-join scope. The same gap leaves a three-part
