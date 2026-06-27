@@ -508,6 +508,13 @@ text-preserving CREATE-text edits).
     unchanged. (BLOB operands are SQLite's binary JSONB, not yet modeled by the
     arrow path, so they keep the existing lenient behaviour — a separate gap.)
     (`tests/json_arrow_malformed.rs`)
+  - **`printf`/`format` trailing `%` is literal (done).** A `%` that is the final
+    character of the format string — with no conversion specifier after it — is
+    emitted literally by sqlite (`printf('%')` → `%`, `printf('abc%')` → `abc%`,
+    `printf('%d%', 5)` → `5%`); graphite dropped the dangling `%`. The format
+    walker now pushes a literal `%` when the `%` is the last byte; a `%` trailed
+    by flags/width that then runs off the end (`%5`, `%-`) still yields nothing,
+    matching sqlite (`tests/printf_trailing_percent.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

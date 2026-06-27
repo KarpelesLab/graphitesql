@@ -1281,6 +1281,12 @@ pub fn printf(args: &[Value]) -> Value {
         }
         i += 1;
         if i >= bytes.len() {
+            // A `%` that is the final character of the format string — with no
+            // conversion specifier following — is emitted literally by SQLite
+            // (`printf('%')` → "%", `printf('abc%')` → "abc%"). A `%` followed
+            // by flags/width that then runs off the end (`%5`, `%-`) still
+            // produces nothing, handled by the conversion path below.
+            out.push('%');
             break;
         }
         if bytes[i] == '%' {
