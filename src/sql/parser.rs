@@ -2386,13 +2386,13 @@ impl Parser {
             return Ok(None);
         };
         let (start, end) = if self.eat_kw("between") {
-            let s = self.frame_bound()?;
+            let s = self.frame_bound(true)?;
             self.expect_kw("and")?;
-            let e = self.frame_bound()?;
+            let e = self.frame_bound(false)?;
             (s, e)
         } else {
             // A bare start bound; the end defaults to CURRENT ROW.
-            (self.frame_bound()?, FrameBound::CurrentRow)
+            (self.frame_bound(true)?, FrameBound::CurrentRow)
         };
         // Optional EXCLUDE clause.
         let exclude = if self.eat_kw("exclude") {
@@ -2411,13 +2411,15 @@ impl Parser {
         } else {
             FrameExclude::NoOthers
         };
-        // Validate the bounds: a start may not be UNBOUNDED FOLLOWING and an end
-        // may not be UNBOUNDED PRECEDING, and the start's bound *category* must not
-        // come after the end's — sqlite rejects all of these ("unsupported frame
-        // specification"). The comparison is by category only (UNBOUNDED PRECEDING
-        // < PRECEDING < CURRENT ROW < FOLLOWING < UNBOUNDED FOLLOWING); the numeric
-        // offset is NOT compared, so `1 PRECEDING AND 2 PRECEDING` is a valid
-        // (empty) frame.
+        // Validate the bounds: the start's bound *category* must not come after the
+        // end's — sqlite rejects these three combos (CURRENT/PRECEDING,
+        // FOLLOWING/PRECEDING, FOLLOWING/CURRENT) with a semantic "unsupported frame
+        // specification" (a real message, not a `near` syntax error). The comparison
+        // is by category only (UNBOUNDED PRECEDING < PRECEDING < CURRENT ROW <
+        // FOLLOWING < UNBOUNDED FOLLOWING); the numeric offset is NOT compared, so
+        // `1 PRECEDING AND 2 PRECEDING` is a valid (empty) frame. The two illegal
+        // UNBOUNDED directions (UNBOUNDED FOLLOWING as a start, UNBOUNDED PRECEDING
+        // as an end) are grammar errors caught in `frame_bound`, not here.
         let rank = |b: &FrameBound| -> u8 {
             match b {
                 FrameBound::UnboundedPreceding => 0,
@@ -2427,11 +2429,8 @@ impl Parser {
                 FrameBound::UnboundedFollowing => 4,
             }
         };
-        if matches!(start, FrameBound::UnboundedFollowing)
-            || matches!(end, FrameBound::UnboundedPreceding)
-            || rank(&start) > rank(&end)
-        {
-            return Err(self.err("unsupported frame specification"));
+        if rank(&start) > rank(&end) {
+            return Err(Error::Parse("unsupported frame specification".into()));
         }
         Ok(Some(WindowFrame {
             mode,
@@ -2441,10 +2440,23 @@ impl Parser {
         }))
     }
 
-    fn frame_bound(&mut self) -> Result<FrameBound> {
+    /// Parse one frame boundary. `is_start` selects the grammar production:
+    /// SQLite's start-bound rule forbids `UNBOUNDED FOLLOWING` and its end-bound
+    /// rule forbids `UNBOUNDED PRECEDING`, each a `near "FOLLOWING"/"PRECEDING":
+    /// syntax error` pointing at the direction keyword.
+    fn frame_bound(&mut self, is_start: bool) -> Result<FrameBound> {
         if self.eat_kw("unbounded") {
-            if self.eat_kw("preceding") {
+            if self.check_kw("preceding") {
+                if !is_start {
+                    // An end bound may not be UNBOUNDED PRECEDING.
+                    return Err(self.err("unsupported end frame bound"));
+                }
+                self.pos += 1;
                 return Ok(FrameBound::UnboundedPreceding);
+            }
+            if is_start {
+                // A start bound may not be UNBOUNDED FOLLOWING (pos is at FOLLOWING).
+                return Err(self.err("unsupported start frame bound"));
             }
             self.expect_kw("following")?;
             return Ok(FrameBound::UnboundedFollowing);

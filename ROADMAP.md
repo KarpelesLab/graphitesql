@@ -245,7 +245,17 @@ reports the subquery), and a bare non-deterministic WHERE uses its own distinct
 message (`non-deterministic functions prohibited in partial index WHERE
 clauses`, *not* "index expressions"); the subquery check (reusing
 `expr_has_subquery`) fires before column resolution so `WHERE zzz IN (SELECT 1)`
-still reports the subquery — all byte-exact vs `sqlite3` 3.50.4.
+still reports the subquery; and a **window frame boundary** now reports SQLite's
+two distinct failure classes instead of collapsing both to `near ")"`: a grammar
+error for an illegal `UNBOUNDED` direction (`UNBOUNDED FOLLOWING` as a *start*
+bound, `UNBOUNDED PRECEDING` as an *end* bound → `near "FOLLOWING"/"PRECEDING":
+syntax error` at the direction keyword) and a semantic `unsupported frame
+specification` when the start category comes after the end's (`CURRENT ROW AND
+1 PRECEDING`, `1 FOLLOWING AND 1 PRECEDING`, `1 FOLLOWING AND CURRENT ROW`) —
+the offset is not compared, so `2 FOLLOWING AND 1 FOLLOWING` stays a valid empty
+frame; the old code built the right message text but routed it through `err()`,
+which discards the string and emits a positional `near` error — all byte-exact
+vs `sqlite3` 3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
