@@ -275,7 +275,11 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   before the write target is swapped into the active `main` slot, so an unqualified
   write to a temp table validates against `temp`, not `main`); `RETURNING` rejects
   *any* schema-qualified column, even a correct one, as sqlite does. Differential
-  tests in `tests/dml_column_qualifier_errors.rs`.
+  tests in `tests/dml_column_qualifier_errors.rs`. The `INSERT … ON CONFLICT …`
+  (UPSERT) clause is covered too — `upsert_expr_unknown_column` now reads the
+  schema part and validates it against the upsert target's database for the
+  conflict-target `WHERE`, the `DO UPDATE` `SET` values and its `WHERE` (the
+  `excluded` pseudo-table is never database-qualified). `tests/upsert_unknown_column.rs`.
   Residual: a three-part ref inside a *correlated subquery body* binding to an
   enclosing FROM is still resolved lazily (the nested-scope gap below).
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs

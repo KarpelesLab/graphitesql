@@ -5748,7 +5748,8 @@ impl Connection {
         // columns (the conflict target and its `WHERE`) plus the `excluded`
         // pseudo-table (in a `DO UPDATE`). Reject an unknown column up front, in
         // sqlite's resolution order, rather than silently ignoring it.
-        validate_upsert_columns(&meta, &ins.table, &ins.upsert)?;
+        let upsert_target_db = self.dml_target_db(ins.schema.as_deref(), &ins.table);
+        validate_upsert_columns(&meta, &ins.table, &upsert_target_db, &ins.upsert)?;
         if meta.without_rowid {
             if !ins.upsert.is_empty() || !ins.returning.is_empty() {
                 return Err(Error::Unsupported(
@@ -19084,16 +19085,29 @@ fn has_resolved_dotted_ref(
     found
 }
 
-/// The first column reference in an `ON CONFLICT … DO UPDATE` value or `WHERE`
-/// expression that resolves to neither the target table (bare or
-/// `table.`-qualified) nor the `excluded` pseudo-table, or `None` if all
-/// resolve. The rowid aliases are accepted under every valid qualifier, matching
-/// sqlite. The bad reference is reported qualified when it was written that way.
-fn upsert_expr_unknown_column(e: &Expr, known: &[String], table: &str) -> Option<String> {
+/// The first column reference in an `ON CONFLICT …` predicate or `DO UPDATE`
+/// value/`WHERE` that does not resolve, or `None` if all resolve. A reference
+/// resolves to the target table (bare, `table.`-qualified, or — when present —
+/// `db.table.`-qualified where `db` names the target's database) and, when
+/// `allow_excluded` is set (a `DO UPDATE` SET/WHERE), to the `excluded`
+/// pseudo-table (which is never schema-qualified). The conflict-target `WHERE`
+/// (a partial-index predicate) passes `allow_excluded = false`. Rowid aliases
+/// are accepted under every valid qualifier, matching sqlite. The bad reference
+/// is reported with whatever qualifier parts it was written with.
+fn upsert_expr_unknown_column(
+    e: &Expr,
+    known: &[String],
+    table: &str,
+    target_db: &str,
+    allow_excluded: bool,
+) -> Option<String> {
     let mut bad: Option<String> = None;
     window::visit(e, &mut |n| {
         if let Expr::Column {
-            table: q, column, ..
+            schema,
+            table: q,
+            column,
+            ..
         } = n
         {
             if bad.is_some() {
@@ -19101,17 +19115,28 @@ fn upsert_expr_unknown_column(e: &Expr, known: &[String], table: &str) -> Option
             }
             let known_col = known.iter().any(|c| c.eq_ignore_ascii_case(column))
                 || eval::is_rowid_alias(column);
-            let resolves = match q {
-                None => known_col,
-                Some(qual) => {
-                    (qual.eq_ignore_ascii_case(table) || qual.eq_ignore_ascii_case("excluded"))
+            let resolves = match (schema, q) {
+                (None, None) => known_col,
+                (None, Some(qual)) => {
+                    (qual.eq_ignore_ascii_case(table)
+                        || (allow_excluded && qual.eq_ignore_ascii_case("excluded")))
                         && known_col
                 }
+                // A three-part `db.table.col` resolves only when `db` names the
+                // target's database and `table` names the target — `excluded` can
+                // never carry a database part.
+                (Some(sch), Some(qual)) => {
+                    sch.eq_ignore_ascii_case(target_db)
+                        && qual.eq_ignore_ascii_case(table)
+                        && known_col
+                }
+                (Some(_), None) => false,
             };
             if !resolves {
-                bad = Some(match q {
-                    Some(qq) => alloc::format!("{qq}.{column}"),
-                    None => column.clone(),
+                bad = Some(match (schema, q) {
+                    (Some(s), Some(qq)) => alloc::format!("{s}.{qq}.{column}"),
+                    (_, Some(qq)) => alloc::format!("{qq}.{column}"),
+                    _ => column.clone(),
                 });
             }
         }
@@ -19126,7 +19151,12 @@ fn upsert_expr_unknown_column(e: &Expr, known: &[String], table: &str) -> Option
 /// index predicate — table columns + rowid only, no `excluded`), then for a
 /// `DO UPDATE` (3) the assignment value expressions, (4) the assigned (target)
 /// columns, and (5) the update `WHERE`; (3)–(5) may also use `excluded`.
-fn validate_upsert_columns(meta: &TableMeta, table: &str, upserts: &[Upsert]) -> Result<()> {
+fn validate_upsert_columns(
+    meta: &TableMeta,
+    table: &str,
+    target_db: &str,
+    upserts: &[Upsert],
+) -> Result<()> {
     if upserts.is_empty() {
         return Ok(());
     }
@@ -19139,8 +19169,10 @@ fn validate_upsert_columns(meta: &TableMeta, table: &str, upserts: &[Upsert]) ->
                 return Err(Error::Error(alloc::format!("no such column: {col}")));
             }
         }
+        // The conflict-target WHERE is a partial-index predicate — target columns
+        // (and a three-part db qualifier) only, never `excluded`.
         if let Some(w) = &up.target_where {
-            if let Some(c) = unknown_column_ref(w, &known, true, Some(table)) {
+            if let Some(c) = upsert_expr_unknown_column(w, &known, table, target_db, false) {
                 return Err(Error::Error(alloc::format!("no such column: {c}")));
             }
         }
@@ -19150,7 +19182,7 @@ fn validate_upsert_columns(meta: &TableMeta, table: &str, upserts: &[Upsert]) ->
         } = &up.action
         {
             for (_, val) in assignments {
-                if let Some(c) = upsert_expr_unknown_column(val, &known, table) {
+                if let Some(c) = upsert_expr_unknown_column(val, &known, table, target_db, true) {
                     return Err(Error::Error(alloc::format!("no such column: {c}")));
                 }
             }
@@ -19160,7 +19192,7 @@ fn validate_upsert_columns(meta: &TableMeta, table: &str, upserts: &[Upsert]) ->
                 }
             }
             if let Some(w) = where_clause {
-                if let Some(c) = upsert_expr_unknown_column(w, &known, table) {
+                if let Some(c) = upsert_expr_unknown_column(w, &known, table, target_db, true) {
                     return Err(Error::Error(alloc::format!("no such column: {c}")));
                 }
             }

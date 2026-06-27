@@ -86,6 +86,49 @@ fn valid_upsert_still_runs() {
 }
 
 #[test]
+fn three_part_qualifier_in_do_update_validates_against_target_db() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES(1,2)").unwrap();
+    // A wrong database part is rejected, echoing the full three-part name.
+    let mut bad = |sql: &str| c.execute(sql).unwrap_err().to_string();
+    assert!(
+        bad("INSERT INTO t VALUES(1,5) ON CONFLICT(a) DO UPDATE SET b=bad.t.b")
+            .contains("no such column: bad.t.b")
+    );
+    assert!(
+        bad("INSERT INTO t VALUES(1,5) ON CONFLICT(a) DO UPDATE SET b=9 WHERE bad.t.a=1")
+            .contains("no such column: bad.t.a")
+    );
+    // `excluded` can never be database-qualified.
+    assert!(
+        bad("INSERT INTO t VALUES(1,5) ON CONFLICT(a) DO UPDATE SET b=main.excluded.b")
+            .contains("no such column: main.excluded.b")
+    );
+    // The correct `main` qualifier resolves like the bare column.
+    c.execute("INSERT INTO t VALUES(1,5) ON CONFLICT(a) DO UPDATE SET b=main.t.b")
+        .unwrap();
+}
+
+#[test]
+fn three_part_qualifier_on_a_temp_upsert_target_uses_temp() {
+    // The upsert target is swapped into the active `main` slot before execution;
+    // the qualifier must still validate against `temp` (the target's real db).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TEMP TABLE t(a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES(1,2)").unwrap();
+    c.execute("INSERT INTO t VALUES(1,5) ON CONFLICT(a) DO UPDATE SET b=temp.t.b")
+        .unwrap();
+    assert!(c
+        .execute("INSERT INTO t VALUES(1,5) ON CONFLICT(a) DO UPDATE SET b=main.t.b")
+        .unwrap_err()
+        .to_string()
+        .contains("no such column: main.t.b"));
+}
+
+#[test]
 fn matches_sqlite_cli() {
     if !sqlite3_available() {
         eprintln!("sqlite3 CLI not found; skipping");
@@ -128,6 +171,16 @@ fn matches_sqlite_cli() {
         "INSERT INTO t VALUES(1,2) ON CONFLICT(a) WHERE qq>0 DO UPDATE SET b=zz",
         "INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=zz WHERE ww>0",
         "INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET z=1 WHERE ww>0",
+        // three-part `db.table.col`: a correct `main` qualifier resolves, a wrong
+        // one is `no such column: db.t.col`; `excluded` is never db-qualified.
+        "INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=main.t.b",
+        "INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=bad.t.b",
+        "INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=temp.t.b",
+        "INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=main.excluded.b",
+        "INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=9 WHERE main.t.a=1",
+        "INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=9 WHERE bad.t.a=1",
+        "INSERT INTO t VALUES(1,2) ON CONFLICT(a) WHERE main.t.b>0 DO NOTHING",
+        "INSERT INTO t VALUES(1,2) ON CONFLICT(a) WHERE bad.t.b>0 DO NOTHING",
     ] {
         let sql = format!("{b} {tail}");
         assert_eq!(run("sqlite3", &sql), run(g, &sql), "for {sql}");
