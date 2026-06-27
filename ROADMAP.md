@@ -469,6 +469,22 @@ the descent is one general fix that closes all of these. Byte-exact vs `sqlite3`
 3.50.4. A bare row value as a scalar result column (`SELECT (sum(a),1) FROM t` →
 `row value misused`) is a separate row-value-context check, still open.
 
+**`LIMIT`/`OFFSET` is resolved in an empty column scope.** SQLite evaluates a
+`LIMIT`/`OFFSET` expression with *no table columns in scope* — not even a
+correlated outer column — and that resolution runs ahead of every other check in
+the statement. So any column reference inside one is `no such column: NAME`, and
+that wins over an aggregate misuse (`LIMIT sum(a)` → `no such column: a`, not
+`misuse of aggregate function sum()`), over an unknown / wrong-arity function
+(`LIMIT nope(a)` → `no such column: a`), and over a result-column / `WHERE`
+resolution error elsewhere; only a `LIMIT` with no column argument keeps its own
+error (`LIMIT count(*)` → `misuse`, `LIMIT nope()` → `no such function`). graphite
+resolved the limit lazily during evaluation, so it saw the aggregate's misuse (or
+a correlated outer column) before the missing one and silently accepted some
+statements SQLite rejects at prepare time. A single early check in `run_core`
+(`reject_scopeless_column_ref` over the query level's own `LIMIT`/`OFFSET`, not
+descending into a subquery, which has its own scope) closes the top-level *and*
+correlated-subquery cases. Byte-exact vs `sqlite3` 3.50.4.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely
@@ -504,6 +520,15 @@ open work:
     depends on the same correlated-scope column resolution above. Derived tables in
     `FROM`, CTE bodies, and compound (`UNION`) arms are already covered (they
     materialize, which resolves them).
+  - an aggregate inside a window's `OVER` spec (`PARTITION BY`/`ORDER BY`) makes
+    the query an aggregate one in SQLite: `SELECT row_number() OVER (ORDER BY
+    sum(a)) FROM t` is valid (a single group → one row), but graphite reports
+    `misuse of aggregate function sum()`. This is not a lazy-validation gap but a
+    missing window-over-aggregate *semantic*: the over-spec aggregate must be
+    exempted from the misuse check, classify the query as aggregate, **and** be
+    computed over the frame — suppressing the error alone would turn a wrong error
+    into a wrong result. (A window *function* nested in the over spec, `OVER
+    (ORDER BY sum(a) OVER ())`, already matches.)
 - **ALTER-time rejection of an ALTER that breaks a dependent.** An `ALTER` that
   makes a dependent view/trigger unresolvable should be rejected and rolled back;
   graphite leaves the now-broken object. Needs statement-level DDL rollback — a

@@ -13816,6 +13816,24 @@ impl Connection {
         // and misuse check and independent of row production — see
         // `reject_aggregate_arity_in_select`.
         self.reject_aggregate_arity_in_select(sel)?;
+        // A `LIMIT`/`OFFSET` is resolved with no table columns in scope — not even
+        // a correlated outer column — so any column reference in it is `no such
+        // column: NAME`, which SQLite reports ahead of every other resolution
+        // error in the statement (the result columns, `WHERE`, an unknown
+        // function, or an aggregate misuse the same `LIMIT` would otherwise raise:
+        // `LIMIT sum(a)`/`LIMIT nope(a)` → `no such column: a`, while
+        // `LIMIT count(*)`, with no column argument, stays a `misuse`). Checked
+        // here, before the VDBE attempt and every later check, on each query
+        // level's own `LIMIT`/`OFFSET` (a nested `SELECT` carries its own scope
+        // and is not descended). The lazy evaluator would otherwise resolve the
+        // aggregate's misuse, or a correlated outer column, before the missing
+        // one and so silently accept it.
+        if let Some(l) = &sel.limit {
+            reject_scopeless_column_ref(l)?;
+        }
+        if let Some(o) = &sel.offset {
+            reject_scopeless_column_ref(o)?;
+        }
         // Opt-in VDBE fast path (Track B, B7a): when enabled and this block takes
         // no bound parameters, try the experimental engine first and use its
         // result only on success — every unsupported shape, and every error, is
@@ -19378,6 +19396,26 @@ fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, Option<&str>,
             }
         }
         _ => {}
+    }
+}
+
+/// Reject any column reference in a *scopeless* expression — a `LIMIT` or
+/// `OFFSET`, which SQLite evaluates with no table columns in scope (not even a
+/// correlated outer column). The first shallow column reference is therefore
+/// `no such column: NAME`, reported ahead of any aggregate-misuse or
+/// unknown-function error the same expression would otherwise raise. A nested
+/// `SELECT` has its own scope and is not descended (so `LIMIT (SELECT …)` and a
+/// scalar/`IN` subquery limit are untouched).
+fn reject_scopeless_column_ref(e: &Expr) -> Result<()> {
+    let mut err: Option<Error> = None;
+    walk_shallow_columns(e, &mut |schema, table, column, quoted| {
+        if err.is_none() {
+            err = Some(eval::no_such_column(schema, table, column, quoted));
+        }
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
