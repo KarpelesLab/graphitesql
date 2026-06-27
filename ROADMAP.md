@@ -272,8 +272,14 @@ now a `near "KW"` syntax error rather than being mis-parsed — most importantly
 `CREATE TABLE t(a) AS SELECT …` now errors at `AS` (the CTAS form is illegal
 once a column list is present), matching SQLite, instead of pointing at the
 later `SELECT`; a non-reserved word there is still `unknown table option: NAME`
-and a column-less `CREATE TABLE t AS SELECT …` still parses — all byte-exact vs
-`sqlite3` 3.50.4.
+and a column-less `CREATE TABLE t AS SELECT …` still parses; and the
+`json_set`/`json_insert`/`json_replace` family (plus the `jsonb_*` blob
+variants) now follows SQLite's varargs arity exactly — zero arguments yield
+`NULL`, a lone document is a no-op that returns the document unchanged, and an
+*even* argument count is the hard error `json_NAME() needs an odd number of
+arguments` (the message always names the text-output `json_*` form, even for a
+`jsonb_*` call), replacing graphite's old over-strict "requires a document and
+(path, value) pairs" rejection — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the

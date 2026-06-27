@@ -876,9 +876,19 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "json_set" | "json_insert" | "json_replace" | "jsonb_set" | "jsonb_insert"
         | "jsonb_replace" => {
-            if v.len() < 3 || v.len().is_multiple_of(2) {
+            // sqlite: zero args → NULL; an even arg count is a hard error (the
+            // message always names the text-output `json_*` form, even for the
+            // `jsonb_*` blob variants); an odd count is the document followed by
+            // zero or more (path, value) pairs (a bare document is a no-op).
+            if v.is_empty() {
+                return Ok(Value::Null);
+            }
+            if v.len().is_multiple_of(2) {
+                let report = lname
+                    .strip_prefix("jsonb_")
+                    .map_or_else(|| lname.clone(), |rest| alloc::format!("json_{rest}"));
                 return Err(Error::Error(alloc::format!(
-                    "{lname}() requires a document and (path, value) pairs"
+                    "{report}() needs an odd number of arguments"
                 )));
             }
             let mode = if lname.ends_with("set") {
