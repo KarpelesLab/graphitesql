@@ -6880,7 +6880,8 @@ impl Connection {
             return self.exec_delete_inner(del, params);
         }
         let base = self.cte_env.borrow().len();
-        let pushed = self.push_ctes(&del.ctes, params, None, None);
+        let used = cte_mask_from_seeds(&delete_cte_seeds(del), &del.ctes);
+        let pushed = self.push_ctes(&del.ctes, params, None, Some(&used));
         let result = pushed.and_then(|()| self.exec_delete_inner(del, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -7035,7 +7036,8 @@ impl Connection {
             return self.exec_update_inner(upd, params);
         }
         let base = self.cte_env.borrow().len();
-        let pushed = self.push_ctes(&upd.ctes, params, None, None);
+        let used = cte_mask_from_seeds(&update_cte_seeds(upd), &upd.ctes);
+        let pushed = self.push_ctes(&upd.ctes, params, None, Some(&used));
         let result = pushed.and_then(|()| self.exec_update_inner(upd, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -8593,7 +8595,8 @@ impl Connection {
             // An unreferenced CTE is never analyzed by SQLite, so a bad column or
             // table inside it is not an error — skip materializing it entirely.
             // (`used == None` keeps the legacy "materialize all" path for callers
-            // without a reachability mask, e.g. the DML `WITH` paths.)
+            // without a reachability mask; the SELECT and DML `WITH` paths all pass
+            // a mask.)
             if used.is_some_and(|u| !u[i]) {
                 continue;
             }
@@ -21094,6 +21097,19 @@ fn collect_expr_sources(e: &Expr, out: &mut alloc::vec::Vec<alloc::string::Strin
 /// (its own `WITH` list is ignored by [`collect_source_names`]); a used CTE pulls
 /// in any sibling it names, walked to a fixpoint. Returns a `used[i]` mask.
 fn used_cte_mask(body: &Select, ctes: &[Cte]) -> alloc::vec::Vec<bool> {
+    let mut seeds = alloc::vec::Vec::new();
+    collect_source_names(body, &mut seeds);
+    cte_mask_from_seeds(&seeds, ctes)
+}
+
+/// The reachability core behind [`used_cte_mask`]: given the source names the
+/// consuming statement refers to directly (`seeds`), mark which `ctes` are
+/// reachable, closing transitively (a used CTE pulls in siblings it names). Used
+/// by both the `SELECT` path (seeds from the query body) and the `UPDATE`/
+/// `DELETE` paths (seeds from the statement's `SET`/`FROM`/`WHERE`/`ORDER BY`/
+/// `RETURNING`), so an unreferenced leading `WITH` CTE is never analyzed — a bad
+/// column or table inside it is not an error, matching SQLite.
+fn cte_mask_from_seeds(seeds: &[alloc::string::String], ctes: &[Cte]) -> alloc::vec::Vec<bool> {
     let names: alloc::vec::Vec<alloc::string::String> =
         ctes.iter().map(|c| c.name.to_ascii_lowercase()).collect();
     let mut used = alloc::vec![false; ctes.len()];
@@ -21109,9 +21125,7 @@ fn used_cte_mask(body: &Select, ctes: &[Cte]) -> alloc::vec::Vec<bool> {
                 }
             }
         };
-    let mut seeds = alloc::vec::Vec::new();
-    collect_source_names(body, &mut seeds);
-    mark(&seeds, &mut used, &mut stack);
+    mark(seeds, &mut used, &mut stack);
     while let Some(i) = stack.pop() {
         // A CTE body opens its own scope: a nested `WITH` inside it shadows an outer
         // sibling of the same name, so use the scope-aware collector here too.
@@ -21120,6 +21134,74 @@ fn used_cte_mask(body: &Select, ctes: &[Cte]) -> alloc::vec::Vec<bool> {
         mark(&refs, &mut used, &mut stack);
     }
     used
+}
+
+/// Collect the source names an `UPDATE` body references — its `SET` values, the
+/// row-value-subquery assignments, the `… FROM` sources and join `ON`, the
+/// `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET`, and the `RETURNING` projection. Feeds
+/// [`cte_mask_from_seeds`] so an unreferenced leading `WITH` CTE can be skipped.
+/// Must stay exhaustive over expression-bearing fields: a missed reference would
+/// wrongly drop a CTE the statement uses, yielding a spurious `no such table`.
+fn update_cte_seeds(upd: &Update) -> alloc::vec::Vec<alloc::string::String> {
+    let mut out = alloc::vec::Vec::new();
+    for (_, e) in &upd.assignments {
+        collect_expr_sources(e, &mut out);
+    }
+    for (_, sel) in &upd.row_assignments {
+        collect_scoped(sel, &mut out);
+    }
+    if let Some(from) = &upd.from {
+        collect_tableref_sources(&from.first, &mut out);
+        for j in &from.joins {
+            collect_tableref_sources(&j.table, &mut out);
+            if let Some(on) = &j.on {
+                collect_expr_sources(on, &mut out);
+            }
+        }
+    }
+    if let Some(w) = &upd.where_clause {
+        collect_expr_sources(w, &mut out);
+    }
+    for t in &upd.order_by {
+        collect_expr_sources(&t.expr, &mut out);
+    }
+    if let Some(l) = &upd.limit {
+        collect_expr_sources(l, &mut out);
+    }
+    if let Some(o) = &upd.offset {
+        collect_expr_sources(o, &mut out);
+    }
+    for c in &upd.returning {
+        if let ResultColumn::Expr { expr, .. } = c {
+            collect_expr_sources(expr, &mut out);
+        }
+    }
+    out
+}
+
+/// Collect the source names a `DELETE` body references (its `WHERE`/`ORDER BY`/
+/// `LIMIT`/`OFFSET` and `RETURNING`). The `DELETE` counterpart of
+/// [`update_cte_seeds`]; see it for the exhaustiveness requirement.
+fn delete_cte_seeds(del: &Delete) -> alloc::vec::Vec<alloc::string::String> {
+    let mut out = alloc::vec::Vec::new();
+    if let Some(w) = &del.where_clause {
+        collect_expr_sources(w, &mut out);
+    }
+    for t in &del.order_by {
+        collect_expr_sources(&t.expr, &mut out);
+    }
+    if let Some(l) = &del.limit {
+        collect_expr_sources(l, &mut out);
+    }
+    if let Some(o) = &del.offset {
+        collect_expr_sources(o, &mut out);
+    }
+    for c in &del.returning {
+        if let ResultColumn::Expr { expr, .. } = c {
+            collect_expr_sources(expr, &mut out);
+        }
+    }
+    out
 }
 
 /// Count the FROM-clause references (the leading table plus every joined table)

@@ -292,8 +292,13 @@ in the siblings it names), and is scope-aware — a derived subquery's own neste
 `WITH` shadows an outer CTE of the same name, so `WITH a AS (SELECT bad) SELECT *
 FROM (WITH a AS (SELECT 7 x) SELECT x FROM a)` binds the inner `a` and leaves the
 outer one unanalyzed; duplicate `WITH` names and syntax errors still fire
-regardless of use. (DML `WITH` — `WITH … UPDATE`/`DELETE` — still materializes
-all of its CTEs; the unused-skip is wired only on the SELECT path so far.) And
+regardless of use. The same unused-skip now covers **DML `WITH`** too (`WITH …
+UPDATE`/`DELETE`): the reachability mask is seeded from the statement's `SET`
+values, `… FROM` sources, `WHERE`/`ORDER BY` and `RETURNING` (the `update_cte_seeds`/
+`delete_cte_seeds` collectors feeding the shared `cte_mask_from_seeds`), so `WITH u
+AS (SELECT nope) UPDATE t SET a = 2` and an unused infinite recursive CTE on a
+`DELETE` are no longer analyzed — while a *used* CTE with a fault still errors and a
+duplicate `WITH` name is still rejected. And
 **`likelihood(X, prob)`** is now validated at prepare time, not per row: SQLite
 checks during analysis that the call has exactly two arguments and that the
 probability is a floating-point literal in `0.0..=1.0` (`exprProbability`), so
