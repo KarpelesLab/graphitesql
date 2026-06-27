@@ -13614,7 +13614,102 @@ impl Connection {
         })
     }
 
+    /// Reject a built-in aggregate call with the wrong number of arguments in
+    /// any of `sel`'s clauses, at prepare time. SQLite resolves a function's
+    /// arity during analysis — before it decides whether the call is misused or
+    /// out of place — so `sum(a,a)`, `avg()`, `count(1,2)` error with `wrong
+    /// number of arguments to function NAME()` in every clause and even over an
+    /// empty/fully-filtered table, *ahead* of the placement checks (`misuse of
+    /// aggregate …`, `aggregate functions are not allowed in the GROUP BY
+    /// clause`). graphite's per-group evaluator only caught the arity when a
+    /// group was actually produced, and those placement checks otherwise fired
+    /// first. Running this at the top of `run_core` (before the VDBE attempt and
+    /// before any reject/placement check) reproduces SQLite's ordering.
+    fn reject_aggregate_arity_in_select(&self, sel: &Select) -> Result<()> {
+        let check = |e: &Expr| self.reject_aggregate_arity(e);
+        for rc in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                check(expr)?;
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            check(w)?;
+        }
+        // HAVING in a non-aggregate query is itself rejected ("HAVING clause on
+        // a non-aggregate query") ahead of any arity check, so only validate the
+        // HAVING expression in a genuine aggregate context.
+        if let Some(h) = &sel.having {
+            if !sel.group_by.is_empty() || self.has_result_aggregate(sel) {
+                check(h)?;
+            }
+        }
+        for g in &sel.group_by {
+            check(g)?;
+        }
+        for t in &sel.order_by {
+            check(&t.expr)?;
+        }
+        if let Some(from) = &sel.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    check(on)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The arity guard for one expression — see `reject_aggregate_arity_in_select`.
+    /// Walks `e` (stopping at subquery boundaries, which validate themselves) for
+    /// each plain-aggregate call (`over: None`); the bounds mirror
+    /// `eval_aggregated`'s exactly so a statically-rejected call is one the
+    /// evaluator would also reject. A registered UDAF carries its own arity, and
+    /// `min`/`max` count as aggregates only at one argument (the multi-arg forms
+    /// are scalar) — both excluded by `func::is_aggregate_call`.
+    fn reject_aggregate_arity(&self, e: &Expr) -> Result<()> {
+        let mut err: Option<Error> = None;
+        window::visit(e, &mut |n| {
+            if err.is_some() {
+                return;
+            }
+            if let Expr::Function {
+                name,
+                args,
+                star,
+                over: None,
+                ..
+            } = n
+            {
+                let lname = name.to_ascii_lowercase();
+                if self.aggregates.contains_key(&lname)
+                    || !func::is_aggregate_call(&lname, args.len(), *star)
+                {
+                    return;
+                }
+                let max_args = match lname.as_str() {
+                    "group_concat" | "string_agg" | "json_group_object" | "jsonb_group_object" => 2,
+                    _ => 1,
+                };
+                let too_many = args.len() > max_args;
+                let too_few = (args.is_empty() && lname != "count")
+                    || (lname == "string_agg" && args.len() < 2)
+                    || ((lname == "json_group_object" || lname == "jsonb_group_object")
+                        && args.len() < 2);
+                if too_many || too_few {
+                    err = Some(Error::Error(alloc::format!(
+                        "wrong number of arguments to function {lname}()"
+                    )));
+                }
+            }
+        });
+        err.map_or(Ok(()), Err)
+    }
+
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
+        // Aggregate arity is resolved at prepare time, ahead of every placement
+        // and misuse check and independent of row production — see
+        // `reject_aggregate_arity_in_select`.
+        self.reject_aggregate_arity_in_select(sel)?;
         // Opt-in VDBE fast path (Track B, B7a): when enabled and this block takes
         // no bound parameters, try the experimental engine first and use its
         // result only on success — every unsupported shape, and every error, is

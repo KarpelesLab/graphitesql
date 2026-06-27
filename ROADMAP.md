@@ -316,7 +316,18 @@ aggregate/window in source order (matching SQLite's resolver), and runs in the
 result list, `HAVING`, and `ORDER BY` — plus the VDBE window-dispatch path, which
 bypasses `run_core` — while leaving scalar wrappers (`abs(count(*))`,
 `max(sum(a), 1)`), an aggregate-as-window (`sum(a) OVER ()`), and subquery-level
-aggregates untouched. All byte-exact vs `sqlite3` 3.50.4.
+aggregates untouched. And **aggregate arity** is now validated during analysis,
+ahead of every placement/misuse check and independent of row production: SQLite
+reports `wrong number of arguments to function NAME()` for `sum()`, `sum(a, a)`,
+`count(1, 2)` and the like even in a clause where the aggregate would otherwise
+be a misuse (`WHERE sum()`, `ORDER BY sum(a, a)`, `GROUP BY avg(a, a)`) and even
+over an empty / fully-filtered table where graphite's lazy evaluator used to
+reach neither check. `reject_aggregate_arity_in_select` walks every clause
+(result list / WHERE / HAVING / GROUP BY / ORDER BY / join `ON`) at the top of
+`run_core` — before the VDBE fast-path — applying SQLite's bound counts (`count`
+0–1; `group_concat`/`string_agg`/`json_group_object` up to 2; the rest exactly
+1) while leaving scalar multi-arg `min`/`max` alone. All byte-exact vs `sqlite3`
+3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
