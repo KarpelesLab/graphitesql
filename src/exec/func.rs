@@ -108,8 +108,16 @@ fn fts5_match_columns(
 pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Result<Value> {
     let lname = name.to_ascii_lowercase();
     if is_aggregate_call(&lname, args.len(), star) {
+        // Reaching the scalar evaluator means this aggregate sits in a position
+        // that forbids one — most commonly nested inside another aggregate's
+        // argument or FILTER (`sum(count(a))`), where the inner call is evaluated
+        // per row as a scalar. SQLite reports this as `misuse of aggregate
+        // function NAME()`, naming the inner call. (Row-filtering positions —
+        // WHERE, join ON, ORDER BY of a non-aggregate query, UPDATE/DELETE
+        // expressions — are intercepted earlier at prepare time so they error even
+        // over an empty table; see `reject_misused_aggregate`.)
         return Err(Error::Error(alloc::format!(
-            "aggregate function {name} used outside an aggregate context"
+            "misuse of aggregate function {name}()"
         )));
     }
     if star {

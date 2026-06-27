@@ -399,6 +399,25 @@ text-preserving CREATE-text edits).
     (`tests/window_misuse.rs`). Follow-up: a window nested in an aggregate
     *argument* in a result column (`sum(row_number() OVER ())`) is still accepted
     over an empty table — a distinct rule not yet hoisted.
+  - **Aggregate misuse in ORDER BY and join ON is rejected at prepare time
+    (done).** Two more positions that filter/precede grouping: an aggregate in the
+    `ORDER BY` of a non-aggregate query (one with no GROUP BY/HAVING and no
+    aggregate result column — an aggregate query may legitimately order by one),
+    and an aggregate (or window) in a join `ON`. graphite accepted both over an
+    empty/filtered table and otherwise emitted its generic lazy message. They are
+    now caught up front in sqlite's position-specific wordings: `misuse of
+    aggregate: f()` for ORDER BY (the colon form, as sqlite resolves it where
+    aggregates are otherwise allowed) and `misuse of aggregate function f()` for a
+    join `ON`. The `ON` check runs before the join is materialized, so a populated
+    table reports the same message as an empty one
+    (`tests/aggregate_order_join_misuse.rs`).
+  - **Nested-aggregate wording matches sqlite (done).** An aggregate whose
+    argument or `FILTER` clause contains another aggregate (`sum(count(a))`,
+    `count(*) FILTER(WHERE sum(a)>0)`) is a misuse — the inner call would be
+    evaluated per row as a scalar. graphite emitted its own `aggregate function
+    NAME used outside an aggregate context`; it now reports sqlite's `misuse of
+    aggregate function NAME()`, naming the inner call. (sqlite never produced the
+    old wording, so this only tightens parity.) `tests/nested_aggregate_misuse.rs`.
 
 ### Track B — Query planner, statistics & the VDBE
 
