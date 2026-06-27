@@ -14615,6 +14615,17 @@ impl Connection {
             reject_misused_aggregate(e, false)?;
             reject_filter_on_non_aggregate(e, &is_agg)?;
         }
+        // A `RETURNING` clause projects one row per modified row, so it is never an
+        // aggregate query and offers no window context either. SQLite rejects an
+        // aggregate or window function here (`misuse of aggregate function …()` /
+        // `misuse of window function …()`); a window-only builtin called without
+        // `OVER` is the same misuse. (INSERT … RETURNING is validated on a separate
+        // path and, like SQLite, is not subject to this.)
+        for e in returning {
+            reject_misused_window(e)?;
+            reject_window_without_over(e)?;
+            reject_misused_aggregate(e, false)?;
+        }
         Ok(())
     }
 

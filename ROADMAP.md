@@ -397,6 +397,19 @@ query` first — which also fixed a pre-existing divergence where an `OVER` wind
 in a non-aggregate query's `HAVING` reported the window misuse ahead of the
 HAVING-context error. Byte-exact vs `sqlite3` 3.50.4 across ~30 permutations.
 
+An **aggregate or window function in a `DELETE`/`UPDATE` `RETURNING` clause** is
+now rejected at prepare time with `misuse of aggregate function NAME()` /
+`misuse of window function NAME()`. A `RETURNING` clause projects one row per
+modified row, so it is never an aggregate query and offers no window context; a
+window-only builtin called there without `OVER` is the same misuse. graphite
+evaluated `RETURNING` lazily and so silently produced no rows over an empty
+(fully deleted/updated) table — the same eager-vs-lazy gap, here closed by
+extending the existing `validate_dml_refs` walk (which already rejected these in
+`WHERE`/`SET`) to the `RETURNING` exprs. A missing column still wins (`no such
+column: zzz`), and `INSERT … RETURNING` is — as in SQLite — *not* subject to this
+(it is validated on a separate path). Byte-exact vs `sqlite3` 3.50.4 across ~24
+permutations.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely
