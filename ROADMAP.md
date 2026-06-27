@@ -588,6 +588,13 @@ text-preserving CREATE-text edits).
     expression. A bare identifier such as `abc` is now a no-op (value `0`)
     instead of raising `no such column: abc`
     (`tests/pragma_header_value.rs`).
+  - **`AUTOINCREMENT` outside `PRIMARY KEY` is a syntax error (done).** The
+    keyword is reserved and only legal right after a column-level
+    `PRIMARY KEY [ASC|DESC]`; graphite used to swallow `a AUTOINCREMENT` /
+    `a INTEGER AUTOINCREMENT` / `a AUTOINCREMENT PRIMARY KEY` by treating it as a
+    type word, where sqlite raises `near "AUTOINCREMENT": syntax error`. The
+    parser now stops the type-name scan at the keyword so the same error fires
+    (`tests/create_table_autoincrement.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

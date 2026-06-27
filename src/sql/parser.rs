@@ -2785,7 +2785,7 @@ fn is_column_constraint_kw(tok: Option<&Token>) -> bool {
     matches!(tok, Some(Token::Word(w)) if matches!(
         w.to_ascii_lowercase().as_str(),
         "constraint" | "primary" | "not" | "null" | "unique" | "default" | "collate"
-            | "check" | "references" | "generated" | "as"
+            | "check" | "references" | "generated" | "as" | "autoincrement"
     ))
 }
 
