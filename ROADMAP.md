@@ -366,6 +366,18 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   own row through the in-process `execute` path — graphite keeps the row where
   SQLite rolls back the statement. Statement-level atomicity on trigger abort is
   a larger, separate change.)*
+- **`PRAGMA journal_size_limit` getter — DONE.** Returned no row; now reports the
+  journal-shrink cap (default -1 = no limit) and round-trips a set value,
+  clamping negatives to -1, like sqlite. Advisory (graphite does not honor the
+  cap), mirroring `analysis_limit`/`busy_timeout`. New `journal_size_limit:
+  Cell<i64>` field; getter arm in `pragma_value`, setter arm in `exec_pragma`.
+  `tests/pragma_journal_size_limit.rs`. *(Two pre-existing, broader residuals
+  surfaced while probing, NOT fixed: (1) a `PRAGMA x=N` setter's row echo is
+  dropped by the CLI's setter routing for all stored pragmas — `analysis_limit`,
+  `busy_timeout`, `journal_size_limit` — sqlite echoes the value; the library
+  `query` path does echo. (2) `PRAGMA trusted_schema` still returns no row;
+  its default is the build-time `SQLITE_TRUSTED_SCHEMA` option, so it isn't
+  safely differential against CI's pinned build.)*
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a

@@ -166,6 +166,11 @@ pub struct Connection {
     /// has no cross-process lock manager, so this never blocks; it is stored and
     /// reported back like sqlite (which clamps a negative value to 0).
     busy_timeout: core::cell::Cell<i64>,
+    /// `PRAGMA journal_size_limit` — the cap (bytes) sqlite would shrink a
+    /// rollback/WAL journal back to (-1 = no limit, the default). graphite's
+    /// journal handling does not honor it, so it is advisory; it is stored and
+    /// reported back like sqlite, which clamps any negative value to -1.
+    journal_size_limit: core::cell::Cell<i64>,
     /// `PRAGMA secure_delete` (0=off, 1=on, 2=fast), round-tripped like sqlite.
     /// When non-zero, freed pages are zeroed (the pager honors it); a
     /// per-connection runtime setting, not persisted in the file.
@@ -304,6 +309,7 @@ impl Connection {
             cache_size: core::cell::Cell::new(-2000),
             analysis_limit: core::cell::Cell::new(0),
             busy_timeout: core::cell::Cell::new(0),
+            journal_size_limit: core::cell::Cell::new(-1),
             secure_delete: core::cell::Cell::new(0),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
@@ -343,6 +349,7 @@ impl Connection {
             cache_size: core::cell::Cell::new(-2000),
             analysis_limit: core::cell::Cell::new(0),
             busy_timeout: core::cell::Cell::new(0),
+            journal_size_limit: core::cell::Cell::new(-1),
             secure_delete: core::cell::Cell::new(0),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
@@ -1935,6 +1942,19 @@ impl Connection {
                 ]],
             }),
             "wal_autocheckpoint" => Ok(single("wal_autocheckpoint", Value::Integer(1000))),
+            // `journal_size_limit` stores/reports the journal-shrink cap. The set
+            // form clamps any negative value to -1 (the "no limit" sentinel) and
+            // echoes the result; the plain form reads it back — exactly like sqlite.
+            "journal_size_limit" => {
+                if let Some(e) = &p.value {
+                    let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(&Params::default()))?);
+                    self.journal_size_limit.set(if v < 0 { -1 } else { v });
+                }
+                Ok(single(
+                    "journal_size_limit",
+                    Value::Integer(self.journal_size_limit.get()),
+                ))
+            }
             "max_page_count" => Ok(single("max_page_count", Value::Integer(4294967294))),
             "locking_mode" => Ok(single("locking_mode", Value::Text("normal".into()))),
             // Recognized boolean / legacy no-op pragmas: graphite does not act on
@@ -4592,6 +4612,14 @@ impl Connection {
             if let Some(e) = &p.value {
                 let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
                 self.busy_timeout.set(v.max(0));
+            }
+        } else if p.name.eq_ignore_ascii_case("journal_size_limit") {
+            // Advisory (graphite does not honor the cap); store it, clamping a
+            // negative value to -1 (the "no limit" sentinel), so a later
+            // `PRAGMA journal_size_limit` reads it back like sqlite.
+            if let Some(e) = &p.value {
+                let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                self.journal_size_limit.set(if v < 0 { -1 } else { v });
             }
         } else if p.name.eq_ignore_ascii_case("secure_delete") {
             // sqlite maps the argument to 0 (off), 2 (the `fast` keyword only), or
