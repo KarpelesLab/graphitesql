@@ -5293,6 +5293,28 @@ impl Connection {
             }
             return Err(Error::Error(format!("trigger {} already exists", ct.name)));
         }
+        // SQLite refuses to attach a trigger to a system table. The schema tables
+        // (sqlite_master / sqlite_schema / sqlite_temp_master) always count; any
+        // other `sqlite_`-prefixed table counts only when it physically exists.
+        // This outranks the missing-table, timing-mismatch, and body-qualifier
+        // checks below but is itself outranked by the duplicate-name check above.
+        if ct
+            .table
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("sqlite_"))
+        {
+            let always = ["sqlite_master", "sqlite_schema", "sqlite_temp_master"]
+                .iter()
+                .any(|n| ct.table.eq_ignore_ascii_case(n));
+            let exists = self.schema.table(&ct.table).is_some()
+                || self
+                    .temp_db
+                    .as_ref()
+                    .is_some_and(|t| t.schema.table(&ct.table).is_some());
+            if always || exists {
+                return Err(Error::Error("cannot create trigger on system table".into()));
+            }
+        }
         // The target may be a table or (for INSTEAD OF triggers) a view. A temp
         // trigger may fire on a main table, so when the temp database is the active
         // schema also consult the swapped-out catalog (which then holds main).

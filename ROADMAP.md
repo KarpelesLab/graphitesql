@@ -381,6 +381,17 @@ the qualified target silently. The check sits after the trigger's own
 missing-target / timing-mismatch / duplicate-name errors so those still win.
 Byte-exact vs `sqlite3` 3.50.4.
 
+A **`CREATE TRIGGER` whose target is a system table** is now rejected with
+SQLite's `cannot create trigger on system table`. The schema tables
+(`sqlite_master` / `sqlite_schema` / `sqlite_temp_master`) always count as system
+tables; any other `sqlite_`-prefixed table counts only once it physically exists
+(so `sqlite_sequence` is rejectable only after an `AUTOINCREMENT` table brings it
+into being, and an absent `sqlite_foo` still falls through to `no such table`).
+The check outranks the missing-table, timing-mismatch and body-qualifier errors
+but is itself outranked by the duplicate-name error. graphite used to report `no
+such table` for the schema tables and even *succeeded* on an existing
+`sqlite_sequence`. Byte-exact vs `sqlite3` 3.50.4.
+
 An **aggregate or window function in a `CREATE INDEX`** key expression or
 partial-index `WHERE` clause is now rejected at prepare time with SQLite's
 `misuse of aggregate function NAME()` / `misuse of window function NAME()`.
