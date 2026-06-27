@@ -278,6 +278,21 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   makes a dependent view/trigger unresolvable should be rejected and rolled back;
   graphite leaves the now-broken object. Needs statement-level DDL rollback — a
   writer savepoint around `exec_alter`, mirroring `run_dml_atomic`.
+- **JSON string-escape provenance.** SQLite preserves a JSON string's *source
+  escapes* verbatim in `json()` text and in JSONB, where graphite decodes them to
+  the literal character. `json('"A"')` → sqlite `"A"` (graphite `"A"`),
+  `"\/"` → `"\/"` (graphite `"/"`), and the JSON5 `"\x41"` → text `"A"` /
+  JSONB **TEXT5** `5C783431` (graphite decodes to plain `A`/TEXT). The *value*
+  side is already correct — `json_extract` decodes in both. SQLite's model keeps
+  the raw string bytes tagged by escape class (TEXT / **TEXTJ** when JSON escapes
+  are present / **TEXT5** for a JSON5-only form), normalizing `\x`→`\u` only when
+  rendering to JSON *text* (not JSONB). Number provenance already works this way
+  (`Json::Real(_, Some(src))`); the symmetric fix is to give `Json::Str` an
+  optional raw-source-body slot + escape-class tag, emit it in `write()`
+  (with `\x`→`\u`) and in `write_jsonb`/`size_jsonb` (raw body, TEXT5/TEXTJ tag),
+  and decode it for `to_sql`/`json_extract`. The cost is mechanical churn:
+  `Json::Str(String)`'s arity changes at every match/construct site. A focused
+  pass, not a quick edit.
 - **Two residual parse-path non-issues (not worth chasing):** `UPDATE SET a=1`
   flags `a` where SQLite flags `SET` (reserved-word leniency), and `BEGIN
   TRANSACTION FOO` silently accepts the trailing name.
