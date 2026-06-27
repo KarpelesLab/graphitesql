@@ -12575,14 +12575,7 @@ impl Connection {
         // aggregate used as a window function — `sum(x) OVER …` — falls through to
         // the aggregate path). SQLite rejects a wrong count: `row_number(1)`,
         // `lag()`, `ntile()`, `nth_value(1)` are all "wrong number of arguments".
-        let win_arity: Option<(usize, usize)> = match lname.as_str() {
-            "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" => Some((0, 0)),
-            "ntile" | "first_value" | "last_value" => Some((1, 1)),
-            "nth_value" => Some((2, 2)),
-            "lag" | "lead" => Some((1, 3)),
-            _ => None,
-        };
-        if let Some((lo, hi)) = win_arity {
+        if let Some((lo, hi)) = builtin_window_arity(&lname) {
             if args.len() < lo || args.len() > hi {
                 return Err(Error::Error(alloc::format!(
                     "wrong number of arguments to function {lname}()"
@@ -13895,8 +13888,15 @@ impl Connection {
         for g in &sel.group_by {
             reject_misused_window(g)?;
         }
+        // A window misuse in HAVING is only reported once HAVING itself is legal:
+        // on a non-aggregate query SQLite emits `HAVING clause on a non-aggregate
+        // query` first (see below), so defer both window checks to a genuine
+        // aggregate context (a GROUP BY or a result-column aggregate).
         if let Some(h) = &sel.having {
-            reject_misused_window(h)?;
+            if !sel.group_by.is_empty() || self.has_result_aggregate(sel) {
+                reject_misused_window(h)?;
+                reject_window_without_over(h)?;
+            }
         }
 
         // An aggregate function in the WHERE clause is a misuse: WHERE filters
@@ -13940,6 +13940,7 @@ impl Connection {
                 if let ResultColumn::Expr { expr, .. } = rc {
                     reject_filter_on_non_aggregate(expr, &is_agg)?;
                     reject_invalid_window_function(expr, &is_agg)?;
+                    reject_window_without_over(expr)?;
                     reject_star_argument(expr)?;
                     reject_invalid_likelihood(expr)?;
                     reject_nested_aggregate_arg(expr)?;
@@ -13947,6 +13948,7 @@ impl Connection {
             }
             if let Some(w) = &sel.where_clause {
                 reject_filter_on_non_aggregate(w, &is_agg)?;
+                reject_window_without_over(w)?;
                 reject_star_argument(w)?;
                 reject_invalid_likelihood(w)?;
             }
@@ -13964,12 +13966,14 @@ impl Connection {
             }
             for g in &sel.group_by {
                 reject_filter_on_non_aggregate(g, &is_agg)?;
+                reject_window_without_over(g)?;
                 reject_star_argument(g)?;
                 reject_invalid_likelihood(g)?;
             }
             for t in &sel.order_by {
                 reject_filter_on_non_aggregate(&t.expr, &is_agg)?;
                 reject_invalid_window_function(&t.expr, &is_agg)?;
+                reject_window_without_over(&t.expr)?;
                 reject_star_argument(&t.expr)?;
                 reject_invalid_likelihood(&t.expr)?;
                 reject_nested_aggregate_arg(&t.expr)?;
@@ -13978,6 +13982,7 @@ impl Connection {
                 for j in &from.joins {
                     if let Some(on) = &j.on {
                         reject_filter_on_non_aggregate(on, &is_agg)?;
+                        reject_window_without_over(on)?;
                         reject_star_argument(on)?;
                         reject_invalid_likelihood(on)?;
                     }
@@ -19919,20 +19924,58 @@ fn reject_misused_window(e: &Expr) -> Result<()> {
 /// solely as window functions, so `OVER` is mandatory; everything else that may
 /// carry `OVER` must be an aggregate.
 fn is_builtin_window_function(lname: &str) -> bool {
-    matches!(
-        lname,
-        "row_number"
-            | "rank"
-            | "dense_rank"
-            | "percent_rank"
-            | "cume_dist"
-            | "ntile"
-            | "first_value"
-            | "last_value"
-            | "nth_value"
-            | "lag"
-            | "lead"
-    )
+    builtin_window_arity(lname).is_some()
+}
+
+/// The `(min, max)` argument count for each built-in ranking/value window
+/// function, or `None` if `lname` is not one. The membership doubles as
+/// [`is_builtin_window_function`]; the arity drives both the `OVER`-clause
+/// evaluator's arity guard and the prepare-time misuse check.
+fn builtin_window_arity(lname: &str) -> Option<(usize, usize)> {
+    match lname {
+        "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" => Some((0, 0)),
+        "ntile" | "first_value" | "last_value" => Some((1, 1)),
+        "nth_value" => Some((2, 2)),
+        "lag" | "lead" => Some((1, 3)),
+        _ => None,
+    }
+}
+
+/// Reject a built-in window-only function (`row_number`, `rank`, `lag`, …) used
+/// without an `OVER` clause. These exist solely as window functions, so calling
+/// one as a plain scalar is `misuse of window function NAME()` in SQLite. The
+/// scalar evaluator already reports this per row, but only when a row is reached;
+/// over an empty (or fully filtered) table the call is never evaluated, so the
+/// error must also be raised at prepare time to match SQLite. A wrong argument
+/// count is diagnosed first (`ntile()` → `wrong number of arguments to function
+/// ntile()`), matching SQLite's order. The walk stops at subquery boundaries, so
+/// a window call inside a nested `SELECT` belongs to that query level.
+fn reject_window_without_over(e: &Expr) -> Result<()> {
+    let mut err: Option<Error> = None;
+    window::visit(e, &mut |n| {
+        if err.is_some() {
+            return;
+        }
+        if let Expr::Function {
+            name,
+            args,
+            over: None,
+            ..
+        } = n
+        {
+            let lname = name.to_ascii_lowercase();
+            if let Some((lo, hi)) = builtin_window_arity(&lname) {
+                err = Some(if args.len() < lo || args.len() > hi {
+                    Error::Error(alloc::format!(
+                        "wrong number of arguments to function {lname}()"
+                    ))
+                } else {
+                    Error::Error(alloc::format!("misuse of window function {lname}()"))
+                });
+            }
+        }
+    });
+    err.map_or(Ok(()), Err)
 }
 
 /// Reject a function call carrying `OVER` that is neither a built-in window

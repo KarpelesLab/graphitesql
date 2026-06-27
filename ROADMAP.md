@@ -382,6 +382,21 @@ and right …`; graphite desugars `VALUES` into a `SELECT` with no surviving mar
 so distinguishing it needs an `is_values` flag threaded through the `Select` AST —
 deferred as a cosmetic message on a malformed-query edge.)*
 
+A **built-in window-only function used without `OVER`** (`row_number()`,
+`rank()`, `lag(a)`, … called as a plain scalar) is now rejected at prepare time
+with `misuse of window function NAME()`. graphite's per-row evaluator already
+reported this when a row was reached, but over an empty or fully filtered table
+the call was never evaluated, so the error was silently skipped (the same
+eager-vs-lazy gap closed earlier for column resolution and aggregate misuse). A
+wrong argument count is diagnosed first (`ntile()` → `wrong number of arguments
+to function ntile()`), matching SQLite's order. The check walks every scalar
+position (result columns, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, join `ON`),
+stopping at subquery boundaries. In `HAVING` the misuse is reported only once the
+clause is legal — a non-aggregate query emits `HAVING clause on a non-aggregate
+query` first — which also fixed a pre-existing divergence where an `OVER` window
+in a non-aggregate query's `HAVING` reported the window misuse ahead of the
+HAVING-context error. Byte-exact vs `sqlite3` 3.50.4 across ~30 permutations.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely
