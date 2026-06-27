@@ -366,25 +366,28 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   own row through the in-process `execute` path — graphite keeps the row where
   SQLite rolls back the statement. Statement-level atomicity on trigger abort is
   a larger, separate change.)*
-- **Function resolution in CHECK / generated-column expressions at CREATE — DONE.**
-  SQLite resolves every scalar function call in a `CHECK` or generated-column
-  expression at CREATE time: an unknown name is `no such function: NAME` and a
-  wrong argument count is `wrong number of arguments to function NAME()`, both
-  before the table exists. graphite used to accept the table and fail only when a
-  row was evaluated. `reject_unresolved_functions` now dry-resolves each call with
-  NULL stand-in arguments (count preserved, so the arity guard fires) against the
+- **Function resolution in CHECK / generated columns / index expressions at
+  CREATE — DONE.** SQLite resolves every scalar function call in a `CHECK`,
+  generated-column, or `CREATE INDEX` key / partial-index `WHERE` expression at
+  CREATE time: an unknown name is `no such function: NAME` and a wrong argument
+  count is `wrong number of arguments to function NAME()`, both before the object
+  exists. graphite used to accept the object and fail only when a row was
+  evaluated. `reject_unresolved_functions` dry-resolves each call with NULL
+  stand-in arguments (count preserved, so the arity guard fires) against the
   scalar evaluator, surfacing only those two resolution errors and snapshotting/
   restoring the RNG so a legal non-deterministic call (`random()` in a `CHECK`)
-  leaves no trace. Runs after the existing column-resolution check.
-  `tests/check_function_resolution.rs`. *(Residuals, NOT fixed: (1) when a CHECK
-  contains **both** an unknown function and an unknown column with the function
-  strictly to the left — `CHECK(unknownfn(a) AND zzz>0)` — sqlite reports the
-  function but graphite reports the column, because column resolution is a
+  leaves no trace. Wired into `exec_create_table` (both CHECK loops + generated
+  columns) and `exec_create_index` (each key expr + the partial `WHERE`), after
+  the existing column-resolution / non-deterministic checks.
+  `tests/check_function_resolution.rs`. *(Residuals, NOT fixed: (1) when one
+  expression contains **both** an unknown function and an unknown column with the
+  function strictly to the left — `CHECK(unknownfn(a) AND zzz>0)` — sqlite reports
+  the function but graphite reports the column, because column resolution is a
   separate earlier pass rather than one interleaved post-order walk; the common
-  single-fault cases, incl. `unknownfn(zzz)` → the column, all match. (2) Function
-  resolution in **CREATE INDEX** expressions / partial-index `WHERE`, and the
-  distinct ALTER-TABLE-ADD-COLUMN-CHECK wording `unknown function: NAME()`, are
-  still unvalidated — a natural next increment reusing the same helper.)*
+  single-fault cases, incl. `unknownfn(zzz)` → the column, all match. (2) The
+  distinct `ALTER TABLE … ADD COLUMN … CHECK(unknownfn())` wording — sqlite says
+  `unknown function: NAME()`, not `no such function: NAME` — is still
+  unvalidated.)*
 - **`PRAGMA journal_size_limit` getter — DONE.** Returned no row; now reports the
   journal-shrink cap (default -1 = no limit) and round-trips a set value,
   clamping negatives to -1, like sqlite. Advisory (graphite does not honor the

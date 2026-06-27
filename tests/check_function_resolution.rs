@@ -119,6 +119,52 @@ fn unknown_column_inside_unknown_function_reports_the_column() {
     );
 }
 
+/// Run `setup` then `sql` on one connection and return `sql`'s error message.
+fn err2(setup: &str, sql: &str) -> String {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute(setup).unwrap();
+    let e = c.execute(sql).unwrap_err().to_string();
+    e.trim_start_matches("error: ").to_string()
+}
+
+#[test]
+fn unknown_function_in_index_key_is_rejected() {
+    assert_eq!(
+        err2("CREATE TABLE t(a)", "CREATE INDEX i ON t(unknownfn(a))"),
+        "no such function: unknownfn"
+    );
+}
+
+#[test]
+fn unknown_function_in_partial_index_where_is_rejected() {
+    assert_eq!(
+        err2(
+            "CREATE TABLE t(a)",
+            "CREATE INDEX i ON t(a) WHERE unknownfn(a)"
+        ),
+        "no such function: unknownfn"
+    );
+}
+
+#[test]
+fn wrong_argument_count_in_index_key_is_rejected() {
+    assert_eq!(
+        err2("CREATE TABLE t(a)", "CREATE INDEX i ON t(abs(a, a))"),
+        "wrong number of arguments to function abs()"
+    );
+}
+
+#[test]
+fn known_function_index_is_built_and_usable() {
+    // A valid expression index over a real function is created and queryable.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("CREATE INDEX i ON t(abs(a))").unwrap();
+    c.execute("INSERT INTO t VALUES (-5), (3)").unwrap();
+    let r = c.query("SELECT a FROM t WHERE abs(a) = 5").unwrap();
+    assert_eq!(r.rows.len(), 1);
+}
+
 #[test]
 fn matches_sqlite_cli() {
     if !sqlite3_available() {
@@ -153,6 +199,10 @@ fn matches_sqlite_cli() {
         "CREATE TABLE t(a, CHECK(length()))",
         "CREATE TABLE t(a, CHECK(abs(a) < 10))",
         "CREATE TABLE t(a, CHECK(unknownfn(zzz)))",
+        "CREATE TABLE t(a); CREATE INDEX i ON t(unknownfn(a))",
+        "CREATE TABLE t(a); CREATE INDEX i ON t(a) WHERE unknownfn(a)",
+        "CREATE TABLE t(a); CREATE INDEX i ON t(abs(a, a))",
+        "CREATE TABLE t(a); CREATE INDEX i ON t(abs(a))",
     ];
     for sql in cases {
         let s = Command::new("sqlite3")

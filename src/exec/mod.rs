@@ -7277,6 +7277,7 @@ impl Connection {
             if let Some(col) = unknown_column_ref(p, &known, true, Some(&ci.table)) {
                 return Err(Error::Error(format!("no such column: {col}")));
             }
+            self.reject_unresolved_functions(p)?;
         }
         // Each index *key* expression may reference only the table's own columns
         // (rowid is not allowed in a key). A `table.col` qualifier naming the
@@ -7297,6 +7298,7 @@ impl Connection {
                         "the \".\" operator prohibited in index expressions".into(),
                     ));
                 }
+                self.reject_unresolved_functions(key)?;
             }
         }
         let (cols, key_exprs, colls) = self.index_key_spec(&tmeta, ci)?;
