@@ -2835,7 +2835,6 @@ fn is_reserved_after_expr(w: &str) -> bool {
             | "having"
             | "order"
             | "limit"
-            | "offset"
             | "join"
             | "inner"
             | "left"

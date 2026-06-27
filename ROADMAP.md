@@ -339,6 +339,17 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   through `run_sql_batch` in turn (exiting non-zero on the first error, like the
   shell) instead of `rest.join(" ")`. A single combined argument with internal
   `;` is unaffected. `tests/cli_multi_arg.rs`.
+- **`OFFSET` is not a reserved keyword — DONE.** SQLite treats `offset` as an
+  ordinary identifier everywhere except immediately inside a `LIMIT` clause, so
+  `SELECT 1 offset` (an implicit result-column alias), `… offset` table aliases,
+  and `offset` column names all parse. graphite classified `offset` as
+  end-of-expression-reserved (alongside `limit`/`order`/`where`), rejecting the
+  implicit-alias case. Dropping `offset` from `is_reserved_after_expr` in
+  `src/sql/parser.rs` fixes it while keeping `SELECT 1 OFFSET 2` an error (the
+  `2` is unexpected once `offset` is taken as the alias) — matching sqlite.
+  `tests/offset_alias.rs`. *(Residual, opposite direction: graphite is still too
+  lenient on `AS <reserved-keyword>` aliases — it accepts `SELECT 1 AS limit`,
+  which sqlite rejects. Low harm, as it only admits otherwise-invalid SQL.)*
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a
