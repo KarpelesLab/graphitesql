@@ -10742,7 +10742,20 @@ impl Connection {
             None => sel,
         };
         let Some(from) = &sel.from else {
-            return Ok(()); // SELECT with no FROM => no scan node
+            // A `FROM`-less SELECT scans a single synthetic constant row. SQLite
+            // renders it `SCAN CONSTANT ROW` (this also covers a single-row
+            // `VALUES(...)`, which desugars to a no-compound, no-FROM select).
+            // We only emit it for the cases we can render byte-exactly: no
+            // compound continuation (a multi-row VALUES / UNION desugars to a
+            // compound, which sqlite renders as its own tree) and no subquery in
+            // any clause (sqlite appends SCALAR/LIST SUBQUERY + bloom-filter
+            // nodes we don't model yet).
+            if sel.compound.is_empty() && !select_no_from_has_subquery(sel) {
+                let id = *next_id;
+                *next_id += 1;
+                out.push((id, parent, String::from("SCAN CONSTANT ROW")));
+            }
+            return Ok(());
         };
         let label = eqp_label(&from.first);
         // A virtual table scans through its module, not a b-tree — render sqlite's
@@ -18796,6 +18809,22 @@ fn expr_has_subquery(e: &Expr) -> bool {
         }
     });
     found
+}
+
+/// Whether any clause of a `FROM`-less `SELECT` contains a subquery. Used by
+/// `EXPLAIN QUERY PLAN`: a constant-row select with a subquery gets extra
+/// `SCALAR`/`LIST SUBQUERY` (and bloom-filter) nodes from sqlite that we don't
+/// model, so we only render the bare `SCAN CONSTANT ROW` when there are none.
+fn select_no_from_has_subquery(sel: &Select) -> bool {
+    sel.columns.iter().any(|c| match c {
+        ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+        ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+    }) || sel.where_clause.as_ref().is_some_and(expr_has_subquery)
+        || sel.group_by.iter().any(expr_has_subquery)
+        || sel.having.as_ref().is_some_and(expr_has_subquery)
+        || sel.order_by.iter().any(|t| expr_has_subquery(&t.expr))
+        || sel.limit.as_ref().is_some_and(expr_has_subquery)
+        || sel.offset.as_ref().is_some_and(expr_has_subquery)
 }
 
 /// The verbatim name of the first built-in aggregate call in `e` (a plain
