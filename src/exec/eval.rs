@@ -712,10 +712,23 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             if matches!(v, Value::Null) {
                 return Ok(Value::Null);
             }
-            let set = match ctx.subqueries {
-                Some(s) => s.column(select, ctx)?,
+            let rows = match ctx.subqueries {
+                Some(s) => s.rows(select, ctx)?,
                 None => return Err(Error::Unsupported("IN (SELECT …) in this context")),
             };
+            // A scalar `x IN (SELECT …)` requires the subquery to yield exactly
+            // one column; SQLite rejects `1 IN (SELECT 1, 2)` ("sub-select
+            // returns 2 columns - expected 1") rather than taking the first.
+            let mut set = Vec::with_capacity(rows.len());
+            for mut row in rows {
+                if row.len() != 1 {
+                    return Err(Error::Error(alloc::format!(
+                        "sub-select returns {} columns - expected 1",
+                        row.len()
+                    )));
+                }
+                set.push(row.swap_remove(0));
+            }
             // Membership uses the left operand's collation, as in SQLite.
             let coll = key_collation(expr, ctx);
             // SQLite applies a comparison affinity to each `x IN (SELECT y)` test,

@@ -515,6 +515,15 @@ text-preserving CREATE-text edits).
     walker now pushes a literal `%` when the `%` is the last byte; a `%` trailed
     by flags/width that then runs off the end (`%5`, `%-`) still yields nothing,
     matching sqlite (`tests/printf_trailing_percent.rs`).
+  - **Scalar `IN (SELECT …)` rejects a multi-column subquery (done).** A scalar
+    `x [NOT] IN (SELECT …)` requires the subquery to return exactly one column;
+    sqlite rejects `1 IN (SELECT 1, 2)` as `sub-select returns 2 columns -
+    expected 1` (the same message its row-value `IN` and scalar `(SELECT …)`
+    paths already give). graphite collapsed the subquery to its first column and
+    silently accepted the extras. The scalar `InSelect` path now materializes
+    full rows and rejects any wider than one column; single-column subqueries
+    (multi-row and table-backed included) are unchanged
+    (`tests/in_select_column_count.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
