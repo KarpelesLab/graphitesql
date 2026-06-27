@@ -147,10 +147,12 @@ progress in parallel.
 **Done:** the full SELECT/join/CTE/window/subquery surface; UPSERT/`RETURNING`/
 row values/`STRICT`/generated columns/`UPDATE … FROM`/`INSERT … SELECT`; the
 scalar/aggregate/date-time/`printf`/JSON/JSONB libraries; type affinity,
-collation, column-name spans; the standing **error-parity** sweep (reject what
-sqlite rejects, byte-exact messages); and cross-object **ALTER** propagation
-(**A-rn1…A-rn4**: RENAME TABLE→views/FKs, RENAME COLUMN→FKs/views/triggers,
-text-preserving CREATE-text edits).
+collation, column-name spans; cross-object **ALTER** propagation (RENAME
+TABLE→views/FKs, RENAME COLUMN→FKs/views/triggers, text-preserving CREATE-text
+edits); and a broad **error-parity** sweep — prepare-time column/aggregate/
+window/row-value resolution, DDL/DML/JSON/PRAGMA/`printf` message wording, and
+lexer/parser error framing (`near "TOKEN"`, `incomplete input`, `unrecognized
+token: "X"`) — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 
@@ -158,709 +160,85 @@ text-preserving CREATE-text edits).
   The token rewrite bails (leaves the body unchanged — never corrupts) on a bare
   column ref that is ambiguous across multiple base sources, because the AST has
   no per-column-ref source span.
-  - **A-rn3-edge-1** — add a source span (byte range) to `Expr::Column`.
-  - **A-rn3-edge-2** — use the span for scope-aware rename (resolve each bare ref
-    to its owning table, rewrite only the matching ones).
-- **Error-parity (standing).** No known leftovers; the sweep continues against new
-  construct families and files any new divergence here.
-  - **Eager column resolution (done for the common case).** SQLite resolves every
-    column reference at prepare time, so `SELECT nope FROM t` errors `no such
-    column: nope` even when the table is empty or `WHERE` filters out every row.
-    The tree-walker resolves lazily (per row), so a result that reached no row
-    used to swallow the error. `validate_columns_exist` now runs an eager check on
-    a top-level, window-free block whose every `FROM` source is a plain base
-    table/view joined by `ON`/cross joins (no `NATURAL`/`USING`): it resolves every
-    column ref in the projection/`WHERE`/join-`ON`, a `table.*` whose qualifier
-    names no source (`no such table: x`), and any *qualified* ref in
-    `GROUP BY`/`HAVING`/`ORDER BY` (a `t.col` there is never an alias or ordinal).
-    `DELETE`/`UPDATE` resolve their `WHERE` and `SET`-value columns eagerly too
-    (`validate_dml_refs`, no-`FROM` updates only). Matches sqlite for that surface
-    (`tests/eager_column_resolution.rs`).
-  - **INSERT column-resolution messages (done).** A bad `INSERT` now reports
-    sqlite's exact wording rather than graphite's old generic text: an unknown
-    column in the list → `table T has no column named C`; a value-count mismatch
-    with an explicit list → `M values for N columns`; and a bare/`SELECT` insert
-    → `table T has N columns but M values were supplied` (where `N` counts the
-    non-generated target columns). The `WITHOUT ROWID` path now also catches the
-    implicit-list count mismatch it previously let slide. Both rowid and
-    `WITHOUT ROWID` paths share `insert_count_mismatch`; verified against sqlite3
-    in `tests/eager_column_resolution.rs`.
-  - **UPDATE SET tuple-width message (done).** `UPDATE t SET (a,b) = (1)` (a
-    parallel-expression tuple narrower/wider than the column list) reported a
-    graphite-specific parse error with a byte location; it now raises sqlite's
-    semantic `N columns assigned M values` — the same wording the row-value
-    `(c1,…) = (SELECT …)` path already used (`tests/update_row_subquery.rs`).
-  - **Multiple-PRIMARY-KEY message (done).** `CREATE TABLE` with two primary keys
-    now quotes the table name like sqlite — `table "t" has more than one primary
-    key` — for both the column-level and table-level forms
-    (`tests/create_validation.rs`).
-  - **JSON non-text / NULL paths (done).** A path argument to any json1 path
-    function is now coerced to text before validation (matching sqlite), so an
-    `INTEGER`/`REAL`/`BLOB` path that does not spell a `$`-rooted path raises
-    `bad JSON path: '<text>'` instead of silently resolving to NULL —
-    `json_extract(j, 1)`, `json_set(j, 5, …)`, etc. And a NULL path in
-    `json_extract` and `json_remove` now short-circuit the whole call to NULL,
-    scanning left to right (a malformed path *before* the NULL still errors
-    first; for `json_remove`, removals already applied are discarded)
-    (`tests/json_surface.rs`).
-  - **`strftime` defaults & format coercion (done).** `strftime(FORMAT)` with no
-    time-value now defaults to 'now' (like `date()`/`time()`/`datetime()`)
-    instead of returning NULL, and a non-text format is coerced to text before
-    rendering (`strftime(123)` → `123`, `strftime(x'41')` → `A`); only a NULL
-    format yields NULL (`tests/strftime_null.rs`).
-  - **`likelihood()` probability validation (done).** The second argument to
-    `likelihood(X, Y)` must be a floating-point *literal* in `0.0..=1.0`, checked
-    against the parsed AST like sqlite's `exprProbability`: an integer literal
-    (even `0`/`1`), a negative, a string, a compound expression (`0.5+0.1`), or a
-    column reference is now rejected with `second argument to likelihood() must
-    be a constant between 0.0 and 1.0`, while `0.5`/`.5`/`1e0`/`(0.5)` are
-    accepted. `likelihood` was dropped from the VDBE pure-function list so the
-    all-constant case still sees the source expression (`tests/likelihood_probability.rs`).
-    *Remaining (both cases):* graphite validates lazily, so an unreached row
-    (`SELECT likelihood(a,2) FROM empty`) is not rejected at prepare time as
-    sqlite would; a statement-level prepare pass would be needed.
-  - **DISTINCT-aggregate arity message (done).** A `DISTINCT` aggregate with a
-    number of arguments other than one now reports sqlite's `DISTINCT aggregates
-    must have exactly one argument`, checked after the function's upper arity
-    bound (so `count(DISTINCT 1,2)`/`sum(DISTINCT 1,2)` still report "wrong number
-    of arguments") but before the lower bound (so `count(DISTINCT)`, whose 0-arg
-    form is valid as `count(*)`, and `group_concat(DISTINCT a,b)` report the
-    DISTINCT message) (`tests/distinct_aggregate_arity.rs`).
-  - **`count()` with no arguments behaves as `count(*)` (done).** The bare
-    no-argument `count()` now tallies every row of the group (NULLs included),
-    matching sqlite, in scalar, `GROUP BY`, and windowed (`count() OVER (…)`)
-    positions — previously graphite rejected it with "wrong number of arguments"
-    (`tests/count_no_args.rs`).
-  - **`string_agg` arity and JSON-group-aggregate recognition (done).**
-    `string_agg(X)` now requires its separator (exactly two arguments, the
-    one-argument form reporting `wrong number of arguments to function
-    string_agg()` — even with `DISTINCT`, since the arity check precedes the
-    DISTINCT one), matching sqlite rather than treating it as a `group_concat`
-    alias. And the JSON group aggregates (`json_group_array`/`json_group_object`
-    and their `jsonb_` variants), which have no scalar form, are now recognized
-    as aggregates at *any* arity, so a wrong count reports `wrong number of
-    arguments` from the aggregate guard instead of falling through to
-    `no such function` (`tests/agg_name_arity.rs`).
-  - **Aggregate in `GROUP BY` is rejected (done).** An aggregate function
-    anywhere inside a `GROUP BY` term now reports sqlite's dedicated `aggregate
-    functions are not allowed in the GROUP BY clause` — including the nested
-    (`1 + count(*)`) and output-alias-rewritten (`SELECT count(*) AS c … GROUP BY
-    c`) forms, and the `GROUP BY max(a)` over a real table that lazy per-row
-    evaluation previously accepted silently. The check runs after alias/positional
-    resolution; aggregates remain legal in `HAVING`/`ORDER BY`
-    (`tests/group_by_aggregate.rs`).
-  - **Window function in `WHERE`/`HAVING` is "misuse" (done).** A call carrying
-    an `OVER` clause — including an aggregate such as `sum(x) OVER ()`, not just
-    the ranking functions — now reports `misuse of window function NAME()` when
-    it appears in `WHERE`/`HAVING`, matching sqlite, instead of falling through
-    to the generic "aggregate … used outside an aggregate context". The per-row
-    evaluator only ever sees an `OVER` call in a disallowed position, since valid
-    window calls are pre-computed and substituted out first
-    (`tests/window_misuse.rs`).
-  - **Row value in a scalar context is "row value misused" (done).** A row value
-    `(a, b, …)` used where a single scalar is expected — bare in the SELECT list,
-    as an arithmetic operand, a function argument, or a bare `WHERE` predicate —
-    now reports sqlite's `row value misused` instead of graphite's own wording
-    ("row value used where a single value is expected"). The legal row contexts
-    (`(a,b) = (c,d)`, `(a,b) < (c,d)`, `(a,b) IN (…)`) are unaffected
-    (`tests/row_value_misused.rs`).
-    *Remaining:* a *multi-column subquery* in a comparison (`(SELECT 1,2) = 1`)
-    should likewise report `row value misused`, but graphite still reports
-    `sub-select returns 2 columns - expected 1` there — the column-count message
-    is correct in the SELECT-list scalar context (`SELECT (SELECT 1,2)`) but the
-    comparison operand needs context-aware detection to switch wording.
-    *Remaining:* extend it past the conservative scope — derived-table/subquery
-    scopes, `NATURAL`/`USING` coalesced names, and *bare* `GROUP BY`/`HAVING`/
-    `ORDER BY` refs (need output-alias/ordinal awareness) are still left to lazy
-    resolution; and ALTER-time re-validation that *rejects* an ALTER making a
-    dependent view/trigger unresolvable needs statement-level DDL rollback (a
-    writer savepoint around `exec_alter`, like `run_dml_atomic`).
-  - **Duplicate CTE name within one `WITH` clause is rejected (done).** Two CTEs
-    sharing a name in the same `WITH` list (`WITH x AS (…), x AS (…) …`) now
-    report sqlite's `duplicate WITH table name: NAME` (case-insensitive, naming
-    the duplicate occurrence) instead of being silently accepted, across
-    `SELECT`/`UPDATE`/`DELETE` and with `RECURSIVE`. A same name re-used in a
-    *nested* `WITH` is a separate scope and stays legal
-    (`tests/duplicate_cte_name.rs`).
-  - **An unrecognized `PRAGMA` name is silently ignored (done).** sqlite raises
-    no error for an unknown pragma — it returns no rows and moves on. graphite's
-    write path already no-oped unknown setters (`PRAGMA made_up = 1`), but the
-    read/function forms (`PRAGMA made_up`, `PRAGMA made_up(1)`) errored with
-    "not yet implemented: this PRAGMA". The `run_pragma` catch-all now returns an
-    empty result instead, so a probing tool/ORM that reads an unsupported pragma
-    sees sqlite's behaviour (`tests/unknown_pragma_ignored.rs`).
-  - **Rowid allocation no longer panics at the `i64::MAX` boundary (done).**
-    Inserting a row whose auto-assigned rowid would exceed `i64::MAX` used to
-    panic with "attempt to add with overflow". It now matches sqlite: an
-    `AUTOINCREMENT` table fails with `SQLITE_FULL` ("database or disk is full")
-    since AUTOINCREMENT never reuses a rowid, while a plain rowid / `INTEGER
-    PRIMARY KEY` table picks a random free rowid and succeeds. `next_rowid`
-    saturates and the new `auto_rowid` helper detects the exhausted range; the
-    result still passes `PRAGMA integrity_check` (`tests/rowid_overflow.rs`).
-  - **`trim`/`ltrim`/`rtrim` with a NULL trim-set return NULL (done).** sqlite
-    propagates a NULL second argument like any other NULL (`trim(X, NULL)` is
-    NULL); graphite previously treated it as an empty trim-set and returned the
-    subject unchanged. The one-arg forms and a NULL subject were already NULL,
-    and a non-NULL or empty-string set still trims as before
-    (`tests/trim_null_set.rs`).
-  - **`substr(X, NULL [, …])` returns NULL (done).** A NULL start position now
-    propagates like any other NULL argument; graphite previously coerced it to 0
-    and returned the whole string. The NULL *length* argument already yielded
-    NULL, and a real start still slices (`tests/substr_null_start.rs`).
-  - **The `sqlite_` object-name prefix is reserved (done).** A user
-    `CREATE TABLE/INDEX/VIEW/TRIGGER/VIRTUAL TABLE` — or an `ALTER … RENAME TO` —
-    naming a new object with the `sqlite_` prefix is now rejected with
-    `object name reserved for internal use: NAME` (case-insensitive on the prefix,
-    the name echoed as written), like sqlite; graphite previously created such
-    objects silently. The check guards only the user statement-dispatch path, so
-    the internal catalogs (`sqlite_sequence` via AUTOINCREMENT, `sqlite_stat1` via
-    ANALYZE) are still created on demand (`tests/reserved_object_name.rs`).
-  - **Trigger-target kind is enforced (done).** `INSTEAD OF` triggers may attach
-    only to a view, and `BEFORE`/`AFTER` triggers only to a real table; sqlite
-    rejects the mismatch at CREATE (`cannot create INSTEAD OF trigger on table:
-    NAME` / `cannot create BEFORE|AFTER trigger on view: NAME`). graphite
-    previously created the trigger silently. The same change matches sqlite's
-    exact wording for a direct write to a view, `cannot modify NAME because it is
-    a view` (was `… — it is a view`) (`tests/trigger_target_kind.rs`).
-  - **A parenthesized `VALUES` clause is a subquery expression (done).**
-    `(VALUES(1),(2))` is now accepted as a scalar subquery (yielding the first
-    row's first column), exactly like a parenthesized `SELECT`; the expression
-    parser previously rejected `VALUES` after `(`
-    (`tests/values_scalar_subquery.rs`).
-  - **`FOREIGN KEY` column-count arity is validated at CREATE (done).** A
-    table-level `FOREIGN KEY(a,b) REFERENCES x(y)` whose explicit parent-column
-    list differs in length from the child list is rejected with `number of
-    columns in foreign key does not match the number of columns in the referenced
-    table`, and a column-level `a REFERENCES x(y,z)` naming more than one parent
-    column with `foreign key on a should reference only one column of table x` —
-    both structural checks sqlite makes before the parent table need even exist.
-    An empty parent list (`REFERENCES x`) still defers to the parent's PRIMARY
-    KEY. graphite previously accepted every malformed form silently
-    (`tests/fk_arity_validation.rs`).
-  - **A partial-index predicate may reference only the table's columns (done).**
-    `CREATE INDEX … WHERE p` whose predicate names an unknown column is now
-    rejected at CREATE with `no such column: NAME` (own columns and the rowid
-    remain valid, and the bad reference is found even nested in a function call);
-    graphite previously built the index silently, leaving a predicate that could
-    never be evaluated (`tests/partial_index_unknown_column.rs`).
-  - **Two DDL error messages aligned verbatim (done).** A `WITHOUT ROWID` table
-    declared with no PRIMARY KEY now reports `PRIMARY KEY missing on table NAME`
-    (was `WITHOUT ROWID table must have a PRIMARY KEY`), and
-    `ALTER TABLE … RENAME COLUMN <missing> …` quotes the unknown column,
-    `no such column: "NAME"`, like the DROP COLUMN variant already did
-    (`tests/ddl_error_wording.rs`).
-  - **A column `DEFAULT` must be constant (done).** A default that references any
-    column — `b DEFAULT (a)`, `DEFAULT (a + 1)`, `DEFAULT (max(a, 1))` — is now
-    rejected at CREATE and `ALTER TABLE … ADD COLUMN` with `default value of
-    column [NAME] is not constant`, while literals, constant arithmetic,
-    `CURRENT_*`, and function calls (including non-deterministic `random()`)
-    stay valid, exactly as sqlite classifies them. graphite previously stored
-    the column-referencing default silently (`tests/default_constant.rs`).
-  - **Qualified (`table.col`) references in DDL expressions are validated (done).**
-    A reference whose qualifier names the object being defined and whose column
-    exists *resolves*, but a generated-column or index-*key* expression then
-    rejects the dotted form — `the "." operator prohibited in generated columns`
-    / `… in index expressions` — exactly as sqlite does even though the bare
-    column would be valid; a CHECK constraint and a partial-index `WHERE` accept
-    the same dotted reference. Any other qualifier, or a correctly-qualified but
-    unknown column, is reported `no such column: q.c` (the prohibition fires only
-    when the ref actually resolves). graphite previously matched on the bare
-    column name alone, so it silently accepted `b AS (t.a)` / `INDEX … (t.a)` and
-    mis-reported `t.nope` as `no such column: nope` (`tests/dotted_column_refs.rs`).
-  - **UPSERT column references are validated at prepare time (done).** An
-    `INSERT … ON CONFLICT … DO …` clause now rejects an unknown column with
-    `no such column: …` (qualified when written `q.c`), in sqlite's resolution
-    order: per clause, the conflict-target columns, then the target `WHERE` (a
-    partial-index predicate — table columns + rowid only), then for a `DO UPDATE`
-    the assignment value expressions, the assigned target columns, and the update
-    `WHERE`. The value/`WHERE` expressions additionally resolve the `excluded`
-    pseudo-table (`excluded.<col>`, incl. `excluded.rowid`) and `table.`-qualified
-    refs. graphite previously ignored every bad reference and ran the statement
-    (`tests/upsert_unknown_column.rs`).
-  - **Aggregate-in-WHERE misuse is rejected at prepare time (done).** An
-    aggregate function in a row-filtering clause (a `WHERE`, an `IN (…)` list, an
-    `UPDATE` assignment value) is a misuse — aggregation runs after filtering.
-    graphite evaluated the predicate lazily per row, so it emitted a non-sqlite
-    message and, over an empty or fully-filtered table, *silently accepted* the
-    statement (`DELETE FROM t WHERE sum(a)>0` ran). It is now caught up front in
-    sqlite's two wordings: `misuse of aggregate: f()` when the statement is itself
-    an aggregate query (GROUP BY/HAVING or an aggregate in the result columns),
-    `misuse of aggregate function f()` otherwise (plain SELECT WHERE, UPDATE,
-    DELETE). An aggregate nested in a subquery (`WHERE x IN (SELECT sum(y) …)`) is
-    untouched (`tests/aggregate_misuse.rs`).
-  - **Window-function misuse is rejected at prepare time (done).** A window
-    function (any call with an `OVER` clause) is valid only in the result columns
-    and `ORDER BY` of its query; in a `WHERE`, `GROUP BY`, `HAVING`, or any
-    `UPDATE`/`DELETE` expression it is a misuse. graphite's per-row evaluator
-    produced the right `misuse of window function f()` message only once a row
-    reached evaluation, so over an empty/fully-filtered table it *silently
-    accepted* the statement. It is now caught up front in all those positions,
-    matching sqlite's single wording; a window nested in a subquery is untouched
-    (`tests/window_misuse.rs`). Follow-up: a window nested in an aggregate
-    *argument* in a result column (`sum(row_number() OVER ())`) is still accepted
-    over an empty table — a distinct rule not yet hoisted.
-  - **Aggregate misuse in ORDER BY and join ON is rejected at prepare time
-    (done).** Two more positions that filter/precede grouping: an aggregate in the
-    `ORDER BY` of a non-aggregate query (one with no GROUP BY/HAVING and no
-    aggregate result column — an aggregate query may legitimately order by one),
-    and an aggregate (or window) in a join `ON`. graphite accepted both over an
-    empty/filtered table and otherwise emitted its generic lazy message. They are
-    now caught up front in sqlite's position-specific wordings: `misuse of
-    aggregate: f()` for ORDER BY (the colon form, as sqlite resolves it where
-    aggregates are otherwise allowed) and `misuse of aggregate function f()` for a
-    join `ON`. The `ON` check runs before the join is materialized, so a populated
-    table reports the same message as an empty one
-    (`tests/aggregate_order_join_misuse.rs`).
-  - **Nested-aggregate wording matches sqlite (done).** An aggregate whose
-    argument or `FILTER` clause contains another aggregate (`sum(count(a))`,
-    `count(*) FILTER(WHERE sum(a)>0)`) is a misuse — the inner call would be
-    evaluated per row as a scalar. graphite emitted its own `aggregate function
-    NAME used outside an aggregate context`; it now reports sqlite's `misuse of
-    aggregate function NAME()`, naming the inner call. (sqlite never produced the
-    old wording, so this only tightens parity.) `tests/nested_aggregate_misuse.rs`.
-  - **`FILTER` on a non-aggregate function is rejected at prepare time (done).** A
-    `FILTER (WHERE …)` clause restricts which rows feed an aggregation, so it is
-    only meaningful on an aggregate (or window-aggregate) call. Attached to an
-    ordinary scalar function (`abs(a) FILTER(WHERE …)`) it is a misuse: sqlite
-    reports `FILTER may not be used with non-aggregate NAME()` (the name echoed
-    exactly as written). graphite parsed the clause and silently ignored it,
-    returning the bare function value. It is now caught up front in every
-    position — result columns, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, join
-    `ON`, and `UPDATE`/`DELETE` expressions — while `FILTER` on a real aggregate
-    or a window-aggregate (`sum(a) FILTER(…) OVER ()`) stays legal
-    (`tests/filter_non_aggregate.rs`).
-  - **Non-integer `LIMIT`/`OFFSET` errors on the VDBE scan path too (done).** A
-    `LIMIT`/`OFFSET` value carries `OP_MustBeInt` semantics: it must be an
-    integer, an integer-valued real, or text that parses as one, else a
-    `datatype mismatch`. The interpreter path already enforced this, but the VDBE
-    single-table scan path folded the constant with a lossy `to_i64` (truncating
-    `1.9` → 1, parsing `'2abc'` → 2, treating NULL/blob as 0), so `SELECT a FROM t
-    LIMIT 1.9` silently succeeded where `SELECT 1 LIMIT 1.9` already errored. The
-    constant folder now returns "not an integer" for a fractional real,
-    non-numeric text, NULL, or blob, bailing to the interpreter which raises the
-    same `datatype mismatch` (`tests/limit_must_be_int.rs`).
-  - **Premature end-of-input reports `incomplete input` (done).** When SQL is a
-    valid prefix that runs out of tokens mid-parse (`SELECT`, `SELECT 1 WHERE 1=1
-    AND`, `CREATE TABLE t(`, `INSERT INTO t VALUES`), sqlite reports a single
-    message — `incomplete input` — distinct from a syntax error at a real token.
-    graphite leaked its internal parser state (`expected an expression, found
-    None`, `expected LParen (at end of input)`, `expected keyword values (at end
-    of input)`, …). The parser's central `err()` helper and the three
-    `advance()`-based primaries (identifier, object name, expression) now all map
-    the end-of-token-stream case to `incomplete input`, matching sqlite in every
-    statement position while a syntax error at an actual token is unchanged
-    (`tests/incomplete_input.rs`).
-  - **Syntax errors render as `near "TOKEN": syntax error` (done).** A wrong
-    token mid-statement is reported by sqlite as `near "TOKEN"`, where `TOKEN` is
-    the *verbatim source text* of the offending token. graphite leaked its
-    recursive-descent expectation instead (`expected keyword key (near byte 25,
-    found RParen)`, `unrecognized statement`, `unexpected keyword "X" in
-    expression`, …). The central `err()` helper now routes through a new
-    `syntax_error(idx)` that slices the token's source span (`&self.source[s..e]`,
-    so a `RParen` renders as `)`, a word as typed), and the three `advance()`-based
-    primaries point at the just-consumed token. This flipped 22 of 25 probed
-    syntax positions to byte-exact parity. The NATURAL-join ON/USING conflict is
-    kept as its own semantic message (`a NATURAL join may not have an ON or USING
-    clause`, both cases collapsed as sqlite does), and `NATURAL <non-join>` maps
-    to `incomplete input`. Residual non-issues: the reserved-word-leniency
-    parse-path divergence (`UPDATE SET a=1` → sqlite flags `SET`, graphite `a`)
-    and sqlite silently accepting a trailing name on `BEGIN TRANSACTION FOO`
-    (`tests/syntax_error_near_token.rs`).
-  - **Lexing failures render as `unrecognized token: "X"` (done).** A stray
-    character (`^`, `#`), an unterminated literal (`'abc`, `x'1`), a malformed
-    blob (`x'zz'`), or a number run with a trailing identifier (`123abc`, `0xGG`,
-    `12e3f`) is reported by sqlite as `unrecognized token: "X"`, where `X` is the
-    verbatim source from the token's start to where the lexer gave up. graphite
-    leaked its lexer state (`unexpected character '^' at byte 7`, `unterminated
-    string literal at byte 11`, `invalid hex in blob literal at byte 12`, …). The
-    tokenizer now records each token's start and a single `unrecognized()` helper
-    slices `&src[tok_start..pos]`; the number-suffix check first consumes the
-    whole adjacent run so `123abc` is echoed entire (not `123`). An unterminated
-    block comment runs off the end and is `incomplete input`, like any premature
-    end. All 24 probed lexer positions are byte-exact vs sqlite
-    (`tests/tokenizer_unrecognized_token.rs`).
-  - **`json_each`/`json_tree` argument-count parity (done).** The table-valued
-    JSON walkers are capped at two arguments (the document and an optional path);
-    sqlite rejects a third up front as `too many arguments on json_each() - max 2`
-    (likewise `json_tree`). graphite silently ignored the extras and produced
-    rows. It also raised its own `json_each() requires a JSON argument` for the
-    zero-argument form, where sqlite treats a missing or `NULL` document as an
-    empty walk (no rows, no error). Both now match: `> 2` args is the structural
-    error before any evaluation, and zero-args / `NULL` yields no rows
-    (`tests/json_each_arg_count.rs`).
-  - **`RANGE`-offset window frame requires one `ORDER BY` (done).** A `RANGE`
-    frame with a value offset bound (`<n> PRECEDING`/`<n> FOLLOWING`, not
-    `UNBOUNDED` or `CURRENT ROW`) compares the `ORDER BY` value ± the offset, so
-    sqlite requires exactly one `ORDER BY` expression — zero or several both
-    raise `RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY
-    expression`. graphite ignored the constraint and produced rows. The guard
-    sits in `compute_window` (covering both the VDBE and tree-walker window
-    paths) and only fires for `FrameMode::Range` with a `Preceding`/`Following`
-    bound; `ROWS`/`GROUPS` offsets are positional and stay exempt
-    (`tests/window_range_offset_order_by.rs`).
-  - **`->`/`->>` reject a malformed text document (done).** The JSON arrow
-    operators treat their left operand as a document; a text (or numeric) value
-    that is not valid JSON is `malformed JSON` in sqlite — the same error
-    `json_extract` already raised — not a silent NULL. graphite swallowed the
-    parse failure (`'' -> 1`, `'notjson' -> 0`, `'{bad' -> 'a'` all returned
-    NULL). `json::arrow` now errors when a non-BLOB document fails to parse;
-    valid JSON, numeric scalars (`5 -> 0` → NULL), and `NULL` documents are
-    unchanged. (BLOB operands are SQLite's binary JSONB, not yet modeled by the
-    arrow path, so they keep the existing lenient behaviour — a separate gap.)
-    (`tests/json_arrow_malformed.rs`)
-  - **`printf`/`format` trailing `%` is literal (done).** A `%` that is the final
-    character of the format string — with no conversion specifier after it — is
-    emitted literally by sqlite (`printf('%')` → `%`, `printf('abc%')` → `abc%`,
-    `printf('%d%', 5)` → `5%`); graphite dropped the dangling `%`. The format
-    walker now pushes a literal `%` when the `%` is the last byte; a `%` trailed
-    by flags/width that then runs off the end (`%5`, `%-`) still yields nothing,
-    matching sqlite (`tests/printf_trailing_percent.rs`).
-  - **Scalar `IN (SELECT …)` rejects a multi-column subquery (done).** A scalar
-    `x [NOT] IN (SELECT …)` requires the subquery to return exactly one column;
-    sqlite rejects `1 IN (SELECT 1, 2)` as `sub-select returns 2 columns -
-    expected 1` (the same message its row-value `IN` and scalar `(SELECT …)`
-    paths already give). graphite collapsed the subquery to its first column and
-    silently accepted the extras. The scalar `InSelect` path now materializes
-    full rows and rejects any wider than one column; single-column subqueries
-    (multi-row and table-backed included) are unchanged
-    (`tests/in_select_column_count.rs`).
-  - **`GROUP BY`/`HAVING`/`ORDER BY` reject a missing column (done).** sqlite
-    resolves every reference at prepare time, so `SELECT count(*) FROM t GROUP
-    BY a HAVING zzz` is `no such column: zzz` whether or not the table is empty.
-    graphite resolved these clauses lazily — reporting the wrong error (`misuse
-    of aggregate function count()`) or silently returning no rows.
-    `validate_columns_exist` now checks bare (not only qualified) names in these
-    clauses against the FROM scope, exempting an explicit output alias (which
-    takes precedence) and positional ordinals. An output alias, an ordinal, and
-    a base column the projection does not select all stay valid; a derived-table
-    (`FROM (SELECT …)`) source remains lazy, as before
-    (`tests/group_having_order_missing_column.rs`).
-  - **`UPDATE`/`DELETE … ORDER BY` rejects a missing column (done).** The
-    update/delete-`LIMIT` extension's `ORDER BY` is resolved at prepare time by
-    sqlite, so a non-column sort key is `no such column` even over an empty
-    table; graphite validated only the `WHERE`/`SET` expressions eagerly and
-    left `ORDER BY` to lazy per-row resolution (silently accepted when no row
-    matched). `ORDER BY` there has no alias scope, so it now feeds
-    `validate_dml_refs` alongside `WHERE`/`SET`; `LIMIT`/`OFFSET` column refs
-    already errored (`tests/dml_order_by_missing_column.rs`).
-  - **`rowid`/`_rowid_`/`oid` accepted as an INSERT target column (done).**
-    sqlite lets an INSERT column list name the rowid alias to supply the rowid
-    explicitly (`INSERT INTO t(rowid, a) VALUES(5, 1)`); graphite rejected it as
-    `table … has no column named rowid`. The alias now maps to the rowid (or, on
-    a table with an INTEGER PRIMARY KEY, to that column so the IPK coercion and
-    "last write wins" both fall out for free). The supplied value gets INTEGER
-    affinity then an integer check — `'5'`/`5.0` → `5`, `NULL` → auto-assign,
-    `1.5`/`'x'`/blob → `datatype mismatch` — matching the IPK path. A real column
-    that shadows the name keeps winning, and WITHOUT ROWID tables still reject it
-    (`tests/insert_rowid_column.rs`).
-  - **`ALTER TABLE … DROP COLUMN` refusal parity (done).** graphite refused to
-    drop a column whenever the table carried *any* CHECK, UNIQUE, FOREIGN KEY,
-    generated column, or index — even one that did not reference the column —
-    and emitted ad-hoc messages. It now mirrors sqlite: a column-level PRIMARY
-    KEY/UNIQUE (and an INTEGER PRIMARY KEY, or a column named by a table-level
-    PRIMARY KEY) is refused outright (`cannot drop PRIMARY KEY/UNIQUE column:
-    "x"`); every other obstruction is detected the way sqlite does it — by
-    regenerating the schema without the column and checking whether the remainder
-    still references it — so a referencing table CHECK / generated column / table
-    UNIQUE yields `error in table t after drop column: no such column: x`, a
-    referencing table FK yields `… unknown column "x" in foreign key
-    definition`, and a referencing explicit index yields `error in index i after
-    drop column: no such column: x`. A constraint that does not name the column
-    (and the dropped column's own constraints) now drops cleanly, byte-compatible
-    and `integrity_check`-clean (`tests/drop_column_constraints.rs`).
-  - **`CREATE VIEW v(c1, …)` column-count mismatch rejected on use (done).** An
-    explicit view column list must declare exactly as many columns as the view's
-    body produces; sqlite accepts the `CREATE VIEW` either way and then errors
-    `expected N columns for 'v' but got M` whenever the view is referenced (FROM,
-    subquery, or join). graphite silently ignored the mismatch and returned the
-    body's columns unrenamed. The check now fires at view expansion in both the
-    main and temp/attached paths (`tests/view_column_count.rs`).
-  - **Introspection PRAGMAs return empty for an unknown object (done).**
-    `PRAGMA index_info`/`index_xinfo` on a nonexistent index, and
-    `PRAGMA foreign_key_list` on a nonexistent table, now yield zero rows with
-    the usual headers instead of raising `no such index`/`no such table` — the
-    way sqlite (and graphite's own `table_info`/`index_list`) already behaves
-    (`tests/pragma_unknown_object_empty.rs`).
-  - **Header-cookie PRAGMA values parse as integer tokens (done).**
-    `PRAGMA user_version = X` / `application_id = X` interpret `X` as an integer
-    token (optional sign, `0x` hex, leading-decimal prefix — no whitespace skip),
-    exactly like sqlite's `sqlite3Atoi`, rather than evaluating it as a SQL
-    expression. A bare identifier such as `abc` is now a no-op (value `0`)
-    instead of raising `no such column: abc`
-    (`tests/pragma_header_value.rs`).
-  - **`AUTOINCREMENT` outside `PRIMARY KEY` is a syntax error (done).** The
-    keyword is reserved and only legal right after a column-level
-    `PRIMARY KEY [ASC|DESC]`; graphite used to swallow `a AUTOINCREMENT` /
-    `a INTEGER AUTOINCREMENT` / `a AUTOINCREMENT PRIMARY KEY` by treating it as a
-    type word, where sqlite raises `near "AUTOINCREMENT": syntax error`. The
-    parser now stops the type-name scan at the keyword so the same error fires
-    (`tests/create_table_autoincrement.rs`).
-  - **A `;`-truncated statement is a syntax error, not "incomplete input" (done).**
-    The CLI splits a batch on `;` before handing each piece to the engine; it used
-    to strip the terminating `;`, so a truncated statement like `SELECT;` reached
-    the parser as `SELECT` and was misreported as `incomplete input`. The `;` is
-    now re-attached to non-empty pieces, so sqlite's distinction holds — `SELECT;`
-    → `near ";": syntax error`, while a genuine end-of-input `SELECT` (no `;`)
-    still yields `incomplete input` (`tests/cli_semicolon_truncation.rs`). The
-    library parser was already correct; this was a CLI statement-splitting bug.
-  - **Remaining error-parity gaps (architectural, tracked).** Two known
-    divergences are deferred as they need broader surgery rather than a localized
-    fix: (1) ~37 reserved keywords (`SELECT`, `WHERE`, …) are still accepted as
-    bare identifiers in DDL (e.g. `CREATE TABLE t(select)`), needing sqlite's exact
-    reserved set applied globally in `ident()`; (2) a 3-part `schema.table.column`
-    qualifier silently drops the schema name instead of validating it, since
-    `Expr::Column` has no schema field (adding one touches ~74 sites). Neither is a
-    quick win; they wait for a dedicated pass.
+  - **A-rn3-edge-1** — add a source span (byte range) to `Expr::Column`. This is
+    the enabling refactor; it *also* unblocks the 3-part-qualifier check below,
+    which wants the same enriched `Expr::Column`. Do them together.
+  - **A-rn3-edge-2** — use the span for scope-aware rename: resolve each bare ref
+    to its owning table, rewrite only the matching ones.
+- **Reserved keywords accepted as bare identifiers.** ~37 reserved words
+  (`SELECT`, `WHERE`, `FROM`, …) are still accepted where SQLite rejects them —
+  e.g. `CREATE TABLE t(select)`. The fix is to apply SQLite's exact reserved-
+  keyword set in `ident()` (an `is_reserved_keyword` helper already exists in
+  `src/sql/parser.rs`, ~line 460, used by `pragma_value`). High regression risk —
+  every accidental-keyword identifier in the test corpus must keep working — so it
+  wants a dedicated pass with a full differential sweep over the keyword list, not
+  a quick edit.
+- **3-part `schema.table.column` qualifier not validated.** `after_name` in
+  `src/sql/parser.rs` (~line 2090) parses a 3-part ref but *drops* the schema part
+  (`table = column; column = self.ident()?`), so a bogus `nope.t.a` is silently
+  accepted instead of erroring. Needs a `schema` field on `Expr::Column` (~74 call
+  sites across `src/exec/func.rs`, `src/exec/mod.rs`, `src/sql/parser.rs`,
+  `src/exec/vdbe.rs`, `src/exec/eval.rs`, `src/sql/print.rs`). Shares the
+  `Expr::Column` enrichment with A-rn3-edge-1.
+- **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
+  are still validated per-row, so an unreached row (empty / fully-filtered table)
+  is accepted where SQLite rejects at prepare time. All want the same fix — a
+  statement-level prepare pass that walks every expression once, independent of
+  row production:
+  - `likelihood(a, 2)` over an empty table — the out-of-range probability literal
+    is not caught until a row is evaluated.
+  - a window nested in an aggregate *argument* in a result column
+    (`sum(row_number() OVER ())`) over an empty table.
+  - bare (unqualified) refs in derived-table/subquery scopes and `NATURAL`/`USING`
+    coalesced names — `validate_columns_exist` only covers the top-level
+    plain-table / `ON`-join scope.
+- **`(SELECT 1,2) = 1` should report `row value misused`.** A multi-column
+  subquery used as a *comparison operand* currently reports `sub-select returns 2
+  columns - expected 1`; SQLite says `row value misused` there (the column-count
+  message is correct in a scalar SELECT-list context like `SELECT (SELECT 1,2)`).
+  Needs context-aware wording at the comparison site.
+- **ALTER-time rejection of an ALTER that breaks a dependent.** An `ALTER` that
+  makes a dependent view/trigger unresolvable should be rejected and rolled back;
+  graphite leaves the now-broken object. Needs statement-level DDL rollback — a
+  writer savepoint around `exec_alter`, mirroring `run_dml_atomic`.
+- **Two residual parse-path non-issues (not worth chasing):** `UPDATE SET a=1`
+  flags `a` where SQLite flags `SET` (reserved-word leniency), and `BEGIN
+  TRANSACTION FOO` silently accepts the trailing name.
 
 ### Track B — Query planner, statistics & the VDBE
 
 **Done:** `ANALYZE`/`sqlite_stat1` stats-driven planning; the full equality/range/
 `IN`/OR-union + inner-join + `WITHOUT ROWID` seek family; hash join + automatic-
-index EQP; index-driven `ORDER BY` and covering reads (**B0/B0b**); the VDBE spike
-+ its scalar-expression compiler; the **VDBE join family** (**B5a**); **VDBE
-routing default-on** (**B7a/B7b**, ~93 % of the corpus, tree-walker is the
-fallback oracle); bytecode `EXPLAIN` (**B8**); the router's **non-correlated
-scalar/`EXISTS` subquery fold** pre-pass (folds such subqueries — in the
-projection, `WHERE`/`HAVING`/`GROUP BY`/`ORDER BY`/join-`ON`, **and now
-`LIMIT`/`OFFSET`** — to constants so the VDBE runs the rest; never changes a
-result).
+index EQP; index-driven `ORDER BY` and covering reads (**B0/B0b**); the VDBE + its
+scalar-expression compiler; **VDBE routing default-on** (**B7a/B7b**, tree-walker
+is the fallback oracle); bytecode `EXPLAIN` (**B8**). Running on the VDBE now: the
+**join family** (**B5a/B5b-1** — N-table inner joins plus 2-table and N-table
+`LEFT`/`RIGHT`/`FULL` nested-loop joins, all with projection / WHERE-merged-ON /
+`DISTINCT` / `ORDER BY` / `LIMIT` / grouped-and-bare aggregates, no cross-product
+materialized); non-correlated scalar/`EXISTS`/`IN (SELECT)` folds (**B5c-1**, incl.
+the native candidate-affinity membership op for a bare-column candidate); compound
+`UNION`/`INTERSECT`/`EXCEPT` (**B5c-3**); positional `GROUP BY <ordinal>`;
+`DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates; and
+window functions over a single table or a plain join (**B5c-4**).
 
-**Remaining — move each remaining shape onto the VDBE.** Additive, gated on
-VDBE-vs-tree-walker parity; results are already correct via the fallback, so this
-is *perf/coverage*, not correctness.
+**Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
+only* (the tree-walker fallback already returns correct results; each step is
+gated on VDBE-vs-tree-walker parity, so it can't regress correctness):
 
-- **B5c-1 — `IN (SELECT …)` on the VDBE — DONE.** A non-correlated `IN (SELECT)`
-  now runs on the VDBE for both candidate kinds. *Computed candidate:* folded to
-  `IN (list)` (a computed result carries NONE affinity, so it's equivalent).
-  *Bare-column candidate (the hard case):* the router carries the candidate
-  column's affinity (resolved via `subquery_column_origins`, as a canonical type
-  name) into a new `Expr::InList.candidate_affinity` field; the VDBE's IN OR-chain
-  feeds it as each `Op::Compare.ra`, so the existing
-  `apply_comparison_affinity(left_aff, candidate_aff)` runtime step computes
-  SQLite's `combine` — crucially an untyped candidate is `Some(Blob)`, NOT `None`,
-  so `lt.x(TEXT) IN (SELECT cn.y)` → `combine(TEXT,Blob)` → no coercion → no match
-  (matching sqlite), where a plain literal-list fold wrongly coerced. `NOT IN` and
-  NULL-in-set fall out of the existing OR-chain. The candidate column's collation
-  is NOT consulted — `IN (SELECT)` uses the LEFT operand's collation (verified vs
-  sqlite: a NOCASE candidate never changes the result), so NOCASE/RTRIM candidate
-  columns route too. Verified across every left×candidate affinity combo vs
-  sqlite3 (`tests/subquery_diff.rs`, `tests/vdbe_in_select.rs`), tree-walker ==
-  VDBE == sqlite.
-  - *Implementation note (investigated 2026-06-25):* a fold to `IN (list)` CANNOT
-    work — list literals report NONE comparison-affinity, but the bare-column
-    candidate must contribute its column affinity; and wrapping each value in
-    `CAST(v AS coltype)` is wrong because CAST changes the *value* (a non-numeric
-    text in an INTEGER-affinity column → `0`), not just the comparison affinity.
-    The correct path: carry the candidate affinity into the VDBE's `Op::Compare.ra`
-    for the IN OR-chain (the chain is built in `vdbe.rs` `Expr::InList`, affinity
-    via `push_compare_coll`→`expr_affinity`). Cleanest minimal change is an
-    `InList { …, candidate_affinity: Option<Affinity> }` field the router sets when
-    folding a bare-column `IN (SELECT)` (then `expr_affinity` of each element
-    yields that). This is **perf-only** (the tree-walker already returns correct
-    results, so no differential test distinguishes done from not-done) and touches
-    the default VDBE path — do it deliberately in a focused turn, not as a quick
-    win.
-  - *Confirmed 2026-06-26 (a fold attempt was tried and REVERTED — do NOT retry
-    it): bare-column `IN (SELECT col)` cannot be folded to `IN (list)` under ANY
-    affinity guard.* SQLite applies the LEFT operand's affinity to an `IN (list)`,
-    but for `x IN (SELECT y)` it uses `combine(left_aff, y_aff)` where `y_aff` is
-    the **subquery result column's** affinity — and these diverge precisely for a
-    bare column. Verified: `lt.x(TEXT) IN (SELECT y+0 FROM cn)` (computed
-    candidate, NONE aff) → 1 == folded `IN (list)` (SQLite uses left TEXT aff,
-    like the fold), but `lt.x(TEXT) IN (SELECT cn.y)` (bare untyped column) → 0
-    (SQLite uses `combine(TEXT, NONE)=BLOB`, no coercion) while a fold to
-    `IN (1)` wrongly applies TEXT and yields 1 (`tests/subquery_diff.rs::
-    in_select_affinity_matches_sqlite3`). So the existing `is_bare_column_expr`
-    bail is **correctness, not conservatism** — the bare-column candidate is
-    exactly the divergent case. Only the native candidate-affinity membership op
-    (B5c-1a/b above) can route it.
-- **B5c-2 — correlated subqueries on the VDBE.**
+- **B5c-2 — correlated subqueries on the VDBE.** Today any subquery reading an
+  outer column defers to the tree-walker.
   - **B5c-2a** — thread the outer row into the subquery's register frame.
   - **B5c-2b** — compile `Subquery`/`Exists`/`InSelect` that read an outer column.
-- **B5c-3 — compound `SELECT` (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) — DONE.**
-  `run_compound_vdbe` runs each constituent SELECT through the VDBE
-  (`run_select_vdbe`) and folds the row-sets left-associatively. The set-combine,
-  the post-dedup sort (rows in sorted order for `UNION`/`INTERSECT`/`EXCEPT`,
-  preserved for `UNION ALL`), and the whole-query `ORDER BY`/`LIMIT`/`OFFSET`
-  reuse the tree-walker's exact helpers (`apply_compound`, `compound_order_limit`,
-  collation-aware via the left SELECT's output collations), so the result is
-  byte-identical. A nested-compound arm (e.g. a multi-row `VALUES`, which
-  desugars to a `UNION ALL` chain), a CTE-bearing arm, or any arm the VDBE
-  cannot run defers the whole query to the tree-walker. Differentially tested
-  vs sqlite 3.50.4 (`tests/vdbe_compound.rs`), incl. `1`/`1.0` dedup keeping the
-  later representation, three-arm left-associativity, per-arm `WHERE`, and the
-  column-count-mismatch error.
-  - **B5c-3a** — *(folded into the above: each arm runs on the VDBE.)*
-  - **B5c-3b** — *(folded into the above: collation-aware set-combine + sort.)*
-- **Positional `GROUP BY <ordinal>` on the VDBE — DONE.** A bare integer
-  `GROUP BY N` term names the N-th *output* column, not the constant N (SQLite's
-  rule). The router (`run_select_vdbe`) rewrites each such term to the referenced
-  result column's expression — mirroring the tree-walker's resolution — before the
-  grouped compiler runs, so `GROUP BY 1` / `GROUP BY 1, 2` / a positional term
-  mixed with a named one all run on the VDBE. A wildcard projection (`*`) or an
-  out-of-range ordinal defers to the tree-walker, which validates and emits the
-  exact `… GROUP BY term out of range …` error. Differentially tested
-  (`tests/vdbe_grouped.rs`, incl. positional + `HAVING`/`ORDER BY`/`LIMIT`).
-- **`DISTINCT` aggregates on the bare aggregate path — DONE.** `count(DISTINCT x)`,
-  `sum`/`avg`/`total`/`min`/`max`/`group_concat` with `DISTINCT` now run on the
-  single-table aggregate path (no GROUP BY). The interpreter already collects each
-  aggregate's non-NULL arguments into a `Vec<Value>`, so `DISTINCT` simply skips a
-  value equal (BINARY) to one already collected (`Op::AggStep { distinct }`),
-  folding over distinct values only. A non-BINARY column collation still defers to
-  the tree-walker (that path already bailed on non-BINARY), so the NOCASE case is
-  handled correctly by fallback. Differentially tested vs sqlite 3.50.4
-  (`tests/vdbe_distinct_agg.rs`). `FILTER`/`ORDER BY` aggregates still fall back.
-  - *Also done — `DISTINCT` aggregates **over `GROUP BY`**.* `AggSpec`/`Op::GroupStep`
-    gained the same `distinct` flag, deduping each group's collected values at fold
-    time, so `SELECT a, count(DISTINCT b) … GROUP BY a` (and the `HAVING`/`ORDER BY`/
-    `LIMIT` general path, mixed with plain aggregates) runs on the VDBE — for both
-    the single-table and the nested-loop-join grouped compilers (they share
-    `emit_group_fold`). The grouped path already bailed on non-BINARY collations, so
-    the dedup is BINARY-safe. Tested in `tests/vdbe_distinct_agg.rs` with
-    within-group duplicate values.
-  - *Also done — `DISTINCT` aggregates **over a bare two-table join**.* The
-    bare-aggregate join compiler (`compile_aggregate_join`, no GROUP BY) now
-    threads the same `distinct` flag into its `Op::AggStep` (previously hardcoded
-    non-distinct), so `SELECT count(DISTINCT a.v), sum(DISTINCT b.w) FROM a JOIN b
-    …` folds-and-dedups over the joined rows on the VDBE. BINARY-safe (the path
-    already bails on non-BINARY collation). Tested in `tests/vdbe_distinct_agg.rs`
-    with a join that replicates a value so the dedup is observable.
-- **Aggregate `FILTER (WHERE …)` on the VDBE — DONE.** `count(*) FILTER (WHERE
-  …)`, `sum`/`avg`/`min`/`max`/`group_concat`/… with a per-aggregate `FILTER`
-  clause now run on the VDBE across all aggregate paths (bare single-table, over
-  `GROUP BY`, and over a two-table join), composing with `DISTINCT`. `Op::AggStep`
-  and `AggSpec` each gained a `filter: Option<usize>` register; the fold evaluates
-  the predicate per row and a row that is not *true* contributes to neither the
-  count bump nor the collected values for that aggregate (each aggregate's filter
-  is independent). `agg_kind_distinct` now binds the `FILTER` predicate instead of
-  bailing on it. Differentially tested vs sqlite 3.50.4 in
-  `tests/vdbe_filter_agg.rs`.
-- **Ordered `group_concat(x ORDER BY …)` on the VDBE — DONE.** A
-  `group_concat` with an inner `ORDER BY` now runs on the VDBE across all
-  aggregate paths (bare single-table, over `GROUP BY`, and over a two-table
-  join). The accumulator (`AggAcc`, now a struct rather than a tuple) records
-  each collected value's `ORDER BY` key row alongside the value; finalization
-  sorts a stable index permutation under those keys (BINARY collation, SQLite
-  NULL placement — NULLs first under `ASC`, last under `DESC`, honoring explicit
-  `NULLS FIRST`/`LAST`) before joining. `Op::AggStep`/`AggSpec` carry an
-  `order: Vec<AggOrderKey>` of pre-compiled key registers; `agg_kind_distinct`
-  binds the `ORDER BY` terms. Tightly scoped: only single-arg `group_concat`
-  ordered — `DISTINCT` + `ORDER BY`, and an `ORDER BY` on any other aggregate,
-  still fall back (no regression — those bailed before). Differentially tested
-  vs sqlite 3.50.4 in `tests/vdbe_ordered_agg.rs`. Windowed (`OVER`) calls still
-  fall back.
-- **B5c-4 — window functions over a single table *or a plain join* on the VDBE —
-  DONE.** A window-function `SELECT` (`row_number`/`rank`/`dense_rank`/`ntile`,
-  aggregate `OVER` with `PARTITION BY`/`ORDER BY`/explicit frames, `lag`/`lead`/
-  `first_value`, named `WINDOW` definitions, and windows *over* `GROUP BY`/
-  aggregates) over one plain main-database table — or over a plain N-table join —
-  now runs on the VDBE. The window evaluation itself is not bytecode:
-  `run_window_vdbe` scans the source on the VDBE (a single table as `SELECT *,
-  rowid`, a join as `SELECT *`) with the query's `WHERE` applied, so the
-  scan/filter/join run as compiled opcodes, then feeds the rows to
-  `finish_from_rows`, the post-`WHERE` tail extracted from `run_core` (windows,
-  aggregation, projection, `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`) that the
-  tree-walker already used, so the result is identical by construction. A single
-  table appends its rowid so a `rowid` reference resolves; a joined row has no
-  single rowid, so the join path supplies `None` and *defers whenever the query
-  references a rowid* anywhere (projection, `WHERE`, `GROUP BY`, `HAVING`, `ORDER
-  BY`, or any window's `PARTITION BY`/`ORDER BY`). A derived/virtual/view source,
-  `WITHOUT ROWID` table (its rowid projection bails), `NATURAL`/`USING` join, CTE,
-  non-`main` schema, or any join shape the VDBE join engine can't scan (e.g. tables
-  sharing a column name) falls back. An outer `ORDER BY` satisfied by the scan also
-  defers (the existing guard), so window queries use a non-rowid/multi-term `ORDER
-  BY`. Differentially tested vs sqlite 3.50.4 in `tests/vdbe_window.rs`.
-- **B5b — per-cursor nested-loop join + inner seek** (stream the inner side
-  instead of materializing the cross-product; *perf-only*).
-  - **B5b-1** — *Done (multi-cursor opcodes + nested-loop join over materialized
-    per-table rows).* The VDBE gained multi-cursor opcodes `RewindC`/`ColumnC`/
-    `NextC` (each carrying a `cursor` id) and a `run_rows_multi` interpreter that
-    threads one position per cursor; the single-cursor `Rewind`/`Column`/`Next`
-    and the whole default path are byte-for-byte unchanged (cursor 0 backs them).
-    A new `compile_join2` emits a nested loop `RewindC 0 [ RewindC 1 <body>
-    NextC 1 ] NextC 0` (outer = left, outermost), with a `Compiler.cursor_boundaries`
-    map turning each combined column index into a `(cursor, local col)` `ColumnC`.
-    The compiler is N-ary (`boundaries` = cumulative per-cursor column counts):
-    the router runs a plain **N-table** inner join (projection + WHERE-merged-ON +
-    `DISTINCT` (BINARY) + `ORDER BY` (staged through a sorter) + constant
-    LIMIT/OFFSET) as an N-deep nested loop — *no `t1 × … × tN` cross-product is
-    materialized for any arity*. A **bare-aggregate** join (`count(*)`, `sum`,
-    `min`/`max`, `group_concat`, … with no GROUP BY) likewise folds over the nested
-    loop via `compile_aggregate_join` (mirroring the single-table
-    `compile_aggregate_select`) and emits one finalized row — again with no
-    cross-product materialized; the fold order matches the cross-product so
-    order-sensitive `group_concat` is byte-identical. A **`GROUP BY`** join folds
-    each surviving combined row into its group over the nested loop — *the full
-    grouped grammar*: keys + aggregates, optional **HAVING / ORDER BY / LIMIT /
-    OFFSET**, no cross-product, same first-seen group order. This came for free by
-    factoring the fold loop into `emit_group_fold` (single-cursor `Rewind`/`Column`
-    when `cursor_boundaries` is `None`, else the N-deep `RewindC`/`ColumnC`/`NextC`)
-    and generalizing `compile_group_select`/`compile_group_emit` over an optional
-    `boundaries` slice; `compile_group_join` is now a thin adapter that expands the
-    projection and delegates, so a join inherits the single-table compiler's plain
-    `GroupEmit` path *and* its general `GroupFinalize`/`GroupNext` emit (with the
-    HAVING skip and ORDER-BY sorter) unchanged. Only `GROUP BY DISTINCT` and
-    aggregates needing DISTINCT/FILTER/ORDER BY still fall back to the cross-product
-    path. An ordered, grouped inner join is now
-    feature-complete on the VDBE (parity with the single-table scan compiler). Row
-    order matches the cross-product and sqlite. Verified by
-    the differential join corpus (2-, 3-, 4-table) + direct unit tests
-    (`exec::vdbe::tests`, `tests/vdbe_nested_join.rs`). This is the multi-cursor
-    foundation the rest of B8 (storage cursors, correlated subqueries, windows)
-    builds on.
-    - *Also done — two-table `LEFT`/`RIGHT`/`FULL JOIN` on the VDBE.*
-      `compile_left_join2` emits a null-padding nested loop: for each preserved-side
-      (cursor 0) row the inner cursor is scanned, a `NullRow` opcode (cleared by
-      `RewindC`, makes a cursor's `ColumnC`s read NULL) pads the output when no
-      inner row satisfied `ON`. The `ON` is kept SEPARATE from `WHERE` (unlike the
-      inner-join merge — they differ for the unmatched row): `ON` gates the match,
-      `WHERE` filters every emitted row including the null-padded one. `RIGHT JOIN`
-      reuses the same compiler with the operands swapped (cursor 0 = the preserved
-      right table; column refs resolve by name regardless of cursor order). `FULL
-      JOIN` (`compile_full_join2`) is a two-pass nested loop: pass 1 is the LEFT
-      join, additionally recording matched right rows in a per-row bitmap
-      (`MarkMatched`); pass 2 scans the right table and emits each row NOT matched
-      (`IfMatched` skips the rest) with the left side NULL — yielding SQLite's
-      FULL-join order (left-driven rows, then unmatched-right). A single 2-table
-      `LEFT`/`RIGHT`/`FULL JOIN` (no `NATURAL`/`USING`) routes here; `NATURAL`/
-      `USING`, 3+-table or non-nested-loopable shapes fall back to the tree-walker.
-      `ORDER BY` and `DISTINCT` over these outer joins are now supported too, at
-      full parity with the inner-join path. Every emission point (matched, left-null,
-      and — for FULL — right-null) projects its row, then a `DistinctCheck` gates it
-      on uniqueness (when `DISTINCT`, BINARY collation only) and — under `ORDER BY` —
-      stages the row + sort keys into one sorter (the null-padded row's keys/columns
-      read NULL via the `NullRow`-cleared `ColumnC`s); a single sorted emit loop then
-      applies OFFSET/LIMIT to the ordered output. `DISTINCT` collapses duplicate
-      matched AND duplicate null-padded rows (two all-NULL right sides compare equal),
-      across both FULL passes. Verified vs the differential corpus + unit/integration
-      tests (incl. `WHERE …col IS NULL`, both empty sides, compound `ON`, `coalesce`
-      over nulls, LIMIT/OFFSET across passes, `ORDER BY` with NULL-first/last keys,
-      and `DISTINCT` over duplicate matched/null-padded rows).
-    - *Also done — N-table `LEFT`/`INNER` join chains on the VDBE.*
-      `compile_left_join_n` generalizes the two-table null-padding loop to a
-      left-deep chain of 2–4 joins, all `LEFT` or `INNER` with at least one `LEFT`
-      (no `NATURAL`/`USING`). A recursive emitter (`emit_join_level`) nests one
-      cursor per table — cursor 0 the always-preserved base — and at each level
-      keeps a per-outer-row "matched" flag: a `LEFT` level whose `ON` matched no
-      inner row null-pads that cursor (`NullRow`) and *still* recurses into the
-      deeper cursors (whose `ON`s may reference the now-NULL columns), while an
-      `INNER` level simply yields nothing. Each join's `ON` gates matches at its own
-      level (kept separate from `WHERE`); `WHERE` filters the fully-assembled row at
-      the innermost leaf, where projection + `DISTINCT` (BINARY) + `ORDER BY` (one
-      sorter) + constant `LIMIT`/`OFFSET` reuse the same emit helpers as the
-      two-table path. The fold order (outermost cursor slowest, each level's matches
-      in scan order then its null-padded row) matches SQLite's left-deep join order.
-      A `RIGHT`/`FULL` join anywhere, `NATURAL`/`USING`, a depth > 4, or a
-      GROUP-BY/aggregate/HAVING shape falls back. Differentially tested vs sqlite
-      3.50.4 in `tests/vdbe_outer_join_chain.rs` (3- and 4-table `LEFT`/`INNER`
-      mixes, mid-chain and tail null-padding, fully-null tails, `WHERE …IS NULL`,
-      `DISTINCT`, `coalesce`, and `LIMIT`/`OFFSET`).
-  - **B5b-2** — seek-driven inner cursor (rowid/PK/index) over real storage
-    (`OpenRead` + a b-tree `TableCursor`), mirroring the tree-walker's inner-join
-    seeks. Needs the VDBE interpreter to hold live storage cursors (the larger B8
-    step); today both cursors are materialized per-table row-sets.
-- **B1c — RIGHT/FULL join inner seeks** (INNER/LEFT seek; RIGHT/FULL still
-  materialize the inner table).
+- **B5b-2 — seek-driven inner cursor over real storage (the big B8 step).** The
+  nested-loop join currently materializes each table's rows into in-memory
+  row-sets. This step gives the VDBE interpreter **live storage cursors**
+  (`OpenRead` + a b-tree `TableCursor`) so the inner side is *seeked* by
+  rowid/PK/index instead of materialized — mirroring the tree-walker's inner-join
+  seeks. B5b-1's multi-cursor opcodes (`RewindC`/`ColumnC`/`NextC`) are the
+  foundation. This is the largest remaining VDBE piece and the prerequisite that
+  makes correlated-subquery (B5c-2) and window streaming worthwhile.
+- **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT already seek; RIGHT/FULL still
+  materialize the inner table.
 
 **Blocked / deferred by design:**
 - **B1b — cost-based join reordering.** graphite's per-cursor seek/bloom-filter
@@ -873,172 +251,67 @@ is *perf/coverage*, not correctness.
 ### Track C — Storage engine, transactions, concurrency
 
 **Done:** the `Vfs` locking contract; rollback-journal writer serialization;
-`SAVEPOINT`; the introspection PRAGMAs; the **entire multi-schema track** (C1–C5,
-`ATTACH`/`DETACH`/`TEMP`); the **whole `auto_vacuum` track** (C6); `VACUUM …
-INTO`; `secure_delete` (C8a); `cache_size`/`mmap_size` reporting (C8b).
+`SAVEPOINT`; the introspection PRAGMAs; the **multi-schema track** (C1–C5,
+`ATTACH`/`DETACH`/`TEMP`); the **`auto_vacuum` track** (C6); `VACUUM … INTO`;
+`secure_delete` (C8a); `cache_size`/`mmap_size` reporting (C8b); the **SQLite-
+format rollback journal** (C7a/C7b — exact byte layout, two-flush commit protocol,
+hot-journal recovery, cross-recovered both ways vs `sqlite3`) with its fault-
+injecting crash-recovery harness; and the **bounded LRU `pcache`** (C8c,
+`src/pager/pcache.rs`, dirty pages structurally never evictable).
 
 **Remaining:**
 
-- **C7 — SQLite-format rollback journal.** *Done (C7a + C7b):* `write_journal`
-  now emits SQLite's exact byte layout (8-byte magic `d9 d5 05 f9 20 a1 63 d7`,
-  record count, checksum nonce, initial page count, sector/page sizes, header
-  padded to one sector; then `(pgno, page, 4-byte sparse checksum)` records), with
-  the count published only after the records sync (sqlite's two-flush protocol).
-  `recover` detects a hot journal, validates the header, replays each
-  checksum-valid record, and truncates to the recorded size — stopping at a torn
-  tail and walking multiple sector-aligned segments. Cross-verified **both ways**
-  vs `sqlite3` 3.50.4: graphite's hot journal recovered by sqlite, and a
-  sqlite-authored hot journal (forced cache-spill + mid-transaction SIGKILL)
-  recovered by graphite (`tests/journal_sqlite_format.rs`).
-  - **C7-harness** — *Done:* a fault-injecting `FaultVfs` (kills a chosen file at
-    the Nth `write`/`truncate`/`sync`, optionally a torn half-write, freezing the
-    on-disk bytes like a power loss) drives the §6 crash-recovery suite
-    (`tests/crash_recovery_harness.rs`). Recovery held at every injection point —
-    before/midway/torn db-page writes, on the db `sync`, on the finalizing
-    journal-clear, and a full ordinal×{clean,torn} sweep — each reopen
-    `integrity_check = ok`, never torn, cross-checked with `sqlite3`. No recovery
-    bug found. graphite's own writer still emits a single journal segment (it
-    buffers the whole overlay and never spills mid-transaction); multi-segment
-    *writing* would land with the bounded pcache (C8c).
-- **C8c — bounded `pcache` with LRU eviction.** *Done:* a `PageCache`
-  (`src/pager/pcache.rs`, **C8c-1**) — fixed-capacity LRU over clean-page images,
-  capacity from `cache_size` (positive = pages, negative = KiB/page_size, default
-  `-2000`), evicting the LRU clean page when a new key would exceed it. The read
-  `Pager`'s keep-everything map is replaced by it (**C8c-2**); `WritePager` gets a
-  bounded clean read-cache that the overlay/WAL shadow, so a **dirty page is
-  structurally never evictable**, invalidated on lock acquire/release/commit for
-  cross-connection coherence. Eviction is transparent (re-read on miss) — verified
-  correct + bounded under tiny caches with writes/rollback, cross-checked vs
-  `sqlite3` and `tests/concurrency.rs` (`tests/pcache_bounded.rs`).
-  - *Leftover:* the `WritePager` read cache is active only inside a write txn
-    (sole-writer); a pure read-only connection over a read-write file falls back to
-    direct (already-bounded) disk reads, since coherent caching there needs a
-    statement-level change-counter revalidation hook from the exec layer.
-- **C9 — concurrency** (each independent):
-  - **C9a** — reader `SHARED`-lock sharing. *Lock model done + verified:*
-    `LockState` (`src/vfs/mod.rs`) already counts `Shared` holders — many readers
-    coexist, `Reserved` is admitted under readers (single write-intent),
-    `Exclusive` BUSYs until every *other* reader drains — proven end-to-end over
-    both the std (per-path registry) and memory VFS (`tests/concurrency_readers.rs`,
-    6 tests). *Remaining (pager-owned):* the pager takes `Shared` only transiently
-    on the way to `Reserved` (pure reads hold no persistent read lock), so
-    "multiple readers across an open read txn block a writer" isn't yet observable
-    at the `Connection` layer — needs a persistent read-lock policy in
-    `src/pager/`.
-  - **C9b** — OS-level cross-process file locks (`std::fs::File::lock`; wants MSRV
-    1.89) behind the std VFS.
-  - **C9c** — the WAL `-shm` wal-index for multi-connection WAL readers.
-  - **C9d** — a thread-safe `Connection` (`Send`/`Sync`, or a documented
-    per-thread model).
+- **C8c-leftover — read-cache for read-only connections.** The `WritePager` read
+  cache is active only inside a write txn (sole-writer); a pure read-only
+  connection over a read-write file falls back to direct (already-bounded) disk
+  reads. Coherent caching there needs a statement-level change-counter
+  revalidation hook from the exec layer.
+- **C9a — persistent read locks.** The lock model is done and verified
+  (`LockState` in `src/vfs/mod.rs` counts `Shared` holders; readers coexist,
+  `Reserved` admits under readers, `Exclusive` BUSYs until readers drain —
+  `tests/concurrency_readers.rs`). What's missing is pager-owned: the pager takes
+  `Shared` only transiently on the way to `Reserved` (pure reads hold no
+  persistent read lock), so "multiple readers across an open read txn block a
+  writer" isn't yet observable at the `Connection` layer. Needs a persistent
+  read-lock policy in `src/pager/`.
+- **C9b — OS-level cross-process file locks** (`std::fs::File::lock`; wants MSRV
+  1.89) behind the std VFS.
+- **C9c — the WAL `-shm` wal-index** for multi-connection WAL readers.
+- **C9d — a thread-safe `Connection`** (`Send`/`Sync`, or a documented per-thread
+  model).
 
 ### Track D — Virtual tables & ecosystem extensions
 
 **Done:** the read-only vtab foundation (TVFs, the `VTabModule`/`VTabRegistry`
 trait, `best_index`/`filter` pushdown — **D1**); the **writable, persistent** vtab
-layer (**W1/W2**); both headline modules — the full **R-Tree** (**D3a–D3c**,
-byte-compatible nodes) and the full **FTS5** (**D2a–D2e**, read + write,
-sqlite-readable on disk, with the `tokenize=` option chain + diacritic folding);
-Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
+layer (**W1/W2**); the full **R-Tree** (**D3a–D3c**, byte-compatible nodes) and
+the full **FTS5** (**D2a–D2e**, read + write, sqlite-readable on disk, with the
+`tokenize=` option chain + diacritic folding); Rust scalar/aggregate **UDFs**
+(**D4**); the **`dbstat`** and read-only **`sqlite_dbpage`** (dbpage-1) vtabs. The
+FTS5 **inverted-index read path** (**D2b-1/2/3**) is comprehensive: *every* `MATCH`
+shape (term / column-scoped / phrase / boolean / prefix / `NEAR`) is index-routed
+over single- *and* multi-segment indexes, including multi-leaf term pagination and
+doclist spanning.
 
 **Remaining:**
 
-- **D2b — a real FTS5 inverted index.** Today `MATCH` scans `_content`; the
-  on-disk segment *format* is already byte-compatible (written by
-  `fts5_rebuild_index`), so this is the *read* path that uses the index for scale.
-  - **D2b-1** — *Done:* decode the `%_data` segment index (leaf header, page-index
-    footer, prefix-compressed term keys, doclists, position lists) for a
-    single-term lookup — `decode_term` in `src/fts5_index.rs`, the byte-inverse of
-    the writer. Single-leaf segments only; a spanning/interior/doclist-index
-    segment returns `None` so the caller falls back to the `_content` scan.
-    Verified by writer→decoder round-trips and against `sqlite3`-written leaves
-    (`tests/fts5_decode.rs`).
-  - **D2b-2** — *Done (single bare term, table-wide + column-scoped):* a single
-    bare-term `MATCH` — both table-wide (`tbl MATCH 'word'`) and column-scoped
-    (`tbl MATCH 'col : word'` / `col:word`) — over a fully-indexed single-segment
-    table is answered via the index: `lookup_term_rowids` /
-    `lookup_term_rowids_in_column` (`src/fts5_index.rs`, filtering the term's
-    per-column positions to the named column) → `fts5_try_index_match`
-    (`src/exec/mod.rs`, `AnyColumn`/`InColumn` routes) seeks just the matching
-    `_content` rows by rowid. Everything else (phrases, `NEAR`, prefixes, boolean,
-    `^`, multi-column filters, `UNINDEXED` columns, multi-segment / interior /
-    dlidx) stays on the `_content` scan. Results are a guaranteed superset
-    re-filtered by `run_core`, so rows/order/`bm25`/`highlight` are identical —
-    verified vs `sqlite3` (`tests/fts5_index_match.rs`) + a route counter.
-    Also routed: a **two-term phrase** (`tbl MATCH '"a b"'`, table-wide and
-    column-scoped) via doclist intersection + per-column position adjacency
-    (`lookup_phrase_rowids` — token a at `p`, token b at `p+1` in the same column,
-    repeated-word `"a a"` handled), identical to the scan's `fts5_phrase_starts`.
-    And an **N-operand bare-term boolean tree** (`a AND b AND c`, `a OR b AND c`,
-    `(a OR b) AND NOT c`, …) — `lookup_bool_tree_rowids`/`eval_bool_tree` walk
-    graphite's parsed FTS5 AST (the same tree `fts5_eval` evaluates, so `NOT > AND
-    > OR` precedence is inherited) and combine the leaves' doclists bottom-up with
-    sorted-merge intersect/union/difference; routed-result == scan == sqlite
-    (precedence pinned by differential tests). And a **prefix term**
-    (`tbl MATCH 'wor*'`, table-wide and column-scoped) — `lookup_prefix_rowids`
-    walks the sorted leaf term keys, unions the doclists of every term sharing the
-    prefix; matches the scan (prefix tokens are not Porter-stemmed). And a
-    **two-term `NEAR(a b, n)`** (default n=10) — `lookup_near_rowids` intersects
-    the two terms' doclists and keeps docs with a per-column position pair within
-    the span; the distance inequality `|pa-pb| <= n+1` is derived from the scan's
-    general `max_end - min_start < n + total_len` rule (two single tokens →
-    total_len 2) and pinned vs `sqlite3` at the boundary. **Multi-segment:**
-    bare-term / column / boolean / prefix routing now also works over the
-    **multiple segments** a real `sqlite3` index accumulates (`all_segments` +
-    `merge_segments` union the per-segment doclists), bailing to the scan on a
-    tombstone or an overlapping docid (update/delete history) — verified vs
-    `sqlite3` on a genuine >1-segment index incl. a deletes-present case
-    (`tests/fts5_index_multiseg.rs`). **K-term phrases:** phrase routing now covers
-    any length (`"a b c …"`, repeated-word, column-scoped) via a consecutive-run
-    check (`phrase_run_matches`: binary-search each term[i] at start+i) + a K-way
-    docid sweep (`phrase_intersect_k`) — the index analogue of the scan's
-    `fts5_phrase_starts`. **Multi-segment phrase+NEAR** (`decode_terms_multiseg`):
-    phrase and NEAR now route over multi-segment indexes too — each doc's
-    positions come from its owning segment, with the same tombstone +
-    combined-overlap bail-to-scan as the rowid merge (verified vs `sqlite3` incl.
-    deletes-present). **MATCH is now comprehensively index-routed: EVERY shape
-    (term/column/phrase/boolean/prefix/NEAR) on BOTH single- and multi-segment
-    indexes.** *Remaining (all PERF-ONLY — the scan handles them, results already
-    correct):* ≥3-phrase `NEAR`, and dlidx/interior segment decode (D2b-3 leftover,
-    only for a single term spanning ~16+ leaves).
-  - **D2b-3** — *Done (multi-leaf):* `decode_term` now handles **multi-leaf term
-    pagination** (terms across leaves, each with its own page-index footer) and
-    **doclist spanning** (carried poslist tail + absolute first-rowid on the
-    continuation leaf, via `gather_doclist_runs`/`decode_spanning_doclist`),
-    including the mixed case where a spill leaf also starts the next term. A
-    segment with **doclist-index (dlidx) or interior (`height > 0`) pages** —
-    reached only by a single term spanning ~16+ leaves — still returns `None` so
-    the caller falls back to the `_content` scan (never a truncated doclist).
-    Verified by writer→decoder round-trips and against real `sqlite3` multi-leaf
-    indexes at pgsz 64/80/128 (`tests/fts5_decode_multileaf.rs`). Remaining:
-    dlidx/interior decode (only for very-high-frequency terms).
-- **D2e-encoder — byte-identical FTS5 at large scale** (structural validity holds
-  today; these only affect exact-byte parity past a few leaves, and each needs the
-  fts5 writer source for the precise split heuristic): the combined
-  spanning-doclist-then-paginated-terms leaf-fill boundary; doclist-index (`dli`)
-  pages; segment-b-tree interior (`height > 0`) `_data` pages.
-- **dbpage — the raw-page vtab** (`sqlite_dbpage`, sibling of `dbstat`).
-  Done: **dbpage-1** — read (one row per page: `pgno`, `data`), byte-exact vs
-  `sqlite3` on the same file (`tests/dbpage.rs`); both eponymous read-only vtabs
-  (`dbstat`, `sqlite_dbpage`) also resolve a `main.`-qualifier, answer
-  `PRAGMA table_info`/`table_xinfo` with their fixed column shape (incl. the
-  trailing hidden columns). Any schema qualifier (`main.`/`temp.`/`<attached>.`)
-  resolves the eponymous tables and — matching SQLite's hidden `schema` column
-  default of `main` — reports the **main** database regardless of the qualifier
-  (so `aux.dbstat`/`temp.dbstat` report main, not the qualified db). A
-  `temp.`-qualified *non-eponymous* read with no temp database now reports the
-  name as missing instead of panicking.
-  - *Deferred:* a `WHERE schema='aux'` constraint to redirect the report to a
-    non-main database (SQLite drives this through the hidden `schema` column;
-    graphite has no hidden-column pushdown for it yet). Also unmatched: SQLite
-    quirkily reports `main` even for an *unknown* schema qualifier
-    (`nope.dbstat`), where graphite errors `unknown database nope`.
-  - **dbpage-2** — write (raw page replacement). *Oracle-blocked:* the pinned
-    `sqlite3 3.50.4` alt1 build was compiled without the writable-dbpage path —
-    every real page write returns `read-only` (deterministically; see §6). With
-    no engine to diff against, a writable `sqlite_dbpage` can't satisfy the
-    differential-test rule; deferred until a writable-dbpage oracle is available.
-- **D4-leftover — window UDFs + custom collations** (the latter needs a user
-  variant on the `Collation` enum — invasive).
+- **D2b-leftover (perf-only).** Two `MATCH` shapes still fall back to the
+  `_content` scan — results already correct: a ≥3-phrase `NEAR`, and a single
+  very-high-frequency term whose segment uses doclist-index (dlidx) or interior
+  (`height > 0`) pages (only reached by a term spanning ~16+ leaves).
+- **D2e-encoder — byte-identical FTS5 at large scale.** Structural validity holds
+  today; exact-byte parity past a few leaves needs the fts5 writer source for the
+  precise split heuristics: the combined spanning-doclist-then-paginated-terms
+  leaf-fill boundary; doclist-index (`dli`) pages; segment-b-tree interior
+  (`height > 0`) `_data` pages.
+- **dbpage-2 — writable `sqlite_dbpage`.** *Oracle-blocked:* the pinned `sqlite3
+  3.50.4` alt1 build was compiled without the writable-dbpage path — every raw
+  page write returns `read-only`, so there is no engine to diff against. Deferred
+  until a writable-dbpage oracle is available. (Also deferred on the read side: a
+  `WHERE schema='aux'` hidden-column constraint to redirect the report off `main`,
+  which SQLite drives through a hidden `schema` column graphite doesn't push down.)
+- **D4-leftover — window UDFs + custom collations.** The latter needs a user
+  variant on the `Collation` enum (invasive).
 - **D5 — `sqlite3_session`** changesets/patchsets for replication.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
 
@@ -1050,16 +323,11 @@ Rust scalar/aggregate **UDFs** (**D4**); the **`dbstat`** vtab.
 ### Track E — Cross-database write resolution  *(essentially complete)*
 
 **Done:** a write to an attached/`temp` database swaps that database in as the
-active `main` for the whole statement, so a subquery/source reading the *original*
-main must still resolve there. **E0** built the regression oracle
-(`tests/cross_db_writes.rs`, deterministic in-memory ATTACH). **`INSERT … SELECT`**
-and **`INSERT … VALUES ((SELECT …))`** are materialized in the original context
-before the swap (`prematerialize_insert_source`). **E1/E2/E3 + E-arch-a:**
-`unqualified_db` now resolves an unqualified name `main`-first and then falls back
-to attached databases (SQLite's `main → temp → attached` order) — which also lets
-a cross-db `UPDATE/DELETE aux.t …` subquery resolve a `main` table (the original
-`main` is in the target's swapped-out attached slot), and fixes a top-level
-`SELECT … FROM s` where `s` lives only in an attached database.
+active `main` for the whole statement, while a subquery/source reading the
+*original* main still resolves there (**E0–E3 + E-arch-a**). `unqualified_db`
+resolves an unqualified name `main`-first then attached (SQLite's `main → temp →
+attached` order); `INSERT … SELECT` and `INSERT … VALUES ((SELECT …))` are
+pre-materialized in the original context before the swap.
 
 **Remaining (rare residual):** a table name present in **both** the active db and
 an attached one, referenced *unqualified inside a cross-database write*, binds to
@@ -1157,20 +425,24 @@ The headline features are done (§3), and **Track E is essentially complete**; w
 remains (§4) is bigger, multi-session work, each track independently shippable. A
 reasonable order:
 
-1. **B5c-1 → B5c-4, then B5b** — VDBE depth (Track B): move `IN (SELECT)`,
-   correlated subqueries, compound, and windows onto the VDBE, then the
-   per-cursor streaming join. Perf/coverage; parity-gated, low risk.
-2. **D2b** — the real FTS5 inverted index (Track D): the one scaling gap in an
-   otherwise-complete module.
-3. **C7a/C7b + crash-recovery harness** — the SQLite-format journal (Track C):
-   durability depth; pairs with the fault-injecting VFS.
-4. **C8c, then C9a–C9d** — bounded pcache, then the concurrency story (Track C).
-5. **dbpage, D5, D6** — ecosystem surfaces (Track D).
+1. **B5b-2 — live storage cursors on the VDBE.** The largest remaining VDBE piece;
+   it turns the materialized inner join into a seek-driven one and is the
+   prerequisite for streaming correlated subqueries and windows. Perf/coverage,
+   parity-gated, low risk.
+2. **B5c-2 — correlated subqueries on the VDBE**, once B5b-2 lands the live-cursor
+   machinery.
+3. **C9a → C9d — the concurrency story** (persistent read locks in `src/pager/`,
+   then OS file locks, the WAL `-shm` index, and a thread-safe `Connection`).
+4. **D2e-encoder / dbpage-2 / D5 / D6** — ecosystem surfaces; pick the unblocked
+   ones (dbpage-2 is oracle-blocked, D2e-encoder needs the fts5 writer source).
+5. **Track A leftovers** — the `Expr::Column` enrichment (source span + schema
+   field) that unblocks both **A-rn3-edge** and the 3-part-qualifier check, plus
+   the statement-level prepare pass for the lazy-validation gaps.
 
 **Deferred / blocked** (documented in §4): **B1b** join reordering and **B4**
 `sqlite_stat4` (diverge from / unverifiable against the stat1-only oracle);
 **B1c** RIGHT/FULL inner seeks (correct via materialization); **D7** the C-API
-shim (needs `unsafe`; a sibling crate); the **A-rn3-edge** ambiguous-ref case
-(needs per-column-ref spans); and the FTS5 large-scale encoder sub-cases (need the
-fts5 writer source). Build-specific oracle quirks we intentionally do NOT match
-are recorded in §6.
+shim (needs `unsafe`; a sibling crate); **dbpage-2** (oracle-blocked); the
+**A-rn3-edge** ambiguous-ref case (needs per-column-ref spans); and the FTS5
+large-scale encoder sub-cases (need the fts5 writer source). Build-specific oracle
+quirks we intentionally do NOT match are recorded in §6.
