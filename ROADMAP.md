@@ -154,9 +154,18 @@ window/row-value resolution, DDL/DML/JSON/PRAGMA/`printf` message wording,
 lexer/parser error framing (`near "TOKEN"`, `incomplete input`, `unrecognized
 token: "X"`), and the `json_each`/`json_tree` `id`/`parent` columns (each row's
 JSONB *byte offset*, not a row counter) and `fullkey`/`path` label quoting
-(`$."a b"` for any non-simple key); and `EXPLAIN QUERY PLAN` of a `FROM`-less
-SELECT now renders `SCAN CONSTANT ROW` (also covering a single-row `VALUES`) —
+(`$."a b"` for any non-simple key); `EXPLAIN QUERY PLAN` of a `FROM`-less
+SELECT now renders `SCAN CONSTANT ROW` (also covering a single-row `VALUES`);
+and the `sqlite_schema.sql` text is now canonicalised the way SQLite stores it
+(regenerated `CREATE <TYPE> ` head — `IF NOT EXISTS`/`TEMP` dropped, prefix
+whitespace collapsed — plus the verbatim body with the trailing `;` removed) —
 all byte-exact vs `sqlite3` 3.50.4.
+
+A couple of `CREATE`-text corners remain on the AST reprinter (quoted
+identifiers, `", "` column separators) rather than sqlite's verbatim-from-name
+form: schema-qualified (`CREATE TABLE aux.t …`) and `TEMP` creates, and
+`CREATE TABLE … AS SELECT` (whose column list sqlite emits unquoted/space-free,
+e.g. `CREATE TABLE t(a,c)`).
 
 **Remaining:**
 

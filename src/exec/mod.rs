@@ -4322,7 +4322,7 @@ impl Connection {
             Value::Text(ct.name.clone()),
             Value::Text(ct.name.clone()),
             Value::Integer(root as i64),
-            Value::Text(sql_text.into()),
+            Value::Text(canonical_schema_sql("CREATE TABLE ", sql_text)),
         ]);
         insert_table(
             self.backend.writer()?,
@@ -5046,7 +5046,7 @@ impl Connection {
             Value::Text(ct.name.clone()),
             Value::Text(ct.table.clone()),
             Value::Integer(0),
-            Value::Text(sql_text.into()),
+            Value::Text(canonical_schema_sql("CREATE TRIGGER ", sql_text)),
         ]);
         insert_table(
             self.backend.writer()?,
@@ -7114,7 +7114,14 @@ impl Connection {
             Value::Text(ci.name.clone()),
             Value::Text(ci.table.clone()),
             Value::Integer(root as i64),
-            Value::Text(sql_text.into()),
+            Value::Text(canonical_schema_sql(
+                if ci.unique {
+                    "CREATE UNIQUE INDEX "
+                } else {
+                    "CREATE INDEX "
+                },
+                sql_text,
+            )),
         ]);
         insert_table(w, crate::schema::SCHEMA_ROOT_PAGE, schema_next, &schema_row)?;
         let cookie = w.header().schema_cookie.wrapping_add(1);
@@ -7146,7 +7153,7 @@ impl Connection {
             Value::Text(cv.name.clone()),
             Value::Text(cv.name.clone()),
             Value::Integer(0), // views have no b-tree root
-            Value::Text(sql_text.into()),
+            Value::Text(canonical_schema_sql("CREATE VIEW ", sql_text)),
         ]);
         insert_table(
             self.backend.writer()?,
@@ -18809,6 +18816,55 @@ fn expr_has_subquery(e: &Expr) -> bool {
         }
     });
     found
+}
+
+/// Reconstruct the `sql` text stored in `sqlite_schema` for a `CREATE` statement
+/// the way SQLite does (`sqlite3EndTable` / `sqlite3CreateIndex`): a regenerated
+/// `CREATE <TYPE> ` head — which drops `TEMP`/`IF NOT EXISTS` and normalises the
+/// prefix whitespace to single spaces — followed by the *verbatim* source from
+/// the object-name token onward, with the trailing statement terminator (`;`) and
+/// any surrounding whitespace removed. `prefix` is the regenerated head ending in
+/// a space (e.g. `"CREATE TABLE "`, `"CREATE UNIQUE INDEX "`). Falls back to the
+/// trailing-trimmed `sql_text` if the name token cannot be located.
+fn canonical_schema_sql(prefix: &str, sql_text: &str) -> String {
+    let trimmed = sql_text.trim_end();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    match schema_sql_name_offset(sql_text) {
+        Some(start) if start <= trimmed.len() => format!("{prefix}{}", &trimmed[start..]),
+        _ => trimmed.to_string(),
+    }
+}
+
+/// Byte offset of the object-name token in a `CREATE …` statement: skips
+/// `CREATE`, any `TEMP`/`TEMPORARY`/`UNIQUE` modifier, the object-type keyword,
+/// and an optional `IF NOT EXISTS`. Returns `None` if the head doesn't match.
+fn schema_sql_name_offset(sql_text: &str) -> Option<usize> {
+    use crate::sql::token::{tokenize, Token};
+    let toks = tokenize(sql_text).ok()?;
+    let kw = |t: &Token, k: &str| matches!(t, Token::Word(w) if w.eq_ignore_ascii_case(k));
+    let mut i = 0;
+    if !kw(&toks.get(i)?.token, "CREATE") {
+        return None;
+    }
+    i += 1;
+    while matches!(&toks.get(i)?.token, Token::Word(w)
+        if ["TEMP", "TEMPORARY", "UNIQUE"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+    {
+        i += 1;
+    }
+    if !matches!(&toks.get(i)?.token, Token::Word(w)
+        if ["TABLE", "INDEX", "VIEW", "TRIGGER"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+    {
+        return None;
+    }
+    i += 1;
+    if kw(&toks.get(i)?.token, "IF")
+        && toks.get(i + 1).is_some_and(|t| kw(&t.token, "NOT"))
+        && toks.get(i + 2).is_some_and(|t| kw(&t.token, "EXISTS"))
+    {
+        i += 3;
+    }
+    Some(toks.get(i)?.start)
 }
 
 /// Whether any clause of a `FROM`-less `SELECT` contains a subquery. Used by
