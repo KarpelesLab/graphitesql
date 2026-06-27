@@ -7332,17 +7332,35 @@ impl Connection {
             )));
         }
         let tmeta = self.table_meta(&ci.table, None)?;
-        // SQLite rejects non-deterministic functions in an index expression (or a
-        // partial-index predicate): the stored key could never match a recomputed
-        // probe. Reject before building anything.
-        if ci.columns.iter().any(|t| expr_is_nondeterministic(&t.expr))
-            || ci
-                .where_clause
-                .as_ref()
-                .is_some_and(expr_is_nondeterministic)
-        {
+        // SQLite rejects non-deterministic functions in an index *key* expression
+        // before it looks at the partial-index predicate at all: a non-deterministic
+        // key outranks a subquery in the WHERE clause (`CREATE INDEX i ON t(random())
+        // WHERE b IN (SELECT 1)` reports the key error, not the subquery one).
+        if ci.columns.iter().any(|t| expr_is_nondeterministic(&t.expr)) {
             return Err(Error::Error(
                 "non-deterministic functions prohibited in index expressions".into(),
+            ));
+        }
+        // A subquery anywhere in a partial-index predicate is rejected next, before
+        // any column / WHERE-determinism resolution (so `WHERE b IN (SELECT random())`
+        // reports the subquery error, not the non-determinism one).
+        if let Some(p) = &ci.where_clause {
+            if expr_has_subquery(p) {
+                return Err(Error::Error(
+                    "subqueries prohibited in partial index WHERE clauses".into(),
+                ));
+            }
+        }
+        // A non-deterministic function in the partial-index predicate itself: the
+        // stored key set could never match a recomputed probe. SQLite uses a distinct
+        // message here ("partial index WHERE clauses", not "index expressions").
+        if ci
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_is_nondeterministic)
+        {
+            return Err(Error::Error(
+                "non-deterministic functions prohibited in partial index WHERE clauses".into(),
             ));
         }
         // Each key's explicit `COLLATE <name>` must name a known collating

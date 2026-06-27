@@ -234,7 +234,18 @@ leading/trailing-`.` number** now renders in JSON text with just the minimal
 `0` inserted to make it valid JSON (`json('1.e5')` → `1.0e5`, `.5e2` → `0.5e2`,
 even the overflowing `1.e5000` → `1.0e5000`) rather than as the computed float
 (`100000.0`) — the JSONB `FLOAT5` payload already stored the raw text byte-exact;
-only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50.4.
+only the text serializer was canonicalizing; and a **partial-index `WHERE`
+predicate** now rejects a subquery (`CREATE INDEX i ON t(a) WHERE b IN (SELECT
+1)` → `subqueries prohibited in partial index WHERE clauses`) and a
+non-deterministic function, in SQLite's exact precedence: a non-deterministic
+*key* expression outranks a WHERE subquery (`t(random()) WHERE b IN (SELECT 1)`
+→ `non-deterministic functions prohibited in index expressions`), a WHERE
+subquery outranks WHERE non-determinism (even `WHERE b IN (SELECT random())`
+reports the subquery), and a bare non-deterministic WHERE uses its own distinct
+message (`non-deterministic functions prohibited in partial index WHERE
+clauses`, *not* "index expressions"); the subquery check (reusing
+`expr_has_subquery`) fires before column resolution so `WHERE zzz IN (SELECT 1)`
+still reports the subquery — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
