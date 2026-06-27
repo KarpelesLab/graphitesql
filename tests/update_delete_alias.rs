@@ -73,6 +73,21 @@ fn same(sql: &str) {
     assert_eq!(g, s, "mismatch for SQL: {sql}");
 }
 
+/// Whether the local `sqlite3` was built with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`
+/// (the `UPDATE/DELETE … ORDER BY … LIMIT` extension). graphite always supports
+/// it, but CI's pinned stock 3.50.4 is not, so the extension-bearing rows can be
+/// compared only against a build that has it. Probe with a valid statement.
+fn sqlite3_has_update_delete_limit() -> bool {
+    let out = Command::new("sqlite3")
+        .arg(":memory:")
+        .arg("CREATE TABLE t(a); INSERT INTO t VALUES(1); UPDATE t SET a=1 ORDER BY a LIMIT 1;")
+        .output();
+    match out {
+        Ok(o) => !String::from_utf8_lossy(&o.stderr).contains("syntax error"),
+        Err(_) => false,
+    }
+}
+
 #[test]
 fn update_delete_alias_parity() {
     if !sqlite3_available() {
@@ -81,9 +96,13 @@ fn update_delete_alias_parity() {
 
     // Alias as the qualifier in SET, WHERE, ORDER BY.
     same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=x.a*10 WHERE x.a=1; SELECT a,b FROM t ORDER BY a;");
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=x.b+1 WHERE x.a>0 ORDER BY x.a LIMIT 1; SELECT a,b FROM t ORDER BY a;");
     same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); DELETE FROM t AS x WHERE x.a=1; SELECT a,b FROM t ORDER BY a;");
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4),(5,6); DELETE FROM t AS x WHERE x.a>0 ORDER BY x.a DESC LIMIT 1; SELECT a,b FROM t ORDER BY a;");
+    // The `ORDER BY … LIMIT` on the UPDATE/DELETE itself needs the update/delete-
+    // limit extension — only compared when the local sqlite3 has it (CI's does not).
+    if sqlite3_has_update_delete_limit() {
+        same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=x.b+1 WHERE x.a>0 ORDER BY x.a LIMIT 1; SELECT a,b FROM t ORDER BY a;");
+        same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4),(5,6); DELETE FROM t AS x WHERE x.a>0 ORDER BY x.a DESC LIMIT 1; SELECT a,b FROM t ORDER BY a;");
+    }
 
     // The real table name no longer resolves once an alias is given.
     same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET b=t.a;");

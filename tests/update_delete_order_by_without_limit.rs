@@ -15,6 +15,23 @@ fn sqlite3_available() -> bool {
     Command::new("sqlite3").arg("--version").output().is_ok()
 }
 
+/// `ORDER BY` / `LIMIT` on an UPDATE/DELETE is the SQLite update/delete-limit
+/// extension, compiled in only with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`.
+/// graphite always supports it; a stock `sqlite3` (incl. CI's pinned 3.50.4) is
+/// built without it and reports `near "ORDER"/"LIMIT": syntax error` for the
+/// whole family, so the differential comparison only holds against a build that
+/// has the extension. Probe with a valid statement and skip when it is absent.
+fn sqlite3_has_update_delete_limit() -> bool {
+    let out = Command::new("sqlite3")
+        .arg(":memory:")
+        .arg("CREATE TABLE t(a); INSERT INTO t VALUES(1); UPDATE t SET a=1 ORDER BY a LIMIT 1;")
+        .output();
+    match out {
+        Ok(o) => !String::from_utf8_lossy(&o.stderr).contains("syntax error"),
+        Err(_) => false,
+    }
+}
+
 /// First non-caret line of combined stdout/stderr, error-prefix stripped.
 fn run(bin: &str, sql: &str) -> String {
     let out = Command::new(bin).arg(":memory:").arg(sql).output().unwrap();
@@ -40,6 +57,13 @@ fn run(bin: &str, sql: &str) -> String {
 fn order_by_without_limit_matches_sqlite_cli() {
     if !sqlite3_available() {
         eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    if !sqlite3_has_update_delete_limit() {
+        eprintln!(
+            "sqlite3 built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT; \
+             skipping the differential UPDATE/DELETE ORDER BY comparison"
+        );
         return;
     }
     let g = env!("CARGO_BIN_EXE_graphitesql");

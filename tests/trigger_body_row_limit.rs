@@ -62,6 +62,22 @@ fn same(sql: &str) {
     assert_eq!(g, s, "mismatch for SQL: {sql}");
 }
 
+/// Whether the local `sqlite3` has the `UPDATE/DELETE … ORDER BY … LIMIT`
+/// extension (`SQLITE_ENABLE_UPDATE_DELETE_LIMIT`). The *body* cases here are a
+/// syntax error with or without it (triggers always forbid the clause), but the
+/// top-level negative controls execute only on a build that has it — and CI's
+/// pinned stock 3.50.4 does not. Probe with a valid statement.
+fn sqlite3_has_update_delete_limit() -> bool {
+    let out = Command::new("sqlite3")
+        .arg(":memory:")
+        .arg("CREATE TABLE t(a); INSERT INTO t VALUES(1); UPDATE t SET a=1 ORDER BY a LIMIT 1;")
+        .output();
+    match out {
+        Ok(o) => !String::from_utf8_lossy(&o.stderr).contains("syntax error"),
+        Err(_) => false,
+    }
+}
+
 #[test]
 fn trigger_body_row_limit_parity() {
     if !sqlite3_available() {
@@ -95,13 +111,17 @@ fn trigger_body_row_limit_parity() {
     // INSTEAD OF / temp triggers reject it the same way.
     same("CREATE VIEW v AS SELECT 1 a; CREATE TRIGGER tr INSTEAD OF INSERT ON v BEGIN DELETE FROM x ORDER BY 1; END;");
 
-    // Negative controls: the extension still parses at top level …
-    same(&format!(
-        "{t} INSERT INTO t(a) VALUES(1),(2); UPDATE t SET b=9 ORDER BY a LIMIT 1; SELECT count(*) FROM t WHERE b=9;"
-    ));
-    same(&format!(
-        "{t} INSERT INTO t(a) VALUES(1),(2); DELETE FROM t ORDER BY a LIMIT 1; SELECT count(*) FROM t;"
-    ));
+    // Negative controls: the extension still parses at top level — but only
+    // against a sqlite3 built with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT` (CI's
+    // pinned stock 3.50.4 is not; graphite always supports it).
+    if sqlite3_has_update_delete_limit() {
+        same(&format!(
+            "{t} INSERT INTO t(a) VALUES(1),(2); UPDATE t SET b=9 ORDER BY a LIMIT 1; SELECT count(*) FROM t WHERE b=9;"
+        ));
+        same(&format!(
+            "{t} INSERT INTO t(a) VALUES(1),(2); DELETE FROM t ORDER BY a LIMIT 1; SELECT count(*) FROM t;"
+        ));
+    }
     // … a plain body UPDATE still builds and fires …
     same(&format!(
         "{t} CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET b=1 WHERE a=new.a; END; INSERT INTO t(a) VALUES(5); SELECT b FROM t;"
