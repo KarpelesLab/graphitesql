@@ -3992,15 +3992,38 @@ impl Connection {
 
     // ---- DDL / DML ----------------------------------------------------------
 
+    /// SQLite keeps tables, views and indexes in a single namespace (triggers
+    /// are separate). A `CREATE TABLE`/`CREATE VIEW`/`CREATE VIRTUAL TABLE` whose
+    /// name is already taken there fails with a message naming the *existing*
+    /// object's kind — `table X already exists`, `view X already exists`, or
+    /// `there is already an index named X`. Returns `None` when the name is free
+    /// (or held only by a trigger, which does not conflict with a table/view).
+    fn table_namespace_conflict(&self, name: &str) -> Option<Error> {
+        use crate::schema::ObjectType;
+        let obj = self.schema.objects().iter().find(|o| {
+            o.name == name
+                && matches!(
+                    o.obj_type,
+                    ObjectType::Table | ObjectType::View | ObjectType::Index
+                )
+        })?;
+        Some(match obj.obj_type {
+            ObjectType::View => Error::Error(format!("view {name} already exists")),
+            ObjectType::Index => Error::Error(format!("there is already an index named {name}")),
+            // Table (and, defensively, any other kind) uses the table wording.
+            _ => Error::Error(format!("table {name} already exists")),
+        })
+    }
+
     fn exec_create_table(&mut self, ct: &CreateTable, sql_text: &str) -> Result<()> {
         if let Some(select) = &ct.as_select {
             return self.exec_create_table_as_select(ct, select);
         }
-        if self.schema.table(&ct.name).is_some() {
+        if let Some(e) = self.table_namespace_conflict(&ct.name) {
             if ct.if_not_exists {
                 return Ok(());
             }
-            return Err(Error::Error(format!("table {} already exists", ct.name)));
+            return Err(e);
         }
         // STRICT tables restrict column types to the six rigid types; reject any
         // other (or missing) declared type at CREATE, like SQLite.
@@ -4403,11 +4426,11 @@ impl Connection {
     /// query's output labels (no declared types/constraints), then populate it
     /// with the query's rows.
     fn exec_create_table_as_select(&mut self, ct: &CreateTable, select: &Select) -> Result<()> {
-        if self.schema.table(&ct.name).is_some() {
+        if let Some(e) = self.table_namespace_conflict(&ct.name) {
             if ct.if_not_exists {
                 return Ok(());
             }
-            return Err(Error::Error(format!("table {} already exists", ct.name)));
+            return Err(e);
         }
         let result = self.run_select(select, &Params::default())?;
         // SQLite auto-renames duplicate output column names in CTAS — the second
@@ -6961,6 +6984,21 @@ impl Connection {
             }
             return Err(Error::Error(format!("index {} already exists", ci.name)));
         }
+        // The index name also shares the table/view namespace; SQLite words that
+        // collision differently from a duplicate index ("there is already a table
+        // named X", and it says "table" even when X is a view).
+        if self.schema.objects().iter().any(|o| {
+            o.name == ci.name
+                && matches!(
+                    o.obj_type,
+                    crate::schema::ObjectType::Table | crate::schema::ObjectType::View
+                )
+        }) {
+            return Err(Error::Error(format!(
+                "there is already a table named {}",
+                ci.name
+            )));
+        }
         if self.is_virtual_table(&ci.table) {
             return Err(Error::Error("virtual tables may not be indexed".into()));
         }
@@ -7129,12 +7167,11 @@ impl Connection {
             }
             None => sql_text,
         };
-        let exists = self.schema.objects().iter().any(|o| o.name == cv.name);
-        if exists {
+        if let Some(e) = self.table_namespace_conflict(&cv.name) {
             if cv.if_not_exists {
                 return Ok(());
             }
-            return Err(Error::Error(format!("table {} already exists", cv.name)));
+            return Err(e);
         }
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
@@ -7180,12 +7217,11 @@ impl Connection {
             }
             None => sql_text,
         };
-        let exists = self.schema.objects().iter().any(|o| o.name == cvt.name);
-        if exists {
+        if let Some(e) = self.table_namespace_conflict(&cvt.name) {
             if cvt.if_not_exists {
                 return Ok(());
             }
-            return Err(Error::Error(format!("table {} already exists", cvt.name)));
+            return Err(e);
         }
         // The module must be registered, and must accept these arguments.
         let module = self

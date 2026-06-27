@@ -191,7 +191,15 @@ option list parsed as a possibly-empty comma-separated set so the first bad
 option wins (`FOO, STRICT` reports `FOO` and never enters STRICT mode) and is
 surfaced only *after* a STRICT table's missing-datatype check (`STRICT, FOO`
 over an untyped column still reports `missing datatype for t.a`), with a
-trailing comma now `incomplete input` — all byte-exact vs `sqlite3` 3.50.4.
+trailing comma now `incomplete input`; and a `CREATE TABLE`/`VIEW`/`INDEX` whose
+name is already taken now names the *existing* object's kind — a table/view
+collision over a view is `view X already exists` and over an index is `there is
+already an index named X` (was uniformly `table X already exists`), while
+`CREATE INDEX` over a table or view is `there is already a table named X` (it
+says "table" even for a view); this also closes a silent-accept hazard where a
+`CREATE TABLE`/`INDEX` over an existing view/index was previously *allowed* to
+create a duplicate name (a shared `table_namespace_conflict` helper, with
+`IF NOT EXISTS` still a no-op) — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 
