@@ -1215,6 +1215,16 @@ impl Parser {
         while self.eat(&Token::Comma) {
             cols.push(self.result_column()?);
         }
+        // SQLite forbids a `TABLE.*` wildcard in `RETURNING` (a bare `*` is
+        // fine), rejecting it at prepare time for INSERT/UPDATE/DELETE alike.
+        if cols
+            .iter()
+            .any(|c| matches!(c, ResultColumn::TableWildcard(_)))
+        {
+            return Err(Error::Error(
+                "RETURNING may not use \"TABLE.*\" wildcards".into(),
+            ));
+        }
         Ok(cols)
     }
 
@@ -1253,6 +1263,14 @@ impl Parser {
             OnConflict::Abort
         };
         let (schema, table) = self.qualified_name()?;
+        // Target-table alias `UPDATE t AS x SET …`. SQLite requires the explicit
+        // `AS` keyword (a bare `UPDATE t x …` is a syntax error), so only consume
+        // an alias when `AS` is present.
+        let alias = if self.eat_kw("as") {
+            Some(self.ident()?)
+        } else {
+            None
+        };
         // `INDEXED BY name` / `NOT INDEXED` planner hint on the target table.
         let index_hint = self.index_hint()?;
         self.expect_kw("set")?;
@@ -1324,6 +1342,7 @@ impl Parser {
             ctes: Vec::new(),
             table,
             schema,
+            alias,
             index_hint,
             on_conflict,
             on_conflict_explicit,
@@ -1342,6 +1361,13 @@ impl Parser {
         self.expect_kw("delete")?;
         self.expect_kw("from")?;
         let (schema, table) = self.qualified_name()?;
+        // Target-table alias `DELETE FROM t AS x WHERE …`. SQLite requires the
+        // explicit `AS` keyword (a bare `DELETE FROM t x …` is a syntax error).
+        let alias = if self.eat_kw("as") {
+            Some(self.ident()?)
+        } else {
+            None
+        };
         // `INDEXED BY name` / `NOT INDEXED` planner hint on the target table.
         let index_hint = self.index_hint()?;
         let where_clause = if self.eat_kw("where") {
@@ -1355,6 +1381,7 @@ impl Parser {
             ctes: Vec::new(),
             table,
             schema,
+            alias,
             index_hint,
             where_clause,
             order_by,

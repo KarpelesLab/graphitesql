@@ -415,6 +415,12 @@ pub struct Update {
     pub table: String,
     /// A `schema.` qualifier (`UPDATE aux.t`), if any.
     pub schema: Option<String>,
+    /// A target-table alias (`UPDATE t AS x …`), if written. SQLite requires the
+    /// `AS` keyword. When present, the alias is the sole qualifier for the
+    /// target's columns in `SET`/`WHERE`/`ORDER BY` (`x.col`); the real table
+    /// name no longer resolves there. (Quirk: `RETURNING` still resolves against
+    /// the real table name, not the alias.)
+    pub alias: Option<String>,
     /// `INDEXED BY name` / `NOT INDEXED` query-planner hint on the target, if
     /// given (`UPDATE t INDEXED BY ix SET …`).
     pub index_hint: Option<IndexHint>,
@@ -453,6 +459,12 @@ pub struct Delete {
     pub table: String,
     /// A `schema.` qualifier (`DELETE FROM aux.t`), if any.
     pub schema: Option<String>,
+    /// A target-table alias (`DELETE FROM t AS x …`), if written. SQLite requires
+    /// the `AS` keyword. When present, the alias is the sole qualifier for the
+    /// target's columns in `WHERE`/`ORDER BY` (`x.col`); the real table name no
+    /// longer resolves there. (Quirk: `RETURNING` still resolves against the real
+    /// table name, not the alias.)
+    pub alias: Option<String>,
     /// `INDEXED BY name` / `NOT INDEXED` query-planner hint on the target, if
     /// given (`DELETE FROM t INDEXED BY ix WHERE …`).
     pub index_hint: Option<IndexHint>,

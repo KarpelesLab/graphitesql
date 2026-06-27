@@ -485,6 +485,32 @@ statements SQLite rejects at prepare time. A single early check in `run_core`
 descending into a subquery, which has its own scope) closes the top-level *and*
 correlated-subquery cases. Byte-exact vs `sqlite3` 3.50.4.
 
+**An `UPDATE`/`DELETE` target table may now carry an `AS` alias** (`UPDATE t AS x
+SET b = x.a … WHERE x.a = 1`, `DELETE FROM t AS x WHERE x.a = 1`). SQLite lets a
+single-table mutation rename its target with the `AS` keyword; the alias then
+becomes the *sole* qualifier for the target's columns in `SET`/`WHERE`/`ORDER BY`
+— the real table name no longer resolves there (`UPDATE t AS x SET b = t.a` →
+`no such column: t.a`). graphite previously had no `alias` field on the `Update`/
+`Delete` AST and silently dropped the alias, so `x.a` failed to resolve. The fix
+parses an optional `AS <ident>` after the target name (a bare `UPDATE t x …` is a
+syntax error, as in SQLite) and, at exec time, AST-rewrites the alias qualifier to
+the real table name across `SET`/`WHERE`/`ORDER BY` and any correlated subqueries,
+descending but stopping at a subquery that re-binds the alias name (so `… SET b =
+(SELECT max(b) FROM t AS x)` shadows correctly). A column the alias can't resolve
+is rejected eagerly at prepare time with the alias qualifier preserved (`x.nope` →
+`no such column: x.nope`, over a populated *or* empty table), and the `rowid`
+family resolves through the alias. `RETURNING` is the documented quirk: it still
+resolves against the **real** table name, not the alias (`… RETURNING t.a` works,
+`RETURNING x.a` is `no such column: x.a`). Bundled with it, a `TABLE.*` wildcard in
+`RETURNING` is now rejected at parse time (`RETURNING may not use "TABLE.*"
+wildcards`) for `INSERT`/`UPDATE`/`DELETE` alike — a bare `*` is still fine —
+closing a pre-existing gap where graphite expanded `t.*` that SQLite rejects.
+Byte-exact vs `sqlite3` 3.50.4 across ~40 permutations (`tests/update_delete_alias.rs`).
+*(Residual: for a **view**/virtual-table target the column set isn't known on the
+best-effort path, so a missing aliased column there is reported against the real
+name rather than the alias — a minor message-only divergence on an already-erroring
+query.)*
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

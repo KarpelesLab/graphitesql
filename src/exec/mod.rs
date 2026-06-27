@@ -6888,6 +6888,26 @@ impl Connection {
 
     fn exec_delete_inner(&mut self, del: &Delete, params: &Params) -> Result<usize> {
         reject_schema_write(&del.table)?;
+        // Resolve a target-table alias (`DELETE FROM t AS x …`) up front so every
+        // downstream path sees alias-qualified `WHERE`/`ORDER BY` references
+        // rewritten to the real table name (and a now-hidden real-name reference
+        // rejected). `RETURNING` is left untouched.
+        let aliased;
+        let del = if del.alias.is_some() {
+            let mut d = del.clone();
+            // A base-table target's columns refine the alias check (a missing
+            // `x.col` is rejected by name); a view/vtab target passes `None`.
+            let cols = if !self.is_virtual_table(&d.table) && !self.is_view(&d.table) {
+                Some(self.table_meta(&d.table, None)?.columns)
+            } else {
+                None
+            };
+            resolve_delete_alias(&mut d, cols.as_deref())?;
+            aliased = d;
+            &aliased
+        } else {
+            del
+        };
         if self.is_virtual_table(&del.table) {
             return self.exec_vtab_delete(del, params);
         }
@@ -7023,6 +7043,27 @@ impl Connection {
 
     fn exec_update_inner(&mut self, upd: &Update, params: &Params) -> Result<usize> {
         reject_schema_write(&upd.table)?;
+        // Resolve a target-table alias (`UPDATE t AS x …`) up front so every
+        // downstream path (rowid, view, vtab, WITHOUT ROWID) sees alias-qualified
+        // `SET`/`WHERE`/`ORDER BY` references rewritten to the real table name
+        // (and a now-hidden real-name reference rejected). `RETURNING` is left
+        // untouched — SQLite resolves it against the real table name, not the alias.
+        let aliased;
+        let upd = if upd.alias.is_some() {
+            let mut u = upd.clone();
+            // A base-table target's columns refine the alias check (a missing
+            // `x.col` is rejected by name); a view/vtab target passes `None`.
+            let cols = if !self.is_virtual_table(&u.table) && !self.is_view(&u.table) {
+                Some(self.table_meta(&u.table, None)?.columns)
+            } else {
+                None
+            };
+            resolve_update_alias(&mut u, cols.as_deref())?;
+            aliased = u;
+            &aliased
+        } else {
+            upd
+        };
         if self.is_virtual_table(&upd.table) {
             return self.exec_vtab_update(upd, params);
         }
@@ -23804,6 +23845,290 @@ fn rename_table_in_expr(e: &mut Expr, old: &str, new: &str) {
             rename_table_in_expr(expr, old, new);
             rename_table_in_select(select, old, new);
         }
+    }
+}
+
+/// Whether `sel` binds the name `alias` as one of its own `FROM` sources or
+/// CTEs — in which case a `DELETE`/`UPDATE` target alias of the same name is
+/// *shadowed* inside it (the reference is the inner source, not the outer
+/// target), so the alias rewrite must not descend into it.
+fn select_binds_name(sel: &Select, alias: &str) -> bool {
+    if sel.ctes.iter().any(|c| c.name.eq_ignore_ascii_case(alias)) {
+        return true;
+    }
+    let binds = |tr: &TableRef| match &tr.alias {
+        Some(a) => a.eq_ignore_ascii_case(alias),
+        None => tr.subquery.is_none() && tr.name.eq_ignore_ascii_case(alias),
+    };
+    match &sel.from {
+        Some(from) => binds(&from.first) || from.joins.iter().any(|j| binds(&j.table)),
+        None => false,
+    }
+}
+
+/// Whether an `alias.column` reference resolves against the target's columns.
+/// `cols` is `None` for a view/vtab target (whose column set is not fetched
+/// here) — treat any name as resolvable then (best-effort: the alias is rewritten
+/// and resolution is left to the downstream path). The rowid pseudo-columns are
+/// always resolvable on a rowid table.
+fn alias_col_resolvable(cols: Option<&[ColumnInfo]>, column: &str) -> bool {
+    match cols {
+        None => true,
+        Some(cs) => {
+            matches!(
+                column.to_ascii_lowercase().as_str(),
+                "rowid" | "oid" | "_rowid_"
+            ) || cs.iter().any(|c| c.name.eq_ignore_ascii_case(column))
+        }
+    }
+}
+
+/// Apply a DML target-table `AS alias` to an expression in a `SET`/`WHERE`/
+/// `ORDER BY` clause: rewrite each `alias.col` qualifier to the real `table`
+/// name (the executor labels the target's columns with their real table name,
+/// so the rewritten reference resolves). Two references are rejected as
+/// `no such column` at this prepare-time step instead, regardless of the table's
+/// row count: a reference through the now-hidden real name (`table.col`), and an
+/// `alias.col` naming a column the target does not have (kept alias-qualified in
+/// the message, exactly as SQLite reports it). Descends into every
+/// sub-expression and nested subquery — a correlated `SET`/`WHERE` subquery may
+/// use the alias — except one that re-binds the alias as its own `FROM`
+/// source/CTE (handled in [`rewrite_target_alias_select`]). Other qualifiers
+/// (`UPDATE … FROM` sources, `OLD`/`NEW`) are never touched.
+fn rewrite_target_alias_expr(
+    e: &mut Expr,
+    alias: &str,
+    table: &str,
+    cols: Option<&[ColumnInfo]>,
+    err: &mut Option<Error>,
+) {
+    match e {
+        Expr::Column {
+            schema,
+            table: Some(t),
+            column,
+            quoted,
+        } => {
+            if t.eq_ignore_ascii_case(alias) {
+                if alias_col_resolvable(cols, column) {
+                    *t = String::from(table);
+                } else if err.is_none() {
+                    // A missing column keeps the alias qualifier in the message.
+                    *err = Some(eval::no_such_column(
+                        None,
+                        Some(t.as_str()),
+                        column,
+                        *quoted,
+                    ));
+                }
+            } else if t.eq_ignore_ascii_case(table) && err.is_none() {
+                *err = Some(eval::no_such_column(
+                    schema.as_deref(),
+                    Some(t.as_str()),
+                    column,
+                    *quoted,
+                ));
+            }
+        }
+        Expr::Column { .. } | Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::Collate { expr, .. } => rewrite_target_alias_expr(expr, alias, table, cols, err),
+        Expr::Binary { left, right, .. } => {
+            rewrite_target_alias_expr(left, alias, table, cols, err);
+            rewrite_target_alias_expr(right, alias, table, cols, err);
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            over,
+            ..
+        } => {
+            for a in args {
+                rewrite_target_alias_expr(a, alias, table, cols, err);
+            }
+            if let Some(f) = filter {
+                rewrite_target_alias_expr(f, alias, table, cols, err);
+            }
+            for o in order_by {
+                rewrite_target_alias_expr(&mut o.expr, alias, table, cols, err);
+            }
+            if let Some(w) = over {
+                rewrite_target_alias_window(w, alias, table, cols, err);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            rewrite_target_alias_expr(expr, alias, table, cols, err);
+            for a in list {
+                rewrite_target_alias_expr(a, alias, table, cols, err);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_target_alias_expr(expr, alias, table, cols, err);
+            rewrite_target_alias_expr(low, alias, table, cols, err);
+            rewrite_target_alias_expr(high, alias, table, cols, err);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                rewrite_target_alias_expr(o, alias, table, cols, err);
+            }
+            for (w, t) in when_then {
+                rewrite_target_alias_expr(w, alias, table, cols, err);
+                rewrite_target_alias_expr(t, alias, table, cols, err);
+            }
+            if let Some(el) = else_result {
+                rewrite_target_alias_expr(el, alias, table, cols, err);
+            }
+        }
+        Expr::RowValue(items) => {
+            for i in items {
+                rewrite_target_alias_expr(i, alias, table, cols, err);
+            }
+        }
+        Expr::Subquery(s) => rewrite_target_alias_select(s, alias, table, cols, err),
+        Expr::Exists { select, .. } => rewrite_target_alias_select(select, alias, table, cols, err),
+        Expr::InSelect { expr, select, .. } => {
+            rewrite_target_alias_expr(expr, alias, table, cols, err);
+            rewrite_target_alias_select(select, alias, table, cols, err);
+        }
+    }
+}
+
+/// Apply the DML target alias rewrite to a window spec's `PARTITION BY`/
+/// `ORDER BY` expressions (a window function here is a misuse rejected later,
+/// but the rewrite still descends for completeness).
+fn rewrite_target_alias_window(
+    ws: &mut WindowSpec,
+    alias: &str,
+    table: &str,
+    cols: Option<&[ColumnInfo]>,
+    err: &mut Option<Error>,
+) {
+    for e in &mut ws.partition_by {
+        rewrite_target_alias_expr(e, alias, table, cols, err);
+    }
+    for t in &mut ws.order_by {
+        rewrite_target_alias_expr(&mut t.expr, alias, table, cols, err);
+    }
+}
+
+/// Apply the DML target alias rewrite throughout a (correlated) subquery. A
+/// subquery that re-binds the alias name as its own `FROM` source/CTE shadows
+/// the outer target and is left untouched; otherwise every expression-bearing
+/// clause is rewritten, recursing into further nested subqueries.
+fn rewrite_target_alias_select(
+    sel: &mut Select,
+    alias: &str,
+    table: &str,
+    cols: Option<&[ColumnInfo]>,
+    err: &mut Option<Error>,
+) {
+    if select_binds_name(sel, alias) {
+        return;
+    }
+    for cte in &mut sel.ctes {
+        rewrite_target_alias_select(&mut cte.select, alias, table, cols, err);
+    }
+    if let Some(from) = &mut sel.from {
+        if let Some(sub) = &mut from.first.subquery {
+            rewrite_target_alias_select(sub, alias, table, cols, err);
+        }
+        for j in &mut from.joins {
+            if let Some(sub) = &mut j.table.subquery {
+                rewrite_target_alias_select(sub, alias, table, cols, err);
+            }
+            if let Some(on) = &mut j.on {
+                rewrite_target_alias_expr(on, alias, table, cols, err);
+            }
+        }
+    }
+    for rc in &mut sel.columns {
+        if let ResultColumn::Expr { expr, .. } = rc {
+            rewrite_target_alias_expr(expr, alias, table, cols, err);
+        }
+    }
+    if let Some(w) = &mut sel.where_clause {
+        rewrite_target_alias_expr(w, alias, table, cols, err);
+    }
+    for e in &mut sel.group_by {
+        rewrite_target_alias_expr(e, alias, table, cols, err);
+    }
+    if let Some(h) = &mut sel.having {
+        rewrite_target_alias_expr(h, alias, table, cols, err);
+    }
+    for t in &mut sel.order_by {
+        rewrite_target_alias_expr(&mut t.expr, alias, table, cols, err);
+    }
+    for (_, ws) in &mut sel.window_defs {
+        rewrite_target_alias_window(ws, alias, table, cols, err);
+    }
+    if let Some(e) = &mut sel.limit {
+        rewrite_target_alias_expr(e, alias, table, cols, err);
+    }
+    if let Some(e) = &mut sel.offset {
+        rewrite_target_alias_expr(e, alias, table, cols, err);
+    }
+    for (_, comp) in &mut sel.compound {
+        rewrite_target_alias_select(comp, alias, table, cols, err);
+    }
+}
+
+/// Resolve an `UPDATE … AS alias` target alias in place: rewrite alias-qualified
+/// `SET`/`WHERE`/`ORDER BY` (including row-value subquery assignments) references
+/// to the real table name and reject a reference through the hidden real name (or
+/// a missing aliased column). `cols` is the target's column metadata (`None` for
+/// a view/vtab target). `RETURNING` is intentionally left alone — SQLite resolves
+/// it against the real table name, not the alias. No-op when no alias was written.
+fn resolve_update_alias(u: &mut Update, cols: Option<&[ColumnInfo]>) -> Result<()> {
+    let Some(alias) = u.alias.clone() else {
+        return Ok(());
+    };
+    let table = u.table.clone();
+    let mut err = None;
+    for (_, e) in &mut u.assignments {
+        rewrite_target_alias_expr(e, &alias, &table, cols, &mut err);
+    }
+    for (_, s) in &mut u.row_assignments {
+        rewrite_target_alias_select(s, &alias, &table, cols, &mut err);
+    }
+    if let Some(w) = &mut u.where_clause {
+        rewrite_target_alias_expr(w, &alias, &table, cols, &mut err);
+    }
+    for t in &mut u.order_by {
+        rewrite_target_alias_expr(&mut t.expr, &alias, &table, cols, &mut err);
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Resolve a `DELETE FROM … AS alias` target alias in place (see
+/// [`resolve_update_alias`]); `WHERE`/`ORDER BY` only.
+fn resolve_delete_alias(d: &mut Delete, cols: Option<&[ColumnInfo]>) -> Result<()> {
+    let Some(alias) = d.alias.clone() else {
+        return Ok(());
+    };
+    let table = d.table.clone();
+    let mut err = None;
+    if let Some(w) = &mut d.where_clause {
+        rewrite_target_alias_expr(w, &alias, &table, cols, &mut err);
+    }
+    for t in &mut d.order_by {
+        rewrite_target_alias_expr(&mut t.expr, &alias, &table, cols, &mut err);
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
