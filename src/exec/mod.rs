@@ -8355,6 +8355,19 @@ impl Connection {
             ));
         }
 
+        // SQLite permits a recursive term to name the recursive table only once in
+        // its FROM clause; a self-join on it (`FROM c, c`) is rejected at prepare
+        // time. graphite would otherwise run the cross-join and report a misleading
+        // `ambiguous column name`.
+        for s in &recursive {
+            if from_reference_count(s, &cte.name) > 1 {
+                return Err(Error::Error(alloc::format!(
+                    "multiple references to recursive table: {}",
+                    cte.name
+                )));
+            }
+        }
+
         // Evaluate the anchor (a compound of the anchor arms).
         let mut anchor_rows: Vec<Vec<Value>> = Vec::new();
         for a in &anchor {
@@ -19916,6 +19929,23 @@ fn references_name_select(select: &Select, name: &str) -> bool {
     from.joins
         .iter()
         .any(|j| j.table.name.eq_ignore_ascii_case(name))
+}
+
+/// Count the FROM-clause references (the leading table plus every joined table)
+/// to a source named `name` in a single `SELECT` arm. SQLite lets a recursive
+/// CTE's recursive term name the recursive table only once in its FROM, so a
+/// count above 1 is the `multiple references to recursive table` error.
+fn from_reference_count(select: &Select, name: &str) -> usize {
+    let Some(from) = &select.from else {
+        return 0;
+    };
+    let mut n = usize::from(from.first.name.eq_ignore_ascii_case(name));
+    n += from
+        .joins
+        .iter()
+        .filter(|j| j.table.name.eq_ignore_ascii_case(name))
+        .count();
+    n
 }
 
 /// Is `e` a bare column reference (ignoring transparent `(…)`/`COLLATE` wrappers)?

@@ -293,6 +293,17 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   `exec_update_inner`/`exec_delete_inner` right after the table meta is resolved (so it
   outranks a bad `WHERE`/`SET` column, matching sqlite's resolution order). `NOT
   INDEXED` and an absent hint are always accepted. `tests/indexed_by_dml.rs`.
+- **Recursive-CTE self-join rejected — DONE.** A recursive term may name the
+  recursive table only once in its FROM; a self-join (`FROM c, c`, `c JOIN c c2`,
+  `c, c d`) is now rejected at prepare time with `multiple references to recursive
+  table: <name>` (echoing the CTE's declared name case-preserving), matching sqlite.
+  graphite previously ran the cross-join and reported a misleading `ambiguous column
+  name`. New `from_reference_count` helper counts the leading + joined sources named
+  like the CTE in each recursive arm; checked in `eval_recursive_cte` right after the
+  anchor/recursive partition. `tests/recursive_cte_multiref.rs`. (Residual: the
+  *separate* `multiple recursive references` error — recursive table named once in
+  FROM **and** again inside a subquery — is not yet emitted; those cases need a deeper
+  walk and several loop forever under the differential oracle, so left for later.)
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a
