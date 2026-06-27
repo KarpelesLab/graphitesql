@@ -14644,7 +14644,14 @@ impl Connection {
                 if matches!(doc, Value::Null) {
                     return Ok((columns, Vec::new()));
                 }
-                let Some(root) = crate::exec::json::parse(&eval::to_text(&doc)) else {
+                // A BLOB document is SQLite's binary JSONB (decoded as a complete
+                // value, trailing bytes rejected); a text/numeric document is
+                // parsed as JSON text. Either failure is `malformed JSON`.
+                let root = match &doc {
+                    Value::Blob(b) => crate::exec::json::Json::from_jsonb(b),
+                    _ => crate::exec::json::parse(&eval::to_text(&doc)),
+                };
+                let Some(root) = root else {
                     return Err(Error::Error("malformed JSON".into()));
                 };
                 // An optional second argument is a path to navigate to first; the

@@ -306,9 +306,14 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   (false everywhere but these two columns); every `*`/`tbl.*` expansion site
   (`output_labels`, `project_column`, result affinities, key collation,
   aggregate-wildcard expansion) filters `!hidden`, and the walker appends the
-  two values to each emitted row. Residual: `json_each`/`json_tree` still reject
-  a **JSONB blob** document (`json_each(jsonb('[1]'))` → `malformed JSON`,
-  because the doc is parsed via `to_text`) — a separate, pre-existing gap.
+  two values to each emitted row.
+- **`json_each`/`json_tree` accept a JSONB blob document — DONE.** A BLOB
+  argument is decoded as SQLite's binary JSONB (one complete value via
+  `Json::from_jsonb`, trailing bytes rejected) instead of being run through
+  `to_text` and failing as `malformed JSON`; a text/numeric document still
+  parses as JSON text. `json_each(jsonb('{"a":1}'))` now walks the structure,
+  `json_each(x'00')` is a single `null` root row, and `x'ffff'` is `malformed
+  JSON`. The hidden `json` column keeps echoing the raw blob argument.
 - **Two residual parse-path non-issues (not worth chasing):** `UPDATE SET a=1`
   flags `a` where SQLite flags `SET` (reserved-word leniency), and `BEGIN
   TRANSACTION FOO` silently accepts the trailing name.
