@@ -122,6 +122,9 @@ struct Tokenizer<'a> {
     src: &'a str,
     bytes: &'a [u8],
     pos: usize,
+    /// Byte offset where the token currently being lexed began. Used to render
+    /// a lexing failure as SQLite's `unrecognized token: "<source slice>"`.
+    tok_start: usize,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -130,6 +133,7 @@ impl<'a> Tokenizer<'a> {
             src,
             bytes: src.as_bytes(),
             pos: 0,
+            tok_start: 0,
         }
     }
 
@@ -138,6 +142,7 @@ impl<'a> Tokenizer<'a> {
         loop {
             self.skip_trivia()?;
             let start = self.pos;
+            self.tok_start = start;
             let Some(c) = self.peek() else { break };
             let token = self.next_token(c)?;
             out.push(Spanned {
@@ -161,6 +166,18 @@ impl<'a> Tokenizer<'a> {
         Error::Parse(alloc::format!("{msg} at byte {}", self.pos))
     }
 
+    /// SQLite reports every lexing failure as `unrecognized token: "X"`, where
+    /// `X` is the verbatim source text from the current token's start to where
+    /// the lexer gave up (a stray `^`, a whole unterminated `'abc`, a malformed
+    /// `x'zz'`, a number run with a bad suffix like `123abc`). The caller is
+    /// responsible for advancing `self.pos` to the end of that run first.
+    fn unrecognized(&self) -> Error {
+        Error::Parse(alloc::format!(
+            "unrecognized token: \"{}\"",
+            &self.src[self.tok_start..self.pos]
+        ))
+    }
+
     fn skip_trivia(&mut self) -> Result<()> {
         loop {
             match self.peek() {
@@ -180,7 +197,10 @@ impl<'a> Tokenizer<'a> {
                     self.pos += 2;
                     loop {
                         match self.peek() {
-                            None => return Err(self.err("unterminated block comment")),
+                            // An unterminated block comment runs off the end of
+                            // the input — SQLite reports this as `incomplete
+                            // input`, like any other premature end.
+                            None => return Err(Error::Parse("incomplete input".into())),
                             Some(b'*') if self.peek_at(1) == Some(b'/') => {
                                 self.pos += 2;
                                 break;
@@ -276,7 +296,13 @@ impl<'a> Tokenizer<'a> {
             b'x' | b'X' if self.peek_at(1) == Some(b'\'') => self.blob_literal(),
             d if d.is_ascii_digit() => self.number(),
             w if is_ident_start(w) => Ok(self.word()),
-            other => Err(self.err(&alloc::format!("unexpected character {:?}", other as char))),
+            _ => {
+                // An unhandled byte here is always single-byte ASCII (every
+                // byte >= 0x80 starts an identifier). Consume it so the reported
+                // token is the character itself.
+                self.pos += 1;
+                Err(self.unrecognized())
+            }
         }
     }
 
@@ -302,7 +328,7 @@ impl<'a> Tokenizer<'a> {
         let mut seg = self.pos;
         loop {
             match self.peek() {
-                None => return Err(self.err("unterminated quoted identifier")),
+                None => return Err(self.unrecognized()),
                 Some(c) if c == quote => {
                     s.push_str(&self.src[seg..self.pos]);
                     self.pos += 1;
@@ -339,7 +365,7 @@ impl<'a> Tokenizer<'a> {
         let mut seg = self.pos;
         loop {
             match self.peek() {
-                None => return Err(self.err("unterminated string literal")),
+                None => return Err(self.unrecognized()),
                 Some(b'\'') => {
                     s.push_str(&self.src[seg..self.pos]);
                     self.pos += 1;
@@ -363,19 +389,19 @@ impl<'a> Tokenizer<'a> {
             self.pos += 1;
         }
         if self.peek() != Some(b'\'') {
-            return Err(self.err("unterminated blob literal"));
+            return Err(self.unrecognized());
         }
         let hex = &self.src[start..self.pos];
         self.pos += 1; // closing quote
         if !hex.len().is_multiple_of(2) {
-            return Err(self.err("blob literal has odd number of hex digits"));
+            return Err(self.unrecognized());
         }
         let mut bytes = Vec::with_capacity(hex.len() / 2);
         let hb = hex.as_bytes();
         let mut i = 0;
         while i < hb.len() {
-            let hi = hex_val(hb[i]).ok_or_else(|| self.err("invalid hex in blob literal"))?;
-            let lo = hex_val(hb[i + 1]).ok_or_else(|| self.err("invalid hex in blob literal"))?;
+            let hi = hex_val(hb[i]).ok_or_else(|| self.unrecognized())?;
+            let lo = hex_val(hb[i + 1]).ok_or_else(|| self.unrecognized())?;
             bytes.push((hi << 4) | lo);
             i += 2;
         }
@@ -393,8 +419,7 @@ impl<'a> Tokenizer<'a> {
             // SQLite allows `_` digit separators between digits (3.46+); strip
             // them before parsing.
             let digits = self.src[hstart..self.pos].replace('_', "");
-            let v = u64::from_str_radix(&digits, 16)
-                .map_err(|_| self.err("invalid hexadecimal integer"))?;
+            let v = u64::from_str_radix(&digits, 16).map_err(|_| self.unrecognized())?;
             return Ok(Token::Integer(v as i64));
         }
 
@@ -418,7 +443,7 @@ impl<'a> Tokenizer<'a> {
         if is_float {
             text.parse::<f64>()
                 .map(Token::Float)
-                .map_err(|_| self.err("invalid floating-point literal"))
+                .map_err(|_| self.unrecognized())
         } else {
             match text.parse::<i64>() {
                 Ok(i) => Ok(Token::Integer(i)),
@@ -429,7 +454,7 @@ impl<'a> Tokenizer<'a> {
                 Err(_) => text
                     .parse::<f64>()
                     .map(Token::Float)
-                    .map_err(|_| self.err("invalid integer literal")),
+                    .map_err(|_| self.unrecognized()),
             }
         }
     }
@@ -437,10 +462,16 @@ impl<'a> Tokenizer<'a> {
     /// Reject a numeric literal that is immediately followed by an identifier
     /// character (`123abc`, `0x1p4`, `12e3f`): SQLite treats the whole run as one
     /// "unrecognized token" rather than a number adjacent to a name.
-    fn reject_number_suffix(&self) -> Result<()> {
+    fn reject_number_suffix(&mut self) -> Result<()> {
         match self.peek() {
             Some(c) if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 => {
-                Err(self.err("unrecognized token"))
+                // Consume the whole adjacent identifier run so the reported token
+                // is the entire offending span (`123abc`, not `123`), matching
+                // SQLite's `unrecognized token: "123abc"`.
+                while matches!(self.peek(), Some(c) if is_ident_continue(c)) {
+                    self.pos += 1;
+                }
+                Err(self.unrecognized())
             }
             _ => Ok(()),
         }
@@ -490,7 +521,7 @@ impl<'a> Tokenizer<'a> {
                     self.pos += 1;
                 }
                 if self.pos == start {
-                    return Err(self.err("named parameter requires a name"));
+                    return Err(self.unrecognized());
                 }
                 let mut name = String::new();
                 name.push(sigil as char);

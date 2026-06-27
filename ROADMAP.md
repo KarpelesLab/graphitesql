@@ -466,6 +466,19 @@ text-preserving CREATE-text edits).
     parse-path divergence (`UPDATE SET a=1` → sqlite flags `SET`, graphite `a`)
     and sqlite silently accepting a trailing name on `BEGIN TRANSACTION FOO`
     (`tests/syntax_error_near_token.rs`).
+  - **Lexing failures render as `unrecognized token: "X"` (done).** A stray
+    character (`^`, `#`), an unterminated literal (`'abc`, `x'1`), a malformed
+    blob (`x'zz'`), or a number run with a trailing identifier (`123abc`, `0xGG`,
+    `12e3f`) is reported by sqlite as `unrecognized token: "X"`, where `X` is the
+    verbatim source from the token's start to where the lexer gave up. graphite
+    leaked its lexer state (`unexpected character '^' at byte 7`, `unterminated
+    string literal at byte 11`, `invalid hex in blob literal at byte 12`, …). The
+    tokenizer now records each token's start and a single `unrecognized()` helper
+    slices `&src[tok_start..pos]`; the number-suffix check first consumes the
+    whole adjacent run so `123abc` is echoed entire (not `123`). An unterminated
+    block comment runs off the end and is `incomplete input`, like any premature
+    end. All 24 probed lexer positions are byte-exact vs sqlite
+    (`tests/tokenizer_unrecognized_token.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
