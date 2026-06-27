@@ -1132,7 +1132,16 @@ pub fn arrow(doc: &Value, path_arg: &Value, as_text: bool) -> crate::Result<Valu
     }
     let text = crate::exec::eval::to_text(doc);
     let Some(root) = parse(&text) else {
-        return Ok(Value::Null);
+        // A text (or numeric) document that is not valid JSON is a hard error,
+        // matching sqlite and `json_extract` (which both reject `'' -> 1` and
+        // `'notjson' -> 0` as `malformed JSON`). A BLOB document is SQLite's
+        // binary JSONB, which the arrow operators do not yet model, so it keeps
+        // the existing lenient raw-bytes path rather than gaining a new
+        // divergence here.
+        if matches!(doc, Value::Blob(_)) {
+            return Ok(Value::Null);
+        }
+        return Err(crate::error::Error::Error("malformed JSON".into()));
     };
     let path = arrow_path(path_arg);
     // An explicit `$`-rooted path operand must be syntactically valid — sqlite

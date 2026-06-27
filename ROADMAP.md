@@ -498,6 +498,16 @@ text-preserving CREATE-text edits).
     paths) and only fires for `FrameMode::Range` with a `Preceding`/`Following`
     bound; `ROWS`/`GROUPS` offsets are positional and stay exempt
     (`tests/window_range_offset_order_by.rs`).
+  - **`->`/`->>` reject a malformed text document (done).** The JSON arrow
+    operators treat their left operand as a document; a text (or numeric) value
+    that is not valid JSON is `malformed JSON` in sqlite — the same error
+    `json_extract` already raised — not a silent NULL. graphite swallowed the
+    parse failure (`'' -> 1`, `'notjson' -> 0`, `'{bad' -> 'a'` all returned
+    NULL). `json::arrow` now errors when a non-BLOB document fails to parse;
+    valid JSON, numeric scalars (`5 -> 0` → NULL), and `NULL` documents are
+    unchanged. (BLOB operands are SQLite's binary JSONB, not yet modeled by the
+    arrow path, so they keep the existing lenient behaviour — a separate gap.)
+    (`tests/json_arrow_malformed.rs`)
 
 ### Track B — Query planner, statistics & the VDBE
 
