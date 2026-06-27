@@ -668,6 +668,22 @@ consume. Byte-exact vs `sqlite3` 3.50.4 (`tests/window_frame_offset_expr.rs`),
 covering the value cases, the affinity edges, the run-time rejections, and the
 empty-input deferral.
 
+An **`ORDER BY` expression may reference a SELECT-output alias**, not just a bare
+alias term. SQLite resolves `SELECT a AS x FROM t ORDER BY x+0` (and `-x`,
+`abs(x)`, `x+y`, `x||c`, `CASE WHEN x>1 …`) by binding the name to the *computed
+output value*, with a real input column of the same name taking precedence
+(`SELECT a AS b … ORDER BY b+0` still orders by the column `b`). The alias is in
+scope for aggregate (`SELECT count(*) AS n … ORDER BY n+0`), window
+(`ORDER BY row_number() OVER (…)+0`), `DISTINCT`, and grouped
+(`ORDER BY n*10+x`) queries alike. The VDBE path already handled this; the
+fix is in the tree-walker fallback (`eval_simple`/`eval_aggregated`), which used
+to resolve only a *whole-term* alias/ordinal (`resolve_order_index`) and raised
+`no such column` the moment the alias appeared inside a larger expression. Each
+now evaluates a general `ORDER BY` term against a context augmented with the
+output columns (base columns first, so they win ties), mirroring the existing
+`HAVING` augmentation. Byte-exact vs `sqlite3` 3.50.4
+(`tests/order_by_alias_expr.rs`).
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

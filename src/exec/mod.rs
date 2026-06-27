@@ -17801,6 +17801,32 @@ impl Connection {
         params: &Params,
     ) -> Result<(Vec<String>, Vec<OutRow>)> {
         let labels = self.output_labels(sel, columns);
+        // An `ORDER BY` *expression* (not a bare alias/ordinal, which
+        // `resolve_order_index` handles) may reference a SELECT-output alias —
+        // `SELECT a AS x … ORDER BY x+0`. SQLite resolves the name to the
+        // computed output value, with a real input column of the same name
+        // taking precedence. Pre-build the augmented column list (base columns
+        // first, then the output labels) once; the per-row values are appended
+        // below.
+        let order_needs_output = sel
+            .order_by
+            .iter()
+            .any(|t| resolve_order_index(&t.expr, &labels, sel.columns.len()).is_none());
+        let aug_cols: Vec<ColumnInfo> = if order_needs_output {
+            let mut c = columns.to_vec();
+            for label in &labels {
+                c.push(ColumnInfo {
+                    name: label.clone(),
+                    table: String::new(),
+                    affinity: eval::Affinity::Blob,
+                    collation: crate::value::Collation::Binary,
+                    hidden: false,
+                });
+            }
+            c
+        } else {
+            Vec::new()
+        };
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let ctx = r.ctx(columns, params).with_subqueries(self);
@@ -17809,12 +17835,30 @@ impl Connection {
                 project_column(col, columns, &ctx, &mut values)?;
             }
             // ORDER BY: resolve by position/alias against the output, else
-            // evaluate against the input row (allows ordering by unselected cols).
+            // evaluate against the input row (allows ordering by unselected
+            // cols) — augmented with the output columns so an expression may
+            // also reference a SELECT-output alias (base columns still win).
             let mut sort_keys = Vec::new();
-            for term in &sel.order_by {
-                match resolve_order_index(&term.expr, &labels, values.len()) {
-                    Some(idx) => sort_keys.push(values[idx].clone()),
-                    None => sort_keys.push(eval::eval(&term.expr, &ctx)?),
+            if !sel.order_by.is_empty() {
+                let aug_row;
+                let octx;
+                let octx = if order_needs_output {
+                    let mut aug_vals = r.values.clone();
+                    aug_vals.extend(values.iter().cloned());
+                    aug_row = InputRow {
+                        values: aug_vals,
+                        rowid: r.rowid,
+                    };
+                    octx = aug_row.ctx(&aug_cols, params).with_subqueries(self);
+                    &octx
+                } else {
+                    &ctx
+                };
+                for term in &sel.order_by {
+                    match resolve_order_index(&term.expr, &labels, values.len()) {
+                        Some(idx) => sort_keys.push(values[idx].clone()),
+                        None => sort_keys.push(eval::eval(&term.expr, octx)?),
+                    }
                 }
             }
             out.push(OutRow { values, sort_keys });
@@ -17988,9 +18032,30 @@ impl Connection {
                 if let Some(idx) = resolve_order_index(&term.expr, &labels, values.len()) {
                     sort_keys.push(values[idx].clone());
                 } else {
+                    // An ORDER BY *expression* may reference a SELECT-output
+                    // alias (`SELECT count(*) AS c … ORDER BY c+0`); resolve it
+                    // to the computed output value, base columns taking
+                    // precedence, just like HAVING above.
                     let s =
                         self.substitute_aggregates(&term.expr, columns, &rows, group, params)?;
-                    sort_keys.push(eval::eval(&s, &repr_ctx)?);
+                    let mut aug_cols = columns.to_vec();
+                    for label in &labels {
+                        aug_cols.push(ColumnInfo {
+                            name: label.clone(),
+                            table: String::new(),
+                            affinity: eval::Affinity::Blob,
+                            collation: crate::value::Collation::Binary,
+                            hidden: false,
+                        });
+                    }
+                    let mut aug_vals = repr.unwrap_or(&empty).values.clone();
+                    aug_vals.extend(values.iter().cloned());
+                    let aug_row = InputRow {
+                        values: aug_vals,
+                        rowid: repr.and_then(|r| r.rowid),
+                    };
+                    let actx = aug_row.ctx(&aug_cols, params).with_subqueries(self);
+                    sort_keys.push(eval::eval(&s, &actx)?);
                 }
             }
             out.push(OutRow { values, sort_keys });
