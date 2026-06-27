@@ -479,6 +479,15 @@ text-preserving CREATE-text edits).
     block comment runs off the end and is `incomplete input`, like any premature
     end. All 24 probed lexer positions are byte-exact vs sqlite
     (`tests/tokenizer_unrecognized_token.rs`).
+  - **`json_each`/`json_tree` argument-count parity (done).** The table-valued
+    JSON walkers are capped at two arguments (the document and an optional path);
+    sqlite rejects a third up front as `too many arguments on json_each() - max 2`
+    (likewise `json_tree`). graphite silently ignored the extras and produced
+    rows. It also raised its own `json_each() requires a JSON argument` for the
+    zero-argument form, where sqlite treats a missing or `NULL` document as an
+    empty walk (no rows, no error). Both now match: `> 2` args is the structural
+    error before any evaluation, and zero-args / `NULL` yields no rows
+    (`tests/json_each_arg_count.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

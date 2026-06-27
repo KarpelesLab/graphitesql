@@ -14410,10 +14410,20 @@ impl Connection {
                     col("fullkey", eval::Affinity::Text),
                     col("path", eval::Affinity::Text),
                 ];
-                let Some(doc_arg) = args.first() else {
-                    return Err(Error::Error(format!("{lname}() requires a JSON argument")));
+                // SQLite caps these table-valued functions at two arguments —
+                // the JSON document and an optional path — and rejects more as a
+                // structural error (before evaluating any of them).
+                if args.len() > 2 {
+                    return Err(Error::Error(format!(
+                        "too many arguments on {lname}() - max 2"
+                    )));
+                }
+                // With no argument at all — or a NULL document — the function
+                // yields no rows, exactly like `json_each(NULL)`.
+                let doc = match args.first() {
+                    Some(doc_arg) => eval::eval(doc_arg, &ctx)?,
+                    None => return Ok((columns, Vec::new())),
                 };
-                let doc = eval::eval(doc_arg, &ctx)?;
                 if matches!(doc, Value::Null) {
                     return Ok((columns, Vec::new()));
                 }
