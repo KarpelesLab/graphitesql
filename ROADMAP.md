@@ -278,26 +278,25 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   makes a dependent view/trigger unresolvable should be rejected and rolled back;
   graphite leaves the now-broken object. Needs statement-level DDL rollback — a
   writer savepoint around `exec_alter`, mirroring `run_dml_atomic`.
-- **JSON string-escape provenance — only object keys remain.** Both string
-  tags are now done. **TEXTJ:** a double-quoted JSON string built from only
-  standard-JSON escapes (`\n`, `\"`, `\/`, `\uXXXX`) keeps its verbatim
-  escaped body in `json()` text and in JSONB (`json('"\u0041"')` →
-  `"\u0041"`, stored TEXTJ `685C7530303431`). **TEXT5:** a string with any
-  JSON5-only escape (`\x41`, `\'`, `\0`) keeps its raw body in JSONB under
-  the TEXT5 tag (`jsonb('"\x41"')` → `495C783431`) and, only at *text*
-  render time, converts it to strict JSON (`\x41`→`\u0041`, `\0`→`\u0000`),
-  matching sqlite — while `json_extract` still decodes to the value (`A`).
-  `Json::Str(String, Option<StrSrc>)` carries the raw body with a
+- **JSON string-escape provenance — DONE** (values and object keys). **TEXTJ:**
+  a double-quoted JSON string built from only standard-JSON escapes (`\n`, `\"`,
+  `\/`, `\uXXXX`) keeps its verbatim escaped body in `json()` text and in
+  JSONB (`json('"\u0041"')` → `"\u0041"`, stored TEXTJ `685C7530303431`).
+  **TEXT5:** a string with any JSON5-only escape (`\x41`, `\'`, `\0`) keeps its
+  raw body in JSONB under the TEXT5 tag (`jsonb('"\x41"')` → `495C783431`) and,
+  only at *text* render time, converts it to strict JSON (`\x41`→`\u0041`,
+  `\0`→`\u0000`), matching sqlite — while `json_extract` still decodes to the
+  value (`A`). **Object keys** carry the same provenance: the key slot is now
+  `Json::Object(Vec<(String, Option<StrSrc>, Json)>)`, so `{"\x41":1}` stores the
+  key TEXT5 and `json_tree`/`json_each` render its `fullkey` from the verbatim
+  source body (`$."\x41"`), while lookups (`$.A`) and the `key` column still use
+  the decoded key. `Json::Str(String, Option<StrSrc>)` carries the raw body with a
   `TextJ`/`Text5` discriminant (mirroring the `Json::Real(_, Some(src))`
   number-provenance model); `string()` captures it during the parse and
-  classifies the escapes it sees. The lone string residual is the `\v` quirk
-  (sqlite's *value* is codepoint 0x0B but its *text* renders `\u0009` — a
-  genuine sqlite internal inconsistency that cannot be matched coherently;
-  graphite decodes `\v`→0x09 and is excluded from preservation).
-  **Remaining: escaped object keys** (`{"\u0041":1}` → graphite `{"A":1}`)
-  — keys live in `Json::Object(Vec<(String, Json)>)` as plain `String`, so
-  preserving them needs the key slot to carry provenance too (a larger
-  `Object` type change than the value-string fix).
+  classifies the escapes it sees. The lone residual is the `\v` quirk (sqlite's
+  *value* is codepoint 0x0B but its *text* renders `\u0009` — a genuine sqlite
+  internal inconsistency that cannot be matched coherently; graphite decodes
+  `\v`→0x09 and is excluded from preservation).
 - **Two residual parse-path non-issues (not worth chasing):** `UPDATE SET a=1`
   flags `a` where SQLite flags `SET` (reserved-word leniency), and `BEGIN
   TRANSACTION FOO` silently accepts the trailing name.

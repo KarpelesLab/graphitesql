@@ -50,7 +50,7 @@ pub enum Json {
     /// An array.
     Array(Vec<Json>),
     /// An object, preserving member order.
-    Object(Vec<(String, Json)>),
+    Object(Vec<(String, Option<StrSrc>, Json)>),
 }
 
 /// The verbatim *escaped* source body of a parsed JSON string (without quotes),
@@ -168,19 +168,10 @@ impl Json {
                     ),
                 }
             }
-            Json::Str(s, raw) => {
-                // A string with a retained source body stores it verbatim under
-                // its escape-class tag (TEXTJ / TEXT5). Otherwise: no escapes
-                // needed → raw bytes (TEXT); else a freshly escaped body (TEXTJ).
-                match raw {
-                    Some(StrSrc::TextJ(body)) => push_jsonb(out, JSONB_TEXTJ, body.as_bytes()),
-                    Some(StrSrc::Text5(body)) => push_jsonb(out, JSONB_TEXT5, body.as_bytes()),
-                    None if json_needs_escape(s) => {
-                        push_jsonb(out, JSONB_TEXTJ, json_escape_body(s).as_bytes());
-                    }
-                    None => push_jsonb(out, JSONB_TEXT, s.as_bytes()),
-                }
-            }
+            // A string with a retained source body stores it verbatim under its
+            // escape-class tag (TEXTJ / TEXT5); otherwise raw bytes (TEXT) or a
+            // freshly escaped body (TEXTJ).
+            Json::Str(s, raw) => write_str_jsonb(s, raw, out),
             Json::Array(items) => {
                 let mut body = Vec::new();
                 for it in items {
@@ -190,12 +181,9 @@ impl Json {
             }
             Json::Object(members) => {
                 let mut body = Vec::new();
-                for (k, v) in members {
-                    if json_needs_escape(k) {
-                        push_jsonb(&mut body, JSONB_TEXTJ, json_escape_body(k).as_bytes());
-                    } else {
-                        push_jsonb(&mut body, JSONB_TEXT, k.as_bytes());
-                    }
+                for (k, kraw, v) in members {
+                    // Keys carry the same escape provenance as string values.
+                    write_str_jsonb(k, kraw, &mut body);
                     v.write_jsonb(&mut body);
                 }
                 push_jsonb(out, JSONB_OBJECT, &body);
@@ -238,14 +226,11 @@ impl Json {
                 }
                 None => crate::exec::eval::format_real(*r).len(),
             },
-            Json::Str(s, raw) => match raw {
-                Some(src) => src.body().len(),
-                None => str_jsonb_payload_len(s),
-            },
+            Json::Str(s, raw) => str_prov_payload_len(s, raw),
             Json::Array(items) => items.iter().map(Json::jsonb_len).sum(),
             Json::Object(members) => members
                 .iter()
-                .map(|(k, v)| str_jsonb_len(k) + v.jsonb_len())
+                .map(|(k, kraw, v)| str_prov_jsonb_len(k, kraw) + v.jsonb_len())
                 .sum(),
         }
     }
@@ -289,13 +274,13 @@ impl Json {
             }
             Json::Object(members) if !members.is_empty() => {
                 out.push('{');
-                for (i, (k, v)) in members.iter().enumerate() {
+                for (i, (k, kraw, v)) in members.iter().enumerate() {
                     if i > 0 {
                         out.push(',');
                     }
                     out.push('\n');
                     pad(out, depth + 1);
-                    write_json_string(k, out);
+                    write_str_text(k, kraw, out);
                     out.push_str(": ");
                     v.write_pretty(out, indent, depth + 1);
                 }
@@ -337,17 +322,7 @@ impl Json {
             // A retained source body is re-emitted between quotes: TEXTJ
             // verbatim, TEXT5 with its JSON5-only escapes converted to standard
             // JSON. Otherwise the decoded value is freshly escaped.
-            Json::Str(_, Some(StrSrc::TextJ(body))) => {
-                out.push('"');
-                out.push_str(body);
-                out.push('"');
-            }
-            Json::Str(_, Some(StrSrc::Text5(body))) => {
-                out.push('"');
-                out.push_str(&json5_to_json_text(body));
-                out.push('"');
-            }
-            Json::Str(s, None) => write_json_string(s, out),
+            Json::Str(s, raw) => write_str_text(s, raw, out),
             Json::Array(items) => {
                 out.push('[');
                 for (i, it) in items.iter().enumerate() {
@@ -360,11 +335,11 @@ impl Json {
             }
             Json::Object(members) => {
                 out.push('{');
-                for (i, (k, v)) in members.iter().enumerate() {
+                for (i, (k, kraw, v)) in members.iter().enumerate() {
                     if i > 0 {
                         out.push(',');
                     }
-                    write_json_string(k, out);
+                    write_str_text(k, kraw, out);
                     out.push(':');
                     v.write(out);
                 }
@@ -416,11 +391,54 @@ fn str_jsonb_payload_len(s: &str) -> usize {
     }
 }
 
-/// Total JSONB length of `s` encoded as a string element. Object keys are
-/// encoded exactly like string values, so this also sizes a key node.
-pub(crate) fn str_jsonb_len(s: &str) -> usize {
-    let payload = str_jsonb_payload_len(s);
+/// The JSONB payload length of a string carrying optional escape provenance:
+/// the verbatim retained body when present (TEXTJ/TEXT5), else `s` encoded as a
+/// plain string. Shared by string *values* and object *keys*.
+fn str_prov_payload_len(s: &str, raw: &Option<StrSrc>) -> usize {
+    match raw {
+        Some(src) => src.body().len(),
+        None => str_jsonb_payload_len(s),
+    }
+}
+
+/// Total JSONB length (header + payload) of a provenance-carrying string. Used
+/// to size object-key nodes when computing `json_each`/`json_tree` byte offsets.
+pub(crate) fn str_prov_jsonb_len(s: &str, raw: &Option<StrSrc>) -> usize {
+    let payload = str_prov_payload_len(s, raw);
     jsonb_header_len(payload) + payload
+}
+
+/// Append a provenance-carrying string as one JSONB element under the tag its
+/// escape class implies: TEXTJ/TEXT5 for a retained body, else TEXT (raw bytes)
+/// or a freshly-escaped TEXTJ. Shared by string values and object keys.
+fn write_str_jsonb(s: &str, raw: &Option<StrSrc>, out: &mut Vec<u8>) {
+    match raw {
+        Some(StrSrc::TextJ(body)) => push_jsonb(out, JSONB_TEXTJ, body.as_bytes()),
+        Some(StrSrc::Text5(body)) => push_jsonb(out, JSONB_TEXT5, body.as_bytes()),
+        None if json_needs_escape(s) => {
+            push_jsonb(out, JSONB_TEXTJ, json_escape_body(s).as_bytes());
+        }
+        None => push_jsonb(out, JSONB_TEXT, s.as_bytes()),
+    }
+}
+
+/// Render a provenance-carrying string as JSON *text*: a retained TEXTJ body is
+/// emitted verbatim, a TEXT5 body is converted to strict JSON, and a plain
+/// string is escaped canonically. Shared by string values and object keys.
+fn write_str_text(s: &str, raw: &Option<StrSrc>, out: &mut String) {
+    match raw {
+        Some(StrSrc::TextJ(body)) => {
+            out.push('"');
+            out.push_str(body);
+            out.push('"');
+        }
+        Some(StrSrc::Text5(body)) => {
+            out.push('"');
+            out.push_str(&json5_to_json_text(body));
+            out.push('"');
+        }
+        None => write_json_string(s, out),
+    }
 }
 
 /// Append one JSONB element: the header byte (type in the low nibble, payload-
@@ -532,11 +550,11 @@ fn decode_jsonb(b: &[u8]) -> Option<(Json, &[u8])> {
             while !p.is_empty() {
                 let (label, next) = decode_jsonb(p)?;
                 let (val, next2) = decode_jsonb(next)?;
-                let key = match label {
-                    Json::Str(s, _) => s,
+                let (key, kraw) = match label {
+                    Json::Str(s, raw) => (s, raw),
                     _ => return None,
                 };
-                members.push((key, val));
+                members.push((key, kraw, val));
                 p = next2;
             }
             Json::Object(members)
@@ -576,6 +594,20 @@ pub(crate) fn push_path_key(path: &str, k: &str) -> String {
         alloc::format!("{path}.{k}")
     } else {
         alloc::format!("{path}.\"{}\"", json_escape_body(k))
+    }
+}
+
+/// Append an object key carrying escape provenance to a path. A key parsed from
+/// an escaped source (TEXTJ/TEXT5) is rendered from its *verbatim* source body,
+/// always double-quoted — so an escaped key whose decoded value is a bare
+/// identifier is still quoted, and a TEXT5 key keeps its raw body (e.g. the `x`
+/// escape stays `."\x41"`, not the `\u`-converted text form), exactly as SQLite
+/// reports in `json_each`/`json_tree`. A key with no provenance falls back to
+/// the decoded-value [`push_path_key`] logic.
+pub(crate) fn push_path_key_prov(path: &str, k: &str, raw: &Option<StrSrc>) -> String {
+    match raw {
+        Some(src) => alloc::format!("{path}.\"{}\"", src.body()),
+        None => push_path_key(path, k),
     }
 }
 
@@ -905,14 +937,14 @@ impl Parser<'_> {
                 self.pos += 1;
                 return Ok(Json::Object(members));
             }
-            let key = self.object_key()?;
+            let (key, key_raw) = self.object_key()?;
             self.skip_ws();
             if self.peek() != Some(b':') {
                 return self.err();
             }
             self.pos += 1;
             let val = self.value()?;
-            members.push((key, val));
+            members.push((key, key_raw, val));
             self.skip_ws();
             match self.peek() {
                 // A comma may be followed by another member or, in JSON5, by the
@@ -929,10 +961,13 @@ impl Parser<'_> {
 
     /// Parse an object key: a double- or single-quoted string, or a JSON5 bare
     /// identifier (`[A-Za-z_$][A-Za-z0-9_$]*`).
-    fn object_key(&mut self) -> Result<String, usize> {
+    fn object_key(&mut self) -> Result<(String, Option<StrSrc>), usize> {
         match self.peek() {
-            Some(b'"') => self.string(b'"').map(|(s, _)| s),
-            Some(b'\'') => self.string(b'\'').map(|(s, _)| s),
+            // A double-quoted key keeps its escape provenance exactly like a
+            // string value; a single-quoted (JSON5) key decodes to canonical
+            // form (raw = None, like a JSON5 string value).
+            Some(b'"') => self.string(b'"'),
+            Some(b'\'') => self.string(b'\''),
             Some(c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$' => {
                 let start = self.pos;
                 while let Some(c) = self.peek() {
@@ -943,9 +978,12 @@ impl Parser<'_> {
                     }
                 }
                 // ASCII-only run, so this is always valid UTF-8.
-                Ok(core::str::from_utf8(&self.bytes[start..self.pos])
-                    .unwrap_or("")
-                    .to_string())
+                Ok((
+                    core::str::from_utf8(&self.bytes[start..self.pos])
+                        .unwrap_or("")
+                        .to_string(),
+                    None,
+                ))
             }
             // Not a key: scan any identifier run so the reported position matches
             // sqlite3, then fail.
@@ -1409,7 +1447,10 @@ pub fn navigate<'a>(root: &'a Json, path: &str) -> Option<&'a Json> {
     for seg in &segs {
         match (cur, seg) {
             (Json::Object(members), Seg::Key(k)) => {
-                cur = members.iter().find(|(kk, _)| kk == k).map(|(_, v)| v)?;
+                cur = members
+                    .iter()
+                    .find(|(kk, _, _)| kk == k)
+                    .map(|(_, _, v)| v)?;
             }
             (Json::Array(items), Seg::Index(idx)) => {
                 let n = idx.resolve_read(items.len())?;
@@ -1443,8 +1484,8 @@ pub(crate) fn navigate_with_offset<'a>(
             (Json::Object(members), Seg::Key(k)) => {
                 let mut at = body;
                 let mut found = None;
-                for (kk, vv) in members {
-                    let klen = str_jsonb_len(kk);
+                for (kk, kraw, vv) in members {
+                    let klen = str_prov_jsonb_len(kk, kraw);
                     if kk == k {
                         found = Some((vv, at, at + klen));
                         break;
@@ -1688,7 +1729,7 @@ fn walk_to_parent<'a>(mut cur: &'a mut Json, segs: &[Seg]) -> Option<&'a mut Jso
     for seg in segs {
         cur = match (cur, seg) {
             (Json::Object(m), Seg::Key(k)) => {
-                m.iter_mut().find(|(kk, _)| kk == k).map(|(_, v)| v)?
+                m.iter_mut().find(|(kk, _, _)| kk == k).map(|(_, _, v)| v)?
             }
             (Json::Array(a), Seg::Index(idx)) => {
                 let n = idx.resolve_read(a.len())?;
@@ -1717,10 +1758,10 @@ fn walk_to_parent_creating<'a>(mut cur: &'a mut Json, segs: &[Seg]) -> Option<&'
         };
         cur = match (cur, &segs[i]) {
             (Json::Object(m), Seg::Key(k)) => {
-                if !m.iter().any(|(kk, _)| kk == k) {
-                    m.push((k.clone(), make()));
+                if !m.iter().any(|(kk, _, _)| kk == k) {
+                    m.push((k.clone(), None, make()));
                 }
-                m.iter_mut().find(|(kk, _)| kk == k).map(|(_, v)| v)?
+                m.iter_mut().find(|(kk, _, _)| kk == k).map(|(_, _, v)| v)?
             }
             (Json::Array(a), Seg::Index(idx)) => match idx.resolve_read(a.len()) {
                 Some(n) if n < a.len() => a.get_mut(n)?,
@@ -1779,14 +1820,14 @@ pub fn set_path(root: &mut Json, path: &str, value: Json, mode: SetMode) -> Opti
 fn write_leaf(cur: &mut Json, last: &Seg, value: Json, mode: SetMode) -> bool {
     match (cur, last) {
         (Json::Object(m), Seg::Key(k)) => {
-            let slot = m.iter_mut().find(|(kk, _)| kk == k);
+            let slot = m.iter_mut().find(|(kk, _, _)| kk == k);
             match (slot, mode) {
                 (Some(s), SetMode::Set) | (Some(s), SetMode::Replace) => {
-                    s.1 = value;
+                    s.2 = value;
                     true
                 }
                 (None, SetMode::Set) | (None, SetMode::Insert) => {
-                    m.push((k.clone(), value));
+                    m.push((k.clone(), None, value));
                     true
                 }
                 _ => false,
@@ -1831,7 +1872,7 @@ pub fn remove_path(root: &mut Json, path: &str) -> Option<()> {
         return Some(());
     };
     match (cur, last) {
-        (Json::Object(m), Seg::Key(k)) => m.retain(|(kk, _)| kk != k),
+        (Json::Object(m), Seg::Key(k)) => m.retain(|(kk, _, _)| kk != k),
         (Json::Array(a), Seg::Index(idx)) => {
             if let Some(n) = idx.resolve_read(a.len()) {
                 if n < a.len() {
@@ -1858,15 +1899,15 @@ pub fn merge_patch(target: &mut Json, patch: &Json) {
     let Json::Object(tm) = target else {
         return;
     };
-    for (k, pv) in pm {
+    for (k, kraw, pv) in pm {
         if matches!(pv, Json::Null) {
-            tm.retain(|(kk, _)| kk != k);
-        } else if let Some(slot) = tm.iter_mut().find(|(kk, _)| kk == k) {
-            merge_patch(&mut slot.1, pv);
+            tm.retain(|(kk, _, _)| kk != k);
+        } else if let Some(slot) = tm.iter_mut().find(|(kk, _, _)| kk == k) {
+            merge_patch(&mut slot.2, pv);
         } else {
-            tm.push((k.clone(), Json::Null));
+            tm.push((k.clone(), kraw.clone(), Json::Null));
             let slot = tm.last_mut().unwrap();
-            merge_patch(&mut slot.1, pv);
+            merge_patch(&mut slot.2, pv);
         }
     }
 }

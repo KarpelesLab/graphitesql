@@ -869,7 +869,8 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     return Err(Error::Error("json_object() labels must be TEXT".into()));
                 };
                 let val = json_value_arg(&kv[1], args.get(2 * i + 1))?;
-                members.push((key.clone(), val));
+                // A key built from a SQL TEXT arg carries no escape provenance.
+                members.push((key.clone(), None, val));
             }
             json_doc_result(&lname, &super::json::Json::Object(members))
         }

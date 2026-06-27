@@ -2,9 +2,9 @@
 //! output when the source used only standard-JSON escapes (`json('"\u0041"')` →
 //! `"\u0041"`, not `"A"`), storing it under the JSONB `TEXTJ` tag, while still
 //! yielding the *decoded* string (`A`) as a SQL value. graphite used to decode
-//! the escape on parse, losing the source form. JSON5-only escapes (`\x41`,
-//! `\'`, `\v`, `\0`) are still rendered from the decoded value (a documented,
-//! separate gap), and escaped *object keys* are likewise not yet preserved.
+//! the escape on parse, losing the source form. Object *keys* carry the same
+//! provenance. The `\v` escape alone still renders from the decoded value (a
+//! documented sqlite internal inconsistency, deliberately not mirrored).
 
 #![cfg(feature = "std")]
 
@@ -110,5 +110,67 @@ fn text5_jsonb_stores_body_verbatim_and_round_trips() {
     assert_eq!(
         text(&c, r#"SELECT json(jsonb('"a\x41\nb"'))"#),
         r#""a\u0041\nb""#
+    );
+}
+
+#[test]
+fn escaped_object_keys_keep_provenance() {
+    // Object *keys* carry the same TEXTJ/TEXT5 escape provenance as string
+    // values: the verbatim escaped body survives in json() text and JSONB, while
+    // path lookups and the SQL key value still use the decoded key.
+    let c = Connection::open_memory().unwrap();
+    // TEXTJ key (`\u0041`) is emitted verbatim; a TEXT5 key (`\x41`) converts in text.
+    assert_eq!(
+        text(&c, r#"SELECT json('{"\u0041":1}')"#),
+        r#"{"\u0041":1}"#
+    );
+    assert_eq!(text(&c, r#"SELECT json('{"\x41":1}')"#), r#"{"\u0041":1}"#);
+    // The key body is stored verbatim in JSONB (TEXT5 tag 9, raw body `\x41`).
+    assert_eq!(
+        text(&c, r#"SELECT hex(jsonb('{"\x41":1}'))"#),
+        "7C495C7834311331"
+    );
+    // Round-trips through JSONB unchanged.
+    assert_eq!(
+        text(&c, r#"SELECT json(jsonb('{"\x41":1}'))"#),
+        r#"{"\u0041":1}"#
+    );
+    // Lookups resolve by the *decoded* key; json_each's key column is decoded.
+    assert_eq!(
+        one(&c, r#"SELECT json_extract('{"\x41":2}','$.A')"#),
+        Value::Integer(2)
+    );
+    assert_eq!(
+        one(&c, r#"SELECT key FROM json_each('{"\x41":2}')"#),
+        Value::Text("A".into())
+    );
+    // A bare key has no provenance and renders canonically.
+    assert_eq!(text(&c, r#"SELECT json('{a:1}')"#), r#"{"a":1}"#);
+}
+
+#[test]
+fn json_tree_fullkey_uses_escaped_key_source() {
+    // json_tree/json_each render an escaped key from its verbatim source body,
+    // always double-quoted — even when the decoded key is a bare identifier that
+    // would otherwise be emitted as `.key`.
+    let c = Connection::open_memory().unwrap();
+    let rows = c
+        .query(r#"SELECT fullkey FROM json_tree('{"\x41":{"\x42":9}}')"#)
+        .unwrap()
+        .rows;
+    let keys: Vec<String> = rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            v => panic!("not text: {v:?}"),
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "$".to_string(),
+            r#"$."\x41""#.to_string(),
+            r#"$."\x41"."\x42""#.to_string(),
+        ]
     );
 }

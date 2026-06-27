@@ -17588,7 +17588,7 @@ impl Connection {
                 let ctx = rows[i].ctx(columns, params).with_subqueries(self);
                 let k = eval::eval(&args[0], &ctx)?;
                 let v = eval::eval(&args[1], &ctx)?;
-                pairs.push((eval::to_text(&k), func::arg_to_json(&v, args.get(1))));
+                pairs.push((eval::to_text(&k), None, func::arg_to_json(&v, args.get(1))));
             }
             let obj = json::Json::Object(pairs);
             return Ok(if lname.starts_with("jsonb") {
@@ -19789,10 +19789,10 @@ fn json_each_children(
     match root {
         Json::Object(members) => {
             let mut at = body;
-            for (k, v) in members {
+            for (k, kraw, v) in members {
                 let key_off = at;
-                let klen = crate::exec::json::str_jsonb_len(k) as i64;
-                let fullkey = crate::exec::json::push_path_key(root_path, k);
+                let klen = crate::exec::json::str_prov_jsonb_len(k, kraw) as i64;
+                let fullkey = crate::exec::json::push_path_key_prov(root_path, k, kraw);
                 json_emit_node(
                     v,
                     Some(Value::Text(k.clone())),
@@ -19876,10 +19876,10 @@ fn json_tree_walk(
     match node {
         Json::Object(members) => {
             let mut at = body;
-            for (k, v) in members {
+            for (k, kraw, v) in members {
                 let key_off = at;
-                let val_off = at + crate::exec::json::str_jsonb_len(k) as i64;
-                let child = crate::exec::json::push_path_key(fullkey, k);
+                let val_off = at + crate::exec::json::str_prov_jsonb_len(k, kraw) as i64;
+                let child = crate::exec::json::push_path_key_prov(fullkey, k, kraw);
                 json_tree_walk(
                     v,
                     Some(Value::Text(k.clone())),
