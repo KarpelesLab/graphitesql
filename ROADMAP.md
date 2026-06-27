@@ -330,6 +330,15 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   SQLite surfaces it as an ordinary row violation in `foreign_key_check` but as
   `no such table: main.<t>` at write time; that split-behavior + the `main.`
   qualifier is a separate, narrower divergence not handled here.)
+- **CLI: each command-line argument is its own batch — DONE.** The `sqlite3`
+  shell runs every trailing argument as an independent statement, so
+  `graphitesql db "SELECT 1" "SELECT 2"` must execute both even though neither
+  ends in `;`. graphite's CLI joined the arguments with a single space, splicing
+  two unterminated statements into a syntax error (`…VALUES(1),(2)` + `SELECT …`
+  → `near "SELECT"`). `src/bin/graphitesql.rs` `main` now runs each argument
+  through `run_sql_batch` in turn (exiting non-zero on the first error, like the
+  shell) instead of `rest.join(" ")`. A single combined argument with internal
+  `;` is unaffected. `tests/cli_multi_arg.rs`.
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a

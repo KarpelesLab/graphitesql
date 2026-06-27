@@ -21,18 +21,14 @@ use std::io::{self, BufRead, IsTerminal, Write};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // First argument (if any) is the database path; the rest, if present, is a
-    // one-shot SQL script to run and exit.
-    let (path, script) = match args.split_first() {
-        None => (String::from(":memory:"), None),
-        Some((db, rest)) => {
-            let script = if rest.is_empty() {
-                None
-            } else {
-                Some(rest.join(" "))
-            };
-            (db.clone(), script)
-        }
+    // First argument (if any) is the database path; each remaining argument is an
+    // independent one-shot SQL batch, run in order then exit. The `sqlite3` CLI
+    // runs each trailing argument as its own statement(s), so `db "SELECT 1"
+    // "SELECT 2"` executes both even though neither ends in `;` — joining them
+    // into one string would instead splice `1SELECT` into a syntax error.
+    let (path, scripts) = match args.split_first() {
+        None => (String::from(":memory:"), &[][..]),
+        Some((db, rest)) => (db.clone(), rest),
     };
 
     let mut conn = match open(&path) {
@@ -45,11 +41,14 @@ fn main() {
 
     let mut shell = Shell { headers: false };
 
-    if let Some(sql) = script {
-        // One-shot mode: run the script, exit non-zero on the first error.
-        if let Err(e) = shell.run_sql_batch(&mut conn, &sql) {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
+    if !scripts.is_empty() {
+        // One-shot mode: run each argument batch, exiting non-zero on the first
+        // error (like the `sqlite3` shell).
+        for sql in scripts {
+            if let Err(e) = shell.run_sql_batch(&mut conn, sql) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
         }
         return;
     }
