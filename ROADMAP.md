@@ -361,6 +361,18 @@ bare name in both cases; the fix tags each fired trigger with its origin catalog
 (swap-aware, so a temp trigger on a main table is still labelled `temp`) and
 qualifies the error only for non-temp triggers. Byte-exact vs `sqlite3` 3.50.4.
 
+A **schema-qualified DML target inside a trigger body** is now rejected at
+`CREATE TRIGGER` time. SQLite compiles a trigger program in the trigger's own
+database, so a `schema.table` qualifier on an `INSERT`/`UPDATE`/`DELETE` *target*
+within the body is forbidden and errors with `qualified table names are not
+allowed on INSERT, UPDATE, and DELETE statements within triggers` — for `main`
+and `temp` triggers and AFTER and INSTEAD OF alike, whether or not the qualified
+schema/table exists. A qualifier on a table in a body *subquery* (`SELECT … FROM
+main.u`) stays legal — only the DML target is checked. graphite used to accept
+the qualified target silently. The check sits after the trigger's own
+missing-target / timing-mismatch / duplicate-name errors so those still win.
+Byte-exact vs `sqlite3` 3.50.4.
+
 An **`ORDER BY` on an UPDATE/DELETE with no `LIMIT`** is now rejected at prepare
 time. SQLite only allows the ordering as a companion to the update/delete-`LIMIT`
 extension — the order decides *which* rows the cap keeps — so a bare `ORDER BY`

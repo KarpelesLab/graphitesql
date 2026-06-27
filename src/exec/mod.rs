@@ -5332,6 +5332,27 @@ impl Connection {
             }
             _ => {}
         }
+        // A trigger body's INSERT/UPDATE/DELETE may not schema-qualify its target —
+        // the body runs in the trigger's own database, so a qualifier there is
+        // forbidden (a qualified table in a *subquery* inside the body is fine; only
+        // the DML target is checked). Fires at CREATE time, regardless of whether
+        // the qualified schema/table exists. The trigger's own target/timing/dup
+        // errors above still win.
+        for stmt in &ct.body {
+            let qualified = match stmt {
+                Statement::Insert(i) => i.schema.is_some(),
+                Statement::Update(u) => u.schema.is_some(),
+                Statement::Delete(d) => d.schema.is_some(),
+                _ => false,
+            };
+            if qualified {
+                return Err(Error::Error(
+                    "qualified table names are not allowed on INSERT, UPDATE, and \
+                     DELETE statements within triggers"
+                        .into(),
+                ));
+            }
+        }
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
             Value::Text("trigger".into()),
