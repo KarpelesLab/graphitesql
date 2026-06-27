@@ -18303,6 +18303,17 @@ impl Connection {
                     else_result,
                 }
             }
+            Expr::Collate { expr, collation } => Expr::Collate {
+                expr: Box::new(self.substitute_aggregates(expr, columns, rows, group, params)?),
+                collation: collation.clone(),
+            },
+            Expr::RowValue(items) => {
+                let mut new_items = Vec::with_capacity(items.len());
+                for it in items {
+                    new_items.push(self.substitute_aggregates(it, columns, rows, group, params)?);
+                }
+                Expr::RowValue(new_items)
+            }
             // Literals, columns, parameters, and subqueries are left as-is
             // (a subquery's own aggregates belong to that subquery).
             other => other.clone(),
@@ -23447,6 +23458,12 @@ fn expr_contains_agg(expr: &Expr, is_agg: &dyn Fn(&str, usize, bool) -> bool) ->
                 || else_result.as_deref().is_some_and(rec)
         }
         Expr::Cast { expr, .. } => rec(expr),
+        // `COLLATE` is transparent to aggregate classification: `sum(a) COLLATE
+        // binary` is an aggregate result column. A `RowValue` is deliberately not
+        // descended — an aggregate inside a row value in a result/HAVING position
+        // is `row value misused` in SQLite regardless, so classifying it as an
+        // aggregate query would not match and risks an unrelated divergence.
+        Expr::Collate { expr, .. } => rec(expr),
         _ => false,
     }
 }

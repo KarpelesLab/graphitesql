@@ -56,6 +56,12 @@ pub fn visit(e: &Expr, f: &mut impl FnMut(&Expr)) {
         }
         Expr::Cast { expr, .. } => visit(expr, f),
         Expr::Paren(inner) => visit(inner, f),
+        Expr::RowValue(items) => {
+            for it in items {
+                visit(it, f);
+            }
+        }
+        Expr::Collate { expr, .. } => visit(expr, f),
         Expr::InSelect { expr, .. } => visit(expr, f),
         _ => {}
     }
@@ -111,6 +117,12 @@ fn replace_in(e: &mut Expr, target: &Expr, repl: &Expr) {
         }
         Expr::Cast { expr, .. } => replace_in(expr, target, repl),
         Expr::Paren(inner) => replace_in(inner, target, repl),
+        Expr::RowValue(items) => {
+            for it in items {
+                replace_in(it, target, repl);
+            }
+        }
+        Expr::Collate { expr, .. } => replace_in(expr, target, repl),
         Expr::InSelect { expr, .. } => replace_in(expr, target, repl),
         _ => {}
     }

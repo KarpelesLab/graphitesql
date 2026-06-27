@@ -452,6 +452,23 @@ whose arity differs only under a locally ICU-enabled sqlite (`lower`/`upper`/
 `substr` take an optional locale argument there) are out of scope, matching the
 ASCII-only CI oracle.
 
+**The shared expression walker now descends into row values and `COLLATE`.**
+`window::visit` (and its `replace_in` twin) — the walker behind the prepare-time
+resolution/misuse checks — stopped at a row value `(a, b, …)` and `expr COLLATE
+name`, so anything nested under those was invisible: `(abs(a,b),1)=(1,2)` and
+`nope(a) COLLATE nocase` slipped past the function-resolution check, and
+`(count(*),1)=(1,1)` / `count(*) COLLATE nocase` / `(row_number() OVER (),1)=…`
+escaped the aggregate/window misuse checks. The same two-node blind spot in the
+aggregate classifier (`expr_contains_agg`) and substitutor
+(`substitute_aggregates`) meant a *valid* aggregate wrapped in `COLLATE` —
+`sum(a) COLLATE binary` — was misclassified as a scalar call and wrongly rejected
+as a misuse; both now descend through `COLLATE` (the classifier deliberately does
+*not* treat a row value as an aggregate context, since an aggregate in a row value
+in result/`HAVING` position is `row value misused` in SQLite regardless). Completing
+the descent is one general fix that closes all of these. Byte-exact vs `sqlite3`
+3.50.4. A bare row value as a scalar result column (`SELECT (sum(a),1) FROM t` →
+`row value misused`) is a separate row-value-context check, still open.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely
@@ -478,6 +495,15 @@ open work:
     `schema.table.column` ref inside a *correlated subquery body* (binding to an
     enclosing FROM) unvalidated: `SELECT (SELECT bad.t.a) FROM t` is accepted where
     sqlite reports `no such column: bad.t.a`.
+  - unknown / wrong-arity *scalar functions* inside an expression-position
+    subquery (`Subquery` / `EXISTS` / `IN (SELECT …)`) — e.g.
+    `SELECT (SELECT nope(a)) FROM t` or `… WHERE a IN (SELECT nope(b) FROM t)`.
+    `reject_unresolved_functions_in_select` does not recurse into nested SELECTs;
+    doing so safely needs the column-vs-function precedence preserved (a bad column
+    in the subquery must still win, `no such column` over `no such function`), which
+    depends on the same correlated-scope column resolution above. Derived tables in
+    `FROM`, CTE bodies, and compound (`UNION`) arms are already covered (they
+    materialize, which resolves them).
 - **ALTER-time rejection of an ALTER that breaks a dependent.** An `ALTER` that
   makes a dependent view/trigger unresolvable should be rejected and rolled back;
   graphite leaves the now-broken object. Needs statement-level DDL rollback — a
