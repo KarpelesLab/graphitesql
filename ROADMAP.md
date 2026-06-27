@@ -410,6 +410,18 @@ column: zzz`), and `INSERT … RETURNING` is — as in SQLite — *not* subject 
 (it is validated on a separate path). Byte-exact vs `sqlite3` 3.50.4 across ~24
 permutations.
 
+**`min()` / `max()` with zero arguments** is now rejected at prepare time with
+`wrong number of arguments to function NAME()`. These two functions are an
+aggregate at one argument and a scalar at two or more, so a zero-argument call
+matches neither signature; graphite's aggregate-arity validator treated them as
+aggregates only at one argument and so skipped the bare call, leaving it to be
+caught lazily — i.e. never, over an empty or fully filtered table, where it
+silently produced no rows. The check now special-cases the zero-arg form ahead of
+the aggregate gate, covering result columns, `WHERE`, `GROUP BY`, `HAVING`, and
+`ORDER BY`. The windowed form (`max() OVER ()`) is left to its own distinct error
+(`max() may not be used as a window function`). Byte-exact vs `sqlite3` 3.50.4
+across ~19 permutations.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

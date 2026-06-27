@@ -13689,7 +13689,9 @@ impl Connection {
     /// `min`/`max` count as aggregates only at one argument (the multi-arg forms
     /// are scalar) — both excluded by `func::is_aggregate_call`. The built-in
     /// window functions (`row_number`, `lag`, …) are not aggregates, so
-    /// `is_aggregate_call` filters them out and their arity is left untouched.
+    /// `is_aggregate_call` filters them out and their arity is left untouched. The
+    /// one exception is `min()`/`max()` with *zero* arguments, handled explicitly
+    /// below since `is_aggregate_call` only treats them as aggregates at one arg.
     fn reject_aggregate_arity(&self, e: &Expr) -> Result<()> {
         let mut err: Option<Error> = None;
         window::visit(e, &mut |n| {
@@ -13697,10 +13699,32 @@ impl Connection {
                 return;
             }
             if let Expr::Function {
-                name, args, star, ..
+                name,
+                args,
+                star,
+                over,
+                ..
             } = n
             {
                 let lname = name.to_ascii_lowercase();
+                // `min()`/`max()` with zero arguments matches neither the one-arg
+                // aggregate nor the (>=2)-arg scalar form, so it is a wrong-arg-count
+                // error. `is_aggregate_call` reports min/max as aggregates only at one
+                // argument, so the gate below would skip the bare zero-arg call and
+                // leave it to be caught lazily (i.e. never, over an empty table). The
+                // windowed form (`max() OVER ()`) is a different error — `min`/`max`
+                // may not be window functions at all — so it is left to that check.
+                if (lname == "min" || lname == "max")
+                    && args.is_empty()
+                    && !*star
+                    && over.is_none()
+                    && !self.aggregates.contains_key(&lname)
+                {
+                    err = Some(Error::Error(alloc::format!(
+                        "wrong number of arguments to function {lname}()"
+                    )));
+                    return;
+                }
                 if self.aggregates.contains_key(&lname)
                     || !func::is_aggregate_call(&lname, args.len(), *star)
                 {
