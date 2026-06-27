@@ -314,6 +314,27 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   parses as JSON text. `json_each(jsonb('{"a":1}'))` now walks the structure,
   `json_each(x'00')` is a single `null` root row, and `x'ffff'` is `malformed
   JSON`. The hidden `json` column keeps echoing the raw blob argument.
+- **Unknown database qualifier on a table reference — DONE.** A `schema.`
+  qualifier naming a database that does not exist now reports the referenced
+  *object* as missing, the way SQLite does — `no such table: bad.t` for a
+  query/`INSERT`/`UPDATE`/`DELETE`/`ALTER`/`DROP TABLE` (and `no such
+  view:`/`no such index:`/`no such trigger:` for the matching `DROP`) — instead
+  of graphite's old `unknown database bad`. SQLite reserves the bare `unknown
+  database <name>` wording for the `CREATE` forms (`CREATE INDEX bad.i`,
+  `CREATE TRIGGER bad.tr`), whose qualifier names a creation target rather than
+  an object to look up; those keep it. A new `resolve_db_or_missing` helper maps
+  `resolve_db`'s unknown-database error to the missing-object message at the
+  query FROM/JOIN sources and in `target_db`'s DML/`DROP`/`ALTER` arms (the
+  unqualified path, including temp-table shadowing, is unchanged).
+  `tests/schema_qualifier_errors.rs`.
+- **Remaining: a *known* database qualifier with a missing object drops the
+  qualifier.** `SELECT * FROM main.nope` / `aux.nope` reports `no such table:
+  nope` where SQLite keeps the qualifier (`no such table: main.nope`). The
+  qualifier is lost before the per-database scan (an explicitly-`main.`-qualified
+  read falls through to the optimized main path, which never sees it; the
+  temp/attached path reaches `table_meta_in`, which formats the bare name). The
+  fix threads the original qualifier into the missing-table error of each scan
+  path — independent of the unknown-database case above.
 - **Two residual parse-path non-issues (not worth chasing):** `UPDATE SET a=1`
   flags `a` where SQLite flags `SET` (reserved-word leniency), and `BEGIN
   TRANSACTION FOO` silently accepts the trailing name.

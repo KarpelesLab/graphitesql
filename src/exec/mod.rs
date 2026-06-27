@@ -3185,11 +3185,27 @@ impl Connection {
         match stmt {
             // CREATE never temp-shadows: a bare `CREATE TABLE t` goes to main.
             Statement::CreateTable(s) => self.resolve_db(s.schema.as_deref()),
-            Statement::Insert(s) => resolved(s.schema.as_deref(), &s.table),
-            Statement::Update(s) => resolved(s.schema.as_deref(), &s.table),
-            Statement::Delete(s) => resolved(s.schema.as_deref(), &s.table),
-            Statement::Drop(s) => resolved(s.schema.as_deref(), &s.name),
-            Statement::Alter(a) => resolved(a.schema.as_deref(), &a.table),
+            Statement::Insert(s) => {
+                self.resolve_db_or_missing(s.schema.as_deref(), &s.table, "table")
+            }
+            Statement::Update(s) => {
+                self.resolve_db_or_missing(s.schema.as_deref(), &s.table, "table")
+            }
+            Statement::Delete(s) => {
+                self.resolve_db_or_missing(s.schema.as_deref(), &s.table, "table")
+            }
+            Statement::Drop(s) => {
+                let noun = match s.kind {
+                    DropKind::Table => "table",
+                    DropKind::Index => "index",
+                    DropKind::View => "view",
+                    DropKind::Trigger => "trigger",
+                };
+                self.resolve_db_or_missing(s.schema.as_deref(), &s.name, noun)
+            }
+            Statement::Alter(a) => {
+                self.resolve_db_or_missing(a.schema.as_deref(), &a.table, "table")
+            }
             // The index lives in the schema named on the index (or, unqualified,
             // wherever its table lives — so a temp table's index goes to temp).
             Statement::CreateIndex(ci) => resolved(ci.schema.as_deref(), &ci.table),
@@ -14098,7 +14114,11 @@ impl Connection {
                 }
             }
             let db = match from.first.schema.as_deref() {
-                Some(_) => self.resolve_db(from.first.schema.as_deref())?,
+                Some(_) => self.resolve_db_or_missing(
+                    from.first.schema.as_deref(),
+                    &from.first.name,
+                    "table",
+                )?,
                 // Don't let a temp table shadow a CTE or view of the same name.
                 None if self.lookup_cte(&from.first.name, None).is_none()
                     && !self.is_view(&from.first.name) =>
@@ -15295,7 +15315,7 @@ impl Connection {
         // database; an unqualified name may be shadowed by a temp table. Either
         // way a non-main source is materialized through its own backend.
         let db = match tref.schema.as_deref() {
-            Some(_) => self.resolve_db(tref.schema.as_deref())?,
+            Some(_) => self.resolve_db_or_missing(tref.schema.as_deref(), &tref.name, "table")?,
             None => self.unqualified_db(&tref.name),
         };
         if db != DbRef::Main {
@@ -15665,6 +15685,23 @@ impl Connection {
                 .position(|d| d.name.eq_ignore_ascii_case(s))
                 .map(DbRef::Attached)
                 .ok_or_else(|| Error::Error(alloc::format!("unknown database {s}"))),
+        }
+    }
+
+    /// Resolve the database for a *table reference* (a query/DML/`DROP`/`ALTER`
+    /// target), where SQLite reports an unknown schema qualifier as the
+    /// referenced object being missing (`no such table: bad.t`) rather than
+    /// `unknown database bad` — it reserves the latter for the `CREATE` forms,
+    /// whose qualifier names a creation target rather than an object to look up.
+    /// An unqualified name resolves like [`resolve_db`](Self::resolve_db) does
+    /// for a bare target (a temp table can shadow `main`). `noun` is the object
+    /// kind (`table`/`view`/`index`/`trigger`).
+    fn resolve_db_or_missing(&self, schema: Option<&str>, name: &str, noun: &str) -> Result<DbRef> {
+        match schema {
+            None => Ok(self.unqualified_db(name)),
+            Some(q) => self
+                .resolve_db(schema)
+                .map_err(|_| Error::Error(alloc::format!("no such {noun}: {q}.{name}"))),
         }
     }
 
