@@ -1131,7 +1131,7 @@ fn unhex(s: &str, ignore: Option<&str>) -> Option<alloc::vec::Vec<u8>> {
 /// literal in `0.0..=1.0`, after peeling any redundant parentheses. SQLite's
 /// `exprProbability` only accepts a bare `TK_FLOAT` token in range, so an
 /// integer literal, a negated float, or any compound expression is rejected.
-fn likelihood_prob_is_valid(e: &Expr) -> bool {
+pub(crate) fn likelihood_prob_is_valid(e: &Expr) -> bool {
     match e {
         Expr::Paren(inner) => likelihood_prob_is_valid(inner),
         Expr::Literal(Literal::Real(r)) => (0.0..=1.0).contains(r),

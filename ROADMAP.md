@@ -293,7 +293,17 @@ in the siblings it names), and is scope-aware — a derived subquery's own neste
 FROM (WITH a AS (SELECT 7 x) SELECT x FROM a)` binds the inner `a` and leaves the
 outer one unanalyzed; duplicate `WITH` names and syntax errors still fire
 regardless of use. (DML `WITH` — `WITH … UPDATE`/`DELETE` — still materializes
-all of its CTEs; the unused-skip is wired only on the SELECT path so far.) All
+all of its CTEs; the unused-skip is wired only on the SELECT path so far.) And
+**`likelihood(X, prob)`** is now validated at prepare time, not per row: SQLite
+checks during analysis that the call has exactly two arguments and that the
+probability is a floating-point literal in `0.0..=1.0` (`exprProbability`), so
+both `wrong number of arguments to function likelihood()` and `second argument
+to likelihood() must be a constant between 0.0 and 1.0` fire even when the query
+yields no rows — over an empty or fully-filtered table — where graphite used to
+defer the check to the evaluator and silently accept the bad call; the new
+`reject_invalid_likelihood` walker runs in every scalar-expression position
+(result list / WHERE / GROUP BY / ORDER BY / join `ON`, and nested function
+arguments), leaving a `likelihood(…) OVER (…)` to the window-misuse path. All
 byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
@@ -316,8 +326,6 @@ open work:
   is accepted where SQLite rejects at prepare time. All want the same fix — a
   statement-level prepare pass that walks every expression once, independent of
   row production:
-  - `likelihood(a, 2)` over an empty table — the out-of-range probability literal
-    is not caught until a row is evaluated.
   - a window nested in an aggregate *argument* in a result column
     (`sum(row_number() OVER ())`) over an empty table.
   - bare (unqualified) refs in derived-table/subquery scopes and `NATURAL`/`USING`

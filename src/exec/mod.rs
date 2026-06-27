@@ -13810,11 +13810,13 @@ impl Connection {
                     reject_filter_on_non_aggregate(expr, &is_agg)?;
                     reject_invalid_window_function(expr, &is_agg)?;
                     reject_star_argument(expr)?;
+                    reject_invalid_likelihood(expr)?;
                 }
             }
             if let Some(w) = &sel.where_clause {
                 reject_filter_on_non_aggregate(w, &is_agg)?;
                 reject_star_argument(w)?;
+                reject_invalid_likelihood(w)?;
             }
             if let Some(h) = &sel.having {
                 reject_filter_on_non_aggregate(h, &is_agg)?;
@@ -13824,22 +13826,26 @@ impl Connection {
                 // aggregate context (a GROUP BY or a result-column aggregate).
                 if !sel.group_by.is_empty() || self.has_result_aggregate(sel) {
                     reject_star_argument(h)?;
+                    reject_invalid_likelihood(h)?;
                 }
             }
             for g in &sel.group_by {
                 reject_filter_on_non_aggregate(g, &is_agg)?;
                 reject_star_argument(g)?;
+                reject_invalid_likelihood(g)?;
             }
             for t in &sel.order_by {
                 reject_filter_on_non_aggregate(&t.expr, &is_agg)?;
                 reject_invalid_window_function(&t.expr, &is_agg)?;
                 reject_star_argument(&t.expr)?;
+                reject_invalid_likelihood(&t.expr)?;
             }
             if let Some(from) = &sel.from {
                 for j in &from.joins {
                     if let Some(on) = &j.on {
                         reject_filter_on_non_aggregate(on, &is_agg)?;
                         reject_star_argument(on)?;
+                        reject_invalid_likelihood(on)?;
                     }
                 }
             }
@@ -19839,6 +19845,44 @@ fn reject_star_argument(e: &Expr) -> Result<()> {
         ))),
         None => Ok(()),
     }
+}
+
+/// Reject an invalid `likelihood(X, prob)` call at prepare time. SQLite checks,
+/// during analysis, that `likelihood` has exactly two arguments and that the
+/// probability is a floating-point literal in `0.0..=1.0` (`exprProbability` in
+/// `expr.c`), so both errors fire even when no row is produced (an empty or
+/// fully-filtered table); graphite's evaluator only caught them per row. Only
+/// the plain-scalar form is checked here — a `likelihood(…) OVER (…)` is left to
+/// the window-misuse path. The walk stops at subquery boundaries (each nested
+/// query validates itself).
+fn reject_invalid_likelihood(e: &Expr) -> Result<()> {
+    let mut err: Option<Error> = None;
+    window::visit(e, &mut |n| {
+        if err.is_some() {
+            return;
+        }
+        if let Expr::Function {
+            name,
+            args,
+            over: None,
+            ..
+        } = n
+        {
+            if !name.eq_ignore_ascii_case("likelihood") {
+                return;
+            }
+            if args.len() != 2 {
+                err = Some(Error::Error(
+                    "wrong number of arguments to function likelihood()".into(),
+                ));
+            } else if !func::likelihood_prob_is_valid(&args[1]) {
+                err = Some(Error::Error(
+                    "second argument to likelihood() must be a constant between 0.0 and 1.0".into(),
+                ));
+            }
+        }
+    });
+    err.map_or(Ok(()), Err)
 }
 
 /// Reject a `FILTER (WHERE …)` clause attached to a non-aggregate function.
