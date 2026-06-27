@@ -13141,6 +13141,15 @@ impl Connection {
             }
         }
 
+        // An aggregate function in the WHERE clause is a misuse: WHERE filters
+        // individual rows, before any grouping. SQLite rejects it at prepare time
+        // (so it errors even over an empty/fully-filtered table, which lazy
+        // per-row evaluation would otherwise silently accept). The wording depends
+        // on whether this is an aggregate query — see `reject_misused_aggregate`.
+        if let Some(w) = &sel.where_clause {
+            reject_misused_aggregate(w, select_is_aggregate_query(sel))?;
+        }
+
         // Apply WHERE.
         let mut rows: Vec<InputRow> = Vec::new();
         for r in input_rows {
@@ -13677,10 +13686,17 @@ impl Connection {
                 }
             });
         }
-        match missing {
-            Some(m) => Err(Error::Error(m)),
-            None => Ok(()),
+        if let Some(m) = missing {
+            return Err(Error::Error(m));
         }
+        // An aggregate in an UPDATE/DELETE WHERE or an UPDATE assignment value is
+        // a misuse (these statements are never aggregate queries). SQLite rejects
+        // it at prepare time; graphite otherwise evaluated it lazily and so
+        // silently accepted it over an empty/filtered table.
+        for e in exprs {
+            reject_misused_aggregate(e, false)?;
+        }
+        Ok(())
     }
 
     fn validate_nested_ambiguity(&self, sel: &Select, top: &[ColumnInfo]) -> Result<()> {
@@ -18556,6 +18572,40 @@ fn first_aggregate_call_name(e: &Expr) -> Option<String> {
         }
     });
     found
+}
+
+/// Whether `sel` is an *aggregate query* — one in which aggregate functions are
+/// valid somewhere (the result columns or `HAVING`). SQLite uses this to pick the
+/// wording when an aggregate is misused in a clause that forbids it: a misuse in
+/// an aggregate query reads `misuse of aggregate: f()`, otherwise `misuse of
+/// aggregate function f()`. A `GROUP BY`/`HAVING` makes it aggregate, as does an
+/// aggregate in any result column. An aggregate in `ORDER BY` does NOT — sqlite
+/// resolves (and rejects) the `WHERE` before it considers `ORDER BY`.
+fn select_is_aggregate_query(sel: &Select) -> bool {
+    !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || sel.columns.iter().any(|rc| match rc {
+            ResultColumn::Expr { expr, .. } => first_aggregate_call_name(expr).is_some(),
+            _ => false,
+        })
+}
+
+/// Reject an aggregate function used in a clause that forbids it (a `WHERE`, an
+/// `UPDATE` assignment, …), in sqlite's two wordings — `misuse of aggregate: f()`
+/// inside an aggregate query, `misuse of aggregate function f()` otherwise. The
+/// walk stops at subquery boundaries (an aggregate inside a nested `SELECT`
+/// belongs to that query level), so a legitimate `WHERE x IN (SELECT sum(y) …)`
+/// is untouched.
+fn reject_misused_aggregate(e: &Expr, aggregate_query: bool) -> Result<()> {
+    match first_aggregate_call_name(e) {
+        Some(name) if aggregate_query => Err(Error::Error(alloc::format!(
+            "misuse of aggregate: {name}()"
+        ))),
+        Some(name) => Err(Error::Error(alloc::format!(
+            "misuse of aggregate function {name}()"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Whether `e` calls a non-deterministic function — one that can return a

@@ -377,6 +377,17 @@ text-preserving CREATE-text edits).
     pseudo-table (`excluded.<col>`, incl. `excluded.rowid`) and `table.`-qualified
     refs. graphite previously ignored every bad reference and ran the statement
     (`tests/upsert_unknown_column.rs`).
+  - **Aggregate-in-WHERE misuse is rejected at prepare time (done).** An
+    aggregate function in a row-filtering clause (a `WHERE`, an `IN (…)` list, an
+    `UPDATE` assignment value) is a misuse — aggregation runs after filtering.
+    graphite evaluated the predicate lazily per row, so it emitted a non-sqlite
+    message and, over an empty or fully-filtered table, *silently accepted* the
+    statement (`DELETE FROM t WHERE sum(a)>0` ran). It is now caught up front in
+    sqlite's two wordings: `misuse of aggregate: f()` when the statement is itself
+    an aggregate query (GROUP BY/HAVING or an aggregate in the result columns),
+    `misuse of aggregate function f()` otherwise (plain SELECT WHERE, UPDATE,
+    DELETE). An aggregate nested in a subquery (`WHERE x IN (SELECT sum(y) …)`) is
+    untouched (`tests/aggregate_misuse.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
