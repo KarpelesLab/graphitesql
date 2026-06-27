@@ -3106,7 +3106,18 @@ impl Connection {
         if target == DbRef::Temp {
             self.ensure_temp()?;
         }
-        match target {
+        // A known schema qualifier on the statement's target (`UPDATE main.nope`,
+        // `DROP VIEW aux.gone`) must survive into a missing-object error — the
+        // deep lookup only knows the bare name. Capture it before `stmt` moves.
+        let missing_qual: Option<(String, String)> = match &stmt {
+            Statement::Insert(s) => s.schema.clone().map(|q| (q, s.table.clone())),
+            Statement::Update(s) => s.schema.clone().map(|q| (q, s.table.clone())),
+            Statement::Delete(s) => s.schema.clone().map(|q| (q, s.table.clone())),
+            Statement::Alter(a) => a.schema.clone().map(|q| (q, a.table.clone())),
+            Statement::Drop(s) => s.schema.clone().map(|q| (q, s.name.clone())),
+            _ => None,
+        };
+        let r = match target {
             DbRef::Main => self.exec_parsed(stmt, sql, params),
             other => {
                 // `INSERT INTO <non-main>.t SELECT … FROM s`: the SELECT's
@@ -3121,6 +3132,10 @@ impl Connection {
                 self.swap_db(other);
                 r
             }
+        };
+        match missing_qual {
+            Some((q, name)) => r.map_err(|e| Self::qualify_missing(Some(&q), &name, e)),
+            None => r,
         }
     }
 
@@ -14133,7 +14148,11 @@ impl Connection {
                 if let Some(r) = self.scan_db_view(db, &from.first.name, alias, params)? {
                     return Ok(r);
                 }
-                return self.scan_db_table(db, &from.first.name, alias);
+                return self
+                    .scan_db_table(db, &from.first.name, alias)
+                    .map_err(|e| {
+                        Self::qualify_missing(from.first.schema.as_deref(), &from.first.name, e)
+                    });
             }
         }
         // A table-valued function used as the sole source.
@@ -14199,7 +14218,11 @@ impl Connection {
         // full WHERE is still applied by run_core, so the index only needs to
         // return a superset of matching rows.
         if from.joins.is_empty() {
-            let first_meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
+            let first_meta = self
+                .table_meta(&from.first.name, from.first.alias.as_deref())
+                .map_err(|e| {
+                    Self::qualify_missing(from.first.schema.as_deref(), &from.first.name, e)
+                })?;
             if first_meta.without_rowid {
                 // A leading-PK equality or range seeks the clustered b-tree; else
                 // scan.
@@ -15325,10 +15348,14 @@ impl Connection {
             {
                 return Ok((cols, input.into_iter().map(|r| r.values).collect()));
             }
-            let (cols, input) = self.scan_db_table(db, &tref.name, tref.alias.as_deref())?;
+            let (cols, input) = self
+                .scan_db_table(db, &tref.name, tref.alias.as_deref())
+                .map_err(|e| Self::qualify_missing(tref.schema.as_deref(), &tref.name, e))?;
             return Ok((cols, input.into_iter().map(|r| r.values).collect()));
         }
-        let meta = self.table_meta(&tref.name, tref.alias.as_deref())?;
+        let meta = self
+            .table_meta(&tref.name, tref.alias.as_deref())
+            .map_err(|e| Self::qualify_missing(tref.schema.as_deref(), &tref.name, e))?;
         let rows = if meta.without_rowid {
             self.scan_without_rowid(&meta)?
         } else {
@@ -15703,6 +15730,27 @@ impl Connection {
                 .resolve_db(schema)
                 .map_err(|_| Error::Error(alloc::format!("no such {noun}: {q}.{name}"))),
         }
+    }
+
+    /// Re-attach an explicit schema qualifier to a `no such <kind>: <name>` error
+    /// for a *known* database (`SELECT … FROM main.nope` → `no such table:
+    /// main.nope`, not the bare `no such table: nope`). SQLite echoes the
+    /// qualifier as written; the low-level lookups only know the bare object
+    /// name, so the resolving call wraps its result with this. Noun-agnostic: it
+    /// preserves whatever kind word the deep error produced (`table`/`view`/
+    /// `index`/`trigger`) and only injects the qualifier. A no-op when the
+    /// reference was unqualified, or when the error is not exactly this object's
+    /// missing-object message (so an unrelated `no such column: …` is untouched).
+    fn qualify_missing(schema: Option<&str>, name: &str, e: Error) -> Error {
+        let Some(q) = schema else { return e };
+        if let Error::Error(m) = &e {
+            if let Some(prefix) = m.strip_suffix(&alloc::format!(": {name}")) {
+                if prefix.starts_with("no such ") {
+                    return Error::Error(alloc::format!("{prefix}: {q}.{name}"));
+                }
+            }
+        }
+        e
     }
 
     /// A `temp.`-qualified read is only resolvable once the temp database has

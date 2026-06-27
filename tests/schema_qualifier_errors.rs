@@ -5,9 +5,10 @@
 //! `no such trigger:` for the matching `DROP`. SQLite reserves the bare `unknown
 //! database <name>` wording for the `CREATE` forms (`CREATE INDEX bad.i`,
 //! `CREATE TRIGGER bad.tr`), whose qualifier names a creation target rather than
-//! an object to look up; graphite keeps those. Matched to the `sqlite3` CLI
-//! (3.50.4). A *known* database with a missing object (`main.nope`, `aux.nope`)
-//! still drops its qualifier — a separate, deferred gap.
+//! an object to look up; graphite keeps those. A *known* database with a missing
+//! object (`main.nope`, `aux.nope`, `temp.nope`) likewise keeps its qualifier
+//! (`no such table: main.nope`) — the qualifier is echoed as written, and the
+//! kind-noun still tracks the statement. Matched to the `sqlite3` CLI (3.50.4).
 
 #![cfg(feature = "std")]
 
@@ -110,6 +111,83 @@ fn create_keeps_the_unknown_database_wording() {
             "CREATE TRIGGER bad.tr AFTER INSERT ON t BEGIN SELECT 1; END"
         ),
         "unknown database bad"
+    );
+}
+
+#[test]
+fn known_database_with_a_missing_object_keeps_its_qualifier() {
+    // The qualifier names a real database; the object is missing. SQLite echoes
+    // the qualifier (`main.nope`), and the kind-noun still tracks the statement.
+    assert_eq!(
+        err(&["CREATE TABLE t(a)"], "SELECT * FROM main.nope"),
+        "no such table: main.nope"
+    );
+    assert_eq!(
+        err(&["CREATE TABLE t(a)"], "SELECT * FROM t JOIN main.nope"),
+        "no such table: main.nope"
+    );
+    assert_eq!(
+        err(&["CREATE TABLE t(a)"], "INSERT INTO main.nope VALUES(1)"),
+        "no such table: main.nope"
+    );
+    assert_eq!(
+        err(&["CREATE TABLE t(a)"], "UPDATE main.nope SET a=1"),
+        "no such table: main.nope"
+    );
+    assert_eq!(
+        err(&["CREATE TABLE t(a)"], "DELETE FROM main.nope"),
+        "no such table: main.nope"
+    );
+    assert_eq!(
+        err(&["CREATE TABLE t(a)"], "ALTER TABLE main.nope RENAME TO u"),
+        "no such table: main.nope"
+    );
+    assert_eq!(
+        err(&["CREATE TABLE t(a)"], "DROP VIEW main.nope"),
+        "no such view: main.nope"
+    );
+    assert_eq!(
+        err(&["CREATE TABLE t(a)"], "DROP TRIGGER main.nope"),
+        "no such trigger: main.nope"
+    );
+}
+
+#[test]
+fn known_database_qualifier_only_rewrites_the_missing_target() {
+    // The rewrite is tied to the target object's own name: a present table whose
+    // *column* is missing keeps the bare `no such column` message — the qualifier
+    // is not spuriously grafted onto an unrelated error.
+    assert_eq!(
+        err(&["CREATE TABLE t(a)"], "UPDATE main.t SET b=1"),
+        "no such column: b"
+    );
+    assert_eq!(
+        err(&["CREATE TABLE t(a)"], "SELECT nope FROM main.t"),
+        "no such column: nope"
+    );
+}
+
+#[test]
+fn attached_database_with_a_missing_object_keeps_its_qualifier() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("ATTACH ':memory:' AS aux").unwrap();
+    c.execute("CREATE TABLE main.t(a)").unwrap();
+    let strip = |m: String| m.strip_prefix("error: ").unwrap_or(&m).to_string();
+    assert_eq!(
+        strip(c.query("SELECT * FROM aux.nope").unwrap_err().to_string()),
+        "no such table: aux.nope"
+    );
+    assert_eq!(
+        strip(
+            c.query("SELECT * FROM t JOIN aux.nope")
+                .unwrap_err()
+                .to_string()
+        ),
+        "no such table: aux.nope"
+    );
+    assert_eq!(
+        strip(c.execute("DROP TABLE aux.nope").unwrap_err().to_string()),
+        "no such table: aux.nope"
     );
 }
 

@@ -325,16 +325,14 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   an object to look up; those keep it. A new `resolve_db_or_missing` helper maps
   `resolve_db`'s unknown-database error to the missing-object message at the
   query FROM/JOIN sources and in `target_db`'s DML/`DROP`/`ALTER` arms (the
-  unqualified path, including temp-table shadowing, is unchanged).
+  unqualified path, including temp-table shadowing, is unchanged). A *known*
+  database with a missing object (`main.nope`, `aux.nope`, `temp.nope`) likewise
+  keeps its qualifier now: a noun-agnostic `qualify_missing` helper re-attaches
+  the written qualifier to the bare `no such <kind>: <name>` the low-level lookup
+  produces, applied at the four read-path lookups and at the statement dispatcher
+  for the DML/`DROP`/`ALTER` targets. The rewrite is tied to the target object's
+  own name, so an unrelated `no such column: …` on a present table is untouched.
   `tests/schema_qualifier_errors.rs`.
-- **Remaining: a *known* database qualifier with a missing object drops the
-  qualifier.** `SELECT * FROM main.nope` / `aux.nope` reports `no such table:
-  nope` where SQLite keeps the qualifier (`no such table: main.nope`). The
-  qualifier is lost before the per-database scan (an explicitly-`main.`-qualified
-  read falls through to the optimized main path, which never sees it; the
-  temp/attached path reaches `table_meta_in`, which formats the bare name). The
-  fix threads the original qualifier into the missing-table error of each scan
-  path — independent of the unknown-database case above.
 - **Two residual parse-path non-issues (not worth chasing):** `UPDATE SET a=1`
   flags `a` where SQLite flags `SET` (reserved-word leniency), and `BEGIN
   TRANSACTION FOO` silently accepts the trailing name.
