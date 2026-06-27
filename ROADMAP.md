@@ -714,6 +714,22 @@ expansion (`SELECT * FROM t, t` → `main.t.a`, `temp.t.a` for a temp table),
 which needs the owning database name threaded onto `ColumnInfo` (it currently
 carries only the table/alias); graphite reports `t.a` there for now.
 
+A **leading `WITH` now rides on every `INSERT` source, not just
+`INSERT … SELECT`.** SQLite extends `WITH` to all DML forms, so
+`WITH c AS (…) INSERT INTO t VALUES(…)` / `DEFAULT VALUES` are accepted, with the
+CTEs in scope for any subquery inside the `VALUES` list
+(`WITH c(n) AS (VALUES(5)) INSERT INTO t VALUES((SELECT n FROM c))` inserts `5`).
+graphite previously parsed only `WITH … INSERT … SELECT` and rejected the
+`VALUES` forms with a spurious `near ";": syntax error` (and answered
+`incomplete input` instead of `no such table` when the CTE name collided with the
+insert target). The CTEs ride on a new `Insert::ctes` field (parsed in
+`with_prefixed`, pushed/popped around the insert by an `exec_insert` wrapper that
+mirrors `exec_delete`, and also pushed inside `prematerialize_insert_source` so
+the cross-database source materializes in the pre-swap context). A CTE never
+shadows the insert *target* — `INSERT INTO c …` stays `no such table: c`.
+Byte-exact vs `sqlite3` 3.50.4 (`tests/with_insert.rs`, plus the parse-acceptance
+guard in `tests/parser_surface.rs`).
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

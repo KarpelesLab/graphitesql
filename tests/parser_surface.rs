@@ -168,9 +168,17 @@ fn deferred_forms_still_rejected() {
     assert!(parse("SELECT * FROM (t JOIN u)").is_err());
     assert!(parse("SELECT * FROM (t, u)").is_err());
     assert!(parse("SELECT * FROM (t JOIN u) AS j").is_err());
-    // `WITH … INSERT … VALUES` is still rejected: a CTE may only prefix a query
-    // body, an `INSERT … SELECT`, or (now) an UPDATE/DELETE — not `VALUES`.
-    assert!(parse("WITH x AS (SELECT 1) INSERT INTO t(a) VALUES (1)").is_err());
+}
+
+/// A leading `WITH` rides on *every* `INSERT` source now, not just
+/// `INSERT … SELECT`: `VALUES` and `DEFAULT VALUES` parse too, with the CTEs in
+/// scope for any subquery inside the VALUES list (see `tests/with_insert.rs` for
+/// the differential behaviour). This guards the parse-acceptance side.
+#[test]
+fn with_prefixed_insert_values_parses() {
+    assert!(parse("WITH x AS (SELECT 1) INSERT INTO t(a) VALUES (1)").is_ok());
+    assert!(parse("WITH x AS (SELECT 1) INSERT INTO t DEFAULT VALUES").is_ok());
+    assert!(parse("WITH x(n) AS (VALUES(5)) INSERT INTO t VALUES ((SELECT n FROM x))").is_ok());
 }
 
 /// `offset` and `end` are usable as bare (unqualified) column names in

@@ -327,6 +327,10 @@ pub struct OrderTerm {
 /// An `INSERT` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Insert {
+    /// A leading `WITH` clause whose CTEs are in scope for the source — the
+    /// inserted `SELECT`, or a subquery inside a `VALUES` expression. Empty when
+    /// the statement has no `WITH` prefix.
+    pub ctes: Vec<Cte>,
     /// Target table.
     pub table: String,
     /// A `schema.` qualifier (`INSERT INTO aux.t`), if any.

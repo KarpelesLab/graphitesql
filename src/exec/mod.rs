@@ -3226,6 +3226,20 @@ impl Connection {
     /// is left untouched (it needs no resolution).
     fn prematerialize_insert_source(&self, stmt: Statement, params: &Params) -> Statement {
         if let Statement::Insert(mut ins) = stmt {
+            // A leading `WITH` must be in scope while the source resolves in this
+            // (pre-swap) context — the CTE body reads the original database, so it
+            // has to be materialized here, not after the swap to the target.
+            let base = self.cte_env.borrow().len();
+            let pushed = if ins.ctes.is_empty() {
+                true
+            } else {
+                let used = cte_mask_from_seeds(&insert_cte_seeds(&ins), &ins.ctes);
+                self.push_ctes(&ins.ctes, params, None, Some(&used)).is_ok()
+            };
+            if !pushed {
+                self.cte_env.borrow_mut().truncate(base);
+                return Statement::Insert(ins);
+            }
             match &ins.source {
                 InsertSource::Select(sel) => {
                     if let Ok(result) = self.run_select(sel, params) {
@@ -4676,6 +4690,7 @@ impl Connection {
                 })
                 .collect();
             let ins = Insert {
+                ctes: Vec::new(),
                 table: ct.name.clone(),
                 schema: None,
                 columns: Vec::new(),
@@ -5986,6 +6001,22 @@ impl Connection {
     }
 
     fn exec_insert(&mut self, ins: &Insert, params: &Params) -> Result<usize> {
+        // A leading `WITH` makes its CTEs visible to the source — the inserted
+        // SELECT or a subquery inside a VALUES expression. Push them for the
+        // duration of the statement, then restore the scope (mirrors the
+        // UPDATE/DELETE WITH paths).
+        if ins.ctes.is_empty() {
+            return self.exec_insert_inner(ins, params);
+        }
+        let base = self.cte_env.borrow().len();
+        let used = cte_mask_from_seeds(&insert_cte_seeds(ins), &ins.ctes);
+        let pushed = self.push_ctes(&ins.ctes, params, None, Some(&used));
+        let result = pushed.and_then(|()| self.exec_insert_inner(ins, params));
+        self.cte_env.borrow_mut().truncate(base);
+        result
+    }
+
+    fn exec_insert_inner(&mut self, ins: &Insert, params: &Params) -> Result<usize> {
         reject_schema_write(&ins.table)?;
         // A virtual table routes INSERT to its module's `update` (xUpdate); only
         // the `VALUES`/`SELECT` source needs materializing first.
@@ -21552,6 +21583,46 @@ fn delete_cte_seeds(del: &Delete) -> alloc::vec::Vec<alloc::string::String> {
         collect_expr_sources(o, &mut out);
     }
     for c in &del.returning {
+        if let ResultColumn::Expr { expr, .. } = c {
+            collect_expr_sources(expr, &mut out);
+        }
+    }
+    out
+}
+
+/// Collect the source names an `INSERT` body references — the `SELECT` source or
+/// the subqueries inside its `VALUES` expressions, plus any `ON CONFLICT … DO
+/// UPDATE` assignments/`WHERE` and `RETURNING` expressions. Feeds
+/// [`cte_mask_from_seeds`] so an unreferenced leading `WITH` CTE is never
+/// analyzed (a bad column/table inside it is not an error, matching SQLite).
+fn insert_cte_seeds(ins: &Insert) -> alloc::vec::Vec<alloc::string::String> {
+    let mut out = alloc::vec::Vec::new();
+    match &ins.source {
+        InsertSource::Select(sel) => collect_scoped(sel, &mut out),
+        InsertSource::Values(rows) => {
+            for row in rows {
+                for e in row {
+                    collect_expr_sources(e, &mut out);
+                }
+            }
+        }
+        InsertSource::DefaultValues => {}
+    }
+    for up in &ins.upsert {
+        if let UpsertAction::Update {
+            assignments,
+            where_clause,
+        } = &up.action
+        {
+            for (_, e) in assignments {
+                collect_expr_sources(e, &mut out);
+            }
+            if let Some(w) = where_clause {
+                collect_expr_sources(w, &mut out);
+            }
+        }
+    }
+    for c in &ins.returning {
         if let ResultColumn::Expr { expr, .. } = c {
             collect_expr_sources(expr, &mut out);
         }

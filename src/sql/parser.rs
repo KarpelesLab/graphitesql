@@ -482,16 +482,11 @@ impl Parser {
             self.record_trigger_body_err(msg);
         }
         if self.check_kw("insert") || self.check_kw("replace") {
+            // The CTEs ride on the statement and are visible to the source — the
+            // inserted SELECT or a subquery inside a VALUES expression (SQLite
+            // extends WITH to every DML form, not just INSERT … SELECT).
             let mut ins = self.insert()?;
-            match &mut ins.source {
-                // The executor materializes a CTE while running the inserted
-                // SELECT, so the clause rides along on that SELECT.
-                InsertSource::Select(sel) => sel.ctes = ctes,
-                _ => {
-                    return Err(self
-                        .err("WITH may only prefix INSERT … SELECT (not VALUES / DEFAULT VALUES)"))
-                }
-            }
+            ins.ctes = ctes;
             return Ok(Statement::Insert(ins));
         }
         // `WITH … DELETE` / `WITH … UPDATE`: the CTEs ride on the statement and are
@@ -1247,6 +1242,7 @@ impl Parser {
         }
         let returning = self.returning_clause()?;
         Ok(Insert {
+            ctes: Vec::new(),
             table,
             schema,
             columns,
