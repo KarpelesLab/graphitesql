@@ -5829,8 +5829,24 @@ impl Connection {
         // the projection when it is not true. (A trigger-body SELECT with a FROM
         // is not a RAISE form handled here; leave it to the projection scan.)
         if sel.from.is_none() {
+            let ctx = EvalCtx::rowless(params).with_subqueries(self);
+            // SQLite compiles the whole trigger program when the firing statement
+            // is prepared, so a body `SELECT`'s name / function / arity errors
+            // surface *before* any row is processed — ahead of the `WHERE` filter
+            // and any sibling `RAISE(…)`. graphite runs the body step by step, so
+            // resolve the FROM-less SELECT's projections up front by evaluating
+            // them (the value is discarded; the statement's atomicity rolls back
+            // any earlier body side-effect if this throws). A `RAISE(…)`-bearing
+            // projection keeps its dedicated path below — `eval` has no RAISE
+            // handling, and SQLite resolves the rest of the row first anyway.
+            for col in &sel.columns {
+                if let ResultColumn::Expr { expr, .. } = col {
+                    if !trigger_select_skip_eval(expr) {
+                        let _ = eval::eval(expr, &ctx)?;
+                    }
+                }
+            }
             if let Some(w) = &sel.where_clause {
-                let ctx = EvalCtx::rowless(params).with_subqueries(self);
                 if eval::truth(&eval::eval(w, &ctx)?) != Some(true) {
                     return Ok(());
                 }
@@ -24373,6 +24389,37 @@ fn from_refs_table(f: &FromClause, name: &str) -> bool {
 /// trigger says `no such table: main.nope`. A *temp* trigger's names resolve
 /// across all schemas, so its error stays bare; any already-qualified name (one
 /// containing a `.`) is likewise left untouched.
+/// Should a FROM-less trigger-body `SELECT` projection be skipped by the
+/// up-front `eval`-based resolution pass? `eval` validates a projection by
+/// evaluating it, which is wrong for two node kinds: a `RAISE(…)` (the evaluator
+/// has no `RAISE` support — it is handled by [`Connection::eval_raise_expr`]) and
+/// an aggregate / window-function call (valid over the zero rows of a FROM-less
+/// `SELECT` — `SELECT count(*)` is `0`, not a `misuse of aggregate` error). Skip
+/// any expression containing one (not descending into nested `SELECT`s, which
+/// resolve themselves).
+fn trigger_select_skip_eval(e: &Expr) -> bool {
+    let mut skip = false;
+    window::visit(e, &mut |n| {
+        if let Expr::Function {
+            name,
+            args,
+            star,
+            over,
+            ..
+        } = n
+        {
+            if name.eq_ignore_ascii_case("raise")
+                || over.is_some()
+                || is_builtin_window_function(&name.to_ascii_lowercase())
+                || func::is_aggregate_call(name, args.len(), *star)
+            {
+                skip = true;
+            }
+        }
+    });
+    skip
+}
+
 fn qualify_trigger_missing_table(e: Error, schema: Option<&str>) -> Error {
     let Some(sch) = schema else { return e };
     if sch.eq_ignore_ascii_case("temp") {

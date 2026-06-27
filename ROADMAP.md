@@ -451,6 +451,25 @@ RETURNING execution path (so the recorded body message wins). Byte-exact vs
 RETURNING / row-limit cases, the full target-resolution precedence matrix, and
 source-order first-wins in both directions.
 
+A bare **`SELECT` step in a trigger body is now resolved when the trigger fires**.
+Such a step is side-effect-free *except* for a `RAISE(…)`, but SQLite still
+compiles (resolves) it when the firing statement is prepared — so a FROM-less body
+`SELECT` naming a missing column, unknown function, wrong arity, or a bad
+`NEW`/`OLD` column raises that error the moment the trigger fires. graphite ran a
+RAISE-only path (`run_trigger_select`) that skipped every non-`RAISE` projection,
+so it silently no-op'd the `SELECT`. It now evaluates each FROM-less projection
+up front (value discarded) to force name/function/arity resolution, *before* the
+`WHERE` filter and any sibling `RAISE` — matching SQLite, where a missing column
+outranks a `RAISE` in the same step and the resulting error rolls the whole firing
+statement back (any earlier body `INSERT` is undone). `RAISE`-bearing projections
+keep their dedicated path (`eval` has no `RAISE` support); aggregate / window
+calls are skipped so a FROM-less `SELECT count(*)` stays the valid `0` rather than
+a spurious `misuse of aggregate`. Byte-exact vs `sqlite3` 3.50.4. *(Residuals, both
+inherent to evaluating rather than statically resolving: a **FROM-bearing** body
+`SELECT` — `SELECT * FROM nope` — and a name inside an **un-taken `CASE` branch**
+are still resolved lazily; a full static resolver over the trigger row scope would
+close them.)*
+
 A misplaced **`ORDER BY` / `LIMIT` before a compound operator** now reports the
 same message SQLite does. These clauses bind to the *whole* compound, so
 `SELECT … ORDER BY … UNION SELECT …` is rejected with `ORDER BY clause should
