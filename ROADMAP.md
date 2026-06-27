@@ -581,6 +581,13 @@ text-preserving CREATE-text edits).
     the usual headers instead of raising `no such index`/`no such table` — the
     way sqlite (and graphite's own `table_info`/`index_list`) already behaves
     (`tests/pragma_unknown_object_empty.rs`).
+  - **Header-cookie PRAGMA values parse as integer tokens (done).**
+    `PRAGMA user_version = X` / `application_id = X` interpret `X` as an integer
+    token (optional sign, `0x` hex, leading-decimal prefix — no whitespace skip),
+    exactly like sqlite's `sqlite3Atoi`, rather than evaluating it as a SQL
+    expression. A bare identifier such as `abc` is now a no-op (value `0`)
+    instead of raising `no such column: abc`
+    (`tests/pragma_header_value.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

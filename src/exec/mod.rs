@@ -4533,12 +4533,12 @@ impl Connection {
             self.backend.writer()?.checkpoint()?;
         } else if p.name.eq_ignore_ascii_case("user_version") {
             if let Some(e) = &p.value {
-                let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?) as u32;
+                let v = pragma_header_int(e, params)?;
                 self.backend.writer()?.header_mut().user_version = v;
             }
         } else if p.name.eq_ignore_ascii_case("application_id") {
             if let Some(e) = &p.value {
-                let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?) as u32;
+                let v = pragma_header_int(e, params)?;
                 self.backend.writer()?.header_mut().application_id = v;
             }
         } else if p.name.eq_ignore_ascii_case("auto_vacuum") {
@@ -20060,6 +20060,65 @@ fn pragma_text(e: &Expr) -> String {
         Expr::Literal(Literal::Str(s)) => s.clone(),
         _ => String::new(),
     }
+}
+
+/// Parse the leading integer of a `PRAGMA name = value` text argument the way
+/// SQLite's `sqlite3Atoi` does: an optional sign, then either a `0x` hex run or
+/// a decimal run, taking the leading prefix and stopping at the first character
+/// that does not fit. Unlike a `CAST … AS INTEGER` it does *not* skip leading
+/// whitespace, so `' 7 '` is `0`. A purely non-numeric token (e.g. `abc`) is `0`.
+fn pragma_atoi(s: &str) -> i64 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let neg = match b.first() {
+        Some(b'-') => {
+            i = 1;
+            true
+        }
+        Some(b'+') => {
+            i = 1;
+            false
+        }
+        _ => false,
+    };
+    let mut v: i64 = 0;
+    if b.len() > i + 1 && b[i] == b'0' && (b[i + 1] | 0x20) == b'x' {
+        i += 2;
+        while i < b.len() {
+            let d = match b[i] {
+                d @ b'0'..=b'9' => d - b'0',
+                d @ b'a'..=b'f' => d - b'a' + 10,
+                d @ b'A'..=b'F' => d - b'A' + 10,
+                _ => break,
+            };
+            v = v.wrapping_mul(16).wrapping_add(d as i64);
+            i += 1;
+        }
+    } else {
+        while i < b.len() && b[i].is_ascii_digit() {
+            v = v.wrapping_mul(10).wrapping_add((b[i] - b'0') as i64);
+            i += 1;
+        }
+    }
+    if neg {
+        v.wrapping_neg()
+    } else {
+        v
+    }
+}
+
+/// Interpret a header-cookie `PRAGMA` argument (`user_version`, `application_id`)
+/// as SQLite does: an integer token, never a SQL expression. A bare identifier
+/// or a string is run through [`pragma_atoi`] (so `abc` is `0`, not the
+/// `no such column` error a general expression evaluation would raise); a
+/// genuine numeric literal or expression keeps its evaluated integer value.
+fn pragma_header_int(e: &Expr, params: &Params) -> Result<u32> {
+    let v: i64 = match e {
+        Expr::Column { column, .. } => pragma_atoi(column),
+        Expr::Literal(Literal::Str(s)) => pragma_atoi(s),
+        _ => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?),
+    };
+    Ok(v as u32)
 }
 
 /// Interpret a `PRAGMA name = value` argument as a boolean, accepting
