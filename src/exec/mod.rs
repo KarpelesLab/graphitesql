@@ -6576,6 +6576,7 @@ impl Connection {
             return self.exec_view_delete(del, params);
         }
         let meta = self.table_meta(&del.table, None)?;
+        self.validate_index_hint(&del.table, del.index_hint.as_ref())?;
         // Resolve the WHERE columns eagerly (top-level only — a trigger body's
         // DML may bind a bare name to NEW/OLD), so a bogus column errors even when
         // the table has no rows, matching sqlite. See `validate_dml_refs`.
@@ -6709,6 +6710,7 @@ impl Connection {
             return self.exec_view_update(upd, params);
         }
         let meta = self.table_meta(&upd.table, None)?;
+        self.validate_index_hint(&upd.table, upd.index_hint.as_ref())?;
         // Validate the SET-target columns up front: sqlite rejects an unknown
         // assignment column at prepare time, even when the table has no rows.
         // graphite otherwise resolves them lazily in the per-row loop and so
@@ -11539,6 +11541,21 @@ impl Connection {
         }
 
         Ok(alloc::format!("SCAN {label}"))
+    }
+
+    /// Validate an `INDEXED BY name` hint on a DML target (`UPDATE`/`DELETE`):
+    /// the named index must exist on `table`, otherwise `no such index: name`
+    /// (case-insensitive, matching sqlite). `NOT INDEXED` and an absent hint are
+    /// always fine. The hint only steers the planner, so it never changes the
+    /// statement's result — this is purely a name-existence check.
+    fn validate_index_hint(&self, table: &str, hint: Option<&IndexHint>) -> Result<()> {
+        if let Some(IndexHint::IndexedBy(n)) = hint {
+            let indexes = self.indexes_of(table)?;
+            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
+                return Err(Error::Error(alloc::format!("no such index: {n}")));
+            }
+        }
+        Ok(())
     }
 
     fn indexes_of(&self, table: &str) -> Result<Vec<IndexMeta>> {

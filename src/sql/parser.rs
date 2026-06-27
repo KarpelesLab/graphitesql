@@ -1192,6 +1192,8 @@ impl Parser {
             OnConflict::Abort
         };
         let (schema, table) = self.qualified_name()?;
+        // `INDEXED BY name` / `NOT INDEXED` planner hint on the target table.
+        let index_hint = self.index_hint()?;
         self.expect_kw("set")?;
         let mut assignments = Vec::new();
         let mut row_assignments: Vec<(Vec<String>, Box<Select>)> = Vec::new();
@@ -1261,6 +1263,7 @@ impl Parser {
             ctes: Vec::new(),
             table,
             schema,
+            index_hint,
             on_conflict,
             on_conflict_explicit,
             assignments,
@@ -1278,6 +1281,8 @@ impl Parser {
         self.expect_kw("delete")?;
         self.expect_kw("from")?;
         let (schema, table) = self.qualified_name()?;
+        // `INDEXED BY name` / `NOT INDEXED` planner hint on the target table.
+        let index_hint = self.index_hint()?;
         let where_clause = if self.eat_kw("where") {
             Some(self.expr()?)
         } else {
@@ -1289,6 +1294,7 @@ impl Parser {
             ctes: Vec::new(),
             table,
             schema,
+            index_hint,
             where_clause,
             order_by,
             limit,

@@ -415,6 +415,9 @@ pub struct Update {
     pub table: String,
     /// A `schema.` qualifier (`UPDATE aux.t`), if any.
     pub schema: Option<String>,
+    /// `INDEXED BY name` / `NOT INDEXED` query-planner hint on the target, if
+    /// given (`UPDATE t INDEXED BY ix SET …`).
+    pub index_hint: Option<IndexHint>,
     /// `UPDATE OR <action>` conflict resolution (default `Abort`).
     pub on_conflict: OnConflict,
     /// Whether an explicit `OR <action>` was written (see [`Insert::on_conflict_explicit`]).
@@ -450,6 +453,9 @@ pub struct Delete {
     pub table: String,
     /// A `schema.` qualifier (`DELETE FROM aux.t`), if any.
     pub schema: Option<String>,
+    /// `INDEXED BY name` / `NOT INDEXED` query-planner hint on the target, if
+    /// given (`DELETE FROM t INDEXED BY ix WHERE …`).
+    pub index_hint: Option<IndexHint>,
     /// `WHERE` predicate.
     pub where_clause: Option<Expr>,
     /// `ORDER BY` for a `LIMIT`ed delete (empty when absent).

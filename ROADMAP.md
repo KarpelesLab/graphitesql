@@ -282,6 +282,17 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   `excluded` pseudo-table is never database-qualified). `tests/upsert_unknown_column.rs`.
   Residual: a three-part ref inside a *correlated subquery body* binding to an
   enclosing FROM is still resolved lazily (the nested-scope gap below).
+- **`INDEXED BY` / `NOT INDEXED` on `UPDATE`/`DELETE` — DONE.** The planner hint
+  that `SELECT … FROM` already accepted is now parsed on `UPDATE`/`DELETE` targets
+  too (a new `index_hint: Option<IndexHint>` on the `Update`/`Delete` AST, parsed by
+  the shared `index_hint()` helper between the table name and `SET`/`WHERE`); graphite
+  previously rejected the syntax with `near "INDEXED": syntax error`. Because the hint
+  only constrains the planner, it leaves results unchanged — the sole observable effect
+  is a prepare-time `no such index: name` (case-insensitive) when the named index does
+  not exist on the target table, validated by `validate_index_hint` in
+  `exec_update_inner`/`exec_delete_inner` right after the table meta is resolved (so it
+  outranks a bad `WHERE`/`SET` column, matching sqlite's resolution order). `NOT
+  INDEXED` and an absent hint are always accepted. `tests/indexed_by_dml.rs`.
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a
