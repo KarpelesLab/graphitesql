@@ -164,7 +164,13 @@ forms; and `CREATE TABLE … AS SELECT` now writes its column list with SQLite's
 `identPut` quoting (bare when safe, keyword-aware, no spaces after commas, e.g.
 `CREATE TABLE t(a,c)`); and `ALTER TABLE … ADD COLUMN` now splices the new column
 in after the last column but before any trailing table-level constraints
-(`t(a, b, c, CHECK(a>0))`) — all byte-exact vs `sqlite3` 3.50.4.
+(`t(a, b, c, CHECK(a>0))`); and a multi-column subquery or row value used as a
+*comparison operand* (`=`/`<>`/`<`/`IS`/`BETWEEN`/…) against a different-width
+operand now reports `row value misused` (the `sub-select returns N columns`
+column-count message is kept for genuinely scalar contexts — bare SELECT list,
+`IN`, function arguments), while two equal-arity vectors row-compare
+lexicographically (`(SELECT 1,2) = (SELECT 3,4)` → `0`, and likewise for
+subquery-vs-subquery `BETWEEN`) — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 
@@ -204,11 +210,6 @@ in after the last column but before any trailing table-level constraints
   - bare (unqualified) refs in derived-table/subquery scopes and `NATURAL`/`USING`
     coalesced names — `validate_columns_exist` only covers the top-level
     plain-table / `ON`-join scope.
-- **`(SELECT 1,2) = 1` should report `row value misused`.** A multi-column
-  subquery used as a *comparison operand* currently reports `sub-select returns 2
-  columns - expected 1`; SQLite says `row value misused` there (the column-count
-  message is correct in a scalar SELECT-list context like `SELECT (SELECT 1,2)`).
-  Needs context-aware wording at the comparison site.
 - **ALTER-time rejection of an ALTER that breaks a dependent.** An `ALTER` that
   makes a dependent view/trigger unresolvable should be rejected and rolled back;
   graphite leaves the now-broken object. Needs statement-level DDL rollback — a

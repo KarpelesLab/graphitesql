@@ -535,25 +535,22 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 Or => eval_or(left, right, ctx),
                 // Comparisons apply operand affinity, then the resolved collation.
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {
-                    // Row-value comparison `(a,b) OP (c,d)` is lexicographic.
-                    if let (Some(ls), Some(rs)) = (as_row_value(left), as_row_value(right)) {
-                        return compare_row_values(*op, ls, rs, ctx);
-                    }
-                    // `(a,b) OP (SELECT x,y)` (and the swapped form): compare the row
-                    // value against the subquery's first row. The subquery's values
-                    // become literal exprs so the existing element-wise comparison
-                    // (operand affinity + the row side's collation) applies; an empty
-                    // subquery makes the whole comparison NULL.
-                    if let (Some(ls), Some(sub)) = (as_row_value(left), as_subquery(right)) {
-                        return match row_subquery_first(sub, ctx)? {
-                            Some(rs) => compare_row_values(*op, ls, &rs, ctx),
-                            None => Ok(Value::Null),
-                        };
-                    }
-                    if let (Some(sub), Some(rs)) = (as_subquery(left), as_row_value(right)) {
-                        return match row_subquery_first(sub, ctx)? {
-                            Some(ls) => compare_row_values(*op, &ls, rs, ctx),
-                            None => Ok(Value::Null),
+                    // A row value `(a,b,…)` or a multi-column subquery `(SELECT x,y)`
+                    // on either side makes this a row (vector) comparison. Equal
+                    // arity compares lexicographically (the subquery's first row
+                    // becomes literal exprs so the element-wise comparison — operand
+                    // affinity + the row side's collation — applies; an empty
+                    // subquery makes the whole comparison NULL). Any *other* arity,
+                    // including a vector against a scalar, is "row value misused".
+                    let la = operand_arity(left, ctx);
+                    let ra = operand_arity(right, ctx);
+                    if la > 1 || ra > 1 {
+                        if la != ra {
+                            return Err(Error::Error("row value misused".into()));
+                        }
+                        return match (operand_row(left, ctx)?, operand_row(right, ctx)?) {
+                            (Some(ls), Some(rs)) => compare_row_values(*op, &ls, &rs, ctx),
+                            _ => Ok(Value::Null),
                         };
                     }
                     let l = eval(left, ctx)?;
@@ -585,10 +582,22 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 // comparison affinity and the resolved collation (so
                 // `intcol IS textcol` numerically coerces, matching SQLite). Without
                 // this, IS compared raw storage classes and missed the coercion.
-                // Row-value `IS` keeps the existing value-level path.
+                // A row value / multi-column subquery on either side: `IS`/`IS NOT`
+                // compares element-wise (NULL matches NULL) when arities match, and
+                // is "row value misused" for any mismatch (incl. vector-vs-scalar).
                 Is | IsNot => {
-                    if as_row_value(left).is_some() || as_row_value(right).is_some() {
-                        return eval_binary(*op, eval(left, ctx)?, eval(right, ctx)?);
+                    let la = operand_arity(left, ctx);
+                    let ra = operand_arity(right, ctx);
+                    if la > 1 || ra > 1 {
+                        if la != ra {
+                            return Err(Error::Error("row value misused".into()));
+                        }
+                        // An empty subquery operand acts as a row of NULLs.
+                        let ls = operand_row(left, ctx)?
+                            .unwrap_or_else(|| alloc::vec![Expr::Literal(Literal::Null); la]);
+                        let rs = operand_row(right, ctx)?
+                            .unwrap_or_else(|| alloc::vec![Expr::Literal(Literal::Null); ra]);
+                        return compare_row_values_is(matches!(op, IsNot), &ls, &rs, ctx);
                     }
                     let l = eval(left, ctx)?;
                     let r = eval(right, ctx)?;
@@ -636,6 +645,29 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             high,
             negated,
         } => {
+            // `x BETWEEN lo AND hi` desugars to `x >= lo AND x <= hi`. When any
+            // operand is a row value / multi-column subquery, all three must share
+            // the same arity (a row comparison on each bound); a mismatch — or a
+            // vector mixed with scalars — is "row value misused".
+            let ea = operand_arity(expr, ctx);
+            let la = operand_arity(low, ctx);
+            let ha = operand_arity(high, ctx);
+            if ea > 1 || la > 1 || ha > 1 {
+                if ea != la || ea != ha {
+                    return Err(Error::Error("row value misused".into()));
+                }
+                let (Some(ev), Some(lv), Some(hv)) = (
+                    operand_row(expr, ctx)?,
+                    operand_row(low, ctx)?,
+                    operand_row(high, ctx)?,
+                ) else {
+                    return Ok(Value::Null);
+                };
+                let ge = compare_row_values(BinaryOp::GtEq, &ev, &lv, ctx)?;
+                let le = compare_row_values(BinaryOp::LtEq, &ev, &hv, ctx)?;
+                let within = and3(&ge, &le);
+                return Ok(if *negated { not3(within) } else { within });
+            }
             let v = eval(expr, ctx)?;
             let lo = eval(low, ctx)?;
             let hi = eval(high, ctx)?;
@@ -778,16 +810,6 @@ fn as_row_value(e: &Expr) -> Option<&[Expr]> {
     }
 }
 
-/// View an expression as a scalar subquery (`(SELECT …)`), through redundant
-/// parens — used to compare a row value against a row-returning subquery.
-fn as_subquery(e: &Expr) -> Option<&Select> {
-    match e {
-        Expr::Subquery(s) => Some(s),
-        Expr::Paren(inner) => as_subquery(inner),
-        _ => None,
-    }
-}
-
 /// The first row of a row-returning subquery as literal expressions (so the
 /// existing row-value comparison machinery can use it), or `None` when the
 /// subquery yields no rows (the comparison is then unknown / NULL).
@@ -808,6 +830,55 @@ fn row_subquery_first(select: &Select, ctx: &EvalCtx) -> Result<Option<Vec<Expr>
             })
             .collect()
     }))
+}
+
+/// The structural column count ("arity") of a comparison operand viewed as a row
+/// value: a literal `(a, b, …)` row value's length, a scalar subquery's
+/// result-column count, or 1 for any ordinary scalar expression. SQLite decides
+/// this at prepare time; here it comes from the row value's element count or the
+/// subquery's output-column metadata (no rows are evaluated).
+fn operand_arity(e: &Expr, ctx: &EvalCtx) -> usize {
+    match unparen(e) {
+        Expr::RowValue(items) => items.len(),
+        Expr::Subquery(select) => ctx
+            .subqueries
+            .map(|s| s.row_column_affinities(select).len())
+            .filter(|&n| n > 0)
+            .unwrap_or(1),
+        _ => 1,
+    }
+}
+
+/// Materialise a comparison operand's first row as literal exprs: a row value's
+/// elements directly, or a subquery's first row (`None` when the subquery yields
+/// no rows). Only called when [`operand_arity`] reported a width above 1, so the
+/// operand is always a row value or a subquery.
+fn operand_row(e: &Expr, ctx: &EvalCtx) -> Result<Option<Vec<Expr>>> {
+    match unparen(e) {
+        Expr::RowValue(items) => Ok(Some(items.clone())),
+        Expr::Subquery(select) => row_subquery_first(select, ctx),
+        other => Ok(Some(alloc::vec![other.clone()])),
+    }
+}
+
+/// SQLite three-valued AND of two comparison results (`0`/`1`/NULL).
+fn and3(a: &Value, b: &Value) -> Value {
+    if matches!(a, Value::Integer(0)) || matches!(b, Value::Integer(0)) {
+        bool_value(false)
+    } else if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        Value::Null
+    } else {
+        bool_value(true)
+    }
+}
+
+/// SQLite three-valued NOT of a comparison result (`NOT NULL` is NULL).
+fn not3(a: Value) -> Value {
+    match a {
+        Value::Null => Value::Null,
+        Value::Integer(0) => bool_value(true),
+        _ => bool_value(false),
+    }
 }
 
 /// Per-element comparison of two row values: `Some(Ordering)` when both sides are
@@ -849,6 +920,37 @@ fn compare_row_values(
 ) -> Result<Value> {
     let cmps = row_element_cmps(lefts, rights, ctx)?;
     Ok(fold_row_comparison(op, &cmps))
+}
+
+/// Row-value `IS` / `IS NOT`: `(a, …) IS (b, …)` holds when every element is
+/// `IS`-equal (NULL matches NULL, NULL never matches a non-NULL). The result is
+/// always definite — unlike `=`, a row `IS` never yields NULL. The caller
+/// guarantees equal arity.
+fn compare_row_values_is(
+    is_not: bool,
+    lefts: &[Expr],
+    rights: &[Expr],
+    ctx: &EvalCtx,
+) -> Result<Value> {
+    let mut all_eq = true;
+    for (le, re) in lefts.iter().zip(rights) {
+        let l = eval(le, ctx)?;
+        let r = eval(re, ctx)?;
+        let eq = match (&l, &r) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            _ => {
+                let (l, r) =
+                    apply_comparison_affinity(l, expr_affinity(le, ctx), r, expr_affinity(re, ctx));
+                crate::value::cmp_values_coll(&l, &r, resolve_collation(le, re, ctx))
+                    == Ordering::Equal
+            }
+        };
+        if !eq {
+            all_eq = false;
+        }
+    }
+    Ok(bool_value(all_eq != is_not))
 }
 
 /// Combine per-element comparisons into the result of a row comparison `op`.
