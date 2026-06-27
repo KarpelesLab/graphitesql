@@ -199,7 +199,14 @@ already an index named X` (was uniformly `table X already exists`), while
 says "table" even for a view); this also closes a silent-accept hazard where a
 `CREATE TABLE`/`INDEX` over an existing view/index was previously *allowed* to
 create a duplicate name (a shared `table_namespace_conflict` helper, with
-`IF NOT EXISTS` still a no-op) — all byte-exact vs `sqlite3` 3.50.4.
+`IF NOT EXISTS` still a no-op); `iif(...)`/`if(...)` now desugars to a CASE
+expression at parse time, so the multi-branch form `iif(c1,v1,c2,v2,…[,else])`
+(SQLite 3.48+) works and untaken branches short-circuit (`iif(1,'a',<overflow>)`
+returns `a` rather than erroring); and a `LIKE … ESCAPE` whose escape character
+is `_` or `%` no longer treats that character as a wildcard — the escape
+character is only ever the escape introducer, and a trailing escape matches just
+the empty remainder (`'ab' LIKE 'a_' ESCAPE '_'` is now false) — all byte-exact
+vs `sqlite3` 3.50.4.
 
 **Remaining:**
 

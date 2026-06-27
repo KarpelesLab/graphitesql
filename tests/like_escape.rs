@@ -39,6 +39,27 @@ fn escape_semantics() {
 }
 
 #[test]
+fn escape_char_is_never_a_wildcard() {
+    // When the ESCAPE character *is* `_` or `%`, that character loses its
+    // wildcard meaning entirely — it is only ever the escape introducer. A
+    // trailing escape (nothing left to escape) matches just the empty remainder.
+    // Previously graphite let a trailing `_`/`%` act as a wildcard.
+    let c = Connection::open_memory().unwrap();
+    // `_` as the escape char: `a_` is `a` followed by a dangling escape, not a
+    // two-character "a + any char" pattern.
+    assert_eq!(one(&c, "SELECT 'ab' LIKE 'a_' ESCAPE '_'"), 0);
+    assert_eq!(one(&c, "SELECT 'a' LIKE 'a_' ESCAPE '_'"), 1);
+    assert_eq!(one(&c, "SELECT 'A' LIKE 'a_' ESCAPE '_'"), 1);
+    assert_eq!(one(&c, "SELECT '' LIKE '_' ESCAPE '_'"), 1);
+    // A trailing escape does not match the escape character literally.
+    assert_eq!(one(&c, "SELECT '_' LIKE '_' ESCAPE '_'"), 0);
+    // `%` as the escape char behaves the same way.
+    assert_eq!(one(&c, "SELECT 'ab' LIKE 'a%' ESCAPE '%'"), 0);
+    assert_eq!(one(&c, "SELECT 'a' LIKE 'a%' ESCAPE '%'"), 1);
+    assert_eq!(one(&c, "SELECT '%' LIKE 'a%' ESCAPE '%'"), 0);
+}
+
+#[test]
 fn against_sqlite3() {
     if !sqlite3_available() {
         eprintln!("sqlite3 not found; skipping");
@@ -51,6 +72,10 @@ fn against_sqlite3() {
         r#"SELECT count(*) FROM (SELECT 'a_b' AS s UNION ALL SELECT 'axb') WHERE s LIKE 'a\_b' ESCAPE '\'"#,
         r#"SELECT likely(42), unlikely(1), likelihood(3, 0.9)"#,
         r#"SELECT like('%abc%', 'xxabcyy')"#,
+        r#"SELECT 'ab' LIKE 'a_' ESCAPE '_'"#,
+        r#"SELECT 'a' LIKE 'a_' ESCAPE '_'"#,
+        r#"SELECT '_' LIKE '_' ESCAPE '_'"#,
+        r#"SELECT 'ab' LIKE 'a%' ESCAPE '%'"#,
     ];
     let c = Connection::open_memory().unwrap();
     let render = |v: &Value| match v {

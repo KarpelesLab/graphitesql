@@ -1859,13 +1859,21 @@ fn like_rec(p: &[char], t: &[char], esc: Option<char>) -> bool {
     if p.is_empty() {
         return t.is_empty();
     }
-    // An escaped character matches literally.
+    // The escape character is never a wildcard: it escapes the next character
+    // (matched literally), and a trailing escape — with nothing left to escape —
+    // matches only the empty remainder, exactly as SQLite does. This is why
+    // `'ab' LIKE 'a_' ESCAPE '_'` is false (the `_` is the escape char, not a
+    // single-character wildcard) while `'a' LIKE 'a_' ESCAPE '_'` is true.
     if let Some(e) = esc {
-        if p[0] == e && p.len() >= 2 {
-            let lit = p[1];
-            return !t.is_empty()
-                && lit.eq_ignore_ascii_case(&t[0])
-                && like_rec(&p[2..], &t[1..], esc);
+        if p[0] == e {
+            return match p.get(1) {
+                Some(&lit) => {
+                    !t.is_empty()
+                        && lit.eq_ignore_ascii_case(&t[0])
+                        && like_rec(&p[2..], &t[1..], esc)
+                }
+                None => t.is_empty(),
+            };
         }
     }
     match p[0] {
