@@ -7466,75 +7466,73 @@ impl Connection {
             )));
         }
         let tmeta = self.table_meta(&ci.table, None)?;
-        // SQLite rejects non-deterministic functions in an index *key* expression
-        // before it looks at the partial-index predicate at all: a non-deterministic
-        // key outranks a subquery in the WHERE clause (`CREATE INDEX i ON t(random())
-        // WHERE b IN (SELECT 1)` reports the key error, not the subquery one).
-        if ci.columns.iter().any(|t| expr_is_nondeterministic(&t.expr)) {
-            return Err(Error::Error(
-                "non-deterministic functions prohibited in index expressions".into(),
-            ));
+        // SQLite resolves the index *key* expressions fully, left to right, before
+        // it looks at the partial-index predicate at all — so a fault in any key
+        // outranks any fault in the WHERE clause. Within one key the precedence is:
+        // an unknown column, then an unknown function, then a non-deterministic
+        // function (`… prohibited in index expressions`), then aggregate- and then
+        // window-function misuse, then a dotted reference, then an unknown collation.
+        let known: Vec<String> = tmeta.columns.iter().map(|c| c.name.clone()).collect();
+        for term in &ci.columns {
+            // A `table.col` qualifier naming the indexed table resolves but is
+            // rejected as a dotted reference; the collation lives on the outer term.
+            let key = match &term.expr {
+                Expr::Collate { expr, .. } => expr.as_ref(),
+                other => other,
+            };
+            if let Some(col) = unknown_column_ref(key, &known, false, Some(&ci.table)) {
+                return Err(Error::Error(format!("no such column: {col}")));
+            }
+            self.reject_unresolved_functions(key)?;
+            if expr_is_nondeterministic(key) {
+                return Err(Error::Error(
+                    "non-deterministic functions prohibited in index expressions".into(),
+                ));
+            }
+            if let Some(name) = first_aggregate_call_name(key) {
+                return Err(Error::Error(format!(
+                    "misuse of aggregate function {name}()"
+                )));
+            }
+            if let Some(name) = first_window_call_name(key) {
+                return Err(Error::Error(format!("misuse of window function {name}()")));
+            }
+            if has_resolved_dotted_ref(key, &known, false, &ci.table) {
+                return Err(Error::Error(
+                    "the \".\" operator prohibited in index expressions".into(),
+                ));
+            }
+            if let Some(name) = unknown_collation(&term.expr) {
+                return Err(Error::Error(format!("no such collation sequence: {name}")));
+            }
         }
-        // A subquery anywhere in a partial-index predicate is rejected next, before
-        // any column / WHERE-determinism resolution (so `WHERE b IN (SELECT random())`
-        // reports the subquery error, not the non-determinism one).
+        // The partial-index predicate (`CREATE INDEX … WHERE p`) is validated after
+        // every key, in SQLite's order: a subquery first, then an unknown column
+        // (rowid is allowed here, unlike a key), then an unknown function, then a
+        // non-deterministic function (its own `… partial index WHERE clauses`
+        // wording), then aggregate- and then window-function misuse.
         if let Some(p) = &ci.where_clause {
             if expr_has_subquery(p) {
                 return Err(Error::Error(
                     "subqueries prohibited in partial index WHERE clauses".into(),
                 ));
             }
-        }
-        // A non-deterministic function in the partial-index predicate itself: the
-        // stored key set could never match a recomputed probe. SQLite uses a distinct
-        // message here ("partial index WHERE clauses", not "index expressions").
-        if ci
-            .where_clause
-            .as_ref()
-            .is_some_and(expr_is_nondeterministic)
-        {
-            return Err(Error::Error(
-                "non-deterministic functions prohibited in partial index WHERE clauses".into(),
-            ));
-        }
-        // Each key's explicit `COLLATE <name>` must name a known collating
-        // sequence; sqlite errors "no such collation sequence" rather than
-        // silently using BINARY.
-        for term in &ci.columns {
-            if let Some(name) = unknown_collation(&term.expr) {
-                return Err(Error::Error(format!("no such collation sequence: {name}")));
-            }
-        }
-        // A partial-index predicate (`CREATE INDEX … WHERE p`) may reference only
-        // the target table's own columns (plus its rowid); sqlite rejects an
-        // unknown column at CREATE rather than silently building the index.
-        if let Some(p) = &ci.where_clause {
-            let known: Vec<String> = tmeta.columns.iter().map(|c| c.name.clone()).collect();
             if let Some(col) = unknown_column_ref(p, &known, true, Some(&ci.table)) {
                 return Err(Error::Error(format!("no such column: {col}")));
             }
             self.reject_unresolved_functions(p)?;
-        }
-        // Each index *key* expression may reference only the table's own columns
-        // (rowid is not allowed in a key). A `table.col` qualifier naming the
-        // indexed table resolves but, like SQLite, is rejected as a dotted
-        // reference; any other qualifier is an unknown column.
-        {
-            let known: Vec<String> = tmeta.columns.iter().map(|c| c.name.clone()).collect();
-            for term in &ci.columns {
-                let key = match &term.expr {
-                    Expr::Collate { expr, .. } => expr.as_ref(),
-                    other => other,
-                };
-                if let Some(col) = unknown_column_ref(key, &known, false, Some(&ci.table)) {
-                    return Err(Error::Error(format!("no such column: {col}")));
-                }
-                if has_resolved_dotted_ref(key, &known, false, &ci.table) {
-                    return Err(Error::Error(
-                        "the \".\" operator prohibited in index expressions".into(),
-                    ));
-                }
-                self.reject_unresolved_functions(key)?;
+            if expr_is_nondeterministic(p) {
+                return Err(Error::Error(
+                    "non-deterministic functions prohibited in partial index WHERE clauses".into(),
+                ));
+            }
+            if let Some(name) = first_aggregate_call_name(p) {
+                return Err(Error::Error(format!(
+                    "misuse of aggregate function {name}()"
+                )));
+            }
+            if let Some(name) = first_window_call_name(p) {
+                return Err(Error::Error(format!("misuse of window function {name}()")));
             }
         }
         let (cols, key_exprs, colls) = self.index_key_spec(&tmeta, ci)?;

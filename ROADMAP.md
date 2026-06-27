@@ -373,6 +373,20 @@ the qualified target silently. The check sits after the trigger's own
 missing-target / timing-mismatch / duplicate-name errors so those still win.
 Byte-exact vs `sqlite3` 3.50.4.
 
+An **aggregate or window function in a `CREATE INDEX`** key expression or
+partial-index `WHERE` clause is now rejected at prepare time with SQLite's
+`misuse of aggregate function NAME()` / `misuse of window function NAME()`.
+graphite used to build the index silently. The whole `CREATE INDEX` validation
+was reordered to SQLite's precedence: every key expression is resolved fully,
+left to right, *before* the `WHERE` predicate, so a key fault outranks a `WHERE`
+fault. Within a key the order is unknown column → unknown function →
+non-determinism → aggregate → window → dotted reference → unknown collation;
+the `WHERE` clause is then checked as subquery → unknown column → unknown
+function → non-determinism → aggregate → window. This also fixes a pre-existing
+ordering bug where an unknown *key* column was reported only after a `WHERE`
+subquery / non-deterministic function. Byte-exact vs `sqlite3` 3.50.4 across
+~25 permutations.
+
 An **`ORDER BY` on an UPDATE/DELETE with no `LIMIT`** is now rejected at prepare
 time. SQLite only allows the ordering as a companion to the update/delete-`LIMIT`
 extension — the order decides *which* rows the cap keeps — so a bare `ORDER BY`
