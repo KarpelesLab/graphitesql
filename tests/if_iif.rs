@@ -1,4 +1,6 @@
-//! `if(...)` as SQLite's alias for `iif(...)`, and the 2-argument form.
+//! `if(...)` as SQLite's alias for `iif(...)`, the 2-argument form, and the
+//! multi-branch `iif(c1,v1,c2,v2,…[,else])` form (SQLite 3.48+) which acts like a
+//! CASE expression — including its short-circuit evaluation.
 
 #![cfg(feature = "std")]
 
@@ -36,4 +38,37 @@ fn wrong_arity_is_an_error() {
     let c = Connection::open_memory().unwrap();
     assert!(c.query("SELECT if(1)").is_err());
     assert!(c.query("SELECT iif()").is_err());
+}
+
+#[test]
+fn multi_branch_form_acts_like_case() {
+    let c = Connection::open_memory().unwrap();
+    // (when, then) pairs; an even argument count has no ELSE, so a fall-through
+    // yields NULL.
+    assert_eq!(val(&c, "SELECT iif(1, 2, 3, 4)"), Value::Integer(2));
+    assert_eq!(val(&c, "SELECT iif(0, 2, 3, 4)"), Value::Integer(4));
+    assert_eq!(val(&c, "SELECT iif(0, 2, 0, 4)"), Value::Null);
+    // An odd argument count uses the trailing argument as the ELSE.
+    assert_eq!(val(&c, "SELECT iif(0, 2, 3, 4, 5)"), Value::Integer(4));
+    assert_eq!(val(&c, "SELECT iif(0, 0, 0, 2, 9)"), Value::Integer(9));
+    assert_eq!(val(&c, "SELECT if(0, 1, 0, 1, 42)"), Value::Integer(42));
+}
+
+#[test]
+fn untaken_branches_are_not_evaluated() {
+    let c = Connection::open_memory().unwrap();
+    // A branch that would raise (here, integer overflow) must not be evaluated
+    // when its condition is not selected — `iif` desugars to a CASE, so it
+    // short-circuits like SQLite rather than eagerly evaluating every argument.
+    assert_eq!(
+        val(&c, "SELECT iif(1, 'a', abs(-9223372036854775808))"),
+        Value::Text("a".into())
+    );
+    assert_eq!(
+        val(
+            &c,
+            "SELECT iif(0, abs(-9223372036854775808), 1, 'b', 'else')"
+        ),
+        Value::Text("b".into())
+    );
 }

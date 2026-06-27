@@ -2226,6 +2226,38 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let filter = self.filter_clause()?;
         let over = self.window_over()?;
+        // SQLite implements `iif(...)`/`if(...)` as a CASE expression: the
+        // arguments are `(when, then)` pairs with an optional trailing ELSE,
+        // evaluated with short-circuit semantics so an untaken branch is never
+        // run. Desugar here (for the plain scalar form only) so the multi-branch
+        // forms `iif(c1,v1,c2,v2,…[,else])` work and a branch like
+        // `iif(1,'a',<overflowing>)` does not error. Fewer than two arguments is
+        // left to the function path, which raises the arity error.
+        if (name.eq_ignore_ascii_case("iif") || name.eq_ignore_ascii_case("if"))
+            && !distinct
+            && order_by.is_empty()
+            && filter.is_none()
+            && over.is_none()
+            && args.len() >= 2
+        {
+            let else_result = if args.len() % 2 == 1 {
+                Some(Box::new(
+                    args.pop().expect("odd arg count has a last element"),
+                ))
+            } else {
+                None
+            };
+            let mut when_then = Vec::with_capacity(args.len() / 2);
+            let mut it = args.into_iter();
+            while let (Some(w), Some(t)) = (it.next(), it.next()) {
+                when_then.push((w, t));
+            }
+            return Ok(Expr::Case {
+                operand: None,
+                when_then,
+                else_result,
+            });
+        }
         Ok(Expr::Function {
             name,
             distinct,

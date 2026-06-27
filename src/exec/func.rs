@@ -425,17 +425,30 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     .unwrap_or(Value::Null),
             }
         }
-        // `if` is SQLite's alias for `iif`. Both take 2 or 3 arguments: the
-        // 2-argument form yields NULL when the condition is not true.
+        // `if` is SQLite's alias for `iif`. The parser desugars the scalar form
+        // (>= 2 args) into a CASE expression so it short-circuits, so this arm is
+        // normally reached only for the <2-arg arity error; it still evaluates the
+        // CASE-form semantics (`(when, then)` pairs with an optional trailing
+        // ELSE) for any non-desugared call, for robustness.
         "iif" | "if" => {
-            if args.len() != 2 && args.len() != 3 {
+            if args.len() < 2 {
                 return Err(wrong_arg_count(&lname));
             }
-            if eval::truth(&v[0]) == Some(true) {
-                v[1].clone()
+            let n = v.len();
+            let mut out = if n % 2 == 1 {
+                v[n - 1].clone()
             } else {
-                v.get(2).cloned().unwrap_or(Value::Null)
+                Value::Null
+            };
+            let mut i = 0;
+            while i + 1 < n {
+                if eval::truth(&v[i]) == Some(true) {
+                    out = v[i + 1].clone();
+                    break;
+                }
+                i += 2;
             }
+            out
         }
         // The SQLite release graphitesql tracks and writes into new file headers
         // (`SQLITE_VERSION_NUMBER` 3_053_002 = 3.53.2).
