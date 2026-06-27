@@ -416,6 +416,24 @@ resolution, matching SQLite's diagnostic precedence: a missing table and a
 modify-a-view error still win, but a bogus `ORDER BY` or `SET` column reports the
 limit error first. Byte-exact vs `sqlite3` 3.50.4 across ~17 permutations.
 
+The companion case — **`ORDER BY`/`LIMIT` on an UPDATE/DELETE *inside a trigger
+body*** — is now rejected too. SQLite's trigger-step grammar omits the row-limit
+extension entirely, so a body `UPDATE … ORDER BY` / `… LIMIT` is a
+`near "ORDER"`/`near "LIMIT": syntax error` (keyword echoed verbatim) rather than
+the prepare-time message above; graphite used to parse it and silently no-op. The
+parser carries an `in_trigger_body` flag (set only while consuming a `CREATE
+TRIGGER … BEGIN … END` body) and the UPDATE/DELETE parsers *record* (rather than
+throw) the would-be `near "…"` error the moment they see a body `ORDER`/`LIMIT`,
+stashing it on the `CreateTrigger` node. The executor surfaces it only **after**
+resolving the trigger target — because SQLite parses the body steps only once the
+target is resolved, a missing-table (`no such table: main.nope`), system-table
+(`cannot create trigger on system table`), or timing-mismatch (`cannot create
+BEFORE trigger on view: v`) error must outrank the body syntax error, and a
+schema-qualified body DML target is reported in preference to a same-statement
+row-limit. The extension still parses at top level and an `ORDER BY` inside a body
+subquery's `SELECT` stays legal. Byte-exact vs `sqlite3` 3.50.4 across ~18
+permutations including the full target-resolution precedence matrix.
+
 A misplaced **`ORDER BY` / `LIMIT` before a compound operator** now reports the
 same message SQLite does. These clauses bind to the *whole* compound, so
 `SELECT … ORDER BY … UNION SELECT …` is rejected with `ORDER BY clause should

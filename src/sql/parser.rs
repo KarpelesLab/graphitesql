@@ -120,6 +120,15 @@ struct Parser {
     /// index is fixed by parse position rather than evaluation order (which would
     /// mis-map under AND/OR short-circuit). Reset per statement in [`parse`].
     max_param: u32,
+    /// True while parsing the statements of a `CREATE TRIGGER … BEGIN … END`
+    /// body. SQLite's trigger-step grammar forbids the `ORDER BY`/`LIMIT`
+    /// row-limit extension on a body `UPDATE`/`DELETE`, so those are flagged only
+    /// in this context.
+    in_trigger_body: bool,
+    /// First trigger-body grammar violation seen while `in_trigger_body`, recorded
+    /// rather than thrown so the executor can surface it only after resolving the
+    /// trigger target (see [`ast::CreateTrigger::body_error`]). First-wins.
+    trigger_body_err: Option<String>,
 }
 
 /// Decrements the parser's depth counter when dropped, so recursion accounting
@@ -142,6 +151,8 @@ impl Parser {
             pos: 0,
             depth: alloc::rc::Rc::new(core::cell::Cell::new(0)),
             max_param: 0,
+            in_trigger_body: false,
+            trigger_body_err: None,
         }
     }
 
@@ -634,6 +645,25 @@ impl Parser {
             }
         }
         Ok(outer)
+    }
+
+    /// Inside a `CREATE TRIGGER` body, the trigger-step grammar has no room for
+    /// the `UPDATE`/`DELETE` row-limit extension, so a leading `ORDER BY`/`LIMIT`
+    /// there is a syntax error (`near "ORDER"`/`near "LIMIT"`), echoing the
+    /// keyword verbatim. Rather than throw here — which would pre-empt the
+    /// executor's target-resolution checks (missing-table / system-table /
+    /// timing all outrank a body syntax error in SQLite) — record the would-be
+    /// error so it can be surfaced after the target is resolved. First-wins;
+    /// outside a body this is a no-op.
+    fn note_trigger_body_row_limit(&mut self) {
+        if self.in_trigger_body
+            && self.trigger_body_err.is_none()
+            && (self.check_kw("order") || self.check_kw("limit"))
+        {
+            if let Error::Parse(msg) = self.syntax_error(self.pos) {
+                self.trigger_body_err = Some(msg);
+            }
+        }
     }
 
     /// Parse a trailing `[ORDER BY …] [LIMIT … [OFFSET …| , …]]`, returning the
@@ -1337,6 +1367,7 @@ impl Parser {
         };
         // RETURNING comes before any ORDER BY/LIMIT extension.
         let returning = self.returning_clause()?;
+        self.note_trigger_body_row_limit();
         let (order_by, limit, offset) = self.order_limit_offset()?;
         Ok(Update {
             ctes: Vec::new(),
@@ -1376,6 +1407,7 @@ impl Parser {
             None
         };
         let returning = self.returning_clause()?;
+        self.note_trigger_body_row_limit();
         let (order_by, limit, offset) = self.order_limit_offset()?;
         Ok(Delete {
             ctes: Vec::new(),
@@ -1484,12 +1516,21 @@ impl Parser {
         };
         self.expect_kw("begin")?;
         let mut body = Vec::new();
+        // The trigger-step grammar forbids the UPDATE/DELETE row-limit extension.
+        // Flag the body so those record (not throw) a deferred ORDER BY/LIMIT
+        // syntax error: SQLite resolves the trigger target before parsing the
+        // body steps, so a missing-table/system-table/timing error must outrank
+        // the body syntax error. Triggers do not nest, so set/clear suffices.
+        self.in_trigger_body = true;
+        self.trigger_body_err = None;
         while !self.check_kw("end") && !self.at_end() {
             let stmt = self.statement()?;
             body.push(stmt);
             // Each body statement is terminated by a semicolon.
             let _ = self.eat(&Token::Semicolon);
         }
+        self.in_trigger_body = false;
+        let body_error = self.trigger_body_err.take();
         self.expect_kw("end")?;
         Ok(CreateTrigger {
             if_not_exists,
@@ -1500,6 +1541,7 @@ impl Parser {
             table,
             when,
             body,
+            body_error,
         })
     }
 

@@ -704,6 +704,15 @@ pub struct CreateTrigger {
     pub when: Option<Expr>,
     /// The trigger body: statements between `BEGIN` and `END`.
     pub body: Vec<Statement>,
+    /// A trigger-step grammar violation detected while parsing the body, deferred
+    /// so the executor can surface it only *after* the target-resolution checks.
+    /// SQLite resolves the trigger's table (missing-table / system-table / timing)
+    /// before parsing the body steps, so those errors outrank a body syntax error;
+    /// recording the violation here instead of throwing it at parse time preserves
+    /// that precedence. The first violation in body source order wins; `None` if
+    /// the body is well-formed. Currently records the `UPDATE`/`DELETE` row-limit
+    /// extension (`ORDER BY`/`LIMIT`), e.g. `near "ORDER": syntax error`.
+    pub body_error: Option<String>,
 }
 
 /// What kind of object a `DROP` targets.

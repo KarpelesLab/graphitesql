@@ -5375,6 +5375,17 @@ impl Connection {
                 ));
             }
         }
+        // A body UPDATE/DELETE row-limit extension (ORDER BY/LIMIT) is a
+        // trigger-step grammar error the parser recorded rather than threw, so
+        // that the target checks above (missing-table/system-table/timing) and
+        // the qualified-DML check still outrank it — matching SQLite, which
+        // resolves the trigger target before parsing the body steps. (In the
+        // rare case where an earlier body step's row-limit coexists with a later
+        // step's qualified target, SQLite reports the earlier row-limit and we
+        // report the qualified-DML; an accepted corner.)
+        if let Some(msg) = &ct.body_error {
+            return Err(Error::Error(msg.clone()));
+        }
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
             Value::Text("trigger".into()),
