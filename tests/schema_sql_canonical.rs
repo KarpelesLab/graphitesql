@@ -94,6 +94,9 @@ fn matches_sqlite_cli() {
         "CREATE TABLE s(a); CREATE TABLE t AS SELECT a AS BigName FROM s; SELECT sql FROM sqlite_master WHERE name='t'",
         // Duplicate output names get SQLite's `:N` suffix (which then needs quoting).
         "CREATE TABLE s(a); CREATE TABLE t AS SELECT a, a FROM s; SELECT sql FROM sqlite_master WHERE name='t'",
+        // ALTER … ADD COLUMN inserts before trailing table-level constraints.
+        "CREATE TABLE t(a, b, CHECK(a>0)); ALTER TABLE t ADD c; SELECT sql FROM sqlite_master WHERE name='t'",
+        "CREATE TABLE t(a, b, PRIMARY KEY(a)); ALTER TABLE t ADD c TEXT; SELECT sql FROM sqlite_master WHERE name='t'",
     ] {
         assert_eq!(run("sqlite3", sql), run(g, sql), "for {sql}");
     }

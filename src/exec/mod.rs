@@ -22887,13 +22887,16 @@ fn rewrite_fk_references(sql: &str, old: &str, new: &str) -> String {
 
 /// Insert `, <col_text>` before the column-list's closing paren of a `CREATE
 /// TABLE` statement's text, preserving everything else verbatim — how SQLite
-/// records an `ADD COLUMN`. Returns `None` if the column list can't be located.
+/// records an `ADD COLUMN`. The new column is inserted after the last column
+/// definition but *before* any table-level constraints (`CHECK`, `PRIMARY KEY`,
+/// …), exactly where SQLite puts it. Returns `None` if the list can't be located.
 fn append_column_to_create(sql: &str, col_text: &str) -> Option<String> {
     use sql::token::Token;
     let toks = sql::token::tokenize(sql).ok()?;
     let open = toks.iter().position(|t| matches!(t.token, Token::LParen))?;
     let mut depth = 0i32;
     let mut close = None;
+    let mut seps = Vec::new();
     for (i, sp) in toks.iter().enumerate().skip(open) {
         match sp.token {
             Token::LParen => depth += 1,
@@ -22904,10 +22907,28 @@ fn append_column_to_create(sql: &str, col_text: &str) -> Option<String> {
                     break;
                 }
             }
+            Token::Comma if depth == 1 => seps.push(i),
             _ => {}
         }
     }
-    let pos = toks[close?].start;
+    let close = close?;
+    // Top-level segment boundaries: the opener, each top-level comma, then the
+    // closer. A segment is a *table constraint* when its first (unquoted) token is
+    // a constraint keyword — the new column must precede the first such segment.
+    let mut bounds = alloc::vec![open];
+    bounds.extend_from_slice(&seps);
+    bounds.push(close);
+    let is_constraint = |i: usize| {
+        matches!(toks.get(i).map(|t| &t.token), Some(Token::Word(w)) if matches!(
+            w.to_ascii_uppercase().as_str(),
+            "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
+        ))
+    };
+    // Position just before the first table-constraint segment (i.e. the comma
+    // that separates it from the preceding column), or the closing paren if none.
+    let pos = (1..bounds.len() - 1)
+        .find(|&j| is_constraint(bounds[j] + 1))
+        .map_or(toks[close].start, |j| toks[bounds[j]].start);
     let mut out = String::with_capacity(sql.len() + col_text.len() + 2);
     out.push_str(&sql[..pos]);
     out.push_str(", ");

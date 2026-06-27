@@ -162,7 +162,9 @@ whitespace collapsed — plus the verbatim body with the trailing `;` removed),
 including the schema-qualified (`CREATE TABLE aux.t …` → bare `t`) and `TEMP`
 forms; and `CREATE TABLE … AS SELECT` now writes its column list with SQLite's
 `identPut` quoting (bare when safe, keyword-aware, no spaces after commas, e.g.
-`CREATE TABLE t(a,c)`) — all byte-exact vs `sqlite3` 3.50.4.
+`CREATE TABLE t(a,c)`); and `ALTER TABLE … ADD COLUMN` now splices the new column
+in after the last column but before any trailing table-level constraints
+(`t(a, b, c, CHECK(a>0))`) — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 

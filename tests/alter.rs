@@ -96,6 +96,25 @@ fn add_column_appends_verbatim_to_schema_text() {
 }
 
 #[test]
+fn add_column_inserts_before_table_constraints() {
+    // When the table has trailing table-level constraints, the new column goes
+    // after the last column but *before* the first constraint — exactly where
+    // sqlite places it (`t(a, b, c, CHECK(a>0))`, not `t(a, b, CHECK(a>0), c)`).
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b, CHECK(a>0))").unwrap();
+    c.execute("ALTER TABLE t ADD COLUMN c").unwrap();
+    let sql = match &c
+        .query("SELECT sql FROM sqlite_master WHERE type='table'")
+        .unwrap()
+        .rows[0][0]
+    {
+        Value::Text(s) => s.clone(),
+        o => panic!("not text: {o:?}"),
+    };
+    assert_eq!(sql, "CREATE TABLE t(a, b, c, CHECK(a>0))");
+}
+
+#[test]
 fn rename_column_preserves_schema_text() {
     // ALTER … RENAME COLUMN edits the column name in the stored CREATE text in
     // place (renaming it inside CHECK/generated expressions and dependent index
