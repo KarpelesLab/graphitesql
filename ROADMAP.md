@@ -553,6 +553,21 @@ text-preserving CREATE-text edits).
     `1.5`/`'x'`/blob → `datatype mismatch` — matching the IPK path. A real column
     that shadows the name keeps winning, and WITHOUT ROWID tables still reject it
     (`tests/insert_rowid_column.rs`).
+  - **`ALTER TABLE … DROP COLUMN` refusal parity (done).** graphite refused to
+    drop a column whenever the table carried *any* CHECK, UNIQUE, FOREIGN KEY,
+    generated column, or index — even one that did not reference the column —
+    and emitted ad-hoc messages. It now mirrors sqlite: a column-level PRIMARY
+    KEY/UNIQUE (and an INTEGER PRIMARY KEY, or a column named by a table-level
+    PRIMARY KEY) is refused outright (`cannot drop PRIMARY KEY/UNIQUE column:
+    "x"`); every other obstruction is detected the way sqlite does it — by
+    regenerating the schema without the column and checking whether the remainder
+    still references it — so a referencing table CHECK / generated column / table
+    UNIQUE yields `error in table t after drop column: no such column: x`, a
+    referencing table FK yields `… unknown column "x" in foreign key
+    definition`, and a referencing explicit index yields `error in index i after
+    drop column: no such column: x`. A constraint that does not name the column
+    (and the dropped column's own constraints) now drops cleanly, byte-compatible
+    and `integrity_check`-clean (`tests/drop_column_constraints.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 

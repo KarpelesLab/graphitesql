@@ -9005,60 +9005,106 @@ impl Connection {
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| Error::Error(format!("no such column: \"{name}\"")))?;
+        // SQLite refuses in a fixed order with specific messages. A column-level
+        // PRIMARY KEY/UNIQUE (and an INTEGER PRIMARY KEY, or any column named by a
+        // table-level PRIMARY KEY) is rejected outright; everything else is
+        // reported the way sqlite does it — by regenerating the schema without the
+        // column and re-parsing — so a table CHECK, generated column, table
+        // UNIQUE, table FK, or explicit index that *references* the dropped column
+        // yields `error in {table|index} … after drop column: …`, while a
+        // constraint that does not reference it drops cleanly (graphite used to
+        // refuse all of these unconditionally).
+        let pk_named = ct.columns[pos]
+            .constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
+            || ct.constraints.iter().any(|tc| {
+                matches!(tc, TableConstraint::PrimaryKey(n, _)
+                    if n.iter().any(|x| x.eq_ignore_ascii_case(name)))
+            });
+        if pk_named {
+            return Err(Error::Error(format!(
+                "cannot drop PRIMARY KEY column: \"{name}\""
+            )));
+        }
+        if ct.columns[pos]
+            .constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::Unique(_)))
+        {
+            return Err(Error::Error(format!(
+                "cannot drop UNIQUE column: \"{name}\""
+            )));
+        }
         if ct.columns.len() <= 1 {
             return Err(Error::Error(format!(
                 "cannot drop column \"{name}\": no other columns exist"
             )));
         }
-        let cannot = |why: &str| {
-            Err(Error::Error(format!(
-                "cannot drop column \"{name}\": {why}"
-            )))
+        // Whether `e` references the dropped column by name (qualified or not).
+        let refs_dropped = |e: &Expr| {
+            let mut hit = false;
+            walk_shallow_columns(e, &mut |_t, col| {
+                if col.eq_ignore_ascii_case(name) {
+                    hit = true;
+                }
+            });
+            hit
         };
-        // The dropped column must not be structural.
-        for c in &ct.columns[pos].constraints {
-            match c {
-                ColumnConstraint::PrimaryKey { .. } => return cannot("PRIMARY KEY"),
-                ColumnConstraint::Unique(_) => return cannot("UNIQUE"),
-                ColumnConstraint::Check(..) => return cannot("CHECK"),
-                ColumnConstraint::References(_) => return cannot("FOREIGN KEY"),
-                ColumnConstraint::Generated { .. } => return cannot("generated"),
+        let in_table = format!("error in table {} after drop column: ", a.table);
+        // A generated column or a CHECK on *another* column that mentions the
+        // dropped column makes the regenerated table text un-reparseable. The
+        // dropped column's own constraints go away with it, so skip `pos`.
+        for (i, c) in ct.columns.iter().enumerate() {
+            if i == pos {
+                continue;
+            }
+            if c.constraints.iter().any(|cc| match cc {
+                ColumnConstraint::Check(e, _) | ColumnConstraint::Generated { expr: e, .. } => {
+                    refs_dropped(e)
+                }
+                _ => false,
+            }) {
+                return Err(Error::Error(format!("{in_table}no such column: {name}")));
+            }
+        }
+        for tc in &ct.constraints {
+            match tc {
+                TableConstraint::Check(e, _) if refs_dropped(e) => {
+                    return Err(Error::Error(format!("{in_table}no such column: {name}")));
+                }
+                TableConstraint::Unique(n, _) if n.iter().any(|x| x.eq_ignore_ascii_case(name)) => {
+                    return Err(Error::Error(format!("{in_table}no such column: {name}")));
+                }
+                TableConstraint::ForeignKey(fk)
+                    if fk.columns.iter().any(|x| x.eq_ignore_ascii_case(name)) =>
+                {
+                    return Err(Error::Error(format!(
+                        "{in_table}unknown column \"{name}\" in foreign key definition"
+                    )));
+                }
                 _ => {}
             }
         }
-        // Table-level constraints / other generated columns force a refusal too
-        // (conservatively, any of these on the table that could reference it).
-        for tc in &ct.constraints {
-            match tc {
-                TableConstraint::PrimaryKey(n, _) | TableConstraint::Unique(n, _) => {
-                    if n.iter().any(|x| x.eq_ignore_ascii_case(name)) {
-                        return cannot("PRIMARY KEY or UNIQUE");
-                    }
-                }
-                TableConstraint::Check(..) => return cannot("a table CHECK constraint exists"),
-                TableConstraint::ForeignKey(_) => {
-                    return cannot("a table FOREIGN KEY constraint exists")
-                }
-            }
-        }
-        if ct.columns.iter().enumerate().any(|(i, c)| {
-            i != pos
-                && c.constraints
-                    .iter()
-                    .any(|x| matches!(x, ColumnConstraint::Generated { .. }))
-        }) {
-            return cannot("a generated column exists");
-        }
         let meta = self.table_meta(&a.table, None)?;
-        if meta.ipk == Some(pos) {
-            return cannot("PRIMARY KEY");
-        }
-        let indexes = self.indexes_of(&a.table)?;
-        if indexes
-            .iter()
-            .any(|i| i.cols.contains(&pos) || i.key_exprs.is_some() || i.partial.is_some())
-        {
-            return cannot("it is indexed");
+        // An explicit index that references the column (an auto-index backing a
+        // table UNIQUE/PK is covered by the table re-parse above).
+        for idx in self.indexes_of(&a.table)? {
+            if idx.name.starts_with("sqlite_autoindex_") {
+                continue;
+            }
+            let references = idx.cols.contains(&pos)
+                || idx
+                    .key_exprs
+                    .as_ref()
+                    .is_some_and(|es| es.iter().any(&refs_dropped))
+                || idx.partial.as_ref().is_some_and(&refs_dropped);
+            if references {
+                return Err(Error::Error(format!(
+                    "error in index {} after drop column: no such column: {name}",
+                    idx.name
+                )));
+            }
         }
 
         // Read the rows, drop the column's value from each.
