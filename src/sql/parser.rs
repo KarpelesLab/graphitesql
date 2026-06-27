@@ -202,7 +202,10 @@ impl Parser {
                 "{msg} (near byte {}, found {:?})",
                 s.start, s.token
             )),
-            None => Error::Parse(format!("{msg} (at end of input)")),
+            // Running out of tokens mid-statement is SQLite's `incomplete input`
+            // (the SQL is a valid prefix that ends prematurely), distinct from a
+            // syntax error at a real token.
+            None => Error::Parse("incomplete input".into()),
         }
     }
 
@@ -234,6 +237,7 @@ impl Parser {
         match self.advance() {
             Some(Token::Word(w)) => Ok(w),
             Some(Token::Ident(i)) => Ok(i),
+            None => Err(Error::Parse("incomplete input".into())),
             other => Err(Error::Parse(format!(
                 "expected identifier, found {other:?}"
             ))),
@@ -960,6 +964,7 @@ impl Parser {
             Some(Token::Word(w)) => Ok(w),
             Some(Token::Ident(i)) => Ok(i),
             Some(Token::Str(s)) => Ok(s),
+            None => Err(Error::Parse("incomplete input".into())),
             other => Err(Error::Parse(format!("expected a name, found {other:?}"))),
         }
     }
@@ -2059,6 +2064,7 @@ impl Parser {
                     _ => self.after_name(w, false),
                 }
             }
+            None => Err(Error::Parse("incomplete input".into())),
             other => Err(Error::Parse(format!(
                 "expected an expression, found {other:?}"
             ))),

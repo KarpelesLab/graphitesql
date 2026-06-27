@@ -439,6 +439,18 @@ text-preserving CREATE-text edits).
     constant folder now returns "not an integer" for a fractional real,
     non-numeric text, NULL, or blob, bailing to the interpreter which raises the
     same `datatype mismatch` (`tests/limit_must_be_int.rs`).
+  - **Premature end-of-input reports `incomplete input` (done).** When SQL is a
+    valid prefix that runs out of tokens mid-parse (`SELECT`, `SELECT 1 WHERE 1=1
+    AND`, `CREATE TABLE t(`, `INSERT INTO t VALUES`), sqlite reports a single
+    message — `incomplete input` — distinct from a syntax error at a real token.
+    graphite leaked its internal parser state (`expected an expression, found
+    None`, `expected LParen (at end of input)`, `expected keyword values (at end
+    of input)`, …). The parser's central `err()` helper and the three
+    `advance()`-based primaries (identifier, object name, expression) now all map
+    the end-of-token-stream case to `incomplete input`, matching sqlite in every
+    statement position while a syntax error at an actual token is unchanged
+    (`tests/incomplete_input.rs`). The distinct `near "TOKEN": syntax error`
+    wording for a wrong token mid-statement is still a separate gap.
 
 ### Track B — Query planner, statistics & the VDBE
 
