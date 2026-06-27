@@ -990,13 +990,17 @@ impl Connection {
                         reject_invalid_window_function(expr, &is_agg)?;
                         // A window nested inside an aggregate's argument
                         // (`sum(row_number() OVER ())`) is a misuse SQLite rejects
-                        // at prepare time; this path bypasses `run_core` too.
+                        // at prepare time; this path bypasses `run_core` too. An
+                        // aggregate/window call inside a non-windowed aggregate's
+                        // `FILTER` predicate is the same kind of bypassed misuse.
                         reject_nested_aggregate_arg(expr)?;
+                        reject_aggregate_in_filter(expr, &is_agg)?;
                     }
                 }
                 for t in &sel.order_by {
                     reject_invalid_window_function(&t.expr, &is_agg)?;
                     reject_nested_aggregate_arg(&t.expr)?;
+                    reject_aggregate_in_filter(&t.expr, &is_agg)?;
                 }
             }
             return self.run_window_vdbe(sel);
@@ -13963,6 +13967,7 @@ impl Connection {
             for rc in &sel.columns {
                 if let ResultColumn::Expr { expr, .. } = rc {
                     reject_filter_on_non_aggregate(expr, &is_agg)?;
+                    reject_aggregate_in_filter(expr, &is_agg)?;
                     reject_invalid_window_function(expr, &is_agg)?;
                     reject_window_without_over(expr)?;
                     reject_star_argument(expr)?;
@@ -13972,12 +13977,14 @@ impl Connection {
             }
             if let Some(w) = &sel.where_clause {
                 reject_filter_on_non_aggregate(w, &is_agg)?;
+                reject_aggregate_in_filter(w, &is_agg)?;
                 reject_window_without_over(w)?;
                 reject_star_argument(w)?;
                 reject_invalid_likelihood(w)?;
             }
             if let Some(h) = &sel.having {
                 reject_filter_on_non_aggregate(h, &is_agg)?;
+                reject_aggregate_in_filter(h, &is_agg)?;
                 // A `*` arg in HAVING is only reached once the HAVING itself is
                 // valid: SQLite reports `HAVING clause on a non-aggregate query`
                 // ahead of the arity error, so defer the star check to a genuine
@@ -13990,12 +13997,14 @@ impl Connection {
             }
             for g in &sel.group_by {
                 reject_filter_on_non_aggregate(g, &is_agg)?;
+                reject_aggregate_in_filter(g, &is_agg)?;
                 reject_window_without_over(g)?;
                 reject_star_argument(g)?;
                 reject_invalid_likelihood(g)?;
             }
             for t in &sel.order_by {
                 reject_filter_on_non_aggregate(&t.expr, &is_agg)?;
+                reject_aggregate_in_filter(&t.expr, &is_agg)?;
                 reject_invalid_window_function(&t.expr, &is_agg)?;
                 reject_window_without_over(&t.expr)?;
                 reject_star_argument(&t.expr)?;
@@ -14006,6 +14015,7 @@ impl Connection {
                 for j in &from.joins {
                     if let Some(on) = &j.on {
                         reject_filter_on_non_aggregate(on, &is_agg)?;
+                        reject_aggregate_in_filter(on, &is_agg)?;
                         reject_window_without_over(on)?;
                         reject_star_argument(on)?;
                         reject_invalid_likelihood(on)?;
@@ -20220,6 +20230,60 @@ fn reject_filter_on_non_aggregate(
         ))),
         None => Ok(()),
     }
+}
+
+/// Reject an aggregate or window function used inside a `FILTER (WHERE …)`
+/// predicate. SQLite resolves the filter as an ordinary boolean expression that
+/// may not itself aggregate, so a nested aggregate (`count(*) FILTER (WHERE
+/// sum(a)>0)`) is `misuse of aggregate function NAME()` and a nested window call
+/// (`… FILTER (WHERE rank()>0)`) is `misuse of window function NAME()`, both
+/// raised at prepare time — where graphite's lazy per-row evaluator would
+/// otherwise run the filter and silently return a value over an empty/filtered
+/// table. The carrier is checked only when it is *not* itself windowed: SQLite
+/// accepts `count(*) FILTER (…) OVER ()`, so an `over: Some(_)` carrier is exempt.
+/// The inner call is reported in source order, classified the same way the misuse
+/// checks classify a bare call (an `OVER` clause or a window-only builtin →
+/// window; otherwise an aggregate). A missing column inside the filter is caught
+/// earlier by column validation, so it still wins.
+fn reject_aggregate_in_filter(e: &Expr, is_agg: &dyn Fn(&str, usize, bool) -> bool) -> Result<()> {
+    let mut err: Option<Error> = None;
+    window::visit(e, &mut |n| {
+        if err.is_some() {
+            return;
+        }
+        if let Expr::Function {
+            filter: Some(f),
+            over: None,
+            ..
+        } = n
+        {
+            window::visit(f, &mut |m| {
+                if err.is_some() {
+                    return;
+                }
+                if let Expr::Function {
+                    name,
+                    args,
+                    star,
+                    over,
+                    ..
+                } = m
+                {
+                    let lname = name.to_ascii_lowercase();
+                    if over.is_some() || is_builtin_window_function(&lname) {
+                        err = Some(Error::Error(alloc::format!(
+                            "misuse of window function {lname}()"
+                        )));
+                    } else if is_agg(name, args.len(), *star) {
+                        err = Some(Error::Error(alloc::format!(
+                            "misuse of aggregate function {lname}()"
+                        )));
+                    }
+                }
+            });
+        }
+    });
+    err.map_or(Ok(()), Err)
 }
 
 /// Whether `e` calls a non-deterministic function — one that can return a

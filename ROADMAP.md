@@ -422,6 +422,19 @@ the aggregate gate, covering result columns, `WHERE`, `GROUP BY`, `HAVING`, and
 (`max() may not be used as a window function`). Byte-exact vs `sqlite3` 3.50.4
 across ~19 permutations.
 
+**An aggregate or window function inside a `FILTER (WHERE …)` predicate** is now
+rejected at prepare time. The filter is an ordinary boolean expression that may
+not itself aggregate, so `count(*) FILTER (WHERE sum(a)>0)` is `misuse of
+aggregate function sum()` and `… FILTER (WHERE rank()>0)` is `misuse of window
+function rank()`. graphite evaluated the predicate lazily per row and so silently
+returned a value over an empty (or fully filtered) table; a new
+`reject_aggregate_in_filter` walk descends into each aggregate's filter from every
+clause (result columns, `WHERE`, `HAVING`, `GROUP BY`, `ORDER BY`, join `ON`, and
+the window-dispatch path). A missing column inside the filter still wins (`no such
+column: zzz`), and the windowed carrier `count(*) FILTER (…) OVER ()` — which
+SQLite accepts — is left untouched. Byte-exact vs `sqlite3` 3.50.4 across ~15
+permutations.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely
