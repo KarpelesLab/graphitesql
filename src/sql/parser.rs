@@ -337,15 +337,16 @@ impl Parser {
             return Ok(Statement::Alter(self.alter()?));
         }
         if self.eat_kw("begin") {
-            let _ = self.eat_kw("transaction")
-                || self.eat_kw("deferred")
-                || self.eat_kw("immediate")
-                || self.eat_kw("exclusive");
-            let _ = self.eat_kw("transaction");
+            let _ = self.eat_kw("deferred") || self.eat_kw("immediate") || self.eat_kw("exclusive");
+            if self.eat_kw("transaction") {
+                self.opt_transaction_name()?;
+            }
             return Ok(Statement::Begin);
         }
         if self.eat_kw("commit") || self.eat_kw("end") {
-            let _ = self.eat_kw("transaction");
+            if self.eat_kw("transaction") {
+                self.opt_transaction_name()?;
+            }
             return Ok(Statement::Commit);
         }
         if self.eat_kw("rollback") {
@@ -1039,6 +1040,17 @@ impl Parser {
             None => Err(Error::Parse("incomplete input".into())),
             _ => Err(self.syntax_error(self.pos - 1)),
         }
+    }
+
+    /// Consume the optional transaction name that may follow `TRANSACTION` in
+    /// `BEGIN`/`COMMIT`/`END` (SQLite parses it and ignores it). It is an ordinary
+    /// name, so a reserved keyword there is a syntax error; a `;`/end-of-input
+    /// simply means no name was given.
+    fn opt_transaction_name(&mut self) -> Result<()> {
+        if matches!(self.peek(), Some(Token::Word(_)) | Some(Token::Ident(_))) {
+            let _ = self.ident()?;
+        }
+        Ok(())
     }
 
     fn insert(&mut self) -> Result<Insert> {
