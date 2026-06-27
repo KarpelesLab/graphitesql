@@ -205,8 +205,10 @@ expression at parse time, so the multi-branch form `iif(c1,v1,c2,v2,…[,else])`
 returns `a` rather than erroring); and a `LIKE … ESCAPE` whose escape character
 is `_` or `%` no longer treats that character as a wildcard — the escape
 character is only ever the escape introducer, and a trailing escape matches just
-the empty remainder (`'ab' LIKE 'a_' ESCAPE '_'` is now false) — all byte-exact
-vs `sqlite3` 3.50.4.
+the empty remainder (`'ab' LIKE 'a_' ESCAPE '_'` is now false); and a hex
+literal wider than 64 bits is now a *recognized* token rejected with SQLite's
+dedicated `hex literal too big: 0x…` (echoing the literal verbatim) rather than a
+generic `unrecognized token` — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 

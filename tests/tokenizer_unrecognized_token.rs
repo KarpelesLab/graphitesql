@@ -57,6 +57,30 @@ fn lexing_failures_report_the_offending_source_run() {
 }
 
 #[test]
+fn hex_literal_too_big_is_its_own_message() {
+    // A hex literal is a *recognized* token even when it overflows 64 bits;
+    // SQLite then rejects it with a dedicated `hex literal too big: <literal>`
+    // rather than the generic `unrecognized token`. The literal is echoed
+    // verbatim (case preserved, `_` separators kept).
+    let c = Connection::open_memory().unwrap();
+    for (sql, lit) in [
+        ("SELECT 0x10000000000000000", "0x10000000000000000"),
+        ("SELECT 0x1ffffffffffffffff", "0x1ffffffffffffffff"),
+        ("SELECT 0xFFFFFFFFFFFFFFFFF", "0xFFFFFFFFFFFFFFFFF"),
+        ("SELECT 0x1_0000000000000000", "0x1_0000000000000000"),
+        ("SELECT 0x10000000000000000 + 0", "0x10000000000000000"),
+    ] {
+        assert_eq!(
+            parse_msg(&c, sql),
+            format!("hex literal too big: {lit}"),
+            "for {sql}"
+        );
+    }
+    // The boundary value (exactly 64 bits) still lexes — it is -1 as i64.
+    assert!(c.query("SELECT 0xffffffffffffffff").is_ok());
+}
+
+#[test]
 fn unterminated_block_comment_is_incomplete_input() {
     let c = Connection::open_memory().unwrap();
     assert_eq!(parse_msg(&c, "SELECT /* unterminated"), "incomplete input");
@@ -100,6 +124,13 @@ fn matches_sqlite_cli() {
         "SELECT x'abc'",
         "SELECT 0xGG",
         "SELECT 0x",
+        // A too-big hex literal is recognized then rejected with its own
+        // message; the positive form matches sqlite verbatim. (A leading
+        // unary minus, `-0x1…`, is a separate token to the lexer, so sqlite's
+        // sign-prefixed `-0x1…` echo is a documented residual and not listed.)
+        "SELECT 0x10000000000000000",
+        "SELECT 0x1ffffffffffffffff",
+        "SELECT 0xFFFFFFFFFFFFFFFFF",
         "SELECT 1e",
         "SELECT 123abc",
         "SELECT 1.5xyz",

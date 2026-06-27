@@ -419,7 +419,19 @@ impl<'a> Tokenizer<'a> {
             // SQLite allows `_` digit separators between digits (3.46+); strip
             // them before parsing.
             let digits = self.src[hstart..self.pos].replace('_', "");
-            let v = u64::from_str_radix(&digits, 16).map_err(|_| self.unrecognized())?;
+            // `0x` with no digits is just an unrecognized token. A non-empty
+            // run that overflows 64 bits is a *recognized* hex literal that
+            // SQLite then rejects with a dedicated message
+            // (`hex literal too big: 0x…`), not a generic unrecognized token.
+            if digits.is_empty() {
+                return Err(self.unrecognized());
+            }
+            let v = u64::from_str_radix(&digits, 16).map_err(|_| {
+                Error::Parse(alloc::format!(
+                    "hex literal too big: {}",
+                    &self.src[start..self.pos]
+                ))
+            })?;
             return Ok(Token::Integer(v as i64));
         }
 
