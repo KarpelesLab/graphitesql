@@ -346,6 +346,16 @@ instead of `must have at least one non-generated column`) and ran the
 duplicate-name / `COLLATE` checks after the STRICT datatype check; both are fixed,
 byte-exact vs `sqlite3` 3.50.4 across ~35 multi-fault permutations.
 
+A **trigger body that targets a missing table** is now reported with the same
+schema qualifier SQLite uses. SQLite compiles a trigger program in the trigger's
+own database, so an unqualified DML target (`INSERT`/`UPDATE`/`DELETE`) that
+resolves to nothing is named schema-qualified — a `main` trigger says `no such
+table: main.nope` — whereas a *temp* trigger, whose names resolve across all
+schemas, keeps the bare `no such table: nope`. graphite previously reported the
+bare name in both cases; the fix tags each fired trigger with its origin catalog
+(swap-aware, so a temp trigger on a main table is still labelled `temp`) and
+qualifies the error only for non-temp triggers. Byte-exact vs `sqlite3` 3.50.4.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

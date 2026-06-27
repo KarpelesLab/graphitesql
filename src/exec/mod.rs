@@ -5349,10 +5349,26 @@ impl Connection {
         // The active schema plus the temp catalog: a temp trigger fires on writes
         // to its (possibly main) table, and a main trigger fires even while a temp
         // database is swapped in. `swap_db` exchanges `self.schema` with the temp
-        // db's, so these two catalogs are always exactly {main, temp}.
-        self.collect_triggers(self.schema.objects(), table, kind, timing, &mut out);
+        // db's, so these two catalogs are always exactly {main, temp}. Tag each
+        // trigger with the database it lives in: a body's missing-table error is
+        // schema-qualified by the trigger's own schema (`main.nope`), except for a
+        // temp trigger, whose names resolve cross-schema and stay bare.
+        let active = self.db_label(self.write_target.get());
+        let other = if active.eq_ignore_ascii_case("temp") {
+            "main"
+        } else {
+            "temp"
+        };
+        self.collect_triggers(
+            self.schema.objects(),
+            table,
+            kind,
+            timing,
+            &active,
+            &mut out,
+        );
         if let Some(t) = &self.temp_db {
-            self.collect_triggers(t.schema.objects(), table, kind, timing, &mut out);
+            self.collect_triggers(t.schema.objects(), table, kind, timing, other, &mut out);
         }
         // SQLite keeps a per-table trigger list that prepends on creation, so
         // triggers of the same event/timing fire in REVERSE creation order
@@ -5369,6 +5385,7 @@ impl Connection {
         table: &str,
         kind: TrigEvent,
         timing: TriggerTiming,
+        schema: &str,
         out: &mut Vec<CreateTrigger>,
     ) {
         for obj in objects {
@@ -5378,9 +5395,12 @@ impl Connection {
                 continue;
             }
             let Some(sql) = &obj.sql else { continue };
-            let Ok(Statement::CreateTrigger(ct)) = sql::parse_one(sql) else {
+            let Ok(Statement::CreateTrigger(mut ct)) = sql::parse_one(sql) else {
                 continue;
             };
+            // The stored SQL is bare-named; record the catalog it came from so a
+            // body's missing-table error can name the trigger's schema.
+            ct.schema = Some(schema.into());
             let event_ok = matches!(
                 (&ct.event, kind),
                 (TriggerEvent::Insert, TrigEvent::Insert)
@@ -5709,16 +5729,20 @@ impl Connection {
                     continue;
                 }
             }
+            let schema = trig.schema.as_deref();
             for stmt in &trig.body {
                 match stmt {
                     Statement::Insert(ins) => {
-                        self.exec_insert(ins, params)?;
+                        self.exec_insert(ins, params)
+                            .map_err(|e| qualify_trigger_missing_table(e, schema))?;
                     }
                     Statement::Update(u) => {
-                        self.exec_update(u, params)?;
+                        self.exec_update(u, params)
+                            .map_err(|e| qualify_trigger_missing_table(e, schema))?;
                     }
                     Statement::Delete(d) => {
-                        self.exec_delete(d, params)?;
+                        self.exec_delete(d, params)
+                            .map_err(|e| qualify_trigger_missing_table(e, schema))?;
                     }
                     // A `SELECT` in a trigger body is side-effect free *except* for
                     // a `RAISE(…)`, which aborts or ignores the firing operation.
@@ -23588,6 +23612,28 @@ fn from_refs_table(f: &FromClause, name: &str) -> bool {
         || f.joins
             .iter()
             .any(|j| j.table.name.eq_ignore_ascii_case(name))
+}
+
+/// Qualify a trigger body's `no such table: X` error with the trigger's schema.
+///
+/// SQLite compiles a trigger program in its own schema, so an unqualified table
+/// reference that resolves to nothing is reported schema-qualified — a `main`
+/// trigger says `no such table: main.nope`. A *temp* trigger's names resolve
+/// across all schemas, so its error stays bare; any already-qualified name (one
+/// containing a `.`) is likewise left untouched.
+fn qualify_trigger_missing_table(e: Error, schema: Option<&str>) -> Error {
+    let Some(sch) = schema else { return e };
+    if sch.eq_ignore_ascii_case("temp") {
+        return e;
+    }
+    if let Error::Error(msg) = &e {
+        if let Some(name) = msg.strip_prefix("no such table: ") {
+            if !name.contains('.') {
+                return Error::Error(format!("no such table: {sch}.{name}"));
+            }
+        }
+    }
+    e
 }
 
 /// Whether a `CREATE TRIGGER` references table `name` — either it is attached to
