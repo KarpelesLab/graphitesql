@@ -38,8 +38,18 @@ pub enum Json {
     /// in `json()`. `None` is a number built programmatically (a SQL REAL,
     /// arithmetic, `Infinity`) or one normalized from a leading-`+` form.
     Real(f64, Option<String>),
-    /// A string (unescaped).
-    Str(String),
+    /// A string. The first field is the decoded (unescaped) value used for all
+    /// SQL value semantics. The optional second field carries the verbatim
+    /// *escaped* source body (without the surrounding quotes) when the string
+    /// was parsed from a double-quoted JSON literal that contained only
+    /// standard-JSON escapes (`\n`, `\"`, `\/`, `\uXXXX`, …). SQLite stores such
+    /// a string under the JSONB `TEXTJ` tag and re-emits the escaped body
+    /// verbatim in `json()` text output (`json('"A"')` → `"A"`) while
+    /// still yielding the decoded value (`A`) as a SQL value. `None` means no
+    /// provenance: a plain unescaped string (`TEXT`), a string built
+    /// programmatically, or one whose source used JSON5-only escapes (`\x41`,
+    /// `\'`, `\v`, `\0`), which are rendered from the decoded value.
+    Str(String, Option<String>),
     /// An array.
     Array(Vec<Json>),
     /// An object, preserving member order.
@@ -55,7 +65,7 @@ impl Json {
             Json::Bool(false) => "false",
             Json::Int(..) => "integer",
             Json::Real(..) => "real",
-            Json::Str(_) => "text",
+            Json::Str(..) => "text",
             Json::Array(_) => "array",
             Json::Object(_) => "object",
         }
@@ -69,7 +79,7 @@ impl Json {
             Json::Bool(b) => Value::Integer(*b as i64),
             Json::Int(i, _) => Value::Integer(*i),
             Json::Real(r, _) => Value::Real(*r),
-            Json::Str(s) => Value::Text(s.clone()),
+            Json::Str(s, _) => Value::Text(s.clone()),
             Json::Array(_) | Json::Object(_) => Value::Text(self.serialize()),
         }
     }
@@ -135,10 +145,13 @@ impl Json {
                     ),
                 }
             }
-            Json::Str(s) => {
-                // A string with no characters needing escapes is stored raw
-                // (TEXT); otherwise its JSON-escaped body is stored as TEXTJ.
-                if json_needs_escape(s) {
+            Json::Str(s, raw) => {
+                // A string parsed with standard-JSON escapes keeps its verbatim
+                // escaped body under TEXTJ. Otherwise: no escapes needed → raw
+                // bytes (TEXT); else the freshly JSON-escaped body (TEXTJ).
+                if let Some(raw) = raw {
+                    push_jsonb(out, JSONB_TEXTJ, raw.as_bytes());
+                } else if json_needs_escape(s) {
                     push_jsonb(out, JSONB_TEXTJ, json_escape_body(s).as_bytes());
                 } else {
                     push_jsonb(out, JSONB_TEXT, s.as_bytes());
@@ -201,7 +214,10 @@ impl Json {
                 }
                 None => crate::exec::eval::format_real(*r).len(),
             },
-            Json::Str(s) => str_jsonb_payload_len(s),
+            Json::Str(s, raw) => match raw {
+                Some(raw) => raw.len(),
+                None => str_jsonb_payload_len(s),
+            },
             Json::Array(items) => items.iter().map(Json::jsonb_len).sum(),
             Json::Object(members) => members
                 .iter()
@@ -294,7 +310,14 @@ impl Json {
                 out.push_str(if *r < 0.0 { "-9e999" } else { "9e999" });
             }
             Json::Real(r, _) => out.push_str(&crate::exec::eval::format_real(*r)),
-            Json::Str(s) => write_json_string(s, out),
+            // A preserved escaped body is re-emitted verbatim between quotes;
+            // otherwise the decoded value is freshly escaped.
+            Json::Str(_, Some(raw)) => {
+                out.push('"');
+                out.push_str(raw);
+                out.push('"');
+            }
+            Json::Str(s, None) => write_json_string(s, out),
             Json::Array(items) => {
                 out.push('[');
                 for (i, it) in items.iter().enumerate() {
@@ -438,15 +461,22 @@ fn decode_jsonb(b: &[u8]) -> Option<(Json, &[u8])> {
                 _ => return None,
             }
         }
-        JSONB_TEXT | JSONB_TEXTRAW => Json::Str(text()?),
+        JSONB_TEXT | JSONB_TEXTRAW => Json::Str(text()?, None),
         JSONB_TEXTJ | JSONB_TEXT5 => {
             // Reparse the escaped body as a quoted JSON string.
+            let body = core::str::from_utf8(payload).ok()?;
             let mut quoted = String::with_capacity(n + 2);
             quoted.push('"');
-            quoted.push_str(core::str::from_utf8(payload).ok()?);
+            quoted.push_str(body);
             quoted.push('"');
             match parse(&quoted)? {
-                Json::Str(s) => Json::Str(s),
+                // A TEXTJ body (standard escapes only) is preserved verbatim so
+                // it round-trips to the same bytes; TEXT5 keeps its existing
+                // (decoded-value) rendering.
+                Json::Str(s, _) => {
+                    let raw = (ty == JSONB_TEXTJ).then(|| String::from(body));
+                    Json::Str(s, raw)
+                }
                 _ => return None,
             }
         }
@@ -467,7 +497,7 @@ fn decode_jsonb(b: &[u8]) -> Option<(Json, &[u8])> {
                 let (label, next) = decode_jsonb(p)?;
                 let (val, next2) = decode_jsonb(next)?;
                 let key = match label {
-                    Json::Str(s) => s,
+                    Json::Str(s, _) => s,
                     _ => return None,
                 };
                 members.push((key, val));
@@ -804,8 +834,8 @@ impl Parser<'_> {
             Some(b'{') => self.object(),
             Some(b'[') => self.array(),
             // JSON5 allows single-quoted strings as well as double-quoted.
-            Some(b'"') => self.string(b'"').map(Json::Str),
-            Some(b'\'') => self.string(b'\'').map(Json::Str),
+            Some(b'"') => self.string(b'"').map(|(s, raw)| Json::Str(s, raw)),
+            Some(b'\'') => self.string(b'\'').map(|(s, raw)| Json::Str(s, raw)),
             Some(b't') => self.literal("true", Json::Bool(true)),
             Some(b'f') => self.literal("false", Json::Bool(false)),
             Some(b'n') => self.literal("null", Json::Null),
@@ -865,8 +895,8 @@ impl Parser<'_> {
     /// identifier (`[A-Za-z_$][A-Za-z0-9_$]*`).
     fn object_key(&mut self) -> Result<String, usize> {
         match self.peek() {
-            Some(b'"') => self.string(b'"'),
-            Some(b'\'') => self.string(b'\''),
+            Some(b'"') => self.string(b'"').map(|(s, _)| s),
+            Some(b'\'') => self.string(b'\'').map(|(s, _)| s),
             Some(c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$' => {
                 let start = self.pos;
                 while let Some(c) = self.peek() {
@@ -922,20 +952,43 @@ impl Parser<'_> {
 
     /// Parse a string literal opened by `quote` (`"` or, in JSON5, `'`). Both
     /// quote styles share the same escapes; `\'` and `\"` are always accepted.
-    fn string(&mut self, quote: u8) -> Result<String, usize> {
+    /// Parse a quoted string, returning the decoded value and — when the source
+    /// was a double-quoted literal using only standard-JSON escapes — its
+    /// verbatim escaped body (between the quotes) for `TEXTJ` provenance. The
+    /// raw body is `None` for a plain unescaped string, a single-quoted string,
+    /// or any string using a JSON5-only escape (`\x`, `\'`, `\v`, `\0`, a line
+    /// continuation) or carrying a literal control byte.
+    fn string(&mut self, quote: u8) -> Result<(String, Option<String>), usize> {
         self.pos += 1; // opening quote
+        let body_start = self.pos;
         let mut s = String::new();
+        // Whether any escape was seen, and whether a non-standard-JSON feature
+        // (a JSON5-only escape or a literal control byte) was seen.
+        let mut had_escape = false;
+        let mut json5 = false;
         loop {
             let Some(c) = self.peek() else {
                 return self.err();
             };
             if c == quote {
+                let body_end = self.pos;
                 self.pos += 1;
-                return Ok(s);
+                // Preserve the verbatim escaped body only for a double-quoted
+                // string whose escapes are all standard JSON (TEXTJ). By
+                // construction it round-trips to the same decoded value.
+                let raw = if quote == b'"' && had_escape && !json5 {
+                    core::str::from_utf8(&self.bytes[body_start..body_end])
+                        .ok()
+                        .map(String::from)
+                } else {
+                    None
+                };
+                return Ok((s, raw));
             }
             self.pos += 1;
             match c {
                 b'\\' => {
+                    had_escape = true;
                     // The escape introducer position, used to report bad escapes
                     // at the escape character itself (matching sqlite3).
                     let esc_pos = self.pos;
@@ -945,28 +998,40 @@ impl Parser<'_> {
                     self.pos += 1;
                     match esc {
                         b'"' => s.push('"'),
-                        b'\'' => s.push('\''),
+                        b'\'' => {
+                            json5 = true;
+                            s.push('\'');
+                        }
                         b'\\' => s.push('\\'),
                         b'/' => s.push('/'),
                         b'n' => s.push('\n'),
+                        b't' => s.push('\t'),
                         // JSON5: `\v` maps to U+0009 in sqlite (not U+000B).
-                        b't' | b'v' => s.push('\t'),
+                        b'v' => {
+                            json5 = true;
+                            s.push('\t');
+                        }
                         b'r' => s.push('\r'),
                         b'b' => s.push('\u{08}'),
                         b'f' => s.push('\u{0c}'),
                         // JSON5: `\0` is a NUL.
-                        b'0' => s.push('\0'),
+                        b'0' => {
+                            json5 = true;
+                            s.push('\0');
+                        }
                         // JSON5: a backslash before a line terminator is a line
                         // continuation (the newline is dropped). `\r\n` counts
                         // as one terminator.
-                        b'\n' => {}
+                        b'\n' => json5 = true,
                         b'\r' => {
+                            json5 = true;
                             if self.peek() == Some(b'\n') {
                                 self.pos += 1;
                             }
                         }
                         // JSON5: `\xHH` is a two-digit hex escape.
                         b'x' => {
+                            json5 = true;
                             let hi = self.hex_digit()?;
                             let lo = self.hex_digit()?;
                             s.push((hi * 16 + lo) as u8 as char);
@@ -1013,7 +1078,14 @@ impl Parser<'_> {
                         Err(_) => return self.err(),
                     }
                 }
-                c => s.push(c as char),
+                c => {
+                    // A literal control byte makes the body non-TEXTJ (sqlite
+                    // stores it as TEXT5), so don't preserve it verbatim.
+                    if c < 0x20 {
+                        json5 = true;
+                    }
+                    s.push(c as char);
+                }
             }
         }
     }
@@ -1305,8 +1377,8 @@ pub fn value_to_json(v: &Value) -> Json {
         Value::Null => Json::Null,
         Value::Integer(i) => Json::Int(*i, None),
         Value::Real(r) => Json::Real(*r, None),
-        Value::Text(s) => Json::Str(s.clone()),
-        Value::Blob(_) => Json::Str(String::new()),
+        Value::Text(s) => Json::Str(s.clone(), None),
+        Value::Blob(_) => Json::Str(String::new(), None),
     }
 }
 
