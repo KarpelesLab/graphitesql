@@ -27,6 +27,31 @@ fn non_integer_limit_offset_errors() {
 }
 
 #[test]
+fn non_integer_limit_offset_errors_over_a_table_scan() {
+    // A `SELECT … FROM t` over a real table compiles to the VDBE scan path,
+    // which folds a constant LIMIT/OFFSET separately from the constant-row
+    // `SELECT 1` path above. That folder previously truncated lossily (1.9 → 1)
+    // and parsed text/NULL leniently, so the table-scan path silently accepted
+    // what sqlite rejects. It must now bail to the interpreter and raise the
+    // same "datatype mismatch".
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a)").unwrap();
+    c.execute("INSERT INTO t VALUES(1),(2),(3)").unwrap();
+    for sql in [
+        "SELECT a FROM t LIMIT 1.9",
+        "SELECT a FROM t LIMIT '2abc'",
+        "SELECT a FROM t LIMIT 'abc'",
+        "SELECT a FROM t LIMIT NULL",
+        "SELECT a FROM t LIMIT x'32'",
+        "SELECT a FROM t LIMIT 2 OFFSET 1.5",
+        "SELECT a FROM t LIMIT 2 OFFSET NULL",
+        "SELECT a FROM t LIMIT 2 OFFSET 'x'",
+    ] {
+        assert!(c.query(sql).is_err(), "{sql} should be a datatype mismatch");
+    }
+}
+
+#[test]
 fn integer_valued_limits_work() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a)").unwrap();

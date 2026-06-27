@@ -541,7 +541,31 @@ fn fold_const_int(e: &Expr) -> Option<i64> {
         &crate::exec::eval::EvalCtx::rowless(&crate::exec::eval::Params::default()),
     )
     .ok()?;
-    Some(crate::exec::eval::to_i64(&v))
+    // A LIMIT/OFFSET value must convert *exactly* to an integer (SQLite's
+    // `OP_MustBeInt`): an integer, an integer-valued real, or text that parses
+    // as one. A fractional real, non-numeric text, NULL, or blob is a datatype
+    // mismatch — return `None` so the caller bails to the interpreter path,
+    // which raises `datatype mismatch` rather than silently truncating.
+    fn exact_int(r: f64) -> Option<i64> {
+        (r.is_finite()
+            && r == crate::util::float::trunc(r)
+            && r >= i64::MIN as f64
+            && r < 9_223_372_036_854_775_808.0)
+            .then_some(r as i64)
+    }
+    match v {
+        Value::Integer(i) => Some(i),
+        Value::Real(r) => exact_int(r),
+        Value::Text(s) => {
+            let t = s.trim();
+            if let Ok(i) = t.parse::<i64>() {
+                Some(i)
+            } else {
+                t.parse::<f64>().ok().and_then(exact_int)
+            }
+        }
+        Value::Null | Value::Blob(_) => None,
+    }
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {
