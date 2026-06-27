@@ -684,6 +684,22 @@ output columns (base columns first, so they win ties), mirroring the existing
 `HAVING` augmentation. Byte-exact vs `sqlite3` 3.50.4
 (`tests/order_by_alias_expr.rs`).
 
+The **`ALL`/`DISTINCT` quantifier keywords** are now parsed exactly where SQLite
+allows them and rejected exactly where it doesn't. They are valid only directly
+after `SELECT` or as the first token inside an aggregate call; `ALL` is the
+default, so `count(ALL a)` counts every non-null `a` (graphite previously failed
+to accept it — `count(ALL a)` errored `near "a"`) and now parses like
+`count(a)`. In any other expression-operand position the keyword is a reserved
+syntax error pointing at *itself* (`1 > ALL (SELECT 1)` → `near "ALL"`,
+`1 > DISTINCT (…)` → `near "DISTINCT"`); graphite used to mis-parse it as a
+column/function so the caret landed on the following `SELECT`/operand. Only one
+quantifier is allowed, so a second one falls through to the same operand-position
+rejection (`count(ALL DISTINCT a)` → `near "DISTINCT"`,
+`count(DISTINCT ALL a)` → `near "ALL"`). The fix is two targeted parser arms: the
+aggregate-call path eats an optional `ALL` after the `DISTINCT` check, and
+`primary()` rejects a bare `all`/`distinct` operand. Byte-exact vs `sqlite3`
+3.50.4 (`tests/all_distinct_operand_syntax.rs`).
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

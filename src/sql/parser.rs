@@ -2384,6 +2384,11 @@ impl Parser {
                             negated: false,
                         })
                     }
+                    // `ALL`/`DISTINCT` are quantifiers, valid only after `SELECT`
+                    // or as the first token inside an aggregate call. In any other
+                    // (expression-operand) position SQLite rejects them as reserved
+                    // keywords, e.g. `1 > ALL (SELECT …)` → `near "ALL"`.
+                    "all" | "distinct" => Err(self.syntax_error(self.pos - 1)),
                     _ if is_reserved_keyword(&lw) => Err(self.syntax_error(self.pos - 1)),
                     _ => self.after_name(w, false, false),
                 }
@@ -2448,6 +2453,13 @@ impl Parser {
             });
         }
         let distinct = self.eat_kw("distinct");
+        // `ALL` is the (default) opposite of `DISTINCT`; accept and ignore it so
+        // `count(ALL a)` parses like `count(a)`. Only one quantifier is allowed,
+        // so a following `DISTINCT`/`ALL` falls through to the operand-position
+        // rejection in `primary()` (matching SQLite's `near "…"`).
+        if !distinct {
+            let _ = self.eat_kw("all");
+        }
         let mut args = Vec::new();
         if !self.check(&Token::RParen) {
             args.push(self.expr()?);
