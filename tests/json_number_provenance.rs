@@ -80,6 +80,28 @@ fn leading_zero_integer_is_malformed() {
 }
 
 #[test]
+fn json5_dot_form_keeps_its_shape_with_minimal_zero() {
+    // A JSON5 leading/trailing-`.` number renders with just the `0` inserted to
+    // make it valid JSON, preserving the rest of the source form — `1.e5` →
+    // `1.0e5`, `.5e2` → `0.5e2`, `-.5` → `-0.5` — instead of the computed float
+    // (`100000.0`). graphite rendered the float for exponent forms.
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(text(&c, "SELECT json('1.e5')"), "1.0e5");
+    assert_eq!(text(&c, "SELECT json('.5e2')"), "0.5e2");
+    assert_eq!(text(&c, "SELECT json('10.e2')"), "10.0e2");
+    assert_eq!(text(&c, "SELECT json('1.E5')"), "1.0E5");
+    // The fixup wins even when the magnitude overflows f64 (renders before the
+    // `9e999` infinity fallback).
+    assert_eq!(text(&c, "SELECT json('1.e5000')"), "1.0e5000");
+    // A form already valid (digits both sides, or no dot) is verbatim.
+    assert_eq!(text(&c, "SELECT json('5.')"), "5.0");
+    assert_eq!(text(&c, "SELECT json('-.5')"), "-0.5");
+    assert_eq!(text(&c, "SELECT json('1.5e3')"), "1.5e3");
+    // Survives a JSONB round-trip (FLOAT5 stores the raw `1.e5` text).
+    assert_eq!(text(&c, "SELECT json(jsonb('1.e5'))"), "1.0e5");
+}
+
+#[test]
 fn extracted_scalar_is_the_canonical_value() {
     let c = Connection::open_memory().unwrap();
     // The SQL value of a JSON number is the f64, not its text.

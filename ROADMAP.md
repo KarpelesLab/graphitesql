@@ -229,8 +229,12 @@ arm, so the parsed source text was dropped; the extracted SQL value is still
 (`00`, `007`, `00.5`, `-01`) is now rejected as `malformed JSON` instead of being
 silently accepted as `0`/`7`/… — a lone `0` and a `0` followed by `.`/`e`
 (`0.5`, `0e1`) stay valid, and `json_error_position` points at the token's
-second character (`00` → 2, `[01]` → 3) to match sqlite — all byte-exact vs
-`sqlite3` 3.50.4.
+second character (`00` → 2, `[01]` → 3) to match sqlite; and a **JSON5
+leading/trailing-`.` number** now renders in JSON text with just the minimal
+`0` inserted to make it valid JSON (`json('1.e5')` → `1.0e5`, `.5e2` → `0.5e2`,
+even the overflowing `1.e5000` → `1.0e5000`) rather than as the computed float
+(`100000.0`) — the JSONB `FLOAT5` payload already stored the raw text byte-exact;
+only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 

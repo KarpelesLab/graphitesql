@@ -281,6 +281,12 @@ impl Json {
             // overflows f64 (`1e1000`, `9.9e999`) still round-trips verbatim,
             // exactly as `json('1e1000')` → `1e1000` in sqlite.
             Json::Real(_, Some(src)) if is_strict_json_number(src) => out.push_str(src),
+            // A JSON5 leading/trailing-`.` form keeps its source shape with the
+            // minimal `0` inserted to make it valid JSON (`1.e5` → `1.0e5`,
+            // `.5e2` → `0.5e2`), matching sqlite — *not* the computed float
+            // (`100000.0`). This precedes the infinity fallback so an overflowing
+            // dot-form (`1.e5000`) still renders `1.0e5000`, like sqlite.
+            Json::Real(_, Some(src)) => out.push_str(&json5_fixup_number(src)),
             Json::Real(r, _) if r.is_infinite() => {
                 // A *computed* infinity (no source text) has no JSON literal;
                 // sqlite renders it as `±9e999` (a value that round-trips to f64
@@ -1181,6 +1187,29 @@ fn is_strict_json_number(t: &str) -> bool {
         }
     }
     i == b.len()
+}
+
+/// Insert the minimal `0` that turns a JSON5 leading/trailing-`.` number into
+/// valid JSON, preserving the rest of the source form (`1.e5` → `1.0e5`, `.5e2`
+/// → `0.5e2`, `-.5` → `-0.5`) — exactly how sqlite renders such a number in
+/// `json()` text output. A number with digits on both sides of the `.` (or none
+/// at all) is already valid and returned verbatim.
+fn json5_fixup_number(src: &str) -> String {
+    let b = src.as_bytes();
+    let Some(dot) = src.find('.') else {
+        return String::from(src);
+    };
+    let mut out = String::with_capacity(src.len() + 2);
+    out.push_str(&src[..dot]);
+    if !(dot > 0 && b[dot - 1].is_ascii_digit()) {
+        out.push('0'); // a leading `.` (or `-.`) becomes `0.`
+    }
+    out.push('.');
+    if !b.get(dot + 1).is_some_and(u8::is_ascii_digit) {
+        out.push('0'); // a trailing `.` (before `e`/end) becomes `.0`
+    }
+    out.push_str(&src[dot + 1..]);
+    out
 }
 
 /// Parse a JSON5 real-number token. `f64::from_str` already accepts a leading or
