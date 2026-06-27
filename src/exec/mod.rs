@@ -13791,25 +13791,37 @@ impl Connection {
                 if let ResultColumn::Expr { expr, .. } = rc {
                     reject_filter_on_non_aggregate(expr, &is_agg)?;
                     reject_invalid_window_function(expr, &is_agg)?;
+                    reject_star_argument(expr)?;
                 }
             }
             if let Some(w) = &sel.where_clause {
                 reject_filter_on_non_aggregate(w, &is_agg)?;
+                reject_star_argument(w)?;
             }
             if let Some(h) = &sel.having {
                 reject_filter_on_non_aggregate(h, &is_agg)?;
+                // A `*` arg in HAVING is only reached once the HAVING itself is
+                // valid: SQLite reports `HAVING clause on a non-aggregate query`
+                // ahead of the arity error, so defer the star check to a genuine
+                // aggregate context (a GROUP BY or a result-column aggregate).
+                if !sel.group_by.is_empty() || self.has_result_aggregate(sel) {
+                    reject_star_argument(h)?;
+                }
             }
             for g in &sel.group_by {
                 reject_filter_on_non_aggregate(g, &is_agg)?;
+                reject_star_argument(g)?;
             }
             for t in &sel.order_by {
                 reject_filter_on_non_aggregate(&t.expr, &is_agg)?;
                 reject_invalid_window_function(&t.expr, &is_agg)?;
+                reject_star_argument(&t.expr)?;
             }
             if let Some(from) = &sel.from {
                 for j in &from.joins {
                     if let Some(on) = &j.on {
                         reject_filter_on_non_aggregate(on, &is_agg)?;
+                        reject_star_argument(on)?;
                     }
                 }
             }
@@ -19778,6 +19790,34 @@ fn reject_invalid_window_function(
     match found {
         Some(name) => Err(Error::Error(alloc::format!(
             "{name}() may not be used as a window function"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Reject a `*` argument on any function but `count`. SQLite accepts the `*`
+/// wildcard form only for `count(*)`; every other call — aggregate or scalar —
+/// gets `wrong number of arguments to function NAME()` at prepare time (even
+/// over an empty input), e.g. `sum(*)`, `min(*)`, `group_concat(*)`, `abs(*)`.
+/// The walk stops at subquery boundaries (each nested query validates itself).
+fn reject_star_argument(e: &Expr) -> Result<()> {
+    let mut found: Option<String> = None;
+    window::visit(e, &mut |n| {
+        if found.is_some() {
+            return;
+        }
+        if let Expr::Function {
+            name, star: true, ..
+        } = n
+        {
+            if !name.eq_ignore_ascii_case("count") {
+                found = Some(name.clone());
+            }
+        }
+    });
+    match found {
+        Some(name) => Err(Error::Error(alloc::format!(
+            "wrong number of arguments to function {name}()"
         ))),
         None => Ok(()),
     }

@@ -261,8 +261,13 @@ rejected at prepare time with `NAME() may not be used as a window function` —
 covering *both* the VDBE window path (a real base table) and the tree-walker
 path (a subquery source), in the projection and in `ORDER BY`; only the eleven
 built-in window functions and the true aggregates (which double as window
-functions, including single-arg `min`/`max`) stay legal there — all byte-exact
-vs `sqlite3` 3.50.4.
+functions, including single-arg `min`/`max`) stay legal there; and the `*`
+wildcard **argument** is now accepted only for `count(*)` — every other call,
+aggregate or scalar (`sum(*)`, `min(*)`, `group_concat(*)`, `abs(*)`,
+`length(*)`), is rejected at prepare time with `wrong number of arguments to
+function NAME()` in every clause position, while in a non-aggregate query the
+`HAVING clause on a non-aggregate query` check still outranks the arity error —
+all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
