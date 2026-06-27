@@ -326,8 +326,10 @@ reach neither check. `reject_aggregate_arity_in_select` walks every clause
 (result list / WHERE / HAVING / GROUP BY / ORDER BY / join `ON`) at the top of
 `run_core` — before the VDBE fast-path — applying SQLite's bound counts (`count`
 0–1; `group_concat`/`string_agg`/`json_group_object` up to 2; the rest exactly
-1) while leaving scalar multi-arg `min`/`max` alone. All byte-exact vs `sqlite3`
-3.50.4.
+1) while leaving scalar multi-arg `min`/`max` alone. The same guard covers an
+aggregate used as a **window function** (`sum(a, b) OVER ()`, `sum() OVER ()`),
+which graphite previously ran silently; the eleven built-in window functions
+keep their own arity. All byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the

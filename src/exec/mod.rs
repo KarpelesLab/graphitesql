@@ -13661,11 +13661,14 @@ impl Connection {
 
     /// The arity guard for one expression — see `reject_aggregate_arity_in_select`.
     /// Walks `e` (stopping at subquery boundaries, which validate themselves) for
-    /// each plain-aggregate call (`over: None`); the bounds mirror
-    /// `eval_aggregated`'s exactly so a statically-rejected call is one the
+    /// each aggregate call, whether plain or used as a window function (`agg(…)
+    /// OVER (…)` — SQLite arity-checks the windowed form the same way); the bounds
+    /// mirror `eval_aggregated`'s exactly so a statically-rejected call is one the
     /// evaluator would also reject. A registered UDAF carries its own arity, and
     /// `min`/`max` count as aggregates only at one argument (the multi-arg forms
-    /// are scalar) — both excluded by `func::is_aggregate_call`.
+    /// are scalar) — both excluded by `func::is_aggregate_call`. The built-in
+    /// window functions (`row_number`, `lag`, …) are not aggregates, so
+    /// `is_aggregate_call` filters them out and their arity is left untouched.
     fn reject_aggregate_arity(&self, e: &Expr) -> Result<()> {
         let mut err: Option<Error> = None;
         window::visit(e, &mut |n| {
@@ -13673,11 +13676,7 @@ impl Connection {
                 return;
             }
             if let Expr::Function {
-                name,
-                args,
-                star,
-                over: None,
-                ..
+                name, args, star, ..
             } = n
             {
                 let lname = name.to_ascii_lowercase();

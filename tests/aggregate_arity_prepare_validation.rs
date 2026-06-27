@@ -89,6 +89,40 @@ fn arity_is_checked_in_every_clause() {
 }
 
 #[test]
+fn an_aggregate_used_as_a_window_is_arity_checked_too() {
+    // `agg(...) OVER (...)` validates the aggregate's argument count exactly as
+    // the plain form does — graphite used to skip the windowed shape and return
+    // rows silently. The built-in window functions keep their own arity rules.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    assert_eq!(
+        err_on(&c, "SELECT sum(a, b) OVER () FROM t"),
+        "wrong number of arguments to function sum()"
+    );
+    assert_eq!(
+        err_on(&c, "SELECT sum() OVER () FROM t"),
+        "wrong number of arguments to function sum()"
+    );
+    assert_eq!(
+        err_on(&c, "SELECT count(a, b) OVER () FROM t"),
+        "wrong number of arguments to function count()"
+    );
+    assert_eq!(
+        err_on(&c, "SELECT group_concat(a, b, a) OVER () FROM t"),
+        "wrong number of arguments to function group_concat()"
+    );
+    // A built-in window function with two args is not an aggregate-arity error.
+    c.execute("INSERT INTO t VALUES(1, 2), (3, 4)").unwrap();
+    assert_eq!(
+        c.query("SELECT nth_value(a, 1) OVER (ORDER BY a) FROM t")
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn legitimate_arities_are_still_accepted() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a, b)").unwrap();
@@ -164,6 +198,12 @@ fn matches_sqlite_cli() {
         "CREATE TABLE t(a); SELECT a FROM t WHERE sum()",
         "CREATE TABLE t(a); SELECT a FROM t WHERE sum(a, a)",
         "CREATE TABLE t(a); SELECT sum(count(1, 2)) FROM t",
+        // Aggregates used as window functions are arity-checked the same way.
+        "CREATE TABLE t(a,b); SELECT sum(a, b) OVER () FROM t",
+        "CREATE TABLE t(a,b); SELECT sum() OVER () FROM t",
+        "CREATE TABLE t(a,b); SELECT group_concat(a, b, a) OVER () FROM t",
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); SELECT sum(a) OVER (), group_concat(a,'-') OVER () FROM t",
+        "CREATE TABLE t(a); INSERT INTO t VALUES(1),(2); SELECT row_number() OVER (ORDER BY a), nth_value(a,1) OVER (ORDER BY a) FROM t",
         // Legitimate forms still compute / report the right value.
         "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,10),(2,20); SELECT sum(a), count(*), count(a), count(), total(a), group_concat(a), group_concat(a,'-') FROM t",
         "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,10),(2,20); SELECT json_group_object(a,b) FROM t",
