@@ -6452,8 +6452,15 @@ impl Connection {
         // DML may bind a bare name to NEW/OLD), so a bogus column errors even when
         // the table has no rows, matching sqlite. See `validate_dml_refs`.
         if self.outer_scope.borrow().is_empty() {
+            // `ORDER BY` (with the LIMIT extension) takes no alias and names only
+            // the target's columns, so it resolves exactly like `WHERE`.
+            let mut refs: Vec<&Expr> = Vec::new();
             if let Some(w) = &del.where_clause {
-                self.validate_dml_refs(&del.table, &meta.columns, &[w])?;
+                refs.push(w);
+            }
+            refs.extend(del.order_by.iter().map(|o| &o.expr));
+            if !refs.is_empty() {
+                self.validate_dml_refs(&del.table, &meta.columns, &refs)?;
             }
         }
         if meta.without_rowid {
@@ -6599,6 +6606,9 @@ impl Connection {
             if let Some(w) = &upd.where_clause {
                 refs.push(w);
             }
+            // `ORDER BY` (with the LIMIT extension) names only the target's
+            // columns — no alias scope — so it resolves like `WHERE`.
+            refs.extend(upd.order_by.iter().map(|o| &o.expr));
             self.validate_dml_refs(&upd.table, &meta.columns, &refs)?;
         }
         if meta.without_rowid {
@@ -13661,22 +13671,30 @@ impl Connection {
                 targets.push(on);
             }
         }
-        // `GROUP BY`/`HAVING`/`ORDER BY` may name an output alias or (for
-        // GROUP/ORDER) a positional ordinal, neither of which appears in
-        // `columns` — so only a *qualified* ref there is safe to check: a
-        // `t.col` qualifier is never an alias or an ordinal, so it must resolve
-        // to a base column. Bare names in these clauses are left to lazy
-        // resolution. Projection/`WHERE`/`ON` (the `targets` above) check every
-        // ref, qualified or not.
-        let mut qualified_only: Vec<&Expr> = Vec::new();
+        // `GROUP BY`/`HAVING`/`ORDER BY` may name an output alias (resolved
+        // ahead of a base column) or a positional ordinal — neither of which is
+        // a base column in `columns`. A *qualified* ref (`t.col`) is never an
+        // alias or an ordinal, so it must resolve to a base column. A *bare* ref
+        // is a base column unless it matches an output alias (an ordinal is an
+        // integer literal, never a column ref, so it is skipped by the walk); so
+        // collect the explicit aliases and exempt a bare name that matches one.
+        let aliases: Vec<&str> = sel
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                ResultColumn::Expr { alias: Some(a), .. } => Some(a.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut clause_refs: Vec<&Expr> = Vec::new();
         for g in &sel.group_by {
-            qualified_only.push(g);
+            clause_refs.push(g);
         }
         if let Some(h) = &sel.having {
-            qualified_only.push(h);
+            clause_refs.push(h);
         }
         for o in &sel.order_by {
-            qualified_only.push(&o.expr);
+            clause_refs.push(&o.expr);
         }
 
         // Resolve one reference against `columns`; `None` if it resolves (or is a
@@ -13715,15 +13733,20 @@ impl Connection {
                 }
             });
         }
-        for e in qualified_only {
+        for e in clause_refs {
             if missing.is_some() {
                 break;
             }
             walk_shallow_columns(e, &mut |table, column| {
-                // Only qualified refs are unambiguous here (a bare name may be an
-                // output alias or a positional ordinal).
-                if missing.is_none() && table.is_some() {
+                if missing.is_some() {
+                    return;
+                }
+                // A qualified ref is always a base column. A bare name is too,
+                // unless it matches an output alias (which takes precedence).
+                if table.is_some() {
                     missing = column_missing(table, column);
+                } else if !aliases.iter().any(|a| a.eq_ignore_ascii_case(column)) {
+                    missing = column_missing(None, column);
                 }
             });
         }

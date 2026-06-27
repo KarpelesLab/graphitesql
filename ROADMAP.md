@@ -524,6 +524,25 @@ text-preserving CREATE-text edits).
     full rows and rejects any wider than one column; single-column subqueries
     (multi-row and table-backed included) are unchanged
     (`tests/in_select_column_count.rs`).
+  - **`GROUP BY`/`HAVING`/`ORDER BY` reject a missing column (done).** sqlite
+    resolves every reference at prepare time, so `SELECT count(*) FROM t GROUP
+    BY a HAVING zzz` is `no such column: zzz` whether or not the table is empty.
+    graphite resolved these clauses lazily — reporting the wrong error (`misuse
+    of aggregate function count()`) or silently returning no rows.
+    `validate_columns_exist` now checks bare (not only qualified) names in these
+    clauses against the FROM scope, exempting an explicit output alias (which
+    takes precedence) and positional ordinals. An output alias, an ordinal, and
+    a base column the projection does not select all stay valid; a derived-table
+    (`FROM (SELECT …)`) source remains lazy, as before
+    (`tests/group_having_order_missing_column.rs`).
+  - **`UPDATE`/`DELETE … ORDER BY` rejects a missing column (done).** The
+    update/delete-`LIMIT` extension's `ORDER BY` is resolved at prepare time by
+    sqlite, so a non-column sort key is `no such column` even over an empty
+    table; graphite validated only the `WHERE`/`SET` expressions eagerly and
+    left `ORDER BY` to lazy per-row resolution (silently accepted when no row
+    matched). `ORDER BY` there has no alias scope, so it now feeds
+    `validate_dml_refs` alongside `WHERE`/`SET`; `LIMIT`/`OFFSET` column refs
+    already errored (`tests/dml_order_by_missing_column.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
