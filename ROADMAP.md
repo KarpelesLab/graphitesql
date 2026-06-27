@@ -350,6 +350,10 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   `tests/offset_alias.rs`. *(Residual, opposite direction: graphite is still too
   lenient on `AS <reserved-keyword>` aliases — it accepts `SELECT 1 AS limit`,
   which sqlite rejects. Low harm, as it only admits otherwise-invalid SQL.)*
+- **`VACUUM INTO` existing-target message — DONE.** Overwriting an existing file
+  reported `output file already exists: <path>`; SQLite's message is exactly
+  `output file already exists` with no path appended. Dropped the suffix in
+  `vacuum_write_into` (`src/exec/mod.rs`). `tests/vacuum_into.rs`.
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a

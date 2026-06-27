@@ -117,8 +117,13 @@ fn vacuum_into_existing_file_errors() {
     std::fs::write(&out, b"not empty").unwrap();
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a)").unwrap();
-    // SQLite refuses to overwrite an existing target.
-    assert!(c.execute(&format!("VACUUM INTO '{out}'")).is_err());
+    // SQLite refuses to overwrite an existing target, with this exact message
+    // (no path appended) — verified against the sqlite3 3.50.4 CLI.
+    let err = c.execute(&format!("VACUUM INTO '{out}'")).unwrap_err();
+    assert_eq!(
+        err.to_string().trim_start_matches("error: "),
+        "output file already exists"
+    );
     let _ = std::fs::remove_file(&out);
 }
 

@@ -3915,9 +3915,8 @@ impl Connection {
             other => eval::to_text(&other),
         };
         if std::path::Path::new(&path).exists() {
-            return Err(Error::Error(alloc::format!(
-                "output file already exists: {path}"
-            )));
+            // SQLite's message is exactly this — no path is appended.
+            return Err(Error::Error("output file already exists".into()));
         }
         let user_version = self.backend.source().header().user_version;
         let mut dst = Connection::create(&path)?;
