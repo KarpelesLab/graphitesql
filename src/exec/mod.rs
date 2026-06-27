@@ -4101,6 +4101,58 @@ impl Connection {
         })
     }
 
+    /// SQLite resolves every scalar function call inside a CHECK or
+    /// generated-column expression at CREATE time, rejecting an unknown function
+    /// (`no such function: NAME`) or a wrong argument count (`wrong number of
+    /// arguments to function NAME()`) before the table is created — graphite only
+    /// noticed at row-evaluation time. Dry-resolve each call by invoking the
+    /// scalar evaluator with NULL stand-in arguments: the count is preserved (so
+    /// the arity guard fires) and an unknown name reaches the `no such function`
+    /// arm, while NULL operands keep the call from doing any real work. Only those
+    /// two resolution errors are surfaced; any other error (a builtin that rejects
+    /// NULL, etc.) is expected here and ignored. The RNG is snapshotted and
+    /// restored so a non-deterministic call (`random()` is legal in a CHECK)
+    /// leaves no observable side effect. Column resolution is validated separately
+    /// (and first), matching sqlite for the common single-fault expression.
+    fn reject_unresolved_functions(&self, e: &Expr) -> Result<()> {
+        let params = Params::default();
+        let ctx = EvalCtx::rowless(&params).with_subqueries(self);
+        let saved_rng = self.rng_state.get();
+        let mut err: Option<Error> = None;
+        window::visit(e, &mut |n| {
+            if err.is_some() {
+                return;
+            }
+            if let Expr::Function {
+                name,
+                args,
+                star,
+                over,
+                ..
+            } = n
+            {
+                // Window calls and aggregate calls are handled by their own
+                // dedicated checks/wordings; only plain scalar positions resolve
+                // here.
+                if over.is_some() || func::is_aggregate_call(name, args.len(), *star) {
+                    return;
+                }
+                let null_args: Vec<Expr> = core::iter::repeat_with(|| Expr::Literal(Literal::Null))
+                    .take(args.len())
+                    .collect();
+                if let Err(Error::Error(m)) = func::eval_scalar(name, &null_args, *star, &ctx) {
+                    if m.starts_with("no such function: ")
+                        || m.starts_with("wrong number of arguments to function ")
+                    {
+                        err = Some(Error::Error(m));
+                    }
+                }
+            }
+        });
+        self.rng_state.set(saved_rng);
+        err.map_or(Ok(()), Err)
+    }
+
     fn exec_create_table(&mut self, ct: &CreateTable, sql_text: &str) -> Result<()> {
         if let Some(select) = &ct.as_select {
             return self.exec_create_table_as_select(ct, select);
@@ -4265,6 +4317,14 @@ impl Connection {
                 if let Some(col) = bad {
                     return Err(Error::Error(format!("no such column: {col}")));
                 }
+                // Every scalar function the expression calls must exist with a
+                // valid argument count, like sqlite (which resolves them at CREATE).
+                match k {
+                    ColumnConstraint::Check(e, _) | ColumnConstraint::Generated { expr: e, .. } => {
+                        self.reject_unresolved_functions(e)?;
+                    }
+                    _ => {}
+                }
                 // A generated column may *reference* its table's columns but not via
                 // a `table.col` qualifier; SQLite rejects the dotted form even though
                 // it resolves. (A CHECK accepts the same dotted reference.)
@@ -4304,6 +4364,7 @@ impl Connection {
                 if let Some(col) = unknown_column_ref(e, &known, true, Some(&ct.name)) {
                     return Err(Error::Error(format!("no such column: {col}")));
                 }
+                self.reject_unresolved_functions(e)?;
             }
             // A table-level FOREIGN KEY's *local* columns must each be a declared
             // column (a generated column counts; `rowid` does not), as SQLite
