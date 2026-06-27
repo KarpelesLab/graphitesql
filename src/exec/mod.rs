@@ -5668,6 +5668,10 @@ impl Connection {
             return self.exec_insert_without_rowid(ins, &meta, &rows, is_default_values, params);
         }
         let n_cols = meta.columns.len();
+        // Sentinel target position meaning "the rowid pseudo-column" (a table
+        // with no INTEGER PRIMARY KEY to alias it) — handled below in the value
+        // loop and rowid determination rather than written into a real column.
+        const ROWID_TARGET: usize = usize::MAX;
 
         // Map the provided column list (or all columns) to table positions.
         let target: Vec<usize> = if ins.columns.is_empty() {
@@ -5680,14 +5684,24 @@ impl Connection {
         } else {
             let mut t = Vec::new();
             for name in &ins.columns {
-                let pos = meta
+                match meta
                     .columns
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(name))
-                    .ok_or_else(|| {
-                        Error::Error(format!("table {} has no column named {name}", ins.table))
-                    })?;
-                t.push(pos);
+                {
+                    Some(pos) => t.push(pos),
+                    // `rowid`/`_rowid_`/`oid` name the rowid (when no real column
+                    // shadows them). An INTEGER PRIMARY KEY *is* the rowid, so
+                    // target that column and reuse its coercion/auto-fill path;
+                    // otherwise mark the synthetic rowid target handled below.
+                    None if is_rowid_alias(name) => t.push(meta.ipk.unwrap_or(ROWID_TARGET)),
+                    None => {
+                        return Err(Error::Error(format!(
+                            "table {} has no column named {name}",
+                            ins.table
+                        )))
+                    }
+                }
             }
             t
         };
@@ -5727,7 +5741,12 @@ impl Connection {
                     None => Ok(Value::Null),
                 })
                 .collect::<Result<_>>()?;
+            let mut explicit_rowid: Option<Value> = None;
             for (i, e) in row_exprs.iter().enumerate() {
+                if target[i] == ROWID_TARGET {
+                    explicit_rowid = Some(eval::eval(e, &ctx)?);
+                    continue;
+                }
                 if meta.is_generated(target[i]) {
                     return Err(Error::Error(format!(
                         "cannot INSERT into generated column \"{}\"",
@@ -5736,6 +5755,16 @@ impl Connection {
                 }
                 values[target[i]] = eval::eval(e, &ctx)?;
             }
+            // INTEGER affinity then an integer check, matching the IPK path: '5'
+            // and 5.0 become 5, NULL means "auto", and 1.5/'x'/a blob mismatch.
+            let explicit_rowid: Option<i64> = match explicit_rowid {
+                Some(v) => match eval::Affinity::Integer.coerce(v) {
+                    Value::Null => None,
+                    Value::Integer(i) => Some(i),
+                    _ => return Err(Error::Error("datatype mismatch".into())),
+                },
+                None => None,
+            };
             apply_column_affinity(&meta, &mut values);
             self.materialize_generated(&meta, &mut values, params)?;
 
@@ -5753,6 +5782,13 @@ impl Connection {
                     };
                     // Advance the auto counter past an explicit rowid, saturating
                     // so a row at `i64::MAX` does not overflow.
+                    next_auto = next_auto.max(r.saturating_add(1));
+                    r
+                }
+                // An explicit rowid supplied via the `rowid` pseudo-column (a
+                // table with no INTEGER PRIMARY KEY to alias it).
+                _ if explicit_rowid.is_some() => {
+                    let r = explicit_rowid.unwrap();
                     next_auto = next_auto.max(r.saturating_add(1));
                     r
                 }
@@ -20956,6 +20992,15 @@ fn col_index(e: &Expr, columns: &[ColumnInfo]) -> Option<usize> {
 /// a row.
 fn const_value(e: &Expr, params: &Params) -> Option<Value> {
     eval::eval(e, &EvalCtx::rowless(params)).ok()
+}
+
+/// Whether `name` is one of SQLite's rowid aliases (`rowid`, `_rowid_`, `oid`),
+/// case-insensitively — usable as a column name only when no real column shadows it.
+fn is_rowid_alias(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "rowid" | "_rowid_" | "oid"
+    )
 }
 
 /// Coerce each value to its column's type affinity (SQLite storage affinity).

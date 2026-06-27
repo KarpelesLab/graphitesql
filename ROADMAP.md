@@ -543,6 +543,16 @@ text-preserving CREATE-text edits).
     matched). `ORDER BY` there has no alias scope, so it now feeds
     `validate_dml_refs` alongside `WHERE`/`SET`; `LIMIT`/`OFFSET` column refs
     already errored (`tests/dml_order_by_missing_column.rs`).
+  - **`rowid`/`_rowid_`/`oid` accepted as an INSERT target column (done).**
+    sqlite lets an INSERT column list name the rowid alias to supply the rowid
+    explicitly (`INSERT INTO t(rowid, a) VALUES(5, 1)`); graphite rejected it as
+    `table … has no column named rowid`. The alias now maps to the rowid (or, on
+    a table with an INTEGER PRIMARY KEY, to that column so the IPK coercion and
+    "last write wins" both fall out for free). The supplied value gets INTEGER
+    affinity then an integer check — `'5'`/`5.0` → `5`, `NULL` → auto-assign,
+    `1.5`/`'x'`/blob → `datatype mismatch` — matching the IPK path. A real column
+    that shadows the name keeps winning, and WITHOUT ROWID tables still reject it
+    (`tests/insert_rowid_column.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
