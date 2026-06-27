@@ -2870,6 +2870,13 @@ impl Connection {
             if fks.is_empty() {
                 continue;
             }
+            // A structurally malformed FK aborts the whole check with a "foreign
+            // key mismatch", regardless of how many child rows exist.
+            for fk in &fks {
+                if self.fk_is_mismatch(fk)? {
+                    return Err(Self::fk_mismatch_err(table, &fk.ref_table));
+                }
+            }
             let n = fks.len();
             for (rowid, values) in self.scan_table(&meta)? {
                 for (i, fk) in fks.iter().enumerate() {
@@ -4700,6 +4707,72 @@ impl Connection {
         Ok(fk)
     }
 
+    /// SQLite's `foreign key mismatch - "<child>" referencing "<parent>"` error.
+    fn fk_mismatch_err(child: &str, parent: &str) -> Error {
+        Error::Error(format!(
+            "foreign key mismatch - \"{child}\" referencing \"{parent}\""
+        ))
+    }
+
+    /// Whether `fk` (declared on the child table) is *structurally* malformed —
+    /// SQLite's "foreign key mismatch". An FK is well-formed only when its
+    /// referenced columns (explicit, or the parent's PRIMARY KEY when omitted)
+    /// exist, match the child column count, and are collectively covered by the
+    /// parent's PRIMARY KEY or a non-partial UNIQUE index whose column set is
+    /// exactly the referenced set. A missing *parent table* is NOT a mismatch
+    /// (SQLite surfaces those as ordinary row violations / `no such table`), so
+    /// that case is left to the row-level paths.
+    fn fk_is_mismatch(&self, fk: &ForeignKey) -> Result<bool> {
+        if self.schema.table(&fk.ref_table).is_none() {
+            return Ok(false);
+        }
+        let pmeta = self.table_meta(&fk.ref_table, None)?;
+        let ref_cols = if fk.ref_columns.is_empty() {
+            self.primary_key_columns(&fk.ref_table)?
+        } else {
+            fk.ref_columns.clone()
+        };
+        // The referenced set must be non-empty (a parent with no PRIMARY KEY and
+        // no explicit columns is a mismatch) and match the child column count.
+        if ref_cols.is_empty() || ref_cols.len() != fk.columns.len() {
+            return Ok(true);
+        }
+        // Every referenced column must exist in the parent.
+        if !ref_cols.iter().all(|c| {
+            pmeta
+                .columns
+                .iter()
+                .any(|pc| pc.name.eq_ignore_ascii_case(c))
+        }) {
+            return Ok(true);
+        }
+        // The referenced columns must form a unique key: the parent's PRIMARY
+        // KEY, or a non-partial UNIQUE index whose column set is exactly the
+        // referenced set (order-independent, as SQLite compares as sets).
+        let same_set = |a: &[String], b: &[String]| {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|x| b.iter().any(|y| y.eq_ignore_ascii_case(x)))
+        };
+        let pk = self.primary_key_columns(&fk.ref_table)?;
+        if !pk.is_empty() && same_set(&pk, &ref_cols) {
+            return Ok(false);
+        }
+        for idx in self.indexes_of(&fk.ref_table)? {
+            if idx.unique && idx.partial.is_none() {
+                let names: Vec<String> = idx
+                    .cols
+                    .iter()
+                    .map(|&p| pmeta.columns[p].name.clone())
+                    .collect();
+                if same_set(&names, &ref_cols) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// The primary-key column names of `table` (the INTEGER PRIMARY KEY, or a
     /// declared PRIMARY KEY constraint).
     fn primary_key_columns(&self, table: &str) -> Result<Vec<String>> {
@@ -4735,6 +4808,12 @@ impl Connection {
             return Ok(());
         }
         for fk in self.foreign_keys_of(table)? {
+            // A structurally malformed FK (bad parent columns / arity / not a
+            // unique key) is a "foreign key mismatch", reported before any
+            // deferred handling or row lookup.
+            if self.fk_is_mismatch(&fk)? {
+                return Err(Self::fk_mismatch_err(table, &fk.ref_table));
+            }
             // A `DEFERRABLE INITIALLY DEFERRED` key is checked at COMMIT, not now
             // — but only inside an explicit transaction. In autocommit the
             // statement *is* the transaction, so its implicit commit is immediate.

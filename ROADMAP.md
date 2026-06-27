@@ -315,6 +315,21 @@ only the text serializer was canonicalizing — all byte-exact vs `sqlite3` 3.50
   the collision and picks `new` vs the existing name by index. A missing old column
   stays the unwrapped `no such column: "old"`; `ADD COLUMN` duplicates keep their
   own unwrapped message. `tests/alter.rs`.
+- **Foreign key mismatch detection — DONE.** A structurally malformed FK now
+  reports SQLite's `foreign key mismatch - "<child>" referencing "<parent>"`
+  (graphite returned no rows from `PRAGMA foreign_key_check` and a misleading
+  `no such column` / `FOREIGN KEY constraint failed` at write time). A new
+  `fk_is_mismatch` helper flags an FK whose referenced columns (explicit, or the
+  parent PRIMARY KEY when omitted) don't exist, don't match the child column
+  count, or aren't collectively the parent's PRIMARY KEY or a non-partial UNIQUE
+  index (column set compared order-independently). It fires from
+  `pragma_foreign_key_check` (per FK, before scanning rows, independent of the
+  `foreign_keys` pragma) and from `check_fk_child` (INSERT/UPDATE enforcement,
+  ahead of the deferred/row-lookup logic), so it outranks the row-level checks.
+  `tests/fk_mismatch.rs`. (Residual: a missing parent *table* is left as-is —
+  SQLite surfaces it as an ordinary row violation in `foreign_key_check` but as
+  `no such table: main.<t>` at write time; that split-behavior + the `main.`
+  qualifier is a separate, narrower divergence not handled here.)
 - **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
   are still validated per-row, so an unreached row (empty / fully-filtered table)
   is accepted where SQLite rejects at prepare time. All want the same fix — a
