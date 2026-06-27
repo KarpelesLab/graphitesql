@@ -7,9 +7,11 @@
 //! including the trailing semicolon and `IF NOT EXISTS`, so every schema row's
 //! `sql` diverged. Verified against the sqlite3 3.50.4 CLI.
 //!
-//! Schema-qualified (`CREATE TABLE aux.t …`) and `TEMP` creates still go through
-//! graphite's AST reprinter (quoted identifiers) and are intentionally not
-//! covered here.
+//! `TEMP` creates store the same canonical form (the `TEMP` modifier is
+//! dropped), schema-qualified creates (`CREATE TABLE aux.t …`) drop the
+//! `schema.` prefix, and `CREATE TABLE … AS SELECT` writes its column list with
+//! SQLite's `identPut` quoting (bare when safe, no spaces after commas) — all
+//! verified against the sqlite3 CLI below.
 
 #![cfg(feature = "std")]
 
@@ -79,7 +81,55 @@ fn matches_sqlite_cli() {
         // View and trigger (the trigger body's internal `;` is preserved).
         "CREATE TABLE t(a); CREATE VIEW IF NOT EXISTS v AS SELECT a+1 FROM t; SELECT sql FROM sqlite_master WHERE type='view'",
         "CREATE TABLE t(a); CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END; SELECT sql FROM sqlite_master WHERE type='trigger'",
+        // TEMP creates store the canonical (TEMP-stripped) head.
+        "CREATE TEMP TABLE t(a,b); SELECT sql FROM sqlite_temp_master",
+        "CREATE TEMPORARY TABLE t(a,   b); SELECT sql FROM sqlite_temp_master",
+        // CREATE TABLE … AS SELECT: identPut quoting, no spaces after commas.
+        "CREATE TABLE s(a,c); CREATE TABLE t AS SELECT a, c FROM s; SELECT sql FROM sqlite_master WHERE name='t'",
+        "CREATE TABLE s(a,c); CREATE TABLE t AS SELECT a+1 AS x, c FROM s; SELECT sql FROM sqlite_master WHERE name='t'",
+        "CREATE TABLE s(a); CREATE TABLE t AS SELECT a AS \"x y\" FROM s; SELECT sql FROM sqlite_master WHERE name='t'",
+        // A column named like a keyword is quoted; a plain mixed-case one is not.
+        "CREATE TABLE s(a); CREATE TABLE t AS SELECT a AS \"select\" FROM s; SELECT sql FROM sqlite_master WHERE name='t'",
+        "CREATE TABLE s(a); CREATE TABLE t AS SELECT a AS key FROM s; SELECT sql FROM sqlite_master WHERE name='t'",
+        "CREATE TABLE s(a); CREATE TABLE t AS SELECT a AS BigName FROM s; SELECT sql FROM sqlite_master WHERE name='t'",
+        // Duplicate output names get SQLite's `:N` suffix (which then needs quoting).
+        "CREATE TABLE s(a); CREATE TABLE t AS SELECT a, a FROM s; SELECT sql FROM sqlite_master WHERE name='t'",
     ] {
         assert_eq!(run("sqlite3", sql), run(g, sql), "for {sql}");
+    }
+}
+
+/// Schema-qualified creates (`CREATE TABLE aux.t …`) store the bare object name
+/// in the attached catalog, byte-identical to sqlite.
+#[test]
+fn schema_qualified_create_drops_prefix() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let dir = std::env::temp_dir();
+    for (i, body) in [
+        "CREATE TABLE aux.t(a,b)",
+        "CREATE TABLE aux.t(a INTEGER PRIMARY KEY, b TEXT)",
+        "CREATE TABLE aux.t(a,b); CREATE INDEX aux.i ON t(b)",
+        "CREATE TABLE aux.t(a); CREATE VIEW aux.v AS SELECT a FROM t",
+    ]
+    .iter()
+    .enumerate()
+    {
+        // Distinct attach-file names keep the parallel test threads independent;
+        // the file is cleared before each engine so neither sees the other's table.
+        let aux = dir.join(format!("graphite_schema_qual_{i}.db"));
+        let sql = format!(
+            "ATTACH '{}' AS aux; {body}; SELECT sql FROM aux.sqlite_master",
+            aux.display()
+        );
+        let _ = std::fs::remove_file(&aux);
+        let want = run("sqlite3", &sql);
+        let _ = std::fs::remove_file(&aux);
+        let got = run(g, &sql);
+        let _ = std::fs::remove_file(&aux);
+        assert_eq!(want, got, "for {body}");
     }
 }

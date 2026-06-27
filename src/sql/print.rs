@@ -16,6 +16,189 @@ pub fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Render an identifier the way SQLite stores generated schema text (its
+/// `identPut`): bare when the name is a "safe" token — non-empty, not starting
+/// with a digit, containing only ASCII alphanumerics and `_`, and not a
+/// keyword — otherwise double-quoted with embedded quotes doubled. This is what
+/// `CREATE TABLE … AS SELECT` writes for its column list, so the stored `sql`
+/// is byte-for-byte what sqlite would store.
+pub fn ident_smart(name: &str) -> String {
+    if ident_is_bare(name) {
+        name.to_string()
+    } else {
+        ident(name)
+    }
+}
+
+/// Whether `name` can appear unquoted in stored schema text (see [`ident_smart`]).
+fn ident_is_bare(name: &str) -> bool {
+    let b = name.as_bytes();
+    if b.is_empty() || b[0].is_ascii_digit() {
+        return false;
+    }
+    if !b.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_') {
+        return false;
+    }
+    !is_keyword(name)
+}
+
+/// Whether `name` (compared case-insensitively) is one of SQLite's SQL keywords,
+/// the set `identPut` quotes. Verified exhaustively against sqlite3 3.50.4.
+fn is_keyword(name: &str) -> bool {
+    /// SQLite's keyword list, lowercased and sorted for `binary_search`.
+    const KEYWORDS: &[&str] = &[
+        "abort",
+        "action",
+        "add",
+        "after",
+        "all",
+        "alter",
+        "always",
+        "analyze",
+        "and",
+        "as",
+        "asc",
+        "attach",
+        "autoincrement",
+        "before",
+        "begin",
+        "between",
+        "by",
+        "cascade",
+        "case",
+        "cast",
+        "check",
+        "collate",
+        "column",
+        "commit",
+        "conflict",
+        "constraint",
+        "create",
+        "cross",
+        "current",
+        "current_date",
+        "current_time",
+        "current_timestamp",
+        "database",
+        "default",
+        "deferrable",
+        "deferred",
+        "delete",
+        "desc",
+        "detach",
+        "distinct",
+        "do",
+        "drop",
+        "each",
+        "else",
+        "end",
+        "escape",
+        "except",
+        "exclude",
+        "exclusive",
+        "exists",
+        "explain",
+        "fail",
+        "filter",
+        "first",
+        "following",
+        "for",
+        "foreign",
+        "from",
+        "full",
+        "generated",
+        "glob",
+        "group",
+        "groups",
+        "having",
+        "if",
+        "ignore",
+        "immediate",
+        "in",
+        "index",
+        "indexed",
+        "initially",
+        "inner",
+        "insert",
+        "instead",
+        "intersect",
+        "into",
+        "is",
+        "isnull",
+        "join",
+        "key",
+        "last",
+        "left",
+        "like",
+        "limit",
+        "match",
+        "materialized",
+        "natural",
+        "no",
+        "not",
+        "nothing",
+        "notnull",
+        "null",
+        "nulls",
+        "of",
+        "offset",
+        "on",
+        "or",
+        "order",
+        "others",
+        "outer",
+        "over",
+        "partition",
+        "plan",
+        "pragma",
+        "preceding",
+        "primary",
+        "query",
+        "raise",
+        "range",
+        "recursive",
+        "references",
+        "regexp",
+        "reindex",
+        "release",
+        "rename",
+        "replace",
+        "restrict",
+        "returning",
+        "right",
+        "rollback",
+        "row",
+        "rows",
+        "savepoint",
+        "select",
+        "set",
+        "table",
+        "temp",
+        "temporary",
+        "then",
+        "ties",
+        "to",
+        "transaction",
+        "trigger",
+        "unbounded",
+        "union",
+        "unique",
+        "update",
+        "using",
+        "vacuum",
+        "values",
+        "view",
+        "virtual",
+        "when",
+        "where",
+        "window",
+        "with",
+        "without",
+    ];
+    let lower = name.to_ascii_lowercase();
+    KEYWORDS.binary_search(&lower.as_str()).is_ok()
+}
+
 /// Render a `CREATE TABLE` statement.
 pub fn create_table(ct: &CreateTable) -> String {
     let mut parts: Vec<String> = ct.columns.iter().map(column_def).collect();

@@ -158,14 +158,11 @@ JSONB *byte offset*, not a row counter) and `fullkey`/`path` label quoting
 SELECT now renders `SCAN CONSTANT ROW` (also covering a single-row `VALUES`);
 and the `sqlite_schema.sql` text is now canonicalised the way SQLite stores it
 (regenerated `CREATE <TYPE> ` head — `IF NOT EXISTS`/`TEMP` dropped, prefix
-whitespace collapsed — plus the verbatim body with the trailing `;` removed) —
-all byte-exact vs `sqlite3` 3.50.4.
-
-A couple of `CREATE`-text corners remain on the AST reprinter (quoted
-identifiers, `", "` column separators) rather than sqlite's verbatim-from-name
-form: schema-qualified (`CREATE TABLE aux.t …`) and `TEMP` creates, and
-`CREATE TABLE … AS SELECT` (whose column list sqlite emits unquoted/space-free,
-e.g. `CREATE TABLE t(a,c)`).
+whitespace collapsed — plus the verbatim body with the trailing `;` removed),
+including the schema-qualified (`CREATE TABLE aux.t …` → bare `t`) and `TEMP`
+forms; and `CREATE TABLE … AS SELECT` now writes its column list with SQLite's
+`identPut` quoting (bare when safe, keyword-aware, no spaces after commas, e.g.
+`CREATE TABLE t(a,c)`) — all byte-exact vs `sqlite3` 3.50.4.
 
 **Remaining:**
 

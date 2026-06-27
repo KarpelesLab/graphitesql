@@ -3996,17 +3996,6 @@ impl Connection {
         if let Some(select) = &ct.as_select {
             return self.exec_create_table_as_select(ct, select);
         }
-        // The schema-qualified form (`CREATE TABLE aux.t …`) must be stored in the
-        // target database's catalog WITHOUT the `schema.` prefix — otherwise the
-        // stored SQL is invalid in that database's own namespace (and unreadable
-        // by sqlite3). Reprint the bare-name form when a qualifier was present.
-        let reprinted;
-        let sql_text = if ct.schema.is_some() {
-            reprinted = sql::print::create_table(ct);
-            reprinted.as_str()
-        } else {
-            sql_text
-        };
         if self.schema.table(&ct.name).is_some() {
             if ct.if_not_exists {
                 return Ok(());
@@ -4433,15 +4422,17 @@ impl Connection {
                 name
             })
             .collect();
-        // Build and create the resolved table `name(col1, col2, …)`.
+        // Build and create the resolved table `name(col1,col2,…)`. SQLite stores
+        // the CTAS schema with `identPut` quoting (bare when safe) and no spaces
+        // after the commas, so mirror that to stay byte-identical.
         let cols = deduped
             .iter()
-            .map(|c| crate::sql::print::ident(c))
+            .map(|c| crate::sql::print::ident_smart(c))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(",");
         let create_sql = format!(
             "CREATE TABLE {}({cols})",
-            crate::sql::print::ident(&ct.name)
+            crate::sql::print::ident_smart(&ct.name)
         );
         let Statement::CreateTable(syn) = sql::parse_one(&create_sql)? else {
             return Err(Error::Corrupt("generated CTAS schema is invalid".into()));
@@ -6957,15 +6948,6 @@ impl Connection {
     // ---- index DDL & maintenance --------------------------------------------
 
     fn exec_create_index(&mut self, ci: &CreateIndex, sql_text: &str) -> Result<()> {
-        // A schema-qualified `CREATE INDEX aux.idx …` stores its SQL bare-named
-        // in the target catalog (the `aux.` prefix is invalid there). Reprint.
-        let reprinted;
-        let sql_text = if ci.schema.is_some() {
-            reprinted = sql::print::create_index(ci);
-            reprinted.as_str()
-        } else {
-            sql_text
-        };
         if self.schema.index(&ci.name).is_some() {
             if ci.if_not_exists {
                 return Ok(());
@@ -18863,6 +18845,15 @@ fn schema_sql_name_offset(sql_text: &str) -> Option<usize> {
         && toks.get(i + 2).is_some_and(|t| kw(&t.token, "EXISTS"))
     {
         i += 3;
+    }
+    // A schema qualifier (`CREATE TABLE aux.t …`) is dropped from the stored SQL —
+    // the catalog row lives in that schema already, so the bare object name is
+    // canonical. Skip the `schema .` pair and point at the real name token.
+    if toks
+        .get(i + 1)
+        .is_some_and(|t| matches!(t.token, Token::Dot))
+    {
+        i += 2;
     }
     Some(toks.get(i)?.start)
 }
