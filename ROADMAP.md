@@ -366,6 +366,22 @@ resolution, matching SQLite's diagnostic precedence: a missing table and a
 modify-a-view error still win, but a bogus `ORDER BY` or `SET` column reports the
 limit error first. Byte-exact vs `sqlite3` 3.50.4 across ~17 permutations.
 
+A misplaced **`ORDER BY` / `LIMIT` before a compound operator** now reports the
+same message SQLite does. These clauses bind to the *whole* compound, so
+`SELECT … ORDER BY … UNION SELECT …` is rejected with `ORDER BY clause should
+come after UNION not before` (or `LIMIT clause …` when only a `LIMIT` is
+misplaced — `ORDER BY` wins when both are present), with the operator spelled out
+(`UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`). graphite previously left the
+operator unconsumed and emitted a bare `near "UNION": syntax error`. The check
+lives in the compound-select parser, right after the trailing-clause parse, and
+leaves the legal trailing form (`… UNION … ORDER BY … LIMIT …`) untouched.
+Byte-exact vs `sqlite3` 3.50.4 across ~13 permutations. *(Residual: when compound
+arms differ in width and the **right** arm is a `VALUES`, SQLite says `all VALUES
+must have the same number of terms` rather than the generic `SELECTs to the left
+and right …`; graphite desugars `VALUES` into a `SELECT` with no surviving marker,
+so distinguishing it needs an `is_values` flag threaded through the `Select` AST —
+deferred as a cosmetic message on a malformed-query edge.)*
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

@@ -608,6 +608,31 @@ impl Parser {
                 outer.limit = Some(self.expr()?);
             }
         }
+
+        // An `ORDER BY` / `LIMIT` binds to the *whole* compound, never an inner
+        // arm. If one trails this arm and a compound operator still follows
+        // (`SELECT … ORDER BY … UNION SELECT …`), SQLite names the misplaced
+        // clause — `ORDER BY` taking precedence over `LIMIT` — and the operator it
+        // should have come after. graphite otherwise left the operator unconsumed
+        // and reported a bare `near "UNION": syntax error`.
+        if !outer.order_by.is_empty() || outer.limit.is_some() {
+            if let Some(op) = self.compound_op() {
+                let clause = if outer.order_by.is_empty() {
+                    "LIMIT"
+                } else {
+                    "ORDER BY"
+                };
+                let op = match op {
+                    CompoundOp::Union => "UNION",
+                    CompoundOp::UnionAll => "UNION ALL",
+                    CompoundOp::Intersect => "INTERSECT",
+                    CompoundOp::Except => "EXCEPT",
+                };
+                return Err(Error::Parse(alloc::format!(
+                    "{clause} clause should come after {op} not before"
+                )));
+            }
+        }
         Ok(outer)
     }
 
