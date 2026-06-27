@@ -8377,6 +8377,15 @@ impl Connection {
             return Err(Error::Corrupt("schema sql is not CREATE VIEW".into()));
         };
         let result = self.run_select(&cv.select, params)?;
+        // An explicit `CREATE VIEW v(c1, …)` column list must match the body's
+        // column count; sqlite reports this when the view is *used*, not created.
+        if !cv.columns.is_empty() && cv.columns.len() != result.columns.len() {
+            return Err(Error::Error(format!(
+                "expected {} columns for '{name}' but got {}",
+                cv.columns.len(),
+                result.columns.len()
+            )));
+        }
         let label = alias.unwrap_or(name).to_string();
         // Column names: explicit view columns, else the SELECT's output labels.
         let names = if cv.columns.is_empty() {
@@ -15719,6 +15728,15 @@ impl Connection {
         let run = self.run_select(&cv.select, params);
         self.read_default.set(prev);
         let result = run?;
+        // Declared `(c1, …)` view columns must match the body's column count
+        // (reported on use, like sqlite); see `try_view`.
+        if !cv.columns.is_empty() && cv.columns.len() != result.columns.len() {
+            return Err(Error::Error(format!(
+                "expected {} columns for '{name}' but got {}",
+                cv.columns.len(),
+                result.columns.len()
+            )));
+        }
         let label = alias.unwrap_or(name).to_string();
         let names = if cv.columns.is_empty() {
             result.columns.clone()

@@ -568,6 +568,13 @@ text-preserving CREATE-text edits).
     drop column: no such column: x`. A constraint that does not name the column
     (and the dropped column's own constraints) now drops cleanly, byte-compatible
     and `integrity_check`-clean (`tests/drop_column_constraints.rs`).
+  - **`CREATE VIEW v(c1, …)` column-count mismatch rejected on use (done).** An
+    explicit view column list must declare exactly as many columns as the view's
+    body produces; sqlite accepts the `CREATE VIEW` either way and then errors
+    `expected N columns for 'v' but got M` whenever the view is referenced (FROM,
+    subquery, or join). graphite silently ignored the mismatch and returned the
+    body's columns unrenamed. The check now fires at view expansion in both the
+    main and temp/attached paths (`tests/view_column_count.rs`).
 
 ### Track B — Query planner, statistics & the VDBE
 
