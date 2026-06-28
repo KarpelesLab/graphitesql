@@ -12669,10 +12669,15 @@ impl Connection {
             // `VALUES`) must project the same number of columns. SQLite rejects a
             // mismatch; match that (errors-vs-succeeds, not exact text).
             if r.columns.len() != result.columns.len() {
-                return Err(Error::Error(if is_values {
+                // When the *right* operand of the mismatching step is itself a
+                // `VALUES` clause, SQLite reports the VALUES-specific message
+                // (regardless of the operator or whether the left is a SELECT);
+                // otherwise it names the operator at the mismatch.
+                let operand_is_values =
+                    operand.from.is_none() && is_values_projection(&operand.columns);
+                return Err(Error::Error(if is_values || operand_is_values {
                     "all VALUES must have the same number of terms".into()
                 } else {
-                    // SQLite names the specific operator at the mismatch.
                     let kw = match op {
                         CompoundOp::Union => "UNION",
                         CompoundOp::UnionAll => "UNION ALL",

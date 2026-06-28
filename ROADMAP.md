@@ -446,6 +446,19 @@ the well-formed element, silently ignoring the malformed one. The one remaining
 residual is a dirty operand where SQLite reports `row value misused` *before* the
 missing column. Byte-exact vs `sqlite3` 3.50.4 for the column-clean cases.
 
+A **compound (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) with arms of unequal
+column count** now picks its message exactly as SQLite does. SQLite chooses by the
+shape of the *right* operand of the mismatching step: when that arm is a `VALUES`
+clause it reports `all VALUES must have the same number of terms` — regardless of
+the operator and even when the left arm is an ordinary `SELECT` (`SELECT 1,2 UNION
+VALUES (1)`) — and otherwise it names the operator (`SELECTs to the left and right
+of UNION do not have the same number of result columns`). graphite previously
+emitted the operator-named message for every `VALUES`-on-the-right mismatch except
+the all-`UNION ALL` case; it now matches in every operator/arm combination, while
+a right-hand `SELECT` and a single multi-row `VALUES` with an internal mismatch
+(`VALUES (1,2),(3)`) keep their existing (already-correct) messages. Byte-exact vs
+`sqlite3` 3.50.4.
+
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite
 does. The per-column "add column" checks run first, left to right — a duplicate
