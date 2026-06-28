@@ -3596,10 +3596,19 @@ impl Connection {
             // Indexes are kept current on every write, so REINDEX is a no-op — but
             // a named target must identify a collation, table, or index, else
             // sqlite errors "unable to identify the object to be reindexed".
-            Statement::Reindex(target) => {
-                if let Some(name) = target {
+            Statement::Reindex { schema, name } => {
+                // A `schema.` qualifier is validated ahead of the object lookup:
+                // sqlite rejects an unknown database with `unknown database <x>`.
+                if let Some(db) = &schema {
+                    self.resolve_db(Some(db.as_str()))
+                        .map_err(|_| Error::Error(format!("unknown database {db}")))?;
+                }
+                if let Some(name) = name {
                     let name = name.as_str();
-                    let known = crate::value::Collation::parse(name).is_some()
+                    // A bare target may name a collation; a `schema.`-qualified one
+                    // may only be a table or index (a collation is not per-database).
+                    let known = (schema.is_none()
+                        && crate::value::Collation::parse(name).is_some())
                         || self.schema.table(name).is_some()
                         || self.schema.index(name).is_some();
                     if !known {

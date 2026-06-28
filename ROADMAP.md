@@ -490,6 +490,17 @@ database, is qualified with `*` (`SELECT * FROM x, x` over a CTE `x` →
 `<source>.<col>`. Explicit references (`SELECT a` / `SELECT x.a`) keep their
 unprefixed spelling, unchanged. Byte-exact vs `sqlite3` 3.50.4.
 
+**`REINDEX schema.name` validates its database qualifier** ahead of the object
+lookup. SQLite rejects an unknown database with `unknown database <name>` (as it
+does for `VACUUM`/`ATTACH`); graphite parsed the qualifier but threw it away,
+reporting the generic `unable to identify the object to be reindexed` for a bad
+database. The `Reindex` AST now carries `schema`/`name`, the executor resolves
+the qualifier first, and two parity points fall out: a *known* database with an
+unidentifiable object still says `unable to identify …` (`REINDEX main.nope`),
+and a collation may be reindexed only *unqualified* — `REINDEX nocase` is a
+no-op but `REINDEX main.nocase` is `unable to identify …` (a collation is not a
+per-database object). Byte-exact vs `sqlite3` 3.50.4.
+
 **Structural DDL on an internal `sqlite_` table is now rejected** rather than
 silently performed. SQLite forbids `ALTER`, `DROP TABLE`, and `CREATE INDEX` on
 any table whose name begins with `sqlite_` — the schema catalog

@@ -63,11 +63,18 @@ pub enum Statement {
         /// The optional `INTO <file>` target path expression.
         into: Option<Box<Expr>>,
     },
-    /// `REINDEX [name]` — accepted as a no-op: graphitesql rebuilds an index
-    /// whenever the underlying rows change, so indexes are always current. The
-    /// optional target (a collation, table, or index name) is kept only to
-    /// validate it, since SQLite rejects an unidentifiable one.
-    Reindex(Option<String>),
+    /// `REINDEX [schema.]name` — accepted as a no-op: graphitesql rebuilds an
+    /// index whenever the underlying rows change, so indexes are always current.
+    /// The optional target (a collation, table, or index name) is kept only to
+    /// validate it, since SQLite rejects an unidentifiable one; the optional
+    /// `schema.` qualifier is validated too (an unknown database is rejected
+    /// ahead of the object lookup).
+    Reindex {
+        /// Optional `schema.` (database) qualifier on the target.
+        schema: Option<String>,
+        /// The collation / table / index name, if any.
+        name: Option<String>,
+    },
     /// `ANALYZE [name]`: gather statistics into `sqlite_stat1`. `None` analyzes
     /// the whole database; `Some(name)` a single table or index.
     Analyze(Option<String>),

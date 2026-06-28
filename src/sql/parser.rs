@@ -421,15 +421,17 @@ impl Parser {
             // `REINDEX` / `REINDEX name` / `REINDEX schema.name` (a no-op here, but
             // the executor validates the name). For a `schema.name` target keep the
             // object name.
-            let mut target = None;
+            let mut schema = None;
+            let mut name = None;
             if !self.check(&Token::Semicolon) && !self.at_end() {
-                let mut name = self.ident()?;
+                let mut nm = self.ident()?;
                 if self.eat(&Token::Dot) {
-                    name = self.ident()?;
+                    schema = Some(nm);
+                    nm = self.ident()?;
                 }
-                target = Some(name);
+                name = Some(nm);
             }
-            return Ok(Statement::Reindex(target));
+            return Ok(Statement::Reindex { schema, name });
         }
         if self.eat_kw("analyze") {
             // `ANALYZE` / `ANALYZE name` / `ANALYZE schema.name`.
