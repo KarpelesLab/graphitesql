@@ -42,6 +42,24 @@ const QUERIES: &[&str] = &[
     "SELECT count(*), a FROM t GROUP BY g",
 ];
 
+// General path (HAVING / ORDER BY / LIMIT): the representative is captured the
+// same way and loaded back via `GroupKey`. ORDER BY keys are deterministic (the
+// grouping key, or a unique value) so the sqlite comparison has a stable order.
+const GENERAL_QUERIES: &[&str] = &[
+    // Representative + ORDER BY the grouping key.
+    "SELECT a, count(*) FROM t GROUP BY g ORDER BY g",
+    // Representative with HAVING and a deterministic ORDER BY.
+    "SELECT a, count(*) AS c FROM t GROUP BY g HAVING count(*) >= 1 ORDER BY g",
+    // Representative + ORDER BY + LIMIT/OFFSET.
+    "SELECT a, count(*) FROM t GROUP BY g ORDER BY g LIMIT 2 OFFSET 1",
+    // A bare column inside a scalar function in the projection.
+    "SELECT upper(a), count(*) FROM t GROUP BY g ORDER BY g",
+    // Two representatives (a and n) plus an aggregate, general path.
+    "SELECT a, n, sum(n) FROM t GROUP BY g ORDER BY g",
+    // ORDER BY references the representative column itself.
+    "SELECT g, count(*) FROM t GROUP BY g ORDER BY a DESC",
+];
+
 fn conn() -> Connection {
     let mut c = Connection::open_memory().unwrap();
     for stmt in SETUP.split(';') {
@@ -69,6 +87,17 @@ fn group_bare_column_runs_on_vdbe_and_matches_tree_walker() {
     for q in QUERIES {
         // `query_vdbe` errors on fallback, so this proves the projection compiled.
         // Both engines emit first-seen group order, so compare rows directly.
+        let got = c.query_vdbe(q).unwrap().rows;
+        let want = c.query(q).unwrap().rows;
+        assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
+    }
+}
+
+#[test]
+fn group_bare_column_general_path_runs_on_vdbe_and_matches_tree_walker() {
+    let c = conn();
+    for q in GENERAL_QUERIES {
+        // Deterministic ORDER BY, so both engines emit the same row order.
         let got = c.query_vdbe(q).unwrap().rows;
         let want = c.query(q).unwrap().rows;
         assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
@@ -106,6 +135,9 @@ fn group_bare_column_min_max_companion_falls_back() {
     for q in [
         "SELECT a, max(n) FROM t GROUP BY g",
         "SELECT a, min(n) FROM t GROUP BY g",
+        // The same rule applies on the general (ORDER BY) path.
+        "SELECT a, max(n) FROM t GROUP BY g ORDER BY g",
+        "SELECT a, min(n) AS m FROM t GROUP BY g HAVING m > 0 ORDER BY g",
     ] {
         assert!(
             c.query_vdbe(q).is_err(),
@@ -123,7 +155,7 @@ fn group_bare_column_matches_sqlite3() {
         return;
     }
     let c = conn();
-    for q in QUERIES {
+    for q in QUERIES.iter().chain(GENERAL_QUERIES) {
         let mut vdbe: Vec<Vec<String>> = c
             .query_vdbe(q)
             .unwrap()
@@ -144,7 +176,8 @@ fn group_bare_column_matches_sqlite3() {
             .filter(|r| !r.is_empty())
             .map(|r| r.split('\u{1f}').map(|f| f.to_string()).collect())
             .collect();
-        // GROUP BY without ORDER BY leaves row order engine-defined; sort to compare.
+        // GROUP BY row order is engine-defined (and an ORDER BY tie is unspecified);
+        // sort both sides so the comparison is order-insensitive.
         vdbe.sort();
         want.sort();
         assert_eq!(vdbe, want, "VDBE vs sqlite3 diverged on {q}");

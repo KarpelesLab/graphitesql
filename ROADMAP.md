@@ -1220,12 +1220,14 @@ text, c)`, a pure context-free call that routes through `Op::Func` →
 `func::eval_scalar`, applying the escape and rejecting a non-single-character
 escape exactly as the tree-walker does); `printf(fmt, …)` / its `format`
 alias (pure string formatting over the argument values, likewise via `Op::Func`);
-and a **bare (non-grouped) column** in a plain `GROUP BY` projection (no
-HAVING/ORDER/LIMIT) — SQLite emits such a column's value from the row that first
-creates each group, which the VDBE captures as an extra slot on the group-key
-vector (set once at group creation, so it keeps the first-seen value). Gated on
-the query having no `min()`/`max()` aggregate; with one, bare columns instead
-track the min/max companion row, so that shape still defers to the tree-walker.
+and a **bare (non-grouped) column** in a `GROUP BY` projection / `HAVING` /
+`ORDER BY` — SQLite emits such a column's value from the row that first creates
+each group, which the VDBE captures as an extra slot on the group-key vector (set
+once at group creation, so it keeps the first-seen value) and loads back via
+`GroupKey` on both the plain and the general (HAVING/ORDER BY/LIMIT) grouped
+paths. Gated on the query having no `min()`/`max()` aggregate; with one, bare
+columns instead track the min/max companion row, so that shape still defers to
+the tree-walker.
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is

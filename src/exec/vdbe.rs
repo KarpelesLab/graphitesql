@@ -870,6 +870,58 @@ fn collect_aggregates(expr: &Expr, out: &mut Vec<Expr>) {
     }
 }
 
+/// Collect the distinct bare column references in `expr` (as `(table, column)`
+/// pairs), *not* descending into aggregate-call arguments — those are folded, not
+/// projected as bare columns. Used by the grouped HAVING/ORDER path to find
+/// non-grouped columns that need a first-seen-row representative. The walk is
+/// deliberately partial: a column inside an expression shape this does not visit
+/// simply isn't pre-bound, so it later bails via `forbid_raw_columns` (a safe
+/// fall-back, never a wrong result).
+fn collect_bare_columns(expr: &Expr, out: &mut Vec<(Option<String>, String)>) {
+    if is_aggregate_expr(expr) {
+        return;
+    }
+    match expr {
+        Expr::Column { table, column, .. } => {
+            let key = (table.clone(), column.clone());
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        Expr::Paren(inner)
+        | Expr::Unary { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => collect_bare_columns(inner, out),
+        Expr::Binary { left, right, .. } => {
+            collect_bare_columns(left, out);
+            collect_bare_columns(right, out);
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_bare_columns(a, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_bare_columns(o, out);
+            }
+            for (w, t) in when_then {
+                collect_bare_columns(w, out);
+                collect_bare_columns(t, out);
+            }
+            if let Some(e) = else_result {
+                collect_bare_columns(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Emit the GROUP-BY fold loop into `c`: allocate the contiguous group-key
 /// registers (one per grouping column), scan the row source, apply `WHERE`, load
 /// each grouping key and aggregate argument, and `GroupStep`. The row source is a
@@ -1131,10 +1183,51 @@ fn compile_group_select(
         }
     }
 
+    // Bare (non-grouped) columns referenced in the projection / HAVING / ORDER BY
+    // get a first-seen-row representative (SQLite's rule), captured by the fold as
+    // extra key-vector slots and loaded back via `GroupKey` in the emit body.
+    // Anything not collected here still bails via `forbid_raw_columns`, so an
+    // unhandled expression shape simply falls back rather than misbehaving.
+    let mut bare_refs: Vec<(Option<String>, String)> = Vec::new();
+    for (e, _) in projections {
+        collect_bare_columns(e, &mut bare_refs);
+    }
+    if let Some(h) = &sel.having {
+        collect_bare_columns(h, &mut bare_refs);
+    }
+    for term in &sel.order_by {
+        collect_bare_columns(&term.expr, &mut bare_refs);
+    }
+    let mut repr_cols: Vec<usize> = Vec::new();
+    for (t, col) in &bare_refs {
+        // A HAVING/ORDER-BY ref that doesn't name a real table column is an output
+        // alias or ordinal, resolved through other bindings — not a representative.
+        let Ok(ci) = c.resolve_column(t.as_deref(), col) else {
+            continue;
+        };
+        // Grouping columns are bound to their key register below, not represented.
+        if group_cols.contains(&ci) {
+            continue;
+        }
+        if !repr_cols.contains(&ci) {
+            repr_cols.push(ci);
+        }
+    }
+    // First-seen representatives only match SQLite without a min()/max() aggregate
+    // (which instead pulls bare columns from the companion row) — defer that shape.
+    if !repr_cols.is_empty()
+        && agg_specs
+            .iter()
+            .any(|(k, ..)| matches!(k, AggKind::Min | AggKind::Max))
+    {
+        return Err(Error::Unsupported(
+            "VDBE: bare column with min/max companion",
+        ));
+    }
+
     // Fold the row source (single cursor or nested-loop join) into per-group
-    // aggregates, allocating the grouping-key registers. The HAVING/ORDER path
-    // binds bare columns through registers (no representatives here).
-    emit_group_fold(&mut c, sel, &group_cols, &[], &agg_specs)?;
+    // aggregates, allocating the grouping-key and representative registers.
+    emit_group_fold(&mut c, sel, &group_cols, &repr_cols, &agg_specs)?;
 
     // Per-group registers: one for each grouping key value, one for each
     // aggregate final. These feed the bindings so HAVING/projection/ORDER-BY
@@ -1176,6 +1269,36 @@ fn compile_group_select(
     // Each aggregate call → its final register.
     for (j, e) in agg_exprs.iter().enumerate() {
         c.bindings.push((e.clone(), gagg_start + j));
+    }
+    // Representative registers for bare non-grouped columns, bound to both the
+    // bare and qualified column forms (mirroring the grouping-key bindings). The
+    // values are loaded from the group's key vector (after the keys) in the emit
+    // body via `GroupKey`.
+    let grepr_start = c.next_reg;
+    for _ in &repr_cols {
+        c.alloc();
+    }
+    for (r, &ci) in repr_cols.iter().enumerate() {
+        c.bindings.push((
+            Expr::Column {
+                schema: None,
+                table: None,
+                column: columns[ci].clone(),
+                quoted: false,
+            },
+            grepr_start + r,
+        ));
+        if let Some(t) = tables.get(ci) {
+            c.bindings.push((
+                Expr::Column {
+                    schema: None,
+                    table: Some(t.clone()),
+                    column: columns[ci].clone(),
+                    quoted: false,
+                },
+                grepr_start + r,
+            ));
+        }
     }
 
     // Output registers for the projected row (a contiguous block).
@@ -1283,11 +1406,18 @@ fn compile_group_select(
             dest: gagg_start + j,
         });
     }
+    // Load each bare-column representative from the group's key vector (stored
+    // right after the real keys by the fold, holding the first-seen row's value).
+    for r in 0..repr_cols.len() {
+        c.ops.push(Op::GroupKey {
+            key: group_cols.len() + r,
+            dest: grepr_start + r,
+        });
+    }
     // The emit phase has no current scan row: every column reference must be a
-    // grouping key or aggregate (resolved via a binding). A bare non-grouped
-    // column (e.g. from `*`) is the "use a representative row" case SQLite allows
-    // but the VDBE does not model — forbid raw column reads so it bails here and
-    // the tree-walker handles it.
+    // grouping key, aggregate, or bound representative (resolved via a binding). A
+    // bare non-grouped column the collector did not pre-bind cannot be read here —
+    // forbid raw column reads so it bails and the tree-walker handles it.
     c.forbid_raw_columns = true;
     // Project the output row into the contiguous output block first, so HAVING
     // (and ORDER BY) can reference output aliases — matching the tree-walker,
