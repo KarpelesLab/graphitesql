@@ -608,6 +608,18 @@ original double-quoting is preserved the way SQLite does — a `"t"."a"` stays
 double-quoted. Byte-exact vs `sqlite3` 3.50.4
 (`tests/rename_column_self_qualified.rs`).
 
+**`RENAME COLUMN` no longer renames a foreign key's *parent* column name.** The
+same table-own bare-token rewrite renamed *every* matching identifier, so a child
+table with `b REFERENCES other(a)` wrongly became `REFERENCES other(aa)` when its
+own column `a` was renamed — `REFERENCES other(a)` names the *parent's* column, not
+this table's, and SQLite leaves it untouched. The rewrite now marks the tokens
+inside each `REFERENCES <name>( … )` group whose `<name>` is not the renamed table
+and skips a bare rename there, while a *self*-referencing FK (`REFERENCES
+<thistable>(a)`, parent == the renamed table) and the FK's own *child* column list
+(`FOREIGN KEY(a)`) still rename. Composite FKs, a quoted parent, and a
+no-column-list `REFERENCES other` are all handled. Byte-exact vs `sqlite3` 3.50.4
+(`tests/rename_column_fk_parent_collist.rs`).
+
 **`json_quote(X)` now renders a JSONB blob as its JSON text.** SQLite accepts a
 BLOB argument to `json_quote` when it decodes as JSONB and emits the
 corresponding JSON (so `jsonb_*` results compose: `json_quote(jsonb('[1,2]'))` →

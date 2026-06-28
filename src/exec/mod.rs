@@ -28527,6 +28527,43 @@ fn rewrite_column_tokens(
         Ok(t) => t,
         Err(_) => return String::from(sql),
     };
+    // SQLite never renames a name inside a foreign key's *parent* column list —
+    // `REFERENCES other(col)` names the parent table's column, not this one. Mark
+    // every token inside a `REFERENCES <name>( … )` group whose `<name>` is not in
+    // `quals` (i.e. not a self-reference to the renamed table) so a bare `old`
+    // there is left intact. A self-FK `REFERENCES <thistable>(old)` keeps the
+    // parent name in `quals`, so it is *not* marked and still renames, like SQLite.
+    let mut in_foreign_ref = alloc::vec![false; toks.len()];
+    {
+        let mut j = 0usize;
+        while j < toks.len() {
+            if matches!(&toks[j].token, Token::Word(w) if w.eq_ignore_ascii_case("references")) {
+                let name_is_self = toks.get(j + 1).is_some_and(|n| {
+                    matches!(&n.token, Token::Word(q) | Token::Ident(q)
+                        if quals.iter().any(|t| t.eq_ignore_ascii_case(q)))
+                });
+                if !name_is_self && matches!(toks.get(j + 2).map(|t| &t.token), Some(Token::LParen))
+                {
+                    let mut depth = 0i32;
+                    let mut k = j + 2;
+                    while k < toks.len() {
+                        match &toks[k].token {
+                            Token::LParen => depth += 1,
+                            Token::RParen => depth -= 1,
+                            _ => {}
+                        }
+                        in_foreign_ref[k] = true;
+                        if depth == 0 {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    j = k;
+                }
+            }
+            j += 1;
+        }
+    }
     let mut out = String::new();
     let mut cursor = 0usize;
     for (i, sp) in toks.iter().enumerate() {
@@ -28540,6 +28577,11 @@ fn rewrite_column_tokens(
             .get(i + 1)
             .is_some_and(|n| matches!(n.token, Token::LParen))
         {
+            continue;
+        }
+        // Inside a foreign table's `REFERENCES name(…)` parent column list: leave
+        // the parent's column name untouched.
+        if in_foreign_ref[i] {
             continue;
         }
         let after_dot = i > 0 && matches!(toks[i - 1].token, Token::Dot);
