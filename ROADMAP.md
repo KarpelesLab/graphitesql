@@ -1579,7 +1579,14 @@ the tree-walker grouper) now resolve via `positional_int`, so `+N` names output
 column N exactly like the bare `N` does — `positional_int` returns `None` for
 `+col`/`(col)`, which still fall through to the alias/expression path. Test:
 `tests/group_by_positional.rs` (`signed_positional_order_by_resolves_to_column`,
-`signed_positional_group_by_resolves_to_column`).
+`signed_positional_group_by_resolves_to_column`). A positional `GROUP BY` term
+that resolves to an *aggregate* output column (`SELECT a, count(*) … GROUP BY 2`)
+is now rejected at prepare time with SQLite's `aggregate functions are not allowed
+in the GROUP BY clause` — the prepare-time aggregate-in-`GROUP BY` check resolves
+each ordinal (via `positional_int`, so `+2`/`(2)` count too) back to its result
+expression before scanning for aggregates, instead of substituting lazily and
+later tripping over the generic `misuse of aggregate function …`. Test:
+`positional_group_by_to_aggregate_is_rejected`.
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is

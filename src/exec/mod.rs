@@ -15755,12 +15755,32 @@ impl Connection {
         // than the generic "aggregate … used outside an aggregate context" — and
         // catching the case (`GROUP BY max(a)` over a real table) that lazy
         // per-row evaluation would otherwise accept silently.
+        // A *positional* term names an output column, so `GROUP BY 2` over
+        // `SELECT a, count(*)` is just as forbidden — resolve the ordinal to its
+        // result expression and check that too (SQLite reports the same error,
+        // not the generic "misuse of aggregate function" that lazy substitution
+        // would otherwise surface).
         {
             let is_agg = |name: &str, n: usize, star: bool| {
                 func::is_aggregate_call(name, n, star)
                     || self.aggregates.contains_key(&name.to_ascii_lowercase())
             };
-            if sel.group_by.iter().any(|g| expr_contains_agg(g, &is_agg)) {
+            let resolves_to_agg = |g: &Expr| {
+                positional_int(g)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|&n| n >= 1)
+                    .and_then(|n| sel.columns.get(n - 1))
+                    .and_then(|c| match c {
+                        ResultColumn::Expr { expr, .. } => Some(expr),
+                        _ => None,
+                    })
+                    .is_some_and(|e| expr_contains_agg(e, &is_agg))
+            };
+            if sel
+                .group_by
+                .iter()
+                .any(|g| expr_contains_agg(g, &is_agg) || resolves_to_agg(g))
+            {
                 return Err(Error::Error(
                     "aggregate functions are not allowed in the GROUP BY clause".into(),
                 ));

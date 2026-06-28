@@ -194,6 +194,40 @@ fn signed_positional_group_by_resolves_to_column() {
     }
 }
 
+/// A positional `GROUP BY` term that resolves to an *aggregate* output column is
+/// forbidden exactly like a direct `GROUP BY count(*)`: SQLite reports `aggregate
+/// functions are not allowed in the GROUP BY clause`. (Regression: graphite used
+/// to substitute the ordinal lazily and only later trip over `misuse of aggregate
+/// function count()` during evaluation — the wrong message.)
+#[test]
+fn positional_group_by_to_aggregate_is_rejected() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("INSERT INTO t VALUES(1, 2), (3, 4)").unwrap();
+
+    let err = |sql: &str| {
+        c.query(sql)
+            .unwrap_err()
+            .to_string()
+            .trim_start_matches("error: ")
+            .to_string()
+    };
+    let msg = "aggregate functions are not allowed in the GROUP BY clause";
+    // Bare, signed, and parenthesized ordinals all resolve to column 2 (`count(*)`
+    // / `a + sum(b)`), and the direct form agrees.
+    for q in [
+        "SELECT a, count(*) FROM t GROUP BY 2",
+        "SELECT a, count(*) FROM t GROUP BY +2",
+        "SELECT a, count(*) FROM t GROUP BY (2)",
+        "SELECT a, a + sum(b) FROM t GROUP BY 2",
+        "SELECT a, count(*) FROM t GROUP BY count(*)",
+    ] {
+        assert_eq!(err(q), msg, "{q}");
+    }
+    // A positional term to a *non-aggregate* column is still fine.
+    assert!(c.query("SELECT a, count(*) FROM t GROUP BY 1").is_ok());
+}
+
 #[test]
 fn generate_series_zero_step_is_one() {
     let c = Connection::open_memory().unwrap();
