@@ -1035,13 +1035,21 @@ impl Connection {
                         // aggregate/window call inside a non-windowed aggregate's
                         // `FILTER` predicate is the same kind of bypassed misuse.
                         reject_nested_aggregate_arg(expr)?;
+                        reject_window_in_window(expr)?;
                         reject_aggregate_in_filter(expr, &is_agg)?;
                     }
                 }
                 for t in &sel.order_by {
                     reject_invalid_window_function(&t.expr, &is_agg, &is_known_scalar)?;
                     reject_nested_aggregate_arg(&t.expr)?;
+                    reject_window_in_window(&t.expr)?;
                     reject_aggregate_in_filter(&t.expr, &is_agg)?;
+                }
+                // A named window (`WINDOW w AS (…)`) carries its spec separately,
+                // so a window function nested in its PARTITION BY / ORDER BY /
+                // frame is checked here rather than via the projection.
+                for (_, spec) in &sel.window_defs {
+                    reject_window_in_windowspec(spec)?;
                 }
             }
             return self.run_window_vdbe(sel);
@@ -14982,7 +14990,14 @@ impl Connection {
                     reject_star_argument(expr)?;
                     reject_invalid_likelihood(expr)?;
                     reject_nested_aggregate_arg(expr)?;
+                    reject_window_in_window(expr)?;
                 }
+            }
+            // A window function nested in a named window's PARTITION BY / ORDER BY
+            // (`WINDOW w AS (ORDER BY sum(a) OVER ())`) — the spec lives apart from
+            // the `OVER w` call site, so check the definitions directly.
+            for (_, spec) in &sel.window_defs {
+                reject_window_in_windowspec(spec)?;
             }
             if let Some(w) = &sel.where_clause {
                 reject_filter_on_non_aggregate(w, &is_agg)?;
@@ -21705,6 +21720,101 @@ fn reject_nested_aggregate_arg(e: &Expr) -> Result<()> {
         }
     });
     err.map_or(Ok(()), Err)
+}
+
+/// Reject a window function nested inside *another* window function's
+/// definition — its arguments, its `FILTER` predicate, or its `OVER`
+/// specification (`PARTITION BY` / `ORDER BY` / frame bounds). SQLite forbids
+/// this at prepare time as `misuse of window function <inner>()` (an ordinary
+/// aggregate in the same spots is fine — `OVER (ORDER BY count(*))` is legal),
+/// firing even over an empty table where graphite's lazy evaluator silently
+/// accepted it. The walk stops at subquery boundaries (each subquery validates
+/// its own windows). The inner aggregate-argument case
+/// (`sum(row_number() OVER ())`, where the outer is a *plain* aggregate) is
+/// handled by [`reject_nested_aggregate_arg`]; this covers the case where the
+/// outer call is itself windowed.
+fn reject_window_in_window(e: &Expr) -> Result<()> {
+    let mut err: Option<Error> = None;
+    window::visit(e, &mut |n| {
+        if err.is_some() {
+            return;
+        }
+        let Expr::Function {
+            filter,
+            order_by,
+            over: Some(spec),
+            args,
+            ..
+        } = n
+        else {
+            return;
+        };
+        // Collect every sub-expression that belongs to this window call's
+        // definition (arguments, FILTER, aggregate ORDER BY, and the OVER spec),
+        // then scan each for a nested window-function node.
+        let mut parts: Vec<&Expr> = Vec::new();
+        for a in args {
+            parts.push(a);
+        }
+        if let Some(f) = filter {
+            parts.push(f);
+        }
+        for o in order_by {
+            parts.push(&o.expr);
+        }
+        windowspec_parts(spec, &mut parts);
+        if let Some(name) = nested_window_name(&parts) {
+            err = Some(Error::Error(alloc::format!(
+                "misuse of window function {name}()"
+            )));
+        }
+    });
+    err.map_or(Ok(()), Err)
+}
+
+/// The `PARTITION BY` / `ORDER BY` sub-expressions of a window specification,
+/// appended to `out`. Frame-bound offsets are deliberately excluded: a window
+/// function there is not this misuse but the ordinary "frame offset must be a
+/// non-negative integer/number" path, which SQLite evaluates lazily (so it does
+/// not fire over an empty partition).
+fn windowspec_parts<'a>(spec: &'a WindowSpec, out: &mut Vec<&'a Expr>) {
+    for p in &spec.partition_by {
+        out.push(p);
+    }
+    for o in &spec.order_by {
+        out.push(&o.expr);
+    }
+}
+
+/// The name of a window function found anywhere within `parts`, if any.
+fn nested_window_name(parts: &[&Expr]) -> Option<String> {
+    let mut hit: Option<String> = None;
+    for p in parts {
+        window::visit(p, &mut |m| {
+            if let Expr::Function {
+                name,
+                over: Some(_),
+                ..
+            } = m
+            {
+                hit = Some(name.to_ascii_lowercase());
+            }
+        });
+    }
+    hit
+}
+
+/// Reject a window function nested inside a `WINDOW name AS (…)` definition's
+/// specification — the named-window form of [`reject_window_in_window`].
+fn reject_window_in_windowspec(spec: &WindowSpec) -> Result<()> {
+    let mut parts: Vec<&Expr> = Vec::new();
+    windowspec_parts(spec, &mut parts);
+    match nested_window_name(&parts) {
+        Some(name) => Err(Error::Error(alloc::format!(
+            "misuse of window function {name}()"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Reject a `FILTER (WHERE …)` clause attached to a non-aggregate function.

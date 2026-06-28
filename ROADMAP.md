@@ -470,6 +470,17 @@ database bad`; `nope()` → `no such table: nope`). graphite previously answered
 TVFs (`generate_series`, `json_each`/`json_tree`, the `pragma_*` forms) are
 unaffected. Byte-exact vs `sqlite3` 3.50.4.
 
+A **window function nested inside another window function's definition** is now
+rejected at prepare time, matching SQLite. A window call may not appear in another
+window's arguments, its `FILTER` predicate, or its `OVER` spec's `PARTITION BY` /
+`ORDER BY` — including a named `WINDOW w AS (…)` reached via `OVER w`. SQLite
+reports `misuse of window function <inner>()` even over an empty table; graphite
+evaluated the spec lazily and silently accepted it. The fix walks each window
+definition (and every `WINDOW` clause entry) for a nested `OVER`. A window
+function in a *frame-bound offset* is deliberately left alone — that is SQLite's
+separate lazy "frame starting offset must be a non-negative integer" path, which
+errors only once a row is produced. Byte-exact vs `sqlite3` 3.50.4.
+
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite
 does. The per-column "add column" checks run first, left to right — a duplicate
