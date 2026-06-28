@@ -15702,19 +15702,21 @@ impl Connection {
                 || sel.window_defs.iter().any(|(_, spec)| spec_has_rowid(spec))
         }
 
-        // A `WITH` of its own could shadow the base table with a CTE the VDBE
-        // scan cannot open — defer.
-        if !sel.ctes.is_empty() {
-            return Err(Error::Unsupported("VDBE window: query carries CTEs"));
-        }
         let Some(from) = &sel.from else {
             return Err(Error::Unsupported("VDBE window: no FROM"));
         };
         // The source is a single plain rowid table (rowid is appended so a `rowid`
-        // reference resolves), a plain N-table join, or a derived subquery (the
-        // last two have no single rowid, so they are only taken when no rowid is
-        // referenced). `rowid_source` records whether a trailing rowid is scanned.
+        // reference resolves), a plain N-table join, a derived subquery, or a
+        // `FROM` reference naming a whole-query `WITH` CTE (the last three have no
+        // single rowid, so they are only taken when no rowid is referenced).
+        // `rowid_source` records whether a trailing rowid is scanned. A join that
+        // carries CTEs still defers: its column set is resolved *statically*
+        // (`static_scope_columns`), which can't see a CTE binding, so a CTE that
+        // shadows a real table name there would resolve to the wrong columns.
         let is_join = !from.joins.is_empty();
+        if is_join && !sel.ctes.is_empty() {
+            return Err(Error::Unsupported("VDBE window: join carries CTEs"));
+        }
         let mut rowid_source = false;
         let columns = if is_join {
             if select_mentions_rowid(sel) {
@@ -15760,6 +15762,56 @@ impl Connection {
                     .iter()
                     .zip(&origins)
                     .map(|((n, _), (aff, coll))| ColumnInfo {
+                        name: n.clone(),
+                        table: qualifier.clone(),
+                        affinity: *aff,
+                        collation: *coll,
+                        hidden: false,
+                    })
+                    .collect()
+            } else if let Some(cte) =
+                (tref.tvf_args.is_none() && tref.index_hint.is_none() && tref.schema.is_none())
+                    .then(|| {
+                        sel.ctes
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(&tref.name))
+                    })
+                    .flatten()
+            {
+                // A `FROM` reference naming a whole-query `WITH` CTE: resolve its
+                // columns through the CTE body — with the explicit `WITH
+                // name(cols…)` rename applied — exactly like the derived-subquery
+                // branch. The base scan (`run_select_vdbe(&base)` below, with
+                // `base.ctes` retained) materializes the CTE through that same
+                // derived path, so columns and rows stay in lockstep. A CTE has no
+                // rowid, so defer if one is referenced; a join / compound / view /
+                // CTE / TVF / `VALUES` body returns `None` from
+                // `subquery_column_origins` and defers.
+                if select_mentions_rowid(sel) {
+                    return Err(Error::Unsupported(
+                        "VDBE window: CTE source references rowid",
+                    ));
+                }
+                let sub = cte.select.as_ref();
+                let origins = self
+                    .subquery_column_origins(sub)
+                    .ok_or(Error::Unsupported("VDBE window: non-plain CTE source"))?;
+                let body = self
+                    .resolved_view_columns(sub)
+                    .ok_or(Error::Unsupported("VDBE window: CTE columns unresolved"))?;
+                let names: Vec<String> = if cte.columns.is_empty() {
+                    body.iter().map(|(n, _)| n.clone()).collect()
+                } else {
+                    cte.columns.clone()
+                };
+                if names.len() != origins.len() || names.len() != body.len() {
+                    return Err(Error::Unsupported("VDBE window: CTE column count mismatch"));
+                }
+                let qualifier = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+                names
+                    .iter()
+                    .zip(&origins)
+                    .map(|(n, (aff, coll))| ColumnInfo {
                         name: n.clone(),
                         table: qualifier.clone(),
                         affinity: *aff,
