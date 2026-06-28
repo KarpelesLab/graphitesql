@@ -1139,15 +1139,43 @@ impl Connection {
             Option<Vec<i64>>,
         );
         let scan_one = |tr: &sql::ast::TableRef| -> Result<ScanOut> {
-            // A derived table (FROM subquery), conservatively: a single-block
-            // subquery over a single all-BINARY base table. Then every output
-            // column has BINARY collation and its affinity comes from the resolved
-            // output type — so the materialized rows compare in the outer query
-            // exactly like the tree-walker. Anything else defers.
-            if let Some(sub) = &tr.subquery {
+            // A derived source: an explicit `FROM` subquery, or a `FROM` reference
+            // naming an in-scope CTE — both materialized through the same
+            // conservative single-block constraints (a constant/`VALUES` body, or a
+            // single-block query over a single all-BINARY base table). A CTE
+            // reference's qualifier is its alias or its name, and an explicit
+            // `WITH name(cols…)` list renames the body's output columns. Anything
+            // else defers to the tree-walker.
+            let cte = if tr.subquery.is_none() && tr.tvf_args.is_none() && tr.schema.is_none() {
+                sel.ctes
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&tr.name))
+            } else {
+                None
+            };
+            let derived: Option<(&Select, String, Option<&[String]>)> =
+                if let Some(sub) = &tr.subquery {
+                    Some((sub.as_ref(), tr.alias.clone().unwrap_or_default(), None))
+                } else if let Some(c) = cte {
+                    let qualifier = tr.alias.clone().unwrap_or_else(|| tr.name.clone());
+                    let rename = (!c.columns.is_empty()).then_some(c.columns.as_slice());
+                    Some((c.select.as_ref(), qualifier, rename))
+                } else {
+                    None
+                };
+            if let Some((sub, qualifier, rename)) = derived {
                 if tr.tvf_args.is_some() {
                     return Err(Error::Unsupported("VDBE: complex subquery source"));
                 }
+                // Apply the CTE's explicit column-name list (if any) to a materialized
+                // result, or keep the body's own output names.
+                let renamed = |cols: Vec<String>| -> Result<Vec<String>> {
+                    match rename {
+                        Some(names) if names.len() == cols.len() => Ok(names.to_vec()),
+                        Some(_) => Err(Error::Unsupported("VDBE: CTE column count mismatch")),
+                        None => Ok(cols),
+                    }
+                };
                 // A constant / `VALUES` subquery — no base table in any compound arm
                 // (a top-level `VALUES (…),(…)` desugars to a `UNION ALL` of FROM-less
                 // constant cores). Its columns carry no affinity and BINARY collation,
@@ -1155,26 +1183,17 @@ impl Connection {
                 // exactly as the tree-walker does.
                 if sub.from.is_none() && sub.compound.iter().all(|(_, s)| s.from.is_none()) {
                     let result = self.run_select(sub, &eval::Params::default())?;
-                    let qualifier = tr.alias.clone().unwrap_or_default();
-                    let tables = result.columns.iter().map(|_| qualifier.clone()).collect();
-                    let affinities = result
-                        .columns
+                    let columns = renamed(result.columns)?;
+                    let tables = columns.iter().map(|_| qualifier.clone()).collect();
+                    let affinities = columns
                         .iter()
                         .map(|_| eval::Affinity::from_type(None))
                         .collect();
-                    let collations = result
-                        .columns
+                    let collations = columns
                         .iter()
                         .map(|_| crate::value::Collation::default())
                         .collect();
-                    return Ok((
-                        result.columns,
-                        tables,
-                        affinities,
-                        collations,
-                        result.rows,
-                        None,
-                    ));
+                    return Ok((columns, tables, affinities, collations, result.rows, None));
                 }
                 if !sub.compound.is_empty() {
                     return Err(Error::Unsupported("VDBE: complex subquery source"));
@@ -1209,25 +1228,17 @@ impl Connection {
                 if result.columns.len() != named.len() {
                     return Err(Error::Unsupported("VDBE: subquery column count mismatch"));
                 }
-                let qualifier = tr.alias.clone().unwrap_or_default();
-                let tables = result.columns.iter().map(|_| qualifier.clone()).collect();
+                let columns = renamed(result.columns)?;
+                let tables = columns.iter().map(|_| qualifier.clone()).collect();
                 let affinities = named
                     .iter()
                     .map(|(_, t)| eval::Affinity::from_type(t.as_deref()))
                     .collect();
-                let collations = result
-                    .columns
+                let collations = columns
                     .iter()
                     .map(|_| crate::value::Collation::default())
                     .collect();
-                return Ok((
-                    result.columns,
-                    tables,
-                    affinities,
-                    collations,
-                    result.rows,
-                    None,
-                ));
+                return Ok((columns, tables, affinities, collations, result.rows, None));
             }
             if tr.tvf_args.is_some() {
                 return Err(Error::Unsupported("VDBE: only plain table sources"));

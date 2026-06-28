@@ -1229,11 +1229,19 @@ paths. With *exactly one* `min()`/`max()` aggregate, SQLite instead pulls bare
 columns from that aggregate's extreme ("companion") row: the fold keeps the
 running extreme in a hidden trailing key slot and overwrites the representatives
 whenever a row beats it. Only *more than one* `min()`/`max()` leaves the
-companion ambiguous, and that shape still defers to the tree-walker. Also a
+companion ambiguous, and that shape still defers to the tree-walker. Grouped
+output is **ordered by the GROUP BY keys** (BINARY ascending, NULLs first) before
+emission — SQLite groups via a sort, so a plain `GROUP BY` with no explicit
+`ORDER BY` comes out key-ordered on the VDBE just as it does in SQLite. Also a
 **constant / `VALUES` subquery source** — `FROM (VALUES (…),(…))` (which desugars
 to a `UNION ALL` of FROM-less constant cores) or `FROM (SELECT <consts>)` — is
 materialized directly as a derived table with no affinity and BINARY collation,
-joining the base-table derived-source path already on the VDBE.
+joining the base-table derived-source path already on the VDBE; and a **`FROM`
+reference naming an in-scope CTE** is materialized through that same derived-table
+path (the CTE's name or alias becomes the row qualifier, and an explicit
+`WITH name(cols…)` list renames the body's columns), so `WITH c AS (…) SELECT …
+FROM c` runs on the VDBE. A CTE body that references a *sibling* CTE still defers
+(the body is materialized on its own, without the other bindings).
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is
