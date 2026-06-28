@@ -1426,7 +1426,7 @@ impl Connection {
                     hidden: false,
                 })
                 .collect();
-            if validate_unambiguous_columns(sel, &join_cols).is_err() {
+            if validate_unambiguous_columns(sel, &join_cols, &|t| t.into()).is_err() {
                 return Err(Error::Unsupported("VDBE: ambiguous column name"));
             }
             let prog = vdbe::compile_table_select(sel, &names, &tabs, &affs, &colls, false)?;
@@ -1512,7 +1512,7 @@ impl Connection {
                         hidden: false,
                     })
                     .collect();
-                if validate_unambiguous_columns(sel, &join_cols).is_err() {
+                if validate_unambiguous_columns(sel, &join_cols, &|t| t.into()).is_err() {
                     return Err(Error::Unsupported("VDBE: ambiguous column name"));
                 }
                 // boundaries[i] = end of cursor i's columns in the combined row.
@@ -1582,7 +1582,7 @@ impl Connection {
                         hidden: false,
                     })
                     .collect();
-                if validate_unambiguous_columns(sel, &join_cols).is_err() {
+                if validate_unambiguous_columns(sel, &join_cols, &|t| t.into()).is_err() {
                     return Err(Error::Unsupported("VDBE: ambiguous column name"));
                 }
                 let n_outer = sources[outer].0.len();
@@ -1631,7 +1631,7 @@ impl Connection {
                     hidden: false,
                 })
                 .collect();
-            if validate_unambiguous_columns(sel, &join_cols).is_err() {
+            if validate_unambiguous_columns(sel, &join_cols, &|t| t.into()).is_err() {
                 return Err(Error::Unsupported("VDBE: ambiguous column name"));
             }
             // B5b-1: a plain N-table inner join with a nested-loopable shape
@@ -14869,7 +14869,7 @@ impl Connection {
         // it. Checked after alias substitution so an ORDER BY/GROUP BY/HAVING
         // reference to an unshadowed output alias is already rewritten to its
         // defining expression and not mistaken for an ambiguous column.
-        validate_unambiguous_columns(sel, &columns)?;
+        validate_unambiguous_columns(sel, &columns, &|t| self.wildcard_source_qualifier(sel, t))?;
         // SQLite also rejects an ambiguous reference *inside a subquery* that binds
         // to an enclosing FROM, statically (whether or not the subquery executes).
         // Run that scope-aware pass once, at the outermost query: `columns` here is
@@ -17675,6 +17675,44 @@ impl Connection {
             DbRef::Temp => "temp".into(),
             DbRef::Attached(i) => self.attached[i].name.clone(),
         }
+    }
+
+    /// The `<db>.<table>` / `*.<alias>` prefix SQLite uses when naming an ambiguous
+    /// column surfaced by `*` expansion of an unaliased self-join. `name` is the
+    /// offending source's effective name (alias, else table name). A base table
+    /// is qualified by the database it resolves to (`main.t`, a temp table that
+    /// shadows it → `temp.t`, an attached `aux.t`); a derived table (subquery) or a
+    /// CTE has no database, so SQLite uses `*` (`*.x`). Falls back to the bare name
+    /// if no FROM source matches (no real self-join can reach the caller then).
+    fn wildcard_source_qualifier(&self, sel: &Select, name: &str) -> alloc::string::String {
+        let sources = sel
+            .from
+            .iter()
+            .flat_map(|f| core::iter::once(&f.first).chain(f.joins.iter().map(|j| &j.table)));
+        for tr in sources {
+            let eff = tr.alias.as_deref().unwrap_or(&tr.name);
+            if !eff.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            // A subquery, or an unqualified name bound to a CTE, has no database.
+            if tr.subquery.is_some()
+                || (tr.schema.is_none()
+                    && sel
+                        .ctes
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&tr.name)))
+            {
+                return alloc::format!("*.{name}");
+            }
+            let db = match &tr.schema {
+                Some(s) => self
+                    .resolve_db(Some(s))
+                    .map_or_else(|_| s.clone(), |r| self.db_label(r)),
+                None => self.db_label(self.unqualified_db(&tr.name)),
+            };
+            return alloc::format!("{db}.{name}");
+        }
+        name.into()
     }
 
     /// The database a `DELETE`/`UPDATE` target resolves to: the explicit `schema.`
@@ -20555,8 +20593,14 @@ fn validate_used_collations(sel: &Select) -> Result<()> {
 /// an unaliased self-join is ambiguous too — two entries then share *both* name
 /// and qualifier, which even `*` cannot tell apart. Nested subqueries validate
 /// their own references when they run, so this neither descends into them nor
-/// considers the outer scope.
-fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<()> {
+/// considers the outer scope. `qualify_wildcard` maps an offending wildcard
+/// source's effective name to the `<db>.<table>` / `*.<alias>` origin prefix
+/// SQLite prints (the bare name suffices for callers that ignore the message).
+fn validate_unambiguous_columns(
+    sel: &Select,
+    columns: &[ColumnInfo],
+    qualify_wildcard: &dyn Fn(&str) -> alloc::string::String,
+) -> Result<()> {
     let mut ambiguous: Option<String> = None;
     vdbe_block_exprs(sel, &mut |e| {
         window::visit(e, &mut |sub| {
@@ -20608,9 +20652,12 @@ fn validate_unambiguous_columns(sel: &Select, columns: &[ColumnInfo]) -> Result<
             if let Some(b) = columns[i + 1..].iter().find(|b| {
                 a.name.eq_ignore_ascii_case(&b.name) && a.table.eq_ignore_ascii_case(&b.table)
             }) {
+                // SQLite qualifies a `*`-expanded ambiguous column by its source's
+                // origin: `<db>.<table>` for a real table (`main.t.a`), or `*.<alias>`
+                // for a derived table / CTE that has no database (`*.x.a`).
                 return Err(Error::Error(alloc::format!(
                     "ambiguous column name: {}.{}",
-                    b.table,
+                    qualify_wildcard(&b.table),
                     b.name
                 )));
             }

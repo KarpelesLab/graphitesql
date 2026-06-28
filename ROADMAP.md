@@ -481,6 +481,15 @@ function in a *frame-bound offset* is deliberately left alone — that is SQLite
 separate lazy "frame starting offset must be a non-negative integer" path, which
 errors only once a row is produced. Byte-exact vs `sqlite3` 3.50.4.
 
+An **ambiguous column surfaced by `*` expansion of an unaliased self-join** is now
+named the way SQLite names it — by the source's *origin*. `SELECT * FROM t, t`
+reports `ambiguous column name: main.t.a` (a temp table that shadows it →
+`temp.t.a`, an attached `aux.t.a`), and a derived table or CTE, which has no
+database, is qualified with `*` (`SELECT * FROM x, x` over a CTE `x` →
+`ambiguous column name: *.x.a`). graphite previously emitted the bare
+`<source>.<col>`. Explicit references (`SELECT a` / `SELECT x.a`) keep their
+unprefixed spelling, unchanged. Byte-exact vs `sqlite3` 3.50.4.
+
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite
 does. The per-column "add column" checks run first, left to right — a duplicate
