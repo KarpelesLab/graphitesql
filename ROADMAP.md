@@ -1304,7 +1304,13 @@ aggregate / GROUP BY / HAVING / DISTINCT / ORDER BY / LIMIT over the view, a vie
 joined to a base table, and a join- or compound-bodied view all run. A view column
 carrying a *non-BINARY* collation defers (the VDBE compare/group paths assume BINARY
 keys); a view has no rowid, so a `rowid` reference over it defers (a view body that
-*projects* `rowid` under an alias exposes an ordinary column that runs). A **single
+*projects* `rowid` under an alias exposes an ordinary column that runs). A
+**window-function `SELECT` over a view source** (`SELECT g, sum(n) OVER (PARTITION BY
+g) FROM vt`) runs on the VDBE too: `run_window_vdbe` resolves the view's columns
+through `try_view` and lets the base scan materialize the body through `scan_one`, then
+the shared `finish_from_rows` tail evaluates the windows — so a join-, compound-, or
+aliased-rowid-bodied view all carry windows. The same non-BINARY-collation and
+`rowid`-reference cases defer (a view has no per-row rowid for the window path). A **single
 table-valued function `FROM` source** runs on
 the VDBE as well: `generate_series(start[,stop[,step]])`, `json_each` / `json_tree`,
 and the table-valued `pragma_<name>(arg)` form are materialized through the same

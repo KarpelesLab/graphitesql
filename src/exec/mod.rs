@@ -15906,9 +15906,12 @@ impl Connection {
     /// `run_compound_vdbe` reuses the set-combine helpers. The base scan appends
     /// each row's rowid as a trailing column so a `rowid`/`_rowid_`/`oid`
     /// reference anywhere in the query resolves; a `WITHOUT ROWID` table makes
-    /// that projection bail, so such queries fall back. Any shape the base scan
-    /// cannot run (a join, a derived/virtual/view source, a non-`main` schema, …)
-    /// returns `Unsupported`, falling the whole query back to the tree-walker.
+    /// that projection bail, so such queries fall back. A plain join, a derived
+    /// subquery, a whole-query `WITH` CTE, and a view source are also handled (the
+    /// last three carry no rowid, so a `rowid` reference there defers); any shape
+    /// the base scan cannot run (a virtual/TVF source, a non-`main` schema, a
+    /// `NATURAL`/`USING` join, …) returns `Unsupported`, falling the whole query
+    /// back to the tree-walker.
     /// The `ColumnInfo` for a derived / CTE window source body — the same column
     /// model the non-window derived-scan path (`scan_one`) uses. A constant /
     /// `VALUES` body's columns carry no affinity and BINARY collation; any other
@@ -16081,6 +16084,31 @@ impl Connection {
                 let qualifier = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
                 let rename = (!cte.columns.is_empty()).then_some(cte.columns.as_slice());
                 self.window_source_columns(cte.select.as_ref(), &qualifier, rename)?
+            } else if tref.tvf_args.is_none()
+                && tref.index_hint.is_none()
+                && tref.schema.is_none()
+                && self.is_view(&tref.name)
+                && !self
+                    .cte_env
+                    .borrow()
+                    .iter()
+                    .any(|b| b.name.eq_ignore_ascii_case(&tref.name))
+            {
+                // A view named directly as the window source. The base scan
+                // materializes it through `scan_one` (which runs the stored body and
+                // defers on a non-BINARY column), so columns and rows stay in
+                // lockstep; `try_view` here resolves the same per-column
+                // `(affinity, collation)` model the base scan exposes. A view has no
+                // rowid, so defer if one is referenced.
+                if select_mentions_rowid(sel) {
+                    return Err(Error::Unsupported(
+                        "VDBE window: view source references rowid",
+                    ));
+                }
+                let (cinfos, _rows) = self
+                    .try_view(&tref.name, tref.alias.as_deref(), &Params::default())?
+                    .ok_or(Error::Unsupported("VDBE window: view not found"))?;
+                cinfos
             } else {
                 if tref.tvf_args.is_some()
                     || tref.index_hint.is_some()
