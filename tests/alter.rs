@@ -715,11 +715,13 @@ fn rename_column_propagates_into_trigger_bodies() {
 
 #[test]
 fn rename_column_propagates_into_cross_object_trigger_body() {
-    // A trigger attached to ANOTHER table, whose body reads/writes ONLY the
-    // renamed table, has every bare and `<table>.`-qualified reference to the
-    // renamed column rewritten byte-for-byte like sqlite3 — while its own
-    // NEW/OLD (which bind to the trigger's table) are left untouched. Conservative:
-    // a body touching a second table is left unchanged (never corrupted).
+    // A trigger attached to ANOTHER table, whose body reads/writes the renamed
+    // table, has every bare and `<table>.`-qualified reference to the renamed
+    // column rewritten byte-for-byte like sqlite3 — while its own NEW/OLD (which
+    // bind to the trigger's table) are left untouched. A body that also touches a
+    // second table is still handled when the renamed column name is globally
+    // unique across every source (the global-uniqueness prover); only a genuinely
+    // ambiguous name is left unchanged (never corrupted).
     let sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
     let after = |create: &str, alter: &str| -> String {
         let mut c = Connection::open_memory().unwrap();
@@ -755,6 +757,13 @@ fn rename_column_propagates_into_cross_object_trigger_body() {
         // Body inserts into only `t`.
         "CREATE TABLE t(a,b); CREATE TABLE u(x); \
          CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO t(a,b) VALUES(NEW.x, 0); END;",
+        // Body touches a SECOND table (INSERT INTO l … SELECT a FROM t), but the
+        // renamed column name is globally unique across both, so the bare `a` in
+        // the source subquery is rewritten to match sqlite (the global-uniqueness
+        // prover; see `tests/rename_column_trigger_subquery.rs`). Previously a
+        // conservative bail.
+        "CREATE TABLE t(a,b); CREATE TABLE l(y); \
+         CREATE TRIGGER tr AFTER INSERT ON l BEGIN INSERT INTO l(y) SELECT a FROM t; END;",
     ];
     for setup in cases {
         let got = after(setup, alter);
@@ -762,17 +771,6 @@ fn rename_column_propagates_into_cross_object_trigger_body() {
             assert_eq!(got, want(setup, alter), "diverged for: {setup}");
         }
     }
-
-    // Conservative bail: a body that touches a SECOND table (INSERT INTO l SELECT
-    // FROM t) is left unchanged rather than risk a wrong rewrite — so it does NOT
-    // match sqlite here, but it is never corrupted (graphite keeps the old text).
-    let two = "CREATE TABLE t(a,b); CREATE TABLE l(y); \
-         CREATE TRIGGER tr AFTER INSERT ON l BEGIN INSERT INTO l(y) SELECT a FROM t; END;";
-    let got = after(two, alter);
-    assert!(
-        got.contains("SELECT a FROM t"),
-        "should be left intact: {got}"
-    );
 }
 
 #[test]

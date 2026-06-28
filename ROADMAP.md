@@ -1235,13 +1235,18 @@ open work:
   (`view_global_unique_quals`): it collects every base-table source at every
   nesting level and rewrites a bare `old` when that column name is unique across
   all of them — so a bare ref can bind only to the renamed table
-  (`tests/rename_column_view_subquery.rs`). What remains is the genuinely
+  (`tests/rename_column_view_subquery.rs`). The **trigger** counterpart
+  (`trigger_global_unique_quals`) now closes the same cross-object gap: a trigger
+  whose `WHEN` guard or body reaches the renamed column through another object —
+  a `WHEN` subquery over the renamed table, a body statement on a different table
+  whose subquery reads it, or a multi-source body on the renamed table where a
+  bare ref would otherwise be left stale by the `NEW`/`OLD`-only branch — is
+  rewritten when the column name is globally unique, with `NEW`/`OLD` added as
+  qualifiers when the trigger is attached to the renamed table
+  (`tests/rename_column_trigger_subquery.rs`). What remains is the genuinely
   ambiguous case — a bare ref to a column that *several* in-scope base tables
   own, where only one occurrence (the one in the renamed table's scope) should
   change. That is what needs the per-ref span:
-  - the same global-uniqueness gap for a **trigger** `WHEN`/body subquery that
-    reaches the renamed column across objects (the body-single-source case is
-    already covered by `trigger_body_single_source_over`); and
   - **A-rn3-edge-1** — add a source span (byte range) to `Expr::Column`. This is
     the enabling refactor. (The sibling `schema` field it once shared with the
     now-landed 3-part `schema.table.column` qualifier check is already in place,

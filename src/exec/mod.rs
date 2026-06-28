@@ -10282,6 +10282,18 @@ impl Connection {
                                     trigger_single_source_quals(&tsql, &table, &old)
                                 {
                                     rewrite_column_tokens(&tsql, &quals, &old, &new_text, true)
+                                } else if let Some((quals, bare)) =
+                                    trigger_global_unique_quals(&tsql, &table, &old, &table_cols)
+                                {
+                                    // The renamed table is reached across objects
+                                    // (the trigger is on another table, or its body
+                                    // touches more than one table) but the column
+                                    // name is globally unique, so every bare/
+                                    // qualified ref binds to it. Must precede the
+                                    // `NEW`/`OLD`-only branch below, which would
+                                    // otherwise short-circuit a trigger ON the
+                                    // renamed table and miss the bare refs.
+                                    rewrite_column_tokens(&tsql, &quals, &old, &new_text, bare)
                                 } else if trigger_on_renamed_table(&tsql, &table, &old) {
                                     rewrite_column_tokens(
                                         &tsql,
@@ -28061,6 +28073,164 @@ fn global_unique_plan(
         }
     }
     Some((quals, count == 1))
+}
+
+/// Recursively gather every base-table source `(name, alias)` reachable from a
+/// trigger *body* statement and its nested expression subqueries, for
+/// [`trigger_global_unique_quals`]. Each `INSERT`/`UPDATE`/`DELETE` contributes
+/// its written target table plus every base source of any `SELECT` it runs (an
+/// `INSERT … SELECT`, or a subquery in a `WHERE`/`SET`/`VALUES`). Returns `false`
+/// to bail on any shape a token rewrite can't safely reason about: a
+/// schema-qualified / RETURNING / upsert / CTE / `UPDATE … FROM` / row-value
+/// assignment statement, a target named or aliased exactly `old`, or any
+/// unprovable nested `SELECT` (handled by [`collect_select_base_sources`]).
+fn collect_trigger_stmt_base_sources(
+    stmt: &Statement,
+    old: &str,
+    srcs: &mut Vec<(String, Option<String>)>,
+) -> bool {
+    // Push a written target table (with optional alias), bailing if its name or
+    // alias collides with `old` (its token would be wrongly rewritten).
+    fn push_target(
+        name: &str,
+        alias: Option<&str>,
+        old: &str,
+        srcs: &mut Vec<(String, Option<String>)>,
+    ) -> bool {
+        if name.eq_ignore_ascii_case(old) || alias.is_some_and(|a| a.eq_ignore_ascii_case(old)) {
+            return false;
+        }
+        srcs.push((name.to_string(), alias.map(|a| a.to_string())));
+        true
+    }
+    // Collect base sources of every immediate subquery in `exprs`.
+    fn collect_expr_subs(
+        exprs: &[&Expr],
+        old: &str,
+        srcs: &mut Vec<(String, Option<String>)>,
+    ) -> bool {
+        let mut subs: Vec<&Select> = Vec::new();
+        for e in exprs {
+            collect_immediate_subselects(e, &mut subs);
+        }
+        subs.into_iter()
+            .all(|s| collect_select_base_sources(s, old, srcs))
+    }
+    match stmt {
+        Statement::Select(sel) => collect_select_base_sources(sel, old, srcs),
+        Statement::Insert(i) => {
+            if i.schema.is_some()
+                || !i.returning.is_empty()
+                || !i.upsert.is_empty()
+                || !i.ctes.is_empty()
+                || !push_target(&i.table, None, old, srcs)
+            {
+                return false;
+            }
+            match &i.source {
+                InsertSource::DefaultValues => true,
+                InsertSource::Values(rows) => {
+                    let exprs: Vec<&Expr> = rows.iter().flatten().collect();
+                    collect_expr_subs(&exprs, old, srcs)
+                }
+                InsertSource::Select(sel) => collect_select_base_sources(sel, old, srcs),
+            }
+        }
+        Statement::Update(u) => {
+            if u.schema.is_some()
+                || u.from.is_some()
+                || !u.returning.is_empty()
+                || !u.row_assignments.is_empty()
+                || !u.ctes.is_empty()
+                || !push_target(&u.table, u.alias.as_deref(), old, srcs)
+            {
+                return false;
+            }
+            let mut exprs: Vec<&Expr> = Vec::new();
+            for (_, e) in &u.assignments {
+                exprs.push(e);
+            }
+            exprs.extend(u.where_clause.as_ref());
+            exprs.extend(u.order_by.iter().map(|t| &t.expr));
+            exprs.extend(u.limit.as_ref());
+            exprs.extend(u.offset.as_ref());
+            collect_expr_subs(&exprs, old, srcs)
+        }
+        Statement::Delete(d) => {
+            if d.schema.is_some()
+                || !d.returning.is_empty()
+                || !d.ctes.is_empty()
+                || !push_target(&d.table, d.alias.as_deref(), old, srcs)
+            {
+                return false;
+            }
+            let mut exprs: Vec<&Expr> = Vec::new();
+            exprs.extend(d.where_clause.as_ref());
+            exprs.extend(d.order_by.iter().map(|t| &t.expr));
+            exprs.extend(d.limit.as_ref());
+            exprs.extend(d.offset.as_ref());
+            collect_expr_subs(&exprs, old, srcs)
+        }
+        _ => false,
+    }
+}
+
+/// The trigger counterpart of [`view_global_unique_quals`]: a `CREATE TRIGGER`
+/// whose `WHEN` guard and body reach the renamed `table` only through base-table
+/// sources (its own target tables and nested-subquery `FROM`s), with the renamed
+/// column name unique across all of them — so a bare `old` resolves unambiguously
+/// to the renamed table everywhere and a whole-text token rewrite is complete and
+/// correct. Returns `None` (leave the trigger byte-identical) on anything outside
+/// that provably-safe, globally-unique shape — never a partial rewrite. When the
+/// trigger is attached to the renamed table, `NEW`/`OLD` are added as qualifiers
+/// (they bind to the renamed table's row).
+fn trigger_global_unique_quals(
+    trigger_sql: &str,
+    table: &str,
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<(Vec<String>, bool)> {
+    let Ok(Statement::CreateTrigger(ct)) = sql::parse_one(trigger_sql) else {
+        return None;
+    };
+    if old.eq_ignore_ascii_case(table)
+        || old.eq_ignore_ascii_case("new")
+        || old.eq_ignore_ascii_case("old")
+    {
+        return None;
+    }
+    let mut srcs: Vec<(String, Option<String>)> = Vec::new();
+    // The `WHEN` guard's subqueries are base-table sources too.
+    if let Some(w) = &ct.when {
+        let mut subs: Vec<&Select> = Vec::new();
+        collect_immediate_subselects(w, &mut subs);
+        if !subs
+            .into_iter()
+            .all(|s| collect_select_base_sources(s, old, &mut srcs))
+        {
+            return None;
+        }
+    }
+    if ct.body.is_empty() {
+        return None;
+    }
+    for stmt in &ct.body {
+        if !collect_trigger_stmt_base_sources(stmt, old, &mut srcs) {
+            return None;
+        }
+    }
+    // Only fire when the rename is globally unambiguous; otherwise bail entirely
+    // rather than do a partial (qualified-only) rewrite — see
+    // [`view_global_unique_quals`] for the rationale.
+    let (mut quals, bare) = match global_unique_plan(&srcs, table, old, table_cols) {
+        Some((q, true)) => (q, true),
+        _ => return None,
+    };
+    if ct.table.eq_ignore_ascii_case(table) {
+        quals.push(String::from("NEW"));
+        quals.push(String::from("OLD"));
+    }
+    Some((quals, bare))
 }
 
 /// Whether a `SELECT` references at most the single source `table` (its `FROM`,

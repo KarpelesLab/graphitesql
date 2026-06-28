@@ -97,6 +97,15 @@ fn trigger_rename_column_subquery_matches_sqlite() {
          UPDATE t SET b=b+1 WHERE a=(SELECT max(a) FROM t t2) AND a<>NEW.a; END; \
          ALTER TABLE t RENAME COLUMN a TO aa; UPDATE t SET b=99 WHERE aa=1; \
          SELECT sql FROM sqlite_schema WHERE name='tr'; SELECT aa,b FROM t ORDER BY aa",
+        // A body statement writes another table (`log`), but the renamed column
+        // name is globally unique across every source the trigger touches, so a
+        // bare `a` can only bind to `t` — every reference is rewritten (the
+        // global-uniqueness prover; see `tests/rename_column_trigger_subquery.rs`
+        // for the cross-object family). Previously a bail case.
+        "CREATE TABLE t(a,b); CREATE TABLE log(x); \
+         CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+         INSERT INTO log SELECT a FROM t WHERE a=(SELECT max(a) FROM t t2); END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
     ];
     for sql in matching {
         assert_eq!(run("sqlite3", sql), run(g, sql), "for {sql}");
@@ -107,16 +116,9 @@ fn trigger_rename_column_subquery_matches_sqlite() {
     // through the other table — so these stay known gaps rather than differential
     // equalities. The invariant guards against a *wrong* rewrite creeping in.)
     let bail = [
-        // Body statement writes another table.
-        (
-            "CREATE TABLE t(a,b); CREATE TABLE log(x); \
-             CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
-             INSERT INTO log SELECT a FROM t WHERE a=(SELECT max(a) FROM t t2); END; \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
-            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
-             INSERT INTO log SELECT a FROM t WHERE a=(SELECT max(a) FROM t t2); END",
-        ),
-        // Nested subquery references another table.
+        // Nested subquery references another table that *also* owns an `a`, so a
+        // bare `a` is ambiguous (it could bind to either) — the global-uniqueness
+        // prover declines rather than guess.
         (
             "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
              CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
