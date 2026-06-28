@@ -7,7 +7,8 @@
 //!
 //! A body that reads a *single-level* sibling CTE now runs too (see
 //! `vdbe_cte_sibling.rs` for the full matrix); a two-or-more-level sibling chain,
-//! or a recursive / join body, still defers — asserted separately. `query_vdbe`
+//! or a recursive / NATURAL-join body, still defers — asserted separately. (A
+//! *plain* join body now runs.) `query_vdbe`
 //! errors on any fallback, so a passing query proves the VDBE handled the CTE
 //! source. Checked against the tree-walker and sqlite3 3.50.4.
 

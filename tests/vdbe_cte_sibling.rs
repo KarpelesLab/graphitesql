@@ -7,9 +7,10 @@
 //! in scope (`subquery_column_origins_in`), so an `INTEGER` column read through a
 //! sibling keeps coercing exactly as SQLite does.
 //!
-//! A recursive (compound) body, a join body, or a two-or-more-level sibling chain
-//! whose intermediate names can't be resolved still defers to the tree-walker
-//! (the body origins don't resolve) — correct, never wrong.
+//! A CTE whose body is a *plain* join now runs too (its origins resolve across the
+//! join's sources, like a derived join table). A recursive (compound) body, a
+//! NATURAL/USING join body, or a two-or-more-level sibling chain whose intermediate
+//! names can't be resolved still defers to the tree-walker — correct, never wrong.
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE ran the
 //! CTE source itself. Checked against the tree-walker and sqlite3 3.50.4.
@@ -44,6 +45,8 @@ const QUERIES: &[&str] = &[
     "WITH t AS (SELECT 9 AS g) SELECT g FROM t",
     // A CTE joined with a base table.
     "WITH c AS (SELECT g,n FROM t) SELECT t.g, c.n FROM t JOIN c ON t.g=c.g ORDER BY 1,2",
+    // A CTE whose *body* is a plain join — origins resolve across both sources.
+    "WITH j AS (SELECT t.g FROM t JOIN t t2 ON t.g=t2.g) SELECT count(*) FROM j",
     // A constant / `VALUES` CTE body still works (no affinity, BINARY).
     "WITH v(a,b) AS (VALUES (1,2),(3,4)) SELECT a+b FROM v ORDER BY 1",
 ];
@@ -84,13 +87,14 @@ fn sibling_cte_runs_on_vdbe_and_matches_tree_walker() {
 #[test]
 fn deep_or_compound_cte_bodies_fall_back() {
     let c = conn();
-    // A recursive (compound) body, a join body, and a two-level sibling chain whose
-    // intermediate name can't be resolved for origins all defer to the tree-walker —
-    // correctly (the tree-walker still runs them).
+    // A recursive (compound) body, a NATURAL-join body (coalesced shared column),
+    // and a two-level sibling chain whose intermediate name can't be resolved for
+    // origins all defer to the tree-walker — correctly (the tree-walker still runs
+    // them).
     for q in [
         "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r WHERE i<3) \
          SELECT i FROM r ORDER BY 1",
-        "WITH j AS (SELECT t.g FROM t JOIN t t2 ON t.g=t2.g) SELECT count(*) FROM j",
+        "WITH j AS (SELECT g FROM t NATURAL JOIN t t2) SELECT count(*) FROM j",
         "WITH a AS (SELECT g FROM t), b AS (SELECT g FROM a), d AS (SELECT g FROM b) \
          SELECT count(*) FROM d",
     ] {

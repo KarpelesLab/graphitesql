@@ -1272,10 +1272,17 @@ tree-walker resolved all of that during materialization. The CTE's name or alias
 the row qualifier and an explicit `WITH name(cols…)` list renames the body's
 columns; the per-column affinity is resolved through the body with the sibling CTEs
 in scope (`subquery_column_origins_in`), so an `INTEGER` column read through a
-single-level sibling keeps coercing exactly as SQLite does. A recursive (compound)
-or join body, a non-BINARY body column, or a two-or-more-level sibling chain whose
-intermediate name can't be resolved for origins still defers to the tree-walker
-(correct, never wrong). A **single table-valued function `FROM` source** runs on
+single-level sibling keeps coercing exactly as SQLite does. A **derived table whose
+body is a *plain* join** (`FROM (SELECT t.g, u.m FROM t JOIN u ON …) x`) runs too:
+the body materializes through `run_select`, and `subquery_column_origins` now
+resolves each output column's `(affinity, collation)` *across the join's sources*
+(first table then each joined table, in declaration order) — so an affinity-sensitive
+outer `WHERE`/`ORDER BY` over a derived numeric column coerces exactly as SQLite does,
+instead of falling back to the BLOB default (this also sharpens a join-bodied view's
+column affinity in the tree-walker). A NATURAL/USING body (coalesced shared column),
+a non-BINARY body column, a recursive/compound body, or a two-or-more-level sibling
+chain whose intermediate name can't be resolved for origins still defers to the
+tree-walker (correct, never wrong). A **single table-valued function `FROM` source** runs on
 the VDBE as well: `generate_series(start[,stop[,step]])`, `json_each` / `json_tree`,
 and the table-valued `pragma_<name>(arg)` form are materialized through the same
 `tvf_rows` the tree-walker uses, so projection / WHERE / ORDER BY / LIMIT / aggregate

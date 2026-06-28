@@ -4,9 +4,10 @@
 //! derived tables, so an inherited affinity — e.g. an `INTEGER` column read
 //! through two `SELECT *` wrappers — keeps coercing exactly as SQLite does.
 //!
-//! A body that is a join, a compound, a view, a CTE, or a table-valued function
-//! still defers to the tree-walker (`subquery_column_origins` returns `None`),
-//! as does any derived column with a non-BINARY collation.
+//! A body that is a NATURAL/USING join, a compound, a view, a CTE, or a
+//! table-valued function still defers to the tree-walker (`subquery_column_origins`
+//! returns `None`), as does any derived column with a non-BINARY collation. (A
+//! *plain* join body now runs — see `vdbe_derived_join.rs`.)
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE ran
 //! the nested source. Checked against the tree-walker and sqlite3 3.50.4.
@@ -75,11 +76,13 @@ fn nested_derived_runs_on_vdbe_and_matches_tree_walker() {
 }
 
 #[test]
-fn nested_derived_over_a_join_falls_back() {
+fn nested_derived_over_a_natural_join_falls_back() {
     let c = conn();
-    // The inner derived body is a join, which `subquery_column_origins` can't
-    // resolve — the VDBE declines and the tree-walker handles the query.
-    let q = "SELECT x FROM (SELECT t1.g AS x FROM t t1 JOIN t t2 ON t1.g = t2.g)";
+    // The inner derived body is a NATURAL join, whose coalesced shared column
+    // `subquery_column_origins` can't resolve by a bare-name lookup — the VDBE
+    // declines and the tree-walker handles the query. (A *plain* join body runs;
+    // see `vdbe_derived_join.rs`.)
+    let q = "SELECT x FROM (SELECT g AS x FROM t t1 NATURAL JOIN t t2) ORDER BY x";
     assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
     assert!(c.query(q).is_ok(), "tree-walker should run {q}");
 }

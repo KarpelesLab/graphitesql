@@ -17445,25 +17445,51 @@ impl Connection {
             return None;
         }
         let from = select.from.as_ref()?;
-        if !from.joins.is_empty() {
+        // A NATURAL / USING join coalesces its shared columns into a single output
+        // column whose affinity is the left source's — a bare-name lookup across both
+        // sources can't disambiguate that. Defer those; a plain join (CROSS / comma /
+        // `ON`) keeps every source column distinct, so each output column resolves to
+        // exactly one source.
+        if from.joins.iter().any(|j| j.natural || !j.using.is_empty()) {
             return None;
         }
-        // The single source's named columns, each with its `(affinity, collation)`.
-        // A base table reads them from its meta; a nested subquery recurses, so a
-        // collation/affinity flows through any depth of single-source derived tables.
-        let src = self.named_source_origins_in(&from.first, ctes)?;
-        let label = from
-            .first
-            .alias
-            .clone()
-            .unwrap_or_else(|| from.first.name.clone());
+        // Each FROM source's `(label, named (affinity, collation) columns)`. A base
+        // table reads them from its meta; a nested subquery / sibling-CTE source
+        // recurses, so a collation/affinity flows through any depth of single-source
+        // derived tables. For a plain join body the sources are the first table then
+        // each joined table in declaration order — the same order the scan's combined
+        // schema concatenates them, so positional column counts line up.
+        let mut sources: Vec<(String, Vec<(String, ColOrigin)>)> = Vec::new();
+        for tref in core::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.table)) {
+            let label = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+            sources.push((label, self.named_source_origins_in(tref, ctes)?));
+        }
         let base = |table: Option<&str>, col: &str| -> Option<ColOrigin> {
-            if table.is_some_and(|t| !t.eq_ignore_ascii_case(&label)) {
-                return None;
+            match table {
+                // A qualified `t.col` resolves within the one named source.
+                Some(t) => {
+                    let (_, src) = sources.iter().find(|(l, _)| l.eq_ignore_ascii_case(t))?;
+                    src.iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(col))
+                        .map(|(_, o)| *o)
+                }
+                // A bare `col` must name exactly one source's column (a valid body
+                // already guarantees this — an ambiguous bare name never produced
+                // rows); an ambiguous match bails to the conservative default.
+                None => {
+                    let mut found = None;
+                    for (_, src) in &sources {
+                        if let Some((_, o)) = src.iter().find(|(n, _)| n.eq_ignore_ascii_case(col))
+                        {
+                            if found.is_some() {
+                                return None;
+                            }
+                            found = Some(*o);
+                        }
+                    }
+                    found
+                }
             }
-            src.iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(col))
-                .map(|(_, o)| *o)
         };
         fn origin(e: &Expr, base: &dyn Fn(Option<&str>, &str) -> Option<ColOrigin>) -> ColOrigin {
             match e {
@@ -17483,11 +17509,15 @@ impl Connection {
         let mut out = Vec::new();
         for rc in &select.columns {
             match rc {
-                ResultColumn::Wildcard => out.extend(src.iter().map(|(_, o)| *o)),
-                ResultColumn::TableWildcard(t) if t.eq_ignore_ascii_case(&label) => {
-                    out.extend(src.iter().map(|(_, o)| *o))
+                ResultColumn::Wildcard => {
+                    for (_, src) in &sources {
+                        out.extend(src.iter().map(|(_, o)| *o));
+                    }
                 }
-                ResultColumn::TableWildcard(_) => return None,
+                ResultColumn::TableWildcard(t) => {
+                    let (_, src) = sources.iter().find(|(l, _)| l.eq_ignore_ascii_case(t))?;
+                    out.extend(src.iter().map(|(_, o)| *o));
+                }
                 ResultColumn::Expr { expr, .. } => out.push(origin(expr, &base)),
             }
         }

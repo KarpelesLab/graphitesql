@@ -6,10 +6,11 @@
 //!
 //! A constant / `VALUES` derived body is also supported — its columns carry no
 //! affinity and BINARY collation, exactly as the non-window derived scan
-//! materializes them. A derived body that is a join, a non-constant compound, a
-//! view, or a table-valued function still defers to the tree-walker, as does any
-//! query whose window or projection references the (non-existent) rowid of the
-//! derived source.
+//! materializes them. A *plain* join body now runs too (its origins resolve across
+//! the join's sources). A derived body that is a NATURAL/USING join, a non-constant
+//! compound, a view, or a table-valued function still defers to the tree-walker, as
+//! does any query whose window or projection references the (non-existent) rowid of
+//! the derived source.
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE ran
 //! the window over the derived source. Checked against the tree-walker and
@@ -46,6 +47,8 @@ const QUERIES: &[&str] = &[
     "SELECT v.g, sum(v.n) OVER (PARTITION BY v.g) FROM (SELECT g, n FROM t) v ORDER BY v.g, v.n",
     // A constant `VALUES` derived body — no affinity, BINARY collation.
     "SELECT column1, sum(column2) OVER (PARTITION BY column1) FROM (VALUES (1,10),(1,20),(2,5)) ORDER BY column1, column2",
+    // A *plain* join body under a window (tie-insensitive: partition count).
+    "SELECT x, count(*) OVER (PARTITION BY x) FROM (SELECT t1.g AS x FROM t t1 JOIN t t2 ON t1.g=t2.g) ORDER BY x",
 ];
 
 fn conn() -> Connection {
@@ -81,12 +84,13 @@ fn window_over_derived_runs_on_vdbe_and_matches_tree_walker() {
 }
 
 #[test]
-fn window_over_derived_join_falls_back() {
+fn window_over_derived_natural_join_falls_back() {
     let c = conn();
-    // The derived body is a join, which `subquery_column_origins` can't resolve —
-    // the VDBE declines and the tree-walker handles the window.
+    // The derived body is a NATURAL join, whose coalesced shared column
+    // `subquery_column_origins` can't resolve — the VDBE declines and the
+    // tree-walker handles the window. (A *plain* join body now runs; see QUERIES.)
     let q = "SELECT x, row_number() OVER (ORDER BY x) \
-             FROM (SELECT t1.g x FROM t t1 JOIN t t2 ON t1.g = t2.g)";
+             FROM (SELECT g x FROM t t1 NATURAL JOIN t t2)";
     assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
     assert!(c.query(q).is_ok(), "tree-walker should run {q}");
 }
