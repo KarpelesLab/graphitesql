@@ -15907,11 +15907,11 @@ impl Connection {
     /// each row's rowid as a trailing column so a `rowid`/`_rowid_`/`oid`
     /// reference anywhere in the query resolves; a `WITHOUT ROWID` table makes
     /// that projection bail, so such queries fall back. A plain join, a derived
-    /// subquery, a whole-query `WITH` CTE, and a view source are also handled (the
-    /// last three carry no rowid, so a `rowid` reference there defers); any shape
-    /// the base scan cannot run (a virtual/TVF source, a non-`main` schema, a
-    /// `NATURAL`/`USING` join, …) returns `Unsupported`, falling the whole query
-    /// back to the tree-walker.
+    /// subquery, a whole-query `WITH` CTE, a view source, and a table-valued
+    /// function source are also handled (all but the join carry no rowid, so a
+    /// `rowid` reference there defers); any shape the base scan cannot run (a
+    /// virtual-table source, a non-`main` schema, a `NATURAL`/`USING` join, …)
+    /// returns `Unsupported`, falling the whole query back to the tree-walker.
     /// The `ColumnInfo` for a derived / CTE window source body — the same column
     /// model the non-window derived-scan path (`scan_one`) uses. A constant /
     /// `VALUES` body's columns carry no affinity and BINARY collation; any other
@@ -16084,6 +16084,22 @@ impl Connection {
                 let qualifier = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
                 let rename = (!cte.columns.is_empty()).then_some(cte.columns.as_slice());
                 self.window_source_columns(cte.select.as_ref(), &qualifier, rename)?
+            } else if tref.index_hint.is_none()
+                && (tref.tvf_args.is_some() || self.is_pragma_tvf(tref))
+            {
+                // A table-valued function window source (`generate_series(…)`,
+                // `json_each` / `json_tree`, the table-valued `pragma_<name>(…)`
+                // form). The base scan materializes it through `scan_one`'s TVF
+                // branch (which masks the hidden input columns), so `tvf_rows` here
+                // resolves the matching *visible* column model. A TVF row has no
+                // rowid, so defer if one is referenced.
+                if select_mentions_rowid(sel) {
+                    return Err(Error::Unsupported(
+                        "VDBE window: TVF source references rowid",
+                    ));
+                }
+                let (cinfos, _rows) = self.tvf_rows(tref, &Params::default())?;
+                cinfos.into_iter().filter(|ci| !ci.hidden).collect()
             } else if tref.tvf_args.is_none()
                 && tref.index_hint.is_none()
                 && tref.schema.is_none()

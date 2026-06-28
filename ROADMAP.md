@@ -1310,7 +1310,14 @@ g) FROM vt`) runs on the VDBE too: `run_window_vdbe` resolves the view's columns
 through `try_view` and lets the base scan materialize the body through `scan_one`, then
 the shared `finish_from_rows` tail evaluates the windows — so a join-, compound-, or
 aliased-rowid-bodied view all carry windows. The same non-BINARY-collation and
-`rowid`-reference cases defer (a view has no per-row rowid for the window path). A **single
+`rowid`-reference cases defer (a view has no per-row rowid for the window path). A
+**window-function `SELECT` over a table-valued-function source** (`SELECT value,
+sum(value) OVER (ORDER BY value) FROM generate_series(1,5)`, or over `json_each` /
+`json_tree` / the `pragma_<name>(arg)` form) runs too: `run_window_vdbe` resolves the
+TVF's *visible* columns through `tvf_rows` (masking the hidden `json`/`root` inputs)
+and the base scan materializes the rows through `scan_one`'s TVF branch. A `rowid`
+reference defers (a TVF row has no rowid), and a TVF *inside a join* window source
+still defers (the static column model can't reproduce it). A **single
 table-valued function `FROM` source** runs on
 the VDBE as well: `generate_series(start[,stop[,step]])`, `json_each` / `json_tree`,
 and the table-valued `pragma_<name>(arg)` form are materialized through the same
