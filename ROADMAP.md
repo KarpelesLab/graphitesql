@@ -1394,7 +1394,10 @@ group and `DISTINCT` then dedups those rows via a `DistinctCheck` inserted after
 `HAVING` and before `OFFSET`/`LIMIT` and the sorter, so dedup precedes both
 ordering and the row counters exactly as in SQLite; the dedup compares output
 rows under BINARY, and an explicit `COLLATE` on an otherwise-BINARY output column
-defers to the tree-walker;
+defers to the tree-walker — this holds for a plain row-level `SELECT DISTINCT a
+COLLATE NOCASE` as well as the grouped form, since the `DistinctCheck` would
+otherwise fold the rows under BINARY (an explicit `COLLATE BINARY` is BINARY
+already and keeps running on the VDBE);
 `DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates (incl.
 the two-argument `group_concat(x, sep)` / `string_agg(x, sep)` form — the constant
 separator is captured at compile time and threaded through the accumulator). A
