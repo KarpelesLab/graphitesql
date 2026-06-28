@@ -7,6 +7,12 @@
 //! accepted the statement. It now reports the same error at prepare time, on
 //! both the SELECT and the UPDATE/DELETE paths.
 //!
+//! An `IN` list whose elements disagree in arity with the left-hand side is the
+//! closely related `IN(...) element has N terms - expected M` (a row element
+//! under a scalar LHS is `row value misused` instead) — also raised at prepare
+//! time, where graphite evaluated it per row and could even return a wrong
+//! result when an earlier list element happened to match.
+//!
 //! Equal-arity row comparisons (`(a,b) = (1,2)`, `(a,b) BETWEEN (1,2) AND
 //! (3,4)`) stay valid. A multi-column subquery in a plain scalar position is a
 //! different message (`sub-select returns N columns - expected 1`) and is not
@@ -76,8 +82,19 @@ fn row_value_misuse_matches_sqlite_cli() {
         // A row value nested inside a valid row comparison's element.
         &format!("{s} SELECT * FROM t WHERE (a, (1, 2)) = (1, 2)"),
         &format!("{s} SELECT * FROM t WHERE (a + (1, 2), b) = (1, 2)"),
+        // An `IN` list element whose arity disagrees with the LHS.
+        &format!("{s} SELECT * FROM t WHERE (a, b) IN ((1, 2), (3))"),
+        &format!("{s} SELECT * FROM t WHERE (a, b) IN (1, 2)"),
+        &format!("{s} SELECT * FROM t WHERE (a, b) IN ((1, 2, 3))"),
+        &format!("{s} SELECT * FROM t WHERE (a, b, a) IN ((1, 2))"),
+        &format!("{s} SELECT * FROM t WHERE a IN ((1, 2))"),
+        &format!("{s} SELECT * FROM t WHERE a IN (1, (2, 3))"),
+        // An earlier matching element used to mask the bad one over a non-empty
+        // table (graphite returned a row); now rejected at prepare time.
+        &format!("{s} INSERT INTO t VALUES(1,2); SELECT * FROM t WHERE (a, b) IN ((1, 2), (3))"),
         // The UPDATE/DELETE SET and WHERE paths reject it the same way.
         &format!("{s} DELETE FROM t WHERE a = (1, 2)"),
+        &format!("{s} DELETE FROM t WHERE (a, b) IN (1, 2)"),
         &format!("{s} UPDATE t SET a = 1 WHERE a = (SELECT 1, 2)"),
         &format!("{s} UPDATE t SET a = (1, 2)"),
         // Equal-arity row comparisons stay valid — no error, empty result.
@@ -85,6 +102,7 @@ fn row_value_misuse_matches_sqlite_cli() {
         &format!("{s} SELECT * FROM t WHERE (a, b) < (3, 4)"),
         &format!("{s} SELECT * FROM t WHERE ((a, b)) = (1, 2)"),
         &format!("{s} SELECT * FROM t WHERE (a, b) IN ((1, 2), (3, 4))"),
+        &format!("{s} SELECT * FROM t WHERE a IN (1, 2, 3)"),
         &format!("{s} SELECT * FROM t WHERE (a, b) BETWEEN (1, 2) AND (3, 4)"),
         &format!("{s} SELECT * FROM t WHERE (a, b) = (SELECT a, b FROM t LIMIT 1)"),
         // And a valid row comparison over a non-empty table still runs.

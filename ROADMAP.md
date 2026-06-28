@@ -435,10 +435,16 @@ output width, else 1) must match. Equal-arity row comparisons (`(a,b) = (1,2)`,
 nested misuse inside a valid row element (`(a, (1,2)) = (1,2)`) is still caught.
 It runs on the SELECT and the UPDATE/DELETE paths after column resolution, so a
 `no such column` still wins; a comparison against a subquery with an unresolved
-column is conservatively skipped (left to its lazy behaviour). Residuals: the
-`IN(…) element has N terms - expected M` list-arity message is a separate path,
-and a dirty operand where SQLite reports `row value misused` *before* the missing
-column is left as-is. Byte-exact vs `sqlite3` 3.50.4 for the column-clean cases.
+column is conservatively skipped (left to its lazy behaviour). The closely
+related **`IN(…) element has N terms - expected M`** is handled in the same pass:
+every element of an `IN` list must share the left-hand side's row width, so
+`(a,b) IN ((1,2),(3))`, `(a,b) IN (1,2)`, and `(a,b) IN ((1,2,3))` are rejected at
+prepare time (a row element under a *scalar* LHS, `a IN ((1,2))`, is the plain
+`row value misused`). This also fixes a latent wrong-answer: over a non-empty
+table graphite used to accept `(a,b) IN ((1,2),(3))` and return the row matched by
+the well-formed element, silently ignoring the malformed one. The one remaining
+residual is a dirty operand where SQLite reports `row value misused` *before* the
+missing column. Byte-exact vs `sqlite3` 3.50.4 for the column-clean cases.
 
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite

@@ -14575,9 +14575,30 @@ impl Connection {
             }
             Expr::IsNull { expr, .. } => self.walk_row_value_misuse(expr, cols)?,
             Expr::InList { expr, list, .. } => {
-                // `(a,b) IN ((1,2),…)` — the LHS and each list element may be a row
-                // value; their term-count mismatch is a *different* message
-                // (`IN(…) element has N terms - expected M`), left to that path.
+                // `(a,b) IN ((1,2),…)` — the LHS and each list element may be a
+                // row value, but every element must have the LHS's arity. A
+                // wider/narrower element under a row LHS is `IN(...) element has
+                // N terms - expected M`; a row element under a scalar LHS is
+                // `row value misused`. (SQLite checks this at prepare time;
+                // graphite evaluated it per row, so an empty/filtered table — or
+                // even a matching first element — masked the bad one.)
+                if let Some(m) = self.row_arity(expr, cols) {
+                    for a in list {
+                        let Some(n) = self.row_arity(a, cols) else {
+                            continue;
+                        };
+                        if m >= 2 {
+                            if n != m {
+                                let term = if n == 1 { "term" } else { "terms" };
+                                return Err(Error::Error(alloc::format!(
+                                    "IN(...) element has {n} {term} - expected {m}"
+                                )));
+                            }
+                        } else if n >= 2 {
+                            return Err(Error::Error("row value misused".into()));
+                        }
+                    }
+                }
                 self.walk_row_value_misuse_operand(expr, cols)?;
                 for a in list {
                     self.walk_row_value_misuse_operand(a, cols)?;
