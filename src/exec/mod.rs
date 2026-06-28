@@ -1279,22 +1279,31 @@ impl Connection {
             Option<Vec<i64>>,
         );
         let scan_one = |tr: &sql::ast::TableRef| -> Result<ScanOut> {
-            // A table-valued function FROM source (`generate_series(…)`, the
-            // table-valued `pragma_<name>(…)` form). `tvf_rows` produces the same
-            // columns and rows the tree-walker would, so the outer query sees them
-            // identically. `json_each` / `json_tree` carry *hidden* input columns
-            // (`json` / `root`) that this single-source path's `*` expansion can't
-            // model — those defer to the tree-walker. (A multi-source query
-            // containing a TVF is rejected earlier as "only plain table sources".)
+            // A table-valued function FROM source (`generate_series(…)`,
+            // `json_each` / `json_tree`, the table-valued `pragma_<name>(…)` form).
+            // `tvf_rows` produces the same columns and rows the tree-walker would, so
+            // the outer query sees them identically. Its *hidden* input columns
+            // (`json_each` / `json_tree`'s `json` / `root`) are dropped here — they are
+            // excluded from `*` / `tbl.*` expansion, and a query naming one explicitly
+            // simply fails to resolve on the VDBE and defers to the tree-walker. Both
+            // the column metadata and every row are projected through the visible-
+            // column mask. (A multi-source query containing a TVF defers earlier.)
             if tr.tvf_args.is_some() || self.is_pragma_tvf(tr) {
                 let (cinfos, rows) = self.tvf_rows(tr, &eval::Params::default())?;
-                if cinfos.iter().any(|ci| ci.hidden) {
-                    return Err(Error::Unsupported("VDBE: TVF with hidden columns"));
-                }
-                let columns = cinfos.iter().map(|ci| ci.name.clone()).collect();
-                let tables = cinfos.iter().map(|ci| ci.table.clone()).collect();
-                let affinities = cinfos.iter().map(|ci| ci.affinity).collect();
-                let collations = cinfos.iter().map(|ci| ci.collation).collect();
+                let visible: Vec<usize> = cinfos
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, ci)| !ci.hidden)
+                    .map(|(i, _)| i)
+                    .collect();
+                let columns = visible.iter().map(|&i| cinfos[i].name.clone()).collect();
+                let tables = visible.iter().map(|&i| cinfos[i].table.clone()).collect();
+                let affinities = visible.iter().map(|&i| cinfos[i].affinity).collect();
+                let collations = visible.iter().map(|&i| cinfos[i].collation).collect();
+                let rows = rows
+                    .into_iter()
+                    .map(|r| visible.iter().map(|&i| r[i].clone()).collect())
+                    .collect();
                 return Ok((columns, tables, affinities, collations, rows, None));
             }
             // A derived source: an explicit `FROM` subquery, or a `FROM` reference

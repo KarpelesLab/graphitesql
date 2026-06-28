@@ -1,12 +1,14 @@
 //! A single table-valued function used as a `FROM` source now runs on the VDBE:
-//! `generate_series(start[,stop[,step]])` and the table-valued `pragma_<name>(arg)`
-//! form. `scan_one` materializes the function's rows through the same `tvf_rows`
-//! the tree-walker uses, so the outer query (projection / WHERE / ORDER BY / LIMIT
-//! / aggregate) sees them identically.
+//! `generate_series(start[,stop[,step]])`, `json_each` / `json_tree`, and the
+//! table-valued `pragma_<name>(arg)` form. `scan_one` materializes the function's
+//! rows through the same `tvf_rows` the tree-walker uses, so the outer query
+//! (projection / WHERE / ORDER BY / LIMIT / aggregate) sees them identically. The
+//! *hidden* input columns `json_each` / `json_tree` expose (`json` / `root`) are
+//! dropped — they're excluded from `*` expansion anyway, and a query naming one
+//! explicitly fails to resolve on the VDBE and defers to the tree-walker.
 //!
 //! Deferred to the tree-walker (asserted separately), never run wrong:
-//!   * `json_each` / `json_tree` — they expose *hidden* input columns (`json` /
-//!     `root`) that this single-source `*` expansion can't model.
+//!   * a query naming a TVF's *hidden* `json` / `root` column explicitly.
 //!   * any TVF appearing in a *join* — its arguments may correlate to another
 //!     source's columns, which `tvf_rows` (rowless context) can't honour.
 //!
@@ -43,6 +45,17 @@ const QUERIES: &[&str] = &[
     "SELECT name, type FROM pragma_table_info('t')",
     "SELECT name FROM pragma_table_info('t') WHERE pk = 0 ORDER BY name",
     "SELECT count(*) FROM pragma_table_info('t')",
+    // json_each: named columns, `*` (hidden json/root dropped), WHERE/ORDER BY,
+    // object keys, an aggregate, and a path argument.
+    "SELECT key, value FROM json_each('[10,20,30]')",
+    "SELECT * FROM json_each('[10,20,30]')",
+    "SELECT type, value FROM json_each('[1,\"a\",2.5,true]')",
+    "SELECT value FROM json_each('[10,20,30]') WHERE value > 15 ORDER BY value DESC",
+    "SELECT key, value FROM json_each('{\"a\":1,\"b\":2}') ORDER BY key",
+    "SELECT count(*), sum(value) FROM json_each('[1,2,3,4]')",
+    "SELECT fullkey, path, value FROM json_each('{\"a\":[1,2]}','$.a')",
+    // json_tree: a full recursive walk.
+    "SELECT key, value, type FROM json_tree('{\"a\":1,\"b\":[2,3]}') ORDER BY id",
 ];
 
 fn conn() -> Connection {
@@ -80,12 +93,12 @@ fn tvf_source_runs_on_vdbe_and_matches_tree_walker() {
 #[test]
 fn hidden_column_and_joined_tvf_fall_back() {
     let c = conn();
-    // `json_each` / `json_tree` expose hidden input columns, and any TVF inside a
-    // join may correlate to another source — both defer to the tree-walker, which
-    // still runs them. (The last query is intentionally ambiguous on `value`, which
-    // the tree-walker rejects exactly like SQLite — so we only assert it deferred.)
+    // A query naming a TVF's hidden `json` / `root` column explicitly, and any TVF
+    // inside a join (its args may correlate to another source), both defer to the
+    // tree-walker, which still runs them.
     for q in [
-        "SELECT key, value FROM json_each('[10,20,30]')",
+        "SELECT json FROM json_each('[1,2]')",
+        "SELECT je.root FROM json_each('[1,2]','$') je",
         "SELECT t.g, j.value FROM t, json_each('[1,2]') j",
         "SELECT g FROM t, generate_series(1,2)",
     ] {

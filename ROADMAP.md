@@ -1276,13 +1276,15 @@ single-level sibling keeps coercing exactly as SQLite does. A recursive (compoun
 or join body, a non-BINARY body column, or a two-or-more-level sibling chain whose
 intermediate name can't be resolved for origins still defers to the tree-walker
 (correct, never wrong). A **single table-valued function `FROM` source** runs on
-the VDBE as well: `generate_series(start[,stop[,step]])` and the table-valued
-`pragma_<name>(arg)` form are materialized through the same `tvf_rows` the
-tree-walker uses, so projection / WHERE / ORDER BY / LIMIT / aggregate over the
-series or pragma rows run without falling back. `json_each` / `json_tree` (which
-expose *hidden* input columns the single-source `*` expansion can't model) and any
-TVF appearing in a *join* (its arguments may correlate to another source, which the
-rowless `tvf_rows` can't honour) still defer to the tree-walker. A **compound
+the VDBE as well: `generate_series(start[,stop[,step]])`, `json_each` / `json_tree`,
+and the table-valued `pragma_<name>(arg)` form are materialized through the same
+`tvf_rows` the tree-walker uses, so projection / WHERE / ORDER BY / LIMIT / aggregate
+over the series, the JSON elements, or the pragma rows run without falling back. The
+*hidden* input columns `json_each` / `json_tree` expose (`json` / `root`) are dropped
+— they're excluded from `*` expansion, and a query naming one explicitly fails to
+resolve on the VDBE and defers. A TVF appearing in a *join* (its arguments may
+correlate to another source, which the rowless `tvf_rows` can't honour) also defers
+to the tree-walker. A **compound
 `SELECT` whose whole-query `WITH` is referenced by one or more arms** runs on the
 VDBE too: the outer CTEs are materialized into the CTE environment (so the first
 core's output-collation scan resolves them) and threaded into every operand (so
