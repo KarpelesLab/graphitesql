@@ -7662,6 +7662,7 @@ impl Connection {
         if self.is_virtual_table(&ci.table) {
             return Err(Error::Error("virtual tables may not be indexed".into()));
         }
+        self.reject_internal_table_ddl(&ci.table, "indexed")?;
         // A missing index target is schema-qualified by SQLite (`main` default),
         // unlike the bare "no such table" of a DML/SELECT reference.
         if self.schema.table(&ci.table).is_none() {
@@ -9189,6 +9190,11 @@ impl Connection {
 
     fn exec_drop(&mut self, d: &Drop) -> Result<()> {
         use crate::schema::ObjectType;
+        if matches!(d.kind, DropKind::Table) {
+            // An internal `sqlite_` table may not be dropped — and this outranks
+            // `IF EXISTS` for a catalog/internal table that actually exists.
+            self.reject_internal_table_ddl(&d.name, "dropped")?;
+        }
         // Dropping a persistent virtual table also drops its shadow tables, as
         // sqlite does: the generic `<name>_data` backing, or an R-Tree's
         // `_node`/`_rowid`/`_parent` node tables.
@@ -9304,7 +9310,32 @@ impl Connection {
         Ok(())
     }
 
+    /// SQLite forbids structural DDL (`ALTER`, `DROP TABLE`, `CREATE INDEX`) on
+    /// any table whose name begins with `sqlite_` — the schema catalog and the
+    /// other internal bookkeeping tables. The check fires only once the target
+    /// is known to exist, so a *missing* `sqlite_`-prefixed name (`sqlite_stat1`
+    /// when absent) still reports `no such table`; but the schema catalog is
+    /// always present. `verb` is `altered` / `dropped` / `indexed`; the reported
+    /// name is the catalog's canonical spelling, otherwise the table's stored name.
+    fn reject_internal_table_ddl(&self, name: &str, verb: &str) -> Result<()> {
+        if let Some(display) = schema_catalog_display_name(name) {
+            return Err(Error::Error(alloc::format!(
+                "table {display} may not be {verb}"
+            )));
+        }
+        if name.len() >= 7 && name[..7].eq_ignore_ascii_case("sqlite_") {
+            if let Some(obj) = self.schema.table(name) {
+                return Err(Error::Error(alloc::format!(
+                    "table {} may not be {verb}",
+                    obj.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn exec_alter(&mut self, a: &Alter) -> Result<()> {
+        self.reject_internal_table_ddl(&a.table, "altered")?;
         // A virtual table can be renamed (sqlite renames its backing tables too),
         // but not otherwise altered — and it isn't a CREATE TABLE, so it must not
         // reach the regular path below.
@@ -20494,6 +20525,19 @@ fn reject_schema_write(table: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The canonical spelling SQLite uses in `table <X> may not be …` messages for
+/// the schema catalog (`sqlite_master`, or `sqlite_temp_master` for the temp
+/// catalog), regardless of how the alias was written. `None` for everything else.
+fn schema_catalog_display_name(name: &str) -> Option<&'static str> {
+    if is_main_schema_table(name) {
+        Some("sqlite_master")
+    } else if is_temp_schema_table(name) {
+        Some("sqlite_temp_master")
+    } else {
+        None
+    }
 }
 
 /// SQLite accepts `ORDER BY` on an UPDATE/DELETE only as a companion to `LIMIT`

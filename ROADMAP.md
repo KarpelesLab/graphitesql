@@ -490,6 +490,21 @@ database, is qualified with `*` (`SELECT * FROM x, x` over a CTE `x` →
 `<source>.<col>`. Explicit references (`SELECT a` / `SELECT x.a`) keep their
 unprefixed spelling, unchanged. Byte-exact vs `sqlite3` 3.50.4.
 
+**Structural DDL on an internal `sqlite_` table is now rejected** rather than
+silently performed. SQLite forbids `ALTER`, `DROP TABLE`, and `CREATE INDEX` on
+any table whose name begins with `sqlite_` — the schema catalog
+(`sqlite_master` / `sqlite_schema`) and the bookkeeping tables (`sqlite_sequence`,
+…) — with `table <name> may not be {altered,dropped,indexed}`. graphite reported
+`no such table` for the catalog (which it doesn't expose as a droppable table)
+and — the real hazard — *actually renamed/dropped/indexed* `sqlite_sequence`.
+A new `reject_internal_table_ddl` guards all three DDL entry points: it
+normalises the catalog aliases to `sqlite_master` (and the temp catalog to
+`sqlite_temp_master`) and otherwise uses the table's stored name, fires only once
+the target exists (a missing `sqlite_stat1` is still `no such table`, and
+`IF EXISTS` still suppresses a genuinely-absent one), and outranks `IF EXISTS`
+for a catalog/internal table that does exist. Direct DML (`INSERT`/`DELETE`) on
+`sqlite_sequence` stays allowed, matching SQLite. Byte-exact vs `sqlite3` 3.50.4.
+
 A **self-referential CTE with no leading anchor** now reports SQLite's
 `circular reference: <name>` rather than graphite's internal "recursive CTE must
 have a non-recursive anchor and a recursive term". When the recursive table
