@@ -14237,6 +14237,7 @@ impl Connection {
         if self.outer_scope.borrow().is_empty() {
             self.validate_nested_ambiguity(sel, &columns)?;
             self.validate_columns_exist(sel, &columns)?;
+            self.validate_derived_columns(sel, &columns)?;
         }
 
         // A positional `GROUP BY` / `ORDER BY` term (an integer literal) must name
@@ -14904,6 +14905,127 @@ impl Connection {
                     missing = column_missing(schema, table, column, quoted);
                 } else if !aliases.iter().any(|a| a.eq_ignore_ascii_case(column)) {
                     missing = column_missing(None, None, column, quoted);
+                }
+            });
+        }
+        match missing {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Eager `no such column` check for a query whose *sole* `FROM` source is a
+    /// derived table (a parenthesized subquery), the counterpart of
+    /// [`Self::validate_columns_exist`] for a case that one bails on. SQLite
+    /// resolves references at prepare time, so a reference to a column the derived
+    /// table does not expose errors even when it yields no rows; the tree-walker
+    /// resolves per row and would otherwise miss that error over an empty (or
+    /// fully-filtered) derived table. `columns` is the derived table's resolved
+    /// output list. Unlike a base table, a subquery has no `rowid`, so a plain
+    /// membership test over `columns` is exact — there is no pseudo-column
+    /// shortcut. Only the outermost query calls this (the caller guards on an
+    /// empty `outer_scope`), so every top-level reference must bind here; there is
+    /// no enclosing `FROM`. A *schema-qualified* reference is left for per-row
+    /// evaluation (conservative — this never raises a false positive). The derived
+    /// body validates its own references when it runs, so this does not descend
+    /// into it (`walk_shallow_columns` stops at nested subqueries).
+    fn validate_derived_columns(&self, sel: &Select, columns: &[ColumnInfo]) -> Result<()> {
+        let Some(from) = &sel.from else { return Ok(()) };
+        // One source, no joins, no window (a window query resolves differently).
+        if !from.joins.is_empty() || window::has_window(sel) {
+            return Ok(());
+        }
+        let s = &from.first;
+        // The sole source must be a derived table: a subquery, not a table-valued
+        // function or a base table/view.
+        if s.subquery.is_none() || s.tvf_args.is_some() {
+            return Ok(());
+        }
+        let alias = s.alias.as_deref();
+        // A `q.*` / `q.col` qualifier may name only the derived table's alias; with
+        // no alias, no qualifier resolves.
+        let qual_ok = |q: &str| alias.is_some_and(|a| a.eq_ignore_ascii_case(q));
+        // `tbl.*` whose qualifier names no source is `no such table: X`, statically
+        // (a star qualifier is never an alias-of-an-alias or an ordinal).
+        for c in &sel.columns {
+            if let ResultColumn::TableWildcard(q) = c {
+                if !qual_ok(q) {
+                    return Err(Error::Error(alloc::format!("no such table: {q}")));
+                }
+            }
+        }
+        // Whether a reference resolves to a derived-table column. A schema-qualified
+        // ref is conservatively treated as resolving (left to per-row evaluation).
+        let resolves = |schema: Option<&str>, table: Option<&str>, column: &str| -> bool {
+            if schema.is_some() {
+                return true;
+            }
+            if let Some(t) = table {
+                if !qual_ok(t) {
+                    return false;
+                }
+            }
+            columns.iter().any(|c| c.name.eq_ignore_ascii_case(column))
+        };
+        // Result-set expressions and `WHERE` can only name a derived column (a
+        // result expression cannot reference a sibling output alias).
+        let mut targets: Vec<&Expr> = Vec::new();
+        for c in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = c {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            targets.push(w);
+        }
+        // `GROUP BY` / `HAVING` / `ORDER BY` may instead name an output alias
+        // (resolved ahead of a base column); exempt a bare name that matches one.
+        let aliases: Vec<&str> = sel
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                ResultColumn::Expr { alias: Some(a), .. } => Some(a.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut clause_refs: Vec<&Expr> = Vec::new();
+        for g in &sel.group_by {
+            clause_refs.push(g);
+        }
+        if let Some(h) = &sel.having {
+            clause_refs.push(h);
+        }
+        for o in &sel.order_by {
+            clause_refs.push(&o.expr);
+        }
+
+        let mut missing: Option<Error> = None;
+        for e in targets {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
+                if missing.is_none() && !resolves(schema, table, column) {
+                    missing = Some(eval::no_such_column(schema, table, column, quoted));
+                }
+            });
+        }
+        for e in clause_refs {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
+                if missing.is_some() {
+                    return;
+                }
+                if table.is_some() {
+                    if !resolves(schema, table, column) {
+                        missing = Some(eval::no_such_column(schema, table, column, quoted));
+                    }
+                } else if !aliases.iter().any(|a| a.eq_ignore_ascii_case(column))
+                    && !resolves(None, None, column)
+                {
+                    missing = Some(eval::no_such_column(None, None, column, quoted));
                 }
             });
         }

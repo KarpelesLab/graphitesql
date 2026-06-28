@@ -810,12 +810,18 @@ open work:
   is accepted where SQLite rejects at prepare time. All want the same fix — a
   statement-level prepare pass that walks every expression once, independent of
   row production:
-  - bare (unqualified) refs in derived-table/subquery scopes and `NATURAL`/`USING`
-    coalesced names — `validate_columns_exist` only covers the top-level
-    plain-table / `ON`-join scope. The same gap leaves a three-part
-    `schema.table.column` ref inside a *correlated subquery body* (binding to an
-    enclosing FROM) unvalidated: `SELECT (SELECT bad.t.a) FROM t` is accepted where
-    sqlite reports `no such column: bad.t.a`.
+  - bare (unqualified) refs in *multi-source* derived/subquery scopes and
+    `NATURAL`/`USING` coalesced names. `validate_columns_exist` covers the
+    top-level plain-table / `ON`-join scope, and `validate_derived_columns` now
+    covers the *single* derived-table (subquery) `FROM` — its top-level result /
+    `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` refs are resolved against the
+    derived output at prepare time, so `SELECT a FROM (SELECT a FROM t) WHERE
+    zzz = 1` errors over an empty derived table, and (since a subquery has no
+    rowid) so does `SELECT rowid FROM (SELECT a FROM t)`. Still open: a derived
+    table *joined* to another source, and a three-part `schema.table.column` ref
+    inside a *correlated subquery body* (binding to an enclosing FROM) —
+    `SELECT (SELECT bad.t.a) FROM t` is accepted where sqlite reports
+    `no such column: bad.t.a`.
   - unknown / wrong-arity *scalar functions* inside an expression-position
     subquery (`Subquery` / `EXISTS` / `IN (SELECT …)`) — e.g.
     `SELECT (SELECT nope(a)) FROM t` or `… WHERE a IN (SELECT nope(b) FROM t)`.
