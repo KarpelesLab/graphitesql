@@ -27323,6 +27323,20 @@ fn select_reads_table(sel: &Select, name: &str) -> bool {
     probe != *sel
 }
 
+/// Whether expression `e` references table `name` — only reachable through a
+/// nested subquery's `FROM` (a bare expression has no table source). Used for a
+/// trigger's `WHEN` clause, which can carry a correlated/uncorrelated subquery
+/// over the renamed table. Mirrors [`select_reads_table`]'s probe-rename trick.
+fn expr_reads_table(e: &Expr, name: &str) -> bool {
+    let mut probe = e.clone();
+    rename_table_in_expr(
+        &mut probe,
+        name,
+        "\u{1}\u{1}graphite_rename_probe\u{1}\u{1}",
+    );
+    probe != *e
+}
+
 /// Whether a `FROM` clause names table `name` as its first source or a join.
 fn from_refs_table(f: &FromClause, name: &str) -> bool {
     f.first.name.eq_ignore_ascii_case(name)
@@ -27394,19 +27408,67 @@ fn trigger_uses_table(trigger_sql: &str, name: &str) -> bool {
     if ct.table.eq_ignore_ascii_case(name) {
         return true;
     }
-    ct.body.iter().any(|s| match s {
+    // The `WHEN` guard can reach the renamed table through a subquery, even when
+    // no body statement does — SQLite rewrites those references too.
+    if ct.when.as_ref().is_some_and(|w| expr_reads_table(w, name)) {
+        return true;
+    }
+    ct.body.iter().any(|s| stmt_reads_table(s, name))
+}
+
+/// Whether a trigger-body statement references table `name` anywhere — as a
+/// target, a `FROM`/`USING` source, or inside any nested expression subquery
+/// (a `WHERE`/`SET`/`VALUES`/`RETURNING`/upsert clause). Used by
+/// [`trigger_uses_table`] to decide whether a `RENAME TABLE` must rewrite the
+/// renamed name in the trigger's stored text; the rewrite itself is a whole-text
+/// token pass, so this only needs to detect *any* reference, not locate it.
+fn stmt_reads_table(s: &Statement, name: &str) -> bool {
+    let ex = |e: &Expr| expr_reads_table(e, name);
+    let exo = |e: &Option<Expr>| e.as_ref().is_some_and(|e| expr_reads_table(e, name));
+    let rc = |c: &ResultColumn| matches!(c, ResultColumn::Expr { expr, .. } if expr_reads_table(expr, name));
+    match s {
         Statement::Select(sel) => select_reads_table(sel, name),
         Statement::Insert(i) => {
             i.table.eq_ignore_ascii_case(name)
-                || matches!(&i.source, InsertSource::Select(sel) if select_reads_table(sel, name))
+                || i.ctes.iter().any(|c| select_reads_table(&c.select, name))
+                || match &i.source {
+                    InsertSource::Values(rows) => rows.iter().flatten().any(ex),
+                    InsertSource::Select(sel) => select_reads_table(sel, name),
+                    InsertSource::DefaultValues => false,
+                }
+                || i.upsert.iter().any(|u| {
+                    exo(&u.target_where)
+                        || matches!(&u.action,
+                            UpsertAction::Update { assignments, where_clause }
+                            if assignments.iter().any(|(_, e)| ex(e)) || exo(where_clause))
+                })
+                || i.returning.iter().any(rc)
         }
         Statement::Update(u) => {
             u.table.eq_ignore_ascii_case(name)
+                || u.ctes.iter().any(|c| select_reads_table(&c.select, name))
                 || u.from.as_ref().is_some_and(|f| from_refs_table(f, name))
+                || u.assignments.iter().any(|(_, e)| ex(e))
+                || u.row_assignments
+                    .iter()
+                    .any(|(_, s)| select_reads_table(s, name))
+                || exo(&u.where_clause)
+                || u.order_by.iter().any(|o| ex(&o.expr))
+                || exo(&u.limit)
+                || exo(&u.offset)
+                || u.returning.iter().any(rc)
         }
-        Statement::Delete(d) => d.table.eq_ignore_ascii_case(name),
+        Statement::Delete(d) => {
+            d.table.eq_ignore_ascii_case(name)
+                || d.ctes.iter().any(|c| select_reads_table(&c.select, name))
+                || exo(&d.where_clause)
+                || d.order_by.iter().any(|o| ex(&o.expr))
+                || exo(&d.limit)
+                || exo(&d.offset)
+                || d.returning.iter().any(rc)
+        }
         _ => false,
-    })
+    }
 }
 
 fn view_uses_table(view_sql: &str, name: &str) -> bool {

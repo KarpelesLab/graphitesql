@@ -575,6 +575,22 @@ function-name protection (`count(*)`), the no-column-list form (`INSERT INTO t
 VALUES …`), and a table-valued-function call in `FROM` are all still left intact.
 Byte-exact vs `sqlite3` 3.50.4 (`tests/rename_trigger_insert_target.rs`).
 
+**`RENAME TO` now rewrites the renamed table inside a dependent trigger's `WHEN`
+guard and any body-statement subquery.** The "is this trigger affected?" detector
+(`trigger_uses_table`) that gates the whole-text token rewrite only inspected the
+`ON` table and each body statement's *direct* target/`FROM`, so a trigger whose
+only reach into the renamed table was a `WHEN EXISTS(SELECT … FROM <old>)` guard,
+or a body `… WHERE c IN (SELECT … FROM <old>)` / `SET c = (SELECT … FROM <old>)` /
+`VALUES((SELECT … FROM <old>))` subquery, was skipped — leaving stale `FROM <old>`
+text that no longer matched SQLite. (A trigger whose body *also* targeted the
+renamed table directly already worked, since detection fired on the body and the
+token pass then rewrote the `WHEN`/subquery too — the bug was purely in detection.)
+The detector now probes the `WHEN` clause (`expr_reads_table`) and walks every
+nested subquery of each body statement (`stmt_reads_table`: target + CTEs + source
++ `where`/`set`/`values`/`row-value`/`order-by`/`returning`/upsert). Unrelated
+triggers stay byte-for-byte untouched. Byte-exact vs `sqlite3` 3.50.4
+(`tests/rename_trigger_when_subquery.rs`).
+
 **`json_quote(X)` now renders a JSONB blob as its JSON text.** SQLite accepts a
 BLOB argument to `json_quote` when it decodes as JSONB and emits the
 corresponding JSON (so `jsonb_*` results compose: `json_quote(jsonb('[1,2]'))` →
