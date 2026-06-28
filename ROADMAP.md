@@ -1247,7 +1247,13 @@ VDBE too: the outer CTEs are materialized into the CTE environment (so the first
 core's output-collation scan resolves them) and threaded into every operand (so
 each arm materializes them through the derived-source path), and any arm whose CTE
 can't run on the VDBE — a sibling/self reference, a recursive body — declines and
-falls the whole compound back to the tree-walker.
+falls the whole compound back to the tree-walker. The derived-source path also
+handles a **nested derived table** — a `FROM` subquery whose own source is another
+subquery, to any depth — by resolving each output column's `(affinity, collation)`
+through the chain of single-source derived tables (an inherited `INTEGER` affinity
+read through two `SELECT *` wrappers keeps coercing exactly as SQLite does); a body
+that is a join, a compound, a view, a CTE, or a table-valued function, or any
+derived column with a non-BINARY collation, still defers.
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is

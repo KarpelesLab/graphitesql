@@ -1195,45 +1195,31 @@ impl Connection {
                         .collect();
                     return Ok((columns, tables, affinities, collations, result.rows, None));
                 }
-                if !sub.compound.is_empty() {
-                    return Err(Error::Unsupported("VDBE: complex subquery source"));
-                }
-                let sfrom = sub
-                    .from
-                    .as_ref()
-                    .ok_or(Error::Unsupported("VDBE: subquery source without FROM"))?;
-                if !sfrom.joins.is_empty()
-                    || sfrom.first.subquery.is_some()
-                    || sfrom.first.tvf_args.is_some()
-                    || sfrom.first.index_hint.is_some()
-                    || sfrom.first.schema.is_some()
-                    || self.schema.table(&sfrom.first.name).is_none()
-                {
-                    return Err(Error::Unsupported("VDBE: complex subquery source"));
-                }
-                let base = self.table_meta(&sfrom.first.name, None)?;
-                if base
-                    .columns
+                // Resolve each output column's `(affinity, collation)` through any
+                // depth of single-source derived tables (a base table or a nested
+                // subquery). `subquery_column_origins` returns `None` for a join /
+                // compound / view / CTE / TVF body — those defer to the tree-walker.
+                let origins = self
+                    .subquery_column_origins(sub)
+                    .ok_or(Error::Unsupported("VDBE: complex subquery source"))?;
+                // Keep the conservative all-BINARY collation posture (the VDBE
+                // grouped / aggregate paths assume BINARY group/agg keys); a
+                // non-BINARY derived column defers to the tree-walker.
+                if origins
                     .iter()
-                    .any(|c| c.collation != crate::value::Collation::default())
+                    .any(|(_, c)| *c != crate::value::Collation::default())
                 {
                     return Err(Error::Unsupported(
                         "VDBE: subquery over a non-BINARY column",
                     ));
                 }
-                let named = self
-                    .resolved_view_columns(sub)
-                    .ok_or(Error::Unsupported("VDBE: subquery columns unresolved"))?;
                 let result = self.run_select(sub, &eval::Params::default())?;
-                if result.columns.len() != named.len() {
+                if result.columns.len() != origins.len() {
                     return Err(Error::Unsupported("VDBE: subquery column count mismatch"));
                 }
                 let columns = renamed(result.columns)?;
                 let tables = columns.iter().map(|_| qualifier.clone()).collect();
-                let affinities = named
-                    .iter()
-                    .map(|(_, t)| eval::Affinity::from_type(t.as_deref()))
-                    .collect();
+                let affinities = origins.iter().map(|(a, _)| *a).collect();
                 let collations = columns
                     .iter()
                     .map(|_| crate::value::Collation::default())
