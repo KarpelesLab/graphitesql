@@ -1334,10 +1334,26 @@ open work:
     that is itself *correlated with a missing column* — coupled to the same
     three-part correlated-scope column resolution noted above. Test:
     `tests/subquery_function_validation.rs`.
-- **ALTER-time rejection of an ALTER that breaks a dependent.** An `ALTER` that
-  makes a dependent view/trigger unresolvable should be rejected and rolled back;
-  graphite leaves the now-broken object. Needs statement-level DDL rollback — a
-  writer savepoint around `exec_alter`, mirroring `run_dml_atomic`.
+- **ALTER-time rejection of an ALTER that breaks a dependent.**
+  - *Done — `DROP COLUMN`.* `ALTER TABLE … DROP COLUMN` is now rejected when the
+    dropped column is referenced (in value/expression position) by a dependent
+    **view** or **trigger**, extending the pre-existing table/index re-validation.
+    All schema objects are re-checked in `sqlite_schema` rowid order, and the
+    first that no longer resolves yields
+    `error in {view|trigger} NAME after drop column: no such column: <ref>` —
+    byte-exact, echoing the offending reference (`c`, `t.c`, `x.c`, `NEW.c`,
+    `OLD.c`). Assignment *targets* (a trigger's `SET col=`, an `INSERT INTO t(col)`
+    column list, an `UPDATE OF col`) do **not** block the drop, matching sqlite.
+    Because every check is a *pre-mutation* validation (graphite computes the
+    post-drop shape before touching storage), no DDL-rollback infra is needed for
+    this case. Detection reuses the RENAME-COLUMN binding provers. Test:
+    `tests/drop_column_dependents.rs`.
+  - *Still open — RENAME that breaks a dependent.* A `RENAME TABLE/COLUMN` whose
+    rewrite cannot be proven (so propagation is skipped) can still leave a
+    dependent that no longer resolves; sqlite rejects and rolls back. This needs
+    statement-level DDL rollback — a writer savepoint around `exec_alter`,
+    mirroring `run_dml_atomic` — because the rename mutates before the breakage is
+    observable.
 
 ### Track B — Query planner, statistics & the VDBE
 

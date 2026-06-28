@@ -10534,23 +10534,84 @@ impl Connection {
             }
         }
         let meta = self.table_meta(&a.table, None)?;
-        // An explicit index that references the column (an auto-index backing a
-        // table UNIQUE/PK is covered by the table re-parse above).
-        for idx in self.indexes_of(&a.table)? {
-            if idx.name.starts_with("sqlite_autoindex_") {
-                continue;
-            }
-            let references = idx.cols.contains(&pos)
-                || idx
-                    .key_exprs
-                    .as_ref()
-                    .is_some_and(|es| es.iter().any(&refs_dropped))
-                || idx.partial.as_ref().is_some_and(&refs_dropped);
-            if references {
-                return Err(Error::Error(format!(
-                    "error in index {} after drop column: no such column: {name}",
-                    idx.name
-                )));
+        // SQLite re-validates *every* schema object against the post-drop schema,
+        // in `sqlite_schema` (rowid / creation) order, and reports the first that
+        // no longer resolves as `error in {kind} NAME after drop column: …`. The
+        // altered table's own row is rowid-first, so its structural checks above
+        // correctly precede everything; among the dependents that follow it —
+        // indexes, views, and triggers — we honor that same creation order.
+        //
+        // An index on a dropped column is reported by name; a view or trigger is
+        // reported when a reference provably binds to the dropped column. The
+        // binding is decided by the same provers RENAME COLUMN uses (if a rename
+        // *would* rewrite a reference, that reference resolves to this column, so
+        // the drop breaks it), so detection never produces a false rejection: a
+        // body the provers cannot bind is simply left to the prior accept path.
+        let idx_metas = self.indexes_of(&a.table)?;
+        // Snapshot every base table's columns for the views'/triggers' global-
+        // uniqueness provers (mirrors the RENAME COLUMN setup).
+        let table_cols: alloc::collections::BTreeMap<String, Vec<String>> = self
+            .schema
+            .objects()
+            .iter()
+            .filter(|o| o.obj_type == crate::schema::ObjectType::Table)
+            .filter_map(|o| {
+                self.table_meta(&o.name, None).ok().map(|m| {
+                    (
+                        o.name.clone(),
+                        m.columns.iter().map(|c| c.name.clone()).collect(),
+                    )
+                })
+            })
+            .collect();
+        for obj in self.schema.objects() {
+            match obj.obj_type {
+                crate::schema::ObjectType::Index
+                    if obj.tbl_name.eq_ignore_ascii_case(&a.table)
+                        && !obj.name.starts_with("sqlite_autoindex_") =>
+                {
+                    // An explicit index that references the column (an auto-index
+                    // backing a table UNIQUE/PK is covered by the table re-parse
+                    // above).
+                    if let Some(idx) = idx_metas
+                        .iter()
+                        .find(|m| m.name.eq_ignore_ascii_case(&obj.name))
+                    {
+                        let references = idx.cols.contains(&pos)
+                            || idx
+                                .key_exprs
+                                .as_ref()
+                                .is_some_and(|es| es.iter().any(&refs_dropped))
+                            || idx.partial.as_ref().is_some_and(&refs_dropped);
+                        if references {
+                            return Err(Error::Error(format!(
+                                "error in index {} after drop column: no such column: {name}",
+                                obj.name
+                            )));
+                        }
+                    }
+                }
+                crate::schema::ObjectType::View => {
+                    if let Some(vsql) = &obj.sql {
+                        if let Some(r) = view_drop_break_ref(vsql, &a.table, name, &table_cols) {
+                            return Err(Error::Error(format!(
+                                "error in view {} after drop column: no such column: {r}",
+                                obj.name
+                            )));
+                        }
+                    }
+                }
+                crate::schema::ObjectType::Trigger => {
+                    if let Some(tsql) = &obj.sql {
+                        if let Some(r) = trigger_drop_break_ref(tsql, &a.table, name, &table_cols) {
+                            return Err(Error::Error(format!(
+                                "error in trigger {} after drop column: no such column: {r}",
+                                obj.name
+                            )));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -28504,6 +28565,189 @@ fn trigger_on_renamed_table(trigger_sql: &str, table: &str, old: &str) -> bool {
             && !old.eq_ignore_ascii_case(table)
             && !old.eq_ignore_ascii_case("new")
             && !old.eq_ignore_ascii_case("old"))
+}
+
+/// Scan `sql`'s tokens for the *first* column reference that binds to `old`
+/// under the same rules as [`rewrite_column_tokens`] (`quals` are the in-scope
+/// table names / aliases; `rewrite_bare` allows an unqualified `old`). Returns
+/// the exact source text of that reference — bare `old`, or `<qual>.old` (e.g.
+/// `t.c`, `x.c`, `NEW.c`) — which is what SQLite echoes in an `error in … after
+/// drop column: no such column: …` message. When `skip_update_of` is set, a
+/// column named in a trigger's `UPDATE OF <list>` clause is ignored: that clause
+/// only *triggers on* the column, so dropping it does not break the trigger in
+/// SQLite (even though a RENAME would rewrite the name there). Used by
+/// [`view_drop_break_ref`] / [`trigger_drop_break_ref`] to decide whether an
+/// `ALTER TABLE … DROP COLUMN` leaves a dependent unresolvable.
+fn first_bound_column_ref(
+    sql: &str,
+    quals: &[String],
+    old: &str,
+    rewrite_bare: bool,
+    skip_write_targets: bool,
+) -> Option<String> {
+    use sql::token::Token;
+    let toks = sql::token::tokenize(sql).ok()?;
+    let kw = |t: &Token, k: &str| matches!(t, Token::Word(w) if w.eq_ignore_ascii_case(k));
+    let mut skip = alloc::vec![false; toks.len()];
+    if skip_write_targets {
+        let mut j = 0usize;
+        while j < toks.len() {
+            // `UPDATE OF <col>[, ...] ON` — the fires-on column list.
+            if j + 1 < toks.len() && kw(&toks[j].token, "update") && kw(&toks[j + 1].token, "of") {
+                let mut k = j + 2;
+                while k < toks.len() && !kw(&toks[k].token, "on") {
+                    skip[k] = true;
+                    k += 1;
+                }
+                j = k;
+                continue;
+            }
+            // `INSERT INTO <name>[. <name>] ( col, ... )` — the target column list
+            // (the parenthesised group immediately after the table name).
+            if kw(&toks[j].token, "into") {
+                let mut k = j + 1;
+                if matches!(
+                    toks.get(k).map(|t| &t.token),
+                    Some(Token::Word(_) | Token::Ident(_))
+                ) {
+                    k += 1;
+                    if matches!(toks.get(k).map(|t| &t.token), Some(Token::Dot)) {
+                        k += 2;
+                    }
+                    if matches!(toks.get(k).map(|t| &t.token), Some(Token::LParen)) {
+                        let mut depth = 0i32;
+                        while k < toks.len() {
+                            match &toks[k].token {
+                                Token::LParen => depth += 1,
+                                Token::RParen => depth -= 1,
+                                _ => {}
+                            }
+                            skip[k] = true;
+                            if depth == 0 {
+                                break;
+                            }
+                            k += 1;
+                        }
+                        j = k + 1;
+                        continue;
+                    }
+                }
+            }
+            // `SET <target> = ...[, <target> = ...]` — each assignment's left
+            // side. The region runs from `SET` to the next depth-0 `WHERE`/`FROM`/
+            // `;`. A bare column immediately followed by `=` is a target.
+            if kw(&toks[j].token, "set") {
+                let mut k = j + 1;
+                let mut depth = 0i32;
+                while k < toks.len() {
+                    match &toks[k].token {
+                        Token::LParen => depth += 1,
+                        Token::RParen => depth -= 1,
+                        Token::Semicolon => break,
+                        _ if depth == 0
+                            && (kw(&toks[k].token, "where") || kw(&toks[k].token, "from")) =>
+                        {
+                            break
+                        }
+                        Token::Word(_) | Token::Ident(_)
+                            if matches!(toks.get(k + 1).map(|t| &t.token), Some(Token::Eq)) =>
+                        {
+                            skip[k] = true;
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                j = k;
+                continue;
+            }
+            j += 1;
+        }
+    }
+    for (i, sp) in toks.iter().enumerate() {
+        if skip[i] {
+            continue;
+        }
+        let hit =
+            matches!(&sp.token, Token::Word(w) | Token::Ident(w) if w.eq_ignore_ascii_case(old));
+        if !hit {
+            continue;
+        }
+        // A function name (`old(`) is never a column reference.
+        if toks
+            .get(i + 1)
+            .is_some_and(|n| matches!(n.token, Token::LParen))
+        {
+            continue;
+        }
+        let after_dot = i > 0 && matches!(toks[i - 1].token, Token::Dot);
+        if after_dot {
+            let qual_ok = i >= 2
+                && matches!(&toks[i - 2].token, Token::Word(q) | Token::Ident(q)
+                    if quals.iter().any(|t| t.eq_ignore_ascii_case(q)));
+            if !qual_ok {
+                continue;
+            }
+            return Some(sql[toks[i - 2].start..sp.end].to_string());
+        } else if !rewrite_bare {
+            continue;
+        }
+        return Some(sql[sp.start..sp.end].to_string());
+    }
+    None
+}
+
+/// If dropping `col` from `table` would leave this view's body unable to resolve
+/// a column, return the exact source text of the first reference that binds to
+/// the dropped column (for SQLite's `error in view … after drop column: no such
+/// column: …` message). Reuses the RENAME COLUMN binding provers: if a rename
+/// *would* rewrite a reference, that reference provably resolves to the dropped
+/// column, so the drop breaks the view. Conservative — a body the provers cannot
+/// bind (subqueries the rename path declines, ambiguous bare refs) yields `None`,
+/// so the drop is allowed (matching graphite's prior behavior, never a false
+/// rejection). A `SELECT *` body carries no column token and so never breaks,
+/// exactly as in SQLite.
+fn view_drop_break_ref(
+    vsql: &str,
+    table: &str,
+    col: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<String> {
+    let (quals, bare) = if let Some(q) = view_single_source_column_quals(vsql, table, col) {
+        (q, true)
+    } else if let Some(q) = view_only_table_quals(vsql, table, col) {
+        (q, true)
+    } else if let Some(p) = view_multi_source_quals(vsql, table, col, table_cols) {
+        p
+    } else {
+        view_global_unique_quals(vsql, table, col, table_cols)?
+    };
+    first_bound_column_ref(vsql, &quals, col, bare, false)
+}
+
+/// The trigger counterpart of [`view_drop_break_ref`]: returns the first body /
+/// `WHEN` reference that binds to `table`'s dropped `col` (e.g. `NEW.c`, `OLD.c`,
+/// or a bare `c`), for SQLite's `error in trigger … after drop column: …`. A
+/// column appearing only in the `UPDATE OF` list does not count (SQLite allows
+/// that drop). Same conservative reuse of the RENAME COLUMN provers.
+fn trigger_drop_break_ref(
+    tsql: &str,
+    table: &str,
+    col: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<String> {
+    let (quals, bare) = if let Some(q) = trigger_single_source_quals(tsql, table, col) {
+        (q, true)
+    } else if let Some(p) = trigger_global_unique_quals(tsql, table, col, table_cols) {
+        p
+    } else if trigger_on_renamed_table(tsql, table, col) {
+        (alloc::vec![String::from("NEW"), String::from("OLD")], false)
+    } else if trigger_body_single_source_over(tsql, table, col) {
+        (alloc::vec![table.to_string()], true)
+    } else {
+        return None;
+    };
+    first_bound_column_ref(tsql, &quals, col, bare, true)
 }
 
 /// Token-rewrite a column rename in DDL where every reference to `old` is known
