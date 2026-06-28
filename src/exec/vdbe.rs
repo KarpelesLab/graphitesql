@@ -245,20 +245,26 @@ pub enum Op {
         companion: Option<(usize, bool)>,
         aggs: Vec<AggSpec>,
     },
-    /// Emit one row per group (in first-seen order): each output is either a
-    /// group-key value or a finalized per-group aggregate.
+    /// Emit one row per group, ordered by the GROUP BY keys (the first
+    /// `key_count` slots of each group vector, BINARY ascending, NULLs first —
+    /// SQLite groups via a sort): each output is either a group-key value or a
+    /// finalized per-group aggregate.
     GroupEmit {
         outputs: Vec<GroupOut>,
+        key_count: usize,
         agg_kinds: Vec<AggKind>,
     },
     /// Finalize the accumulated groups (computing each slot's value per group)
-    /// into an emit list, then position the group cursor at the first group;
-    /// jump to `target` (the emit-loop exit) when there are no groups. Used by
-    /// the `HAVING`/`ORDER BY` grouped path, where each group's keys and
-    /// aggregates are loaded into registers so arbitrary predicates / sort keys
-    /// can be computed by ordinary ops.
+    /// into an emit list ordered by the GROUP BY keys (the first `key_count`
+    /// slots, BINARY ascending, NULLs first), then position the group cursor at
+    /// the first group; jump to `target` (the emit-loop exit) when there are no
+    /// groups. Used by the `HAVING`/`ORDER BY` grouped path, where each group's
+    /// keys and aggregates are loaded into registers so arbitrary predicates /
+    /// sort keys can be computed by ordinary ops. (A later explicit `ORDER BY`
+    /// re-sorts the output; this key order is what SQLite emits without one.)
     GroupFinalize {
         agg_kinds: Vec<AggKind>,
+        key_count: usize,
         target: usize,
     },
     /// Load group-key value at index `key` of the current group into `dest`.
@@ -1424,6 +1430,7 @@ fn compile_group_select(
     let gfin = c.ops.len();
     c.ops.push(Op::GroupFinalize {
         agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _)| *k).collect(),
+        key_count: group_cols.len(),
         target: 0,
     });
     let gbody = c.ops.len();
@@ -1685,6 +1692,7 @@ fn compile_group_emit(
 
     c.ops.push(Op::GroupEmit {
         outputs,
+        key_count: group_cols.len(),
         agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _)| *k).collect(),
     });
     c.ops.push(Op::Halt);
@@ -4766,7 +4774,12 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
                     }
                 }
             }
-            Op::GroupEmit { outputs, agg_kinds } => {
+            Op::GroupEmit {
+                outputs,
+                key_count,
+                agg_kinds,
+            } => {
+                sort_groups_by_key(&mut groups, *key_count);
                 for (key, accs) in groups.drain(..) {
                     let finals: Vec<Value> = agg_kinds
                         .iter()
@@ -4783,9 +4796,15 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
                     out.push(row);
                 }
             }
-            Op::GroupFinalize { agg_kinds, target } => {
-                // Finalize each group's aggregates once, into `emit_groups`, in
-                // first-seen order; position the group cursor at the first.
+            Op::GroupFinalize {
+                agg_kinds,
+                key_count,
+                target,
+            } => {
+                // Finalize each group's aggregates once, into `emit_groups`,
+                // ordered by the GROUP BY keys; position the group cursor at the
+                // first. (An explicit ORDER BY re-sorts the output downstream.)
+                sort_groups_by_key(&mut groups, *key_count);
                 emit_groups.clear();
                 for (key, accs) in groups.drain(..) {
                     let finals: Vec<Value> = agg_kinds
@@ -4831,6 +4850,24 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
 /// real (NULL over no rows), `total` is always real, `avg` is real (NULL over no
 /// rows), `min`/`max` reduce by value comparison (NULL over no rows), and
 /// `group_concat` joins with `,` (NULL over no rows).
+/// Order accumulated groups by their GROUP BY keys — the first `key_count` slots
+/// of each group vector — under BINARY collation, ascending with NULLs first.
+/// SQLite emits grouped output in this order (its grouping is done via a sort);
+/// the grouped VDBE path bails on a non-BINARY group key, so a plain BINARY value
+/// comparison reproduces it. An explicit `ORDER BY` re-sorts downstream, so this
+/// pre-order is harmless then.
+fn sort_groups_by_key(groups: &mut [(Vec<Value>, Vec<AggAcc>)], key_count: usize) {
+    groups.sort_by(|a, b| {
+        for k in 0..key_count {
+            let ord = crate::value::cmp_values(&a.0[k], &b.0[k]);
+            if ord != core::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        core::cmp::Ordering::Equal
+    });
+}
+
 /// Record the current row's `ORDER BY` key values into `acc`, parallel to the
 /// just-pushed argument value, capturing the per-key sort directions on the first
 /// ordered push. A no-op when the aggregate carries no `ORDER BY`.
