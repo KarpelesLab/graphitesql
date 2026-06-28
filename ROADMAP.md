@@ -761,6 +761,18 @@ main-target and the swapped temp/attached paths route through it. Byte-exact vs
 an existing index is not blocked — graphite models REINDEX as a no-op (indexes
 stay current on every write), so it never opens a write transaction.
 
+**`PRAGMA ignore_check_constraints` is now honored**, not silently ignored. With
+it `ON`, INSERT and UPDATE skip CHECK enforcement — column-level, table-level,
+and named `CONSTRAINT … CHECK` alike — so a row that would violate a CHECK is
+stored unchanged; NOT NULL, UNIQUE, and foreign keys are unaffected, since those
+are enforced on separate paths. Turning it back off re-enforces CHECK, and the
+get form reads the live flag. graphite previously parsed the pragma but always
+enforced CHECK. The flag rides on a `Connection` `ignore_check_constraints` field
+(set in the `exec_pragma` setter, surfaced on the read path); the gate is a
+single early-return at the top of `check_constraints`, the one function both
+INSERT and UPDATE call to validate CHECK exprs. Byte-exact vs `sqlite3` 3.50.4
+(`tests/ignore_check_constraints.rs`).
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

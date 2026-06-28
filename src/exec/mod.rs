@@ -112,6 +112,10 @@ pub struct Connection {
     /// readonly database`; reads and read-only transactions are unaffected. Off by
     /// default.
     query_only: bool,
+    /// Whether CHECK constraints are skipped on INSERT/UPDATE (`PRAGMA
+    /// ignore_check_constraints`). NOT NULL, UNIQUE, and foreign keys are
+    /// unaffected. Off by default, matching SQLite.
+    ignore_check_constraints: bool,
     /// Re-entrancy depth of trigger firing.
     trigger_depth: core::cell::Cell<usize>,
     /// Set by an `OR FAIL` conflict before it raises: tells the statement-level
@@ -304,6 +308,7 @@ impl Connection {
             foreign_keys: false,
             case_sensitive_like: false,
             query_only: false,
+            ignore_check_constraints: false,
             trigger_depth: core::cell::Cell::new(0),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
@@ -346,6 +351,7 @@ impl Connection {
             foreign_keys: false,
             case_sensitive_like: false,
             query_only: false,
+            ignore_check_constraints: false,
             trigger_depth: core::cell::Cell::new(0),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
@@ -2034,15 +2040,18 @@ impl Connection {
                 rows: Vec::new(),
             }),
             "short_column_names" | "automatic_index" => Ok(single(&name, Value::Integer(1))),
-            // `query_only` reflects the live connection flag; the others below are
-            // accepted but inert, so they report their default `0`.
+            // `query_only`/`ignore_check_constraints` reflect the live connection
+            // flags; the others below are accepted but inert (default `0`).
             "query_only" => Ok(single(&name, Value::Integer(self.query_only as i64))),
+            "ignore_check_constraints" => Ok(single(
+                &name,
+                Value::Integer(self.ignore_check_constraints as i64),
+            )),
             "legacy_alter_table"
             | "count_changes"
             | "full_column_names"
             | "empty_result_callbacks"
             | "defer_foreign_keys"
-            | "ignore_check_constraints"
             | "reverse_unordered_selects"
             | "writable_schema"
             | "threads"
@@ -4762,6 +4771,12 @@ impl Connection {
             // `exec_parsed`). The get form reads the live flag back (read path).
             if let Some(e) = &p.value {
                 self.query_only = pragma_truth(e, params);
+            }
+        } else if p.name.eq_ignore_ascii_case("ignore_check_constraints") {
+            // `ON` makes INSERT/UPDATE skip CHECK enforcement; the get form reads
+            // the live flag back (read path).
+            if let Some(e) = &p.value {
+                self.ignore_check_constraints = pragma_truth(e, params);
             }
         } else if p.name.eq_ignore_ascii_case("cache_size") {
             // Round-trip the value verbatim (graphite keeps all pages resident, so
@@ -19322,6 +19337,12 @@ impl Connection {
         rowid: Option<i64>,
         params: &Params,
     ) -> Result<()> {
+        // `PRAGMA ignore_check_constraints = ON` suppresses CHECK enforcement on
+        // INSERT/UPDATE (NOT NULL, UNIQUE, and foreign keys are unaffected — those
+        // are enforced elsewhere). Off by default, matching SQLite.
+        if self.ignore_check_constraints {
+            return Ok(());
+        }
         for (expr, label) in &meta.checks {
             let ctx = row_ctx(values, &meta.columns, rowid, params).with_subqueries(self);
             if eval::truth(&eval::eval(expr, &ctx)?) == Some(false) {
