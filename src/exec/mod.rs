@@ -788,6 +788,13 @@ impl Connection {
         if is_bare_column_expr(expr) {
             return None;
         }
+        // A compound body's value is folded to a literal, so every additional arm
+        // must also project a COMPUTED column (NONE affinity / BINARY collation);
+        // a bare-column arm would carry that column's affinity, which the literal
+        // would drop — see `is_bare_column_expr` above for the base arm.
+        if !self.compound_arms_computed(sel2) {
+            return None;
+        }
         let r = self.run_select(sel2, &Params::default()).ok()?;
         Some(
             r.rows
@@ -796,6 +803,20 @@ impl Connection {
                 .cloned()
                 .unwrap_or(Value::Null),
         )
+    }
+
+    /// True when every *compound arm* of `sel2` (the `UNION`/… operands after the
+    /// base) projects a single computed (non-bare-column) expression — so the
+    /// whole compound's result column carries NONE affinity, exactly like an
+    /// ordinary literal list. Trivially true for a non-compound body.
+    fn compound_arms_computed(&self, sel2: &Select) -> bool {
+        sel2.compound.iter().all(|(_, arm)| {
+            arm.columns.len() == 1
+                && matches!(
+                    &arm.columns[0],
+                    sql::ast::ResultColumn::Expr { expr, .. } if !is_bare_column_expr(expr)
+                )
+        })
     }
 
     /// Materialize an `IN (SELECT …)` candidate set to its values, with the
@@ -834,10 +855,18 @@ impl Connection {
         // (verified vs sqlite) — and the folded IN-list comparison already applies
         // the left's collation.
         let candidate_affinity = if is_bare_column_expr(expr) {
+            // A bare-column candidate over a compound body has no single resolvable
+            // origin (`subquery_column_origins` returns `None` for compounds), so
+            // this bails — only a single-source bare column carries its affinity.
             let origins = self.subquery_column_origins(sel2)?;
             let (aff, _coll) = origins.first().copied()?;
             Some(affinity_type_name(aff))
         } else {
+            // Computed base arm → NONE affinity; a compound must have every other
+            // arm computed too, else a bare-column arm's affinity would be lost.
+            if !self.compound_arms_computed(sel2) {
+                return None;
+            }
             None
         };
         let r = self.run_select(sel2, &Params::default()).ok()?;
@@ -886,7 +915,7 @@ impl Connection {
         outer_quals: &[String],
         outer_cols: &[String],
     ) -> bool {
-        if !sel2.compound.is_empty() || !sel2.ctes.is_empty() {
+        if !sel2.ctes.is_empty() {
             return false;
         }
         // Start from the inherited scope and add this body's own sources; every
@@ -924,7 +953,16 @@ impl Connection {
                 }
             }
         }
-        self.expr_positions_internal(sel2, &quals, &cols)
+        if !self.expr_positions_internal(sel2, &quals, &cols) {
+            return false;
+        }
+        // Every compound arm (`UNION`/`INTERSECT`/`EXCEPT` operand) has its own
+        // `FROM`, so each must be self-contained against the same surrounding
+        // scope on its own terms. `expr_positions_internal` above checked the base
+        // arm's expressions plus the whole query's `ORDER BY`/`LIMIT`.
+        sel2.compound
+            .iter()
+            .all(|(_, arm)| self.select_self_contained(arm, outer_quals, outer_cols))
     }
 
     /// True when every column reference in every top-level expression of `sel2`

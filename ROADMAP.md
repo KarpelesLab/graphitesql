@@ -1215,7 +1215,12 @@ subquery folds too, as long as every nested body is itself self-contained agains
 the accumulated scope (it may reference its parent's sources — correlation that
 stays inside the folded unit — but a reference further out still defers); the whole
 unit is evaluated by the tree-walker, so the nested subquery's affinity/collation
-are preserved exactly. Compound
+are preserved exactly. A subquery whose body is itself a *compound*
+(`UNION`/`INTERSECT`/`EXCEPT`) folds too — each arm is proven self-contained and
+the whole compound runs through the tree-walker — provided every arm of a
+value-producing fold (scalar / `IN`) projects a computed column (so the result
+carries NONE affinity, exactly like a literal list); a bare-column arm would carry
+that column's affinity and still defers. Compound
 `UNION`/`INTERSECT`/`EXCEPT` (**B5c-3**); positional `GROUP BY <ordinal>`;
 `DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates (incl.
 the two-argument `group_concat(x, sep)` / `string_agg(x, sep)` form — the constant
