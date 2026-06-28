@@ -1193,8 +1193,43 @@ fn compile_group_select(
     // identifies the group, and the projection resolves the same expression
     // through the binding table). A column-only key set can still take the compact
     // `GroupEmit` plain path; a computed key forces the general path below.
+    //
+    // SQLite resolves a bare `GROUP BY <name>` to a SOURCE column first, then to a
+    // SELECT-list output alias. The VDBE column resolver only knows source columns,
+    // so a bare name that is NOT a source column but IS an output alias is rewritten
+    // here to that output column's expression (mirroring the positional rewrite in
+    // `run_select_vdbe` and the ORDER BY alias handling below). A name matching a
+    // source column is left untouched (source precedence — it resolves normally); an
+    // alias bound to an aggregate is left untouched so the tree-walker raises
+    // SQLite's "aggregate functions are not allowed in the GROUP BY clause" error.
+    let effective_group: Vec<Expr> = sel
+        .group_by
+        .iter()
+        .map(|g| {
+            if let Expr::Column {
+                table: None,
+                column,
+                ..
+            } = g
+            {
+                if !columns.iter().any(|n| n.eq_ignore_ascii_case(column)) {
+                    if let Some((e, _)) = projections
+                        .iter()
+                        .find(|(_, l)| l.eq_ignore_ascii_case(column))
+                    {
+                        let mut aggs = Vec::new();
+                        collect_aggregates(e, &mut aggs);
+                        if aggs.is_empty() {
+                            return e.clone();
+                        }
+                    }
+                }
+            }
+            g.clone()
+        })
+        .collect();
     let mut group_keys: Vec<GroupKeySpec> = Vec::new();
-    for g in &sel.group_by {
+    for g in &effective_group {
         match g {
             Expr::Column { table, column, .. } => {
                 group_keys.push(GroupKeySpec::Col(

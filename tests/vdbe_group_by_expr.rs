@@ -10,6 +10,11 @@
 //! computed key), non-grouped representative columns, and function-valued keys are
 //! all covered.
 //!
+//! A bare `GROUP BY <name>` that is not a source column is also resolved to a
+//! SELECT-list output alias and rewritten to that column's expression (a source
+//! column of the same name takes precedence; an alias bound to an aggregate is left
+//! for the tree-walker to reject).
+//!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE ran the
 //! computed-key grouping itself. Checked against the tree-walker and sqlite3 3.50.4.
 
@@ -52,6 +57,14 @@ const QUERIES: &[&str] = &[
     // grouping of the uppercased result is correct (an explicit `COLLATE` would
     // not be — see `non_binary_collation_key_falls_back`).
     "SELECT upper(a), count(*) FROM t GROUP BY upper(a) ORDER BY 1",
+    // GROUP BY an OUTPUT ALIAS of a computed column: SQLite resolves the bare name
+    // to the SELECT-list label (no source column `d`), and the VDBE rewrites it to
+    // the column's expression. ORDER BY the same alias is resolved separately.
+    "SELECT n*2 AS d, count(*) FROM t GROUP BY d ORDER BY d",
+    // GROUP BY an alias of a bare column (rewrites to the column, takes the Col key).
+    "SELECT a AS lbl, count(*) FROM t GROUP BY lbl ORDER BY lbl",
+    // GROUP BY an alias with HAVING over an aggregate.
+    "SELECT g+0 AS gg, sum(n) FROM t GROUP BY gg HAVING sum(n) > 10 ORDER BY gg",
 ];
 
 fn conn() -> Connection {
@@ -88,14 +101,33 @@ fn computed_group_key_runs_on_vdbe_and_matches_tree_walker() {
 }
 
 #[test]
-fn group_by_output_alias_still_falls_back() {
+fn aggregate_alias_group_key_falls_back() {
     let c = conn();
-    // `GROUP BY d` names an output alias, not a source column or the key
-    // expression; the VDBE does not rewrite aliases, so it defers to the
-    // tree-walker (which resolves the alias).
-    let q = "SELECT n*2 AS d, count(*) FROM t GROUP BY d ORDER BY d";
+    // `GROUP BY c` names an alias bound to an aggregate. Grouping by an aggregate
+    // is an error in SQLite ("aggregate functions are not allowed in the GROUP BY
+    // clause"); the VDBE leaves such an alias unrewritten so it defers to the
+    // tree-walker, which raises that error.
+    let q = "SELECT count(*) AS c FROM t GROUP BY c";
     assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    assert!(
+        c.query(q).is_err(),
+        "grouping by an aggregate alias must error"
+    );
+}
+
+#[test]
+fn source_column_shadows_output_alias_in_group_by() {
+    let mut c = Connection::open_memory().unwrap();
+    // A source column takes precedence over a same-named output alias in GROUP BY
+    // (SQLite's rule). Here `GROUP BY x` must group by the source column `x`
+    // (values 1,1,2 -> two groups), NOT the alias `x` bound to `n` (5 distinct).
+    c.execute("CREATE TABLE u(x INTEGER, n INTEGER)").unwrap();
+    c.execute("INSERT INTO u VALUES (1,10),(1,20),(2,30)")
+        .unwrap();
+    let q = "SELECT n AS x, count(*) FROM u GROUP BY x ORDER BY 1";
+    let got = c.query_vdbe(q).unwrap().rows;
+    let want = c.query(q).unwrap().rows;
+    assert_eq!(got, want, "source-column precedence diverged on {q}");
 }
 
 #[test]
