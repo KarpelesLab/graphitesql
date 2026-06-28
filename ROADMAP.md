@@ -459,6 +459,17 @@ a right-hand `SELECT` and a single multi-row `VALUES` with an internal mismatch
 (`VALUES (1,2),(3)`) keep their existing (already-correct) messages. Byte-exact vs
 `sqlite3` 3.50.4.
 
+A **`FROM name(args)` whose name is not a built-in table-valued function** now
+reports what SQLite reports. SQLite resolves the bare name as a table/view first:
+if such an object exists, calling it with an argument list is `'<name>' is not a
+function` (the schema qualifier, if any, is dropped — `main.t()` over an existing
+`t` → `'t' is not a function`); otherwise it is a plain missing table with the
+qualifier echoed as written (`bad.t()` → `no such table: bad.t`, never `unknown
+database bad`; `nope()` → `no such table: nope`). graphite previously answered
+`no such table-valued function: <name>` for every such call. The genuine built-in
+TVFs (`generate_series`, `json_each`/`json_tree`, the `pragma_*` forms) are
+unaffected. Byte-exact vs `sqlite3` 3.50.4.
+
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite
 does. The per-column "add column" checks run first, left to right — a duplicate

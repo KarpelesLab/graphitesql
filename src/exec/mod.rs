@@ -16571,10 +16571,35 @@ impl Connection {
                     .collect();
                 Ok((columns, result.rows))
             }
-            _ => Err(Error::Error(format!(
-                "no such table-valued function: {}",
-                tref.name
-            ))),
+            _ => {
+                // Not a built-in table-valued function. SQLite resolves the bare
+                // name as a table/view: if such an object exists, calling it with
+                // an argument list is `'<name>' is not a function` (the qualifier,
+                // if any, is dropped); otherwise it is a plain missing table, with
+                // the schema qualifier echoed as written (an unknown qualifier is
+                // `no such table: bad.t`, never `unknown database bad`).
+                use crate::schema::ObjectType;
+                let exists = is_main_schema_table(&tref.name)
+                    || match self.resolve_db(tref.schema.as_deref()) {
+                        Ok(db) if db == DbRef::Temp && self.temp_db.is_none() => false,
+                        Ok(db) => {
+                            let (schema, _) = self.db_parts(db);
+                            schema.objects().iter().any(|o| {
+                                matches!(o.obj_type, ObjectType::Table | ObjectType::View)
+                                    && o.name == tref.name
+                            })
+                        }
+                        Err(_) => false,
+                    };
+                if exists {
+                    return Err(Error::Error(format!("'{}' is not a function", tref.name)));
+                }
+                let qualified = match &tref.schema {
+                    Some(q) => format!("{q}.{}", tref.name),
+                    None => tref.name.clone(),
+                };
+                Err(Error::Error(format!("no such table: {qualified}")))
+            }
         }
     }
 
