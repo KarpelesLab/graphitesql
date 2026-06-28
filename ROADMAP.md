@@ -340,6 +340,21 @@ aggregate used as a **window function** (`sum(a, b) OVER ()`, `sum() OVER ()`),
 which graphite previously ran silently; the eleven built-in window functions
 keep their own arity. All byte-exact vs `sqlite3` 3.50.4.
 
+And **`sum()` now picks INTEGER vs REAL from each argument's *numeric type*, not
+its storage class** — matching `sqlite3_value_numeric_type` in SQLite's
+`sumStep`. The result stays an exact INTEGER only when every input is
+integer-typed: an INTEGER value, or a TEXT value that is a pure signed integer
+(optional surrounding whitespace, no decimal point or exponent, in `i64` range).
+A REAL value, or any text/blob that is real-valued, overflows `i64`, or is
+non-numeric, forces REAL. graphite previously keyed off the storage class alone,
+so a numeric-integer *text* like `'1'` wrongly promoted the whole sum to REAL
+(`sum('1', 10)` → `11.0` instead of `11`); the same rule now governs the windowed
+form `sum(x) OVER (…)`, and an all-integer overflow is the `integer overflow`
+error in both. The three former `sum` sites (the VDBE aggregate, the tree-walker
+plain aggregate, and the tree-walker window finalize — the last of which used to
+fall back to REAL on overflow rather than erroring) now share one
+`eval::sum_values` helper. Test: `tests/sum_numeric_affinity.rs` (VDBE on and off).
+
 And an **aggregate inside a window function's `OVER` spec** (`PARTITION BY` /
 `ORDER BY`) now classifies the query as a single aggregate group, matching
 SQLite: `SELECT row_number() OVER (ORDER BY sum(a)) FROM t` computes `sum(a)`

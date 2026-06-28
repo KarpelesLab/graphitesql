@@ -21244,34 +21244,7 @@ impl Connection {
                     Value::Integer(vals.len() as i64)
                 }
             }
-            "sum" => {
-                if vals.is_empty() {
-                    Value::Null
-                } else if vals.iter().all(|v| matches!(v, Value::Integer(_))) {
-                    let mut acc: i64 = 0;
-                    let mut overflow = false;
-                    for v in &vals {
-                        if let Value::Integer(i) = v {
-                            match acc.checked_add(*i) {
-                                Some(s) => acc = s,
-                                None => {
-                                    overflow = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if overflow {
-                        // Like SQLite: an integer `sum()` that overflows i64 is an
-                        // error (use `total()` for a non-failing real sum).
-                        return Err(Error::Error("integer overflow".into()));
-                    } else {
-                        Value::Integer(acc)
-                    }
-                } else {
-                    Value::Real(vals.iter().map(eval::to_f64).sum())
-                }
-            }
+            "sum" => eval::sum_values(&vals)?,
             "total" => Value::Real(vals.iter().map(eval::to_f64).sum()),
             "avg" => {
                 if vals.is_empty() {
@@ -24843,32 +24816,7 @@ fn window_aggregate(lname: &str, star: bool, frame: &[&Vec<Value>]) -> Result<Va
                 Value::Integer(vals.len() as i64)
             }
         }
-        "sum" => {
-            if vals.is_empty() {
-                Value::Null
-            } else if vals.iter().all(|v| matches!(v, Value::Integer(_))) {
-                let mut acc: i64 = 0;
-                let mut overflow = false;
-                for v in &vals {
-                    if let Value::Integer(i) = v {
-                        match acc.checked_add(*i) {
-                            Some(s) => acc = s,
-                            None => {
-                                overflow = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if overflow {
-                    Value::Real(vals.iter().map(eval::to_f64).sum())
-                } else {
-                    Value::Integer(acc)
-                }
-            } else {
-                Value::Real(vals.iter().map(eval::to_f64).sum())
-            }
-        }
+        "sum" => eval::sum_values(&vals)?,
         "total" => Value::Real(vals.iter().map(eval::to_f64).sum()),
         "avg" => {
             if vals.is_empty() {

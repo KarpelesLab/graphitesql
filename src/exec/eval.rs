@@ -1781,6 +1781,44 @@ pub fn to_f64(v: &Value) -> f64 {
     number_as_f64(&to_number(v))
 }
 
+/// SQLite-compatible `sum()` over `vals` (the already-collected non-null inputs).
+///
+/// The result is an exact INTEGER only when *every* value's numeric type is
+/// INTEGER, mirroring `sqlite3_value_numeric_type` in SQLite's `sumStep`: an
+/// INTEGER storage value — or a TEXT value that is a pure signed integer (with
+/// optional surrounding whitespace and no decimal point or exponent, fitting in
+/// an `i64`) — counts as integer. A REAL value, or any text/blob that is
+/// real-valued or non-numeric, makes the result REAL. An all-integer sum that
+/// overflows `i64` is the "integer overflow" error, exactly as SQLite reports
+/// for both plain and windowed `sum()`. An empty input is NULL.
+pub fn sum_values(vals: &[Value]) -> Result<Value> {
+    if vals.is_empty() {
+        return Ok(Value::Null);
+    }
+    // The numeric type SQLite assigns each argument (`sqlite3_value_numeric_type`)
+    // decides integer-vs-real, not the storage class: a pure-integer *text* like
+    // `'1'` keeps the running sum exact, while `'1.5'`, `'1e2'`, an out-of-range
+    // integer string, or non-numeric text each force a REAL result.
+    let exact_int = vals
+        .iter()
+        .all(|v| matches!(to_number_strict(v), Some(Value::Integer(_))));
+    if exact_int {
+        let mut acc: i64 = 0;
+        for v in vals {
+            let i = match to_number_strict(v) {
+                Some(Value::Integer(i)) => i,
+                _ => 0,
+            };
+            acc = acc
+                .checked_add(i)
+                .ok_or_else(|| Error::Error("integer overflow".into()))?;
+        }
+        Ok(Value::Integer(acc))
+    } else {
+        Ok(Value::Real(vals.iter().map(to_f64).sum()))
+    }
+}
+
 /// The raw bytes of a value's text representation, used by `||`. A blob
 /// contributes its bytes verbatim (no UTF-8 coercion); every other class
 /// contributes the bytes of its [`to_text`] form. Unlike `to_text(..).into_bytes()`

@@ -5154,33 +5154,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
     Ok(match kind {
         AggKind::CountStar => Value::Integer(star),
         AggKind::Count => Value::Integer(vals.len() as i64),
-        AggKind::Sum => {
-            if vals.is_empty() {
-                Value::Null
-            } else if vals.iter().all(|v| matches!(v, Value::Integer(_))) {
-                let mut acc: i64 = 0;
-                let mut overflow = false;
-                for v in &vals {
-                    if let Value::Integer(i) = v {
-                        match acc.checked_add(*i) {
-                            Some(s) => acc = s,
-                            None => {
-                                overflow = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if overflow {
-                    // Match SQLite: integer `sum()` overflow is an error.
-                    return Err(Error::Error("integer overflow".into()));
-                } else {
-                    Value::Integer(acc)
-                }
-            } else {
-                Value::Real(vals.iter().map(eval::to_f64).sum())
-            }
-        }
+        AggKind::Sum => eval::sum_values(&vals)?,
         AggKind::Total => Value::Real(vals.iter().map(eval::to_f64).sum()),
         AggKind::Avg => {
             if vals.is_empty() {
