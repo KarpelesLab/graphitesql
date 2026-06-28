@@ -1200,13 +1200,25 @@ open work:
     *execute* a bare/qualified `rowid` over any join — orthogonal to this check.)
   - unknown / wrong-arity *scalar functions* inside an expression-position
     subquery (`Subquery` / `EXISTS` / `IN (SELECT …)`) — e.g.
-    `SELECT (SELECT nope(a)) FROM t` or `… WHERE a IN (SELECT nope(b) FROM t)`.
-    `reject_unresolved_functions_in_select` does not recurse into nested SELECTs;
-    doing so safely needs the column-vs-function precedence preserved (a bad column
-    in the subquery must still win, `no such column` over `no such function`), which
-    depends on the same correlated-scope column resolution above. Derived tables in
-    `FROM`, CTE bodies, and compound (`UNION`) arms are already covered (they
-    materialize, which resolves them).
+    `SELECT (SELECT nope(a)) FROM t` or `… WHERE a IN (SELECT nope(b) FROM t)` —
+    are now rejected at prepare time. `reject_unresolved_functions_in_subqueries`
+    collects each depth-1 subselect the outer expressions carry (result/`WHERE`/
+    `HAVING`/`GROUP BY`/`ORDER BY`/join-`ON`) and runs the existing
+    `reject_unresolved_functions_in_select` dry-resolver on it, but **only** when
+    `subquery_body_columns_clean` confirms the subquery body resolves every column
+    against its own `FROM` plus the outer scope. That gate preserves sqlite's
+    column-before-function precedence: `SELECT (SELECT nope(zzz)) FROM t` stays a
+    `no such column` case left to the lazy path, never masked by a function error.
+    So `SELECT (SELECT nope(a)) FROM t`, `… WHERE a IN (SELECT nope(c) FROM u)`,
+    `EXISTS (SELECT nope(c) FROM u)`, and wrong-arity calls (`(SELECT abs(1,2))`,
+    `EXISTS (SELECT 1 FROM u WHERE substr(b)=c)`) all error like sqlite, while
+    valid calls (`abs(c)`, `upper(b)`, `max(c)`) and unverifiable bodies (a
+    compound `UNION` subquery, a correlated-but-missing column) are left untouched.
+    Derived tables in `FROM`, CTE bodies, and compound (`UNION`) arms were already
+    covered (they materialize, which resolves them). Still open: a subquery body
+    that is itself *correlated with a missing column* — coupled to the same
+    three-part correlated-scope column resolution noted above. Test:
+    `tests/subquery_function_validation.rs`.
 - **ALTER-time rejection of an ALTER that breaks a dependent.** An `ALTER` that
   makes a dependent view/trigger unresolvable should be rejected and rolled back;
   graphite leaves the now-broken object. Needs statement-level DDL rollback — a

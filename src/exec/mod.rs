@@ -14737,6 +14737,64 @@ impl Connection {
         Ok(())
     }
 
+    /// Eager `no such function` / `wrong number of arguments` check for scalar calls
+    /// inside an **expression-position subquery** (`(SELECT …)`, `EXISTS (…)`,
+    /// `… IN (SELECT …)`). [`Self::reject_unresolved_functions_in_select`]'s
+    /// `window::visit` walk never descends into a nested subquery body, so an unknown
+    /// or wrong-arity call there was only noticed at row evaluation — missed entirely
+    /// over an empty / fully-filtered outer table where SQLite still rejects at
+    /// prepare time. This collects each subquery the outer expressions carry and,
+    /// **only when the body is column-clean** against its own `FROM` plus the outer
+    /// scope ([`Self::subquery_body_columns_clean`]), checks its scalar calls. The
+    /// column-clean gate preserves SQLite's precedence: a `no such column` it would
+    /// report first is never masked by a function error (`SELECT (SELECT nope(zzz))`
+    /// stays a missing-column case, left to the lazy path). A subquery it cannot
+    /// fully verify — correlated-but-missing, compound, or further-nested — is left
+    /// alone, so this never raises a false positive. `cols` is the outer query's scan
+    /// scope (the sole correlation scope, since this runs only at the outermost
+    /// query).
+    fn reject_unresolved_functions_in_subqueries(
+        &self,
+        sel: &Select,
+        cols: &[ColumnInfo],
+    ) -> Result<()> {
+        let mut targets: Vec<&Expr> = Vec::new();
+        for rc in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            targets.push(w);
+        }
+        if let Some(h) = &sel.having {
+            targets.push(h);
+        }
+        for g in &sel.group_by {
+            targets.push(g);
+        }
+        for t in &sel.order_by {
+            targets.push(&t.expr);
+        }
+        if let Some(from) = &sel.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    targets.push(on);
+                }
+            }
+        }
+        let mut subs: Vec<&Select> = Vec::new();
+        for e in targets {
+            collect_subselects(e, &mut subs);
+        }
+        for sub in subs {
+            if self.subquery_body_columns_clean(sub, cols) {
+                self.reject_unresolved_functions_in_select(sub)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Reject an `expr IN (SELECT …)` whose subquery yields a different number of
     /// columns than the left-hand side expects — SQLite reports `sub-select
     /// returns N columns - expected M` at prepare time, so the mismatch is caught
@@ -15664,6 +15722,13 @@ impl Connection {
         // `reject_unresolved_functions_in_select` (run ahead of this block, on
         // both the VDBE-success and tree-walker paths).
         self.reject_unresolved_functions_in_select(sel)?;
+        // Scalar calls inside an expression-position subquery are not reached by the
+        // walk above; check them at the outermost query, after the outer call so an
+        // outer fault still wins. Gated to a column-clean subquery body so a
+        // `no such column` SQLite reports first is never masked.
+        if self.outer_scope.borrow().is_empty() {
+            self.reject_unresolved_functions_in_subqueries(sel, &columns)?;
+        }
         {
             let is_agg = |name: &str, n: usize, star: bool| {
                 func::is_aggregate_call(name, n, star)
