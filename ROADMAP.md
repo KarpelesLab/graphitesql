@@ -607,6 +607,19 @@ true f64 (`%.2e` of 1.005 stays `1.00e+00`, because 1.005's f64 is just below th
 tie). Byte-exact vs `sqlite3` 3.50.4 across values × precisions 0..=6 for both
 `%e` and `%E` (`tests/printf_exp_rounding.rs`).
 
+**Known remaining gap — `printf`'s `!` (alt-form-2) flag at high precision.**
+Without `!` graphite is byte-exact (SQLite caps a `%f`/`%e`/`%g` double at 16
+significant digits; `%.20f` of `0.1` is `0.10000000000000000000` in both). The
+`!` flag lifts that cap to 20 significant digits via SQLite's bespoke float
+decoder, where graphite instead emits the *exact* f64 decimal expansion — so
+`printf('%!.20f', 0.1)` is graphite's `0.10000000000000000555` vs SQLite's
+`0.1000000000000000055` (and likewise `%!.25f`/`%!.30f`/`%!.20e`/`%!.20g`).
+Matching it byte-for-byte requires porting SQLite's `sqlite3FpDecode` and its
+double-double binary→decimal machinery (`sqlite3Fp2Convert10`, `powerOfTen` with
+the `aBase`/`aScale`/`aScaleLo` tables, `sqlite3Multiply128`/`160`) — a ~300-line
+table-heavy port for an obscure printf extension flag, deferred as low-ROI. The
+non-`!` path is unaffected.
+
 **A plain window-function `SELECT` with no outer `ORDER BY` now emits its rows
 in the first window's `(PARTITION BY …, ORDER BY …)` order, like SQLite.** SQLite
 evaluates a window by sorting the rows into partition+order order and never
