@@ -25,6 +25,7 @@ const BP_ADD: u8 = 70;
 const BP_MUL: u8 = 80;
 const BP_CONCAT: u8 = 90;
 const BP_UNARY: u8 = 100;
+const BP_COLLATE: u8 = 110; // postfix COLLATE binds tighter than any operator
 
 /// Parse a SQL string into a list of statements (split on `;`).
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
@@ -2243,7 +2244,24 @@ impl Parser {
     fn expr_bp(&mut self, min_bp: u8) -> Result<Expr> {
         let _guard = self.enter()?;
         let mut left = self.prefix()?;
-        while let Some((op, bp)) = self.peek_infix() {
+        loop {
+            // A postfix COLLATE binds tighter than any binary operator. The
+            // common case (`col COLLATE NOCASE = x`) is absorbed by
+            // `primary_collate`, but a COLLATE trailing a closed infix construct
+            // (`x IN (…) COLLATE C`, `x IN (SELECT …) COLLATE C`) lands here —
+            // SQLite's grammar then applies it to the whole expression.
+            if BP_COLLATE >= min_bp && self.check_kw("collate") {
+                self.pos += 1;
+                let collation = self.ident()?;
+                left = Expr::Collate {
+                    expr: Box::new(left),
+                    collation,
+                };
+                continue;
+            }
+            let Some((op, bp)) = self.peek_infix() else {
+                break;
+            };
             if bp < min_bp {
                 break;
             }

@@ -1076,6 +1076,20 @@ the descent is one general fix that closes all of these. Byte-exact vs `sqlite3`
 3.50.4. A bare row value as a scalar result column (`SELECT (sum(a),1) FROM t` →
 `row value misused`) is a separate row-value-context check, still open.
 
+**A postfix `COLLATE` after a closed `IN (…)` construct now parses.** SQLite's
+grammar makes `COLLATE` a postfix operator that binds tighter than any binary
+operator (`expr ::= expr COLLATE name`), so `'A' IN ('a','b') COLLATE NOCASE` and
+`x IN (SELECT …) COLLATE C` apply the collation to the whole `IN` expression. The
+parser only consumed a trailing `COLLATE` at the *primary* level
+(`primary_collate`), which covers the common `col COLLATE NOCASE = x` (the
+collation rides on the primary operand), but a `COLLATE` trailing the `)` that
+closes an `IN` list/subquery landed nowhere and raised `near "COLLATE": syntax
+error`. The fix handles a postfix `COLLATE` in the `expr_bp` Pratt loop at the
+highest binding power, so it wraps whatever expression precedes it. Since an `IN`
+result is a 0/1 integer, the collation is a semantic no-op there (it never alters
+the comparison) — exactly as in SQLite; the win is parse acceptance and a
+round-trip-clean `CREATE VIEW`/`CHECK` reprint. Byte-exact vs `sqlite3` 3.50.4.
+
 **`LIMIT`/`OFFSET` is resolved in an empty column scope.** SQLite evaluates a
 `LIMIT`/`OFFSET` expression with *no table columns in scope* — not even a
 correlated outer column — and that resolution runs ahead of every other check in

@@ -36,6 +36,24 @@ fn collate_in_list() {
 }
 
 #[test]
+fn collate_postfix_after_in() {
+    // A COLLATE trailing a closed `IN (…)` construct binds to the whole `IN`
+    // expression (SQLite's grammar: `expr ::= expr COLLATE name`, highest
+    // precedence). graphite previously rejected this as `near "COLLATE":
+    // syntax error`. Since the `IN` result is a 0/1 integer, the trailing
+    // collation is a no-op — it never changes the comparison, exactly as in
+    // SQLite. The point is that it parses and evaluates rather than erroring.
+    let c = Connection::open_memory().unwrap();
+    assert_eq!(b(&c, "SELECT 'A' IN ('a','b') COLLATE NOCASE"), 0);
+    assert_eq!(b(&c, "SELECT 1 IN (1,2) COLLATE BINARY"), 1);
+    assert_eq!(b(&c, "SELECT 'A' NOT IN ('a','b') COLLATE NOCASE"), 1);
+    // `IN (SELECT …)` followed by COLLATE parses too.
+    assert_eq!(b(&c, "SELECT 'A' IN (SELECT 'a') COLLATE NOCASE"), 0);
+    // To actually fold case, COLLATE must sit on the left operand — unchanged.
+    assert_eq!(b(&c, "SELECT 'A' COLLATE NOCASE IN ('a','b')"), 1);
+}
+
+#[test]
 fn collate_case_when() {
     let c = Connection::open_memory().unwrap();
     // An explicit COLLATE on any WHEN applies to that comparison.
