@@ -520,6 +520,20 @@ statement writing another table, a subquery touching another table, or a derived
 table in a `FROM`. Byte-exact vs `sqlite3` 3.50.4
 (`tests/trigger_rename_column_subquery.rs`).
 
+**`RENAME TO` now rewrites an `INSERT INTO <old>(col-list)` target inside a
+dependent trigger body.** The token rewriter that repoints a renamed table's name
+throughout a trigger/view's stored text skipped any `<old>(` token as a presumed
+function call (so a table named `count` would not clobber the `count()` function).
+But `INSERT INTO t(a) …` also reads as `t(`, so the INSERT *target's* column-list
+form was wrongly skipped — leaving the trigger's `ON` clause and a body `FROM t`
+renamed while `INSERT INTO t(a)` kept the dead old name, diverging the stored
+`sqlite_schema.sql` and breaking the trigger the next time it fired. A token that
+immediately follows `INTO` is a table reference with a column list, never a
+function, so the `before_lparen` guard now yields to an `after_into` check. The
+function-name protection (`count(*)`), the no-column-list form (`INSERT INTO t
+VALUES …`), and a table-valued-function call in `FROM` are all still left intact.
+Byte-exact vs `sqlite3` 3.50.4 (`tests/rename_trigger_insert_target.rs`).
+
 **`json_quote(X)` now renders a JSONB blob as its JSON text.** SQLite accepts a
 BLOB argument to `json_quote` when it decodes as JSONB and emits the
 corresponding JSON (so `jsonb_*` results compose: `json_quote(jsonb('[1,2]'))` →

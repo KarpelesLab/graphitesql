@@ -27291,7 +27291,13 @@ fn rewrite_ident_tokens(sql: &str, old: &str, rendered: &str) -> String {
         let before_lparen = toks
             .get(i + 1)
             .is_some_and(|n| matches!(n.token, sql::token::Token::LParen));
-        if after_dot || before_lparen {
+        // `INSERT INTO old(col-list)` reads as `old(` but is a table reference
+        // with a column list, not a function call — so the `before_lparen` guard
+        // must not skip a token that immediately follows `INTO`.
+        let after_into = i > 0
+            && matches!(&toks[i - 1].token,
+                sql::token::Token::Word(w) if w.eq_ignore_ascii_case("into"));
+        if after_dot || (before_lparen && !after_into) {
             continue;
         }
         out.push_str(&sql[cursor..sp.start]);
