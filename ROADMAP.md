@@ -1227,7 +1227,13 @@ or a mix of a column and an expression — the grouped fold evaluates each key
 expression per row to identify the group, and the projection / `HAVING` /
 `ORDER BY` resolve a structurally-equal key expression through the binding table;
 a computed key forces the binding-driven general grouped path rather than the
-compact column-index `GroupEmit` shortcut);
+compact column-index `GroupEmit` shortcut); a **`SELECT DISTINCT` over a grouped
+query** (`SELECT DISTINCT count(*) … GROUP BY …`) — grouping yields one row per
+group and `DISTINCT` then dedups those rows via a `DistinctCheck` inserted after
+`HAVING` and before `OFFSET`/`LIMIT` and the sorter, so dedup precedes both
+ordering and the row counters exactly as in SQLite; the dedup compares output
+rows under BINARY, and an explicit `COLLATE` on an otherwise-BINARY output column
+defers to the tree-walker;
 `DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates (incl.
 the two-argument `group_concat(x, sep)` / `string_agg(x, sep)` form — the constant
 separator is captured at compile time and threaded through the accumulator);

@@ -1161,11 +1161,10 @@ fn compile_group_select(
     projections: &[(Expr, String)],
     boundaries: Option<&[usize]>,
 ) -> Result<Program> {
-    if sel.distinct {
-        return Err(Error::Unsupported("VDBE: GROUP BY + DISTINCT"));
-    }
     // Group-key matching and min/max reduction compare under BINARY; a non-BINARY
-    // column collation would diverge, so defer to the tree-walker.
+    // column collation would diverge, so defer to the tree-walker. This guard also
+    // covers a `SELECT DISTINCT … GROUP BY` (handled on the general path below):
+    // its post-grouping dedup likewise compares output rows under BINARY.
     if collations.iter().any(|c| *c != Collation::Binary) {
         return Err(Error::Unsupported("VDBE: non-BINARY collation in GROUP BY"));
     }
@@ -1242,10 +1241,26 @@ fn compile_group_select(
         })
         .collect();
 
+    // `SELECT DISTINCT` dedups output rows under BINARY (`DistinctCheck` below). An
+    // output expression carrying a non-BINARY collation — an explicit `COLLATE` on
+    // an otherwise-BINARY column — would dedup case-insensitively in SQLite (a
+    // non-BINARY *declared* column already bailed via the table-wide guard above),
+    // so defer that case to the tree-walker.
+    if sel.distinct
+        && projections
+            .iter()
+            .any(|(e, _)| c.col_collation(e).is_some_and(|co| co != Collation::Binary))
+    {
+        return Err(Error::Unsupported(
+            "VDBE: non-BINARY collation in DISTINCT output",
+        ));
+    }
+
     // The plain path (no HAVING / ORDER BY / LIMIT, all keys bare columns) keeps
     // its compact `GroupEmit`. A computed key needs the binding-driven general
-    // path, so it falls through even without HAVING/ORDER BY/LIMIT.
-    if !has_having && !has_order && !has_limit && all_col_keys {
+    // path, so it falls through even without HAVING/ORDER BY/LIMIT. `SELECT
+    // DISTINCT` likewise needs the general path's post-grouping `DistinctCheck`.
+    if !has_having && !has_order && !has_limit && all_col_keys && !sel.distinct {
         return compile_group_emit(
             sel,
             columns,
@@ -1569,6 +1584,21 @@ fn compile_group_select(
         }
         None => None,
     };
+    // `SELECT DISTINCT`: drop a group whose projected output row duplicates one
+    // already emitted (BINARY compare — non-BINARY output bailed above). This runs
+    // after HAVING and before OFFSET/LIMIT and the sorter, so dedup precedes both
+    // ordering and the row counters, matching SQLite.
+    let distinct_skip = if sel.distinct {
+        let at = c.ops.len();
+        c.ops.push(Op::DistinctCheck {
+            start: out_start,
+            count,
+            target: 0,
+        });
+        Some(at)
+    } else {
+        None
+    };
     let mut limit_done = None;
     let mut offset_skip = None;
     if has_order {
@@ -1601,6 +1631,13 @@ fn compile_group_select(
     c.ops.push(Op::GroupNext { target: gbody });
     if let Some(at) = having_skip {
         if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = gnext;
+        }
+    }
+    if let Some(at) = distinct_skip {
+        // A duplicate group advances to the next without emitting (and without
+        // entering the sorter on the ORDER BY path).
+        if let Op::DistinctCheck { target, .. } = &mut c.ops[at] {
             *target = gnext;
         }
     }
@@ -5408,6 +5445,8 @@ mod tests {
             // A bare column with exactly one min/max tracks that aggregate's
             // companion row.
             "SELECT a.x, b.p, max(b.p) FROM a, b GROUP BY a.x",
+            // DISTINCT dedups the grouped output rows (general path, BINARY).
+            "SELECT DISTINCT a.x, count(*) FROM a, b GROUP BY a.x",
         ] {
             let Statement::Select(sel) = parse_one(sql).unwrap() else {
                 panic!()
@@ -5417,10 +5456,9 @@ mod tests {
                 "{sql} should compile as a GROUP BY join"
             );
         }
-        // DISTINCT / a bare column alongside more than one min/max (ambiguous
-        // companion) / no GROUP BY still bail.
+        // A bare column alongside more than one min/max (ambiguous companion) /
+        // no GROUP BY still bail.
         for sql in [
-            "SELECT DISTINCT a.x, count(*) FROM a, b GROUP BY a.x",
             "SELECT a.x, b.p, max(b.p), min(b.p) FROM a, b GROUP BY a.x", // >1 min/max
             "SELECT count(*) FROM a, b",                                  // no GROUP BY
         ] {
