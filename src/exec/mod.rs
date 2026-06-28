@@ -13097,6 +13097,44 @@ impl Connection {
     /// Compute every window function in `sel` over `rows`, append each result as
     /// a synthetic column on `columns`/`rows`, and return a rewritten `SELECT`
     /// whose projection/ORDER BY reference those columns.
+    /// When a plain window-function query has no outer `ORDER BY`, SQLite emits
+    /// rows in the *first* window's `(PARTITION BY …, ORDER BY …)` order — a side
+    /// effect of how it evaluates windows (it sorts the rows into partition+order
+    /// order and never shuffles them back to the scan order). Build that implicit
+    /// ordering so a plain windowed `SELECT` is row-for-row byte-compatible with
+    /// sqlite. Returns `None` when there is no window function, or the first one
+    /// has neither `PARTITION BY` nor `ORDER BY` (e.g. `OVER ()`) — then the scan
+    /// order is left untouched, as sqlite leaves it.
+    fn window_output_order(&self, sel: &Select) -> Result<Option<Vec<OrderTerm>>> {
+        let wins = window::collect_window_exprs(sel);
+        let Some(first) = wins.first() else {
+            return Ok(None);
+        };
+        let resolved = resolve_window_ref(first, &sel.window_defs)?;
+        let Expr::Function {
+            over: Some(spec), ..
+        } = &resolved
+        else {
+            return Ok(None);
+        };
+        if spec.partition_by.is_empty() && spec.order_by.is_empty() {
+            return Ok(None);
+        }
+        let mut terms: Vec<OrderTerm> =
+            Vec::with_capacity(spec.partition_by.len() + spec.order_by.len());
+        // PARTITION BY keys sort ascending (NULLs first), then the window's own
+        // ORDER BY terms with their directions.
+        for p in &spec.partition_by {
+            terms.push(OrderTerm {
+                expr: p.clone(),
+                descending: false,
+                nulls_first: None,
+            });
+        }
+        terms.extend(spec.order_by.iter().cloned());
+        Ok(Some(terms))
+    }
+
     fn apply_windows(
         &self,
         sel: &Select,
@@ -15401,7 +15439,14 @@ impl Connection {
         };
         let rewritten;
         let sel = if window::has_window(sel) && !windowed_agg {
-            rewritten = self.apply_windows(sel, &mut columns, &mut rows, params)?;
+            let mut w = self.apply_windows(sel, &mut columns, &mut rows, params)?;
+            // Absent an explicit ORDER BY, match sqlite's window-induced row order.
+            if w.order_by.is_empty() {
+                if let Some(order) = self.window_output_order(sel)? {
+                    w.order_by = order;
+                }
+            }
+            rewritten = w;
             &rewritten
         } else {
             sel

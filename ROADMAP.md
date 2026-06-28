@@ -567,6 +567,22 @@ true f64 (`%.2e` of 1.005 stays `1.00e+00`, because 1.005's f64 is just below th
 tie). Byte-exact vs `sqlite3` 3.50.4 across values × precisions 0..=6 for both
 `%e` and `%E` (`tests/printf_exp_rounding.rs`).
 
+**A plain window-function `SELECT` with no outer `ORDER BY` now emits its rows
+in the first window's `(PARTITION BY …, ORDER BY …)` order, like SQLite.** SQLite
+evaluates a window by sorting the rows into partition+order order and never
+shuffles them back, so the result set comes out sorted even though the query
+named no `ORDER BY`; graphite left the rows in table-scan order. Now, absent an
+explicit `ORDER BY`, the plain-window path injects a synthetic ordering — the
+first window's `PARTITION BY` keys (ascending) followed by its `ORDER BY` terms —
+through the existing collation/NULLS-aware sort, so `SELECT x, row_number() OVER
+(ORDER BY x) FROM t` over rows inserted `5,3,8` returns them `3,5,8`. The *first*
+window in the select list wins; `OVER ()` induces no ordering (scan order
+preserved). Byte-exact vs `sqlite3` 3.50.4 (`tests/window_output_order.rs`). Two
+residuals are deferred (separate, larger fixes): the `GROUP BY` + window path
+(`eval_windowed_aggregate`) does not yet apply the window order, and a window
+`PARTITION BY`/`ORDER BY … COLLATE` still computes its *frame* under BINARY
+(wrong cumulative values, though the row order is now correct).
+
 **CTEs in one `WITH` clause now see each other — forward references work, and
 true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
 (it expands them on demand from the outer query), so a CTE may reference one
