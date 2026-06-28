@@ -520,6 +520,16 @@ statement writing another table, a subquery touching another table, or a derived
 table in a `FROM`. Byte-exact vs `sqlite3` 3.50.4
 (`tests/trigger_rename_column_subquery.rs`).
 
+**`json_quote(X)` now renders a JSONB blob as its JSON text.** SQLite accepts a
+BLOB argument to `json_quote` when it decodes as JSONB and emits the
+corresponding JSON (so `jsonb_*` results compose: `json_quote(jsonb('[1,2]'))` →
+`[1,2]`, and the 1-byte JSONB scalars `x'00'`/`x'01'` → `null`/`true`), raising
+`JSON cannot hold BLOB values` only for a blob that is *not* valid JSONB.
+graphite rejected every blob unconditionally. It now routes the blob through its
+existing JSONB decoder (the one behind `jsonb()`/`jsonb_extract`): valid JSONB
+renders, invalid still errors. Byte-exact vs `sqlite3` 3.50.4
+(`tests/json_quote_jsonb.rs`).
+
 **CTEs in one `WITH` clause now see each other — forward references work, and
 true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
 (it expands them on demand from the outer query), so a CTE may reference one

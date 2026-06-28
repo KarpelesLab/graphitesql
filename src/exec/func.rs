@@ -274,7 +274,13 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         // the subtype. Anything else falls through to the quoting arm below.
         "json_quote" if args.len() == 1 && produces_json(&args[0]) => {
             let val = eval::eval(&args[0], ctx)?;
-            reject_blob(&val)?;
+            // A JSONB blob (e.g. `json_quote(jsonb('[1,2]'))`) renders as its JSON
+            // text; any other blob is rejected.
+            if let Value::Blob(b) = &val {
+                let j = super::json::Json::from_jsonb(b)
+                    .ok_or_else(|| Error::Error("JSON cannot hold BLOB values".into()))?;
+                return Ok(Value::Text(j.quote()));
+            }
             return Ok(val);
         }
         _ => {}
@@ -795,8 +801,17 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "json_quote" => {
             arity(&lname, args, 1)?;
-            reject_blob(&v[0])?;
-            Value::Text(super::json::value_to_json(&v[0]).quote())
+            // A BLOB that decodes as JSONB renders as its JSON text (so
+            // `json_quote(x'01')` → `true`, `json_quote(jsonb('[1,2]'))` →
+            // `[1,2]`); any other BLOB is rejected. graphite has no value
+            // subtypes, so it falls back to "does it parse as JSONB", matching
+            // sqlite.
+            let j = match &v[0] {
+                Value::Blob(b) => super::json::Json::from_jsonb(b)
+                    .ok_or_else(|| Error::Error("JSON cannot hold BLOB values".into()))?,
+                other => super::json::value_to_json(other),
+            };
+            Value::Text(j.quote())
         }
         "json_type" => {
             if v.is_empty() || v.len() > 2 {
@@ -1336,15 +1351,6 @@ fn check_path(p: &Value) -> Result<()> {
     let s = eval::to_text(p);
     if !super::json::path_is_valid(&s) {
         return Err(Error::Error(alloc::format!("bad JSON path: '{s}'")));
-    }
-    Ok(())
-}
-
-/// Reject a BLOB argument to a JSON constructor/mutator: SQLite cannot store a
-/// BLOB in JSON and raises `JSON cannot hold BLOB values`.
-fn reject_blob(v: &Value) -> Result<()> {
-    if matches!(v, Value::Blob(_)) {
-        return Err(Error::Error("JSON cannot hold BLOB values".into()));
     }
     Ok(())
 }
