@@ -937,6 +937,16 @@ fn collect_bare_columns(expr: &Expr, out: &mut Vec<(Option<String>, String)>) {
     }
 }
 
+/// A resolved `GROUP BY` key: either a bare table column (kept as a combined
+/// column index, so the compact `GroupEmit` plain path and representative-column
+/// bookkeeping can index it directly) or an arbitrary scalar expression evaluated
+/// per row in the fold. A computed key forces the general grouped path, where the
+/// projection resolves the same expression through the binding table.
+enum GroupKeySpec {
+    Col(usize),
+    Expr(Expr),
+}
+
 /// Emit the GROUP-BY fold loop into `c`: allocate the contiguous group-key
 /// registers (one per grouping column), scan the row source, apply `WHERE`, load
 /// each grouping key and aggregate argument, and `GroupStep`. The row source is a
@@ -948,7 +958,7 @@ fn collect_bare_columns(expr: &Expr, out: &mut Vec<(Option<String>, String)>) {
 fn emit_group_fold(
     c: &mut Compiler,
     sel: &Select,
-    group_cols: &[usize],
+    group_keys: &[GroupKeySpec],
     repr_cols: &[usize],
     agg_specs: &[AggCallSpec],
 ) -> Result<()> {
@@ -957,7 +967,7 @@ fn emit_group_fold(
     // representative (loaded per row, but only the group's first-seen row's values
     // are retained — see `Op::GroupStep`).
     let key_start = c.next_reg;
-    for _ in group_cols {
+    for _ in group_keys {
         c.alloc();
     }
     for _ in repr_cols {
@@ -997,26 +1007,34 @@ fn emit_group_fold(
         }
         None => None,
     };
-    // Load each grouping key into its register (per-cursor `ColumnC` for a join).
-    for (k, &ci) in group_cols.iter().enumerate() {
-        match &bounds {
-            Some(b) => {
-                let (cursor, col) = Compiler::cursor_of(b, ci);
-                c.ops.push(Op::ColumnC {
-                    cursor,
-                    col,
+    // Load each grouping key into its register. A bare column reads the scan row
+    // (per-cursor `ColumnC` for a join); a computed key compiles its expression
+    // into the key register (bindings are still empty here, so column refs read
+    // the live scan row — exactly the per-row key value we want).
+    for (k, key) in group_keys.iter().enumerate() {
+        match key {
+            GroupKeySpec::Col(ci) => match &bounds {
+                Some(b) => {
+                    let (cursor, col) = Compiler::cursor_of(b, *ci);
+                    c.ops.push(Op::ColumnC {
+                        cursor,
+                        col,
+                        dest: key_start + k,
+                    });
+                }
+                None => c.ops.push(Op::Column {
+                    col: *ci,
                     dest: key_start + k,
-                });
+                }),
+            },
+            GroupKeySpec::Expr(e) => {
+                c.compile_expr_into(e, key_start + k)?;
             }
-            None => c.ops.push(Op::Column {
-                col: ci,
-                dest: key_start + k,
-            }),
         }
     }
     // Load each bare-column representative right after the keys. `GroupStep` keeps
     // the value from the row that first creates the group (first-seen semantics).
-    let kn = group_cols.len();
+    let kn = group_keys.len();
     for (r, &ci) in repr_cols.iter().enumerate() {
         match &bounds {
             Some(b) => {
@@ -1078,7 +1096,7 @@ fn emit_group_fold(
     };
     c.ops.push(Op::GroupStep {
         key_start,
-        key_count: group_cols.len(),
+        key_count: group_keys.len(),
         repr_count: repr_cols.len(),
         companion,
         aggs,
@@ -1171,19 +1189,63 @@ fn compile_group_select(
         rowid_index: None,
         cursor_boundaries: boundaries.map(|b| b.to_vec()),
     };
-    // Resolve each grouping key to a (combined) column index (column refs only).
-    let mut group_cols: Vec<usize> = Vec::new();
+    // Resolve each grouping key. A bare column becomes a (combined) column index;
+    // any other expression is kept and evaluated per row in the fold (its value
+    // identifies the group, and the projection resolves the same expression
+    // through the binding table). A column-only key set can still take the compact
+    // `GroupEmit` plain path; a computed key forces the general path below.
+    let mut group_keys: Vec<GroupKeySpec> = Vec::new();
     for g in &sel.group_by {
         match g {
             Expr::Column { table, column, .. } => {
-                group_cols.push(c.resolve_column(table.as_deref(), column)?)
+                group_keys.push(GroupKeySpec::Col(
+                    c.resolve_column(table.as_deref(), column)?,
+                ));
             }
-            _ => return Err(Error::Unsupported("VDBE: GROUP BY column refs only")),
+            other => {
+                // A *constant* (column-free) key is left to the tree-walker. SQLite
+                // treats a signed-integer literal key as a positional reference
+                // (`GROUP BY -1` is "out of range", not "group by −1"), while other
+                // constants (`'x'`, `1+0`) collapse every row into one group; the
+                // tree-walker already draws that distinction exactly, and a constant
+                // key has no grouping value on the VDBE. Only a key that reads at
+                // least one column becomes a computed VDBE key.
+                let mut refs = Vec::new();
+                collect_bare_columns(other, &mut refs);
+                if refs.is_empty() {
+                    return Err(Error::Unsupported("VDBE: constant GROUP BY key"));
+                }
+                // Group matching is BINARY (`GroupStep`); a key carrying a non-BINARY
+                // collation — an explicit `COLLATE NOCASE` or a non-BINARY declared
+                // column collation — would group differently, so defer. (An all-BINARY
+                // column set otherwise passes the table-wide collation guard below,
+                // which would miss an explicit override on the key expression.)
+                if c.col_collation(other)
+                    .is_some_and(|co| co != Collation::Binary)
+                {
+                    return Err(Error::Unsupported(
+                        "VDBE: non-BINARY collation in GROUP BY key",
+                    ));
+                }
+                group_keys.push(GroupKeySpec::Expr(other.clone()));
+            }
         }
     }
+    let all_col_keys = group_keys.iter().all(|k| matches!(k, GroupKeySpec::Col(_)));
+    // Column indices of the bare-column keys: used to exclude a grouping column
+    // from the representative set and (on the plain path) to classify outputs.
+    let key_col_indices: Vec<usize> = group_keys
+        .iter()
+        .filter_map(|k| match k {
+            GroupKeySpec::Col(i) => Some(*i),
+            GroupKeySpec::Expr(_) => None,
+        })
+        .collect();
 
-    // The plain path (no HAVING / ORDER BY / LIMIT) keeps its compact `GroupEmit`.
-    if !has_having && !has_order && !has_limit {
+    // The plain path (no HAVING / ORDER BY / LIMIT, all keys bare columns) keeps
+    // its compact `GroupEmit`. A computed key needs the binding-driven general
+    // path, so it falls through even without HAVING/ORDER BY/LIMIT.
+    if !has_having && !has_order && !has_limit && all_col_keys {
         return compile_group_emit(
             sel,
             columns,
@@ -1191,7 +1253,7 @@ fn compile_group_select(
             affinities,
             collations,
             projections,
-            &group_cols,
+            &key_col_indices,
             boundaries,
         );
     }
@@ -1243,7 +1305,7 @@ fn compile_group_select(
             continue;
         };
         // Grouping columns are bound to their key register below, not represented.
-        if group_cols.contains(&ci) {
+        if key_col_indices.contains(&ci) {
             continue;
         }
         if !repr_cols.contains(&ci) {
@@ -1267,24 +1329,34 @@ fn compile_group_select(
 
     // Fold the row source (single cursor or nested-loop join) into per-group
     // aggregates, allocating the grouping-key and representative registers.
-    emit_group_fold(&mut c, sel, &group_cols, &repr_cols, &agg_specs)?;
+    emit_group_fold(&mut c, sel, &group_keys, &repr_cols, &agg_specs)?;
 
     // Per-group registers: one for each grouping key value, one for each
     // aggregate final. These feed the bindings so HAVING/projection/ORDER-BY
     // expressions resolve grouping-column refs and aggregate calls to registers.
     let gkey_start = c.next_reg;
-    for _ in &group_cols {
+    for _ in &group_keys {
         c.alloc();
     }
     let gagg_start = c.next_reg;
     for _ in &agg_specs {
         c.alloc();
     }
-    // Grouping-column reference → its key register. Bind both the bare form
-    // (`g`) and the qualified form (`t.g`) so a qualified reference in the
+    // Grouping key → its key register. For a bare-column key bind both the bare
+    // form (`g`) and the qualified form (`t.g`) so a qualified reference in the
     // projection / HAVING / ORDER BY resolves to the key register too (otherwise
-    // it would compile to a scan-column read that is invalid during emit).
-    for (k, &ci) in group_cols.iter().enumerate() {
+    // it would compile to a scan-column read that is invalid during emit). For a
+    // computed key bind the whole expression: a projection/HAVING/ORDER-BY term
+    // structurally equal to the key resolves to the key register, and anything
+    // else bails via `forbid_raw_columns` (so it simply falls back).
+    for (k, key) in group_keys.iter().enumerate() {
+        let ci = match key {
+            GroupKeySpec::Expr(e) => {
+                c.bindings.push((e.clone(), gkey_start + k));
+                continue;
+            }
+            GroupKeySpec::Col(ci) => *ci,
+        };
         c.bindings.push((
             Expr::Column {
                 schema: None,
@@ -1430,12 +1502,12 @@ fn compile_group_select(
     let gfin = c.ops.len();
     c.ops.push(Op::GroupFinalize {
         agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _)| *k).collect(),
-        key_count: group_cols.len(),
+        key_count: group_keys.len(),
         target: 0,
     });
     let gbody = c.ops.len();
     // Load this group's keys and aggregate finals into their registers.
-    for k in 0..group_cols.len() {
+    for k in 0..group_keys.len() {
         c.ops.push(Op::GroupKey {
             key: k,
             dest: gkey_start + k,
@@ -1451,7 +1523,7 @@ fn compile_group_select(
     // right after the real keys by the fold, holding the first-seen row's value).
     for r in 0..repr_cols.len() {
         c.ops.push(Op::GroupKey {
-            key: group_cols.len() + r,
+            key: group_keys.len() + r,
             dest: grepr_start + r,
         });
     }
@@ -1687,8 +1759,10 @@ fn compile_group_emit(
     }
 
     // Fold the row source (single cursor or nested-loop join) into per-group
-    // aggregates, allocating the grouping-key and representative registers.
-    emit_group_fold(&mut c, sel, group_cols, &repr_cols, &agg_specs)?;
+    // aggregates, allocating the grouping-key and representative registers. The
+    // plain path only ever has bare-column keys, lifted into `GroupKeySpec::Col`.
+    let group_keys: Vec<GroupKeySpec> = group_cols.iter().map(|&i| GroupKeySpec::Col(i)).collect();
+    emit_group_fold(&mut c, sel, &group_keys, &repr_cols, &agg_specs)?;
 
     c.ops.push(Op::GroupEmit {
         outputs,

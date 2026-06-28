@@ -1221,7 +1221,13 @@ the whole compound runs through the tree-walker — provided every arm of a
 value-producing fold (scalar / `IN`) projects a computed column (so the result
 carries NONE affinity, exactly like a literal list); a bare-column arm would carry
 that column's affinity and still defers. Compound
-`UNION`/`INTERSECT`/`EXCEPT` (**B5c-3**); positional `GROUP BY <ordinal>`;
+`UNION`/`INTERSECT`/`EXCEPT` (**B5c-3**); positional `GROUP BY <ordinal>` and a
+**computed (non-column) `GROUP BY` key** (`GROUP BY n*2`, `g/2`, `substr(a,1,1)`,
+or a mix of a column and an expression — the grouped fold evaluates each key
+expression per row to identify the group, and the projection / `HAVING` /
+`ORDER BY` resolve a structurally-equal key expression through the binding table;
+a computed key forces the binding-driven general grouped path rather than the
+compact column-index `GroupEmit` shortcut);
 `DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates (incl.
 the two-argument `group_concat(x, sep)` / `string_agg(x, sep)` form — the constant
 separator is captured at compile time and threaded through the accumulator);
