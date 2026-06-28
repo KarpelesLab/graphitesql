@@ -35,6 +35,13 @@ format**.
 - **Functions & planning** — date/time, `printf`, math, and **JSON + JSONB**; an
   index-driven planner with **`EXPLAIN QUERY PLAN`** matching sqlite (plain
   `EXPLAIN` lists the compiled bytecode).
+- **SQLite-compatible diagnostics** — errors are byte-for-byte the same as
+  `sqlite3`, down to the wording and the order faults are reported in, and the
+  same checks fire at **prepare time** (before any row runs): unknown columns and
+  functions, aggregate/window misuse, and the row-value family (`row value
+  misused`, `sub-select returns N columns`, `IN(...) element has N terms`), so a
+  statement that would only fault on a non-empty table is still rejected over an
+  empty one.
 - **Virtual tables** — built-in `series`, **`rtree`** (queries prune the node
   tree by coordinate bounds), and **`fts5`** (full-text `MATCH` with phrases/
   prefixes/column filters/`NEAR`/`^` anchors, `bm25()`/`rank` ordering,
