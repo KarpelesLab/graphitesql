@@ -31,7 +31,9 @@ format**.
   `GROUP BY`/`HAVING`, compound queries, (recursive) **CTEs**, correlated
   subqueries & `EXISTS`, **window functions**; UPSERT, `RETURNING`, `STRICT`
   tables, generated columns; **triggers**, **foreign keys**, and **ATTACH / TEMP**
-  multi-schema.
+  multi-schema; **`ALTER TABLE`** (rename table/column, add/drop column) with
+  text-preserving schema edits and cross-object propagation into dependent
+  views, triggers, indexes, and foreign keys — byte-for-byte as `sqlite3`.
 - **Functions & planning** — date/time, `printf`, math, and **JSON + JSONB**; an
   index-driven planner with **`EXPLAIN QUERY PLAN`** matching sqlite (plain
   `EXPLAIN` lists the compiled bytecode).
