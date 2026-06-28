@@ -123,21 +123,46 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
             Value::Blob(_) => 3,
         }
     }
-    fn as_f64(v: &Value) -> f64 {
-        match v {
-            Value::Integer(i) => *i as f64,
-            Value::Real(r) => *r,
-            _ => 0.0,
-        }
-    }
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Integer(_) | Value::Real(_), Value::Integer(_) | Value::Real(_)) => {
-            as_f64(a).partial_cmp(&as_f64(b)).unwrap_or(Ordering::Equal)
-        }
+        // Two integers compare exactly as `i64`; coercing both through `f64`
+        // (as this used to) collapses values above 2^53 — e.g. `10^16` and
+        // `10^16 + 1` would wrongly read equal.
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        // A mixed integer/real comparison uses SQLite's exact algorithm, which
+        // never loses the integer's low bits to a lossy `f64` round-trip.
+        (Value::Integer(i), Value::Real(r)) => int_float_cmp(*i, *r),
+        (Value::Real(r), Value::Integer(i)) => int_float_cmp(*i, *r).reverse(),
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
         _ => class(a).cmp(&class(b)),
+    }
+}
+
+/// Compare an `i64` with an `f64` exactly, mirroring SQLite's
+/// `sqlite3IntFloatCompare` (the 8-byte-`double` branch). Returns the ordering
+/// of `i` relative to `r`. The naive `i as f64` comparison loses precision once
+/// `|i| > 2^53`; this truncates the real toward zero, compares integer parts
+/// first, then disambiguates an equal-integer-part tie by the real's fraction.
+fn int_float_cmp(i: i64, r: f64) -> Ordering {
+    if r.is_nan() {
+        // SQLite never stores a NaN (it becomes NULL); match the prior
+        // `partial_cmp(..).unwrap_or(Equal)` fallback defensively.
+        return Ordering::Equal;
+    }
+    // `r` entirely outside the `i64` range: any finite integer is on the near
+    // side. (`2^63` is not representable as `i64`, so the upper bound is `>=`.)
+    if r < -9_223_372_036_854_775_808.0 {
+        return Ordering::Greater;
+    }
+    if r >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    let y = r as i64; // truncates toward zero; exact since `r` is in range
+    match i.cmp(&y) {
+        Ordering::Equal => (i as f64).partial_cmp(&r).unwrap_or(Ordering::Equal),
+        other => other,
     }
 }
 

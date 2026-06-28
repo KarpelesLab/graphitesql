@@ -355,6 +355,17 @@ plain aggregate, and the tree-walker window finalize — the last of which used 
 fall back to REAL on overflow rather than erroring) now share one
 `eval::sum_values` helper. Test: `tests/sum_numeric_affinity.rs` (VDBE on and off).
 
+And **two `i64` values now compare exactly, never through a lossy `f64`
+round-trip.** `cmp_values` (the routine behind `=`/`<`/`>`, `ORDER BY`, index
+seeks, `DISTINCT`, `GROUP BY`, and `IN`) used to coerce both numeric operands to
+`f64` and compare those, so any two integers above 2^53 sharing an `f64` rounding
+(e.g. `10^16` and `10^16 + 1`) wrongly read equal — silently corrupting equality,
+ordering, de-duplication and grouping. It now compares two integers as `i64`, two
+reals via `partial_cmp`, and a mixed integer/real pair with SQLite's exact
+`sqlite3IntFloatCompare` (truncate the real toward zero, compare integer parts,
+break an equal-part tie by the real's fraction). Test:
+`tests/integer_comparison_precision.rs` (VDBE on and off).
+
 And an **aggregate inside a window function's `OVER` spec** (`PARTITION BY` /
 `ORDER BY`) now classifies the query as a single aggregate group, matching
 SQLite: `SELECT row_number() OVER (ORDER BY sum(a)) FROM t` computes `sum(a)`
