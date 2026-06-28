@@ -1827,14 +1827,12 @@ impl Connection {
     /// post-dedup sort, and the overall `ORDER BY` / `LIMIT` / `OFFSET` reuse the
     /// exact helpers the tree-walker uses ([`apply_compound`],
     /// [`compound_order_limit`](Self::compound_order_limit)), so the result is
-    /// byte-identical. Returns `Unsupported` — falling back to the tree-walker —
-    /// if any arm is a shape the VDBE cannot run, or carries CTEs or its own
-    /// nested compound (e.g. a multi-row `VALUES`, which desugars to a nested
-    /// `UNION ALL` chain).
+    /// byte-identical. The whole-query `WITH` is threaded into every arm (each
+    /// resolves the CTEs through the CTE-source path). Returns `Unsupported` —
+    /// falling back to the tree-walker — if any arm is a shape the VDBE cannot
+    /// run, or carries its own nested compound (e.g. a multi-row `VALUES`, which
+    /// desugars to a nested `UNION ALL` chain).
     fn run_compound_vdbe(&self, sel: &Select) -> Result<QueryResult> {
-        if !sel.ctes.is_empty() {
-            return Err(Error::Unsupported("VDBE: compound with CTEs"));
-        }
         // Each arm must be a flat (non-compound, CTE-free) SELECT so the
         // left-associative fold matches SQLite without recursing into operand
         // tails (a multi-row `VALUES` operand keeps its rows in its own compound
@@ -1846,6 +1844,28 @@ impl Connection {
         {
             return Err(Error::Unsupported("VDBE: nested compound arm"));
         }
+        let params = eval::Params::default();
+        if sel.ctes.is_empty() {
+            return self.run_compound_vdbe_arms(sel, &params);
+        }
+        // Materialize the whole-query `WITH` into the CTE environment (mirroring
+        // `run_select`) so the tree-walker collation scan below resolves the CTE
+        // sources; restore the environment on exit. Each VDBE arm additionally
+        // materializes the CTEs through the derived-source path (the outer CTEs
+        // are threaded into every operand in `run_compound_vdbe_arms`).
+        let base = self.cte_env.borrow().len();
+        let outer_cap = self.recursive_cte_outer_cap(sel, &params);
+        let mut seeds = Vec::new();
+        collect_source_names(sel, &mut seeds);
+        let pushed = self.push_ctes(&sel.ctes, &params, outer_cap, Some(&seeds));
+        let result = pushed.and_then(|()| self.run_compound_vdbe_arms(sel, &params));
+        self.cte_env.borrow_mut().truncate(base);
+        result
+    }
+
+    /// The compound fold itself, assuming any whole-query `WITH` is already live
+    /// in the CTE environment (see [`run_compound_vdbe`](Self::run_compound_vdbe)).
+    fn run_compound_vdbe_arms(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
         // The first core, stripped of the compound tail and the whole-query
         // ORDER BY / LIMIT / OFFSET.
         let mut first = sel.clone();
@@ -1855,13 +1875,25 @@ impl Connection {
         first.offset = None;
         let mut result = self.run_select_vdbe(&first)?;
         // Set comparison uses the left SELECT's per-column output collations.
-        let params = eval::Params::default();
         let colls = {
-            let (cols, _) = self.scan_source(&first, &params)?;
-            self.output_collations(&first, &cols, &params)
+            let (cols, _) = self.scan_source(&first, params)?;
+            self.output_collations(&first, &cols, params)
         };
         for (op, operand) in &sel.compound {
-            let r = self.run_select_vdbe(operand)?;
+            // The whole-query `WITH` binds every arm. The first core already
+            // carries it (it is a clone of `sel`), but each operand parses with
+            // empty `ctes`, so thread the outer CTEs in before running the arm —
+            // each arm then materializes them through the CTE-source path. (A
+            // sibling-referencing or otherwise non-VDBE-able CTE makes the arm
+            // return `Unsupported`, falling the whole query back.)
+            let operand = if sel.ctes.is_empty() {
+                operand.clone()
+            } else {
+                let mut o = operand.clone();
+                o.ctes = sel.ctes.clone();
+                o
+            };
+            let r = self.run_select_vdbe(&operand)?;
             // Every operand must project the same number of columns; SQLite names
             // the operator at the mismatch.
             if r.columns.len() != result.columns.len() {
@@ -1898,7 +1930,7 @@ impl Connection {
                 core::cmp::Ordering::Equal
             });
         }
-        self.compound_order_limit(&mut result, sel, &params, &colls)?;
+        self.compound_order_limit(&mut result, sel, params, &colls)?;
         Ok(result)
     }
 

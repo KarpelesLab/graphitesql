@@ -1241,7 +1241,13 @@ reference naming an in-scope CTE** is materialized through that same derived-tab
 path (the CTE's name or alias becomes the row qualifier, and an explicit
 `WITH name(cols…)` list renames the body's columns), so `WITH c AS (…) SELECT …
 FROM c` runs on the VDBE. A CTE body that references a *sibling* CTE still defers
-(the body is materialized on its own, without the other bindings).
+(the body is materialized on its own, without the other bindings). A **compound
+`SELECT` whose whole-query `WITH` is referenced by one or more arms** runs on the
+VDBE too: the outer CTEs are materialized into the CTE environment (so the first
+core's output-collation scan resolves them) and threaded into every operand (so
+each arm materializes them through the derived-source path), and any arm whose CTE
+can't run on the VDBE — a sibling/self reference, a recursive body — declines and
+falls the whole compound back to the tree-walker.
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is
