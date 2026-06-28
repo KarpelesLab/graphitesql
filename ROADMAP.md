@@ -1229,7 +1229,11 @@ paths. With *exactly one* `min()`/`max()` aggregate, SQLite instead pulls bare
 columns from that aggregate's extreme ("companion") row: the fold keeps the
 running extreme in a hidden trailing key slot and overwrites the representatives
 whenever a row beats it. Only *more than one* `min()`/`max()` leaves the
-companion ambiguous, and that shape still defers to the tree-walker.
+companion ambiguous, and that shape still defers to the tree-walker. Also a
+**constant / `VALUES` subquery source** — `FROM (VALUES (…),(…))` (which desugars
+to a `UNION ALL` of FROM-less constant cores) or `FROM (SELECT <consts>)` — is
+materialized directly as a derived table with no affinity and BINARY collation,
+joining the base-table derived-source path already on the VDBE.
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is

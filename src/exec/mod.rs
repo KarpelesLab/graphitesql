@@ -1145,7 +1145,38 @@ impl Connection {
             // output type — so the materialized rows compare in the outer query
             // exactly like the tree-walker. Anything else defers.
             if let Some(sub) = &tr.subquery {
-                if tr.tvf_args.is_some() || !sub.compound.is_empty() {
+                if tr.tvf_args.is_some() {
+                    return Err(Error::Unsupported("VDBE: complex subquery source"));
+                }
+                // A constant / `VALUES` subquery — no base table in any compound arm
+                // (a top-level `VALUES (…),(…)` desugars to a `UNION ALL` of FROM-less
+                // constant cores). Its columns carry no affinity and BINARY collation,
+                // so materialize the rows directly and the outer query sees them
+                // exactly as the tree-walker does.
+                if sub.from.is_none() && sub.compound.iter().all(|(_, s)| s.from.is_none()) {
+                    let result = self.run_select(sub, &eval::Params::default())?;
+                    let qualifier = tr.alias.clone().unwrap_or_default();
+                    let tables = result.columns.iter().map(|_| qualifier.clone()).collect();
+                    let affinities = result
+                        .columns
+                        .iter()
+                        .map(|_| eval::Affinity::from_type(None))
+                        .collect();
+                    let collations = result
+                        .columns
+                        .iter()
+                        .map(|_| crate::value::Collation::default())
+                        .collect();
+                    return Ok((
+                        result.columns,
+                        tables,
+                        affinities,
+                        collations,
+                        result.rows,
+                        None,
+                    ));
+                }
+                if !sub.compound.is_empty() {
                     return Err(Error::Unsupported("VDBE: complex subquery source"));
                 }
                 let sfrom = sub
