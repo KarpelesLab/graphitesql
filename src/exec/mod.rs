@@ -1024,9 +1024,11 @@ impl Connection {
                     func::is_aggregate_call(name, n, star)
                         || self.aggregates.contains_key(&name.to_ascii_lowercase())
                 };
+                let is_known_scalar =
+                    |name: &str, n: usize, star: bool| self.scalar_function_exists(name, n, star);
                 for rc in &sel.columns {
                     if let ResultColumn::Expr { expr, .. } = rc {
-                        reject_invalid_window_function(expr, &is_agg)?;
+                        reject_invalid_window_function(expr, &is_agg, &is_known_scalar)?;
                         // A window nested inside an aggregate's argument
                         // (`sum(row_number() OVER ())`) is a misuse SQLite rejects
                         // at prepare time; this path bypasses `run_core` too. An
@@ -1037,7 +1039,7 @@ impl Connection {
                     }
                 }
                 for t in &sel.order_by {
-                    reject_invalid_window_function(&t.expr, &is_agg)?;
+                    reject_invalid_window_function(&t.expr, &is_agg, &is_known_scalar)?;
                     reject_nested_aggregate_arg(&t.expr)?;
                     reject_aggregate_in_filter(&t.expr, &is_agg)?;
                 }
@@ -4283,6 +4285,28 @@ impl Connection {
         });
         self.rng_state.set(saved_rng);
         err.map_or(Ok(()), Err)
+    }
+
+    /// Whether `name` resolves to a built-in or registered *scalar* function,
+    /// regardless of argument count. Used to choose between SQLite's two prepare-
+    /// time errors for a function carrying `OVER (…)` that is neither a window
+    /// function nor an aggregate: an unknown name is `no such function: NAME`
+    /// (checked first), while a *known* scalar misused as a window is `NAME() may
+    /// not be used as a window function`. Dry-resolves with NULL stand-in
+    /// arguments exactly like `reject_unresolved_functions`, treating only the
+    /// `no such function` outcome as "does not exist" (a wrong-arity error still
+    /// means the name is known). The RNG is snapshotted and restored so a
+    /// non-deterministic builtin leaves no observable side effect.
+    fn scalar_function_exists(&self, name: &str, nargs: usize, star: bool) -> bool {
+        let params = Params::default();
+        let ctx = EvalCtx::rowless(&params).with_subqueries(self);
+        let null_args: Vec<Expr> = core::iter::repeat_with(|| Expr::Literal(Literal::Null))
+            .take(nargs)
+            .collect();
+        let saved_rng = self.rng_state.get();
+        let r = func::eval_scalar(name, &null_args, star, &ctx);
+        self.rng_state.set(saved_rng);
+        !matches!(&r, Err(Error::Error(m)) if m.starts_with("no such function: "))
     }
 
     fn exec_create_table(&mut self, ct: &CreateTable, sql_text: &str) -> Result<()> {
@@ -14322,11 +14346,13 @@ impl Connection {
                 func::is_aggregate_call(name, n, star)
                     || self.aggregates.contains_key(&name.to_ascii_lowercase())
             };
+            let is_known_scalar =
+                |name: &str, n: usize, star: bool| self.scalar_function_exists(name, n, star);
             for rc in &sel.columns {
                 if let ResultColumn::Expr { expr, .. } = rc {
                     reject_filter_on_non_aggregate(expr, &is_agg)?;
                     reject_aggregate_in_filter(expr, &is_agg)?;
-                    reject_invalid_window_function(expr, &is_agg)?;
+                    reject_invalid_window_function(expr, &is_agg, &is_known_scalar)?;
                     reject_window_without_over(expr)?;
                     reject_star_argument(expr)?;
                     reject_invalid_likelihood(expr)?;
@@ -14363,7 +14389,7 @@ impl Connection {
             for t in &sel.order_by {
                 reject_filter_on_non_aggregate(&t.expr, &is_agg)?;
                 reject_aggregate_in_filter(&t.expr, &is_agg)?;
-                reject_invalid_window_function(&t.expr, &is_agg)?;
+                reject_invalid_window_function(&t.expr, &is_agg, &is_known_scalar)?;
                 reject_window_without_over(&t.expr)?;
                 reject_star_argument(&t.expr)?;
                 reject_invalid_likelihood(&t.expr)?;
@@ -20814,12 +20840,17 @@ fn reject_window_without_over(e: &Expr) -> Result<()> {
 /// multi-argument forms of `min`/`max` (`max(a,b) OVER ()`, where the one-arg
 /// form is the aggregate) — are rejected at prepare time as `NAME() may not be
 /// used as a window function`. `is_agg` decides aggregate-ness (builtins plus
-/// any registered user aggregate). The walk stops at subquery boundaries.
+/// any registered user aggregate). An *unknown* name, though, is reported as
+/// `no such function: NAME` ahead of the window-misuse wording (SQLite resolves
+/// the name before classifying the `OVER`), so `is_known_scalar` distinguishes
+/// the two. The walk stops at subquery boundaries.
 fn reject_invalid_window_function(
     e: &Expr,
     is_agg: &dyn Fn(&str, usize, bool) -> bool,
+    is_known_scalar: &dyn Fn(&str, usize, bool) -> bool,
 ) -> Result<()> {
-    let mut found: Option<String> = None;
+    // (name, whether it exists as a scalar function)
+    let mut found: Option<(String, bool)> = None;
     window::visit(e, &mut |n| {
         if found.is_some() {
             return;
@@ -20834,14 +20865,15 @@ fn reject_invalid_window_function(
         {
             let lname = name.to_ascii_lowercase();
             if !is_builtin_window_function(&lname) && !is_agg(name, args.len(), *star) {
-                found = Some(name.clone());
+                found = Some((name.clone(), is_known_scalar(name, args.len(), *star)));
             }
         }
     });
     match found {
-        Some(name) => Err(Error::Error(alloc::format!(
+        Some((name, true)) => Err(Error::Error(alloc::format!(
             "{name}() may not be used as a window function"
         ))),
+        Some((name, false)) => Err(Error::Error(alloc::format!("no such function: {name}"))),
         None => Ok(()),
     }
 }

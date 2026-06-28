@@ -261,7 +261,11 @@ rejected at prepare time with `NAME() may not be used as a window function` —
 covering *both* the VDBE window path (a real base table) and the tree-walker
 path (a subquery source), in the projection and in `ORDER BY`; only the eleven
 built-in window functions and the true aggregates (which double as window
-functions, including single-arg `min`/`max`) stay legal there; and the `*`
+functions, including single-arg `min`/`max`) stay legal there; an **unknown**
+name carrying `OVER (…)` (`nope() OVER ()`), though, is now reported as `no such
+function: nope` ahead of the window-misuse wording — SQLite resolves the name
+before it classifies the `OVER`, so existence wins (a *known* scalar of any
+arity keeps the misuse wording); and the `*`
 wildcard **argument** is now accepted only for `count(*)` — every other call,
 aggregate or scalar (`sum(*)`, `min(*)`, `group_concat(*)`, `abs(*)`,
 `length(*)`), is rejected at prepare time with `wrong number of arguments to
