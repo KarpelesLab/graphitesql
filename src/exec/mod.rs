@@ -1476,6 +1476,16 @@ impl Connection {
             Ok((cols, tables, affinities, collations, rows, rowids))
         };
 
+        // An aggregate or window function in a join `ON` predicate (or in the
+        // `WHERE` clause) is a misuse — there is no grouping context at the join /
+        // row-filter level. A join whose `ON` is never evaluated (e.g. an empty
+        // outer table) would otherwise run silently and return rows; defer to the
+        // tree-walker, which reports the proper "misuse of aggregate/window
+        // function" error at prepare time.
+        if !from.joins.is_empty() {
+            vdbe::reject_aggregate_or_window_in_predicates(sel)?;
+        }
+
         // A table-valued function in a *join* runs only when every one of its
         // arguments is a constant expression. A non-constant argument may correlate
         // to another source's columns (`json_each(t.j)`, `generate_series(1, t.n)`),
@@ -16036,13 +16046,15 @@ impl Connection {
                 return Err(Error::Unsupported("VDBE window: join references rowid"));
             }
             // `static_scope_columns` yields the `SELECT *` column set in expansion
-            // order, and returns `None` for exactly the join shapes whose column set
-            // the VDBE scan can't reproduce (`NATURAL`/`USING` coalescing, a view,
-            // CTE, derived table, table-valued function, or schema-qualified name).
-            let Some(cols) = self.static_scope_columns(sel) else {
-                return Err(Error::Unsupported("VDBE window: non-plain join source"));
-            };
-            cols
+            // order from plain base tables (no rows read). When a join source is a
+            // view or TVF it returns `None`; `window_join_source_columns` then
+            // resolves each source's columns by materializing it exactly as the base
+            // scan's `scan_one` does (a `NATURAL`/`USING`, derived, CTE, or
+            // schema-qualified join source still defers).
+            match self.static_scope_columns(sel) {
+                Some(cols) => cols,
+                None => self.window_join_source_columns(sel)?,
+            }
         } else {
             let tref = &from.first;
             if let Some(sub) = &tref.subquery {
@@ -16232,6 +16244,51 @@ impl Connection {
             cols.extend(meta.columns);
         }
         Some(cols)
+    }
+
+    /// Resolve a join window source's full `SELECT *` column list when one or more
+    /// sources is a view or table-valued function — the cases `static_scope_columns`
+    /// reports as unknown (it reads no rows). Each source's columns are resolved
+    /// exactly as the base scan's `scan_one` exposes them: a plain main-database
+    /// table via `table_meta`, a view via `try_view`, a visible-masked TVF via
+    /// `tvf_rows`. A `NATURAL`/`USING` join (coalesced columns), or a derived / CTE /
+    /// virtual / schema-qualified source, defers — the base scan's column order there
+    /// can't be proven to match. (A non-BINARY view column is caught by the base scan
+    /// itself, which refuses it, so the whole window query falls back.)
+    fn window_join_source_columns(&self, sel: &Select) -> Result<Vec<ColumnInfo>> {
+        let from = sel
+            .from
+            .as_ref()
+            .ok_or(Error::Unsupported("VDBE window: no FROM"))?;
+        if from.joins.iter().any(|j| j.natural || !j.using.is_empty()) {
+            return Err(Error::Unsupported("VDBE window: NATURAL/USING join source"));
+        }
+        let mut cols = Vec::new();
+        for tref in core::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.table)) {
+            if tref.subquery.is_some() || tref.schema.is_some() || tref.index_hint.is_some() {
+                return Err(Error::Unsupported("VDBE window: non-plain join source"));
+            }
+            let shadows_cte = self
+                .cte_env
+                .borrow()
+                .iter()
+                .any(|b| b.name.eq_ignore_ascii_case(&tref.name));
+            if tref.tvf_args.is_some() || self.is_pragma_tvf(tref) {
+                let (cinfos, _rows) = self.tvf_rows(tref, &Params::default())?;
+                cols.extend(cinfos.into_iter().filter(|ci| !ci.hidden));
+            } else if !shadows_cte && self.is_view(&tref.name) {
+                let (cinfos, _rows) = self
+                    .try_view(&tref.name, tref.alias.as_deref(), &Params::default())?
+                    .ok_or(Error::Unsupported("VDBE window: view not found"))?;
+                cols.extend(cinfos);
+            } else if shadows_cte || self.is_virtual_table(&tref.name) {
+                return Err(Error::Unsupported("VDBE window: non-plain join source"));
+            } else {
+                let meta = self.table_meta(&tref.name, tref.alias.as_deref())?;
+                cols.extend(meta.columns);
+            }
+        }
+        Ok(cols)
     }
 
     /// Static, scope-aware ambiguity check for nested subqueries, run once at the

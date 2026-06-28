@@ -620,6 +620,54 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
     )
 }
 
+/// True if an aggregate call or a window (`OVER …`) function appears anywhere
+/// within `e` (recursively, not just at the top level).
+fn expr_has_aggregate_or_window(e: &Expr) -> bool {
+    let mut found = false;
+    crate::exec::window::visit(e, &mut |node| {
+        if let Expr::Function {
+            name,
+            args,
+            star,
+            over,
+            ..
+        } = node
+        {
+            if over.is_some() || crate::exec::func::is_aggregate_call(name, args.len(), *star) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// Defer a join to the tree-walker when an aggregate or window function appears in
+/// any join `ON` predicate or in the `WHERE` clause. Both are misuses (there is no
+/// grouping context at the row-filter level); the tree-walker reports them with the
+/// proper "misuse of aggregate/window function" error, whereas a join compiler that
+/// never evaluates the predicate (e.g. an empty outer table) would silently succeed.
+pub(crate) fn reject_aggregate_or_window_in_predicates(sel: &Select) -> Result<()> {
+    if let Some(from) = &sel.from {
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                if expr_has_aggregate_or_window(on) {
+                    return Err(Error::Unsupported(
+                        "VDBE: aggregate/window in join ON predicate",
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(w) = &sel.where_clause {
+        if expr_has_aggregate_or_window(w) {
+            return Err(Error::Unsupported(
+                "VDBE: aggregate/window in WHERE predicate",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Map a 1-arg-or-star aggregate call to its [`AggKind`] (binding the argument
 /// register expression), reporting whether the call carried `DISTINCT` (third
 /// tuple element), its `FILTER (WHERE …)` predicate if any (fourth element), and
@@ -2145,11 +2193,19 @@ fn expand_projections(
     for rc in &sel.columns {
         match rc {
             ResultColumn::Wildcard => {
-                for name in columns {
+                // Qualify each expanded column with its source table. Across a join
+                // whose sources share a column name (`SELECT * FROM t JOIN u` where
+                // both have `g`), a bare reference would be ambiguous; the qualifier
+                // (from the parallel `tables` slice) picks each source's own column,
+                // so `*` expands to every column the way the tree-walker does. The
+                // output *label* stays the bare column name, matching SQLite. A
+                // source with no table qualifier (an empty string) is left unqualified.
+                for (i, name) in columns.iter().enumerate() {
+                    let table = tables.get(i).filter(|t| !t.is_empty()).cloned();
                     projections.push((
                         Expr::Column {
                             schema: None,
-                            table: None,
+                            table,
                             column: name.clone(),
                             quoted: false,
                         },
@@ -2272,6 +2328,7 @@ pub fn compile_join2(
     if !sel.compound.is_empty() || !sel.group_by.is_empty() || sel.having.is_some() {
         return Err(Error::Unsupported("VDBE: join shape not nested-loopable"));
     }
+    reject_aggregate_or_window_in_predicates(sel)?;
     // DISTINCT compares output rows under BINARY; a non-BINARY column collation
     // would diverge, so defer those to the tree-walker (as the single-table path
     // does).
@@ -2718,6 +2775,7 @@ pub fn compile_left_join2(
             "VDBE: left-join shape not nested-loopable",
         ));
     }
+    reject_aggregate_or_window_in_predicates(sel)?;
     // DISTINCT compares output rows under BINARY; a non-BINARY column collation
     // would diverge, so defer those to the tree-walker (as the inner-join and
     // single-table paths do).
@@ -3124,6 +3182,7 @@ pub fn compile_full_join2(
             "VDBE: full-join shape not nested-loopable",
         ));
     }
+    reject_aggregate_or_window_in_predicates(sel)?;
     // DISTINCT compares output rows under BINARY; a non-BINARY column collation
     // would diverge, so defer those to the tree-walker.
     if sel.distinct && collations.iter().any(|cl| *cl != Collation::Binary) {
@@ -3623,6 +3682,7 @@ pub fn compile_left_join_n(
             "VDBE: outer-join shape not nested-loopable",
         ));
     }
+    reject_aggregate_or_window_in_predicates(sel)?;
     if sel.distinct && collations.iter().any(|cl| *cl != Collation::Binary) {
         return Err(Error::Unsupported(
             "VDBE: non-BINARY collation with DISTINCT",

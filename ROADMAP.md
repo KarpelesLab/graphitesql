@@ -1316,8 +1316,22 @@ sum(value) OVER (ORDER BY value) FROM generate_series(1,5)`, or over `json_each`
 `json_tree` / the `pragma_<name>(arg)` form) runs too: `run_window_vdbe` resolves the
 TVF's *visible* columns through `tvf_rows` (masking the hidden `json`/`root` inputs)
 and the base scan materializes the rows through `scan_one`'s TVF branch. A `rowid`
-reference defers (a TVF row has no rowid), and a TVF *inside a join* window source
-still defers (the static column model can't reproduce it). A **single
+reference defers (a TVF row has no rowid). A **window function whose `FROM` is a join
+containing a view or table-valued function** runs on the VDBE too: when the row-less
+`static_scope_columns` reports the join shape as unknown, `window_join_source_columns`
+resolves each source's columns exactly as the base scan exposes them — a plain table
+via `table_meta`, a view via `try_view`, a visible-masked TVF via `tvf_rows` — and the
+column-qualified `SELECT *` base scan materializes the joined rows; a `NATURAL`/`USING`
+join, a non-BINARY view column, or a `rowid` reference defers. This builds on a general
+**`SELECT *` / `tbl.*` over a join whose sources share a column name** fix: the wildcard
+expansion now qualifies each expanded column with its source table (from the scan's
+parallel `tables` slice), so `SELECT * FROM t JOIN u` where both carry `g` resolves each
+`g` to its own source instead of erroring on an ambiguous bare reference. An **aggregate
+or window function in a join `ON` predicate or in the `WHERE` clause** (a misuse — there
+is no grouping context at the row-filter level) is detected up front and deferred so the
+tree-walker raises the proper "misuse of aggregate/window function" error, rather than a
+join whose predicate is never evaluated (e.g. an empty outer table) silently returning
+rows. A **single
 table-valued function `FROM` source** runs on
 the VDBE as well: `generate_series(start[,stop[,step]])`, `json_each` / `json_tree`,
 and the table-valued `pragma_<name>(arg)` form are materialized through the same

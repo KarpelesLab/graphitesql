@@ -8,10 +8,12 @@
 //! Covered sources: `generate_series(start[,stop[,step]])`, `json_each` / `json_tree`,
 //! and the table-valued `pragma_<name>(arg)` form.
 //!
+//! A TVF inside a *join* window source also runs now (its columns resolve through
+//! `window_join_source_columns`), asserted by `tvf_in_cross_join_window_runs_on_vdbe`.
+//!
 //! Deferred to the tree-walker (asserted separately), never run wrong:
 //!   * a `rowid` reference over the TVF — a TVF row has no rowid (like a derived / CTE
 //!     / view window source), so any `rowid`/`_rowid_`/`oid` reference defers.
-//!   * a TVF inside a *join* window source — the static column model can't reproduce it.
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE handled the
 //! TVF window source. Checked against the tree-walker and sqlite3 3.50.4.
@@ -116,12 +118,13 @@ fn rowid_over_tvf_window_defers() {
 }
 
 #[test]
-fn tvf_in_join_window_defers() {
+fn tvf_in_cross_join_window_runs_on_vdbe() {
     let c = conn();
-    // A TVF inside a join window source: the static column model can't reproduce it,
-    // so the window query defers to the tree-walker (which still runs it).
+    // A TVF inside a (comma / cross) join window source now resolves its columns via
+    // `window_join_source_columns` and runs on the VDBE — matching the tree-walker.
     let q = "SELECT t.g, s.value, sum(s.value) OVER () FROM t JOIN generate_series(1,2) s \
              ORDER BY 1, 2";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    let got = c.query_vdbe(q).unwrap().rows;
+    let want = c.query(q).unwrap().rows;
+    assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
 }
