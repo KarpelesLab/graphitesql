@@ -16265,7 +16265,23 @@ impl Connection {
         }
         let mut cols = Vec::new();
         for tref in core::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.table)) {
-            if tref.subquery.is_some() || tref.schema.is_some() || tref.index_hint.is_some() {
+            if let Some(sub) = &tref.subquery {
+                // A derived subquery join source: resolve its output columns through
+                // the same `(affinity, collation)` model the derived scan path uses
+                // (`window_source_columns`), exactly as the single-source derived
+                // window branch does. The base scan materializes it via `scan_one`'s
+                // subquery branch, so columns and rows stay in lockstep; a body that
+                // is itself a join / non-constant compound / view / TVF, or a
+                // non-BINARY derived column, makes the base scan decline and the whole
+                // window query defer.
+                if tref.tvf_args.is_some() || tref.schema.is_some() || tref.index_hint.is_some() {
+                    return Err(Error::Unsupported("VDBE window: non-plain join source"));
+                }
+                let qualifier = tref.alias.clone().unwrap_or_default();
+                cols.extend(self.window_source_columns(sub, &qualifier, None)?);
+                continue;
+            }
+            if tref.schema.is_some() || tref.index_hint.is_some() {
                 return Err(Error::Unsupported("VDBE window: non-plain join source"));
             }
             let shadows_cte = self

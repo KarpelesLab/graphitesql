@@ -1317,12 +1317,15 @@ sum(value) OVER (ORDER BY value) FROM generate_series(1,5)`, or over `json_each`
 TVF's *visible* columns through `tvf_rows` (masking the hidden `json`/`root` inputs)
 and the base scan materializes the rows through `scan_one`'s TVF branch. A `rowid`
 reference defers (a TVF row has no rowid). A **window function whose `FROM` is a join
-containing a view or table-valued function** runs on the VDBE too: when the row-less
-`static_scope_columns` reports the join shape as unknown, `window_join_source_columns`
-resolves each source's columns exactly as the base scan exposes them — a plain table
-via `table_meta`, a view via `try_view`, a visible-masked TVF via `tvf_rows` — and the
-column-qualified `SELECT *` base scan materializes the joined rows; a `NATURAL`/`USING`
-join, a non-BINARY view column, or a `rowid` reference defers. This builds on a general
+containing a view, table-valued function, or derived subquery** runs on the VDBE too:
+when the row-less `static_scope_columns` reports the join shape as unknown,
+`window_join_source_columns` resolves each source's columns exactly as the base scan
+exposes them — a plain table via `table_meta`, a view via `try_view`, a visible-masked
+TVF via `tvf_rows`, and a derived subquery via `window_source_columns` (the same
+`(affinity, collation)` model the single-source derived window path uses, so a
+join-bodied or two-derived join carries windows) — and the column-qualified `SELECT *`
+base scan materializes the joined rows; a `NATURAL`/`USING` join, a non-BINARY view or
+derived column, or a `rowid` reference defers. This builds on a general
 **`SELECT *` / `tbl.*` over a join whose sources share a column name** fix: the wildcard
 expansion now qualifies each expanded column with its source table (from the scan's
 parallel `tables` slice), so `SELECT * FROM t JOIN u` where both carry `g` resolves each
