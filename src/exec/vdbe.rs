@@ -1552,9 +1552,13 @@ fn compile_group_select(
             Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count => {
                 projections[*k as usize - 1].0.clone()
             }
-            // An out-of-range positional ORDER BY term is an error in SQLite.
-            Expr::Literal(Literal::Integer(_)) => {
-                return Err(Error::Unsupported("VDBE: ORDER BY ordinal out of range"))
+            // Any other positional ordinal — out of range, or written with a
+            // unary `+`/`-`, parenthesis, or `COLLATE` wrapper SQLite still reads
+            // as a position (`ORDER BY -1`, `ORDER BY +2`) — is deferred to the
+            // tree-walker, which owns the exact range error and never sorts by a
+            // constant. (A bare in-range ordinal is accelerated above.)
+            _ if super::positional_int(&term.expr).is_some() => {
+                return Err(Error::Unsupported("VDBE: positional ORDER BY term"))
             }
             Expr::Column {
                 table: None,
@@ -2268,8 +2272,12 @@ fn build_sort_keys(
             Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count => {
                 projections[*k as usize - 1].0.clone()
             }
-            Expr::Literal(Literal::Integer(_)) => {
-                return Err(Error::Unsupported("VDBE: ORDER BY ordinal out of range"))
+            // Any other positional ordinal — out of range, or wrapped in a unary
+            // `+`/`-`, parenthesis, or `COLLATE` SQLite still reads as a position
+            // (`ORDER BY -1`) — is deferred to the tree-walker, which owns the
+            // exact range error and never sorts by a constant.
+            _ if super::positional_int(&term.expr).is_some() => {
+                return Err(Error::Unsupported("VDBE: positional ORDER BY term"))
             }
             Expr::Column {
                 table: None,

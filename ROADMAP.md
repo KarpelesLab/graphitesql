@@ -1413,6 +1413,17 @@ column-resolution helper (`window_source_columns`). A non-constant compound / jo
 carries CTEs (its column set is resolved statically and can't see a CTE binding)
 still defers.
 
+A **positional `ORDER BY` ordinal written as anything but a bare in-range positive
+integer** — a negative (`ORDER BY -1`), an out-of-range value, or a unary
+`+`/parenthesis/`COLLATE` wrapper SQLite still reads as a position — now defers to
+the tree-walker instead of being compiled as a sort by that constant value. The
+VDBE only accelerates a bare `ORDER BY <N>` with `1 ≤ N ≤ ncols`; every other form
+that `positional_int` recognizes as an ordinal is handed back, so the tree-walker's
+`check_positional_terms` produces SQLite's exact `Nth ORDER BY term out of range -
+should be between 1 and M` (previously `ORDER BY -1` silently succeeded as a no-op
+constant sort under the default VDBE path). Test:
+`tests/order_by_negative_ordinal.rs`.
+
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is
 gated on VDBE-vs-tree-walker parity, so it can't regress correctness):
