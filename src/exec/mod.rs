@@ -15710,10 +15710,12 @@ impl Connection {
         let Some(from) = &sel.from else {
             return Err(Error::Unsupported("VDBE window: no FROM"));
         };
-        // The source is either a single plain rowid table (rowid is appended so a
-        // `rowid` reference resolves) or a plain N-table join (a joined row has no
-        // single rowid, so the path is only taken when no rowid is referenced).
+        // The source is a single plain rowid table (rowid is appended so a `rowid`
+        // reference resolves), a plain N-table join, or a derived subquery (the
+        // last two have no single rowid, so they are only taken when no rowid is
+        // referenced). `rowid_source` records whether a trailing rowid is scanned.
         let is_join = !from.joins.is_empty();
+        let mut rowid_source = false;
         let columns = if is_join {
             if select_mentions_rowid(sel) {
                 return Err(Error::Unsupported("VDBE window: join references rowid"));
@@ -15728,22 +15730,61 @@ impl Connection {
             cols
         } else {
             let tref = &from.first;
-            if tref.subquery.is_some()
-                || tref.tvf_args.is_some()
-                || tref.index_hint.is_some()
-                || tref.schema.is_some()
-                || self.is_pragma_tvf(tref)
-                || self.is_view(&tref.name)
-                || self.is_virtual_table(&tref.name)
-                || self
-                    .cte_env
-                    .borrow()
+            if let Some(sub) = &tref.subquery {
+                // A derived subquery source has no rowid, so (like a join) defer if
+                // a rowid is referenced. Resolve its column names and
+                // `(affinity, collation)` through the same helpers the derived scan
+                // path uses; a join / compound / view / CTE / TVF body returns
+                // `None` and defers.
+                if tref.tvf_args.is_some() || tref.index_hint.is_some() {
+                    return Err(Error::Unsupported("VDBE window: non-plain source"));
+                }
+                if select_mentions_rowid(sel) {
+                    return Err(Error::Unsupported(
+                        "VDBE window: derived source references rowid",
+                    ));
+                }
+                let names = self.resolved_view_columns(sub).ok_or(Error::Unsupported(
+                    "VDBE window: derived columns unresolved",
+                ))?;
+                let origins = self
+                    .subquery_column_origins(sub)
+                    .ok_or(Error::Unsupported("VDBE window: non-plain derived source"))?;
+                if names.len() != origins.len() {
+                    return Err(Error::Unsupported(
+                        "VDBE window: derived column count mismatch",
+                    ));
+                }
+                let qualifier = tref.alias.clone().unwrap_or_default();
+                names
                     .iter()
-                    .any(|b| b.name.eq_ignore_ascii_case(&tref.name))
-            {
-                return Err(Error::Unsupported("VDBE window: non-plain source"));
+                    .zip(&origins)
+                    .map(|((n, _), (aff, coll))| ColumnInfo {
+                        name: n.clone(),
+                        table: qualifier.clone(),
+                        affinity: *aff,
+                        collation: *coll,
+                        hidden: false,
+                    })
+                    .collect()
+            } else {
+                if tref.tvf_args.is_some()
+                    || tref.index_hint.is_some()
+                    || tref.schema.is_some()
+                    || self.is_pragma_tvf(tref)
+                    || self.is_view(&tref.name)
+                    || self.is_virtual_table(&tref.name)
+                    || self
+                        .cte_env
+                        .borrow()
+                        .iter()
+                        .any(|b| b.name.eq_ignore_ascii_case(&tref.name))
+                {
+                    return Err(Error::Unsupported("VDBE window: non-plain source"));
+                }
+                rowid_source = true;
+                self.table_meta(&tref.name, tref.alias.as_deref())?.columns
             }
-            self.table_meta(&tref.name, tref.alias.as_deref())?.columns
         };
         let ncols = columns.len();
         // Scan the base source with `WHERE` applied; for a single table append each
@@ -15758,9 +15799,7 @@ impl Connection {
         base.order_by = Vec::new();
         base.limit = None;
         base.offset = None;
-        base.columns = if is_join {
-            alloc::vec![ResultColumn::Wildcard]
-        } else {
+        base.columns = if rowid_source {
             alloc::vec![
                 ResultColumn::Wildcard,
                 ResultColumn::Expr {
@@ -15774,11 +15813,13 @@ impl Connection {
                     source: None,
                 },
             ]
+        } else {
+            alloc::vec![ResultColumn::Wildcard]
         };
         let scanned = self.run_select_vdbe(&base)?;
         let mut rows: Vec<InputRow> = Vec::with_capacity(scanned.rows.len());
         for mut values in scanned.rows {
-            let rowid = if is_join {
+            let rowid = if !rowid_source {
                 if values.len() != ncols {
                     return Err(Error::Unsupported("VDBE window: column count mismatch"));
                 }

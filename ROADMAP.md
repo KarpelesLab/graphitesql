@@ -1253,7 +1253,14 @@ subquery, to any depth — by resolving each output column's `(affinity, collati
 through the chain of single-source derived tables (an inherited `INTEGER` affinity
 read through two `SELECT *` wrappers keeps coercing exactly as SQLite does); a body
 that is a join, a compound, a view, a CTE, or a table-valued function, or any
-derived column with a non-BINARY collation, still defers.
+derived column with a non-BINARY collation, still defers. A **window function over
+a derived subquery source** runs on the VDBE too: the derived source's columns are
+resolved through that same `(affinity, collation)` chain and materialized, then the
+window operator partitions/orders/frames over the rows — so `SELECT …, sum(n) OVER
+(PARTITION BY g) FROM (SELECT g, n FROM t)` (and a nested derived body under it)
+runs without falling back. A derived body the source path can't resolve (join /
+compound / view / CTE / TVF), or a window or projection that references the
+derived source's non-existent rowid, still defers.
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is
