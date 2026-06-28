@@ -490,6 +490,19 @@ database, is qualified with `*` (`SELECT * FROM x, x` over a CTE `x` →
 `<source>.<col>`. Explicit references (`SELECT a` / `SELECT x.a`) keep their
 unprefixed spelling, unchanged. Byte-exact vs `sqlite3` 3.50.4.
 
+**A duplicate PRIMARY KEY now outranks a generated-column PK error when the
+first PK is non-generated.** SQLite processes `PRIMARY KEY` declarations
+sequentially (`sqlite3AddPrimaryKey`), so the *first* declared PK decides which
+error a `CREATE TABLE` reports: a generated first PK yields `generated columns
+cannot be part of the PRIMARY KEY`, but a non-generated first PK followed by any
+second PK yields `table "X" has more than one primary key`. graphite fired the
+generated-column error eagerly from its per-column loop, so
+`CREATE TABLE t(a PRIMARY KEY, b AS (a) PRIMARY KEY)` reported the generated
+error where SQLite says "more than one primary key". The generated-PK check is
+now gated on whether the first PK declaration (column-level PKs precede
+table-level ones in source order) is itself generated. Byte-exact vs `sqlite3`
+3.50.4 (`tests/pk_generated_precedence.rs`).
+
 **`REINDEX schema.name` validates its database qualifier** ahead of the object
 lookup. SQLite rejects an unknown database with `unknown database <name>` (as it
 does for `VACUUM`/`ATTACH`); graphite parsed the qualifier but threw it away,

@@ -4353,6 +4353,38 @@ impl Connection {
             .flatten()
             .map(String::as_str)
             .collect();
+        // SQLite processes PRIMARY KEY declarations sequentially (column-level
+        // PKs precede table-level ones in source order), so the *first* declared
+        // PRIMARY KEY decides which error a conflict reports: a generated first
+        // PK yields "generated columns cannot be part of the PRIMARY KEY", while
+        // a non-generated first PK followed by any second PK yields "table has
+        // more than one primary key" (caught at end-of-table below). Only fire
+        // the generated-PK error when that first PK is itself generated.
+        let is_generated_col = |name: &str| {
+            ct.columns.iter().any(|c| {
+                c.name.eq_ignore_ascii_case(name)
+                    && c.constraints
+                        .iter()
+                        .any(|k| matches!(k, ColumnConstraint::Generated { .. }))
+            })
+        };
+        let first_pk_is_generated = if let Some(i) = ct.columns.iter().position(|c| {
+            c.constraints
+                .iter()
+                .any(|k| matches!(k, ColumnConstraint::PrimaryKey { .. }))
+        }) {
+            ct.columns[i]
+                .constraints
+                .iter()
+                .any(|k| matches!(k, ColumnConstraint::Generated { .. }))
+        } else if let Some(cols) = ct.constraints.iter().find_map(|tc| match tc {
+            TableConstraint::PrimaryKey(cols, _) => Some(cols),
+            _ => None,
+        }) {
+            cols.iter().any(|name| is_generated_col(name))
+        } else {
+            false
+        };
         for (i, c) in ct.columns.iter().enumerate() {
             if ct.columns[..i]
                 .iter()
@@ -4390,7 +4422,7 @@ impl Connection {
                     || table_pk_cols
                         .iter()
                         .any(|p| p.eq_ignore_ascii_case(&c.name));
-                if in_primary_key {
+                if in_primary_key && first_pk_is_generated {
                     return Err(Error::Error(
                         "generated columns cannot be part of the PRIMARY KEY".into(),
                     ));
