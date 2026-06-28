@@ -1830,6 +1830,56 @@ fn lead_exp10(f: f64) -> i32 {
     capped16(f).1
 }
 
+/// Round `ax` (a finite, non-negative magnitude) to `prec` fractional mantissa
+/// digits, **half away from zero**, reading the f64's exact decimal value so the
+/// tie-break is correct (Rust's own formatter rounds half to even). Returns the
+/// rounded mantissa (`"D"` for `prec == 0`, else `"D.DDD…"`) and the base-10
+/// exponent of its leading digit as a Rust-style (unpadded, signed) integer.
+fn round_exp_mantissa(ax: f64, prec: usize) -> (String, i32) {
+    // Rust's fixed-precision scientific formatting emits the TRUE f64 value
+    // (e.g. `{:.30e}` of 0.1 is `1.000000000000000055511151231258e-1`), so the
+    // first dropped digit gives a correct half-away decision. A 30-digit guard
+    // is past f64's ~17 significant digits, so the kept run is always exact.
+    let guard = prec + 30;
+    let sci = alloc::format!("{ax:.guard$e}");
+    let (mantissa, exp) = sci.split_once(['e', 'E']).expect("scientific form has 'e'");
+    let mut exp: i32 = exp.parse().unwrap_or(0);
+    // Significant digits with the decimal point removed; `digits[0]` is the lone
+    // leading digit (1-9, or 0 when `ax == 0`).
+    let mut digits: alloc::vec::Vec<u8> = mantissa.bytes().filter(|&b| b != b'.').collect();
+    let keep = prec + 1;
+    let round_up = digits.get(keep).is_some_and(|&d| d >= b'5');
+    digits.truncate(keep);
+    if round_up {
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                // A carry out of the leading digit (`9.99…` -> `10.0…`) adds a
+                // significant digit and bumps the exponent; drop the now-extra
+                // trailing digit to keep exactly `prec + 1`.
+                digits.insert(0, b'1');
+                exp += 1;
+                digits.truncate(keep);
+                break;
+            }
+            i -= 1;
+            if digits[i] == b'9' {
+                digits[i] = b'0';
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+    }
+    let mant = if prec == 0 {
+        alloc::format!("{}", digits[0] as char)
+    } else {
+        let tail: String = digits[1..].iter().map(|&b| b as char).collect();
+        alloc::format!("{}.{tail}", digits[0] as char)
+    };
+    (mant, exp)
+}
+
 fn fmt_exp(f: f64, prec: usize, upper: bool, bang: bool) -> String {
     // Rust's `{:.*e}` takes the precision as a `u16`; beyond what the f64
     // mantissa can carry the extra fraction digits are zeros, so render at a safe
@@ -1853,7 +1903,17 @@ fn fmt_exp(f: f64, prec: usize, upper: bool, bang: bool) -> String {
             None => short,
         }
     } else if prec <= CAP {
-        alloc::format!("{:.*e}", prec, f)
+        // Round the mantissa half away from zero (like `%f` and SQLite), not
+        // half-to-even the way Rust's `{:.*e}` would — the two differ only on an
+        // exact tie at the rounding position (`%.3e` of 1234.5 is `1.235e+03`,
+        // not `1.234e+03`). The tie-break reads an exact digit of the f64.
+        let (mant, e) = round_exp_mantissa(crate::util::float::abs(f), prec);
+        let body = alloc::format!("{mant}e{e}");
+        if f < 0.0 {
+            alloc::format!("-{body}")
+        } else {
+            body
+        }
     } else {
         let head = alloc::format!("{:.*e}", CAP, f);
         match head.find(['e', 'E']) {

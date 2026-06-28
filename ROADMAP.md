@@ -553,6 +553,20 @@ the standalone unique indexes (collation- and partial-predicate aware) and
 renders `t.col[, …]`. Byte-exact vs `sqlite3` 3.50.4
 (`tests/without_rowid_secondary_unique_message.rs`).
 
+**`printf`/`format` scientific conversions (`%e`/`%E`) now round the mantissa
+half away from zero**, like SQLite (and like graphite's own `%f` path), not half
+to even the way Rust's built-in float formatter does. The two differ only on an
+exact tie at the rounding position: `printf('%.3e', 1234.5)` is `1.235e+03` (the
+trailing `5` carries the `4` up), not `1.234e+03`; `printf('%.0e', 2.5)` is
+`3e+00`, not `2e+00`. graphite delegated the `%e` rounding to Rust's `{:.*e}`,
+which rounds half-to-even, while its `%f` path already rounded half-away — so the
+two conversions disagreed on ties. The fix reads the exact decimal digits of the
+f64 (`{:.*e}` at `prec + 30` guard digits) and does the half-away rounding with
+carry in string space, so a value that only *looks* like a tie still follows its
+true f64 (`%.2e` of 1.005 stays `1.00e+00`, because 1.005's f64 is just below the
+tie). Byte-exact vs `sqlite3` 3.50.4 across values × precisions 0..=6 for both
+`%e` and `%E` (`tests/printf_exp_rounding.rs`).
+
 **CTEs in one `WITH` clause now see each other — forward references work, and
 true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
 (it expands them on demand from the outer query), so a CTE may reference one
