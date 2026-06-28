@@ -176,7 +176,18 @@ impl Shell {
             self.print_result(&result);
         } else {
             match conn.execute(sql) {
-                Ok(_) => {}
+                Ok(_) => {
+                    // `PRAGMA journal_mode = X` is a setter that still reports the
+                    // resulting journal mode — SQLite prints it (e.g. `wal`, or
+                    // `memory` for an in-memory database that cannot change it).
+                    // The side effect ran through execute(); read the mode back via
+                    // the getter and print it, matching SQLite's output.
+                    if let Some(getter) = pragma_setter_result_query(sql) {
+                        if let Ok(result) = conn.query(&getter) {
+                            self.print_result(&result);
+                        }
+                    }
+                }
                 Err(graphitesql::Error::Unsupported(m)) if m.contains("use query()") => {
                     let result = conn.query(sql)?;
                     self.print_result(&result);
@@ -417,6 +428,27 @@ fn is_pragma_setter(sql: &str) -> bool {
         .unwrap_or("")
         .to_ascii_uppercase();
     word == "PRAGMA" && sql.contains('=')
+}
+
+/// A `PRAGMA [schema.]name = value` setter that SQLite still reports a result
+/// row for: returns the equivalent getter (`PRAGMA [schema.]name`) to re-query
+/// and print after the side effect has run. Currently only `journal_mode`, which
+/// echoes the resulting journal mode (every other common setter is silent).
+/// Any `schema.` qualifier is preserved so a per-database setter reads back from
+/// the same database.
+fn pragma_setter_result_query(sql: &str) -> Option<String> {
+    let rest = sql.trim_start();
+    if rest.len() < 6 || !rest[..6].eq_ignore_ascii_case("pragma") {
+        return None;
+    }
+    // The target (possibly `schema.name`) is everything between PRAGMA and `=`.
+    let target = rest[6..].split('=').next()?.trim();
+    let name = target.rsplit('.').next().unwrap_or(target).trim();
+    if name.eq_ignore_ascii_case("journal_mode") {
+        Some(format!("PRAGMA {target}"))
+    } else {
+        None
+    }
 }
 
 /// Split a batch into statements on `;`, respecting single-quoted strings so a

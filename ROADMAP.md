@@ -490,6 +490,28 @@ database, is qualified with `*` (`SELECT * FROM x, x` over a CTE `x` →
 `<source>.<col>`. Explicit references (`SELECT a` / `SELECT x.a`) keep their
 unprefixed spelling, unchanged. Byte-exact vs `sqlite3` 3.50.4.
 
+The **`PRAGMA journal_mode = <mode>` setter now reports its result row**, as
+SQLite does — it echoes the resulting journal mode (`wal` after a successful
+switch, `memory` for an in-memory database that cannot change it, or the
+unchanged current mode when the requested one is invalid). The shell had routed
+every `PRAGMA … = …` setter through the row-discarding write path, so the setter
+form printed nothing; it now reads the mode back through the getter (preserving
+any `schema.` qualifier) and prints it. Genuinely silent setters
+(`foreign_keys = ON`, `user_version = 5`) stay silent. Byte-exact vs `sqlite3`
+3.50.4, on both in-memory and file databases.
+
+A known remaining gap, newly tracked: **eponymous table-valued functions used as
+a bare table name** (`FROM generate_series`, `FROM json_each`, `FROM
+pragma_table_info`, without a parenthesised argument list). SQLite exposes these
+as eponymous virtual tables whose hidden arguments can be supplied through the
+`WHERE` clause (`FROM generate_series WHERE start = 1 AND stop = 3` returns rows),
+and an unconstrained reference either yields no rows (`json_each`, the pragma
+functions) or the function-specific "first argument … missing or unusable" error
+(`generate_series`). graphite only recognises these when called with parentheses,
+so a bare reference is `no such table: <name>`. Closing this means treating the
+eponymous TVFs as real `FROM` sources with `WHERE`-driven hidden-column binding —
+a feature, not a message tweak, so it is deferred rather than half-aligned.
+
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite
 does. The per-column "add column" checks run first, left to right — a duplicate
