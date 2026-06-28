@@ -15574,6 +15574,7 @@ impl Connection {
             self.validate_nested_ambiguity(sel, &columns)?;
             self.validate_columns_exist(sel, &columns)?;
             self.validate_derived_columns(sel, &columns)?;
+            self.validate_join_derived_columns(sel)?;
             // An `IN (SELECT …)` whose width disagrees with the LHS is a
             // prepare-time error in SQLite; run it after column resolution so a
             // missing column (its first error) still wins.
@@ -16611,6 +16612,173 @@ impl Connection {
         }
         // `GROUP BY` / `HAVING` / `ORDER BY` may instead name an output alias
         // (resolved ahead of a base column); exempt a bare name that matches one.
+        let aliases: Vec<&str> = sel
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                ResultColumn::Expr { alias: Some(a), .. } => Some(a.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut clause_refs: Vec<&Expr> = Vec::new();
+        for g in &sel.group_by {
+            clause_refs.push(g);
+        }
+        if let Some(h) = &sel.having {
+            clause_refs.push(h);
+        }
+        for o in &sel.order_by {
+            clause_refs.push(&o.expr);
+        }
+
+        let mut missing: Option<Error> = None;
+        for e in targets {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
+                if missing.is_none() && !resolves(schema, table, column) {
+                    missing = Some(eval::no_such_column(schema, table, column, quoted));
+                }
+            });
+        }
+        for e in clause_refs {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
+                if missing.is_some() {
+                    return;
+                }
+                if table.is_some() {
+                    if !resolves(schema, table, column) {
+                        missing = Some(eval::no_such_column(schema, table, column, quoted));
+                    }
+                } else if !aliases.iter().any(|a| a.eq_ignore_ascii_case(column))
+                    && !resolves(None, None, column)
+                {
+                    missing = Some(eval::no_such_column(None, None, column, quoted));
+                }
+            });
+        }
+        match missing {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Eager `no such column` check for a window-free top-level query whose `FROM`
+    /// is an `ON`/cross **join that includes at least one derived (subquery)
+    /// source** — the case both [`Self::validate_columns_exist`] (which bails on a
+    /// non-plain source) and [`Self::validate_derived_columns`] (which bails on any
+    /// join) decline, so a reference to a column no source exposes was silently
+    /// accepted over an empty / fully-filtered result. Each source's columns are
+    /// resolved exactly as the scan exposes them ([`Self::window_join_one_source`]);
+    /// a source that cannot be resolved cleanly (a virtual table, a non-constant
+    /// TVF, a non-BINARY derived column, …) bails the whole check conservatively, so
+    /// it never raises a false positive. Only a *base table* carries a `rowid`, so a
+    /// qualified `x.rowid` over a derived `x` is `no such column` while a bare
+    /// `rowid` (which binds to any base-table source) resolves; a `NATURAL`/`USING`
+    /// join coalesces names and is left alone.
+    fn validate_join_derived_columns(&self, sel: &Select) -> Result<()> {
+        let Some(from) = &sel.from else { return Ok(()) };
+        if from.joins.is_empty() || window::has_window(sel) {
+            return Ok(());
+        }
+        for j in &from.joins {
+            if j.natural || !j.using.is_empty() {
+                return Ok(());
+            }
+        }
+        let mut srcs = alloc::vec![&from.first];
+        for j in &from.joins {
+            srcs.push(&j.table);
+        }
+        // Only take over when a derived source is present; an all-base/view join is
+        // `validate_columns_exist`'s responsibility.
+        if !srcs.iter().any(|s| s.subquery.is_some()) {
+            return Ok(());
+        }
+        struct Src {
+            label: alloc::string::String,
+            names: Vec<alloc::string::String>,
+            has_rowid: bool,
+        }
+        let mut scope: Vec<Src> = Vec::with_capacity(srcs.len());
+        for s in &srcs {
+            if s.schema.is_some() || s.index_hint.is_some() {
+                return Ok(());
+            }
+            let cols = match self.window_join_one_source(s) {
+                Ok(c) => c,
+                Err(_) => return Ok(()),
+            };
+            let has_rowid = s.subquery.is_none()
+                && s.tvf_args.is_none()
+                && !self.is_pragma_tvf(s)
+                && !self.is_view(&s.name)
+                && !self.is_virtual_table(&s.name);
+            scope.push(Src {
+                label: s.alias.as_deref().unwrap_or(&s.name).into(),
+                names: cols.into_iter().map(|c| c.name).collect(),
+                has_rowid,
+            });
+        }
+        // A `tbl.*` whose qualifier names no source is `no such table: X`.
+        for c in &sel.columns {
+            if let ResultColumn::TableWildcard(q) = c {
+                if !scope.iter().any(|s| s.label.eq_ignore_ascii_case(q)) {
+                    return Err(Error::Error(alloc::format!("no such table: {q}")));
+                }
+            }
+        }
+        let is_rowid_kw =
+            |c: &str| matches!(c.to_ascii_lowercase().as_str(), "rowid" | "oid" | "_rowid_");
+        let is_dt_kw = |c: &str| {
+            matches!(
+                c.to_ascii_lowercase().as_str(),
+                "current_date" | "current_time" | "current_timestamp"
+            )
+        };
+        // `None` if the reference resolves, else its `no such column` message.
+        let resolves = |schema: Option<&str>, table: Option<&str>, column: &str| -> bool {
+            // A three-part qualifier is left to per-row evaluation (conservative).
+            if schema.is_some() || is_dt_kw(column) {
+                return true;
+            }
+            if let Some(t) = table {
+                let Some(src) = scope.iter().find(|s| s.label.eq_ignore_ascii_case(t)) else {
+                    return false;
+                };
+                if is_rowid_kw(column) {
+                    return src.has_rowid;
+                }
+                return src.names.iter().any(|n| n.eq_ignore_ascii_case(column));
+            }
+            // A bare `rowid` binds to any base-table source (conservatively resolved).
+            if is_rowid_kw(column) {
+                return true;
+            }
+            scope
+                .iter()
+                .any(|s| s.names.iter().any(|n| n.eq_ignore_ascii_case(column)))
+        };
+        // Result-set / `WHERE` / `ON` expressions can only name a source column.
+        let mut targets: Vec<&Expr> = Vec::new();
+        for c in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = c {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            targets.push(w);
+        }
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                targets.push(on);
+            }
+        }
+        // `GROUP BY` / `HAVING` / `ORDER BY` may name an output alias.
         let aliases: Vec<&str> = sel
             .columns
             .iter()

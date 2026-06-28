@@ -1179,11 +1179,20 @@ open work:
     `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` refs are resolved against the
     derived output at prepare time, so `SELECT a FROM (SELECT a FROM t) WHERE
     zzz = 1` errors over an empty derived table, and (since a subquery has no
-    rowid) so does `SELECT rowid FROM (SELECT a FROM t)`. Still open: a derived
-    table *joined* to another source, and a three-part `schema.table.column` ref
-    inside a *correlated subquery body* (binding to an enclosing FROM) —
-    `SELECT (SELECT bad.t.a) FROM t` is accepted where sqlite reports
-    `no such column: bad.t.a`.
+    rowid) so does `SELECT rowid FROM (SELECT a FROM t)`. `validate_join_derived_columns`
+    extends this to a derived table *joined* to another source (`ON`/cross join,
+    window-free): each source's columns are resolved exactly as the scan exposes
+    them (base via `table_meta`, view via `try_view`, derived via
+    `window_source_columns`), and the combined scope checks the result / `WHERE` /
+    join-`ON` / `GROUP BY` / `HAVING` / `ORDER BY` refs — so `SELECT zzz FROM
+    (SELECT a FROM t) x JOIN u ON x.a=u.c` and `SELECT x.rowid FROM (SELECT a FROM
+    t) x JOIN u …` (a derived source has no rowid) both error at prepare time. Any
+    source it cannot resolve cleanly (NATURAL/USING, schema-qualified, index-hint,
+    vtab) bails the whole check, never a false positive. Still open: a three-part
+    `schema.table.column` ref inside a *correlated subquery body* (binding to an
+    enclosing FROM) — `SELECT (SELECT bad.t.a) FROM t` is accepted where sqlite
+    reports `no such column: bad.t.a`. (Separately, the tree-walker still cannot
+    *execute* a bare/qualified `rowid` over any join — orthogonal to this check.)
   - unknown / wrong-arity *scalar functions* inside an expression-position
     subquery (`Subquery` / `EXISTS` / `IN (SELECT …)`) — e.g.
     `SELECT (SELECT nope(a)) FROM t` or `… WHERE a IN (SELECT nope(b) FROM t)`.
