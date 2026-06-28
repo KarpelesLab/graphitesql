@@ -745,6 +745,22 @@ the VDBE's `Like` op always folds case, so `run_select_vdbe` defers to the
 tree-walker whenever the flag is set (off by default, so the common path is
 unchanged). Byte-exact vs `sqlite3` 3.50.4 (`tests/case_sensitive_like.rs`).
 
+**`PRAGMA query_only` is now enforced**, not silently ignored. With it `ON` the
+connection is read-only: any statement that opens a write transaction —
+INSERT/UPDATE/DELETE, every CREATE/DROP/ALTER (including on TEMP tables), VACUUM,
+and ANALYZE (which writes `sqlite_stat1`) — fails with `attempt to write a
+readonly database`, while SELECT, PRAGMA, ATTACH/DETACH, and read-only
+transaction/savepoint control pass through; turning it back off restores writes,
+and the get form reads the live flag. graphite previously parsed the pragma but
+never gated writes on it. The flag rides on a `Connection` `query_only` field
+(set in the `exec_pragma` setter, surfaced on the read path); the gate is a
+single chokepoint at the top of `exec_parsed` (`statement_writes_db`), which
+every write reaches — DML descends to `run_dml_atomic` from there, and both the
+main-target and the swapped temp/attached paths route through it. Byte-exact vs
+`sqlite3` 3.50.4 (`tests/query_only.rs`). One documented residual: `REINDEX` of
+an existing index is not blocked — graphite models REINDEX as a no-op (indexes
+stay current on every write), so it never opens a write transaction.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

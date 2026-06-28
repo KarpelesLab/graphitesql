@@ -106,6 +106,12 @@ pub struct Connection {
     /// case_sensitive_like`). Off by default (SQLite folds ASCII case in `LIKE`);
     /// `GLOB` is always case-sensitive regardless of this flag.
     case_sensitive_like: bool,
+    /// Whether the connection is in read-only mode (`PRAGMA query_only`). When on,
+    /// any statement that would write to a database — INSERT/UPDATE/DELETE, every
+    /// CREATE/DROP/ALTER, VACUUM, and ANALYZE — fails with `attempt to write a
+    /// readonly database`; reads and read-only transactions are unaffected. Off by
+    /// default.
+    query_only: bool,
     /// Re-entrancy depth of trigger firing.
     trigger_depth: core::cell::Cell<usize>,
     /// Set by an `OR FAIL` conflict before it raises: tells the statement-level
@@ -297,6 +303,7 @@ impl Connection {
             outer_scope: core::cell::RefCell::new(Vec::new()),
             foreign_keys: false,
             case_sensitive_like: false,
+            query_only: false,
             trigger_depth: core::cell::Cell::new(0),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
@@ -338,6 +345,7 @@ impl Connection {
             outer_scope: core::cell::RefCell::new(Vec::new()),
             foreign_keys: false,
             case_sensitive_like: false,
+            query_only: false,
             trigger_depth: core::cell::Cell::new(0),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
@@ -2026,6 +2034,9 @@ impl Connection {
                 rows: Vec::new(),
             }),
             "short_column_names" | "automatic_index" => Ok(single(&name, Value::Integer(1))),
+            // `query_only` reflects the live connection flag; the others below are
+            // accepted but inert, so they report their default `0`.
+            "query_only" => Ok(single(&name, Value::Integer(self.query_only as i64))),
             "legacy_alter_table"
             | "count_changes"
             | "full_column_names"
@@ -2033,7 +2044,6 @@ impl Connection {
             | "defer_foreign_keys"
             | "ignore_check_constraints"
             | "reverse_unordered_selects"
-            | "query_only"
             | "writable_schema"
             | "threads"
             | "soft_heap_limit"
@@ -3431,6 +3441,15 @@ impl Connection {
 
     /// Execute a parsed non-transaction-control statement on the active database.
     fn exec_parsed(&mut self, stmt: Statement, sql: &str, params: &Params) -> Result<usize> {
+        // `PRAGMA query_only = ON` makes the connection read-only: any statement
+        // that would open a write transaction (DML, every CREATE/DROP/ALTER,
+        // VACUUM, ANALYZE) fails here before it runs, while reads, PRAGMAs, and
+        // read-only transaction control pass through. This is the single write
+        // chokepoint — DML reaches `run_dml_atomic` from below, and both the
+        // main-target and swapped (temp/attached) paths call `exec_parsed`.
+        if self.query_only && statement_writes_db(&stmt) {
+            return Err(Error::Error("attempt to write a readonly database".into()));
+        }
         // `changes()`/`total_changes()` track only INSERT/UPDATE/DELETE.
         let is_dml = matches!(
             stmt,
@@ -4736,6 +4755,13 @@ impl Connection {
             // read path), so this is a write-only toggle, like SQLite.
             if let Some(e) = &p.value {
                 self.case_sensitive_like = pragma_truth(e, params);
+            }
+        } else if p.name.eq_ignore_ascii_case("query_only") {
+            // `ON` puts the connection in read-only mode: any write statement then
+            // fails with `attempt to write a readonly database` (gated in
+            // `exec_parsed`). The get form reads the live flag back (read path).
+            if let Some(e) = &p.value {
+                self.query_only = pragma_truth(e, params);
             }
         } else if p.name.eq_ignore_ascii_case("cache_size") {
             // Round-trip the value verbatim (graphite keeps all pages resident, so
@@ -24813,6 +24839,32 @@ fn ddl_text(sql: &str) -> &str {
         Ok(toks) if !toks.is_empty() => sql[toks[0].start..].trim_end(),
         _ => sql.trim(),
     }
+}
+
+/// Whether a statement opens a write transaction against a database, and so is
+/// refused under `PRAGMA query_only = ON`. This mirrors SQLite, which blocks
+/// every DML and schema change plus `VACUUM` and `ANALYZE` (the latter writes
+/// `sqlite_stat1`), while letting `SELECT`, `PRAGMA`, `ATTACH`/`DETACH`, and
+/// transaction/savepoint control through. `REINDEX` is intentionally excluded:
+/// graphite models it as a no-op (indexes are kept current on every write), so
+/// it never opens a write transaction here — the lone residual versus SQLite,
+/// which blocks a `REINDEX` that would actually rebuild an existing index.
+fn statement_writes_db(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::CreateTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::CreateView(_)
+            | Statement::CreateVirtualTable(_)
+            | Statement::CreateTrigger(_)
+            | Statement::Drop(_)
+            | Statement::Alter(_)
+            | Statement::Vacuum { .. }
+            | Statement::Analyze(_)
+    )
 }
 
 /// The `sqlite_` name prefix is reserved for SQLite's own catalog objects
