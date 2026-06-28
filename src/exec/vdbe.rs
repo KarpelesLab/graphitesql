@@ -215,6 +215,8 @@ pub enum Op {
         distinct: bool,
         filter: Option<usize>,
         order: Vec<AggOrderKey>,
+        /// Constant `group_concat`/`string_agg` separator (`None` = default `,`).
+        sep: Option<String>,
     },
     /// Finalize aggregate `slot` into `dest`.
     AggFinal {
@@ -273,6 +275,8 @@ pub struct AggSpec {
     pub filter: Option<usize>,
     /// `ORDER BY` keys for an ordered `group_concat`; empty when unordered.
     pub order: Vec<AggOrderKey>,
+    /// Constant `group_concat`/`string_agg` separator (`None` = default `,`).
+    pub sep: Option<String>,
 }
 
 /// One output column of a [`Op::GroupEmit`]: a group-key value (by key index) or
@@ -326,14 +330,25 @@ struct AggAcc {
     /// Per-key `(descending, nulls_first)` sort directions, captured once on the
     /// first ordered push (empty when unordered).
     dirs: Vec<(bool, Option<bool>)>,
+    /// The `group_concat`/`string_agg` separator, captured on the first folded
+    /// value (`None` = the default `,`).
+    sep: Option<String>,
 }
 /// One `GROUP BY` group: its key values and one accumulator per aggregate slot.
 type Group = (Vec<Value>, Vec<AggAcc>);
 
 /// A compile-time aggregate spec from [`agg_kind_distinct`]: the kind, the
 /// argument expression, the `DISTINCT` flag, the optional `FILTER (WHERE …)`
-/// predicate, and the `ORDER BY` terms (only meaningful for `group_concat`).
-type AggCallSpec = (AggKind, Option<Expr>, bool, Option<Expr>, Vec<OrderTerm>);
+/// predicate, the `ORDER BY` terms (only meaningful for `group_concat`), and the
+/// constant `group_concat`/`string_agg` separator (`None` = the default `,`).
+type AggCallSpec = (
+    AggKind,
+    Option<Expr>,
+    bool,
+    Option<Expr>,
+    Vec<OrderTerm>,
+    Option<String>,
+);
 
 /// One `ORDER BY` key inside an ordered aggregate (`group_concat(x ORDER BY …)`):
 /// the register holding the key value for the current row, plus its sort
@@ -639,23 +654,58 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
                 false,
                 filter,
                 Vec::new(),
+                None,
             ));
         }
-        "count" if args.len() == 1 => AggKind::Count,
-        "sum" if args.len() == 1 => AggKind::Sum,
-        "total" if args.len() == 1 => AggKind::Total,
-        "avg" if args.len() == 1 => AggKind::Avg,
-        "min" if args.len() == 1 => AggKind::Min,
-        "max" if args.len() == 1 => AggKind::Max,
-        "group_concat" if args.len() == 1 => AggKind::GroupConcat,
+        "count" if args.len() == 1 => (AggKind::Count, None),
+        "sum" if args.len() == 1 => (AggKind::Sum, None),
+        "total" if args.len() == 1 => (AggKind::Total, None),
+        "avg" if args.len() == 1 => (AggKind::Avg, None),
+        "min" if args.len() == 1 => (AggKind::Min, None),
+        "max" if args.len() == 1 => (AggKind::Max, None),
+        // One-argument `group_concat` uses the default `,` separator.
+        "group_concat" if args.len() == 1 => (AggKind::GroupConcat, None),
+        // The two-argument `group_concat(x, sep)` and its standard-SQL alias
+        // `string_agg(x, sep)` take an explicit separator. The tree-walker
+        // evaluates that separator in a *rowless* context (it is a constant), so
+        // the VDBE accepts it only when it is a literal — otherwise it falls back.
+        // `DISTINCT` with two arguments is a tree-walker error ("DISTINCT
+        // aggregates must have exactly one argument"), so leave it to fall back.
+        "group_concat" | "string_agg" if args.len() == 2 && !*distinct => {
+            match const_sep_text(&args[1]) {
+                Some(s) => (AggKind::GroupConcat, Some(s)),
+                None => return None,
+            }
+        }
         _ => return None,
     };
+    let (kind, sep) = kind;
     // `ORDER BY` inside an aggregate only changes `group_concat` output; defer
     // any other ordered aggregate, and `DISTINCT` + `ORDER BY`, to the tree-walker.
     if !order.is_empty() && (*distinct || kind != AggKind::GroupConcat) {
         return None;
     }
-    Some((kind, arg, *distinct, filter, order))
+    Some((kind, arg, *distinct, filter, order, sep))
+}
+
+/// The text of a constant `group_concat`/`string_agg` separator, matching the
+/// tree-walker (which evaluates the separator argument in a rowless context and
+/// renders it with `to_text`). Returns `None` for a non-literal separator so the
+/// caller falls back to the tree-walker, which sees the real expression.
+fn const_sep_text(expr: &Expr) -> Option<String> {
+    use crate::exec::eval;
+    let Expr::Literal(l) = unparen(expr) else {
+        return None;
+    };
+    let v = match l {
+        Literal::Null => Value::Null,
+        Literal::Integer(i) => Value::Integer(*i),
+        Literal::Real(r) => Value::Real(*r),
+        Literal::Str(s) => Value::Text(s.clone()),
+        Literal::Blob(b) => Value::Blob(b.clone()),
+        Literal::Boolean(b) => Value::Integer(*b as i64),
+    };
+    Some(eval::to_text(&v))
 }
 
 /// Compile `SELECT <aggregates> FROM <table> [WHERE …]` (no GROUP BY): the scan
@@ -724,7 +774,7 @@ fn compile_aggregate_select(
         }
         None => None,
     };
-    for (slot, (kind, arg, distinct, filter, order)) in slots.iter().enumerate() {
+    for (slot, (kind, arg, distinct, filter, order, sep)) in slots.iter().enumerate() {
         let arg_reg = match arg {
             Some(expr) => Some(c.compile_expr(expr)?),
             None => None,
@@ -741,6 +791,7 @@ fn compile_aggregate_select(
             distinct: *distinct,
             filter: filter_reg,
             order: order_keys,
+            sep: sep.clone(),
         });
     }
     let next = c.ops.len();
@@ -755,7 +806,7 @@ fn compile_aggregate_select(
         *target = end;
     }
     // Finalize each slot into its output register, then emit the single row.
-    for (slot, (kind, _, _, _, _)) in slots.iter().enumerate() {
+    for (slot, (kind, _, _, _, _, _)) in slots.iter().enumerate() {
         c.ops.push(Op::AggFinal {
             slot,
             kind: *kind,
@@ -889,7 +940,7 @@ fn emit_group_fold(
     // Evaluate each aggregate argument (and its FILTER predicate) into a register
     // for this row.
     let mut aggs: Vec<AggSpec> = Vec::new();
-    for (kind, arg, distinct, filter, order) in agg_specs {
+    for (kind, arg, distinct, filter, order, sep) in agg_specs {
         let arg_reg = match arg {
             Some(expr) => Some(c.compile_expr(expr)?),
             None => None,
@@ -905,6 +956,7 @@ fn emit_group_fold(
             distinct: *distinct,
             filter: filter_reg,
             order: order_keys,
+            sep: sep.clone(),
         });
     }
     c.ops.push(Op::GroupStep {
@@ -1183,7 +1235,7 @@ fn compile_group_select(
     // Finalize groups and position the group cursor; the emit loop body follows.
     let gfin = c.ops.len();
     c.ops.push(Op::GroupFinalize {
-        agg_kinds: agg_specs.iter().map(|(k, _, _, _, _)| *k).collect(),
+        agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _)| *k).collect(),
         target: 0,
     });
     let gbody = c.ops.len();
@@ -1414,7 +1466,7 @@ fn compile_group_emit(
 
     c.ops.push(Op::GroupEmit {
         outputs,
-        agg_kinds: agg_specs.iter().map(|(k, _, _, _, _)| *k).collect(),
+        agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _)| *k).collect(),
     });
     c.ops.push(Op::Halt);
     Ok(Program {
@@ -2165,7 +2217,7 @@ pub fn compile_aggregate_join(
         None => None,
     };
     // Fold the surviving combined row into every aggregate slot.
-    for (slot, (kind, arg, distinct, filter, order)) in slots.iter().enumerate() {
+    for (slot, (kind, arg, distinct, filter, order, sep)) in slots.iter().enumerate() {
         let arg_reg = match arg {
             Some(expr) => Some(c.compile_expr(expr)?),
             None => None,
@@ -2182,6 +2234,7 @@ pub fn compile_aggregate_join(
             distinct: *distinct,
             filter: filter_reg,
             order: order_keys,
+            sep: sep.clone(),
         });
     }
     // `NextC` chain, innermost-first (as in `compile_join2`).
@@ -2206,7 +2259,7 @@ pub fn compile_aggregate_join(
         }
     }
     // Finalize each slot into its output register, then emit the single row.
-    for (slot, (kind, _, _, _, _)) in slots.iter().enumerate() {
+    for (slot, (kind, _, _, _, _, _)) in slots.iter().enumerate() {
         c.ops.push(Op::AggFinal {
             slot,
             kind: *kind,
@@ -4375,9 +4428,13 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
                 distinct,
                 filter,
                 order,
+                sep,
             } => {
                 if *slot >= agg.len() {
                     agg.resize(*slot + 1, AggAcc::default());
+                }
+                if sep.is_some() && agg[*slot].sep.is_none() {
+                    agg[*slot].sep = sep.clone();
                 }
                 // FILTER (WHERE …): a row whose predicate is not true contributes
                 // to neither the count nor the collected values for this slot.
@@ -4423,6 +4480,9 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
                     }
                 };
                 for (j, spec) in aggs.iter().enumerate() {
+                    if spec.sep.is_some() && groups[gi].1[j].sep.is_none() {
+                        groups[gi].1[j].sep = spec.sep.clone();
+                    }
                     // FILTER (WHERE …) gates each aggregate independently per row.
                     let pass = spec
                         .filter
@@ -4579,7 +4639,9 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
         count: star,
         keys,
         dirs,
+        sep,
     } = acc;
+    let sep = sep.as_deref().unwrap_or(",");
     Ok(match kind {
         AggKind::CountStar => Value::Integer(star),
         AggKind::Count => Value::Integer(vals.len() as i64),
@@ -4644,7 +4706,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
                 Value::Null
             } else if keys.is_empty() {
                 let parts: Vec<String> = vals.iter().map(eval::to_text).collect();
-                Value::Text(parts.join(","))
+                Value::Text(parts.join(sep))
             } else {
                 // Ordered `group_concat(x ORDER BY …)`: sort the collected values
                 // by their parallel key rows (stable, so ties keep first-seen
@@ -4652,7 +4714,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
                 let mut idx: Vec<usize> = (0..vals.len()).collect();
                 idx.sort_by(|&i, &j| cmp_key_rows(&keys[i], &keys[j], &dirs));
                 let parts: Vec<String> = idx.iter().map(|&i| eval::to_text(&vals[i])).collect();
-                Value::Text(parts.join(","))
+                Value::Text(parts.join(sep))
             }
         }
     })

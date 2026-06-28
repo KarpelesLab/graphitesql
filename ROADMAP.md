@@ -1211,7 +1211,9 @@ is the fallback oracle); bytecode `EXPLAIN` (**B8**). Running on the VDBE now: t
 materialized); non-correlated scalar/`EXISTS`/`IN (SELECT)` folds (**B5c-1**, incl.
 the native candidate-affinity membership op for a bare-column candidate); compound
 `UNION`/`INTERSECT`/`EXCEPT` (**B5c-3**); positional `GROUP BY <ordinal>`;
-`DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates;
+`DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates (incl.
+the two-argument `group_concat(x, sep)` / `string_agg(x, sep)` form — the constant
+separator is captured at compile time and threaded through the accumulator);
 window functions over a single table or a plain join (**B5c-4**); and the
 three-argument `text LIKE pattern ESCAPE c` form (it desugars to `like(pattern,
 text, c)`, a pure context-free call that routes through `Op::Func` →
