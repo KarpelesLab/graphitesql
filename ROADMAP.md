@@ -402,6 +402,23 @@ unresolved column (still silently accepted over an empty table, as before), a
 compound (`UNION`) subquery, and a doubly-nested subquery body are conservatively
 skipped. Byte-exact vs `sqlite3` 3.50.4 for the column-clean cases.
 
+The companion case — a **multi-column subquery used where a single value is
+expected** — is now rejected the same way (`sub-select returns N columns -
+expected 1`), again on both the SELECT and the UPDATE/DELETE paths and again over
+an empty or fully-filtered table the lazy evaluator never reaches. The walker is
+context-aware: it descends into operands of every scalar expression (arithmetic,
+concat, `||`, unary `-`/`NOT`, `CAST`, `LIKE`/`GLOB`, `AND`/`OR`, `IS NULL`,
+function arguments, `ORDER BY`/`GROUP BY`/`HAVING`/`WHERE`, an `IN` list element)
+and flags a bare `(SELECT a, b)` there, but it deliberately stops at a subquery
+that is a **direct operand of a comparison operator** (`=`, `<>`, `<`, `<=`, `>`,
+`>=`, `IS`, `IS NOT`) or of `BETWEEN`: SQLite reports `row value misused` in those
+positions, a separate diagnostic left to its existing behaviour. The same
+column-clean gate applies — the arity error fires only when the subquery body
+resolves against its own FROM plus the outer scope — so a dirty subquery yields a
+`no such column` rather than a wrong arity report. A correlated subquery and the
+`SET`/`WHERE` DML positions are covered. Byte-exact vs `sqlite3` 3.50.4 for the
+column-clean scalar contexts.
+
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite
 does. The per-column "add column" checks run first, left to right — a duplicate

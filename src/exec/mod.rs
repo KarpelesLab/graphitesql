@@ -14198,8 +14198,25 @@ impl Connection {
         select: &Select,
         outer_cols: &[ColumnInfo],
     ) -> bool {
-        // A compound (`UNION`/…) subquery has arms this single-arm walk does not
-        // inspect, so it cannot be confirmed clean.
+        // The LHS lives in the outer scope; the subquery body resolves against
+        // its own FROM plus the outer columns (handled by the body helper).
+        let mut lhs_ok = true;
+        walk_shallow_columns(lhs, &mut |_schema, table, column, _quoted| {
+            if lhs_ok && !column_resolves(outer_cols, table, column) {
+                lhs_ok = false;
+            }
+        });
+        lhs_ok && self.subquery_body_columns_clean(select, outer_cols)
+    }
+
+    /// Whether every column the subquery body references resolves, against its
+    /// own FROM plus the outer (correlation) scope — the LHS-free half of
+    /// [`Self::in_subquery_columns_clean`], shared with the scalar-subquery arity
+    /// check. Conservative: a compound (`UNION`/…) subquery, a scan failure, or a
+    /// clause hiding a further-nested subquery (which `walk_shallow_columns` does
+    /// not descend) all return `false` so a hidden bad column is never mistaken
+    /// for a clean body.
+    fn subquery_body_columns_clean(&self, select: &Select, outer_cols: &[ColumnInfo]) -> bool {
         if !select.compound.is_empty() {
             return false;
         }
@@ -14207,33 +14224,8 @@ impl Connection {
         let Ok((incols, _)) = self.scan_source(select, &params) else {
             return false;
         };
-        let resolves = |cols: &[ColumnInfo], table: Option<&str>, column: &str| -> bool {
-            if matches!(
-                column.to_ascii_lowercase().as_str(),
-                "rowid" | "oid" | "_rowid_" | "current_date" | "current_time" | "current_timestamp"
-            ) {
-                return true;
-            }
-            cols.iter().any(|c| {
-                c.name.eq_ignore_ascii_case(column)
-                    && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
-            })
-        };
-        // The LHS lives in the outer scope.
-        let mut lhs_ok = true;
-        walk_shallow_columns(lhs, &mut |_schema, table, column, _quoted| {
-            if lhs_ok && !resolves(outer_cols, table, column) {
-                lhs_ok = false;
-            }
-        });
-        if !lhs_ok {
-            return false;
-        }
-        // The subquery body resolves against its own FROM plus the outer columns;
-        // a bare name may also match one of its own output aliases (GROUP BY /
-        // HAVING / ORDER BY). A further-nested subquery in any clause is not
-        // walked by `walk_shallow_columns`, so bail if one is present rather than
-        // miss a bad column it hides.
+        // A bare name may match one of the subquery's own output aliases (a
+        // GROUP BY / HAVING / ORDER BY reference), so exempt those.
         let aliases: Vec<&str> = select
             .columns
             .iter()
@@ -14267,7 +14259,6 @@ impl Connection {
                 }
             }
         }
-        let mut clean = true;
         for e in &targets {
             let mut nested = Vec::new();
             collect_subselects(e, &mut nested);
@@ -14275,6 +14266,7 @@ impl Connection {
                 return false;
             }
         }
+        let mut clean = true;
         for e in targets {
             if !clean {
                 break;
@@ -14283,7 +14275,9 @@ impl Connection {
                 if !clean {
                     return;
                 }
-                if resolves(&incols, table, column) || resolves(outer_cols, table, column) {
+                if column_resolves(&incols, table, column)
+                    || column_resolves(outer_cols, table, column)
+                {
                     return;
                 }
                 if table.is_none() && aliases.iter().any(|a| a.eq_ignore_ascii_case(column)) {
@@ -14293,6 +14287,152 @@ impl Connection {
             });
         }
         clean
+    }
+
+    /// Reject a multi-column scalar subquery `(SELECT a, b …)` used where a single
+    /// value is required — SQLite reports `sub-select returns N columns - expected
+    /// 1` at prepare time, but graphite resolved the subquery lazily and so
+    /// silently accepted it over an empty/filtered table. Mirrors
+    /// [`Self::reject_invalid_in_subquery_arity`]'s clause coverage and column-clean
+    /// gate. A subquery that is the direct operand of a comparison (`=`/`<`/`IS`/…)
+    /// or `BETWEEN` is *not* this error — SQLite treats it as a row value there and
+    /// reports `row value misused` instead — so those positions are skipped.
+    fn reject_invalid_scalar_subquery_arity(
+        &self,
+        sel: &Select,
+        cols: &[ColumnInfo],
+    ) -> Result<()> {
+        let mut targets: Vec<&Expr> = Vec::new();
+        for rc in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            targets.push(w);
+        }
+        if let Some(h) = &sel.having {
+            targets.push(h);
+        }
+        for g in &sel.group_by {
+            targets.push(g);
+        }
+        for t in &sel.order_by {
+            targets.push(&t.expr);
+        }
+        if let Some(from) = &sel.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    targets.push(on);
+                }
+            }
+        }
+        for e in targets {
+            self.walk_scalar_subquery_arity(e, cols, false)?;
+        }
+        Ok(())
+    }
+
+    /// Walk `e` for scalar subqueries used in a single-value position and arity
+    /// check each — see [`Self::reject_invalid_scalar_subquery_arity`]. `in_cmp`
+    /// tracks whether `e` is the direct operand of a comparison/`BETWEEN` (where a
+    /// wide subquery is `row value misused`, not this arity error). A nested
+    /// subquery body is not descended (its own scope validates itself).
+    fn walk_scalar_subquery_arity(
+        &self,
+        e: &Expr,
+        cols: &[ColumnInfo],
+        in_cmp: bool,
+    ) -> Result<()> {
+        match e {
+            Expr::Subquery(select) => {
+                if !in_cmp {
+                    let width = eval::Subqueries::row_column_affinities(self, select).len();
+                    if width > 1 && self.subquery_body_columns_clean(select, cols) {
+                        return Err(Error::Error(alloc::format!(
+                            "sub-select returns {width} columns - expected 1"
+                        )));
+                    }
+                }
+            }
+            Expr::Binary {
+                op, left, right, ..
+            } => {
+                let cmp = matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq
+                        | BinaryOp::Is
+                        | BinaryOp::IsNot
+                );
+                self.walk_scalar_subquery_arity(left, cols, cmp)?;
+                self.walk_scalar_subquery_arity(right, cols, cmp)?;
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                // All three operands of a `BETWEEN` are comparison operands.
+                self.walk_scalar_subquery_arity(expr, cols, true)?;
+                self.walk_scalar_subquery_arity(low, cols, true)?;
+                self.walk_scalar_subquery_arity(high, cols, true)?;
+            }
+            Expr::Unary { expr, .. } => self.walk_scalar_subquery_arity(expr, cols, false)?,
+            Expr::Function {
+                args,
+                filter,
+                order_by,
+                ..
+            } => {
+                for a in args {
+                    self.walk_scalar_subquery_arity(a, cols, false)?;
+                }
+                if let Some(flt) = filter {
+                    self.walk_scalar_subquery_arity(flt, cols, false)?;
+                }
+                for t in order_by {
+                    self.walk_scalar_subquery_arity(&t.expr, cols, false)?;
+                }
+            }
+            Expr::IsNull { expr, .. } => self.walk_scalar_subquery_arity(expr, cols, false)?,
+            Expr::InList { expr, list, .. } => {
+                self.walk_scalar_subquery_arity(expr, cols, false)?;
+                for a in list {
+                    self.walk_scalar_subquery_arity(a, cols, false)?;
+                }
+            }
+            Expr::InSelect { expr, .. } => self.walk_scalar_subquery_arity(expr, cols, false)?,
+            Expr::Case {
+                operand,
+                when_then,
+                else_result,
+            } => {
+                if let Some(o) = operand {
+                    self.walk_scalar_subquery_arity(o, cols, false)?;
+                }
+                for (w, t) in when_then {
+                    self.walk_scalar_subquery_arity(w, cols, false)?;
+                    self.walk_scalar_subquery_arity(t, cols, false)?;
+                }
+                if let Some(el) = else_result {
+                    self.walk_scalar_subquery_arity(el, cols, false)?;
+                }
+            }
+            Expr::Cast { expr, .. } => self.walk_scalar_subquery_arity(expr, cols, false)?,
+            Expr::Collate { expr, .. } => self.walk_scalar_subquery_arity(expr, cols, false)?,
+            // A parenthesised comparison operand keeps its `in_cmp` status.
+            Expr::Paren(inner) => self.walk_scalar_subquery_arity(inner, cols, in_cmp)?,
+            Expr::RowValue(items) => {
+                for it in items {
+                    self.walk_scalar_subquery_arity(it, cols, false)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// The arity guard for one expression — see `reject_aggregate_arity_in_select`.
@@ -14526,6 +14666,9 @@ impl Connection {
             // prepare-time error in SQLite; run it after column resolution so a
             // missing column (its first error) still wins.
             self.reject_invalid_in_subquery_arity(sel, &columns)?;
+            // Likewise a multi-column scalar subquery used where one value is
+            // required (`sub-select returns N columns - expected 1`).
+            self.reject_invalid_scalar_subquery_arity(sel, &columns)?;
         }
 
         // A positional `GROUP BY` / `ORDER BY` term (an integer literal) must name
@@ -15452,9 +15595,11 @@ impl Connection {
         // was resolved above, so a missing column still wins.
         for e in exprs {
             self.walk_in_subquery_arity(e, columns)?;
+            self.walk_scalar_subquery_arity(e, columns, false)?;
         }
         for e in returning {
             self.walk_in_subquery_arity(e, columns)?;
+            self.walk_scalar_subquery_arity(e, columns, false)?;
         }
         Ok(())
     }
@@ -20237,6 +20382,24 @@ fn returning_exprs(returning: &[ResultColumn]) -> Vec<&Expr> {
 /// that subquery's scope (with this query merely an outer fallback), so it must
 /// not be checked against this query's column list. Used by
 /// [`Executor::validate_columns_exist`] for an eager "no such column" check.
+/// Whether a (`table`-qualified or bare) `column` reference resolves against
+/// `cols` — a name match, with the table also matching when qualified. A rowid
+/// alias and the date/time keyword pseudo-columns resolve without appearing in
+/// `cols`. Used by the IN/scalar-subquery arity gates to confirm a body is
+/// column-clean before reporting an arity mismatch (so a `no such column`, which
+/// SQLite reports first, is never masked).
+fn column_resolves(cols: &[ColumnInfo], table: Option<&str>, column: &str) -> bool {
+    if matches!(
+        column.to_ascii_lowercase().as_str(),
+        "rowid" | "oid" | "_rowid_" | "current_date" | "current_time" | "current_timestamp"
+    ) {
+        return true;
+    }
+    cols.iter().any(|c| {
+        c.name.eq_ignore_ascii_case(column) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+    })
+}
+
 fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, Option<&str>, &str, bool)) {
     match e {
         Expr::Column {
