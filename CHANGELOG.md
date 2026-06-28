@@ -7,6 +7,159 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/KarpelesLab/graphitesql/compare/v0.0.11...v0.0.12) - 2026-06-28
+
+### Added
+
+- *(exec)* resolve forward CTE references and reject true cycles by entry point
+- *(exec)* validate the database qualifier on REINDEX schema.name
+- *(exec)* forbid ALTER/DROP/CREATE INDEX on internal sqlite_ tables
+- *(exec)* report circular reference for anchorless recursive CTE
+- *(cli)* report the result row of a PRAGMA journal_mode setter
+- *(exec)* name a *-expansion self-join ambiguity by its source origin
+- *(exec)* reject a window function nested in another window's definition
+- *(exec)* match sqlite's message for a non-TVF name called in FROM
+- *(exec)* match sqlite's VALUES vs operator message on compound arity mismatch
+- *(exec)* reject IN-list element arity mismatch at prepare time
+- *(exec)* reject row-value misuse at prepare time
+- *(exec)* reject a multi-column scalar subquery at prepare time
+- *(exec)* reject IN-subquery column-count mismatch at prepare time
+- *(exec)* reject unknown/wrong-arity functions in DELETE/UPDATE clauses
+- *(exec)* report an unknown windowed function as "no such function"
+- *(exec)* validate columns over a single derived-table FROM at prepare time
+- *(pragma)* round-trip automatic_index and cell_size_check
+- *(pragma)* honor PRAGMA ignore_check_constraints
+- *(pragma)* enforce PRAGMA query_only as read-only mode
+- *(pragma)* honor PRAGMA case_sensitive_like for LIKE
+- *(parser)* accept WITH before any INSERT source, not just INSERT … SELECT
+- *(window)* allow any constant expression as a frame offset
+- *(exec)* reject CREATE TRIGGER on a system table
+- *(exec)* re-apply the non-generated-column rule after DROP COLUMN
+- *(exec)* reject aggregate/window functions in CREATE INDEX
+- *(exec)* reject a qualified DML target in a trigger body
+- *(exec)* skip an unreferenced WITH CTE on UPDATE/DELETE
+- *(exec)* support an UPDATE/DELETE target table alias (... AS x)
+- *(exec)* detect foreign key mismatch like sqlite
+- *(cte)* reject a recursive CTE that self-joins its recursive table
+- *(dml)* honor INDEXED BY / NOT INDEXED on UPDATE and DELETE
+- *(exec)* validate three-part column qualifiers in UPSERT clauses
+- *(exec)* validate three-part column qualifiers in UPDATE/DELETE
+- *(exec)* validate three-part schema.table.column column qualifiers
+- *(json)* json_each/json_tree accept a JSONB blob document
+- *(json)* expose hidden json/root columns on json_each and json_tree
+- *(json)* preserve escaped object-key provenance through JSONB and text
+- *(json)* preserve JSON5 string escapes via the TEXT5 JSONB tag
+- *(json)* preserve standard-JSON string escapes verbatim in text and JSONB
+- *(func)* implement sqlite_source_id()
+- *(eqp)* render SCAN CONSTANT ROW for a FROM-less SELECT
+- *(exec)* accept rowid/_rowid_/oid as an INSERT target column
+- *(parser)* report premature end-of-input as "incomplete input"
+- *(exec)* reject FILTER on a non-aggregate function at prepare time
+- *(exec)* reject aggregate misuse in ORDER BY and join ON at prepare time
+- *(exec)* reject window-function misuse at prepare time
+- *(exec)* reject aggregate-in-WHERE misuse at prepare time
+- *(exec)* validate UPSERT column references against the target table
+
+### Documentation
+
+- note SQLite-compatible prepare-time diagnostics in README
+- bump differential test-suite count to 260+
+- record JSON string-escape provenance as a remaining Track A item
+- prune completed items from ROADMAP and expand what remains
+
+### Fixed
+
+- *(window)* honor key collation in PARTITION BY / ORDER BY
+- *(window)* emit rows in window order when no outer ORDER BY
+- *(printf)* round %e mantissa half away from zero like SQLite
+- *(index)* name the column in WITHOUT ROWID secondary-index UNIQUE errors
+- *(index)* reject CREATE UNIQUE INDEX over existing duplicate rows
+- *(json)* json_quote(X) renders a JSONB blob as its JSON text
+- *(exec)* RENAME COLUMN rewrites trigger refs inside WHEN/body subqueries
+- *(exec)* rewrite view subquery refs on RENAME COLUMN
+- *(exec)* sequence PRIMARY KEY validation so a duplicate PK outranks a generated-column PK error
+- *(exec)* echo the written qualifier in the ambiguous-column-name message
+- *(parser)* reject ALL/DISTINCT in operand position, accept ALL in aggregates
+- *(exec)* resolve a SELECT-output alias inside an ORDER BY expression
+- *(exec)* treat an aggregate in a window OVER spec as a single group
+- *(exec)* resolve generated-column forward refs and reject cycles at CREATE
+- *(trigger)* resolve a FROM-less SELECT step when the trigger fires
+- *(trigger)* police the full trigger-step grammar inside a body
+- *(trigger)* defer body ORDER BY/LIMIT error behind target resolution
+- *(exec)* resolve LIMIT/OFFSET in an empty column scope at prepare time
+- *(exec)* resolve functions and aggregate misuse nested in row values and COLLATE
+- *(exec)* resolve unknown and wrong-arity scalar functions at prepare time
+- *(exec)* reject an aggregate or window function inside a FILTER predicate
+- *(exec)* reject min()/max() with zero arguments at prepare time
+- *(exec)* reject aggregate/window function in DELETE/UPDATE RETURNING
+- *(window)* reject a window-only function used without OVER at prepare time
+- *(parser)* name the clause when ORDER BY/LIMIT precedes a compound op
+- *(update)* reject ORDER BY without LIMIT on UPDATE/DELETE
+- *(trigger)* schema-qualify a trigger body's missing-table error
+- *(ddl)* order CREATE TABLE validation like sqlite's schema-build pass
+- *(exec)* arity-check aggregates used as window functions
+- *(exec)* validate aggregate arity at prepare time
+- *(exec)* reject a nested aggregate or window in an aggregate argument at prepare time
+- *(func)* validate likelihood() at prepare time, not per row
+- *(cte)* do not analyze an unreferenced WITH CTE
+- *(json)* match sqlite arity for json_set/insert/replace family
+- *(parser)* reject a reserved keyword in table-option position
+- *(exec)* a `*` argument is valid only for count()
+- *(exec)* reject a scalar function used as a window function
+- *(parser)* report window frame-bound errors with sqlite's two messages
+- *(exec)* order partial-index WHERE subquery/non-determinism errors like sqlite
+- *(parser)* accept an optional transaction name in BEGIN/COMMIT/END
+- *(parser)* reject SQLite's reserved keywords as bare names
+- *(dml)* reject ON CONFLICT targets that match no PK/UNIQUE constraint
+- *(ddl)* resolve CHECK/generated/index functions at CREATE
+- *(ddl)* resolve CHECK/generated-column functions at CREATE
+- *(pragma)* report PRAGMA journal_size_limit getter
+- *(exec)* reject RAISE() used outside a trigger program
+- *(vacuum)* match SQLite's VACUUM INTO existing-file message
+- *(parser)* OFFSET is not a reserved keyword outside LIMIT
+- *(cli)* run each command-line argument as its own SQL batch
+- *(alter)* wrap a RENAME COLUMN name collision like sqlite
+- *(exec)* keep the schema qualifier when a known database is missing the object
+- *(exec)* report an unknown database qualifier on a table reference as a missing object
+- *(json)* render a JSON5 dot-form number with the minimal zero, not the float
+- *(json)* reject a JSON number with a leading-zero integer part
+- *(json)* preserve verbatim text of an f64-overflowing JSON number
+- *(pragma)* report notnull=1 for WITHOUT ROWID primary-key columns
+- *(lexer)* report an over-64-bit hex literal as "hex literal too big"
+- *(eval)* the LIKE ESCAPE character is never a wildcard
+- *(parser)* desugar iif()/if() to CASE for multi-branch + short-circuit
+- *(exec)* name the existing object's kind in a CREATE collision
+- *(parser)* report unknown table options like SQLite
+- *(eval)* hint at a string literal for an unresolved double-quoted column
+- *(parser)* reject ORDER BY/LIMIT after a VALUES query core
+- *(eval)* report "row value misused" for vector comparison operands
+- *(alter)* ADD COLUMN inserts before trailing table constraints
+- *(schema)* canonicalise schema-qualified, TEMP and CTAS stored sql
+- *(schema)* canonicalise sqlite_schema.sql like sqlite
+- *(json)* quote non-simple keys in json_each/json_tree fullkey/path
+- *(json)* number json_each/json_tree id by JSONB byte offset
+- *(cli)* a ;-truncated statement is a syntax error, not "incomplete input"
+- *(parser)* reject AUTOINCREMENT outside a column PRIMARY KEY
+- *(pragma)* parse user_version/application_id value as an integer token
+- *(pragma)* return empty for index_info/foreign_key_list on an unknown object
+- *(exec)* reject a CREATE VIEW column-count mismatch on use
+- *(alter)* match sqlite's DROP COLUMN refusal rules and messages
+- *(exec)* reject a missing column in GROUP BY/HAVING/ORDER BY clauses
+- *(eval)* reject a scalar IN (SELECT …) with the wrong column count
+- *(func)* emit a trailing % in printf/format literally
+- *(json)* -> and ->> reject a malformed text document
+- *(window)* RANGE offset frame requires exactly one ORDER BY expression
+- *(json)* json_each/json_tree reject >2 args and accept zero args
+- *(tokenizer)* report lexing failures as `unrecognized token: "X"`
+- *(parser)* report syntax errors as `near "TOKEN": syntax error`
+- *(vdbe)* reject non-integer LIMIT/OFFSET on the table-scan path
+- *(exec)* use sqlite's nested-aggregate misuse wording
+
+### Testing
+
+- drop a build-divergent LIKE-trailing-escape query from the oracle list
+- gate UPDATE/DELETE ORDER BY LIMIT diffs on the update/delete-limit extension
+
 ## [0.0.11](https://github.com/KarpelesLab/graphitesql/compare/v0.0.10...v0.0.11) - 2026-06-26
 
 ### Added
