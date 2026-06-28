@@ -773,6 +773,23 @@ single early-return at the top of `check_constraints`, the one function both
 INSERT and UPDATE call to validate CHECK exprs. Byte-exact vs `sqlite3` 3.50.4
 (`tests/ignore_check_constraints.rs`).
 
+**`PRAGMA automatic_index` and `PRAGMA cell_size_check` now round-trip** instead
+of being pinned to their defaults. Both are inert in graphite — it builds no
+transient automatic indexes, and it validates btree cells on every read
+regardless — but, like sqlite, the stored value is observable: setting one and
+reading it back returns what was set (previously the get form hard-coded `1` /
+`0` and dropped any assignment). Each rides on a `Connection` `Cell` (set in both
+the `exec_pragma` setter and the read path, so the assignment persists whether it
+arrives via `execute()` or `query()`). Byte-exact vs `sqlite3` 3.50.4
+(`tests/pragma_index_check_roundtrip.rs`). One related residual, left as a
+documented CLI concern: the *set-form echo* of the value-returning pragmas
+(`PRAGMA secure_delete=1`, `busy_timeout`, `analysis_limit`, `journal_size_limit`)
+— sqlite prints the resulting value as a row on the assignment itself, while
+graphite's one-shot CLI routes `=` setters through `execute()` (which discards
+rows); the value is stored correctly and reads back via the plain form. Matching
+the echo needs per-pragma knowledge of which setters return a row, since
+`foreign_keys=1`/`cache_size=N` do not.
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

@@ -189,6 +189,14 @@ pub struct Connection {
     /// When non-zero, freed pages are zeroed (the pager honors it); a
     /// per-connection runtime setting, not persisted in the file.
     secure_delete: core::cell::Cell<i64>,
+    /// `PRAGMA automatic_index` (default on). graphite's planner never builds
+    /// transient automatic indexes, so the flag is inert; it is stored and
+    /// reported back like sqlite for drop-in compatibility.
+    automatic_index: core::cell::Cell<bool>,
+    /// `PRAGMA cell_size_check` (default off). graphite already validates btree
+    /// cells on every read, so the flag is inert; it is stored and reported back
+    /// like sqlite for drop-in compatibility.
+    cell_size_check: core::cell::Cell<bool>,
     /// User-defined scalar functions registered via
     /// [`register_function`](Self::register_function), keyed by lowercased name.
     /// Built-in functions take precedence; these fill otherwise-unknown names.
@@ -328,6 +336,8 @@ impl Connection {
             busy_timeout: core::cell::Cell::new(0),
             journal_size_limit: core::cell::Cell::new(-1),
             secure_delete: core::cell::Cell::new(0),
+            automatic_index: core::cell::Cell::new(true),
+            cell_size_check: core::cell::Cell::new(false),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
@@ -371,6 +381,8 @@ impl Connection {
             busy_timeout: core::cell::Cell::new(0),
             journal_size_limit: core::cell::Cell::new(-1),
             secure_delete: core::cell::Cell::new(0),
+            automatic_index: core::cell::Cell::new(true),
+            cell_size_check: core::cell::Cell::new(false),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
@@ -1965,7 +1977,18 @@ impl Connection {
                 Value::Integer(self.secure_delete.get()),
             )),
             "read_uncommitted" => Ok(single("read_uncommitted", Value::Integer(0))),
-            "cell_size_check" => Ok(single("cell_size_check", Value::Integer(0))),
+            // Inert in graphite (cells are validated on every read regardless),
+            // but stored and echoed so the round-trip matches sqlite.
+            "cell_size_check" => {
+                if let Some(e) = &p.value {
+                    self.cell_size_check
+                        .set(pragma_truth(e, &Params::default()));
+                }
+                Ok(single(
+                    "cell_size_check",
+                    Value::Integer(self.cell_size_check.get() as i64),
+                ))
+            }
             "checkpoint_fullfsync" => Ok(single("checkpoint_fullfsync", Value::Integer(0))),
             "fullfsync" => Ok(single("fullfsync", Value::Integer(0))),
             // `busy_timeout` round-trips the lock-wait timeout (graphite never
@@ -2039,7 +2062,19 @@ impl Connection {
                 columns: alloc::vec![name.clone()],
                 rows: Vec::new(),
             }),
-            "short_column_names" | "automatic_index" => Ok(single(&name, Value::Integer(1))),
+            "short_column_names" => Ok(single(&name, Value::Integer(1))),
+            // Inert in graphite (it builds no transient automatic indexes), but
+            // stored and echoed so the round-trip matches sqlite (default on).
+            "automatic_index" => {
+                if let Some(e) = &p.value {
+                    self.automatic_index
+                        .set(pragma_truth(e, &Params::default()));
+                }
+                Ok(single(
+                    "automatic_index",
+                    Value::Integer(self.automatic_index.get() as i64),
+                ))
+            }
             // `query_only`/`ignore_check_constraints` reflect the live connection
             // flags; the others below are accepted but inert (default `0`).
             "query_only" => Ok(single(&name, Value::Integer(self.query_only as i64))),
@@ -4777,6 +4812,18 @@ impl Connection {
             // the live flag back (read path).
             if let Some(e) = &p.value {
                 self.ignore_check_constraints = pragma_truth(e, params);
+            }
+        } else if p.name.eq_ignore_ascii_case("automatic_index") {
+            // Inert (graphite builds no automatic indexes); stored so a later
+            // `PRAGMA automatic_index` reads the value back, like sqlite.
+            if let Some(e) = &p.value {
+                self.automatic_index.set(pragma_truth(e, params));
+            }
+        } else if p.name.eq_ignore_ascii_case("cell_size_check") {
+            // Inert (graphite validates cells on every read); stored so a later
+            // `PRAGMA cell_size_check` reads the value back, like sqlite.
+            if let Some(e) = &p.value {
+                self.cell_size_check.set(pragma_truth(e, params));
             }
         } else if p.name.eq_ignore_ascii_case("cache_size") {
             // Round-trip the value verbatim (graphite keeps all pages resident, so
