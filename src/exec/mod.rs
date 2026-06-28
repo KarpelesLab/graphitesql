@@ -16668,35 +16668,37 @@ impl Connection {
     }
 
     /// Eager `no such column` check for a window-free top-level query whose `FROM`
-    /// is an `ON`/cross **join that includes at least one derived (subquery)
-    /// source** — the case both [`Self::validate_columns_exist`] (which bails on a
-    /// non-plain source) and [`Self::validate_derived_columns`] (which bails on any
-    /// join) decline, so a reference to a column no source exposes was silently
-    /// accepted over an empty / fully-filtered result. Each source's columns are
-    /// resolved exactly as the scan exposes them ([`Self::window_join_one_source`]);
-    /// a source that cannot be resolved cleanly (a virtual table, a non-constant
-    /// TVF, a non-BINARY derived column, …) bails the whole check conservatively, so
-    /// it never raises a false positive. Only a *base table* carries a `rowid`, so a
-    /// qualified `x.rowid` over a derived `x` is `no such column` while a bare
-    /// `rowid` (which binds to any base-table source) resolves; a `NATURAL`/`USING`
-    /// join coalesces names and is left alone.
+    /// is a **join that [`Self::validate_columns_exist`] declines** — either it
+    /// includes a derived (subquery) source (that validator bails on a non-plain
+    /// source) or it is a `NATURAL`/`USING` join (which coalesces names, so the flat
+    /// `columns` scope that validator uses would not list a qualified `u.g` of a
+    /// coalesced pair). Without this, a reference to a column no source exposes was
+    /// silently accepted over an empty / fully-filtered result. Each source's columns
+    /// are resolved exactly as the scan exposes them
+    /// ([`Self::window_join_one_source`]); a source that cannot be resolved cleanly
+    /// (a virtual table, a non-constant TVF, a non-BINARY derived column, …) bails
+    /// the whole check conservatively, so it never raises a false positive. A bare
+    /// name resolves if **any** source exposes it; a qualified `u.g` checks source
+    /// `u` specifically — so both `t.g` and `u.g` of a `NATURAL`/`USING`-coalesced
+    /// pair resolve, matching SQLite. Only a *base table* carries a `rowid`, so a
+    /// qualified `x.rowid` over a derived `x` is `no such column` while a bare `rowid`
+    /// resolves. A genuinely *ambiguous* bare name (shared but not coalesced) is left
+    /// to per-row evaluation — this check only catches missing names, never ambiguity.
     fn validate_join_derived_columns(&self, sel: &Select) -> Result<()> {
         let Some(from) = &sel.from else { return Ok(()) };
         if from.joins.is_empty() || window::has_window(sel) {
             return Ok(());
         }
-        for j in &from.joins {
-            if j.natural || !j.using.is_empty() {
-                return Ok(());
-            }
-        }
         let mut srcs = alloc::vec![&from.first];
         for j in &from.joins {
             srcs.push(&j.table);
         }
-        // Only take over when a derived source is present; an all-base/view join is
-        // `validate_columns_exist`'s responsibility.
-        if !srcs.iter().any(|s| s.subquery.is_some()) {
+        // Take over only for the shapes `validate_columns_exist` bails on: a derived
+        // (subquery) source, or a `NATURAL`/`USING` coalesced join. An all-base/view
+        // `ON`/cross join is that validator's responsibility.
+        let has_coalesce = from.joins.iter().any(|j| j.natural || !j.using.is_empty());
+        let has_derived = srcs.iter().any(|s| s.subquery.is_some());
+        if !has_coalesce && !has_derived {
             return Ok(());
         }
         struct Src {
