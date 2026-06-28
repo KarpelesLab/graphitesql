@@ -53,6 +53,13 @@ pub trait Subqueries {
     fn changes(&self) -> i64 {
         0
     }
+    /// Whether `PRAGMA case_sensitive_like` is ON for this connection, making the
+    /// `LIKE` operator and the `like()` function compare ASCII case-sensitively
+    /// (`GLOB` is always case-sensitive regardless). Default `false` — SQLite's
+    /// case-insensitive default — for the rowless/connection-less contexts.
+    fn case_sensitive_like(&self) -> bool {
+        false
+    }
     /// `total_changes()` — rows modified since the connection opened.
     fn total_changes(&self) -> i64 {
         0
@@ -656,7 +663,12 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     };
                     Ok(bool_value(eq == matches!(op, Is)))
                 }
-                _ => eval_binary(*op, eval(left, ctx)?, eval(right, ctx)?),
+                _ => eval_binary(
+                    *op,
+                    eval(left, ctx)?,
+                    eval(right, ctx)?,
+                    ctx.subqueries.is_some_and(|s| s.case_sensitive_like()),
+                ),
             }
         }
         Expr::IsNull { expr, negated } => {
@@ -1273,7 +1285,7 @@ fn eval_case(
     }
 }
 
-fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
+fn eval_binary(op: BinaryOp, l: Value, r: Value, case_sensitive_like: bool) -> Result<Value> {
     use BinaryOp::*;
     Ok(match op {
         Eq | NotEq | Lt | LtEq | Gt | GtEq => {
@@ -1345,7 +1357,9 @@ fn eval_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
                 let text = to_text(&l);
                 let pat = to_text(&r);
                 let m = if matches!(op, Like) {
-                    like_match(&pat, &text)
+                    // GLOB ignores `case_sensitive_like` (always case-sensitive);
+                    // LIKE folds ASCII case unless the pragma is on.
+                    like_match_escape(&pat, &text, None, case_sensitive_like)
                 } else {
                     glob_match(&pat, &text)
                 };
@@ -1860,20 +1874,36 @@ pub fn format_real(r: f64) -> String {
 // ---- LIKE / GLOB ------------------------------------------------------------
 
 /// SQLite `LIKE`: `%` matches any run, `_` any single char; case-insensitive for
-/// ASCII (SQLite's default).
+/// ASCII (SQLite's default — `case_sensitive` false).
 fn like_match(pattern: &str, text: &str) -> bool {
-    like_match_escape(pattern, text, None)
+    like_match_escape(pattern, text, None, false)
 }
 
 /// `LIKE` with an optional `ESCAPE` character: a wildcard (`%`/`_`) or the escape
 /// character itself, when preceded by the escape character, matches literally.
-pub fn like_match_escape(pattern: &str, text: &str, escape: Option<char>) -> bool {
+/// `case_sensitive` true (`PRAGMA case_sensitive_like = ON`) compares ASCII
+/// letters exactly; false folds case, SQLite's default.
+pub fn like_match_escape(
+    pattern: &str,
+    text: &str,
+    escape: Option<char>,
+    case_sensitive: bool,
+) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    like_rec(&p, &t, escape)
+    like_rec(&p, &t, escape, case_sensitive)
 }
 
-fn like_rec(p: &[char], t: &[char], esc: Option<char>) -> bool {
+/// Compare one pattern char to one text char, honoring ASCII case sensitivity.
+fn like_char_eq(pc: char, tc: char, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        pc == tc
+    } else {
+        pc.eq_ignore_ascii_case(&tc)
+    }
+}
+
+fn like_rec(p: &[char], t: &[char], esc: Option<char>, cs: bool) -> bool {
     if p.is_empty() {
         return t.is_empty();
     }
@@ -1887,8 +1917,8 @@ fn like_rec(p: &[char], t: &[char], esc: Option<char>) -> bool {
             return match p.get(1) {
                 Some(&lit) => {
                     !t.is_empty()
-                        && lit.eq_ignore_ascii_case(&t[0])
-                        && like_rec(&p[2..], &t[1..], esc)
+                        && like_char_eq(lit, t[0], cs)
+                        && like_rec(&p[2..], &t[1..], esc, cs)
                 }
                 None => t.is_empty(),
             };
@@ -1898,18 +1928,18 @@ fn like_rec(p: &[char], t: &[char], esc: Option<char>) -> bool {
         '%' => {
             // Collapse consecutive %.
             let rest = &p[1..];
-            if like_rec(rest, t, esc) {
+            if like_rec(rest, t, esc, cs) {
                 return true;
             }
             for i in 0..t.len() {
-                if like_rec(rest, &t[i + 1..], esc) {
+                if like_rec(rest, &t[i + 1..], esc, cs) {
                     return true;
                 }
             }
             false
         }
-        '_' => !t.is_empty() && like_rec(&p[1..], &t[1..], esc),
-        pc => !t.is_empty() && pc.eq_ignore_ascii_case(&t[0]) && like_rec(&p[1..], &t[1..], esc),
+        '_' => !t.is_empty() && like_rec(&p[1..], &t[1..], esc, cs),
+        pc => !t.is_empty() && like_char_eq(pc, t[0], cs) && like_rec(&p[1..], &t[1..], esc, cs),
     }
 }
 
@@ -2031,7 +2061,8 @@ mod tests {
             eval_binary(
                 BinaryOp::Concat,
                 Value::Blob(vec![0x00]),
-                Value::Blob(vec![0xff])
+                Value::Blob(vec![0xff]),
+                false
             )
             .unwrap(),
             Value::Blob(vec![0x00, 0xff])
@@ -2041,7 +2072,8 @@ mod tests {
             eval_binary(
                 BinaryOp::Concat,
                 Value::Blob(vec![0x61]),
-                Value::Text("b".into())
+                Value::Text("b".into()),
+                false
             )
             .unwrap(),
             Value::Text("ab".into())

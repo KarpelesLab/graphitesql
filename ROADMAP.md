@@ -730,6 +730,21 @@ shadows the insert *target* — `INSERT INTO c …` stays `no such table: c`.
 Byte-exact vs `sqlite3` 3.50.4 (`tests/with_insert.rs`, plus the parse-acceptance
 guard in `tests/parser_surface.rs`).
 
+**`PRAGMA case_sensitive_like` is now honored**, not silently ignored. With the
+pragma `ON`, the `LIKE` operator and the two-argument `like()` function compare
+ASCII letters case-sensitively (`'A' LIKE 'a'` → `0`), while the `_`/`%`
+wildcards, `ESCAPE`, and non-ASCII letters behave as before — only ASCII folding
+is switched off, matching SQLite's built-in `LIKE`. `GLOB` stays case-sensitive
+regardless, and the get form (`PRAGMA case_sensitive_like`) returns no rows (a
+write-only toggle). graphite previously parsed the pragma but never wired it into
+comparison, so the flag was a no-op. The setting rides on a `Connection`
+`case_sensitive_like` field, surfaced to pure eval through a new
+`Subqueries::case_sensitive_like()` hook so `eval_binary`'s `LIKE` arm and
+`func.rs`'s `like()` thread it without touching the ~100 `EvalCtx` build sites;
+the VDBE's `Like` op always folds case, so `run_select_vdbe` defers to the
+tree-walker whenever the flag is set (off by default, so the common path is
+unchanged). Byte-exact vs `sqlite3` 3.50.4 (`tests/case_sensitive_like.rs`).
+
 **Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
 items that used to sit here has been cleared — each lives in the git history, the
 release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely

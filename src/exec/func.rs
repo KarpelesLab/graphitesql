@@ -581,8 +581,12 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     }
                     None => None,
                 };
-                let m =
-                    eval::like_match_escape(&eval::to_text(&v[0]), &eval::to_text(&v[1]), escape);
+                let m = eval::like_match_escape(
+                    &eval::to_text(&v[0]),
+                    &eval::to_text(&v[1]),
+                    escape,
+                    ctx.subqueries.is_some_and(|s| s.case_sensitive_like()),
+                );
                 Value::Integer(m as i64)
             }
         }

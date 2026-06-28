@@ -102,6 +102,10 @@ pub struct Connection {
     /// Whether foreign-key constraints are enforced (`PRAGMA foreign_keys`).
     /// Off by default, matching SQLite.
     foreign_keys: bool,
+    /// Whether `LIKE` compares ASCII case-sensitively (`PRAGMA
+    /// case_sensitive_like`). Off by default (SQLite folds ASCII case in `LIKE`);
+    /// `GLOB` is always case-sensitive regardless of this flag.
+    case_sensitive_like: bool,
     /// Re-entrancy depth of trigger firing.
     trigger_depth: core::cell::Cell<usize>,
     /// Set by an `OR FAIL` conflict before it raises: tells the statement-level
@@ -292,6 +296,7 @@ impl Connection {
             cte_env: core::cell::RefCell::new(Vec::new()),
             outer_scope: core::cell::RefCell::new(Vec::new()),
             foreign_keys: false,
+            case_sensitive_like: false,
             trigger_depth: core::cell::Cell::new(0),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
@@ -332,6 +337,7 @@ impl Connection {
             cte_env: core::cell::RefCell::new(Vec::new()),
             outer_scope: core::cell::RefCell::new(Vec::new()),
             foreign_keys: false,
+            case_sensitive_like: false,
             trigger_depth: core::cell::Cell::new(0),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
@@ -952,6 +958,13 @@ impl Connection {
         // reports `no such column: schema.table.column` on a mismatch.
         if select_has_schema_qualified_column(sel) {
             return Err(Error::Unsupported("VDBE: schema-qualified column"));
+        }
+        // `PRAGMA case_sensitive_like = ON` makes the `LIKE` operator ASCII
+        // case-sensitive, but the VDBE's `Like` op always folds case. Defer to the
+        // tree-walker (which honors the flag via the `Subqueries` hook) whenever the
+        // pragma is set — it is off by default, so this costs nothing normally.
+        if self.case_sensitive_like {
+            return Err(Error::Unsupported("VDBE: case_sensitive_like set"));
         }
         // A compound query (UNION / UNION ALL / INTERSECT / EXCEPT) runs each
         // constituent SELECT on the VDBE and combines the row-sets with the same
@@ -4716,6 +4729,13 @@ impl Connection {
         } else if p.name.eq_ignore_ascii_case("recursive_triggers") {
             if let Some(e) = &p.value {
                 self.recursive_triggers = pragma_truth(e, params);
+            }
+        } else if p.name.eq_ignore_ascii_case("case_sensitive_like") {
+            // `ON` makes the LIKE operator (and the `like()` function) compare
+            // ASCII case-sensitively; the get form returns no rows (handled in the
+            // read path), so this is a write-only toggle, like SQLite.
+            if let Some(e) = &p.value {
+                self.case_sensitive_like = pragma_truth(e, params);
             }
         } else if p.name.eq_ignore_ascii_case("cache_size") {
             // Round-trip the value verbatim (graphite keeps all pages resident, so
@@ -21067,6 +21087,9 @@ impl eval::Subqueries for Connection {
     }
     fn total_changes(&self) -> i64 {
         self.total_changes.get()
+    }
+    fn case_sensitive_like(&self) -> bool {
+        self.case_sensitive_like
     }
     fn next_random(&self) -> i64 {
         // SplitMix64: advance a 64-bit counter by the golden-ratio increment,
