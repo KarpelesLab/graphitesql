@@ -13265,14 +13265,28 @@ impl Connection {
             });
         }
         let descending: Vec<bool> = spec.order_by.iter().map(|t| t.descending).collect();
+        // The collation of each PARTITION BY / ORDER BY key (an explicit
+        // `COLLATE`, else the expression's column collation, else BINARY), so
+        // partitioning, ordering, and peer detection honor it like sqlite.
+        let kctx = row_ctx(&[], columns, None, params);
+        let part_colls: Vec<crate::value::Collation> = spec
+            .partition_by
+            .iter()
+            .map(|e| eval::key_collation(e, &kctx))
+            .collect();
+        let ord_colls: Vec<crate::value::Collation> = spec
+            .order_by
+            .iter()
+            .map(|t| eval::key_collation(&t.expr, &kctx))
+            .collect();
 
         // Partition rows by partition key, preserving first-seen order.
         let mut partitions: Vec<Vec<usize>> = Vec::new();
         let mut part_of: Vec<usize> = Vec::new();
         for i in 0..n {
-            let p = partitions
-                .iter()
-                .position(|members| rows_equal(&part_keys[members[0]], &part_keys[i]));
+            let p = partitions.iter().position(|members| {
+                cmp_keys_coll(&part_keys[members[0]], &part_keys[i], &[], &part_colls).is_eq()
+            });
             match p {
                 Some(idx) => {
                     partitions[idx].push(i);
@@ -13289,7 +13303,9 @@ impl Connection {
         for members in &partitions {
             // Order the partition's rows (stable).
             let mut ordered = members.clone();
-            ordered.sort_by(|&a, &b| cmp_keys(&ord_keys[a], &ord_keys[b], &descending));
+            ordered.sort_by(|&a, &b| {
+                cmp_keys_coll(&ord_keys[a], &ord_keys[b], &descending, &ord_colls)
+            });
             self.fill_window_partition(
                 &lname,
                 // `count()` (no arguments) tallies every row, exactly like
@@ -13297,6 +13313,7 @@ impl Connection {
                 *star || (lname == "count" && args.is_empty()),
                 &ordered,
                 &ord_keys,
+                &ord_colls,
                 &arg_vals,
                 &passes,
                 spec,
@@ -13315,6 +13332,7 @@ impl Connection {
         star: bool,
         ordered: &[usize],
         ord_keys: &[Vec<Value>],
+        ord_colls: &[crate::value::Collation],
         arg_vals: &[Vec<Value>],
         passes: &[bool],
         spec: &WindowSpec,
@@ -13326,7 +13344,13 @@ impl Connection {
         for q in 1..m {
             gid[q] = gid[q - 1]
                 + usize::from(
-                    !cmp_keys(&ord_keys[ordered[q - 1]], &ord_keys[ordered[q]], &[]).is_eq(),
+                    !cmp_keys_coll(
+                        &ord_keys[ordered[q - 1]],
+                        &ord_keys[ordered[q]],
+                        &[],
+                        ord_colls,
+                    )
+                    .is_eq(),
                 );
         }
         // The single ORDER BY value per ordered position, for RANGE value
@@ -13374,7 +13398,9 @@ impl Connection {
                 "rank" => {
                     // 1 + number of strictly-preceding rows by order key.
                     let mut r = p;
-                    while r > 0 && cmp_keys(&ord_keys[ordered[r - 1]], &ord_keys[idx], &[]).is_eq()
+                    while r > 0
+                        && cmp_keys_coll(&ord_keys[ordered[r - 1]], &ord_keys[idx], &[], ord_colls)
+                            .is_eq()
                     {
                         r -= 1;
                     }
@@ -13383,7 +13409,13 @@ impl Connection {
                 "dense_rank" => {
                     let mut dr = 1i64;
                     for q in 1..=p {
-                        if !cmp_keys(&ord_keys[ordered[q - 1]], &ord_keys[ordered[q]], &[]).is_eq()
+                        if !cmp_keys_coll(
+                            &ord_keys[ordered[q - 1]],
+                            &ord_keys[ordered[q]],
+                            &[],
+                            ord_colls,
+                        )
+                        .is_eq()
                         {
                             dr += 1;
                         }
@@ -13393,7 +13425,9 @@ impl Connection {
                 "percent_rank" => {
                     // (rank - 1) / (rows - 1); 0 for a single-row partition.
                     let mut r = p;
-                    while r > 0 && cmp_keys(&ord_keys[ordered[r - 1]], &ord_keys[idx], &[]).is_eq()
+                    while r > 0
+                        && cmp_keys_coll(&ord_keys[ordered[r - 1]], &ord_keys[idx], &[], ord_colls)
+                            .is_eq()
                     {
                         r -= 1;
                     }
@@ -13407,7 +13441,13 @@ impl Connection {
                     // (# rows ordered <= current, incl. peers) / rows.
                     let mut last = p;
                     while last + 1 < m
-                        && cmp_keys(&ord_keys[idx], &ord_keys[ordered[last + 1]], &[]).is_eq()
+                        && cmp_keys_coll(
+                            &ord_keys[idx],
+                            &ord_keys[ordered[last + 1]],
+                            &[],
+                            ord_colls,
+                        )
+                        .is_eq()
                     {
                         last += 1;
                     }
@@ -23213,7 +23253,17 @@ fn expr_is_internal(e: &Expr, quals: &[String], cols: &[String]) -> bool {
 
 /// Compare two ordering-key vectors with per-position `descending` flags
 /// (missing flags default to ascending).
-fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> core::cmp::Ordering {
+/// Compare two key tuples lexicographically, each position under its own
+/// collation (`colls[i]`, defaulting to `BINARY` past the end) and `DESC` flag
+/// (`desc[i]`, defaulting to ascending). Used by the window machinery so a
+/// `PARTITION BY`/`ORDER BY … COLLATE NOCASE` orders and groups peers the way
+/// the collation dictates, matching sqlite.
+fn cmp_keys_coll(
+    a: &[Value],
+    b: &[Value],
+    desc: &[bool],
+    colls: &[crate::value::Collation],
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for (i, (x, y)) in a.iter().zip(b).enumerate() {
         let o = cmp_order(
@@ -23221,7 +23271,10 @@ fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> core::cmp::Ordering {
             y,
             desc.get(i).copied().unwrap_or(false),
             None,
-            crate::value::Collation::Binary,
+            colls
+                .get(i)
+                .copied()
+                .unwrap_or(crate::value::Collation::Binary),
         );
         if o != Ordering::Equal {
             return o;

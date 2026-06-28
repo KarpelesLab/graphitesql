@@ -577,11 +577,22 @@ first window's `PARTITION BY` keys (ascending) followed by its `ORDER BY` terms 
 through the existing collation/NULLS-aware sort, so `SELECT x, row_number() OVER
 (ORDER BY x) FROM t` over rows inserted `5,3,8` returns them `3,5,8`. The *first*
 window in the select list wins; `OVER ()` induces no ordering (scan order
-preserved). Byte-exact vs `sqlite3` 3.50.4 (`tests/window_output_order.rs`). Two
-residuals are deferred (separate, larger fixes): the `GROUP BY` + window path
-(`eval_windowed_aggregate`) does not yet apply the window order, and a window
-`PARTITION BY`/`ORDER BY … COLLATE` still computes its *frame* under BINARY
-(wrong cumulative values, though the row order is now correct).
+preserved). Byte-exact vs `sqlite3` 3.50.4 (`tests/window_output_order.rs`). One
+residual is deferred (a separate, larger fix): the `GROUP BY` + window path
+(`eval_windowed_aggregate`) does not yet apply the window order.
+
+**Window `PARTITION BY` / `ORDER BY` now honor the key's collation.** A window
+key with an explicit `COLLATE` operator, or a column with a declared collation,
+must partition rows, order them, and group order-by *peers* (for `rank`,
+`dense_rank`, `percent_rank`, `cume_dist`, and `RANGE`/`GROUPS` frames) under
+that collation — `PARTITION BY g COLLATE NOCASE` puts `'a'` and `'A'` in one
+partition, and `rank() OVER (ORDER BY g COLLATE NOCASE)` makes them peers.
+graphite compared every window key under `BINARY` (the `cmp_keys` helper
+hardcoded it), splitting case-insensitive partitions and over-ranking peers —
+silently wrong values. The window machinery now derives each key's collation
+(`eval::key_collation`) and threads it through a collation-aware `cmp_keys_coll`
+in partitioning, ordering, and all five peer-equality checks. Byte-exact vs
+`sqlite3` 3.50.4 (`tests/window_collation.rs`).
 
 **CTEs in one `WITH` clause now see each other — forward references work, and
 true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
