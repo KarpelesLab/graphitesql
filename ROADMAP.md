@@ -144,1477 +144,200 @@ progress in parallel.
 
 ### Track A — SQL language & functions  *(substantially complete)*
 
-**Done:** the full SELECT/join/CTE/window/subquery surface; UPSERT/`RETURNING`/
-row values/`STRICT`/generated columns/`UPDATE … FROM`/`INSERT … SELECT`; the
-scalar/aggregate/date-time/`printf`/JSON/JSONB libraries; type affinity,
-collation, column-name spans; cross-object **ALTER** propagation (RENAME
-TABLE→views/FKs, RENAME COLUMN→FKs/views/triggers, text-preserving CREATE-text
-edits); and a broad **error-parity** sweep — prepare-time column/aggregate/
-window/row-value resolution, DDL/DML/JSON/PRAGMA/`printf` message wording,
-lexer/parser error framing (`near "TOKEN"`, `incomplete input`, `unrecognized
-token: "X"`), and the `json_each`/`json_tree` `id`/`parent` columns (each row's
-JSONB *byte offset*, not a row counter) and `fullkey`/`path` label quoting
-(`$."a b"` for any non-simple key); `EXPLAIN QUERY PLAN` of a `FROM`-less
-SELECT now renders `SCAN CONSTANT ROW` (also covering a single-row `VALUES`);
-and the `sqlite_schema.sql` text is now canonicalised the way SQLite stores it
-(regenerated `CREATE <TYPE> ` head — `IF NOT EXISTS`/`TEMP` dropped, prefix
-whitespace collapsed — plus the verbatim body with the trailing `;` removed),
-including the schema-qualified (`CREATE TABLE aux.t …` → bare `t`) and `TEMP`
-forms; and `CREATE TABLE … AS SELECT` now writes its column list with SQLite's
-`identPut` quoting (bare when safe, keyword-aware, no spaces after commas, e.g.
-`CREATE TABLE t(a,c)`); and `ALTER TABLE … ADD COLUMN` now splices the new column
-in after the last column but before any trailing table-level constraints
-(`t(a, b, c, CHECK(a>0))`); and a multi-column subquery or row value used as a
-*comparison operand* (`=`/`<>`/`<`/`IS`/`BETWEEN`/…) against a different-width
-operand now reports `row value misused` (the `sub-select returns N columns`
-column-count message is kept for genuinely scalar contexts — bare SELECT list,
-`IN`, function arguments), while two equal-arity vectors row-compare
-lexicographically (`(SELECT 1,2) = (SELECT 3,4)` → `0`, and likewise for
-subquery-vs-subquery `BETWEEN`); and a trailing `ORDER BY`/`LIMIT` after a
-`VALUES` query core is now a `near "ORDER"/"LIMIT": syntax error` (SQLite's
-grammar attaches them only to the `SELECT` form of a core, so `VALUES (1),(2)
-ORDER BY 1` — and the same after a compound whose last core is `VALUES` — is
-rejected, while a compound ending in a `SELECT` or an outer `SELECT … FROM
-(VALUES …) ORDER BY` still parses); and an unresolved column written as a
-*double-quoted* identifier (`SELECT "foo"`) now carries SQLite's
-string-literal hint — `no such column: "foo" - should this be a string literal
-in single-quotes?` — re-quoting the name, while a bare word, a `[bracket]`/
-`` `backtick` `` identifier, and any table-qualified reference keep the plain
-`no such column: NAME` wording (the hint reaches the result-list, `WHERE`,
-`GROUP BY`/`ORDER BY`, and `UPDATE`/`DELETE` paths via a `quoted` flag on
-`Expr::Column` threaded through the resolvers and the eager prepare-time
-validators); and an unrecognized table option after the column list
-(`CREATE TABLE t(a) FOO`) is now `unknown table option: FOO` — the name echoed
-verbatim (a bare word, a `"quoted"` identifier or a `'string'` are all option
-names; a number/operator there stays a `near "TOKEN"` syntax error), the
-option list parsed as a possibly-empty comma-separated set so the first bad
-option wins (`FOO, STRICT` reports `FOO` and never enters STRICT mode) and is
-surfaced only *after* a STRICT table's missing-datatype check (`STRICT, FOO`
-over an untyped column still reports `missing datatype for t.a`), with a
-trailing comma now `incomplete input`; and a `CREATE TABLE`/`VIEW`/`INDEX` whose
-name is already taken now names the *existing* object's kind — a table/view
-collision over a view is `view X already exists` and over an index is `there is
-already an index named X` (was uniformly `table X already exists`), while
-`CREATE INDEX` over a table or view is `there is already a table named X` (it
-says "table" even for a view); this also closes a silent-accept hazard where a
-`CREATE TABLE`/`INDEX` over an existing view/index was previously *allowed* to
-create a duplicate name (a shared `table_namespace_conflict` helper, with
-`IF NOT EXISTS` still a no-op); `iif(...)`/`if(...)` now desugars to a CASE
-expression at parse time, so the multi-branch form `iif(c1,v1,c2,v2,…[,else])`
-(SQLite 3.48+) works and untaken branches short-circuit (`iif(1,'a',<overflow>)`
-returns `a` rather than erroring); and a `LIKE … ESCAPE` whose escape character
-is `_` or `%` no longer treats that character as a wildcard — the escape
-character is only ever the escape introducer, and a trailing escape matches just
-the empty remainder (`'ab' LIKE 'a_' ESCAPE '_'` is now false); and a hex
-literal wider than 64 bits is now a *recognized* token rejected with SQLite's
-dedicated `hex literal too big: 0x…` (echoing the literal verbatim) rather than a
-generic `unrecognized token`; and the `sqlite_source_id()` scalar is now
-implemented (it returned `no such function`) — an independent reimplementation
-can't carry a C build's id, so it returns graphitesql's own identifier in
-SQLite's `YYYY-MM-DD HH:MM:SS <hash>` shape (the build-invariant contract —
-non-NULL `text` with a timestamp-shaped leading field, and an arity error for
-any argument — is what the differential test checks); and `PRAGMA
-table_info`/`table_xinfo` now reports `notnull=1` for the PRIMARY KEY columns of
-a **WITHOUT ROWID** table (they are implicitly NOT NULL — a table-level
-composite key and an INTEGER PRIMARY KEY included), while a rowid table's PK
-columns stay `notnull=0`; the *enforcement* already matched sqlite (a NULL-PK
-insert was rejected), only the introspection column was out of sync; and a
-strict JSON number whose magnitude overflows `f64` to ±infinity now round-trips
-its verbatim source text in JSON *text* output (`json('1e1000')` → `1e1000`,
-`json('[1e1000]')` → `[1e1000]`) instead of collapsing to the `9e999` infinity
-literal — the serializer checked `is_infinite()` before the text-preserving
-arm, so the parsed source text was dropped; the extracted SQL value is still
-`f64` infinity, and a *computed* infinity (no source text) still renders as
-`9e999`; and a JSON number with a **leading zero** on its integer part
-(`00`, `007`, `00.5`, `-01`) is now rejected as `malformed JSON` instead of being
-silently accepted as `0`/`7`/… — a lone `0` and a `0` followed by `.`/`e`
-(`0.5`, `0e1`) stay valid, and `json_error_position` points at the token's
-second character (`00` → 2, `[01]` → 3) to match sqlite; and a **JSON5
-leading/trailing-`.` number** now renders in JSON text with just the minimal
-`0` inserted to make it valid JSON (`json('1.e5')` → `1.0e5`, `.5e2` → `0.5e2`,
-even the overflowing `1.e5000` → `1.0e5000`) rather than as the computed float
-(`100000.0`) — the JSONB `FLOAT5` payload already stored the raw text byte-exact;
-only the text serializer was canonicalizing; and a **partial-index `WHERE`
-predicate** now rejects a subquery (`CREATE INDEX i ON t(a) WHERE b IN (SELECT
-1)` → `subqueries prohibited in partial index WHERE clauses`) and a
-non-deterministic function, in SQLite's exact precedence: a non-deterministic
-*key* expression outranks a WHERE subquery (`t(random()) WHERE b IN (SELECT 1)`
-→ `non-deterministic functions prohibited in index expressions`), a WHERE
-subquery outranks WHERE non-determinism (even `WHERE b IN (SELECT random())`
-reports the subquery), and a bare non-deterministic WHERE uses its own distinct
-message (`non-deterministic functions prohibited in partial index WHERE
-clauses`, *not* "index expressions"); the subquery check (reusing
-`expr_has_subquery`) fires before column resolution so `WHERE zzz IN (SELECT 1)`
-still reports the subquery; and a **window frame boundary** now reports SQLite's
-two distinct failure classes instead of collapsing both to `near ")"`: a grammar
-error for an illegal `UNBOUNDED` direction (`UNBOUNDED FOLLOWING` as a *start*
-bound, `UNBOUNDED PRECEDING` as an *end* bound → `near "FOLLOWING"/"PRECEDING":
-syntax error` at the direction keyword) and a semantic `unsupported frame
-specification` when the start category comes after the end's (`CURRENT ROW AND
-1 PRECEDING`, `1 FOLLOWING AND 1 PRECEDING`, `1 FOLLOWING AND CURRENT ROW`) —
-the offset is not compared, so `2 FOLLOWING AND 1 FOLLOWING` stays a valid empty
-frame; the old code built the right message text but routed it through `err()`,
-which discards the string and emits a positional `near` error; and a **scalar
-function used as a window function** (`abs(a) OVER ()`, `upper(a) OVER ()`, or a
-two-argument `min`/`max` like `max(a,b) OVER ()`, which is scalar) is now
-rejected at prepare time with `NAME() may not be used as a window function` —
-covering *both* the VDBE window path (a real base table) and the tree-walker
-path (a subquery source), in the projection and in `ORDER BY`; only the eleven
-built-in window functions and the true aggregates (which double as window
-functions, including single-arg `min`/`max`) stay legal there; an **unknown**
-name carrying `OVER (…)` (`nope() OVER ()`), though, is now reported as `no such
-function: nope` ahead of the window-misuse wording — SQLite resolves the name
-before it classifies the `OVER`, so existence wins (a *known* scalar of any
-arity keeps the misuse wording); and the `*`
-wildcard **argument** is now accepted only for `count(*)` — every other call,
-aggregate or scalar (`sum(*)`, `min(*)`, `group_concat(*)`, `abs(*)`,
-`length(*)`), is rejected at prepare time with `wrong number of arguments to
-function NAME()` in every clause position, while in a non-aggregate query the
-`HAVING clause on a non-aggregate query` check still outranks the arity error;
-and a **reserved keyword in table-option position** (after the column list) is
-now a `near "KW"` syntax error rather than being mis-parsed — most importantly
-`CREATE TABLE t(a) AS SELECT …` now errors at `AS` (the CTAS form is illegal
-once a column list is present), matching SQLite, instead of pointing at the
-later `SELECT`; a non-reserved word there is still `unknown table option: NAME`
-and a column-less `CREATE TABLE t AS SELECT …` still parses; and the
-`json_set`/`json_insert`/`json_replace` family (plus the `jsonb_*` blob
-variants) now follows SQLite's varargs arity exactly — zero arguments yield
-`NULL`, a lone document is a no-op that returns the document unchanged, and an
-*even* argument count is the hard error `json_NAME() needs an odd number of
-arguments` (the message always names the text-output `json_*` form, even for a
-`jsonb_*` call), replacing graphite's old over-strict "requires a document and
-(path, value) pairs" rejection; and an **unreferenced `WITH` CTE** is no longer
-semantically analyzed — SQLite never validates a common table expression that the
-consuming query does not reach, so a bad column or missing table inside an unused
-CTE (`WITH r AS (SELECT nope) SELECT 1`) is not an error and an otherwise-infinite
-unused recursive CTE is simply never run; graphite used to eagerly materialize
-*every* CTE in a `WITH` clause. Reachability is computed by an exhaustive
-source-name walker over the query (FROM/joins/ON, every projection and predicate
-`Expr`, subqueries, `EXISTS`/`IN (SELECT …)`, `FILTER`, window specs, `ORDER
-BY`/`LIMIT`) seeded from the outer query and closed transitively (a used CTE pulls
-in the siblings it names), and is scope-aware — a derived subquery's own nested
-`WITH` shadows an outer CTE of the same name, so `WITH a AS (SELECT bad) SELECT *
-FROM (WITH a AS (SELECT 7 x) SELECT x FROM a)` binds the inner `a` and leaves the
-outer one unanalyzed; duplicate `WITH` names and syntax errors still fire
-regardless of use. The same unused-skip now covers **DML `WITH`** too (`WITH …
-UPDATE`/`DELETE`): the reachability mask is seeded from the statement's `SET`
-values, `… FROM` sources, `WHERE`/`ORDER BY` and `RETURNING` (the `update_cte_seeds`/
-`delete_cte_seeds` collectors feeding the shared `cte_mask_from_seeds`), so `WITH u
-AS (SELECT nope) UPDATE t SET a = 2` and an unused infinite recursive CTE on a
-`DELETE` are no longer analyzed — while a *used* CTE with a fault still errors and a
-duplicate `WITH` name is still rejected. And
-**`likelihood(X, prob)`** is now validated at prepare time, not per row: SQLite
-checks during analysis that the call has exactly two arguments and that the
-probability is a floating-point literal in `0.0..=1.0` (`exprProbability`), so
-both `wrong number of arguments to function likelihood()` and `second argument
-to likelihood() must be a constant between 0.0 and 1.0` fire even when the query
-yields no rows — over an empty or fully-filtered table — where graphite used to
-defer the check to the evaluator and silently accept the bad call; the new
-`reject_invalid_likelihood` walker runs in every scalar-expression position
-(result list / WHERE / GROUP BY / ORDER BY / join `ON`, and nested function
-arguments), leaving a `likelihood(…) OVER (…)` to the window-misuse path. And
-**nested aggregates** are now rejected at prepare time: SQLite forbids an
-aggregate (or window function) inside another aggregate's argument — the argument
-is resolved with `NC_InAggFunc` set — so `sum(count(*))` is `misuse of aggregate
-function count()` and `sum(row_number() OVER ())` is `misuse of window function
-row_number()`, both fired during analysis (even over an empty/fully-filtered
-table, where graphite's lazy evaluator used to accept the nesting and even
-mis-evaluate it — `count(sum(a))` returned `0`). The `reject_nested_aggregate_arg`
-walker scans each plain-aggregate call's arguments, names the last nested
-aggregate/window in source order (matching SQLite's resolver), and runs in the
-result list, `HAVING`, and `ORDER BY` — plus the VDBE window-dispatch path, which
-bypasses `run_core` — while leaving scalar wrappers (`abs(count(*))`,
-`max(sum(a), 1)`), an aggregate-as-window (`sum(a) OVER ()`), and subquery-level
-aggregates untouched. And **aggregate arity** is now validated during analysis,
-ahead of every placement/misuse check and independent of row production: SQLite
-reports `wrong number of arguments to function NAME()` for `sum()`, `sum(a, a)`,
-`count(1, 2)` and the like even in a clause where the aggregate would otherwise
-be a misuse (`WHERE sum()`, `ORDER BY sum(a, a)`, `GROUP BY avg(a, a)`) and even
-over an empty / fully-filtered table where graphite's lazy evaluator used to
-reach neither check. `reject_aggregate_arity_in_select` walks every clause
-(result list / WHERE / HAVING / GROUP BY / ORDER BY / join `ON`) at the top of
-`run_core` — before the VDBE fast-path — applying SQLite's bound counts (`count`
-0–1; `group_concat`/`string_agg`/`json_group_object` up to 2; the rest exactly
-1) while leaving scalar multi-arg `min`/`max` alone. The same guard covers an
-aggregate used as a **window function** (`sum(a, b) OVER ()`, `sum() OVER ()`),
-which graphite previously ran silently; the eleven built-in window functions
-keep their own arity. All byte-exact vs `sqlite3` 3.50.4.
-
-And **`sum()` now picks INTEGER vs REAL from each argument's *numeric type*, not
-its storage class** — matching `sqlite3_value_numeric_type` in SQLite's
-`sumStep`. The result stays an exact INTEGER only when every input is
-integer-typed: an INTEGER value, or a TEXT value that is a pure signed integer
-(optional surrounding whitespace, no decimal point or exponent, in `i64` range).
-A REAL value, or any text/blob that is real-valued, overflows `i64`, or is
-non-numeric, forces REAL. graphite previously keyed off the storage class alone,
-so a numeric-integer *text* like `'1'` wrongly promoted the whole sum to REAL
-(`sum('1', 10)` → `11.0` instead of `11`); the same rule now governs the windowed
-form `sum(x) OVER (…)`, and an all-integer overflow is the `integer overflow`
-error in both. The three former `sum` sites (the VDBE aggregate, the tree-walker
-plain aggregate, and the tree-walker window finalize — the last of which used to
-fall back to REAL on overflow rather than erroring) now share one
-`eval::sum_values` helper. Test: `tests/sum_numeric_affinity.rs` (VDBE on and off).
-
-And **two `i64` values now compare exactly, never through a lossy `f64`
-round-trip.** `cmp_values` (the routine behind `=`/`<`/`>`, `ORDER BY`, index
-seeks, `DISTINCT`, `GROUP BY`, and `IN`) used to coerce both numeric operands to
-`f64` and compare those, so any two integers above 2^53 sharing an `f64` rounding
-(e.g. `10^16` and `10^16 + 1`) wrongly read equal — silently corrupting equality,
-ordering, de-duplication and grouping. It now compares two integers as `i64`, two
-reals via `partial_cmp`, and a mixed integer/real pair with SQLite's exact
-`sqlite3IntFloatCompare` (truncate the real toward zero, compare integer parts,
-break an equal-part tie by the real's fraction). Test:
-`tests/integer_comparison_precision.rs` (VDBE on and off).
-
-And a **blob in an arithmetic or numeric-function context now coerces like
-SQLite**, which reads the blob's bytes *as a text string* and applies the
-text→number rule. `abs(x'3132')` is now `12.0` (the bytes `0x31 0x32` are the
-ASCII text `"12"`), not `0.0`; likewise `x'3132' + 0` → `12`, `-x'35'` → `-5`,
-`round(x'332E3134',1)` → `3.1`, and a blob inside `sum`/`total`/`avg` contributes
-its parsed value (`sum(x'3132', 3)` → `15.0`). The fix is a single point —
-`eval::to_number`'s `Blob` arm now parses `String::from_utf8_lossy(bytes)` through
-`parse_number` instead of returning `0` — so it covers the tree-walker and the
-VDBE (which share the helper) and every numeric caller (`+ - * / %`, `abs`,
-`round`, unary negate, truthiness in `WHERE`/`CASE`/`AND`/`OR`). Affinity
-application and the strict aggregate-type test (`to_number_strict`) deliberately
-still leave blobs unconverted, matching SQLite (a blob keeps BLOB affinity and is
-non-integer-typed for `sum`'s exact-int choice, so a blob makes the sum REAL).
-Test: `tests/blob_numeric_coercion.rs` (VDBE on and off).
-
-And an **aggregate inside a window function's `OVER` spec** (`PARTITION BY` /
-`ORDER BY`) now classifies the query as a single aggregate group, matching
-SQLite: `SELECT row_number() OVER (ORDER BY sum(a)) FROM t` computes `sum(a)`
-over the whole table first (one group), then runs the window over that single
-row — graphite used to take the plain-window path over the raw rows and emit one
-result row per input row. Routing is decided by `has_over_spec_aggregate` (a walk
-of each result column's window-function nodes, testing their `PARTITION BY` /
-`ORDER BY` exprs for an aggregate), which is OR-ed into the `windowed_agg`
-condition in `finish_from_rows`, so the over-spec case flows through
-`eval_windowed_aggregate` and composes with `GROUP BY`, `DISTINCT`, `ORDER BY`
-and `LIMIT`. Crucially the over-spec aggregate is **not** counted by
-`has_result_aggregate`, so it does not make a `HAVING` legal: `… OVER (ORDER BY
-sum(a)) … HAVING sum(a)>0` still reports `HAVING clause on a non-aggregate query`
-(even `HAVING 1`/`HAVING 0`) unless a *real* non-windowed result aggregate is
-present, exactly as SQLite. Byte-exact vs `sqlite3` 3.50.4.
-
-And an **unknown or wrong-arity scalar function in a DELETE/UPDATE `SET` value,
-`WHERE` predicate, or `RETURNING` clause** is now rejected during analysis
-(`no such function: NAME` / `wrong number of arguments to function NAME()`),
-where graphite's lazy evaluator used to accept it over an empty or
-fully-filtered table — no surviving row ever evaluated the call. The existing
-`reject_unresolved_functions` dry-resolver (NULL stand-in arguments, skipping
-window/aggregate/`MATCH`/FTS names) now runs in `validate_dml_refs` over the
-SET/WHERE expressions and the `RETURNING` list. Column existence is still
-resolved first (`RETURNING nope(zzz)` → `no such column: zzz`). The two clauses
-order the function check differently, matching SQLite's two resolution regimes:
-in `RETURNING` (where, as in a SELECT result, an aggregate passes name
-resolution and is only flagged a misuse afterwards) the unknown-name check runs
-*ahead of* the aggregate/window misuse checks, so `RETURNING nope(count(*))` is
-`no such function: nope` while `RETURNING abs(count(*))` — outer name known — is
-`misuse of aggregate function count()`; in `SET`/`WHERE` (aggregates forbidden
-at resolve time) the misuse check stays first, so `nope(sum(a))` keeps `misuse
-of aggregate function sum()`. The one residual corner is a SET/WHERE expression
-that nests an unknown function *inside* an aggregate (`SET a=sum(nope(a))`):
-SQLite's true innermost-first post-order reports `no such function: nope`,
-whereas graphite reports the outer `misuse of aggregate function sum()` — a
-pre-existing divergence left untouched (no global pass order satisfies both that
-and `nope(sum(a))`). Byte-exact vs `sqlite3` 3.50.4 otherwise.
-
-And an **`IN (SELECT …)` whose subquery width disagrees with the left-hand side**
-is now rejected during analysis (`sub-select returns N columns - expected M`) on
-both the SELECT and the UPDATE/DELETE paths, where graphite's per-row evaluator
-used to accept the mismatch over an empty or fully-filtered table (the `IN` is
-never reached, so the lazy width check never fires). The structural subquery
-width comes from `row_column_affinities` (no rows needed; `*` expands to the
-FROM width, a literal row counts its elements); the LHS arity is its row-value
-width (`(a,b)` → 2, a bare scalar → 1). It runs right after `validate_columns_exist`
-at the outermost query and after column resolution in `validate_dml_refs`, so a
-missing column still wins. Crucially the arity error fires **only when the
-subquery and the LHS are column-clean** — every referenced column resolves
-against the subquery's own FROM plus the outer (correlation) scope, with no
-compound arm or further-nested subquery the single-arm walk cannot inspect:
-SQLite reports a `no such column` *before* the arity mismatch, and graphite
-resolves a subquery body's columns lazily, so a dirty subquery (`a IN (SELECT
-zzz, zzz)`, `zzz IN (SELECT a, a)`) is left to its existing behaviour rather than
-risk reporting an arity error where a `no such column` is due. A correlated
-subquery (`a IN (SELECT a, b FROM t WHERE b=t.a)`), a constant-row subquery, and
-a `HAVING`/`SET` position are all covered. Residuals: a subquery with an
-unresolved column (still silently accepted over an empty table, as before), a
-compound (`UNION`) subquery, and a doubly-nested subquery body are conservatively
-skipped. Byte-exact vs `sqlite3` 3.50.4 for the column-clean cases.
-
-The companion case — a **multi-column subquery used where a single value is
-expected** — is now rejected the same way (`sub-select returns N columns -
-expected 1`), again on both the SELECT and the UPDATE/DELETE paths and again over
-an empty or fully-filtered table the lazy evaluator never reaches. The walker is
-context-aware: it descends into operands of every scalar expression (arithmetic,
-concat, `||`, unary `-`/`NOT`, `CAST`, `LIKE`/`GLOB`, `AND`/`OR`, `IS NULL`,
-function arguments, `ORDER BY`/`GROUP BY`/`HAVING`/`WHERE`, an `IN` list element)
-and flags a bare `(SELECT a, b)` there, but it deliberately stops at a subquery
-that is a **direct operand of a comparison operator** (`=`, `<>`, `<`, `<=`, `>`,
-`>=`, `IS`, `IS NOT`) or of `BETWEEN`: SQLite reports `row value misused` in those
-positions, a separate diagnostic left to its existing behaviour. The same
-column-clean gate applies — the arity error fires only when the subquery body
-resolves against its own FROM plus the outer scope — so a dirty subquery yields a
-`no such column` rather than a wrong arity report. A correlated subquery and the
-`SET`/`WHERE` DML positions are covered. Byte-exact vs `sqlite3` 3.50.4 for the
-column-clean scalar contexts.
-
-The third member of that family — **`row value misused`** — is now also raised at
-prepare time. A row value `(a, b, …)` is legal only as an operand of a row
-comparison, `BETWEEN`, or `IN`; used anywhere a single value is expected (a bare
-result column, an arithmetic or function operand, a `WHERE`/`ORDER BY`) SQLite
-rejects it, and a comparison or `BETWEEN` whose operands disagree in row width
-(`a = (1,2)`, `(a,b) = (1,2,3)`, `a = (SELECT 1,2)`) is the same error. graphite
-evaluated this per row — the row-value arm of the scalar evaluator and the
-`operand_arity` checks on `=`/`IS`/`BETWEEN` — so over an empty or fully-filtered
-table it was silently accepted. A prepare-time walker now mirrors that exactly: a
-bare row value in a scalar position is rejected, and at each comparison/`BETWEEN`
-the structural operand widths (a row value's length, a column-clean subquery's
-output width, else 1) must match. Equal-arity row comparisons (`(a,b) = (1,2)`,
-`(a,b) BETWEEN (1,2) AND (3,4)`, `(a,b) IN ((1,2),(3,4))`) stay valid, and a
-nested misuse inside a valid row element (`(a, (1,2)) = (1,2)`) is still caught.
-It runs on the SELECT and the UPDATE/DELETE paths after column resolution, so a
-`no such column` still wins; a comparison against a subquery with an unresolved
-column is conservatively skipped (left to its lazy behaviour). The closely
-related **`IN(…) element has N terms - expected M`** is handled in the same pass:
-every element of an `IN` list must share the left-hand side's row width, so
-`(a,b) IN ((1,2),(3))`, `(a,b) IN (1,2)`, and `(a,b) IN ((1,2,3))` are rejected at
-prepare time (a row element under a *scalar* LHS, `a IN ((1,2))`, is the plain
-`row value misused`). This also fixes a latent wrong-answer: over a non-empty
-table graphite used to accept `(a,b) IN ((1,2),(3))` and return the row matched by
-the well-formed element, silently ignoring the malformed one. The one remaining
-residual is a dirty operand where SQLite reports `row value misused` *before* the
-missing column. Byte-exact vs `sqlite3` 3.50.4 for the column-clean cases.
-
-A **compound (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) with arms of unequal
-column count** now picks its message exactly as SQLite does. SQLite chooses by the
-shape of the *right* operand of the mismatching step: when that arm is a `VALUES`
-clause it reports `all VALUES must have the same number of terms` — regardless of
-the operator and even when the left arm is an ordinary `SELECT` (`SELECT 1,2 UNION
-VALUES (1)`) — and otherwise it names the operator (`SELECTs to the left and right
-of UNION do not have the same number of result columns`). graphite previously
-emitted the operator-named message for every `VALUES`-on-the-right mismatch except
-the all-`UNION ALL` case; it now matches in every operator/arm combination, while
-a right-hand `SELECT` and a single multi-row `VALUES` with an internal mismatch
-(`VALUES (1,2),(3)`) keep their existing (already-correct) messages. Byte-exact vs
-`sqlite3` 3.50.4.
-
-A **`FROM name(args)` whose name is not a built-in table-valued function** now
-reports what SQLite reports. SQLite resolves the bare name as a table/view first:
-if such an object exists, calling it with an argument list is `'<name>' is not a
-function` (the schema qualifier, if any, is dropped — `main.t()` over an existing
-`t` → `'t' is not a function`); otherwise it is a plain missing table with the
-qualifier echoed as written (`bad.t()` → `no such table: bad.t`, never `unknown
-database bad`; `nope()` → `no such table: nope`). graphite previously answered
-`no such table-valued function: <name>` for every such call. The genuine built-in
-TVFs (`generate_series`, `json_each`/`json_tree`, the `pragma_*` forms) are
-unaffected. Byte-exact vs `sqlite3` 3.50.4.
-
-An **unrecognized `pragma_<name>` table-valued source** now reports `no such
-table: pragma_<name>`, matching SQLite. SQLite exposes only its *result-returning*
-pragmas as eponymous `pragma_<name>` virtual tables; a typo (`pragma_made_up`) or a
-statement-only pragma whose TVF form SQLite rejects (`pragma_wal_checkpoint`,
-`pragma_mmap_size`, `pragma_incremental_vacuum`, `pragma_legacy_file_format`,
-`pragma_wal_autocheckpoint`, `pragma_case_sensitive_like`) is `no such table`.
-graphite previously routed *every* `pragma_`-prefixed FROM name through
-`run_pragma`, whose unknown-name arm returns an empty result — so a bad pragma TVF
-silently produced zero rows instead of erroring. The fix gates the TVF path on a
-`pragma_has_tvf` allow-list (the pragmas graphite implements *and* SQLite exposes;
-kept in lockstep with `run_pragma`'s arms); the statement form `PRAGMA made_up` is
-still the no-op SQLite specifies. Test: `tests/pragma_tvf_unknown.rs`. Byte-exact
-vs `sqlite3` 3.50.4.
-
-A **window function nested inside another window function's definition** is now
-rejected at prepare time, matching SQLite. A window call may not appear in another
-window's arguments, its `FILTER` predicate, or its `OVER` spec's `PARTITION BY` /
-`ORDER BY` — including a named `WINDOW w AS (…)` reached via `OVER w`. SQLite
-reports `misuse of window function <inner>()` even over an empty table; graphite
-evaluated the spec lazily and silently accepted it. The fix walks each window
-definition (and every `WINDOW` clause entry) for a nested `OVER`. A window
-function in a *frame-bound offset* is deliberately left alone — that is SQLite's
-separate lazy "frame starting offset must be a non-negative integer" path, which
-errors only once a row is produced. Byte-exact vs `sqlite3` 3.50.4.
-
-An **ambiguous column surfaced by `*` expansion of an unaliased self-join** is now
-named the way SQLite names it — by the source's *origin*. `SELECT * FROM t, t`
-reports `ambiguous column name: main.t.a` (a temp table that shadows it →
-`temp.t.a`, an attached `aux.t.a`), and a derived table or CTE, which has no
-database, is qualified with `*` (`SELECT * FROM x, x` over a CTE `x` →
-`ambiguous column name: *.x.a`). graphite previously emitted the bare
-`<source>.<col>`. Explicit references (`SELECT a` / `SELECT x.a`) keep their
-unprefixed spelling, unchanged. Byte-exact vs `sqlite3` 3.50.4.
-
-**`RENAME COLUMN` now rewrites a dependent view's references that live inside
-expression subqueries.** SQLite rewrites every reference to a renamed column
-wherever a view names it — including within a scalar `(SELECT …)`, `EXISTS`, or
-`x IN (SELECT …)`. graphite used to abandon the *entire* view rewrite the moment
-the body held any subquery, leaving stale references so the view became
-unqueryable (`no such column: a`). A single-source view whose subqueries
-reference only the renamed table is now rewritten in full — bare and
-`<alias>.`-qualified references, at every nesting level (the validator walks the
-top `SELECT` and every nested expression subquery, accumulating each alias bound
-to the table). It still conservatively leaves the view untouched (a known gap,
-never a wrong rewrite) when a token rewrite can't be proven safe: a subquery
-touching another table, a derived table in a `FROM`, or a result-column alias
-colliding with the renamed name. Byte-exact vs `sqlite3` 3.50.4
-(`tests/view_rename_column_subquery.rs`).
-
-**`RENAME COLUMN` now rewrites a dependent trigger's references that live inside
-`WHEN`/body expression subqueries.** The exact trigger analog of the view fix
-above: a trigger attached to the renamed table, whose `WHEN` guard and body
-statements (`UPDATE`/`DELETE`/`INSERT … SELECT` over the same table) nest a
-scalar `(SELECT …)`, `EXISTS`, or `x IN (SELECT …)` referencing only that table,
-used to bail the moment any subquery appeared — leaving stale references so the
-trigger broke (`no such column: a`) the next time it fired. It is now rewritten
-in full: bare, `NEW.`/`OLD.`, and `<alias>.`-qualified references at every
-nesting level (reusing the view validator to accumulate each nested-subquery
-`FROM` alias). It still conservatively leaves the trigger untouched (a known gap,
-never a wrong rewrite) when a token rewrite can't be proven safe: a body
-statement writing another table, a subquery touching another table, or a derived
-table in a `FROM`. Byte-exact vs `sqlite3` 3.50.4
-(`tests/trigger_rename_column_subquery.rs`).
-
-**`RENAME TO` now rewrites an `INSERT INTO <old>(col-list)` target inside a
-dependent trigger body.** The token rewriter that repoints a renamed table's name
-throughout a trigger/view's stored text skipped any `<old>(` token as a presumed
-function call (so a table named `count` would not clobber the `count()` function).
-But `INSERT INTO t(a) …` also reads as `t(`, so the INSERT *target's* column-list
-form was wrongly skipped — leaving the trigger's `ON` clause and a body `FROM t`
-renamed while `INSERT INTO t(a)` kept the dead old name, diverging the stored
-`sqlite_schema.sql` and breaking the trigger the next time it fired. A token that
-immediately follows `INTO` is a table reference with a column list, never a
-function, so the `before_lparen` guard now yields to an `after_into` check. The
-function-name protection (`count(*)`), the no-column-list form (`INSERT INTO t
-VALUES …`), and a table-valued-function call in `FROM` are all still left intact.
-Byte-exact vs `sqlite3` 3.50.4 (`tests/rename_trigger_insert_target.rs`).
-
-**`RENAME TO` now rewrites the renamed table inside a dependent trigger's `WHEN`
-guard and any body-statement subquery.** The "is this trigger affected?" detector
-(`trigger_uses_table`) that gates the whole-text token rewrite only inspected the
-`ON` table and each body statement's *direct* target/`FROM`, so a trigger whose
-only reach into the renamed table was a `WHEN EXISTS(SELECT … FROM <old>)` guard,
-or a body `… WHERE c IN (SELECT … FROM <old>)` / `SET c = (SELECT … FROM <old>)` /
-`VALUES((SELECT … FROM <old>))` subquery, was skipped — leaving stale `FROM <old>`
-text that no longer matched SQLite. (A trigger whose body *also* targeted the
-renamed table directly already worked, since detection fired on the body and the
-token pass then rewrote the `WHEN`/subquery too — the bug was purely in detection.)
-The detector now probes the `WHEN` clause (`expr_reads_table`) and walks every
-nested subquery of each body statement (`stmt_reads_table`: target + CTEs + source
-+ `where`/`set`/`values`/`row-value`/`order-by`/`returning`/upsert). The body-source
-walk (`from_refs_table`) also descends into a `FROM` source's *derived table*, its
-table-valued-function arguments, and a join `ON` predicate, so an `UPDATE … FROM
-(SELECT … FROM <old>) s` / `… FROM w JOIN (SELECT … FROM <old>) s ON …` body — where
-the renamed table is reached only through a derived source — is detected too.
-Unrelated triggers stay byte-for-byte untouched. Byte-exact vs `sqlite3` 3.50.4
-(`tests/rename_trigger_when_subquery.rs`).
-
-**`RENAME COLUMN` now propagates into the table's own `<table>.col`-qualified
-self-references.** The token pass that rewrites a renamed column in the table's
-stored CREATE text (and an index over it) skipped every `x.col` after-`.` token to
-avoid clobbering an unrelated `other.col` — but in a single-table definition the
-only possible qualifier *is* the table itself, so a `CHECK(t.a > 0)`, a column-level
-`CHECK(t.a > 0)`, or a partial index's `WHERE t.a > 0` kept the dead old name. The
-table's own definition (and an index whose `ON` table matches) is now rewritten with
-the table name accepted as a qualifier (bare + `<table>.col`), and each occurrence's
-original double-quoting is preserved the way SQLite does — a `"t"."a"` stays
-`"t"."aa"`, a bare entry becomes quoted only when the new name is itself typed
-double-quoted. Byte-exact vs `sqlite3` 3.50.4
-(`tests/rename_column_self_qualified.rs`).
-
-**`RENAME COLUMN` no longer renames a foreign key's *parent* column name.** The
-same table-own bare-token rewrite renamed *every* matching identifier, so a child
-table with `b REFERENCES other(a)` wrongly became `REFERENCES other(aa)` when its
-own column `a` was renamed — `REFERENCES other(a)` names the *parent's* column, not
-this table's, and SQLite leaves it untouched. The rewrite now marks the tokens
-inside each `REFERENCES <name>( … )` group whose `<name>` is not the renamed table
-and skips a bare rename there, while a *self*-referencing FK (`REFERENCES
-<thistable>(a)`, parent == the renamed table) and the FK's own *child* column list
-(`FOREIGN KEY(a)`) still rename. Composite FKs, a quoted parent, and a
-no-column-list `REFERENCES other` are all handled. Byte-exact vs `sqlite3` 3.50.4
-(`tests/rename_column_fk_parent_collist.rs`).
-
-**`json_quote(X)` now renders a JSONB blob as its JSON text.** SQLite accepts a
-BLOB argument to `json_quote` when it decodes as JSONB and emits the
-corresponding JSON (so `jsonb_*` results compose: `json_quote(jsonb('[1,2]'))` →
-`[1,2]`, and the 1-byte JSONB scalars `x'00'`/`x'01'` → `null`/`true`), raising
-`JSON cannot hold BLOB values` only for a blob that is *not* valid JSONB.
-graphite rejected every blob unconditionally. It now routes the blob through its
-existing JSONB decoder (the one behind `jsonb()`/`jsonb_extract`): valid JSONB
-renders, invalid still errors. Byte-exact vs `sqlite3` 3.50.4
-(`tests/json_quote_jsonb.rs`).
-
-**`CREATE UNIQUE INDEX` over a table that already holds duplicate keys now
-fails** with `UNIQUE constraint failed: …`, as SQLite does. graphite built the
-index silently — the trailing rowid in each encoded index key made every entry
-distinct, so the btree insert never saw the clash — leaving a "unique" index
-that did not enforce uniqueness yet still passed `PRAGMA integrity_check`: a
-silent-corruption bug. `exec_create_index` now pre-checks the indexed key tuples
-before writing the btree (NULLs distinct, collation-aware, the partial-index
-`WHERE` predicate applied), on both the rowid and `WITHOUT ROWID` paths, and
-raises `t.col[, …]` for a column index or `index '<name>'` for an expression
-index. Byte-exact vs `sqlite3` 3.50.4 (`tests/create_unique_index_duplicate.rs`).
-
-**A runtime UNIQUE violation on a *standalone* secondary index of a `WITHOUT
-ROWID` table now names the column(s)** — `UNIQUE constraint failed: t.b` — as
-SQLite does. graphite degraded just this corner to the bare `UNIQUE constraint
-failed`: the message builder consulted only the table's inline `UNIQUE`/`PRIMARY
-KEY` sets, not the separately-created unique indexes that the collision detector
-actually enforces (the inline-UNIQUE column, the primary key, and a rowid-table
-secondary index were already correct). The INSERT and UPDATE WITHOUT ROWID paths
-now build the message through a new `wr_conflict_message`, which falls through to
-the standalone unique indexes (collation- and partial-predicate aware) and
-renders `t.col[, …]`. Byte-exact vs `sqlite3` 3.50.4
-(`tests/without_rowid_secondary_unique_message.rs`).
-
-**`printf`/`format` scientific conversions (`%e`/`%E`) now round the mantissa
-half away from zero**, like SQLite (and like graphite's own `%f` path), not half
-to even the way Rust's built-in float formatter does. The two differ only on an
-exact tie at the rounding position: `printf('%.3e', 1234.5)` is `1.235e+03` (the
-trailing `5` carries the `4` up), not `1.234e+03`; `printf('%.0e', 2.5)` is
-`3e+00`, not `2e+00`. graphite delegated the `%e` rounding to Rust's `{:.*e}`,
-which rounds half-to-even, while its `%f` path already rounded half-away — so the
-two conversions disagreed on ties. The fix reads the exact decimal digits of the
-f64 (`{:.*e}` at `prec + 30` guard digits) and does the half-away rounding with
-carry in string space, so a value that only *looks* like a tie still follows its
-true f64 (`%.2e` of 1.005 stays `1.00e+00`, because 1.005's f64 is just below the
-tie). Byte-exact vs `sqlite3` 3.50.4 across values × precisions 0..=6 for both
-`%e` and `%E` (`tests/printf_exp_rounding.rs`).
-
-**Known remaining gap — `printf`'s `!` (alt-form-2) flag at high precision.**
-Without `!` graphite is byte-exact (SQLite caps a `%f`/`%e`/`%g` double at 16
-significant digits; `%.20f` of `0.1` is `0.10000000000000000000` in both). The
-`!` flag lifts that cap to 20 significant digits via SQLite's bespoke float
-decoder, where graphite instead emits the *exact* f64 decimal expansion — so
-`printf('%!.20f', 0.1)` is graphite's `0.10000000000000000555` vs SQLite's
-`0.1000000000000000055` (and likewise `%!.25f`/`%!.30f`/`%!.20e`/`%!.20g`).
-Matching it byte-for-byte requires porting SQLite's `sqlite3FpDecode` and its
-double-double binary→decimal machinery (`sqlite3Fp2Convert10`, `powerOfTen` with
-the `aBase`/`aScale`/`aScaleLo` tables, `sqlite3Multiply128`/`160`) — a ~300-line
-table-heavy port for an obscure printf extension flag, deferred as low-ROI. The
-non-`!` path is unaffected.
-
-**A plain window-function `SELECT` with no outer `ORDER BY` now emits its rows
-in the first window's `(PARTITION BY …, ORDER BY …)` order, like SQLite.** SQLite
-evaluates a window by sorting the rows into partition+order order and never
-shuffles them back, so the result set comes out sorted even though the query
-named no `ORDER BY`; graphite left the rows in table-scan order. Now, absent an
-explicit `ORDER BY`, the plain-window path injects a synthetic ordering — the
-first window's `PARTITION BY` keys (ascending) followed by its `ORDER BY` terms —
-through the existing collation/NULLS-aware sort, so `SELECT x, row_number() OVER
-(ORDER BY x) FROM t` over rows inserted `5,3,8` returns them `3,5,8`. The *first*
-window in the select list wins; `OVER ()` induces no ordering (scan order
-preserved). Byte-exact vs `sqlite3` 3.50.4 (`tests/window_output_order.rs`).
-
-**Window `PARTITION BY` / `ORDER BY` now honor the key's collation.** A window
-key with an explicit `COLLATE` operator, or a column with a declared collation,
-must partition rows, order them, and group order-by *peers* (for `rank`,
-`dense_rank`, `percent_rank`, `cume_dist`, and `RANGE`/`GROUPS` frames) under
-that collation — `PARTITION BY g COLLATE NOCASE` puts `'a'` and `'A'` in one
-partition, and `rank() OVER (ORDER BY g COLLATE NOCASE)` makes them peers.
-graphite compared every window key under `BINARY` (the `cmp_keys` helper
-hardcoded it), splitting case-insensitive partitions and over-ranking peers —
-silently wrong values. The window machinery now derives each key's collation
-(`eval::key_collation`) and threads it through a collation-aware `cmp_keys_coll`
-in partitioning, ordering, and all five peer-equality checks. Byte-exact vs
-`sqlite3` 3.50.4 (`tests/window_collation.rs`).
-
-**A `GROUP BY` query with a window function now orders its grouped rows like
-SQLite too.** The window-induced output ordering above was previously only
-applied on the plain-window path; the `GROUP BY` + window path
-(`eval_windowed_aggregate`) left the grouped rows in group-key order, so
-`SELECT g, sum(x), row_number() OVER (ORDER BY sum(x) DESC) FROM t GROUP BY g`
-came out ascending-by-`sum` instead of descending. The window here runs over the
-*grouped* rows, so its `ORDER BY` may reference a group aggregate (`sum(x)`,
-`avg(x)`); `extract_aggregates` already rewrites those aggregates to `__aggN`
-synthetic columns, so the same first-window ordering — `PARTITION BY` keys then
-`ORDER BY` terms, collation/NULLS-aware — resolves against the grouped row and is
-sorted in place. `OVER ()` still induces no ordering (group-key order preserved),
-and an explicit outer `ORDER BY` still wins. Byte-exact vs `sqlite3` 3.50.4
-(`tests/window_grouped_order.rs`).
-
-**CTEs in one `WITH` clause now see each other — forward references work, and
-true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
-(it expands them on demand from the outer query), so a CTE may reference one
-declared *after* it (`WITH a AS (SELECT * FROM b), b AS (SELECT 9) …`), and a
-genuine cycle is `circular reference: <name>`, naming the CTE the outer query
-enters through (`… FROM a` over an `a`<->`b` cycle reports `a`; `… FROM b`
-reports `b`). graphite exposed only the CTEs declared *before* each one, so a
-forward reference fell through to the schema as `no such table: <name>`.
-`push_ctes` now takes the consuming statement's source names (the entry order),
-builds the sibling dependency graph, detects cycles in entry order, and
-materializes dependencies before dependents — declaration order is preserved for
-independent CTEs, so every backward-only (pre-existing) query is unaffected. A
-direct self-reference is still recursion, not a cycle. Byte-exact vs `sqlite3`
-3.50.4 (`tests/cte_forward_reference.rs`).
-
-**A duplicate PRIMARY KEY now outranks a generated-column PK error when the
-first PK is non-generated.** SQLite processes `PRIMARY KEY` declarations
-sequentially (`sqlite3AddPrimaryKey`), so the *first* declared PK decides which
-error a `CREATE TABLE` reports: a generated first PK yields `generated columns
-cannot be part of the PRIMARY KEY`, but a non-generated first PK followed by any
-second PK yields `table "X" has more than one primary key`. graphite fired the
-generated-column error eagerly from its per-column loop, so
-`CREATE TABLE t(a PRIMARY KEY, b AS (a) PRIMARY KEY)` reported the generated
-error where SQLite says "more than one primary key". The generated-PK check is
-now gated on whether the first PK declaration (column-level PKs precede
-table-level ones in source order) is itself generated. Byte-exact vs `sqlite3`
-3.50.4 (`tests/pk_generated_precedence.rs`).
-
-**`REINDEX schema.name` validates its database qualifier** ahead of the object
-lookup. SQLite rejects an unknown database with `unknown database <name>` (as it
-does for `VACUUM`/`ATTACH`); graphite parsed the qualifier but threw it away,
-reporting the generic `unable to identify the object to be reindexed` for a bad
-database. The `Reindex` AST now carries `schema`/`name`, the executor resolves
-the qualifier first, and two parity points fall out: a *known* database with an
-unidentifiable object still says `unable to identify …` (`REINDEX main.nope`),
-and a collation may be reindexed only *unqualified* — `REINDEX nocase` is a
-no-op but `REINDEX main.nocase` is `unable to identify …` (a collation is not a
-per-database object). Byte-exact vs `sqlite3` 3.50.4.
-
-**Structural DDL on an internal `sqlite_` table is now rejected** rather than
-silently performed. SQLite forbids `ALTER`, `DROP TABLE`, and `CREATE INDEX` on
-any table whose name begins with `sqlite_` — the schema catalog
-(`sqlite_master` / `sqlite_schema`) and the bookkeeping tables (`sqlite_sequence`,
-…) — with `table <name> may not be {altered,dropped,indexed}`. graphite reported
-`no such table` for the catalog (which it doesn't expose as a droppable table)
-and — the real hazard — *actually renamed/dropped/indexed* `sqlite_sequence`.
-A new `reject_internal_table_ddl` guards all three DDL entry points: it
-normalises the catalog aliases to `sqlite_master` (and the temp catalog to
-`sqlite_temp_master`) and otherwise uses the table's stored name, fires only once
-the target exists (a missing `sqlite_stat1` is still `no such table`, and
-`IF EXISTS` still suppresses a genuinely-absent one), and outranks `IF EXISTS`
-for a catalog/internal table that does exist. Direct DML (`INSERT`/`DELETE`) on
-`sqlite_sequence` stays allowed, matching SQLite. Byte-exact vs `sqlite3` 3.50.4.
-
-A **self-referential CTE with no leading anchor** now reports SQLite's
-`circular reference: <name>` rather than graphite's internal "recursive CTE must
-have a non-recursive anchor and a recursive term". When the recursive table
-appears already in the *first* arm — a plain self-`FROM` (`WITH c AS (SELECT *
-FROM c) …`, with or without `RECURSIVE`), a self-join, a recursive arm placed
-before the anchor in a compound, or every arm recursive — there is nothing to
-seed the recursion, and SQLite rejects it by name. graphite now splits that case
-out from the genuinely-unsupported "no recursive term anywhere" case and emits
-the matching message. Valid recursive CTEs (anchor first) are unaffected.
-Byte-exact vs `sqlite3` 3.50.4. (The harder *mutual*-recursion forward-reference
-case — `WITH a AS (SELECT * FROM b), b AS (SELECT * FROM a) …`, where SQLite says
-`circular reference: a` and graphite still says `no such table: b` — is a CTE
-scoping issue tracked separately.)
-
-The **`PRAGMA journal_mode = <mode>` setter now reports its result row**, as
-SQLite does — it echoes the resulting journal mode (`wal` after a successful
-switch, `memory` for an in-memory database that cannot change it, or the
-unchanged current mode when the requested one is invalid). The shell had routed
-every `PRAGMA … = …` setter through the row-discarding write path, so the setter
-form printed nothing; it now reads the mode back through the getter (preserving
-any `schema.` qualifier) and prints it. Genuinely silent setters
-(`foreign_keys = ON`, `user_version = 5`) stay silent. Byte-exact vs `sqlite3`
-3.50.4, on both in-memory and file databases.
-
-A known remaining gap, newly tracked: **eponymous table-valued functions used as
-a bare table name** (`FROM generate_series`, `FROM json_each`, `FROM
-pragma_table_info`, without a parenthesised argument list). SQLite exposes these
-as eponymous virtual tables whose hidden arguments can be supplied through the
-`WHERE` clause (`FROM generate_series WHERE start = 1 AND stop = 3` returns rows),
-and an unconstrained reference either yields no rows (`json_each`, the pragma
-functions) or the function-specific "first argument … missing or unusable" error
-(`generate_series`). graphite only recognises these when called with parentheses,
-so a bare reference is `no such table: <name>`. Closing this means treating the
-eponymous TVFs as real `FROM` sources with `WHERE`-driven hidden-column binding —
-a feature, not a message tweak, so it is deferred rather than half-aligned.
-
-And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
-builds a schema, so a statement with several faults reports the same one SQLite
-does. The per-column "add column" checks run first, left to right — a duplicate
-name, then the structural generated-column rules (a second `AS`, a `DEFAULT`, or
-membership in the PRIMARY KEY), then the `COLLATE` sequence — *ahead of* the
-end-of-table checks, including STRICT's missing/unknown-datatype check. The first
-end-of-table check is "must have at least one non-generated column", which
-therefore outranks an unknown table option, a prohibited subquery/aggregate, and
-any `no such column` resolution of a CHECK / generated expression. graphite used
-to resolve a generated column's expression before noticing the table was
-all-generated (so `CREATE TABLE t(a AS (b))` wrongly said `no such column: b`
-instead of `must have at least one non-generated column`) and ran the
-duplicate-name / `COLLATE` checks after the STRICT datatype check; both are fixed,
-byte-exact vs `sqlite3` 3.50.4 across ~35 multi-fault permutations. The same
-"must have at least one non-generated column" rule is now also re-applied after
-an **`ALTER TABLE … DROP COLUMN`**: dropping the last ordinary column (leaving
-only generated columns) is rejected with `error in table T after drop column:
-must have at least one non-generated column`, ahead of the generated-expression
-re-resolution — so `DROP COLUMN a` from `t(a, b AS (a+1))` reports that rule
-rather than `no such column: a`, and `t(a, b AS (1))` (whose generated expression
-no longer mentions the dropped column) is now rejected instead of silently
-building an all-generated table.
-
-A **generated column may reference another column declared later in the table**,
-including another generated column. SQLite resolves these forward references
-topologically (`b AS (c+1), c AS (a+1)` yields the same values whichever order
-the two generated columns appear in); graphite used to evaluate generated columns
-strictly in declaration order, so a forward-referenced generated column was still
-`NULL` when its dependant was computed. Both the read path (VIRTUAL columns) and
-the write path (STORED columns, which must be byte-exact on disk for
-`integrity_check`) now evaluate generated columns in dependency order via a
-post-order DFS. A **cycle among the generated columns** is rejected at CREATE —
-before any row is inserted, exactly as SQLite does — with `generated column loop
-on "X"`, where `X` is the column whose expression *closes* the cycle (the
-generated columns being visited in declaration order); graphite used to accept
-the cyclic table and silently emit `NULL`s. Byte-exact vs `sqlite3` 3.50.4 across
-self-loops, 2- and 3-cycles in both declaration orders, and cycle references
-buried inside larger expressions.
-
-A **trigger body that targets a missing table** is now reported with the same
-schema qualifier SQLite uses. SQLite compiles a trigger program in the trigger's
-own database, so an unqualified DML target (`INSERT`/`UPDATE`/`DELETE`) that
-resolves to nothing is named schema-qualified — a `main` trigger says `no such
-table: main.nope` — whereas a *temp* trigger, whose names resolve across all
-schemas, keeps the bare `no such table: nope`. graphite previously reported the
-bare name in both cases; the fix tags each fired trigger with its origin catalog
-(swap-aware, so a temp trigger on a main table is still labelled `temp`) and
-qualifies the error only for non-temp triggers. Byte-exact vs `sqlite3` 3.50.4.
-
-A **schema-qualified DML target inside a trigger body** is now rejected at
-`CREATE TRIGGER` time. SQLite compiles a trigger program in the trigger's own
-database, so a `schema.table` qualifier on an `INSERT`/`UPDATE`/`DELETE` *target*
-within the body is forbidden and errors with `qualified table names are not
-allowed on INSERT, UPDATE, and DELETE statements within triggers` — for `main`
-and `temp` triggers and AFTER and INSTEAD OF alike, whether or not the qualified
-schema/table exists. A qualifier on a table in a body *subquery* (`SELECT … FROM
-main.u`) stays legal — only the DML target is checked. graphite used to accept
-the qualified target silently. The check sits after the trigger's own
-missing-target / timing-mismatch / duplicate-name errors so those still win.
-Byte-exact vs `sqlite3` 3.50.4.
-
-A **`CREATE TRIGGER` whose target is a system table** is now rejected with
-SQLite's `cannot create trigger on system table`. The schema tables
-(`sqlite_master` / `sqlite_schema` / `sqlite_temp_master`) always count as system
-tables; any other `sqlite_`-prefixed table counts only once it physically exists
-(so `sqlite_sequence` is rejectable only after an `AUTOINCREMENT` table brings it
-into being, and an absent `sqlite_foo` still falls through to `no such table`).
-The check outranks the missing-table, timing-mismatch and body-qualifier errors
-but is itself outranked by the duplicate-name error. graphite used to report `no
-such table` for the schema tables and even *succeeded* on an existing
-`sqlite_sequence`. Byte-exact vs `sqlite3` 3.50.4.
-
-An **aggregate or window function in a `CREATE INDEX`** key expression or
-partial-index `WHERE` clause is now rejected at prepare time with SQLite's
-`misuse of aggregate function NAME()` / `misuse of window function NAME()`.
-graphite used to build the index silently. The whole `CREATE INDEX` validation
-was reordered to SQLite's precedence: every key expression is resolved fully,
-left to right, *before* the `WHERE` predicate, so a key fault outranks a `WHERE`
-fault. Within a key the order is unknown column → unknown function →
-non-determinism → aggregate → window → dotted reference → unknown collation;
-the `WHERE` clause is then checked as subquery → unknown column → unknown
-function → non-determinism → aggregate → window. This also fixes a pre-existing
-ordering bug where an unknown *key* column was reported only after a `WHERE`
-subquery / non-deterministic function. Byte-exact vs `sqlite3` 3.50.4 across
-~25 permutations.
-
-An **`ORDER BY` on an UPDATE/DELETE with no `LIMIT`** is now rejected at prepare
-time. SQLite only allows the ordering as a companion to the update/delete-`LIMIT`
-extension — the order decides *which* rows the cap keeps — so a bare `ORDER BY`
-is meaningless and errors with `ORDER BY without LIMIT on UPDATE` / `... on
-DELETE`. graphite used to accept it silently and update/delete nothing. The guard
-sits after the target's existence / view / vtab checks but ahead of column
-resolution, matching SQLite's diagnostic precedence: a missing table and a
-modify-a-view error still win, but a bogus `ORDER BY` or `SET` column reports the
-limit error first. Byte-exact vs `sqlite3` 3.50.4 across ~17 permutations.
-
-The companion family — **the whole trigger-step grammar inside a `BEGIN … END`
-body** — is now policed to match SQLite. SQLite admits only
-`SELECT`/`VALUES`/`INSERT`/`REPLACE`/`UPDATE`/`DELETE`/`WITH`-then-`SELECT|VALUES`
-steps and rejects everything else at prepare time; graphite used to parse a wider
-grammar and silently accept or no-op several constructs. Now matched byte-for-byte:
-a **disallowed leading keyword** (`PRAGMA`, `VACUUM`, `CREATE`, `DROP`, `ALTER`,
-`EXPLAIN`, `SAVEPOINT`, `BEGIN`, `COMMIT`, `ATTACH`, …) → `near "KW": syntax
-error`; a **`WITH`-prefixed body DML** (`WITH … INSERT|UPDATE|DELETE|REPLACE`) →
-`near "<dmlkw>": syntax error` (the DML keyword, not `WITH`); a **schema-qualified
-DML target** (`UPDATE main.t …`) → `qualified table names are not allowed on
-INSERT, UPDATE, and DELETE statements within triggers`; **`UPDATE`/`DELETE …
-RETURNING`** → `near "RETURNING": syntax error`; **`INSERT`/`REPLACE … RETURNING`**
-→ `cannot use RETURNING in a trigger`; and the prior **`UPDATE/DELETE … ORDER
-BY`/`LIMIT`** → `near "ORDER"`/`near "LIMIT": syntax error` (the row-limit
-extension SQLite omits from the trigger grammar entirely).
-
-The mechanism is *record-not-throw*: the parser carries an `in_trigger_body` flag
-(set only while consuming a `CREATE TRIGGER … BEGIN … END` body, saved/restored so
-a nested CREATE-TRIGGER-in-body is safe) and the body-step parsers record the
-would-be `near "…"` / semantic message — **first in source order wins** — onto a
-`body_error: Option<String>` field of the `CreateTrigger` node rather than throwing
-on the spot. The executor surfaces it only **after** resolving the trigger target:
-because SQLite parses the body steps only once the target resolves, a
-duplicate-name (`trigger tr already exists`), missing-table (`no such table:
-main.nope`), system-table (`cannot create trigger on system table`), or
-timing-mismatch (`cannot create BEFORE trigger on view: v`) error outranks every
-body error. `WITH`-then-`SELECT|VALUES`, a parenthesised `SELECT`, a qualified
-table inside a body *subquery*, and a top-level `RETURNING`/`ORDER BY`/`LIMIT` all
-stay legal. A leading-keyword guard in the CLI's `has_returning()` keeps a
-`CREATE TRIGGER` whose body contains `RETURNING` from being misrouted to the
-RETURNING execution path (so the recorded body message wins). Byte-exact vs
-`sqlite3` 3.50.4 across the disallowed-keyword set, the `WITH`-DML / qualified /
-RETURNING / row-limit cases, the full target-resolution precedence matrix, and
-source-order first-wins in both directions.
-
-A bare **`SELECT` step in a trigger body is now resolved when the trigger fires**.
-Such a step is side-effect-free *except* for a `RAISE(…)`, but SQLite still
-compiles (resolves) it when the firing statement is prepared — so a FROM-less body
-`SELECT` naming a missing column, unknown function, wrong arity, or a bad
-`NEW`/`OLD` column raises that error the moment the trigger fires. graphite ran a
-RAISE-only path (`run_trigger_select`) that skipped every non-`RAISE` projection,
-so it silently no-op'd the `SELECT`. It now evaluates each FROM-less projection
-up front (value discarded) to force name/function/arity resolution, *before* the
-`WHERE` filter and any sibling `RAISE` — matching SQLite, where a missing column
-outranks a `RAISE` in the same step and the resulting error rolls the whole firing
-statement back (any earlier body `INSERT` is undone). `RAISE`-bearing projections
-keep their dedicated path (`eval` has no `RAISE` support); aggregate / window
-calls are skipped so a FROM-less `SELECT count(*)` stays the valid `0` rather than
-a spurious `misuse of aggregate`. Byte-exact vs `sqlite3` 3.50.4. *(Residuals, both
-inherent to evaluating rather than statically resolving: a **FROM-bearing** body
-`SELECT` — `SELECT * FROM nope` — and a name inside an **un-taken `CASE` branch**
-are still resolved lazily; a full static resolver over the trigger row scope would
-close them.)*
-
-A misplaced **`ORDER BY` / `LIMIT` before a compound operator** now reports the
-same message SQLite does. These clauses bind to the *whole* compound, so
-`SELECT … ORDER BY … UNION SELECT …` is rejected with `ORDER BY clause should
-come after UNION not before` (or `LIMIT clause …` when only a `LIMIT` is
-misplaced — `ORDER BY` wins when both are present), with the operator spelled out
-(`UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`). graphite previously left the
-operator unconsumed and emitted a bare `near "UNION": syntax error`. The check
-lives in the compound-select parser, right after the trailing-clause parse, and
-leaves the legal trailing form (`… UNION … ORDER BY … LIMIT …`) untouched.
-Byte-exact vs `sqlite3` 3.50.4 across ~13 permutations. *(Residual: when compound
-arms differ in width and the **right** arm is a `VALUES`, SQLite says `all VALUES
-must have the same number of terms` rather than the generic `SELECTs to the left
-and right …`; graphite desugars `VALUES` into a `SELECT` with no surviving marker,
-so distinguishing it needs an `is_values` flag threaded through the `Select` AST —
-deferred as a cosmetic message on a malformed-query edge.)*
-
-A **built-in window-only function used without `OVER`** (`row_number()`,
-`rank()`, `lag(a)`, … called as a plain scalar) is now rejected at prepare time
-with `misuse of window function NAME()`. graphite's per-row evaluator already
-reported this when a row was reached, but over an empty or fully filtered table
-the call was never evaluated, so the error was silently skipped (the same
-eager-vs-lazy gap closed earlier for column resolution and aggregate misuse). A
-wrong argument count is diagnosed first (`ntile()` → `wrong number of arguments
-to function ntile()`), matching SQLite's order. The check walks every scalar
-position (result columns, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, join `ON`),
-stopping at subquery boundaries. In `HAVING` the misuse is reported only once the
-clause is legal — a non-aggregate query emits `HAVING clause on a non-aggregate
-query` first — which also fixed a pre-existing divergence where an `OVER` window
-in a non-aggregate query's `HAVING` reported the window misuse ahead of the
-HAVING-context error. Byte-exact vs `sqlite3` 3.50.4 across ~30 permutations.
-
-An **aggregate or window function in a `DELETE`/`UPDATE` `RETURNING` clause** is
-now rejected at prepare time with `misuse of aggregate function NAME()` /
-`misuse of window function NAME()`. A `RETURNING` clause projects one row per
-modified row, so it is never an aggregate query and offers no window context; a
-window-only builtin called there without `OVER` is the same misuse. graphite
-evaluated `RETURNING` lazily and so silently produced no rows over an empty
-(fully deleted/updated) table — the same eager-vs-lazy gap, here closed by
-extending the existing `validate_dml_refs` walk (which already rejected these in
-`WHERE`/`SET`) to the `RETURNING` exprs. A missing column still wins (`no such
-column: zzz`), and `INSERT … RETURNING` is — as in SQLite — *not* subject to this
-(it is validated on a separate path). Byte-exact vs `sqlite3` 3.50.4 across ~24
-permutations.
-
-**`min()` / `max()` with zero arguments** is now rejected at prepare time with
-`wrong number of arguments to function NAME()`. These two functions are an
-aggregate at one argument and a scalar at two or more, so a zero-argument call
-matches neither signature; graphite's aggregate-arity validator treated them as
-aggregates only at one argument and so skipped the bare call, leaving it to be
-caught lazily — i.e. never, over an empty or fully filtered table, where it
-silently produced no rows. The check now special-cases the zero-arg form ahead of
-the aggregate gate, covering result columns, `WHERE`, `GROUP BY`, `HAVING`, and
-`ORDER BY`. The windowed form (`max() OVER ()`) is left to its own distinct error
-(`max() may not be used as a window function`). Byte-exact vs `sqlite3` 3.50.4
-across ~19 permutations.
-
-**An aggregate or window function inside a `FILTER (WHERE …)` predicate** is now
-rejected at prepare time. The filter is an ordinary boolean expression that may
-not itself aggregate, so `count(*) FILTER (WHERE sum(a)>0)` is `misuse of
-aggregate function sum()` and `… FILTER (WHERE rank()>0)` is `misuse of window
-function rank()`. graphite evaluated the predicate lazily per row and so silently
-returned a value over an empty (or fully filtered) table; a new
-`reject_aggregate_in_filter` walk descends into each aggregate's filter from every
-clause (result columns, `WHERE`, `HAVING`, `GROUP BY`, `ORDER BY`, join `ON`, and
-the window-dispatch path). A missing column inside the filter still wins (`no such
-column: zzz`), and the windowed carrier `count(*) FILTER (…) OVER ()` — which
-SQLite accepts — is left untouched. Byte-exact vs `sqlite3` 3.50.4 across ~15
-permutations.
-
-**Unknown or wrong-arity scalar functions are now resolved at prepare time.**
-SQLite rejects an unknown name (`no such function: NAME`) and a wrong argument
-count (`wrong number of arguments to function NAME()`) before the query runs;
-graphite noticed only at row-evaluation time — i.e. never over an empty (or fully
-filtered) table, where it silently returned no rows — and the experimental VDBE
-fast path compiled a *known* call without re-checking its arity, so even
-`SELECT abs(a,b) FROM t` over an empty table slipped through. A new
-`reject_unresolved_functions_in_select` runs the existing
-`reject_unresolved_functions` dry-resolve (the same one CHECK/generated-column
-expressions already used) across every clause, on both the VDBE-success path
-(where a success guarantees the columns resolved, so a function fault is the sole
-remaining error) and the tree-walker path. A missing column still wins (`no such
-column: c`). Byte-exact vs `sqlite3` 3.50.4 across ~24 permutations; functions
-whose arity differs only under a locally ICU-enabled sqlite (`lower`/`upper`/
-`substr` take an optional locale argument there) are out of scope, matching the
-ASCII-only CI oracle.
-
-**The shared expression walker now descends into row values and `COLLATE`.**
-`window::visit` (and its `replace_in` twin) — the walker behind the prepare-time
-resolution/misuse checks — stopped at a row value `(a, b, …)` and `expr COLLATE
-name`, so anything nested under those was invisible: `(abs(a,b),1)=(1,2)` and
-`nope(a) COLLATE nocase` slipped past the function-resolution check, and
-`(count(*),1)=(1,1)` / `count(*) COLLATE nocase` / `(row_number() OVER (),1)=…`
-escaped the aggregate/window misuse checks. The same two-node blind spot in the
-aggregate classifier (`expr_contains_agg`) and substitutor
-(`substitute_aggregates`) meant a *valid* aggregate wrapped in `COLLATE` —
-`sum(a) COLLATE binary` — was misclassified as a scalar call and wrongly rejected
-as a misuse; both now descend through `COLLATE` (the classifier deliberately does
-*not* treat a row value as an aggregate context, since an aggregate in a row value
-in result/`HAVING` position is `row value misused` in SQLite regardless). Completing
-the descent is one general fix that closes all of these. Byte-exact vs `sqlite3`
-3.50.4. A bare row value as a scalar result column (`SELECT (sum(a),1) FROM t` →
-`row value misused`) is a separate row-value-context check, still open.
-
-**A postfix `COLLATE` after a closed `IN (…)` construct now parses.** SQLite's
-grammar makes `COLLATE` a postfix operator that binds tighter than any binary
-operator (`expr ::= expr COLLATE name`), so `'A' IN ('a','b') COLLATE NOCASE` and
-`x IN (SELECT …) COLLATE C` apply the collation to the whole `IN` expression. The
-parser only consumed a trailing `COLLATE` at the *primary* level
-(`primary_collate`), which covers the common `col COLLATE NOCASE = x` (the
-collation rides on the primary operand), but a `COLLATE` trailing the `)` that
-closes an `IN` list/subquery landed nowhere and raised `near "COLLATE": syntax
-error`. The fix handles a postfix `COLLATE` in the `expr_bp` Pratt loop at the
-highest binding power, so it wraps whatever expression precedes it. Since an `IN`
-result is a 0/1 integer, the collation is a semantic no-op there (it never alters
-the comparison) — exactly as in SQLite; the win is parse acceptance and a
-round-trip-clean `CREATE VIEW`/`CHECK` reprint. Byte-exact vs `sqlite3` 3.50.4.
-
-**`LIMIT`/`OFFSET` is resolved in an empty column scope.** SQLite evaluates a
-`LIMIT`/`OFFSET` expression with *no table columns in scope* — not even a
-correlated outer column — and that resolution runs ahead of every other check in
-the statement. So any column reference inside one is `no such column: NAME`, and
-that wins over an aggregate misuse (`LIMIT sum(a)` → `no such column: a`, not
-`misuse of aggregate function sum()`), over an unknown / wrong-arity function
-(`LIMIT nope(a)` → `no such column: a`), and over a result-column / `WHERE`
-resolution error elsewhere; only a `LIMIT` with no column argument keeps its own
-error (`LIMIT count(*)` → `misuse`, `LIMIT nope()` → `no such function`). graphite
-resolved the limit lazily during evaluation, so it saw the aggregate's misuse (or
-a correlated outer column) before the missing one and silently accepted some
-statements SQLite rejects at prepare time. A single early check in `run_core`
-(`reject_scopeless_column_ref` over the query level's own `LIMIT`/`OFFSET`, not
-descending into a subquery, which has its own scope) closes the top-level *and*
-correlated-subquery cases. Byte-exact vs `sqlite3` 3.50.4.
-
-**An `UPDATE`/`DELETE` target table may now carry an `AS` alias** (`UPDATE t AS x
-SET b = x.a … WHERE x.a = 1`, `DELETE FROM t AS x WHERE x.a = 1`). SQLite lets a
-single-table mutation rename its target with the `AS` keyword; the alias then
-becomes the *sole* qualifier for the target's columns in `SET`/`WHERE`/`ORDER BY`
-— the real table name no longer resolves there (`UPDATE t AS x SET b = t.a` →
-`no such column: t.a`). graphite previously had no `alias` field on the `Update`/
-`Delete` AST and silently dropped the alias, so `x.a` failed to resolve. The fix
-parses an optional `AS <ident>` after the target name (a bare `UPDATE t x …` is a
-syntax error, as in SQLite) and, at exec time, AST-rewrites the alias qualifier to
-the real table name across `SET`/`WHERE`/`ORDER BY` and any correlated subqueries,
-descending but stopping at a subquery that re-binds the alias name (so `… SET b =
-(SELECT max(b) FROM t AS x)` shadows correctly). A column the alias can't resolve
-is rejected eagerly at prepare time with the alias qualifier preserved (`x.nope` →
-`no such column: x.nope`, over a populated *or* empty table), and the `rowid`
-family resolves through the alias. `RETURNING` is the documented quirk: it still
-resolves against the **real** table name, not the alias (`… RETURNING t.a` works,
-`RETURNING x.a` is `no such column: x.a`). Bundled with it, a `TABLE.*` wildcard in
-`RETURNING` is now rejected at parse time (`RETURNING may not use "TABLE.*"
-wildcards`) for `INSERT`/`UPDATE`/`DELETE` alike — a bare `*` is still fine —
-closing a pre-existing gap where graphite expanded `t.*` that SQLite rejects.
-Byte-exact vs `sqlite3` 3.50.4 across ~40 permutations (`tests/update_delete_alias.rs`).
-*(Residual: for a **view**/virtual-table target the column set isn't known on the
-best-effort path, so a missing aliased column there is reported against the real
-name rather than the alias — a minor message-only divergence on an already-erroring
-query.)*
-
-A **window frame offset may be any constant expression**, not just an integer
-literal. SQLite accepts `ROWS (1+1) PRECEDING`, `RANGE (2.5-0.5) FOLLOWING`,
-`CAST(2 AS INT)`, `2 COLLATE NOCASE`, `1<<1`, and so on — anything built from
-literals and operators (including `CAST`/`COLLATE`/parentheses) — and validates
-the offset at *run time*, once the partition has a row: it folds the expression,
-applies **numeric affinity** (so a text `'2'`/`'2.0'`/`' 2 '` coerces and works,
-but `'2x'`, a blob, or `NULL` fail), then requires a non-negative integer for
-`ROWS`/`GROUPS` or a non-negative number for `RANGE`. A row-dependent offset (a
-column, a function call like `abs(2)`, or a subquery) is rejected with the same
-`frame {starting,ending} offset must be a non-negative {integer,number}` message,
-and the whole check is **deferred over an empty input** (no rows ⇒ no
-evaluation ⇒ no error), exactly as SQLite's stepping-time validation. graphite
-used to reject every non-integer-literal offset at *parse* time with a bogus
-`near "PRECEDING": syntax error`. The parser now keeps the offset as a full
-`Expr` (`FrameBound::Preceding/Following(Box<Expr>)`); `resolve_frame` evaluates
-and validates each offset once per non-empty partition into a numeric
-`ResolvedFrame`, which the `row_bound`/`group_bound`/`range_value_bound` helpers
-consume. Byte-exact vs `sqlite3` 3.50.4 (`tests/window_frame_offset_expr.rs`),
-covering the value cases, the affinity edges, the run-time rejections, and the
-empty-input deferral.
-
-An **`ORDER BY` expression may reference a SELECT-output alias**, not just a bare
-alias term. SQLite resolves `SELECT a AS x FROM t ORDER BY x+0` (and `-x`,
-`abs(x)`, `x+y`, `x||c`, `CASE WHEN x>1 …`) by binding the name to the *computed
-output value*, with a real input column of the same name taking precedence
-(`SELECT a AS b … ORDER BY b+0` still orders by the column `b`). The alias is in
-scope for aggregate (`SELECT count(*) AS n … ORDER BY n+0`), window
-(`ORDER BY row_number() OVER (…)+0`), `DISTINCT`, and grouped
-(`ORDER BY n*10+x`) queries alike. The VDBE path already handled this; the
-fix is in the tree-walker fallback (`eval_simple`/`eval_aggregated`), which used
-to resolve only a *whole-term* alias/ordinal (`resolve_order_index`) and raised
-`no such column` the moment the alias appeared inside a larger expression. Each
-now evaluates a general `ORDER BY` term against a context augmented with the
-output columns (base columns first, so they win ties), mirroring the existing
-`HAVING` augmentation. Byte-exact vs `sqlite3` 3.50.4
-(`tests/order_by_alias_expr.rs`).
-
-The **`ALL`/`DISTINCT` quantifier keywords** are now parsed exactly where SQLite
-allows them and rejected exactly where it doesn't. They are valid only directly
-after `SELECT` or as the first token inside an aggregate call; `ALL` is the
-default, so `count(ALL a)` counts every non-null `a` (graphite previously failed
-to accept it — `count(ALL a)` errored `near "a"`) and now parses like
-`count(a)`. In any other expression-operand position the keyword is a reserved
-syntax error pointing at *itself* (`1 > ALL (SELECT 1)` → `near "ALL"`,
-`1 > DISTINCT (…)` → `near "DISTINCT"`); graphite used to mis-parse it as a
-column/function so the caret landed on the following `SELECT`/operand. Only one
-quantifier is allowed, so a second one falls through to the same operand-position
-rejection (`count(ALL DISTINCT a)` → `near "DISTINCT"`,
-`count(DISTINCT ALL a)` → `near "ALL"`). The fix is two targeted parser arms: the
-aggregate-call path eats an optional `ALL` after the `DISTINCT` check, and
-`primary()` rejects a bare `all`/`distinct` operand. Byte-exact vs `sqlite3`
-3.50.4 (`tests/all_distinct_operand_syntax.rs`).
-
-The **"ambiguous column name" message now echoes the reference as written.**
-SQLite names the offending column with the exact qualifier the user typed — a
-bare `column`, a `table.column`, or a three-part `schema.table.column` — so
-`SELECT t.a FROM t, t` reports `ambiguous column name: t.a` and
-`SELECT main.t.a FROM t, t` reports `main.t.a`. graphite used to strip the
-qualifier and always print the bare `a`. The fix reconstructs the written form
-from the `Expr::Column { schema, table, column }` fields in
-`validate_unambiguous_columns`. Byte-exact vs `sqlite3` 3.50.4
-(`tests/ambiguous_column_qualifier.rs`). One sub-case is deferred: a `*`/`t.*`
-wildcard over an *unaliased self-join* is ambiguous on the database-qualified
-expansion (`SELECT * FROM t, t` → `main.t.a`, `temp.t.a` for a temp table),
-which needs the owning database name threaded onto `ColumnInfo` (it currently
-carries only the table/alias); graphite reports `t.a` there for now.
-
-A **leading `WITH` now rides on every `INSERT` source, not just
-`INSERT … SELECT`.** SQLite extends `WITH` to all DML forms, so
-`WITH c AS (…) INSERT INTO t VALUES(…)` / `DEFAULT VALUES` are accepted, with the
-CTEs in scope for any subquery inside the `VALUES` list
-(`WITH c(n) AS (VALUES(5)) INSERT INTO t VALUES((SELECT n FROM c))` inserts `5`).
-graphite previously parsed only `WITH … INSERT … SELECT` and rejected the
-`VALUES` forms with a spurious `near ";": syntax error` (and answered
-`incomplete input` instead of `no such table` when the CTE name collided with the
-insert target). The CTEs ride on a new `Insert::ctes` field (parsed in
-`with_prefixed`, pushed/popped around the insert by an `exec_insert` wrapper that
-mirrors `exec_delete`, and also pushed inside `prematerialize_insert_source` so
-the cross-database source materializes in the pre-swap context). A CTE never
-shadows the insert *target* — `INSERT INTO c …` stays `no such table: c`.
-Byte-exact vs `sqlite3` 3.50.4 (`tests/with_insert.rs`, plus the parse-acceptance
-guard in `tests/parser_surface.rs`).
-
-**`PRAGMA case_sensitive_like` is now honored**, not silently ignored. With the
-pragma `ON`, the `LIKE` operator and the two-argument `like()` function compare
-ASCII letters case-sensitively (`'A' LIKE 'a'` → `0`), while the `_`/`%`
-wildcards, `ESCAPE`, and non-ASCII letters behave as before — only ASCII folding
-is switched off, matching SQLite's built-in `LIKE`. `GLOB` stays case-sensitive
-regardless, and the get form (`PRAGMA case_sensitive_like`) returns no rows (a
-write-only toggle). graphite previously parsed the pragma but never wired it into
-comparison, so the flag was a no-op. The setting rides on a `Connection`
-`case_sensitive_like` field, surfaced to pure eval through a new
-`Subqueries::case_sensitive_like()` hook so `eval_binary`'s `LIKE` arm and
-`func.rs`'s `like()` thread it without touching the ~100 `EvalCtx` build sites;
-the VDBE's `Like` op always folds case, so `run_select_vdbe` defers to the
-tree-walker whenever the flag is set (off by default, so the common path is
-unchanged). Byte-exact vs `sqlite3` 3.50.4 (`tests/case_sensitive_like.rs`).
-
-**`PRAGMA query_only` is now enforced**, not silently ignored. With it `ON` the
-connection is read-only: any statement that opens a write transaction —
-INSERT/UPDATE/DELETE, every CREATE/DROP/ALTER (including on TEMP tables), VACUUM,
-and ANALYZE (which writes `sqlite_stat1`) — fails with `attempt to write a
-readonly database`, while SELECT, PRAGMA, ATTACH/DETACH, and read-only
-transaction/savepoint control pass through; turning it back off restores writes,
-and the get form reads the live flag. graphite previously parsed the pragma but
-never gated writes on it. The flag rides on a `Connection` `query_only` field
-(set in the `exec_pragma` setter, surfaced on the read path); the gate is a
-single chokepoint at the top of `exec_parsed` (`statement_writes_db`), which
-every write reaches — DML descends to `run_dml_atomic` from there, and both the
-main-target and the swapped temp/attached paths route through it. Byte-exact vs
-`sqlite3` 3.50.4 (`tests/query_only.rs`). One documented residual: `REINDEX` of
-an existing index is not blocked — graphite models REINDEX as a no-op (indexes
-stay current on every write), so it never opens a write transaction.
-
-**`PRAGMA ignore_check_constraints` is now honored**, not silently ignored. With
-it `ON`, INSERT and UPDATE skip CHECK enforcement — column-level, table-level,
-and named `CONSTRAINT … CHECK` alike — so a row that would violate a CHECK is
-stored unchanged; NOT NULL, UNIQUE, and foreign keys are unaffected, since those
-are enforced on separate paths. Turning it back off re-enforces CHECK, and the
-get form reads the live flag. graphite previously parsed the pragma but always
-enforced CHECK. The flag rides on a `Connection` `ignore_check_constraints` field
-(set in the `exec_pragma` setter, surfaced on the read path); the gate is a
-single early-return at the top of `check_constraints`, the one function both
-INSERT and UPDATE call to validate CHECK exprs. Byte-exact vs `sqlite3` 3.50.4
-(`tests/ignore_check_constraints.rs`).
-
-**`PRAGMA automatic_index` and `PRAGMA cell_size_check` now round-trip** instead
-of being pinned to their defaults. Both are inert in graphite — it builds no
-transient automatic indexes, and it validates btree cells on every read
-regardless — but, like sqlite, the stored value is observable: setting one and
-reading it back returns what was set (previously the get form hard-coded `1` /
-`0` and dropped any assignment). Each rides on a `Connection` `Cell` (set in both
-the `exec_pragma` setter and the read path, so the assignment persists whether it
-arrives via `execute()` or `query()`). Byte-exact vs `sqlite3` 3.50.4
-(`tests/pragma_index_check_roundtrip.rs`). One related residual, left as a
-documented CLI concern: the *set-form echo* of the value-returning pragmas
-(`PRAGMA secure_delete=1`, `busy_timeout`, `analysis_limit`, `journal_size_limit`)
-— sqlite prints the resulting value as a row on the assignment itself, while
-graphite's one-shot CLI routes `=` setters through `execute()` (which discards
-rows); the value is stored correctly and reads back via the plain form. Matching
-the echo needs per-pragma knowledge of which setters return a row, since
-`foreign_keys=1`/`cache_size=N` do not.
-
-**Remaining.** The long run of completed error-parity / DDL / JSON / qualifier
-items that used to sit here has been cleared — each lives in the git history, the
-release-plz `CHANGELOG`, and its own `tests/*.rs`. What is left is the genuinely
-open work:
+**Done** — the per-feature write-ups that used to fill this section have been
+cleared; each completed item lives in the git history, the release-plz
+`CHANGELOG`, and its own `tests/*.rs`. Everything below is differentially
+byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
+
+- **Query surface** — SELECT with every join kind (INNER/LEFT/RIGHT/FULL,
+  NATURAL, USING-coalesced, cross), correlated / `EXISTS` / `IN (SELECT)` /
+  scalar subqueries, compound set-ops (UNION[ ALL]/INTERSECT/EXCEPT), CTEs
+  (recursive, mutual, `[NOT] MATERIALIZED`), window functions (ROWS/RANGE/GROUPS
+  frames, `EXCLUDE`, value-offsets, `FILTER`, named windows), DISTINCT,
+  GROUP BY / HAVING, ORDER BY (`NULLS FIRST/LAST`, `COLLATE`, positional),
+  LIMIT/OFFSET (incl. subquery operands).
+- **DML** — INSERT (multi-row, `DEFAULT VALUES`, `INSERT … SELECT` with snapshot
+  semantics), UPSERT (`ON CONFLICT DO UPDATE/NOTHING`, `excluded.*`, partial-index
+  targets), `RETURNING`, UPDATE (simultaneous SET, `UPDATE … FROM`, row-value
+  `SET (a,b)=(…)` and `=(SELECT …)`), DELETE, all `OR <conflict>` clauses, and
+  `AS`-aliased UPDATE/DELETE targets.
+- **DDL** — CREATE/DROP/ALTER TABLE (ADD / DROP / RENAME COLUMN, RENAME TABLE),
+  CREATE/DROP VIEW / INDEX / TRIGGER (BEFORE/AFTER/INSTEAD OF, WHEN, `RAISE`),
+  STRICT and WITHOUT ROWID, generated columns (VIRTUAL/STORED), AUTOINCREMENT +
+  `sqlite_sequence`, partial / expression / collation / DESC indexes,
+  constraint-level `ON CONFLICT`, and FK enforcement (CASCADE / SET NULL /
+  SET DEFAULT / RESTRICT, composite, self-referential, DEFERRABLE).
+- **Cross-object ALTER propagation** — RENAME TABLE → dependent views / FKs /
+  triggers; RENAME COLUMN → FKs / views / triggers, including single-source
+  nested-subquery bodies via the global-uniqueness provers, with quote- and
+  whitespace-preserving edits to the regenerated CREATE text. DROP COLUMN is
+  rejected when a view/trigger still references the column in value position.
+- **Functions & values** — the full scalar / aggregate / date-time /
+  `printf`+`format` / JSON + JSONB libraries; type affinity (comparison and
+  storage), collation (BINARY/NOCASE/RTRIM, propagated through
+  IN/BETWEEN/CASE/min-max/compound), `random()`/`randomblob()`, blob↔text↔number
+  coercion, and verbatim column-name source spans.
+- **Schema catalog & introspection** — `sqlite_schema`/`sqlite_master` readable;
+  stored `sql` text canonicalised the way SQLite stores it (regenerated
+  `CREATE <TYPE>` head, dropped `IF NOT EXISTS`/`TEMP`/trailing `;`, CTAS column
+  quoting); the introspection PRAGMAs and the `pragma_*` table-valued-function
+  surface; `EXPLAIN QUERY PLAN` shaping (incl. `SCAN CONSTANT ROW`).
+- **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
+  TEMP tables, cross-database joins / views / transactions (see Track E).
+- **Error parity** — prepare-time column / aggregate / window / row-value
+  resolution and misuse checks; DDL/DML/JSON/PRAGMA/`printf` message wording;
+  lexer/parser framing (`near "TOKEN"`, `incomplete input`,
+  `unrecognized token: "X"`); the double-quote→string-literal hint; and
+  constraint-failure column naming.
+
+**Remaining — genuinely open work.** Ordered roughly easiest → hardest. These are
+the residuals left after the differential sweep; the surface is otherwise
+exhausted for bounded (single-fix) work.
+
+- **A-misc-1 — `IN`-operand error ordering.** For a row-value `IN` list with a
+  *dirty* operand (a bad column **and** a width mismatch), SQLite reports
+  `row value misused` *before* the `no such column`. graphite resolves columns
+  first, so it emits the column error in that one combined case. Column-clean
+  cases are already byte-exact. Low-impact message-ordering nicety; the fix is to
+  run the row-width check ahead of column resolution in the `IN`-list validator.
+
+- **A-misc-2 — row value as a scalar result column.** `SELECT (sum(a), 1) FROM t`
+  should be `row value misused` at prepare time. The shared expression walker now
+  descends *into* row values for the function/aggregate/window checks, but a row
+  value sitting directly in scalar **result** position is a separate
+  row-value-context check that is still open (the bare-vector comparison and `IN`
+  cases are done). Needs a result-list/`HAVING` context flag passed to the walker
+  so a top-level `Expr::RowValue` in a scalar slot is rejected.
+
+- **A-misc-3 — `*` / `t.*` over an unaliased self-join.** `SELECT * FROM t, t`
+  is ambiguous on the *database-qualified* expansion (`main.t.a`, `temp.t.a`);
+  graphite reports the bare `t.a`. Needs the owning database name threaded onto
+  `ColumnInfo` (it currently carries only table/alias). The non-wildcard
+  ambiguous-column message already echoes the written qualifier exactly.
+
+- **A-tvf-bare — eponymous TVFs used as a bare table name (no parens).**
+  `FROM generate_series`, `FROM json_each`, `FROM pragma_table_info` (without a
+  parenthesised argument list) are real eponymous virtual tables in SQLite: their
+  hidden arguments can be supplied through the `WHERE` clause
+  (`FROM generate_series WHERE start=1 AND stop=3`), and an unconstrained
+  reference yields either no rows (`json_each`, the pragma TVFs) or a
+  function-specific "first argument … missing or unusable" error
+  (`generate_series`). graphite only recognises these *with* parentheses, so a
+  bare reference is `no such table: <name>`. Closing this means modelling the
+  eponymous TVFs as `FROM` sources with `WHERE`-driven hidden-column binding —
+  a feature, not a message tweak.
+
+- **A-printf-bang — `printf`/`format` `!` (alt-form-2) flag at high precision.**
+  Without `!` graphite is byte-exact (SQLite caps a `%f`/`%e`/`%g` double at 16
+  significant digits). The `!` flag lifts the cap to 20 sig-digits via SQLite's
+  bespoke float decoder, where graphite instead emits the exact f64 decimal
+  expansion — so `printf('%!.20f', 0.1)` is graphite's `0.10000000000000000555`
+  vs SQLite's `0.1000000000000000055`. Matching it requires porting
+  `sqlite3FpDecode` + the double-double binary→decimal machinery
+  (`sqlite3Fp2Convert10`, `powerOfTen`/`aBase`/`aScale`/`aScaleLo`,
+  `sqlite3Multiply128/160`) — a ~300-line table-heavy port for an obscure
+  extension flag. Deferred as low-ROI; see [[printf-bang-float-decode]].
 
 - **A-rn3-edge — RENAME COLUMN in genuinely multi-table view/trigger bodies.**
-  The token rewrite bails (leaves the body unchanged — never corrupts) on a bare
-  column ref that is ambiguous across multiple base sources, because the AST has
-  no per-column-ref source span. The *single*-source-with-subqueries cases are
-  now handled for both views (`tests/view_rename_column_subquery.rs`) and
-  triggers (`tests/trigger_rename_column_subquery.rs`). A view that reaches the
-  renamed table only through a *nested* subquery (its top-level `FROM` is an
-  unrelated base table — e.g. `SELECT c FROM u WHERE c IN (SELECT a FROM t)`) is
-  now handled too, via a **global-uniqueness** prover
-  (`view_global_unique_quals`): it collects every base-table source at every
-  nesting level and rewrites a bare `old` when that column name is unique across
-  all of them — so a bare ref can bind only to the renamed table
-  (`tests/rename_column_view_subquery.rs`). The **trigger** counterpart
-  (`trigger_global_unique_quals`) now closes the same cross-object gap: a trigger
-  whose `WHEN` guard or body reaches the renamed column through another object —
-  a `WHEN` subquery over the renamed table, a body statement on a different table
-  whose subquery reads it, or a multi-source body on the renamed table where a
-  bare ref would otherwise be left stale by the `NEW`/`OLD`-only branch — is
-  rewritten when the column name is globally unique, with `NEW`/`OLD` added as
-  qualifiers when the trigger is attached to the renamed table
-  (`tests/rename_column_trigger_subquery.rs`). What remains is the genuinely
-  ambiguous case — a bare ref to a column that *several* in-scope base tables
-  own, where only one occurrence (the one in the renamed table's scope) should
-  change. That is what needs the per-ref span:
-  - **A-rn3-edge-1** — add a source span (byte range) to `Expr::Column`. This is
-    the enabling refactor. (The sibling `schema` field it once shared with the
-    now-landed 3-part `schema.table.column` qualifier check is already in place,
-    so this is now just the span.)
+  The token rewrite already handles single-source-with-subqueries bodies and
+  nested-subquery / cross-object reaches via the global-uniqueness provers
+  (`view_global_unique_quals` / `trigger_global_unique_quals`): a bare `old` is
+  rewritten when that column name is unique across *every* base source at any
+  nesting level. What remains is the genuinely **ambiguous** case — a bare ref to
+  a column that *several* in-scope base tables own, where only the occurrence in
+  the renamed table's scope should change. The rewrite currently bails (leaves the
+  body unchanged — never corrupts) because the AST has no per-column-ref span.
+  Two steps:
+  - **A-rn3-edge-1** *(enabling refactor)* — add a source span (byte range) to
+    `Expr::Column`. The sibling `schema` field it once shared with the now-landed
+    3-part qualifier check is already in place, so this is just the span.
   - **A-rn3-edge-2** — use the span for scope-aware rename: resolve each bare ref
-    to its owning table, rewrite only the matching ones.
-- **Prepare-time validation gaps (lazy where SQLite is eager).** A few constructs
-  are still validated per-row, so an unreached row (empty / fully-filtered table)
-  is accepted where SQLite rejects at prepare time. All want the same fix — a
-  statement-level prepare pass that walks every expression once, independent of
-  row production:
-  - bare (unqualified) refs in *multi-source* derived/subquery scopes.
-    `validate_columns_exist` covers the
-    top-level plain-table / `ON`-join scope, and `validate_derived_columns` now
-    covers the *single* derived-table (subquery) `FROM` — its top-level result /
-    `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` refs are resolved against the
-    derived output at prepare time, so `SELECT a FROM (SELECT a FROM t) WHERE
-    zzz = 1` errors over an empty derived table, and (since a subquery has no
-    rowid) so does `SELECT rowid FROM (SELECT a FROM t)`. `validate_join_derived_columns`
-    extends this to any join `validate_columns_exist` declines — a derived table
-    *joined* to another source (`ON`/cross), **and a `NATURAL`/`USING` coalesced
-    join** (which that validator skips because its flat scope can't list a qualified
-    `u.g` of a coalesced pair). Each source's columns are resolved exactly as the
-    scan exposes them (base via `table_meta`, view via `try_view`, derived via
-    `window_source_columns`); a bare name resolves if any source exposes it, a
-    qualified `u.g` checks source `u` — so both `t.g` and `u.g` of a coalesced pair
-    resolve, while `SELECT zzz FROM (SELECT a FROM t) x JOIN u ON x.a=u.c`,
-    `SELECT x.rowid FROM (SELECT a FROM t) x JOIN u …` (a derived source has no
-    rowid), and `SELECT zzz FROM t NATURAL JOIN u` all error at prepare time. A
-    genuinely *ambiguous* bare name (shared but not coalesced) is left to the
-    separate ambiguity validator — this check only catches missing names. Any source
-    it cannot resolve cleanly (schema-qualified, index-hint, vtab) bails the whole
-    check, never a false positive. Still open: a three-part
-    `schema.table.column` ref inside a *correlated subquery body* (binding to an
-    enclosing FROM) — `SELECT (SELECT bad.t.a) FROM t` is accepted where sqlite
-    reports `no such column: bad.t.a`. (Separately, the tree-walker still cannot
-    *execute* a bare/qualified `rowid` over any join — orthogonal to this check.)
-  - unknown / wrong-arity *scalar functions* inside an expression-position
-    subquery (`Subquery` / `EXISTS` / `IN (SELECT …)`) — e.g.
-    `SELECT (SELECT nope(a)) FROM t` or `… WHERE a IN (SELECT nope(b) FROM t)` —
-    are now rejected at prepare time. `reject_unresolved_functions_in_subqueries`
-    collects each depth-1 subselect the outer expressions carry (result/`WHERE`/
-    `HAVING`/`GROUP BY`/`ORDER BY`/join-`ON`) and runs the existing
-    `reject_unresolved_functions_in_select` dry-resolver on it, but **only** when
-    `subquery_body_columns_clean` confirms the subquery body resolves every column
-    against its own `FROM` plus the outer scope. That gate preserves sqlite's
-    column-before-function precedence: `SELECT (SELECT nope(zzz)) FROM t` stays a
-    `no such column` case left to the lazy path, never masked by a function error.
-    So `SELECT (SELECT nope(a)) FROM t`, `… WHERE a IN (SELECT nope(c) FROM u)`,
-    `EXISTS (SELECT nope(c) FROM u)`, and wrong-arity calls (`(SELECT abs(1,2))`,
-    `EXISTS (SELECT 1 FROM u WHERE substr(b)=c)`) all error like sqlite, while
-    valid calls (`abs(c)`, `upper(b)`, `max(c)`) and unverifiable bodies (a
-    compound `UNION` subquery, a correlated-but-missing column) are left untouched.
-    Derived tables in `FROM`, CTE bodies, and compound (`UNION`) arms were already
-    covered (they materialize, which resolves them). Still open: a subquery body
-    that is itself *correlated with a missing column* — coupled to the same
-    three-part correlated-scope column resolution noted above. Test:
-    `tests/subquery_function_validation.rs`.
-- **ALTER-time rejection of an ALTER that breaks a dependent.**
-  - *Done — `DROP COLUMN`.* `ALTER TABLE … DROP COLUMN` is now rejected when the
-    dropped column is referenced (in value/expression position) by a dependent
-    **view** or **trigger**, extending the pre-existing table/index re-validation.
-    All schema objects are re-checked in `sqlite_schema` rowid order, and the
-    first that no longer resolves yields
-    `error in {view|trigger} NAME after drop column: no such column: <ref>` —
-    byte-exact, echoing the offending reference (`c`, `t.c`, `x.c`, `NEW.c`,
-    `OLD.c`). Assignment *targets* (a trigger's `SET col=`, an `INSERT INTO t(col)`
-    column list, an `UPDATE OF col`) do **not** block the drop, matching sqlite.
-    Because every check is a *pre-mutation* validation (graphite computes the
-    post-drop shape before touching storage), no DDL-rollback infra is needed for
-    this case. Detection reuses the RENAME-COLUMN binding provers. Test:
-    `tests/drop_column_dependents.rs`.
-  - *Still open — RENAME that breaks a dependent.* A `RENAME TABLE/COLUMN` whose
-    rewrite cannot be proven (so propagation is skipped) can still leave a
-    dependent that no longer resolves; sqlite rejects and rolls back. This needs
-    statement-level DDL rollback — a writer savepoint around `exec_alter`,
-    mirroring `run_dml_atomic` — because the rename mutates before the breakage is
-    observable.
+    to its owning table and rewrite only the matching occurrences.
+
+- **A-prepare-correlated — prepare-time validation in correlated subquery bodies.**
+  The eager (prepare-time, row-independent) validators now cover the common
+  scopes — `validate_columns_exist` (top-level plain-table / `ON`-join),
+  `validate_derived_columns` (single derived-table `FROM`),
+  `validate_join_derived_columns` (a derived source joined or `NATURAL`/`USING`
+  coalesced), and `reject_unresolved_functions_in_subqueries` (unknown / wrong-
+  arity scalar functions inside expression-position subqueries, gated on
+  `subquery_body_columns_clean`). The single residual is a three-part
+  `schema.table.column` reference inside a **correlated subquery body** that binds
+  to an enclosing `FROM`: `SELECT (SELECT bad.t.a) FROM t` is accepted where
+  SQLite reports `no such column: bad.t.a`, and a subquery body that is itself
+  correlated-with-a-missing-column is likewise left to the lazy path. Both want
+  the same missing piece — correlated-outer-scope resolution for a three-part ref.
+  *(Orthogonal: the tree-walker still cannot* execute *a bare/qualified `rowid`
+  over any join — a per-table-rowid-in-join-rows gap, not a validation gap.)*
+
+- **A-alter-rollback — ALTER-time rejection of a RENAME that breaks a dependent.**
+  `DROP COLUMN` already rejects pre-mutation when a dependent view/trigger would
+  break (it computes the post-drop shape before touching storage, so no rollback
+  infra is needed). A `RENAME TABLE`/`RENAME COLUMN` whose propagation *cannot be
+  proven* (so the rewrite is skipped) can still leave a dependent that no longer
+  resolves; SQLite rejects and rolls back. graphite mutates before the breakage is
+  observable, so this needs **statement-level DDL rollback** — a writer savepoint
+  around `exec_alter`, mirroring `run_dml_atomic` — which is the one piece of
+  infrastructure the whole "reject an ALTER that breaks a dependent" story is
+  waiting on.
 
 ### Track B — Query planner, statistics & the VDBE
 
-**Done:** `ANALYZE`/`sqlite_stat1` stats-driven planning; the full equality/range/
-`IN`/OR-union + inner-join + `WITHOUT ROWID` seek family; hash join + automatic-
-index EQP; index-driven `ORDER BY` and covering reads (**B0/B0b**); the VDBE + its
-scalar-expression compiler; **VDBE routing default-on** (**B7a/B7b**, tree-walker
-is the fallback oracle); bytecode `EXPLAIN` (**B8**). Running on the VDBE now: the
-**join family** (**B5a/B5b-1** — N-table inner joins plus 2-table and N-table
-`LEFT`/`RIGHT`/`FULL` nested-loop joins, all with projection / WHERE-merged-ON /
-`DISTINCT` / `ORDER BY` / `LIMIT` / grouped-and-bare aggregates, no cross-product
-materialized); non-correlated scalar/`EXISTS`/`IN (SELECT)` folds (**B5c-1**, incl.
-the native candidate-affinity membership op for a bare-column candidate). The fold
-now threads scope as it descends, so a subquery whose body holds a *further* nested
-subquery folds too, as long as every nested body is itself self-contained against
-the accumulated scope (it may reference its parent's sources — correlation that
-stays inside the folded unit — but a reference further out still defers); the whole
-unit is evaluated by the tree-walker, so the nested subquery's affinity/collation
-are preserved exactly. A subquery whose body is itself a *compound*
-(`UNION`/`INTERSECT`/`EXCEPT`) folds too — each arm is proven self-contained and
-the whole compound runs through the tree-walker — provided every arm of a
-value-producing fold (scalar / `IN`) projects a computed column (so the result
-carries NONE affinity, exactly like a literal list); a bare-column arm would carry
-that column's affinity and still defers. Compound
-`UNION`/`INTERSECT`/`EXCEPT` (**B5c-3**); positional `GROUP BY <ordinal>` and a
-**computed (non-column) `GROUP BY` key** (`GROUP BY n*2`, `g/2`, `substr(a,1,1)`,
-or a mix of a column and an expression — the grouped fold evaluates each key
-expression per row to identify the group, and the projection / `HAVING` /
-`ORDER BY` resolve a structurally-equal key expression through the binding table;
-a computed key forces the binding-driven general grouped path rather than the
-compact column-index `GroupEmit` shortcut; a bare `GROUP BY <name>` that is not a
-source column is resolved to a **SELECT-list output alias** and rewritten to that
-column's expression — a same-named source column takes precedence, and an alias
-bound to an aggregate is left for the tree-walker to reject as SQLite does); a
-**`SELECT DISTINCT` over a grouped
-query** (`SELECT DISTINCT count(*) … GROUP BY …`) — grouping yields one row per
-group and `DISTINCT` then dedups those rows via a `DistinctCheck` inserted after
-`HAVING` and before `OFFSET`/`LIMIT` and the sorter, so dedup precedes both
-ordering and the row counters exactly as in SQLite; the dedup compares output
-rows under BINARY, and an explicit `COLLATE` on an otherwise-BINARY output column
-defers to the tree-walker — this holds for a plain row-level `SELECT DISTINCT a
-COLLATE NOCASE` as well as the grouped form, since the `DistinctCheck` would
-otherwise fold the rows under BINARY (an explicit `COLLATE BINARY` is BINARY
-already and keeps running on the VDBE);
-`DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates (incl.
-the two-argument `group_concat(x, sep)` / `string_agg(x, sep)` form — the constant
-separator is captured at compile time and threaded through the accumulator). A
-`DISTINCT` dedup and a `min`/`max` comparison both fold under BINARY, so a
-non-BINARY argument collation must drive them elsewhere: a column's *declared*
-collation already trips the aggregate path's non-BINARY bail, and an **explicit
-`COLLATE`** on the argument (`count(DISTINCT a COLLATE NOCASE)`,
-`group_concat(DISTINCT a COLLATE NOCASE)`, `min(a COLLATE NOCASE)`) now likewise
-defers the whole query to the tree-walker — which honors it via
-`eval::key_collation` — rather than silently folding under BINARY (an explicit
-`COLLATE BINARY` is BINARY already and stays on the VDBE; collation-insensitive
-aggregates like `count`/`sum` keep running on the VDBE regardless);
-window functions over a single table or a plain join (**B5c-4**); and the
-three-argument `text LIKE pattern ESCAPE c` form (it desugars to `like(pattern,
-text, c)`, a pure context-free call that routes through `Op::Func` →
-`func::eval_scalar`, applying the escape and rejecting a non-single-character
-escape exactly as the tree-walker does); `printf(fmt, …)` / its `format`
-alias (pure string formatting over the argument values, likewise via `Op::Func`);
-and a **bare (non-grouped) column** in a `GROUP BY` projection / `HAVING` /
-`ORDER BY` — SQLite emits such a column's value from the row that first creates
-each group, which the VDBE captures as an extra slot on the group-key vector (set
-once at group creation, so it keeps the first-seen value) and loads back via
-`GroupKey` on both the plain and the general (HAVING/ORDER BY/LIMIT) grouped
-paths. With *exactly one* `min()`/`max()` aggregate, SQLite instead pulls bare
-columns from that aggregate's extreme ("companion") row: the fold keeps the
-running extreme in a hidden trailing key slot and overwrites the representatives
-whenever a row beats it. Only *more than one* `min()`/`max()` leaves the
-companion ambiguous, and that shape still defers to the tree-walker. Grouped
-output is **ordered by the GROUP BY keys** (BINARY ascending, NULLs first) before
-emission — SQLite groups via a sort, so a plain `GROUP BY` with no explicit
-`ORDER BY` comes out key-ordered on the VDBE just as it does in SQLite. Also a
-**constant / `VALUES` subquery source** — `FROM (VALUES (…),(…))` (which desugars
-to a `UNION ALL` of FROM-less constant cores) or `FROM (SELECT <consts>)` — is
-materialized directly as a derived table with no affinity and BINARY collation,
-joining the base-table derived-source path already on the VDBE; and a **`FROM`
-reference naming an in-scope CTE** runs on the VDBE: the whole-query `WITH` is
-materialized into the CTE environment before scanning (a small RAII guard restores
-it on every exit), and the CTE source's rows are pulled straight from there, so the
-body may read a *sibling* CTE, be recursive, or shadow a base-table name — the
-tree-walker resolved all of that during materialization. The CTE's name or alias is
-the row qualifier and an explicit `WITH name(cols…)` list renames the body's
-columns; the per-column affinity is resolved through the body with the sibling CTEs
-in scope (`subquery_column_origins_in`), so an `INTEGER` column read through a
-single-level sibling keeps coercing exactly as SQLite does. A **derived table whose
-body is a *plain* join** (`FROM (SELECT t.g, u.m FROM t JOIN u ON …) x`) runs too:
-the body materializes through `run_select`, and `subquery_column_origins` now
-resolves each output column's `(affinity, collation)` *across the join's sources*
-(first table then each joined table, in declaration order) — so an affinity-sensitive
-outer `WHERE`/`ORDER BY` over a derived numeric column coerces exactly as SQLite does,
-instead of falling back to the BLOB default (this also sharpens a join-bodied view's
-column affinity in the tree-walker). A **derived table whose body is a *same-affinity
-compound*** (`FROM (SELECT g FROM t UNION SELECT m FROM u) x`) runs too: when every
-arm yields the identical `(affinity, collation)` for each column, `arm_column_origins`
-resolves the result column to that shared origin, so an outer `WHERE v='2'` coerces
-through the inherited `INTEGER` affinity (this fixes a real tree-walker divergence —
-the conservative BLOB default previously dropped the row). A **derived table whose
-body reads a *view*** (`FROM (SELECT g AS v FROM vt) x`) runs too: `named_source_origins`
-parses the view's stored `CREATE VIEW` and threads its body through
-`subquery_column_origins` — the same origins `try_view` assigns when materializing the
-view — so a derived/outer predicate over a view column coerces through the view
-column's affinity (this *also* fixed a real tree-walker divergence: a derived table
-over a view previously fell back to the BLOB default, so `(SELECT g AS v FROM vt)
-WHERE v='2'` wrongly returned no rows). A view column carrying a *non-BINARY*
-collation still defers. A NATURAL/USING body
-(coalesced shared column), a non-BINARY body column, a recursive body, a
-*mixed-affinity* or `FROM`-less or nested compound body, or a two-or-more-level sibling
-chain whose intermediate name can't be resolved for origins still defers to the
-tree-walker (correct, never wrong). A **view named directly as a `FROM` source**
-(`SELECT g, n FROM vt`) now runs on the VDBE too: `scan_one` materializes the view by
-running its stored body (exactly as the tree-walker does) and exposes its output
-columns with the `(affinity, collation)` `try_view` resolves — so projection / WHERE /
-aggregate / GROUP BY / HAVING / DISTINCT / ORDER BY / LIMIT over the view, a view
-joined to a base table, and a join- or compound-bodied view all run. A view column
-carrying a *non-BINARY* collation defers (the VDBE compare/group paths assume BINARY
-keys); a view has no rowid, so a `rowid` reference over it defers (a view body that
-*projects* `rowid` under an alias exposes an ordinary column that runs). A
-**window-function `SELECT` over a view source** (`SELECT g, sum(n) OVER (PARTITION BY
-g) FROM vt`) runs on the VDBE too: `run_window_vdbe` resolves the view's columns
-through `try_view` and lets the base scan materialize the body through `scan_one`, then
-the shared `finish_from_rows` tail evaluates the windows — so a join-, compound-, or
-aliased-rowid-bodied view all carry windows. The same non-BINARY-collation and
-`rowid`-reference cases defer (a view has no per-row rowid for the window path). A
-**window-function `SELECT` over a table-valued-function source** (`SELECT value,
-sum(value) OVER (ORDER BY value) FROM generate_series(1,5)`, or over `json_each` /
-`json_tree` / the `pragma_<name>(arg)` form) runs too: `run_window_vdbe` resolves the
-TVF's *visible* columns through `tvf_rows` (masking the hidden `json`/`root` inputs)
-and the base scan materializes the rows through `scan_one`'s TVF branch. A `rowid`
-reference defers (a TVF row has no rowid). A **window function whose `FROM` is a join
-containing a view, table-valued function, or derived subquery** runs on the VDBE too:
-when the row-less `static_scope_columns` reports the join shape as unknown,
-`window_join_source_columns` resolves each source's columns exactly as the base scan
-exposes them — a plain table via `table_meta`, a view via `try_view`, a visible-masked
-TVF via `tvf_rows`, and a derived subquery via `window_source_columns` (the same
-`(affinity, collation)` model the single-source derived window path uses, so a
-join-bodied or two-derived join carries windows) — and the column-qualified `SELECT *`
-base scan materializes the joined rows. A **`NATURAL` or `USING` join** window source
-runs too: `window_join_source_columns` mirrors the base scan's coalescing — it drops the
-right-hand duplicate of each same-named (`NATURAL`) or named (`USING`) pair, keeping the
-left column's name/affinity/collation — so a coalesced-key `PARTITION BY` or window over
-the join matches the tree-walker byte-for-byte (including when the coalesced column
-itself carries `NOCASE`). A non-BINARY view or derived column, or a `rowid` reference
-(a joined row has no single rowid), still defers. This builds on a general
-**`SELECT *` / `tbl.*` over a join whose sources share a column name** fix: the wildcard
-expansion now qualifies each expanded column with its source table (from the scan's
-parallel `tables` slice), so `SELECT * FROM t JOIN u` where both carry `g` resolves each
-`g` to its own source instead of erroring on an ambiguous bare reference. An **aggregate
-or window function in a join `ON` predicate or in the `WHERE` clause** (a misuse — there
-is no grouping context at the row-filter level) is detected up front and deferred so the
-tree-walker raises the proper "misuse of aggregate/window function" error, rather than a
-join whose predicate is never evaluated (e.g. an empty outer table) silently returning
-rows. A **single
-table-valued function `FROM` source** runs on
-the VDBE as well: `generate_series(start[,stop[,step]])`, `json_each` / `json_tree`,
-and the table-valued `pragma_<name>(arg)` form are materialized through the same
-`tvf_rows` the tree-walker uses, so projection / WHERE / ORDER BY / LIMIT / aggregate
-over the series, the JSON elements, or the pragma rows run without falling back. The
-*hidden* input columns `json_each` / `json_tree` expose (`json` / `root`) are dropped
-— they're excluded from `*` expansion, and a query naming one explicitly fails to
-resolve on the VDBE and defers. A TVF in a *join* runs too when **every argument is
-a constant expression** (`json_each('[7,8]')`, `generate_series(1,2)`,
-`pragma_table_info('t')`) — the ordinary join machinery materializes it through
-`scan_one`; only a TVF with a *non-constant* argument (which may correlate to
-another source, and the rowless `tvf_rows` can't honour) still defers to the
-tree-walker. A **compound
-`SELECT` whose whole-query `WITH` is referenced by one or more arms** runs on the
-VDBE too: the outer CTEs are materialized into the CTE environment (so the first
-core's output-collation scan resolves them) and threaded into every operand (so
-each arm pulls them from that environment), and any arm whose CTE can't run on the
-VDBE — a recursive body, a join body, or a deep sibling chain — declines and falls
-the whole compound back to the tree-walker (a single-level sibling reference now
-runs, like a non-compound CTE source). The derived-source path also
-handles a **nested derived table** — a `FROM` subquery whose own source is another
-subquery, to any depth — by resolving each output column's `(affinity, collation)`
-through the chain of single-source derived tables (an inherited `INTEGER` affinity
-read through two `SELECT *` wrappers keeps coercing exactly as SQLite does); a body
-that is a join, a compound, a view, a CTE, or a table-valued function, or any
-derived column with a non-BINARY collation, still defers. A **window function over
-a derived subquery source** runs on the VDBE too: the derived source's columns are
-resolved through that same `(affinity, collation)` chain and materialized, then the
-window operator partitions/orders/frames over the rows — so `SELECT …, sum(n) OVER
-(PARTITION BY g) FROM (SELECT g, n FROM t)` (and a nested derived body under it)
-runs without falling back. A constant / `VALUES` derived body works too (its
-columns carry no affinity and BINARY collation, like the non-window derived scan).
-A derived body the source path can't resolve (join / non-constant compound / view
-/ TVF), or a window or projection that references the derived source's
-non-existent rowid, still defers. A **window function whose `FROM` source names a
-whole-query `WITH` CTE** runs on the VDBE as well: the CTE is resolved from
-`sel.ctes` (the same path the non-window scan uses), its columns' `(affinity,
-collation)` flow through the CTE body — an explicit `WITH name(cols…)` rename and
-any inherited affinity honored — and the base scan materializes the CTE's rows, so
-`WITH c AS (SELECT g, n FROM t) SELECT g, sum(n) OVER (PARTITION BY g) FROM c` runs
-without falling back; a query carrying an unused `WITH` over a base table, and a
-constant / `VALUES` CTE body, run too. The derived and CTE window paths share one
-column-resolution helper (`window_source_columns`). A non-constant compound / join
-/ view CTE body, a reference to the CTE's non-existent rowid, or a *join* that
-carries CTEs (its column set is resolved statically and can't see a CTE binding)
-still defers.
+**Done.** The per-shape write-ups have been cleared (git history + `tests/*.rs`
+keep the detail); each item below is gated on VDBE-vs-tree-walker parity, so it
+returns the tree-walker's results or declines to it — never a wrong answer.
 
-A **positional `ORDER BY` ordinal written as anything but a bare in-range positive
-integer** — a negative (`ORDER BY -1`), an out-of-range value, or a unary
-`+`/parenthesis/`COLLATE` wrapper SQLite still reads as a position — now defers to
-the tree-walker instead of being compiled as a sort by that constant value. The
-VDBE only accelerates a bare `ORDER BY <N>` with `1 ≤ N ≤ ncols`; every other form
-that `positional_int` recognizes as an ordinal is handed back, so the tree-walker's
-`check_positional_terms` produces SQLite's exact `Nth ORDER BY term out of range -
-should be between 1 and M` (previously `ORDER BY -1` silently succeeded as a no-op
-constant sort under the default VDBE path). Test:
-`tests/order_by_negative_ordinal.rs`.
-
-The VDBE hands those forms to the tree-walker — but the tree-walker itself was
-only resolving a **bare** integer literal to its output column: an *in-range*
-signed / parenthesized / `COLLATE`-wrapped ordinal (`ORDER BY +1`, `GROUP BY +1`,
-`ORDER BY (2)`) fell through to ordinary expression evaluation, so it sorted /
-grouped by the *constant* (a no-op sort leaving scan order, or a single collapsed
-group) — and in a compound query it errored `ORDER BY term does not match any
-column in the result set`. Both `resolve_order_index` (ORDER BY, every row/window/
-compound path) and the two positional-`GROUP BY` rewriters (the VDBE pre-pass and
-the tree-walker grouper) now resolve via `positional_int`, so `+N` names output
-column N exactly like the bare `N` does — `positional_int` returns `None` for
-`+col`/`(col)`, which still fall through to the alias/expression path. Test:
-`tests/group_by_positional.rs` (`signed_positional_order_by_resolves_to_column`,
-`signed_positional_group_by_resolves_to_column`). A positional `GROUP BY` term
-that resolves to an *aggregate* output column (`SELECT a, count(*) … GROUP BY 2`)
-is now rejected at prepare time with SQLite's `aggregate functions are not allowed
-in the GROUP BY clause` — the prepare-time aggregate-in-`GROUP BY` check resolves
-each ordinal (via `positional_int`, so `+2`/`(2)` count too) back to its result
-expression before scanning for aggregates, instead of substituting lazily and
-later tripping over the generic `misuse of aggregate function …`. Test:
-`positional_group_by_to_aggregate_is_rejected`.
+- **Planner / access paths** — `ANALYZE`/`sqlite_stat1` stats-driven planning;
+  the full equality / range / `IN` / OR-union + inner-join + `WITHOUT ROWID` seek
+  family; hash join + automatic-index EQP; index-driven `ORDER BY` and covering
+  reads (**B0/B0b**).
+- **VDBE core** — the register VM + its scalar-expression compiler; **routing
+  default-on** (**B7a/B7b**, tree-walker is the fallback oracle); bytecode
+  `EXPLAIN` (**B8**).
+- **Joins on the VDBE** (**B5a/B5b-1**) — N-table inner joins plus 2-table and
+  N-table `LEFT`/`RIGHT`/`FULL` nested-loop joins, with projection /
+  WHERE-merged-ON / `DISTINCT` / `ORDER BY` / `LIMIT` / grouped-and-bare
+  aggregates, no cross-product materialized. `SELECT *` / `tbl.*` over a
+  same-named-column join self-qualifies each column to its source. An aggregate /
+  window function misused in an `ON`/`WHERE` predicate is detected up front and
+  deferred so the tree-walker raises the proper error.
+- **Subquery folds** (**B5c-1**) — non-correlated scalar / `EXISTS` / `IN (SELECT)`
+  evaluated by the tree-walker with affinity/collation preserved; the fold threads
+  scope as it descends, so further-nested self-contained subqueries and
+  compound-bodied (`UNION`/`INTERSECT`/`EXCEPT`) subqueries fold too (value folds
+  require every arm to project a computed column so the result carries NONE
+  affinity, matching a literal list).
+- **Grouping & aggregates** — positional and computed `GROUP BY` keys; bare
+  (non-grouped) columns emitted from the group's first row (or a lone
+  `min`/`max`'s companion row); `SELECT DISTINCT` over a grouped query (dedup via
+  a `DistinctCheck` placed after `HAVING`, before `LIMIT`/sorter); `DISTINCT` /
+  `FILTER` / ordered + two-arg `group_concat`/`string_agg` aggregates; grouped
+  output key-ordered before emission. An explicit non-BINARY `COLLATE` on a
+  `DISTINCT` / `min`/`max` / aggregate argument correctly defers to the
+  tree-walker rather than folding under BINARY.
+- **Compound set-ops** (**B5c-3**) — `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`,
+  including a whole-query `WITH` referenced by one or more arms (arms that can't
+  run — recursive / join / deep-sibling CTE bodies — decline the whole compound).
+- **Derived / view / CTE / TVF sources** — `FROM (VALUES …)` and `FROM (SELECT
+  consts)`; an in-scope CTE source (recursive / sibling-reading / shadowing);
+  derived bodies that are a plain join, a same-affinity compound, a view, or
+  nested to any depth, with each output column's `(affinity, collation)` resolved
+  across the body (`subquery_column_origins` / `arm_column_origins` /
+  `named_source_origins`) so affinity-sensitive outer predicates coerce exactly;
+  a view named directly as a `FROM` source; a single table-valued-function source
+  (`generate_series`, `json_each`/`json_tree`, `pragma_<name>(arg)`) and a
+  constant-argument TVF in a join. Non-BINARY-collation columns, `rowid` over a
+  rowid-less source, and bodies the origin resolver can't crack still defer.
+- **Window functions** (**B5c-4**) over a table, a plain/NATURAL/USING join, a
+  view, a TVF, a derived subquery, or a CTE — `window_source_columns` /
+  `window_join_source_columns` resolve each source's columns exactly as the base
+  scan exposes them, then the shared `finish_from_rows` tail evaluates the frames.
+- **Misc operators** — three-argument `LIKE … ESCAPE`, `printf`/`format`
+  (both via `Op::Func`); positional `ORDER BY`/`GROUP BY` ordinals resolved
+  through `positional_int` (a signed/parenthesized/`COLLATE`-wrapped in-range
+  ordinal names its output column on every path; an out-of-range or non-ordinal
+  form defers so the tree-walker raises SQLite's exact range error; an ordinal
+  resolving to an aggregate output column is rejected at prepare time).
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is
