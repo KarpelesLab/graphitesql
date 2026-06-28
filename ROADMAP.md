@@ -1228,9 +1228,20 @@ open work:
   column ref that is ambiguous across multiple base sources, because the AST has
   no per-column-ref source span. The *single*-source-with-subqueries cases are
   now handled for both views (`tests/view_rename_column_subquery.rs`) and
-  triggers (`tests/trigger_rename_column_subquery.rs`); what remains is the truly
-  multi-table body (a join, a subquery over another table, a body statement
-  writing a different table).
+  triggers (`tests/trigger_rename_column_subquery.rs`). A view that reaches the
+  renamed table only through a *nested* subquery (its top-level `FROM` is an
+  unrelated base table — e.g. `SELECT c FROM u WHERE c IN (SELECT a FROM t)`) is
+  now handled too, via a **global-uniqueness** prover
+  (`view_global_unique_quals`): it collects every base-table source at every
+  nesting level and rewrites a bare `old` when that column name is unique across
+  all of them — so a bare ref can bind only to the renamed table
+  (`tests/rename_column_view_subquery.rs`). What remains is the genuinely
+  ambiguous case — a bare ref to a column that *several* in-scope base tables
+  own, where only one occurrence (the one in the renamed table's scope) should
+  change. That is what needs the per-ref span:
+  - the same global-uniqueness gap for a **trigger** `WHEN`/body subquery that
+    reaches the renamed column across objects (the body-single-source case is
+    already covered by `trigger_body_single_source_over`); and
   - **A-rn3-edge-1** — add a source span (byte range) to `Expr::Column`. This is
     the enabling refactor. (The sibling `schema` field it once shared with the
     now-landed 3-part `schema.table.column` qualifier check is already in place,

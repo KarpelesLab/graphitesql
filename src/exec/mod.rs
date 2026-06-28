@@ -10248,6 +10248,14 @@ impl Connection {
                                     view_multi_source_quals(&vsql, &table, &old, &table_cols)
                                 {
                                     rewrite_column_tokens(&vsql, &quals, &old, &new_text, bare)
+                                } else if let Some((quals, bare)) =
+                                    view_global_unique_quals(&vsql, &table, &old, &table_cols)
+                                {
+                                    // The renamed table is reached only through a
+                                    // nested subquery (top-level FROM is another
+                                    // base table); a bare `old` is rewritten when
+                                    // the column name is globally unique.
+                                    rewrite_column_tokens(&vsql, &quals, &old, &new_text, bare)
                                 } else {
                                     vsql.clone()
                                 };
@@ -27909,6 +27917,150 @@ fn view_multi_source_quals(
         }
     }
     Some((quals, rewrite_bare))
+}
+
+/// A-rn3 (global-uniqueness extension): a column-rename rewrite plan for a view
+/// whose body reaches the renamed `table` only through a *nested* expression
+/// subquery — the top-level `FROM` may be an unrelated base table, so neither the
+/// single-source nor the join (`view_multi_source_quals`) prover applies. Walks
+/// every base-table source at every nesting level; if the renamed column name is
+/// unique across all of them, a bare `old` (in any scope) can resolve only to the
+/// renamed table, so SQLite renames it and so can we. Returns `(quals,
+/// rewrite_bare)` like [`view_multi_source_quals`], or `None` (leave the view
+/// untouched) on any shape a token rewrite can't prove safe: a CTE/compound
+/// anywhere, a derived/TVF source, a NATURAL/USING join, a source named or
+/// aliased `old`, a result alias `old`, `old == table`, an unknown source table,
+/// or the renamed table never appearing.
+fn view_global_unique_quals(
+    view_sql: &str,
+    table: &str,
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<(Vec<String>, bool)> {
+    let Ok(Statement::CreateView(cv)) = sql::parse_one(view_sql) else {
+        return None;
+    };
+    if old.eq_ignore_ascii_case(table) {
+        return None;
+    }
+    let mut srcs: Vec<(String, Option<String>)> = Vec::new();
+    if !collect_select_base_sources(&cv.select, old, &mut srcs) {
+        return None;
+    }
+    // Only fire when the rename is globally unambiguous (`rewrite_bare`): then a
+    // bare `old` anywhere can resolve only to the renamed table, so the whole-text
+    // rewrite is complete and correct. When `old` is non-unique across the
+    // sources, a bare ref may belong to another scope's table — which a token
+    // rewrite can't tell apart without per-ref spans — so we bail entirely rather
+    // than do a partial (qualified-only) rewrite that would leave the view in a
+    // half-renamed, broken state. (That ambiguous case is the A-rn3-edge work.)
+    match global_unique_plan(&srcs, table, old, table_cols) {
+        Some((quals, true)) => Some((quals, true)),
+        _ => None,
+    }
+}
+
+/// Recursively gather every base-table source `(name, alias)` reachable from
+/// `sel` and its nested *expression* subqueries (a scalar `(SELECT …)`, `EXISTS`,
+/// or `IN (SELECT …)`), for [`view_global_unique_quals`]. Returns `false` to bail
+/// on any shape a token rewrite can't safely reason about: a CTE/compound, a
+/// derived subquery / TVF / schema-qualified source in a `FROM`, a NATURAL/USING
+/// join (column coalescing), a source named or aliased exactly `old` (its token
+/// would be wrongly rewritten), or a result-column alias equal to `old`.
+fn collect_select_base_sources(
+    sel: &Select,
+    old: &str,
+    srcs: &mut Vec<(String, Option<String>)>,
+) -> bool {
+    if !sel.ctes.is_empty() || !sel.compound.is_empty() {
+        return false;
+    }
+    if let Some(from) = &sel.from {
+        let mut take = |tr: &crate::sql::ast::TableRef| -> bool {
+            if tr.subquery.is_some() || tr.tvf_args.is_some() || tr.schema.is_some() {
+                return false;
+            }
+            if tr.name.eq_ignore_ascii_case(old) {
+                return false;
+            }
+            if tr
+                .alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(old))
+            {
+                return false;
+            }
+            srcs.push((tr.name.clone(), tr.alias.clone()));
+            true
+        };
+        if !take(&from.first) {
+            return false;
+        }
+        for j in &from.joins {
+            if j.natural || !j.using.is_empty() || !take(&j.table) {
+                return false;
+            }
+        }
+    }
+    for rc in &sel.columns {
+        if let ResultColumn::Expr { alias: Some(a), .. } = rc {
+            if a.eq_ignore_ascii_case(old) {
+                return false;
+            }
+        }
+    }
+    let mut subs: Vec<&Select> = Vec::new();
+    for e in view_select_exprs(sel) {
+        collect_immediate_subselects(e, &mut subs);
+    }
+    subs.into_iter()
+        .all(|s| collect_select_base_sources(s, old, srcs))
+}
+
+/// Build the column-rename plan from every base-table source `(name, alias)`
+/// collected across all nesting levels of an object: the renamed `table` must
+/// appear at least once; `quals` is its name plus every alias bound to it; and a
+/// bare `old` is rewritable only when exactly one *distinct* source table owns a
+/// column of that name (so a bare reference is globally unambiguous). Every source
+/// must be a known base table in `table_cols`; an unknown one bails (`None`).
+fn global_unique_plan(
+    srcs: &[(String, Option<String>)],
+    table: &str,
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<(Vec<String>, bool)> {
+    if !srcs.iter().any(|(n, _)| n.eq_ignore_ascii_case(table)) {
+        return None;
+    }
+    let mut quals: Vec<String> = alloc::vec![table.to_string()];
+    for (n, a) in srcs {
+        if n.eq_ignore_ascii_case(table) {
+            if let Some(a) = a {
+                if !quals.iter().any(|q| q.eq_ignore_ascii_case(a)) {
+                    quals.push(a.clone());
+                }
+            }
+        }
+    }
+    let has_old = |name: &str| -> Option<bool> {
+        let cols = table_cols
+            .iter()
+            .find(|(t, _)| t.eq_ignore_ascii_case(name))
+            .map(|(_, c)| c)?;
+        Some(cols.iter().any(|c| c.eq_ignore_ascii_case(old)))
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    for (n, _) in srcs {
+        if seen.iter().any(|s| s.eq_ignore_ascii_case(n)) {
+            continue;
+        }
+        seen.push(n.clone());
+        if has_old(n)? {
+            count += 1;
+        }
+    }
+    Some((quals, count == 1))
 }
 
 /// Whether a `SELECT` references at most the single source `table` (its `FROM`,

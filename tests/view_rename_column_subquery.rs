@@ -93,6 +93,13 @@ fn view_rename_column_subquery_matches_sqlite() {
         // A FROM-less subquery (references no table) is fine.
         "CREATE TABLE t(a,b); CREATE VIEW v AS SELECT a, (SELECT 1) AS one FROM t; \
          ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Subquery over ANOTHER table whose column name doesn't collide: the
+        // renamed column is globally unique, so a bare `a` can only bind to `t`
+        // and is rewritten (the global-uniqueness prover; see
+        // `tests/rename_column_view_subquery.rs` for the cross-source family).
+        "CREATE TABLE t(a,b); CREATE TABLE other(id); \
+         CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT id FROM other); \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
     ];
     for sql in matching {
         assert_eq!(run("sqlite3", sql), run(g, sql), "for {sql}");
@@ -104,13 +111,6 @@ fn view_rename_column_subquery_matches_sqlite() {
     // rather than differential equalities. The invariant guards against a *wrong*
     // rewrite creeping in.)
     let bail = [
-        // Subquery references another table.
-        (
-            "CREATE TABLE t(a,b); CREATE TABLE other(id); \
-             CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT id FROM other); \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-            "CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT id FROM other)",
-        ),
         // Result-column alias collides with the renamed column name.
         (
             "CREATE TABLE t(a,b); CREATE VIEW v AS SELECT b AS a, a FROM t; \
