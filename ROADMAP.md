@@ -1282,9 +1282,12 @@ and the table-valued `pragma_<name>(arg)` form are materialized through the same
 over the series, the JSON elements, or the pragma rows run without falling back. The
 *hidden* input columns `json_each` / `json_tree` expose (`json` / `root`) are dropped
 — they're excluded from `*` expansion, and a query naming one explicitly fails to
-resolve on the VDBE and defers. A TVF appearing in a *join* (its arguments may
-correlate to another source, which the rowless `tvf_rows` can't honour) also defers
-to the tree-walker. A **compound
+resolve on the VDBE and defers. A TVF in a *join* runs too when **every argument is
+a constant expression** (`json_each('[7,8]')`, `generate_series(1,2)`,
+`pragma_table_info('t')`) — the ordinary join machinery materializes it through
+`scan_one`; only a TVF with a *non-constant* argument (which may correlate to
+another source, and the rowless `tvf_rows` can't honour) still defers to the
+tree-walker. A **compound
 `SELECT` whose whole-query `WITH` is referenced by one or more arms** runs on the
 VDBE too: the outer CTEs are materialized into the CTE environment (so the first
 core's output-collation scan resolves them) and threaded into every operand (so

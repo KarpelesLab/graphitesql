@@ -7,10 +7,14 @@
 //! dropped — they're excluded from `*` expansion anyway, and a query naming one
 //! explicitly fails to resolve on the VDBE and defers to the tree-walker.
 //!
+//! A TVF in a *join* runs too when every argument is a constant expression
+//! (`json_each('[7,8]')`, `generate_series(1,2)`, `pragma_table_info('t')`) — the
+//! ordinary join machinery materializes it through `scan_one`.
+//!
 //! Deferred to the tree-walker (asserted separately), never run wrong:
 //!   * a query naming a TVF's *hidden* `json` / `root` column explicitly.
-//!   * any TVF appearing in a *join* — its arguments may correlate to another
-//!     source's columns, which `tvf_rows` (rowless context) can't honour.
+//!   * a TVF in a *join* with a *non-constant* argument — it may correlate to
+//!     another source's columns, which `tvf_rows` (rowless context) can't honour.
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE ran the
 //! TVF source itself. Checked against the tree-walker and sqlite3 3.50.4.
@@ -90,27 +94,85 @@ fn tvf_source_runs_on_vdbe_and_matches_tree_walker() {
     }
 }
 
+// A constant-argument TVF in a join is non-correlated, so it runs on the VDBE
+// through the ordinary join machinery (`scan_one` materializes it). ORDER BY pins
+// the row order. (`t(g INTEGER, a TEXT, n INTEGER)` from SETUP.)
+const JOIN_QUERIES: &[&str] = &[
+    "SELECT t.g, s.value FROM t, generate_series(1,2) s ORDER BY t.g, s.value",
+    "SELECT t.g, s.value FROM t CROSS JOIN generate_series(1,3) s ORDER BY 1,2",
+    "SELECT t.a, j.value FROM t, json_each('[7,8]') j ORDER BY 1,2",
+    "SELECT count(*) FROM t, generate_series(1,5)",
+    "SELECT s.value FROM generate_series(10,12) s, t ORDER BY 1",
+    "SELECT t.a, p.name FROM t, pragma_table_info('t') p ORDER BY t.a, p.name",
+];
+
 #[test]
-fn hidden_column_and_joined_tvf_fall_back() {
+fn constant_arg_tvf_in_join_runs_on_vdbe() {
     let c = conn();
-    // A query naming a TVF's hidden `json` / `root` column explicitly, and any TVF
-    // inside a join (its args may correlate to another source), both defer to the
-    // tree-walker, which still runs them.
+    for q in JOIN_QUERIES {
+        let got = c.query_vdbe(q).unwrap().rows;
+        let want = c.query(q).unwrap().rows;
+        assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
+    }
+}
+
+#[test]
+fn constant_arg_tvf_in_join_matches_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let c = conn();
+    for q in JOIN_QUERIES {
+        let vdbe: Vec<Vec<String>> = c
+            .query_vdbe(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.iter().map(render).collect())
+            .collect();
+        let out = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg("-ascii")
+            .arg(format!("{SETUP}{q};"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "sqlite3 failed on {q}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        let want: Vec<Vec<String>> = text
+            .split('\u{1e}')
+            .filter(|r| !r.is_empty())
+            .map(|r| r.split('\u{1f}').map(|f| f.to_string()).collect())
+            .collect();
+        assert_eq!(vdbe, want, "VDBE vs sqlite3 diverged on {q}");
+    }
+}
+
+#[test]
+fn hidden_column_and_correlated_tvf_fall_back() {
+    let c = conn();
+    // A query naming a TVF's hidden `json` / `root` column explicitly defers to the
+    // tree-walker, which still runs it.
     for q in [
         "SELECT json FROM json_each('[1,2]')",
         "SELECT je.root FROM json_each('[1,2]','$') je",
-        "SELECT t.g, j.value FROM t, json_each('[1,2]') j",
-        "SELECT g FROM t, generate_series(1,2)",
     ] {
         assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
         assert!(c.query(q).is_ok(), "tree-walker should run {q}");
     }
-    // A TVF inside a join with a TVF-only ambiguity defers too (tree-walker errors).
-    let amb = "SELECT value FROM generate_series(1,5), generate_series(1,2)";
-    assert!(
-        c.query_vdbe(amb).is_err(),
-        "expected VDBE fallback for {amb}"
-    );
+    // A TVF in a join with a *non-constant* argument may correlate to another
+    // source, which the rowless `tvf_rows` can't honour, so the VDBE defers. (The
+    // tree-walker may itself reject these — correlated TVF args / a non-JSON column —
+    // so we only assert the VDBE didn't run them.)
+    for q in [
+        "SELECT t.g, j.value FROM t, json_each(t.a) j",
+        "SELECT t.g, s.value FROM t, generate_series(1, t.g) s",
+        // Two constant-arg TVFs are non-correlated, but `value` is ambiguous across
+        // them, so the VDBE still defers (the tree-walker rejects it like SQLite).
+        "SELECT value FROM generate_series(1,5), generate_series(1,2)",
+    ] {
+        assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
+    }
 }
 
 #[test]

@@ -1451,16 +1451,28 @@ impl Connection {
             Ok((cols, tables, affinities, collations, rows, rowids))
         };
 
-        // A table-valued function appearing in a *join* defers to the tree-walker:
-        // its arguments may correlate to another source's columns (`json_each(t.j)`),
-        // which `tvf_rows` — evaluating in a rowless context — can't honour. Only a
-        // single TVF source (handled below via `scan_one`) runs on the VDBE.
+        // A table-valued function in a *join* runs only when every one of its
+        // arguments is a constant expression. A non-constant argument may correlate
+        // to another source's columns (`json_each(t.j)`, `generate_series(1, t.n)`),
+        // which `tvf_rows` — evaluating in a rowless context — can't honour, so such
+        // a TVF defers to the tree-walker. (A bare `pragma_x` / a literal-argument
+        // `pragma_x('t')` has only constant arguments, so it runs.)
         if !from.joins.is_empty()
             && core::iter::once(&from.first)
                 .chain(from.joins.iter().map(|j| &j.table))
-                .any(|tr| tr.tvf_args.is_some() || self.is_pragma_tvf(tr))
+                .any(|tr| {
+                    (tr.tvf_args.is_some() || self.is_pragma_tvf(tr))
+                        && !tr
+                            .tvf_args
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .all(is_const_offset_expr)
+                })
         {
-            return Err(Error::Unsupported("VDBE: table-valued function in a join"));
+            return Err(Error::Unsupported(
+                "VDBE: correlated table-valued function in a join",
+            ));
         }
 
         // Outer / NATURAL / USING join(s) — anything beyond a plain INNER chain. A
