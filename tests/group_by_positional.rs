@@ -119,6 +119,81 @@ fn positional_term_out_of_range_message_matches_sqlite() {
     assert!(c.query("SELECT 1 ORDER BY '2'").is_ok());
 }
 
+/// An *in-range* signed / parenthesized / `COLLATE`-wrapped integer in `ORDER BY`
+/// is a positional column reference, exactly like a bare integer — SQLite folds
+/// the unary sign, so `ORDER BY +1` sorts by output column 1. (Regression: it used
+/// to be treated as the constant expression `+1`, a no-op sort that left rows in
+/// scan order.)
+#[test]
+fn signed_positional_order_by_resolves_to_column() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("INSERT INTO t VALUES(30, 11), (10, 22), (20, 33)")
+        .unwrap();
+
+    let sorted_by_a = vec![
+        vec![Value::Integer(10), Value::Integer(22)],
+        vec![Value::Integer(20), Value::Integer(33)],
+        vec![Value::Integer(30), Value::Integer(11)],
+    ];
+    // `+1`, `(1)`, `1 COLLATE BINARY`, the bare `1`, and the column name all agree
+    // — and all genuinely sort (not the old insertion-order no-op).
+    for q in [
+        "SELECT a, b FROM t ORDER BY +1",
+        "SELECT a, b FROM t ORDER BY (1)",
+        "SELECT a, b FROM t ORDER BY 1 COLLATE BINARY",
+        "SELECT a, b FROM t ORDER BY 1",
+        "SELECT a, b FROM t ORDER BY a",
+    ] {
+        assert_eq!(rows(&c, q), sorted_by_a, "{q}");
+    }
+
+    // The sign composes with ASC/DESC on the resolved column, not the literal.
+    assert_eq!(
+        rows(&c, "SELECT a, b FROM t ORDER BY +2 DESC"),
+        vec![
+            vec![Value::Integer(20), Value::Integer(33)],
+            vec![Value::Integer(10), Value::Integer(22)],
+            vec![Value::Integer(30), Value::Integer(11)],
+        ]
+    );
+
+    // A compound query: `+2` is positional there too (it used to error with
+    // "ORDER BY term does not match any column in the result set").
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT a, b FROM t UNION SELECT a, b FROM t ORDER BY +2"
+        ),
+        rows(&c, "SELECT a, b FROM t UNION SELECT a, b FROM t ORDER BY 2")
+    );
+}
+
+/// An *in-range* signed / wrapped integer in `GROUP BY` is positional too, so
+/// `GROUP BY +1` groups by output column 1 (not the constant `+1`, which would
+/// collapse every row into one group).
+#[test]
+fn signed_positional_group_by_resolves_to_column() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("INSERT INTO t VALUES(1, 5), (1, 6), (2, 7), (3, 8)")
+        .unwrap();
+
+    let grouped = vec![
+        vec![Value::Integer(1), Value::Integer(2)],
+        vec![Value::Integer(2), Value::Integer(1)],
+        vec![Value::Integer(3), Value::Integer(1)],
+    ];
+    for q in [
+        "SELECT a, count(*) FROM t GROUP BY +1 ORDER BY +1",
+        "SELECT a, count(*) FROM t GROUP BY (1) ORDER BY 1",
+        "SELECT a, count(*) FROM t GROUP BY 1 ORDER BY 1",
+        "SELECT a, count(*) FROM t GROUP BY a ORDER BY a",
+    ] {
+        assert_eq!(rows(&c, q), grouped, "{q}");
+    }
+}
+
 #[test]
 fn generate_series_zero_step_is_one() {
     let c = Connection::open_memory().unwrap();

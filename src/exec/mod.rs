@@ -1202,11 +1202,7 @@ impl Connection {
         // ordinal must be *rejected* — both defer to the tree-walker, which
         // validates and errors them exactly like SQLite.
         let regrouped;
-        let sel = if sel
-            .group_by
-            .iter()
-            .any(|g| matches!(g, Expr::Literal(Literal::Integer(_))))
-        {
+        let sel = if sel.group_by.iter().any(|g| positional_int(g).is_some()) {
             if sel
                 .columns
                 .iter()
@@ -1218,8 +1214,11 @@ impl Connection {
             }
             let mut s = sel.clone();
             for g in &mut s.group_by {
-                if let Expr::Literal(Literal::Integer(n)) = g {
-                    match usize::try_from(*n)
+                // A positional `GROUP BY N` — including the signed / parenthesized /
+                // `COLLATE`-wrapped forms SQLite folds (`GROUP BY +1`) — names the
+                // N-th output column.
+                if let Some(n) = positional_int(g) {
+                    match usize::try_from(n)
                         .ok()
                         .filter(|&n| n >= 1)
                         .and_then(|n| sel.columns.get(n - 1))
@@ -20379,13 +20378,16 @@ impl Connection {
             .group_by
             .iter()
             .map(|g| {
-                if let Expr::Literal(Literal::Integer(n)) = g {
-                    if *n >= 1 {
-                        if let Some(ResultColumn::Expr { expr, .. }) =
-                            sel.columns.get((*n - 1) as usize)
-                        {
-                            return expr.clone();
-                        }
+                // A positional `GROUP BY N` — including the signed / parenthesized /
+                // `COLLATE`-wrapped forms SQLite folds (`GROUP BY +1`) — names the
+                // N-th output column.
+                if let Some(n) = positional_int(g) {
+                    if let Some(ResultColumn::Expr { expr, .. }) = usize::try_from(n)
+                        .ok()
+                        .filter(|&n| n >= 1)
+                        .and_then(|n| sel.columns.get(n - 1))
+                    {
+                        return expr.clone();
                     }
                 }
                 g.clone()
@@ -20729,13 +20731,16 @@ impl Connection {
             .group_by
             .iter()
             .map(|g| {
-                if let Expr::Literal(Literal::Integer(n)) = g {
-                    if *n >= 1 {
-                        if let Some(ResultColumn::Expr { expr, .. }) =
-                            sel.columns.get((*n - 1) as usize)
-                        {
-                            return expr.clone();
-                        }
+                // A positional `GROUP BY N` — including the signed / parenthesized /
+                // `COLLATE`-wrapped forms SQLite folds (`GROUP BY +1`) — names the
+                // N-th output column.
+                if let Some(n) = positional_int(g) {
+                    if let Some(ResultColumn::Expr { expr, .. }) = usize::try_from(n)
+                        .ok()
+                        .filter(|&n| n >= 1)
+                        .and_then(|n| sel.columns.get(n - 1))
+                    {
+                        return expr.clone();
                     }
                 }
                 g.clone()
@@ -26453,11 +26458,16 @@ fn must_be_int(v: Value) -> Result<i64> {
 /// matches a result-column label/alias. Returns `None` for general expressions,
 /// which are evaluated against the row instead.
 fn resolve_order_index(expr: &Expr, labels: &[String], ncols: usize) -> Option<usize> {
+    // A (possibly signed / parenthesized / `COLLATE`-wrapped) integer literal is a
+    // 1-based positional reference: SQLite folds the unary sign, so `ORDER BY +2`
+    // is position 2 just like `ORDER BY 2`. Resolve it the same way a bare literal
+    // is (`positional_int` recognizes exactly these wrapped-integer-literal forms;
+    // it returns `None` for `+col`/`(col)`, which fall through to the alias match).
+    if let Some(n) = positional_int(expr) {
+        let idx = usize::try_from(n).ok()?.checked_sub(1)?;
+        return (idx < ncols).then_some(idx);
+    }
     match expr {
-        Expr::Literal(Literal::Integer(n)) => {
-            let idx = (*n as usize).checked_sub(1)?;
-            (idx < ncols).then_some(idx)
-        }
         Expr::Column {
             table: None,
             column,

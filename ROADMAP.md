@@ -1567,6 +1567,20 @@ should be between 1 and M` (previously `ORDER BY -1` silently succeeded as a no-
 constant sort under the default VDBE path). Test:
 `tests/order_by_negative_ordinal.rs`.
 
+The VDBE hands those forms to the tree-walker — but the tree-walker itself was
+only resolving a **bare** integer literal to its output column: an *in-range*
+signed / parenthesized / `COLLATE`-wrapped ordinal (`ORDER BY +1`, `GROUP BY +1`,
+`ORDER BY (2)`) fell through to ordinary expression evaluation, so it sorted /
+grouped by the *constant* (a no-op sort leaving scan order, or a single collapsed
+group) — and in a compound query it errored `ORDER BY term does not match any
+column in the result set`. Both `resolve_order_index` (ORDER BY, every row/window/
+compound path) and the two positional-`GROUP BY` rewriters (the VDBE pre-pass and
+the tree-walker grouper) now resolve via `positional_int`, so `+N` names output
+column N exactly like the bare `N` does — `positional_int` returns `None` for
+`+col`/`(col)`, which still fall through to the alias/expression path. Test:
+`tests/group_by_positional.rs` (`signed_positional_order_by_resolves_to_column`,
+`signed_positional_group_by_resolves_to_column`).
+
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is
 gated on VDBE-vs-tree-walker parity, so it can't regress correctness):
