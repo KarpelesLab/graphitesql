@@ -366,6 +366,21 @@ reals via `partial_cmp`, and a mixed integer/real pair with SQLite's exact
 break an equal-part tie by the real's fraction). Test:
 `tests/integer_comparison_precision.rs` (VDBE on and off).
 
+And a **blob in an arithmetic or numeric-function context now coerces like
+SQLite**, which reads the blob's bytes *as a text string* and applies the
+text→number rule. `abs(x'3132')` is now `12.0` (the bytes `0x31 0x32` are the
+ASCII text `"12"`), not `0.0`; likewise `x'3132' + 0` → `12`, `-x'35'` → `-5`,
+`round(x'332E3134',1)` → `3.1`, and a blob inside `sum`/`total`/`avg` contributes
+its parsed value (`sum(x'3132', 3)` → `15.0`). The fix is a single point —
+`eval::to_number`'s `Blob` arm now parses `String::from_utf8_lossy(bytes)` through
+`parse_number` instead of returning `0` — so it covers the tree-walker and the
+VDBE (which share the helper) and every numeric caller (`+ - * / %`, `abs`,
+`round`, unary negate, truthiness in `WHERE`/`CASE`/`AND`/`OR`). Affinity
+application and the strict aggregate-type test (`to_number_strict`) deliberately
+still leave blobs unconverted, matching SQLite (a blob keeps BLOB affinity and is
+non-integer-typed for `sum`'s exact-int choice, so a blob makes the sum REAL).
+Test: `tests/blob_numeric_coercion.rs` (VDBE on and off).
+
 And an **aggregate inside a window function's `OVER` spec** (`PARTITION BY` /
 `ORDER BY`) now classifies the query as a single aggregate group, matching
 SQLite: `SELECT row_number() OVER (ORDER BY sum(a)) FROM t` computes `sum(a)`

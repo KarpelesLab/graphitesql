@@ -1634,7 +1634,11 @@ pub fn to_number(v: &Value) -> Value {
         Value::Integer(_) | Value::Real(_) => v.clone(),
         Value::Null => Value::Null,
         Value::Text(s) => parse_number(s),
-        Value::Blob(_) => Value::Integer(0),
+        // SQLite reads a blob's bytes *as a text string* and applies the same
+        // text→number rule (so `abs(x'3132')` is 12, not 0). The numeric prefix
+        // is ASCII, so a lossy UTF-8 view preserves it; trailing invalid bytes
+        // become non-digits that end the prefix just as they would in SQLite.
+        Value::Blob(b) => parse_number(&String::from_utf8_lossy(b)),
     }
 }
 
