@@ -1211,8 +1211,12 @@ is the fallback oracle); bytecode `EXPLAIN` (**B8**). Running on the VDBE now: t
 materialized); non-correlated scalar/`EXISTS`/`IN (SELECT)` folds (**B5c-1**, incl.
 the native candidate-affinity membership op for a bare-column candidate); compound
 `UNION`/`INTERSECT`/`EXCEPT` (**B5c-3**); positional `GROUP BY <ordinal>`;
-`DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates; and
-window functions over a single table or a plain join (**B5c-4**).
+`DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates;
+window functions over a single table or a plain join (**B5c-4**); and the
+three-argument `text LIKE pattern ESCAPE c` form (it desugars to `like(pattern,
+text, c)`, a pure context-free call that routes through `Op::Func` →
+`func::eval_scalar`, applying the escape and rejecting a non-single-character
+escape exactly as the tree-walker does).
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is

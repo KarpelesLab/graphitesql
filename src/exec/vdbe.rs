@@ -415,8 +415,14 @@ fn is_pure_scalar_fn(name: &str, argc: usize) -> bool {
         // the real AST.
         "typeof" | "nullif" | "zeroblob" | "likely" | "unlikely" => true,
         "coalesce" | "ifnull" => argc >= 1,
-        // Pattern predicates in function form.
-        "glob" | "like" => argc == 2,
+        // Pattern predicates in function form. `glob(pattern, text)` is always
+        // two-argument; `like` also takes the three-argument `ESCAPE` form
+        // (`text LIKE pattern ESCAPE c` desugars to `like(pattern, text, c)`).
+        // Both route through `Op::Func` → `func::eval_scalar`, which applies the
+        // escape character and rejects a non-single-character escape exactly as
+        // the tree-walker does.
+        "glob" => argc == 2,
+        "like" => argc == 2 || argc == 3,
         // JSON functions that operate purely on their argument *values*. The
         // subtype-aware ones (`json_array`/`json_object`/`json_quote`, which embed
         // a `json(...)`-typed argument as JSON rather than quoting it) are
