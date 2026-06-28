@@ -14035,6 +14035,266 @@ impl Connection {
         Ok(())
     }
 
+    /// Reject an `expr IN (SELECT …)` whose subquery yields a different number of
+    /// columns than the left-hand side expects — SQLite reports `sub-select
+    /// returns N columns - expected M` at prepare time, so the mismatch is caught
+    /// even over an empty (or fully filtered) outer table where the row-evaluated
+    /// `IN` is never reached and graphite's lazy check never fires. `cols` is the
+    /// outer query's scan scope (this runs only at the outermost query, so it is
+    /// the sole correlation scope a subquery body can bind to). Mirrors
+    /// `reject_unresolved_functions_in_select`'s clause coverage. The check fires
+    /// only when every column the subquery and the LHS reference resolves: a
+    /// missing column is SQLite's error *first*, and graphite resolves those
+    /// lazily, so a dirty subquery is left to its existing behaviour rather than
+    /// risk reporting an arity error where a `no such column` is due.
+    fn reject_invalid_in_subquery_arity(&self, sel: &Select, cols: &[ColumnInfo]) -> Result<()> {
+        let mut targets: Vec<&Expr> = Vec::new();
+        for rc in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            targets.push(w);
+        }
+        if let Some(h) = &sel.having {
+            targets.push(h);
+        }
+        for g in &sel.group_by {
+            targets.push(g);
+        }
+        for t in &sel.order_by {
+            targets.push(&t.expr);
+        }
+        if let Some(from) = &sel.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    targets.push(on);
+                }
+            }
+        }
+        for e in targets {
+            self.walk_in_subquery_arity(e, cols)?;
+        }
+        Ok(())
+    }
+
+    /// Walk `e` for top-level-scope `expr IN (SELECT …)` nodes — descending
+    /// through scalar operands but never into a nested subquery body, which
+    /// carries its own scope — and arity-check each. See
+    /// [`Self::reject_invalid_in_subquery_arity`].
+    fn walk_in_subquery_arity(&self, e: &Expr, cols: &[ColumnInfo]) -> Result<()> {
+        match e {
+            Expr::InSelect { expr, select, .. } => {
+                self.check_in_subquery_arity(expr, select, cols)?;
+                // The LHS shares this scope, so a further `IN` nested in it is
+                // still resolvable here; the subquery body is not descended.
+                self.walk_in_subquery_arity(expr, cols)?;
+            }
+            Expr::Unary { expr, .. } => self.walk_in_subquery_arity(expr, cols)?,
+            Expr::Binary { left, right, .. } => {
+                self.walk_in_subquery_arity(left, cols)?;
+                self.walk_in_subquery_arity(right, cols)?;
+            }
+            Expr::Function {
+                args,
+                filter,
+                order_by,
+                ..
+            } => {
+                for a in args {
+                    self.walk_in_subquery_arity(a, cols)?;
+                }
+                if let Some(flt) = filter {
+                    self.walk_in_subquery_arity(flt, cols)?;
+                }
+                for t in order_by {
+                    self.walk_in_subquery_arity(&t.expr, cols)?;
+                }
+            }
+            Expr::IsNull { expr, .. } => self.walk_in_subquery_arity(expr, cols)?,
+            Expr::InList { expr, list, .. } => {
+                self.walk_in_subquery_arity(expr, cols)?;
+                for a in list {
+                    self.walk_in_subquery_arity(a, cols)?;
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.walk_in_subquery_arity(expr, cols)?;
+                self.walk_in_subquery_arity(low, cols)?;
+                self.walk_in_subquery_arity(high, cols)?;
+            }
+            Expr::Case {
+                operand,
+                when_then,
+                else_result,
+            } => {
+                if let Some(o) = operand {
+                    self.walk_in_subquery_arity(o, cols)?;
+                }
+                for (w, t) in when_then {
+                    self.walk_in_subquery_arity(w, cols)?;
+                    self.walk_in_subquery_arity(t, cols)?;
+                }
+                if let Some(el) = else_result {
+                    self.walk_in_subquery_arity(el, cols)?;
+                }
+            }
+            Expr::Cast { expr, .. } => self.walk_in_subquery_arity(expr, cols)?,
+            Expr::Collate { expr, .. } => self.walk_in_subquery_arity(expr, cols)?,
+            Expr::Paren(inner) => self.walk_in_subquery_arity(inner, cols)?,
+            Expr::RowValue(items) => {
+                for it in items {
+                    self.walk_in_subquery_arity(it, cols)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Arity-check one `lhs IN (select)`: the LHS arity is its row-value width (a
+    /// bare scalar is 1), the subquery width is its structural output-column count
+    /// (no rows needed). Reports the mismatch only when the subquery and LHS are
+    /// column-clean — see [`Self::reject_invalid_in_subquery_arity`].
+    fn check_in_subquery_arity(
+        &self,
+        lhs: &Expr,
+        select: &Select,
+        outer_cols: &[ColumnInfo],
+    ) -> Result<()> {
+        let width = eval::Subqueries::row_column_affinities(self, select).len();
+        if width == 0 {
+            // Scan failed or an unknown shape — leave it to the lazy path.
+            return Ok(());
+        }
+        let expected = match lhs {
+            Expr::RowValue(v) => v.len(),
+            _ => 1,
+        };
+        if width == expected {
+            return Ok(());
+        }
+        if self.in_subquery_columns_clean(lhs, select, outer_cols) {
+            return Err(Error::Error(alloc::format!(
+                "sub-select returns {width} columns - expected {expected}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether every column the LHS and the subquery body reference resolves, so
+    /// an arity error would not mask a `no such column` SQLite reports first. The
+    /// LHS resolves against the outer scope only; the subquery body against its
+    /// own FROM plus the outer scope (a correlated reference). Conservative: any
+    /// shape it cannot fully verify — a scan failure, a compound subquery, or a
+    /// further-nested subquery whose own columns it does not walk — returns
+    /// `false`, leaving the mismatch to the existing lazy behaviour.
+    fn in_subquery_columns_clean(
+        &self,
+        lhs: &Expr,
+        select: &Select,
+        outer_cols: &[ColumnInfo],
+    ) -> bool {
+        // A compound (`UNION`/…) subquery has arms this single-arm walk does not
+        // inspect, so it cannot be confirmed clean.
+        if !select.compound.is_empty() {
+            return false;
+        }
+        let params = Params::default();
+        let Ok((incols, _)) = self.scan_source(select, &params) else {
+            return false;
+        };
+        let resolves = |cols: &[ColumnInfo], table: Option<&str>, column: &str| -> bool {
+            if matches!(
+                column.to_ascii_lowercase().as_str(),
+                "rowid" | "oid" | "_rowid_" | "current_date" | "current_time" | "current_timestamp"
+            ) {
+                return true;
+            }
+            cols.iter().any(|c| {
+                c.name.eq_ignore_ascii_case(column)
+                    && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+            })
+        };
+        // The LHS lives in the outer scope.
+        let mut lhs_ok = true;
+        walk_shallow_columns(lhs, &mut |_schema, table, column, _quoted| {
+            if lhs_ok && !resolves(outer_cols, table, column) {
+                lhs_ok = false;
+            }
+        });
+        if !lhs_ok {
+            return false;
+        }
+        // The subquery body resolves against its own FROM plus the outer columns;
+        // a bare name may also match one of its own output aliases (GROUP BY /
+        // HAVING / ORDER BY). A further-nested subquery in any clause is not
+        // walked by `walk_shallow_columns`, so bail if one is present rather than
+        // miss a bad column it hides.
+        let aliases: Vec<&str> = select
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                ResultColumn::Expr { alias: Some(a), .. } => Some(a.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut targets: Vec<&Expr> = Vec::new();
+        for rc in &select.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &select.where_clause {
+            targets.push(w);
+        }
+        if let Some(h) = &select.having {
+            targets.push(h);
+        }
+        for g in &select.group_by {
+            targets.push(g);
+        }
+        for t in &select.order_by {
+            targets.push(&t.expr);
+        }
+        if let Some(from) = &select.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    targets.push(on);
+                }
+            }
+        }
+        let mut clean = true;
+        for e in &targets {
+            let mut nested = Vec::new();
+            collect_subselects(e, &mut nested);
+            if !nested.is_empty() {
+                return false;
+            }
+        }
+        for e in targets {
+            if !clean {
+                break;
+            }
+            walk_shallow_columns(e, &mut |_schema, table, column, _quoted| {
+                if !clean {
+                    return;
+                }
+                if resolves(&incols, table, column) || resolves(outer_cols, table, column) {
+                    return;
+                }
+                if table.is_none() && aliases.iter().any(|a| a.eq_ignore_ascii_case(column)) {
+                    return;
+                }
+                clean = false;
+            });
+        }
+        clean
+    }
+
     /// The arity guard for one expression — see `reject_aggregate_arity_in_select`.
     /// Walks `e` (stopping at subquery boundaries, which validate themselves) for
     /// each aggregate call, whether plain or used as a window function (`agg(…)
@@ -14262,6 +14522,10 @@ impl Connection {
             self.validate_nested_ambiguity(sel, &columns)?;
             self.validate_columns_exist(sel, &columns)?;
             self.validate_derived_columns(sel, &columns)?;
+            // An `IN (SELECT …)` whose width disagrees with the LHS is a
+            // prepare-time error in SQLite; run it after column resolution so a
+            // missing column (its first error) still wins.
+            self.reject_invalid_in_subquery_arity(sel, &columns)?;
         }
 
         // A positional `GROUP BY` / `ORDER BY` term (an integer literal) must name
@@ -15181,6 +15445,16 @@ impl Connection {
             reject_misused_window(e)?;
             reject_window_without_over(e)?;
             reject_misused_aggregate(e, false)?;
+        }
+        // An `IN (SELECT …)` whose width disagrees with the LHS is a prepare-time
+        // error, the same as on the SELECT path. The target table's `columns` are
+        // the outer scope a (correlated) subquery body binds to; column existence
+        // was resolved above, so a missing column still wins.
+        for e in exprs {
+            self.walk_in_subquery_arity(e, columns)?;
+        }
+        for e in returning {
+            self.walk_in_subquery_arity(e, columns)?;
         }
         Ok(())
     }

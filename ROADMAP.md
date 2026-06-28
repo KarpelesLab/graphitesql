@@ -379,6 +379,29 @@ whereas graphite reports the outer `misuse of aggregate function sum()` — a
 pre-existing divergence left untouched (no global pass order satisfies both that
 and `nope(sum(a))`). Byte-exact vs `sqlite3` 3.50.4 otherwise.
 
+And an **`IN (SELECT …)` whose subquery width disagrees with the left-hand side**
+is now rejected during analysis (`sub-select returns N columns - expected M`) on
+both the SELECT and the UPDATE/DELETE paths, where graphite's per-row evaluator
+used to accept the mismatch over an empty or fully-filtered table (the `IN` is
+never reached, so the lazy width check never fires). The structural subquery
+width comes from `row_column_affinities` (no rows needed; `*` expands to the
+FROM width, a literal row counts its elements); the LHS arity is its row-value
+width (`(a,b)` → 2, a bare scalar → 1). It runs right after `validate_columns_exist`
+at the outermost query and after column resolution in `validate_dml_refs`, so a
+missing column still wins. Crucially the arity error fires **only when the
+subquery and the LHS are column-clean** — every referenced column resolves
+against the subquery's own FROM plus the outer (correlation) scope, with no
+compound arm or further-nested subquery the single-arm walk cannot inspect:
+SQLite reports a `no such column` *before* the arity mismatch, and graphite
+resolves a subquery body's columns lazily, so a dirty subquery (`a IN (SELECT
+zzz, zzz)`, `zzz IN (SELECT a, a)`) is left to its existing behaviour rather than
+risk reporting an arity error where a `no such column` is due. A correlated
+subquery (`a IN (SELECT a, b FROM t WHERE b=t.a)`), a constant-row subquery, and
+a `HAVING`/`SET` position are all covered. Residuals: a subquery with an
+unresolved column (still silently accepted over an empty table, as before), a
+compound (`UNION`) subquery, and a doubly-nested subquery body are conservatively
+skipped. Byte-exact vs `sqlite3` 3.50.4 for the column-clean cases.
+
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite
 does. The per-column "add column" checks run first, left to right — a duplicate
