@@ -1209,7 +1209,13 @@ is the fallback oracle); bytecode `EXPLAIN` (**B8**). Running on the VDBE now: t
 `LEFT`/`RIGHT`/`FULL` nested-loop joins, all with projection / WHERE-merged-ON /
 `DISTINCT` / `ORDER BY` / `LIMIT` / grouped-and-bare aggregates, no cross-product
 materialized); non-correlated scalar/`EXISTS`/`IN (SELECT)` folds (**B5c-1**, incl.
-the native candidate-affinity membership op for a bare-column candidate); compound
+the native candidate-affinity membership op for a bare-column candidate). The fold
+now threads scope as it descends, so a subquery whose body holds a *further* nested
+subquery folds too, as long as every nested body is itself self-contained against
+the accumulated scope (it may reference its parent's sources — correlation that
+stays inside the folded unit — but a reference further out still defers); the whole
+unit is evaluated by the tree-walker, so the nested subquery's affinity/collation
+are preserved exactly. Compound
 `UNION`/`INTERSECT`/`EXCEPT` (**B5c-3**); positional `GROUP BY <ordinal>`;
 `DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates (incl.
 the two-argument `group_concat(x, sep)` / `string_agg(x, sep)` form — the constant

@@ -867,54 +867,72 @@ impl Connection {
     /// result can be folded to a constant. Bails (returns `false`) on anything it
     /// cannot prove: compound/CTE bodies, non-base-table sources, etc.
     fn vdbe_subquery_foldable(&self, sel2: &Select) -> bool {
+        self.select_self_contained(sel2, &[], &[])
+    }
+
+    /// Conservatively decide whether `sel2` is self-contained relative to a
+    /// surrounding scope (`outer_quals`/`outer_cols`): every column reference
+    /// resolves to `sel2`'s own sources or that inherited scope, it takes no bound
+    /// parameter, and every nested subquery is itself self-contained against the
+    /// accumulated scope. With an empty inherited scope this proves a top-level
+    /// subquery non-correlated; a nested subquery is checked with its parent's
+    /// scope passed down, so a reference *into the parent* (correlation that stays
+    /// inside the folded unit) is fine while a reference further out is not. Bails
+    /// on compound/CTE bodies or any non-base-table source, whose column set it
+    /// can't enumerate.
+    fn select_self_contained(
+        &self,
+        sel2: &Select,
+        outer_quals: &[String],
+        outer_cols: &[String],
+    ) -> bool {
         if !sel2.compound.is_empty() || !sel2.ctes.is_empty() {
             return false;
         }
-        let Some(from) = &sel2.from else {
-            // A `FROM`-less scalar (`(SELECT 1)`) is trivially constant, but only
-            // if it carries no column reference at all.
-            return self.expr_positions_internal(sel2, &[], &[]);
-        };
-        // Collect the source qualifiers and the union of their columns; every
-        // source must be a plain base table so the column set is known.
-        let mut quals: Vec<String> = Vec::new();
-        let mut cols: Vec<String> = Vec::new();
-        let mut collect = |tr: &sql::ast::TableRef| -> bool {
-            if tr.subquery.is_some()
-                || tr.tvf_args.is_some()
-                || tr.schema.is_some()
-                || tr.name.is_empty()
-            {
-                return false;
-            }
-            let Ok(meta) = self.table_meta(&tr.name, None) else {
-                return false;
+        // Start from the inherited scope and add this body's own sources; every
+        // source must be a plain base table so the column set is known. A
+        // `FROM`-less body (`(SELECT 1)`) inherits only the outer scope.
+        let mut quals: Vec<String> = outer_quals.to_vec();
+        let mut cols: Vec<String> = outer_cols.to_vec();
+        if let Some(from) = &sel2.from {
+            let mut collect = |tr: &sql::ast::TableRef| -> bool {
+                if tr.subquery.is_some()
+                    || tr.tvf_args.is_some()
+                    || tr.schema.is_some()
+                    || tr.name.is_empty()
+                {
+                    return false;
+                }
+                let Ok(meta) = self.table_meta(&tr.name, None) else {
+                    return false;
+                };
+                quals.push(tr.name.clone());
+                if let Some(a) = &tr.alias {
+                    quals.push(a.clone());
+                }
+                for c in &meta.columns {
+                    cols.push(c.name.clone());
+                }
+                true
             };
-            quals.push(tr.name.clone());
-            if let Some(a) = &tr.alias {
-                quals.push(a.clone());
-            }
-            for c in &meta.columns {
-                cols.push(c.name.clone());
-            }
-            true
-        };
-        if !collect(&from.first) {
-            return false;
-        }
-        for j in &from.joins {
-            if !collect(&j.table) {
+            if !collect(&from.first) {
                 return false;
+            }
+            for j in &from.joins {
+                if !collect(&j.table) {
+                    return false;
+                }
             }
         }
         self.expr_positions_internal(sel2, &quals, &cols)
     }
 
     /// True when every column reference in every top-level expression of `sel2`
-    /// resolves to one of `quals`/`cols` (its own sources) and no expression
-    /// contains a parameter or a nested subquery — see [`expr_is_internal`].
+    /// resolves to one of `quals`/`cols` (the accumulated scope) and no expression
+    /// contains a parameter or a *correlated* nested subquery — see
+    /// [`Self::expr_internal`].
     fn expr_positions_internal(&self, sel2: &Select, quals: &[String], cols: &[String]) -> bool {
-        let ok = |e: &Expr| expr_is_internal(e, quals, cols);
+        let ok = |e: &Expr| self.expr_internal(e, quals, cols);
         for rc in &sel2.columns {
             if let sql::ast::ResultColumn::Expr { expr, .. } = rc {
                 if !ok(expr) {
@@ -958,6 +976,73 @@ impl Connection {
             }
         }
         true
+    }
+
+    /// Does `e` reference only columns of `quals`/`cols` (the accumulated scope),
+    /// with no bound parameter and no *correlated* nested subquery? A nested
+    /// subquery is allowed when it is itself self-contained against the current
+    /// scope (its body may reach into `quals`/`cols`, but not further out): the
+    /// whole unit then folds to the same constant for every outer row, and the
+    /// tree-walker evaluates the nested subquery with full affinity semantics — no
+    /// value is lost. Conservative: a parameter, an out-of-scope column, or a
+    /// subquery that can't be proven self-contained makes it return `false`.
+    fn expr_internal(&self, e: &Expr, quals: &[String], cols: &[String]) -> bool {
+        let rec = |x: &Expr| self.expr_internal(x, quals, cols);
+        match e {
+            Expr::Literal(_) => true,
+            // A parameter would need the statement's bindings to evaluate; the fold
+            // runs with empty params, so bail and let the normal path handle it.
+            Expr::Parameter(_) => false,
+            // A nested subquery folds only when it stays inside the current scope.
+            Expr::Subquery(s) => self.select_self_contained(s, quals, cols),
+            Expr::Exists { select, .. } => self.select_self_contained(select, quals, cols),
+            Expr::InSelect { expr, select, .. } => {
+                rec(expr) && self.select_self_contained(select, quals, cols)
+            }
+            Expr::Column { table, column, .. } => match table {
+                Some(q) => quals.iter().any(|x| x.eq_ignore_ascii_case(q)),
+                None => {
+                    cols.iter().any(|c| c.eq_ignore_ascii_case(column))
+                        || column.eq_ignore_ascii_case("rowid")
+                        || column.eq_ignore_ascii_case("_rowid_")
+                        || column.eq_ignore_ascii_case("oid")
+                }
+            },
+            Expr::Unary { expr, .. } => rec(expr),
+            Expr::Binary { left, right, .. } => rec(left) && rec(right),
+            Expr::IsNull { expr, .. } => rec(expr),
+            Expr::InList { expr, list, .. } => rec(expr) && list.iter().all(rec),
+            Expr::Between {
+                expr, low, high, ..
+            } => rec(expr) && rec(low) && rec(high),
+            Expr::Case {
+                operand,
+                when_then,
+                else_result,
+            } => {
+                operand.as_deref().map(rec).unwrap_or(true)
+                    && when_then.iter().all(|(w, t)| rec(w) && rec(t))
+                    && else_result.as_deref().map(rec).unwrap_or(true)
+            }
+            Expr::Cast { expr, .. } => rec(expr),
+            Expr::Paren(inner) => rec(inner),
+            Expr::Collate { expr, .. } => rec(expr),
+            Expr::RowValue(items) => items.iter().all(rec),
+            // A window function would not compile on the VDBE anyway; a non-windowed
+            // call is internal when its arguments and `FILTER` are.
+            Expr::Function {
+                args,
+                filter,
+                order_by,
+                over,
+                ..
+            } => {
+                over.is_none()
+                    && args.iter().all(rec)
+                    && filter.as_deref().map(rec).unwrap_or(true)
+                    && order_by.iter().all(|t| rec(&t.expr))
+            }
+        }
     }
 
     /// Compile and run a parsed `SELECT` through the VDBE engine, or `Unsupported`
@@ -23397,66 +23482,6 @@ fn affinity_type_name(aff: eval::Affinity) -> alloc::string::String {
         eval::Affinity::Blob => "BLOB",
     }
     .into()
-}
-
-/// Does `e` reference only columns of `quals`/`cols` (its own query's sources),
-/// with no bound parameter and no nested subquery? Used to prove a subquery is
-/// non-correlated before folding it to a constant. Conservative: any nested
-/// subquery, parameter, or out-of-scope column makes it return `false`.
-fn expr_is_internal(e: &Expr, quals: &[String], cols: &[String]) -> bool {
-    let rec = |x: &Expr| expr_is_internal(x, quals, cols);
-    match e {
-        Expr::Literal(_) => true,
-        // A parameter would need the statement's bindings to evaluate; the fold
-        // runs with empty params, so bail and let the normal path handle it.
-        Expr::Parameter(_) => false,
-        // A nested subquery may itself reference our outer scope; without deeper
-        // scope tracking, refuse to prove non-correlation.
-        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. } => false,
-        Expr::Column { table, column, .. } => match table {
-            Some(q) => quals.iter().any(|x| x.eq_ignore_ascii_case(q)),
-            None => {
-                cols.iter().any(|c| c.eq_ignore_ascii_case(column))
-                    || column.eq_ignore_ascii_case("rowid")
-                    || column.eq_ignore_ascii_case("_rowid_")
-                    || column.eq_ignore_ascii_case("oid")
-            }
-        },
-        Expr::Unary { expr, .. } => rec(expr),
-        Expr::Binary { left, right, .. } => rec(left) && rec(right),
-        Expr::IsNull { expr, .. } => rec(expr),
-        Expr::InList { expr, list, .. } => rec(expr) && list.iter().all(rec),
-        Expr::Between {
-            expr, low, high, ..
-        } => rec(expr) && rec(low) && rec(high),
-        Expr::Case {
-            operand,
-            when_then,
-            else_result,
-        } => {
-            operand.as_deref().map(rec).unwrap_or(true)
-                && when_then.iter().all(|(w, t)| rec(w) && rec(t))
-                && else_result.as_deref().map(rec).unwrap_or(true)
-        }
-        Expr::Cast { expr, .. } => rec(expr),
-        Expr::Paren(inner) => rec(inner),
-        Expr::Collate { expr, .. } => rec(expr),
-        Expr::RowValue(items) => items.iter().all(rec),
-        // A window function would not compile on the VDBE anyway; a non-windowed
-        // call is internal when its arguments and `FILTER` are.
-        Expr::Function {
-            args,
-            filter,
-            order_by,
-            over,
-            ..
-        } => {
-            over.is_none()
-                && args.iter().all(rec)
-                && filter.as_deref().map(rec).unwrap_or(true)
-                && order_by.iter().all(|t| rec(&t.expr))
-        }
-    }
 }
 
 /// Compare two ordering-key vectors with per-position `descending` flags
