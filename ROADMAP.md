@@ -587,9 +587,26 @@ renamed table directly already worked, since detection fired on the body and the
 token pass then rewrote the `WHEN`/subquery too — the bug was purely in detection.)
 The detector now probes the `WHEN` clause (`expr_reads_table`) and walks every
 nested subquery of each body statement (`stmt_reads_table`: target + CTEs + source
-+ `where`/`set`/`values`/`row-value`/`order-by`/`returning`/upsert). Unrelated
-triggers stay byte-for-byte untouched. Byte-exact vs `sqlite3` 3.50.4
++ `where`/`set`/`values`/`row-value`/`order-by`/`returning`/upsert). The body-source
+walk (`from_refs_table`) also descends into a `FROM` source's *derived table*, its
+table-valued-function arguments, and a join `ON` predicate, so an `UPDATE … FROM
+(SELECT … FROM <old>) s` / `… FROM w JOIN (SELECT … FROM <old>) s ON …` body — where
+the renamed table is reached only through a derived source — is detected too.
+Unrelated triggers stay byte-for-byte untouched. Byte-exact vs `sqlite3` 3.50.4
 (`tests/rename_trigger_when_subquery.rs`).
+
+**`RENAME COLUMN` now propagates into the table's own `<table>.col`-qualified
+self-references.** The token pass that rewrites a renamed column in the table's
+stored CREATE text (and an index over it) skipped every `x.col` after-`.` token to
+avoid clobbering an unrelated `other.col` — but in a single-table definition the
+only possible qualifier *is* the table itself, so a `CHECK(t.a > 0)`, a column-level
+`CHECK(t.a > 0)`, or a partial index's `WHERE t.a > 0` kept the dead old name. The
+table's own definition (and an index whose `ON` table matches) is now rewritten with
+the table name accepted as a qualifier (bare + `<table>.col`), and each occurrence's
+original double-quoting is preserved the way SQLite does — a `"t"."a"` stays
+`"t"."aa"`, a bare entry becomes quoted only when the new name is itself typed
+double-quoted. Byte-exact vs `sqlite3` 3.50.4
+(`tests/rename_column_self_qualified.rs`).
 
 **`json_quote(X)` now renders a JSONB blob as its JSON text.** SQLite accepts a
 BLOB argument to `json_quote` when it decodes as JSONB and emits the

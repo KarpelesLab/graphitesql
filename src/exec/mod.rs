@@ -10198,15 +10198,34 @@ impl Connection {
                     .collect();
                 self.rewrite_schema_rows(|cols| {
                     if is_text(&cols[0], "table") && is_text(&cols[1], &table) {
+                        // The table's own definition: rename the bare column wherever
+                        // it appears (column list, CHECK/generated/default exprs) and
+                        // any `<table>.col` self-qualified reference (e.g. a CHECK
+                        // written `CHECK(t.a > 0)`), like SQLite. Other `x.col`
+                        // qualifiers can't occur in a single-table definition.
                         cols[4] = Value::Text(match cols.get(4) {
-                            Some(Value::Text(s)) => rewrite_ident_tokens(s, &old, &new_text),
+                            Some(Value::Text(s)) => rewrite_column_tokens(
+                                s,
+                                core::slice::from_ref(&table),
+                                &old,
+                                &new_text,
+                                true,
+                            ),
                             _ => reprint.clone(),
                         });
                         true
                     } else if is_text(&cols[0], "index") && is_text(&cols[2], &table) {
-                        // Rewrite an index over this table if it names the column.
+                        // Rewrite an index over this table if it names the column —
+                        // both bare (`ON t(col)`) and `<table>.col`-qualified (e.g. a
+                        // partial-index `WHERE t.col > 0`) references.
                         if let Some(Value::Text(isql)) = cols.get(4).cloned() {
-                            let rewritten = rewrite_ident_tokens(&isql, &old, &new_text);
+                            let rewritten = rewrite_column_tokens(
+                                &isql,
+                                core::slice::from_ref(&table),
+                                &old,
+                                &new_text,
+                                true,
+                            );
                             if rewritten != isql {
                                 cols[4] = Value::Text(rewritten);
                                 return true;
@@ -28539,7 +28558,18 @@ fn rewrite_column_tokens(
             continue;
         }
         out.push_str(&sql[cursor..sp.start]);
-        out.push_str(rendered);
+        // SQLite preserves each occurrence's own quoting: a token written
+        // double-quoted stays double-quoted (`"a"` → `"aa"`) even when the new
+        // name was typed bare. `rendered` already carries the typed style, so
+        // only a quoted occurrence whose replacement isn't already quoted needs
+        // to be force-quoted.
+        if matches!(&sp.token, Token::Ident(_)) && !rendered.starts_with('"') {
+            out.push('"');
+            out.push_str(rendered);
+            out.push('"');
+        } else {
+            out.push_str(rendered);
+        }
         cursor = sp.end;
     }
     out.push_str(&sql[cursor..]);
