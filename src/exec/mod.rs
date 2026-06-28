@@ -1433,6 +1433,31 @@ impl Connection {
             if tr.index_hint.is_some() {
                 return Err(Error::Unsupported("VDBE: index hint"));
             }
+            // A view `FROM` source: materialize it exactly as the tree-walker does
+            // (running its stored body), then expose the view's output columns — their
+            // `(affinity, collation)` come from `try_view`'s origin resolution, so an
+            // outer `WHERE` / `ORDER BY` over a view column coerces correctly. Keep the
+            // conservative all-BINARY posture: a view column carrying a non-BINARY
+            // collation defers (the VDBE grouped / aggregate paths assume BINARY keys).
+            // A view has no rowid, so a `rowid` reference over it resolves to nothing
+            // and the query defers (like a derived table).
+            if tr.schema.is_none() && self.is_view(&tr.name) {
+                let (cinfos, inrows) = self
+                    .try_view(&tr.name, tr.alias.as_deref(), &eval::Params::default())?
+                    .ok_or(Error::Unsupported("VDBE: view not found"))?;
+                if cinfos
+                    .iter()
+                    .any(|ci| ci.collation != crate::value::Collation::default())
+                {
+                    return Err(Error::Unsupported("VDBE: view over a non-BINARY column"));
+                }
+                let columns = cinfos.iter().map(|ci| ci.name.clone()).collect();
+                let tables = cinfos.iter().map(|ci| ci.table.clone()).collect();
+                let affinities = cinfos.iter().map(|ci| ci.affinity).collect();
+                let collations = cinfos.iter().map(|ci| ci.collation).collect();
+                let rows = inrows.into_iter().map(|r| r.values).collect();
+                return Ok((columns, tables, affinities, collations, rows, None));
+            }
             let meta = self.table_meta(&tr.name, tr.alias.as_deref())?;
             let cols = meta.columns.iter().map(|c| c.name.clone()).collect();
             let collations = meta.columns.iter().map(|c| c.collation).collect();

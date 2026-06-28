@@ -1296,7 +1296,16 @@ collation still defers. A NATURAL/USING body
 (coalesced shared column), a non-BINARY body column, a recursive body, a
 *mixed-affinity* or `FROM`-less or nested compound body, or a two-or-more-level sibling
 chain whose intermediate name can't be resolved for origins still defers to the
-tree-walker (correct, never wrong). A **single table-valued function `FROM` source** runs on
+tree-walker (correct, never wrong). A **view named directly as a `FROM` source**
+(`SELECT g, n FROM vt`) now runs on the VDBE too: `scan_one` materializes the view by
+running its stored body (exactly as the tree-walker does) and exposes its output
+columns with the `(affinity, collation)` `try_view` resolves — so projection / WHERE /
+aggregate / GROUP BY / HAVING / DISTINCT / ORDER BY / LIMIT over the view, a view
+joined to a base table, and a join- or compound-bodied view all run. A view column
+carrying a *non-BINARY* collation defers (the VDBE compare/group paths assume BINARY
+keys); a view has no rowid, so a `rowid` reference over it defers (a view body that
+*projects* `rowid` under an alias exposes an ordinary column that runs). A **single
+table-valued function `FROM` source** runs on
 the VDBE as well: `generate_series(start[,stop[,step]])`, `json_each` / `json_tree`,
 and the table-valued `pragma_<name>(arg)` form are materialized through the same
 `tvf_rows` the tree-walker uses, so projection / WHERE / ORDER BY / LIMIT / aggregate
