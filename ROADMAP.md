@@ -194,22 +194,33 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
 the residuals left after the differential sweep; the surface is otherwise
 exhausted for bounded (single-fix) work.
 
-- **A-misc-1 — `IN`-operand error ordering.** For a row-value `IN` list with a
-  *dirty* operand (a bad column **and** a width mismatch), SQLite reports
-  `row value misused` *before* the `no such column`. graphite resolves columns
-  first, so it emits the column error in that one combined case. Column-clean
-  cases are already byte-exact. Low-impact message-ordering nicety; the fix is to
-  run the row-width check ahead of column resolution in the `IN`-list validator.
+- **A-misc-1 — structural row-arity error ordering vs name resolution.** When a
+  clause holds *both* a structural row-arity error and a missing column, SQLite's
+  precedence is **clause-ordered, then pre-order within each clause's expression
+  tree** (it raises these during a single name-resolution walk that visits each
+  node before its children, in clause order). Concretely:
+  - within one clause, a structural mismatch on a node beats a `no such column`
+    in that same subtree — `(nope,a) IN ((1,2,3))` → `IN(...) element has 3 terms
+    - expected 2`; `(nope,a)=(1,2,3)` and `(nope,a) BETWEEN (1,2,3) AND (4,5,6)`
+    → `row value misused`; `nope=(1,2)` (scalar-vs-row) → `row value misused`;
+  - but a missing column in an *earlier-resolved clause* wins over a later
+    clause's structural error — `SELECT nope FROM t WHERE (a,a)=(1,2,3)` →
+    `no such column: nope`;
+  - and the `IN` *scalar-LHS + row-element* misuse (`nope IN ((1,2))`) is **not**
+    structural — a missing column wins there (`no such column: nope`).
 
-- **A-misc-2 — row value as a scalar result column.** `SELECT (sum(a), 1) FROM t`
-  should be `row value misused` at prepare time. The shared expression walker now
-  descends *into* row values for the function/aggregate/window checks, but a row
-  value sitting directly in scalar **result** position is a separate
-  row-value-context check that is still open (the bare-vector comparison and `IN`
-  cases are done). Needs a result-list/`HAVING` context flag passed to the walker
-  so a top-level `Expr::RowValue` in a scalar slot is rejected.
+  graphite resolves all columns up front (`validate_columns_exist`) and only then
+  runs the structural checks (`reject_row_value_misuse`), so it emits the column
+  error in every "structural + missing-column **in the same clause**" case. The
+  structural logic itself is already correct and byte-exact for column-clean
+  inputs; only the *ordering* against name resolution diverges. A naive
+  whole-statement structural pre-pass would regress the cross-clause case above,
+  so the real fix is to **interleave** the structural arity check with column
+  resolution clause-by-clause in SQLite's clause order (pre-order within each
+  tree) — a resolver-ordering change, not a one-line hoist. Low-impact (the
+  message body is identical; only which of two errors fires first differs).
 
-- **A-misc-3 — `*` / `t.*` over an unaliased self-join.** `SELECT * FROM t, t`
+- **A-misc-2 — `*` / `t.*` over an unaliased self-join.** `SELECT * FROM t, t`
   is ambiguous on the *database-qualified* expansion (`main.t.a`, `temp.t.a`);
   graphite reports the bare `t.a`. Needs the owning database name threaded onto
   `ColumnInfo` (it currently carries only table/alias). The non-wildcard
