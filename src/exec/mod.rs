@@ -26738,12 +26738,103 @@ fn select_single_source_ok(sel: &Select, table: &str) -> bool {
     ok
 }
 
-/// For a `CREATE TRIGGER` ON the renamed `table` whose body and `WHEN` reference
-/// ONLY that table (every body statement targets `table`, draws from at most
-/// `table`, and contains no subquery), return the qualifiers under which the
-/// renamed column can appear (`table`, `NEW`, `OLD`) so a column rename can be
+/// Whether every expression subquery nested *directly* within `e` references
+/// only the renamed `table` (reusing the view validator, which recurses through
+/// further nesting and accumulates each subquery's `FROM` alias into `quals`).
+/// A `FROM`-less subquery (`(SELECT 1)`) trivially qualifies.
+fn expr_subqueries_only_table(e: &Expr, table: &str, old: &str, quals: &mut Vec<String>) -> bool {
+    let mut subs: Vec<&Select> = Vec::new();
+    collect_immediate_subselects(e, &mut subs);
+    subs.into_iter()
+        .all(|s| validate_view_select_only_table(s, table, old, quals))
+}
+
+/// Whether a single trigger-body statement targets only `table` and any
+/// subqueries it nests reference only `table` — the imperative analog of
+/// `validate_view_select_only_table` for `INSERT`/`UPDATE`/`DELETE` (and a bare
+/// `SELECT`). Accumulates nested-subquery aliases into `quals` so the caller can
+/// token-rewrite every reference, bare and `<alias>.`-qualified alike.
+fn trigger_stmt_only_table(
+    stmt: &Statement,
+    table: &str,
+    old: &str,
+    quals: &mut Vec<String>,
+) -> bool {
+    match stmt {
+        Statement::Select(sel) => validate_view_select_only_table(sel, table, old, quals),
+        Statement::Insert(i) => {
+            if i.schema.is_some()
+                || !i.returning.is_empty()
+                || !i.upsert.is_empty()
+                || !i.table.eq_ignore_ascii_case(table)
+            {
+                return false;
+            }
+            match &i.source {
+                InsertSource::DefaultValues => true,
+                InsertSource::Values(rows) => rows.iter().all(|r| {
+                    r.iter()
+                        .all(|e| expr_subqueries_only_table(e, table, old, quals))
+                }),
+                InsertSource::Select(sel) => {
+                    validate_view_select_only_table(sel, table, old, quals)
+                }
+            }
+        }
+        Statement::Update(u) => {
+            if u.schema.is_some()
+                || u.from.is_some()
+                || !u.returning.is_empty()
+                || !u.table.eq_ignore_ascii_case(table)
+                || !u.row_assignments.is_empty()
+            {
+                return false;
+            }
+            u.assignments
+                .iter()
+                .all(|(_, e)| expr_subqueries_only_table(e, table, old, quals))
+                && u.where_clause
+                    .as_ref()
+                    .is_none_or(|e| expr_subqueries_only_table(e, table, old, quals))
+                && u.order_by
+                    .iter()
+                    .all(|t| expr_subqueries_only_table(&t.expr, table, old, quals))
+                && u.limit
+                    .as_ref()
+                    .is_none_or(|e| expr_subqueries_only_table(e, table, old, quals))
+                && u.offset
+                    .as_ref()
+                    .is_none_or(|e| expr_subqueries_only_table(e, table, old, quals))
+        }
+        Statement::Delete(d) => {
+            if d.schema.is_some() || !d.returning.is_empty() || !d.table.eq_ignore_ascii_case(table)
+            {
+                return false;
+            }
+            d.where_clause
+                .as_ref()
+                .is_none_or(|e| expr_subqueries_only_table(e, table, old, quals))
+                && d.order_by
+                    .iter()
+                    .all(|t| expr_subqueries_only_table(&t.expr, table, old, quals))
+                && d.limit
+                    .as_ref()
+                    .is_none_or(|e| expr_subqueries_only_table(e, table, old, quals))
+                && d.offset
+                    .as_ref()
+                    .is_none_or(|e| expr_subqueries_only_table(e, table, old, quals))
+        }
+        _ => false,
+    }
+}
+
+/// For a `CREATE TRIGGER` ON the renamed `table` whose body and `WHEN` target
+/// only that table — every body statement targets `table` and draws from at most
+/// `table`, including inside any nested expression subquery — return the
+/// qualifiers under which the renamed column can appear (`table`, `NEW`, `OLD`,
+/// plus every nested-subquery `FROM` alias) so a column rename can be
 /// token-rewritten. Returns `None` (leave the trigger unchanged) on anything
-/// outside this provably-safe shape — the multi-table / scope-aware remainder.
+/// outside this provably-safe shape — the cross-object / scope-aware remainder.
 fn trigger_single_source_quals(trigger_sql: &str, table: &str, old: &str) -> Option<Vec<String>> {
     let Ok(Statement::CreateTrigger(ct)) = sql::parse_one(trigger_sql) else {
         return None;
@@ -26757,59 +26848,20 @@ fn trigger_single_source_quals(trigger_sql: &str, table: &str, old: &str) -> Opt
     {
         return None;
     }
-    if ct.when.as_ref().is_some_and(expr_has_subquery) {
+    let mut quals = alloc::vec![table.to_string(), String::from("NEW"), String::from("OLD"),];
+    if !ct
+        .when
+        .as_ref()
+        .is_none_or(|e| expr_subqueries_only_table(e, table, old, &mut quals))
+    {
         return None;
     }
-    // A subquery anywhere could reach another table, breaking the single-source
-    // guarantee; `expr_has_subquery` is a plain fn so it passes by value freely.
     for stmt in &ct.body {
-        let safe = match stmt {
-            Statement::Select(sel) => select_single_source_ok(sel, table),
-            Statement::Insert(i) => {
-                i.schema.is_none()
-                    && i.returning.is_empty()
-                    && i.upsert.is_empty()
-                    && i.table.eq_ignore_ascii_case(table)
-                    && match &i.source {
-                        InsertSource::DefaultValues => true,
-                        InsertSource::Values(rows) => {
-                            !rows.iter().any(|r| r.iter().any(expr_has_subquery))
-                        }
-                        InsertSource::Select(sel) => select_single_source_ok(sel, table),
-                    }
-            }
-            Statement::Update(u) => {
-                u.schema.is_none()
-                    && u.from.is_none()
-                    && u.returning.is_empty()
-                    && u.table.eq_ignore_ascii_case(table)
-                    && u.row_assignments.is_empty()
-                    && !u.assignments.iter().any(|(_, e)| expr_has_subquery(e))
-                    && !u.where_clause.as_ref().is_some_and(expr_has_subquery)
-                    && !u.order_by.iter().any(|t| expr_has_subquery(&t.expr))
-                    && !u.limit.as_ref().is_some_and(expr_has_subquery)
-                    && !u.offset.as_ref().is_some_and(expr_has_subquery)
-            }
-            Statement::Delete(d) => {
-                d.schema.is_none()
-                    && d.returning.is_empty()
-                    && d.table.eq_ignore_ascii_case(table)
-                    && !d.where_clause.as_ref().is_some_and(expr_has_subquery)
-                    && !d.order_by.iter().any(|t| expr_has_subquery(&t.expr))
-                    && !d.limit.as_ref().is_some_and(expr_has_subquery)
-                    && !d.offset.as_ref().is_some_and(expr_has_subquery)
-            }
-            _ => false,
-        };
-        if !safe {
+        if !trigger_stmt_only_table(stmt, table, old, &mut quals) {
             return None;
         }
     }
-    Some(alloc::vec![
-        table.to_string(),
-        String::from("NEW"),
-        String::from("OLD"),
-    ])
+    Some(quals)
 }
 
 /// Whether `trigger_sql`'s body+WHEN reference `table` as their ONLY base table

@@ -505,6 +505,21 @@ touching another table, a derived table in a `FROM`, or a result-column alias
 colliding with the renamed name. Byte-exact vs `sqlite3` 3.50.4
 (`tests/view_rename_column_subquery.rs`).
 
+**`RENAME COLUMN` now rewrites a dependent trigger's references that live inside
+`WHEN`/body expression subqueries.** The exact trigger analog of the view fix
+above: a trigger attached to the renamed table, whose `WHEN` guard and body
+statements (`UPDATE`/`DELETE`/`INSERT … SELECT` over the same table) nest a
+scalar `(SELECT …)`, `EXISTS`, or `x IN (SELECT …)` referencing only that table,
+used to bail the moment any subquery appeared — leaving stale references so the
+trigger broke (`no such column: a`) the next time it fired. It is now rewritten
+in full: bare, `NEW.`/`OLD.`, and `<alias>.`-qualified references at every
+nesting level (reusing the view validator to accumulate each nested-subquery
+`FROM` alias). It still conservatively leaves the trigger untouched (a known gap,
+never a wrong rewrite) when a token rewrite can't be proven safe: a body
+statement writing another table, a subquery touching another table, or a derived
+table in a `FROM`. Byte-exact vs `sqlite3` 3.50.4
+(`tests/trigger_rename_column_subquery.rs`).
+
 **CTEs in one `WITH` clause now see each other — forward references work, and
 true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
 (it expands them on demand from the outer query), so a CTE may reference one
@@ -1041,7 +1056,11 @@ open work:
 - **A-rn3-edge — RENAME COLUMN in genuinely multi-table view/trigger bodies.**
   The token rewrite bails (leaves the body unchanged — never corrupts) on a bare
   column ref that is ambiguous across multiple base sources, because the AST has
-  no per-column-ref source span.
+  no per-column-ref source span. The *single*-source-with-subqueries cases are
+  now handled for both views (`tests/view_rename_column_subquery.rs`) and
+  triggers (`tests/trigger_rename_column_subquery.rs`); what remains is the truly
+  multi-table body (a join, a subquery over another table, a body statement
+  writing a different table).
   - **A-rn3-edge-1** — add a source span (byte range) to `Expr::Column`. This is
     the enabling refactor. (The sibling `schema` field it once shared with the
     now-landed 3-part `schema.table.column` qualifier check is already in place,
