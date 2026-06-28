@@ -14435,6 +14435,195 @@ impl Connection {
         Ok(())
     }
 
+    /// Reject a row value `(a, b, …)` used where a single value is required, and a
+    /// comparison/`BETWEEN` whose operands have mismatched row arity — both are
+    /// `row value misused` in SQLite, raised at prepare time. graphite evaluates
+    /// the misuse per row (the `Expr::RowValue` arm of `eval`, and the
+    /// `operand_arity` checks on `=`/`IS`/`BETWEEN`), so over an empty or
+    /// fully-filtered table — where no row is ever evaluated — it was silently
+    /// accepted. The clause coverage mirrors the subquery-arity walkers. A
+    /// *multi-column subquery* in a plain scalar position is a different message
+    /// (`sub-select returns N columns - expected 1`, handled by
+    /// [`Self::reject_invalid_scalar_subquery_arity`]) and is left to that check;
+    /// here a subquery only participates as the wide operand of a row comparison.
+    fn reject_row_value_misuse(&self, sel: &Select, cols: &[ColumnInfo]) -> Result<()> {
+        let mut targets: Vec<&Expr> = Vec::new();
+        for rc in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            targets.push(w);
+        }
+        if let Some(h) = &sel.having {
+            targets.push(h);
+        }
+        for g in &sel.group_by {
+            targets.push(g);
+        }
+        for t in &sel.order_by {
+            targets.push(&t.expr);
+        }
+        if let Some(from) = &sel.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    targets.push(on);
+                }
+            }
+        }
+        for e in targets {
+            self.walk_row_value_misuse(e, cols)?;
+        }
+        Ok(())
+    }
+
+    /// The structural row arity of a comparison operand at prepare time, mirroring
+    /// the runtime `operand_arity`: a literal `(a, b, …)` row value's length, a
+    /// column-clean subquery's output-column count (no rows evaluated), or 1 for
+    /// an ordinary scalar. Returns `None` when a subquery operand is *not*
+    /// column-clean — SQLite reports its `no such column` before any misuse, so
+    /// the caller must skip the arity check rather than risk the wrong message.
+    fn row_arity(&self, e: &Expr, cols: &[ColumnInfo]) -> Option<usize> {
+        match unparen(e) {
+            Expr::RowValue(items) => Some(items.len()),
+            Expr::Subquery(select) => {
+                if self.subquery_body_columns_clean(select, cols) {
+                    let w = eval::Subqueries::row_column_affinities(self, select).len();
+                    Some(if w == 0 { 1 } else { w })
+                } else {
+                    None
+                }
+            }
+            _ => Some(1),
+        }
+    }
+
+    /// Walk `e` in a *scalar* position (one value expected): a bare row value
+    /// there is `row value misused`. Comparison/`BETWEEN` nodes are the one place a
+    /// row value is legal — their operands are checked for matching arity via
+    /// [`Self::walk_row_value_misuse_operand`] instead. See
+    /// [`Self::reject_row_value_misuse`].
+    fn walk_row_value_misuse(&self, e: &Expr, cols: &[ColumnInfo]) -> Result<()> {
+        match e {
+            Expr::RowValue(_) => {
+                // A bare row value in a scalar position.
+                return Err(Error::Error("row value misused".into()));
+            }
+            Expr::Paren(inner) => self.walk_row_value_misuse(inner, cols)?,
+            Expr::Binary {
+                op, left, right, ..
+            } => {
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq
+                        | BinaryOp::Is
+                        | BinaryOp::IsNot
+                ) {
+                    if let (Some(la), Some(ra)) =
+                        (self.row_arity(left, cols), self.row_arity(right, cols))
+                    {
+                        if (la > 1 || ra > 1) && la != ra {
+                            return Err(Error::Error("row value misused".into()));
+                        }
+                    }
+                    self.walk_row_value_misuse_operand(left, cols)?;
+                    self.walk_row_value_misuse_operand(right, cols)?;
+                } else {
+                    // Arithmetic, logical, concat — both operands are scalar.
+                    self.walk_row_value_misuse(left, cols)?;
+                    self.walk_row_value_misuse(right, cols)?;
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                if let (Some(ea), Some(la), Some(ha)) = (
+                    self.row_arity(expr, cols),
+                    self.row_arity(low, cols),
+                    self.row_arity(high, cols),
+                ) {
+                    if (ea > 1 || la > 1 || ha > 1) && (ea != la || ea != ha) {
+                        return Err(Error::Error("row value misused".into()));
+                    }
+                }
+                self.walk_row_value_misuse_operand(expr, cols)?;
+                self.walk_row_value_misuse_operand(low, cols)?;
+                self.walk_row_value_misuse_operand(high, cols)?;
+            }
+            Expr::Unary { expr, .. } => self.walk_row_value_misuse(expr, cols)?,
+            Expr::Function {
+                args,
+                filter,
+                order_by,
+                ..
+            } => {
+                for a in args {
+                    self.walk_row_value_misuse(a, cols)?;
+                }
+                if let Some(flt) = filter {
+                    self.walk_row_value_misuse(flt, cols)?;
+                }
+                for t in order_by {
+                    self.walk_row_value_misuse(&t.expr, cols)?;
+                }
+            }
+            Expr::IsNull { expr, .. } => self.walk_row_value_misuse(expr, cols)?,
+            Expr::InList { expr, list, .. } => {
+                // `(a,b) IN ((1,2),…)` — the LHS and each list element may be a row
+                // value; their term-count mismatch is a *different* message
+                // (`IN(…) element has N terms - expected M`), left to that path.
+                self.walk_row_value_misuse_operand(expr, cols)?;
+                for a in list {
+                    self.walk_row_value_misuse_operand(a, cols)?;
+                }
+            }
+            Expr::InSelect { expr, .. } => self.walk_row_value_misuse_operand(expr, cols)?,
+            Expr::Case {
+                operand,
+                when_then,
+                else_result,
+            } => {
+                if let Some(o) = operand {
+                    self.walk_row_value_misuse(o, cols)?;
+                }
+                for (w, t) in when_then {
+                    self.walk_row_value_misuse(w, cols)?;
+                    self.walk_row_value_misuse(t, cols)?;
+                }
+                if let Some(el) = else_result {
+                    self.walk_row_value_misuse(el, cols)?;
+                }
+            }
+            Expr::Cast { expr, .. } => self.walk_row_value_misuse(expr, cols)?,
+            Expr::Collate { expr, .. } => self.walk_row_value_misuse(expr, cols)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Walk `e` where a row value *is* permitted (a direct operand of a row
+    /// comparison / `BETWEEN` / `IN`): its outer row-ness is fine, but each element
+    /// is a scalar position. A subquery operand is the legal wide form and its body
+    /// validates itself, so it is not descended.
+    fn walk_row_value_misuse_operand(&self, e: &Expr, cols: &[ColumnInfo]) -> Result<()> {
+        match unparen(e) {
+            Expr::RowValue(items) => {
+                for it in items {
+                    self.walk_row_value_misuse(it, cols)?;
+                }
+            }
+            Expr::Subquery(_) => {}
+            other => self.walk_row_value_misuse(other, cols)?,
+        }
+        Ok(())
+    }
+
     /// The arity guard for one expression — see `reject_aggregate_arity_in_select`.
     /// Walks `e` (stopping at subquery boundaries, which validate themselves) for
     /// each aggregate call, whether plain or used as a window function (`agg(…)
@@ -14669,6 +14858,9 @@ impl Connection {
             // Likewise a multi-column scalar subquery used where one value is
             // required (`sub-select returns N columns - expected 1`).
             self.reject_invalid_scalar_subquery_arity(sel, &columns)?;
+            // And a row value in a scalar position, or a comparison/`BETWEEN`
+            // whose operands disagree in row arity (`row value misused`).
+            self.reject_row_value_misuse(sel, &columns)?;
         }
 
         // A positional `GROUP BY` / `ORDER BY` term (an integer literal) must name
@@ -15596,10 +15788,12 @@ impl Connection {
         for e in exprs {
             self.walk_in_subquery_arity(e, columns)?;
             self.walk_scalar_subquery_arity(e, columns, false)?;
+            self.walk_row_value_misuse(e, columns)?;
         }
         for e in returning {
             self.walk_in_subquery_arity(e, columns)?;
             self.walk_scalar_subquery_arity(e, columns, false)?;
+            self.walk_row_value_misuse(e, columns)?;
         }
         Ok(())
     }

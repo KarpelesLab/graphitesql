@@ -419,6 +419,27 @@ resolves against its own FROM plus the outer scope — so a dirty subquery yield
 `SET`/`WHERE` DML positions are covered. Byte-exact vs `sqlite3` 3.50.4 for the
 column-clean scalar contexts.
 
+The third member of that family — **`row value misused`** — is now also raised at
+prepare time. A row value `(a, b, …)` is legal only as an operand of a row
+comparison, `BETWEEN`, or `IN`; used anywhere a single value is expected (a bare
+result column, an arithmetic or function operand, a `WHERE`/`ORDER BY`) SQLite
+rejects it, and a comparison or `BETWEEN` whose operands disagree in row width
+(`a = (1,2)`, `(a,b) = (1,2,3)`, `a = (SELECT 1,2)`) is the same error. graphite
+evaluated this per row — the row-value arm of the scalar evaluator and the
+`operand_arity` checks on `=`/`IS`/`BETWEEN` — so over an empty or fully-filtered
+table it was silently accepted. A prepare-time walker now mirrors that exactly: a
+bare row value in a scalar position is rejected, and at each comparison/`BETWEEN`
+the structural operand widths (a row value's length, a column-clean subquery's
+output width, else 1) must match. Equal-arity row comparisons (`(a,b) = (1,2)`,
+`(a,b) BETWEEN (1,2) AND (3,4)`, `(a,b) IN ((1,2),(3,4))`) stay valid, and a
+nested misuse inside a valid row element (`(a, (1,2)) = (1,2)`) is still caught.
+It runs on the SELECT and the UPDATE/DELETE paths after column resolution, so a
+`no such column` still wins; a comparison against a subquery with an unresolved
+column is conservatively skipped (left to its lazy behaviour). Residuals: the
+`IN(…) element has N terms - expected M` list-arity message is a separate path,
+and a dirty operand where SQLite reports `row value misused` *before* the missing
+column is left as-is. Byte-exact vs `sqlite3` 3.50.4 for the column-clean cases.
+
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite
 does. The per-column "add column" checks run first, left to right — a duplicate
