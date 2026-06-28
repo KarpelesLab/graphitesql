@@ -1284,7 +1284,15 @@ compound*** (`FROM (SELECT g FROM t UNION SELECT m FROM u) x`) runs too: when ev
 arm yields the identical `(affinity, collation)` for each column, `arm_column_origins`
 resolves the result column to that shared origin, so an outer `WHERE v='2'` coerces
 through the inherited `INTEGER` affinity (this fixes a real tree-walker divergence —
-the conservative BLOB default previously dropped the row). A NATURAL/USING body
+the conservative BLOB default previously dropped the row). A **derived table whose
+body reads a *view*** (`FROM (SELECT g AS v FROM vt) x`) runs too: `named_source_origins`
+parses the view's stored `CREATE VIEW` and threads its body through
+`subquery_column_origins` — the same origins `try_view` assigns when materializing the
+view — so a derived/outer predicate over a view column coerces through the view
+column's affinity (this *also* fixed a real tree-walker divergence: a derived table
+over a view previously fell back to the BLOB default, so `(SELECT g AS v FROM vt)
+WHERE v='2'` wrongly returned no rows). A view column carrying a *non-BINARY*
+collation still defers. A NATURAL/USING body
 (coalesced shared column), a non-BINARY body column, a recursive body, a
 *mixed-affinity* or `FROM`-less or nested compound body, or a two-or-more-level sibling
 chain whose intermediate name can't be resolved for origins still defers to the

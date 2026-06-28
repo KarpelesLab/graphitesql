@@ -17606,7 +17606,16 @@ impl Connection {
                 return Some(names.into_iter().zip(origins).collect());
             }
         }
-        // A base table only — a view/CTE source defers to the conservative default.
+        // A view source resolves through its stored body: the view's output columns
+        // carry their defining expressions' `(affinity, collation)`, so a derived
+        // table / outer predicate over the view coerces exactly as it would over the
+        // body (e.g. `(SELECT g AS v FROM vt) WHERE v = '2'` keeps `vt.g`'s INTEGER
+        // affinity). Unqualified only — a schema-qualified name never names a view here.
+        if tref.schema.is_none() && self.is_view(&tref.name) {
+            return self.view_named_origins(&tref.name);
+        }
+        // A base table only — a CTE source out of scope defers to the conservative
+        // default.
         self.schema.table(&tref.name)?;
         let meta = self.table_meta(&tref.name, tref.alias.as_deref()).ok()?;
         Some(
@@ -17615,6 +17624,55 @@ impl Connection {
                 .map(|c| (c.name.clone(), (c.affinity, c.collation)))
                 .collect(),
         )
+    }
+
+    /// A view's per-column `(name, (affinity, collation))` origins, resolved by
+    /// parsing its stored `CREATE VIEW` and threading the body through
+    /// [`subquery_column_origins`](Self::subquery_column_origins) — exactly the
+    /// origins [`try_view`](Self::try_view) assigns when it materializes the view.
+    /// Returns `None` (conservative defer) when the view body's origins can't be
+    /// resolved (a join/compound/CTE/TVF body the resolver declines), so a caller
+    /// keeps the NONE/BINARY default rather than guess.
+    fn view_named_origins(&self, name: &str) -> Option<Vec<(String, ColOrigin)>> {
+        let sql = if self.temp_has_view(name) {
+            self.temp_db
+                .as_ref()?
+                .schema
+                .objects()
+                .iter()
+                .find(|o| {
+                    o.obj_type == crate::schema::ObjectType::View
+                        && o.name.eq_ignore_ascii_case(name)
+                })?
+                .sql
+                .clone()?
+        } else {
+            self.schema
+                .objects()
+                .iter()
+                .find(|o| {
+                    o.obj_type == crate::schema::ObjectType::View
+                        && o.name.eq_ignore_ascii_case(name)
+                })?
+                .sql
+                .clone()?
+        };
+        let Ok(Statement::CreateView(cv)) = sql::parse_one(&sql) else {
+            return None;
+        };
+        let origins = self.subquery_column_origins(&cv.select)?;
+        let names: Vec<String> = if cv.columns.is_empty() {
+            self.resolved_view_columns(&cv.select)?
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        } else {
+            cv.columns.clone()
+        };
+        if names.len() != origins.len() {
+            return None;
+        }
+        Some(names.into_iter().zip(origins).collect())
     }
 
     /// The single shared decision for the rowid-seek join optimization (roadmap
