@@ -752,7 +752,29 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
     if !order.is_empty() && (*distinct || kind != AggKind::GroupConcat) {
         return None;
     }
+    // A `DISTINCT` slot folds under BINARY equality (see `AggSpec::distinct`). An
+    // explicit non-BINARY `COLLATE` on the argument — `count(DISTINCT a COLLATE
+    // NOCASE)`, `group_concat(DISTINCT a COLLATE NOCASE)` — must drive the dedup
+    // instead. The tree-walker honors it via `eval::key_collation`, so defer the
+    // whole query there. (A column's *declared* collation is already caught by the
+    // caller's non-BINARY-collation bail.)
+    if *distinct && arg.as_ref().is_some_and(explicit_non_binary_collation) {
+        return None;
+    }
     Some((kind, arg, *distinct, filter, order, sep))
+}
+
+/// True when `expr` carries an explicit `COLLATE` that is not BINARY (peeling
+/// parentheses). Mirrors the explicit-collation arm of `eval::key_collation`,
+/// used to defer a `DISTINCT` aggregate whose dedup would otherwise fold under
+/// the wrong (BINARY) collation.
+fn explicit_non_binary_collation(expr: &Expr) -> bool {
+    match unparen(expr) {
+        Expr::Collate { collation, .. } => {
+            Collation::parse(collation).is_some_and(|c| c != Collation::Binary)
+        }
+        _ => false,
+    }
 }
 
 /// The text of a constant `group_concat`/`string_agg` separator, matching the

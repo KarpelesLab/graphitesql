@@ -220,3 +220,81 @@ fn distinct_aggregate_over_nocase_defers_but_is_correct() {
     let r = c.query("SELECT count(DISTINCT x) FROM u").unwrap();
     assert_eq!(r.rows, vec![vec![Value::Integer(2)]]);
 }
+
+/// An *explicit* `COLLATE` on a `DISTINCT` aggregate argument
+/// (`count(DISTINCT a COLLATE NOCASE)`) must drive the dedup. The VDBE folds
+/// under BINARY, so it has to defer to the tree-walker — which honors the
+/// collation and matches sqlite. An explicit `COLLATE BINARY`, by contrast,
+/// is BINARY already and stays on the VDBE.
+#[test]
+fn distinct_aggregate_with_explicit_collate_arg_defers_but_is_correct() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a TEXT)").unwrap();
+    c.execute("INSERT INTO t VALUES ('a'),('A'),('b')").unwrap();
+
+    // Non-BINARY explicit collation: VDBE bails, tree-walker collapses 'a'=='A'.
+    for q in [
+        "SELECT count(DISTINCT a COLLATE NOCASE) FROM t",
+        "SELECT group_concat(DISTINCT a COLLATE NOCASE) FROM t",
+        "SELECT count(DISTINCT (a COLLATE NOCASE)) FROM t",
+    ] {
+        assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
+    }
+    assert_eq!(
+        c.query("SELECT count(DISTINCT a COLLATE NOCASE) FROM t")
+            .unwrap()
+            .rows,
+        vec![vec![Value::Integer(2)]],
+    );
+    assert_eq!(
+        c.query("SELECT group_concat(DISTINCT a COLLATE NOCASE) FROM t")
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("a,b".into())]],
+    );
+
+    // Explicit COLLATE BINARY is the default fold, so it stays on the VDBE and
+    // keeps 'a' and 'A' distinct.
+    let r = c
+        .query_vdbe("SELECT count(DISTINCT a COLLATE BINARY) FROM t")
+        .unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Integer(3)]]);
+}
+
+/// The same explicit-`COLLATE` deferral over `GROUP BY`: the tree-walker dedups
+/// each group under the argument collation, matching sqlite 3.50.4.
+#[test]
+fn distinct_aggregate_with_explicit_collate_over_group_by_matches_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(g INT, a TEXT)").unwrap();
+    c.execute("INSERT INTO t VALUES (1,'a'),(1,'A'),(1,'b'),(2,'x'),(2,'X')")
+        .unwrap();
+    let q = "SELECT g, count(DISTINCT a COLLATE NOCASE) FROM t GROUP BY g ORDER BY g";
+    let got: Vec<Vec<String>> = c
+        .query(q)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.iter().map(render).collect())
+        .collect();
+    let setup =
+        "CREATE TABLE t(g INT, a TEXT);\nINSERT INTO t VALUES (1,'a'),(1,'A'),(1,'b'),(2,'x'),(2,'X');\n";
+    let out = Command::new("sqlite3")
+        .arg(":memory:")
+        .arg("-ascii")
+        .arg(format!("{setup}{q};"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let expected: Vec<Vec<String>> = text
+        .split('\u{1e}')
+        .filter(|r| !r.is_empty())
+        .map(|r| r.split('\u{1f}').map(|f| f.to_string()).collect())
+        .collect();
+    assert_eq!(got, expected);
+}
