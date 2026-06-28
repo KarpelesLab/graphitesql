@@ -19788,7 +19788,22 @@ impl Connection {
 
         // --- Window functions over the grouped rows, then project. ---
         let mut wcols = cols;
-        let win_sel = self.apply_windows(&rsel, &mut wcols, &mut grows, params)?;
+        let mut win_sel = self.apply_windows(&rsel, &mut wcols, &mut grows, params)?;
+        // Absent an explicit ORDER BY, match sqlite's window-induced row order
+        // (the first window's PARTITION BY + ORDER BY) over the grouped rows. The
+        // keys come from `rsel`, whose window specs reference the aggregate
+        // columns (`__aggN`), so `ORDER BY sum(x)` sorts by the group's aggregate.
+        // The windowed-aggregate path produces its rows here (finish_from_rows
+        // only sorts when the *original* query named an ORDER BY), so apply the
+        // implicit order locally.
+        let synth_order = if win_sel.order_by.is_empty() {
+            self.window_output_order(&rsel)?
+        } else {
+            None
+        };
+        if let Some(order) = &synth_order {
+            win_sel.order_by = order.clone();
+        }
         let mut out = Vec::with_capacity(grows.len());
         for r in &grows {
             let ctx = r.ctx(&wcols, params).with_subqueries(self);
@@ -19804,6 +19819,28 @@ impl Connection {
                 }
             }
             out.push(OutRow { values, sort_keys });
+        }
+        if let Some(order) = &synth_order {
+            let octx = row_ctx(&[], &wcols, None, params);
+            let colls: Vec<crate::value::Collation> = order
+                .iter()
+                .map(|t| eval::key_collation(&t.expr, &octx))
+                .collect();
+            out.sort_by(|a, b| {
+                for (i, term) in order.iter().enumerate() {
+                    let o = cmp_order(
+                        &a.sort_keys[i],
+                        &b.sort_keys[i],
+                        term.descending,
+                        term.nulls_first,
+                        colls[i],
+                    );
+                    if o != core::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
         }
         Ok((labels, out))
     }

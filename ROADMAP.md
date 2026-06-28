@@ -577,9 +577,7 @@ first window's `PARTITION BY` keys (ascending) followed by its `ORDER BY` terms 
 through the existing collation/NULLS-aware sort, so `SELECT x, row_number() OVER
 (ORDER BY x) FROM t` over rows inserted `5,3,8` returns them `3,5,8`. The *first*
 window in the select list wins; `OVER ()` induces no ordering (scan order
-preserved). Byte-exact vs `sqlite3` 3.50.4 (`tests/window_output_order.rs`). One
-residual is deferred (a separate, larger fix): the `GROUP BY` + window path
-(`eval_windowed_aggregate`) does not yet apply the window order.
+preserved). Byte-exact vs `sqlite3` 3.50.4 (`tests/window_output_order.rs`).
 
 **Window `PARTITION BY` / `ORDER BY` now honor the key's collation.** A window
 key with an explicit `COLLATE` operator, or a column with a declared collation,
@@ -593,6 +591,20 @@ silently wrong values. The window machinery now derives each key's collation
 (`eval::key_collation`) and threads it through a collation-aware `cmp_keys_coll`
 in partitioning, ordering, and all five peer-equality checks. Byte-exact vs
 `sqlite3` 3.50.4 (`tests/window_collation.rs`).
+
+**A `GROUP BY` query with a window function now orders its grouped rows like
+SQLite too.** The window-induced output ordering above was previously only
+applied on the plain-window path; the `GROUP BY` + window path
+(`eval_windowed_aggregate`) left the grouped rows in group-key order, so
+`SELECT g, sum(x), row_number() OVER (ORDER BY sum(x) DESC) FROM t GROUP BY g`
+came out ascending-by-`sum` instead of descending. The window here runs over the
+*grouped* rows, so its `ORDER BY` may reference a group aggregate (`sum(x)`,
+`avg(x)`); `extract_aggregates` already rewrites those aggregates to `__aggN`
+synthetic columns, so the same first-window ordering — `PARTITION BY` keys then
+`ORDER BY` terms, collation/NULLS-aware — resolves against the grouped row and is
+sorted in place. `OVER ()` still induces no ordering (group-key order preserved),
+and an explicit outer `ORDER BY` still wins. Byte-exact vs `sqlite3` 3.50.4
+(`tests/window_grouped_order.rs`).
 
 **CTEs in one `WITH` clause now see each other — forward references work, and
 true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
