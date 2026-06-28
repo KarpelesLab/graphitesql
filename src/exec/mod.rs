@@ -16260,51 +16260,102 @@ impl Connection {
             .from
             .as_ref()
             .ok_or(Error::Unsupported("VDBE window: no FROM"))?;
-        if from.joins.iter().any(|j| j.natural || !j.using.is_empty()) {
-            return Err(Error::Unsupported("VDBE window: NATURAL/USING join source"));
-        }
-        let mut cols = Vec::new();
-        for tref in core::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.table)) {
-            if let Some(sub) = &tref.subquery {
-                // A derived subquery join source: resolve its output columns through
-                // the same `(affinity, collation)` model the derived scan path uses
-                // (`window_source_columns`), exactly as the single-source derived
-                // window branch does. The base scan materializes it via `scan_one`'s
-                // subquery branch, so columns and rows stay in lockstep; a body that
-                // is itself a join / non-constant compound / view / TVF, or a
-                // non-BINARY derived column, makes the base scan decline and the whole
-                // window query defer.
-                if tref.tvf_args.is_some() || tref.schema.is_some() || tref.index_hint.is_some() {
-                    return Err(Error::Unsupported("VDBE window: non-plain join source"));
+        // Accumulate the combined column model left-to-right, coalescing each
+        // `NATURAL`/`USING` join's shared columns exactly as the base scan
+        // (`run_select_vdbe`'s outer-join path) does: the right duplicate is dropped
+        // and the coalesced column keeps the left source's metadata. A plain join
+        // simply concatenates.
+        let mut cols = self.window_join_one_source(&from.first)?;
+        for j in &from.joins {
+            let src = self.window_join_one_source(&j.table)?;
+            let lw = cols.len();
+            // Coalesce pairs `(left index, right local index)`: NATURAL matches every
+            // shared column name; USING matches the named columns (which must be
+            // present in both sides).
+            let pairs: Vec<(usize, usize)> = if j.natural {
+                src.iter()
+                    .enumerate()
+                    .filter_map(|(rl, rc)| {
+                        cols.iter()
+                            .position(|lc| lc.name.eq_ignore_ascii_case(&rc.name))
+                            .map(|li| (li, rl))
+                    })
+                    .collect()
+            } else if !j.using.is_empty() {
+                let mut v = Vec::with_capacity(j.using.len());
+                for name in &j.using {
+                    let li = cols.iter().position(|c| c.name.eq_ignore_ascii_case(name));
+                    let rl = src.iter().position(|c| c.name.eq_ignore_ascii_case(name));
+                    match (li, rl) {
+                        (Some(li), Some(rl)) => v.push((li, rl)),
+                        // A USING column absent from a side is an error the
+                        // tree-walker reports; defer so it surfaces there.
+                        _ => {
+                            return Err(Error::Unsupported(
+                                "VDBE window: USING column not in both sources",
+                            ))
+                        }
+                    }
                 }
-                let qualifier = tref.alias.clone().unwrap_or_default();
-                cols.extend(self.window_source_columns(sub, &qualifier, None)?);
-                continue;
-            }
-            if tref.schema.is_some() || tref.index_hint.is_some() {
-                return Err(Error::Unsupported("VDBE window: non-plain join source"));
-            }
-            let shadows_cte = self
-                .cte_env
-                .borrow()
-                .iter()
-                .any(|b| b.name.eq_ignore_ascii_case(&tref.name));
-            if tref.tvf_args.is_some() || self.is_pragma_tvf(tref) {
-                let (cinfos, _rows) = self.tvf_rows(tref, &Params::default())?;
-                cols.extend(cinfos.into_iter().filter(|ci| !ci.hidden));
-            } else if !shadows_cte && self.is_view(&tref.name) {
-                let (cinfos, _rows) = self
-                    .try_view(&tref.name, tref.alias.as_deref(), &Params::default())?
-                    .ok_or(Error::Unsupported("VDBE window: view not found"))?;
-                cols.extend(cinfos);
-            } else if shadows_cte || self.is_virtual_table(&tref.name) {
-                return Err(Error::Unsupported("VDBE window: non-plain join source"));
+                v
             } else {
-                let meta = self.table_meta(&tref.name, tref.alias.as_deref())?;
-                cols.extend(meta.columns);
+                Vec::new()
+            };
+            cols.extend(src);
+            // Drop the right duplicates (highest index first) so the surviving
+            // coalesced column appears once, in its left position.
+            if !pairs.is_empty() {
+                let mut drop: Vec<usize> = pairs.iter().map(|&(_, rl)| lw + rl).collect();
+                drop.sort_unstable();
+                drop.dedup();
+                for &d in drop.iter().rev() {
+                    cols.remove(d);
+                }
             }
         }
         Ok(cols)
+    }
+
+    /// Resolve one join-source `TableRef`'s columns exactly as the window base scan
+    /// exposes them: a plain table via `table_meta`, a view via `try_view`, a
+    /// visible-masked TVF via `tvf_rows`, and a derived subquery via
+    /// `window_source_columns`. A CTE-shadowing name, a virtual table, or a
+    /// schema-qualified / index-hinted source defers.
+    fn window_join_one_source(&self, tref: &sql::ast::TableRef) -> Result<Vec<ColumnInfo>> {
+        if let Some(sub) = &tref.subquery {
+            // A derived subquery join source: resolve its output columns through the
+            // same `(affinity, collation)` model the single-source derived window
+            // branch uses. A body that is itself a join / non-constant compound /
+            // view / TVF, or a non-BINARY derived column, makes the base scan decline
+            // and the whole window query defer.
+            if tref.tvf_args.is_some() || tref.schema.is_some() || tref.index_hint.is_some() {
+                return Err(Error::Unsupported("VDBE window: non-plain join source"));
+            }
+            let qualifier = tref.alias.clone().unwrap_or_default();
+            return self.window_source_columns(sub, &qualifier, None);
+        }
+        if tref.schema.is_some() || tref.index_hint.is_some() {
+            return Err(Error::Unsupported("VDBE window: non-plain join source"));
+        }
+        let shadows_cte = self
+            .cte_env
+            .borrow()
+            .iter()
+            .any(|b| b.name.eq_ignore_ascii_case(&tref.name));
+        if tref.tvf_args.is_some() || self.is_pragma_tvf(tref) {
+            let (cinfos, _rows) = self.tvf_rows(tref, &Params::default())?;
+            Ok(cinfos.into_iter().filter(|ci| !ci.hidden).collect())
+        } else if !shadows_cte && self.is_view(&tref.name) {
+            let (cinfos, _rows) = self
+                .try_view(&tref.name, tref.alias.as_deref(), &Params::default())?
+                .ok_or(Error::Unsupported("VDBE window: view not found"))?;
+            Ok(cinfos)
+        } else if shadows_cte || self.is_virtual_table(&tref.name) {
+            Err(Error::Unsupported("VDBE window: non-plain join source"))
+        } else {
+            let meta = self.table_meta(&tref.name, tref.alias.as_deref())?;
+            Ok(meta.columns)
+        }
     }
 
     /// Static, scope-aware ambiguity check for nested subqueries, run once at the

@@ -6,8 +6,10 @@
 //! the base scan (`SELECT *` over the join, now column-qualified) materializes the rows.
 //! The window evaluation runs in the shared `finish_from_rows` tail.
 //!
+//! A `NATURAL`/`USING` join (coalesced columns) runs too — see the dedicated
+//! `vdbe_window_natural_join.rs` and `natural_join_view_window_runs_on_vdbe` below.
+//!
 //! Deferred to the tree-walker (asserted separately), never run wrong:
-//!   * a `NATURAL`/`USING` join (coalesced columns) containing a view/TVF.
 //!   * a view column carrying a *non-BINARY* collation (the base scan refuses it).
 //!   * a `rowid` reference (a joined row has no single rowid).
 //!
@@ -109,12 +111,15 @@ fn window_join_matches_sqlite3() {
 }
 
 #[test]
-fn natural_join_view_window_defers() {
+fn natural_join_view_window_runs_on_vdbe() {
     let c = conn();
-    // A NATURAL join coalesces the shared column; the join window source defers.
-    let q = "SELECT g, sum(n) OVER () FROM t NATURAL JOIN vt";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    // A NATURAL join coalesces the shared columns; `window_join_source_columns` now
+    // mirrors the base scan's coalescing, so the join window source runs on the VDBE
+    // and matches the tree-walker (covered broadly in vdbe_window_natural_join.rs).
+    let q = "SELECT g, sum(n) OVER () FROM t NATURAL JOIN vt ORDER BY 1, 2";
+    let got = c.query_vdbe(q).unwrap().rows;
+    let want = c.query(q).unwrap().rows;
+    assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
 }
 
 #[test]

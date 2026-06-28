@@ -1324,8 +1324,13 @@ exposes them — a plain table via `table_meta`, a view via `try_view`, a visibl
 TVF via `tvf_rows`, and a derived subquery via `window_source_columns` (the same
 `(affinity, collation)` model the single-source derived window path uses, so a
 join-bodied or two-derived join carries windows) — and the column-qualified `SELECT *`
-base scan materializes the joined rows; a `NATURAL`/`USING` join, a non-BINARY view or
-derived column, or a `rowid` reference defers. This builds on a general
+base scan materializes the joined rows. A **`NATURAL` or `USING` join** window source
+runs too: `window_join_source_columns` mirrors the base scan's coalescing — it drops the
+right-hand duplicate of each same-named (`NATURAL`) or named (`USING`) pair, keeping the
+left column's name/affinity/collation — so a coalesced-key `PARTITION BY` or window over
+the join matches the tree-walker byte-for-byte (including when the coalesced column
+itself carries `NOCASE`). A non-BINARY view or derived column, or a `rowid` reference
+(a joined row has no single rowid), still defers. This builds on a general
 **`SELECT *` / `tbl.*` over a join whose sources share a column name** fix: the wildcard
 expansion now qualifies each expanded column with its source table (from the scan's
 parallel `tables` slice), so `SELECT * FROM t JOIN u` where both carry `g` resolves each
