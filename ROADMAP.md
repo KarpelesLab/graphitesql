@@ -1279,8 +1279,14 @@ resolves each output column's `(affinity, collation)` *across the join's sources
 (first table then each joined table, in declaration order) — so an affinity-sensitive
 outer `WHERE`/`ORDER BY` over a derived numeric column coerces exactly as SQLite does,
 instead of falling back to the BLOB default (this also sharpens a join-bodied view's
-column affinity in the tree-walker). A NATURAL/USING body (coalesced shared column),
-a non-BINARY body column, a recursive/compound body, or a two-or-more-level sibling
+column affinity in the tree-walker). A **derived table whose body is a *same-affinity
+compound*** (`FROM (SELECT g FROM t UNION SELECT m FROM u) x`) runs too: when every
+arm yields the identical `(affinity, collation)` for each column, `arm_column_origins`
+resolves the result column to that shared origin, so an outer `WHERE v='2'` coerces
+through the inherited `INTEGER` affinity (this fixes a real tree-walker divergence —
+the conservative BLOB default previously dropped the row). A NATURAL/USING body
+(coalesced shared column), a non-BINARY body column, a recursive body, a
+*mixed-affinity* or `FROM`-less or nested compound body, or a two-or-more-level sibling
 chain whose intermediate name can't be resolved for origins still defers to the
 tree-walker (correct, never wrong). A **single table-valued function `FROM` source** runs on
 the VDBE as well: `generate_series(start[,stop[,step]])`, `json_each` / `json_tree`,

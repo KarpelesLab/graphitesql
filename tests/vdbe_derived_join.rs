@@ -117,18 +117,18 @@ fn derived_join_matches_sqlite3() {
 }
 
 #[test]
-fn natural_using_collation_and_compound_bodies_defer() {
+fn natural_using_and_collation_bodies_defer() {
     let mut c = conn();
     c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE, v INTEGER)")
         .unwrap();
     c.execute("INSERT INTO w VALUES ('A',1),('b',2)").unwrap();
-    // A NATURAL / USING join body (coalesced shared column), a non-BINARY collation
-    // body, and a compound body each defer to the tree-walker, which still runs them.
+    // A NATURAL / USING join body (coalesced shared column) and a non-BINARY
+    // collation body each defer to the tree-walker, which still runs them. (A
+    // same-affinity compound body now runs — see `vdbe_derived_compound.rs`.)
     for q in [
         "SELECT g FROM (SELECT g FROM t NATURAL JOIN u) x ORDER BY 1",
         "SELECT g FROM (SELECT g FROM t JOIN u USING(g)) x ORDER BY 1",
         "SELECT x.k FROM (SELECT w.k, t.g FROM w JOIN t ON w.v=t.g) x WHERE x.k='a'",
-        "SELECT v FROM (SELECT g AS v FROM t UNION SELECT m FROM u) x ORDER BY 1",
     ] {
         assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
         assert!(c.query(q).is_ok(), "tree-walker should run {q}");

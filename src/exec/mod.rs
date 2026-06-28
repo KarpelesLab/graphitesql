@@ -17441,9 +17441,36 @@ impl Connection {
     /// Existing callers use the no-CTE wrapper above; only the VDBE derived-source
     /// path threads `sel.ctes` in, so the tree-walker paths are unaffected.
     fn subquery_column_origins_in(&self, select: &Select, ctes: &[Cte]) -> Option<Vec<ColOrigin>> {
-        if !select.compound.is_empty() {
-            return None;
+        // The leftmost arm's per-column origins.
+        let head = self.arm_column_origins(select, ctes)?;
+        if select.compound.is_empty() {
+            return Some(head);
         }
+        // A compound (UNION / UNION ALL / INTERSECT / EXCEPT) body resolves only when
+        // *every* arm yields the identical `(affinity, collation)` for each column —
+        // then the result column carries that shared origin (e.g. two `INTEGER`
+        // arms keep INTEGER affinity, so an outer `v = '2'` coerces and matches). Any
+        // per-column disagreement, a differing column count, an unresolvable arm, or a
+        // nested compound arm defers to the tree-walker, whose conservative NONE/BINARY
+        // default already matches SQLite for mixed-affinity arms (verified vs sqlite3).
+        for (_, arm) in &select.compound {
+            if !arm.compound.is_empty() {
+                return None;
+            }
+            let arm_origins = self.arm_column_origins(arm, ctes)?;
+            if arm_origins.len() != head.len() || arm_origins != head {
+                return None;
+            }
+        }
+        Some(head)
+    }
+
+    /// One arm of a (possibly compound) subquery: its per-column `(affinity,
+    /// collation)` origins. A single source or a *plain* join body resolves; a
+    /// NATURAL/USING join, a FROM-less arm, or an unresolvable source returns `None`.
+    /// [`subquery_column_origins_in`](Self::subquery_column_origins_in) combines the
+    /// arms.
+    fn arm_column_origins(&self, select: &Select, ctes: &[Cte]) -> Option<Vec<ColOrigin>> {
         let from = select.from.as_ref()?;
         // A NATURAL / USING join coalesces its shared columns into a single output
         // column whose affinity is the left source's — a bare-name lookup across both
