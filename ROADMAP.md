@@ -1275,7 +1275,14 @@ in scope (`subquery_column_origins_in`), so an `INTEGER` column read through a
 single-level sibling keeps coercing exactly as SQLite does. A recursive (compound)
 or join body, a non-BINARY body column, or a two-or-more-level sibling chain whose
 intermediate name can't be resolved for origins still defers to the tree-walker
-(correct, never wrong). A **compound
+(correct, never wrong). A **single table-valued function `FROM` source** runs on
+the VDBE as well: `generate_series(start[,stop[,step]])` and the table-valued
+`pragma_<name>(arg)` form are materialized through the same `tvf_rows` the
+tree-walker uses, so projection / WHERE / ORDER BY / LIMIT / aggregate over the
+series or pragma rows run without falling back. `json_each` / `json_tree` (which
+expose *hidden* input columns the single-source `*` expansion can't model) and any
+TVF appearing in a *join* (its arguments may correlate to another source, which the
+rowless `tvf_rows` can't honour) still defer to the tree-walker. A **compound
 `SELECT` whose whole-query `WITH` is referenced by one or more arms** runs on the
 VDBE too: the outer CTEs are materialized into the CTE environment (so the first
 core's output-collation scan resolves them) and threaded into every operand (so

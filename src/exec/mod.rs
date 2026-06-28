@@ -1266,8 +1266,8 @@ impl Connection {
             collect_source_names(sel, &mut seeds);
             self.push_ctes(&sel.ctes, &params, outer_cap, Some(&seeds))?;
         }
-        // Materialize a plain table source's column names and rows. Subqueries
-        // and table-valued functions are out of the spike's scope.
+        // Materialize a FROM source's column names and rows — a plain table, a safe
+        // subquery / in-scope CTE, or a table-valued function.
         // (column names, owning-table qualifier, affinities, collations, rows, and
         // the per-row rowids — `None` for a `WITHOUT ROWID` table, which has none).
         type ScanOut = (
@@ -1279,6 +1279,24 @@ impl Connection {
             Option<Vec<i64>>,
         );
         let scan_one = |tr: &sql::ast::TableRef| -> Result<ScanOut> {
+            // A table-valued function FROM source (`generate_series(…)`, the
+            // table-valued `pragma_<name>(…)` form). `tvf_rows` produces the same
+            // columns and rows the tree-walker would, so the outer query sees them
+            // identically. `json_each` / `json_tree` carry *hidden* input columns
+            // (`json` / `root`) that this single-source path's `*` expansion can't
+            // model — those defer to the tree-walker. (A multi-source query
+            // containing a TVF is rejected earlier as "only plain table sources".)
+            if tr.tvf_args.is_some() || self.is_pragma_tvf(tr) {
+                let (cinfos, rows) = self.tvf_rows(tr, &eval::Params::default())?;
+                if cinfos.iter().any(|ci| ci.hidden) {
+                    return Err(Error::Unsupported("VDBE: TVF with hidden columns"));
+                }
+                let columns = cinfos.iter().map(|ci| ci.name.clone()).collect();
+                let tables = cinfos.iter().map(|ci| ci.table.clone()).collect();
+                let affinities = cinfos.iter().map(|ci| ci.affinity).collect();
+                let collations = cinfos.iter().map(|ci| ci.collation).collect();
+                return Ok((columns, tables, affinities, collations, rows, None));
+            }
             // A derived source: an explicit `FROM` subquery, or a `FROM` reference
             // naming an in-scope CTE — both materialized through the same
             // conservative single-block constraints (a constant/`VALUES` body, or a
@@ -1400,9 +1418,6 @@ impl Connection {
                     .collect();
                 return Ok((columns, tables, affinities, collations, result.rows, None));
             }
-            if tr.tvf_args.is_some() {
-                return Err(Error::Unsupported("VDBE: only plain table sources"));
-            }
             // The VDBE always full-scans and does not model `INDEXED BY`/`NOT
             // INDEXED` (and an invalid `INDEXED BY` must error); defer to the
             // tree-walker so the hint is honoured or rejected.
@@ -1426,6 +1441,18 @@ impl Connection {
             };
             Ok((cols, tables, affinities, collations, rows, rowids))
         };
+
+        // A table-valued function appearing in a *join* defers to the tree-walker:
+        // its arguments may correlate to another source's columns (`json_each(t.j)`),
+        // which `tvf_rows` — evaluating in a rowless context — can't honour. Only a
+        // single TVF source (handled below via `scan_one`) runs on the VDBE.
+        if !from.joins.is_empty()
+            && core::iter::once(&from.first)
+                .chain(from.joins.iter().map(|j| &j.table))
+                .any(|tr| tr.tvf_args.is_some() || self.is_pragma_tvf(tr))
+        {
+            return Err(Error::Unsupported("VDBE: table-valued function in a join"));
+        }
 
         // Outer / NATURAL / USING join(s) — anything beyond a plain INNER chain. A
         // filtered cross-product can't model the NULL-extension of unmatched rows
@@ -1936,10 +1963,7 @@ impl Connection {
         }
 
         // Single source — a plain table or a derived table (`scan_one` materializes
-        // a safe FROM subquery; a table-valued function is out of scope).
-        if from.first.tvf_args.is_some() {
-            return Err(Error::Unsupported("VDBE: table-valued function source"));
-        }
+        // a safe FROM subquery, an in-scope CTE, or a table-valued function source).
         let (col_names, col_tables, col_aff, col_coll, mut rows, rowids) = scan_one(&from.first)?;
         // Append each row's rowid as a hidden trailing value so a `rowid`/`_rowid_`/
         // `oid` reference resolves (a `WITHOUT ROWID` table has none → `rowids` is
