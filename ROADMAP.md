@@ -490,6 +490,21 @@ database, is qualified with `*` (`SELECT * FROM x, x` over a CTE `x` →
 `<source>.<col>`. Explicit references (`SELECT a` / `SELECT x.a`) keep their
 unprefixed spelling, unchanged. Byte-exact vs `sqlite3` 3.50.4.
 
+**CTEs in one `WITH` clause now see each other — forward references work, and
+true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
+(it expands them on demand from the outer query), so a CTE may reference one
+declared *after* it (`WITH a AS (SELECT * FROM b), b AS (SELECT 9) …`), and a
+genuine cycle is `circular reference: <name>`, naming the CTE the outer query
+enters through (`… FROM a` over an `a`<->`b` cycle reports `a`; `… FROM b`
+reports `b`). graphite exposed only the CTEs declared *before* each one, so a
+forward reference fell through to the schema as `no such table: <name>`.
+`push_ctes` now takes the consuming statement's source names (the entry order),
+builds the sibling dependency graph, detects cycles in entry order, and
+materializes dependencies before dependents — declaration order is preserved for
+independent CTEs, so every backward-only (pre-existing) query is unaffected. A
+direct self-reference is still recursion, not a cycle. Byte-exact vs `sqlite3`
+3.50.4 (`tests/cte_forward_reference.rs`).
+
 **A duplicate PRIMARY KEY now outranks a generated-column PK error when the
 first PK is non-generated.** SQLite processes `PRIMARY KEY` declarations
 sequentially (`sqlite3AddPrimaryKey`), so the *first* declared PK decides which

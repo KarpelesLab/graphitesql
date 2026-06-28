@@ -3310,8 +3310,9 @@ impl Connection {
             let pushed = if ins.ctes.is_empty() {
                 true
             } else {
-                let used = cte_mask_from_seeds(&insert_cte_seeds(&ins), &ins.ctes);
-                self.push_ctes(&ins.ctes, params, None, Some(&used)).is_ok()
+                let seeds = insert_cte_seeds(&ins);
+                self.push_ctes(&ins.ctes, params, None, Some(&seeds))
+                    .is_ok()
             };
             if !pushed {
                 self.cte_env.borrow_mut().truncate(base);
@@ -6190,8 +6191,8 @@ impl Connection {
             return self.exec_insert_inner(ins, params);
         }
         let base = self.cte_env.borrow().len();
-        let used = cte_mask_from_seeds(&insert_cte_seeds(ins), &ins.ctes);
-        let pushed = self.push_ctes(&ins.ctes, params, None, Some(&used));
+        let seeds = insert_cte_seeds(ins);
+        let pushed = self.push_ctes(&ins.ctes, params, None, Some(&seeds));
         let result = pushed.and_then(|()| self.exec_insert_inner(ins, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -7148,8 +7149,8 @@ impl Connection {
             return self.exec_delete_inner(del, params);
         }
         let base = self.cte_env.borrow().len();
-        let used = cte_mask_from_seeds(&delete_cte_seeds(del), &del.ctes);
-        let pushed = self.push_ctes(&del.ctes, params, None, Some(&used));
+        let seeds = delete_cte_seeds(del);
+        let pushed = self.push_ctes(&del.ctes, params, None, Some(&seeds));
         let result = pushed.and_then(|()| self.exec_delete_inner(del, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -7304,8 +7305,8 @@ impl Connection {
             return self.exec_update_inner(upd, params);
         }
         let base = self.cte_env.borrow().len();
-        let used = cte_mask_from_seeds(&update_cte_seeds(upd), &upd.ctes);
-        let pushed = self.push_ctes(&upd.ctes, params, None, Some(&used));
+        let seeds = update_cte_seeds(upd);
+        let pushed = self.push_ctes(&upd.ctes, params, None, Some(&seeds));
         let result = pushed.and_then(|()| self.exec_update_inner(upd, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -8839,7 +8840,7 @@ impl Connection {
         ctes: &[Cte],
         params: &Params,
         outer_cap: Option<usize>,
-        used: Option<&[bool]>,
+        seeds: Option<&[alloc::string::String]>,
     ) -> Result<()> {
         // SQLite rejects two CTEs that share a name (case-insensitive) within one
         // WITH clause, naming the duplicate (second) occurrence. A same name in a
@@ -8858,15 +8859,120 @@ impl Connection {
                 )));
             }
         }
-        for (i, cte) in ctes.iter().enumerate() {
-            // An unreferenced CTE is never analyzed by SQLite, so a bad column or
-            // table inside it is not an error — skip materializing it entirely.
-            // (`used == None` keeps the legacy "materialize all" path for callers
-            // without a reachability mask; the SELECT and DML `WITH` paths all pass
-            // a mask.)
-            if used.is_some_and(|u| !u[i]) {
+        // Which CTEs the consuming statement actually reaches. SQLite never
+        // analyzes an unreferenced CTE, so a bad table/column inside it is not an
+        // error. Callers without a seed list (legacy) materialize every CTE.
+        let used: alloc::vec::Vec<bool> = match seeds {
+            Some(s) => cte_mask_from_seeds(s, ctes),
+            None => alloc::vec![true; ctes.len()],
+        };
+        // Sibling dependency edges among the used CTEs: CTE `i` depends on sibling
+        // `j` (j != i) when i's body names j. A *direct* self-reference is
+        // recursion, not a dependency, so it is excluded here. SQLite makes every
+        // CTE in a WITH mutually visible — forward references included — so a
+        // dependency must be materialized before its dependents, and a true cycle
+        // is rejected with `circular reference: <name>`.
+        let lname: alloc::vec::Vec<alloc::string::String> =
+            ctes.iter().map(|c| c.name.to_ascii_lowercase()).collect();
+        let dep_list: alloc::vec::Vec<alloc::vec::Vec<usize>> = (0..ctes.len())
+            .map(|i| {
+                if !used[i] {
+                    return alloc::vec::Vec::new();
+                }
+                let mut refs = alloc::vec::Vec::new();
+                collect_scoped(&ctes[i].select, &mut refs);
+                let mut out = alloc::vec::Vec::new();
+                for r in &refs {
+                    let rl = r.to_ascii_lowercase();
+                    if let Some(j) = lname.iter().position(|n| *n == rl) {
+                        if j != i && used[j] && !out.contains(&j) {
+                            out.push(j);
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        // Cycle detection in *entry order* — the order the consuming statement
+        // first names the CTEs — so the reported name matches SQLite, which
+        // expands CTEs on demand from the outer query: over an `a`<->`b` cycle,
+        // `… SELECT * FROM a` reports `a` while `… FROM b` reports `b`. The named
+        // CTE is the one re-entered while still being expanded.
+        let entry_order: alloc::vec::Vec<usize> = match seeds {
+            Some(s) => {
+                let mut order = alloc::vec::Vec::new();
+                for r in s {
+                    let rl = r.to_ascii_lowercase();
+                    if let Some(j) = lname.iter().position(|n| *n == rl) {
+                        if used[j] && !order.contains(&j) {
+                            order.push(j);
+                        }
+                    }
+                }
+                order
+            }
+            None => (0..ctes.len()).filter(|&i| used[i]).collect(),
+        };
+        // 0 = unvisited, 1 = on the current expansion stack, 2 = fully expanded.
+        let mut state = alloc::vec![0u8; ctes.len()];
+        for &start in &entry_order {
+            if state[start] != 0 {
                 continue;
             }
+            state[start] = 1;
+            let mut stack: alloc::vec::Vec<(usize, usize)> = alloc::vec![(start, 0)];
+            while let Some(&(node, di)) = stack.last() {
+                if di < dep_list[node].len() {
+                    stack.last_mut().unwrap().1 += 1;
+                    let v = dep_list[node][di];
+                    match state[v] {
+                        1 => {
+                            return Err(Error::Error(alloc::format!(
+                                "circular reference: {}",
+                                ctes[v].name
+                            )));
+                        }
+                        0 => {
+                            state[v] = 1;
+                            stack.push((v, 0));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    state[node] = 2;
+                    stack.pop();
+                }
+            }
+        }
+        // Materialization order: dependencies before dependents, but otherwise in
+        // declaration order so independent CTEs keep their natural evaluation
+        // order. For backward-only references (every legacy query) this is exactly
+        // declaration order, so existing behaviour is unchanged.
+        let mut order: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let mut placed = alloc::vec![false; ctes.len()];
+        for start in 0..ctes.len() {
+            if !used[start] || placed[start] {
+                continue;
+            }
+            let mut stack: alloc::vec::Vec<(usize, usize)> = alloc::vec![(start, 0)];
+            while let Some(&(node, di)) = stack.last() {
+                if di < dep_list[node].len() {
+                    stack.last_mut().unwrap().1 += 1;
+                    let v = dep_list[node][di];
+                    if !placed[v] && !stack.iter().any(|&(n, _)| n == v) {
+                        stack.push((v, 0));
+                    }
+                } else {
+                    if !placed[node] {
+                        placed[node] = true;
+                        order.push(node);
+                    }
+                    stack.pop();
+                }
+            }
+        }
+        for &i in &order {
+            let cte = &ctes[i];
             let binding = if references_name(&cte.select, &cte.name) {
                 self.eval_recursive_cte(cte, params, outer_cap)?
             } else {
@@ -12711,8 +12817,9 @@ impl Connection {
         let outer_cap = self.recursive_cte_outer_cap(sel, params);
         // Only materialize the CTEs the body actually reaches: SQLite leaves an
         // unreferenced CTE unanalyzed, so a bad column/table in it is not an error.
-        let used = used_cte_mask(sel, &sel.ctes);
-        let pushed = self.push_ctes(&sel.ctes, params, outer_cap, Some(&used));
+        let mut seeds = alloc::vec::Vec::new();
+        collect_source_names(sel, &mut seeds);
+        let pushed = self.push_ctes(&sel.ctes, params, outer_cap, Some(&seeds));
         let result = pushed.and_then(|()| self.run_select_compound(sel, params));
         self.cte_env.borrow_mut().truncate(base);
         result
@@ -22696,16 +22803,6 @@ fn collect_expr_sources(e: &Expr, out: &mut alloc::vec::Vec<alloc::string::Strin
             collect_scoped(select, out);
         }
     }
-}
-
-/// Which entries of `ctes` are reachable (transitively) from `body`'s source
-/// references — the CTEs SQLite actually resolves. `body` is the consuming query
-/// (its own `WITH` list is ignored by [`collect_source_names`]); a used CTE pulls
-/// in any sibling it names, walked to a fixpoint. Returns a `used[i]` mask.
-fn used_cte_mask(body: &Select, ctes: &[Cte]) -> alloc::vec::Vec<bool> {
-    let mut seeds = alloc::vec::Vec::new();
-    collect_source_names(body, &mut seeds);
-    cte_mask_from_seeds(&seeds, ctes)
 }
 
 /// The reachability core behind [`used_cte_mask`]: given the source names the
