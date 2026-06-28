@@ -530,6 +530,17 @@ existing JSONB decoder (the one behind `jsonb()`/`jsonb_extract`): valid JSONB
 renders, invalid still errors. Byte-exact vs `sqlite3` 3.50.4
 (`tests/json_quote_jsonb.rs`).
 
+**`CREATE UNIQUE INDEX` over a table that already holds duplicate keys now
+fails** with `UNIQUE constraint failed: …`, as SQLite does. graphite built the
+index silently — the trailing rowid in each encoded index key made every entry
+distinct, so the btree insert never saw the clash — leaving a "unique" index
+that did not enforce uniqueness yet still passed `PRAGMA integrity_check`: a
+silent-corruption bug. `exec_create_index` now pre-checks the indexed key tuples
+before writing the btree (NULLs distinct, collation-aware, the partial-index
+`WHERE` predicate applied), on both the rowid and `WITHOUT ROWID` paths, and
+raises `t.col[, …]` for a column index or `index '<name>'` for an expression
+index. Byte-exact vs `sqlite3` 3.50.4 (`tests/create_unique_index_duplicate.rs`).
+
 **CTEs in one `WITH` clause now see each other — forward references work, and
 true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
 (it expands them on demand from the outer query), so a CTE may reference one

@@ -7808,12 +7808,44 @@ impl Connection {
 
         // WITHOUT ROWID secondary indexes are keyed by (indexed cols, PK cols)
         // instead of (indexed cols, rowid).
+        // A UNIQUE index over rows that already collide is rejected at build time
+        // (`UNIQUE constraint failed: t.a[, t.b]`, or `index '<name>'` for an
+        // expression index) — matching SQLite, which scans the existing rows when
+        // it builds the index rather than silently admitting a duplicate key.
+        let uniq_msg = || -> String {
+            if key_exprs.is_some() {
+                alloc::format!("UNIQUE constraint failed: index '{}'", ci.name)
+            } else {
+                let detail = cols
+                    .iter()
+                    .map(|&i| {
+                        alloc::format!("{}.{}", tmeta.columns[i].table, tmeta.columns[i].name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                alloc::format!("UNIQUE constraint failed: {detail}")
+            }
+        };
+
         let root = if tmeta.without_rowid {
             let rows = self.scan_without_rowid(&tmeta)?;
             let keep: Vec<bool> = rows
                 .iter()
                 .map(|row| keep_row(row, None))
                 .collect::<Result<_>>()?;
+            // (Expression indexes on WITHOUT ROWID tables are rejected above, so
+            // the uniqueness key here is always plain column values.)
+            if ci.unique {
+                let tuples: Vec<Vec<Value>> = rows
+                    .iter()
+                    .zip(&keep)
+                    .filter(|(_, &k)| k)
+                    .map(|(row, _)| cols.iter().map(|&c| row[c].clone()).collect())
+                    .collect();
+                if unique_index_conflict(&tuples, &colls) {
+                    return Err(Error::Constraint(uniq_msg()));
+                }
+            }
             let pk_cols = tmeta.storage_order[..tmeta.pk_len].to_vec();
             let mut key_colls = colls.clone();
             key_colls.extend(self.col_collations(&tmeta, &pk_cols));
@@ -7829,25 +7861,39 @@ impl Connection {
             let rows = self.scan_table(&tmeta)?;
             // Precompute the key bytes of every included row (column values, or
             // evaluated expressions for an expression index) before the writer
-            // borrow.
+            // borrow. For a UNIQUE index, also collect the key values (rowid
+            // excluded) so existing duplicates can be rejected before any write.
             let mut keys: Vec<Vec<u8>> = Vec::new();
+            let mut uniq: Vec<Vec<Value>> = Vec::new();
             for (rowid, values) in &rows {
                 if !keep_row(values, Some(*rowid))? {
                     continue;
                 }
                 keys.push(match &key_exprs {
-                    None => index_key(&cols, values, *rowid),
+                    None => {
+                        if ci.unique {
+                            uniq.push(cols.iter().map(|&c| values[c].clone()).collect());
+                        }
+                        index_key(&cols, values, *rowid)
+                    }
                     Some(exprs) => {
                         let ctx = row_ctx(values, &tmeta.columns, Some(*rowid), &no_params)
                             .with_subqueries(self);
-                        let mut k: Vec<Value> = exprs
+                        let k: Vec<Value> = exprs
                             .iter()
                             .map(|e| eval::eval(e, &ctx))
                             .collect::<Result<_>>()?;
+                        if ci.unique {
+                            uniq.push(k.clone());
+                        }
+                        let mut k = k;
                         k.push(Value::Integer(*rowid));
                         encode_record(&k)
                     }
                 });
+            }
+            if ci.unique && unique_index_conflict(&uniq, &colls) {
+                return Err(Error::Constraint(uniq_msg()));
             }
             let w = self.backend.writer()?;
             let root = create_index_root(w)?;
@@ -24924,6 +24970,33 @@ fn unique_match(meta: &TableMeta, a: &[Value], b: &[Value]) -> bool {
                 && crate::value::cmp_values_coll(&a[c], &b[c], meta.columns[c].collation).is_eq()
         })
     })
+}
+
+/// Whether building a UNIQUE index over `tuples` (the indexed key values of each
+/// included row, with the trailing rowid / PK suffix excluded) would be violated
+/// by the existing rows: two of them share an all-non-NULL key under the index
+/// collations `colls`. SQLite treats any index key containing a NULL as distinct,
+/// so such rows never conflict. O(n log n) — runs once at `CREATE UNIQUE INDEX`.
+fn unique_index_conflict(tuples: &[Vec<Value>], colls: &[crate::value::Collation]) -> bool {
+    use core::cmp::Ordering;
+    let mut idx: Vec<usize> = tuples
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.iter().any(|v| matches!(v, Value::Null)))
+        .map(|(i, _)| i)
+        .collect();
+    let key_cmp = |a: usize, b: usize| -> Ordering {
+        for (k, &coll) in colls.iter().enumerate() {
+            let o = crate::value::cmp_values_coll(&tuples[a][k], &tuples[b][k], coll);
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        Ordering::Equal
+    };
+    idx.sort_by(|&a, &b| key_cmp(a, b));
+    idx.windows(2)
+        .any(|w| key_cmp(w[0], w[1]) == Ordering::Equal)
 }
 
 /// SQLite's UNIQUE-violation message for two WITHOUT ROWID rows that collide on
