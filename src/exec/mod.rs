@@ -9822,6 +9822,12 @@ impl Connection {
                                     view_single_source_column_quals(&vsql, &table, &old)
                                 {
                                     rewrite_column_tokens(&vsql, &quals, &old, &new_text, true)
+                                } else if let Some(quals) =
+                                    view_only_table_quals(&vsql, &table, &old)
+                                {
+                                    // Single-source view whose body nests expression
+                                    // subqueries that reference only the renamed table.
+                                    rewrite_column_tokens(&vsql, &quals, &old, &new_text, true)
                                 } else if let Some((quals, bare)) =
                                     view_multi_source_quals(&vsql, &table, &old, &table_cols)
                                 {
@@ -26390,6 +26396,202 @@ fn view_single_source_column_quals(view_sql: &str, table: &str, old: &str) -> Op
         return None;
     }
     Some(quals)
+}
+
+/// A-rn (subquery extension): column-rename rewrite for a SINGLE-source view
+/// whose body may contain *expression* subqueries (a scalar `(SELECT …)`,
+/// `EXISTS (SELECT …)`, or `x IN (SELECT …)`) — but where the renamed `table` is
+/// the *only* table referenced anywhere, at every nesting level. SQLite rewrites
+/// every reference to the renamed column (bare and qualified, inside the
+/// subqueries too), so this returns the qualifiers (`table` plus every alias
+/// bound to it across all levels) for a full `rewrite_bare = true` token
+/// rewrite. Bails (→ `None`, leaving the view untouched) on anything that breaks
+/// the single-source guarantee or that a token rewrite can't safely handle: a
+/// CTE/compound anywhere, any join, any derived subquery/TVF in a `FROM`, any
+/// `FROM` naming another table, a table alias equal to `old`, a result-column
+/// alias equal to `old` (at any level), or `old == table`.
+fn view_only_table_quals(view_sql: &str, table: &str, old: &str) -> Option<Vec<String>> {
+    let Ok(Statement::CreateView(cv)) = sql::parse_one(view_sql) else {
+        return None;
+    };
+    if old.eq_ignore_ascii_case(table) {
+        return None;
+    }
+    let mut quals = alloc::vec![table.to_string()];
+    if validate_view_select_only_table(&cv.select, table, old, &mut quals) {
+        Some(quals)
+    } else {
+        None
+    }
+}
+
+/// Recursive worker for [`view_only_table_quals`]: checks that `sel` and every
+/// nested expression subquery reference only `table`, accumulating the renamed
+/// table's qualifiers (its name plus every alias bound to it). Returns `false`
+/// to bail.
+fn validate_view_select_only_table(
+    sel: &Select,
+    table: &str,
+    old: &str,
+    quals: &mut Vec<String>,
+) -> bool {
+    if !sel.ctes.is_empty() || !sel.compound.is_empty() {
+        return false;
+    }
+    // A `FROM`, when present, must be exactly the renamed base table — no joins,
+    // no derived subquery/TVF, no other table. (A `FROM`-less subquery is fine.)
+    if let Some(from) = &sel.from {
+        if !from.joins.is_empty() || from.first.subquery.is_some() || from.first.tvf_args.is_some()
+        {
+            return false;
+        }
+        if !from.first.name.eq_ignore_ascii_case(table) {
+            return false;
+        }
+        if let Some(a) = &from.first.alias {
+            if a.eq_ignore_ascii_case(old) {
+                return false; // alias collides with the renamed column name
+            }
+            if !quals.iter().any(|q| q.eq_ignore_ascii_case(a)) {
+                quals.push(a.clone());
+            }
+        }
+    }
+    // A result-column alias equal to `old` can't be told apart from a real
+    // column reference by a token rewrite — bail (at every nesting level).
+    for rc in &sel.columns {
+        if let ResultColumn::Expr { alias: Some(a), .. } = rc {
+            if a.eq_ignore_ascii_case(old) {
+                return false;
+            }
+        }
+    }
+    // Recurse into every nested expression subquery; each must, in turn,
+    // reference only the renamed table.
+    let mut subs: Vec<&Select> = Vec::new();
+    for e in view_select_exprs(sel) {
+        collect_immediate_subselects(e, &mut subs);
+    }
+    subs.into_iter()
+        .all(|s| validate_view_select_only_table(s, table, old, quals))
+}
+
+/// Every top-level expression of `sel` (result columns, `WHERE`/`GROUP`/
+/// `HAVING`/`ORDER`/`LIMIT`/`OFFSET`, and named-window specs) — used to find the
+/// expression subqueries nested directly within `sel`.
+fn view_select_exprs(sel: &Select) -> Vec<&Expr> {
+    let mut v: Vec<&Expr> = Vec::new();
+    for rc in &sel.columns {
+        if let ResultColumn::Expr { expr, .. } = rc {
+            v.push(expr);
+        }
+    }
+    if let Some(e) = &sel.where_clause {
+        v.push(e);
+    }
+    for e in &sel.group_by {
+        v.push(e);
+    }
+    if let Some(e) = &sel.having {
+        v.push(e);
+    }
+    for t in &sel.order_by {
+        v.push(&t.expr);
+    }
+    if let Some(e) = &sel.limit {
+        v.push(e);
+    }
+    if let Some(e) = &sel.offset {
+        v.push(e);
+    }
+    for (_, spec) in &sel.window_defs {
+        windowspec_parts(spec, &mut v);
+    }
+    v
+}
+
+/// Push the `Select` of every expression subquery found *directly* within `e`
+/// (a scalar `(SELECT …)`, `EXISTS`, or `IN (SELECT …)`) into `out`, descending
+/// through all sub-expressions — including a function's `FILTER`/`ORDER BY`/
+/// `OVER` parts — but *not* into the collected subqueries themselves (the caller
+/// recurses into those).
+fn collect_immediate_subselects<'a>(e: &'a Expr, out: &mut Vec<&'a Select>) {
+    match e {
+        Expr::Subquery(s) => out.push(s),
+        Expr::Exists { select, .. } => out.push(select),
+        Expr::InSelect { expr, select, .. } => {
+            collect_immediate_subselects(expr, out);
+            out.push(select);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::Collate { expr, .. } => collect_immediate_subselects(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_immediate_subselects(left, out);
+            collect_immediate_subselects(right, out);
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            over,
+            ..
+        } => {
+            for a in args {
+                collect_immediate_subselects(a, out);
+            }
+            if let Some(f) = filter {
+                collect_immediate_subselects(f, out);
+            }
+            for t in order_by {
+                collect_immediate_subselects(&t.expr, out);
+            }
+            if let Some(spec) = over {
+                let mut parts: Vec<&Expr> = Vec::new();
+                windowspec_parts(spec, &mut parts);
+                for p in parts {
+                    collect_immediate_subselects(p, out);
+                }
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_immediate_subselects(expr, out);
+            for a in list {
+                collect_immediate_subselects(a, out);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_immediate_subselects(expr, out);
+            collect_immediate_subselects(low, out);
+            collect_immediate_subselects(high, out);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_immediate_subselects(o, out);
+            }
+            for (w, t) in when_then {
+                collect_immediate_subselects(w, out);
+                collect_immediate_subselects(t, out);
+            }
+            if let Some(el) = else_result {
+                collect_immediate_subselects(el, out);
+            }
+        }
+        Expr::RowValue(items) => {
+            for it in items {
+                collect_immediate_subselects(it, out);
+            }
+        }
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Column { .. } => {}
+    }
 }
 
 /// A-rn3: column-rename rewrite plan for a MULTI-source view (a join of plain

@@ -490,6 +490,21 @@ database, is qualified with `*` (`SELECT * FROM x, x` over a CTE `x` →
 `<source>.<col>`. Explicit references (`SELECT a` / `SELECT x.a`) keep their
 unprefixed spelling, unchanged. Byte-exact vs `sqlite3` 3.50.4.
 
+**`RENAME COLUMN` now rewrites a dependent view's references that live inside
+expression subqueries.** SQLite rewrites every reference to a renamed column
+wherever a view names it — including within a scalar `(SELECT …)`, `EXISTS`, or
+`x IN (SELECT …)`. graphite used to abandon the *entire* view rewrite the moment
+the body held any subquery, leaving stale references so the view became
+unqueryable (`no such column: a`). A single-source view whose subqueries
+reference only the renamed table is now rewritten in full — bare and
+`<alias>.`-qualified references, at every nesting level (the validator walks the
+top `SELECT` and every nested expression subquery, accumulating each alias bound
+to the table). It still conservatively leaves the view untouched (a known gap,
+never a wrong rewrite) when a token rewrite can't be proven safe: a subquery
+touching another table, a derived table in a `FROM`, or a result-column alias
+colliding with the renamed name. Byte-exact vs `sqlite3` 3.50.4
+(`tests/view_rename_column_subquery.rs`).
+
 **CTEs in one `WITH` clause now see each other — forward references work, and
 true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
 (it expands them on demand from the outer query), so a CTE may reference one
