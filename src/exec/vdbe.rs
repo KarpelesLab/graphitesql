@@ -230,10 +230,19 @@ pub enum Op {
     /// keys hold bare-column "representatives" — captured from the row that first
     /// creates the group (first-seen semantics) and not compared for group
     /// identity; a later [`Op::GroupEmit`] reads them via `Key(key_count + r)`.
+    ///
+    /// `companion` switches the representatives to SQLite's min()/max() rule: when
+    /// the query has exactly one min()/max() aggregate, bare columns take values
+    /// from the row that holds that extreme. It is `Some((arg_reg, is_max))` — the
+    /// register holding the governing aggregate's argument and whether it is max().
+    /// The running extreme is kept in a hidden trailing slot of the key vector (at
+    /// index `key_count + repr_count`); each row that beats it overwrites both the
+    /// extreme and the representative slots.
     GroupStep {
         key_start: usize,
         key_count: usize,
         repr_count: usize,
+        companion: Option<(usize, bool)>,
         aggs: Vec<AggSpec>,
     },
     /// Emit one row per group (in first-seen order): each output is either a
@@ -1040,10 +1049,32 @@ fn emit_group_fold(
             sep: sep.clone(),
         });
     }
+    // With bare-column representatives and exactly one min()/max() aggregate,
+    // SQLite pulls bare columns from that aggregate's extreme row (the "companion"
+    // row) rather than the first-seen row. Identify the governing aggregate's
+    // argument register so `GroupStep` can track the extreme. (Callers bail when
+    // more than one min/max is present, so the companion is unambiguous here.)
+    let companion = if repr_cols.is_empty() {
+        None
+    } else {
+        let mm: Vec<usize> = aggs
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| matches!(a.kind, AggKind::Min | AggKind::Max))
+            .map(|(i, _)| i)
+            .collect();
+        match mm.as_slice() {
+            [j] => aggs[*j]
+                .arg
+                .map(|areg| (areg, aggs[*j].kind == AggKind::Max)),
+            _ => None,
+        }
+    };
     c.ops.push(Op::GroupStep {
         key_start,
         key_count: group_cols.len(),
         repr_count: repr_cols.len(),
+        companion,
         aggs,
     });
     // Epilogue: advance the loop(s) and backpatch the empty/exit edges so an empty
@@ -1213,15 +1244,18 @@ fn compile_group_select(
             repr_cols.push(ci);
         }
     }
-    // First-seen representatives only match SQLite without a min()/max() aggregate
-    // (which instead pulls bare columns from the companion row) — defer that shape.
+    // Bare columns track exactly one min()/max() aggregate's companion row (handled
+    // by `emit_group_fold`); with more than one, the companion is ambiguous and
+    // SQLite leaves it unspecified — bail there rather than pick arbitrarily.
     if !repr_cols.is_empty()
         && agg_specs
             .iter()
-            .any(|(k, ..)| matches!(k, AggKind::Min | AggKind::Max))
+            .filter(|(k, ..)| matches!(k, AggKind::Min | AggKind::Max))
+            .count()
+            > 1
     {
         return Err(Error::Unsupported(
-            "VDBE: bare column with min/max companion",
+            "VDBE: bare column with multiple min/max companions",
         ));
     }
 
@@ -1614,9 +1648,9 @@ fn compile_group_emit(
                 Some(k) => outputs.push(GroupOut::Key(k)),
                 // A non-grouped bare column. SQLite emits the value from the row
                 // that first creates the group (a "representative"). We capture it
-                // as an extra key-vector slot after the real keys — but only when
-                // there is no min()/max() aggregate, which would instead pull bare
-                // columns from the min/max companion row (gated after the loop).
+                // as an extra key-vector slot after the real keys; with exactly one
+                // min()/max() aggregate the fold instead tracks that aggregate's
+                // companion row (gated after the loop for >1 min/max).
                 None => {
                     let r = repr_cols.len();
                     repr_cols.push(ci);
@@ -1630,15 +1664,18 @@ fn compile_group_emit(
         }
     }
 
-    // First-seen-row representatives only match SQLite when no min()/max() is
-    // present; otherwise bare columns track the companion row — defer that shape.
+    // Bare columns track exactly one min()/max() aggregate's companion row (handled
+    // by `emit_group_fold`); with more than one, the companion is ambiguous and
+    // SQLite leaves it unspecified — bail there rather than pick arbitrarily.
     if !repr_cols.is_empty()
         && agg_specs
             .iter()
-            .any(|(k, ..)| matches!(k, AggKind::Min | AggKind::Max))
+            .filter(|(k, ..)| matches!(k, AggKind::Min | AggKind::Max))
+            .count()
+            > 1
     {
         return Err(Error::Unsupported(
-            "VDBE: bare column with min/max companion",
+            "VDBE: bare column with multiple min/max companions",
         ));
     }
 
@@ -4650,22 +4687,52 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
                 key_start,
                 key_count,
                 repr_count,
+                companion,
                 aggs,
             } => {
                 // The stored vector is the grouping keys followed by any bare-column
                 // representatives; group identity compares only the first `key_count`
-                // entries, so the representatives keep the first-seen row's values.
+                // entries. Without a companion the representatives keep the first-seen
+                // row's values; with one, a hidden trailing slot holds the running
+                // extreme and the representatives track the extreme row.
                 let total = *key_count + *repr_count;
-                let key = regs[*key_start..*key_start + total].to_vec();
                 let gi = match groups.iter().position(|(k, _)| {
-                    k.len() == key.len()
-                        && k.iter()
-                            .zip(&key)
-                            .take(*key_count)
-                            .all(|(a, b)| distinct_eq(a, b))
+                    k.iter()
+                        .zip(regs[*key_start..].iter())
+                        .take(*key_count)
+                        .all(|(a, b)| distinct_eq(a, b))
                 }) {
-                    Some(i) => i,
+                    Some(i) => {
+                        if let Some((arg, is_max)) = companion {
+                            let gv = &regs[*arg];
+                            if !matches!(gv, Value::Null) {
+                                let best = &groups[i].0[total];
+                                let beats = matches!(best, Value::Null) || {
+                                    let o = crate::exec::eval::compare(gv, best);
+                                    if *is_max {
+                                        o == core::cmp::Ordering::Greater
+                                    } else {
+                                        o == core::cmp::Ordering::Less
+                                    }
+                                };
+                                if beats {
+                                    groups[i].0[total] = gv.clone();
+                                    for r in 0..*repr_count {
+                                        groups[i].0[*key_count + r] =
+                                            regs[*key_start + *key_count + r].clone();
+                                    }
+                                }
+                            }
+                        }
+                        i
+                    }
                     None => {
+                        let mut key = regs[*key_start..*key_start + total].to_vec();
+                        // Hidden companion slot: seed the extreme with this first row's
+                        // governing value (NULL if absent — any real value then beats).
+                        if let Some((arg, _)) = companion {
+                            key.push(regs[*arg].clone());
+                        }
                         groups.push((key, alloc::vec![AggAcc::default(); aggs.len()]));
                         groups.len() - 1
                     }
@@ -5227,6 +5294,9 @@ mod tests {
             "SELECT a.x, count(*) FROM a, b GROUP BY a.x ORDER BY a.x",
             "SELECT a.x, count(*) FROM a, b GROUP BY a.x LIMIT 1",
             "SELECT a.x, count(*) AS n FROM a, b GROUP BY a.x ORDER BY n DESC LIMIT 2 OFFSET 1",
+            // A bare column with exactly one min/max tracks that aggregate's
+            // companion row.
+            "SELECT a.x, b.p, max(b.p) FROM a, b GROUP BY a.x",
         ] {
             let Statement::Select(sel) = parse_one(sql).unwrap() else {
                 panic!()
@@ -5236,12 +5306,12 @@ mod tests {
                 "{sql} should compile as a GROUP BY join"
             );
         }
-        // DISTINCT / a bare column alongside min/max (companion-row rule) / no
-        // GROUP BY still bail.
+        // DISTINCT / a bare column alongside more than one min/max (ambiguous
+        // companion) / no GROUP BY still bail.
         for sql in [
             "SELECT DISTINCT a.x, count(*) FROM a, b GROUP BY a.x",
-            "SELECT a.x, b.p, max(b.p) FROM a, b GROUP BY a.x", // min/max companion
-            "SELECT count(*) FROM a, b",                        // no GROUP BY
+            "SELECT a.x, b.p, max(b.p), min(b.p) FROM a, b GROUP BY a.x", // >1 min/max
+            "SELECT count(*) FROM a, b",                                  // no GROUP BY
         ] {
             let Statement::Select(sel) = parse_one(sql).unwrap() else {
                 panic!()

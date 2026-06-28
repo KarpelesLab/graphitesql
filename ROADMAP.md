@@ -1225,9 +1225,11 @@ and a **bare (non-grouped) column** in a `GROUP BY` projection / `HAVING` /
 each group, which the VDBE captures as an extra slot on the group-key vector (set
 once at group creation, so it keeps the first-seen value) and loads back via
 `GroupKey` on both the plain and the general (HAVING/ORDER BY/LIMIT) grouped
-paths. Gated on the query having no `min()`/`max()` aggregate; with one, bare
-columns instead track the min/max companion row, so that shape still defers to
-the tree-walker.
+paths. With *exactly one* `min()`/`max()` aggregate, SQLite instead pulls bare
+columns from that aggregate's extreme ("companion") row: the fold keeps the
+running extreme in a hidden trailing key slot and overwrites the representatives
+whenever a row beats it. Only *more than one* `min()`/`max()` leaves the
+companion ambiguous, and that shape still defers to the tree-walker.
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is

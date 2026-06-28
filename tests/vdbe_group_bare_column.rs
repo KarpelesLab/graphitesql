@@ -4,10 +4,11 @@
 //! slot on the group-key vector (set once, at group creation, so it keeps the
 //! first-seen row's value) and reads it back in `GroupEmit`.
 //!
-//! This holds *only* when the query has no `min()`/`max()` aggregate: with one,
-//! SQLite instead pulls bare columns from the min/max companion row. That shape
-//! still falls back to the tree-walker, which `query_vdbe` reports as an error —
-//! asserted separately.
+//! With *exactly one* `min()`/`max()` aggregate, SQLite instead pulls bare
+//! columns from that aggregate's extreme ("companion") row; the VDBE tracks the
+//! running extreme in a hidden key slot and overwrites the representatives when a
+//! row beats it. More than one `min()`/`max()` leaves the companion ambiguous, so
+//! that shape still falls back to the tree-walker — asserted separately.
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE
 //! compiled the projection. Results match the tree-walker and sqlite3 3.50.4.
@@ -58,6 +59,25 @@ const GENERAL_QUERIES: &[&str] = &[
     "SELECT a, n, sum(n) FROM t GROUP BY g ORDER BY g",
     // ORDER BY references the representative column itself.
     "SELECT g, count(*) FROM t GROUP BY g ORDER BY a DESC",
+];
+
+// Exactly one min()/max() aggregate: a bare column takes its value from that
+// aggregate's extreme ("companion") row, not the first-seen row. Each group here
+// has a unique extreme, so the companion row is unambiguous. Spans the plain and
+// the general (HAVING/ORDER BY) paths.
+const COMPANION_QUERIES: &[&str] = &[
+    // Plain path: bare column tracks max() / min().
+    "SELECT a, max(n) FROM t GROUP BY g",
+    "SELECT a, min(n) FROM t GROUP BY g",
+    // Grouping key, representative, and the governing aggregate together.
+    "SELECT g, a, max(n) FROM t GROUP BY g",
+    // The bare column is the aggregate's own argument: it equals the extreme.
+    "SELECT a, n, max(n) FROM t GROUP BY g",
+    // A second, non-min/max aggregate alongside the governing one.
+    "SELECT a, max(n), count(*) FROM t GROUP BY g",
+    // General path: companion + ORDER BY / HAVING.
+    "SELECT max(n), a FROM t GROUP BY g ORDER BY g",
+    "SELECT a, min(n) AS m FROM t GROUP BY g HAVING m > 0 ORDER BY g",
 ];
 
 fn conn() -> Connection {
@@ -128,20 +148,29 @@ fn group_bare_column_over_join_runs_on_vdbe() {
 }
 
 #[test]
-fn group_bare_column_min_max_companion_falls_back() {
+fn group_bare_column_companion_runs_on_vdbe_and_matches_tree_walker() {
     let c = conn();
-    // With a min()/max() aggregate, the bare column must come from the companion
-    // row, not the first-seen row — the VDBE declines to compile it (falls back).
+    for q in COMPANION_QUERIES {
+        // No-ORDER-BY companion queries still emit first-seen group order; ORDER BY
+        // ones are deterministic — both compare directly against the tree-walker.
+        let got = c.query_vdbe(q).unwrap().rows;
+        let want = c.query(q).unwrap().rows;
+        assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
+    }
+}
+
+#[test]
+fn group_bare_column_multiple_min_max_falls_back() {
+    let c = conn();
+    // More than one min()/max() makes the companion row ambiguous (SQLite leaves it
+    // unspecified) — the VDBE declines to compile it and falls back.
     for q in [
-        "SELECT a, max(n) FROM t GROUP BY g",
-        "SELECT a, min(n) FROM t GROUP BY g",
-        // The same rule applies on the general (ORDER BY) path.
-        "SELECT a, max(n) FROM t GROUP BY g ORDER BY g",
-        "SELECT a, min(n) AS m FROM t GROUP BY g HAVING m > 0 ORDER BY g",
+        "SELECT a, max(n), min(n) FROM t GROUP BY g",
+        "SELECT a, max(n), min(n) FROM t GROUP BY g ORDER BY g",
     ] {
         assert!(
             c.query_vdbe(q).is_err(),
-            "expected VDBE fallback for min/max companion query {q}"
+            "expected VDBE fallback for ambiguous companion query {q}"
         );
         // The tree-walker still handles it.
         assert!(c.query(q).is_ok(), "tree-walker should run {q}");
@@ -155,7 +184,11 @@ fn group_bare_column_matches_sqlite3() {
         return;
     }
     let c = conn();
-    for q in QUERIES.iter().chain(GENERAL_QUERIES) {
+    for q in QUERIES
+        .iter()
+        .chain(GENERAL_QUERIES)
+        .chain(COMPANION_QUERIES)
+    {
         let mut vdbe: Vec<Vec<String>> = c
             .query_vdbe(q)
             .unwrap()
