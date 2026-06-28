@@ -490,6 +490,20 @@ database, is qualified with `*` (`SELECT * FROM x, x` over a CTE `x` →
 `<source>.<col>`. Explicit references (`SELECT a` / `SELECT x.a`) keep their
 unprefixed spelling, unchanged. Byte-exact vs `sqlite3` 3.50.4.
 
+A **self-referential CTE with no leading anchor** now reports SQLite's
+`circular reference: <name>` rather than graphite's internal "recursive CTE must
+have a non-recursive anchor and a recursive term". When the recursive table
+appears already in the *first* arm — a plain self-`FROM` (`WITH c AS (SELECT *
+FROM c) …`, with or without `RECURSIVE`), a self-join, a recursive arm placed
+before the anchor in a compound, or every arm recursive — there is nothing to
+seed the recursion, and SQLite rejects it by name. graphite now splits that case
+out from the genuinely-unsupported "no recursive term anywhere" case and emits
+the matching message. Valid recursive CTEs (anchor first) are unaffected.
+Byte-exact vs `sqlite3` 3.50.4. (The harder *mutual*-recursion forward-reference
+case — `WITH a AS (SELECT * FROM b), b AS (SELECT * FROM a) …`, where SQLite says
+`circular reference: a` and graphite still says `no such table: b` — is a CTE
+scoping issue tracked separately.)
+
 The **`PRAGMA journal_mode = <mode>` setter now reports its result row**, as
 SQLite does — it echoes the resulting journal mode (`wal` after a successful
 switch, `memory` for an in-memory database that cannot change it, or the

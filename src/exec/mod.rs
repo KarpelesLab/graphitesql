@@ -8974,7 +8974,17 @@ impl Connection {
                 anchor.push(s);
             }
         }
-        if anchor.is_empty() || recursive.is_empty() {
+        if anchor.is_empty() {
+            // The recursive table appears already in the first arm, with no leading
+            // non-recursive anchor to seed the recursion (`WITH c AS (SELECT * FROM
+            // c) …`, or a recursive arm placed before the anchor). SQLite rejects
+            // this as a circular reference, naming the CTE.
+            return Err(Error::Error(alloc::format!(
+                "circular reference: {}",
+                cte.name
+            )));
+        }
+        if recursive.is_empty() {
             return Err(Error::Unsupported(
                 "recursive CTE must have a non-recursive anchor and a recursive term",
             ));
