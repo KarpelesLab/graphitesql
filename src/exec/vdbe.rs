@@ -432,6 +432,10 @@ fn is_pure_scalar_fn(name: &str, argc: usize) -> bool {
         "json" | "json_valid" | "json_type" | "json_array_length" | "json_extract" | "jsonb" => {
             true
         }
+        // `printf`/`format` are pure string formatting over their argument values
+        // (no row/connection state): a format string plus zero or more values.
+        // They route through `Op::Func` → `func::eval_scalar` → `datetime::printf`.
+        "printf" | "format" => argc >= 1,
         // Variadic scalar min/max need at least two args (one arg is the aggregate).
         "min" | "max" => argc >= 2,
         _ => false,

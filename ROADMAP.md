@@ -1216,7 +1216,8 @@ window functions over a single table or a plain join (**B5c-4**); and the
 three-argument `text LIKE pattern ESCAPE c` form (it desugars to `like(pattern,
 text, c)`, a pure context-free call that routes through `Op::Func` →
 `func::eval_scalar`, applying the escape and rejecting a non-single-character
-escape exactly as the tree-walker does).
+escape exactly as the tree-walker does); and `printf(fmt, …)` / its `format`
+alias (pure string formatting over the argument values, likewise via `Op::Func`).
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is
