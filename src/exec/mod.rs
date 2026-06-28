@@ -1249,6 +1249,23 @@ impl Connection {
                 rows,
             });
         };
+        // Materialize the whole-query `WITH` into the CTE environment so a `FROM`
+        // reference naming a CTE can pull its already-materialized rows during
+        // scanning (correct even when the body reads a sibling CTE, is recursive, or
+        // shadows a base-table name — the tree-walker resolved all of that here). The
+        // guard restores the environment on every exit. Mirrors `run_select` /
+        // `run_compound_vdbe`; only the used CTEs (per `seeds`) are materialized.
+        let _cte_scope = CteEnvGuard {
+            env: &self.cte_env,
+            base: self.cte_env.borrow().len(),
+        };
+        if !sel.ctes.is_empty() {
+            let params = eval::Params::default();
+            let outer_cap = self.recursive_cte_outer_cap(sel, &params);
+            let mut seeds = Vec::new();
+            collect_source_names(sel, &mut seeds);
+            self.push_ctes(&sel.ctes, &params, outer_cap, Some(&seeds))?;
+        }
         // Materialize a plain table source's column names and rows. Subqueries
         // and table-valued functions are out of the spike's scope.
         // (column names, owning-table qualifier, affinities, collations, rows, and
@@ -1276,29 +1293,63 @@ impl Connection {
             } else {
                 None
             };
-            let derived: Option<(&Select, String, Option<&[String]>)> =
-                if let Some(sub) = &tr.subquery {
-                    Some((sub.as_ref(), tr.alias.clone().unwrap_or_default(), None))
-                } else if let Some(c) = cte {
-                    let qualifier = tr.alias.clone().unwrap_or_else(|| tr.name.clone());
-                    let rename = (!c.columns.is_empty()).then_some(c.columns.as_slice());
-                    Some((c.select.as_ref(), qualifier, rename))
+            // A `FROM` reference naming an in-scope CTE. The whole-query `WITH` was
+            // materialized into the CTE environment at the top of this function, so
+            // the rows are pulled straight from there — correct even when the body
+            // reads a *sibling* CTE, is recursive, or shadows a base-table name (the
+            // tree-walker resolved all of that during materialization, and the
+            // explicit `WITH name(cols…)` rename is already applied to the looked-up
+            // column names). The per-column affinity comes from the body's origins,
+            // CTE-scope-aware so a sibling reference resolves; a non-BINARY column,
+            // or a body whose origins don't resolve (join / compound / recursive),
+            // defers to the tree-walker.
+            if let Some(c) = cte {
+                let (cinfos, inrows) = self
+                    .lookup_cte(&tr.name, tr.alias.as_deref())
+                    .ok_or(Error::Unsupported("VDBE: CTE not in scope"))?;
+                let qualifier = tr.alias.clone().unwrap_or_else(|| tr.name.clone());
+                // A constant / `VALUES` CTE body carries no affinity (BINARY
+                // collation), exactly like a constant derived subquery; otherwise
+                // resolve each output column's affinity through the body.
+                let const_body = c.select.from.is_none()
+                    && c.select.compound.iter().all(|(_, s)| s.from.is_none());
+                let affinities: Vec<eval::Affinity> = if const_body {
+                    cinfos
+                        .iter()
+                        .map(|_| eval::Affinity::from_type(None))
+                        .collect()
                 } else {
-                    None
+                    let origins = self
+                        .subquery_column_origins_in(&c.select, &sel.ctes)
+                        .ok_or(Error::Unsupported("VDBE: complex CTE body"))?;
+                    if origins.len() != cinfos.len() {
+                        return Err(Error::Unsupported("VDBE: CTE column count mismatch"));
+                    }
+                    // Keep the conservative all-BINARY collation posture (the VDBE
+                    // grouped / aggregate paths assume BINARY keys).
+                    if origins
+                        .iter()
+                        .any(|(_, co)| *co != crate::value::Collation::default())
+                    {
+                        return Err(Error::Unsupported("VDBE: CTE over a non-BINARY column"));
+                    }
+                    origins.iter().map(|(a, _)| *a).collect()
                 };
-            if let Some((sub, qualifier, rename)) = derived {
+                let columns: Vec<String> = cinfos.iter().map(|ci| ci.name.clone()).collect();
+                let tables = columns.iter().map(|_| qualifier.clone()).collect();
+                let collations = columns
+                    .iter()
+                    .map(|_| crate::value::Collation::default())
+                    .collect();
+                let rows = inrows.into_iter().map(|r| r.values).collect();
+                return Ok((columns, tables, affinities, collations, rows, None));
+            }
+            if let Some(sub) = &tr.subquery {
+                let sub = sub.as_ref();
+                let qualifier = tr.alias.clone().unwrap_or_default();
                 if tr.tvf_args.is_some() {
                     return Err(Error::Unsupported("VDBE: complex subquery source"));
                 }
-                // Apply the CTE's explicit column-name list (if any) to a materialized
-                // result, or keep the body's own output names.
-                let renamed = |cols: Vec<String>| -> Result<Vec<String>> {
-                    match rename {
-                        Some(names) if names.len() == cols.len() => Ok(names.to_vec()),
-                        Some(_) => Err(Error::Unsupported("VDBE: CTE column count mismatch")),
-                        None => Ok(cols),
-                    }
-                };
                 // A constant / `VALUES` subquery — no base table in any compound arm
                 // (a top-level `VALUES (…),(…)` desugars to a `UNION ALL` of FROM-less
                 // constant cores). Its columns carry no affinity and BINARY collation,
@@ -1306,7 +1357,7 @@ impl Connection {
                 // exactly as the tree-walker does.
                 if sub.from.is_none() && sub.compound.iter().all(|(_, s)| s.from.is_none()) {
                     let result = self.run_select(sub, &eval::Params::default())?;
-                    let columns = renamed(result.columns)?;
+                    let columns = result.columns;
                     let tables = columns.iter().map(|_| qualifier.clone()).collect();
                     let affinities = columns
                         .iter()
@@ -1340,7 +1391,7 @@ impl Connection {
                 if result.columns.len() != origins.len() {
                     return Err(Error::Unsupported("VDBE: subquery column count mismatch"));
                 }
-                let columns = renamed(result.columns)?;
+                let columns = result.columns;
                 let tables = columns.iter().map(|_| qualifier.clone()).collect();
                 let affinities = origins.iter().map(|(a, _)| *a).collect();
                 let collations = columns
@@ -17336,6 +17387,15 @@ impl Connection {
     /// `(BLOB, BINARY)`. Returns `None` (caller defaults all to `BLOB`/`BINARY`)
     /// for a compound / join / nested / TVF subquery, or a count mismatch.
     fn subquery_column_origins(&self, select: &Select) -> Option<Vec<ColOrigin>> {
+        self.subquery_column_origins_in(select, &[])
+    }
+
+    /// As [`subquery_column_origins`](Self::subquery_column_origins), but with a
+    /// slice of in-scope CTEs whose bodies a `FROM` reference may name (so a sibling
+    /// CTE reference resolves to that CTE's own column origins instead of failing).
+    /// Existing callers use the no-CTE wrapper above; only the VDBE derived-source
+    /// path threads `sel.ctes` in, so the tree-walker paths are unaffected.
+    fn subquery_column_origins_in(&self, select: &Select, ctes: &[Cte]) -> Option<Vec<ColOrigin>> {
         if !select.compound.is_empty() {
             return None;
         }
@@ -17346,7 +17406,7 @@ impl Connection {
         // The single source's named columns, each with its `(affinity, collation)`.
         // A base table reads them from its meta; a nested subquery recurses, so a
         // collation/affinity flows through any depth of single-source derived tables.
-        let src = self.named_source_origins(&from.first)?;
+        let src = self.named_source_origins_in(&from.first, ctes)?;
         let label = from
             .first
             .alias
@@ -17391,16 +17451,23 @@ impl Connection {
 
     /// A single FROM source's `(name, (affinity, collation))` per column. A base
     /// table reads its meta; a nested subquery recurses through
-    /// `subquery_column_origins` (its names from `resolved_view_columns`), so an
+    /// `subquery_column_origins_in` (its names from `resolved_view_columns`), so an
     /// inherited affinity/collation flows through nested single-source derived
-    /// tables. A view / CTE / TVF / join-or-compound subquery returns `None`.
-    fn named_source_origins(&self, tref: &TableRef) -> Option<Vec<(String, ColOrigin)>> {
+    /// tables. A `FROM` reference that names an in-scope CTE (from `ctes`) resolves
+    /// through that CTE's body — so an outer derived source whose body reads a
+    /// *sibling* CTE inherits the right `(affinity, collation)` per column. A view /
+    /// TVF / join-or-compound (incl. recursive) subquery or CTE body returns `None`.
+    fn named_source_origins_in(
+        &self,
+        tref: &TableRef,
+        ctes: &[Cte],
+    ) -> Option<Vec<(String, ColOrigin)>> {
         if tref.tvf_args.is_some() {
             return None;
         }
         if let Some(sub) = &tref.subquery {
             let names = self.resolved_view_columns(sub)?;
-            let origins = self.subquery_column_origins(sub)?;
+            let origins = self.subquery_column_origins_in(sub, ctes)?;
             if names.len() != origins.len() {
                 return None;
             }
@@ -17411,6 +17478,31 @@ impl Connection {
                     .map(|((n, _), o)| (n, o))
                     .collect(),
             );
+        }
+        // A `FROM` reference naming an in-scope CTE resolves through that CTE's body
+        // (recursively CTE-scope-aware, so a chain of sibling references resolves).
+        // The names come from the body's output, or the explicit `WITH name(cols…)`
+        // rename. A base table of the same name is shadowed by the CTE, matching the
+        // outer scan's own CTE-before-table precedence.
+        if tref.schema.is_none() {
+            if let Some(c) = ctes
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&tref.name))
+            {
+                let origins = self.subquery_column_origins_in(&c.select, ctes)?;
+                let names: Vec<String> = if c.columns.is_empty() {
+                    self.resolved_view_columns(&c.select)?
+                        .into_iter()
+                        .map(|(n, _)| n)
+                        .collect()
+                } else {
+                    c.columns.clone()
+                };
+                if names.len() != origins.len() {
+                    return None;
+                }
+                return Some(names.into_iter().zip(origins).collect());
+            }
         }
         // A base table only — a view/CTE source defers to the conservative default.
         self.schema.table(&tref.name)?;
@@ -23179,6 +23271,22 @@ fn collect_source_names(select: &Select, out: &mut alloc::vec::Vec<alloc::string
     collect_source_names_arm(select, out);
     for (_, s) in &select.compound {
         collect_source_names_arm(s, out);
+    }
+}
+
+/// Restores the CTE environment to a saved depth when dropped. The VDBE path
+/// materializes a whole-query `WITH` for the duration of source scanning (so a
+/// `FROM` reference to a CTE can be pulled from the environment), and this guard
+/// truncates it back on *every* exit — including the `?` early-returns scattered
+/// through the source-scan branches — without an explicit `truncate` on each.
+struct CteEnvGuard<'a> {
+    env: &'a core::cell::RefCell<alloc::vec::Vec<CteBinding>>,
+    base: usize,
+}
+
+impl core::ops::Drop for CteEnvGuard<'_> {
+    fn drop(&mut self) {
+        self.env.borrow_mut().truncate(self.base);
     }
 }
 

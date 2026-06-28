@@ -1264,17 +1264,25 @@ emission — SQLite groups via a sort, so a plain `GROUP BY` with no explicit
 to a `UNION ALL` of FROM-less constant cores) or `FROM (SELECT <consts>)` — is
 materialized directly as a derived table with no affinity and BINARY collation,
 joining the base-table derived-source path already on the VDBE; and a **`FROM`
-reference naming an in-scope CTE** is materialized through that same derived-table
-path (the CTE's name or alias becomes the row qualifier, and an explicit
-`WITH name(cols…)` list renames the body's columns), so `WITH c AS (…) SELECT …
-FROM c` runs on the VDBE. A CTE body that references a *sibling* CTE still defers
-(the body is materialized on its own, without the other bindings). A **compound
+reference naming an in-scope CTE** runs on the VDBE: the whole-query `WITH` is
+materialized into the CTE environment before scanning (a small RAII guard restores
+it on every exit), and the CTE source's rows are pulled straight from there, so the
+body may read a *sibling* CTE, be recursive, or shadow a base-table name — the
+tree-walker resolved all of that during materialization. The CTE's name or alias is
+the row qualifier and an explicit `WITH name(cols…)` list renames the body's
+columns; the per-column affinity is resolved through the body with the sibling CTEs
+in scope (`subquery_column_origins_in`), so an `INTEGER` column read through a
+single-level sibling keeps coercing exactly as SQLite does. A recursive (compound)
+or join body, a non-BINARY body column, or a two-or-more-level sibling chain whose
+intermediate name can't be resolved for origins still defers to the tree-walker
+(correct, never wrong). A **compound
 `SELECT` whose whole-query `WITH` is referenced by one or more arms** runs on the
 VDBE too: the outer CTEs are materialized into the CTE environment (so the first
 core's output-collation scan resolves them) and threaded into every operand (so
-each arm materializes them through the derived-source path), and any arm whose CTE
-can't run on the VDBE — a sibling/self reference, a recursive body — declines and
-falls the whole compound back to the tree-walker. The derived-source path also
+each arm pulls them from that environment), and any arm whose CTE can't run on the
+VDBE — a recursive body, a join body, or a deep sibling chain — declines and falls
+the whole compound back to the tree-walker (a single-level sibling reference now
+runs, like a non-compound CTE source). The derived-source path also
 handles a **nested derived table** — a `FROM` subquery whose own source is another
 subquery, to any depth — by resolving each output column's `(affinity, collation)`
 through the chain of single-source derived tables (an inherited `INTEGER` affinity

@@ -1,14 +1,15 @@
-//! A `FROM` reference naming an in-scope CTE now runs on the VDBE. The CTE body
-//! is materialized through the same derived-table path as an explicit `FROM`
-//! subquery (a constant/`VALUES` body, or a single-block query over a single
-//! all-BINARY base table), with the CTE's name (or alias) as the row qualifier
-//! and an explicit `WITH name(cols…)` list renaming the body's output columns.
+//! A `FROM` reference naming an in-scope CTE now runs on the VDBE. The whole-query
+//! `WITH` is materialized into the CTE environment before scanning, so the CTE's
+//! rows are pulled straight from there (the CTE's name or alias is the row
+//! qualifier; an explicit `WITH name(cols…)` list renames the body's columns). The
+//! per-column affinity is resolved through the body — a constant/`VALUES` body
+//! carries none, otherwise it flows through the single-source chain.
 //!
-//! Bodies that reference a sibling CTE fall back to the tree-walker (the
-//! materialized body is resolved on its own, without the other CTE bindings) —
-//! asserted separately. `query_vdbe` errors on any fallback, so a passing query
-//! proves the VDBE handled the CTE source. Checked against the tree-walker and
-//! sqlite3 3.50.4.
+//! A body that reads a *single-level* sibling CTE now runs too (see
+//! `vdbe_cte_sibling.rs` for the full matrix); a two-or-more-level sibling chain,
+//! or a recursive / join body, still defers — asserted separately. `query_vdbe`
+//! errors on any fallback, so a passing query proves the VDBE handled the CTE
+//! source. Checked against the tree-walker and sqlite3 3.50.4.
 
 #![cfg(feature = "std")]
 
@@ -74,13 +75,27 @@ fn cte_source_runs_on_vdbe_and_matches_tree_walker() {
 }
 
 #[test]
-fn cte_referencing_sibling_falls_back() {
+fn cte_referencing_sibling_runs_on_vdbe() {
     let c = conn();
-    // The referenced CTE body names another CTE; materializing it on its own can't
-    // resolve that sibling, so the VDBE declines and the tree-walker handles it.
-    let q = "WITH a AS (SELECT g FROM t), b AS (SELECT g FROM a) SELECT * FROM b";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    // The whole-query `WITH` is now materialized into scope before scanning, so a
+    // CTE source whose body names a *single-level* sibling resolves from the
+    // environment and runs on the VDBE (see `vdbe_cte_sibling.rs` for the full
+    // matrix). A two-or-more-level sibling chain whose intermediate name can't be
+    // resolved for origins still defers — correctly.
+    let one = "WITH a AS (SELECT g FROM t), b AS (SELECT g FROM a) SELECT * FROM b";
+    assert!(
+        c.query_vdbe(one).is_ok(),
+        "single-level sibling should run on the VDBE"
+    );
+    assert_eq!(c.query_vdbe(one).unwrap().rows, c.query(one).unwrap().rows);
+
+    let two = "WITH a AS (SELECT g FROM t), b AS (SELECT g FROM a), d AS (SELECT g FROM b) \
+               SELECT * FROM d";
+    assert!(
+        c.query_vdbe(two).is_err(),
+        "deep sibling chain should defer"
+    );
+    assert!(c.query(two).is_ok(), "tree-walker should run {two}");
 }
 
 #[test]
