@@ -1258,18 +1258,22 @@ a derived subquery source** runs on the VDBE too: the derived source's columns a
 resolved through that same `(affinity, collation)` chain and materialized, then the
 window operator partitions/orders/frames over the rows — so `SELECT …, sum(n) OVER
 (PARTITION BY g) FROM (SELECT g, n FROM t)` (and a nested derived body under it)
-runs without falling back. A derived body the source path can't resolve (join /
-compound / view / CTE / TVF), or a window or projection that references the
-derived source's non-existent rowid, still defers. A **window function whose
-`FROM` source names a whole-query `WITH` CTE** runs on the VDBE as well: the CTE
-is resolved from `sel.ctes` (the same path the non-window scan uses), its columns'
-`(affinity, collation)` flow through the CTE body — an explicit `WITH name(cols…)`
-rename and any inherited affinity honored — and the base scan materializes the
-CTE's rows, so `WITH c AS (SELECT g, n FROM t) SELECT g, sum(n) OVER (PARTITION BY
-g) FROM c` runs without falling back; a query carrying an unused `WITH` over a base
-table runs too. A `VALUES`/compound/view CTE body, a reference to the CTE's
-non-existent rowid, or a *join* that carries CTEs (its column set is resolved
-statically and can't see a CTE binding) still defers.
+runs without falling back. A constant / `VALUES` derived body works too (its
+columns carry no affinity and BINARY collation, like the non-window derived scan).
+A derived body the source path can't resolve (join / non-constant compound / view
+/ TVF), or a window or projection that references the derived source's
+non-existent rowid, still defers. A **window function whose `FROM` source names a
+whole-query `WITH` CTE** runs on the VDBE as well: the CTE is resolved from
+`sel.ctes` (the same path the non-window scan uses), its columns' `(affinity,
+collation)` flow through the CTE body — an explicit `WITH name(cols…)` rename and
+any inherited affinity honored — and the base scan materializes the CTE's rows, so
+`WITH c AS (SELECT g, n FROM t) SELECT g, sum(n) OVER (PARTITION BY g) FROM c` runs
+without falling back; a query carrying an unused `WITH` over a base table, and a
+constant / `VALUES` CTE body, run too. The derived and CTE window paths share one
+column-resolution helper (`window_source_columns`). A non-constant compound / join
+/ view CTE body, a reference to the CTE's non-existent rowid, or a *join* that
+carries CTEs (its column set is resolved statically and can't see a CTE binding)
+still defers.
 
 **Remaining — move the last shapes onto the VDBE.** Additive and *perf/coverage
 only* (the tree-walker fallback already returns correct results; each step is

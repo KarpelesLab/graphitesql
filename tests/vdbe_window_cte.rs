@@ -6,10 +6,11 @@
 //! through the derived-source path, so columns and rows stay in lockstep. A query
 //! that merely carries an unused `WITH` over a base table runs too.
 //!
-//! A CTE body the source path can't resolve (a `VALUES`/compound/join/view body),
-//! a window/projection that references the CTE's non-existent rowid, or a *join*
-//! that carries CTEs (its column set is resolved statically and can't see a CTE
-//! binding) all still defer to the tree-walker.
+//! A constant / `VALUES` CTE body is supported too (its columns carry no affinity
+//! and BINARY collation). A CTE body the source path still can't resolve (a
+//! non-constant compound / join / view body), a window/projection that references
+//! the CTE's non-existent rowid, or a *join* that carries CTEs (its column set is
+//! resolved statically and can't see a CTE binding) all still defer.
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE ran the
 //! window over the CTE source. Checked against the tree-walker and sqlite3 3.50.4.
@@ -43,6 +44,10 @@ const QUERIES: &[&str] = &[
     "WITH cte AS (SELECT n FROM t) SELECT n, sum(n) OVER () FROM cte WHERE n = '10'",
     // Two CTEs, the window over the second.
     "WITH a AS (SELECT g FROM t), b AS (SELECT g, n FROM t) SELECT g, lag(n) OVER (ORDER BY n) FROM b ORDER BY n",
+    // A constant `VALUES` CTE body — no affinity, BINARY collation.
+    "WITH cte AS (VALUES (1,10),(1,20),(2,5)) SELECT column1, sum(column2) OVER (PARTITION BY column1) FROM cte ORDER BY column1, column2",
+    // A `VALUES` CTE with an explicit `WITH name(cols…)` rename.
+    "WITH cte(p, q) AS (VALUES (1,10),(2,20),(2,5)) SELECT p, sum(q) OVER (PARTITION BY p) FROM cte ORDER BY p, q",
 ];
 
 fn conn() -> Connection {
@@ -75,18 +80,6 @@ fn window_over_cte_runs_on_vdbe_and_matches_tree_walker() {
         let want = c.query(q).unwrap().rows;
         assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
     }
-}
-
-#[test]
-fn window_over_values_cte_falls_back() {
-    let c = conn();
-    // A `VALUES`-body CTE source — `subquery_column_origins` returns `None`, so
-    // the VDBE declines and the tree-walker handles the window.
-    let q = "WITH cte AS (VALUES (1,10),(1,20),(2,5)) \
-             SELECT column1, sum(column2) OVER (PARTITION BY column1) FROM cte \
-             ORDER BY column1, column2";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
 }
 
 #[test]

@@ -4,9 +4,12 @@
 //! `(affinity, collation)` while the window operator partitions/orders/frames
 //! over the materialized rows.
 //!
-//! A derived body that is a join, a compound, a view, a CTE, or a table-valued
-//! function still defers to the tree-walker, as does any query whose window or
-//! projection references the (non-existent) rowid of the derived source.
+//! A constant / `VALUES` derived body is also supported — its columns carry no
+//! affinity and BINARY collation, exactly as the non-window derived scan
+//! materializes them. A derived body that is a join, a non-constant compound, a
+//! view, or a table-valued function still defers to the tree-walker, as does any
+//! query whose window or projection references the (non-existent) rowid of the
+//! derived source.
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE ran
 //! the window over the derived source. Checked against the tree-walker and
@@ -41,6 +44,8 @@ const QUERIES: &[&str] = &[
     "SELECT a, count(*) OVER (PARTITION BY g) FROM (SELECT g, a FROM t) ORDER BY g, a",
     // A derived alias, referenced qualified in both the window and ORDER BY.
     "SELECT v.g, sum(v.n) OVER (PARTITION BY v.g) FROM (SELECT g, n FROM t) v ORDER BY v.g, v.n",
+    // A constant `VALUES` derived body — no affinity, BINARY collation.
+    "SELECT column1, sum(column2) OVER (PARTITION BY column1) FROM (VALUES (1,10),(1,20),(2,5)) ORDER BY column1, column2",
 ];
 
 fn conn() -> Connection {

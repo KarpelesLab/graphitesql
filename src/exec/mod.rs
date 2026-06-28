@@ -15665,6 +15665,72 @@ impl Connection {
     /// that projection bail, so such queries fall back. Any shape the base scan
     /// cannot run (a join, a derived/virtual/view source, a non-`main` schema, …)
     /// returns `Unsupported`, falling the whole query back to the tree-walker.
+    /// The `ColumnInfo` for a derived / CTE window source body — the same column
+    /// model the non-window derived-scan path (`scan_one`) uses. A constant /
+    /// `VALUES` body's columns carry no affinity and BINARY collation; any other
+    /// single-source body resolves each column's `(affinity, collation)` through
+    /// `subquery_column_origins`, with names from the body's output (`resolved_
+    /// view_columns`). `rename` applies an explicit CTE `(cols…)` list. Returns
+    /// `Unsupported` for a body neither helper can resolve (a join, a non-constant
+    /// compound, a view, a TVF), so the window defers to the tree-walker.
+    fn window_source_columns(
+        &self,
+        sub: &Select,
+        qualifier: &str,
+        rename: Option<&[String]>,
+    ) -> Result<Vec<ColumnInfo>> {
+        let apply_rename = |names: Vec<String>| -> Result<Vec<String>> {
+            match rename {
+                Some(r) if r.len() == names.len() => Ok(r.to_vec()),
+                Some(_) => Err(Error::Unsupported(
+                    "VDBE window: source column count mismatch",
+                )),
+                None => Ok(names),
+            }
+        };
+        // A constant / `VALUES` body — no base table in any compound arm (a
+        // top-level `VALUES (…),(…)` desugars to a `UNION ALL` of FROM-less
+        // constant cores). Its columns carry no affinity and BINARY collation, so
+        // the base scan's `scan_one` materializes them the same way.
+        if sub.from.is_none() && sub.compound.iter().all(|(_, s)| s.from.is_none()) {
+            let result = self.run_select(sub, &Params::default())?;
+            let names = apply_rename(result.columns)?;
+            return Ok(names
+                .into_iter()
+                .map(|n| ColumnInfo {
+                    name: n,
+                    table: qualifier.to_string(),
+                    affinity: eval::Affinity::from_type(None),
+                    collation: crate::value::Collation::default(),
+                    hidden: false,
+                })
+                .collect());
+        }
+        let origins = self
+            .subquery_column_origins(sub)
+            .ok_or(Error::Unsupported("VDBE window: non-plain derived source"))?;
+        let body = self.resolved_view_columns(sub).ok_or(Error::Unsupported(
+            "VDBE window: derived columns unresolved",
+        ))?;
+        let names = apply_rename(body.iter().map(|(n, _)| n.clone()).collect())?;
+        if names.len() != origins.len() {
+            return Err(Error::Unsupported(
+                "VDBE window: derived column count mismatch",
+            ));
+        }
+        Ok(names
+            .into_iter()
+            .zip(&origins)
+            .map(|(n, (aff, coll))| ColumnInfo {
+                name: n,
+                table: qualifier.to_string(),
+                affinity: *aff,
+                collation: *coll,
+                hidden: false,
+            })
+            .collect())
+    }
+
     fn run_window_vdbe(&self, sel: &Select) -> Result<QueryResult> {
         // Whether `sel` references a `rowid`/`_rowid_`/`oid` pseudo-column anywhere
         // in its expressions (projection, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
@@ -15734,10 +15800,9 @@ impl Connection {
             let tref = &from.first;
             if let Some(sub) = &tref.subquery {
                 // A derived subquery source has no rowid, so (like a join) defer if
-                // a rowid is referenced. Resolve its column names and
-                // `(affinity, collation)` through the same helpers the derived scan
-                // path uses; a join / compound / view / CTE / TVF body returns
-                // `None` and defers.
+                // a rowid is referenced. Resolve its columns through the same model
+                // the derived scan path uses (constant/`VALUES` or single-source
+                // chain); a join / non-constant compound / view / TVF body defers.
                 if tref.tvf_args.is_some() || tref.index_hint.is_some() {
                     return Err(Error::Unsupported("VDBE window: non-plain source"));
                 }
@@ -15746,29 +15811,8 @@ impl Connection {
                         "VDBE window: derived source references rowid",
                     ));
                 }
-                let names = self.resolved_view_columns(sub).ok_or(Error::Unsupported(
-                    "VDBE window: derived columns unresolved",
-                ))?;
-                let origins = self
-                    .subquery_column_origins(sub)
-                    .ok_or(Error::Unsupported("VDBE window: non-plain derived source"))?;
-                if names.len() != origins.len() {
-                    return Err(Error::Unsupported(
-                        "VDBE window: derived column count mismatch",
-                    ));
-                }
                 let qualifier = tref.alias.clone().unwrap_or_default();
-                names
-                    .iter()
-                    .zip(&origins)
-                    .map(|((n, _), (aff, coll))| ColumnInfo {
-                        name: n.clone(),
-                        table: qualifier.clone(),
-                        affinity: *aff,
-                        collation: *coll,
-                        hidden: false,
-                    })
-                    .collect()
+                self.window_source_columns(sub, &qualifier, None)?
             } else if let Some(cte) =
                 (tref.tvf_args.is_none() && tref.index_hint.is_none() && tref.schema.is_none())
                     .then(|| {
@@ -15784,41 +15828,15 @@ impl Connection {
                 // branch. The base scan (`run_select_vdbe(&base)` below, with
                 // `base.ctes` retained) materializes the CTE through that same
                 // derived path, so columns and rows stay in lockstep. A CTE has no
-                // rowid, so defer if one is referenced; a join / compound / view /
-                // CTE / TVF / `VALUES` body returns `None` from
-                // `subquery_column_origins` and defers.
+                // rowid, so defer if one is referenced.
                 if select_mentions_rowid(sel) {
                     return Err(Error::Unsupported(
                         "VDBE window: CTE source references rowid",
                     ));
                 }
-                let sub = cte.select.as_ref();
-                let origins = self
-                    .subquery_column_origins(sub)
-                    .ok_or(Error::Unsupported("VDBE window: non-plain CTE source"))?;
-                let body = self
-                    .resolved_view_columns(sub)
-                    .ok_or(Error::Unsupported("VDBE window: CTE columns unresolved"))?;
-                let names: Vec<String> = if cte.columns.is_empty() {
-                    body.iter().map(|(n, _)| n.clone()).collect()
-                } else {
-                    cte.columns.clone()
-                };
-                if names.len() != origins.len() || names.len() != body.len() {
-                    return Err(Error::Unsupported("VDBE window: CTE column count mismatch"));
-                }
                 let qualifier = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
-                names
-                    .iter()
-                    .zip(&origins)
-                    .map(|(n, (aff, coll))| ColumnInfo {
-                        name: n.clone(),
-                        table: qualifier.clone(),
-                        affinity: *aff,
-                        collation: *coll,
-                        hidden: false,
-                    })
-                    .collect()
+                let rename = (!cte.columns.is_empty()).then_some(cte.columns.as_slice());
+                self.window_source_columns(cte.select.as_ref(), &qualifier, rename)?
             } else {
                 if tref.tvf_args.is_some()
                     || tref.index_hint.is_some()
