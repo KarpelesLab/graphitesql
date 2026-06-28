@@ -1398,13 +1398,15 @@ defers to the tree-walker;
 `DISTINCT`, `FILTER`, and ordered `group_concat(x ORDER BY …)` aggregates (incl.
 the two-argument `group_concat(x, sep)` / `string_agg(x, sep)` form — the constant
 separator is captured at compile time and threaded through the accumulator). A
-`DISTINCT` slot folds under BINARY equality, so a non-BINARY argument collation
-must drive the dedup elsewhere: a column's *declared* collation already trips the
-aggregate path's non-BINARY bail, and an **explicit `COLLATE`** on the argument
-(`count(DISTINCT a COLLATE NOCASE)`, `group_concat(DISTINCT a COLLATE NOCASE)`)
-now likewise defers the whole query to the tree-walker — which honors it via
-`eval::key_collation` — rather than silently deduping under BINARY (an explicit
-`COLLATE BINARY` is BINARY already and stays on the VDBE);
+`DISTINCT` dedup and a `min`/`max` comparison both fold under BINARY, so a
+non-BINARY argument collation must drive them elsewhere: a column's *declared*
+collation already trips the aggregate path's non-BINARY bail, and an **explicit
+`COLLATE`** on the argument (`count(DISTINCT a COLLATE NOCASE)`,
+`group_concat(DISTINCT a COLLATE NOCASE)`, `min(a COLLATE NOCASE)`) now likewise
+defers the whole query to the tree-walker — which honors it via
+`eval::key_collation` — rather than silently folding under BINARY (an explicit
+`COLLATE BINARY` is BINARY already and stays on the VDBE; collation-insensitive
+aggregates like `count`/`sum` keep running on the VDBE regardless);
 window functions over a single table or a plain join (**B5c-4**); and the
 three-argument `text LIKE pattern ESCAPE c` form (it desugars to `like(pattern,
 text, c)`, a pure context-free call that routes through `Op::Func` →

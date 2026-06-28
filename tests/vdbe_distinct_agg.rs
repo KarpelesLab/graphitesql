@@ -298,3 +298,79 @@ fn distinct_aggregate_with_explicit_collate_over_group_by_matches_sqlite3() {
         .collect();
     assert_eq!(got, expected);
 }
+
+/// `min`/`max` compare under the argument collation, not BINARY. An explicit
+/// `COLLATE` on a `min`/`max` argument (even without DISTINCT) must therefore
+/// defer to the tree-walker; an explicit `COLLATE BINARY` stays on the VDBE.
+#[test]
+fn min_max_with_explicit_collate_arg_defers_but_is_correct() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a TEXT)").unwrap();
+    c.execute("INSERT INTO t VALUES ('B'),('a'),('C')").unwrap();
+
+    // Non-BINARY explicit collation: VDBE bails (it folds min/max under BINARY).
+    for q in [
+        "SELECT min(a COLLATE NOCASE) FROM t",
+        "SELECT max(a COLLATE NOCASE) FROM t",
+        "SELECT min(a COLLATE NOCASE), max(a COLLATE NOCASE) FROM t",
+    ] {
+        assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
+    }
+    // The tree-walker honors NOCASE: min='a', max='C'.
+    assert_eq!(
+        c.query("SELECT min(a COLLATE NOCASE), max(a COLLATE NOCASE) FROM t")
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("a".into()), Value::Text("C".into())]],
+    );
+
+    // Explicit COLLATE BINARY is the default comparison, so it stays on the VDBE:
+    // BINARY orders uppercase before lowercase, so min='B'.
+    let r = c.query_vdbe("SELECT min(a COLLATE BINARY) FROM t").unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Text("B".into())]]);
+
+    // A collation-insensitive aggregate keeps running on the VDBE even with the
+    // explicit COLLATE on its argument (count ignores collation).
+    let r = c
+        .query_vdbe("SELECT count(a COLLATE NOCASE) FROM t")
+        .unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Integer(3)]]);
+}
+
+/// The same `min`/`max` explicit-`COLLATE` deferral over `GROUP BY`, matching
+/// sqlite 3.50.4.
+#[test]
+fn min_max_with_explicit_collate_over_group_by_matches_sqlite3() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(g INT, a TEXT)").unwrap();
+    c.execute("INSERT INTO t VALUES (1,'B'),(1,'a'),(1,'C'),(2,'Z'),(2,'y')")
+        .unwrap();
+    let q = "SELECT g, min(a COLLATE NOCASE), max(a COLLATE NOCASE) FROM t GROUP BY g ORDER BY g";
+    let got: Vec<Vec<String>> = c
+        .query(q)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.iter().map(render).collect())
+        .collect();
+    let setup =
+        "CREATE TABLE t(g INT, a TEXT);\nINSERT INTO t VALUES (1,'B'),(1,'a'),(1,'C'),(2,'Z'),(2,'y');\n";
+    let out = Command::new("sqlite3")
+        .arg(":memory:")
+        .arg("-ascii")
+        .arg(format!("{setup}{q};"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let expected: Vec<Vec<String>> = text
+        .split('\u{1e}')
+        .filter(|r| !r.is_empty())
+        .map(|r| r.split('\u{1f}').map(|f| f.to_string()).collect())
+        .collect();
+    assert_eq!(got, expected);
+}

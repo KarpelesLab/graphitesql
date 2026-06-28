@@ -752,13 +752,17 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
     if !order.is_empty() && (*distinct || kind != AggKind::GroupConcat) {
         return None;
     }
-    // A `DISTINCT` slot folds under BINARY equality (see `AggSpec::distinct`). An
-    // explicit non-BINARY `COLLATE` on the argument — `count(DISTINCT a COLLATE
-    // NOCASE)`, `group_concat(DISTINCT a COLLATE NOCASE)` — must drive the dedup
-    // instead. The tree-walker honors it via `eval::key_collation`, so defer the
-    // whole query there. (A column's *declared* collation is already caught by the
-    // caller's non-BINARY-collation bail.)
-    if *distinct && arg.as_ref().is_some_and(explicit_non_binary_collation) {
+    // A non-BINARY argument collation drives two folds the VDBE performs under
+    // BINARY: a `DISTINCT` dedup (see `AggSpec::distinct`) and a `min`/`max`
+    // comparison. An explicit `COLLATE` on the argument — `count(DISTINCT a
+    // COLLATE NOCASE)`, `min(a COLLATE NOCASE)` — must drive that fold, so defer
+    // the whole query to the tree-walker, which honors it via
+    // `eval::key_collation`. (A column's *declared* collation is already caught by
+    // the caller's non-BINARY-collation bail.) The other aggregates
+    // (`count`/`sum`/`avg`/`total`, and non-DISTINCT `group_concat`) ignore the
+    // argument collation, so they stay on the VDBE.
+    let collation_sensitive = *distinct || matches!(kind, AggKind::Min | AggKind::Max);
+    if collation_sensitive && arg.as_ref().is_some_and(explicit_non_binary_collation) {
         return None;
     }
     Some((kind, arg, *distinct, filter, order, sep))
