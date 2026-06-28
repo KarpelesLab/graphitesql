@@ -7142,6 +7142,62 @@ impl Connection {
         Ok(false)
     }
 
+    /// The `UNIQUE constraint failed: …` message for two colliding WITHOUT ROWID
+    /// rows. Tries the inline `UNIQUE`/`PRIMARY KEY` sets first (like
+    /// `wr_unique_message`), then the standalone unique indexes — naming the
+    /// matching index's columns (`t.b, t.c`), or `index '<name>'` for an
+    /// expression index — so a secondary-index conflict no longer degrades to the
+    /// bare message. Falls back to the bare message only if nothing matches.
+    fn wr_conflict_message(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        a: &[Value],
+        b: &[Value],
+        params: &Params,
+    ) -> Result<String> {
+        let inline = wr_unique_message(meta, a, b);
+        if inline != "UNIQUE constraint failed" {
+            return Ok(inline);
+        }
+        for idx in self
+            .indexes_of(table)?
+            .iter()
+            .filter(|i| i.unique && autoindex_number(&i.name, table).is_none())
+        {
+            if !self.row_in_index(idx, meta, a, None, params)?
+                || !self.row_in_index(idx, meta, b, None, params)?
+            {
+                continue;
+            }
+            let ka = self.index_key_values(idx, meta, a, 0, params)?;
+            if ka.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            let kb = self.index_key_values(idx, meta, b, 0, params)?;
+            let eq = ka.len() == kb.len()
+                && ka.iter().zip(&kb).zip(&idx.collations).all(|((x, y), &c)| {
+                    crate::value::cmp_values_coll(x, y, c) == core::cmp::Ordering::Equal
+                });
+            if eq {
+                return Ok(if idx.key_exprs.is_some() {
+                    alloc::format!("UNIQUE constraint failed: index '{}'", idx.name)
+                } else {
+                    let cols = idx
+                        .cols
+                        .iter()
+                        .map(|&i| {
+                            alloc::format!("{}.{}", meta.columns[i].table, meta.columns[i].name)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    alloc::format!("UNIQUE constraint failed: {cols}")
+                });
+            }
+        }
+        Ok(String::from("UNIQUE constraint failed"))
+    }
+
     fn exec_delete(&mut self, del: &Delete, params: &Params) -> Result<usize> {
         // A leading `WITH` makes its CTEs visible to the WHERE subqueries; push
         // them for the duration of the statement, then restore the scope.
@@ -17584,7 +17640,13 @@ impl Connection {
             if !collide.is_empty() {
                 match ins.on_conflict {
                     oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
-                        let m = wr_unique_message(meta, &existing[collide[0]], &values);
+                        let m = self.wr_conflict_message(
+                            &ins.table,
+                            meta,
+                            &existing[collide[0]],
+                            &values,
+                            params,
+                        )?;
                         return Err(self.conflict_error(oc, &m));
                     }
                     OnConflict::Ignore => continue,
@@ -17704,7 +17766,8 @@ impl Connection {
                 if unique_match(meta, &out[i], &out[j])
                     || self.wr_index_collision(&upd.table, meta, &out[i], &out[j], params)?
                 {
-                    return Err(Error::Constraint(wr_unique_message(meta, &out[i], &out[j])));
+                    let m = self.wr_conflict_message(&upd.table, meta, &out[i], &out[j], params)?;
+                    return Err(Error::Constraint(m));
                 }
             }
         }

@@ -541,6 +541,18 @@ before writing the btree (NULLs distinct, collation-aware, the partial-index
 raises `t.col[, …]` for a column index or `index '<name>'` for an expression
 index. Byte-exact vs `sqlite3` 3.50.4 (`tests/create_unique_index_duplicate.rs`).
 
+**A runtime UNIQUE violation on a *standalone* secondary index of a `WITHOUT
+ROWID` table now names the column(s)** — `UNIQUE constraint failed: t.b` — as
+SQLite does. graphite degraded just this corner to the bare `UNIQUE constraint
+failed`: the message builder consulted only the table's inline `UNIQUE`/`PRIMARY
+KEY` sets, not the separately-created unique indexes that the collision detector
+actually enforces (the inline-UNIQUE column, the primary key, and a rowid-table
+secondary index were already correct). The INSERT and UPDATE WITHOUT ROWID paths
+now build the message through a new `wr_conflict_message`, which falls through to
+the standalone unique indexes (collation- and partial-predicate aware) and
+renders `t.col[, …]`. Byte-exact vs `sqlite3` 3.50.4
+(`tests/without_rowid_secondary_unique_message.rs`).
+
 **CTEs in one `WITH` clause now see each other — forward references work, and
 true cycles are rejected.** SQLite makes every CTE in a `WITH` mutually visible
 (it expands them on demand from the outer query), so a CTE may reference one
