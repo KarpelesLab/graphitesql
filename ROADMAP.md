@@ -356,6 +356,29 @@ sum(a)) … HAVING sum(a)>0` still reports `HAVING clause on a non-aggregate que
 (even `HAVING 1`/`HAVING 0`) unless a *real* non-windowed result aggregate is
 present, exactly as SQLite. Byte-exact vs `sqlite3` 3.50.4.
 
+And an **unknown or wrong-arity scalar function in a DELETE/UPDATE `SET` value,
+`WHERE` predicate, or `RETURNING` clause** is now rejected during analysis
+(`no such function: NAME` / `wrong number of arguments to function NAME()`),
+where graphite's lazy evaluator used to accept it over an empty or
+fully-filtered table — no surviving row ever evaluated the call. The existing
+`reject_unresolved_functions` dry-resolver (NULL stand-in arguments, skipping
+window/aggregate/`MATCH`/FTS names) now runs in `validate_dml_refs` over the
+SET/WHERE expressions and the `RETURNING` list. Column existence is still
+resolved first (`RETURNING nope(zzz)` → `no such column: zzz`). The two clauses
+order the function check differently, matching SQLite's two resolution regimes:
+in `RETURNING` (where, as in a SELECT result, an aggregate passes name
+resolution and is only flagged a misuse afterwards) the unknown-name check runs
+*ahead of* the aggregate/window misuse checks, so `RETURNING nope(count(*))` is
+`no such function: nope` while `RETURNING abs(count(*))` — outer name known — is
+`misuse of aggregate function count()`; in `SET`/`WHERE` (aggregates forbidden
+at resolve time) the misuse check stays first, so `nope(sum(a))` keeps `misuse
+of aggregate function sum()`. The one residual corner is a SET/WHERE expression
+that nests an unknown function *inside* an aggregate (`SET a=sum(nope(a))`):
+SQLite's true innermost-first post-order reports `no such function: nope`,
+whereas graphite reports the outer `misuse of aggregate function sum()` — a
+pre-existing divergence left untouched (no global pass order satisfies both that
+and `nope(sum(a))`). Byte-exact vs `sqlite3` 3.50.4 otherwise.
+
 And **`CREATE TABLE` validation ordering** now mirrors the order in which SQLite
 builds a schema, so a statement with several faults reports the same one SQLite
 does. The per-column "add column" checks run first, left to right — a duplicate

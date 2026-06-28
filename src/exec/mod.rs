@@ -15155,6 +15155,13 @@ impl Connection {
             reject_misused_window(e)?;
             reject_misused_aggregate(e, false)?;
             reject_filter_on_non_aggregate(e, &is_agg)?;
+            // An unknown or wrong-arity *scalar* call in a SET value or WHERE
+            // predicate is a prepare-time error in SQLite; graphite otherwise
+            // resolved it lazily and so silently accepted it over an empty or
+            // fully-filtered table (no row ever evaluates the call). Runs after
+            // the aggregate/window misuse checks so a misused aggregate keeps its
+            // own wording — the existence pass only fires when nothing else did.
+            self.reject_unresolved_functions(e)?;
         }
         // A `RETURNING` clause projects one row per modified row, so it is never an
         // aggregate query and offers no window context either. SQLite rejects an
@@ -15163,6 +15170,14 @@ impl Connection {
         // `OVER` is the same misuse. (INSERT … RETURNING is validated on a separate
         // path and, like SQLite, is not subject to this.)
         for e in returning {
+            // Unlike a SET/WHERE expression, a `RETURNING`/SELECT-position
+            // aggregate passes name resolution and is only flagged as a misuse
+            // afterwards, so SQLite resolves an unknown/wrong-arity scalar across
+            // the whole expression *first*: `RETURNING nope(count(*))` is `no such
+            // function: nope`, while `RETURNING abs(count(*))` — outer name known —
+            // is `misuse of aggregate function count()`. (Column existence was
+            // already checked above, so `RETURNING nope(zzz)` → `no such column`.)
+            self.reject_unresolved_functions(e)?;
             reject_misused_window(e)?;
             reject_window_without_over(e)?;
             reject_misused_aggregate(e, false)?;
