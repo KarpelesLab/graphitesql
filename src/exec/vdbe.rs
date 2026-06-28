@@ -226,10 +226,14 @@ pub enum Op {
     },
     /// `GROUP BY` fold: find-or-create the group for the key in `[key_start,
     /// key_start+key_count)` (first-seen order, NULLs group together) and step
-    /// each per-group aggregate.
+    /// each per-group aggregate. The `repr_count` registers immediately after the
+    /// keys hold bare-column "representatives" — captured from the row that first
+    /// creates the group (first-seen semantics) and not compared for group
+    /// identity; a later [`Op::GroupEmit`] reads them via `Key(key_count + r)`.
     GroupStep {
         key_start: usize,
         key_count: usize,
+        repr_count: usize,
         aggs: Vec<AggSpec>,
     },
     /// Emit one row per group (in first-seen order): each output is either a
@@ -878,12 +882,18 @@ fn emit_group_fold(
     c: &mut Compiler,
     sel: &Select,
     group_cols: &[usize],
+    repr_cols: &[usize],
     agg_specs: &[AggCallSpec],
 ) -> Result<()> {
     let bounds = c.cursor_boundaries.clone();
-    // Contiguous key registers, loaded per row from the grouping columns.
+    // Contiguous registers: one per grouping column, then one per bare-column
+    // representative (loaded per row, but only the group's first-seen row's values
+    // are retained — see `Op::GroupStep`).
     let key_start = c.next_reg;
     for _ in group_cols {
+        c.alloc();
+    }
+    for _ in repr_cols {
         c.alloc();
     }
     // Prologue: position the row source. A join opens N cursors (outermost first);
@@ -937,6 +947,25 @@ fn emit_group_fold(
             }),
         }
     }
+    // Load each bare-column representative right after the keys. `GroupStep` keeps
+    // the value from the row that first creates the group (first-seen semantics).
+    let kn = group_cols.len();
+    for (r, &ci) in repr_cols.iter().enumerate() {
+        match &bounds {
+            Some(b) => {
+                let (cursor, col) = Compiler::cursor_of(b, ci);
+                c.ops.push(Op::ColumnC {
+                    cursor,
+                    col,
+                    dest: key_start + kn + r,
+                });
+            }
+            None => c.ops.push(Op::Column {
+                col: ci,
+                dest: key_start + kn + r,
+            }),
+        }
+    }
     // Evaluate each aggregate argument (and its FILTER predicate) into a register
     // for this row.
     let mut aggs: Vec<AggSpec> = Vec::new();
@@ -962,6 +991,7 @@ fn emit_group_fold(
     c.ops.push(Op::GroupStep {
         key_start,
         key_count: group_cols.len(),
+        repr_count: repr_cols.len(),
         aggs,
     });
     // Epilogue: advance the loop(s) and backpatch the empty/exit edges so an empty
@@ -1102,8 +1132,9 @@ fn compile_group_select(
     }
 
     // Fold the row source (single cursor or nested-loop join) into per-group
-    // aggregates, allocating the grouping-key registers.
-    emit_group_fold(&mut c, sel, &group_cols, &agg_specs)?;
+    // aggregates, allocating the grouping-key registers. The HAVING/ORDER path
+    // binds bare columns through registers (no representatives here).
+    emit_group_fold(&mut c, sel, &group_cols, &[], &agg_specs)?;
 
     // Per-group registers: one for each grouping key value, one for each
     // aggregate final. These feed the bindings so HAVING/projection/ORDER-BY
@@ -1437,6 +1468,7 @@ fn compile_group_emit(
     // qualified `t.col` and ambiguous bare names are handled like the tree-walker.
     let mut outputs: Vec<GroupOut> = Vec::new();
     let mut agg_specs: Vec<AggCallSpec> = Vec::new();
+    let mut repr_cols: Vec<usize> = Vec::new();
     for (e, _) in projections {
         if is_aggregate_expr(e) {
             match agg_kind_distinct(e) {
@@ -1447,11 +1479,19 @@ fn compile_group_emit(
                 None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
             }
         } else if let Expr::Column { table, column, .. } = e {
-            // Must be one of the grouping columns (by combined column index).
             let ci = c.resolve_column(table.as_deref(), column)?;
             match group_cols.iter().position(|&g| g == ci) {
                 Some(k) => outputs.push(GroupOut::Key(k)),
-                None => return Err(Error::Unsupported("VDBE: non-grouped column")),
+                // A non-grouped bare column. SQLite emits the value from the row
+                // that first creates the group (a "representative"). We capture it
+                // as an extra key-vector slot after the real keys — but only when
+                // there is no min()/max() aggregate, which would instead pull bare
+                // columns from the min/max companion row (gated after the loop).
+                None => {
+                    let r = repr_cols.len();
+                    repr_cols.push(ci);
+                    outputs.push(GroupOut::Key(group_cols.len() + r));
+                }
             }
         } else {
             return Err(Error::Unsupported(
@@ -1460,9 +1500,21 @@ fn compile_group_emit(
         }
     }
 
+    // First-seen-row representatives only match SQLite when no min()/max() is
+    // present; otherwise bare columns track the companion row — defer that shape.
+    if !repr_cols.is_empty()
+        && agg_specs
+            .iter()
+            .any(|(k, ..)| matches!(k, AggKind::Min | AggKind::Max))
+    {
+        return Err(Error::Unsupported(
+            "VDBE: bare column with min/max companion",
+        ));
+    }
+
     // Fold the row source (single cursor or nested-loop join) into per-group
-    // aggregates, allocating the grouping-key registers.
-    emit_group_fold(&mut c, sel, group_cols, &agg_specs)?;
+    // aggregates, allocating the grouping-key and representative registers.
+    emit_group_fold(&mut c, sel, group_cols, &repr_cols, &agg_specs)?;
 
     c.ops.push(Op::GroupEmit {
         outputs,
@@ -4467,11 +4519,20 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
             Op::GroupStep {
                 key_start,
                 key_count,
+                repr_count,
                 aggs,
             } => {
-                let key = regs[*key_start..*key_start + *key_count].to_vec();
+                // The stored vector is the grouping keys followed by any bare-column
+                // representatives; group identity compares only the first `key_count`
+                // entries, so the representatives keep the first-seen row's values.
+                let total = *key_count + *repr_count;
+                let key = regs[*key_start..*key_start + total].to_vec();
                 let gi = match groups.iter().position(|(k, _)| {
-                    k.len() == key.len() && k.iter().zip(&key).all(|(a, b)| distinct_eq(a, b))
+                    k.len() == key.len()
+                        && k.iter()
+                            .zip(&key)
+                            .take(*key_count)
+                            .all(|(a, b)| distinct_eq(a, b))
                 }) {
                     Some(i) => i,
                     None => {
@@ -5029,6 +5090,9 @@ mod tests {
             "SELECT a.x, count(*) FROM a, b GROUP BY a.x",
             "SELECT x, sum(p) FROM a, b GROUP BY x",
             "SELECT a.x FROM a, b GROUP BY a.x",
+            // A non-grouped bare column emits a first-seen-row representative (no
+            // min/max present), on the plain path.
+            "SELECT a.x, b.p FROM a, b GROUP BY a.x",
             "SELECT a.x, count(*) FROM a, b GROUP BY a.x HAVING count(*) > 1",
             "SELECT a.x, count(*) FROM a, b GROUP BY a.x ORDER BY a.x",
             "SELECT a.x, count(*) FROM a, b GROUP BY a.x LIMIT 1",
@@ -5042,11 +5106,12 @@ mod tests {
                 "{sql} should compile as a GROUP BY join"
             );
         }
-        // DISTINCT / a non-grouped output / no GROUP BY still bail.
+        // DISTINCT / a bare column alongside min/max (companion-row rule) / no
+        // GROUP BY still bail.
         for sql in [
             "SELECT DISTINCT a.x, count(*) FROM a, b GROUP BY a.x",
-            "SELECT a.x, b.p FROM a, b GROUP BY a.x", // b.p not grouped/aggregated
-            "SELECT count(*) FROM a, b",              // no GROUP BY
+            "SELECT a.x, b.p, max(b.p) FROM a, b GROUP BY a.x", // min/max companion
+            "SELECT count(*) FROM a, b",                        // no GROUP BY
         ] {
             let Statement::Select(sel) = parse_one(sql).unwrap() else {
                 panic!()
