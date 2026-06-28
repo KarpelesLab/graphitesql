@@ -27357,12 +27357,28 @@ fn expr_reads_table(e: &Expr, name: &str) -> bool {
     probe != *e
 }
 
-/// Whether a `FROM` clause names table `name` as its first source or a join.
+/// Whether a `FROM` clause references table `name` — as a named source or join,
+/// a derived-subquery / TVF-argument source, or inside a join's `ON` predicate.
+/// The rename rewrite is a whole-text token pass, so this only needs to detect
+/// *any* reference, not locate it. (Used for an `UPDATE … FROM` trigger body,
+/// whose `FROM` can reach the renamed table through a subquery the way a plain
+/// `SELECT`'s `FROM` can.)
 fn from_refs_table(f: &FromClause, name: &str) -> bool {
-    f.first.name.eq_ignore_ascii_case(name)
+    let tref = |tr: &crate::sql::ast::TableRef| -> bool {
+        tr.name.eq_ignore_ascii_case(name)
+            || tr
+                .subquery
+                .as_ref()
+                .is_some_and(|s| select_reads_table(s, name))
+            || tr
+                .tvf_args
+                .as_ref()
+                .is_some_and(|args| args.iter().any(|e| expr_reads_table(e, name)))
+    };
+    tref(&f.first)
         || f.joins
             .iter()
-            .any(|j| j.table.name.eq_ignore_ascii_case(name))
+            .any(|j| tref(&j.table) || j.on.as_ref().is_some_and(|e| expr_reads_table(e, name)))
 }
 
 /// Qualify a trigger body's `no such table: X` error with the trigger's schema.

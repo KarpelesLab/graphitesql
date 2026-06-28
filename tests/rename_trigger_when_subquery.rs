@@ -7,11 +7,13 @@
 //! graphite's "is this trigger affected?" check (`trigger_uses_table`) only
 //! inspected the `ON` table and each body statement's direct target, so a
 //! trigger whose *only* reference to the renamed table sat in a `WHEN` subquery
-//! — or in a body `WHERE … IN (SELECT … FROM <old>)` — was skipped entirely,
-//! leaving stale `FROM <old>` text that no longer matched SQLite. The rewrite
-//! itself is a whole-text token pass, so once the trigger is recognized as
-//! affected every reference (WHEN + body) is renamed; the bug was purely in the
-//! detection. Now the `WHEN` clause and every nested body subquery are probed.
+//! — or in a body `WHERE … IN (SELECT … FROM <old>)`, or in an `UPDATE … FROM
+//! (SELECT … FROM <old>)` derived source — was skipped entirely, leaving stale
+//! `FROM <old>` text that no longer matched SQLite. The rewrite itself is a
+//! whole-text token pass, so once the trigger is recognized as affected every
+//! reference (WHEN + body) is renamed; the bug was purely in the detection. Now
+//! the `WHEN` clause and every nested body subquery — including an `UPDATE … FROM`
+//! clause's derived-table / TVF sources and join `ON` predicates — are probed.
 //!
 //! Verified against the sqlite3 3.50.4 CLI.
 
@@ -85,6 +87,28 @@ fn rename_rewrites_subquery_refs_in_when_and_body() {
          CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
            INSERT INTO u VALUES(1) ON CONFLICT(b) DO UPDATE SET b=2 \
              WHERE b IN (SELECT a FROM t); END; \
+         ALTER TABLE t RENAME TO t2; \
+         SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // Body UPDATE … FROM (SELECT … FROM <old>): a derived-table source in the
+        // SQLite `UPDATE … FROM` extension reaches the renamed table only through
+        // a subquery (its `FROM` source name is empty).
+        "CREATE TABLE t(a,b); CREATE TABLE u(c,d); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET d=s.a FROM (SELECT a FROM t) s; END; \
+         ALTER TABLE t RENAME TO t2; \
+         SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // Body UPDATE … FROM <w> JOIN (SELECT … FROM <old>) ON …: the renamed
+        // table sits in a join's derived source.
+        "CREATE TABLE t(a,b); CREATE TABLE u(c,d); CREATE TABLE w(e); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET d=1 FROM w JOIN (SELECT a FROM t) s ON s.a=w.e; END; \
+         ALTER TABLE t RENAME TO t2; \
+         SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // Regression guard: an `UPDATE … FROM (subquery over an UNRELATED table)`
+        // must not trigger a spurious rewrite when a different table is renamed.
+        "CREATE TABLE t(a,b); CREATE TABLE u(c,d); CREATE TABLE z(a); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET d=s.a FROM (SELECT a FROM z) s; END; \
          ALTER TABLE t RENAME TO t2; \
          SELECT sql FROM sqlite_schema WHERE name='tr'",
         // Regression guard: a trigger that never touches the renamed table is
