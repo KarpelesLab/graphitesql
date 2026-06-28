@@ -511,6 +511,20 @@ database bad`; `nope()` → `no such table: nope`). graphite previously answered
 TVFs (`generate_series`, `json_each`/`json_tree`, the `pragma_*` forms) are
 unaffected. Byte-exact vs `sqlite3` 3.50.4.
 
+An **unrecognized `pragma_<name>` table-valued source** now reports `no such
+table: pragma_<name>`, matching SQLite. SQLite exposes only its *result-returning*
+pragmas as eponymous `pragma_<name>` virtual tables; a typo (`pragma_made_up`) or a
+statement-only pragma whose TVF form SQLite rejects (`pragma_wal_checkpoint`,
+`pragma_mmap_size`, `pragma_incremental_vacuum`, `pragma_legacy_file_format`,
+`pragma_wal_autocheckpoint`, `pragma_case_sensitive_like`) is `no such table`.
+graphite previously routed *every* `pragma_`-prefixed FROM name through
+`run_pragma`, whose unknown-name arm returns an empty result — so a bad pragma TVF
+silently produced zero rows instead of erroring. The fix gates the TVF path on a
+`pragma_has_tvf` allow-list (the pragmas graphite implements *and* SQLite exposes;
+kept in lockstep with `run_pragma`'s arms); the statement form `PRAGMA made_up` is
+still the no-op SQLite specifies. Test: `tests/pragma_tvf_unknown.rs`. Byte-exact
+vs `sqlite3` 3.50.4.
+
 A **window function nested inside another window function's definition** is now
 rejected at prepare time, matching SQLite. A window call may not appear in another
 window's arguments, its `FILTER` predicate, or its `OVER` spec's `PARTITION BY` /

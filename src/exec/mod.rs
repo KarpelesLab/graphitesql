@@ -17725,6 +17725,10 @@ impl Connection {
     /// A bare `pragma_<name>` (no parentheses) used as a `FROM` source is the
     /// zero-argument table-valued form of that PRAGMA — unless a real table,
     /// view, or CTE of the same name shadows it.
+    ///
+    /// `is_pragma_tvf` only routes the `pragma_`-prefixed name into the TVF path;
+    /// whether that name is actually a *valid* table source is decided by
+    /// [`pragma_has_tvf`] once the bare pragma name is known.
     fn is_pragma_tvf(&self, tref: &TableRef) -> bool {
         tref.tvf_args.is_none()
             && tref.subquery.is_none()
@@ -17893,8 +17897,16 @@ impl Connection {
             // `pragma_<name>(arg)` is the table-valued form of a PRAGMA, usable in
             // a FROM clause (e.g. `SELECT name FROM pragma_table_info('t')`).
             pragma if pragma.starts_with("pragma_") => {
+                let bare = &pragma["pragma_".len()..];
+                // Only a pragma that SQLite exposes as an eponymous table-valued
+                // function is a valid FROM source; an unrecognized name (or a
+                // statement-only pragma like `wal_checkpoint`) is `no such table`,
+                // not a silently-empty result.
+                if !pragma_has_tvf(bare) {
+                    return Err(Error::Error(format!("no such table: {}", tref.name)));
+                }
                 let p = Pragma {
-                    name: String::from(&pragma["pragma_".len()..]),
+                    name: String::from(bare),
                     value: args.first().cloned(),
                 };
                 let result = self.run_pragma(&p)?;
@@ -21964,6 +21976,68 @@ fn value_to_literal_expr(v: Value) -> Expr {
 /// under both the modern `sqlite_schema` and the historical `sqlite_master`.
 fn is_main_schema_table(name: &str) -> bool {
     name.eq_ignore_ascii_case("sqlite_schema") || name.eq_ignore_ascii_case("sqlite_master")
+}
+
+/// Whether SQLite exposes the pragma `bare` (the name after the `pragma_` prefix)
+/// as an eponymous table-valued function — i.e. whether `SELECT * FROM
+/// pragma_<bare>` is a valid `FROM` source rather than `no such table`.
+///
+/// SQLite builds a `pragma_<name>` virtual table for every *result-returning*
+/// pragma it knows, with a handful of statement-only exceptions
+/// (`wal_checkpoint`, `mmap_size`, …) whose TVF form is rejected. This is the set
+/// of pragmas graphite both implements (in `run_pragma`) and SQLite 3.50.4
+/// exposes — keep it in lockstep with `run_pragma`'s arms. An unrecognized name
+/// (a typo, or a real pragma graphite does not implement) is not a TVF either.
+fn pragma_has_tvf(bare: &str) -> bool {
+    // Names checked case-insensitively; `bare` arrives lowercased from the caller
+    // but normalize defensively.
+    const TVF_PRAGMAS: &[&str] = &[
+        "analysis_limit",
+        "application_id",
+        "auto_vacuum",
+        "automatic_index",
+        "busy_timeout",
+        "cache_size",
+        "cell_size_check",
+        "checkpoint_fullfsync",
+        "collation_list",
+        "data_version",
+        "database_list",
+        "encoding",
+        "foreign_key_check",
+        "foreign_key_list",
+        "foreign_keys",
+        "freelist_count",
+        "fullfsync",
+        "hard_heap_limit",
+        "ignore_check_constraints",
+        "index_info",
+        "index_list",
+        "index_xinfo",
+        "integrity_check",
+        "journal_mode",
+        "journal_size_limit",
+        "locking_mode",
+        "max_page_count",
+        "optimize",
+        "page_count",
+        "page_size",
+        "query_only",
+        "quick_check",
+        "read_uncommitted",
+        "recursive_triggers",
+        "schema_version",
+        "secure_delete",
+        "short_column_names",
+        "synchronous",
+        "table_info",
+        "table_list",
+        "table_xinfo",
+        "temp_store",
+        "user_version",
+    ];
+    let lname = bare.to_ascii_lowercase();
+    TVF_PRAGMAS.contains(&lname.as_str())
 }
 
 /// Whether `name` is the temp-database catalog (`sqlite_temp_schema` /
