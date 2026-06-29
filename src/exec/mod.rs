@@ -14322,31 +14322,40 @@ impl Connection {
                 prefix_open = false;
             }
         }
-        let sorted_suffix = sel.order_by.len() - uniform_prefix;
         // A lone rowid/IPK term is the `rowid_ordered_scan` case.
         if cols.len() == 1 && meta.ipk == Some(cols[0]) {
             return None;
         }
-        // A full index whose leading columns are exactly `cols` (in order), each
-        // with the column's own collation (so index order == ORDER BY order for
-        // the uniform prefix). When the ORDER BY is fully uniform (`sorted_suffix
-        // == 0`) the walk needs no sort; a mixed-direction ORDER BY is taken only
-        // for the NON-covering case (the covered one is `covering_scan` +
-        // `scan_order_prefix`, which already reads in order).
+        // An index whose leading columns agree with a LEADING PREFIX of the ORDER
+        // BY columns (in order, same collation) walks that prefix in order; sqlite
+        // sorts only the remaining terms. The usable prefix is the shorter of the
+        // index/ORDER-BY column match (`match_len`) and the uniform-direction run
+        // (`uniform_prefix`) — an index can be SHORTER than the ORDER BY (`ORDER BY
+        // a, b` over an index on `a` → walk `a`, sort `b`) as well as longer. When
+        // the prefix is the whole ORDER BY (`sorted_suffix == 0`) the walk needs no
+        // sort; a partial walk (`sorted_suffix > 0`) is taken only for the
+        // NON-covering case (the covered one is `covering_scan` + `scan_order_
+        // prefix`, which already reads in order).
         for idx in self.indexes_of(&t.name).ok()? {
             if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
             }
-            if idx.cols.len() < cols.len() || idx.cols[..cols.len()] != cols[..] {
+            let match_len = idx
+                .cols
+                .iter()
+                .zip(cols.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let ordered = match_len.min(uniform_prefix);
+            if ordered == 0 {
                 continue;
             }
-            let coll_ok = cols
-                .iter()
-                .enumerate()
-                .all(|(i, &c)| idx.collations[i] == meta.columns[c].collation);
+            let coll_ok =
+                (0..ordered).all(|i| idx.collations[i] == meta.columns[cols[i]].collation);
             if !coll_ok {
                 continue;
             }
+            let sorted_suffix = cols.len() - ordered;
             let covering = self.index_covers_query(sel, &meta, &idx.cols);
             if sorted_suffix > 0 && covering {
                 continue;

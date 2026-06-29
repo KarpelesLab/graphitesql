@@ -201,7 +201,11 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   a covering index on `a` emits a bare `SCAN … USING COVERING INDEX` with **no**
   temp-btree node — the group-by access already yields the ORDER BY term in order, so
   zero terms need sorting and graphite no longer over-emits a nonsensical
-  `USE TEMP B-TREE FOR LAST 0 TERMS OF ORDER BY`).
+  `USE TEMP B-TREE FOR LAST 0 TERMS OF ORDER BY`; and an `ORDER BY` that is *longer*
+  than the chosen index — `ORDER BY a, b` over an index on `(a)` — walks the index
+  for the `a` prefix and sorts only the trailing terms (`SCAN t USING INDEX it` +
+  `USE TEMP B-TREE FOR LAST TERM OF ORDER BY`), where graphite previously rejected any
+  index shorter than the ORDER BY and fell back to a full `SCAN t` + full sort).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

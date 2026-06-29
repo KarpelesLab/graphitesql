@@ -136,6 +136,52 @@ fn group_by_order_by_same_prefix_emits_no_temp_btree() {
 }
 
 #[test]
+fn order_by_longer_than_index_walks_the_prefix() {
+    // index on `(a)` only, but `ORDER BY a, b` (or a, b, c): the index walks the
+    // `a` prefix in order and sqlite sorts only the trailing terms —
+    // `SCAN t USING INDEX it` + `USE TEMP B-TREE FOR LAST TERM[S] OF ORDER BY`.
+    // graphite previously rejected any index shorter than the ORDER BY and fell
+    // back to a plain `SCAN t` + full sort.
+    let have_sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    const NC: &str = "CREATE TABLE t(a,b,c); CREATE INDEX it ON t(a); \
+                      INSERT INTO t VALUES (3,9,1),(1,5,2),(2,7,3),(1,2,4),(3,1,5),(2,8,6);";
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in NC.split_inclusive(';') {
+        if !stmt.trim().is_empty() {
+            c.execute(stmt).unwrap();
+        }
+    }
+    let queries = [
+        "SELECT a,b,c FROM t ORDER BY a, b",
+        "SELECT a,b,c FROM t ORDER BY a, b, c",
+        "SELECT a,b,c FROM t ORDER BY a DESC, b",
+        "SELECT a,b,c FROM t ORDER BY a, b DESC",
+    ];
+    for q in queries {
+        let g = g_eqp(&c, q);
+        assert!(
+            g.contains("USING INDEX it") && g.contains("LAST"),
+            "expected index-prefix walk + partial sort, got: {g} ({q})"
+        );
+        if have_sqlite {
+            let want_eqp = sqlite_out(&format!("{NC} EXPLAIN QUERY PLAN {q};"))
+                .lines()
+                .filter(|l| !l.trim().eq_ignore_ascii_case("QUERY PLAN"))
+                .map(|l| l.trim_start_matches(|ch| "|`- ".contains(ch)).to_string())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert_eq!(g, want_eqp, "EQP diverged for: {q}");
+            let want_rows = sqlite_out(&format!("{NC} {q};"));
+            assert_eq!(
+                g_rows(&c, q).trim(),
+                want_rows.trim(),
+                "rows diverged for: {q}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mixed_direction_partial_sort_over_noncovering_index() {
     // index (a,b) but the projection needs `d` (not in the index) → non-covering.
     // sqlite walks the index for the leading prefix then sorts the trailing term:
