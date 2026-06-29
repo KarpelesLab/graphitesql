@@ -220,6 +220,23 @@ exhausted for bounded (single-fix) work.
   tree) — a resolver-ordering change, not a one-line hoist. Low-impact (the
   message body is identical; only which of two errors fires first differs).
 
+  *Empirically-mapped precedence (2026-06-30, vs sqlite3 3.50.4 — supersedes the
+  simple clause model above):* the deciding factor is SQLite's actual name-
+  resolution **clause order**, which is `result-set → HAVING → WHERE → GROUP BY /
+  ORDER BY` — note **HAVING resolves before WHERE** (`WHERE zzz=1 … HAVING yyy=1`
+  → `no such column: yyy`, not `zzz`; `WHERE nope=1 … HAVING (a,a)=(1,2,3)` →
+  `row value misused`; but `WHERE (a,a)=(1,2,3) … ORDER BY nope` / `GROUP BY nope`
+  → `row value misused`, so WHERE outranks GROUP BY/ORDER BY). Within one clause it
+  is a single pre-order walk in which a structural fault (checked at the node,
+  before its children — so `(nope,a) IN ((1,2,3))` flags arity before descending to
+  `nope`) and a `no such column` at a leaf are detected together, first-fault-wins
+  (`nope=1 AND (a,a)=(1,2,3)` → column; `(a,a)=(1,2,3) AND nope=1` → structural).
+  The scalar-LHS `IN (row)` case (`nope IN ((1,2))`) is *not* a node-level
+  structural fault, so the column wins. Implementing this means one combined
+  ordered walk reusing the existing node predicates from both `validate_columns_exist`
+  and `reject_row_value_misuse`; deferred as fragile-for-cosmetic-gain (only
+  reorders two already-correct messages on doubly-malformed input).
+
 - **A-misc-2 — `*` / `t.*` over a same-named self-join — DONE.** Both facets now
   match SQLite. (1) The database-qualified expansion error names the source
   origin (`main.t.a`, `temp.t.a`, attached `aux.t.a`, or `*.x.a` for a
