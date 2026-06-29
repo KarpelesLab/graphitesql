@@ -325,9 +325,20 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   secondary index, `WITHOUT ROWID` PK, automatic covering index) — a shared `left_suffix`
   applied across all four join EQP branches; previously the rowid/index join branches
   omitted it (`tests/eqp_alias_label.rs`, and the corrected hardcoded assertions in
-  `tests/explain.rs`, `tests/join_seek.rs`, `tests/join_index_seek.rs`). (Residual: the
-  INDEX-vs-COVERING-INDEX detection for `count(*)/min/max … WHERE col=?` — graphite renders
-  `SEARCH x USING INDEX ia (a=?)` where sqlite picks the covering form — is unchanged.)
+  `tests/explain.rs`, `tests/join_seek.rs`, `tests/join_index_seek.rs`).
+  A WHERE-equality / range / IN seek whose chosen index holds every referenced
+  column — *including through aggregate/function arguments* (`SELECT count(*) …
+  WHERE a=?`, `sum(a) … WHERE a=?`) — is now labelled `USING COVERING INDEX`,
+  matching sqlite: `seek_index_covers` (which drives BOTH the EQP label and the
+  executor's index-only read, so they stay in lockstep) now routes through
+  `query_cols_covered` (recurses into function args) rather than the plain-column
+  `index_covers_query`, so an aggregate referencing no uncovered column qualifies
+  (`tests/eqp_covering_seek_aggregate.rs`). (Residual: when sqlite picks a *wider*
+  covering index than graphite — `SELECT b FROM t WHERE a=?` where graphite seeks
+  the narrow `ia` and sqlite the covering `iab` — graphite honestly labels its
+  narrower index `USING INDEX`; that is the separate cost-model index-*choice* gap,
+  unchanged. `min/max … WHERE col=?` SCAN-vs-SEARCH via one-end index read is also
+  still open.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

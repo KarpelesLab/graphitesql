@@ -14731,7 +14731,14 @@ impl Connection {
         idx_cols: &[usize],
         where_expr: &Expr,
     ) -> bool {
-        if !self.index_covers_query(sel, meta, idx_cols) {
+        // `query_cols_covered` recurses through function/aggregate arguments, so a
+        // covered-only-by-WHERE aggregate (`SELECT count(*) … WHERE a=?`,
+        // `sum(a) … WHERE a=?`) qualifies as covering — matching sqlite, which
+        // labels that seek `USING COVERING INDEX`. It also folds in the GROUP BY /
+        // HAVING / ORDER BY / WHERE coverage checks; the explicit `where_expr`
+        // check below is retained for the (executor) call sites that narrow the
+        // predicate before reaching here.
+        if !self.query_cols_covered(sel, meta, idx_cols) {
             return false;
         }
         where_cols_covered(where_expr, meta, idx_cols)
