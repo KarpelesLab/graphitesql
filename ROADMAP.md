@@ -197,7 +197,11 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   `COMPOUND QUERY` / `LEFT-MOST SUBQUERY` / per-arm-operator tree byte-exactly
   (3+ arms, per-arm WHERE seeks, a shared `WITH`, and a bare `LIMIT`/`OFFSET` all
   carry through), while a trailing `ORDER BY` on the compound — SQLite's separate
-  `MERGE` plan — declines cleanly).
+  `MERGE` plan — declines cleanly; an aggregate `GROUP BY a ORDER BY a` answered by
+  a covering index on `a` emits a bare `SCAN … USING COVERING INDEX` with **no**
+  temp-btree node — the group-by access already yields the ORDER BY term in order, so
+  zero terms need sorting and graphite no longer over-emits a nonsensical
+  `USE TEMP B-TREE FOR LAST 0 TERMS OF ORDER BY`).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

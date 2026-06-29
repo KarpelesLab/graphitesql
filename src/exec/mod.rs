@@ -12670,14 +12670,21 @@ impl Connection {
             } else {
                 n - self.scan_order_prefix(sel, params).min(n)
             };
-            let detail = match sorted {
-                _ if sorted >= n => String::from("USE TEMP B-TREE FOR ORDER BY"),
-                1 => String::from("USE TEMP B-TREE FOR LAST TERM OF ORDER BY"),
-                _ => alloc::format!("USE TEMP B-TREE FOR LAST {sorted} TERMS OF ORDER BY"),
-            };
-            let id = *next_id;
-            *next_id += 1;
-            out.push((id, parent, detail));
+            // `sorted == 0` means the access path already yields every ORDER BY term
+            // in order, so no sort is needed — emit nothing (a `LAST 0 TERMS` node is
+            // never valid SQLite output). This arises for an aggregate `GROUP BY a
+            // ORDER BY a` answered by an index on `a`, where the group-by access
+            // provides the order but `order_satisfied_by_scan` does not recognise it.
+            if sorted > 0 {
+                let detail = match sorted {
+                    _ if sorted >= n => String::from("USE TEMP B-TREE FOR ORDER BY"),
+                    1 => String::from("USE TEMP B-TREE FOR LAST TERM OF ORDER BY"),
+                    _ => alloc::format!("USE TEMP B-TREE FOR LAST {sorted} TERMS OF ORDER BY"),
+                };
+                let id = *next_id;
+                *next_id += 1;
+                out.push((id, parent, detail));
+            }
         }
         Ok(())
     }

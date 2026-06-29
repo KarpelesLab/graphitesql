@@ -97,6 +97,45 @@ fn mixed_direction_partial_sort_over_covering_index() {
 }
 
 #[test]
+fn group_by_order_by_same_prefix_emits_no_temp_btree() {
+    // `GROUP BY a ORDER BY a` answered by a covering index on `a`: the group-by
+    // access already yields every ORDER BY term in order, so zero terms need
+    // sorting. SQLite emits a bare `SCAN … USING COVERING INDEX` with NO
+    // temp-btree node — graphite must not over-emit a nonsensical
+    // `USE TEMP B-TREE FOR LAST 0 TERMS OF ORDER BY`.
+    let have_sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    const GB: &str = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); \
+                      INSERT INTO t VALUES (3,1),(1,2),(2,3),(1,4),(3,5);";
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in GB.split_inclusive(';') {
+        if !stmt.trim().is_empty() {
+            c.execute(stmt).unwrap();
+        }
+    }
+    let q = "SELECT a, count(*) FROM t GROUP BY a ORDER BY a";
+    let g = g_eqp(&c, q);
+    assert!(
+        g.contains("USING COVERING INDEX it") && !g.contains("TEMP B-TREE"),
+        "expected covering index with no temp-btree, got: {g}"
+    );
+    if have_sqlite {
+        let want_eqp = sqlite_out(&format!("{GB} EXPLAIN QUERY PLAN {q};"))
+            .lines()
+            .filter(|l| !l.trim().eq_ignore_ascii_case("QUERY PLAN"))
+            .map(|l| l.trim_start_matches(|ch| "|`- ".contains(ch)).to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(g, want_eqp, "EQP diverged for: {q}");
+        let want_rows = sqlite_out(&format!("{GB} {q};"));
+        assert_eq!(
+            g_rows(&c, q).trim(),
+            want_rows.trim(),
+            "rows diverged for: {q}"
+        );
+    }
+}
+
+#[test]
 fn mixed_direction_partial_sort_over_noncovering_index() {
     // index (a,b) but the projection needs `d` (not in the index) → non-covering.
     // sqlite walks the index for the leading prefix then sorts the trailing term:
