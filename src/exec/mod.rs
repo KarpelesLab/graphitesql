@@ -14235,15 +14235,19 @@ impl Connection {
             || !sel.group_by.is_empty()
             || sel.having.is_some()
             || sel.distinct
-            || sel.order_by.len() != 1
+            || sel.order_by.is_empty()
         {
             return None;
         }
         if self.has_aggregate(sel) || window::has_window(sel) {
             return None;
         }
-        // The single ORDER BY term must be a plain (un-COLLATE'd) reference to the
-        // rowid or the INTEGER PRIMARY KEY column of this table.
+        // The *leading* ORDER BY term must be a plain (un-COLLATE'd) reference to
+        // the rowid or the INTEGER PRIMARY KEY column of this table. Because that
+        // key is unique, any trailing terms can never break a tie — the rowid
+        // scan order alone fully determines the result order — so a multi-term
+        // `ORDER BY id, b` is satisfied by the scan exactly like a lone `ORDER BY
+        // id`, matching sqlite (which emits no temp b-tree for either).
         let term = &sel.order_by[0];
         let (tbl, col) = match &term.expr {
             Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),

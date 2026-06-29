@@ -218,7 +218,14 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   tolerates any per-column direction; a `DISTINCT` b-tree is ascending-only; the default
   NULL ordering must hold). graphite now mirrors that suppression for plain-column ORDER
   BY terms, declining the whole node for positional / alias / expression / `COLLATE`
-  terms (left at their prior single-node rendering, never a new divergence).
+  terms (left at their prior single-node rendering, never a new divergence). A
+  multi-term `ORDER BY` whose *leading* term is the rowid / INTEGER PRIMARY KEY is
+  likewise served entirely by the full scan — because that key is unique no trailing
+  term can break a tie — so `ORDER BY id, b` skips the sort and its temp-btree node
+  exactly like a lone `ORDER BY id` (previously only the single-term form was
+  recognised; the trailing-rowid-*within-a-secondary-index* case, e.g. `ORDER BY b,
+  id` served by the `(b, rowid)` walk, remains a separate deferred `order_index_scan`
+  gap).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
