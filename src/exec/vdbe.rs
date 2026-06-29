@@ -509,9 +509,6 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         || sel.having.is_some()
         || !sel.compound.is_empty()
         || !sel.order_by.is_empty()
-        || sel.limit.is_some()
-        || sel.offset.is_some()
-        || sel.distinct
     {
         return Err(Error::Unsupported("VDBE spike: only constant SELECT lists"));
     }
@@ -566,7 +563,32 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         c.compile_expr_into(expr, i)?;
         columns.push(result_label(expr, alias, source, i));
     }
-    c.ops.push(Op::ResultRow { start: 0, count });
+    // A FROM-less SELECT yields at most one row, so `LIMIT`/`OFFSET` reduce to a
+    // compile-time emit/suppress decision and `DISTINCT` is a no-op (one row is
+    // trivially distinct). Fold both bounds to constants — a non-constant form
+    // defers exactly as the scan path does — and suppress the row when `LIMIT` is
+    // exactly 0 or a positive `OFFSET` skips past it. A negative `LIMIT` is
+    // unlimited and a non-positive `OFFSET` skips nothing, both as in SQLite. The
+    // projection (and any `WHERE`) is still compiled even when suppressed, so a
+    // bad column reference defers to the tree-walker's error rather than being
+    // silently dropped (e.g. `SELECT x LIMIT 0` must still raise `no such column`).
+    let limit_zero = match &sel.limit {
+        None => false,
+        Some(e) => match fold_const_int(e) {
+            Some(n) => n == 0,
+            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
+        },
+    };
+    let offset_skips = match &sel.offset {
+        None => false,
+        Some(e) => match fold_const_int(e) {
+            Some(n) => n > 0,
+            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
+        },
+    };
+    if !(limit_zero || offset_skips) {
+        c.ops.push(Op::ResultRow { start: 0, count });
+    }
     let halt = c.ops.len();
     c.ops.push(Op::Halt);
     if let Some(at) = skip {

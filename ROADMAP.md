@@ -306,7 +306,10 @@ returns the tree-walker's results or declines to it — never a wrong answer.
   default-on** (**B7a/B7b**, tree-walker is the fallback oracle); bytecode
   `EXPLAIN` (**B8**). A `FROM`-less `SELECT … WHERE <pred>` runs here too: the
   predicate is gated before the projection (an `IfFalse` over the rowless row), so
-  a false/NULL predicate emits zero rows and never evaluates the SELECT list.
+  a false/NULL predicate emits zero rows and never evaluates the SELECT list. A
+  constant `LIMIT`/`OFFSET` folds at compile time (the single row is suppressed when
+  `LIMIT` is 0 or a positive `OFFSET` skips it; a negative `LIMIT`/`OFFSET` matches
+  SQLite's unlimited/no-skip), and `DISTINCT` is a no-op over one row.
 - **Joins on the VDBE** (**B5a/B5b-1**) — N-table inner joins plus 2-table and
   N-table `LEFT`/`RIGHT`/`FULL` nested-loop joins, with projection /
   WHERE-merged-ON / `DISTINCT` / `ORDER BY` / `LIMIT` / grouped-and-bare
