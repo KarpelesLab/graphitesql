@@ -343,8 +343,11 @@ returns the tree-walker's results or declines to it — never a wrong answer.
   view, a TVF, a derived subquery, or a CTE — `window_source_columns` /
   `window_join_source_columns` resolve each source's columns exactly as the base
   scan exposes them, then the shared `finish_from_rows` tail evaluates the frames.
-- **Misc operators** — three-argument `LIKE … ESCAPE`, `printf`/`format`
-  (both via `Op::Func`); positional `ORDER BY`/`GROUP BY` ordinals resolved
+- **Misc operators** — three-argument `LIKE … ESCAPE`, `printf`/`format`, and the
+  date/time library (`date`/`time`/`datetime`/`julianday`/`unixepoch`/`strftime`/
+  `timediff`, all via `Op::Func` over reconstructed argument values — `'now'`
+  reads the wall clock identically on both paths, never the `ctx`); positional
+  `ORDER BY`/`GROUP BY` ordinals resolved
   through `positional_int` (a signed/parenthesized/`COLLATE`-wrapped in-range
   ordinal names its output column on every path; an out-of-range or non-ordinal
   form defers so the tree-walker raises SQLite's exact range error; an ordinal

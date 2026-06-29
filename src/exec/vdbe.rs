@@ -470,6 +470,17 @@ fn is_pure_scalar_fn(name: &str, argc: usize) -> bool {
         // (no row/connection state): a format string plus zero or more values.
         // They route through `Op::Func` → `func::eval_scalar` → `datetime::printf`.
         "printf" | "format" => argc >= 1,
+        // Date/time functions operate purely on their argument *values* — each
+        // dispatches to `datetime::<fn>(&values)` with no `ctx` access, so the
+        // VDBE's value round-trip reproduces the tree-walker exactly. The current
+        // time (`'now'`, or the no-time-value default forms) is read from the wall
+        // clock inside `datetime` — identically on both paths — not from the
+        // connection, so it stays out of the `ctx`-free contract (it is merely
+        // non-deterministic, never wrong). `strftime` needs at least its format
+        // argument; `timediff` is exactly two-argument.
+        "date" | "time" | "datetime" | "julianday" | "unixepoch" => true,
+        "strftime" => argc >= 1,
+        "timediff" => argc == 2,
         // Variadic scalar min/max need at least two args (one arg is the aggregate).
         "min" | "max" => argc >= 2,
         _ => false,
