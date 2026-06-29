@@ -220,11 +220,16 @@ exhausted for bounded (single-fix) work.
   tree) — a resolver-ordering change, not a one-line hoist. Low-impact (the
   message body is identical; only which of two errors fires first differs).
 
-- **A-misc-2 — `*` / `t.*` over an unaliased self-join.** `SELECT * FROM t, t`
-  is ambiguous on the *database-qualified* expansion (`main.t.a`, `temp.t.a`);
-  graphite reports the bare `t.a`. Needs the owning database name threaded onto
-  `ColumnInfo` (it currently carries only table/alias). The non-wildcard
-  ambiguous-column message already echoes the written qualifier exactly.
+- **A-misc-2 — `*` / `t.*` over a same-named self-join — DONE.** Both facets now
+  match SQLite. (1) The database-qualified expansion error names the source
+  origin (`main.t.a`, `temp.t.a`, attached `aux.t.a`, or `*.x.a` for a
+  derived/CTE source). (2) The dual false-positive is fixed: `SELECT * FROM t,
+  aux.t` (same table name, *different* databases) no longer mis-reports
+  `ambiguous column name: main.t.a` — it keeps all columns, because the
+  ambiguity test now compares the full `(database, table, name)` origin.
+  `eval::ColumnInfo` carries a `schema: Option<String>` stamped at base-table
+  `FROM`-resolution (`main`/`temp`/attached name), which rides through
+  NATURAL/USING coalescing. Differentially verified — `tests/ambiguous_wildcard_origin.rs`.
 
 - **A-tvf-bare — eponymous TVFs used as a bare table name (no parens).**
   `FROM generate_series`, `FROM json_each`, `FROM pragma_table_info` (without a

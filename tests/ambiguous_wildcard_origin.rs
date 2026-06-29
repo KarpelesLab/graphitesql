@@ -68,6 +68,22 @@ fn wildcard_ambiguity_names_source_origin() {
         "CREATE TABLE t(a); CREATE TABLE u(a); SELECT * FROM t,u WHERE a=1",
         // Aliased self-join is unambiguous — both run fine.
         "CREATE TABLE t(a); SELECT * FROM t t1, t t2",
+        // Same name in *different databases* is NOT ambiguous: the origin
+        // `(db, table, name)` differs, so `*` keeps every column (regression
+        // guard for A-misc-2 — graphite used to reject these as `main.t.a`).
+        "ATTACH ':memory:' AS aux; CREATE TABLE aux.t(a,c); INSERT INTO aux.t VALUES(3,4); \
+         CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); SELECT * FROM t, aux.t",
+        "ATTACH ':memory:' AS aux; CREATE TABLE aux.t(a,c); INSERT INTO aux.t VALUES(3,4); \
+         CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); SELECT * FROM aux.t, t",
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); \
+         CREATE TEMP TABLE u(a,c); INSERT INTO u VALUES(9,8); SELECT * FROM t, temp.u",
+        // …but a real self-join still collides even with an unrelated other-db
+        // table present, and an attached self-join names that db's origin.
+        "ATTACH ':memory:' AS aux; CREATE TABLE aux.t(a,c); \
+         CREATE TABLE t(a,b); SELECT * FROM t, t, aux.t",
+        "ATTACH ':memory:' AS aux; CREATE TABLE aux.t(a,b); SELECT * FROM aux.t, aux.t",
+        // Explicit `main.` self-join is the same origin as the unqualified one.
+        "CREATE TABLE t(a,b); SELECT * FROM t, main.t",
     ] {
         assert_eq!(err_tail("sqlite3", sql), err_tail(g, sql), "for {sql}");
     }

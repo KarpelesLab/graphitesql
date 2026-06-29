@@ -1568,6 +1568,7 @@ impl Connection {
                         table: n_tabs[i].clone(),
                         affinity: n_affs[i],
                         collation: n_colls[i],
+                        schema: None,
                         hidden: false,
                     })
                     .collect();
@@ -1707,6 +1708,7 @@ impl Connection {
                     table: tabs[i].clone(),
                     affinity: affs[i],
                     collation: colls[i],
+                    schema: None,
                     hidden: false,
                 })
                 .collect();
@@ -1793,6 +1795,7 @@ impl Connection {
                         table: combined_tables[i].clone(),
                         affinity: combined_aff[i],
                         collation: combined_coll[i],
+                        schema: None,
                         hidden: false,
                     })
                     .collect();
@@ -1863,6 +1866,7 @@ impl Connection {
                         table: oj_tables[i].clone(),
                         affinity: oj_aff[i],
                         collation: oj_coll[i],
+                        schema: None,
                         hidden: false,
                     })
                     .collect();
@@ -1912,6 +1916,7 @@ impl Connection {
                     table: combined_tables[i].clone(),
                     affinity: combined_aff[i],
                     collation: combined_coll[i],
+                    schema: None,
                     hidden: false,
                 })
                 .collect();
@@ -6044,6 +6049,7 @@ impl Connection {
                 table: String::from(label),
                 affinity: c.affinity,
                 collation: c.collation,
+                schema: None,
                 hidden: false,
             })
             .collect();
@@ -6906,6 +6912,7 @@ impl Connection {
             table: String::from("excluded"),
             affinity: c.affinity,
             collation: c.collation,
+            schema: None,
             hidden: false,
         }));
         // Evaluate the DO UPDATE WHERE and SET right-hand sides against the
@@ -9116,6 +9123,7 @@ impl Connection {
                 table: label.clone(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                schema: None,
                 hidden: false,
             })
             .collect();
@@ -9419,6 +9427,7 @@ impl Connection {
                 table: label.to_string(),
                 affinity: c.affinity,
                 collation: c.collation,
+                schema: None,
                 hidden: false,
             })
             .collect();
@@ -9450,6 +9459,7 @@ impl Connection {
                 table: cte.name.clone(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                schema: None,
                 hidden: false,
             })
             .collect())
@@ -9735,6 +9745,7 @@ impl Connection {
                     table: label.clone(),
                     affinity,
                     collation,
+                    schema: None,
                     hidden: false,
                 }
             })
@@ -12152,6 +12163,7 @@ impl Connection {
                 table: label.to_string(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                schema: None,
                 hidden: false,
             })
             .collect();
@@ -13568,6 +13580,7 @@ impl Connection {
                 table: String::new(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                schema: None,
                 hidden: false,
             });
             for (row, v) in rows.iter_mut().zip(values) {
@@ -16144,6 +16157,7 @@ impl Connection {
                     table: qualifier.to_string(),
                     affinity: eval::Affinity::from_type(None),
                     collation: crate::value::Collation::default(),
+                    schema: None,
                     hidden: false,
                 })
                 .collect());
@@ -16168,6 +16182,7 @@ impl Connection {
                 table: qualifier.to_string(),
                 affinity: *aff,
                 collation: *coll,
+                schema: None,
                 hidden: false,
             })
             .collect())
@@ -17756,6 +17771,7 @@ impl Connection {
             table: label.clone(),
             affinity,
             collation: crate::value::Collation::default(),
+            schema: None,
             hidden: false,
         };
         // A hidden column (`json_each`/`json_tree`'s `json`/`root` input columns)
@@ -17765,6 +17781,7 @@ impl Connection {
             table: label.clone(),
             affinity,
             collation: crate::value::Collation::default(),
+            schema: None,
             hidden: true,
         };
         match lname.as_str() {
@@ -17977,6 +17994,7 @@ impl Connection {
                     table: label.clone(),
                     affinity,
                     collation,
+                    schema: None,
                     hidden: false,
                 }
             })
@@ -18688,9 +18706,16 @@ impl Connection {
                 .map_err(|e| Self::qualify_missing(tref.schema.as_deref(), &tref.name, e))?;
             return Ok((cols, input.into_iter().map(|r| r.values).collect()));
         }
-        let meta = self
+        let mut meta = self
             .table_meta(&tref.name, tref.alias.as_deref())
             .map_err(|e| Self::qualify_missing(tref.schema.as_deref(), &tref.name, e))?;
+        // A main-database base-table join source: stamp the `main` origin so the
+        // `*`-wildcard ambiguity check distinguishes it from a same-named column
+        // in another database (`SELECT * FROM t, aux.t`).
+        let db_label = self.db_label(DbRef::Main);
+        for col in &mut meta.columns {
+            col.schema = Some(db_label.clone());
+        }
         let rows = if meta.without_rowid {
             self.scan_without_rowid(&meta)?
         } else {
@@ -19255,7 +19280,13 @@ impl Connection {
         alias: Option<&str>,
     ) -> Result<(Vec<ColumnInfo>, Vec<InputRow>)> {
         let (schema, backend) = self.db_parts(db);
-        let meta = self.table_meta_in(schema, name, alias)?;
+        let mut meta = self.table_meta_in(schema, name, alias)?;
+        // Stamp each base-table column with its database of origin so the
+        // `*`-wildcard ambiguity check can tell `main.t.a` from `aux.t.a`.
+        let db_label = self.db_label(db);
+        for col in &mut meta.columns {
+            col.schema = Some(db_label.clone());
+        }
         let source = backend.source();
         let encoding = source.header().text_encoding;
         // WITHOUT ROWID: walk the clustered index b-tree (records stored
@@ -19351,6 +19382,7 @@ impl Connection {
                 table: label.clone(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                schema: None,
                 hidden: false,
             })
             .collect();
@@ -19390,6 +19422,7 @@ impl Connection {
             table: label.clone(),
             affinity,
             collation: crate::value::Collation::default(),
+            schema: None,
             hidden: false,
         };
         let columns = alloc::vec![col("pgno", Integer), col("data", Blob)];
@@ -19423,6 +19456,7 @@ impl Connection {
             table: label.clone(),
             affinity,
             collation: crate::value::Collation::default(),
+            schema: None,
             hidden: false,
         };
         let columns = alloc::vec![
@@ -19597,6 +19631,7 @@ impl Connection {
                 table: label.clone(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                schema: None,
                 hidden: false,
             })
             .collect();
@@ -20333,6 +20368,7 @@ impl Connection {
                     table: String::new(),
                     affinity: eval::Affinity::Blob,
                     collation: crate::value::Collation::Binary,
+                    schema: None,
                     hidden: false,
                 });
             }
@@ -20527,6 +20563,7 @@ impl Connection {
                         table: String::new(),
                         affinity: eval::Affinity::Blob,
                         collation: crate::value::Collation::Binary,
+                        schema: None,
                         hidden: false,
                     });
                 }
@@ -20561,6 +20598,7 @@ impl Connection {
                             table: String::new(),
                             affinity: eval::Affinity::Blob,
                             collation: crate::value::Collation::Binary,
+                            schema: None,
                             hidden: false,
                         });
                     }
@@ -20859,6 +20897,7 @@ impl Connection {
                 table: String::new(),
                 affinity: eval::Affinity::Blob,
                 collation: crate::value::Collation::default(),
+                schema: None,
                 hidden: false,
             });
         }
@@ -21588,6 +21627,7 @@ impl Connection {
                 table: table_label.clone(),
                 affinity: eval::Affinity::from_type(c.type_name.as_deref()),
                 collation: column_collation(c),
+                schema: None,
                 hidden: false,
             })
             .collect();
@@ -22100,6 +22140,7 @@ fn schema_table_meta(label: &str) -> TableMeta {
         table: label.to_string(),
         affinity: aff,
         collation: crate::value::Collation::default(),
+        schema: None,
         hidden: false,
     };
     let columns = alloc::vec![
@@ -22235,7 +22276,16 @@ fn validate_unambiguous_columns(
     if has_wildcard {
         for (i, a) in columns.iter().enumerate() {
             if let Some(b) = columns[i + 1..].iter().find(|b| {
-                a.name.eq_ignore_ascii_case(&b.name) && a.table.eq_ignore_ascii_case(&b.table)
+                a.name.eq_ignore_ascii_case(&b.name)
+                    && a.table.eq_ignore_ascii_case(&b.table)
+                    // Two same-named, same-table columns are only ambiguous when
+                    // they share a database of origin: `SELECT * FROM t, aux.t`
+                    // keeps `main.t.a` and `aux.t.a` distinct.
+                    && match (&a.schema, &b.schema) {
+                        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+                        (None, None) => true,
+                        _ => false,
+                    }
             }) {
                 // SQLite qualifies a `*`-expanded ambiguous column by its source's
                 // origin: `<db>.<table>` for a real table (`main.t.a`), or `*.<alias>`

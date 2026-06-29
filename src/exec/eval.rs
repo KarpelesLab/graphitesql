@@ -239,6 +239,12 @@ pub struct ColumnInfo {
     pub name: String,
     /// The table (or alias) the column belongs to.
     pub table: String,
+    /// The database the column's source table lives in (`main`/`temp`/an attached
+    /// name), when it is a real base table. `None` for synthetic/derived/subquery/
+    /// CTE/view columns that carry no database origin. Used by the `*`-wildcard
+    /// ambiguity check to keep same-named columns from different databases distinct
+    /// (`SELECT * FROM t, aux.t`).
+    pub schema: Option<String>,
     /// The column's type affinity (Blob/NONE when unknown).
     pub affinity: Affinity,
     /// The column's declared collating sequence (`BINARY` by default).
