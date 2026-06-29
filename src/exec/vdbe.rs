@@ -435,12 +435,16 @@ fn is_pure_scalar_fn(name: &str, argc: usize) -> bool {
         // String functions.
         "lower" | "upper" | "length" | "octet_length" | "trim" | "ltrim" | "rtrim" | "substr"
         | "substring" | "replace" | "instr" | "hex" | "unhex" | "quote" | "char" | "unicode"
-        | "concat" | "concat_ws" | "soundex" => true,
+        | "concat" | "concat_ws" | "soundex" | "unistr" | "unistr_quote" => true,
+        // Build-constant strings — graphite's reported version / source identifier.
+        // Both are nullary and read no row or connection state, so the VDBE's
+        // `Op::Func` reproduces them exactly.
+        "sqlite_version" | "sqlite_source_id" => argc == 0,
         // Numeric functions.
         "abs" | "round" | "sign" | "ceil" | "ceiling" | "floor" | "trunc" | "exp" | "ln"
         | "log" | "log2" | "log10" | "sqrt" | "pow" | "power" | "mod" | "sin" | "cos" | "tan"
-        | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "radians" | "degrees"
-        | "pi" => true,
+        | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
+        | "atanh" | "radians" | "degrees" | "pi" => true,
         // Type / null helpers.
         // `likelihood` is excluded (unlike the no-op `likely`/`unlikely`): its
         // prepare-time check that the second argument is a floating-point literal
@@ -463,9 +467,17 @@ fn is_pure_scalar_fn(name: &str, argc: usize) -> bool {
         // excluded: the VDBE passes `eval_scalar` literal-reconstructed values, so
         // the argument's JSON subtype — carried by its source expression — is
         // lost. They fall back to the tree-walker, which sees the real expression.
-        "json" | "json_valid" | "json_type" | "json_array_length" | "json_extract" | "jsonb" => {
-            true
-        }
+        // `json_error_position(X)` parses X's *text* and reports the first syntax
+        // error offset; it reads no JSON subtype off the source expression, so the
+        // VDBE's reconstructed value reproduces it exactly (unlike the
+        // subtype-aware constructors above, it is safe here).
+        "json"
+        | "json_valid"
+        | "json_type"
+        | "json_array_length"
+        | "json_extract"
+        | "jsonb"
+        | "json_error_position" => true,
         // `printf`/`format` are pure string formatting over their argument values
         // (no row/connection state): a format string plus zero or more values.
         // They route through `Op::Func` → `func::eval_scalar` → `datetime::printf`.

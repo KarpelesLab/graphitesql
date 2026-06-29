@@ -343,10 +343,15 @@ returns the tree-walker's results or declines to it — never a wrong answer.
   view, a TVF, a derived subquery, or a CTE — `window_source_columns` /
   `window_join_source_columns` resolve each source's columns exactly as the base
   scan exposes them, then the shared `finish_from_rows` tail evaluates the frames.
-- **Misc operators** — three-argument `LIKE … ESCAPE`, `printf`/`format`, and the
+- **Misc operators** — three-argument `LIKE … ESCAPE`, `printf`/`format`, the
   date/time library (`date`/`time`/`datetime`/`julianday`/`unixepoch`/`strftime`/
   `timediff`, all via `Op::Func` over reconstructed argument values — `'now'`
-  reads the wall clock identically on both paths, never the `ctx`); positional
+  reads the wall clock identically on both paths, never the `ctx`), and the rest
+  of the pure-value scalar library on the same `Op::Func` path: the
+  inverse-hyperbolic math (`asinh`/`acosh`/`atanh`), the Unicode-escape helpers
+  (`unistr`/`unistr_quote`), the JSON syntax probe (`json_error_position`, which
+  reads only its argument's text, not a JSON subtype), and the build-constant
+  identifiers (`sqlite_version`/`sqlite_source_id`); positional
   `ORDER BY`/`GROUP BY` ordinals resolved
   through `positional_int` (a signed/parenthesized/`COLLATE`-wrapped in-range
   ordinal names its output column on every path; an out-of-range or non-ordinal
