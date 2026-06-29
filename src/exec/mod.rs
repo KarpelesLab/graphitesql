@@ -12664,18 +12664,26 @@ impl Connection {
         // access order does not already cluster the key columns. Render it for the
         // clean single-table bare-`SCAN` case, placed after the SCAN line and
         // before any ORDER BY node — matching sqlite's node order.
+        let mut group_btree_suppresses_order = false;
         if single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str()) {
-            if let Some(kind) = self.group_distinct_btree(sel, &meta, &from.first.name) {
+            if let Some((kind, suppress)) = self.group_distinct_btree(sel, &meta, &from.first.name)
+            {
                 let id = *next_id;
                 *next_id += 1;
                 out.push((id, parent, alloc::format!("USE TEMP B-TREE FOR {kind}")));
+                group_btree_suppresses_order = suppress;
             }
         }
         // ORDER BY that we satisfy with an in-memory sort — unless the scan already
-        // yields the requested order (no temp b-tree then, like sqlite). When a
-        // seek walks a *prefix* of the ORDER BY in order, only the trailing terms
-        // are sorted, which sqlite reports as "LAST n TERM[S] OF ORDER BY".
-        if !sel.order_by.is_empty() && self.order_satisfied_by_scan(sel, params).is_none() {
+        // yields the requested order (no temp b-tree then, like sqlite), or the
+        // grouping b-tree above already delivers exactly this order (sqlite folds
+        // the sort into it, emitting no separate ORDER BY node). When a seek walks
+        // a *prefix* of the ORDER BY in order, only the trailing terms are sorted,
+        // which sqlite reports as "LAST n TERM[S] OF ORDER BY".
+        if !sel.order_by.is_empty()
+            && !group_btree_suppresses_order
+            && self.order_satisfied_by_scan(sel, params).is_none()
+        {
             let n = sel.order_by.len();
             // Only the trailing terms are sorted when the access walks a prefix of
             // the ORDER BY in order: a non-covering index walk (mixed direction,
@@ -14602,9 +14610,12 @@ impl Connection {
                 .is_none_or(|w| where_cols_covered(w, meta, idx_cols))
     }
 
-    /// For a single-table, no-`ORDER BY`, plain-`SCAN` query that groups or
-    /// deduplicates by plain columns, decide whether `EXPLAIN QUERY PLAN` should
-    /// print `USE TEMP B-TREE FOR GROUP BY` / `FOR DISTINCT`, and which.
+    /// For a single-table, plain-`SCAN` query that groups (`GROUP BY`) or
+    /// deduplicates (`DISTINCT`) over plain columns, decide whether `EXPLAIN
+    /// QUERY PLAN` should print `USE TEMP B-TREE FOR GROUP BY` / `FOR DISTINCT`
+    /// (and which), plus — when an `ORDER BY` is present — whether sqlite reuses
+    /// that same grouping b-tree to satisfy the sort (suppressing the separate
+    /// `USE TEMP B-TREE FOR ORDER BY` node).
     ///
     /// SQLite materializes a transient b-tree whenever the access order does not
     /// already cluster the key columns. Over a bare table scan that is *always*
@@ -14616,13 +14627,23 @@ impl Connection {
     /// it`, a scan-line shape graphite does not produce for grouping, so the whole
     /// plan would diverge). `WITHOUT ROWID` tables are clustered by their primary
     /// key — a separate, deferred case — and are excluded here.
+    ///
+    /// The returned `bool` is `suppress_order_by`: `true` iff the query's `ORDER
+    /// BY` key list is *exactly* the grouping key list and the grouping b-tree
+    /// already delivers that order. `GROUP BY` can be walked either direction (any
+    /// per-column ASC/DESC); a `DISTINCT` b-tree is ascending-only (all terms must
+    /// be ASC). Either way the default NULL ordering must be in force (no explicit
+    /// `NULLS`). When the `ORDER BY` contains a term we cannot resolve to a plain
+    /// column of this table (positional, alias, expression, `COLLATE`), we return
+    /// `None` entirely — declining the whole node — rather than risk a plan that
+    /// emits the grouping node with a mis-decided sort node.
     fn group_distinct_btree(
         &self,
         sel: &Select,
         meta: &TableMeta,
         tname: &str,
-    ) -> Option<&'static str> {
-        if !sel.order_by.is_empty() || !sel.compound.is_empty() || meta.without_rowid {
+    ) -> Option<(&'static str, bool)> {
+        if !sel.compound.is_empty() || meta.without_rowid {
             return None;
         }
         // Exactly one of GROUP BY / DISTINCT, over plain columns of this table.
@@ -14687,7 +14708,47 @@ impl Connection {
                 }
             }
         }
-        Some(kind)
+        // Decide whether sqlite folds the `ORDER BY` into this grouping b-tree.
+        let suppress_order_by = if sel.order_by.is_empty() {
+            false
+        } else {
+            // Every `ORDER BY` term must resolve to a plain column of this table.
+            // A positional index, result-set alias, expression, or `COLLATE`
+            // wrapper takes us off sqlite's fast path — decline the whole node
+            // (return `None`) rather than guess at suppression.
+            let mut ob_cols = Vec::with_capacity(sel.order_by.len());
+            let mut any_nulls = false;
+            let mut any_desc = false;
+            for term in &sel.order_by {
+                any_nulls |= term.nulls_first.is_some();
+                any_desc |= term.descending;
+                match &term.expr {
+                    Expr::Column {
+                        schema: None,
+                        table,
+                        column,
+                        ..
+                    } if table
+                        .as_deref()
+                        .is_none_or(|t| t.eq_ignore_ascii_case(tname)) =>
+                    {
+                        // `?` returns `None` (decline) when the name is not a
+                        // table column — e.g. a bare result-set alias.
+                        let pos = meta
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(column))?;
+                        ob_cols.push(pos);
+                    }
+                    _ => return None,
+                }
+            }
+            // sqlite reuses the grouping b-tree only for an exact key-list match
+            // under the default NULL ordering; `DISTINCT` additionally requires
+            // every term ascending (its b-tree is ascending-only).
+            ob_cols == key_cols && !any_nulls && (kind == "GROUP BY" || !any_desc)
+        };
+        Some((kind, suppress_order_by))
     }
 
     /// Choose a full secondary index to satisfy a query by a *covering scan* —

@@ -211,7 +211,14 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   sqlite — restricted to the clean bare-scan case (`GROUP BY`/`DISTINCT` on the rowid
   alone needs no node; a secondary index leading with the first key, which sqlite would
   walk instead of plain-scanning, is declined so the plan never desyncs), with the
-  covering-index-but-not-leading and `WITHOUT ROWID` shapes still deferred).
+  covering-index-but-not-leading and `WITHOUT ROWID` shapes still deferred). When an
+  `ORDER BY` accompanies that bare-scan grouping/dedup, sqlite reuses the grouping
+  b-tree to satisfy the sort — suppressing the separate `USE TEMP B-TREE FOR ORDER BY`
+  node exactly when the ORDER BY key list equals the grouping key list (`GROUP BY`
+  tolerates any per-column direction; a `DISTINCT` b-tree is ascending-only; the default
+  NULL ordering must hold). graphite now mirrors that suppression for plain-column ORDER
+  BY terms, declining the whole node for positional / alias / expression / `COLLATE`
+  terms (left at their prior single-node rendering, never a new divergence).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

@@ -187,6 +187,55 @@ fn group_by_distinct_temp_btree_matches_sqlite() {
 }
 
 #[test]
+fn group_distinct_order_by_suppression_matches_sqlite() {
+    // Slice 2: with an `ORDER BY` present over a bare-`SCAN` grouping/dedup query,
+    // sqlite still materializes the grouping b-tree, and reuses it for the sort
+    // (suppressing the separate `USE TEMP B-TREE FOR ORDER BY` node) exactly when
+    // the ORDER BY key list equals the grouping key list. `GROUP BY` tolerates any
+    // per-column direction; a `DISTINCT` b-tree is ascending-only. The default
+    // NULL ordering must be in force. These queries carry an `ORDER BY`, so the row
+    // *order* is fully specified — compare rows in order, not just as a set.
+    let have_sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    if !have_sqlite {
+        return;
+    }
+    let ddl = "CREATE TABLE t(a,b);";
+    let data = format!("{ddl} INSERT INTO t VALUES (3,7),(1,2),(2,3),(1,2),(3,9),(2,3);");
+    let c = conn(&data);
+
+    // (query, the trailing EQP details we expect, in order)
+    let cases: &[&str] = &[
+        // GROUP BY: exact key match suppresses the ORDER BY node, any direction.
+        "SELECT a FROM t GROUP BY a ORDER BY a",
+        "SELECT a FROM t GROUP BY a ORDER BY a DESC",
+        "SELECT a,b FROM t GROUP BY a,b ORDER BY a,b",
+        "SELECT a,b FROM t GROUP BY a,b ORDER BY a DESC, b",
+        // GROUP BY: non-exact ORDER BY keeps both nodes.
+        "SELECT a,b FROM t GROUP BY a,b ORDER BY a",
+        "SELECT a,b FROM t GROUP BY a,b ORDER BY b,a",
+        "SELECT a FROM t GROUP BY a ORDER BY b",
+        // GROUP BY: explicit NULLS defeats the reuse → both nodes.
+        "SELECT a FROM t GROUP BY a ORDER BY a NULLS LAST",
+        // DISTINCT: exact + all-ASC suppresses; any DESC keeps both.
+        "SELECT DISTINCT a FROM t ORDER BY a",
+        "SELECT DISTINCT a FROM t ORDER BY a DESC",
+        "SELECT DISTINCT a,b FROM t ORDER BY a,b",
+        "SELECT DISTINCT a,b FROM t ORDER BY a,b DESC",
+    ];
+
+    for &q in cases {
+        let g = g_eqp(&c, q);
+        assert_eq!(g, sqlite_eqp(&data, q), "EQP diverged for: {q}");
+        // ORDER BY is present → exact, ordered row comparison.
+        assert_eq!(
+            g_rows(&c, q).trim(),
+            sqlite_out(&format!("{data} {q};")).trim(),
+            "rows diverged for: {q}"
+        );
+    }
+}
+
+#[test]
 fn temp_btree_node_only_for_bare_scan() {
     // Guard the gate: graphite must NOT bolt a node onto a non-bare scan line.
     // `GROUP BY b` over a covering index on `(a,b)` (graphite picks the covering
