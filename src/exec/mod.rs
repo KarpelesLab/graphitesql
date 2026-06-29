@@ -1151,10 +1151,46 @@ impl Connection {
             }
         }
 
-        // A multi-value `IN` is deliberately *not* handled here: SQLite seeks once
-        // per sorted value, but the tree-walker walks the `IN` list in written
-        // order, so deferring would not match SQLite either (a separate, pre-
-        // existing `IN`-order gap). Leaving it on the VDBE changes nothing.
+        // A multi-value `IN` on a plain secondary index's leading column: SQLite
+        // seeks once per sorted value, walking the index in key order. The
+        // tree-walker reproduces that (a covering `IN` reads the whole index in
+        // order; a non-covering `in_seek_fetch` sorts its keys), so defer it. A
+        // rowid/IPK `IN` walks the table b-tree in rowid order — the same order the
+        // VDBE scan produces — so it stays. A single-value `IN` is one key (rowid
+        // order within it = the scan order), so it stays too; only `len >= 2` with
+        // no NULL key (a NULL makes the tree-walker decline to a plain scan) spans
+        // multiple keys.
+        let multi = |vals: &[Value]| vals.iter().filter(|v| !matches!(v, Value::Null)).count() >= 2;
+        // `col IN (…)` walked via a plain or a (pred-guaranteed) partial index.
+        if let Some((col, values)) = find_in_constraint(where_expr, &meta.columns, params) {
+            if multi(&values)
+                && meta.ipk != Some(col)
+                && indexes.iter().any(|idx| {
+                    idx.key_exprs.is_none()
+                        && idx.cols.first() == Some(&col)
+                        && (idx.partial.is_none() || partial_pred_guaranteed(idx, where_expr))
+                })
+            {
+                return Ok(true);
+            }
+        }
+        // `<expr> IN (…)` walked via an expression index keyed by that expression.
+        for idx in &indexes {
+            let Some(exprs) = &idx.key_exprs else {
+                continue;
+            };
+            let [key_expr] = exprs.as_slice() else {
+                continue;
+            };
+            if !partial_pred_guaranteed(idx, where_expr) {
+                continue;
+            }
+            if let Some(values) = find_expr_in_values(key_expr, where_expr, params) {
+                if multi(&values) {
+                    return Ok(true);
+                }
+            }
+        }
 
         // (2) A covering `IS NOT NULL` seek (spans every non-NULL key).
         let mut isnotnull_cols: Vec<usize> = Vec::new();
@@ -11917,8 +11953,24 @@ impl Connection {
     ) -> Result<Vec<InputRow>> {
         let src = self.backend.source();
         let encoding = src.header().text_encoding;
+        // SQLite seeks an `IN` list in *sorted key order*, so the rows (absent an
+        // `ORDER BY`) come out in index order, not list order. Sort the keys the
+        // same way — component-wise under the index collations — so a non-covering
+        // `IN` seek reproduces that order (within one key, `index_seek_rowids`
+        // already returns rowids ascending, matching the trailing-rowid index sort).
+        let mut keys: Vec<Vec<Value>> = keys.to_vec();
+        keys.sort_by(|a, b| {
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                let c = colls.get(i).copied().unwrap_or_default();
+                let o = crate::value::cmp_values_coll(x, y, c);
+                if o != core::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            core::cmp::Ordering::Equal
+        });
         let mut rowids: Vec<i64> = Vec::new();
-        for key in keys {
+        for key in &keys {
             for rid in crate::btree::index_seek_rowids(src, root, key, colls)? {
                 if !rowids.contains(&rid) {
                     rowids.push(rid);
@@ -12053,8 +12105,15 @@ impl Connection {
         // Column `IN (…)`: rowid b-tree, a plain index, or a partial index whose
         // leading column is the IN column (and whose predicate the WHERE proves).
         if let Some((col, values)) = find_in_constraint(where_expr, &meta.columns, params) {
-            // `x IN (NULL)` is never true/usable as a seek key.
-            if !values.iter().any(|v| matches!(v, Value::Null)) {
+            // A `NULL` list entry is never a usable seek key (`x = NULL` is never
+            // true), so drop it and seek the rest: `x IN (5, NULL, 2)` matches
+            // exactly the rows `x IN (5, 2)` does, and `run_core` re-applies the
+            // full `IN` (superset-safe). Seek only when a non-NULL key remains.
+            let values: Vec<Value> = values
+                .into_iter()
+                .filter(|v| !matches!(v, Value::Null))
+                .collect();
+            if !values.is_empty() {
                 let encoding = self.backend.source().header().text_encoding;
                 let aff = meta.columns[col].affinity;
 

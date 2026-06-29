@@ -131,10 +131,9 @@ fn single_key_seeks_keep_rowid_order() {
     }
     // A single index key (an equality or a one-element `IN`) returns its rows in
     // rowid order — exactly the VDBE scan order — so these stay on the VDBE and
-    // still match. (A *multi-value* `IN` is a separate, pre-existing ordering gap:
-    // SQLite seeks in sorted value order while the tree-walker walks the list in
-    // written order, so neither engine reproduces it — it is intentionally left
-    // untouched here.)
+    // still match. (A *multi-value* `IN` spans several keys and so walks the index;
+    // it is deferred to the tree-walker and checked in
+    // `multi_value_in_seeks_in_index_order` below.)
     let d = "CREATE TABLE t(a, b); CREATE INDEX ia ON t(a); \
              INSERT INTO t VALUES(5,1),(2,2),(8,3),(2,4),(5,5);";
     for q in [
@@ -167,6 +166,63 @@ fn covering_isnotnull_seeks_the_index() {
     ] {
         check(d, q);
     }
+}
+
+#[test]
+fn multi_value_in_seeks_in_index_order() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    // A multi-value `IN` selects several index keys: SQLite seeks them in sorted
+    // key order, so the rows arrive in index order, not list order and not rowid
+    // order. The VDBE defers to the tree-walker (which sorts its seek keys), so
+    // covering and non-covering seeks both reproduce SQLite's order. A `NULL` list
+    // entry is dropped before the seek (`a IN (5, NULL)` matches the same rows as
+    // `a IN (5)`), and duplicate / absent values are folded.
+    let d = "CREATE TABLE t(a, b); CREATE INDEX ia ON t(a); \
+             INSERT INTO t VALUES(5,1),(2,2),(8,3),(2,4),(5,5),(7,6);";
+    for q in [
+        // List order differs from index order; covering and non-covering.
+        "SELECT a, b FROM t WHERE a IN (5, 2)",
+        "SELECT a FROM t WHERE a IN (8, 2, 5)",
+        "SELECT a, b FROM t WHERE a IN (7, 5, 2, 8)",
+        // A NULL key is dropped; the rest still seek in index order.
+        "SELECT a, b FROM t WHERE a IN (5, NULL, 2)",
+        "SELECT a, b FROM t WHERE a IN (NULL, 5)",
+        // Duplicate and absent values fold away.
+        "SELECT a, b FROM t WHERE a IN (5, 2, 5)",
+        "SELECT a, b FROM t WHERE a IN (99, 5, 2, 100)",
+        // Aggregates / grouping over the seek.
+        "SELECT count(*) FROM t WHERE a IN (5, 2)",
+        "SELECT a, count(*) FROM t WHERE a IN (5, 2) GROUP BY a",
+        // A single non-NULL key stays a single-key seek (rowid order = index order
+        // for one key) and still matches.
+        "SELECT a, b FROM t WHERE a IN (5, NULL)",
+        // An explicit ORDER BY is access-path-independent.
+        "SELECT a, b FROM t WHERE a IN (5, 2) ORDER BY b",
+    ] {
+        check(d, q);
+    }
+
+    // A rowid / INTEGER PRIMARY KEY `IN` walks the table b-tree in rowid order —
+    // the VDBE scan order — so it stays on the VDBE and matches without deferral.
+    let dr = "CREATE TABLE t(id INTEGER PRIMARY KEY, a); \
+              INSERT INTO t VALUES(5,50),(2,20),(8,80),(7,70);";
+    for q in [
+        "SELECT id, a FROM t WHERE id IN (8, 2, 5)",
+        "SELECT id, a FROM t WHERE id IN (8, NULL, 2)",
+    ] {
+        check(dr, q);
+    }
+
+    // A partial index (predicate proven by the WHERE) and an expression index are
+    // walked in key order too.
+    let dp = "CREATE TABLE t(a, b); CREATE INDEX ip ON t(a) WHERE b > 0; \
+              INSERT INTO t VALUES(5,1),(2,2),(8,-1),(2,4),(5,5);";
+    check(dp, "SELECT a, b FROM t WHERE a IN (5, 2) AND b > 0");
+    let de = "CREATE TABLE t(a, b); CREATE INDEX ie ON t(abs(a)); \
+              INSERT INTO t VALUES(5,1),(-2,2),(8,3),(2,4),(-5,5);";
+    check(de, "SELECT a, b FROM t WHERE abs(a) IN (5, 2)");
 }
 
 #[test]

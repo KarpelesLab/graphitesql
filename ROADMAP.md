@@ -395,11 +395,21 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   NULL` over an index on `a` now reads `USING COVERING INDEX a (a>?)` (NULLs sort
   first), while the near-full-table non-covering `SELECT *`/`SELECT b` stay a
   plain `SCAN` on both sides — EQP and rows byte-exact vs sqlite3 3.50.4
-  (`tests/vdbe_secondary_index_order.rs`). (Deferred, both pre-existing and not
-  regressed: a *multi-value* `IN` seek — SQLite walks the list in sorted value
-  order, the tree-walker in written order, so neither engine reproduces it; and a
-  parameterized range bound `a > ?`, whose constant isn't known at the
-  defer-decision point, so it stays on the VDBE as before.)
+  (`tests/vdbe_secondary_index_order.rs`).
+  A follow-up extends the same defer to a **multi-value `IN`** on a secondary
+  index: SQLite seeks the list in sorted key order (so the rows arrive in index
+  order), so `in_seek_fetch` now sorts its seek keys under the index collations,
+  and `vdbe_seek_returns_index_order` defers a `col IN (…)` whose column leads a
+  plain, partial (predicate proven), or expression index — covering and
+  non-covering, with NULL list entries dropped before the seek (`a IN (5,NULL,2)`
+  matches the same rows as `a IN (5,2)`) and duplicate/absent values folded. A
+  rowid/IPK `IN` keeps walking the table b-tree in rowid order (= the VDBE scan
+  order) so it stays on the VDBE, and a single non-NULL key stays a single-key
+  seek. (Deferred, pre-existing and not regressed: a parameterized range bound
+  `a > ?`, whose constant isn't known at the defer-decision point, so it stays on
+  the VDBE; and the `ORDER BY a DESC` duplicate-key tiebreak — the VDBE's stable
+  sort keeps equal-key rows in rowid order where SQLite's reverse index walk
+  emits them in reverse-rowid order — an orthogonal DESC-sort quirk.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
