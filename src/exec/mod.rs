@@ -15795,6 +15795,16 @@ impl Connection {
                     // the sole possible error and is safe to surface here without
                     // masking a missing column.
                     self.reject_unresolved_functions_in_select(sel)?;
+                    // A scalar call inside an expression-position subquery is
+                    // likewise compiled without an arity recheck and may never
+                    // execute (empty / fully-filtered outer table), so validate
+                    // those too. The scan scope isn't materialized yet here, but
+                    // an uncorrelated FROM-less subquery — the only shape the
+                    // const arm inlines — is column-clean regardless of it, so an
+                    // empty scope checks exactly those and safely skips anything
+                    // correlated (no false positive, missing-column precedence
+                    // preserved).
+                    self.reject_unresolved_functions_in_subqueries(sel, &[])?;
                     return Ok(result);
                 }
             }

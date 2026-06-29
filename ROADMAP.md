@@ -405,7 +405,15 @@ returns the tree-walker's results or declines to it — never a wrong answer.
   whose terms resolve is likewise a no-op (one row can't reorder) and runs here —
   the key is compiled to force type/column resolution, then discarded; a positional
   ordinal (`ORDER BY 2`, needs range-checking) or an output-alias reference still
-  defers to the tree-walker.
+  defers to the tree-walker. An uncorrelated `FROM`-less scalar subquery in
+  expression position (`(SELECT <e> [WHERE <p>])`) compiles inline: the result
+  register defaults to NULL, an optional `WHERE` gates it (`IfFalse` over the
+  rowless row), and the projected value overwrites the NULL when the row
+  qualifies — so a filtered-out subquery yields NULL. A scalar call buried in such
+  a subquery is arity-checked at prepare time even when the outer row never
+  executes (the VDBE-success path now runs the subquery function validator too);
+  an aggregate / multi-column / `ORDER BY`/`LIMIT`/`OFFSET` or `FROM`-bearing
+  subquery body still defers.
 - **Joins on the VDBE** (**B5a/B5b-1**) — N-table inner joins plus 2-table and
   N-table `LEFT`/`RIGHT`/`FULL` nested-loop joins, with projection /
   WHERE-merged-ON / `DISTINCT` / `ORDER BY` / `LIMIT` / grouped-and-bare

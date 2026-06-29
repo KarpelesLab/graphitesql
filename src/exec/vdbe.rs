@@ -4615,6 +4615,64 @@ impl Compiler {
                 });
                 Ok(())
             }
+            // An uncorrelated, FROM-less scalar subquery `(SELECT <e> [WHERE <p>])`
+            // yields its single column's value for the one (rowless) row, or NULL
+            // when a `WHERE` predicate filters that row out. Inline it: default the
+            // result register to NULL, gate on the optional predicate, then
+            // overwrite it with the projected value when the row qualifies.
+            // Anything outside this grammar — a real `FROM`, `WITH`/window defs,
+            // `GROUP BY`/`HAVING`/compound, `ORDER BY`/`LIMIT`/`OFFSET`, a
+            // multi-column or aggregate projection, or a correlated column
+            // reference (which fails to resolve in this rowless scope) — propagates
+            // `Unsupported` and defers to the tree-walker, which evaluates or
+            // rejects it exactly as SQLite does.
+            Expr::Subquery(sel) => {
+                if sel.from.is_some()
+                    || !sel.ctes.is_empty()
+                    || !sel.window_defs.is_empty()
+                    || !sel.group_by.is_empty()
+                    || sel.having.is_some()
+                    || !sel.compound.is_empty()
+                    || !sel.order_by.is_empty()
+                    || sel.limit.is_some()
+                    || sel.offset.is_some()
+                {
+                    return Err(Error::Unsupported("VDBE: scalar subquery shape"));
+                }
+                // A scalar subquery must yield exactly one column; a multi-column
+                // inner (`(SELECT 1, 2)`) is an error SQLite raises at prepare —
+                // defer so the tree-walker reports it.
+                let [ResultColumn::Expr { expr: inner, .. }] = &sel.columns[..] else {
+                    return Err(Error::Unsupported("VDBE: scalar subquery arity"));
+                };
+                // An aggregate projection (`(SELECT max(5))`) needs the aggregate
+                // machinery the const path lacks — defer.
+                if is_aggregate_expr(inner) {
+                    return Err(Error::Unsupported("VDBE: aggregate scalar subquery"));
+                }
+                // Default to NULL: a `WHERE`-filtered (zero-row) subquery is NULL.
+                self.ops.push(Op::Null { dest });
+                let skip = match &sel.where_clause {
+                    Some(pred) => {
+                        let preg = self.compile_expr(pred)?;
+                        let at = self.ops.len();
+                        self.ops.push(Op::IfFalse {
+                            reg: preg,
+                            target: 0,
+                        });
+                        Some(at)
+                    }
+                    None => None,
+                };
+                self.compile_expr_into(inner, dest)?;
+                let end = self.ops.len();
+                if let Some(at) = skip {
+                    if let Op::IfFalse { target, .. } = &mut self.ops[at] {
+                        *target = end;
+                    }
+                }
+                Ok(())
+            }
             _ => Err(Error::Unsupported("VDBE spike: this expression")),
         }
     }
