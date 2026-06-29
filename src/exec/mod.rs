@@ -14984,9 +14984,9 @@ impl Connection {
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
         eqs.retain(|(_, v)| !matches!(v, Value::Null));
-        // The columns the chosen seek walks in index-ascending order (those after
-        // any equality prefix), with their index collations.
-        let (walk_cols, walk_colls): (&[usize], &[crate::value::Collation]) = if !eqs.is_empty() {
+        // The chosen index and the length of its equality-pinned prefix. The seek
+        // walks the columns *after* that prefix in index-ascending order.
+        let (idx, prefix): (&IndexMeta, usize) = if !eqs.is_empty() {
             // Equality seek (try_index_lookup). A rowid/IPK equality returns at most
             // one row — a different path; bail to the cheap, correct sort.
             if meta
@@ -15012,7 +15012,7 @@ impl Connection {
                 .iter()
                 .take_while(|&&c| eqs.iter().any(|(col, _)| *col == c))
                 .count();
-            (&idx.cols[prefix..], &idx.collations[prefix..])
+            (idx, prefix)
         } else {
             // Range seek (try_index_range). Guard so the chosen index is exactly the
             // one the executor walks (see the doc comment).
@@ -15038,8 +15038,10 @@ impl Connection {
             if seekable.next().is_some() {
                 return None;
             }
-            (&idx.cols[..], &idx.collations[..])
+            (idx, 0)
         };
+        let walk_cols = &idx.cols[prefix..];
+        let walk_colls = &idx.collations[prefix..];
         // Count the leading ORDER BY terms the walk already produces: each must be a
         // plain column of this table, in the walk's uniform direction (default
         // NULLs), matching the next walked column under its own collation.
@@ -15067,6 +15069,37 @@ impl Connection {
                 break;
             }
             k += 1;
+        }
+        // Trailing rowid: once the walk has consumed the index's whole key, it
+        // continues in rowid order, so an ORDER BY term that is the INTEGER PRIMARY
+        // KEY right after the full key is already ordered too. The rowid is stored
+        // ascending, so this only holds when every walked column is ascending (a
+        // DESC column would put the rowid out of phase under a reversed walk) and
+        // the index is a named one with accurate directions (not an automatic
+        // UNIQUE/PK index). Mirrors `order_index_scan`'s no-WHERE trailing credit.
+        if k == walk_cols.len()
+            && k < sel.order_by.len()
+            && !idx.is_auto
+            && idx.descending[prefix..].iter().all(|d| !d)
+        {
+            let term = &sel.order_by[k];
+            if let Expr::Column { table, column, .. } = &term.expr {
+                let tbl_ok = table
+                    .as_deref()
+                    .is_none_or(|tn| tn.eq_ignore_ascii_case(label));
+                let pos = meta
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(column));
+                if tbl_ok
+                    && meta.ipk == pos
+                    && pos.is_some()
+                    && term.descending == descending
+                    && term.nulls_first.is_none()
+                {
+                    k += 1;
+                }
+            }
         }
         Some((k, descending))
     }

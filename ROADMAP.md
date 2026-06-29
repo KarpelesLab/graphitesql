@@ -235,9 +235,14 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   same credit (its entries are still `(key…, rowid)`, with multiple NULLs broken by
   the rowid), since a `CREATE UNIQUE INDEX` carries accurate per-column directions;
   an *automatic* UNIQUE/PK index is excluded (its directions are not reconstructed,
-  so a `UNIQUE(b DESC)` constraint must not be mis-credited) and, together with the
-  trailing rowid under a `WHERE`-seek path, remains a deferred `order_index_scan`
-  gap.
+  so a `UNIQUE(b DESC)` constraint must not be mis-credited) — a deferred
+  `order_index_scan` gap. The same trailing-rowid credit now also applies on the
+  `WHERE`-*seek* path (`seek_order_prefix`): once a seek has walked an index's whole
+  key (after any equality-pinned prefix) the walk continues in rowid order, so
+  `WHERE b>2 ORDER BY b, id` or `WHERE b=3 ORDER BY id` over an index on `(b)` is
+  served by the seek with no temp-btree node, with the same DESC / mixed-direction /
+  automatic-index exclusions. (Eliding an equality-*pinned* leading `ORDER BY` term —
+  `WHERE b=3 ORDER BY b, id`, where `b` is constant — stays a separate deferred gap.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
