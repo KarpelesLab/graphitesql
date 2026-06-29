@@ -280,9 +280,18 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   `rowid`-alias and implicit-rowid spellings). The collapse is scoped to the pure
   all-equality case: an `IN`-list disjunct (`id=3 OR id IN(4,5)`), a non-rowid disjunct
   (`id=3 OR a=5`), or any mix keeps sqlite's `MULTI-INDEX OR` — `rowid_eq_or_chain`
-  rejects the non-equality leaf (`tests/eqp_rowid_or_seek.rs`). (Deferred: the
-  pre-existing `rowid IN`/OR-seek `ORDER BY` sort that is not yet elided, since the
-  executor seeks in list order, not sorted rowid order.) A same-column equality OR-chain on a
+  rejects the non-equality leaf (`tests/eqp_rowid_or_seek.rs`). A `rowid`/INTEGER-PK
+  `IN`-list (or the equivalent same-column equality OR-chain) combined with `ORDER BY`
+  on that rowid now elides the `USE TEMP B-TREE FOR ORDER BY`, matching sqlite, which
+  seeks the listed rowids in *sorted* order: `in_seek_order` is the single shared
+  predicate driving both the EQP elision and the executor — when it fires, the rowid
+  seek sorts its keys so rows emit in ascending rowid order and `run_core` reverses for
+  `DESC` (`id IN(5,1,3) ORDER BY id [ASC|DESC]`, the OR-chain spelling, `ORDER BY rowid`,
+  a multi-term `ORDER BY id, b` — `tests/eqp_rowid_in_order_by_seek.rs`). (Deferred,
+  with a tripwire test: the same `ORDER BY` elision for a *secondary*-index `IN`
+  (`a IN(..) ORDER BY a`, which sqlite serves from the ordered covering index), for a
+  `WITHOUT ROWID` PK, and for a bare-`rowid` alias table with no INTEGER PRIMARY KEY —
+  graphite still builds the temp b-tree there; rows stay correct.) A same-column equality OR-chain on a
   *secondary* index column (`a = 1 OR a = 2 OR …`, every disjunct a bare equality on
   the *same* column) is likewise the equivalent of `a IN (1, 2, …)` and collapses to a
   single `SEARCH … USING INDEX` seek (or a `SCAN` when the column has no index), exactly

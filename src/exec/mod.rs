@@ -11152,8 +11152,17 @@ impl Connection {
         // specific index, so it forbids this fast path. (`run_core` re-applies the
         // full WHERE, so the seeked rows are a valid superset.)
         if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
-            if let Some(rowids) = rowid_seek_constraint(where_expr, &meta.columns, meta.ipk, params)
+            if let Some(mut rowids) =
+                rowid_seek_constraint(where_expr, &meta.columns, meta.ipk, params)
             {
+                // When a sole `ORDER BY` on the rowid/IPK is satisfied by walking the
+                // values in ascending rowid order (`in_seek_order`), seek them sorted
+                // so `run_core` can elide the temp b-tree (it reverses for DESC). The
+                // recogniser is in lockstep with this sort — both key off the same
+                // `find_in_constraint` IPK `IN`/OR shape.
+                if self.in_seek_order(sel, params).is_some() {
+                    rowids.sort_unstable();
+                }
                 let encoding = self.backend.source().header().text_encoding;
                 let mut cur = TableCursor::new(self.backend.source(), meta.root);
                 let mut out = Vec::new();
@@ -15144,9 +15153,89 @@ impl Connection {
         }
         // A `WHERE` seek that walks an index in key order satisfies the ORDER BY
         // when *every* term matches the walked columns (B0b-iii).
+        if let Some(d) = self.in_seek_order(sel, params) {
+            return Some(d);
+        }
         match self.seek_order_prefix(sel, params) {
             Some((k, descending)) if k == sel.order_by.len() => Some(descending),
             _ => None,
+        }
+    }
+
+    /// A rowid/IPK `IN`-list — or the equivalent same-column equality `OR`-chain,
+    /// which [`find_in_constraint`] collapses to the same shape — seeks the table
+    /// b-tree once per value. When the executor walks those values in ascending rowid
+    /// order ([`Self::try_index_in`] sorts them when this returns `Some`), the rows
+    /// arrive in rowid order, so a sole leading `ORDER BY` term on the rowid / INTEGER
+    /// PRIMARY KEY column needs no temp b-tree — sqlite plans it the same way. Returns
+    /// `Some(descending)` for that leading term. Because the rowid/IPK is unique, any
+    /// trailing `ORDER BY` terms can never break a tie, so a multi-term
+    /// `ORDER BY id, b` is satisfied exactly like a lone `ORDER BY id` (mirrors
+    /// [`Self::rowid_ordered_scan`]). Scoped to the rowid/IPK seek column; a secondary
+    /// index or `WITHOUT ROWID` PK `IN`/OR seek still sorts.
+    fn in_seek_order(&self, sel: &Select, params: &Params) -> Option<bool> {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let t = &from.first;
+        if t.subquery.is_some()
+            || t.tvf_args.is_some()
+            || t.schema.is_some()
+            || t.index_hint.is_some()
+        {
+            return None;
+        }
+        let where_expr = sel.where_clause.as_ref()?;
+        if sel.order_by.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || self.has_aggregate(sel)
+            || window::has_window(sel)
+        {
+            return None;
+        }
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+        if meta.without_rowid {
+            return None;
+        }
+        // The WHERE must be a rowid/IPK `IN`-list (or collapsed equality OR-chain),
+        // matching the rowid fast path in `try_index_in`: the IN column is the IPK and
+        // no list entry is NULL.
+        let ipk = meta.ipk?;
+        let (col, vals) = find_in_constraint(where_expr, &meta.columns, params)?;
+        if col != ipk || vals.iter().any(|v| matches!(v, Value::Null)) {
+            return None;
+        }
+        // The leading ORDER BY term must be a plain (un-COLLATE'd) reference to the
+        // rowid / IPK column of this table; its uniqueness makes trailing terms
+        // irrelevant. A `COLLATE` wrapper is `Expr::Collate`, rejected by the match.
+        let term = &sel.order_by[0];
+        let (tbl, ocol) = match &term.expr {
+            Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
+            _ => return None,
+        };
+        if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
+            return None;
+        }
+        let shadowed = meta
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(ocol));
+        let is_rowid_alias = matches!(
+            ocol.to_ascii_lowercase().as_str(),
+            "rowid" | "_rowid_" | "oid"
+        ) && !shadowed;
+        let is_ipk = meta.columns[ipk].name.eq_ignore_ascii_case(ocol);
+        if is_rowid_alias || is_ipk {
+            Some(term.descending)
+        } else {
+            None
         }
     }
 
