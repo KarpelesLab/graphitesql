@@ -326,6 +326,19 @@ exhausted for bounded (single-fix) work.
   (`user_version=42`, `journal_mode=wal`, …) still route to `execute`.
   Differential test in `tests/cli_pragma_setter.rs`.
 
+- **A-pragma-noarg — argumentless / numeric-argument introspection PRAGMAs. DONE.**
+  A bare argument-taking query pragma (`PRAGMA table_info`, no `(name)`/`=name`)
+  named no object, so graphite raised `PRAGMA … requires a … name` where SQLite
+  returns an *empty* result. Likewise a numeric argument: SQLite coerces it to
+  text (`PRAGMA index_info(1)` looks up an object literally named `1`, finds none,
+  returns empty; `PRAGMA foreign_key_check(1)` → `no such table: 1`). Fixed in
+  `run_pragma` (`src/exec/mod.rs`): `pragma_arg_name` now returns
+  `Option<String>` (with integer→text coercion), and the row-returning getters
+  (`table_info`/`table_xinfo`, `index_list`, `index_info`/`index_xinfo`,
+  `foreign_key_list`) treat an absent/non-name argument as a name that matches
+  nothing → empty result. `foreign_key_check` keeps its `None` = check-all-tables
+  behaviour. Test: `tests/pragma_introspection.rs`.
+
 - **A-alter-rollback — ALTER-time rejection of a RENAME that breaks a dependent.**
   `DROP COLUMN` already rejects pre-mutation when a dependent view/trigger would
   break (it computes the post-drop shape before touching storage, so no rollback
@@ -603,6 +616,15 @@ standard, not the build:
   (`BINARY`/`NOCASE`/`RTRIM`, reverse-registration order) and does not implement
   `function_list`. Result-value semantics that *are* build-independent are pinned
   in `tests/value_semantics_diff.rs`.
+- **`PRAGMA table_list` row order.** SQLite emits rows in its internal schema
+  hash-table iteration order (e.g. a two-table db created `foo, bar` lists
+  `bar, foo`; a view created last can sort ahead of earlier tables), which is
+  neither creation nor alphabetical order and depends on SQLite's exact string
+  hash and rehash thresholds. Reproducing it byte-for-byte would mean
+  reimplementing that hash — high-effort, fragile, and cosmetic — so graphite
+  emits a stable per-schema order (its own object order) instead. The row *set*
+  and every column value match; only inter-row ordering differs. Same
+  non-reproducible category as `collation_list` ordering above.
 
 ---
 

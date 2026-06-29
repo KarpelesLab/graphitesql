@@ -39,6 +39,45 @@ fn table_info_pk_is_the_one_based_ordinal() {
 }
 
 #[test]
+fn argument_pragmas_without_a_name_return_empty_not_error() {
+    // A bare argument-taking query pragma (no `(arg)` / `=arg`) names no object;
+    // SQLite returns an empty result rather than erroring. So does a numeric
+    // argument, which is coerced to text and names a non-existent object.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE foo(a INT PRIMARY KEY, b TEXT REFERENCES bar(id))")
+        .unwrap();
+    c.execute("CREATE TABLE bar(id INT PRIMARY KEY)").unwrap();
+    c.execute("CREATE INDEX ix ON foo(b)").unwrap();
+
+    for sql in [
+        "PRAGMA table_info",
+        "PRAGMA table_xinfo",
+        "PRAGMA index_list",
+        "PRAGMA index_info",
+        "PRAGMA index_xinfo",
+        "PRAGMA foreign_key_list",
+        "PRAGMA table_info(1)",
+        "PRAGMA index_list(1)",
+        "PRAGMA index_info(1)",
+        "PRAGMA foreign_key_list(1)",
+    ] {
+        let r = c
+            .query(sql)
+            .unwrap_or_else(|e| panic!("`{sql}` should not error: {e}"));
+        assert!(
+            r.rows.is_empty(),
+            "`{sql}` should yield no rows, got {:?}",
+            r.rows
+        );
+    }
+
+    // The named form still returns rows (no regression).
+    assert!(!rows(&c, "PRAGMA table_info(foo)").is_empty());
+    assert!(!rows(&c, "PRAGMA index_info(ix)").is_empty());
+    assert!(!rows(&c, "PRAGMA foreign_key_list(foo)").is_empty());
+}
+
+#[test]
 fn index_list_origin_distinguishes_pk_from_unique() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a UNIQUE, b PRIMARY KEY)")

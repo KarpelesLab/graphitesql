@@ -2590,11 +2590,12 @@ impl Connection {
         let table = match &p.value {
             Some(Expr::Column { column, .. }) => column.clone(),
             Some(Expr::Literal(Literal::Str(s))) => s.clone(),
-            _ => {
-                return Err(Error::Error(
-                    "PRAGMA table_info requires a table name".into(),
-                ))
-            }
+            // SQLite coerces a numeric argument to its text form; a bare
+            // `PRAGMA table_info` (or other non-name argument) names no table.
+            // Either way the lookup below finds nothing and returns an empty
+            // result rather than erroring, matching SQLite.
+            Some(Expr::Literal(Literal::Integer(n))) => n.to_string(),
+            _ => String::new(),
         };
         // The schema catalog is queryable but has no stored CREATE statement;
         // report its fixed five columns, as SQLite does for `sqlite_master` /
@@ -2957,19 +2958,26 @@ impl Connection {
         )
     }
 
-    /// The single name argument of a `PRAGMA foo(name)` / `PRAGMA foo = name`.
-    fn pragma_arg_name(p: &Pragma) -> Result<String> {
+    /// The single name argument of a `PRAGMA foo(name)` / `PRAGMA foo = name`,
+    /// or `None` for the bare argumentless form. SQLite coerces a numeric
+    /// argument to its text form (so `PRAGMA index_info(1)` looks up an object
+    /// literally named "1", which simply does not exist); a non-name argument
+    /// likewise names nothing.
+    fn pragma_arg_name(p: &Pragma) -> Option<String> {
         match &p.value {
-            Some(Expr::Column { column, .. }) => Ok(column.clone()),
-            Some(Expr::Literal(Literal::Str(s))) => Ok(s.clone()),
-            _ => Err(Error::Error("PRAGMA requires a name argument".into())),
+            None => None,
+            Some(Expr::Column { column, .. }) => Some(column.clone()),
+            Some(Expr::Literal(Literal::Str(s))) => Some(s.clone()),
+            Some(Expr::Literal(Literal::Integer(n))) => Some(n.to_string()),
+            Some(_) => Some(String::new()),
         }
     }
 
     /// `PRAGMA index_list(table)` → `(seq, name, unique, origin, partial)`, newest
     /// index first (as SQLite lists them).
     fn pragma_index_list(&self, p: &Pragma) -> Result<QueryResult> {
-        let table = Self::pragma_arg_name(p)?;
+        // A bare / non-name argument names no table → empty result (SQLite parity).
+        let table = Self::pragma_arg_name(p).unwrap_or_default();
         let objs: Vec<_> = self.schema.indexes_on(&table).collect();
 
         // To label an automatic index's origin `pk` vs `u`, find the PRIMARY KEY's
@@ -3055,7 +3063,8 @@ impl Connection {
 
     /// `PRAGMA index_info(index)` → `(seqno, cid, name)` for each indexed column.
     fn pragma_index_info(&self, p: &Pragma, extended: bool) -> Result<QueryResult> {
-        let index = Self::pragma_arg_name(p)?;
+        // A bare / non-name argument names no index → empty result (SQLite parity).
+        let index = Self::pragma_arg_name(p).unwrap_or_default();
         let columns: Vec<String> = if extended {
             ["seqno", "cid", "name", "desc", "coll", "key"]
                 .iter()
@@ -3193,7 +3202,8 @@ impl Connection {
     /// `PRAGMA foreign_key_list(table)` →
     /// `(id, seq, table, from, to, on_update, on_delete, match)`.
     fn pragma_foreign_key_list(&self, p: &Pragma) -> Result<QueryResult> {
-        let table = Self::pragma_arg_name(p)?;
+        // A bare / non-name argument names no table → empty result (SQLite parity).
+        let table = Self::pragma_arg_name(p).unwrap_or_default();
         let columns: Vec<String> = [
             "id",
             "seq",
@@ -3293,7 +3303,7 @@ impl Connection {
     fn pragma_foreign_key_check(&self, p: &Pragma) -> Result<QueryResult> {
         use crate::schema::ObjectType;
         let tables: Vec<String> = match &p.value {
-            Some(_) => alloc::vec![Self::pragma_arg_name(p)?],
+            Some(_) => alloc::vec![Self::pragma_arg_name(p).unwrap_or_default()],
             None => self
                 .schema
                 .objects()
