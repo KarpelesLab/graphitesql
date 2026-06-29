@@ -152,3 +152,31 @@ fn rowid_isnull_still_scans() {
     check(d, "SELECT * FROM t WHERE id IS NULL");
     check(d, "SELECT * FROM t WHERE a IS NULL");
 }
+
+#[test]
+fn without_rowid_secondary_isnull_seeks() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    // A `col IS NULL` on a WITHOUT ROWID table's secondary index seeks the index
+    // (its records carry the trailing PRIMARY KEY columns) exactly as on a rowid
+    // table. The PRIMARY KEY itself is NOT NULL, so `k IS NULL` cannot match and
+    // both scan. (A *composite* covering seek that returns several rows is omitted
+    // here: graphite emits them in PK order and sqlite in index order — a separate,
+    // pre-existing WITHOUT ROWID ordering quirk unrelated to the IS NULL seek.)
+    let d1 = "CREATE TABLE w(k TEXT PRIMARY KEY, v, u) WITHOUT ROWID; \
+              CREATE INDEX iv ON w(v); \
+              INSERT INTO w VALUES('a',NULL,1),('b',2,2),('c',NULL,3);";
+    check(d1, "SELECT * FROM w WHERE v IS NULL");
+    check(d1, "SELECT count(*) FROM w WHERE v IS NULL");
+    check(d1, "SELECT k FROM w WHERE v IS NULL");
+    check(d1, "SELECT * FROM w WHERE k IS NULL");
+
+    // Composite secondary index: a NULL/NULL prefix (empty result) and a
+    // NULL-then-value prefix (single row) — both order-insensitive.
+    let d2 = "CREATE TABLE w(k TEXT PRIMARY KEY, v, u) WITHOUT ROWID; \
+              CREATE INDEX ivu ON w(v, u); \
+              INSERT INTO w VALUES('a',NULL,1),('b',2,2),('c',NULL,NULL);";
+    check(d2, "SELECT k FROM w WHERE v IS NULL AND u IS NULL");
+    check(d2, "SELECT k, u FROM w WHERE v IS NULL AND u = 1");
+}

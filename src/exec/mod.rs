@@ -10937,7 +10937,11 @@ impl Connection {
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
         eqs.retain(|(_, v)| !matches!(v, Value::Null));
-        if eqs.is_empty() {
+        // `col IS NULL` is a seekable NULL-key equality (see `collect_isnull_cols`),
+        // mirroring the rowid-table seek in `try_index_lookup`.
+        let mut is_null_cols: Vec<usize> = Vec::new();
+        collect_isnull_cols(where_expr, &meta.columns, &mut is_null_cols);
+        if eqs.is_empty() && is_null_cols.is_empty() {
             return Ok(None);
         }
         let pk: Vec<usize> = meta.storage_order[..meta.pk_len].to_vec();
@@ -10957,14 +10961,18 @@ impl Connection {
             if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
             }
-            // Equality prefix over the index's leading columns.
+            // Equality prefix over the index's leading columns (a `col IS NULL`
+            // contributes a NULL key component).
             let mut key = Vec::new();
             let mut colls = Vec::new();
             for (i, &c) in idx.cols.iter().enumerate() {
-                let Some((_, v)) = eqs.iter().find(|(col, _)| *col == c) else {
+                if let Some((_, v)) = eqs.iter().find(|(col, _)| *col == c) {
+                    key.push(meta.columns[c].affinity.coerce(v.clone()));
+                } else if is_null_cols.contains(&c) {
+                    key.push(Value::Null);
+                } else {
                     break;
-                };
-                key.push(meta.columns[c].affinity.coerce(v.clone()));
+                }
                 colls.push(idx.collations.get(i).copied().unwrap_or_default());
             }
             if key.is_empty() {
@@ -12962,7 +12970,7 @@ impl Connection {
                 }
                 let mut matched = Vec::new();
                 for &c in &idx.cols {
-                    if eqs.iter().any(|(col, _)| *col == c) {
+                    if eqs.iter().any(|(col, _)| *col == c) || is_null_cols.contains(&c) {
                         matched.push(c);
                     } else {
                         break;

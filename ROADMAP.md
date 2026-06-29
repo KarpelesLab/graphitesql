@@ -352,10 +352,15 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   constraint is tracked *apart* from value equalities so the rowid / INTEGER PRIMARY
   KEY fast paths never fire for `rowid IS NULL` (sqlite SCANs there — the rowid is
   never NULL) and so `col = NULL` (never true) keeps bailing unchanged
-  (`tests/eqp_isnull_seek.rs`). (Residuals: `IS NULL` on a `WITHOUT ROWID`
-  secondary index still SCANs — a distinct pre-existing gap, rows stay correct — and
-  the same index-*choice* tiebreak above applies when two equal-prefix indexes
-  qualify.)
+  (`tests/eqp_isnull_seek.rs`). The same NULL-key seek now also extends to a
+  `WITHOUT ROWID` table's secondary index (`try_without_rowid_index_seek` + its
+  `eqp_access` branch, in lockstep): `col IS NULL` over a secondary index whose
+  records carry the trailing PK seeks the index (`SEARCH … USING [COVERING] INDEX
+  … (col=?)`) instead of scanning, while `pk IS NULL` (the PK is NOT NULL) keeps
+  scanning. (Residuals: the index-*choice* tiebreak above applies when two
+  equal-prefix indexes qualify; and a *multi-row composite covering* seek on a
+  `WITHOUT ROWID` table emits rows in PK order where sqlite emits index order — a
+  separate, pre-existing ordering quirk unrelated to IS NULL.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
