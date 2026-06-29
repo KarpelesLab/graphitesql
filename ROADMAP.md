@@ -231,9 +231,13 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   ascending rowid would fall out of phase: a `DESC` index column (reversed walk),
   a mixed-direction boundary (`ORDER BY b, id DESC`), or a non-rowid column sitting
   between the matched prefix and the rowid (`ORDER BY b, id` over `(b, c)`); those
-  keep their prior `LAST TERM OF ORDER BY` sort. The trailing rowid under a
-  `UNIQUE` index (sqlite's unique-prefix elision) and under a `WHERE`-seek path
-  remain separate deferred `order_index_scan` gaps.
+  keep their prior `LAST TERM OF ORDER BY` sort. A *named* `UNIQUE` index gets the
+  same credit (its entries are still `(key…, rowid)`, with multiple NULLs broken by
+  the rowid), since a `CREATE UNIQUE INDEX` carries accurate per-column directions;
+  an *automatic* UNIQUE/PK index is excluded (its directions are not reconstructed,
+  so a `UNIQUE(b DESC)` constraint must not be mis-credited) and, together with the
+  trailing rowid under a `WHERE`-seek path, remains a deferred `order_index_scan`
+  gap.
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

@@ -13209,6 +13209,7 @@ impl Connection {
                         partial: ci.where_clause.clone(),
                         key_exprs,
                         unique: ci.unique,
+                        is_auto: false,
                     });
                 }
                 // Automatic index: its columns are the n-th UNIQUE/PK set.
@@ -13225,6 +13226,7 @@ impl Connection {
                                 partial: None,
                                 key_exprs: None,
                                 unique: true,
+                                is_auto: true,
                             });
                         }
                     }
@@ -14400,14 +14402,18 @@ impl Connection {
             // KEY (i.e. the rowid) is ordered too — provided the matched columns are
             // all ascending, so the single forward/backward walk keeps the rowid in
             // phase (a DESC index column stores the rowid out of phase under
-            // reversal). Being unique, the rowid then fully determines the row
-            // order, so nothing after it needs sorting: `ORDER BY b, id` over an
-            // index on `(b)` is served entirely by the walk, like sqlite (no temp
-            // b-tree). A UNIQUE index is left to the separate unique-prefix path.
+            // reversal). The rowid then fully determines the row order, so nothing
+            // after it needs sorting: `ORDER BY b, id` over an index on `(b)` is
+            // served entirely by the walk, like sqlite (no temp b-tree). This holds
+            // for a UNIQUE index too (its entries are still `(key…, rowid)`, with
+            // multiple NULLs broken by rowid) — but only a *named* index has
+            // accurate per-column directions; an automatic UNIQUE/PK index assumes
+            // ascending, so it is excluded to avoid mis-crediting a `UNIQUE(b DESC)`
+            // constraint.
             let rowid_tail = match_len == idx.cols.len()
                 && ordered < uniform_prefix
                 && meta.ipk == Some(cols[ordered])
-                && !idx.unique
+                && !idx.is_auto
                 && idx.descending.iter().take(match_len).all(|d| !d);
             let sorted_suffix = if rowid_tail { 0 } else { cols.len() - ordered };
             let covering = self.index_covers_query(sel, &meta, &idx.cols);
@@ -24627,6 +24633,11 @@ struct IndexMeta {
     /// uniqueness enforcement for standalone/partial/expression indexes, which
     /// the inline-constraint `TableMeta::unique` sets do not cover.
     unique: bool,
+    /// `true` for an automatic UNIQUE/PK index (no backing `CREATE INDEX` SQL).
+    /// Its `descending` flags are assumed ascending (the declared per-column
+    /// direction of the constraint is not reconstructed here), so order-walk
+    /// reasoning that depends on accurate directions must stand down for it.
+    is_auto: bool,
 }
 
 impl Connection {

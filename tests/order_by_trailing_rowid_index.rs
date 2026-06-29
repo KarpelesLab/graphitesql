@@ -150,3 +150,60 @@ fn trailing_rowid_served_by_index_walk() {
         );
     }
 }
+
+#[test]
+fn trailing_rowid_served_by_named_unique_index_walk() {
+    let have_sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    if !have_sqlite {
+        return;
+    }
+
+    // Distinct non-NULL `b`, plus two NULLs (a UNIQUE index permits multiple NULLs;
+    // those rows are ordered among themselves by the trailing rowid in the walk).
+    let rows = " INSERT INTO t VALUES (3,7,1),(1,NULL,9),(2,3,5),(4,NULL,5),(5,1,2);";
+
+    let cases: &[(&str, &str, bool)] = &[
+        // A *named* UNIQUE index has accurate per-column directions, so the trailing
+        // rowid credit applies just like a non-unique index — the (b, rowid) walk
+        // even orders the multiple NULL-b rows by id.
+        (
+            "CREATE UNIQUE INDEX ub ON t(b);",
+            "SELECT * FROM t ORDER BY b, id",
+            true,
+        ),
+        (
+            "CREATE UNIQUE INDEX ub ON t(b);",
+            "SELECT * FROM t ORDER BY b DESC, id DESC",
+            true,
+        ),
+        // Mixed direction across the boundary → trailing term sorted.
+        (
+            "CREATE UNIQUE INDEX ub ON t(b);",
+            "SELECT * FROM t ORDER BY b, id DESC",
+            false,
+        ),
+        // A DESC unique index puts the ascending rowid out of phase → not credited.
+        (
+            "CREATE UNIQUE INDEX ubd ON t(b DESC);",
+            "SELECT * FROM t ORDER BY b, id",
+            false,
+        ),
+    ];
+
+    for &(idx, q, expect_no_node) in cases {
+        let full = format!("CREATE TABLE t(id INTEGER PRIMARY KEY,b,c); {idx}{rows}");
+        let c = conn(&full);
+        let g = g_eqp(&c, q);
+        assert_eq!(
+            !g.contains("TEMP B-TREE FOR ORDER BY") && !g.contains("LAST TERM OF ORDER BY"),
+            expect_no_node,
+            "node presence wrong for [{idx}] {q}\n  got: {g}"
+        );
+        assert_eq!(g, sqlite_eqp(&full, q), "EQP diverged for [{idx}] {q}");
+        assert_eq!(
+            g_rows(&c, q).trim(),
+            sqlite_out(&format!("{full} {q};")).trim(),
+            "rows diverged for [{idx}] {q}"
+        );
+    }
+}
