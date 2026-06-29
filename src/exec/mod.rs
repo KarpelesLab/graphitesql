@@ -12753,6 +12753,14 @@ impl Connection {
         if rowid_seek_constraint(where_expr, &meta.columns, meta.ipk, params).is_some() {
             return Ok(false);
         }
+        // A same-column equality OR-chain (`a = 1 OR a = 2 OR …`) is the equivalent of
+        // `a IN (1, 2, …)`: `find_in_constraint` recognises it, the executor's
+        // `try_index_in` seeks the single index for it, and `eqp_access` renders one
+        // `SEARCH … USING INDEX` (or a SCAN if `a` has no index). sqlite plans it the
+        // same way — never a MULTI-INDEX OR — so decline and let that single node show.
+        if find_in_constraint(where_expr, &meta.columns, params).is_some() {
+            return Ok(false);
+        }
         // Each disjunct must seek (its eqp_access is a SEARCH, not a SCAN).
         let mut details = Vec::with_capacity(disjuncts.len());
         for d in &disjuncts {
@@ -26865,9 +26873,40 @@ fn flatten_or<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+/// A single `column = const` equality leaf (either operand order, descending
+/// through redundant parens), returning the column index and the constant. A NULL
+/// constant is rejected: `col = NULL` is never true and is not a usable seek key.
+fn eq_col_const(e: &Expr, columns: &[ColumnInfo], params: &Params) -> Option<(usize, Value)> {
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = unparen(e)
+    else {
+        return None;
+    };
+    let (ci, v) =
+        if let (Some(ci), Some(v)) = (col_index(left, columns), const_value(right, params)) {
+            (ci, v)
+        } else if let (Some(ci), Some(v)) = (col_index(right, columns), const_value(left, params)) {
+            (ci, v)
+        } else {
+            return None;
+        };
+    if matches!(v, Value::Null) {
+        return None;
+    }
+    Some((ci, v))
+}
+
 /// Find a top-level `column IN (const, const, …)` conjunct (not `NOT IN`, all
 /// list entries constant), returning the column index and the constant values.
 /// Used to drive per-value index seeks; only the first such term is returned.
+///
+/// A same-column equality `OR`-chain (`c = a OR c = b OR …`, every disjunct a bare
+/// equality on the *same* column) is recognised as the equivalent `c IN (a, b, …)`,
+/// since sqlite plans the two identically — one index seek, not a `MULTI-INDEX OR`.
+/// A mixed-column chain (`a = 1 OR b = 2`) or any non-equality disjunct declines.
 fn find_in_constraint(
     e: &Expr,
     columns: &[ColumnInfo],
@@ -26896,6 +26935,26 @@ fn find_in_constraint(
                 vals.push(const_value(item, params)?);
             }
             Some((ci, vals))
+        }
+        // `c = a OR c = b OR …`: collapse a same-column equality chain to an IN-list.
+        Expr::Binary {
+            op: BinaryOp::Or, ..
+        } => {
+            let mut disjuncts: Vec<&Expr> = Vec::new();
+            flatten_or(e, &mut disjuncts);
+            let mut col: Option<usize> = None;
+            let mut vals = Vec::with_capacity(disjuncts.len());
+            for d in disjuncts {
+                let (ci, v) = eq_col_const(d, columns, params)?;
+                match col {
+                    None => col = Some(ci),
+                    Some(c) if c == ci => {}
+                    // A different column means this is a genuine multi-index OR.
+                    Some(_) => return None,
+                }
+                vals.push(v);
+            }
+            Some((col?, vals))
         }
         _ => None,
     }

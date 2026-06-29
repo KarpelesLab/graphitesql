@@ -281,10 +281,22 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   all-equality case: an `IN`-list disjunct (`id=3 OR id IN(4,5)`), a non-rowid disjunct
   (`id=3 OR a=5`), or any mix keeps sqlite's `MULTI-INDEX OR` — `rowid_eq_or_chain`
   rejects the non-equality leaf (`tests/eqp_rowid_or_seek.rs`). (Deferred: the
-  secondary-column OR→single-index collapse `a=3 OR a=5` — entangled with cost-model
-  index choice — and the `WITHOUT ROWID` PK OR-chain collapse, both still
-  `MULTI-INDEX OR`; and the pre-existing `rowid IN`/OR-seek `ORDER BY` sort that is not
-  yet elided, since the executor seeks in list order, not sorted rowid order.)
+  `WITHOUT ROWID` PK OR-chain collapse, still `MULTI-INDEX OR`; and the pre-existing
+  `rowid IN`/OR-seek `ORDER BY` sort that is not yet elided, since the executor seeks
+  in list order, not sorted rowid order.) A same-column equality OR-chain on a
+  *secondary* index column (`a = 1 OR a = 2 OR …`, every disjunct a bare equality on
+  the *same* column) is likewise the equivalent of `a IN (1, 2, …)` and collapses to a
+  single `SEARCH … USING INDEX` seek (or a `SCAN` when the column has no index), exactly
+  as sqlite plans the IN-list: `find_in_constraint` now recognises the chain (via
+  `flatten_or` + an `eq_col_const` leaf that rejects mixed columns and NULL keys), so
+  the executor's existing `try_index_in` seeks the unioned values (a valid superset)
+  and `eqp_or_plan` declines, letting the single node render (`a=5 OR a=1 [OR a=8]`,
+  `(a=5 OR a=1) AND b>0`, reversed/parenthesised leaves; an unindexed `b=… OR b=…`
+  chain stays one `SCAN`; a mixed-column `a=5 OR b=2` keeps `MULTI-INDEX OR`). The
+  collapse tracks graphite's own `IN` path exactly, so the only residual vs sqlite is
+  the *pre-existing* `IN` covering-index choice (graphite picks the narrow `ia`, sqlite
+  the covering `iab`) — identical for `a IN (5,1)` and `a=5 OR a=1`, no new divergence
+  (`tests/eqp_secondary_or_seek.rs`).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
