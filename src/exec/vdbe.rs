@@ -499,12 +499,12 @@ fn is_pure_scalar_fn(name: &str, argc: usize) -> bool {
     }
 }
 
-/// Compile a constant-projection `SELECT` (no `FROM`/`WHERE`/aggregates) into a
-/// program. Returns `Unsupported` for anything outside the spike's grammar so the
-/// caller can fall back to the tree-walking executor.
+/// Compile a constant-projection `SELECT` (no `FROM`/aggregates) into a program,
+/// optionally filtered by a `WHERE` over rowless expressions. Returns
+/// `Unsupported` for anything outside the spike's grammar so the caller can fall
+/// back to the tree-walking executor.
 pub fn compile_const_select(sel: &Select) -> Result<Program> {
     if sel.from.is_some()
-        || sel.where_clause.is_some()
         || !sel.group_by.is_empty()
         || sel.having.is_some()
         || !sel.compound.is_empty()
@@ -534,6 +534,25 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         rowid_index: None,
         cursor_boundaries: None,
     };
+    // A FROM-less `SELECT … WHERE <pred>` evaluates the predicate once over the
+    // single (rowless) row and emits the projection only when it is true; a NULL
+    // or false predicate yields zero rows. Compile and gate on the predicate
+    // *before* the projections so a filtered row never evaluates the SELECT list
+    // (matching SQLite, e.g. `SELECT abs('x') WHERE 0` produces no row, no work).
+    // The predicate's scratch registers sit above the output block, so the gating
+    // `IfFalse` reads its register before any projection op can reuse it.
+    let skip = match &sel.where_clause {
+        Some(pred) => {
+            let preg = c.compile_expr(pred)?;
+            let at = c.ops.len();
+            c.ops.push(Op::IfFalse {
+                reg: preg,
+                target: 0,
+            });
+            Some(at)
+        }
+        None => None,
+    };
     let mut columns = Vec::new();
     for (i, rc) in sel.columns.iter().enumerate() {
         let ResultColumn::Expr {
@@ -548,7 +567,13 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         columns.push(result_label(expr, alias, source, i));
     }
     c.ops.push(Op::ResultRow { start: 0, count });
+    let halt = c.ops.len();
     c.ops.push(Op::Halt);
+    if let Some(at) = skip {
+        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
+            *target = halt;
+        }
+    }
     Ok(Program {
         ops: c.ops,
         n_registers: c.next_reg,

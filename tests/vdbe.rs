@@ -501,15 +501,42 @@ fn explain_lists_vdbe_bytecode() {
 
 #[test]
 fn falls_back_for_non_constant() {
-    // Anything beyond a constant SELECT list is Unsupported, so the engine can
-    // fall back to the tree-walker.
-    for q in ["SELECT * FROM t", "SELECT 1 WHERE 1=1", "SELECT count(*)"] {
+    // A `FROM` source or an aggregate over the rowless row is beyond the constant
+    // compiler, so the engine falls back to the tree-walker. (A bare `WHERE` over
+    // constant expressions IS handled — see `const_select_with_where`.)
+    for q in [
+        "SELECT * FROM t",
+        "SELECT count(*)",
+        "SELECT a FROM t WHERE a=1",
+    ] {
         let Statement::Select(sel) = parse_one(q).unwrap() else {
             panic!()
         };
         assert!(
             vdbe::compile_const_select(&sel).is_err(),
             "expected {q} to be unsupported by the spike"
+        );
+    }
+}
+
+#[test]
+fn const_select_with_where() {
+    // A FROM-less `SELECT … WHERE <pred>` compiles: the predicate gates the single
+    // rowless row via an `IfFalse` placed before the projection.
+    for q in [
+        "SELECT 1 WHERE 1=1",
+        "SELECT 1, 2 WHERE 'a'='a'",
+        "SELECT 1 WHERE 0",
+    ] {
+        let Statement::Select(sel) = parse_one(q).unwrap() else {
+            panic!()
+        };
+        let prog = vdbe::compile_const_select(&sel).expect("WHERE form should compile");
+        assert!(
+            prog.ops
+                .iter()
+                .any(|op| matches!(op, vdbe::Op::IfFalse { .. })),
+            "expected an IfFalse gate in {q}"
         );
     }
 }
