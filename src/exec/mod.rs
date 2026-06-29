@@ -11090,7 +11090,8 @@ impl Connection {
         // specific index, so it forbids this fast path. (`run_core` re-applies the
         // full WHERE, so the seeked rows are a valid superset.)
         if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
-            if let Some(rowids) = rowid_seek_constraint(where_expr, &meta.columns, params) {
+            if let Some(rowids) = rowid_seek_constraint(where_expr, &meta.columns, meta.ipk, params)
+            {
                 let encoding = self.backend.source().header().text_encoding;
                 let mut cur = TableCursor::new(self.backend.source(), meta.root);
                 let mut out = Vec::new();
@@ -12744,6 +12745,14 @@ impl Connection {
         if disjuncts.len() < 2 {
             return Ok(false);
         }
+        // A `rowid = a OR rowid = b OR …` chain seeks the rowid table b-tree as a
+        // single set of candidates (`eqp_access` renders it `SEARCH … USING INTEGER
+        // PRIMARY KEY (rowid=?)`), exactly as the executor's `rowid_seek_constraint`
+        // path does — sqlite plans it the same, not a MULTI-INDEX OR. Decline here so
+        // the single SEARCH node renders.
+        if rowid_seek_constraint(where_expr, &meta.columns, meta.ipk, params).is_some() {
+            return Ok(false);
+        }
         // Each disjunct must seek (its eqp_access is a SEARCH, not a SCAN).
         let mut details = Vec::with_capacity(disjuncts.len());
         for d in &disjuncts {
@@ -12925,7 +12934,7 @@ impl Connection {
         }
         // A `rowid`/`_rowid_`/`oid` `= N` or `IN (list)` seek wins (matches the
         // rowid fast path at the top of try_index_lookup), with or without an IPK.
-        if rowid_seek_constraint(where_expr, &meta.columns, params).is_some() {
+        if rowid_seek_constraint(where_expr, &meta.columns, meta.ipk, params).is_some() {
             return Ok(alloc::format!(
                 "SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"
             ));
@@ -27119,13 +27128,63 @@ fn is_rowid_ref(e: &Expr, columns: &[ColumnInfo]) -> bool {
             && !columns.iter().any(|c| c.name.eq_ignore_ascii_case(column)))
 }
 
-/// Detect a `rowid = const` equality or `rowid IN (list)` in `where_expr` (the
-/// rowid alias not shadowed by a real column), returning the candidate rowids to
-/// seek directly in the table b-tree. `run_core` re-applies the full WHERE, so a
-/// non-integer literal (`rowid = 5.5`) is a harmless superset.
+/// Whether `e` denotes the table's rowid: either a `rowid`/`_rowid_`/`oid` alias
+/// (not shadowed by a real column) or the explicit INTEGER PRIMARY KEY column
+/// itself, which *is* the rowid. Both seek the table b-tree directly by rowid.
+fn is_rowid_or_ipk(e: &Expr, columns: &[ColumnInfo], ipk: Option<usize>) -> bool {
+    is_rowid_ref(e, columns) || (ipk.is_some() && col_index(e, columns) == ipk)
+}
+
+/// The candidate rowids of a pure `rowid = a OR rowid = b OR …` equality chain
+/// (descending through `Paren`/`Or`), or `None` if any leaf is not a bare rowid
+/// equality. Deliberately rejects `IN`-list / range / unbounded leaves: sqlite only
+/// collapses an all-equality OR-chain into one rowid seek, keeping any other leaf as
+/// its own MULTI-INDEX OR branch. Used by [`rowid_seek_constraint`]'s `Or` arm.
+fn rowid_eq_or_chain(
+    e: &Expr,
+    columns: &[ColumnInfo],
+    ipk: Option<usize>,
+    params: &Params,
+) -> Option<Vec<i64>> {
+    match e {
+        Expr::Paren(inner) => rowid_eq_or_chain(inner, columns, ipk, params),
+        Expr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let mut l = rowid_eq_or_chain(left, columns, ipk, params)?;
+            let r = rowid_eq_or_chain(right, columns, ipk, params)?;
+            l.extend(r);
+            Some(l)
+        }
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            let other = if is_rowid_or_ipk(left, columns, ipk) {
+                right
+            } else if is_rowid_or_ipk(right, columns, ipk) {
+                left
+            } else {
+                return None;
+            };
+            Some(alloc::vec![eval::to_i64(&const_value(other, params)?)])
+        }
+        _ => None,
+    }
+}
+
+/// Detect a `rowid = const` equality or `rowid IN (list)` in `where_expr` — where
+/// `rowid` is the rowid alias (not shadowed by a real column) *or* the explicit
+/// INTEGER PRIMARY KEY column — returning the candidate rowids to seek directly in
+/// the table b-tree. `run_core` re-applies the full WHERE, so a non-integer literal
+/// (`rowid = 5.5`) is a harmless superset.
 fn rowid_seek_constraint(
     where_expr: &Expr,
     columns: &[ColumnInfo],
+    ipk: Option<usize>,
     params: &Params,
 ) -> Option<Vec<i64>> {
     match where_expr {
@@ -27133,17 +27192,32 @@ fn rowid_seek_constraint(
             op: BinaryOp::And,
             left,
             right,
-        } => rowid_seek_constraint(left, columns, params)
-            .or_else(|| rowid_seek_constraint(right, columns, params)),
-        Expr::Paren(inner) => rowid_seek_constraint(inner, columns, params),
+        } => rowid_seek_constraint(left, columns, ipk, params)
+            .or_else(|| rowid_seek_constraint(right, columns, ipk, params)),
+        // A `rowid = a OR rowid = b OR …` chain seeks the union of the per-disjunct
+        // rowids. Every disjunct must be a bare rowid *equality* (`rowid_eq_or_chain`
+        // rejects an `IN`, range, or unbounded leaf): sqlite collapses an all-equality
+        // OR-chain into a single rowid seek but keeps an `IN`-list disjunct as its own
+        // MULTI-INDEX OR branch, so matching that boundary keeps the EQP byte-exact.
+        Expr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let mut l = rowid_eq_or_chain(left, columns, ipk, params)?;
+            let r = rowid_eq_or_chain(right, columns, ipk, params)?;
+            l.extend(r);
+            Some(l)
+        }
+        Expr::Paren(inner) => rowid_seek_constraint(inner, columns, ipk, params),
         Expr::Binary {
             op: BinaryOp::Eq,
             left,
             right,
         } => {
-            let other = if is_rowid_ref(left, columns) {
+            let other = if is_rowid_or_ipk(left, columns, ipk) {
                 right
-            } else if is_rowid_ref(right, columns) {
+            } else if is_rowid_or_ipk(right, columns, ipk) {
                 left
             } else {
                 return None;
@@ -27155,7 +27229,7 @@ fn rowid_seek_constraint(
             list,
             negated: false,
             ..
-        } if is_rowid_ref(expr, columns) && !list.is_empty() => {
+        } if is_rowid_or_ipk(expr, columns, ipk) && !list.is_empty() => {
             let mut out = Vec::with_capacity(list.len());
             for item in list {
                 out.push(eval::to_i64(&const_value(item, params)?));

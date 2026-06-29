@@ -268,7 +268,23 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   (the IPK is in its expansion); an *expression* projection (`id+0`) does not (sqlite
   keeps its DISTINCT b-tree) and is left untouched. (Deferred, orthogonal: a no-`ORDER
   BY` `DISTINCT`/covering scan still emits rows in rowid order rather than sqlite's
-  index-walk order; and `WITHOUT ROWID` DISTINCT/grouping.)
+  index-walk order; and `WITHOUT ROWID` DISTINCT/grouping.) A pure
+  `rowid = a OR rowid = b OR …` equality OR-chain — the key being the `rowid` alias
+  *or* the explicit INTEGER PRIMARY KEY column — collapses to a single
+  `SEARCH … USING INTEGER PRIMARY KEY (rowid=?)` rather than a `MULTI-INDEX OR`, exactly
+  as sqlite plans it: `rowid_seek_constraint` now recognises the IPK column (not just
+  the alias) and an all-equality OR-chain (`rowid_eq_or_chain`), so the executor's
+  existing rowid fast path seeks the unioned candidates (a valid superset — `run_core`
+  re-applies the WHERE) and `eqp_or_plan` declines, letting the single SEARCH node
+  render (`SELECT * FROM t WHERE id=3 OR id=5 [OR id=2]`, `(id=3 OR id=5) AND a>0`, the
+  `rowid`-alias and implicit-rowid spellings). The collapse is scoped to the pure
+  all-equality case: an `IN`-list disjunct (`id=3 OR id IN(4,5)`), a non-rowid disjunct
+  (`id=3 OR a=5`), or any mix keeps sqlite's `MULTI-INDEX OR` — `rowid_eq_or_chain`
+  rejects the non-equality leaf (`tests/eqp_rowid_or_seek.rs`). (Deferred: the
+  secondary-column OR→single-index collapse `a=3 OR a=5` — entangled with cost-model
+  index choice — and the `WITHOUT ROWID` PK OR-chain collapse, both still
+  `MULTI-INDEX OR`; and the pre-existing `rowid IN`/OR-seek `ORDER BY` sort that is not
+  yet elided, since the executor seeks in list order, not sorted rowid order.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
