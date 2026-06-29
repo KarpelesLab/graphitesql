@@ -10794,6 +10794,68 @@ impl Connection {
         Ok(Some(out))
     }
 
+    /// IN-list / same-column equality OR-chain variant of
+    /// [`try_without_rowid_pk_seek`](Self::try_without_rowid_pk_seek): a
+    /// `k IN (a, b, …)` (or the equivalent `k = a OR k = b OR …`, which
+    /// [`find_in_constraint`] collapses to the same shape) on the *leading* PK column
+    /// seeks the clustered b-tree once per distinct value instead of scanning. Each
+    /// distinct leading-PK value addresses a disjoint slice of the b-tree, so the
+    /// concatenation is duplicate-free (repeated list values are de-duplicated); a
+    /// superset is fine regardless, since `run_core` re-applies the full `WHERE`.
+    /// Declines (→ scan) when the IN column is not the leading PK column, when any
+    /// value is `NULL` (never a usable key — mirrors [`Self::try_index_in`]), or under
+    /// a `NOT INDEXED` hint.
+    fn try_without_rowid_pk_in(
+        &self,
+        meta: &TableMeta,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let Some(where_expr) = &sel.where_clause else {
+            return Ok(None);
+        };
+        let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
+        if matches!(hint, Some(IndexHint::NotIndexed)) {
+            return Ok(None);
+        }
+        let pk = &meta.storage_order[..meta.pk_len];
+        let Some(&lead) = pk.first() else {
+            return Ok(None);
+        };
+        let Some((col, values)) = find_in_constraint(where_expr, &meta.columns, params) else {
+            return Ok(None);
+        };
+        if col != lead || values.iter().any(|v| matches!(v, Value::Null)) {
+            return Ok(None);
+        }
+        let coll = wr_storage_collations(meta)[0];
+        let aff = meta.columns[lead].affinity;
+        let mut out = Vec::new();
+        let mut seen: Vec<Value> = Vec::new();
+        for v in &values {
+            let key_val = aff.coerce(v.clone());
+            if seen.contains(&key_val) {
+                continue;
+            }
+            seen.push(key_val.clone());
+            let records = crate::btree::index_seek_records(
+                self.backend.source(),
+                meta.root,
+                &[key_val],
+                &[coll],
+            )?;
+            for storage in records {
+                let mut row = unpermute_row(meta, storage);
+                self.compute_generated(meta, &mut row, params)?;
+                out.push(InputRow {
+                    values: row,
+                    rowid: None,
+                });
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Range variant of [`try_without_rowid_pk_seek`](Self::try_without_rowid_pk_seek):
     /// a `< / <= / > / >= / BETWEEN` bound on the *leading* PK column walks the
     /// clustered b-tree between bounds instead of scanning. A superset is fine
@@ -12835,6 +12897,18 @@ impl Connection {
                     "SEARCH {label} USING PRIMARY KEY ({})",
                     names.join(" AND ")
                 ));
+            }
+            // An IN-list / same-column equality OR-chain on the leading PK column
+            // seeks the clustered b-tree per value (try_without_rowid_pk_in). As in the
+            // rowid/secondary-index IN branch, a NULL list entry doesn't change the
+            // plan label — sqlite still reports the seek (the NULL just never matches).
+            if let Some((col, _)) = find_in_constraint(where_expr, &meta.columns, params) {
+                if pk.first() == Some(&col) {
+                    return Ok(alloc::format!(
+                        "SEARCH {label} USING PRIMARY KEY ({}=?)",
+                        meta.columns[col].name
+                    ));
+                }
             }
             // Else a range bound on the leading PK column (try_without_rowid_pk_range).
             if let Some(&lead) = pk.first() {
@@ -18224,6 +18298,9 @@ impl Connection {
                 // A leading-PK equality or range seeks the clustered b-tree; else
                 // scan.
                 if let Some(rows) = self.try_without_rowid_pk_seek(&first_meta, sel, params)? {
+                    return Ok((first_meta.columns, rows));
+                }
+                if let Some(rows) = self.try_without_rowid_pk_in(&first_meta, sel, params)? {
                     return Ok((first_meta.columns, rows));
                 }
                 if let Some(rows) = self.try_without_rowid_pk_range(&first_meta, sel, params)? {

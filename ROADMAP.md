@@ -281,9 +281,8 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   all-equality case: an `IN`-list disjunct (`id=3 OR id IN(4,5)`), a non-rowid disjunct
   (`id=3 OR a=5`), or any mix keeps sqlite's `MULTI-INDEX OR` — `rowid_eq_or_chain`
   rejects the non-equality leaf (`tests/eqp_rowid_or_seek.rs`). (Deferred: the
-  `WITHOUT ROWID` PK OR-chain collapse, still `MULTI-INDEX OR`; and the pre-existing
-  `rowid IN`/OR-seek `ORDER BY` sort that is not yet elided, since the executor seeks
-  in list order, not sorted rowid order.) A same-column equality OR-chain on a
+  pre-existing `rowid IN`/OR-seek `ORDER BY` sort that is not yet elided, since the
+  executor seeks in list order, not sorted rowid order.) A same-column equality OR-chain on a
   *secondary* index column (`a = 1 OR a = 2 OR …`, every disjunct a bare equality on
   the *same* column) is likewise the equivalent of `a IN (1, 2, …)` and collapses to a
   single `SEARCH … USING INDEX` seek (or a `SCAN` when the column has no index), exactly
@@ -296,7 +295,16 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   collapse tracks graphite's own `IN` path exactly, so the only residual vs sqlite is
   the *pre-existing* `IN` covering-index choice (graphite picks the narrow `ia`, sqlite
   the covering `iab`) — identical for `a IN (5,1)` and `a=5 OR a=1`, no new divergence
-  (`tests/eqp_secondary_or_seek.rs`).
+  (`tests/eqp_secondary_or_seek.rs`). On a `WITHOUT ROWID` table the same `IN`/OR-chain
+  on the *leading* PRIMARY KEY column now seeks the clustered b-tree once per value
+  (`try_without_rowid_pk_in`) rather than scanning, rendering one
+  `SEARCH … USING PRIMARY KEY (k=?)` exactly as sqlite plans it: previously graphite
+  recognised only single-equality and range bounds on the WITHOUT ROWID PK, so an
+  `IN`/`OR` fell to a full `SCAN`. Each distinct leading-PK value addresses a disjoint
+  b-tree slice (composite PK leading column prefix-seeks), so repeated values
+  de-duplicate and the concatenation is a valid superset; a non-leading-PK or unindexed
+  column still scans (`SELECT * FROM t WHERE k IN ('a','c')`, `k='a' OR k='c'`, the
+  INTEGER/TEXT/composite-PK and `NOT INDEXED` cases — `tests/eqp_without_rowid_pk_in_seek.rs`).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
