@@ -339,6 +339,23 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   narrower index `USING INDEX`; that is the separate cost-model index-*choice* gap,
   unchanged. `min/max … WHERE col=?` SCAN-vs-SEARCH via one-end index read is also
   still open.)
+  A `col IS NULL` conjunct is now a *seekable* NULL-key equality: sqlite renders
+  `SEARCH … USING [COVERING] INDEX … (col=?)` for it (NULLs sort first in the
+  index and `cmp_values` treats `NULL == NULL` as equal, so the prefix seek finds
+  exactly the NULL-keyed entries), and graphite now matches — previously it SCANned
+  because the eq-constraint collector only recognised `col = const`. A new
+  `collect_isnull_cols` feeds the index chooser (and `eqp_access`, in lockstep) a
+  `Value::Null` key per `col IS NULL`, covering single-column seeks, covering
+  aggregates (`count(*)/sum(a) … WHERE a IS NULL` → `USING COVERING INDEX`),
+  composite NULL-or-mixed prefixes (`a IS NULL AND b IS NULL`, `a=1 AND b IS NULL`),
+  and a range on the column after a NULL equality prefix (`a IS NULL AND b>?`). The
+  constraint is tracked *apart* from value equalities so the rowid / INTEGER PRIMARY
+  KEY fast paths never fire for `rowid IS NULL` (sqlite SCANs there — the rowid is
+  never NULL) and so `col = NULL` (never true) keeps bailing unchanged
+  (`tests/eqp_isnull_seek.rs`). (Residuals: `IS NULL` on a `WITHOUT ROWID`
+  secondary index still SCANs — a distinct pre-existing gap, rows stay correct — and
+  the same index-*choice* tiebreak above applies when two equal-prefix indexes
+  qualify.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

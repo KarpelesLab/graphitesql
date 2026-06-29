@@ -11185,7 +11185,14 @@ impl Connection {
         }
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
-        if eqs.is_empty() || eqs.iter().any(|(_, v)| matches!(v, Value::Null)) {
+        // `col IS NULL` is a separate, seekable NULL-key equality (see
+        // `collect_isnull_cols`). Tracked apart from `eqs` so the rowid/IPK fast
+        // paths below never seek on it (`rowid IS NULL` scans, as in sqlite).
+        let mut is_null_cols: Vec<usize> = Vec::new();
+        collect_isnull_cols(where_expr, &meta.columns, &mut is_null_cols);
+        if eqs.iter().any(|(_, v)| matches!(v, Value::Null))
+            || (eqs.is_empty() && is_null_cols.is_empty())
+        {
             // No usable column equality (`col = NULL` is never true). A plain or
             // partial *column* index can't seek, but an *expression* index might
             // (e.g. `lower(x) = 'b'` leaves no column eq behind). Try that, then
@@ -11253,9 +11260,14 @@ impl Connection {
             }
             let mut key = Vec::new();
             for &c in &idx.cols {
-                match eqs.iter().find(|(col, _)| *col == c) {
-                    Some((_, v)) => key.push(meta.columns[c].affinity.coerce(v.clone())),
-                    None => break,
+                if let Some((_, v)) = eqs.iter().find(|(col, _)| *col == c) {
+                    key.push(meta.columns[c].affinity.coerce(v.clone()));
+                } else if is_null_cols.contains(&c) {
+                    // `col IS NULL`: a NULL index key, which the prefix seek
+                    // matches against the index's NULL-keyed entries.
+                    key.push(Value::Null);
+                } else {
+                    break;
                 }
             }
             if key.is_empty() {
@@ -12885,6 +12897,11 @@ impl Connection {
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
         eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        // `col IS NULL` seeks a NULL index key (kept in lockstep with
+        // `try_index_lookup`). Tracked apart from `eqs` so the rowid/IPK paths
+        // below never fire for it (`rowid IS NULL` scans, as in sqlite).
+        let mut is_null_cols: Vec<usize> = Vec::new();
+        collect_isnull_cols(where_expr, &meta.columns, &mut is_null_cols);
         // WITHOUT ROWID: the executor seeks the clustered PRIMARY KEY b-tree on a
         // leading-PK equality (`try_without_rowid_pk_seek`) and otherwise scans —
         // it never uses a secondary index — so report exactly that.
@@ -13054,7 +13071,7 @@ impl Connection {
             }
             let mut matched = Vec::new();
             for &c in &idx.cols {
-                if eqs.iter().any(|(col, _)| *col == c) {
+                if eqs.iter().any(|(col, _)| *col == c) || is_null_cols.contains(&c) {
                     matched.push(c);
                 } else {
                     break;
@@ -26819,6 +26836,37 @@ fn collect_eq_constraints(
                 (col_index(right, columns), const_value(left, params))
             {
                 out.push((ci, v));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect the columns constrained by a top-level `col IS NULL` conjunct. This
+/// is a *seekable* equality against a NULL index key (NULLs sort first in the
+/// b-tree and `cmp_values` treats `NULL == NULL` as equal, so an index seek on a
+/// NULL key finds exactly the NULL-keyed entries) — distinct from `col = NULL`,
+/// which is never true and is left to bail. `col IS NOT NULL` (`negated`) is not
+/// seekable (sqlite scans), so it is skipped. Kept separate from
+/// [`collect_eq_constraints`] so the rowid/INTEGER-PRIMARY-KEY fast paths, which
+/// must *not* fire for `rowid IS NULL` (sqlite scans there), never see it.
+fn collect_isnull_cols(e: &Expr, columns: &[ColumnInfo], out: &mut Vec<usize>) {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            collect_isnull_cols(left, columns, out);
+            collect_isnull_cols(right, columns, out);
+        }
+        Expr::Paren(inner) => collect_isnull_cols(inner, columns, out),
+        Expr::IsNull {
+            expr,
+            negated: false,
+        } => {
+            if let Some(ci) = col_index(expr, columns) {
+                out.push(ci);
             }
         }
         _ => {}
