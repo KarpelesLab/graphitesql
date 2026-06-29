@@ -15161,6 +15161,144 @@ impl Connection {
         clean
     }
 
+    /// Eager `no such column` for a column reference inside an expression-position
+    /// subquery body (A-prepare-correlated). SQLite resolves every reference at
+    /// prepare time, so a subquery-body reference that binds to neither the
+    /// subquery's own `FROM` nor any enclosing (correlation) scope errors even
+    /// when the outer table is empty or every row is filtered out — exactly where
+    /// graphite's lazy, per-row resolution never reaches the subquery and so
+    /// missed it. `outer_cols` is the accumulated enclosing scope: the outermost
+    /// query's scan columns at entry, extended by each level's own `FROM` as the
+    /// walk descends.
+    ///
+    /// Conservative throughout, because a false positive would reject valid SQL in
+    /// the byte-exact differential suite: a compound subquery body, a `FROM` that
+    /// [`Self::scan_source`] cannot build, and a reference whose only candidate
+    /// column carries an unknown origin (`schema: None`) are each left to the lazy
+    /// path rather than risk a spurious error. See [`column_resolves_scoped`].
+    fn validate_subquery_body_columns(
+        &self,
+        sel: &Select,
+        outer_cols: &[ColumnInfo],
+    ) -> Result<()> {
+        let mut targets: Vec<&Expr> = Vec::new();
+        for rc in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            targets.push(w);
+        }
+        if let Some(h) = &sel.having {
+            targets.push(h);
+        }
+        for g in &sel.group_by {
+            targets.push(g);
+        }
+        for t in &sel.order_by {
+            targets.push(&t.expr);
+        }
+        if let Some(from) = &sel.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    targets.push(on);
+                }
+            }
+        }
+        let mut subs: Vec<&Select> = Vec::new();
+        for e in targets {
+            collect_subselects(e, &mut subs);
+        }
+        for sub in subs {
+            self.check_subquery_body_columns(sub, outer_cols)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve every shallow column reference in one expression-position subquery
+    /// body against its own `FROM` plus the enclosing scope, raising the first
+    /// `no such column` SQLite would, then recurse into further-nested bodies with
+    /// this body's `FROM` added to the scope. See
+    /// [`Self::validate_subquery_body_columns`].
+    fn check_subquery_body_columns(&self, sub: &Select, outer_cols: &[ColumnInfo]) -> Result<()> {
+        // A compound body carries its own per-arm scope rules — leave it to the
+        // lazy path rather than risk a wrong resolution here.
+        if !sub.compound.is_empty() {
+            return Ok(());
+        }
+        let params = Params::default();
+        let Ok((incols, _)) = self.scan_source(sub, &params) else {
+            return Ok(());
+        };
+        // A bare name may match one of the body's own output aliases (a
+        // GROUP BY / HAVING / ORDER BY reference), so exempt those.
+        let aliases: Vec<&str> = sub
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                ResultColumn::Expr { alias: Some(a), .. } => Some(a.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut targets: Vec<&Expr> = Vec::new();
+        for rc in &sub.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &sub.where_clause {
+            targets.push(w);
+        }
+        if let Some(h) = &sub.having {
+            targets.push(h);
+        }
+        for g in &sub.group_by {
+            targets.push(g);
+        }
+        for t in &sub.order_by {
+            targets.push(&t.expr);
+        }
+        if let Some(from) = &sub.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    targets.push(on);
+                }
+            }
+        }
+        let mut missing: Option<Error> = None;
+        for e in &targets {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
+                if missing.is_some() {
+                    return;
+                }
+                if column_resolves_scoped(&incols, schema, table, column)
+                    || column_resolves_scoped(outer_cols, schema, table, column)
+                {
+                    return;
+                }
+                if schema.is_none()
+                    && table.is_none()
+                    && aliases.iter().any(|a| a.eq_ignore_ascii_case(column))
+                {
+                    return;
+                }
+                missing = Some(eval::no_such_column(schema, table, column, quoted));
+            });
+        }
+        if let Some(e) = missing {
+            return Err(e);
+        }
+        // Descend into further-nested bodies; their correlation scope is this
+        // body's own `FROM` plus everything already enclosing.
+        let mut combined = incols;
+        combined.extend_from_slice(outer_cols);
+        self.validate_subquery_body_columns(sub, &combined)
+    }
+
     /// Reject a multi-column scalar subquery `(SELECT a, b …)` used where a single
     /// value is required — SQLite reports `sub-select returns N columns - expected
     /// 1` at prepare time, but graphite resolved the subquery lazily and so
@@ -15745,6 +15883,13 @@ impl Connection {
             self.validate_columns_exist(sel, &columns)?;
             self.validate_derived_columns(sel, &columns)?;
             self.validate_join_derived_columns(sel)?;
+            // A column reference inside an expression-position subquery body that
+            // binds to neither the body's own FROM nor any enclosing scope is a
+            // prepare-time `no such column` in SQLite — caught here even over an
+            // empty/filtered outer table the lazy path never reaches. Run after the
+            // outer column checks (an outer fault wins) and before the arity gates
+            // (a missing column is SQLite's first error).
+            self.validate_subquery_body_columns(sel, &columns)?;
             // An `IN (SELECT …)` whose width disagrees with the LHS is a
             // prepare-time error in SQLite; run it after column resolution so a
             // missing column (its first error) still wins.
@@ -17375,11 +17520,19 @@ impl Connection {
         // full WHERE is still applied by run_core, so the index only needs to
         // return a superset of matching rows.
         if from.joins.is_empty() {
-            let first_meta = self
+            let mut first_meta = self
                 .table_meta(&from.first.name, from.first.alias.as_deref())
                 .map_err(|e| {
                     Self::qualify_missing(from.first.schema.as_deref(), &from.first.name, e)
                 })?;
+            // This fast path is only reached for a main-database base table (a
+            // non-main source returned earlier); stamp the `main` origin so the
+            // `*`-wildcard and correlated-subquery validators see the column's
+            // database. See `scan_db_table` / `resolve_join_source`.
+            let db_label = self.db_label(DbRef::Main);
+            for col in &mut first_meta.columns {
+                col.schema = Some(db_label.clone());
+            }
             if first_meta.without_rowid {
                 // A leading-PK equality or range seeks the clustered b-tree; else
                 // scan.
@@ -22339,6 +22492,46 @@ fn column_resolves(cols: &[ColumnInfo], table: Option<&str>, column: &str) -> bo
     }
     cols.iter().any(|c| {
         c.name.eq_ignore_ascii_case(column) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+    })
+}
+
+/// Schema-aware sibling of [`column_resolves`] for the correlated-subquery body
+/// check ([`Executor::validate_subquery_body_columns`]): a three-part
+/// `schema.table.column` reference must also match a candidate column's database
+/// of origin (`ColumnInfo::schema`). A candidate whose origin is unknown
+/// (`schema: None` — a derived/CTE/subquery/synthetic source) matches any
+/// qualifier, so the check stays conservative and never raises a spurious
+/// `no such column` on a valid reference into such a source.
+fn column_resolves_scoped(
+    cols: &[ColumnInfo],
+    schema: Option<&str>,
+    table: Option<&str>,
+    column: &str,
+) -> bool {
+    let schema_ok = |c: &ColumnInfo| {
+        schema.is_none_or(|s| {
+            c.schema
+                .as_deref()
+                .is_none_or(|cs| cs.eq_ignore_ascii_case(s))
+        })
+    };
+    if matches!(
+        column.to_ascii_lowercase().as_str(),
+        "rowid" | "oid" | "_rowid_" | "current_date" | "current_time" | "current_timestamp"
+    ) {
+        // A bare date/time keyword (or rowid alias) always resolves; a qualified
+        // one still needs an in-scope source matching the qualifier.
+        let Some(t) = table else {
+            return true;
+        };
+        return cols
+            .iter()
+            .any(|c| c.table.eq_ignore_ascii_case(t) && schema_ok(c));
+    }
+    cols.iter().any(|c| {
+        c.name.eq_ignore_ascii_case(column)
+            && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+            && schema_ok(c)
     })
 }
 

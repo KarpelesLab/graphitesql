@@ -9,10 +9,10 @@
 //! each subquery the outer expressions carry and checks its scalar calls — but only
 //! when the subquery body is *column-clean* against its own `FROM` plus the outer
 //! scope. That gate preserves sqlite's precedence: a `no such column` it reports
-//! first is never masked by a function error (`SELECT (SELECT nope(zzz))` stays a
-//! missing-column case, left to the lazy path). A subquery it cannot fully verify —
-//! correlated-but-missing, compound, or further-nested — is left alone, never a
-//! false positive. Verified against sqlite3 3.50.4.
+//! first is never masked by a function error (`SELECT (SELECT nope(zzz))` is a
+//! missing-column case — now caught eagerly by `validate_subquery_body_columns`).
+//! A subquery it cannot fully verify — compound or further-nested — is left alone,
+//! never a false positive. Verified against sqlite3 3.50.4.
 
 #![cfg(feature = "std")]
 
@@ -89,11 +89,14 @@ fn does_not_reject_valid_or_unverifiable_subqueries() {
         .is_ok());
     // An aggregate in the subquery is not a scalar call (no false "no such function").
     assert!(c.query("SELECT (SELECT max(c) FROM u) FROM t").is_ok());
-    // A subquery whose own column does not resolve is left to the lazy path: sqlite
-    // reports `no such column` first, which graphite resolves per row — so this check
-    // must NOT raise a function error here (no false positive). Over empty tables the
-    // query simply yields no rows.
-    assert!(c.query("SELECT (SELECT nope(zzz)) FROM t").is_ok());
+    // A subquery whose own column does not resolve is a `no such column`, NOT a
+    // function error: sqlite reports the missing column first, and graphite now does
+    // too (eagerly, via `validate_subquery_body_columns`), so this must NOT surface
+    // as `no such function`.
+    assert_eq!(
+        err(&c, "SELECT (SELECT nope(zzz)) FROM t"),
+        "no such column: zzz"
+    );
     // A compound subquery body cannot be verified clean, so it is left alone too.
     assert!(c
         .query("SELECT a FROM t WHERE a IN (SELECT nope(c) FROM u UNION SELECT c FROM u)")

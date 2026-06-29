@@ -270,19 +270,29 @@ exhausted for bounded (single-fix) work.
   - **A-rn3-edge-2** — use the span for scope-aware rename: resolve each bare ref
     to its owning table and rewrite only the matching occurrences.
 
-- **A-prepare-correlated — prepare-time validation in correlated subquery bodies.**
-  The eager (prepare-time, row-independent) validators now cover the common
-  scopes — `validate_columns_exist` (top-level plain-table / `ON`-join),
+- **A-prepare-correlated — prepare-time validation in correlated subquery bodies. DONE.**
+  The eager (prepare-time, row-independent) validators cover the common scopes —
+  `validate_columns_exist` (top-level plain-table / `ON`-join),
   `validate_derived_columns` (single derived-table `FROM`),
   `validate_join_derived_columns` (a derived source joined or `NATURAL`/`USING`
   coalesced), and `reject_unresolved_functions_in_subqueries` (unknown / wrong-
   arity scalar functions inside expression-position subqueries, gated on
-  `subquery_body_columns_clean`). The single residual is a three-part
-  `schema.table.column` reference inside a **correlated subquery body** that binds
-  to an enclosing `FROM`: `SELECT (SELECT bad.t.a) FROM t` is accepted where
-  SQLite reports `no such column: bad.t.a`, and a subquery body that is itself
-  correlated-with-a-missing-column is likewise left to the lazy path. Both want
-  the same missing piece — correlated-outer-scope resolution for a three-part ref.
+  `subquery_body_columns_clean`). The residual — a column reference inside a
+  **correlated subquery body** that binds to neither the body's own `FROM` nor any
+  enclosing scope — is now closed by `validate_subquery_body_columns` /
+  `check_subquery_body_columns` (mod.rs), run once at the outermost query right
+  after `validate_join_derived_columns`. It collects every expression-position
+  subquery (scalar, `IN (SELECT)`, `EXISTS`), resolves each body's shallow column
+  refs against the body's own `FROM` plus the accumulated correlation scope via the
+  schema-aware `column_resolves_scoped` (a three-part `schema.table.column` must
+  also match the candidate's database of origin — the `ColumnInfo::schema` added
+  in A-misc-2), and raises the first `no such column: <as-written>` SQLite would,
+  recursing into deeper bodies with each level's `FROM` added to the scope.
+  Conservative throughout (compound bodies, un-buildable `FROM`s, and unknown-origin
+  candidates fall back to the lazy path) so no valid SQL is rejected. So
+  `SELECT (SELECT bad.t.a) FROM t` now errors `no such column: bad.t.a` over an
+  empty table, matching SQLite. Differential test in
+  `tests/subquery_body_columns.rs`.
   *(Orthogonal: the tree-walker still cannot* execute *a bare/qualified `rowid`
   over any join — a per-table-rowid-in-join-rows gap, not a validation gap.)*
 
