@@ -188,7 +188,12 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   resolution and misuse checks; DDL/DML/JSON/PRAGMA/`printf` message wording;
   lexer/parser framing (`near "TOKEN"`, `incomplete input`,
   `unrecognized token: "X"`); the double-quote→string-literal hint; and
-  constraint-failure column naming.
+  constraint-failure column naming. A `FROM`-less wildcard projection is rejected
+  at prepare time with SQLite's highest precedence — a bare `*` is `no tables
+  specified`, a qualified `X.*` is `no such table: X`, ahead of a missing `LIMIT`
+  column / wrong-arity aggregate / compound column-count mismatch — recursively
+  over compound arms, derived-table and expression-position subqueries, while an
+  unreferenced CTE body stays lazily accepted (`tests/fromless_wildcard.rs`).
 
 **Remaining — genuinely open work.** Ordered roughly easiest → hardest. These are
 the residuals left after the differential sweep; the surface is otherwise

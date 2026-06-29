@@ -15735,6 +15735,16 @@ impl Connection {
     }
 
     fn run_core(&self, sel: &Select, params: &Params) -> Result<QueryResult> {
+        // A `FROM`-less wildcard projection (`SELECT *` / `SELECT X.*` with no
+        // table) is a prepare-time error in SQLite — `no tables specified` /
+        // `no such table: X` — with the highest resolution precedence (it wins
+        // over a missing LIMIT column, a wrong-arity aggregate, and a compound
+        // column-count mismatch), so it runs before every other check. Recursive
+        // over the whole tree, so it is gated to the outermost query level (a
+        // nested level re-enters `run_core` with a non-empty `outer_scope`).
+        if self.outer_scope.borrow().is_empty() {
+            reject_fromless_wildcard(sel)?;
+        }
         // Aggregate arity is resolved at prepare time, ahead of every placement
         // and misuse check and independent of row production — see
         // `reject_aggregate_arity_in_select`.
@@ -22781,6 +22791,81 @@ fn reject_scopeless_column_ref(e: &Expr) -> Result<()> {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Reject a `FROM`-less query that projects a wildcard, as SQLite does at prepare
+/// time: a bare `*` with no `FROM` is `no tables specified`, and a qualified
+/// `X.*` is `no such table: X` (the qualifier can name no source). The tree-walker
+/// would instead expand the wildcard to zero columns and return a row, silently
+/// accepting it. SQLite gives this the highest resolution precedence — it wins
+/// over a missing `LIMIT` column, a wrong-arity aggregate, and a compound
+/// column-count mismatch — so this runs first, before any other check.
+///
+/// Walks the whole query tree from the outermost level: each compound arm, every
+/// derived-table subquery in a `FROM`, and every expression-position subquery
+/// (scalar / `EXISTS` / `IN (SELECT)`) is checked. A `CTE` definition is *not*
+/// descended — SQLite analyzes a CTE lazily, so an unreferenced `WITH c AS
+/// (SELECT *)` is accepted.
+fn reject_fromless_wildcard(sel: &Select) -> Result<()> {
+    if sel.from.is_none() {
+        for c in &sel.columns {
+            match c {
+                ResultColumn::Wildcard => {
+                    return Err(Error::Error("no tables specified".into()));
+                }
+                ResultColumn::TableWildcard(q) => {
+                    return Err(Error::Error(alloc::format!("no such table: {q}")));
+                }
+                ResultColumn::Expr { .. } => {}
+            }
+        }
+    }
+    for (_, arm) in &sel.compound {
+        reject_fromless_wildcard(arm)?;
+    }
+    if let Some(from) = &sel.from {
+        if let Some(sub) = &from.first.subquery {
+            reject_fromless_wildcard(sub)?;
+        }
+        for j in &from.joins {
+            if let Some(sub) = &j.table.subquery {
+                reject_fromless_wildcard(sub)?;
+            }
+        }
+    }
+    let mut targets: Vec<&Expr> = Vec::new();
+    for c in &sel.columns {
+        if let ResultColumn::Expr { expr, .. } = c {
+            targets.push(expr);
+        }
+    }
+    if let Some(w) = &sel.where_clause {
+        targets.push(w);
+    }
+    if let Some(h) = &sel.having {
+        targets.push(h);
+    }
+    for g in &sel.group_by {
+        targets.push(g);
+    }
+    for t in &sel.order_by {
+        targets.push(&t.expr);
+    }
+    if let Some(from) = &sel.from {
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                targets.push(on);
+            }
+        }
+    }
+    let mut subs: Vec<&Select> = Vec::new();
+    for e in targets {
+        collect_subselects(e, &mut subs);
+    }
+    for sub in subs {
+        reject_fromless_wildcard(sub)?;
+    }
+    Ok(())
 }
 
 fn collect_subselects<'a>(e: &'a Expr, out: &mut Vec<&'a Select>) {
