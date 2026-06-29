@@ -13194,11 +13194,18 @@ impl Connection {
                         continue;
                     };
                     let (cols, key_exprs, collations) = self.index_key_spec(&tmeta, &ci)?;
+                    // Per-column DESC flags, aligned with `cols` for a plain index.
+                    let descending = if key_exprs.is_none() {
+                        ci.columns.iter().map(|t| t.descending).collect()
+                    } else {
+                        Vec::new()
+                    };
                     out.push(IndexMeta {
                         name: obj.name.clone(),
                         root: obj.rootpage,
                         cols,
                         collations,
+                        descending,
                         partial: ci.where_clause.clone(),
                         key_exprs,
                         unique: ci.unique,
@@ -13212,6 +13219,7 @@ impl Connection {
                             out.push(IndexMeta {
                                 name: obj.name.clone(),
                                 root: obj.rootpage,
+                                descending: alloc::vec![false; cols.len()],
                                 cols: cols.clone(),
                                 collations,
                                 partial: None,
@@ -14385,7 +14393,23 @@ impl Connection {
             if !coll_ok {
                 continue;
             }
-            let sorted_suffix = cols.len() - ordered;
+            // Every secondary index on a rowid table is implicitly ordered by
+            // `(key columns…, rowid)`, with the rowid stored ASCENDING. So once the
+            // walk has consumed ALL of the index's explicit columns as a uniform-
+            // direction prefix, a trailing ORDER BY term that is the INTEGER PRIMARY
+            // KEY (i.e. the rowid) is ordered too — provided the matched columns are
+            // all ascending, so the single forward/backward walk keeps the rowid in
+            // phase (a DESC index column stores the rowid out of phase under
+            // reversal). Being unique, the rowid then fully determines the row
+            // order, so nothing after it needs sorting: `ORDER BY b, id` over an
+            // index on `(b)` is served entirely by the walk, like sqlite (no temp
+            // b-tree). A UNIQUE index is left to the separate unique-prefix path.
+            let rowid_tail = match_len == idx.cols.len()
+                && ordered < uniform_prefix
+                && meta.ipk == Some(cols[ordered])
+                && !idx.unique
+                && idx.descending.iter().take(match_len).all(|d| !d);
+            let sorted_suffix = if rowid_tail { 0 } else { cols.len() - ordered };
             let covering = self.index_covers_query(sel, &meta, &idx.cols);
             if sorted_suffix > 0 && covering {
                 continue;
@@ -24587,6 +24611,11 @@ struct IndexMeta {
     cols: Vec<usize>,
     /// Collating sequence for each indexed column (aligned with `cols`).
     collations: Vec<crate::value::Collation>,
+    /// `DESC` flag for each indexed column (aligned with `cols`). Only meaningful
+    /// for a plain column index (`key_exprs.is_none()`); empty otherwise. Used to
+    /// reason about whether the index's implicit trailing-rowid order lines up with
+    /// an `ORDER BY` walk (the rowid is always stored ascending).
+    descending: Vec<bool>,
     /// `CREATE INDEX … WHERE <predicate>` — a partial index only stores rows for
     /// which the predicate is true. `None` for a full index.
     partial: Option<Expr>,

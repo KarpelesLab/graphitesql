@@ -223,9 +223,17 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   likewise served entirely by the full scan — because that key is unique no trailing
   term can break a tie — so `ORDER BY id, b` skips the sort and its temp-btree node
   exactly like a lone `ORDER BY id` (previously only the single-term form was
-  recognised; the trailing-rowid-*within-a-secondary-index* case, e.g. `ORDER BY b,
-  id` served by the `(b, rowid)` walk, remains a separate deferred `order_index_scan`
-  gap).
+  recognised). The trailing-rowid-*within-a-secondary-index* case is handled too:
+  every secondary index on a rowid table is implicitly ordered by `(key columns…,
+  rowid)` with the rowid stored *ascending*, so `ORDER BY b, id` over an index on
+  `(b)` — or `ORDER BY b, c, id` over `(b, c)` — is fully served by the index walk
+  with no temp-btree node, matching sqlite. The credit is withheld whenever the
+  ascending rowid would fall out of phase: a `DESC` index column (reversed walk),
+  a mixed-direction boundary (`ORDER BY b, id DESC`), or a non-rowid column sitting
+  between the matched prefix and the rowid (`ORDER BY b, id` over `(b, c)`); those
+  keep their prior `LAST TERM OF ORDER BY` sort. The trailing rowid under a
+  `UNIQUE` index (sqlite's unique-prefix elision) and under a `WHERE`-seek path
+  remain separate deferred `order_index_scan` gaps.
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
