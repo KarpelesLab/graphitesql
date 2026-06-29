@@ -14226,12 +14226,56 @@ impl Connection {
         out
     }
 
+    /// Whether the query groups by *exactly* the rowid / INTEGER PRIMARY KEY of
+    /// its single base table. Such a `GROUP BY` degenerates to one row per group,
+    /// emitted in rowid order, so sqlite plain-scans the table (it never picks a
+    /// covering index for it) and — for a sole `ORDER BY` term on that same key —
+    /// needs no temp b-tree. `label` is the table's alias-or-name (the group key
+    /// may qualify with it). `meta` must be this table's metadata.
+    fn group_by_is_rowid(&self, sel: &Select, meta: &TableMeta, label: &str) -> bool {
+        if sel.group_by.len() != 1 || sel.distinct || meta.without_rowid {
+            return false;
+        }
+        let Expr::Column {
+            schema: None,
+            table,
+            column,
+            ..
+        } = &sel.group_by[0]
+        else {
+            return false;
+        };
+        if table
+            .as_deref()
+            .is_some_and(|tn| !tn.eq_ignore_ascii_case(label))
+        {
+            return false;
+        }
+        let shadowed = meta
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(column));
+        let is_rowid_alias = matches!(
+            column.to_ascii_lowercase().as_str(),
+            "rowid" | "_rowid_" | "oid"
+        ) && !shadowed;
+        let is_ipk = meta
+            .ipk
+            .is_some_and(|i| meta.columns[i].name.eq_ignore_ascii_case(column));
+        is_rowid_alias || is_ipk
+    }
+
     /// When a query's sole `ORDER BY` term is the rowid / INTEGER PRIMARY KEY of
-    /// a single plain table that is scanned in full (no `WHERE`, no grouping,
-    /// aggregate, window, or `DISTINCT`), the table b-tree already yields rows in
-    /// rowid order — so the sort is redundant. Returns `Some(descending)` in that
-    /// case (the caller reverses for `DESC`), else `None` (sort normally). Shared
-    /// by `run_core` and `eqp_access` so execution and `EXPLAIN QUERY PLAN` agree.
+    /// a single plain table that is scanned in full (no `WHERE`, no aggregate,
+    /// window, or `DISTINCT`), the table b-tree already yields rows in rowid order
+    /// — so the sort is redundant. A `GROUP BY` is permitted only when it is itself
+    /// exactly that rowid/IPK ([`group_by_is_rowid`](Self::group_by_is_rowid)): each
+    /// group is then a single row in rowid order, and sqlite suppresses the sort —
+    /// but only for a *single-term* `ORDER BY` on that key (unlike the plain scan
+    /// below, it does not elide trailing terms via key uniqueness). Returns
+    /// `Some(descending)` in that case (the caller reverses for `DESC`), else `None`
+    /// (sort normally). Shared by `run_core` and `eqp_access` so execution and
+    /// `EXPLAIN QUERY PLAN` agree.
     fn rowid_ordered_scan(&self, sel: &Select) -> Option<bool> {
         let from = sel.from.as_ref()?;
         if !from.joins.is_empty() {
@@ -14241,15 +14285,38 @@ impl Connection {
         if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
             return None;
         }
-        if sel.where_clause.is_some()
-            || !sel.group_by.is_empty()
-            || sel.having.is_some()
-            || sel.distinct
-            || sel.order_by.is_empty()
-        {
+        if sel.where_clause.is_some() || sel.distinct || sel.order_by.is_empty() {
             return None;
         }
-        if self.has_aggregate(sel) || window::has_window(sel) {
+        if window::has_window(sel) {
+            return None;
+        }
+        // A CTE/view of the same name is not a rowid table scan.
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+        if meta.without_rowid {
+            return None;
+        }
+        // A `GROUP BY` is acceptable only when it is itself exactly the rowid/IPK:
+        // each group is then a single row in rowid order. Unlike the plain-scan
+        // case, sqlite does NOT then elide trailing `ORDER BY` terms via the key's
+        // uniqueness (e.g. `GROUP BY id ORDER BY id, a` still sorts), so require a
+        // single-term `ORDER BY`. A non-rowid `GROUP BY` disqualifies the scan.
+        let rowid_group = self.group_by_is_rowid(sel, &meta, label);
+        if !sel.group_by.is_empty() && !rowid_group {
+            return None;
+        }
+        if rowid_group {
+            if sel.order_by.len() != 1 {
+                return None;
+            }
+            // An aggregate such as `count(*)` is fine here — every group is one row
+            // — and a `HAVING` only filters whole (singleton, rowid-ordered) groups,
+            // so neither disturbs the order; both are permitted in this case only.
+        } else if sel.having.is_some() || self.has_aggregate(sel) {
             return None;
         }
         // The *leading* ORDER BY term must be a plain (un-COLLATE'd) reference to
@@ -14257,22 +14324,14 @@ impl Connection {
         // key is unique, any trailing terms can never break a tie — the rowid
         // scan order alone fully determines the result order — so a multi-term
         // `ORDER BY id, b` is satisfied by the scan exactly like a lone `ORDER BY
-        // id`, matching sqlite (which emits no temp b-tree for either).
+        // id`, matching sqlite (which emits no temp b-tree for either). (In the
+        // rowid-group case there is only the one term, checked above.)
         let term = &sel.order_by[0];
         let (tbl, col) = match &term.expr {
             Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
             _ => return None,
         };
-        // A CTE/view of the same name is not a rowid table scan.
-        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
-            return None;
-        }
-        let label = t.alias.as_deref().unwrap_or(&t.name);
         if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
-            return None;
-        }
-        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
-        if meta.without_rowid {
             return None;
         }
         let shadowed = meta
@@ -14820,6 +14879,12 @@ impl Connection {
         // the rows arrive in rowid order (and the ordered-index case already
         // renders as covering).
         if self.order_satisfied_by_scan(sel, params).is_some() {
+            return None;
+        }
+        // `GROUP BY` on the rowid/IPK degenerates to a rowid-ordered plain scan;
+        // sqlite never picks a covering index for it (it would still bare-`SCAN t`).
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        if self.group_by_is_rowid(sel, meta, label) {
             return None;
         }
         let mut covering = self.indexes_of(&t.name).ok()?.into_iter().filter(|idx| {

@@ -247,7 +247,17 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   sort just like `WHERE b=3 ORDER BY id`, even when the pinned term *leads* (the
   effective walk direction then comes from the first non-constant term, so
   `WHERE b=3 ORDER BY b, id DESC` walks the rowid descending). The pin applies to any
-  equality column, indexed or not (`WHERE b=3 AND c=5 ORDER BY c, id`).
+  equality column, indexed or not (`WHERE b=3 AND c=5 ORDER BY c, id`). A `GROUP BY`
+  on the rowid / INTEGER PRIMARY KEY is recognised as degenerate too: each group is a
+  single row emitted in rowid order, so sqlite plain-`SCAN`s the table (never a
+  covering index — `group_by_is_rowid` now stands `covering_scan` down) and skips the
+  `USE TEMP B-TREE FOR ORDER BY` for a sole `ORDER BY` term on that same key, both
+  directions (`SELECT id FROM t GROUP BY id ORDER BY id [DESC]`), including with an
+  aggregate (`count(*)`) or an aggregate `HAVING`. It is withheld for a multi-term
+  `ORDER BY` (sqlite does not elide trailing terms via key-uniqueness in the GROUP BY
+  case) and a non-rowid `GROUP BY`. (A `HAVING` *range* on the group-key rowid — which
+  sqlite pushes down to a `SEARCH … (rowid>?)` — is a separate deferred pushdown gap;
+  rows stay correct.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
