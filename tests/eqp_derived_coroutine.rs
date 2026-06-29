@@ -158,6 +158,42 @@ fn non_flattenable_outer_shapes_decline() {
 }
 
 #[test]
+fn derived_table_combined_with_a_join_declines() {
+    // A derived-table source combined with another FROM source (a comma-join or an
+    // explicit JOIN, in either position) is cost-reordered by sqlite (BLOOM FILTER /
+    // AUTOMATIC COVERING INDEX / table reordering) — not byte-exact renderable. It
+    // must decline cleanly: a derived *first* source used to crash with a malformed
+    // empty `no such table:`, and a derived *join* source used to emit a malformed
+    // empty-named `SCAN  AS s`.
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); CREATE TABLE u(x,y);";
+    for q in [
+        "SELECT * FROM (SELECT * FROM t) AS s, u",
+        "SELECT * FROM u, (SELECT * FROM t) AS s",
+        "SELECT * FROM (SELECT * FROM t) AS s JOIN u ON s.a=u.x",
+        "SELECT * FROM u JOIN (SELECT * FROM t) AS s ON s.a=u.x",
+        "SELECT * FROM u LEFT JOIN (SELECT * FROM t) AS s ON s.a=u.x",
+        "SELECT * FROM (SELECT 1) AS s, u",
+        "SELECT * FROM u, (SELECT 1) AS s",
+    ] {
+        let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
+        let got = run(g, &sql);
+        assert!(
+            !got.contains("no such table"),
+            "{q} regressed to the malformed crash: {got:?}"
+        );
+        assert!(
+            !got.contains("SCAN  AS"),
+            "{q} emitted a malformed empty-named node: {got:?}"
+        );
+        assert!(
+            got.contains("EXPLAIN QUERY PLAN for this query shape"),
+            "{q} should decline as unsupported, got {got:?}"
+        );
+    }
+}
+
+#[test]
 fn matches_sqlite_cli() {
     if !sqlite3_available() {
         eprintln!("sqlite3 CLI not found; skipping");

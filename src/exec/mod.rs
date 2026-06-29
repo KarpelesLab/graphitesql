@@ -12386,6 +12386,17 @@ impl Connection {
                 ));
             }
         }
+        // A derived-table (subquery) source that survives to here is combined with
+        // a join — SQLite cost-reorders such plans (BLOOM FILTER / AUTOMATIC
+        // COVERING INDEX / table reordering) into a shape we can't render
+        // byte-exactly. Decline cleanly rather than fall through to `table_meta`
+        // with an empty name (which crashed with a malformed `no such table: `) or
+        // emit a malformed empty-named `SCAN  AS s` node for a derived join source.
+        if from.first.subquery.is_some() || from.joins.iter().any(|j| j.table.subquery.is_some()) {
+            return Err(Error::Unsupported(
+                "EXPLAIN QUERY PLAN for this query shape",
+            ));
+        }
         // First source.
         let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
         // A top-level OR of seekable disjuncts is a MULTI-INDEX OR plan (multiple
