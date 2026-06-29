@@ -192,7 +192,12 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   declines cleanly; a `WITH`-clause CTE referenced as a FROM source renders the same
   way — `WITH c AS (SELECT 1) SELECT * FROM c` → `CO-ROUTINE c`, `WITH c AS (SELECT *
   FROM t) SELECT * FROM c` → `SCAN t` — instead of crashing with `no such table: c`;
-  a derived/CTE source combined with a join declines cleanly instead of crashing).
+  a derived/CTE source combined with a join declines cleanly instead of crashing; a
+  compound query — `SELECT … UNION/UNION ALL/INTERSECT/EXCEPT …` — renders the
+  `COMPOUND QUERY` / `LEFT-MOST SUBQUERY` / per-arm-operator tree byte-exactly
+  (3+ arms, per-arm WHERE seeks, a shared `WITH`, and a bare `LIMIT`/`OFFSET` all
+  carry through), while a trailing `ORDER BY` on the compound — SQLite's separate
+  `MERGE` plan — declines cleanly).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

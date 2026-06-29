@@ -12256,6 +12256,52 @@ impl Connection {
             }
             None => sel,
         };
+        // A compound query (`… UNION / UNION ALL / INTERSECT / EXCEPT …`) renders as
+        // a `COMPOUND QUERY` node whose first child is the `LEFT-MOST SUBQUERY` (the
+        // first arm's plan) followed by one operator node per continuation, each
+        // parenting that arm's plan. A trailing `ORDER BY` on the whole compound
+        // switches SQLite to an entirely different `MERGE (UNION)` plan we don't
+        // model, so decline when one is present (a bare `LIMIT`/`OFFSET` keeps the
+        // plain tree, so it is allowed).
+        if !sel.compound.is_empty() {
+            if !sel.order_by.is_empty() {
+                return Err(Error::Unsupported(
+                    "EXPLAIN QUERY PLAN for this query shape",
+                ));
+            }
+            let compound_id = *next_id;
+            *next_id += 1;
+            out.push((compound_id, parent, String::from("COMPOUND QUERY")));
+            let left_id = *next_id;
+            *next_id += 1;
+            out.push((left_id, compound_id, String::from("LEFT-MOST SUBQUERY")));
+            // The first arm is `sel` itself without its compound tail / the outer
+            // modifiers (which belong to the whole compound, not the arm).
+            let mut first = sel.clone();
+            first.compound = Vec::new();
+            first.limit = None;
+            first.offset = None;
+            self.eqp_select(&first, left_id, next_id, out, params)?;
+            for (op, arm) in &sel.compound {
+                let detail = match op {
+                    CompoundOp::Union => "UNION USING TEMP B-TREE",
+                    CompoundOp::UnionAll => "UNION ALL",
+                    CompoundOp::Intersect => "INTERSECT USING TEMP B-TREE",
+                    CompoundOp::Except => "EXCEPT USING TEMP B-TREE",
+                };
+                let op_id = *next_id;
+                *next_id += 1;
+                out.push((op_id, compound_id, String::from(detail)));
+                // The `WITH` clause is shared across all arms; propagate it to an arm
+                // that carries none so a CTE reference in a later arm still resolves.
+                let mut arm = arm.clone();
+                if arm.ctes.is_empty() {
+                    arm.ctes = sel.ctes.clone();
+                }
+                self.eqp_select(&arm, op_id, next_id, out, params)?;
+            }
+            return Ok(());
+        }
         let Some(from) = &sel.from else {
             // A `FROM`-less SELECT scans a single synthetic constant row. SQLite
             // renders it `SCAN CONSTANT ROW` (this also covers a single-row
