@@ -255,10 +255,31 @@ exhausted for bounded (single-fix) work.
   (`FROM generate_series WHERE start=1 AND stop=3`), and an unconstrained
   reference yields either no rows (`json_each`, the pragma TVFs) or a
   function-specific "first argument … missing or unusable" error
-  (`generate_series`). graphite only recognises these *with* parentheses, so a
-  bare reference is `no such table: <name>`. Closing this means modelling the
-  eponymous TVFs as `FROM` sources with `WHERE`-driven hidden-column binding —
-  a feature, not a message tweak.
+  (`generate_series`).
+  - **A-tvf-bare-pragma — bare `pragma_*` TVFs driven by `WHERE arg=…`. DONE.**
+    A bare `FROM pragma_table_info WHERE arg='t'` (and `pragma_index_list` /
+    `index_info` / `index_xinfo` / `foreign_key_list` / `table_xinfo` / … —
+    every argument-taking pragma TVF) now binds its pragma argument from a
+    top-level equality constraint on the hidden `arg` column, with an optional
+    `schema=…` constraint. Every pragma TVF — bare *or* called — now also exposes
+    the hidden `arg`/`schema` input columns SQLite does: they echo the
+    call/constraint values, are selectable and filterable, and are omitted from
+    `*` expansion. Implementation: `push_pragma_tvf_args` rewrites a bare
+    pragma source into the call form by lifting `arg`/`schema` literal/parameter
+    equalities out of the `WHERE` (descending `AND`/parens) into synthetic
+    positional `tvf_args`; the pragma branch of `tvf_rows` appends the two hidden
+    columns echoing those values. run_core still re-applies the full `WHERE`
+    (the echoed columns satisfy it — a superset, never wrong); a bare reference
+    with no `arg=` constraint or only a non-equality (`arg LIKE …`) yields no
+    rows, matching the argument-less `PRAGMA`. Differential test in
+    `tests/pragma_tvf_bare.rs`. See [[pragma-fidelity]].
+  - **A-tvf-bare-series — bare `generate_series` / `json_each` (remaining).**
+    Still `no such table: <name>` for the parenthesis-free form. `generate_series`
+    is the hard one: its default `stop` is `0xffffffff`, so a bare
+    `WHERE start=1` (no `stop=`) is an effectively unbounded series that SQLite
+    streams lazily — graphite's tree-walker *materialises* every TVF source, so it
+    cannot represent the unbounded case without hanging. This belongs on the VDBE
+    cursor track (lazy row production), not the materialise path; deferred there.
 
 - **A-printf-bang — `printf`/`format` `!` (alt-form-2) flag at high precision.**
   Without `!` graphite is byte-exact (SQLite caps a `%f`/`%e`/`%g` double at 16

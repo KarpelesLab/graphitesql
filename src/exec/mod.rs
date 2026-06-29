@@ -17471,7 +17471,19 @@ impl Connection {
         if from.joins.is_empty()
             && (from.first.tvf_args.is_some() || self.is_pragma_tvf(&from.first))
         {
-            let (columns, rows) = self.tvf_rows(&from.first, params)?;
+            // A bare pragma TVF (`FROM pragma_table_info WHERE arg='t'`) takes its
+            // argument from an equality constraint on the hidden `arg` (and
+            // optional `schema`) column. Push those into the call so the pragma is
+            // actually driven; run_core still re-applies the full WHERE and the
+            // echoed hidden columns satisfy it, so this is a superset — never wrong.
+            let pushed;
+            let source = if from.first.tvf_args.is_none() && self.is_pragma_tvf(&from.first) {
+                pushed = Self::push_pragma_tvf_args(&from.first, sel.where_clause.as_ref());
+                &pushed
+            } else {
+                &from.first
+            };
+            let (columns, rows) = self.tvf_rows(source, params)?;
             let input = rows
                 .into_iter()
                 .map(|values| InputRow {
@@ -17918,6 +17930,38 @@ impl Connection {
             && self.schema.table(&tref.name).is_none()
     }
 
+    /// Drive a bare pragma table-valued function from its `WHERE` clause: a
+    /// `pragma_*` source written without an argument list takes its pragma
+    /// argument from an equality constraint on the hidden `arg` column (and an
+    /// optional `schema` constraint), exactly as SQLite's eponymous pragma vtab
+    /// consumes those hidden-column constraints. Returns a clone of `tref` with
+    /// synthesized positional `tvf_args` (`[arg]` or `[arg, schema]`) when an
+    /// `arg = <constant>` constraint is present; otherwise an unchanged clone (the
+    /// argument-less form, which yields no rows — matching `pragma_table_info`
+    /// with no table named). Only top-level `AND`-conjoined equalities against a
+    /// literal/parameter are consumed; the full `WHERE` is still re-applied by
+    /// run_core (the echoed hidden columns satisfy it), so this never widens or
+    /// narrows the result incorrectly.
+    fn push_pragma_tvf_args(tref: &TableRef, where_clause: Option<&Expr>) -> TableRef {
+        let label = tref.alias.as_deref().unwrap_or(&tref.name);
+        let find = |col: &str| -> Option<Expr> {
+            let mut out = None;
+            if let Some(w) = where_clause {
+                collect_tvf_eq(w, label, col, &mut out);
+            }
+            out
+        };
+        let mut result = tref.clone();
+        if let Some(arg) = find("arg") {
+            let mut args = alloc::vec![arg];
+            if let Some(schema) = find("schema") {
+                args.push(schema);
+            }
+            result.tvf_args = Some(args);
+        }
+        result
+    }
+
     /// Produce the rows of a table-valued function (`generate_series`, `json_each`,
     /// `json_tree`) used as a `FROM` source.
     fn tvf_rows(
@@ -18090,12 +18134,37 @@ impl Connection {
                     value: args.first().cloned(),
                 };
                 let result = self.run_pragma(&p)?;
-                let columns = result
+                // SQLite exposes every pragma table-valued function with two
+                // hidden input columns — `schema` (the database) and `arg` (the
+                // pragma argument) — that echo the call/constraint values and are
+                // omitted from `*` expansion. They let the bare form be driven by
+                // `WHERE arg=…` (see `push_pragma_tvf_args`); the call form
+                // (`pragma_table_info('t')`) echoes its positional `(arg, schema)`.
+                let mut columns: Vec<ColumnInfo> = result
                     .columns
                     .iter()
                     .map(|n| col(n, eval::Affinity::Blob))
                     .collect();
-                Ok((columns, result.rows))
+                columns.push(hcol("schema", eval::Affinity::Text));
+                columns.push(hcol("arg", eval::Affinity::Text));
+                let arg_val = match args.first() {
+                    Some(a) => eval::eval(a, &ctx)?,
+                    None => Value::Null,
+                };
+                let schema_val = match args.get(1) {
+                    Some(a) => eval::eval(a, &ctx)?,
+                    None => Value::Null,
+                };
+                let rows = result
+                    .rows
+                    .into_iter()
+                    .map(|mut r| {
+                        r.push(schema_val.clone());
+                        r.push(arg_val.clone());
+                        r
+                    })
+                    .collect();
+                Ok((columns, rows))
             }
             _ => {
                 // Not a built-in table-valued function. SQLite resolves the bare
@@ -22191,6 +22260,58 @@ fn is_main_schema_table(name: &str) -> bool {
 /// of pragmas graphite both implements (in `run_pragma`) and SQLite 3.50.4
 /// exposes — keep it in lockstep with `run_pragma`'s arms. An unrecognized name
 /// (a typo, or a real pragma graphite does not implement) is not a TVF either.
+/// Collect a top-level `<label-qualified-or-bare> <col> = <constant>` equality
+/// out of a `WHERE` predicate (descending through `AND` and parentheses), used to
+/// drive a bare pragma table-valued function from `WHERE arg=…`. Only the first
+/// match is taken; the constant must be a literal or bound parameter (so it
+/// evaluates without row context). See [`Connection::push_pragma_tvf_args`].
+fn collect_tvf_eq(e: &Expr, label: &str, col: &str, out: &mut Option<Expr>) {
+    if out.is_some() {
+        return;
+    }
+    match e {
+        Expr::Paren(inner) => collect_tvf_eq(inner, label, col, out),
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            collect_tvf_eq(left, label, col, out);
+            collect_tvf_eq(right, label, col, out);
+        }
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            for (side, other) in [(left, right), (right, left)] {
+                if is_tvf_hidden_col(side, label, col) && is_const_arg(other) {
+                    *out = Some((**other).clone());
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `e` names the hidden column `col` of a pragma TVF labelled `label`
+/// (either bare `arg` or `label.arg`, case-insensitive, unquoted or not).
+fn is_tvf_hidden_col(e: &Expr, label: &str, col: &str) -> bool {
+    matches!(
+        e,
+        Expr::Column { table, column, .. }
+            if column.eq_ignore_ascii_case(col)
+                && table.as_deref().is_none_or(|t| t.eq_ignore_ascii_case(label))
+    )
+}
+
+/// Whether `e` is a constant the pragma-TVF pushdown may consume as an argument:
+/// a literal or a bound parameter (both evaluate without a current row).
+fn is_const_arg(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(_) | Expr::Parameter(_))
+}
+
 fn pragma_has_tvf(bare: &str) -> bool {
     // Names checked case-insensitively; `bare` arrives lowercased from the caller
     // but normalize defensively.
