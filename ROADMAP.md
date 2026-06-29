@@ -205,7 +205,13 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   than the chosen index — `ORDER BY a, b` over an index on `(a)` — walks the index
   for the `a` prefix and sorts only the trailing terms (`SCAN t USING INDEX it` +
   `USE TEMP B-TREE FOR LAST TERM OF ORDER BY`), where graphite previously rejected any
-  index shorter than the ORDER BY and fell back to a full `SCAN t` + full sort).
+  index shorter than the ORDER BY and fell back to a full `SCAN t` + full sort; and a
+  single-table `GROUP BY` / `DISTINCT` over a plain `SCAN` now emits
+  `USE TEMP B-TREE FOR GROUP BY` / `FOR DISTINCT` after the `SCAN` line, exactly like
+  sqlite — restricted to the clean bare-scan case (`GROUP BY`/`DISTINCT` on the rowid
+  alone needs no node; a secondary index leading with the first key, which sqlite would
+  walk instead of plain-scanning, is declined so the plan never desyncs), with the
+  covering-index-but-not-leading and `WITHOUT ROWID` shapes still deferred).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

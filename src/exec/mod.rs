@@ -12476,6 +12476,10 @@ impl Connection {
         let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
         // A top-level OR of seekable disjuncts is a MULTI-INDEX OR plan (multiple
         // rows); otherwise a single SCAN/SEARCH node.
+        // The single-table scan-line text, captured so the GROUP BY / DISTINCT
+        // temp-b-tree decision below can restrict itself to the clean bare-`SCAN`
+        // case (no covering index, no seek to surprise the access order).
+        let mut single_scan_detail: Option<String> = None;
         if from.joins.is_empty()
             && self.eqp_or_plan(
                 &label,
@@ -12525,6 +12529,9 @@ impl Connection {
                 // Joins run in FROM order as nested-loop scans (no reordering).
                 alloc::format!("SCAN {label}")
             };
+            if from.joins.is_empty() {
+                single_scan_detail = Some(detail.clone());
+            }
             let id = *next_id;
             *next_id += 1;
             out.push((id, parent, detail));
@@ -12651,6 +12658,17 @@ impl Connection {
                         left_columns.remove(d);
                     }
                 }
+            }
+        }
+        // SQLite spills GROUP BY / DISTINCT through a transient b-tree when the
+        // access order does not already cluster the key columns. Render it for the
+        // clean single-table bare-`SCAN` case, placed after the SCAN line and
+        // before any ORDER BY node — matching sqlite's node order.
+        if single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str()) {
+            if let Some(kind) = self.group_distinct_btree(sel, &meta, &from.first.name) {
+                let id = *next_id;
+                *next_id += 1;
+                out.push((id, parent, alloc::format!("USE TEMP B-TREE FOR {kind}")));
             }
         }
         // ORDER BY that we satisfy with an in-memory sort — unless the scan already
@@ -14582,6 +14600,94 @@ impl Connection {
                 .where_clause
                 .as_ref()
                 .is_none_or(|w| where_cols_covered(w, meta, idx_cols))
+    }
+
+    /// For a single-table, no-`ORDER BY`, plain-`SCAN` query that groups or
+    /// deduplicates by plain columns, decide whether `EXPLAIN QUERY PLAN` should
+    /// print `USE TEMP B-TREE FOR GROUP BY` / `FOR DISTINCT`, and which.
+    ///
+    /// SQLite materializes a transient b-tree whenever the access order does not
+    /// already cluster the key columns. Over a bare table scan that is *always*
+    /// the case, except when the single key is the rowid (rows already arrive in
+    /// rowid order — sqlite emits no node). The caller invokes this only for
+    /// graphite's bare `SCAN t` line, so there is no covering index or seek to
+    /// reorder rows; we additionally decline when sqlite would instead walk a
+    /// secondary index leading with the first key (rendering `SCAN t USING INDEX
+    /// it`, a scan-line shape graphite does not produce for grouping, so the whole
+    /// plan would diverge). `WITHOUT ROWID` tables are clustered by their primary
+    /// key — a separate, deferred case — and are excluded here.
+    fn group_distinct_btree(
+        &self,
+        sel: &Select,
+        meta: &TableMeta,
+        tname: &str,
+    ) -> Option<&'static str> {
+        if !sel.order_by.is_empty() || !sel.compound.is_empty() || meta.without_rowid {
+            return None;
+        }
+        // Exactly one of GROUP BY / DISTINCT, over plain columns of this table.
+        let (kind, key_exprs): (&'static str, Vec<&Expr>) = if !sel.group_by.is_empty() {
+            if sel.distinct {
+                return None;
+            }
+            ("GROUP BY", sel.group_by.iter().collect())
+        } else if sel.distinct {
+            let mut ks = Vec::with_capacity(sel.columns.len());
+            for rc in &sel.columns {
+                match rc {
+                    ResultColumn::Expr { expr, .. } => ks.push(expr),
+                    _ => return None, // wildcard projection → deferred
+                }
+            }
+            ("DISTINCT", ks)
+        } else {
+            return None;
+        };
+        // Map every key to a plain column position of this table; bail otherwise.
+        let mut key_cols = Vec::with_capacity(key_exprs.len());
+        for e in &key_exprs {
+            match e {
+                Expr::Column {
+                    schema: None,
+                    table,
+                    column,
+                    ..
+                } if table
+                    .as_deref()
+                    .is_none_or(|t| t.eq_ignore_ascii_case(tname)) =>
+                {
+                    let pos = meta
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(column))?;
+                    key_cols.push(pos);
+                }
+                _ => return None, // expression / qualified-other key → deferred
+            }
+        }
+        if key_cols.is_empty() {
+            return None;
+        }
+        // Rows already arrive clustered by the rowid: `GROUP BY` / `DISTINCT` on
+        // the integer primary key alone needs no temp b-tree (no sqlite node).
+        if key_cols.len() == 1 && meta.ipk == Some(key_cols[0]) {
+            return None;
+        }
+        // A secondary index leading with the first key column makes sqlite walk it
+        // (`SCAN t USING INDEX it`) rather than plain-scan — a scan-line shape
+        // graphite does not emit for grouping. Decline so the plan never desyncs.
+        let first = key_cols[0];
+        if let Ok(indexes) = self.indexes_of(tname) {
+            for idx in indexes {
+                if idx.partial.is_none()
+                    && idx.key_exprs.is_none()
+                    && idx.cols.first() == Some(&first)
+                {
+                    return None;
+                }
+            }
+        }
+        Some(kind)
     }
 
     /// Choose a full secondary index to satisfy a query by a *covering scan* —
