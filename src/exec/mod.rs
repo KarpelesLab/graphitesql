@@ -1287,7 +1287,7 @@ impl Connection {
             // simply fails to resolve on the VDBE and defers to the tree-walker. Both
             // the column metadata and every row are projected through the visible-
             // column mask. (A multi-source query containing a TVF defers earlier.)
-            if tr.tvf_args.is_some() || self.is_pragma_tvf(tr) {
+            if tr.tvf_args.is_some() || self.is_bare_tvf(tr) {
                 let (cinfos, rows) = self.tvf_rows(tr, &eval::Params::default())?;
                 let visible: Vec<usize> = cinfos
                     .iter()
@@ -1495,7 +1495,7 @@ impl Connection {
             && core::iter::once(&from.first)
                 .chain(from.joins.iter().map(|j| &j.table))
                 .any(|tr| {
-                    (tr.tvf_args.is_some() || self.is_pragma_tvf(tr))
+                    (tr.tvf_args.is_some() || self.is_bare_tvf(tr))
                         && !tr
                             .tvf_args
                             .as_deref()
@@ -16452,7 +16452,7 @@ impl Connection {
                 let rename = (!cte.columns.is_empty()).then_some(cte.columns.as_slice());
                 self.window_source_columns(cte.select.as_ref(), &qualifier, rename)?
             } else if tref.index_hint.is_none()
-                && (tref.tvf_args.is_some() || self.is_pragma_tvf(tref))
+                && (tref.tvf_args.is_some() || self.is_bare_tvf(tref))
             {
                 // A table-valued function window source (`generate_series(…)`,
                 // `json_each` / `json_tree`, the table-valued `pragma_<name>(…)`
@@ -16496,7 +16496,7 @@ impl Connection {
                 if tref.tvf_args.is_some()
                     || tref.index_hint.is_some()
                     || tref.schema.is_some()
-                    || self.is_pragma_tvf(tref)
+                    || self.is_bare_tvf(tref)
                     || self.is_view(&tref.name)
                     || self.is_virtual_table(&tref.name)
                     || self
@@ -16585,7 +16585,7 @@ impl Connection {
             if tref.subquery.is_some()
                 || tref.tvf_args.is_some()
                 || tref.schema.is_some()
-                || self.is_pragma_tvf(tref)
+                || self.is_bare_tvf(tref)
                 || self.is_view(&tref.name)
                 || self
                     .cte_env
@@ -16697,7 +16697,7 @@ impl Connection {
             .borrow()
             .iter()
             .any(|b| b.name.eq_ignore_ascii_case(&tref.name));
-        if tref.tvf_args.is_some() || self.is_pragma_tvf(tref) {
+        if tref.tvf_args.is_some() || self.is_bare_tvf(tref) {
             let (cinfos, _rows) = self.tvf_rows(tref, &Params::default())?;
             Ok(cinfos.into_iter().filter(|ci| !ci.hidden).collect())
         } else if !shadows_cte && self.is_view(&tref.name) {
@@ -17071,7 +17071,7 @@ impl Connection {
             };
             let has_rowid = s.subquery.is_none()
                 && s.tvf_args.is_none()
-                && !self.is_pragma_tvf(s)
+                && !self.is_bare_tvf(s)
                 && !self.is_view(&s.name)
                 && !self.is_virtual_table(&s.name);
             scope.push(Src {
@@ -17468,17 +17468,17 @@ impl Connection {
             }
         }
         // A table-valued function used as the sole source.
-        if from.joins.is_empty()
-            && (from.first.tvf_args.is_some() || self.is_pragma_tvf(&from.first))
+        if from.joins.is_empty() && (from.first.tvf_args.is_some() || self.is_bare_tvf(&from.first))
         {
-            // A bare pragma TVF (`FROM pragma_table_info WHERE arg='t'`) takes its
-            // argument from an equality constraint on the hidden `arg` (and
-            // optional `schema`) column. Push those into the call so the pragma is
-            // actually driven; run_core still re-applies the full WHERE and the
-            // echoed hidden columns satisfy it, so this is a superset — never wrong.
+            // A bare eponymous TVF (`FROM pragma_table_info WHERE arg='t'`,
+            // `FROM json_each WHERE json='[…]'`) takes its hidden arguments from
+            // equality constraints on its hidden input columns. Push those into the
+            // call so the function is actually driven; run_core still re-applies the
+            // full WHERE and the echoed hidden columns satisfy it, so this is a
+            // superset — never wrong.
             let pushed;
-            let source = if from.first.tvf_args.is_none() && self.is_pragma_tvf(&from.first) {
-                pushed = Self::push_pragma_tvf_args(&from.first, sel.where_clause.as_ref());
+            let source = if from.first.tvf_args.is_none() && self.is_bare_tvf(&from.first) {
+                pushed = Self::push_bare_tvf_args(&from.first, sel.where_clause.as_ref());
                 &pushed
             } else {
                 &from.first
@@ -17912,37 +17912,49 @@ impl Connection {
     /// recursive one — can appear as a join source).
     /// Run a derived-table subquery (`FROM (SELECT …) AS alias`) into column
     /// metadata (labeled with the alias) and row values.
-    /// A bare `pragma_<name>` (no parentheses) used as a `FROM` source is the
-    /// zero-argument table-valued form of that PRAGMA — unless a real table,
-    /// view, or CTE of the same name shadows it.
+    /// A bare eponymous table-valued function (no parentheses) used as a `FROM`
+    /// source: a `pragma_<name>` form, or `json_each` / `json_tree`. These take
+    /// their hidden arguments from `WHERE` equalities (see `push_bare_tvf_args`)
+    /// rather than a parenthesised list — unless a real table, view, or CTE of the
+    /// same name shadows them. `generate_series` is deliberately excluded: its
+    /// default `stop` is unbounded, which the materialising tree-walker cannot
+    /// stream, so its bare form stays `no such table` (deferred to the VDBE track).
     ///
-    /// `is_pragma_tvf` only routes the `pragma_`-prefixed name into the TVF path;
-    /// whether that name is actually a *valid* table source is decided by
-    /// [`pragma_has_tvf`] once the bare pragma name is known.
-    fn is_pragma_tvf(&self, tref: &TableRef) -> bool {
+    /// For a `pragma_*` name this only routes it into the TVF path; whether it is
+    /// a *valid* table source is decided by [`pragma_has_tvf`] in `tvf_rows`.
+    fn is_bare_tvf(&self, tref: &TableRef) -> bool {
+        let lname = tref.name.to_ascii_lowercase();
         tref.tvf_args.is_none()
             && tref.subquery.is_none()
             && tref.schema.is_none()
-            && tref.name.to_ascii_lowercase().starts_with("pragma_")
+            && (lname.starts_with("pragma_") || matches!(lname.as_str(), "json_each" | "json_tree"))
             && self.lookup_cte(&tref.name, None).is_none()
             && !self.is_view(&tref.name)
             && self.unqualified_db(&tref.name) == DbRef::Main
             && self.schema.table(&tref.name).is_none()
     }
 
-    /// Drive a bare pragma table-valued function from its `WHERE` clause: a
-    /// `pragma_*` source written without an argument list takes its pragma
-    /// argument from an equality constraint on the hidden `arg` column (and an
-    /// optional `schema` constraint), exactly as SQLite's eponymous pragma vtab
-    /// consumes those hidden-column constraints. Returns a clone of `tref` with
-    /// synthesized positional `tvf_args` (`[arg]` or `[arg, schema]`) when an
-    /// `arg = <constant>` constraint is present; otherwise an unchanged clone (the
-    /// argument-less form, which yields no rows — matching `pragma_table_info`
-    /// with no table named). Only top-level `AND`-conjoined equalities against a
-    /// literal/parameter are consumed; the full `WHERE` is still re-applied by
-    /// run_core (the echoed hidden columns satisfy it), so this never widens or
-    /// narrows the result incorrectly.
-    fn push_pragma_tvf_args(tref: &TableRef, where_clause: Option<&Expr>) -> TableRef {
+    /// Drive a bare eponymous table-valued function from its `WHERE` clause: a
+    /// `pragma_*` / `json_each` / `json_tree` source written without an argument
+    /// list takes its hidden positional arguments from equality constraints on its
+    /// hidden input columns — `arg` (+ optional `schema`) for a pragma TVF, `json`
+    /// (+ optional `root`) for `json_each` / `json_tree` — exactly as SQLite's
+    /// eponymous virtual tables consume those hidden-column constraints. Returns a
+    /// clone of `tref` with synthesized positional `tvf_args` when the leading
+    /// (required) constraint is present; otherwise an unchanged clone (the
+    /// argument-less form, which yields no rows). Only top-level `AND`-conjoined
+    /// equalities against a literal/parameter are consumed; the full `WHERE` is
+    /// still re-applied by run_core (the echoed hidden columns satisfy it), so this
+    /// never widens or narrows the result incorrectly.
+    fn push_bare_tvf_args(tref: &TableRef, where_clause: Option<&Expr>) -> TableRef {
+        let lname = tref.name.to_ascii_lowercase();
+        // Hidden input columns in positional order; the first is the required
+        // driver, the rest are an optional trailing run.
+        let cols: &[&str] = match lname.as_str() {
+            "json_each" | "json_tree" => &["json", "root"],
+            _ if lname.starts_with("pragma_") => &["arg", "schema"],
+            _ => return tref.clone(),
+        };
         let label = tref.alias.as_deref().unwrap_or(&tref.name);
         let find = |col: &str| -> Option<Expr> {
             let mut out = None;
@@ -17952,10 +17964,13 @@ impl Connection {
             out
         };
         let mut result = tref.clone();
-        if let Some(arg) = find("arg") {
-            let mut args = alloc::vec![arg];
-            if let Some(schema) = find("schema") {
-                args.push(schema);
+        if let Some(first) = find(cols[0]) {
+            let mut args = alloc::vec![first];
+            for c in &cols[1..] {
+                match find(c) {
+                    Some(e) => args.push(e),
+                    None => break,
+                }
             }
             result.tvf_args = Some(args);
         }
@@ -18514,7 +18529,7 @@ impl Connection {
         // CTE / view / TVF, and not schema-qualified.
         if tref.subquery.is_some()
             || tref.tvf_args.is_some()
-            || self.is_pragma_tvf(tref)
+            || self.is_bare_tvf(tref)
             || tref.schema.is_some()
             || self.lookup_cte(&tref.name, tref.alias.as_deref()).is_some()
             || self.is_view(&tref.name)
@@ -18586,7 +18601,7 @@ impl Connection {
         // CTE / view / TVF, and not schema-qualified.
         if tref.subquery.is_some()
             || tref.tvf_args.is_some()
-            || self.is_pragma_tvf(tref)
+            || self.is_bare_tvf(tref)
             || tref.schema.is_some()
             || self.lookup_cte(&tref.name, tref.alias.as_deref()).is_some()
             || self.is_view(&tref.name)
@@ -18656,7 +18671,7 @@ impl Connection {
         let tref = &join.table;
         if tref.subquery.is_some()
             || tref.tvf_args.is_some()
-            || self.is_pragma_tvf(tref)
+            || self.is_bare_tvf(tref)
             || tref.schema.is_some()
             || self.lookup_cte(&tref.name, tref.alias.as_deref()).is_some()
             || self.is_view(&tref.name)
@@ -18898,7 +18913,7 @@ impl Connection {
         tref: &TableRef,
         params: &Params,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
-        if tref.tvf_args.is_some() || self.is_pragma_tvf(tref) {
+        if tref.tvf_args.is_some() || self.is_bare_tvf(tref) {
             return self.tvf_rows(tref, params);
         }
         if let Some(sub) = &tref.subquery {
@@ -22262,9 +22277,10 @@ fn is_main_schema_table(name: &str) -> bool {
 /// (a typo, or a real pragma graphite does not implement) is not a TVF either.
 /// Collect a top-level `<label-qualified-or-bare> <col> = <constant>` equality
 /// out of a `WHERE` predicate (descending through `AND` and parentheses), used to
-/// drive a bare pragma table-valued function from `WHERE arg=…`. Only the first
-/// match is taken; the constant must be a literal or bound parameter (so it
-/// evaluates without row context). See [`Connection::push_pragma_tvf_args`].
+/// drive a bare eponymous table-valued function from `WHERE arg=…` / `json=…`.
+/// Only the first match is taken; the constant must be a literal or bound
+/// parameter (so it evaluates without row context). See
+/// [`Connection::push_bare_tvf_args`].
 fn collect_tvf_eq(e: &Expr, label: &str, col: &str, out: &mut Option<Expr>) {
     if out.is_some() {
         return;

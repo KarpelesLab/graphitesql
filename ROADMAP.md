@@ -273,7 +273,20 @@ exhausted for bounded (single-fix) work.
     with no `arg=` constraint or only a non-equality (`arg LIKE …`) yields no
     rows, matching the argument-less `PRAGMA`. Differential test in
     `tests/pragma_tvf_bare.rs`. See [[pragma-fidelity]].
-  - **A-tvf-bare-series — bare `generate_series` / `json_each` (remaining).**
+  - **A-tvf-bare-json — bare `json_each` / `json_tree` driven by `WHERE json=…`. DONE.**
+    A bare `FROM json_each WHERE json='[10,20,30]'` (and `json_tree`, with an
+    optional `root='$.a'` constraint) now binds the document and path from
+    top-level equality constraints on the hidden `json`/`root` columns — the same
+    mechanism as the pragma case, generalized. `is_pragma_tvf`→`is_bare_tvf`
+    (recognizes `json_each`/`json_tree` as well as `pragma_*`); `push_bare_tvf_args`
+    name-dispatches the hidden-column list (`["json","root"]` vs `["arg","schema"]`)
+    and lifts the equalities into synthetic positional `tvf_args`. The existing
+    `tvf_rows` json path already echoes the hidden `json`/`root` columns and excludes
+    them from `*`. Bare with no `json=` / only a non-equality (`json LIKE …`) yields
+    no rows, like an argument-less reference. Because these forms are always
+    *bounded* (unlike `generate_series`), the materialise path handles them.
+    Differential test in `tests/json_each_hidden_columns.rs`. See [[pragma-fidelity]].
+  - **A-tvf-bare-series — bare `generate_series` (remaining).**
     Still `no such table: <name>` for the parenthesis-free form. `generate_series`
     is the hard one: its default `stop` is `0xffffffff`, so a bare
     `WHERE start=1` (no `stop=`) is an effectively unbounded series that SQLite

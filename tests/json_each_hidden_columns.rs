@@ -80,3 +80,50 @@ fn hidden_columns_are_usable_in_where_and_explicit_select() {
     let r = rows(&c, "SELECT value FROM json_each('[1,2]') WHERE root='$'");
     assert_eq!(r.len(), 2);
 }
+
+#[test]
+fn bare_form_is_driven_by_a_where_constraint_on_json() {
+    // `json_each` / `json_tree` written WITHOUT parentheses are eponymous virtual
+    // tables: the document comes from an equality constraint on the hidden `json`
+    // column (and an optional `root`), exactly like SQLite.
+    let c = Connection::open_memory().unwrap();
+    let vals: Vec<Value> = rows(&c, "SELECT value FROM json_each WHERE json='[10,20,30]'")
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect();
+    assert_eq!(
+        vals,
+        vec![Value::Integer(10), Value::Integer(20), Value::Integer(30)]
+    );
+
+    // An optional `root` constraint walks a sub-document.
+    let vals: Vec<Value> = rows(
+        &c,
+        "SELECT value FROM json_each WHERE json='{\"a\":[7,8]}' AND root='$.a'",
+    )
+    .into_iter()
+    .map(|r| r[0].clone())
+    .collect();
+    assert_eq!(vals, vec![Value::Integer(7), Value::Integer(8)]);
+
+    // json_tree bare works the same way (here: the array node then its elements).
+    assert_eq!(
+        rows(&c, "SELECT value FROM json_tree WHERE json='[1,2]'").len(),
+        3
+    );
+
+    // The hidden columns still echo and are excluded from `*`.
+    assert_eq!(
+        one(&c, "SELECT json FROM json_each WHERE json='[1,2]'"),
+        Value::Text("[1,2]".into())
+    );
+    assert_eq!(
+        rows(&c, "SELECT * FROM json_each WHERE json='[1,2]'")[0].len(),
+        8
+    );
+
+    // No constraint, or a non-equality, drives nothing → no rows (not an error),
+    // like a bare argument-less reference.
+    assert!(rows(&c, "SELECT value FROM json_each").is_empty());
+    assert!(rows(&c, "SELECT value FROM json_each WHERE json LIKE '[1]'").is_empty());
+}
