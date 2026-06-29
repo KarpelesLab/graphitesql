@@ -380,6 +380,26 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   orders by *scanning a secondary index* — `SCAN … USING INDEX ib` — and an
   `IS NOT NULL` range seek (`a > NULL`); graphite still scans + sorts there, rows
   correct.)
+  A `WHERE`-bearing single-table `SELECT` *without* `ORDER BY` whose seek SQLite
+  answers by walking a secondary index now returns rows in *index-key* order on
+  the VDBE path too. The VDBE executes such a query as a rowid-order table scan,
+  which diverges from index order for any multi-row seek (a range bound, a
+  covering `IS NOT NULL`, an equality-prefixed range on a composite index) — a
+  latent gap the differential corpus missed because it ORDER-BYs or doesn't
+  project bare indexed columns. `run_select_vdbe` now defers exactly those shapes
+  to the tree-walker (whose seek paths already walk the index in key order) via a
+  `vdbe_seek_returns_index_order` predicate; single-key seeks (`a=?`, `a IS NULL`,
+  one-element `IN`) keep rowid order and stay on the VDBE, and any explicit
+  `ORDER BY` makes the order access-path-independent so those stay too. This also
+  lands a new covering plan, `try_isnotnull_covering`: `SELECT a … WHERE a IS NOT
+  NULL` over an index on `a` now reads `USING COVERING INDEX a (a>?)` (NULLs sort
+  first), while the near-full-table non-covering `SELECT *`/`SELECT b` stay a
+  plain `SCAN` on both sides — EQP and rows byte-exact vs sqlite3 3.50.4
+  (`tests/vdbe_secondary_index_order.rs`). (Deferred, both pre-existing and not
+  regressed: a *multi-value* `IN` seek — SQLite walks the list in sorted value
+  order, the tree-walker in written order, so neither engine reproduces it; and a
+  parameterized range bound `a > ?`, whose constant isn't known at the
+  defer-decision point, so it stays on the VDBE as before.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

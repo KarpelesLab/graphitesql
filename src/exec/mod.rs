@@ -1083,6 +1083,99 @@ impl Connection {
         }
     }
 
+    /// Whether the tree-walker would emit this single-table query's rows in a
+    /// *secondary-index* order that a plain rowid scan does not — i.e. the chosen
+    /// seek spans more than one index key: a range bound (on the index's leading
+    /// column, or the column right after an all-equality/`IS NULL` prefix), a
+    /// multi-value `IN`, or a covering `IS NOT NULL`. SQLite walks the index for
+    /// these and so returns the rows in key order; the VDBE executes the query as
+    /// a rowid-order table scan, so without an `ORDER BY` to re-sort, its output
+    /// order would diverge. `run_select_vdbe` defers such queries to the
+    /// tree-walker (whose seek paths already walk the index in key order, matching
+    /// SQLite). Single-key seeks (`a=?`, `a IS NULL`, a one-element `IN`) keep
+    /// rowid order and stay on the VDBE. Conservative: any uncertainty (a CTE,
+    /// view, subquery, `NOT INDEXED`, missing metadata) returns `false`, leaving
+    /// the query on the VDBE — the row order only differs when an index is
+    /// genuinely walked.
+    fn vdbe_seek_returns_index_order(&self, sel: &Select, params: &Params) -> Result<bool> {
+        let Some(from) = sel.from.as_ref() else {
+            return Ok(false);
+        };
+        if !from.joins.is_empty() {
+            return Ok(false);
+        }
+        let t = &from.first;
+        if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
+            return Ok(false);
+        }
+        if matches!(t.index_hint, Some(IndexHint::NotIndexed)) {
+            return Ok(false);
+        }
+        let Some(where_expr) = sel.where_clause.as_ref() else {
+            return Ok(false);
+        };
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return Ok(false);
+        }
+        let Ok(meta) = self.table_meta(&t.name, t.alias.as_deref()) else {
+            return Ok(false);
+        };
+        let indexes = self.indexes_of(&t.name)?;
+        let plain = |idx: &&IndexMeta| idx.partial.is_none() && idx.key_exprs.is_none();
+
+        // The equality / `IS NULL` prefix that pins leading index columns to a
+        // single key value (those keep rowid order); a range on the column right
+        // after the prefix is the first multi-key span.
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        let mut isnull_cols: Vec<usize> = Vec::new();
+        collect_isnull_cols(where_expr, &meta.columns, &mut isnull_cols);
+        let pinned = |c: usize| eqs.iter().any(|(col, _)| *col == c) || isnull_cols.contains(&c);
+
+        // (1) A range after the pinned prefix of a plain secondary index. A range
+        //     on the rowid/IPK walks the table b-tree in rowid order instead, so
+        //     it never counts.
+        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+            alloc::collections::BTreeMap::new();
+        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+        for idx in indexes.iter().filter(plain) {
+            let mut k = 0;
+            while k < idx.cols.len() && pinned(idx.cols[k]) {
+                k += 1;
+            }
+            if let Some(&next) = idx.cols.get(k) {
+                if meta.ipk != Some(next) && ranges.contains_key(&next) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // A multi-value `IN` is deliberately *not* handled here: SQLite seeks once
+        // per sorted value, but the tree-walker walks the `IN` list in written
+        // order, so deferring would not match SQLite either (a separate, pre-
+        // existing `IN`-order gap). Leaving it on the VDBE changes nothing.
+
+        // (2) A covering `IS NOT NULL` seek (spans every non-NULL key).
+        let mut isnotnull_cols: Vec<usize> = Vec::new();
+        collect_isnotnull_cols(where_expr, &meta.columns, &mut isnotnull_cols);
+        if !isnotnull_cols.is_empty()
+            && self
+                .isnotnull_covering_index(
+                    &meta,
+                    &t.name,
+                    sel,
+                    where_expr,
+                    &isnotnull_cols,
+                    t.index_hint.as_ref(),
+                )?
+                .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Compile and run a parsed `SELECT` through the VDBE engine, or `Unsupported`
     /// when its shape is outside the spike's grammar (so callers fall back).
     fn run_select_vdbe(&self, sel: &Select) -> Result<QueryResult> {
@@ -1132,6 +1225,17 @@ impl Connection {
                 .is_some()
         {
             return Err(Error::Unsupported("VDBE: ORDER BY satisfied by a scan"));
+        }
+        // A secondary-index seek (range / multi-value IN / covering `IS NOT NULL`)
+        // returns rows in index-key order, which the VDBE's rowid-order table scan
+        // does not reproduce. With no `ORDER BY` to re-sort, defer to the
+        // tree-walker (which walks the index in key order, matching SQLite); an
+        // explicit `ORDER BY` makes the order independent of the access path, so
+        // the VDBE keeps those.
+        if sel.order_by.is_empty()
+            && self.vdbe_seek_returns_index_order(sel, &eval::Params::default())?
+        {
+            return Err(Error::Unsupported("VDBE: secondary-index seek order"));
         }
         // A window-function query (Track B5c-4): scan the single base table on the
         // VDBE (with `WHERE` applied and the rowid appended), then evaluate the
@@ -11673,6 +11777,100 @@ impl Connection {
         }
     }
 
+    /// Pick the sole covering index a bare `col IS NOT NULL` can seek. `col IS
+    /// NOT NULL` selects every non-NULL key — a `col > NULL` lower-bounded range
+    /// spanning ~the whole table — so sqlite only prefers the index over a plain
+    /// scan when that index is *covering* (a near-full-table non-covering seek,
+    /// re-fetching every row by rowid, loses to a scan). graphite has no
+    /// selectivity cost model, so this matches sqlite by gating strictly on the
+    /// covering case: it returns rows only when a single plain index's leading
+    /// column is `IS NOT NULL`-constrained and the index covers the query. The
+    /// bare non-covering `SELECT *` keeps falling through to the scan, exactly as
+    /// sqlite plans it. Walking the whole index and letting `run_core` re-apply
+    /// the `WHERE` drops the NULL-keyed entries (the superset invariant), so the
+    /// surviving rows arrive in index order — the same order sqlite's seek yields.
+    /// Must stay in lockstep with `eqp_access`'s matching covering branch.
+    fn try_isnotnull_covering(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        sel: &Select,
+        params: &Params,
+    ) -> Result<Option<Vec<InputRow>>> {
+        let _ = params;
+        let Some(where_expr) = &sel.where_clause else {
+            return Ok(None);
+        };
+        let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
+        if matches!(hint, Some(IndexHint::NotIndexed)) {
+            return Ok(None);
+        }
+        let mut isnotnull_cols: Vec<usize> = Vec::new();
+        collect_isnotnull_cols(where_expr, &meta.columns, &mut isnotnull_cols);
+        if isnotnull_cols.is_empty() {
+            return Ok(None);
+        }
+        let Some((_, root, idx_cols)) = self.isnotnull_covering_index(
+            meta,
+            table_name,
+            sel,
+            where_expr,
+            &isnotnull_cols,
+            hint,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.covering_seek_rows(meta, root, &idx_cols)?))
+    }
+
+    /// The index `try_isnotnull_covering` / `eqp_access` agree to seek for a
+    /// `col IS NOT NULL`: a single plain (non-partial, non-expression) index
+    /// whose leading column is in `isnotnull_cols` and which covers the whole
+    /// query. Honors `INDEXED BY` (filter to the named index, erroring if it
+    /// doesn't exist) and declines on ambiguity (two qualifying indexes — sqlite's
+    /// no-stats tiebreak is creation-order-dependent), returning the chosen
+    /// index's `(name, root, cols)`.
+    #[allow(clippy::type_complexity)]
+    fn isnotnull_covering_index(
+        &self,
+        meta: &TableMeta,
+        table_name: &str,
+        sel: &Select,
+        where_expr: &Expr,
+        isnotnull_cols: &[usize],
+        hint: Option<&IndexHint>,
+    ) -> Result<Option<(String, u32, Vec<usize>)>> {
+        let indexes = self.indexes_of(table_name)?;
+        if let Some(IndexHint::IndexedBy(n)) = hint {
+            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
+                return Err(Error::Error(alloc::format!("no such index: {n}")));
+            }
+        }
+        let mut qualifying = indexes.iter().filter(|idx| {
+            if let Some(IndexHint::IndexedBy(n)) = hint {
+                if !idx.name.eq_ignore_ascii_case(n) {
+                    return false;
+                }
+            }
+            idx.partial.is_none()
+                && idx.key_exprs.is_none()
+                && idx.cols.first().is_some_and(|c| isnotnull_cols.contains(c))
+                && self.seek_index_covers(sel, meta, &idx.cols, where_expr)
+        });
+        let Some(chosen) = qualifying.next() else {
+            return Ok(None);
+        };
+        if qualifying.next().is_some() {
+            return Ok(None);
+        }
+        Ok(Some((
+            chosen.name.clone(),
+            chosen.root,
+            chosen.cols.clone(),
+        )))
+    }
+
     /// Walk an index between `bound`'s lower/upper keys (single leading column,
     /// under `coll`) and fetch each matching row from the table by rowid. Returns
     /// a superset — `run_core` re-applies the full `WHERE`.
@@ -13287,6 +13485,38 @@ impl Connection {
                     "SEARCH {label} USING INDEX {} (<expr>=?)",
                     idx.name
                 ));
+            }
+        }
+
+        // A bare `col IS NOT NULL` covering seek (mirrors `try_isnotnull_covering`):
+        // sqlite reads the sole covering index as `col>?` (NULLs sort first, so the
+        // non-NULL keys are the `> NULL` suffix). Gated on covering only — the
+        // near-full-table non-covering case stays `SCAN` on both sides.
+        {
+            let hint = sel
+                .and_then(|s| s.from.as_ref())
+                .and_then(|f| f.first.index_hint.as_ref());
+            if !matches!(hint, Some(IndexHint::NotIndexed)) {
+                let mut isnotnull_cols: Vec<usize> = Vec::new();
+                collect_isnotnull_cols(where_expr, &meta.columns, &mut isnotnull_cols);
+                if let Some(s) = sel {
+                    if !isnotnull_cols.is_empty() {
+                        if let Some((name, _, idx_cols)) = self.isnotnull_covering_index(
+                            meta,
+                            table,
+                            s,
+                            where_expr,
+                            &isnotnull_cols,
+                            hint,
+                        )? {
+                            let lead = idx_cols[0];
+                            return Ok(alloc::format!(
+                                "SEARCH {label} USING COVERING INDEX {name} ({}>?)",
+                                meta.columns[lead].name
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -18517,6 +18747,11 @@ impl Connection {
                 return Ok((first_meta.columns, rows));
             }
             if let Some(rows) = self.try_index_or(&first_meta, &from.first.name, sel, params)? {
+                return Ok((first_meta.columns, rows));
+            }
+            if let Some(rows) =
+                self.try_isnotnull_covering(&first_meta, &from.first.name, sel, params)?
+            {
                 return Ok((first_meta.columns, rows));
             }
             // ORDER BY satisfied by a full secondary index (B0): walk that index
@@ -26934,6 +27169,35 @@ fn collect_isnull_cols(e: &Expr, columns: &[ColumnInfo], out: &mut Vec<usize>) {
         Expr::IsNull {
             expr,
             negated: false,
+        } => {
+            if let Some(ci) = col_index(expr, columns) {
+                out.push(ci);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Columns constrained `col IS NOT NULL` by the top-level `AND` conjuncts of a
+/// `WHERE` — the complement of [`collect_isnull_cols`] (`negated: true`). Such a
+/// column selects every non-NULL key, i.e. a `col > NULL` lower-bounded range;
+/// sqlite seeks an index for it only when that index is *covering* (a near-
+/// full-table non-covering seek loses to a plain scan), which is exactly the gate
+/// `try_isnotnull_covering` applies.
+fn collect_isnotnull_cols(e: &Expr, columns: &[ColumnInfo], out: &mut Vec<usize>) {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            collect_isnotnull_cols(left, columns, out);
+            collect_isnotnull_cols(right, columns, out);
+        }
+        Expr::Paren(inner) => collect_isnotnull_cols(inner, columns, out),
+        Expr::IsNull {
+            expr,
+            negated: true,
         } => {
             if let Some(ci) = col_index(expr, columns) {
                 out.push(ci);
