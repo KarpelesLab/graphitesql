@@ -314,6 +314,20 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   de-duplicate and the concatenation is a valid superset; a non-leading-PK or unindexed
   column still scans (`SELECT * FROM t WHERE k IN ('a','c')`, `k='a' OR k='c'`, the
   INTEGER/TEXT/composite-PK and `NOT INDEXED` cases — `tests/eqp_without_rowid_pk_in_seek.rs`).
+  `EXPLAIN QUERY PLAN` now names an *aliased* base table by its **alias alone**
+  (`SCAN x`, `SEARCH x USING INDEX ia (a=?)`, `SCAN x VIRTUAL TABLE …`), exactly as
+  sqlite does, rather than the `table AS alias` form graphite used to print: `eqp_label`
+  returns the alias when present. The single quirk sqlite makes is the bare `count(*)`
+  covering-index plan, which it labels with the *table name* even when aliased
+  (`SCAN t USING COVERING INDEX ia`) — the `count_covering_index` EQP branch mirrors that
+  by using `from.first.name`. Adjacent fix: the inner side of a `LEFT JOIN` now carries
+  sqlite's ` LEFT-JOIN` suffix on its `SEARCH` node for every seek kind (rowid IPK,
+  secondary index, `WITHOUT ROWID` PK, automatic covering index) — a shared `left_suffix`
+  applied across all four join EQP branches; previously the rowid/index join branches
+  omitted it (`tests/eqp_alias_label.rs`, and the corrected hardcoded assertions in
+  `tests/explain.rs`, `tests/join_seek.rs`, `tests/join_index_seek.rs`). (Residual: the
+  INDEX-vs-COVERING-INDEX detection for `count(*)/min/max … WHERE col=?` — graphite renders
+  `SEARCH x USING INDEX ia (a=?)` where sqlite picks the covering form — is unchanged.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

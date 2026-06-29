@@ -357,7 +357,7 @@ fn aliased_table() {
     let c = setup();
     assert_eq!(
         detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t AS x WHERE x.a = 2"),
-        ["SEARCH t AS x USING INDEX it_a (a=?)"]
+        ["SEARCH x USING INDEX it_a (a=?)"]
     );
 }
 

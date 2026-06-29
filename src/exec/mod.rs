@@ -12569,9 +12569,11 @@ impl Connection {
             let detail = if from.joins.is_empty() {
                 // `SELECT count(*)` answered by counting a full secondary index
                 // (B2b) reads as `USING COVERING INDEX`. Kept in lockstep with
-                // `run_core` via the shared `count_covering_index` helper.
+                // `run_core` via the shared `count_covering_index` helper. SQLite
+                // labels this particular plan with the *table name* even when the
+                // table is aliased (unlike every other scan, which uses the alias).
                 if let Some((name, _)) = self.count_covering_index(sel) {
-                    alloc::format!("SCAN {label} USING COVERING INDEX {name}")
+                    alloc::format!("SCAN {} USING COVERING INDEX {name}", from.first.name)
                 }
                 // A full index scanned to satisfy ORDER BY reads as `USING INDEX`,
                 // or `USING COVERING INDEX` when it holds every referenced column.
@@ -12616,6 +12618,14 @@ impl Connection {
             let mut left_columns = self.resolve_join_source(&from.first, params)?.0;
             for join in &from.joins {
                 let label = eqp_label(&join.table);
+                // SQLite tags the inner side of a LEFT join with a ` LEFT-JOIN`
+                // suffix on its SEARCH node (every seek kind), so the outer-row
+                // null-padding is visible in the plan.
+                let left_suffix = if matches!(join.kind, JoinKind::Left) {
+                    " LEFT-JOIN"
+                } else {
+                    ""
+                };
                 // Most joins emit one plan row; an automatic-index (hash) join
                 // emits two (a BLOOM FILTER then the SEARCH), so collect details.
                 let (details, jcols): (Vec<String>, Vec<ColumnInfo>) = if let Some((
@@ -12626,7 +12636,7 @@ impl Connection {
                 {
                     (
                         alloc::vec![alloc::format!(
-                            "SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"
+                            "SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?){left_suffix}"
                         )],
                         inner_meta.columns,
                     )
@@ -12635,7 +12645,7 @@ impl Connection {
                     let col = &inner_meta.columns[idx.cols[0]].name;
                     (
                         alloc::vec![alloc::format!(
-                            "SEARCH {label} USING INDEX {} ({col}=?)",
+                            "SEARCH {label} USING INDEX {} ({col}=?){left_suffix}",
                             idx.name
                         )],
                         inner_meta.columns,
@@ -12644,14 +12654,9 @@ impl Connection {
                     self.without_rowid_pk_join_seek(join, &left_columns)
                 {
                     let col = &inner_meta.columns[inner_meta.storage_order[0]].name;
-                    let suffix = if matches!(join.kind, JoinKind::Left) {
-                        " LEFT-JOIN"
-                    } else {
-                        ""
-                    };
                     (
                         alloc::vec![alloc::format!(
-                            "SEARCH {label} USING PRIMARY KEY ({col}=?){suffix}"
+                            "SEARCH {label} USING PRIMARY KEY ({col}=?){left_suffix}"
                         )],
                         inner_meta.columns,
                     )
@@ -12676,22 +12681,15 @@ impl Connection {
                         })
                     };
                     match auto_col {
-                        Some(col) => {
-                            let suffix = if matches!(join.kind, JoinKind::Left) {
-                                " LEFT-JOIN"
-                            } else {
-                                ""
-                            };
-                            (
-                                alloc::vec![
-                                    alloc::format!("BLOOM FILTER ON {label} ({col}=?)"),
-                                    alloc::format!(
-                                        "SEARCH {label} USING AUTOMATIC COVERING INDEX ({col}=?){suffix}"
-                                    ),
-                                ],
-                                jcols,
-                            )
-                        }
+                        Some(col) => (
+                            alloc::vec![
+                                alloc::format!("BLOOM FILTER ON {label} ({col}=?)"),
+                                alloc::format!(
+                                    "SEARCH {label} USING AUTOMATIC COVERING INDEX ({col}=?){left_suffix}"
+                                ),
+                            ],
+                            jcols,
+                        ),
                         None => (alloc::vec![alloc::format!("SCAN {label}")], jcols),
                     }
                 };
@@ -26468,11 +26466,14 @@ fn pragma_truth(e: &Expr, params: &Params) -> bool {
     }
 }
 
-/// The EXPLAIN QUERY PLAN display label for a table reference: SQLite shows
-/// `name AS alias` when an alias is present, else just the name.
+/// The EXPLAIN QUERY PLAN display label for a table reference: SQLite names the
+/// scan by its *alias* alone when one is present (`SCAN x`, not `SCAN t AS x`),
+/// else by the table name. The lone exception is the bare `count(*)` covering-index
+/// optimization, which SQLite labels with the table name even when aliased — that
+/// caller passes the name directly rather than this label.
 fn eqp_label(t: &TableRef) -> String {
     match &t.alias {
-        Some(a) => alloc::format!("{} AS {}", t.name, a),
+        Some(a) => a.clone(),
         None => t.name.clone(),
     }
 }

@@ -80,7 +80,8 @@ fn left_join_eqp_searches_by_index() {
             &c,
             "EXPLAIN QUERY PLAN SELECT t.a,u.n FROM t LEFT JOIN u ON t.uk=u.k"
         ),
-        ["SCAN t", "SEARCH u USING INDEX iuk (k=?)"]
+        // The inner side of a LEFT join carries sqlite's ` LEFT-JOIN` suffix.
+        ["SCAN t", "SEARCH u USING INDEX iuk (k=?) LEFT-JOIN"]
     );
 }
 

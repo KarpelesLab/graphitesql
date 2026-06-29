@@ -66,7 +66,11 @@ fn left_join_eqp_searches_by_rowid() {
             &c,
             "EXPLAIN QUERY PLAN SELECT t.a,u.n FROM t LEFT JOIN u ON t.uid=u.id"
         ),
-        ["SCAN t", "SEARCH u USING INTEGER PRIMARY KEY (rowid=?)"]
+        // The inner side of a LEFT join carries sqlite's ` LEFT-JOIN` suffix.
+        [
+            "SCAN t",
+            "SEARCH u USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN"
+        ]
     );
 }
 
