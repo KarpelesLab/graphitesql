@@ -257,7 +257,18 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   `ORDER BY` (sqlite does not elide trailing terms via key-uniqueness in the GROUP BY
   case) and a non-rowid `GROUP BY`. (A `HAVING` *range* on the group-key rowid — which
   sqlite pushes down to a `SEARCH … (rowid>?)` — is a separate deferred pushdown gap;
-  rows stay correct.)
+  rows stay correct.) A `DISTINCT` whose projection *pins* the rowid / INTEGER PRIMARY
+  KEY is likewise recognised as a **no-op** (`distinct_is_noop`): the key is unique per
+  row, so de-duplication removes nothing and sqlite plans the query exactly as if
+  `DISTINCT` were absent — no `USE TEMP B-TREE FOR DISTINCT` node, a bare `SCAN`
+  (`covering_scan` stands down via `rowid_ordered_scan`), and a sole leading `ORDER BY`
+  on that key skips the sort too (`SELECT DISTINCT id FROM t ORDER BY id [DESC]`,
+  `SELECT DISTINCT id, a FROM t ORDER BY id`, `SELECT DISTINCT * FROM t ORDER BY id`,
+  and the implicit-rowid `SELECT DISTINCT rowid FROM u …`). A bare `*` / `t.*` counts
+  (the IPK is in its expansion); an *expression* projection (`id+0`) does not (sqlite
+  keeps its DISTINCT b-tree) and is left untouched. (Deferred, orthogonal: a no-`ORDER
+  BY` `DISTINCT`/covering scan still emits rows in rowid order rather than sqlite's
+  index-walk order; and `WITHOUT ROWID` DISTINCT/grouping.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

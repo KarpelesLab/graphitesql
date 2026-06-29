@@ -12665,7 +12665,11 @@ impl Connection {
         // clean single-table bare-`SCAN` case, placed after the SCAN line and
         // before any ORDER BY node — matching sqlite's node order.
         let mut group_btree_suppresses_order = false;
-        if single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str()) {
+        // A no-op `DISTINCT` (its projection pins the rowid/IPK, so it removes
+        // nothing) is planned by sqlite as if absent — no `FOR DISTINCT` node.
+        if single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str())
+            && !self.distinct_is_noop(sel, &meta, &label)
+        {
             if let Some((kind, suppress)) = self.group_distinct_btree(sel, &meta, &from.first.name)
             {
                 let id = *next_id;
@@ -14265,9 +14269,62 @@ impl Connection {
         is_rowid_alias || is_ipk
     }
 
+    /// Whether a `DISTINCT` is a no-op because the projection includes the rowid /
+    /// INTEGER PRIMARY KEY of its single base table: that column is unique per row,
+    /// so no two output rows can be equal and the de-duplication removes nothing.
+    /// sqlite then plans the query exactly as if `DISTINCT` were absent (it may
+    /// still pick a covering index for the scan; only the *redundant* `ORDER BY`
+    /// temp b-tree on the rowid is dropped). A bare `*` / `t.*` counts when the
+    /// table has an explicit INTEGER PRIMARY KEY column (it is in the expansion);
+    /// an *expression* projection (`id+0`) does not — sqlite keeps a `DISTINCT`
+    /// b-tree for it. `meta` must be this table's metadata, `label` its alias-or-name.
+    fn distinct_is_noop(&self, sel: &Select, meta: &TableMeta, label: &str) -> bool {
+        if !sel.distinct {
+            return false;
+        }
+        let col_is_rowid = |table: &Option<String>, column: &str| -> bool {
+            if table
+                .as_deref()
+                .is_some_and(|tn| !tn.eq_ignore_ascii_case(label))
+            {
+                return false;
+            }
+            let shadowed = meta
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(column));
+            let is_alias = matches!(
+                column.to_ascii_lowercase().as_str(),
+                "rowid" | "_rowid_" | "oid"
+            ) && !shadowed
+                && !meta.without_rowid;
+            let is_ipk = meta
+                .ipk
+                .is_some_and(|i| meta.columns[i].name.eq_ignore_ascii_case(column));
+            is_alias || is_ipk
+        };
+        sel.columns.iter().any(|rc| match rc {
+            ResultColumn::Expr {
+                expr:
+                    Expr::Column {
+                        schema: None,
+                        table,
+                        column,
+                        ..
+                    },
+                ..
+            } => col_is_rowid(table, column),
+            // `*` / `t.*` expands to include an explicit INTEGER PRIMARY KEY column.
+            ResultColumn::Wildcard => meta.ipk.is_some(),
+            ResultColumn::TableWildcard(t) => meta.ipk.is_some() && t.eq_ignore_ascii_case(label),
+            _ => false,
+        })
+    }
+
     /// When a query's sole `ORDER BY` term is the rowid / INTEGER PRIMARY KEY of
     /// a single plain table that is scanned in full (no `WHERE`, no aggregate,
-    /// window, or `DISTINCT`), the table b-tree already yields rows in rowid order
+    /// window, or non-trivial `DISTINCT`), the table b-tree already yields rows in
+    /// rowid order
     /// — so the sort is redundant. A `GROUP BY` is permitted only when it is itself
     /// exactly that rowid/IPK ([`group_by_is_rowid`](Self::group_by_is_rowid)): each
     /// group is then a single row in rowid order, and sqlite suppresses the sort —
@@ -14285,7 +14342,7 @@ impl Connection {
         if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
             return None;
         }
-        if sel.where_clause.is_some() || sel.distinct || sel.order_by.is_empty() {
+        if sel.where_clause.is_some() || sel.order_by.is_empty() {
             return None;
         }
         if window::has_window(sel) {
@@ -14298,6 +14355,11 @@ impl Connection {
         let label = t.alias.as_deref().unwrap_or(&t.name);
         let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
         if meta.without_rowid {
+            return None;
+        }
+        // A `DISTINCT` is acceptable only when it is a no-op — its projection pins the
+        // rowid/IPK, so it removes nothing and sqlite plans the query as if absent.
+        if sel.distinct && !self.distinct_is_noop(sel, &meta, label) {
             return None;
         }
         // A `GROUP BY` is acceptable only when it is itself exactly the rowid/IPK:
