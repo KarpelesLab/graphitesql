@@ -401,7 +401,11 @@ returns the tree-walker's results or declines to it — never a wrong answer.
   a false/NULL predicate emits zero rows and never evaluates the SELECT list. A
   constant `LIMIT`/`OFFSET` folds at compile time (the single row is suppressed when
   `LIMIT` is 0 or a positive `OFFSET` skips it; a negative `LIMIT`/`OFFSET` matches
-  SQLite's unlimited/no-skip), and `DISTINCT` is a no-op over one row.
+  SQLite's unlimited/no-skip), and `DISTINCT` is a no-op over one row. An `ORDER BY`
+  whose terms resolve is likewise a no-op (one row can't reorder) and runs here —
+  the key is compiled to force type/column resolution, then discarded; a positional
+  ordinal (`ORDER BY 2`, needs range-checking) or an output-alias reference still
+  defers to the tree-walker.
 - **Joins on the VDBE** (**B5a/B5b-1**) — N-table inner joins plus 2-table and
   N-table `LEFT`/`RIGHT`/`FULL` nested-loop joins, with projection /
   WHERE-merged-ON / `DISTINCT` / `ORDER BY` / `LIMIT` / grouped-and-bare

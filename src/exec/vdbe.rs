@@ -508,7 +508,6 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         || !sel.group_by.is_empty()
         || sel.having.is_some()
         || !sel.compound.is_empty()
-        || !sel.order_by.is_empty()
     {
         return Err(Error::Unsupported("VDBE spike: only constant SELECT lists"));
     }
@@ -562,6 +561,28 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         };
         c.compile_expr_into(expr, i)?;
         columns.push(result_label(expr, alias, source, i));
+    }
+    // A FROM-less SELECT yields at most one row, so `ORDER BY` cannot reorder
+    // anything — it is a no-op. Each term is still VALIDATED, though, so an
+    // invalid one defers to the tree-walker (which raises SQLite's exact error)
+    // rather than being silently accepted: a positional ordinal (`ORDER BY 1`)
+    // needs range-checking against the output arity — owned by the tree-walker —
+    // so every positional form defers; any other term is compiled then discarded
+    // purely to force column/alias resolution, so an unresolved reference
+    // (`ORDER BY x`, or an output alias the const compiler can't see) makes
+    // `compile_expr` defer too. A constant key (`ORDER BY abs(-1)`) resolves and
+    // runs as the no-op it is.
+    for term in &sel.order_by {
+        if super::positional_int(&term.expr).is_some() {
+            return Err(Error::Unsupported(
+                "VDBE: positional ORDER BY in const SELECT",
+            ));
+        }
+        let saved_ops = c.ops.len();
+        let saved_reg = c.next_reg;
+        c.compile_expr(&term.expr)?;
+        c.ops.truncate(saved_ops);
+        c.next_reg = saved_reg;
     }
     // A FROM-less SELECT yields at most one row, so `LIMIT`/`OFFSET` reduce to a
     // compile-time emit/suppress decision and `DISTINCT` is a no-op (one row is
