@@ -1097,6 +1097,23 @@ impl Connection {
     /// view, subquery, `NOT INDEXED`, missing metadata) returns `false`, leaving
     /// the query on the VDBE — the row order only differs when an index is
     /// genuinely walked.
+    /// True when the tree-walker would answer this no-`WHERE` query via a covering
+    /// secondary index (`covering_scan`), reading rows in index-key order that the
+    /// VDBE's rowid-order table scan cannot reproduce. Used to defer such queries
+    /// to the tree-walker so the observable row order matches SQLite. Only meaningful
+    /// with no `ORDER BY` (an explicit sort makes the order access-path-independent).
+    fn vdbe_covering_scan_reorders(&self, sel: &Select) -> bool {
+        let Some(from) = sel.from.as_ref() else {
+            return false;
+        };
+        let t = &from.first;
+        let Ok(meta) = self.table_meta(&t.name, t.alias.as_deref()) else {
+            return false;
+        };
+        self.covering_scan(sel, &meta, &eval::Params::default())
+            .is_some()
+    }
+
     fn vdbe_seek_returns_index_order(&self, sel: &Select, params: &Params) -> Result<bool> {
         let Some(from) = sel.from.as_ref() else {
             return Ok(false);
@@ -1272,6 +1289,15 @@ impl Connection {
             && self.vdbe_seek_returns_index_order(sel, &eval::Params::default())?
         {
             return Err(Error::Unsupported("VDBE: secondary-index seek order"));
+        }
+        // With no `WHERE` and no `ORDER BY`, the tree-walker may answer a query by
+        // reading a covering secondary index (`covering_scan`) — rows arrive in
+        // index-key order, which the VDBE's rowid-order table scan does not
+        // reproduce. Defer those so the observable order matches SQLite. (An
+        // `ORDER BY` re-sorts the rows, making the order independent of the access
+        // path; `covering_scan` already declines when a scan satisfies the sort.)
+        if sel.order_by.is_empty() && self.vdbe_covering_scan_reorders(sel) {
+            return Err(Error::Unsupported("VDBE: covering-index scan order"));
         }
         // A window-function query (Track B5c-4): scan the single base table on the
         // VDBE (with `WHERE` applied and the rowid appended), then evaluate the

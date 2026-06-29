@@ -410,6 +410,19 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   the VDBE; and the `ORDER BY a DESC` duplicate-key tiebreak — the VDBE's stable
   sort keeps equal-key rows in rowid order where SQLite's reverse index walk
   emits them in reverse-rowid order — an orthogonal DESC-sort quirk.)
+  A second follow-up closes the same divergence for a **no-`WHERE` covering scan**:
+  `SELECT a FROM t` (or `SELECT DISTINCT a`, composite `SELECT a,b` over `(a,b)`)
+  with no `ORDER BY` is served by the tree-walker's `covering_scan` — reading the
+  covering secondary index in key order — while the VDBE rowid-scans the table.
+  `run_select_vdbe` now defers whenever `vdbe_covering_scan_reorders` (a thin wrapper
+  over `covering_scan`'s own applicability check) fires, so the rows arrive in index
+  order matching sqlite3 3.50.4; `SELECT *`/non-covered projections keep the rowid
+  `SCAN`, and an `ORDER BY` re-sorts independently of the access path
+  (`tests/vdbe_covering_scan_order.rs`). (Pre-existing, not regressed: a redundant
+  index on the IPK still mislabels its EQP `USING COVERING INDEX` vs sqlite's bare
+  `SCAN`, and two identical covering indexes leave both EQP and seek-order ambiguous
+  — `covering_scan` declines rather than guess sqlite's cost-model choice. Both need
+  separate EQP-side work and arise only from degenerate schemas.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
