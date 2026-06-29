@@ -241,8 +241,13 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   key (after any equality-pinned prefix) the walk continues in rowid order, so
   `WHERE b>2 ORDER BY b, id` or `WHERE b=3 ORDER BY id` over an index on `(b)` is
   served by the seek with no temp-btree node, with the same DESC / mixed-direction /
-  automatic-index exclusions. (Eliding an equality-*pinned* leading `ORDER BY` term —
-  `WHERE b=3 ORDER BY b, id`, where `b` is constant — stays a separate deferred gap.)
+  automatic-index exclusions. An equality-*pinned* `ORDER BY` term is now elided too:
+  a column constrained by `WHERE col = <literal>` is constant across the seeked rows,
+  so sqlite drops any `ORDER BY` term on it — `WHERE b=3 ORDER BY b, id` skips the
+  sort just like `WHERE b=3 ORDER BY id`, even when the pinned term *leads* (the
+  effective walk direction then comes from the first non-constant term, so
+  `WHERE b=3 ORDER BY b, id DESC` walks the rowid descending). The pin applies to any
+  equality column, indexed or not (`WHERE b=3 AND c=5 ORDER BY c, id`).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

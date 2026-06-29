@@ -154,6 +154,64 @@ fn seek_trailing_rowid_served_by_index_walk() {
 }
 
 #[test]
+fn seek_drops_equality_pinned_order_by_terms() {
+    let have_sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
+    if !have_sqlite {
+        return;
+    }
+
+    let rows = " INSERT INTO t VALUES (3,7,1),(1,7,9),(2,3,5),(4,3,5),(5,3,2);";
+    // An ORDER BY term on an equality-pinned column is constant across the seeked
+    // rows, so sqlite drops it — and when the remainder is served by the walk the
+    // whole sort is skipped. The effective walk direction is that of the first
+    // *non-constant* term, which may differ from the leading (pinned) term.
+    let cases: &[(&str, &str)] = &[
+        (
+            "CREATE INDEX ib ON t(b);",
+            "SELECT * FROM t WHERE b=3 ORDER BY b, id",
+        ),
+        (
+            "CREATE INDEX ib ON t(b);",
+            "SELECT * FROM t WHERE b=3 ORDER BY b, id DESC",
+        ),
+        (
+            "CREATE INDEX ib ON t(b);",
+            "SELECT * FROM t WHERE b=3 ORDER BY b",
+        ),
+        (
+            "CREATE INDEX ib ON t(b);",
+            "SELECT * FROM t WHERE b=3 ORDER BY b DESC, id",
+        ),
+        // A pinned column need not be the indexed one — any equality makes it constant.
+        (
+            "CREATE INDEX ib ON t(b);",
+            "SELECT * FROM t WHERE b=3 AND c=5 ORDER BY c, id",
+        ),
+        // Pinned leading + trailing rowid over a composite seek.
+        (
+            "CREATE INDEX ibc ON t(b,c);",
+            "SELECT * FROM t WHERE b=3 ORDER BY b, c, id",
+        ),
+    ];
+
+    for &(idx, q) in cases {
+        let full = format!("CREATE TABLE t(id INTEGER PRIMARY KEY,b,c); {idx}{rows}");
+        let c = conn(&full);
+        let g = g_eqp(&c, q);
+        assert!(
+            !g.contains("TEMP B-TREE FOR ORDER BY") && !g.contains("LAST TERM OF ORDER BY"),
+            "expected no sort node for [{idx}] {q}\n  got: {g}"
+        );
+        assert_eq!(g, sqlite_eqp(&full, q), "EQP diverged for [{idx}] {q}");
+        assert_eq!(
+            g_rows(&c, q).trim(),
+            sqlite_out(&format!("{full} {q};")).trim(),
+            "rows diverged for [{idx}] {q}"
+        );
+    }
+}
+
+#[test]
 fn seek_trailing_rowid_named_unique_index() {
     let have_sqlite = Command::new("sqlite3").arg("--version").output().is_ok();
     if !have_sqlite {

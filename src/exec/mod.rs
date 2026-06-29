@@ -15101,6 +15101,74 @@ impl Connection {
                 }
             }
         }
+        // Equality-pinned columns are constant across the seeked rows, so sqlite
+        // drops ORDER BY terms on them entirely. If, after dropping those, the walk
+        // (plus a single trailing rowid) orders every remaining term in one uniform
+        // direction, the sort is skipped — even when a pinned term *leads* the ORDER
+        // BY, in which case the effective walk direction comes from the first
+        // non-constant term and may differ from `order_by[0]`. Purely additive: it
+        // only upgrades a not-yet-full result to a full skip; the partial label
+        // computed above is otherwise left untouched.
+        if k < sel.order_by.len() {
+            let mut eff: Option<bool> = None;
+            let mut wp = 0usize;
+            let mut rowid_used = false;
+            let mut fully = true;
+            for term in &sel.order_by {
+                let Expr::Column { table, column, .. } = &term.expr else {
+                    fully = false;
+                    break;
+                };
+                if table
+                    .as_deref()
+                    .is_some_and(|tn| !tn.eq_ignore_ascii_case(label))
+                {
+                    fully = false;
+                    break;
+                }
+                let Some(pos) = meta
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(column))
+                else {
+                    fully = false;
+                    break;
+                };
+                if eqs.iter().any(|(c, _)| *c == pos) {
+                    continue; // constant under the WHERE equality
+                }
+                if term.nulls_first.is_some() {
+                    fully = false;
+                    break;
+                }
+                let d = *eff.get_or_insert(term.descending);
+                if term.descending != d {
+                    fully = false;
+                    break;
+                }
+                if wp < walk_cols.len()
+                    && walk_cols[wp] == pos
+                    && walk_colls[wp] == meta.columns[pos].collation
+                {
+                    wp += 1;
+                } else if !rowid_used
+                    && wp == walk_cols.len()
+                    && !idx.is_auto
+                    && idx.descending[prefix..].iter().all(|x| !x)
+                    && meta.ipk == Some(pos)
+                {
+                    rowid_used = true;
+                } else {
+                    fully = false;
+                    break;
+                }
+            }
+            if fully {
+                // `eff` is None only when *every* term was constant — any walk
+                // direction yields the required (vacuous) order.
+                return Some((sel.order_by.len(), eff.unwrap_or(false)));
+            }
+        }
         Some((k, descending))
     }
 
