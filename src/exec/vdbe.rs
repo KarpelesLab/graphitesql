@@ -4673,6 +4673,77 @@ impl Compiler {
                 }
                 Ok(())
             }
+            // `[NOT] EXISTS (SELECT … [WHERE p])` over a FROM-less body: the inner
+            // has exactly one rowless row, so the result is whether an optional
+            // `WHERE` keeps it — `EXISTS` is 1 with no predicate or a true one,
+            // else 0 (inverted for `NOT EXISTS`). `EXISTS` never evaluates the
+            // projection, but each term is still compiled-and-discarded to force
+            // column/type resolution so an unresolved column (`EXISTS(SELECT zzz)`)
+            // or a `SELECT *` (no tables) defers and the tree-walker rejects it as
+            // SQLite does. A real `FROM`, an aggregate projection (which yields a
+            // row even over a false-`WHERE` empty input, so `EXISTS` is always 1),
+            // a wildcard, or any clause the const path lacks defers too.
+            Expr::Exists {
+                select: sel,
+                negated,
+            } => {
+                if sel.from.is_some()
+                    || !sel.ctes.is_empty()
+                    || !sel.window_defs.is_empty()
+                    || !sel.group_by.is_empty()
+                    || sel.having.is_some()
+                    || !sel.compound.is_empty()
+                    || !sel.order_by.is_empty()
+                    || sel.limit.is_some()
+                    || sel.offset.is_some()
+                {
+                    return Err(Error::Unsupported("VDBE: exists subquery shape"));
+                }
+                for rc in &sel.columns {
+                    let ResultColumn::Expr { expr: inner, .. } = rc else {
+                        return Err(Error::Unsupported("VDBE: exists wildcard projection"));
+                    };
+                    if is_aggregate_expr(inner) {
+                        return Err(Error::Unsupported("VDBE: aggregate exists subquery"));
+                    }
+                    // Compile the term to force resolution, then discard its ops.
+                    let saved_ops = self.ops.len();
+                    let saved_reg = self.next_reg;
+                    self.compile_expr(inner)?;
+                    self.ops.truncate(saved_ops);
+                    self.next_reg = saved_reg;
+                }
+                match &sel.where_clause {
+                    // No predicate: the rowless row always survives.
+                    None => self.ops.push(Op::Integer {
+                        value: if *negated { 0 } else { 1 },
+                        dest,
+                    }),
+                    // Default to "filtered out"; flip when the predicate holds.
+                    Some(pred) => {
+                        let (default_v, match_v) = if *negated { (1, 0) } else { (0, 1) };
+                        self.ops.push(Op::Integer {
+                            value: default_v,
+                            dest,
+                        });
+                        let preg = self.compile_expr(pred)?;
+                        let at = self.ops.len();
+                        self.ops.push(Op::IfFalse {
+                            reg: preg,
+                            target: 0,
+                        });
+                        self.ops.push(Op::Integer {
+                            value: match_v,
+                            dest,
+                        });
+                        let end = self.ops.len();
+                        if let Op::IfFalse { target, .. } = &mut self.ops[at] {
+                            *target = end;
+                        }
+                    }
+                }
+                Ok(())
+            }
             _ => Err(Error::Unsupported("VDBE spike: this expression")),
         }
     }

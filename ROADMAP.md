@@ -413,7 +413,13 @@ returns the tree-walker's results or declines to it — never a wrong answer.
   a subquery is arity-checked at prepare time even when the outer row never
   executes (the VDBE-success path now runs the subquery function validator too);
   an aggregate / multi-column / `ORDER BY`/`LIMIT`/`OFFSET` or `FROM`-bearing
-  subquery body still defers.
+  subquery body still defers. A `[NOT] EXISTS (SELECT … [WHERE <p>])` over a
+  FROM-less body folds the same way: with no predicate (or a true one) the rowless
+  row survives so `EXISTS` is 1, a false predicate makes it 0 (inverted for `NOT
+  EXISTS`). `EXISTS` ignores the projection — a multi-column inner is fine — but
+  each term is still compiled to force resolution, so an unresolved column or a
+  `SELECT *` (no tables) defers; an aggregate projection (a row exists even over a
+  false-`WHERE` empty input) defers too.
 - **Joins on the VDBE** (**B5a/B5b-1**) — N-table inner joins plus 2-table and
   N-table `LEFT`/`RIGHT`/`FULL` nested-loop joins, with projection /
   WHERE-merged-ON / `DISTINCT` / `ORDER BY` / `LIMIT` / grouped-and-bare
