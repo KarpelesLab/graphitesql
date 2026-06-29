@@ -194,6 +194,63 @@ fn derived_table_combined_with_a_join_declines() {
 }
 
 #[test]
+fn cte_reference_renders_like_a_derived_table() {
+    // A `WITH`-clause CTE referenced as a FROM source is, to the planner, a derived
+    // table whose body is the CTE definition: a constant-row body materializes as
+    // `CO-ROUTINE c` (label = the CTE name), and a flattenable base-table body
+    // flattens into a plain `SCAN t` (with the inner `WHERE`/`ORDER BY` carried
+    // through). graphite previously crashed EQP on any CTE source with
+    // `no such table: c`.
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a);";
+    for q in [
+        "WITH c AS (SELECT * FROM t) SELECT * FROM c",
+        "WITH c AS (SELECT 1) SELECT * FROM c",
+        "WITH c AS (SELECT 1, 2) SELECT * FROM c",
+        "WITH c AS (SELECT * FROM t WHERE a=5) SELECT * FROM c",
+        "WITH c AS (SELECT * FROM t ORDER BY b) SELECT * FROM c",
+    ] {
+        let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
+        assert_eq!(run("sqlite3", &sql), run(g, &sql), "for {q}");
+    }
+}
+
+#[test]
+fn non_flattenable_cte_shapes_decline() {
+    // The CTE subset mirrors the derived-table one. A join onto the CTE, a narrower
+    // outer projection, an outer WHERE, an inner aggregate, an inner view, a CTE
+    // whose body reads *another* CTE, and an aliased CTE reference each fall outside
+    // it and must decline cleanly — never the old `no such table: c` crash.
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); \
+                CREATE TABLE u(x,y); CREATE VIEW v AS SELECT * FROM t;";
+    for q in [
+        "WITH c AS (SELECT * FROM t) SELECT * FROM c, u",
+        "WITH c AS (SELECT * FROM t) SELECT a FROM c",
+        "WITH c AS (SELECT * FROM t) SELECT * FROM c WHERE a=5",
+        "WITH c AS (SELECT count(*) FROM t) SELECT * FROM c",
+        "WITH c AS (SELECT * FROM t), d AS (SELECT * FROM c) SELECT * FROM d",
+        "WITH c AS (SELECT * FROM v) SELECT * FROM c",
+        "WITH c AS (SELECT * FROM t) SELECT * FROM c AS x",
+    ] {
+        let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
+        let got = run(g, &sql);
+        assert!(
+            !got.contains("no such table"),
+            "{q} regressed to the malformed crash: {got:?}"
+        );
+        assert!(
+            got.contains("EXPLAIN QUERY PLAN for this query shape"),
+            "{q} should decline as unsupported, got {got:?}"
+        );
+    }
+}
+
+#[test]
 fn matches_sqlite_cli() {
     if !sqlite3_available() {
         eprintln!("sqlite3 CLI not found; skipping");

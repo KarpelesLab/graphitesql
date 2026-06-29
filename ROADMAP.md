@@ -189,7 +189,10 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   t)` — flattened to the body's own plan the way SQLite does, so an inner
   `WHERE`/`ORDER BY` carries through to `SEARCH`/`TEMP B-TREE`, while a narrower
   outer projection, an outer `WHERE`, or an inner join/aggregate/DISTINCT/view/LIMIT
-  declines cleanly).
+  declines cleanly; a `WITH`-clause CTE referenced as a FROM source renders the same
+  way — `WITH c AS (SELECT 1) SELECT * FROM c` → `CO-ROUTINE c`, `WITH c AS (SELECT *
+  FROM t) SELECT * FROM c` → `SCAN t` — instead of crashing with `no such table: c`;
+  a derived/CTE source combined with a join declines cleanly instead of crashing).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

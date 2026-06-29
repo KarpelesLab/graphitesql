@@ -12289,21 +12289,39 @@ impl Connection {
             out.push((id, parent, detail));
             return Ok(());
         }
-        // A derived-table (subquery) first source has no b-tree to look up, so it
-        // must be handled before `table_meta` (which would fail with an empty
-        // name). SQLite *flattens* most derived tables into the outer plan
-        // (`FROM (SELECT * FROM t)` reads as a plain `SCAN t`), and predicting
-        // which subqueries flatten is exactly the codegen-order-fragile territory
-        // we don't model. The one shape that is deterministic is a *constant-row*
-        // body (`FROM (SELECT <consts>)`): SQLite can't flatten it (there is no
-        // table to merge), so it always materializes as a `CO-ROUTINE` whose child
-        // is the body's `SCAN CONSTANT ROW`, followed by the outer `SCAN`. We
-        // render that byte-exactly only when the source is aliased — so the label
-        // is the alias, never the fragile `(subquery-N)` numbering — and the outer
-        // query adds no further plan nodes (`DISTINCT`/`GROUP BY`/`ORDER BY`/a
-        // compound/an expression-position subquery would each emit extra nodes).
+        // A subquery FROM source — a derived table (`FROM (<body>) [AS x]`) or a
+        // `WITH`-clause CTE reference (`FROM c`, whose body is the CTE definition) —
+        // has no b-tree to look up, so it must be handled before `table_meta` (which
+        // would fail with an empty name for a derived table, or a `no such table: c`
+        // for a CTE). SQLite treats the two identically here: it *flattens* most
+        // such sources into the outer plan (`FROM (SELECT * FROM t)` and a CTE
+        // `c AS (SELECT * FROM t)` both read as a plain `SCAN t`), and predicting
+        // which bodies flatten is the codegen-order-fragile territory we don't
+        // model. The deterministic shape is a *constant-row* body: SQLite can't
+        // flatten it (there is no table to merge), so it always materializes as a
+        // `CO-ROUTINE` whose child is the body's `SCAN CONSTANT ROW`, followed by
+        // the outer `SCAN`. We render that byte-exactly only when the label is
+        // deterministic — a derived table's *alias* (an unaliased one gets the
+        // fragile `(subquery-N)` numbering, so it has none) or the CTE's own name —
+        // and the outer query adds no further plan nodes (`DISTINCT`/`GROUP BY`/
+        // `ORDER BY`/a compound/an expression-position subquery would each add one).
+        let is_cte_name = |n: &str| sel.ctes.iter().any(|c| c.name.eq_ignore_ascii_case(n));
+        // Resolve the body + its CO-ROUTINE label. A derived table's label is its
+        // alias; a CTE reference's label is the CTE name (only when the reference is
+        // itself unaliased and not a TVF call).
+        let derived: Option<(&Select, Option<&str>)> = if let Some(sub) = &from.first.subquery {
+            Some((sub.as_ref(), from.first.alias.as_deref()))
+        } else if from.first.tvf_args.is_none() && from.first.alias.is_none() {
+            sel.ctes
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&from.first.name))
+                .map(|c| (c.select.as_ref(), Some(c.name.as_str())))
+        } else {
+            None
+        };
         if from.joins.is_empty() {
-            if let Some(sub) = &from.first.subquery {
+            if let Some((sub, co_label)) = derived {
+                let from_cte = from.first.subquery.is_none();
                 let body_is_const_row = sub.from.is_none()
                     && sub.compound.is_empty()
                     && !select_no_from_has_subquery(sub);
@@ -12317,49 +12335,54 @@ impl Connection {
                         ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
                     })
                     && !sel.where_clause.as_ref().is_some_and(expr_has_subquery);
-                if let (Some(alias), true, true) =
-                    (&from.first.alias, body_is_const_row, outer_adds_no_nodes)
+                if let (Some(label), true, true) =
+                    (co_label, body_is_const_row, outer_adds_no_nodes)
                 {
                     let co_id = *next_id;
                     *next_id += 1;
-                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {alias}")));
+                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {label}")));
                     // The body renders as its `SCAN CONSTANT ROW` child of the
                     // co-routine node.
                     self.eqp_select(sub, co_id, next_id, out, params)?;
                     let scan_id = *next_id;
                     *next_id += 1;
-                    out.push((scan_id, parent, alloc::format!("SCAN {alias}")));
+                    out.push((scan_id, parent, alloc::format!("SCAN {label}")));
                     return Ok(());
                 }
-                // A *flattenable* derived table: SQLite merges the subquery into
-                // the outer plan (`FROM (SELECT * FROM t)` reads as a plain
-                // `SCAN t`). When the outer is a bare `SELECT *` over the subquery
-                // with no other clauses, `SELECT * FROM (<body>)` is plan-equivalent
-                // to `<body>` itself, so we render it by recursing into the body
-                // under the SAME parent (no `CO-ROUTINE` wrapper, no outer `SCAN`).
-                // We restrict to the provably-equivalent subset:
+                // A *flattenable* body: SQLite merges the subquery into the outer
+                // plan (`FROM (SELECT * FROM t)` reads as a plain `SCAN t`). When the
+                // outer is a bare `SELECT *` over the source with no other clauses,
+                // `SELECT * FROM (<body>)` is plan-equivalent to `<body>` itself, so
+                // we render it by recursing into the body under the SAME parent (no
+                // `CO-ROUTINE` wrapper, no outer `SCAN`). We restrict to the
+                // provably-equivalent subset:
                 //  - a *pure-wildcard* outer with no `WHERE`. A narrower projection
                 //    (`SELECT a FROM …`) would re-derive the covering-index choice
                 //    after the merge, and an outer `WHERE` pushes into the flattened
                 //    scan (turning a `SCAN` into a `SEARCH`) — neither is captured by
-                //    recursing into the raw body.
+                //    recursing into the raw body. (A `WITH` clause on the outer is
+                //    expected for a CTE reference and adds no node when its only
+                //    reference is the single flattened source; a derived table keeps
+                //    the original `no outer CTE` requirement.)
                 //  - a body that is a single *base-table* scan: no inner join
-                //    (SQLite cost-reorders those, diverging from our plan), and no
-                //    aggregate / `DISTINCT` / compound / window / `LIMIT`/`OFFSET`
-                //    (each makes SQLite materialize a `CO-ROUTINE` instead). An inner
-                //    `WHERE` / `ORDER BY` is fine — the same planner renders it
-                //    identically. An inner projection/`WHERE` subquery would add
-                //    `SCALAR SUBQUERY` nodes we don't model, so it is excluded.
+                //    (SQLite cost-reorders those, diverging from our plan), no inner
+                //    CTE/view/vtab/subquery source, and no aggregate / `DISTINCT` /
+                //    compound / window / `LIMIT`/`OFFSET` (each makes SQLite
+                //    materialize a `CO-ROUTINE` instead). An inner `WHERE` /
+                //    `ORDER BY` is fine — the same planner renders it identically. An
+                //    inner projection/`WHERE` subquery would add `SCALAR SUBQUERY`
+                //    nodes we don't model, so it is excluded.
                 let outer_is_pure_wildcard =
                     matches!(sel.columns.as_slice(), [ResultColumn::Wildcard])
                         && sel.where_clause.is_none()
-                        && sel.ctes.is_empty()
+                        && (from_cte || sel.ctes.is_empty())
                         && outer_adds_no_nodes;
                 let inner_is_base_table_scan = sub.from.as_ref().is_some_and(|f| {
                     f.joins.is_empty()
                         && f.first.subquery.is_none()
                         && f.first.tvf_args.is_none()
                         && self.lookup_cte(&f.first.name, None).is_none()
+                        && !is_cte_name(&f.first.name)
                         && !self.is_view(&f.first.name)
                         && !self.is_virtual_table(&f.first.name)
                 }) && sub.ctes.is_empty()
@@ -12377,22 +12400,28 @@ impl Connection {
                 if outer_is_pure_wildcard && inner_is_base_table_scan {
                     return self.eqp_select(sub, parent, next_id, out, params);
                 }
-                // Any other derived-table shape (a narrowing/clause-bearing outer, a
-                // table-bearing body we can't prove flattenable, a compound body, or
-                // an outer query that emits extra nodes) is not one we render
-                // byte-exactly.
+                // Any other shape (a narrowing/clause-bearing outer, a table-bearing
+                // body we can't prove flattenable, a compound body, or an outer query
+                // that emits extra nodes) is not one we render byte-exactly.
                 return Err(Error::Unsupported(
                     "EXPLAIN QUERY PLAN for this query shape",
                 ));
             }
         }
-        // A derived-table (subquery) source that survives to here is combined with
-        // a join — SQLite cost-reorders such plans (BLOOM FILTER / AUTOMATIC
-        // COVERING INDEX / table reordering) into a shape we can't render
-        // byte-exactly. Decline cleanly rather than fall through to `table_meta`
-        // with an empty name (which crashed with a malformed `no such table: `) or
-        // emit a malformed empty-named `SCAN  AS s` node for a derived join source.
-        if from.first.subquery.is_some() || from.joins.iter().any(|j| j.table.subquery.is_some()) {
+        // A subquery/CTE source that survives to here is combined with a join —
+        // SQLite cost-reorders such plans (BLOOM FILTER / AUTOMATIC COVERING INDEX /
+        // table reordering) into a shape we can't render byte-exactly. Decline
+        // cleanly rather than fall through to `table_meta` with an empty name (which
+        // crashed with a malformed `no such table: `), a `no such table: c` for a
+        // CTE, or a malformed empty-named `SCAN  AS s` node for a derived join
+        // source.
+        if from.first.subquery.is_some()
+            || is_cte_name(&from.first.name)
+            || from
+                .joins
+                .iter()
+                .any(|j| j.table.subquery.is_some() || is_cte_name(&j.table.name))
+        {
             return Err(Error::Unsupported(
                 "EXPLAIN QUERY PLAN for this query shape",
             ));
