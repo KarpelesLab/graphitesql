@@ -12331,9 +12331,56 @@ impl Connection {
                     out.push((scan_id, parent, alloc::format!("SCAN {alias}")));
                     return Ok(());
                 }
-                // Any other derived-table shape (unaliased, a flattenable
-                // table-bearing body, a compound body, or an outer query that
-                // emits extra nodes) is not one we render byte-exactly.
+                // A *flattenable* derived table: SQLite merges the subquery into
+                // the outer plan (`FROM (SELECT * FROM t)` reads as a plain
+                // `SCAN t`). When the outer is a bare `SELECT *` over the subquery
+                // with no other clauses, `SELECT * FROM (<body>)` is plan-equivalent
+                // to `<body>` itself, so we render it by recursing into the body
+                // under the SAME parent (no `CO-ROUTINE` wrapper, no outer `SCAN`).
+                // We restrict to the provably-equivalent subset:
+                //  - a *pure-wildcard* outer with no `WHERE`. A narrower projection
+                //    (`SELECT a FROM …`) would re-derive the covering-index choice
+                //    after the merge, and an outer `WHERE` pushes into the flattened
+                //    scan (turning a `SCAN` into a `SEARCH`) — neither is captured by
+                //    recursing into the raw body.
+                //  - a body that is a single *base-table* scan: no inner join
+                //    (SQLite cost-reorders those, diverging from our plan), and no
+                //    aggregate / `DISTINCT` / compound / window / `LIMIT`/`OFFSET`
+                //    (each makes SQLite materialize a `CO-ROUTINE` instead). An inner
+                //    `WHERE` / `ORDER BY` is fine — the same planner renders it
+                //    identically. An inner projection/`WHERE` subquery would add
+                //    `SCALAR SUBQUERY` nodes we don't model, so it is excluded.
+                let outer_is_pure_wildcard =
+                    matches!(sel.columns.as_slice(), [ResultColumn::Wildcard])
+                        && sel.where_clause.is_none()
+                        && sel.ctes.is_empty()
+                        && outer_adds_no_nodes;
+                let inner_is_base_table_scan = sub.from.as_ref().is_some_and(|f| {
+                    f.joins.is_empty()
+                        && f.first.subquery.is_none()
+                        && f.first.tvf_args.is_none()
+                        && self.lookup_cte(&f.first.name, None).is_none()
+                        && !self.is_view(&f.first.name)
+                        && !self.is_virtual_table(&f.first.name)
+                }) && sub.ctes.is_empty()
+                    && !select_is_aggregate_query(sub)
+                    && !sub.distinct
+                    && sub.compound.is_empty()
+                    && sub.window_defs.is_empty()
+                    && sub.limit.is_none()
+                    && sub.offset.is_none()
+                    && !sub.columns.iter().any(|c| match c {
+                        ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                        ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                    })
+                    && !sub.where_clause.as_ref().is_some_and(expr_has_subquery);
+                if outer_is_pure_wildcard && inner_is_base_table_scan {
+                    return self.eqp_select(sub, parent, next_id, out, params);
+                }
+                // Any other derived-table shape (a narrowing/clause-bearing outer, a
+                // table-bearing body we can't prove flattenable, a compound body, or
+                // an outer query that emits extra nodes) is not one we render
+                // byte-exactly.
                 return Err(Error::Unsupported(
                     "EXPLAIN QUERY PLAN for this query shape",
                 ));

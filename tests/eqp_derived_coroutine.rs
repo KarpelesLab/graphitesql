@@ -99,6 +99,65 @@ fn unrendered_derived_shapes_decline_without_crashing() {
 }
 
 #[test]
+fn flattenable_wildcard_over_base_table_matches_sqlite() {
+    // A pure `SELECT *` outer over a single *base-table* body is flattened by
+    // sqlite into the body's own plan — `FROM (SELECT * FROM t)` reads as a plain
+    // `SCAN t`. graphite renders this by recursing into the body under the same
+    // parent (its planner produces the identical flattened plan), so an inner
+    // `WHERE`/`ORDER BY` carries through (indexed → SEARCH, sort → TEMP B-TREE).
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a);";
+    for q in [
+        "SELECT * FROM (SELECT * FROM t) AS s",
+        "SELECT * FROM (SELECT * FROM t)",
+        "SELECT * FROM (SELECT a FROM t) AS s",
+        "SELECT * FROM (SELECT * FROM t WHERE a=5) AS s",
+        "SELECT * FROM (SELECT * FROM t WHERE a>5) AS s",
+        "SELECT * FROM (SELECT * FROM t WHERE b>0) AS s",
+        "SELECT * FROM (SELECT * FROM t ORDER BY b) AS s",
+        "SELECT * FROM (SELECT * FROM t) AS s LIMIT 5",
+    ] {
+        let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
+        assert_eq!(run("sqlite3", &sql), run(g, &sql), "for {q}");
+    }
+}
+
+#[test]
+fn non_flattenable_outer_shapes_decline() {
+    // The flatten subset is restricted to a *pure wildcard* outer over a single
+    // base table. A narrower outer projection re-derives a covering index, an
+    // outer WHERE merges into the scan, and an inner join/aggregate/DISTINCT/view
+    // each change the flattened plan — all decline cleanly rather than mis-render.
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); \
+                CREATE TABLE u(x,y); CREATE VIEW v AS SELECT * FROM t;";
+    for q in [
+        "SELECT a FROM (SELECT * FROM t) AS s", // narrower outer projection
+        "SELECT * FROM (SELECT * FROM t) AS s WHERE a=5", // outer WHERE
+        "SELECT * FROM (SELECT * FROM t JOIN u ON t.a=u.x) AS s", // inner join
+        "SELECT * FROM (SELECT DISTINCT a FROM t) AS s", // inner DISTINCT
+        "SELECT * FROM (SELECT count(*) FROM t) AS s", // inner aggregate
+        "SELECT * FROM (SELECT * FROM v) AS s", // inner view
+        "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s", // inner LIMIT
+    ] {
+        let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
+        let got = run(g, &sql);
+        assert!(
+            !got.contains("no such table"),
+            "{q} regressed to the malformed crash: {got:?}"
+        );
+        assert!(
+            got.contains("EXPLAIN QUERY PLAN for this query shape"),
+            "{q} should decline as unsupported, got {got:?}"
+        );
+    }
+}
+
+#[test]
 fn matches_sqlite_cli() {
     if !sqlite3_available() {
         eprintln!("sqlite3 CLI not found; skipping");

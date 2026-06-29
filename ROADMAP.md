@@ -184,7 +184,12 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   surface; `EXPLAIN QUERY PLAN` shaping (incl. `SCAN CONSTANT ROW`, and an
   aliased constant-row derived table — `FROM (SELECT <consts>) AS s` — rendered as
   `CO-ROUTINE s` / `SCAN CONSTANT ROW` / `SCAN s` byte-exactly; previously any
-  derived-table source crashed EQP with a malformed empty `no such table:`).
+  derived-table source crashed EQP with a malformed empty `no such table:`; plus a
+  pure-wildcard outer over a single base-table body — `SELECT * FROM (SELECT * FROM
+  t)` — flattened to the body's own plan the way SQLite does, so an inner
+  `WHERE`/`ORDER BY` carries through to `SEARCH`/`TEMP B-TREE`, while a narrower
+  outer projection, an outer `WHERE`, or an inner join/aggregate/DISTINCT/view/LIMIT
+  declines cleanly).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
