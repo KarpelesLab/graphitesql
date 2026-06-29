@@ -313,6 +313,19 @@ exhausted for bounded (single-fix) work.
   *(Orthogonal: the tree-walker still cannot* execute *a bare/qualified `rowid`
   over any join — a per-table-rowid-in-join-rows gap, not a validation gap.)*
 
+- **A-cli-pragma-eq — `=arg` form of argument-taking query PRAGMAs in the shell. DONE.**
+  The `graphitesql` shell routed any `PRAGMA … = …` to `execute` (a setter that
+  discards rows), so the `=arg` form of the *row-returning* argument pragmas
+  (`PRAGMA table_info=foo`, same query as `PRAGMA table_info(foo)`) printed
+  nothing. The library/parser were already correct — both forms parse to the same
+  AST — so the fix is purely in `is_pragma_setter` (`src/bin/graphitesql.rs`): it
+  now extracts the pragma name and excludes the eight argument-taking query
+  pragmas (`table_info`, `table_xinfo`, `table_list`, `index_list`, `index_info`,
+  `index_xinfo`, `foreign_key_list`, `foreign_key_check`) so their `=arg` form
+  routes to `query` and prints rows, byte-for-byte with sqlite, while real setters
+  (`user_version=42`, `journal_mode=wal`, …) still route to `execute`.
+  Differential test in `tests/cli_pragma_setter.rs`.
+
 - **A-alter-rollback — ALTER-time rejection of a RENAME that breaks a dependent.**
   `DROP COLUMN` already rejects pre-mutation when a dependent view/trigger would
   break (it computes the post-drop shape before touching storage, so no rollback

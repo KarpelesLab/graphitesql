@@ -57,6 +57,56 @@ fn getter_pragmas_still_print_rows() {
 }
 
 #[test]
+fn arg_taking_query_pragmas_route_via_eq_form() {
+    // A row-returning pragma that takes an argument accepts both `(arg)` and
+    // `=arg`. The `=arg` form contains '=' but is a getter, not a setter — it
+    // must route to `query` and print its rows, matching `(arg)` and sqlite.
+    let setup = "CREATE TABLE foo(a INT PRIMARY KEY, b TEXT REFERENCES bar(id)); \
+                 CREATE TABLE bar(id INT PRIMARY KEY); CREATE INDEX ix ON foo(b); ";
+
+    // The `=arg` form yields the same rows as the `(arg)` form.
+    for (eq, paren) in [
+        ("PRAGMA table_info=foo", "PRAGMA table_info(foo)"),
+        ("PRAGMA table_xinfo=foo", "PRAGMA table_xinfo(foo)"),
+        ("PRAGMA index_list=foo", "PRAGMA index_list(foo)"),
+        ("PRAGMA index_info=ix", "PRAGMA index_info(ix)"),
+        ("PRAGMA index_xinfo=ix", "PRAGMA index_xinfo(ix)"),
+        (
+            "PRAGMA foreign_key_list=foo",
+            "PRAGMA foreign_key_list(foo)",
+        ),
+    ] {
+        let (a, _) = run(&format!("{setup}{eq}"));
+        let (b, _) = run(&format!("{setup}{paren}"));
+        assert_eq!(a, b, "`{eq}` should equal `{paren}`");
+        assert!(!a.trim().is_empty(), "`{eq}` should print rows, got empty");
+    }
+
+    // Differential: each `=arg` form must match the sqlite3 CLI byte-for-byte.
+    if Command::new("sqlite3").arg("--version").output().is_ok() {
+        for tail in [
+            "PRAGMA table_info=foo",
+            "PRAGMA table_xinfo=foo",
+            "PRAGMA index_list=foo",
+            "PRAGMA index_info=ix",
+            "PRAGMA index_xinfo=ix",
+            "PRAGMA foreign_key_list=foo",
+            "PRAGMA foreign_key_check=foo",
+        ] {
+            let sql = format!("{setup}{tail}");
+            let (g, _) = run(&sql);
+            let s = Command::new("sqlite3")
+                .arg(":memory:")
+                .arg(&sql)
+                .output()
+                .expect("run sqlite3");
+            let s = String::from_utf8_lossy(&s.stdout).into_owned();
+            assert_eq!(g.trim_end(), s.trim_end(), "mismatch for `{tail}`");
+        }
+    }
+}
+
+#[test]
 fn trigger_bodies_and_returning() {
     // A trigger's BEGIN…END body contains internal ';' — the splitter must keep
     // the whole CREATE TRIGGER together (it previously broke at the first ';').

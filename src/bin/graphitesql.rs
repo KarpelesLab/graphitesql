@@ -420,14 +420,37 @@ fn has_returning(sql: &str) -> bool {
 /// Whether `sql` is a `PRAGMA name = value` setter (which mutates connection
 /// state and so must run through `execute`, not `query`). The `= value` form is
 /// the distinguishing mark; bare/`(arg)` getter pragmas have no `=`.
+///
+/// Exception: a handful of *row-returning* pragmas accept their argument in
+/// either the `(arg)` or `=arg` form (`PRAGMA table_info=foo` is the same query
+/// as `PRAGMA table_info(foo)`). Those `=arg` forms are getters, not setters, so
+/// they must route to `query` and print their rows — never be mistaken for a
+/// state-mutating setter just because they contain `=`.
 fn is_pragma_setter(sql: &str) -> bool {
-    let word = sql
-        .trim_start()
-        .split(|c: char| !c.is_ascii_alphabetic())
-        .find(|w| !w.is_empty())
+    let rest = sql.trim_start();
+    let mut words = rest.split(|c: char| !c.is_ascii_alphabetic());
+    let first = words.find(|w| !w.is_empty()).unwrap_or("");
+    if !first.eq_ignore_ascii_case("PRAGMA") || !sql.contains('=') {
+        return false;
+    }
+    // The pragma name: everything after PRAGMA up to `=`/`(`/`.`, last dotted part.
+    let target = rest[first.len()..]
+        .split(['=', '('])
+        .next()
         .unwrap_or("")
-        .to_ascii_uppercase();
-    word == "PRAGMA" && sql.contains('=')
+        .trim();
+    let name = target.rsplit('.').next().unwrap_or(target).trim();
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "table_info"
+            | "table_xinfo"
+            | "table_list"
+            | "index_list"
+            | "index_info"
+            | "index_xinfo"
+            | "foreign_key_list"
+            | "foreign_key_check"
+    )
 }
 
 /// A `PRAGMA [schema.]name = value` setter that SQLite still reports a result
