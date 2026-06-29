@@ -15186,6 +15186,11 @@ impl Connection {
         if let Some(d) = self.in_seek_order(sel, params) {
             return Some(d);
         }
+        // A single-row rowid/IPK equality seek returns at most one row, so any
+        // ORDER BY over the single base table is already satisfied.
+        if self.rowid_eq_single_row(sel, params) {
+            return Some(false);
+        }
         match self.seek_order_prefix(sel, params) {
             Some((k, descending)) if k == sel.order_by.len() => Some(descending),
             _ => None,
@@ -15269,6 +15274,58 @@ impl Connection {
         }
     }
 
+    /// A bare rowid / INTEGER PRIMARY KEY equality (`rowid = const`, or a single-
+    /// element `IN`) seeks the table b-tree for at most one row — the rowid is
+    /// unique — so *any* `ORDER BY` over the single base table is trivially
+    /// satisfied and needs no temp b-tree, exactly as sqlite plans it. Unlike
+    /// [`Self::in_seek_order`], the ORDER BY terms need not name the rowid: with one
+    /// row there is nothing to sort, whatever the terms are. Multi-row rowid seeks
+    /// (`IN`-lists, equality `OR`-chains) collapse to several rowids and stay with
+    /// `in_seek_order`, which checks the leading ORDER BY column.
+    fn rowid_eq_single_row(&self, sel: &Select, params: &Params) -> bool {
+        let Some(from) = sel.from.as_ref() else {
+            return false;
+        };
+        if !from.joins.is_empty() {
+            return false;
+        }
+        let t = &from.first;
+        if t.subquery.is_some()
+            || t.tvf_args.is_some()
+            || t.schema.is_some()
+            || t.index_hint.is_some()
+        {
+            return false;
+        }
+        let Some(where_expr) = sel.where_clause.as_ref() else {
+            return false;
+        };
+        if sel.order_by.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || self.has_aggregate(sel)
+            || window::has_window(sel)
+        {
+            return false;
+        }
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return false;
+        }
+        let Ok(meta) = self.table_meta(&t.name, t.alias.as_deref()) else {
+            return false;
+        };
+        if meta.without_rowid {
+            return false;
+        }
+        // A single seeked rowid (`= const` or one-element `IN`) means at most one
+        // matching row; an `IN`-list or `OR`-chain of several rowids does not.
+        matches!(
+            rowid_seek_constraint(where_expr, &meta.columns, meta.ipk, params),
+            Some(v) if v.len() == 1
+        )
+    }
+
     /// How many leading `ORDER BY` terms a `WHERE` seek already produces in order,
     /// and the walk direction — the shared core of B0b-iii (full match → skip the
     /// sort) and the partial-sort EXPLAIN label. A seek walks its index in key
@@ -15321,9 +15378,15 @@ impl Connection {
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
         eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        // A `col IS NULL` conjunct pins `col` to a single (NULL) key, exactly like a
+        // value equality: it both makes `col` a seekable leading index column and a
+        // constant the ORDER BY can drop. Tracked apart from `eqs` so it never feeds
+        // the rowid/IPK fast-path checks (an IPK is never NULL).
+        let mut is_null_cols: Vec<usize> = Vec::new();
+        collect_isnull_cols(where_expr, &meta.columns, &mut is_null_cols);
         // The chosen index and the length of its equality-pinned prefix. The seek
         // walks the columns *after* that prefix in index-ascending order.
-        let (idx, prefix): (&IndexMeta, usize) = if !eqs.is_empty() {
+        let (idx, prefix): (&IndexMeta, usize) = if !eqs.is_empty() || !is_null_cols.is_empty() {
             // Equality seek (try_index_lookup). A rowid/IPK equality returns at most
             // one row — a different path; bail to the cheap, correct sort.
             if meta
@@ -15335,10 +15398,9 @@ impl Connection {
             let mut seekable = indexes.iter().filter(|idx| {
                 idx.partial.is_none()
                     && idx.key_exprs.is_none()
-                    && idx
-                        .cols
-                        .first()
-                        .is_some_and(|c| eqs.iter().any(|(col, _)| col == c))
+                    && idx.cols.first().is_some_and(|c| {
+                        eqs.iter().any(|(col, _)| col == c) || is_null_cols.contains(c)
+                    })
             });
             let idx = seekable.next()?;
             if seekable.next().is_some() {
@@ -15347,7 +15409,7 @@ impl Connection {
             let prefix = idx
                 .cols
                 .iter()
-                .take_while(|&&c| eqs.iter().any(|(col, _)| *col == c))
+                .take_while(|&&c| eqs.iter().any(|(col, _)| *col == c) || is_null_cols.contains(&c))
                 .count();
             (idx, prefix)
         } else {
@@ -15471,8 +15533,8 @@ impl Connection {
                     fully = false;
                     break;
                 };
-                if eqs.iter().any(|(c, _)| *c == pos) {
-                    continue; // constant under the WHERE equality
+                if eqs.iter().any(|(c, _)| *c == pos) || is_null_cols.contains(&pos) {
+                    continue; // constant under the WHERE equality / IS NULL
                 }
                 if term.nulls_first.is_some() {
                     fully = false;

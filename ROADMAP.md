@@ -361,6 +361,25 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   equal-prefix indexes qualify; and a *multi-row composite covering* seek on a
   `WITHOUT ROWID` table emits rows in PK order where sqlite emits index order — a
   separate, pre-existing ordering quirk unrelated to IS NULL.)
+  A `WHERE` seek that pins a column to a *single value* now lets graphite elide a
+  matching `ORDER BY` (no `USE TEMP B-TREE FOR ORDER BY`), as sqlite does, in two
+  more cases feeding `order_satisfied_by_scan`. (1) A bare `rowid` / INTEGER
+  PRIMARY KEY equality — `id = 5`, the `rowid` alias, or a one-element `IN` —
+  returns at most one row, so *any* `ORDER BY` is already satisfied regardless of
+  which columns it names (`rowid_eq_single_row` keys off `rowid_seek_constraint`
+  returning a single candidate; a multi-value `IN`/OR-chain stays with
+  `in_seek_order`, which checks the leading term). (2) A `col IS NULL` conjunct
+  pins `col` to its single NULL key exactly like a value equality, so an
+  `ORDER BY` term on it is constant and drops out, while a following term on an
+  index-walked column keeps the seek order: `seek_order_prefix` now folds
+  `collect_isnull_cols` into both its index choice and its constant-drop loop
+  (`a IS NULL ORDER BY a [DESC]`, `a IS NULL ORDER BY a, b` / `ORDER BY b` over an
+  `(a,b)` index, both columns pinned via `a=2 AND b IS NULL ORDER BY a, b`) —
+  EQP and rows byte-exact vs sqlite (`tests/eqp_orderby_seek_elision.rs`).
+  (Deferred, pre-existing and unrelated: an empty `id IS NULL` result sqlite
+  orders by *scanning a secondary index* — `SCAN … USING INDEX ib` — and an
+  `IS NOT NULL` range seek (`a > NULL`); graphite still scans + sorts there, rows
+  correct.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
