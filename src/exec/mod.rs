@@ -12289,6 +12289,56 @@ impl Connection {
             out.push((id, parent, detail));
             return Ok(());
         }
+        // A derived-table (subquery) first source has no b-tree to look up, so it
+        // must be handled before `table_meta` (which would fail with an empty
+        // name). SQLite *flattens* most derived tables into the outer plan
+        // (`FROM (SELECT * FROM t)` reads as a plain `SCAN t`), and predicting
+        // which subqueries flatten is exactly the codegen-order-fragile territory
+        // we don't model. The one shape that is deterministic is a *constant-row*
+        // body (`FROM (SELECT <consts>)`): SQLite can't flatten it (there is no
+        // table to merge), so it always materializes as a `CO-ROUTINE` whose child
+        // is the body's `SCAN CONSTANT ROW`, followed by the outer `SCAN`. We
+        // render that byte-exactly only when the source is aliased — so the label
+        // is the alias, never the fragile `(subquery-N)` numbering — and the outer
+        // query adds no further plan nodes (`DISTINCT`/`GROUP BY`/`ORDER BY`/a
+        // compound/an expression-position subquery would each emit extra nodes).
+        if from.joins.is_empty() {
+            if let Some(sub) = &from.first.subquery {
+                let body_is_const_row = sub.from.is_none()
+                    && sub.compound.is_empty()
+                    && !select_no_from_has_subquery(sub);
+                let outer_adds_no_nodes = !sel.distinct
+                    && sel.compound.is_empty()
+                    && sel.group_by.is_empty()
+                    && sel.having.is_none()
+                    && sel.order_by.is_empty()
+                    && !sel.columns.iter().any(|c| match c {
+                        ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                        ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                    })
+                    && !sel.where_clause.as_ref().is_some_and(expr_has_subquery);
+                if let (Some(alias), true, true) =
+                    (&from.first.alias, body_is_const_row, outer_adds_no_nodes)
+                {
+                    let co_id = *next_id;
+                    *next_id += 1;
+                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {alias}")));
+                    // The body renders as its `SCAN CONSTANT ROW` child of the
+                    // co-routine node.
+                    self.eqp_select(sub, co_id, next_id, out, params)?;
+                    let scan_id = *next_id;
+                    *next_id += 1;
+                    out.push((scan_id, parent, alloc::format!("SCAN {alias}")));
+                    return Ok(());
+                }
+                // Any other derived-table shape (unaliased, a flattenable
+                // table-bearing body, a compound body, or an outer query that
+                // emits extra nodes) is not one we render byte-exactly.
+                return Err(Error::Unsupported(
+                    "EXPLAIN QUERY PLAN for this query shape",
+                ));
+            }
+        }
         // First source.
         let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
         // A top-level OR of seekable disjuncts is a MULTI-INDEX OR plan (multiple

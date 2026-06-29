@@ -181,7 +181,10 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   stored `sql` text canonicalised the way SQLite stores it (regenerated
   `CREATE <TYPE>` head, dropped `IF NOT EXISTS`/`TEMP`/trailing `;`, CTAS column
   quoting); the introspection PRAGMAs and the `pragma_*` table-valued-function
-  surface; `EXPLAIN QUERY PLAN` shaping (incl. `SCAN CONSTANT ROW`).
+  surface; `EXPLAIN QUERY PLAN` shaping (incl. `SCAN CONSTANT ROW`, and an
+  aliased constant-row derived table — `FROM (SELECT <consts>) AS s` — rendered as
+  `CO-ROUTINE s` / `SCAN CONSTANT ROW` / `SCAN s` byte-exactly; previously any
+  derived-table source crashed EQP with a malformed empty `no such table:`).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
