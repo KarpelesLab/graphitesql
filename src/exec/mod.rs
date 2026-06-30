@@ -12917,6 +12917,28 @@ impl Connection {
             if from.joins.is_empty() {
                 single_scan_detail = Some(detail.clone());
             }
+            // SQLite spills each `DISTINCT` aggregate through its own transient
+            // b-tree, rendered *before* the scan line (when there is no GROUP BY).
+            // The node is emitted exactly when the access path is a bare full
+            // `SCAN {label}`: no index then delivers the distinct values pre-ordered,
+            // so every distinct aggregate needs its own sort — independent of any
+            // WHERE/ORDER BY (which only matter insofar as they engage an index, and
+            // an engaged index changes `detail` away from the bare scan). GROUP BY is
+            // the separate `group_distinct_btree` path (node placed after the scan).
+            if from.joins.is_empty()
+                && detail == alloc::format!("SCAN {label}")
+                && sel.group_by.is_empty()
+            {
+                for fname in self.distinct_agg_btrees(sel, &meta) {
+                    let id = *next_id;
+                    *next_id += 1;
+                    out.push((
+                        id,
+                        parent,
+                        alloc::format!("USE TEMP B-TREE FOR {fname}(DISTINCT)"),
+                    ));
+                }
+            }
             let id = *next_id;
             *next_id += 1;
             out.push((id, parent, detail));
@@ -15431,6 +15453,119 @@ impl Connection {
     /// unindexed column reads a bare `SEARCH <table>`. The `WHERE`-bearing case
     /// (which sqlite may serve from a *non-covering* index) is left to the
     /// ordinary access path.
+    /// SQLite spills every `DISTINCT` aggregate *except* `min`/`max` (which seek
+    /// one end of an ordered scan instead) through its own transient b-tree,
+    /// rendered as `USE TEMP B-TREE FOR <fname>(DISTINCT)` *before* the scan line —
+    /// one node per such call, in result-column order. Returns the lowercased
+    /// function names of those calls, or an empty vector when none apply or the
+    /// shape must be declined.
+    ///
+    /// Declined (empty) shapes: a `min(DISTINCT …)`/`max(DISTINCT …)` (the SEARCH
+    /// path renders those, not this node); a multi-argument `DISTINCT` aggregate
+    /// (SQLite rejects it at prepare time); and a `FILTER`/windowed/in-aggregate-
+    /// `ORDER BY` call (different plan). The caller fires this only for the clean
+    /// bare-`SCAN t` case (no `WHERE`/`GROUP BY`/`ORDER BY`/join), where no covering
+    /// index or seek can deliver the distinct values pre-ordered, so SQLite emits a
+    /// node for *every* distinct aggregate (none is elided) and graphite's scan-line
+    /// choice already matches.
+    fn distinct_agg_btrees(&self, sel: &Select, meta: &TableMeta) -> Vec<String> {
+        // (lowercase name, bare-argument column index) for each *unique* distinct
+        // aggregate, in first-occurrence order. SQLite's `AggInfo` coalesces
+        // identical aggregate calls, so `count(DISTINCT b)+count(DISTINCT b)` spills
+        // through a single b-tree, not two.
+        let mut uniq: Vec<(String, Option<usize>)> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        // Any non-min/max aggregate that is *not* `DISTINCT` (e.g. `sum(b)`): its
+        // presence means the query has more than one aggregate, which disqualifies
+        // the ordered-scan elision below.
+        let mut other_agg = false;
+        let mut total_cols = 0usize;
+        let mut agg_arg_cols = 0usize;
+        let mut decline = false;
+        for rc in &sel.columns {
+            let ResultColumn::Expr { expr, .. } = rc else {
+                return Vec::new();
+            };
+            window::visit(expr, &mut |node| match node {
+                Expr::Column { .. } => total_cols += 1,
+                Expr::Function {
+                    name,
+                    distinct,
+                    args,
+                    star,
+                    filter,
+                    order_by,
+                    over,
+                } => {
+                    if !func::is_aggregate_call(name, args.len(), *star) {
+                        return;
+                    }
+                    for a in args {
+                        window::visit(a, &mut |n| {
+                            if matches!(n, Expr::Column { .. }) {
+                                agg_arg_cols += 1;
+                            }
+                        });
+                    }
+                    if !*distinct {
+                        other_agg = true;
+                        return;
+                    }
+                    // `min`/`max(DISTINCT …)` seek an ordered end (the SEARCH path),
+                    // and a multi-argument or filtered/windowed `DISTINCT` aggregate
+                    // is either rejected at prepare time or plans differently — leave
+                    // those shapes alone.
+                    if over.is_some()
+                        || filter.is_some()
+                        || !order_by.is_empty()
+                        || args.len() != 1
+                        || name.eq_ignore_ascii_case("min")
+                        || name.eq_ignore_ascii_case("max")
+                    {
+                        decline = true;
+                        return;
+                    }
+                    let key = alloc::format!(
+                        "{}\u{0}{}",
+                        name.to_ascii_lowercase(),
+                        sql::print::expr(&args[0])
+                    );
+                    if !seen.contains(&key) {
+                        seen.push(key);
+                        uniq.push((
+                            name.to_ascii_lowercase(),
+                            col_index(&args[0], &meta.columns),
+                        ));
+                    }
+                }
+                _ => {}
+            });
+        }
+        if decline {
+            return Vec::new();
+        }
+        // Elision: when the bare table scan already yields the distinct column in
+        // sorted order — the rowid-aliasing INTEGER PRIMARY KEY of a rowid table, or
+        // the leading primary-key column of a WITHOUT ROWID table — and that single
+        // distinct aggregate is the *entire* computation (one unique distinct
+        // aggregate, no other aggregate, no bare column reference), SQLite consumes
+        // the ordered scan directly and emits no b-tree node.
+        let lead = if meta.without_rowid {
+            meta.storage_order.first().copied()
+        } else {
+            meta.ipk
+        };
+        let bare_cols = total_cols.saturating_sub(agg_arg_cols);
+        if uniq.len() == 1 && !other_agg && bare_cols == 0 {
+            if let (Some(arg), Some(l)) = (uniq[0].1, lead) {
+                if arg == l {
+                    return Vec::new();
+                }
+            }
+        }
+        uniq.into_iter().map(|(n, _)| n).collect()
+    }
+
     fn minmax_search_detail(&self, sel: &Select, meta: &TableMeta, label: &str) -> Option<String> {
         if sel.where_clause.is_some()
             || !sel.group_by.is_empty()

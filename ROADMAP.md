@@ -452,6 +452,24 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   of scope: a `WHERE` clause (sqlite serves the seek from the WHERE index); the
   `DISTINCT` temp-b-tree shapes above; and the ambiguous case of ≥2 equally-covering
   or ≥2 leading indexes, where sqlite's cost model picks one — graphite declines.)
+- **EQP `DISTINCT`-aggregate temp-b-tree** — every `f(DISTINCT col)` aggregate other
+  than `min`/`max` collects its distinct values through a private sorter, which SQLite
+  renders as a **`USE TEMP B-TREE FOR <f>(DISTINCT)`** node — one per *unique* such
+  aggregate (the function name lowercased: `count`/`sum`/`avg`/`total`/`group_concat`),
+  placed *before* the scan line, in result-column order. `eqp_select` emits these via
+  `distinct_agg_btrees` exactly when the access path is a bare full `SCAN t` (no index
+  then delivers the distinct values pre-ordered; a `WHERE`/`ORDER BY` that engages no
+  index leaves the scan bare and the node stands, while a covering/seeking index moves
+  the scan off the bare form and elides the node through the ordinary access path). Two
+  rules mirror sqlite's `AggInfo`: identical calls coalesce (`count(DISTINCT b)+count(DISTINCT b)`
+  → one node), and when the bare scan already yields the column ordered — the
+  rowid-aliasing `INTEGER PRIMARY KEY`, or the leading PK column of a `WITHOUT ROWID`
+  table — and the lone distinct aggregate is the *entire* computation (one unique
+  distinct aggregate, no other aggregate, no bare column), the node is elided; a second
+  aggregate, a bare column, or a non-leading distinct column brings it back. Byte-exact
+  vs sqlite3 3.50.4 (`tests/eqp_distinct_agg_btree.rs`). (Deferred: `GROUP BY`, where
+  sqlite places the node *after* the GROUP BY temp-b-tree; multi-argument `DISTINCT`,
+  which sqlite rejects at prepare time.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
