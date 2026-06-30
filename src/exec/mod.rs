@@ -13732,7 +13732,7 @@ impl Connection {
                         && sel.where_clause.is_none()
                         && (from_cte || sel.ctes.is_empty())
                         && outer_adds_no_nodes;
-                let inner_is_base_table_scan = sub.from.as_ref().is_some_and(|f| {
+                let inner_base_scan_no_limit = sub.from.as_ref().is_some_and(|f| {
                     f.joins.is_empty()
                         && f.first.subquery.is_none()
                         && f.first.tvf_args.is_none()
@@ -13745,14 +13745,22 @@ impl Connection {
                     && !sub.distinct
                     && sub.compound.is_empty()
                     && sub.window_defs.is_empty()
-                    && sub.limit.is_none()
-                    && sub.offset.is_none()
                     && !sub.columns.iter().any(|c| match c {
                         ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
                         ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
                     })
                     && !sub.where_clause.as_ref().is_some_and(expr_has_subquery);
-                if outer_is_pure_wildcard && inner_is_base_table_scan {
+                let inner_is_base_table_scan =
+                    inner_base_scan_no_limit && sub.limit.is_none() && sub.offset.is_none();
+                // A pure-wildcard outer over a single base-table body recurses into the
+                // body's own plan. A bare `LIMIT` body (no `OFFSET`) flattens the same
+                // way — SQLite renders just the body's `SCAN`/index walk, the `LIMIT`
+                // adding no plan node (`SELECT * FROM (SELECT * FROM t LIMIT 5)` →
+                // `SCAN t`, `(… ORDER BY b LIMIT 5)` → `SCAN t USING INDEX tb`). An
+                // `OFFSET` body materializes as a `CO-ROUTINE` instead, so it is excluded
+                // and declines (as does a narrower / `WHERE`-bearing outer over a `LIMIT`
+                // body — those need separate merge handling).
+                if outer_is_pure_wildcard && inner_base_scan_no_limit && sub.offset.is_none() {
                     return self.eqp_select(sub, parent, next_id, out, params);
                 }
                 // The general flatten: the outer may *narrow* the projection (`SELECT a`

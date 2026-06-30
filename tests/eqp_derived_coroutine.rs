@@ -129,6 +129,10 @@ fn flattenable_wildcard_over_base_table_matches_sqlite() {
         "SELECT * FROM (SELECT * FROM t WHERE b>0) AS s",
         "SELECT * FROM (SELECT * FROM t ORDER BY b) AS s",
         "SELECT * FROM (SELECT * FROM t) AS s LIMIT 5",
+        // A bare-LIMIT body (no OFFSET) flattens under a pure-wildcard outer — the
+        // LIMIT adds no plan node, so the body's scan/index walk renders directly.
+        "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s",
+        "SELECT * FROM (SELECT * FROM t ORDER BY b LIMIT 5) AS s",
         // Outer WHERE pushed into the flattened scan.
         "SELECT * FROM (SELECT * FROM t) AS s WHERE a=5",
         "SELECT * FROM (SELECT * FROM t) AS s WHERE a>5",
@@ -167,10 +171,13 @@ fn non_flattenable_outer_shapes_decline() {
     // into the scan (see `flattenable_wildcard_over_base_table_matches_sqlite`).
     // Outside it: a *computed* inner projection (`a+1 AS aa`) has no base column to
     // seek on, an outer reference to a column the source does not output
-    // (`no such column` in sqlite) cannot resolve, and an inner join/view/LIMIT each
-    // change the flattened plan — all decline cleanly rather than mis-render. (An
-    // inner *aggregate* or *DISTINCT* body now renders as a CO-ROUTINE — see
-    // `tests/eqp_aggregate_coroutine.rs`.)
+    // (`no such column` in sqlite) cannot resolve, an inner join/view changes the
+    // plan, an inner `LIMIT`+`OFFSET` body materializes as a CO-ROUTINE, and a
+    // narrower outer over a `LIMIT` body needs separate merge handling — all decline
+    // cleanly rather than mis-render. (An inner *aggregate* or *DISTINCT* body renders
+    // as a CO-ROUTINE, and a bare-`LIMIT` body under a pure-wildcard outer flattens —
+    // see `tests/eqp_aggregate_coroutine.rs` and
+    // `flattenable_wildcard_over_base_table_matches_sqlite`.)
     let g = env!("CARGO_BIN_EXE_graphitesql");
     let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); \
                 CREATE TABLE u(x,y); CREATE VIEW v AS SELECT * FROM t;";
@@ -179,7 +186,8 @@ fn non_flattenable_outer_shapes_decline() {
         "SELECT b FROM (SELECT a AS aa FROM t) AS s", // outer ref not an output of the source
         "SELECT * FROM (SELECT * FROM t JOIN u ON t.a=u.x) AS s", // inner join
         "SELECT * FROM (SELECT * FROM v) AS s",       // inner view
-        "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s", // inner LIMIT
+        "SELECT * FROM (SELECT * FROM t LIMIT 5 OFFSET 2) AS s", // inner LIMIT+OFFSET (co-routine)
+        "SELECT a FROM (SELECT * FROM t LIMIT 5) AS s", // narrower outer over a LIMIT body
     ] {
         let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
         let got = run(g, &sql);

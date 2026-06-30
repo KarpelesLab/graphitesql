@@ -211,7 +211,13 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   is bare columns or `*` (a computed `a+1 AS x` has no base column to seek on) and the
   outer references only names the source actually outputs (a reference to a column the
   source doesn't expose — a sqlite `no such column` — declines, as do a foreign outer
-  qualifier and an inner join/aggregate/DISTINCT/view/LIMIT);
+  qualifier and an inner join/view); a *bare-`LIMIT`* body (no `OFFSET`) under a
+  pure-wildcard outer flattens too — the `LIMIT` adds no plan node, so
+  `SELECT * FROM (SELECT * FROM t LIMIT 5)` reads as `SCAN t` and
+  `(… ORDER BY b LIMIT 5)` as `SCAN t USING INDEX tb` (an `OFFSET` body, or a
+  narrower / `WHERE`-bearing outer over a `LIMIT` body, takes the CO-ROUTINE /
+  separate-merge path and declines for now); an inner aggregate / `DISTINCT` body
+  materializes as a CO-ROUTINE (see below);
   a `WITH`-clause CTE referenced as a FROM source renders the same
   way — `WITH c AS (SELECT 1) SELECT * FROM c` → `CO-ROUTINE c`, `WITH c AS (SELECT *
   FROM t) SELECT * FROM c` → `SCAN t` — instead of crashing with `no such table: c`;
