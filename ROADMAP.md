@@ -197,10 +197,13 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   drops to a plain `INDEX`); a *narrower* outer projection of bare unqualified
   columns — `SELECT a FROM (SELECT * FROM t)` / `SELECT x FROM (SELECT x,y FROM u)
   WHERE y>3` — flattens the same way, substituting the outer projection into the body
-  so it can pick a `COVERING INDEX` access path the full-row body could not; this all
-  holds only when the inner projection is pass-through (`*` or bare unaliased columns)
-  and the outer projection/predicate are unqualified — an alias-qualified projection
-  (`s.a`) or predicate (`s.a=5`), an aliased inner projection (`a AS aa`), or an inner
+  so it can pick a `COVERING INDEX` access path the full-row body could not; a column
+  qualified by the derived source's own alias / CTE name — `SELECT s.a FROM (SELECT *
+  FROM t) s WHERE s.a<5` / `WITH c AS (…) SELECT c.a FROM c` — flattens as well, the
+  qualifier being stripped on merge since it names the source itself; this all holds
+  only when the inner projection is pass-through (`*` or bare unaliased columns) and
+  every outer projection/predicate qualifier is the source's own — a *foreign*
+  qualifier, an aliased inner projection (`a AS aa`), or an inner
   join/aggregate/DISTINCT/view/LIMIT still declines cleanly;
   a `WITH`-clause CTE referenced as a FROM source renders the same
   way — `WITH c AS (SELECT 1) SELECT * FROM c` → `CO-ROUTINE c`, `WITH c AS (SELECT *

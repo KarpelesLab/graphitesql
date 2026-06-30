@@ -13597,17 +13597,27 @@ impl Connection {
                 //    or computed projection (`a+1 AS b`) has no base column to carry the
                 //    substituted projection or pushed predicate;
                 //  - every outer projection column is a *bare unqualified* `Column` (no
-                //    `s.a` qualifier, no expression/alias), so it names a base column
-                //    directly; a wildcard outer keeps the body's own projection;
-                //  - the outer predicate (if any) uses only *unqualified* column names —
-                //    a derived-alias qualifier (`s.b`) would not resolve once merged.
+                //    no expression/alias), so it names a base column directly; a
+                //    wildcard outer keeps the body's own projection. The qualifier may
+                //    be the derived source's own alias / CTE name (`co_label`) — that
+                //    refers to the source itself, so it is *stripped* during the merge
+                //    (`s.a` → `a`); any *other* qualifier would not resolve, so the
+                //    merge declines.
+                //  - likewise the outer predicate (if any) is qualifier-free or only
+                //    `co_label`-qualified, with the qualifier stripped on merge.
                 // The outer must still add no other nodes and the body be a single
                 // base-table scan (same gate as the pure-wildcard case).
+                let bind_matches = |table: &Option<String>| {
+                    table
+                        .as_deref()
+                        .is_none_or(|t| co_label.is_some_and(|b| t.eq_ignore_ascii_case(b)))
+                };
                 let outer_is_wildcard = matches!(sel.columns.as_slice(), [ResultColumn::Wildcard]);
                 let outer_proj_bare_columns = !sel.columns.is_empty()
                     && sel.columns.iter().all(|c| match c {
                         ResultColumn::Expr { expr, alias, .. } => {
-                            alias.is_none() && matches!(expr, Expr::Column { table: None, .. })
+                            alias.is_none()
+                                && matches!(expr, Expr::Column { table, .. } if bind_matches(table))
                         }
                         ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
                     });
@@ -13621,28 +13631,40 @@ impl Connection {
                         alias.is_none() && matches!(expr, Expr::Column { .. })
                     }
                 });
-                let outer_where_unqualified = sel
+                let outer_where_qualifiers_ok = sel
                     .where_clause
                     .as_ref()
-                    .is_none_or(|p| !expr_has_qualified_column(p));
+                    .is_none_or(|p| all_qualifiers_match(p, co_label));
                 if outer_general_flatten
                     && inner_is_base_table_scan
                     && inner_proj_passthrough
-                    && outer_where_unqualified
+                    && outer_where_qualifiers_ok
                     && !(outer_is_wildcard && sel.where_clause.is_none())
                 {
                     let mut merged = sub.clone();
                     if !outer_is_wildcard {
-                        merged.columns = sel.columns.clone();
+                        let mut cols = sel.columns.clone();
+                        if let Some(bind) = co_label {
+                            for c in &mut cols {
+                                if let ResultColumn::Expr { expr, .. } = c {
+                                    strip_bind_qualifier(expr, bind);
+                                }
+                            }
+                        }
+                        merged.columns = cols;
                     }
                     if let Some(pred) = &sel.where_clause {
+                        let mut pred = pred.clone();
+                        if let Some(bind) = co_label {
+                            strip_bind_qualifier(&mut pred, bind);
+                        }
                         merged.where_clause = Some(match merged.where_clause.take() {
                             Some(inner) => Expr::Binary {
                                 op: BinaryOp::And,
                                 left: Box::new(inner),
-                                right: Box::new(pred.clone()),
+                                right: Box::new(pred),
                             },
-                            None => pred.clone(),
+                            None => pred,
                         });
                     }
                     return self.eqp_select(&merged, parent, next_id, out, params);
@@ -26380,19 +26402,90 @@ fn expr_has_subquery(e: &Expr) -> bool {
     found
 }
 
-/// Whether `e` contains any *table-qualified* (`t.col` / `s.t.col`) column
-/// reference. Used when merging a derived table's outer `WHERE` into its inner
-/// body for EXPLAIN QUERY PLAN: an unqualified name resolves against the single
-/// base table, but a derived-alias qualifier (`s.col`) would not, so the caller
-/// declines the merge in that case.
-fn expr_has_qualified_column(e: &Expr) -> bool {
-    let mut found = false;
+/// Whether every *table-qualified* column reference in `e` is qualified by
+/// `bind` (case-insensitive). An unqualified column always passes; a column
+/// qualified by any other name fails, and with `bind == None` *any* qualifier
+/// fails. Used when flattening a derived table / CTE into its inner body for
+/// EXPLAIN QUERY PLAN: an unqualified name (or the derived source's own alias /
+/// CTE name `bind`, which is then stripped) resolves against the flattened base
+/// table; any other qualifier would not, so the caller declines.
+fn all_qualifiers_match(e: &Expr, bind: Option<&str>) -> bool {
+    let mut ok = true;
     window::visit(e, &mut |n| {
-        if let Expr::Column { table: Some(_), .. } = n {
-            found = true;
+        if let Expr::Column { table: Some(q), .. } = n {
+            if !bind.is_some_and(|b| q.eq_ignore_ascii_case(b)) {
+                ok = false;
+            }
         }
     });
-    found
+    ok
+}
+
+/// Drop a `bind`-qualified column's table qualifier in place (`s.a` → `a`) so it
+/// resolves against the flattened base table after a derived-table / CTE merge.
+/// Mirrors `window::visit`'s expression recursion; does not descend into nested
+/// `SELECT`s (the flatten gate excludes any subquery in the merged clauses).
+fn strip_bind_qualifier(e: &mut Expr, bind: &str) {
+    if let Expr::Column { table, .. } = e {
+        if table
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(bind))
+        {
+            *table = None;
+        }
+        return;
+    }
+    match e {
+        Expr::Unary { expr, .. } => strip_bind_qualifier(expr, bind),
+        Expr::Binary { left, right, .. } => {
+            strip_bind_qualifier(left, bind);
+            strip_bind_qualifier(right, bind);
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                strip_bind_qualifier(a, bind);
+            }
+        }
+        Expr::IsNull { expr, .. } => strip_bind_qualifier(expr, bind),
+        Expr::InList { expr, list, .. } => {
+            strip_bind_qualifier(expr, bind);
+            for a in list {
+                strip_bind_qualifier(a, bind);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            strip_bind_qualifier(expr, bind);
+            strip_bind_qualifier(low, bind);
+            strip_bind_qualifier(high, bind);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                strip_bind_qualifier(o, bind);
+            }
+            for (w, t) in when_then {
+                strip_bind_qualifier(w, bind);
+                strip_bind_qualifier(t, bind);
+            }
+            if let Some(el) = else_result {
+                strip_bind_qualifier(el, bind);
+            }
+        }
+        Expr::Cast { expr, .. } => strip_bind_qualifier(expr, bind),
+        Expr::Paren(inner) => strip_bind_qualifier(inner, bind),
+        Expr::RowValue(items) => {
+            for it in items {
+                strip_bind_qualifier(it, bind);
+            }
+        }
+        Expr::Collate { expr, .. } => strip_bind_qualifier(expr, bind),
+        _ => {}
+    }
 }
 
 /// Collect, in pre-order, every scalar `(SELECT …)` subquery appearing directly
