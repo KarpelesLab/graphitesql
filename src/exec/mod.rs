@@ -12848,6 +12848,54 @@ impl Connection {
         Some(subs)
     }
 
+    /// The access keyword plus at most one trailing `USE TEMP B-TREE FOR …` node
+    /// SQLite renders for an outer query reading from a *materialized* source — a
+    /// recursive-CTE co-routine or a multi-row `VALUES` clause in `FROM`. Both
+    /// share the same shape: the source has no usable index, so a lone
+    /// `min()`/`max()` seeks one end (`SEARCH`) while everything else `SCAN`s, and a
+    /// single outer `GROUP BY` / `DISTINCT` / `ORDER BY` appends one root-level
+    /// temp-b-tree node.
+    ///
+    /// `Some((kw, trailing))` renders; `None` declines (an expression-position
+    /// subquery, a `min(DISTINCT …)`, or a *combination* of GROUP BY / DISTINCT /
+    /// ORDER BY that SQLite folds or reorders). `kw` is `"SEARCH"` for a lone
+    /// min/max without `GROUP BY`, else `"SCAN"`; `trailing` is the temp-b-tree
+    /// label (`HAVING` rides along `GROUP BY` only; an `ORDER BY` over a bare
+    /// aggregate is elided as a single row, so it declines).
+    fn eqp_materialized_outer_render(
+        &self,
+        sel: &Select,
+    ) -> Option<(&'static str, Option<&'static str>)> {
+        let outer_base_ok = sel.compound.is_empty()
+            && !window::has_window(sel)
+            && !sel.columns.iter().any(|c| match c {
+                ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+            })
+            && !sel.where_clause.as_ref().is_some_and(expr_has_subquery)
+            && !sel.having.as_ref().is_some_and(expr_has_subquery);
+        let minmax = coroutine_outer_minmax(sel);
+        if !outer_base_ok || minmax == Some(true) {
+            return None;
+        }
+        let has_group = !sel.group_by.is_empty();
+        let has_having = sel.having.is_some();
+        let outer_kw = if !has_group && minmax == Some(false) {
+            "SEARCH"
+        } else {
+            "SCAN"
+        };
+        match (has_group, sel.distinct, !sel.order_by.is_empty()) {
+            (false, false, false) if !has_having => Some((outer_kw, None)),
+            (true, false, false) => Some((outer_kw, Some("GROUP BY"))),
+            (false, true, false) if !has_having => Some((outer_kw, Some("DISTINCT"))),
+            (false, false, true) if !has_having && !self.has_aggregate(sel) => {
+                Some((outer_kw, Some("ORDER BY")))
+            }
+            _ => None,
+        }
+    }
+
     fn eqp_select(
         &self,
         sel: &Select,
@@ -13042,6 +13090,41 @@ impl Connection {
         if from.joins.is_empty() {
             if let Some((sub, co_label)) = derived {
                 let from_cte = from.first.subquery.is_none();
+                // A *multi-row* `VALUES` clause as a derived `FROM` source is the
+                // values clause itself — SQLite reads it directly (no co-routine,
+                // unlike a one-row `VALUES` or a flattening sub-SELECT) as a single
+                // `{SCAN|SEARCH} N-ROW VALUES CLAUSE` node plus the outer query's
+                // one optional trailing temp-b-tree node. (A subquery in any row
+                // switches it to the plural `SCAN N CONSTANT ROWS` shape, so decline
+                // via `values_clause_has_subquery`.)
+                if !from_cte {
+                    let value_arm_count = sub.values_rows.saturating_sub(1).min(sub.compound.len());
+                    let pure_values = value_arm_count >= 1
+                        && value_arm_count == sub.compound.len()
+                        && !values_clause_has_subquery(sub, value_arm_count);
+                    if pure_values {
+                        if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
+                        {
+                            let id = *next_id;
+                            *next_id += 1;
+                            out.push((
+                                id,
+                                parent,
+                                alloc::format!("{outer_kw} {}-ROW VALUES CLAUSE", sub.values_rows),
+                            ));
+                            if let Some(lbl) = trailing {
+                                let tid = *next_id;
+                                *next_id += 1;
+                                out.push((
+                                    tid,
+                                    parent,
+                                    alloc::format!("USE TEMP B-TREE FOR {lbl}"),
+                                ));
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
                 // A *recursive* CTE — a self-referential compound body — can't
                 // flatten. SQLite renders it as a `CO-ROUTINE <name>` whose two
                 // children are `SETUP` (the non-recursive anchor's plan) and
@@ -13080,62 +13163,11 @@ impl Connection {
                                 .where_clause
                                 .as_ref()
                                 .is_some_and(expr_has_subquery);
-                            // The outer query over the materialized co-routine must
-                            // carry no compound and no expression-position subquery in
-                            // its projection / WHERE / HAVING (each would add or shift
-                            // a node). Beyond that, SQLite renders the access plus at
-                            // most ONE trailing temp-b-tree node, at the root level.
-                            let outer_base_ok = sel.compound.is_empty()
-                                && !window::has_window(sel)
-                                && !sel.columns.iter().any(|c| match c {
-                                    ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
-                                    ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => {
-                                        false
-                                    }
-                                })
-                                && !sel.where_clause.as_ref().is_some_and(expr_has_subquery)
-                                && !sel.having.as_ref().is_some_and(expr_has_subquery);
-                            // The access keyword: a lone `min()`/`max()` aggregate
-                            // seeks one end and reads as `SEARCH` (the min/max
-                            // optimization, no index detail for a co-routine) — but
-                            // only without `GROUP BY`, which makes the extreme
-                            // per-group and keeps the `SCAN`. A `min(DISTINCT …)`
-                            // argument (interposing a `USE TEMP B-TREE FOR
-                            // min(DISTINCT)` node we do not render) declines.
-                            let minmax = coroutine_outer_minmax(sel);
-                            let has_group = !sel.group_by.is_empty();
-                            let has_having = sel.having.is_some();
-                            // The single trailing node, if any: an outer `GROUP BY`
-                            // (a co-routine is unordered, so it always sorts; a
-                            // `HAVING` rides along), a statement-level `DISTINCT`, or
-                            // an `ORDER BY` over a *non-aggregate* projection (a bare
-                            // aggregate is single-row, so SQLite elides the sort).
-                            // Any combination of these can fold or reorder the
-                            // sorter, so it declines. `None` outer_render = decline.
-                            let outer_render: Option<(&str, Option<&str>)> = if !outer_base_ok
-                                || minmax == Some(true)
-                            {
-                                None
-                            } else {
-                                let outer_kw = if !has_group && minmax == Some(false) {
-                                    "SEARCH"
-                                } else {
-                                    "SCAN"
-                                };
-                                match (has_group, sel.distinct, !sel.order_by.is_empty()) {
-                                    (false, false, false) if !has_having => Some((outer_kw, None)),
-                                    (true, false, false) => Some((outer_kw, Some("GROUP BY"))),
-                                    (false, true, false) if !has_having => {
-                                        Some((outer_kw, Some("DISTINCT")))
-                                    }
-                                    (false, false, true)
-                                        if !has_having && !self.has_aggregate(sel) =>
-                                    {
-                                        Some((outer_kw, Some("ORDER BY")))
-                                    }
-                                    _ => None,
-                                }
-                            };
+                            // The access keyword plus at most ONE trailing
+                            // temp-b-tree node SQLite renders for the outer query over
+                            // the materialized co-routine (shared with the multi-row
+                            // `VALUES`-in-`FROM` path). `None` = decline.
+                            let outer_render = self.eqp_materialized_outer_render(sel);
                             if is_recursive && rec_simple {
                                 if let Some((outer_kw, trailing)) = outer_render {
                                     let co_id = *next_id;

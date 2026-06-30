@@ -205,7 +205,13 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   their operator nodes — driven by a new `Select::values_rows` row-count the parser
   stamps (purely informational, distinguishing a real `VALUES` from a hand-written
   `SELECT … column1 UNION ALL …`); a row carrying a subquery (SQLite's plural
-  `SCAN N CONSTANT ROWS` + interposed subquery nodes) declines cleanly; an aggregate
+  `SCAN N CONSTANT ROWS` + interposed subquery nodes) declines cleanly; the same
+  multi-row clause used as a derived `FROM` source — `SELECT * FROM (VALUES(1,2),(3,4))`
+  — also folds to a bare `SCAN N-ROW VALUES CLAUSE` (no co-routine wrapper) plus at
+  most one trailing outer `USE TEMP B-TREE FOR ORDER BY|GROUP BY|DISTINCT`, with a lone
+  `min`/`max` switching it to `SEARCH N-ROW VALUES CLAUSE`; the *single-row* FROM-source
+  (still co-routine-wrapped), a subquery-bearing row, a multi-table FROM/JOIN, and a
+  combination of outer clauses all decline cleanly; an aggregate
   `GROUP BY a ORDER BY a` answered by
   a covering index on `a` emits a bare `SCAN … USING COVERING INDEX` with **no**
   temp-btree node — the group-by access already yields the ORDER BY term in order, so
