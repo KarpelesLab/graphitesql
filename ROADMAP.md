@@ -518,8 +518,18 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   rowid/IPK ordinal all follow. Byte-exact vs sqlite3 3.50.4, plan and rows
   (`tests/eqp_order_by_ordinal_scan.rs`). (Out of scope, pre-existing: an ordinal over
   `SELECT *` (wildcard column map), and an alias that shadows a table column but projects
-  an *expression* — an executor alias-resolution corner. `EXPLAIN QUERY PLAN` also does
-  not range-check an out-of-range ordinal, unlike the executed path; pre-existing.)
+  an *expression* — an executor alias-resolution corner.)
+- **EQP positional-term range check** — an out-of-range positional `GROUP BY` / `ORDER BY`
+  ordinal (`SELECT a FROM t ORDER BY 2`, one output column) is a prepare-time error in
+  SQLite, reported identically whether the statement is executed or `EXPLAIN QUERY
+  PLAN`'d. graphite's executed path runs `check_positional_terms` in `run_core`, but the
+  plan path (`eqp_select`) skipped it and silently built a tree for the invalid query.
+  `eqp_select` now runs the same check for a wildcard-free projection — where the output-
+  column count is exactly the projected-column count — so the plan path errors byte-exact
+  with the executed path and with sqlite (`Nth <clause> term out of range - should be
+  between 1 and M`); ORDER BY is resolved before GROUP BY, so its term wins when both are
+  out of range. Verified vs sqlite3 3.50.4 (`tests/eqp_positional_out_of_range.rs`). (A
+  `SELECT *` projection still defers the count to the scan; unchanged.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

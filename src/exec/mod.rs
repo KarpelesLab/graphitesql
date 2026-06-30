@@ -12631,6 +12631,20 @@ impl Connection {
             }
             None => sel,
         };
+        // A positional `GROUP BY` / `ORDER BY` term out of range is a prepare-time
+        // error in SQLite — reported the same for `EXPLAIN QUERY PLAN` as for the
+        // executed statement. `run_core` runs this check (after wildcard expansion);
+        // mirror it here so the plan path doesn't silently build a tree for an invalid
+        // query. With no `*`/`t.*` in the projection the output-column count is exactly
+        // `sel.columns.len()` (each result column is one output column); a wildcard
+        // projection needs the resolved source columns, so leave that to the scan.
+        if !sel
+            .columns
+            .iter()
+            .any(|c| matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_)))
+        {
+            check_positional_terms(&sel.group_by, &sel.order_by, sel.columns.len())?;
+        }
         // A compound query (`… UNION / UNION ALL / INTERSECT / EXCEPT …`) renders as
         // a `COMPOUND QUERY` node whose first child is the `LEFT-MOST SUBQUERY` (the
         // first arm's plan) followed by one operator node per continuation, each
