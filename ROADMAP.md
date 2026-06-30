@@ -219,7 +219,15 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   hint never changes the executed rows, and a subquery-bearing `VALUES` body or an
   outer-clause combination decline cleanly (the hint is carried on a new
   `Cte::materialized` field the parser stamps);
-  a derived/CTE source combined with a join declines cleanly instead of crashing; a
+  a derived/CTE source combined with a join declines cleanly instead of crashing;
+  a **view** source flattens the same way — `EXPLAIN QUERY PLAN SELECT * FROM v` over
+  `CREATE VIEW v AS SELECT a,b FROM t` reads as the body's own `SCAN t` (covering
+  index when only its columns are needed) and an outer `WHERE` tightens it to a
+  `SEARCH`; graphite rewrites `FROM v` into `FROM (<view body>) AS v` and reuses the
+  derived-table machinery (so the view name stays the bind qualifier for a `v.col`
+  reference), where any view source *previously crashed EQP* with a malformed
+  `no such table: <view>`; an aggregate/join/compound view body and a view combined
+  with a join decline cleanly instead of crashing; a
   compound query — `SELECT … UNION/UNION ALL/INTERSECT/EXCEPT …` — renders the
   `COMPOUND QUERY` / `LEFT-MOST SUBQUERY` / per-arm-operator tree byte-exactly
   (3+ arms, per-arm WHERE seeks, a shared `WITH`, and a bare `LIMIT`/`OFFSET` all

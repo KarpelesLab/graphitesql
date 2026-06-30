@@ -13331,6 +13331,51 @@ impl Connection {
             }
             return Ok(());
         };
+        // A view source has no b-tree of its own: SQLite flattens the view body into
+        // the outer plan exactly as it does a derived table. Rewrite `FROM v` into
+        // `FROM (<view body>) AS v` and recurse, reusing the derived-table machinery
+        // (which renders the flattenable shapes and declines the rest). Previously any
+        // view source crashed EQP with a malformed `no such table: <view>` (the view
+        // name fell through to a base-table `table_meta` lookup). Only the no-join,
+        // unaliased-name case is rewritten; a view combined with a join is left to the
+        // existing decline path.
+        if from.joins.is_empty()
+            && from.first.subquery.is_none()
+            && from.first.tvf_args.is_none()
+            && self.lookup_cte(&from.first.name, None).is_none()
+            && !sel
+                .ctes
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&from.first.name))
+            && self.is_view(&from.first.name)
+        {
+            if let Some(view_select) = self
+                .schema
+                .objects()
+                .iter()
+                .find(|o| {
+                    o.obj_type == crate::schema::ObjectType::View
+                        && o.name.eq_ignore_ascii_case(&from.first.name)
+                })
+                .and_then(|o| o.sql.as_deref())
+                .and_then(|s| match sql::parse_one(s) {
+                    Ok(Statement::CreateView(cv)) => Some(cv.select),
+                    _ => None,
+                })
+            {
+                let mut rewritten = sel.clone();
+                if let Some(f) = rewritten.from.as_mut() {
+                    let view_name = f.first.name.clone();
+                    f.first.subquery = Some(view_select);
+                    // Keep the view name as the source's bind qualifier so a
+                    // `v.col` reference still resolves once flattened.
+                    if f.first.alias.is_none() {
+                        f.first.alias = Some(view_name);
+                    }
+                }
+                return self.eqp_select(&rewritten, parent, next_id, out, params);
+            }
+        }
         let label = eqp_label(&from.first);
         // A virtual table scans through its module, not a b-tree — render sqlite's
         // `VIRTUAL TABLE INDEX <n>:<str>` node and skip the regular-table planning
@@ -13879,19 +13924,21 @@ impl Connection {
                 ));
             }
         }
-        // A subquery/CTE source that survives to here is combined with a join —
+        // A subquery/CTE/view source that survives to here is combined with a join —
         // SQLite cost-reorders such plans (BLOOM FILTER / AUTOMATIC COVERING INDEX /
         // table reordering) into a shape we can't render byte-exactly. Decline
         // cleanly rather than fall through to `table_meta` with an empty name (which
         // crashed with a malformed `no such table: `), a `no such table: c` for a
-        // CTE, or a malformed empty-named `SCAN  AS s` node for a derived join
-        // source.
+        // CTE, a `no such table: v` for a view, or a malformed empty-named
+        // `SCAN  AS s` node for a derived join source.
         if from.first.subquery.is_some()
             || is_cte_name(&from.first.name)
-            || from
-                .joins
-                .iter()
-                .any(|j| j.table.subquery.is_some() || is_cte_name(&j.table.name))
+            || self.is_view(&from.first.name)
+            || from.joins.iter().any(|j| {
+                j.table.subquery.is_some()
+                    || is_cte_name(&j.table.name)
+                    || self.is_view(&j.table.name)
+            })
         {
             return Err(Error::Unsupported(
                 "EXPLAIN QUERY PLAN for this query shape",
