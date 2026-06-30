@@ -192,6 +192,14 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   declines cleanly; a `WITH`-clause CTE referenced as a FROM source renders the same
   way — `WITH c AS (SELECT 1) SELECT * FROM c` → `CO-ROUTINE c`, `WITH c AS (SELECT *
   FROM t) SELECT * FROM c` → `SCAN t` — instead of crashing with `no such table: c`;
+  an explicit `WITH c AS MATERIALIZED (…)` hint forces the `MATERIALIZE c` node SQLite
+  renders (its child is the body's plan — a table `SCAN`, an index scan, or a
+  `SCAN N CONSTANT ROWS` for a multi-row `VALUES` body — followed by the outer
+  `SCAN c`/`SEARCH c` plus one optional trailing temp-b-tree), where graphite would
+  otherwise flatten the body away; `NOT MATERIALIZED`/absent keeps the flatten, the
+  hint never changes the executed rows, and a subquery-bearing `VALUES` body or an
+  outer-clause combination decline cleanly (the hint is carried on a new
+  `Cte::materialized` field the parser stamps);
   a derived/CTE source combined with a join declines cleanly instead of crashing; a
   compound query — `SELECT … UNION/UNION ALL/INTERSECT/EXCEPT …` — renders the
   `COMPOUND QUERY` / `LEFT-MOST SUBQUERY` / per-arm-operator tree byte-exactly

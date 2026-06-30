@@ -569,11 +569,17 @@ impl Parser {
             }
             self.expect_kw("as")?;
             // An optional `MATERIALIZED` / `NOT MATERIALIZED` hint follows
-            // `AS` (an optimizer directive; accepted and ignored). A lone
-            // `NOT` here must be part of `NOT MATERIALIZED`.
-            if !self.eat_kw("materialized") && self.eat_kw("not") {
+            // `AS` (an optimizer directive). A lone `NOT` here must be part of
+            // `NOT MATERIALIZED`. It does not change graphite's execution, but is
+            // recorded so `EXPLAIN QUERY PLAN` can honor a `MATERIALIZED` hint.
+            let materialized = if self.eat_kw("materialized") {
+                Some(true)
+            } else if self.eat_kw("not") {
                 self.expect_kw("materialized")?;
-            }
+                Some(false)
+            } else {
+                None
+            };
             self.expect(&Token::LParen)?;
             let select = Box::new(self.select()?);
             self.expect(&Token::RParen)?;
@@ -581,6 +587,7 @@ impl Parser {
                 name,
                 columns,
                 select,
+                materialized,
             });
             if !self.eat(&Token::Comma) {
                 break;

@@ -106,6 +106,13 @@ pub struct Cte {
     pub columns: Vec<String>,
     /// The CTE's query.
     pub select: Box<Select>,
+    /// The optional optimizer hint after `AS`: `Some(true)` for `MATERIALIZED`,
+    /// `Some(false)` for `NOT MATERIALIZED`, `None` when absent. SQLite uses it to
+    /// force or forbid materializing the CTE; graphite's execution is unaffected
+    /// (the rows are the same either way) but `EXPLAIN QUERY PLAN` honors a
+    /// `MATERIALIZED` hint by rendering a `MATERIALIZE <name>` node instead of
+    /// flattening the body into the outer plan.
+    pub materialized: Option<bool>,
 }
 
 /// A window-function `OVER (…)` specification.

@@ -13087,9 +13087,76 @@ impl Connection {
         } else {
             None
         };
+        // A `WITH c AS MATERIALIZED (…)` hint forces SQLite to materialize the CTE
+        // rather than flatten it into the outer plan, even when the body is a
+        // trivially-inlinable single source.
+        let cte_forces_materialize = from.first.subquery.is_none()
+            && from.first.tvf_args.is_none()
+            && from.first.alias.is_none()
+            && sel.ctes.iter().any(|c| {
+                c.name.eq_ignore_ascii_case(&from.first.name) && c.materialized == Some(true)
+            });
         if from.joins.is_empty() {
             if let Some((sub, co_label)) = derived {
                 let from_cte = from.first.subquery.is_none();
+                // An explicit `MATERIALIZED` hint renders a `MATERIALIZE <name>`
+                // node whose child is the body's plan (recursed normally),
+                // followed by the outer query's `{SCAN|SEARCH} <name>` plus one
+                // optional trailing temp-b-tree node — the same outer shape as the
+                // co-routine paths, just a forced materialization of any body.
+                if from_cte && cte_forces_materialize {
+                    if let Some(name) = co_label {
+                        // A pure *multi-row* `VALUES` body materializes as
+                        // `SCAN {N} CONSTANT ROWS` — the CTE-materialization phrasing,
+                        // NOT the FROM-source's `SCAN {N}-ROW VALUES CLAUSE` the body
+                        // would otherwise recurse into. A single-row `VALUES(…)`
+                        // recurses to the correct singular `SCAN CONSTANT ROW`. A
+                        // subquery-bearing row would need a `SCALAR SUBQUERY` node we
+                        // don't model, so decline rather than mis-render.
+                        let body_arm = sub.values_rows.saturating_sub(1).min(sub.compound.len());
+                        let body_pure_values = body_arm >= 1
+                            && body_arm == sub.compound.len()
+                            && !values_clause_has_subquery(sub, body_arm);
+                        let body_values_with_subquery = sub.values_rows >= 1
+                            && !body_pure_values
+                            && values_clause_has_subquery(sub, body_arm);
+                        if body_values_with_subquery {
+                            return Err(Error::Unsupported(
+                                "EXPLAIN QUERY PLAN for this query shape",
+                            ));
+                        }
+                        if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
+                        {
+                            let mat_id = *next_id;
+                            *next_id += 1;
+                            out.push((mat_id, parent, alloc::format!("MATERIALIZE {name}")));
+                            if body_pure_values {
+                                let rid = *next_id;
+                                *next_id += 1;
+                                out.push((
+                                    rid,
+                                    mat_id,
+                                    alloc::format!("SCAN {} CONSTANT ROWS", sub.values_rows),
+                                ));
+                            } else {
+                                self.eqp_select(sub, mat_id, next_id, out, params)?;
+                            }
+                            let scan_id = *next_id;
+                            *next_id += 1;
+                            out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                            if let Some(lbl) = trailing {
+                                let tid = *next_id;
+                                *next_id += 1;
+                                out.push((
+                                    tid,
+                                    parent,
+                                    alloc::format!("USE TEMP B-TREE FOR {lbl}"),
+                                ));
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
                 // A *multi-row* `VALUES` clause as a derived `FROM` source is the
                 // values clause itself — SQLite reads it directly (no co-routine,
                 // unlike a one-row `VALUES` or a flattening sub-SELECT) as a single
