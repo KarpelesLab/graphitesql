@@ -483,8 +483,24 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   the result-column count, or which column the irrelevant `ORDER BY` names; the min/max
   SEARCH path elides too. A `GROUP BY` (multi-row) keeps the sorter, and a window function
   is excluded (per-row output). Byte-exact vs sqlite3 3.50.4
-  (`tests/eqp_aggregate_order_by.rs`). (Still divergent, separate slices: the
-  `GROUP BY … ORDER BY` sorter-ordering reuse, and window-coroutine EQP rendering.)
+  (`tests/eqp_aggregate_order_by.rs`). (Still divergent, separate slice: window-coroutine
+  EQP rendering.)
+- **EQP `ORDER BY`-into-grouping fold** — when a bare-`SCAN` aggregate spills its key
+  through a `USE TEMP B-TREE FOR GROUP BY` / `… FOR DISTINCT` node, that b-tree already
+  delivers key order, so SQLite reuses it for the `ORDER BY` and emits no separate sorter.
+  `group_distinct_btree` now decides this fold after resolving each `ORDER BY` term to a
+  grouping key column — directly, by 1-based position (`ORDER BY 1`), or through an output
+  alias (`SELECT a AS x … ORDER BY x`) — and folds iff the resolved term list equals the
+  key list with compatible sort options: a `GROUP BY` b-tree honors any per-column (even
+  mixed) `ASC`/`DESC`, a `DISTINCT` b-tree is ascending-only, and each term's `NULLS`
+  placement must be the default for its direction (`ASC` ⇒ FIRST, `DESC` ⇒ LAST). A term
+  that escapes the key (`ORDER BY count(*)`, `ORDER BY 3`), a reordered key list
+  (`ORDER BY 2, 1`), or a non-default `NULLS` keeps both nodes. Previously graphite
+  *declined the grouping node itself* whenever an `ORDER BY` term was not a plain column,
+  emitting a lone wrong sorter; now the grouping node always stands. Byte-exact vs sqlite3
+  3.50.4 (`tests/eqp_group_order_fold.rs`). (Out of scope: expression grouping keys
+  (`GROUP BY a+0`), and an `ORDER BY` ordinal over an *index-ordered* scan, where the
+  access path — not this b-tree — provides the order.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

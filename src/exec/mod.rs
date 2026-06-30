@@ -15360,45 +15360,83 @@ impl Connection {
                 }
             }
         }
-        // Decide whether sqlite folds the `ORDER BY` into this grouping b-tree.
-        let suppress_order_by = if sel.order_by.is_empty() {
-            false
-        } else {
-            // Every `ORDER BY` term must resolve to a plain column of this table.
-            // A positional index, result-set alias, expression, or `COLLATE`
-            // wrapper takes us off sqlite's fast path — decline the whole node
-            // (return `None`) rather than guess at suppression.
+        // Decide whether sqlite folds the `ORDER BY` into this grouping b-tree. The
+        // b-tree itself always materializes (the caller emits its node regardless of
+        // the `ORDER BY`); the only question here is whether a *separate* sort node is
+        // still needed. sqlite reuses the grouping order — suppressing the ORDER BY
+        // node — exactly when every term names a grouping key column (directly, by
+        // 1-based position, or through an output alias), the resolved term list equals
+        // the key list, and each term's sort options are compatible: a GROUP BY b-tree
+        // can be walked to honor any per-column ASC/DESC (even mixed), while a DISTINCT
+        // b-tree is ascending-only; either way the NULL placement must be the default
+        // for that term's direction (ASC ⇒ NULLS FIRST, DESC ⇒ NULLS LAST). Any
+        // deviation simply leaves the ORDER BY node in place — it never declines the
+        // grouping node.
+        let as_table_col = |x: &Expr| -> Option<usize> {
+            match x {
+                Expr::Column {
+                    schema: None,
+                    table,
+                    column,
+                    ..
+                } if table
+                    .as_deref()
+                    .is_none_or(|t| t.eq_ignore_ascii_case(tname)) =>
+                {
+                    meta.columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(column))
+                }
+                _ => None,
+            }
+        };
+        // Resolve one ORDER BY term to a plain column position of this table, following
+        // a positional ordinal or an output alias to its underlying result column.
+        // `None` ⇒ the term is an aggregate / expression / foreign column, defeating
+        // the fold.
+        let resolve_term = |e: &Expr| -> Option<usize> {
+            if let Some(p) = as_table_col(e) {
+                return Some(p);
+            }
+            let ri = if let Some(n) = positional_int(e) {
+                usize::try_from(n).ok()?.checked_sub(1)?
+            } else if let Expr::Column {
+                schema: None,
+                table: None,
+                column,
+                ..
+            } = e
+            {
+                sel.columns.iter().position(|rc| {
+                    matches!(rc, ResultColumn::Expr { alias: Some(a), .. }
+                        if a.eq_ignore_ascii_case(column))
+                })?
+            } else {
+                return None;
+            };
+            match sel.columns.get(ri)? {
+                ResultColumn::Expr { expr, .. } => as_table_col(expr),
+                _ => None,
+            }
+        };
+        let suppress_order_by = !sel.order_by.is_empty() && {
             let mut ob_cols = Vec::with_capacity(sel.order_by.len());
-            let mut any_nulls = false;
-            let mut any_desc = false;
+            let mut ok = true;
             for term in &sel.order_by {
-                any_nulls |= term.nulls_first.is_some();
-                any_desc |= term.descending;
-                match &term.expr {
-                    Expr::Column {
-                        schema: None,
-                        table,
-                        column,
-                        ..
-                    } if table
-                        .as_deref()
-                        .is_none_or(|t| t.eq_ignore_ascii_case(tname)) =>
-                    {
-                        // `?` returns `None` (decline) when the name is not a
-                        // table column — e.g. a bare result-set alias.
-                        let pos = meta
-                            .columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(column))?;
-                        ob_cols.push(pos);
+                let nulls_default = term.nulls_first.is_none_or(|nf| nf != term.descending);
+                if !nulls_default || (kind == "DISTINCT" && term.descending) {
+                    ok = false;
+                    break;
+                }
+                match resolve_term(&term.expr) {
+                    Some(p) => ob_cols.push(p),
+                    None => {
+                        ok = false;
+                        break;
                     }
-                    _ => return None,
                 }
             }
-            // sqlite reuses the grouping b-tree only for an exact key-list match
-            // under the default NULL ordering; `DISTINCT` additionally requires
-            // every term ascending (its b-tree is ascending-only).
-            ob_cols == key_cols && !any_nulls && (kind == "GROUP BY" || !any_desc)
+            ok && ob_cols == key_cols
         };
         Some((kind, suppress_order_by))
     }
