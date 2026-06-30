@@ -12546,11 +12546,31 @@ impl Connection {
                     }
                 }
             }
-            Statement::Insert(ins) => {
-                if let InsertSource::Select(sel) = &ins.source {
+            Statement::Insert(ins) => match &ins.source {
+                InsertSource::Select(sel) => {
                     self.eqp_select(sel, 0, &mut next_id, &mut details, params)?;
                 }
-            }
+                // A single-row `VALUES` carrying one non-correlated scalar subquery
+                // renders just that `SCALAR SUBQUERY 1` node (an INSERT has no scan of
+                // its own). A multi-row `VALUES` adds a `SCAN N CONSTANT ROWS` node and
+                // shifts the numbering, and several subqueries are reverse-numbered —
+                // both fragile — so only the single-row / single-subquery case renders.
+                InsertSource::Values(rows)
+                    if ins.ctes.is_empty()
+                        && ins.upsert.is_empty()
+                        && ins.returning.is_empty()
+                        && rows.len() == 1 =>
+                {
+                    let exprs: Vec<&Expr> = rows[0].iter().collect();
+                    if let Some(body) = self.eqp_dml_scalar_subquery(&exprs) {
+                        let sid = next_id;
+                        next_id += 1;
+                        details.push((sid, 0, String::from("SCALAR SUBQUERY 1")));
+                        self.eqp_select(body, sid, &mut next_id, &mut details, params)?;
+                    }
+                }
+                _ => {}
+            },
             _ => return Err(Error::Unsupported("EXPLAIN QUERY PLAN for this statement")),
         }
         Ok(QueryResult {

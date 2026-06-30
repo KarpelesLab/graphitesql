@@ -1,8 +1,9 @@
-//! `EXPLAIN QUERY PLAN` for an UPDATE/DELETE carrying a non-correlated scalar
-//! subquery in a `SET` assignment or the `WHERE` clause. SQLite renders the access
-//! node followed by a `SCALAR SUBQUERY N` sibling whose child is the subquery
-//! body's plan — exactly as it does for a SELECT. graphite previously emitted only
-//! the access node, diverging on every such statement; it now renders the node for
+//! `EXPLAIN QUERY PLAN` for an UPDATE/DELETE/INSERT carrying a non-correlated
+//! scalar subquery — in a `SET` assignment, the `WHERE` clause, or a single-row
+//! `VALUES`. SQLite renders the access node (none for an INSERT) followed by a
+//! `SCALAR SUBQUERY N` sibling whose child is the subquery body's plan — exactly as
+//! it does for a SELECT. graphite previously emitted only the access node (nothing
+//! for an INSERT), diverging on every such statement; it now renders the node for
 //! the unambiguous single-subquery case (always `SCALAR SUBQUERY 1`).
 //!
 //! Several `SET` subqueries are emitted in source order but numbered in *reverse*
@@ -55,6 +56,11 @@ fn single_scalar_subquery_renders_like_sqlite() {
         "UPDATE t SET c=1 WHERE c=(SELECT count(*) FROM u)",
         "DELETE FROM t WHERE c=(SELECT count(*) FROM u)",
         "DELETE FROM t WHERE c=(SELECT 5)",
+        // A single-row INSERT VALUES carrying one scalar subquery (no access node
+        // of its own — the scalar node is the whole plan).
+        "INSERT INTO t(b) VALUES((SELECT count(*) FROM u))",
+        "INSERT INTO t VALUES(1,(SELECT max(y) FROM u),3)",
+        "INSERT INTO t(b) VALUES((SELECT 5))",
     ] {
         assert_eq!(plan("sqlite3", BASE, q), plan(g, BASE, q), "plan for {q}");
         // The node must actually be present (guards against both rendering nothing).
@@ -79,6 +85,11 @@ fn fragile_or_correlated_subqueries_decline_to_the_bare_access_node() {
         "UPDATE t SET c=(SELECT count(*) FROM u) WHERE c=(SELECT max(x) FROM u)",
         "UPDATE t SET c=(SELECT y FROM u WHERE x=t.a)",
         "DELETE FROM t WHERE a IN (SELECT x FROM u)",
+        // INSERT: multi-subquery (reverse-numbered), multi-row (+SCAN N CONSTANT
+        // ROWS), and a nested IN (LIST SUBQUERY + bloom) all decline.
+        "INSERT INTO t VALUES((SELECT min(x) FROM u),(SELECT max(y) FROM u),3)",
+        "INSERT INTO t(b) VALUES((SELECT count(*) FROM u)),((SELECT max(y) FROM u))",
+        "INSERT INTO t(b) VALUES((SELECT x FROM u WHERE x IN (SELECT y FROM u)))",
     ] {
         let got = plan(g, BASE, q);
         assert!(
@@ -101,6 +112,8 @@ fn plain_dml_without_a_subquery_is_unchanged() {
         "UPDATE t SET c=c+1",
         "DELETE FROM t WHERE b>5",
         "DELETE FROM t WHERE a=3",
+        "INSERT INTO t(b) VALUES(5)",
+        "INSERT INTO t VALUES(1,2,3)",
     ] {
         assert_eq!(plan("sqlite3", BASE, q), plan(g, BASE, q), "plan for {q}");
     }

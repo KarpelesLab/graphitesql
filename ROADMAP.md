@@ -558,7 +558,12 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   (`CORRELATED SCALAR SUBQUERY`) / `IN (SELECT)` (`LIST SUBQUERY` + bloom) are
   different shapes — so multi-subquery, `UPDATE … FROM`, row-value `SET (…)=(SELECT)`,
   a CTE, a trailing `ORDER BY`/`LIMIT`, and `RETURNING` all decline to the bare access
-  node (`tests/eqp_dml_scalar_subquery.rs`).
+  node. A **single-row `INSERT … VALUES`** carrying one such scalar subquery
+  (`INSERT INTO t(b) VALUES((SELECT count(*) FROM u))`) renders the same node — and,
+  having no scan of its own, the node *is* the whole plan (`SCALAR SUBQUERY 1` at the
+  root); a multi-row `VALUES` (which adds a `SCAN N CONSTANT ROWS` node), several value
+  subqueries, an `INSERT … SELECT`, a CTE, an upsert, or `RETURNING` decline
+  (`tests/eqp_dml_scalar_subquery.rs`).
 - **EQP recursive CTE** — a `WITH RECURSIVE c(…) AS (<anchor> UNION[ ALL]
   <recursive>) SELECT … FROM c` source now renders SQLite's `CO-ROUTINE c` subtree
   byte-exactly: a `SETUP` child holding the non-recursive anchor arm's plan (recursed
