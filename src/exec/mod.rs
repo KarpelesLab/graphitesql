@@ -13583,47 +13583,69 @@ impl Connection {
                 if outer_is_pure_wildcard && inner_is_base_table_scan {
                     return self.eqp_select(sub, parent, next_id, out, params);
                 }
-                // The same flatten, but the outer carries a `WHERE`: SQLite pushes
-                // the predicate into the flattened base-table scan, so a `SCAN`
-                // tightens into a `SEARCH` (or an existing range gains a bound). We
-                // reproduce it by ANDing the outer predicate into the inner body and
-                // recursing — `eqp_select` then re-derives the covering-index / seek
-                // exactly — but only when the merge is provably name-sound:
+                // The general flatten: the outer may *narrow* the projection (`SELECT a`
+                // / `SELECT a,b` instead of `*`) and/or carry a `WHERE`. SQLite folds the
+                // derived table away, so the outer projection picks the access path
+                // (`SELECT a` over an indexed table → a COVERING-INDEX scan) and the
+                // outer predicate tightens a `SCAN` into a `SEARCH`. We reproduce it by
+                // rebuilding the inner body with the outer projection substituted and the
+                // outer predicate ANDed in, then recursing — `eqp_select` re-derives the
+                // covering-index / seek from the merged body exactly — but only when the
+                // merge is provably name-sound:
                 //  - the inner projection is *pass-through* (`*` or bare unaliased
-                //    columns), so a derived output name *is* its base column; an
-                //    aliased or computed projection (`a+1 AS b`) has no such column to
-                //    push the predicate onto;
-                //  - the outer predicate uses only *unqualified* column names — a
-                //    derived-alias qualifier (`s.b`) would not resolve against the base
-                //    table once merged.
-                // The outer must still be a bare wildcard adding no other nodes, and
-                // the body a single base-table scan (same gate as the no-`WHERE` case).
-                let outer_wildcard_only_where =
-                    matches!(sel.columns.as_slice(), [ResultColumn::Wildcard])
-                        && sel.where_clause.is_some()
-                        && (from_cte || sel.ctes.is_empty())
-                        && outer_adds_no_nodes;
+                //    columns), so a derived output name *is* its base column; an aliased
+                //    or computed projection (`a+1 AS b`) has no base column to carry the
+                //    substituted projection or pushed predicate;
+                //  - every outer projection column is a *bare unqualified* `Column` (no
+                //    `s.a` qualifier, no expression/alias), so it names a base column
+                //    directly; a wildcard outer keeps the body's own projection;
+                //  - the outer predicate (if any) uses only *unqualified* column names —
+                //    a derived-alias qualifier (`s.b`) would not resolve once merged.
+                // The outer must still add no other nodes and the body be a single
+                // base-table scan (same gate as the pure-wildcard case).
+                let outer_is_wildcard = matches!(sel.columns.as_slice(), [ResultColumn::Wildcard]);
+                let outer_proj_bare_columns = !sel.columns.is_empty()
+                    && sel.columns.iter().all(|c| match c {
+                        ResultColumn::Expr { expr, alias, .. } => {
+                            alias.is_none() && matches!(expr, Expr::Column { table: None, .. })
+                        }
+                        ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                    });
+                let outer_flattenable_proj = outer_is_wildcard || outer_proj_bare_columns;
+                let outer_general_flatten = outer_flattenable_proj
+                    && (from_cte || sel.ctes.is_empty())
+                    && outer_adds_no_nodes;
                 let inner_proj_passthrough = sub.columns.iter().all(|c| match c {
                     ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => true,
                     ResultColumn::Expr { expr, alias, .. } => {
                         alias.is_none() && matches!(expr, Expr::Column { .. })
                     }
                 });
-                if outer_wildcard_only_where && inner_is_base_table_scan && inner_proj_passthrough {
-                    if let Some(pred) = &sel.where_clause {
-                        if !expr_has_qualified_column(pred) {
-                            let mut merged = sub.clone();
-                            merged.where_clause = Some(match merged.where_clause.take() {
-                                Some(inner) => Expr::Binary {
-                                    op: BinaryOp::And,
-                                    left: Box::new(inner),
-                                    right: Box::new(pred.clone()),
-                                },
-                                None => pred.clone(),
-                            });
-                            return self.eqp_select(&merged, parent, next_id, out, params);
-                        }
+                let outer_where_unqualified = sel
+                    .where_clause
+                    .as_ref()
+                    .is_none_or(|p| !expr_has_qualified_column(p));
+                if outer_general_flatten
+                    && inner_is_base_table_scan
+                    && inner_proj_passthrough
+                    && outer_where_unqualified
+                    && !(outer_is_wildcard && sel.where_clause.is_none())
+                {
+                    let mut merged = sub.clone();
+                    if !outer_is_wildcard {
+                        merged.columns = sel.columns.clone();
                     }
+                    if let Some(pred) = &sel.where_clause {
+                        merged.where_clause = Some(match merged.where_clause.take() {
+                            Some(inner) => Expr::Binary {
+                                op: BinaryOp::And,
+                                left: Box::new(inner),
+                                right: Box::new(pred.clone()),
+                            },
+                            None => pred.clone(),
+                        });
+                    }
+                    return self.eqp_select(&merged, parent, next_id, out, params);
                 }
                 // A *compound* CTE/derived body that carries at least one dedup set
                 // operator (`UNION` / `INTERSECT` / `EXCEPT`) cannot flatten into the

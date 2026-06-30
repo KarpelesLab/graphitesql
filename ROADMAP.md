@@ -194,10 +194,14 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   outer predicate into the body and recurses, tightening the `SCAN` into a `SEARCH`
   or adding a range bound (re-deriving the covering-index choice from the body's own
   projection, so a `SELECT b` body keeps `COVERING INDEX` where a `SELECT *` body
-  drops to a plain `INDEX`); this holds only when the inner projection is
-  pass-through (`*` or bare unaliased columns) and the outer predicate is
-  unqualified — a narrower outer projection, a derived-alias-qualified predicate
-  (`s.a=5`), or an inner join/aggregate/DISTINCT/view/LIMIT still declines cleanly;
+  drops to a plain `INDEX`); a *narrower* outer projection of bare unqualified
+  columns — `SELECT a FROM (SELECT * FROM t)` / `SELECT x FROM (SELECT x,y FROM u)
+  WHERE y>3` — flattens the same way, substituting the outer projection into the body
+  so it can pick a `COVERING INDEX` access path the full-row body could not; this all
+  holds only when the inner projection is pass-through (`*` or bare unaliased columns)
+  and the outer projection/predicate are unqualified — an alias-qualified projection
+  (`s.a`) or predicate (`s.a=5`), an aliased inner projection (`a AS aa`), or an inner
+  join/aggregate/DISTINCT/view/LIMIT still declines cleanly;
   a `WITH`-clause CTE referenced as a FROM source renders the same
   way — `WITH c AS (SELECT 1) SELECT * FROM c` → `CO-ROUTINE c`, `WITH c AS (SELECT *
   FROM t) SELECT * FROM c` → `SCAN t` — instead of crashing with `no such table: c`;
