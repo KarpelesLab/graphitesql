@@ -1,6 +1,7 @@
 //! `EXPLAIN QUERY PLAN` for an UPDATE/DELETE/INSERT carrying a non-correlated
-//! scalar subquery — in a `SET` assignment, the `WHERE` clause, or a single-row
-//! `VALUES`. SQLite renders the access node (none for an INSERT) followed by a
+//! scalar subquery — in a `SET` assignment (scalar or row-value `(…)=(SELECT …)`),
+//! the `WHERE` clause, or a single-row `VALUES`. SQLite renders the access node
+//! (none for an INSERT) followed by a
 //! `SCALAR SUBQUERY N` sibling whose child is the subquery body's plan — exactly as
 //! it does for a SELECT. graphite previously emitted only the access node (nothing
 //! for an INSERT), diverging on every such statement; it now renders the node for
@@ -61,6 +62,13 @@ fn single_scalar_subquery_renders_like_sqlite() {
         "INSERT INTO t(b) VALUES((SELECT count(*) FROM u))",
         "INSERT INTO t VALUES(1,(SELECT max(y) FROM u),3)",
         "INSERT INTO t(b) VALUES((SELECT 5))",
+        // A single non-correlated row-value `SET (…)=(SELECT …)` assignment — the
+        // body is the lone subquery, rendered `SCALAR SUBQUERY 1` (a plain
+        // non-subquery assignment may ride alongside).
+        "UPDATE t SET (b,c)=(SELECT x,y FROM u WHERE x=1) WHERE a=1",
+        "UPDATE t SET (b,c)=(SELECT x,y FROM u)",
+        "UPDATE t SET (b,c)=(SELECT x,y FROM u) WHERE b=5",
+        "UPDATE t SET (b,c)=(SELECT x,y FROM u), a=5",
     ] {
         assert_eq!(plan("sqlite3", BASE, q), plan(g, BASE, q), "plan for {q}");
         // The node must actually be present (guards against both rendering nothing).
@@ -90,6 +98,13 @@ fn fragile_or_correlated_subqueries_decline_to_the_bare_access_node() {
         "INSERT INTO t VALUES((SELECT min(x) FROM u),(SELECT max(y) FROM u),3)",
         "INSERT INTO t(b) VALUES((SELECT count(*) FROM u)),((SELECT max(y) FROM u))",
         "INSERT INTO t(b) VALUES((SELECT x FROM u WHERE x IN (SELECT y FROM u)))",
+        // Row-value SET subquery: correlated (CORRELATED SCALAR SUBQUERY), paired
+        // with another SET / WHERE subquery (reverse-numbered), or a compound body
+        // all decline.
+        "UPDATE t SET (b,c)=(SELECT x,y FROM u WHERE x=t.a) WHERE a=1",
+        "UPDATE t SET (b,c)=(SELECT x,y FROM u), a=(SELECT max(x) FROM u)",
+        "UPDATE t SET (b,c)=(SELECT x,y FROM u) WHERE c=(SELECT max(x) FROM u)",
+        "UPDATE t SET (b,c)=(SELECT x,y FROM u UNION SELECT x,y FROM u)",
     ] {
         let got = plan(g, BASE, q);
         assert!(

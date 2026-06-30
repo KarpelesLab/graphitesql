@@ -556,9 +556,12 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   single-subquery case is rendered — SQLite emits several `SET` subqueries in source
   order but numbered in *reverse* (codegen-fragile), and a correlated body
   (`CORRELATED SCALAR SUBQUERY`) / `IN (SELECT)` (`LIST SUBQUERY` + bloom) are
-  different shapes — so multi-subquery, `UPDATE … FROM`, row-value `SET (…)=(SELECT)`,
-  a CTE, a trailing `ORDER BY`/`LIMIT`, and `RETURNING` all decline to the bare access
-  node. A **single-row `INSERT … VALUES`** carrying one such scalar subquery
+  different shapes — so multi-subquery, `UPDATE … FROM`, a CTE, a trailing
+  `ORDER BY`/`LIMIT`, and `RETURNING` all decline to the bare access node. A single
+  non-correlated **row-value** assignment — `UPDATE t SET (b,c)=(SELECT x,y FROM u)
+  WHERE …` — renders the same `SCALAR SUBQUERY 1` (a plain non-subquery assignment may
+  ride alongside); a correlated, compound, or paired-with-another-subquery row-value
+  body declines. A **single-row `INSERT … VALUES`** carrying one such scalar subquery
   (`INSERT INTO t(b) VALUES((SELECT count(*) FROM u))`) renders the same node — and,
   having no scan of its own, the node *is* the whole plan (`SCALAR SUBQUERY 1` at the
   root); a multi-row `VALUES` (which adds a `SCAN N CONSTANT ROWS` node), several value
