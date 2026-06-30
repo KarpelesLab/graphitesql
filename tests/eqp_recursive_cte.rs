@@ -11,8 +11,11 @@
 //! the CTE, exactly one recursive arm whose `FROM` is a *bare* reference to it
 //! (`FROM c`, no join/alias/subquery), and an outer query that is a single bare
 //! reference adding no further plan node (an outer `WHERE` and a bare aggregate add
-//! none; the self-reference is a co-routine so the outer is always a `SCAN`, never a
-//! `SEARCH`). The anchor arm itself is recursed normally, so a `SELECT <consts>` /
+//! none). The outer access over the materialized co-routine is normally a `SCAN`,
+//! except a lone `min()`/`max()` aggregate seeks one end and reads as `SEARCH c`
+//! (no index detail — a co-routine has none); a second aggregate keeps the `SCAN`,
+//! and a `min(DISTINCT …)` (which interposes a `USE TEMP B-TREE FOR min(DISTINCT)`
+//! node) declines. The anchor arm itself is recursed normally, so a `SELECT <consts>` /
 //! `VALUES(…)` body renders `SCAN CONSTANT ROW` and a `SELECT … FROM t` body renders
 //! `SCAN t`. `UNION` vs `UNION ALL` is the same plan.
 //!
@@ -151,6 +154,42 @@ fn recursive_cte_renders_co_routine() {
         ),
         "CO-ROUTINE c | SETUP | SCAN t | RECURSIVE STEP | SCAN c | SCAN c"
     );
+    // A lone `min()`/`max()` over the co-routine seeks one end, so the outer
+    // access reads `SEARCH c` (no index detail — a co-routine has none) rather
+    // than `SCAN c`. Scalar wrappers, an expression argument, and an extra plain
+    // column keep the single-aggregate shape.
+    for q in [
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
+         SELECT max(n) FROM c",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
+         SELECT min(n) FROM c WHERE n>1",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
+         SELECT abs(min(n)) FROM c",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
+         SELECT min(n+1) FROM c",
+    ] {
+        assert_eq!(
+            g_eqp(D, q),
+            "CO-ROUTINE c | SETUP | SCAN CONSTANT ROW | RECURSIVE STEP | SCAN c | SEARCH c",
+            "min/max outer should render SEARCH for {q}"
+        );
+        check(D, q);
+    }
+    // A *second* aggregate disqualifies the min/max optimization — the outer
+    // access stays a plain `SCAN c`.
+    for q in [
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
+         SELECT min(n),max(n) FROM c",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
+         SELECT min(n),count(*) FROM c",
+    ] {
+        assert_eq!(
+            g_eqp(D, q),
+            "CO-ROUTINE c | SETUP | SCAN CONSTANT ROW | RECURSIVE STEP | SCAN c | SCAN c",
+            "two aggregates should keep SCAN for {q}"
+        );
+        check(D, q);
+    }
     for q in [
         // A `SELECT <const>` anchor and a counter recursion (the textbook form).
         "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) SELECT * FROM c",
@@ -199,6 +238,11 @@ fn recursive_cte_declines_unrenderable() {
         // An outer DISTINCT likewise.
         "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
          SELECT DISTINCT n FROM c",
+        // A `min(DISTINCT …)` over the co-routine interposes a
+        // `USE TEMP B-TREE FOR min(DISTINCT)` node before the `SEARCH c` that
+        // graphite does not render, so it declines rather than emit a wrong plan.
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
+         SELECT min(DISTINCT n) FROM c",
     ] {
         // We must never emit a CO-ROUTINE plan that disagrees with SQLite for a
         // declined shape; the prior behavior was an error, so assert no node.

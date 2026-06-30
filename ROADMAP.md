@@ -476,12 +476,15 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   canonical two-arm split with the executor's own `references_name_select` (one
   anchor arm that does not name the CTE, one recursive arm whose `FROM` is a bare
   reference to it) and renders it when the outer query adds no further node (an outer
-  `WHERE` and a bare aggregate add none — a co-routine source is always a `SCAN`,
-  never a `SEARCH`). `UNION` and `UNION ALL` are the same plan. A join in the
-  recursive arm (`FROM c, t` — a second scan child) and an outer
-  `ORDER BY`/`GROUP BY`/`DISTINCT` (each appends a temp-b-tree node) decline cleanly,
-  keeping the prior error rather than emitting a wrong plan; the executed rows always
-  match (`tests/eqp_recursive_cte.rs`).
+  `WHERE` and a bare aggregate add none). The outer access over the materialized
+  co-routine is normally a `SCAN`, but a lone `min()`/`max()` aggregate seeks one end
+  and reads as **`SEARCH c`** (no index detail — a co-routine has none); a second
+  aggregate keeps the `SCAN`, and a `min(DISTINCT …)` (which interposes a
+  `USE TEMP B-TREE FOR min(DISTINCT)` node) declines. `UNION` and `UNION ALL` are the
+  same plan. A join in the recursive arm (`FROM c, t` — a second scan child) and an
+  outer `ORDER BY`/`GROUP BY`/`DISTINCT` (each appends a temp-b-tree node) decline
+  cleanly, keeping the prior error rather than emitting a wrong plan; the executed
+  rows always match (`tests/eqp_recursive_cte.rs`).
 - **Recursive-CTE base-anchor execution** — *executing* (not just `EXPLAIN`ing) a
   recursive CTE whose body carried a base-table source — a base-table anchor
   (`SELECT a FROM t UNION ALL …`), a single-row aggregate/filtered anchor, or a

@@ -13051,7 +13051,19 @@ impl Connection {
                                     }
                                 })
                                 && !sel.where_clause.as_ref().is_some_and(expr_has_subquery);
-                            if is_recursive && rec_simple && outer_plain {
+                            // The outer access over the materialized co-routine is
+                            // a `SCAN`, except a lone `min()`/`max()` aggregate seeks
+                            // one end and reads as `SEARCH {name}` (no index detail —
+                            // a co-routine has none). A `min(DISTINCT …)` argument
+                            // interposes a `USE TEMP B-TREE FOR min(DISTINCT)` node we
+                            // do not render, so that sub-case declines (keeps the
+                            // prior error; rows still match).
+                            let outer_minmax = coroutine_outer_minmax(sel);
+                            if is_recursive
+                                && rec_simple
+                                && outer_plain
+                                && outer_minmax != Some(true)
+                            {
                                 let co_id = *next_id;
                                 *next_id += 1;
                                 out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
@@ -13069,7 +13081,12 @@ impl Connection {
                                 out.push((rec_scan, step_id, alloc::format!("SCAN {name}")));
                                 let scan_id = *next_id;
                                 *next_id += 1;
-                                out.push((scan_id, parent, alloc::format!("SCAN {name}")));
+                                let outer_kw = if outer_minmax == Some(false) {
+                                    "SEARCH"
+                                } else {
+                                    "SCAN"
+                                };
+                                out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
                                 return Ok(());
                             }
                         }
@@ -29896,6 +29913,63 @@ fn for_each_minmax(expr: &Expr, f: &mut dyn FnMut(bool, &Expr)) {
         }
         _ => {}
     }
+}
+
+/// Whether an outer query over a materialized co-routine (a recursive CTE's
+/// `SCAN c`) is the single `min()`/`max()` shape SQLite serves as a one-end
+/// `SEARCH` rather than a `SCAN` — the same min/max optimization as for a base
+/// table, but with no index detail since a co-routine has none.
+///
+/// Returns `Some(arg_distinct)` when the result columns hold *exactly one*
+/// aggregate and it is a single-argument `min`/`max` (scalar wrappers like
+/// `abs(min(a))`/`max(a)+1` and additional plain columns are allowed; only the
+/// projection is inspected, so the caller must already have excluded
+/// `GROUP BY`/`HAVING`/`DISTINCT`). `arg_distinct` is the call's `DISTINCT` flag:
+/// `min(DISTINCT x)` makes SQLite interpose a `USE TEMP B-TREE FOR min(DISTINCT)`
+/// node that graphite does not render, so the caller declines that sub-case.
+/// `None` for any other shape (no aggregate, a second aggregate, a
+/// window/filter/ordered call) — the access stays a plain `SCAN`.
+fn coroutine_outer_minmax(sel: &Select) -> Option<bool> {
+    let mut agg_count = 0usize;
+    let mut minmax_count = 0usize;
+    let mut arg_distinct = false;
+    let mut disqualified = false;
+    for rc in &sel.columns {
+        let ResultColumn::Expr { expr, .. } = rc else {
+            return None;
+        };
+        window::visit(expr, &mut |node| {
+            if let Expr::Function {
+                name,
+                distinct,
+                args,
+                star,
+                filter,
+                order_by,
+                over,
+            } = node
+            {
+                if over.is_some() || filter.is_some() || !order_by.is_empty() {
+                    disqualified = true;
+                    return;
+                }
+                if func::is_aggregate_call(name, args.len(), *star) {
+                    agg_count += 1;
+                    if !*star
+                        && args.len() == 1
+                        && (name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max"))
+                    {
+                        minmax_count += 1;
+                        arg_distinct = *distinct;
+                    }
+                }
+            }
+        });
+    }
+    if disqualified || agg_count != 1 || minmax_count != 1 {
+        return None;
+    }
+    Some(arg_distinct)
 }
 
 /// If a grouped query references exactly one `min()`/`max()` aggregate (anywhere
