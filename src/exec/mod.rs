@@ -12483,7 +12483,29 @@ impl Connection {
                     None,
                     params,
                 )?;
-                details.push((next_id, 0, detail));
+                let access_id = next_id;
+                next_id += 1;
+                details.push((access_id, 0, detail));
+                // A single non-correlated scalar subquery in the WHERE renders a
+                // `SCALAR SUBQUERY 1` sibling of the scan, its body as the child —
+                // only when no CTE / trailing clause shifts SQLite's id counter.
+                if d.ctes.is_empty()
+                    && d.order_by.is_empty()
+                    && d.limit.is_none()
+                    && d.offset.is_none()
+                    && d.returning.is_empty()
+                {
+                    if let Some(body) = d
+                        .where_clause
+                        .as_ref()
+                        .and_then(|w| self.eqp_dml_scalar_subquery(&[w]))
+                    {
+                        let sid = next_id;
+                        next_id += 1;
+                        details.push((sid, 0, String::from("SCALAR SUBQUERY 1")));
+                        self.eqp_select(body, sid, &mut next_id, &mut details, params)?;
+                    }
+                }
             }
             Statement::Update(u) => {
                 let meta = self.table_meta(&u.table, None)?;
@@ -12495,7 +12517,34 @@ impl Connection {
                     None,
                     params,
                 )?;
-                details.push((next_id, 0, detail));
+                let access_id = next_id;
+                next_id += 1;
+                details.push((access_id, 0, detail));
+                // As for DELETE, but the lone scalar subquery may live in a `SET`
+                // assignment as well as the `WHERE`. Multiple SET subqueries are
+                // emitted in source order yet numbered in reverse (codegen-fragile),
+                // so only the single-subquery case (always `SCALAR SUBQUERY 1`) is
+                // rendered; `UPDATE … FROM` / row-value `SET (…)=(SELECT)` / a
+                // trailing clause each shift the plan and decline.
+                if u.ctes.is_empty()
+                    && u.from.is_none()
+                    && u.row_assignments.is_empty()
+                    && u.order_by.is_empty()
+                    && u.limit.is_none()
+                    && u.offset.is_none()
+                    && u.returning.is_empty()
+                {
+                    let mut exprs: Vec<&Expr> = u.assignments.iter().map(|(_, e)| e).collect();
+                    if let Some(w) = u.where_clause.as_ref() {
+                        exprs.push(w);
+                    }
+                    if let Some(body) = self.eqp_dml_scalar_subquery(&exprs) {
+                        let sid = next_id;
+                        next_id += 1;
+                        details.push((sid, 0, String::from("SCALAR SUBQUERY 1")));
+                        self.eqp_select(body, sid, &mut next_id, &mut details, params)?;
+                    }
+                }
             }
             Statement::Insert(ins) => {
                 if let InsertSource::Select(sel) = &ins.source {
@@ -12677,6 +12726,29 @@ impl Connection {
             return None;
         }
         Some(subs)
+    }
+
+    /// The single non-correlated scalar subquery in an UPDATE/DELETE's `SET` /
+    /// `WHERE` expressions to render as `SCALAR SUBQUERY 1`, when provably
+    /// byte-exact. SQLite numbers DML subqueries with the same shared counter as a
+    /// SELECT's, and several `SET` subqueries are emitted in source order yet
+    /// numbered in *reverse* (codegen-fragile), so only the unambiguous single-
+    /// subquery case is rendered — it is always `SCALAR SUBQUERY 1`. `EXISTS` /
+    /// `IN (SELECT)` (different node shapes) and a correlated body (a `CORRELATED
+    /// SCALAR SUBQUERY` node) decline via the shared collector / renderable check.
+    /// SQLite always emits a node here where we emitted none, so adding the correct
+    /// one can only converge a plan, never regress.
+    fn eqp_dml_scalar_subquery<'a>(&self, exprs: &[&'a Expr]) -> Option<&'a Select> {
+        let mut subs: Vec<&Select> = Vec::new();
+        for e in exprs {
+            if !collect_where_scalar_subqueries(e, &mut subs) {
+                return None;
+            }
+        }
+        if subs.len() != 1 || !self.eqp_scalar_bodies_renderable(&subs) {
+            return None;
+        }
+        Some(subs[0])
     }
 
     /// Whether every collected scalar-subquery body renders byte-exactly and

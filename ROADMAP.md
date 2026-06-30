@@ -547,7 +547,18 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   column order, with a non-subquery `HAVING` and a folded/unfolded `ORDER BY` riding
   along. `DISTINCT` (separate distinct sorter), a `HAVING`/`ORDER BY` subquery (which
   reorders or renumbers the nodes), and a correlated/compound/join body all decline,
-  unchanged from before (`tests/eqp_grouped_projection_scalar_subquery.rs`).
+  unchanged from before (`tests/eqp_grouped_projection_scalar_subquery.rs`). The same
+  `SCALAR SUBQUERY 1` node now also renders for an **UPDATE/DELETE** carrying a single
+  non-correlated scalar subquery in a `SET` assignment or the `WHERE` clause
+  (`UPDATE t SET c=(SELECT count(*) FROM u) WHERE b=1`, `DELETE FROM t WHERE
+  c=(SELECT …)`): the node is a sibling of the access node, its body recursed as the
+  child, where graphite previously emitted only the access node. Only the
+  single-subquery case is rendered — SQLite emits several `SET` subqueries in source
+  order but numbered in *reverse* (codegen-fragile), and a correlated body
+  (`CORRELATED SCALAR SUBQUERY`) / `IN (SELECT)` (`LIST SUBQUERY` + bloom) are
+  different shapes — so multi-subquery, `UPDATE … FROM`, row-value `SET (…)=(SELECT)`,
+  a CTE, a trailing `ORDER BY`/`LIMIT`, and `RETURNING` all decline to the bare access
+  node (`tests/eqp_dml_scalar_subquery.rs`).
 - **EQP recursive CTE** — a `WITH RECURSIVE c(…) AS (<anchor> UNION[ ALL]
   <recursive>) SELECT … FROM c` source now renders SQLite's `CO-ROUTINE c` subtree
   byte-exactly: a `SETUP` child holding the non-recursive anchor arm's plan (recursed
