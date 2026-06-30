@@ -552,6 +552,21 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   pre-existing: a non-prefix or mixed-direction `ORDER BY` — `ORDER BY y`, `ORDER BY x, z`
   — which SQLite serves with a *partial* "LAST TERM" sorter; graphite keeps its full
   sorter there, an unchanged divergence.)
+- **EQP `WITHOUT ROWID` PK-seek ordered output** — the seek companion to the scan above.
+  The executor tries a `WITHOUT ROWID` PK seek/range *before* any secondary index, so an
+  equality on a leading-key prefix (or a range on the leading key) walks the matching rows
+  in PK-clustered storage order; after dropping the equality-pinned (constant) columns, a
+  uniform-direction `ORDER BY` prefix of the remaining walk needs no sorter — SQLite plans
+  the bare `SEARCH w USING PRIMARY KEY …`, graphite spuriously kept the temp b-tree. A new
+  `without_rowid_seek_order`, plugged into the same `order_satisfied_by_scan` chokepoint,
+  confirms a leading-PK equality/range guards the seek (declining a non-leading or
+  secondary-index seek, and an `IN` on the leading key), folds the pinned columns out, and
+  matches the rest of the PK walk plus trailing payload as a uniform prefix. Same
+  all-ascending-PK restriction (`meta.pk_all_asc`) as the scan slice — a `DESC` PK keeps
+  its sorter. Byte-exact vs sqlite3 3.50.4, plan and rows
+  (`tests/eqp_without_rowid_seek_order.rs`). (Out of scope, pre-existing: a full scan whose
+  non-seek `WHERE` filters a non-PK column yet still walks in PK order — SQLite elides the
+  sorter, graphite keeps it — and the partial "LAST TERM" sorter divergence above.)
 - **EQP positional-term range check** — an out-of-range positional `GROUP BY` / `ORDER BY`
   ordinal (`SELECT a FROM t ORDER BY 2`, one output column) is a prepare-time error in
   SQLite, reported identically whether the statement is executed or `EXPLAIN QUERY

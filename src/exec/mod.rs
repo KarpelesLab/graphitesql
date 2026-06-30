@@ -14994,6 +14994,127 @@ impl Connection {
         Some(dir)
     }
 
+    /// The `WHERE`-seek analogue of [`without_rowid_ordered_scan`]: a leading-PK
+    /// equality (`try_without_rowid_pk_seek`) or range (`try_without_rowid_pk_range`)
+    /// seeks the PK-clustered b-tree and then walks it forward, so the rows arrive
+    /// in PK storage order from the seek point — exactly the orders SQLite plans
+    /// with no sorter on top of the `SEARCH … USING PRIMARY KEY (…)`. The executor
+    /// tries these PK seeks before any secondary index or scan, so a leading-PK
+    /// constraint guarantees the PK-ordered walk.
+    ///
+    /// Equality-pinned columns (any `col = const` / `col IS NULL` conjunct) are
+    /// constant across the seeked rows, so SQLite drops `ORDER BY` terms on them; if
+    /// every remaining term is then a uniform-direction contiguous prefix of the
+    /// walked storage order (skipping the constant columns there too), the sort is
+    /// elided. Returns `Some(descending)`. Restricted to an all-ascending PK
+    /// (`meta.pk_all_asc`); a leading-PK `IN`-list (`try_without_rowid_pk_in`, whose
+    /// multi-value order is not proven here) declines.
+    fn without_rowid_seek_order(&self, sel: &Select, params: &Params) -> Option<bool> {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let t = &from.first;
+        if t.subquery.is_some()
+            || t.tvf_args.is_some()
+            || t.schema.is_some()
+            || t.index_hint.is_some()
+        {
+            return None;
+        }
+        let where_expr = sel.where_clause.as_ref()?;
+        if sel.order_by.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || self.has_aggregate(sel)
+            || window::has_window(sel)
+        {
+            return None;
+        }
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+        if !meta.without_rowid || !meta.pk_all_asc {
+            return None;
+        }
+        let pk = &meta.storage_order[..meta.pk_len];
+        // Columns the WHERE pins to a single value — constant across the result, so
+        // an `ORDER BY` term on one of them carries no ordering and is dropped.
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        let mut const_cols: Vec<usize> = eqs.iter().map(|(c, _)| *c).collect();
+        collect_isnull_cols(where_expr, &meta.columns, &mut const_cols);
+        // The seek mode picks where the PK walk begins. A leading-PK equality
+        // prefix (the contiguous run of `pk[i]` pinned by `=`) seeks past those
+        // columns; otherwise a leading-PK range walks the whole PK from the start.
+        // A leading-PK `IN`-list takes a different (unproven-order) path — decline.
+        let eq_prefix = pk
+            .iter()
+            .take_while(|&&c| eqs.iter().any(|(col, _)| *col == c))
+            .count();
+        let walk_start = if eq_prefix > 0 {
+            eq_prefix
+        } else {
+            if let Some((col, _)) = find_in_constraint(where_expr, &meta.columns, params) {
+                if pk.first() == Some(&col) {
+                    return None;
+                }
+            }
+            let lead = *pk.first()?;
+            let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                alloc::collections::BTreeMap::new();
+            collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+            match ranges.get(&lead) {
+                Some(b) if b.lower.is_some() || b.upper.is_some() => 0,
+                _ => return None,
+            }
+        };
+        // Walk the remaining storage columns, dropping the constant ones, and check
+        // every non-constant ORDER BY term lands on the next walked column in one
+        // uniform direction (default NULLs). A bare `ORDER BY col` uses the column's
+        // own collation, which is its storage collation; a `COLLATE`-wrapped term is
+        // an `Expr::Collate`, not a bare column, and bails.
+        let order_cols = order_projection(&sel.columns, &meta.columns);
+        let storage = &meta.storage_order;
+        let mut walk = walk_start;
+        let mut dir: Option<bool> = None;
+        for term in &sel.order_by {
+            let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
+                Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
+                _ => return None,
+            };
+            if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
+                return None;
+            }
+            let oc = meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))?;
+            if const_cols.contains(&oc) {
+                continue; // constant column: contributes no ordering
+            }
+            let d = *dir.get_or_insert(term.descending);
+            if term.descending != d || term.nulls_first.is_some() {
+                return None;
+            }
+            while walk < storage.len() && const_cols.contains(&storage[walk]) {
+                walk += 1;
+            }
+            if walk >= storage.len() || storage[walk] != oc {
+                return None;
+            }
+            walk += 1;
+        }
+        // Every term was either constant or matched the walk in `dir` (or all terms
+        // were constant — a fully-pinned key, at most one row, any order trivially
+        // satisfied → no reversal needed).
+        Some(dir.unwrap_or(false))
+    }
+
     /// The secondary-index analogue of [`rowid_ordered_scan`]: when the same
     /// single-table full-scan shape has its sole `ORDER BY` term as a plain
     /// column that is the leading column of a full (non-partial, non-expression)
@@ -16002,6 +16123,9 @@ impl Connection {
             return Some(d);
         }
         if let Some(d) = self.without_rowid_ordered_scan(sel) {
+            return Some(d);
+        }
+        if let Some(d) = self.without_rowid_seek_order(sel, params) {
             return Some(d);
         }
         if let Some(s) = self.order_index_scan(sel) {
