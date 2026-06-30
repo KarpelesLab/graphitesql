@@ -8,7 +8,15 @@
 //! model from this path, so it declines; a row carrying a subquery, a multi-table
 //! FROM/JOIN, or a combination of outer ORDER BY/GROUP BY/DISTINCT clauses all
 //! switch SQLite to shapes we don't model and likewise decline cleanly rather
-//! than mis-render. Verified vs the sqlite3 3.50.4 CLI.
+//! than mis-render.
+//!
+//! The same multi-row clause used as a *CTE body* (`WITH c AS (VALUES…) SELECT *
+//! FROM c`) cannot flatten: SQLite materializes it as `CO-ROUTINE c` whose single
+//! child is `SCAN {N} CONSTANT ROWS` (note the plural "CONSTANT ROWS" phrasing,
+//! distinct from the FROM-source's `SCAN {N}-ROW VALUES CLAUSE`), then the outer
+//! `{SCAN|SEARCH} c` plus one optional trailing temp-b-tree. A single-row body is
+//! the singular `SCAN CONSTANT ROW`; a subquery-bearing row, a join across CTEs,
+//! and a combination of outer clauses decline. Verified vs the sqlite3 3.50.4 CLI.
 
 #![cfg(feature = "std")]
 
@@ -70,6 +78,34 @@ fn from_values_renders_single_node() {
 }
 
 #[test]
+fn cte_values_renders_coroutine() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    for q in [
+        // A multi-row VALUES CTE body materializes as CO-ROUTINE + SCAN N CONSTANT
+        // ROWS (plural) + the outer SCAN; a single-row body is singular.
+        "WITH c AS (VALUES(1,2),(3,4)) SELECT * FROM c",
+        "WITH c AS (VALUES(1)) SELECT * FROM c",
+        "WITH c AS (VALUES(1,2),(3,4),(5,6)) SELECT * FROM c",
+        "WITH c AS (VALUES(1,2),(3,4)) SELECT * FROM c WHERE column1>1",
+        "WITH c AS (VALUES(1,2),(3,4)) SELECT count(*) FROM c",
+        // One outer ORDER BY / GROUP BY / DISTINCT appends a temp-b-tree.
+        "WITH c AS (VALUES(1,2),(3,4)) SELECT * FROM c ORDER BY column1 DESC",
+        "WITH c AS (VALUES(1,2),(3,4)) SELECT column1 FROM c GROUP BY column1",
+        "WITH c AS (VALUES(1,2),(3,4)) SELECT DISTINCT column1 FROM c",
+        // A lone min/max makes the outer access a SEARCH (child stays SCAN).
+        "WITH c AS (VALUES(1,2),(3,4)) SELECT max(column1) FROM c",
+    ] {
+        let sql = format!("EXPLAIN QUERY PLAN {q}");
+        assert_eq!(run("sqlite3", &sql), run(g, &sql), "for {q}");
+        assert_eq!(run("sqlite3", q), run(g, q), "rows for {q}");
+    }
+}
+
+#[test]
 fn from_values_edge_cases_decline() {
     // A single-row VALUES source (co-routine wrapper), a subquery inside a row, a
     // multi-table FROM, and a combination of outer clauses each switch SQLite to a
@@ -82,6 +118,10 @@ fn from_values_edge_cases_decline() {
         "SELECT * FROM (VALUES(1,2),(3,4)) t JOIN (VALUES(5,6)) u",
         "SELECT DISTINCT column1 FROM (VALUES(1),(2),(2)) ORDER BY column1",
         "SELECT * FROM (SELECT * FROM (VALUES(1,2),(3,4)))",
+        // CTE-body VALUES variants that switch SQLite to shapes we don't model.
+        "WITH c AS (VALUES((SELECT 1),2),(3,4)) SELECT * FROM c",
+        "WITH c AS (VALUES(1,2),(3,4)), d AS (VALUES(5)) SELECT * FROM c, d",
+        "WITH c AS (VALUES(1,2),(3,4)) SELECT DISTINCT column1 FROM c ORDER BY column1",
     ] {
         let sql = format!("EXPLAIN QUERY PLAN {q}");
         let got = run(g, &sql);

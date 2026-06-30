@@ -13207,6 +13207,52 @@ impl Connection {
                         }
                     }
                 }
+                // A *multi-row* `VALUES` clause as a CTE body cannot flatten into
+                // the outer plan: SQLite materializes it as a `CO-ROUTINE <name>`
+                // whose single child is `SCAN {N} CONSTANT ROWS` (note the plural
+                // "CONSTANT ROWS" phrasing — distinct from the `SCAN {N}-ROW VALUES
+                // CLAUSE` node a `VALUES`-in-`FROM` source folds to), followed by the
+                // outer query's `{SCAN|SEARCH} <name>` plus one optional trailing
+                // temp-b-tree node. A single-row body falls through to the
+                // `body_is_const_row` path below (`SCAN CONSTANT ROW`, singular).
+                if from_cte {
+                    if let Some(name) = co_label {
+                        let value_arm_count =
+                            sub.values_rows.saturating_sub(1).min(sub.compound.len());
+                        let pure_values = value_arm_count >= 1
+                            && value_arm_count == sub.compound.len()
+                            && !values_clause_has_subquery(sub, value_arm_count);
+                        if pure_values {
+                            if let Some((outer_kw, trailing)) =
+                                self.eqp_materialized_outer_render(sel)
+                            {
+                                let co_id = *next_id;
+                                *next_id += 1;
+                                out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                                let rows_id = *next_id;
+                                *next_id += 1;
+                                out.push((
+                                    rows_id,
+                                    co_id,
+                                    alloc::format!("SCAN {} CONSTANT ROWS", sub.values_rows),
+                                ));
+                                let scan_id = *next_id;
+                                *next_id += 1;
+                                out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                                if let Some(lbl) = trailing {
+                                    let tid = *next_id;
+                                    *next_id += 1;
+                                    out.push((
+                                        tid,
+                                        parent,
+                                        alloc::format!("USE TEMP B-TREE FOR {lbl}"),
+                                    ));
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 let body_is_const_row = sub.from.is_none()
                     && sub.compound.is_empty()
                     && !select_no_from_has_subquery(sub);

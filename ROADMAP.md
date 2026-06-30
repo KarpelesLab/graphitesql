@@ -211,7 +211,13 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   most one trailing outer `USE TEMP B-TREE FOR ORDER BY|GROUP BY|DISTINCT`, with a lone
   `min`/`max` switching it to `SEARCH N-ROW VALUES CLAUSE`; the *single-row* FROM-source
   (still co-routine-wrapped), a subquery-bearing row, a multi-table FROM/JOIN, and a
-  combination of outer clauses all decline cleanly; an aggregate
+  combination of outer clauses all decline cleanly; the same multi-row clause used as a
+  *CTE body* — `WITH c AS (VALUES(1,2),(3,4)) SELECT * FROM c` — materializes as
+  `CO-ROUTINE c` whose child is `SCAN N CONSTANT ROWS` (the plural phrasing, distinct
+  from the FROM-source's `SCAN N-ROW VALUES CLAUSE`) followed by the outer
+  `SCAN c`/`SEARCH c` plus one optional trailing temp-b-tree (a single-row body is the
+  singular `SCAN CONSTANT ROW`; a subquery-bearing row, a join across CTEs, and a
+  combination of outer clauses decline); an aggregate
   `GROUP BY a ORDER BY a` answered by
   a covering index on `a` emits a bare `SCAN … USING COVERING INDEX` with **no**
   temp-btree node — the group-by access already yields the ORDER BY term in order, so
