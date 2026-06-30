@@ -29437,6 +29437,28 @@ fn collect_eq_constraints(
                 out.push((ci, v));
             }
         }
+        // `col IS <non-null const>` selects exactly the rows `col = <const>` does (a
+        // NULL `col` makes `IS` false, same as `=`), and SQLite's `IS` behaves
+        // identically to `=` for non-NULL operands — so it seeks the same index key.
+        // A NULL operand is the `col IS NULL` NULL-key seek (handled by
+        // `collect_isnull_cols`), so it is excluded here.
+        Expr::Binary {
+            op: BinaryOp::Is,
+            left,
+            right,
+        } => {
+            if let (Some(ci), Some(v)) = (col_index(left, columns), const_value(right, params)) {
+                if !matches!(v, Value::Null) {
+                    out.push((ci, v));
+                }
+            } else if let (Some(ci), Some(v)) =
+                (col_index(right, columns), const_value(left, params))
+            {
+                if !matches!(v, Value::Null) {
+                    out.push((ci, v));
+                }
+            }
+        }
         _ => {}
     }
 }

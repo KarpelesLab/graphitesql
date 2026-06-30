@@ -461,6 +461,12 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   equal-prefix indexes qualify; and a *multi-row composite covering* seek on a
   `WITHOUT ROWID` table emits rows in PK order where sqlite emits index order — a
   separate, pre-existing ordering quirk unrelated to IS NULL.)
+  Symmetrically, `col IS <non-null constant>` is now a *seekable equality*: SQLite's
+  `IS` behaves exactly like `=` for non-NULL operands (a NULL `col` makes both false),
+  so `col IS 5` seeks the same index/rowid key as `col = 5` — graphite previously
+  SCANned. The fix is one arm in the shared `collect_eq_constraints` (a NULL operand
+  is excluded, staying the `col IS NULL` NULL-key seek), so the executor seek and the
+  `eqp_access` label move in lockstep; `col IS NOT <const>` (a `!=`) stays a scan.
   A `WHERE` seek that pins a column to a *single value* now lets graphite elide a
   matching `ORDER BY` (no `USE TEMP B-TREE FOR ORDER BY`), as sqlite does, in two
   more cases feeding `order_satisfied_by_scan`. (1) A bare `rowid` / INTEGER
