@@ -13,11 +13,15 @@
 //! expressions (`abs(min(a))`, `max(a)+1`) and may be `min(DISTINCT a)`. Verified
 //! byte-exact against sqlite3 3.50.4, both the plan and the result value.
 //!
+//! A `WITHOUT ROWID` table is its own clustered primary-key b-tree, so a single
+//! min/max reads `SEARCH t USING PRIMARY KEY` (or `… USING COVERING INDEX <name>`
+//! when a secondary index covers the aggregated column) — also recognised here.
+//!
 //! Deliberately left to the ordinary access path (rendered differently by sqlite,
 //! deferred as out of scope): a `WHERE` on another column (sqlite uses a
 //! *non-covering* index), a bare column beside the aggregate (`min(a), b` — also
 //! non-covering), result `DISTINCT` (sqlite adds `USE TEMP B-TREE FOR DISTINCT`),
-//! a `WITHOUT ROWID` PK seek (`SEARCH t USING PRIMARY KEY`), and `min(<expr>)`.
+//! and `min(<expr>)`.
 
 #![cfg(feature = "std")]
 
@@ -165,6 +169,41 @@ fn non_minmax_aggregates_stay_scan() {
         "SELECT a FROM t",
     ] {
         check(d, q);
+    }
+}
+
+#[test]
+fn minmax_over_without_rowid_reads_primary_key() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    // A `WITHOUT ROWID` table is its own clustered primary-key b-tree, so a single
+    // min/max seek reads `SEARCH t USING PRIMARY KEY` — regardless of which column
+    // is aggregated, since the whole row lives in the PK index.
+    let d = "CREATE TABLE t(a PRIMARY KEY, b) WITHOUT ROWID; \
+             INSERT INTO t VALUES(5,1),(2,2),(8,3);";
+    for q in [
+        "SELECT min(a) FROM t",
+        "SELECT max(a) FROM t",
+        "SELECT min(b) FROM t",
+        "SELECT abs(min(a)) FROM t",
+        "SELECT min(DISTINCT a) FROM t",
+    ] {
+        check(d, q);
+    }
+    // A composite primary key behaves the same: still `USING PRIMARY KEY`.
+    let dc = "CREATE TABLE t(a, b, c, PRIMARY KEY(a, b)) WITHOUT ROWID; \
+              INSERT INTO t VALUES(5,1,1),(2,2,2),(8,3,3);";
+    for q in ["SELECT min(a) FROM t", "SELECT min(c) FROM t"] {
+        check(dc, q);
+    }
+    // A secondary index that *covers* the aggregated column is preferred over the
+    // clustered PK b-tree (`SEARCH t USING COVERING INDEX ib`); a min over the PK
+    // column, which `ib` does not cover, still reads `USING PRIMARY KEY`.
+    let di = "CREATE TABLE t(a PRIMARY KEY, b) WITHOUT ROWID; \
+              CREATE INDEX ib ON t(b); INSERT INTO t VALUES(5,1),(2,2),(8,3);";
+    for q in ["SELECT min(a) FROM t", "SELECT min(b) FROM t"] {
+        check(di, q);
     }
 }
 

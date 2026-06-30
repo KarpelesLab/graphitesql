@@ -434,12 +434,17 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   scan — one output row, so only the label differed and the value already matched).
   `eqp_select` now recognises the shape via `minmax_search_detail` /
   `is_single_minmax_column` and emits `SEARCH`, sharing `covering_scan`'s index
-  choice for the `USING COVERING INDEX` clause. Byte-exact vs sqlite3 3.50.4
+  choice for the `USING COVERING INDEX` clause. A **`WITHOUT ROWID`** table is its
+  own clustered primary-key b-tree, so the same min/max reads
+  `SEARCH t USING PRIMARY KEY` — unless a secondary index covers the aggregated
+  column, in which case it prefers `… USING COVERING INDEX <name>`
+  (`minmax_covering_index`, which mirrors `covering_scan`'s index filter but works
+  regardless of rowid-ness). Byte-exact vs sqlite3 3.50.4
   (`tests/eqp_minmax_search.rs`). (Deferred, rendered differently by sqlite and out
   of scope: a `WHERE` on another column or a bare column beside the aggregate
   (`min(a), b`) — sqlite uses a *non-covering* `USING INDEX`; result `DISTINCT`
-  (sqlite adds `USE TEMP B-TREE FOR DISTINCT`); a `WITHOUT ROWID` PK seek
-  (`SEARCH t USING PRIMARY KEY`); and `min(<expr>)` over a non-column argument.)
+  (sqlite adds `USE TEMP B-TREE FOR DISTINCT`); and `min(<expr>)` over a non-column
+  argument.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

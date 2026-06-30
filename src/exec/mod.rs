@@ -15442,16 +15442,25 @@ impl Connection {
             || !sel.group_by.is_empty()
             || sel.having.is_some()
             || sel.distinct
-            || meta.without_rowid
         {
-            // A `WHERE` (sqlite may use a *non-covering* index), `DISTINCT` (sqlite
-            // adds a `USE TEMP B-TREE FOR DISTINCT` line even over the single row),
-            // and a `WITHOUT ROWID` PK seek (`SEARCH t USING PRIMARY KEY`) each
-            // render differently; leave those to the ordinary access path.
+            // A `WHERE` (sqlite may use a *non-covering* index) and `DISTINCT`
+            // (sqlite adds a `USE TEMP B-TREE FOR DISTINCT` line even over the
+            // single row) each render differently; leave those to the ordinary
+            // access path.
             return None;
         }
         if !self.is_single_minmax_column(sel, meta) {
             return None;
+        }
+        // A `WITHOUT ROWID` table *is* its own clustered primary-key b-tree, so the
+        // min/max seek runs over the primary key (`SEARCH t USING PRIMARY KEY`)
+        // unless a secondary index covers the aggregated column — in which case
+        // sqlite seeks that smaller b-tree instead (`… USING COVERING INDEX <name>`).
+        if meta.without_rowid {
+            return Some(match self.minmax_covering_index(sel, meta) {
+                Some(name) => alloc::format!("SEARCH {label} USING COVERING INDEX {name}"),
+                None => alloc::format!("SEARCH {label} USING PRIMARY KEY"),
+            });
         }
         Some(match self.covering_scan(sel, meta, params) {
             Some((name, _, _)) => alloc::format!("SEARCH {label} USING COVERING INDEX {name}"),
@@ -15459,6 +15468,26 @@ impl Connection {
             // unindexed (only-referenced) column still reads `SEARCH <table>`.
             None => alloc::format!("SEARCH {label}"),
         })
+    }
+
+    /// The sole full (non-partial, non-expression) secondary index that covers the
+    /// columns `sel` references, by name — or `None` when there is none or the
+    /// choice is ambiguous (two or more cover it). Mirrors
+    /// [`covering_scan`](Self::covering_scan)'s index filter but works regardless of
+    /// the table's rowid-ness, so the `WITHOUT ROWID` min/max path can prefer a
+    /// covering secondary index over the clustered primary-key b-tree.
+    fn minmax_covering_index(&self, sel: &Select, meta: &TableMeta) -> Option<String> {
+        let t = &sel.from.as_ref()?.first;
+        let mut covering = self.indexes_of(&t.name).ok()?.into_iter().filter(|idx| {
+            idx.partial.is_none()
+                && idx.key_exprs.is_none()
+                && self.query_cols_covered(sel, meta, &idx.cols)
+        });
+        let chosen = covering.next()?;
+        if covering.next().is_some() {
+            return None;
+        }
+        Some(chosen.name)
     }
 
     /// True when `sel`'s result set holds exactly one aggregate call and it is a
