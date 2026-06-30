@@ -15115,6 +15115,137 @@ impl Connection {
         Some(dir.unwrap_or(false))
     }
 
+    /// The full-scan analogue of [`without_rowid_seek_order`]: a `WITHOUT ROWID`
+    /// table whose `WHERE` constrains *only* non-seekable columns is still walked
+    /// by a full scan of the PK-clustered b-tree, so the surviving rows arrive in
+    /// PK storage order — SQLite plans a bare `SCAN w` and elides the sorter for a
+    /// uniform `ORDER BY` prefix of that order, while graphite kept a spurious
+    /// `USE TEMP B-TREE FOR ORDER BY`.
+    ///
+    /// The PK-ordered walk only holds while *no* seek fires. graphite seeks a
+    /// `WITHOUT ROWID` table's PRIMARY KEY when its leading key column is
+    /// constrained (handled by [`without_rowid_seek_order`]) and a secondary index
+    /// when *that* index's leading column is constrained (its walk is the index's
+    /// order, not the PK's — and unlike a rowid table, `order_index_scan` never
+    /// picks a secondary index for *ordering* here, so an unconstrained index is
+    /// never walked). So this path stands down if the leading PK column, or any
+    /// secondary index's leading column, carries an equality / `IN` / range
+    /// constraint; otherwise the scan is the PK b-tree and the equality-pinned
+    /// columns drop out of the `ORDER BY` exactly as in the seek case.
+    fn without_rowid_scan_filtered_order(&self, sel: &Select, params: &Params) -> Option<bool> {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let t = &from.first;
+        if t.subquery.is_some()
+            || t.tvf_args.is_some()
+            || t.schema.is_some()
+            || t.index_hint.is_some()
+        {
+            return None;
+        }
+        let where_expr = sel.where_clause.as_ref()?;
+        if sel.order_by.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || self.has_aggregate(sel)
+            || window::has_window(sel)
+        {
+            return None;
+        }
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+        if !meta.without_rowid || !meta.pk_all_asc {
+            return None;
+        }
+        let lead = *meta.storage_order[..meta.pk_len].first()?;
+        // Gather the WHERE's column constraints once: equalities (the constant /
+        // pinned columns), an `IN`-list, and range bounds. A leading-column
+        // constraint of any of these kinds would steer the executor onto a seek.
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+            alloc::collections::BTreeMap::new();
+        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+        let in_col = find_in_constraint(where_expr, &meta.columns, params).map(|(c, _)| c);
+        // `true` when column `c` would drive a PK or index seek.
+        let seekable = |c: usize| -> bool {
+            eqs.iter().any(|(col, _)| *col == c)
+                || in_col == Some(c)
+                || ranges
+                    .get(&c)
+                    .is_some_and(|b| b.lower.is_some() || b.upper.is_some())
+        };
+        // A constrained leading PK column → PK seek (the seek path's job). A
+        // constrained secondary-index leading column → that index is seeked.
+        if seekable(lead) {
+            return None;
+        }
+        for idx in self.indexes_of(&t.name).ok()? {
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
+                continue;
+            }
+            if idx.cols.first().is_some_and(|&c| seekable(c)) {
+                return None;
+            }
+        }
+        // The access path is the full PK-ordered scan. Drop the equality-pinned
+        // (constant) columns and match every remaining ORDER BY term against the
+        // next non-constant storage column in one uniform direction (default NULLs).
+        let mut const_cols: Vec<usize> = eqs.iter().map(|(c, _)| *c).collect();
+        collect_isnull_cols(where_expr, &meta.columns, &mut const_cols);
+        let order_cols = order_projection(&sel.columns, &meta.columns);
+        let storage = &meta.storage_order;
+        let mut walk = 0usize;
+        let mut dir: Option<bool> = None;
+        let mut consumed = 0usize;
+        for term in &sel.order_by {
+            let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
+                Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
+                _ => return None,
+            };
+            if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
+                return None;
+            }
+            let oc = meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))?;
+            if const_cols.contains(&oc) {
+                continue;
+            }
+            let before = walk;
+            while walk < storage.len() && const_cols.contains(&storage[walk]) {
+                walk += 1;
+            }
+            // An *internal* pinned-column skip (a constant column sitting between two
+            // consumed terms) makes the later term functionally determined by the
+            // earlier ones, so graphite *could* drop it — but SQLite keeps a partial
+            // `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` there, which graphite does
+            // not model. Decline so that pre-existing divergence stays exactly as it
+            // was (graphite's full sorter) rather than becoming a new one.
+            if consumed > 0 && walk > before {
+                return None;
+            }
+            if walk >= storage.len() || storage[walk] != oc {
+                return None;
+            }
+            let d = *dir.get_or_insert(term.descending);
+            if term.descending != d || term.nulls_first.is_some() {
+                return None;
+            }
+            walk += 1;
+            consumed += 1;
+        }
+        Some(dir.unwrap_or(false))
+    }
+
     /// The secondary-index analogue of [`rowid_ordered_scan`]: when the same
     /// single-table full-scan shape has its sole `ORDER BY` term as a plain
     /// column that is the leading column of a full (non-partial, non-expression)
@@ -16126,6 +16257,9 @@ impl Connection {
             return Some(d);
         }
         if let Some(d) = self.without_rowid_seek_order(sel, params) {
+            return Some(d);
+        }
+        if let Some(d) = self.without_rowid_scan_filtered_order(sel, params) {
             return Some(d);
         }
         if let Some(s) = self.order_index_scan(sel) {

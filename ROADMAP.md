@@ -567,6 +567,25 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   (`tests/eqp_without_rowid_seek_order.rs`). (Out of scope, pre-existing: a full scan whose
   non-seek `WHERE` filters a non-PK column yet still walks in PK order — SQLite elides the
   sorter, graphite keeps it — and the partial "LAST TERM" sorter divergence above.)
+- **EQP `WITHOUT ROWID` filtered full-scan ordered output** — the case the seek slice
+  deferred. When a `WITHOUT ROWID` table's `WHERE` constrains *only* non-seekable columns
+  the executor still full-scans the PK-clustered b-tree, so the surviving rows keep PK
+  storage order; SQLite plans a bare `SCAN w` and elides the sorter for a uniform
+  (constant-column-dropped) `ORDER BY` prefix, while graphite kept the temp b-tree. A new
+  `without_rowid_scan_filtered_order`, on the same `order_satisfied_by_scan` chokepoint,
+  stands down when the leading PK column *or* any secondary index's leading column carries
+  an equality/`IN`/range constraint (either would steer the executor onto a seek whose walk
+  is not the PK order — and `order_index_scan` never picks a secondary index for *ordering*
+  on a `WITHOUT ROWID` table, so an unconstrained index is never walked); otherwise it drops
+  the equality-pinned columns and matches the rest as a contiguous uniform prefix of the
+  storage order. An *internal* pinned-column skip (`WHERE y=2 ORDER BY x, z`, where the
+  later term is functionally determined) is declined so SQLite's *partial* "LAST TERM"
+  sorter stays the unchanged pre-existing divergence rather than becoming a new one (graphite
+  cannot emit a partial sorter). Verified against sqlite3 3.50.4: across a 39-query
+  `WITHOUT ROWID` sweep the change cut EQP divergences 31→16 (the residue is all
+  pre-existing: index-vs-scan access choices, secondary-index ordering, partial sorters) and
+  introduced none — the detector can only ever *remove* a graphite sorter. Byte-exact, plan
+  and rows (`tests/eqp_without_rowid_scan_filtered_order.rs`).
 - **EQP positional-term range check** — an out-of-range positional `GROUP BY` / `ORDER BY`
   ordinal (`SELECT a FROM t ORDER BY 2`, one output column) is a prepare-time error in
   SQLite, reported identically whether the statement is executed or `EXPLAIN QUERY
