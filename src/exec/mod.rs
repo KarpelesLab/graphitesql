@@ -12870,12 +12870,20 @@ impl Connection {
             // rows already emitted
         } else {
             let detail = if from.joins.is_empty() {
+                // A single `min(col)`/`max(col)` aggregate (no GROUP BY/HAVING/WHERE,
+                // no other aggregate) is the min/max optimization: sqlite seeks one
+                // end of an ordered scan and labels the access `SEARCH`. Checked
+                // before the covering-`SCAN` branch (which a min/max query would
+                // otherwise match) so the label matches sqlite.
+                if let Some(d) = self.minmax_search_detail(sel, &meta, &label, params) {
+                    d
+                }
                 // `SELECT count(*)` answered by counting a full secondary index
                 // (B2b) reads as `USING COVERING INDEX`. Kept in lockstep with
                 // `run_core` via the shared `count_covering_index` helper. SQLite
                 // labels this particular plan with the *table name* even when the
                 // table is aliased (unlike every other scan, which uses the alias).
-                if let Some((name, _)) = self.count_covering_index(sel) {
+                else if let Some((name, _)) = self.count_covering_index(sel) {
                     alloc::format!("SCAN {} USING COVERING INDEX {name}", from.first.name)
                 }
                 // A full index scanned to satisfy ORDER BY reads as `USING INDEX`,
@@ -15406,6 +15414,118 @@ impl Connection {
             return None;
         }
         Some((chosen.name, chosen.root, chosen.cols))
+    }
+
+    /// SQLite's min/max optimization: a query whose only aggregate is a single
+    /// `min(col)` / `max(col)` (no `GROUP BY`, no `HAVING`, no `WHERE`, no second
+    /// aggregate; the call may be wrapped in scalar expressions and may be
+    /// `DISTINCT`) reads one end of an ordered scan, so `EXPLAIN QUERY PLAN`
+    /// renders its access as `SEARCH` rather than `SCAN`. Returns that detail
+    /// string when the optimization applies, else `None`.
+    ///
+    /// graphite still *executes* this as an ordinary (covering) scan that folds
+    /// the aggregate — the result is a single row, so the access label is the only
+    /// observable difference and the value already matches sqlite. The index
+    /// choice is shared with [`covering_scan`](Self::covering_scan) so the
+    /// `USING COVERING INDEX` clause stays in lockstep; a min/max over an
+    /// unindexed column reads a bare `SEARCH <table>`. The `WHERE`-bearing case
+    /// (which sqlite may serve from a *non-covering* index) is left to the
+    /// ordinary access path.
+    fn minmax_search_detail(
+        &self,
+        sel: &Select,
+        meta: &TableMeta,
+        label: &str,
+        params: &Params,
+    ) -> Option<String> {
+        if sel.where_clause.is_some()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || meta.without_rowid
+        {
+            // A `WHERE` (sqlite may use a *non-covering* index), `DISTINCT` (sqlite
+            // adds a `USE TEMP B-TREE FOR DISTINCT` line even over the single row),
+            // and a `WITHOUT ROWID` PK seek (`SEARCH t USING PRIMARY KEY`) each
+            // render differently; leave those to the ordinary access path.
+            return None;
+        }
+        if !self.is_single_minmax_column(sel, meta) {
+            return None;
+        }
+        Some(match self.covering_scan(sel, meta, params) {
+            Some((name, _, _)) => alloc::format!("SEARCH {label} USING COVERING INDEX {name}"),
+            // No covering index for the aggregated column — `min`/`max` over an
+            // unindexed (only-referenced) column still reads `SEARCH <table>`.
+            None => alloc::format!("SEARCH {label}"),
+        })
+    }
+
+    /// True when `sel`'s result set holds exactly one aggregate call and it is a
+    /// single-argument `min`/`max` over a bare column of `meta`, with no *other*
+    /// column referenced anywhere in the result set. Scalar wrappers around the
+    /// call (`abs(min(a))`, `max(a)+1`) are allowed; a window function, a second
+    /// aggregate, a `*`/expression argument, a wildcard result column, or a bare
+    /// column outside the aggregate (`min(a), b`, which sqlite serves from a
+    /// *non-covering* index) disqualify it. The min/max optimization's structural
+    /// precondition — restricted to the covering / no-index cases that render
+    /// byte-identically to sqlite.
+    fn is_single_minmax_column(&self, sel: &Select, meta: &TableMeta) -> bool {
+        let mut agg_count = 0usize;
+        let mut minmax_count = 0usize;
+        let mut minmax_col: Option<String> = None;
+        let mut other_column = false;
+        let mut disqualified = false;
+        for rc in &sel.columns {
+            let ResultColumn::Expr { expr, .. } = rc else {
+                return false;
+            };
+            window::visit(expr, &mut |node| match node {
+                Expr::Function {
+                    name,
+                    args,
+                    star,
+                    over,
+                    ..
+                } => {
+                    if over.is_some() {
+                        disqualified = true;
+                        return;
+                    }
+                    if func::is_aggregate_call(name, args.len(), *star) {
+                        agg_count += 1;
+                        if !*star
+                            && args.len() == 1
+                            && (name.eq_ignore_ascii_case("min")
+                                || name.eq_ignore_ascii_case("max"))
+                        {
+                            if let Expr::Column { column, .. } = &args[0] {
+                                minmax_count += 1;
+                                minmax_col = Some(column.clone());
+                            }
+                        }
+                    }
+                }
+                // Any column reference that is *not* the sole min/max argument means
+                // a non-covering plan (`SEARCH … USING INDEX`) — left to the
+                // ordinary path. `window::visit` also visits the aggregate's own
+                // argument column, so reconcile against `minmax_col` after the walk.
+                Expr::Column { column, .. } if minmax_col.as_deref() != Some(column.as_str()) => {
+                    other_column = true;
+                }
+                _ => {}
+            });
+        }
+        if disqualified || other_column || agg_count != 1 || minmax_count != 1 {
+            return false;
+        }
+        match minmax_col {
+            Some(c) => meta
+                .columns
+                .iter()
+                .any(|ci| ci.name.eq_ignore_ascii_case(&c)),
+            None => false,
+        }
     }
 
     /// `SELECT count(*) FROM <single rowid table>` can be answered by counting a

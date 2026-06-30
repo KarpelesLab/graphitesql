@@ -423,6 +423,23 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   `SCAN`, and two identical covering indexes leave both EQP and seek-order ambiguous
   — `covering_scan` declines rather than guess sqlite's cost-model choice. Both need
   separate EQP-side work and arise only from degenerate schemas.)
+- **EQP min/max optimization** — a query whose only aggregate is a single
+  `min(col)`/`max(col)` (no `GROUP BY`/`HAVING`/`WHERE`/`DISTINCT`, no second
+  aggregate, no other referenced column; the call may be scalar-wrapped like
+  `abs(min(a))`/`max(a)+1` or `min(DISTINCT a)`) reads one end of an ordered scan,
+  so SQLite renders the access as **`SEARCH`** rather than `SCAN` —
+  `SEARCH t USING COVERING INDEX ia` with a covering index on the column, a bare
+  `SEARCH t` over an unindexed (sole-referenced) column. graphite previously
+  labelled both `SCAN` (it still *executes* the aggregate over an ordinary covering
+  scan — one output row, so only the label differed and the value already matched).
+  `eqp_select` now recognises the shape via `minmax_search_detail` /
+  `is_single_minmax_column` and emits `SEARCH`, sharing `covering_scan`'s index
+  choice for the `USING COVERING INDEX` clause. Byte-exact vs sqlite3 3.50.4
+  (`tests/eqp_minmax_search.rs`). (Deferred, rendered differently by sqlite and out
+  of scope: a `WHERE` on another column or a bare column beside the aggregate
+  (`min(a), b`) — sqlite uses a *non-covering* `USING INDEX`; result `DISTINCT`
+  (sqlite adds `USE TEMP B-TREE FOR DISTINCT`); a `WITHOUT ROWID` PK seek
+  (`SEARCH t USING PRIMARY KEY`); and `min(<expr>)` over a non-column argument.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
