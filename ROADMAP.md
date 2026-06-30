@@ -516,9 +516,24 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   checks (`index_covers_query`, `query_cols_covered`) so the index is recognised as
   covering. The sorter elision, the partial mixed-direction "LAST n TERMS" label, and the
   rowid/IPK ordinal all follow. Byte-exact vs sqlite3 3.50.4, plan and rows
-  (`tests/eqp_order_by_ordinal_scan.rs`). (Out of scope, pre-existing: an ordinal over
-  `SELECT *` (wildcard column map), and an alias that shadows a table column but projects
-  an *expression* — an executor alias-resolution corner.)
+  (`tests/eqp_order_by_ordinal_scan.rs`). (Out of scope, pre-existing: an alias that
+  shadows a table column but projects an *expression* — an executor alias-resolution
+  corner.)
+- **EQP `ORDER BY` ordinal over `SELECT *`** — the prior fold's out-of-scope sibling: a
+  positional ordinal over a `*` / `table.*` wildcard (`SELECT * FROM t ORDER BY 1`) names
+  the column SQLite resolves it to against the *expanded* output list before planning, so
+  an index on that column serves the sort with no sorter. graphite left a wildcard ordinal
+  unresolved (there is no `ResultColumn::Expr` to borrow), so it spuriously emitted `USE
+  TEMP B-TREE FOR ORDER BY`. A shared `order_projection(columns, table_cols)` now expands a
+  `*` / `table.*` in place into one synthetic unqualified column reference per non-hidden
+  table column, and the five single-table order-detection paths plus the two covering
+  checks resolve the ordinal through that expansion. The sorter elision, the `DESC` walk, a
+  `WHERE`-seek serving the ordinal, a mixed `SELECT a, * … ORDER BY n`, the rowid/IPK
+  ordinal, and the all-columns-covered `SELECT * FROM s ORDER BY 1` → `USING COVERING
+  INDEX` all follow. Byte-exact vs sqlite3 3.50.4, plan and rows
+  (`tests/eqp_order_by_ordinal_wildcard.rs`). (Out of scope, pre-existing: a `WITHOUT
+  ROWID` table's PK-clustered scan order — graphite's single-table order paths all decline
+  a `WITHOUT ROWID` table, wildcard or named alike.)
 - **EQP positional-term range check** — an out-of-range positional `GROUP BY` / `ORDER BY`
   ordinal (`SELECT a FROM t ORDER BY 2`, one output column) is a prepare-time error in
   SQLite, reported identically whether the statement is executed or `EXPLAIN QUERY

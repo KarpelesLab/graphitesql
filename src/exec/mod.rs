@@ -35,6 +35,7 @@ use crate::vfs::{OpenFlags, Vfs};
 use crate::vtab::{
     ConstraintOp, DynVTabModule, IndexConstraint, IndexPlan, VTabChange, VTabRegistry, VTabStore,
 };
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -14892,8 +14893,9 @@ impl Connection {
         // `ORDER BY id, b` is satisfied by the scan exactly like a lone `ORDER BY
         // id`, matching sqlite (which emits no temp b-tree for either). (In the
         // rowid-group case there is only the one term, checked above.)
+        let order_cols = order_projection(&sel.columns, &meta.columns);
         let term = &sel.order_by[0];
-        let (tbl, col) = match order_key_expr(sel, &term.expr) {
+        let (tbl, col) = match order_key_expr(&order_cols, &term.expr) {
             Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
             _ => return None,
         };
@@ -14961,6 +14963,7 @@ impl Connection {
         // suffix`). The default-NULLs walk can't honour an explicit `NULLS
         // FIRST`/`LAST`, and a `COLLATE`/non-column term isn't a plain column —
         // both still disqualify the scan entirely.
+        let order_cols = order_projection(&sel.columns, &meta.columns);
         let descending = sel.order_by[0].descending;
         let mut cols: Vec<usize> = Vec::with_capacity(sel.order_by.len());
         let mut uniform_prefix = 0usize;
@@ -14969,7 +14972,7 @@ impl Connection {
             if term.nulls_first.is_some() {
                 return None;
             }
-            let (tbl, col_name) = match order_key_expr(sel, &term.expr) {
+            let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
                 Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => return None,
             };
@@ -15093,13 +15096,14 @@ impl Connection {
             return 0;
         };
         let label = from.first.alias.as_deref().unwrap_or(&from.first.name);
+        let order_cols = order_projection(&sel.columns, &meta.columns);
         let backward = sel.order_by[0].descending;
         let mut k = 0usize;
         for (i, term) in sel.order_by.iter().enumerate() {
             if i >= idx.cols.len() || term.nulls_first.is_some() || term.descending != backward {
                 break;
             }
-            let (tbl, col_name) = match order_key_expr(sel, &term.expr) {
+            let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
                 Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => break,
             };
@@ -15229,11 +15233,14 @@ impl Connection {
             }
         }
         // A positional/alias `ORDER BY` term references the column it resolves to,
-        // not the literal ordinal; resolve it so an index that holds that column is
-        // still recognised as covering (`SELECT b FROM t ORDER BY 1`).
+        // not the literal ordinal; resolve it (through the wildcard-expanded
+        // projection, so an ordinal over `SELECT *` resolves too) so an index that
+        // holds that column is still recognised as covering (`SELECT b FROM t ORDER
+        // BY 1`, and the all-columns-covered `SELECT * FROM s ORDER BY 1`).
+        let order_cols = order_projection(&sel.columns, &meta.columns);
         sel.order_by
             .iter()
-            .all(|t| col_ok(order_key_expr(sel, &t.expr)))
+            .all(|t| col_ok(order_key_expr(&order_cols, &t.expr)))
     }
 
     /// Thorough covering test for a *full-table covering scan*: every column the
@@ -15264,6 +15271,7 @@ impl Connection {
                 }
             }
         }
+        let order_cols = order_projection(&sel.columns, &meta.columns);
         sel.group_by
             .iter()
             .all(|e| where_cols_covered(e, meta, idx_cols))
@@ -15274,7 +15282,7 @@ impl Connection {
             && sel
                 .order_by
                 .iter()
-                .all(|t| where_cols_covered(order_key_expr(sel, &t.expr), meta, idx_cols))
+                .all(|t| where_cols_covered(order_key_expr(&order_cols, &t.expr), meta, idx_cols))
             && sel
                 .where_clause
                 .as_ref()
@@ -15995,8 +16003,9 @@ impl Connection {
         // The leading ORDER BY term must be a plain (un-COLLATE'd) reference to the
         // rowid / IPK column of this table; its uniqueness makes trailing terms
         // irrelevant. A `COLLATE` wrapper is `Expr::Collate`, rejected by the match.
+        let order_cols = order_projection(&sel.columns, &meta.columns);
         let term = &sel.order_by[0];
-        let (tbl, ocol) = match order_key_expr(sel, &term.expr) {
+        let (tbl, ocol) = match order_key_expr(&order_cols, &term.expr) {
             Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
             _ => return None,
         };
@@ -16189,13 +16198,14 @@ impl Connection {
         // Count the leading ORDER BY terms the walk already produces: each must be a
         // plain column of this table, in the walk's uniform direction (default
         // NULLs), matching the next walked column under its own collation.
+        let order_cols = order_projection(&sel.columns, &meta.columns);
         let descending = sel.order_by[0].descending;
         let mut k = 0;
         for term in &sel.order_by {
             if k >= walk_cols.len() || term.descending != descending || term.nulls_first.is_some() {
                 break;
             }
-            let (tbl, col_name) = match order_key_expr(sel, &term.expr) {
+            let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
                 Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => break,
             };
@@ -16227,7 +16237,7 @@ impl Connection {
             && idx.descending[prefix..].iter().all(|d| !d)
         {
             let term = &sel.order_by[k];
-            if let Expr::Column { table, column, .. } = order_key_expr(sel, &term.expr) {
+            if let Expr::Column { table, column, .. } = order_key_expr(&order_cols, &term.expr) {
                 let tbl_ok = table
                     .as_deref()
                     .is_none_or(|tn| tn.eq_ignore_ascii_case(label));
@@ -16259,7 +16269,8 @@ impl Connection {
             let mut rowid_used = false;
             let mut fully = true;
             for term in &sel.order_by {
-                let Expr::Column { table, column, .. } = order_key_expr(sel, &term.expr) else {
+                let Expr::Column { table, column, .. } = order_key_expr(&order_cols, &term.expr)
+                else {
                     fully = false;
                     break;
                 };
@@ -28785,14 +28796,16 @@ fn positional_int(expr: &Expr) -> Option<i64> {
 /// term is such an ordinal or alias and the named result column is a plain
 /// expression; otherwise it returns the term unchanged (a directly-written column,
 /// or an ordinal/alias landing on a wildcard or out-of-range slot, for which the
-/// callers fall back to their own matching). The returned reference borrows from
-/// `sel`'s projection or from `e`, so it is valid for as long as both are.
-fn order_key_expr<'a>(sel: &'a Select, e: &'a Expr) -> &'a Expr {
+/// callers fall back to their own matching). `columns` is the projection — pass the
+/// wildcard-expanded form ([`order_projection`]) so an ordinal over `SELECT *`
+/// resolves to the column it names. The returned reference borrows from `columns`
+/// or from `e`, so it is valid for as long as both are.
+fn order_key_expr<'a>(columns: &'a [ResultColumn], e: &'a Expr) -> &'a Expr {
     // Positional ordinal → the n-th result column's expression.
     if let Some(n) = positional_int(e) {
         if let Ok(i) = usize::try_from(n) {
             if let Some(i) = i.checked_sub(1) {
-                if let Some(ResultColumn::Expr { expr, .. }) = sel.columns.get(i) {
+                if let Some(ResultColumn::Expr { expr, .. }) = columns.get(i) {
                     return expr;
                 }
             }
@@ -28809,13 +28822,61 @@ fn order_key_expr<'a>(sel: &'a Select, e: &'a Expr) -> &'a Expr {
         ..
     } = e
     {
-        if let Some(ResultColumn::Expr { expr, .. }) = sel.columns.iter().find(|rc| {
+        if let Some(ResultColumn::Expr { expr, .. }) = columns.iter().find(|rc| {
             matches!(rc, ResultColumn::Expr { alias: Some(a), .. } if a.eq_ignore_ascii_case(column))
         }) {
             return expr;
         }
     }
     e
+}
+
+/// The projection as the order-detection paths should see it for ordinal
+/// resolution: a `*` / `table.*` wildcard expanded in place into one synthetic
+/// unqualified column reference per non-hidden table column (declared order).
+/// SQLite resolves a positional `ORDER BY` ordinal against the *expanded* output
+/// list before planning, so `SELECT * FROM t ORDER BY 1` orders by the first table
+/// column and an index on it can serve the sort with no sorter. Returns the
+/// projection borrowed unchanged when it holds no wildcard, so the common case
+/// clones nothing. The synthetic references are unqualified (`table: None`) to
+/// match a directly-written bare `ORDER BY col` — these single-table paths resolve
+/// the name against the one table regardless.
+fn order_projection<'a>(
+    columns: &'a [ResultColumn],
+    table_cols: &[ColumnInfo],
+) -> Cow<'a, [ResultColumn]> {
+    if !columns
+        .iter()
+        .any(|c| matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_)))
+    {
+        return Cow::Borrowed(columns);
+    }
+    let col_ref = |c: &ColumnInfo| ResultColumn::Expr {
+        expr: Expr::Column {
+            schema: None,
+            table: None,
+            column: c.name.clone(),
+            quoted: false,
+        },
+        alias: None,
+        source: None,
+    };
+    let mut out = Vec::with_capacity(columns.len());
+    for c in columns {
+        match c {
+            ResultColumn::Wildcard => {
+                out.extend(table_cols.iter().filter(|c| !c.hidden).map(&col_ref))
+            }
+            ResultColumn::TableWildcard(t) => out.extend(
+                table_cols
+                    .iter()
+                    .filter(|c| !c.hidden && c.table.eq_ignore_ascii_case(t))
+                    .map(&col_ref),
+            ),
+            other => out.push(other.clone()),
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Whether a projection has the exact shape `values_core` produces for a desugared
