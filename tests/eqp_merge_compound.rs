@@ -8,14 +8,16 @@
 //! `MERGE` with `LEFT`/`RIGHT` arm children; three-plus arms nest, the inner
 //! `MERGE` becoming the outer's `LEFT` child (each level uses its own operator).
 //!
-//! Graphite renders this only for plain positional terms (`ORDER BY 1`,
-//! `ORDER BY 2,1`) with default null-ordering that cover *all* output columns —
-//! the merge sorts each arm by the whole output row, so a partial cover makes
-//! SQLite append a per-arm `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` we would
-//! miss. A named term (needs per-arm position translation), an explicit `COLLATE`
-//! (SQLite falls to a CO-ROUTINE+materialize shape), an explicit `NULLS FIRST`/
-//! `LAST`, a `*` projection (column count unresolved), and a `VALUES` arm all
-//! decline rather than mis-render. Verified vs the sqlite3 3.50.4 CLI.
+//! Graphite renders this for positional (`ORDER BY 1`, `ORDER BY 2,1`) or bare
+//! named/alias (`ORDER BY a`, `ORDER BY b,a`) terms with default null-ordering
+//! that cover *all* output columns — a named term is resolved to its result-set
+//! position and the whole `ORDER BY` is rewritten to positional before being
+//! pushed into the arms. The merge sorts each arm by the whole output row, so a
+//! partial cover makes SQLite append a per-arm `USE TEMP B-TREE FOR LAST TERM OF
+//! ORDER BY` we would miss; that declines, as do an explicit `COLLATE` (SQLite
+//! falls to a CO-ROUTINE+materialize shape), an explicit `NULLS FIRST`/`LAST`, a
+//! non-column expression term, a `*` projection (column count unresolved), and a
+//! `VALUES` arm. Verified vs the sqlite3 3.50.4 CLI.
 
 #![cfg(feature = "std")]
 
@@ -87,12 +89,20 @@ fn compound_order_by_renders_merge() {
         // order) needs no extra per-arm sort term.
         "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 1,2",
         "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 2,1",
+        // A bare named or aliased term resolves to its result-set position (matched
+        // case-insensitively) and is rewritten to positional for the arms.
+        "SELECT a FROM t UNION SELECT x FROM u ORDER BY a",
+        "SELECT a AS p FROM t UNION SELECT x FROM u ORDER BY p",
+        "SELECT a FROM t UNION SELECT x FROM u ORDER BY a DESC",
+        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY b,a",
+        "SELECT a,b FROM t INTERSECT SELECT x,y FROM u ORDER BY B,A",
         // Three-plus arms nest left-associatively; the inner MERGE is the outer
         // MERGE's LEFT child, each level carrying its own operator.
         "SELECT a FROM t UNION SELECT x FROM u UNION SELECT a FROM t ORDER BY 1",
         "SELECT a FROM t UNION SELECT x FROM u INTERSECT SELECT a FROM t ORDER BY 1",
         "SELECT a FROM t UNION ALL SELECT x FROM u UNION SELECT a FROM t ORDER BY 1",
         "SELECT a FROM t EXCEPT SELECT x FROM u UNION SELECT a FROM t ORDER BY 1 DESC",
+        "SELECT a FROM t UNION SELECT x FROM u UNION SELECT a FROM t ORDER BY a",
     ] {
         assert_eq!(plan("sqlite3", BASE, q), plan(g, BASE, q), "for {q}");
     }
@@ -111,6 +121,8 @@ fn compound_merge_does_not_change_rows() {
         "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 2,1",
         "SELECT a FROM t INTERSECT SELECT x FROM u ORDER BY 1",
         "SELECT a FROM t UNION SELECT x FROM u UNION SELECT a FROM t ORDER BY 1",
+        "SELECT a FROM t UNION SELECT x FROM u ORDER BY a DESC",
+        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY b,a",
     ] {
         let sql = format!("{DATA} {q}");
         let a = Command::new("sqlite3")
@@ -130,17 +142,19 @@ fn compound_merge_does_not_change_rows() {
 #[test]
 fn compound_merge_fragile_shapes_decline() {
     // Shapes graphite declines rather than mis-render: a partial-cover ORDER BY
-    // (the merge appends a per-arm temp-b-tree for the uncovered columns), an
-    // explicit COLLATE (SQLite uses a CO-ROUTINE+materialize plan instead), an
-    // explicit NULLS ordering (diverges from our per-arm sort choice), a named
-    // term (needs per-arm position translation), and a `*` projection (output
-    // column count unresolved here).
+    // (positional or named — the merge appends a per-arm temp-b-tree for the
+    // uncovered columns), an explicit COLLATE (SQLite uses a CO-ROUTINE+materialize
+    // plan instead), an explicit NULLS ordering (diverges from our per-arm sort
+    // choice), a non-column expression term (no result-set position), and a `*`
+    // projection (output column count unresolved here).
     let g = env!("CARGO_BIN_EXE_graphitesql");
     for q in [
         "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 1",
+        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY a",
         "SELECT a FROM t UNION SELECT x FROM u ORDER BY 1 COLLATE NOCASE",
+        "SELECT a FROM t UNION SELECT x FROM u ORDER BY a COLLATE NOCASE",
         "SELECT a FROM t UNION SELECT x FROM u ORDER BY 1 NULLS LAST",
-        "SELECT a FROM t UNION SELECT x FROM u ORDER BY a",
+        "SELECT a FROM t UNION SELECT x FROM u ORDER BY a+0",
         "SELECT * FROM t UNION SELECT * FROM u ORDER BY 1",
     ] {
         let got = raw(g, BASE, q);

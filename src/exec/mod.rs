@@ -13035,31 +13035,75 @@ impl Connection {
                     } else {
                         sel.columns.len()
                     };
-                let mut covered = alloc::vec![false; ncols];
-                let positional = ncols >= 1
-                    && sel.order_by.iter().all(|t| {
-                        t.nulls_first.is_none()
-                            && match t.expr {
-                                Expr::Literal(Literal::Integer(n)) if n >= 1 => {
-                                    let i = n as usize;
-                                    if i <= ncols {
-                                        covered[i - 1] = true;
-                                    }
-                                    i <= ncols
-                                }
+                //
+                // A term may be a bare positional integer or a bare unqualified
+                // name/alias — SQLite resolves a compound's `ORDER BY` against the
+                // result-set column names, so we map each name to its output
+                // position and rewrite the whole `ORDER BY` to positional before
+                // pushing it into the arms (a name would not resolve inside a later
+                // arm whose columns differ). An expression, a qualified or
+                // `COLLATE`-wrapped term, or an explicit `NULLS` ordering is
+                // unresolvable here and declines.
+                let resolve_pos = |t: &OrderTerm| -> Option<usize> {
+                    if t.nulls_first.is_some() {
+                        return None;
+                    }
+                    match &t.expr {
+                        Expr::Literal(Literal::Integer(n)) if *n >= 1 && *n as usize <= ncols => {
+                            Some(*n as usize)
+                        }
+                        Expr::Column {
+                            schema: None,
+                            table: None,
+                            column,
+                            ..
+                        } => sel
+                            .columns
+                            .iter()
+                            .position(|c| match c {
+                                ResultColumn::Expr { expr, alias, .. } => alias
+                                    .as_deref()
+                                    .or(match expr {
+                                        Expr::Column { column, .. } => Some(column.as_str()),
+                                        _ => None,
+                                    })
+                                    .is_some_and(|nm| nm.eq_ignore_ascii_case(column)),
                                 _ => false,
-                            }
-                    })
-                    && covered.iter().all(|&c| c);
+                            })
+                            .map(|i| i + 1),
+                        _ => None,
+                    }
+                };
+                let mut covered = alloc::vec![false; ncols];
+                let mut pos_order: Vec<OrderTerm> = Vec::with_capacity(sel.order_by.len());
+                let mut resolvable = ncols >= 1;
+                for t in &sel.order_by {
+                    match resolve_pos(t) {
+                        Some(p) => {
+                            covered[p - 1] = true;
+                            pos_order.push(OrderTerm {
+                                expr: Expr::Literal(Literal::Integer(p as i64)),
+                                descending: t.descending,
+                                nulls_first: None,
+                            });
+                        }
+                        None => {
+                            resolvable = false;
+                            break;
+                        }
+                    }
+                }
+                let full_cover = resolvable && covered.iter().all(|&c| c);
                 let no_values = sel.values_rows == 0
                     && real_compound.iter().all(|(_, arm)| arm.values_rows == 0);
-                if positional && no_values {
+                if full_cover && no_values {
                     // The head arm is `sel` without its compound tail / whole-compound
-                    // `LIMIT`/`OFFSET`; it keeps `sel.order_by`. Each continuation arm
-                    // inherits the same `ORDER BY` and the shared `WITH` clause.
+                    // `LIMIT`/`OFFSET`; every arm carries the positional `ORDER BY` and
+                    // the shared `WITH` clause.
                     let mut arms: Vec<Select> = Vec::with_capacity(real_compound.len() + 1);
                     let mut first = sel.clone();
                     first.compound = Vec::new();
+                    first.order_by = pos_order.clone();
                     first.limit = None;
                     first.offset = None;
                     arms.push(first);
@@ -13071,7 +13115,7 @@ impl Connection {
                             arm.ctes = sel.ctes.clone();
                         }
                         arm.compound = Vec::new();
-                        arm.order_by = sel.order_by.clone();
+                        arm.order_by = pos_order.clone();
                         arm.limit = None;
                         arm.offset = None;
                         arms.push(arm);

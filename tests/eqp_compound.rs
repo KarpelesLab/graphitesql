@@ -124,18 +124,17 @@ fn values_clause_with_subquery_declines() {
 #[test]
 fn order_by_on_a_compound_partial_or_fragile_declines() {
     // A trailing ORDER BY makes sqlite emit a `MERGE (<OP>)` tree. graphite renders
-    // it for plain positional terms covering all output columns (see
+    // it for positional or named terms covering all output columns (see
     // `tests/eqp_merge_compound.rs`); the shapes below still decline cleanly rather
     // than mis-render — a `*` projection (output column count unresolved), a partial
     // cover (the merge appends a per-arm temp-b-tree), an explicit `COLLATE` (sqlite
-    // uses a CO-ROUTINE+materialize plan), and a named term (needs per-arm position
-    // translation).
+    // uses a CO-ROUTINE+materialize plan), and a non-column expression term.
     let g = env!("CARGO_BIN_EXE_graphitesql");
     for q in [
         "SELECT * FROM t UNION SELECT * FROM u ORDER BY 1",
         "SELECT a, b FROM t EXCEPT SELECT x, y FROM u ORDER BY 1",
         "SELECT a FROM t UNION SELECT x FROM u ORDER BY 1 COLLATE NOCASE",
-        "SELECT a FROM t UNION SELECT x FROM u ORDER BY a",
+        "SELECT a FROM t UNION SELECT x FROM u ORDER BY a+0",
     ] {
         let sql = format!("{BASE} EXPLAIN QUERY PLAN {q}");
         let got = run(g, &sql);
