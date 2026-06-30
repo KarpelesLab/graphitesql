@@ -105,6 +105,9 @@ fn flattenable_wildcard_over_base_table_matches_sqlite() {
     // `SCAN t`. graphite renders this by recursing into the body under the same
     // parent (its planner produces the identical flattened plan), so an inner
     // `WHERE`/`ORDER BY` carries through (indexed → SEARCH, sort → TEMP B-TREE).
+    // An *outer* `WHERE` over a pass-through wildcard body also flattens: sqlite
+    // pushes the predicate into the scan, so graphite ANDs it into the body and
+    // recurses, tightening the `SCAN` into a `SEARCH` (or adding a range bound).
     if !sqlite3_available() {
         eprintln!("sqlite3 CLI not found; skipping");
         return;
@@ -120,6 +123,11 @@ fn flattenable_wildcard_over_base_table_matches_sqlite() {
         "SELECT * FROM (SELECT * FROM t WHERE b>0) AS s",
         "SELECT * FROM (SELECT * FROM t ORDER BY b) AS s",
         "SELECT * FROM (SELECT * FROM t) AS s LIMIT 5",
+        // Outer WHERE pushed into the flattened scan.
+        "SELECT * FROM (SELECT * FROM t) AS s WHERE a=5",
+        "SELECT * FROM (SELECT * FROM t) AS s WHERE a>5",
+        "SELECT * FROM (SELECT a FROM t) AS s WHERE a<5",
+        "SELECT * FROM (SELECT * FROM t WHERE a>0) AS s WHERE a<9",
     ] {
         let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
         assert_eq!(run("sqlite3", &sql), run(g, &sql), "for {q}");
@@ -129,15 +137,18 @@ fn flattenable_wildcard_over_base_table_matches_sqlite() {
 #[test]
 fn non_flattenable_outer_shapes_decline() {
     // The flatten subset is restricted to a *pure wildcard* outer over a single
-    // base table. A narrower outer projection re-derives a covering index, an
-    // outer WHERE merges into the scan, and an inner join/aggregate/DISTINCT/view
-    // each change the flattened plan — all decline cleanly rather than mis-render.
+    // base table (an outer `WHERE` is allowed and pushed into the scan — see
+    // `flattenable_wildcard_over_base_table_matches_sqlite`). A narrower outer
+    // projection re-derives a covering index, a derived-alias-qualified outer
+    // predicate would not resolve once merged, and an inner join/aggregate/
+    // DISTINCT/view/LIMIT each change the flattened plan — all decline cleanly
+    // rather than mis-render.
     let g = env!("CARGO_BIN_EXE_graphitesql");
     let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); \
                 CREATE TABLE u(x,y); CREATE VIEW v AS SELECT * FROM t;";
     for q in [
         "SELECT a FROM (SELECT * FROM t) AS s", // narrower outer projection
-        "SELECT * FROM (SELECT * FROM t) AS s WHERE a=5", // outer WHERE
+        "SELECT * FROM (SELECT * FROM t) AS s WHERE s.a=5", // alias-qualified outer WHERE
         "SELECT * FROM (SELECT * FROM t JOIN u ON t.a=u.x) AS s", // inner join
         "SELECT * FROM (SELECT DISTINCT a FROM t) AS s", // inner DISTINCT
         "SELECT * FROM (SELECT count(*) FROM t) AS s", // inner aggregate
@@ -213,6 +224,10 @@ fn cte_reference_renders_like_a_derived_table() {
         "WITH c AS (SELECT 1, 2) SELECT * FROM c",
         "WITH c AS (SELECT * FROM t WHERE a=5) SELECT * FROM c",
         "WITH c AS (SELECT * FROM t ORDER BY b) SELECT * FROM c",
+        // Outer WHERE over a flattened CTE pushes into the scan, same as a derived
+        // table.
+        "WITH c AS (SELECT * FROM t) SELECT * FROM c WHERE a=5",
+        "WITH c AS (SELECT a FROM t) SELECT * FROM c WHERE a<5",
     ] {
         let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
         assert_eq!(run("sqlite3", &sql), run(g, &sql), "for {q}");
@@ -222,16 +237,18 @@ fn cte_reference_renders_like_a_derived_table() {
 #[test]
 fn non_flattenable_cte_shapes_decline() {
     // The CTE subset mirrors the derived-table one. A join onto the CTE, a narrower
-    // outer projection, an outer WHERE, an inner aggregate, an inner view, a CTE
-    // whose body reads *another* CTE, and an aliased CTE reference each fall outside
-    // it and must decline cleanly — never the old `no such table: c` crash.
+    // outer projection, a CTE-qualified outer WHERE (`c.a=5`, which would not resolve
+    // once merged), an inner aggregate, an inner view, a CTE whose body reads
+    // *another* CTE, and an aliased CTE reference each fall outside it and must
+    // decline cleanly — never the old `no such table: c` crash. (An *unqualified*
+    // outer WHERE does flatten — see `cte_reference_renders_like_a_derived_table`.)
     let g = env!("CARGO_BIN_EXE_graphitesql");
     let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); \
                 CREATE TABLE u(x,y); CREATE VIEW v AS SELECT * FROM t;";
     for q in [
         "WITH c AS (SELECT * FROM t) SELECT * FROM c, u",
         "WITH c AS (SELECT * FROM t) SELECT a FROM c",
-        "WITH c AS (SELECT * FROM t) SELECT * FROM c WHERE a=5",
+        "WITH c AS (SELECT * FROM t) SELECT * FROM c WHERE c.a=5",
         "WITH c AS (SELECT count(*) FROM t) SELECT * FROM c",
         "WITH c AS (SELECT * FROM t), d AS (SELECT * FROM c) SELECT * FROM d",
         "WITH c AS (SELECT * FROM v) SELECT * FROM c",

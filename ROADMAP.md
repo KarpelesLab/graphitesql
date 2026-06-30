@@ -187,9 +187,18 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   derived-table source crashed EQP with a malformed empty `no such table:`; plus a
   pure-wildcard outer over a single base-table body — `SELECT * FROM (SELECT * FROM
   t)` — flattened to the body's own plan the way SQLite does, so an inner
-  `WHERE`/`ORDER BY` carries through to `SEARCH`/`TEMP B-TREE`, while a narrower
-  outer projection, an outer `WHERE`, or an inner join/aggregate/DISTINCT/view/LIMIT
-  declines cleanly; a `WITH`-clause CTE referenced as a FROM source renders the same
+  `WHERE`/`ORDER BY` carries through to `SEARCH`/`TEMP B-TREE`; an *outer* `WHERE`
+  over a pass-through wildcard body — `SELECT * FROM (SELECT * FROM t) s WHERE a=5`
+  / `SELECT * FROM (SELECT b FROM t WHERE b>0) WHERE b<10` — now also flattens:
+  SQLite pushes the predicate into the scan, so graphite ANDs the (unqualified)
+  outer predicate into the body and recurses, tightening the `SCAN` into a `SEARCH`
+  or adding a range bound (re-deriving the covering-index choice from the body's own
+  projection, so a `SELECT b` body keeps `COVERING INDEX` where a `SELECT *` body
+  drops to a plain `INDEX`); this holds only when the inner projection is
+  pass-through (`*` or bare unaliased columns) and the outer predicate is
+  unqualified — a narrower outer projection, a derived-alias-qualified predicate
+  (`s.a=5`), or an inner join/aggregate/DISTINCT/view/LIMIT still declines cleanly;
+  a `WITH`-clause CTE referenced as a FROM source renders the same
   way — `WITH c AS (SELECT 1) SELECT * FROM c` → `CO-ROUTINE c`, `WITH c AS (SELECT *
   FROM t) SELECT * FROM c` → `SCAN t` — instead of crashing with `no such table: c`;
   an explicit `WITH c AS MATERIALIZED (…)` hint forces the `MATERIALIZE c` node SQLite

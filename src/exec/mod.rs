@@ -13583,6 +13583,48 @@ impl Connection {
                 if outer_is_pure_wildcard && inner_is_base_table_scan {
                     return self.eqp_select(sub, parent, next_id, out, params);
                 }
+                // The same flatten, but the outer carries a `WHERE`: SQLite pushes
+                // the predicate into the flattened base-table scan, so a `SCAN`
+                // tightens into a `SEARCH` (or an existing range gains a bound). We
+                // reproduce it by ANDing the outer predicate into the inner body and
+                // recursing — `eqp_select` then re-derives the covering-index / seek
+                // exactly — but only when the merge is provably name-sound:
+                //  - the inner projection is *pass-through* (`*` or bare unaliased
+                //    columns), so a derived output name *is* its base column; an
+                //    aliased or computed projection (`a+1 AS b`) has no such column to
+                //    push the predicate onto;
+                //  - the outer predicate uses only *unqualified* column names — a
+                //    derived-alias qualifier (`s.b`) would not resolve against the base
+                //    table once merged.
+                // The outer must still be a bare wildcard adding no other nodes, and
+                // the body a single base-table scan (same gate as the no-`WHERE` case).
+                let outer_wildcard_only_where =
+                    matches!(sel.columns.as_slice(), [ResultColumn::Wildcard])
+                        && sel.where_clause.is_some()
+                        && (from_cte || sel.ctes.is_empty())
+                        && outer_adds_no_nodes;
+                let inner_proj_passthrough = sub.columns.iter().all(|c| match c {
+                    ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => true,
+                    ResultColumn::Expr { expr, alias, .. } => {
+                        alias.is_none() && matches!(expr, Expr::Column { .. })
+                    }
+                });
+                if outer_wildcard_only_where && inner_is_base_table_scan && inner_proj_passthrough {
+                    if let Some(pred) = &sel.where_clause {
+                        if !expr_has_qualified_column(pred) {
+                            let mut merged = sub.clone();
+                            merged.where_clause = Some(match merged.where_clause.take() {
+                                Some(inner) => Expr::Binary {
+                                    op: BinaryOp::And,
+                                    left: Box::new(inner),
+                                    right: Box::new(pred.clone()),
+                                },
+                                None => pred.clone(),
+                            });
+                            return self.eqp_select(&merged, parent, next_id, out, params);
+                        }
+                    }
+                }
                 // A *compound* CTE/derived body that carries at least one dedup set
                 // operator (`UNION` / `INTERSECT` / `EXCEPT`) cannot flatten into the
                 // outer plan: SQLite materializes it as a `CO-ROUTINE <name>` whose
@@ -26310,6 +26352,21 @@ fn expr_has_subquery(e: &Expr) -> bool {
             n,
             Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. }
         ) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Whether `e` contains any *table-qualified* (`t.col` / `s.t.col`) column
+/// reference. Used when merging a derived table's outer `WHERE` into its inner
+/// body for EXPLAIN QUERY PLAN: an unqualified name resolves against the single
+/// base table, but a derived-alias qualifier (`s.col`) would not, so the caller
+/// declines the merge in that case.
+fn expr_has_qualified_column(e: &Expr) -> bool {
+    let mut found = false;
+    window::visit(e, &mut |n| {
+        if let Expr::Column { table: Some(_), .. } = n {
             found = true;
         }
     });
