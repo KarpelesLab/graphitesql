@@ -9,15 +9,21 @@
 //! `MERGE` becoming the outer's `LEFT` child (each level uses its own operator).
 //!
 //! Graphite renders this for positional (`ORDER BY 1`, `ORDER BY 2,1`) or bare
-//! named/alias (`ORDER BY a`, `ORDER BY b,a`) terms with default null-ordering
-//! that cover *all* output columns — a named term is resolved to its result-set
-//! position and the whole `ORDER BY` is rewritten to positional before being
-//! pushed into the arms. The merge sorts each arm by the whole output row, so a
-//! partial cover makes SQLite append a per-arm `USE TEMP B-TREE FOR LAST TERM OF
-//! ORDER BY` we would miss; that declines, as do an explicit `COLLATE` (SQLite
-//! falls to a CO-ROUTINE+materialize shape), an explicit `NULLS FIRST`/`LAST`, a
-//! non-column expression term, a `*` projection (column count unresolved), and a
-//! `VALUES` arm. Verified vs the sqlite3 3.50.4 CLI.
+//! named/alias (`ORDER BY a`, `ORDER BY b,a`) terms with default null-ordering —
+//! a named term is resolved to its result-set position and the whole `ORDER BY`
+//! is rewritten to positional before being pushed into the arms. A merge sorts
+//! each arm by the *whole output row* whenever a de-duplicating operator
+//! (`UNION`/`INTERSECT`/`EXCEPT`) governs that arm (the set operation compares
+//! full rows), so a partial cover makes SQLite append the not-yet-covered output
+//! columns (ascending) to that arm's sort — surfacing as a per-arm `USE TEMP
+//! B-TREE FOR [LAST [N TERMS] OF] ORDER BY`. An arm is governed by a dedup op iff
+//! one appears in the operator suffix from that arm onward: in `a UNION b UNION
+//! ALL c` the `c` arm (only ever joined by `UNION ALL`) keeps a bare sort while
+//! `a`/`b` append; a pure `UNION ALL` compound appends nothing. We reproduce that
+//! per-arm. What still declines: an explicit `COLLATE` (SQLite falls to a
+//! CO-ROUTINE+materialize shape), an explicit `NULLS FIRST`/`LAST`, a non-column
+//! expression term, a `*` projection (column count unresolved), and a `VALUES`
+//! arm. Verified vs the sqlite3 3.50.4 CLI.
 
 #![cfg(feature = "std")]
 
@@ -89,6 +95,24 @@ fn compound_order_by_renders_merge() {
         // order) needs no extra per-arm sort term.
         "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 1,2",
         "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 2,1",
+        // Partial cover: a dedup-governed arm appends the uncovered column(s) as
+        // a per-arm `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` (or `... ORDER BY`
+        // when even the leading term is not index-satisfiable).
+        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 1",
+        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 2",
+        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 1 DESC",
+        "SELECT a,b FROM t INTERSECT SELECT x,y FROM u ORDER BY 1",
+        "SELECT a,b FROM t EXCEPT SELECT x,y FROM u ORDER BY 2",
+        // A partial cover named/aliased the same way.
+        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY a",
+        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY b",
+        // UNION ALL with no dedup anywhere appends nothing even on a partial cover.
+        "SELECT a,b FROM t UNION ALL SELECT x,y FROM u ORDER BY 1",
+        // Mixed ops: only the arms governed by a dedup op (a suffix containing
+        // UNION/INTERSECT/EXCEPT) append — the trailing UNION-ALL-only arm does not.
+        "SELECT a,b FROM t UNION SELECT x,y FROM u UNION ALL SELECT a,b FROM t ORDER BY 1",
+        "SELECT a,b FROM t UNION ALL SELECT x,y FROM u UNION SELECT a,b FROM t ORDER BY 1",
+        "SELECT a,b FROM t EXCEPT SELECT x,y FROM u UNION ALL SELECT a,b FROM t ORDER BY 2",
         // A bare named or aliased term resolves to its result-set position (matched
         // case-insensitively) and is rewritten to positional for the arms.
         "SELECT a FROM t UNION SELECT x FROM u ORDER BY a",
@@ -123,6 +147,11 @@ fn compound_merge_does_not_change_rows() {
         "SELECT a FROM t UNION SELECT x FROM u UNION SELECT a FROM t ORDER BY 1",
         "SELECT a FROM t UNION SELECT x FROM u ORDER BY a DESC",
         "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY b,a",
+        // Partial cover: each dedup-governed arm appends the uncovered column, but
+        // the merged output must still match sqlite row-for-row.
+        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 1",
+        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 2 DESC",
+        "SELECT a,b FROM t EXCEPT SELECT x,y FROM u UNION ALL SELECT a,b FROM t ORDER BY 1",
     ] {
         let sql = format!("{DATA} {q}");
         let a = Command::new("sqlite3")
@@ -141,16 +170,13 @@ fn compound_merge_does_not_change_rows() {
 
 #[test]
 fn compound_merge_fragile_shapes_decline() {
-    // Shapes graphite declines rather than mis-render: a partial-cover ORDER BY
-    // (positional or named — the merge appends a per-arm temp-b-tree for the
-    // uncovered columns), an explicit COLLATE (SQLite uses a CO-ROUTINE+materialize
-    // plan instead), an explicit NULLS ordering (diverges from our per-arm sort
-    // choice), a non-column expression term (no result-set position), and a `*`
-    // projection (output column count unresolved here).
+    // Shapes graphite declines rather than mis-render: an explicit COLLATE (SQLite
+    // uses a CO-ROUTINE+materialize plan instead), an explicit NULLS ordering
+    // (diverges from our per-arm sort choice), a non-column expression term (no
+    // result-set position), and a `*` projection (output column count unresolved
+    // here). A partial cover now *renders* (see the render test above).
     let g = env!("CARGO_BIN_EXE_graphitesql");
     for q in [
-        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY 1",
-        "SELECT a,b FROM t UNION SELECT x,y FROM u ORDER BY a",
         "SELECT a FROM t UNION SELECT x FROM u ORDER BY 1 COLLATE NOCASE",
         "SELECT a FROM t UNION SELECT x FROM u ORDER BY a COLLATE NOCASE",
         "SELECT a FROM t UNION SELECT x FROM u ORDER BY 1 NULLS LAST",

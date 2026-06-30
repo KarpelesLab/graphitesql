@@ -13093,29 +13093,54 @@ impl Connection {
                         }
                     }
                 }
-                let full_cover = resolvable && covered.iter().all(|&c| c);
                 let no_values = sel.values_rows == 0
                     && real_compound.iter().all(|(_, arm)| arm.values_rows == 0);
-                if full_cover && no_values {
+                if resolvable && no_values {
+                    // A trailing `ORDER BY` turns the compound into a `MERGE` plan: each
+                    // arm streams pre-sorted and the merge key is the explicit `ORDER BY`
+                    // terms. Whenever a de-duplicating operator (`UNION`/`INTERSECT`/
+                    // `EXCEPT`) governs an arm, that arm must instead emit whole rows in
+                    // order (the set operation compares full rows), so SQLite appends the
+                    // not-yet-covered output columns (ascending) to that arm's sort —
+                    // surfacing as a per-arm `USE TEMP B-TREE FOR [LAST [N TERMS] OF]
+                    // ORDER BY`. An arm is governed by a dedup op iff one appears in the
+                    // operator suffix from that arm onward; a pure `UNION ALL` compound
+                    // appends nothing. The head arm is governed by every operator.
+                    let uncovered = (1..=ncols).filter(|&p| !covered[p - 1]).map(|p| OrderTerm {
+                        expr: Expr::Literal(Literal::Integer(p as i64)),
+                        descending: false,
+                        nulls_first: None,
+                    });
+                    let full_order: Vec<OrderTerm> =
+                        pos_order.iter().cloned().chain(uncovered).collect();
+                    let is_dedup = |op: &CompoundOp| !matches!(op, CompoundOp::UnionAll);
+                    let order_for = |full: bool| -> Vec<OrderTerm> {
+                        if full {
+                            full_order.clone()
+                        } else {
+                            pos_order.clone()
+                        }
+                    };
                     // The head arm is `sel` without its compound tail / whole-compound
-                    // `LIMIT`/`OFFSET`; every arm carries the positional `ORDER BY` and
-                    // the shared `WITH` clause.
+                    // `LIMIT`/`OFFSET`; every arm carries its effective `ORDER BY` and the
+                    // shared `WITH` clause.
                     let mut arms: Vec<Select> = Vec::with_capacity(real_compound.len() + 1);
                     let mut first = sel.clone();
                     first.compound = Vec::new();
-                    first.order_by = pos_order.clone();
+                    first.order_by = order_for(real_compound.iter().any(|(op, _)| is_dedup(op)));
                     first.limit = None;
                     first.offset = None;
                     arms.push(first);
                     let mut ops: Vec<CompoundOp> = Vec::with_capacity(real_compound.len());
-                    for (op, arm) in real_compound {
+                    for (j, (op, arm)) in real_compound.iter().enumerate() {
                         ops.push(*op);
+                        let arm_full = real_compound[j..].iter().any(|(o, _)| is_dedup(o));
                         let mut arm = arm.clone();
                         if arm.ctes.is_empty() {
                             arm.ctes = sel.ctes.clone();
                         }
                         arm.compound = Vec::new();
-                        arm.order_by = pos_order.clone();
+                        arm.order_by = order_for(arm_full);
                         arm.limit = None;
                         arm.offset = None;
                         arms.push(arm);

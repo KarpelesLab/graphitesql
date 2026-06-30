@@ -208,15 +208,21 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   separate `MERGE (<OP>)` plan, which graphite now renders for positional
   (`ORDER BY 1`) or bare named/aliased (`ORDER BY a`, `ORDER BY b,a`, matched
   case-insensitively against the result-set names and rewritten to positional for
-  the arms) terms with default null-ordering that cover *all* output columns — each
-  arm is recursed with the `ORDER BY` pushed in and the arms combine
-  left-associatively under nested `MERGE` nodes (`LEFT` = accumulated head, `RIGHT`
-  = next arm; every operator including `UNION ALL` uses `MERGE` once an `ORDER BY`
-  is present, a whole-compound `LIMIT`/`OFFSET` and a per-arm `WHERE` `SEARCH` carry
-  through); a partial-cover `ORDER BY` (the merge appends a per-arm `USE TEMP B-TREE
-  FOR LAST TERM OF ORDER BY` for the uncovered columns), an explicit `COLLATE`
-  (SQLite falls to a CO-ROUTINE+materialize shape), an explicit `NULLS FIRST`/`LAST`,
-  a non-column expression term, and a `*` projection all decline cleanly; a top-level multi-row `VALUES (…),(…),…` clause —
+  the arms) terms with default null-ordering — each arm is recursed with the
+  `ORDER BY` pushed in and the arms combine left-associatively under nested `MERGE`
+  nodes (`LEFT` = accumulated head, `RIGHT` = next arm; every operator including
+  `UNION ALL` uses `MERGE` once an `ORDER BY` is present, a whole-compound
+  `LIMIT`/`OFFSET` and a per-arm `WHERE` `SEARCH` carry through); a *partial-cover*
+  `ORDER BY` also renders — a merge sorts an arm by the whole output row whenever a
+  de-duplicating operator (`UNION`/`INTERSECT`/`EXCEPT`) governs it (the set
+  operation compares full rows), so SQLite appends the not-yet-covered output
+  columns (ascending) to that arm's sort, surfacing as a per-arm `USE TEMP B-TREE
+  FOR [LAST [N TERMS] OF] ORDER BY`; an arm is governed by a dedup op iff one
+  appears in the operator suffix from that arm onward (in `a UNION b UNION ALL c`
+  the trailing `c` keeps a bare sort while `a`/`b` append; a pure `UNION ALL`
+  compound appends nothing), reproduced per-arm; an explicit `COLLATE` (SQLite falls
+  to a CO-ROUTINE+materialize shape), an explicit `NULLS FIRST`/`LAST`, a non-column
+  expression term, and a `*` projection all still decline cleanly; a top-level multi-row `VALUES (…),(…),…` clause —
   which graphite desugars to `UNION ALL` arms — folds into the single
   `SCAN N-ROW VALUES CLAUSE` node SQLite renders (a one-row `VALUES` stays
   `SCAN CONSTANT ROW`), and when such a clause is the left-most arm of, or an operand
