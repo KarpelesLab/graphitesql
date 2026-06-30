@@ -12730,6 +12730,53 @@ impl Connection {
         Some(subs)
     }
 
+    /// The `ORDER BY` scalar subqueries to render as `SCALAR SUBQUERY N`, the
+    /// third positional analogue of [`Self::eqp_where_scalar_subqueries`] /
+    /// [`Self::eqp_projection_scalar_subqueries`].
+    ///
+    /// An `ORDER BY` subquery is sequenced just like a WHERE one — *after* the
+    /// scan and *before* the `USE TEMP B-TREE FOR ORDER BY` sorter — so our single
+    /// insertion point right after the scan matches SQLite. The exceptions need
+    /// declining: a `GROUP BY` / `HAVING` shifts the node *after* the grouping
+    /// sorter (a different insertion point), and `DISTINCT` introduces a separate
+    /// `USE TEMP B-TREE FOR DISTINCT` sorter whose interplay with the ORDER BY
+    /// sorter we do not model here. As with the other forms, the subqueries must
+    /// live solely in `ORDER BY` (one elsewhere would shift the shared id counter),
+    /// and each must be a non-correlated, non-compound scalar `(SELECT …)` over base
+    /// tables with no nested subquery. Numbered `1..n` left-to-right in term order.
+    /// SQLite always emits such a node where we emitted none, so rendering the
+    /// correct one can only converge a plan, never regress.
+    fn eqp_orderby_scalar_subqueries<'a>(&self, sel: &'a Select) -> Option<Vec<&'a Select>> {
+        if !sel.group_by.is_empty() || sel.having.is_some() || sel.distinct {
+            return None;
+        }
+        // Subqueries must appear only in ORDER BY; one in WHERE / the projection /
+        // LIMIT / OFFSET would consume an id and shift the count off `1..n`.
+        let elsewhere = sel.where_clause.as_ref().is_some_and(expr_has_subquery)
+            || sel.columns.iter().any(|c| match c {
+                ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+            })
+            || sel.limit.as_ref().is_some_and(expr_has_subquery)
+            || sel.offset.as_ref().is_some_and(expr_has_subquery);
+        if elsewhere {
+            return None;
+        }
+        // Collect ORDER BY subqueries left-to-right (SQLite's numbering order)
+        // without descending into a body. Any `IN (SELECT)` / `EXISTS` term makes
+        // the set unrenderable here.
+        let mut subs: Vec<&Select> = Vec::new();
+        for term in &sel.order_by {
+            if !collect_where_scalar_subqueries(&term.expr, &mut subs) {
+                return None;
+            }
+        }
+        if subs.is_empty() || !self.eqp_scalar_bodies_renderable(&subs) {
+            return None;
+        }
+        Some(subs)
+    }
+
     fn eqp_select(
         &self,
         sel: &Select,
@@ -13074,20 +13121,22 @@ impl Connection {
             *next_id += 1;
             out.push((id, parent, detail));
         }
-        // A non-correlated scalar subquery in the WHERE clause or the projection is
-        // computed once and rendered by SQLite as a `SCALAR SUBQUERY N` sibling of
-        // the scan node, numbered left-to-right, with the subquery body's plan as
-        // its child. A WHERE subquery is placed before any GROUP BY / ORDER BY
-        // sorter; a projection subquery before DISTINCT / ORDER BY but after GROUP
-        // BY (so the projection form is declined when grouping is present — see the
-        // two collectors). Either way we only emit when the whole set is provably
-        // `1..n`; single-table queries only, so this runs before the join-folding
-        // below (which is a no-op when there are no joins). The two positions are
-        // mutually exclusive: each collector declines if the other holds a subquery.
+        // A non-correlated scalar subquery in the WHERE clause, the projection, or
+        // ORDER BY is computed once and rendered by SQLite as a `SCALAR SUBQUERY N`
+        // sibling of the scan node, numbered left-to-right, with the subquery body's
+        // plan as its child. A WHERE / ORDER BY subquery is placed before any
+        // GROUP BY / ORDER BY sorter; a projection subquery before DISTINCT / ORDER
+        // BY but after GROUP BY (so the projection / ORDER BY forms are declined when
+        // grouping is present — see the three collectors). Either way we only emit
+        // when the whole set is provably `1..n`; single-table queries only, so this
+        // runs before the join-folding below (which is a no-op when there are no
+        // joins). The three positions are mutually exclusive: each collector declines
+        // if another clause holds a subquery.
         if from.joins.is_empty() {
             if let Some(subs) = self
                 .eqp_where_scalar_subqueries(sel)
                 .or_else(|| self.eqp_projection_scalar_subqueries(sel))
+                .or_else(|| self.eqp_orderby_scalar_subqueries(sel))
             {
                 for (i, body) in subs.iter().enumerate() {
                     let scalar_id = *next_id;

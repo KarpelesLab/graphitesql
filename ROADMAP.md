@@ -449,7 +449,15 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   The two positions are mutually exclusive (each collector declines if the other
   holds a subquery), so a subquery in *both* projection and WHERE — SQLite's
   cross-position `SCALAR SUBQUERY 2` then `1` numbering — declines cleanly
-  (`tests/eqp_projection_scalar_subquery.rs`).
+  (`tests/eqp_projection_scalar_subquery.rs`). The same node now also renders for a
+  scalar `(SELECT …)` in an **`ORDER BY`** term (`… ORDER BY (SELECT …)`), numbered
+  `1..n` in term order; an ORDER BY subquery is sequenced exactly like a WHERE one —
+  after the scan, before the `USE TEMP B-TREE FOR ORDER BY` sorter — so the same
+  insertion point matches. GROUP BY / HAVING are declined (the node would sequence
+  after the grouping sorter) and so is `DISTINCT` (a separate distinct sorter whose
+  ORDER BY interplay we do not model); a body join / compound / correlation / `EXISTS`
+  and a subquery in another clause decline as in the other two forms
+  (`tests/eqp_orderby_scalar_subquery.rs`).
 - **EQP min/max optimization** — a query whose only aggregate is a single
   `min(X)`/`max(X)` (no `GROUP BY`/`HAVING`/`WHERE`/statement-level `DISTINCT`, no
   second aggregate; the call may be scalar-wrapped like `abs(min(a))`/`max(a)+1`)
