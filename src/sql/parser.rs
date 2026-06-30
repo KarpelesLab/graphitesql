@@ -850,6 +850,7 @@ impl Parser {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            values_rows: 0,
         })
     }
 
@@ -886,13 +887,19 @@ impl Parser {
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
+                values_rows: 0,
             }
         };
+        let row_count = rows.len();
         let mut it = rows.into_iter();
         let mut core = make(it.next().expect("VALUES has at least one row"));
         for r in it {
             core.compound.push((CompoundOp::UnionAll, make(r)));
         }
+        // Record the clause's row count on the head select. Its first
+        // `row_count - 1` compound arms are the remaining `VALUES` rows (not true
+        // compound continuations); `EXPLAIN QUERY PLAN` folds them into one node.
+        core.values_rows = row_count;
         Ok(core)
     }
 

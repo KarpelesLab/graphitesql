@@ -197,7 +197,16 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   `COMPOUND QUERY` / `LEFT-MOST SUBQUERY` / per-arm-operator tree byte-exactly
   (3+ arms, per-arm WHERE seeks, a shared `WITH`, and a bare `LIMIT`/`OFFSET` all
   carry through), while a trailing `ORDER BY` on the compound — SQLite's separate
-  `MERGE` plan — declines cleanly; an aggregate `GROUP BY a ORDER BY a` answered by
+  `MERGE` plan — declines cleanly; a top-level multi-row `VALUES (…),(…),…` clause —
+  which graphite desugars to `UNION ALL` arms — folds into the single
+  `SCAN N-ROW VALUES CLAUSE` node SQLite renders (a one-row `VALUES` stays
+  `SCAN CONSTANT ROW`), and when such a clause is the left-most arm of, or an operand
+  within, a *real* compound only its own rows fold while the genuine boundaries keep
+  their operator nodes — driven by a new `Select::values_rows` row-count the parser
+  stamps (purely informational, distinguishing a real `VALUES` from a hand-written
+  `SELECT … column1 UNION ALL …`); a row carrying a subquery (SQLite's plural
+  `SCAN N CONSTANT ROWS` + interposed subquery nodes) declines cleanly; an aggregate
+  `GROUP BY a ORDER BY a` answered by
   a covering index on `a` emits a bare `SCAN … USING COVERING INDEX` with **no**
   temp-btree node — the group-by access already yields the ORDER BY term in order, so
   zero terms need sorting and graphite no longer over-emits a nonsensical

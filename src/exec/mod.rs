@@ -7986,6 +7986,7 @@ impl Connection {
                     order_by: Vec::new(),
                     limit: None,
                     offset: None,
+                    values_rows: 0,
                 };
                 let (cols, rows) = self.scan_source(&synth, params)?;
                 Some((cols, rows.into_iter().map(|r| r.values).collect::<Vec<_>>()))
@@ -12884,6 +12885,29 @@ impl Connection {
         {
             check_positional_terms(&sel.group_by, &sel.order_by, sel.columns.len())?;
         }
+        // A multi-row `VALUES` clause desugars to `UNION ALL` compound arms, but
+        // SQLite folds them into a single `SCAN N-ROW VALUES CLAUSE` node (a lone
+        // `VALUES (…)` row is `SCAN CONSTANT ROW`, handled by the `FROM`-less path
+        // below). `value_arm_count` is how many leading compound arms belong to
+        // that clause; the rest are true compound continuations.
+        let value_arm_count = sel.values_rows.saturating_sub(1).min(sel.compound.len());
+        let real_compound = &sel.compound[value_arm_count..];
+        // A subquery in any row switches SQLite to a plural `SCAN N CONSTANT ROWS`
+        // shape with interposed subquery nodes we do not model, so decline.
+        let values_renderable =
+            sel.values_rows >= 1 && !values_clause_has_subquery(sel, value_arm_count);
+        // The folded `VALUES` clause as a single node under `parent` (only ever
+        // reached with `values_rows >= 2`, i.e. an `N-ROW VALUES CLAUSE`).
+        let push_values_node =
+            |next_id: &mut i64, out: &mut Vec<(i64, i64, String)>, parent: i64| {
+                let id = *next_id;
+                *next_id += 1;
+                out.push((
+                    id,
+                    parent,
+                    alloc::format!("SCAN {}-ROW VALUES CLAUSE", sel.values_rows),
+                ));
+            };
         // A compound query (`… UNION / UNION ALL / INTERSECT / EXCEPT …`) renders as
         // a `COMPOUND QUERY` node whose first child is the `LEFT-MOST SUBQUERY` (the
         // first arm's plan) followed by one operator node per continuation, each
@@ -12891,7 +12915,7 @@ impl Connection {
         // switches SQLite to an entirely different `MERGE (UNION)` plan we don't
         // model, so decline when one is present (a bare `LIMIT`/`OFFSET` keeps the
         // plain tree, so it is allowed).
-        if !sel.compound.is_empty() {
+        if !real_compound.is_empty() {
             if !sel.order_by.is_empty() {
                 return Err(Error::Unsupported(
                     "EXPLAIN QUERY PLAN for this query shape",
@@ -12903,14 +12927,24 @@ impl Connection {
             let left_id = *next_id;
             *next_id += 1;
             out.push((left_id, compound_id, String::from("LEFT-MOST SUBQUERY")));
-            // The first arm is `sel` itself without its compound tail / the outer
-            // modifiers (which belong to the whole compound, not the arm).
-            let mut first = sel.clone();
-            first.compound = Vec::new();
-            first.limit = None;
-            first.offset = None;
-            self.eqp_select(&first, left_id, next_id, out, params)?;
-            for (op, arm) in &sel.compound {
+            if value_arm_count >= 1 {
+                // The left-most arm is a folded multi-row `VALUES` clause.
+                if !values_renderable {
+                    return Err(Error::Unsupported(
+                        "EXPLAIN QUERY PLAN for this query shape",
+                    ));
+                }
+                push_values_node(next_id, out, left_id);
+            } else {
+                // The first arm is `sel` itself without its compound tail / the outer
+                // modifiers (which belong to the whole compound, not the arm).
+                let mut first = sel.clone();
+                first.compound = Vec::new();
+                first.limit = None;
+                first.offset = None;
+                self.eqp_select(&first, left_id, next_id, out, params)?;
+            }
+            for (op, arm) in real_compound {
                 let detail = match op {
                     CompoundOp::Union => "UNION USING TEMP B-TREE",
                     CompoundOp::UnionAll => "UNION ALL",
@@ -12928,6 +12962,18 @@ impl Connection {
                 }
                 self.eqp_select(&arm, op_id, next_id, out, params)?;
             }
+            return Ok(());
+        }
+        // No true compound continuation. A pure multi-row `VALUES` clause folds to
+        // one node; a subquery-bearing one declines. (A single-row `VALUES` has no
+        // value arms and falls through to the `FROM`-less `SCAN CONSTANT ROW` path.)
+        if value_arm_count >= 1 {
+            if !values_renderable {
+                return Err(Error::Unsupported(
+                    "EXPLAIN QUERY PLAN for this query shape",
+                ));
+            }
+            push_values_node(next_id, out, parent);
             return Ok(());
         }
         let Some(from) = &sel.from else {
@@ -26000,6 +26046,25 @@ fn schema_sql_name_offset(sql_text: &str) -> Option<usize> {
 /// `EXPLAIN QUERY PLAN`: a constant-row select with a subquery gets extra
 /// `SCALAR`/`LIST SUBQUERY` (and bloom-filter) nodes from sqlite that we don't
 /// model, so we only render the bare `SCAN CONSTANT ROW` when there are none.
+/// True when any row of a `VALUES` clause carries a subquery. SQLite renders a
+/// subquery-free multi-row `VALUES` as a single `SCAN N-ROW VALUES CLAUSE` node,
+/// but a row holding a subquery switches it to the plural `SCAN N CONSTANT ROWS`
+/// phrasing plus interposed `SCALAR`/`LIST SUBQUERY` nodes we do not model — so
+/// such a clause declines. `value_arm_count` is how many leading compound arms
+/// (besides the head) are extra rows of the clause.
+fn values_clause_has_subquery(sel: &Select, value_arm_count: usize) -> bool {
+    let row_has = |cols: &[ResultColumn]| {
+        cols.iter().any(|c| match c {
+            ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+            ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+        })
+    };
+    row_has(&sel.columns)
+        || sel.compound[..value_arm_count]
+            .iter()
+            .any(|(_, arm)| row_has(&arm.columns))
+}
+
 fn select_no_from_has_subquery(sel: &Select) -> bool {
     sel.columns.iter().any(|c| match c {
         ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),

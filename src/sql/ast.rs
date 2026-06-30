@@ -224,6 +224,16 @@ pub struct Select {
     pub limit: Option<Expr>,
     /// `OFFSET` expression.
     pub offset: Option<Expr>,
+    /// When this select is a `VALUES (…), (…), …` query core, the number of
+    /// rows in that clause (≥ 1); `0` for an ordinary `SELECT`. The parser
+    /// desugars a multi-row `VALUES` into `UNION ALL` compound arms, so this
+    /// records how many leading [`compound`](Self::compound) arms (its first
+    /// `values_rows - 1`) are extra rows of one `VALUES` clause rather than true
+    /// compound continuations — which SQLite renders as a single
+    /// `SCAN N-ROW VALUES CLAUSE` node in `EXPLAIN QUERY PLAN`. Purely
+    /// informational; it does not affect execution (the `UNION ALL` desugaring
+    /// already has the right semantics).
+    pub values_rows: usize,
 }
 
 /// A single result column in a `SELECT`.
