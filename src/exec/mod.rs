@@ -12795,6 +12795,58 @@ impl Connection {
         Some(subs)
     }
 
+    /// The projection scalar subqueries of a *grouped* query — the GROUP BY
+    /// analogue of [`Self::eqp_projection_scalar_subqueries`].
+    ///
+    /// With a `GROUP BY`, SQLite sequences a projection subquery's node *after*
+    /// the grouping sorter (`USE TEMP B-TREE FOR GROUP BY`, and any distinct-
+    /// aggregate b-trees) yet still *before* an ORDER BY sorter — a second
+    /// insertion point distinct from the after-scan one the un-grouped collectors
+    /// use. The caller emits the returned bodies at exactly that point, so this
+    /// declines the no-GROUP-BY shapes (handled by the un-grouped collectors) and
+    /// `DISTINCT` (its separate sorter's interplay with ORDER BY we do not model).
+    /// A `HAVING` with no subquery is fine (the node still numbers `1..n` after the
+    /// grouping sorter), but a subquery in `HAVING` / `WHERE` / `ORDER BY` /
+    /// `LIMIT` / `OFFSET` reorders or renumbers the nodes, so any such case
+    /// declines. Each body must be a non-correlated, non-compound scalar
+    /// `(SELECT …)` over base tables with no nested subquery. Numbered `1..n` in
+    /// left-to-right column order. SQLite always emits such a node where we emitted
+    /// none, so rendering the correct one can only converge a plan, never regress.
+    fn eqp_grouped_projection_scalar_subqueries<'a>(
+        &self,
+        sel: &'a Select,
+    ) -> Option<Vec<&'a Select>> {
+        if sel.group_by.is_empty() || sel.distinct {
+            return None;
+        }
+        // Subqueries must live solely in the projection; one in WHERE / HAVING /
+        // ORDER BY / LIMIT / OFFSET would consume an id and shift the count off
+        // `1..n` (a HAVING subquery in particular reorders the nodes).
+        let elsewhere = sel.where_clause.as_ref().is_some_and(expr_has_subquery)
+            || sel.having.as_ref().is_some_and(expr_has_subquery)
+            || sel.order_by.iter().any(|t| expr_has_subquery(&t.expr))
+            || sel.limit.as_ref().is_some_and(expr_has_subquery)
+            || sel.offset.as_ref().is_some_and(expr_has_subquery);
+        if elsewhere {
+            return None;
+        }
+        let mut subs: Vec<&Select> = Vec::new();
+        for col in &sel.columns {
+            match col {
+                ResultColumn::Expr { expr, .. } => {
+                    if !collect_where_scalar_subqueries(expr, &mut subs) {
+                        return None;
+                    }
+                }
+                ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => {}
+            }
+        }
+        if subs.is_empty() || !self.eqp_scalar_bodies_renderable(&subs) {
+            return None;
+        }
+        Some(subs)
+    }
+
     fn eqp_select(
         &self,
         sel: &Select,
@@ -13322,6 +13374,27 @@ impl Connection {
                         parent,
                         alloc::format!("USE TEMP B-TREE FOR {fname}(DISTINCT)"),
                     ));
+                }
+            }
+        }
+        // A projection scalar subquery in a GROUP BY query is sequenced by SQLite
+        // *after* the grouping sorter (and any distinct-aggregate b-trees) but
+        // *before* an ORDER BY sorter — a second insertion point, distinct from the
+        // after-scan one used by the un-grouped collectors above. Single-table only
+        // (the join fold handles the multi-table shapes). Numbered `1..n` in
+        // left-to-right column order; the set is provably `1..n` (no subquery in any
+        // other clause), so emitting it can only converge the plan.
+        if from.joins.is_empty() {
+            if let Some(subs) = self.eqp_grouped_projection_scalar_subqueries(sel) {
+                for (i, body) in subs.iter().enumerate() {
+                    let scalar_id = *next_id;
+                    *next_id += 1;
+                    out.push((
+                        scalar_id,
+                        parent,
+                        alloc::format!("SCALAR SUBQUERY {}", i + 1),
+                    ));
+                    self.eqp_select(body, scalar_id, next_id, out, params)?;
                 }
             }
         }

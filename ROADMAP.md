@@ -457,7 +457,15 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   after the grouping sorter) and so is `DISTINCT` (a separate distinct sorter whose
   ORDER BY interplay we do not model); a body join / compound / correlation / `EXISTS`
   and a subquery in another clause decline as in the other two forms
-  (`tests/eqp_orderby_scalar_subquery.rs`).
+  (`tests/eqp_orderby_scalar_subquery.rs`). The **GROUP BY projection** case the
+  un-grouped collector declines now renders via a *second* insertion point: a
+  projection `(SELECT …)` in a grouped query is sequenced *after* the
+  `USE TEMP B-TREE FOR GROUP BY` sorter (and any distinct-aggregate b-trees) but
+  *before* an ORDER BY sorter, so its node is emitted there — numbered `1..n` in
+  column order, with a non-subquery `HAVING` and a folded/unfolded `ORDER BY` riding
+  along. `DISTINCT` (separate distinct sorter), a `HAVING`/`ORDER BY` subquery (which
+  reorders or renumbers the nodes), and a correlated/compound/join body all decline,
+  unchanged from before (`tests/eqp_grouped_projection_scalar_subquery.rs`).
 - **EQP min/max optimization** — a query whose only aggregate is a single
   `min(X)`/`max(X)` (no `GROUP BY`/`HAVING`/`WHERE`/statement-level `DISTINCT`, no
   second aggregate; the call may be scalar-wrapped like `abs(min(a))`/`max(a)+1`)

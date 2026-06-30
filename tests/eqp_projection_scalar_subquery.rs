@@ -12,9 +12,11 @@
 //! subquery. The one wrinkle vs the WHERE form is *sequencing*: a projection
 //! subquery is evaluated after grouping, so SQLite places its node *after* a
 //! `USE TEMP B-TREE FOR GROUP BY` sorter (but still *before* DISTINCT / ORDER BY).
-//! Our single insertion point — right after the scan — only matches the
-//! no-GROUP-BY shapes, so GROUP BY / HAVING are declined. `DISTINCT` is declined
-//! too: graphite's separate `USE TEMP B-TREE FOR DISTINCT` node does not fire when
+//! This file covers the no-GROUP-BY shapes, where our after-scan insertion point
+//! matches; the GROUP BY projection case (rendered via a second insertion point
+//! after the grouping sorter) lives in
+//! `tests/eqp_grouped_projection_scalar_subquery.rs`. `DISTINCT` is declined
+//! here: graphite's separate `USE TEMP B-TREE FOR DISTINCT` node does not fire when
 //! a projection column is a subquery, so emitting the scalar node there would leave
 //! the plan still diverging (missing the DISTINCT sorter) rather than byte-exact —
 //! we never emit a node into a plan that does not fully match.
@@ -25,8 +27,8 @@
 //! and a projection subquery alongside a non-subquery WHERE / ORDER BY / LIMIT.
 //!
 //! Deliberately declined (verified — graphite emits no `SCALAR SUBQUERY` node, the
-//! rows stay correct): GROUP BY / HAVING (node sequenced after the grouping
-//! sorter), `DISTINCT` (graphite's distinct node does not fire), a correlated body
+//! rows stay correct): a subquery in `HAVING` (no projection node), `DISTINCT`
+//! (graphite's distinct node does not fire), a correlated body
 //! and `EXISTS` (a `CORRELATED` node), a compound (`UNION`) body (numbered past 1),
 //! and a subquery in *both* the projection and the WHERE clause (cross-position
 //! numbering — `SCALAR SUBQUERY 2` then `1`).
@@ -174,8 +176,10 @@ fn projection_scalar_subquery_declines_unrenderable() {
         return;
     }
     for q in [
-        // GROUP BY / HAVING: SQLite sequences the node *after* the grouping sorter.
-        "SELECT a, (SELECT count(*) FROM u) FROM t GROUP BY a",
+        // A subquery in HAVING (not the projection) → no projection node here; the
+        // grouped-projection collector only fires for a subquery *in the projection*
+        // (see `tests/eqp_grouped_projection_scalar_subquery.rs` for the rendered
+        // GROUP BY projection case).
         "SELECT a FROM t GROUP BY a HAVING count(*)>(SELECT count(*) FROM u)",
         // DISTINCT: graphite's distinct sorter node does not fire here.
         "SELECT DISTINCT (SELECT count(*) FROM u), a FROM t",
