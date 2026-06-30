@@ -13936,6 +13936,60 @@ impl Connection {
                         }
                     }
                 }
+                // An *aggregate* CTE/derived body (a bare aggregate or a `GROUP BY`
+                // over a single base table) also can't flatten: SQLite materializes it
+                // as a `CO-ROUTINE <name>` whose child is the body's own plan, then the
+                // outer `{SCAN|SEARCH} <name>` plus at most one trailing temp-b-tree —
+                // the same wrapper as the compound case. Rendered only with a
+                // deterministic label, a single-base-table body with no compound /
+                // window / `ORDER BY` / `LIMIT` / nested subquery, no outer `WHERE`, and
+                // an outer shape `eqp_materialized_outer_render` accounts for. The body
+                // child is the body's own (already byte-exact) aggregate plan.
+                if let Some(name) = co_label {
+                    let body_single_base_table = sub.from.as_ref().is_some_and(|f| {
+                        f.joins.is_empty()
+                            && f.first.subquery.is_none()
+                            && f.first.tvf_args.is_none()
+                            && self.lookup_cte(&f.first.name, None).is_none()
+                            && !is_cte_name(&f.first.name)
+                            && !self.is_view(&f.first.name)
+                            && !self.is_virtual_table(&f.first.name)
+                    });
+                    let renderable_aggregate_body = select_is_aggregate_query(sub)
+                        && body_single_base_table
+                        && sub.compound.is_empty()
+                        && sub.window_defs.is_empty()
+                        && sub.order_by.is_empty()
+                        && sub.limit.is_none()
+                        && sub.offset.is_none()
+                        && !sub.columns.iter().any(|c| match c {
+                            ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                            ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                        })
+                        && !sub.where_clause.as_ref().is_some_and(expr_has_subquery);
+                    if renderable_aggregate_body && sel.where_clause.is_none() {
+                        if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
+                        {
+                            let co_id = *next_id;
+                            *next_id += 1;
+                            out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                            self.eqp_select(sub, co_id, next_id, out, params)?;
+                            let scan_id = *next_id;
+                            *next_id += 1;
+                            out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                            if let Some(lbl) = trailing {
+                                let tid = *next_id;
+                                *next_id += 1;
+                                out.push((
+                                    tid,
+                                    parent,
+                                    alloc::format!("USE TEMP B-TREE FOR {lbl}"),
+                                ));
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
                 // Any other shape (a narrowing/clause-bearing outer, a table-bearing
                 // body we can't prove flattenable, a `UNION ALL`-only compound body, or
                 // an outer query that emits extra nodes) is not one we render

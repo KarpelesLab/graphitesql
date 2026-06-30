@@ -74,6 +74,9 @@ fn flattenable_view_matches_sqlite() {
         "SELECT v.a FROM v WHERE v.b=5",
         // An inner WHERE in the view body carries through.
         "SELECT * FROM vw",
+        // An aggregate view body materializes as a CO-ROUTINE (see the
+        // aggregate-body co-routine rendering).
+        "SELECT * FROM vagg",
     ] {
         assert_eq!(plan("sqlite3", BASE, q), plan(g, BASE, q), "plan for {q}");
     }
@@ -81,12 +84,11 @@ fn flattenable_view_matches_sqlite() {
 
 #[test]
 fn non_flattenable_view_shapes_decline_without_crashing() {
-    // The pre-fix bug surfaced as a malformed `no such table: <view>`. An aggregate
-    // / join view body (SQLite renders a CO-ROUTINE or a cost-reordered join) and a
-    // view combined with a join must now decline cleanly instead.
+    // The pre-fix bug surfaced as a malformed `no such table: <view>`. A join view
+    // body (SQLite cost-reorders) and a view combined with a join must now decline
+    // cleanly instead.
     let g = env!("CARGO_BIN_EXE_graphitesql");
     for q in [
-        "SELECT * FROM vagg",                // aggregate view body → CO-ROUTINE
         "SELECT * FROM vj",                  // join view body
         "SELECT * FROM v JOIN u ON v.a=u.x", // view combined with a join
         "SELECT * FROM u JOIN v ON v.a=u.x", // view in the join position

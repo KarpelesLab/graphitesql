@@ -167,9 +167,10 @@ fn non_flattenable_outer_shapes_decline() {
     // into the scan (see `flattenable_wildcard_over_base_table_matches_sqlite`).
     // Outside it: a *computed* inner projection (`a+1 AS aa`) has no base column to
     // seek on, an outer reference to a column the source does not output
-    // (`no such column` in sqlite) cannot resolve, and an inner
-    // join/aggregate/DISTINCT/view/LIMIT each change the flattened plan — all
-    // decline cleanly rather than mis-render.
+    // (`no such column` in sqlite) cannot resolve, and an inner join/DISTINCT/view/
+    // LIMIT each change the flattened plan — all decline cleanly rather than
+    // mis-render. (An inner *aggregate* body now renders as a CO-ROUTINE — see
+    // `tests/eqp_aggregate_coroutine.rs`.)
     let g = env!("CARGO_BIN_EXE_graphitesql");
     let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); \
                 CREATE TABLE u(x,y); CREATE VIEW v AS SELECT * FROM t;";
@@ -178,7 +179,6 @@ fn non_flattenable_outer_shapes_decline() {
         "SELECT b FROM (SELECT a AS aa FROM t) AS s", // outer ref not an output of the source
         "SELECT * FROM (SELECT * FROM t JOIN u ON t.a=u.x) AS s", // inner join
         "SELECT * FROM (SELECT DISTINCT a FROM t) AS s", // inner DISTINCT
-        "SELECT * FROM (SELECT count(*) FROM t) AS s", // inner aggregate
         "SELECT * FROM (SELECT * FROM v) AS s",       // inner view
         "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s", // inner LIMIT
     ] {
@@ -276,17 +276,17 @@ fn cte_reference_renders_like_a_derived_table() {
 #[test]
 fn non_flattenable_cte_shapes_decline() {
     // The CTE subset mirrors the derived-table one. A join onto the CTE, an inner
-    // aggregate, an inner view, a CTE whose body reads *another* CTE, and an aliased
-    // CTE reference each fall outside it and must decline cleanly — never the old
-    // `no such table: c` crash. (An *unqualified* or CTE-name-qualified narrower
-    // projection and outer WHERE do flatten — see
-    // `cte_reference_renders_like_a_derived_table`.)
+    // view, a CTE whose body reads *another* CTE, and an aliased CTE reference each
+    // fall outside it and must decline cleanly — never the old `no such table: c`
+    // crash. (An *unqualified* or CTE-name-qualified narrower projection and outer
+    // WHERE do flatten — see `cte_reference_renders_like_a_derived_table`; an inner
+    // aggregate body now renders as a CO-ROUTINE — see
+    // `tests/eqp_aggregate_coroutine.rs`.)
     let g = env!("CARGO_BIN_EXE_graphitesql");
     let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); \
                 CREATE TABLE u(x,y); CREATE VIEW v AS SELECT * FROM t;";
     for q in [
         "WITH c AS (SELECT * FROM t) SELECT * FROM c, u",
-        "WITH c AS (SELECT count(*) FROM t) SELECT * FROM c",
         "WITH c AS (SELECT * FROM t), d AS (SELECT * FROM c) SELECT * FROM d",
         "WITH c AS (SELECT * FROM v) SELECT * FROM c",
         "WITH c AS (SELECT * FROM t) SELECT * FROM c AS x",

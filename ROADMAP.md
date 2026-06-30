@@ -290,7 +290,13 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   switching to `SEARCH`); an unaliased derived table (SQLite numbers it `(subquery-N)`),
   a `UNION ALL`-only body (it streams without a dedup b-tree and flattens to a bare
   `COMPOUND QUERY`), and an outer `WHERE` (the predicate pushes into the arms,
-  re-deriving their scans) each decline cleanly; an aggregate
+  re-deriving their scans) each decline cleanly; an *aggregate* CTE/derived body (a
+  bare aggregate or a `GROUP BY` over a single base table) — `SELECT * FROM (SELECT
+  count(*) FROM t)`, `WITH c AS (SELECT count(*) FROM t) SELECT * FROM c`, a `CREATE
+  VIEW` whose body aggregates — materializes the same way (`CO-ROUTINE {s|c}` whose
+  child is the body's own aggregate plan, then the outer `SCAN`/`SEARCH`), where it
+  previously declined; a join / nested-subquery aggregate body or an aggregate source
+  combined with another table still decline; an aggregate
   `GROUP BY a ORDER BY a` answered by
   a covering index on `a` emits a bare `SCAN … USING COVERING INDEX` with **no**
   temp-btree node — the group-by access already yields the ORDER BY term in order, so
