@@ -531,9 +531,27 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   `WHERE`-seek serving the ordinal, a mixed `SELECT a, * … ORDER BY n`, the rowid/IPK
   ordinal, and the all-columns-covered `SELECT * FROM s ORDER BY 1` → `USING COVERING
   INDEX` all follow. Byte-exact vs sqlite3 3.50.4, plan and rows
-  (`tests/eqp_order_by_ordinal_wildcard.rs`). (Out of scope, pre-existing: a `WITHOUT
-  ROWID` table's PK-clustered scan order — graphite's single-table order paths all decline
-  a `WITHOUT ROWID` table, wildcard or named alike.)
+  (`tests/eqp_order_by_ordinal_wildcard.rs`).
+- **EQP `WITHOUT ROWID` PK-ordered scan** — the prior fold's out-of-scope sibling: a
+  `WITHOUT ROWID` table is stored as a b-tree clustered by its PRIMARY KEY, so a full
+  scan yields rows in PK-clustered storage order (PK columns first, then the rest)
+  ascending. When the whole `ORDER BY` is a uniform-direction *contiguous prefix* of that
+  storage order, SQLite plans a bare `SCAN w`; graphite declined every `WITHOUT ROWID`
+  ordered scan (all its order-detection paths bail on `meta.without_rowid`) and spuriously
+  emitted `USE TEMP B-TREE FOR ORDER BY`. A new `without_rowid_ordered_scan`, plugged into
+  the single `order_satisfied_by_scan` chokepoint (so the executor elides the sort and the
+  EQP elides the temp-b-tree node together), matches the `ORDER BY` against a uniform
+  prefix of `storage_order` — the ascending walk needs no sorter, the `DESC` walk only the
+  executor's existing materialise-then-reverse. Restricted to an all-ascending PK
+  (`meta.pk_all_asc`, detected via a standalone-`DESC`-keyword scan of the CREATE text,
+  since the parser drops table-level key directions): graphite stores every `WITHOUT
+  ROWID` PK ascending regardless of a declared `DESC`, so eliding for a `DESC` PK would
+  diverge from SQLite's DESC-clustered storage — those keep the sorter. The `SELECT *` /
+  positional-ordinal projections resolve through the same `order_projection`. Byte-exact
+  vs sqlite3 3.50.4, plan and rows (`tests/eqp_without_rowid_order.rs`). (Out of scope,
+  pre-existing: a non-prefix or mixed-direction `ORDER BY` — `ORDER BY y`, `ORDER BY x, z`
+  — which SQLite serves with a *partial* "LAST TERM" sorter; graphite keeps its full
+  sorter there, an unchanged divergence.)
 - **EQP positional-term range check** — an out-of-range positional `GROUP BY` / `ORDER BY`
   ordinal (`SELECT a FROM t ORDER BY 2`, one output column) is a prepare-time error in
   SQLite, reported identically whether the statement is executed or `EXPLAIN QUERY

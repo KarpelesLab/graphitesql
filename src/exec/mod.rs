@@ -14920,6 +14920,80 @@ impl Connection {
         }
     }
 
+    /// The `WITHOUT ROWID` analogue of [`rowid_ordered_scan`]: such a table is
+    /// stored as a b-tree clustered by its PRIMARY KEY, so a full scan yields rows
+    /// in `storage_order` (PK columns first, then the rest) ascending. When the
+    /// whole `ORDER BY` is a uniform-direction **contiguous prefix** of that storage
+    /// order, the scan already produces the requested order — ascending needs no
+    /// sorter, descending only the executor's materialise-then-reverse — so sqlite
+    /// plans a bare `SCAN`. Returns `Some(descending)`.
+    ///
+    /// Restricted to an all-ascending PK (`meta.pk_all_asc`): graphite stores every
+    /// `WITHOUT ROWID` PK ascending regardless of a declared `DESC`, so for a `DESC`
+    /// PK its storage order would not match sqlite's and the elision would diverge —
+    /// we decline and keep the sorter. A `WHERE` clause, join, grouping, aggregate,
+    /// window, `DISTINCT`, or explicit `NULLS` ordering also declines. (A
+    /// mixed-direction or non-prefix `ORDER BY` falls through to the existing
+    /// full-sort path, which still differs from sqlite's *partial* sorter for such a
+    /// query — a separate, pre-existing divergence not addressed here.)
+    fn without_rowid_ordered_scan(&self, sel: &Select) -> Option<bool> {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let t = &from.first;
+        if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
+            return None;
+        }
+        if sel.where_clause.is_some()
+            || sel.order_by.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || self.has_aggregate(sel)
+            || window::has_window(sel)
+        {
+            return None;
+        }
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+        if !meta.without_rowid || !meta.pk_all_asc {
+            return None;
+        }
+        // The ORDER BY must be a uniform-direction contiguous prefix of the
+        // PK-clustered storage order. `order_projection` resolves a `SELECT *`
+        // wildcard / positional ordinal to the column it names, as elsewhere; a
+        // `COLLATE`-wrapped term is an `Expr::Collate`, not a bare column, and bails
+        // — a bare `ORDER BY col` inherently uses the column's storage collation.
+        if sel.order_by.len() > meta.storage_order.len() {
+            return None;
+        }
+        let order_cols = order_projection(&sel.columns, &meta.columns);
+        let dir = sel.order_by[0].descending;
+        for (i, term) in sel.order_by.iter().enumerate() {
+            if term.descending != dir || term.nulls_first.is_some() {
+                return None;
+            }
+            let (tbl, col) = match order_key_expr(&order_cols, &term.expr) {
+                Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
+                _ => return None,
+            };
+            if tbl.is_some_and(|tn| !tn.eq_ignore_ascii_case(label)) {
+                return None;
+            }
+            if !meta.columns[meta.storage_order[i]]
+                .name
+                .eq_ignore_ascii_case(col)
+            {
+                return None;
+            }
+        }
+        Some(dir)
+    }
+
     /// The secondary-index analogue of [`rowid_ordered_scan`]: when the same
     /// single-table full-scan shape has its sole `ORDER BY` term as a plain
     /// column that is the leading column of a full (non-partial, non-expression)
@@ -15925,6 +15999,9 @@ impl Connection {
     /// rowid/IPK and secondary-index cases; shared with `eqp_access`.
     fn order_satisfied_by_scan(&self, sel: &Select, params: &Params) -> Option<bool> {
         if let Some(d) = self.rowid_ordered_scan(sel) {
+            return Some(d);
+        }
+        if let Some(d) = self.without_rowid_ordered_scan(sel) {
             return Some(d);
         }
         if let Some(s) = self.order_index_scan(sel) {
@@ -23626,7 +23703,7 @@ impl Connection {
         let unique = collect_unique_sets(&ct, ipk);
 
         // WITHOUT ROWID: derive the PK-first storage order.
-        let (without_rowid, storage_order, pk_len) = if ct.without_rowid {
+        let (without_rowid, storage_order, pk_len, pk_all_asc) = if ct.without_rowid {
             let pk = primary_key_positions(&ct);
             if pk.is_empty() {
                 return Err(Error::Error(format!(
@@ -23644,9 +23721,9 @@ impl Connection {
                 }
             }
             let pk_len = pk.len();
-            (true, order, pk_len)
+            (true, order, pk_len, !sql_has_desc_keyword(sql))
         } else {
-            (false, Vec::new(), 0)
+            (false, Vec::new(), 0, true)
         };
 
         // STRICT tables: record each column's rigid type for write-time checking,
@@ -23683,6 +23760,7 @@ impl Connection {
             without_rowid,
             storage_order,
             pk_len,
+            pk_all_asc,
             strict_types,
             autoincrement: ipk.is_some_and(|i| {
                 ct.columns[i].constraints.iter().any(|k| {
@@ -23792,6 +23870,12 @@ struct TableMeta {
     /// for ordinary rowid tables. `pk_len` is how many leading entries are PK.
     storage_order: Vec<usize>,
     pk_len: usize,
+    /// For a `WITHOUT ROWID` table, `true` when no PRIMARY KEY column is declared
+    /// `DESC`. graphite always stores a `WITHOUT ROWID` PK ascending (it drops a
+    /// declared key direction), so the PK-clustered ordered-scan optimisation only
+    /// applies — and only matches sqlite's plan — when the PK is all-ascending.
+    /// Always `true` for an ordinary rowid table (unused there).
+    pk_all_asc: bool,
     /// For a `STRICT` table, each column's rigid type and its declared type name
     /// (aligned with `columns`); `None` for an ordinary table. Drives write-time
     /// type checking.
@@ -24147,6 +24231,7 @@ fn schema_table_meta(label: &str) -> TableMeta {
         without_rowid: false,
         storage_order: Vec::new(),
         pk_len: 0,
+        pk_all_asc: true,
         strict_types: None,
         autoincrement: false,
     }
@@ -31793,6 +31878,17 @@ fn primary_key_positions(ct: &CreateTable) -> Vec<usize> {
         }
     }
     Vec::new()
+}
+
+/// True if the `CREATE TABLE` text contains a standalone `DESC` keyword. Within a
+/// `CREATE TABLE` statement `DESC` can only appear as a column direction in a
+/// PRIMARY KEY / UNIQUE key list, so this conservatively flags a possibly-DESC
+/// PRIMARY KEY — the parser drops table-level key directions, so the AST alone
+/// cannot tell. Used to decline the `WITHOUT ROWID` PK-ordered-scan optimisation
+/// (a quoted column literally named `desc` only makes it over-conservative).
+fn sql_has_desc_keyword(sql: &str) -> bool {
+    sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| w.eq_ignore_ascii_case("desc"))
 }
 
 /// Parse the `<n>` from `sqlite_autoindex_<table>_<n>` (1-based), if `name` is an
