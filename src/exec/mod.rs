@@ -30380,6 +30380,12 @@ fn collect_range_constraints(
 
 /// The column index a bare/qualified column expression resolves to, if any.
 fn col_index(e: &Expr, columns: &[ColumnInfo]) -> Option<usize> {
+    // A parenthesized column (`(a) = 2`) is the same column for seek purposes, so
+    // unwrap any `Paren` wrappers first — SQLite seeks it exactly as the bare form.
+    let mut e = e;
+    while let Expr::Paren(inner) = e {
+        e = inner;
+    }
     if let Expr::Column { table, column, .. } = e {
         columns.iter().position(|c| {
             c.name.eq_ignore_ascii_case(column)

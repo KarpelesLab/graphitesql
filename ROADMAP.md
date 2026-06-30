@@ -473,6 +473,10 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   SCANned. The fix is one arm in the shared `collect_eq_constraints` (a NULL operand
   is excluded, staying the `col IS NULL` NULL-key seek), so the executor seek and the
   `eqp_access` label move in lockstep; `col IS NOT <const>` (a `!=`) stays a scan.
+  A *parenthesized* column — `(a) = 2`, `(b) > 10`, `(a) IN (1,2)`, `(b) IS NULL` —
+  now seeks exactly as the bare column does (SQLite ignores the redundant parens);
+  the fix unwraps `Expr::Paren` in the shared `col_index`, so every seek path and
+  `eqp_access` pick it up together.
   The `NOT INDEXED` planner hint is now honored in the *plan* (the executor already
   honored it, so rows were always correct): SQLite forbids every *secondary* index on
   that table, so a `WHERE` seek, covering scan, ORDER-BY index walk, and MULTI-INDEX OR
