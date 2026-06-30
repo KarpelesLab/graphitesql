@@ -220,8 +220,15 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   FOR [LAST [N TERMS] OF] ORDER BY`; an arm is governed by a dedup op iff one
   appears in the operator suffix from that arm onward (in `a UNION b UNION ALL c`
   the trailing `c` keeps a bare sort while `a`/`b` append; a pure `UNION ALL`
-  compound appends nothing), reproduced per-arm; an explicit `COLLATE` (SQLite falls
-  to a CO-ROUTINE+materialize shape), an explicit `NULLS FIRST`/`LAST`, a non-column
+  compound appends nothing), reproduced per-arm; a *redundant* explicit `NULLS`
+  clause whose placement matches the natural index/PK walk (`ASC NULLS FIRST` /
+  `DESC NULLS LAST`, i.e. `nulls_first == !descending`) is now treated exactly like
+  a bare term — across the single-table scan, the covering scan, a `WHERE`-seek
+  prefix, and each compound `MERGE` arm — so SQLite serves it from the index with no
+  sorter; the *opposite* placement (`ASC NULLS LAST` / `DESC NULLS FIRST`) is a
+  two-pass index scan graphite does not model, so it keeps its sorter (a known EQP
+  residual; rows stay correct), shared via the `redundant_nulls` helper; an explicit
+  `COLLATE` (SQLite falls to a CO-ROUTINE+materialize shape), a non-column
   expression term, and a `*` projection all still decline cleanly; a top-level multi-row `VALUES (…),(…),…` clause —
   which graphite desugars to `UNION ALL` arms — folds into the single
   `SCAN N-ROW VALUES CLAUSE` node SQLite renders (a one-row `VALUES` stays

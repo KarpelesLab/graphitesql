@@ -13042,10 +13042,12 @@ impl Connection {
                 // position and rewrite the whole `ORDER BY` to positional before
                 // pushing it into the arms (a name would not resolve inside a later
                 // arm whose columns differ). An expression, a qualified or
-                // `COLLATE`-wrapped term, or an explicit `NULLS` ordering is
-                // unresolvable here and declines.
+                // `COLLATE`-wrapped term, or a non-redundant explicit `NULLS` ordering
+                // (one a single uniform walk can't produce) is unresolvable here and
+                // declines; a redundant `NULLS` (matching the walk's natural placement)
+                // is treated like a bare term and rewritten to positional below.
                 let resolve_pos = |t: &OrderTerm| -> Option<usize> {
-                    if t.nulls_first.is_some() {
+                    if !redundant_nulls(t) {
                         return None;
                     }
                     match &t.expr {
@@ -15782,7 +15784,8 @@ impl Connection {
     /// `WITHOUT ROWID` PK ascending regardless of a declared `DESC`, so for a `DESC`
     /// PK its storage order would not match sqlite's and the elision would diverge —
     /// we decline and keep the sorter. A `WHERE` clause, join, grouping, aggregate,
-    /// window, `DISTINCT`, or explicit `NULLS` ordering also declines. (A
+    /// window, `DISTINCT`, or a non-redundant explicit `NULLS` ordering (one the
+    /// uniform storage walk can't produce, per [`redundant_nulls`]) also declines. (A
     /// mixed-direction or non-prefix `ORDER BY` falls through to the existing
     /// full-sort path, which still differs from sqlite's *partial* sorter for such a
     /// query — a separate, pre-existing divergence not addressed here.)
@@ -15824,7 +15827,7 @@ impl Connection {
         let order_cols = order_projection(&sel.columns, &meta.columns);
         let dir = sel.order_by[0].descending;
         for (i, term) in sel.order_by.iter().enumerate() {
-            if term.descending != dir || term.nulls_first.is_some() {
+            if term.descending != dir || !redundant_nulls(term) {
                 return None;
             }
             let (tbl, col) = match order_key_expr(&order_cols, &term.expr) {
@@ -15948,7 +15951,7 @@ impl Connection {
                 continue; // constant column: contributes no ordering
             }
             let d = *dir.get_or_insert(term.descending);
-            if term.descending != d || term.nulls_first.is_some() {
+            if term.descending != d || !redundant_nulls(term) {
                 return None;
             }
             while walk < storage.len() && const_cols.contains(&storage[walk]) {
@@ -16087,7 +16090,7 @@ impl Connection {
                 return None;
             }
             let d = *dir.get_or_insert(term.descending);
-            if term.descending != d || term.nulls_first.is_some() {
+            if term.descending != d || !redundant_nulls(term) {
                 return None;
             }
             walk += 1;
@@ -16136,16 +16139,18 @@ impl Connection {
         // (stored ascending; reversed for a leading DESC) walks its columns in ONE
         // direction, so it satisfies a uniform leading PREFIX of the ORDER BY;
         // trailing terms that change direction are sorted by the caller (`sorted_
-        // suffix`). The default-NULLs walk can't honour an explicit `NULLS
-        // FIRST`/`LAST`, and a `COLLATE`/non-column term isn't a plain column —
-        // both still disqualify the scan entirely.
+        // suffix`). The walk yields the default NULL placement for its direction, so
+        // a redundant explicit `NULLS` clause (matching that default, per
+        // [`redundant_nulls`]) is fine; the opposite placement needs a two-pass scan
+        // we don't model and disqualifies the index, as does a `COLLATE`/non-column
+        // term (not a plain column).
         let order_cols = order_projection(&sel.columns, &meta.columns);
         let descending = sel.order_by[0].descending;
         let mut cols: Vec<usize> = Vec::with_capacity(sel.order_by.len());
         let mut uniform_prefix = 0usize;
         let mut prefix_open = true;
         for term in &sel.order_by {
-            if term.nulls_first.is_some() {
+            if !redundant_nulls(term) {
                 return None;
             }
             let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
@@ -16276,7 +16281,7 @@ impl Connection {
         let backward = sel.order_by[0].descending;
         let mut k = 0usize;
         for (i, term) in sel.order_by.iter().enumerate() {
-            if i >= idx.cols.len() || term.nulls_first.is_some() || term.descending != backward {
+            if i >= idx.cols.len() || !redundant_nulls(term) || term.descending != backward {
                 break;
             }
             let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
@@ -16626,7 +16631,7 @@ impl Connection {
             let mut ob_cols = Vec::with_capacity(sel.order_by.len());
             let mut ok = true;
             for term in &sel.order_by {
-                let nulls_default = term.nulls_first.is_none_or(|nf| nf != term.descending);
+                let nulls_default = redundant_nulls(term);
                 if !nulls_default || (kind == "DISTINCT" && term.descending) {
                     ok = false;
                     break;
@@ -17387,7 +17392,7 @@ impl Connection {
         let descending = sel.order_by[0].descending;
         let mut k = 0;
         for term in &sel.order_by {
-            if k >= walk_cols.len() || term.descending != descending || term.nulls_first.is_some() {
+            if k >= walk_cols.len() || term.descending != descending || !redundant_nulls(term) {
                 break;
             }
             let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
@@ -17477,7 +17482,7 @@ impl Connection {
                 if eqs.iter().any(|(c, _)| *c == pos) || is_null_cols.contains(&pos) {
                     continue; // constant under the WHERE equality / IS NULL
                 }
-                if term.nulls_first.is_some() {
+                if !redundant_nulls(term) {
                     fully = false;
                     break;
                 }
@@ -30104,6 +30109,25 @@ fn positional_int(expr: &Expr) -> Option<i64> {
         } => positional_int(expr),
         Expr::Collate { expr, .. } | Expr::Paren(expr) => positional_int(expr),
         _ => None,
+    }
+}
+
+/// Whether an `ORDER BY` term's explicit `NULLS FIRST`/`LAST` is *redundant* — i.e.
+/// it requests exactly the null placement a uniform-direction index/storage walk
+/// already produces, so the term orders identically to one with no `NULLS` clause.
+///
+/// A forward index/PK walk yields NULLs first (they sort lowest); a reversed
+/// (`DESC`) walk yields them last. SQLite's defaults match: `ASC` ⇒ `NULLS FIRST`,
+/// `DESC` ⇒ `NULLS LAST` — i.e. `nulls_first == !descending`. So an explicit clause
+/// equal to that default is a no-op the order-detection paths can treat exactly
+/// like a bare term (no sorter, no EQP temp-b-tree). The *opposite* placement
+/// (`ASC NULLS LAST` / `DESC NULLS FIRST`) is NOT produced by a single walk — SQLite
+/// serves it with a two-pass index scan we don't model — so it is not redundant and
+/// the callers still decline.
+fn redundant_nulls(term: &OrderTerm) -> bool {
+    match term.nulls_first {
+        None => true,
+        Some(nf) => nf != term.descending,
     }
 }
 
