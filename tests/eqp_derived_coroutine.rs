@@ -146,6 +146,13 @@ fn flattenable_wildcard_over_base_table_matches_sqlite() {
         "SELECT s.a, s.b FROM (SELECT * FROM t) AS s WHERE s.a<5",
         "SELECT * FROM (SELECT * FROM t) AS s WHERE s.a=5",
         "SELECT s.a FROM (SELECT * FROM t) AS s WHERE s.a<5",
+        // *Aliased* inner projection (`a AS aa`): the derived output name `aa` is
+        // mapped back to base column `a` on merge, so the outer reference seeks the
+        // index on `a` exactly as a bare projection would.
+        "SELECT aa FROM (SELECT a AS aa FROM t) AS s",
+        "SELECT aa FROM (SELECT a AS aa FROM t) AS s WHERE aa<5",
+        "SELECT * FROM (SELECT a AS aa FROM t) AS s WHERE aa>0",
+        "SELECT s.aa FROM (SELECT a AS aa FROM t) AS s WHERE s.aa<5",
     ] {
         let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
         assert_eq!(run("sqlite3", &sql), run(g, &sql), "for {q}");
@@ -154,23 +161,26 @@ fn flattenable_wildcard_over_base_table_matches_sqlite() {
 
 #[test]
 fn non_flattenable_outer_shapes_decline() {
-    // The flatten subset covers a wildcard or narrower outer projection over a
-    // single base table — bare or qualified by the derived source's own alias —
-    // with an optional same-qualified outer `WHERE` pushed into the scan (see
-    // `flattenable_wildcard_over_base_table_matches_sqlite`). Outside it: an
-    // *aliased* inner projection (`a AS aa`) has no base column to carry the
-    // substitution, and an inner join/aggregate/DISTINCT/view/LIMIT each change the
-    // flattened plan — all decline cleanly rather than mis-render.
+    // The flatten subset covers a wildcard or narrower outer projection (bare, or
+    // qualified by the derived source's own alias) over a single base table whose
+    // inner projection is bare columns or `*`, with an optional outer `WHERE` pushed
+    // into the scan (see `flattenable_wildcard_over_base_table_matches_sqlite`).
+    // Outside it: a *computed* inner projection (`a+1 AS aa`) has no base column to
+    // seek on, an outer reference to a column the source does not output
+    // (`no such column` in sqlite) cannot resolve, and an inner
+    // join/aggregate/DISTINCT/view/LIMIT each change the flattened plan — all
+    // decline cleanly rather than mis-render.
     let g = env!("CARGO_BIN_EXE_graphitesql");
     let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); \
                 CREATE TABLE u(x,y); CREATE VIEW v AS SELECT * FROM t;";
     for q in [
-        "SELECT * FROM (SELECT a AS aa FROM t) AS s WHERE aa>0", // aliased inner projection
+        "SELECT * FROM (SELECT a+1 AS aa FROM t) AS s WHERE aa>0", // computed inner projection
+        "SELECT b FROM (SELECT a AS aa FROM t) AS s", // outer ref not an output of the source
         "SELECT * FROM (SELECT * FROM t JOIN u ON t.a=u.x) AS s", // inner join
-        "SELECT * FROM (SELECT DISTINCT a FROM t) AS s",         // inner DISTINCT
-        "SELECT * FROM (SELECT count(*) FROM t) AS s",           // inner aggregate
-        "SELECT * FROM (SELECT * FROM v) AS s",                  // inner view
-        "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s",          // inner LIMIT
+        "SELECT * FROM (SELECT DISTINCT a FROM t) AS s", // inner DISTINCT
+        "SELECT * FROM (SELECT count(*) FROM t) AS s", // inner aggregate
+        "SELECT * FROM (SELECT * FROM v) AS s",       // inner view
+        "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s", // inner LIMIT
     ] {
         let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
         let got = run(g, &sql);
@@ -254,6 +264,9 @@ fn cte_reference_renders_like_a_derived_table() {
         "WITH c AS (SELECT * FROM t) SELECT c.a FROM c",
         "WITH c AS (SELECT * FROM t) SELECT * FROM c WHERE c.a=5",
         "WITH c AS (SELECT * FROM t) SELECT c.a FROM c WHERE c.a<5",
+        // Aliased CTE body projection (`a AS aa`): the output name maps back to the
+        // base column on merge, same as a derived table.
+        "WITH c AS (SELECT a AS aa FROM t) SELECT aa FROM c WHERE aa<5",
     ] {
         let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
         assert_eq!(run("sqlite3", &sql), run(g, &sql), "for {q}");

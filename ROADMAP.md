@@ -200,11 +200,14 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   so it can pick a `COVERING INDEX` access path the full-row body could not; a column
   qualified by the derived source's own alias / CTE name — `SELECT s.a FROM (SELECT *
   FROM t) s WHERE s.a<5` / `WITH c AS (…) SELECT c.a FROM c` — flattens as well, the
-  qualifier being stripped on merge since it names the source itself; this all holds
-  only when the inner projection is pass-through (`*` or bare unaliased columns) and
-  every outer projection/predicate qualifier is the source's own — a *foreign*
-  qualifier, an aliased inner projection (`a AS aa`), or an inner
-  join/aggregate/DISTINCT/view/LIMIT still declines cleanly;
+  qualifier being stripped on merge since it names the source itself; an *aliased*
+  inner projection — `SELECT aa FROM (SELECT a AS aa FROM t) WHERE aa<5` — flattens
+  too, the derived output name `aa` being mapped back to base column `a` on merge so
+  the seek lands on the index over `a`; this all holds only when the inner projection
+  is bare columns or `*` (a computed `a+1 AS x` has no base column to seek on) and the
+  outer references only names the source actually outputs (a reference to a column the
+  source doesn't expose — a sqlite `no such column` — declines, as do a foreign outer
+  qualifier and an inner join/aggregate/DISTINCT/view/LIMIT);
   a `WITH`-clause CTE referenced as a FROM source renders the same
   way — `WITH c AS (SELECT 1) SELECT * FROM c` → `CO-ROUTINE c`, `WITH c AS (SELECT *
   FROM t) SELECT * FROM c` → `SCAN t` — instead of crashing with `no such table: c`;

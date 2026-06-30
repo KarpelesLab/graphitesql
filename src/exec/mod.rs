@@ -13592,19 +13592,19 @@ impl Connection {
                 // outer predicate ANDed in, then recursing — `eqp_select` re-derives the
                 // covering-index / seek from the merged body exactly — but only when the
                 // merge is provably name-sound:
-                //  - the inner projection is *pass-through* (`*` or bare unaliased
-                //    columns), so a derived output name *is* its base column; an aliased
-                //    or computed projection (`a+1 AS b`) has no base column to carry the
-                //    substituted projection or pushed predicate;
-                //  - every outer projection column is a *bare unqualified* `Column` (no
-                //    no expression/alias), so it names a base column directly; a
-                //    wildcard outer keeps the body's own projection. The qualifier may
-                //    be the derived source's own alias / CTE name (`co_label`) — that
-                //    refers to the source itself, so it is *stripped* during the merge
-                //    (`s.a` → `a`); any *other* qualifier would not resolve, so the
-                //    merge declines.
-                //  - likewise the outer predicate (if any) is qualifier-free or only
-                //    `co_label`-qualified, with the qualifier stripped on merge.
+                //  - the inner projection's output columns are *knowable* and each
+                //    maps to a base column we can substitute: all *bare columns*
+                //    (aliased or not — `a AS aa` maps the output `aa` back to base `a`),
+                //    or a single `*` / all `t.*` over the base table (output names are
+                //    the base table's columns). A computed `a+1 AS x` projection has no
+                //    base column to seek on, so the merge declines.
+                //  - every outer projection column is a bare `Column`, and the outer
+                //    projection/predicate reference only names the source actually
+                //    outputs (else SQLite raises `no such column`, so we decline). A
+                //    wildcard outer keeps the body's own projection. A qualifier may be
+                //    the derived source's own alias / CTE name (`co_label`) — it refers
+                //    to the source itself, so it is *stripped* on merge (`s.a` → `a`);
+                //    any *other* qualifier would not resolve, so the merge declines.
                 // The outer must still add no other nodes and the body be a single
                 // base-table scan (same gate as the pure-wildcard case).
                 let bind_matches = |table: &Option<String>| {
@@ -13625,49 +13625,90 @@ impl Connection {
                 let outer_general_flatten = outer_flattenable_proj
                     && (from_cte || sel.ctes.is_empty())
                     && outer_adds_no_nodes;
-                let inner_proj_passthrough = sub.columns.iter().all(|c| match c {
-                    ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => true,
-                    ResultColumn::Expr { expr, alias, .. } => {
-                        alias.is_none() && matches!(expr, Expr::Column { .. })
-                    }
+                // The derived source's `(output_name, base_column)` map. For a bare-
+                // column inner each `[base] AS [out]` pair maps the output back to its
+                // base column; for a `*` / `t.*` inner the outputs *are* the base
+                // table's columns (identity pairs). A computed inner projection has no
+                // base column, so it yields `None` and the merge declines.
+                let inner_bare_cols: Option<Vec<(String, String)>> = sub
+                    .columns
+                    .iter()
+                    .map(|c| match c {
+                        ResultColumn::Expr {
+                            expr: Expr::Column { column, .. },
+                            alias,
+                            ..
+                        } => Some((
+                            alias.clone().unwrap_or_else(|| column.clone()),
+                            column.clone(),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                let inner_all_wildcard = !sub.columns.is_empty()
+                    && sub.columns.iter().all(|c| {
+                        matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_))
+                    });
+                let derived_map: Option<Vec<(String, String)>> = inner_bare_cols.or_else(|| {
+                    inner_all_wildcard
+                        .then(|| {
+                            sub.from
+                                .as_ref()
+                                .and_then(|f| self.table_meta(&f.first.name, None).ok())
+                                .map(|m| {
+                                    m.columns
+                                        .iter()
+                                        .map(|c| (c.name.clone(), c.name.clone()))
+                                        .collect()
+                                })
+                        })
+                        .flatten()
                 });
+                let outer_refs_resolve = |map: &[(String, String)]| {
+                    let names: Vec<String> = map.iter().map(|(o, _)| o.clone()).collect();
+                    sel.columns.iter().all(|c| match c {
+                        ResultColumn::Expr { expr, .. } => all_column_names_in(expr, &names),
+                        ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => true,
+                    }) && sel
+                        .where_clause
+                        .as_ref()
+                        .is_none_or(|p| all_column_names_in(p, &names))
+                };
                 let outer_where_qualifiers_ok = sel
                     .where_clause
                     .as_ref()
                     .is_none_or(|p| all_qualifiers_match(p, co_label));
-                if outer_general_flatten
-                    && inner_is_base_table_scan
-                    && inner_proj_passthrough
-                    && outer_where_qualifiers_ok
-                    && !(outer_is_wildcard && sel.where_clause.is_none())
-                {
-                    let mut merged = sub.clone();
-                    if !outer_is_wildcard {
-                        let mut cols = sel.columns.clone();
-                        if let Some(bind) = co_label {
+                if let (true, true, true, Some(rename)) = (
+                    outer_general_flatten,
+                    inner_is_base_table_scan,
+                    outer_where_qualifiers_ok && !(outer_is_wildcard && sel.where_clause.is_none()),
+                    derived_map,
+                ) {
+                    if outer_refs_resolve(&rename) {
+                        let mut merged = sub.clone();
+                        if !outer_is_wildcard {
+                            let mut cols = sel.columns.clone();
                             for c in &mut cols {
                                 if let ResultColumn::Expr { expr, .. } = c {
-                                    strip_bind_qualifier(expr, bind);
+                                    rewrite_flattened_column(expr, co_label, &rename);
                                 }
                             }
+                            merged.columns = cols;
                         }
-                        merged.columns = cols;
-                    }
-                    if let Some(pred) = &sel.where_clause {
-                        let mut pred = pred.clone();
-                        if let Some(bind) = co_label {
-                            strip_bind_qualifier(&mut pred, bind);
+                        if let Some(pred) = &sel.where_clause {
+                            let mut pred = pred.clone();
+                            rewrite_flattened_column(&mut pred, co_label, &rename);
+                            merged.where_clause = Some(match merged.where_clause.take() {
+                                Some(inner) => Expr::Binary {
+                                    op: BinaryOp::And,
+                                    left: Box::new(inner),
+                                    right: Box::new(pred),
+                                },
+                                None => pred,
+                            });
                         }
-                        merged.where_clause = Some(match merged.where_clause.take() {
-                            Some(inner) => Expr::Binary {
-                                op: BinaryOp::And,
-                                left: Box::new(inner),
-                                right: Box::new(pred),
-                            },
-                            None => pred,
-                        });
+                        return self.eqp_select(&merged, parent, next_id, out, params);
                     }
-                    return self.eqp_select(&merged, parent, next_id, out, params);
                 }
                 // A *compound* CTE/derived body that carries at least one dedup set
                 // operator (`UNION` / `INTERSECT` / `EXCEPT`) cannot flatten into the
@@ -26421,44 +26462,57 @@ fn all_qualifiers_match(e: &Expr, bind: Option<&str>) -> bool {
     ok
 }
 
-/// Drop a `bind`-qualified column's table qualifier in place (`s.a` → `a`) so it
-/// resolves against the flattened base table after a derived-table / CTE merge.
-/// Mirrors `window::visit`'s expression recursion; does not descend into nested
-/// `SELECT`s (the flatten gate excludes any subquery in the merged clauses).
-fn strip_bind_qualifier(e: &mut Expr, bind: &str) {
-    if let Expr::Column { table, .. } = e {
-        if table
-            .as_deref()
-            .is_some_and(|t| t.eq_ignore_ascii_case(bind))
-        {
-            *table = None;
+/// Whether every bare column reference in `e` names one of `names`
+/// (case-insensitive). Used when flattening a derived table / CTE: an outer
+/// projection / predicate may only reference columns the source actually outputs
+/// — otherwise SQLite raises `no such column`, so the caller declines rather than
+/// mis-resolve the name against the flattened base table.
+fn all_column_names_in(e: &Expr, names: &[String]) -> bool {
+    let mut ok = true;
+    window::visit(e, &mut |n| {
+        if let Expr::Column { column, .. } = n {
+            if !names.iter().any(|nm| nm.eq_ignore_ascii_case(column)) {
+                ok = false;
+            }
         }
+    });
+    ok
+}
+
+/// Apply `f` to every `Column` node in `e` in place. Mirrors `window::visit`'s
+/// expression recursion but mutably; does not descend into nested `SELECT`s (the
+/// derived-flatten gate excludes any subquery in the merged clauses). Used to
+/// strip a derived source's own qualifier (`s.a` → `a`) and to map a derived
+/// output name back to its base column (`aa` → `a`) before a flatten merge.
+fn visit_columns_mut(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
+    if matches!(e, Expr::Column { .. }) {
+        f(e);
         return;
     }
     match e {
-        Expr::Unary { expr, .. } => strip_bind_qualifier(expr, bind),
+        Expr::Unary { expr, .. } => visit_columns_mut(expr, f),
         Expr::Binary { left, right, .. } => {
-            strip_bind_qualifier(left, bind);
-            strip_bind_qualifier(right, bind);
+            visit_columns_mut(left, f);
+            visit_columns_mut(right, f);
         }
         Expr::Function { args, .. } => {
             for a in args {
-                strip_bind_qualifier(a, bind);
+                visit_columns_mut(a, f);
             }
         }
-        Expr::IsNull { expr, .. } => strip_bind_qualifier(expr, bind),
+        Expr::IsNull { expr, .. } => visit_columns_mut(expr, f),
         Expr::InList { expr, list, .. } => {
-            strip_bind_qualifier(expr, bind);
+            visit_columns_mut(expr, f);
             for a in list {
-                strip_bind_qualifier(a, bind);
+                visit_columns_mut(a, f);
             }
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            strip_bind_qualifier(expr, bind);
-            strip_bind_qualifier(low, bind);
-            strip_bind_qualifier(high, bind);
+            visit_columns_mut(expr, f);
+            visit_columns_mut(low, f);
+            visit_columns_mut(high, f);
         }
         Expr::Case {
             operand,
@@ -26466,26 +26520,45 @@ fn strip_bind_qualifier(e: &mut Expr, bind: &str) {
             else_result,
         } => {
             if let Some(o) = operand {
-                strip_bind_qualifier(o, bind);
+                visit_columns_mut(o, f);
             }
             for (w, t) in when_then {
-                strip_bind_qualifier(w, bind);
-                strip_bind_qualifier(t, bind);
+                visit_columns_mut(w, f);
+                visit_columns_mut(t, f);
             }
             if let Some(el) = else_result {
-                strip_bind_qualifier(el, bind);
+                visit_columns_mut(el, f);
             }
         }
-        Expr::Cast { expr, .. } => strip_bind_qualifier(expr, bind),
-        Expr::Paren(inner) => strip_bind_qualifier(inner, bind),
+        Expr::Cast { expr, .. } => visit_columns_mut(expr, f),
+        Expr::Paren(inner) => visit_columns_mut(inner, f),
         Expr::RowValue(items) => {
             for it in items {
-                strip_bind_qualifier(it, bind);
+                visit_columns_mut(it, f);
             }
         }
-        Expr::Collate { expr, .. } => strip_bind_qualifier(expr, bind),
+        Expr::Collate { expr, .. } => visit_columns_mut(expr, f),
         _ => {}
     }
+}
+
+/// Drop a `bind`-qualified column's table qualifier in place (`s.a` → `a`) and
+/// remap a derived output name to its base column via `rename` (`aa` → `a` for an
+/// inner `a AS aa`), so the column resolves against the flattened base table after
+/// a derived-table / CTE merge. `rename` pairs are `(output_name, base_column)`.
+fn rewrite_flattened_column(e: &mut Expr, bind: Option<&str>, rename: &[(String, String)]) {
+    visit_columns_mut(e, &mut |c| {
+        if let Expr::Column { table, column, .. } = c {
+            if let Some(b) = bind {
+                if table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(b)) {
+                    *table = None;
+                }
+            }
+            if let Some((_, base)) = rename.iter().find(|(o, _)| o.eq_ignore_ascii_case(column)) {
+                *column = base.clone();
+            }
+        }
+    });
 }
 
 /// Collect, in pre-order, every scalar `(SELECT …)` subquery appearing directly
