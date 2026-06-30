@@ -13319,15 +13319,36 @@ impl Connection {
             // A `FROM`-less SELECT scans a single synthetic constant row. SQLite
             // renders it `SCAN CONSTANT ROW` (this also covers a single-row
             // `VALUES(...)`, which desugars to a no-compound, no-FROM select).
-            // We only emit it for the cases we can render byte-exactly: no
-            // compound continuation (a multi-row VALUES / UNION desugars to a
-            // compound, which sqlite renders as its own tree) and no subquery in
-            // any clause (sqlite appends SCALAR/LIST SUBQUERY + bloom-filter
-            // nodes we don't model yet).
-            if sel.compound.is_empty() && !select_no_from_has_subquery(sel) {
+            // A multi-row VALUES / UNION desugars to a compound (its own tree), so
+            // only the no-compound case is rendered here.
+            if !sel.compound.is_empty() {
+                return Ok(());
+            }
+            if !select_no_from_has_subquery(sel) {
+                // No subquery: the bare constant row.
                 let id = *next_id;
                 *next_id += 1;
                 out.push((id, parent, String::from("SCAN CONSTANT ROW")));
+            } else if let Some(subs) = self
+                .eqp_where_scalar_subqueries(sel)
+                .or_else(|| self.eqp_projection_scalar_subqueries(sel))
+            {
+                // A clean, single-position set of non-correlated scalar subqueries:
+                // SQLite renders the constant row followed by a `SCALAR SUBQUERY N`
+                // sibling per subquery (numbered left-to-right, body recursed as the
+                // child). A cross-position set (subqueries in both projection and
+                // WHERE) is reverse/renumbered and an `EXISTS` / `IN (SELECT)` is a
+                // different node shape — those collectors decline, leaving the prior
+                // emit-nothing behaviour.
+                let cr_id = *next_id;
+                *next_id += 1;
+                out.push((cr_id, parent, String::from("SCAN CONSTANT ROW")));
+                for (i, body) in subs.iter().enumerate() {
+                    let sid = *next_id;
+                    *next_id += 1;
+                    out.push((sid, parent, alloc::format!("SCALAR SUBQUERY {}", i + 1)));
+                    self.eqp_select(body, sid, next_id, out, params)?;
+                }
             }
             return Ok(());
         };
