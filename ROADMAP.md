@@ -466,10 +466,15 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   rowid-aliasing `INTEGER PRIMARY KEY`, or the leading PK column of a `WITHOUT ROWID`
   table — and the lone distinct aggregate is the *entire* computation (one unique
   distinct aggregate, no other aggregate, no bare column), the node is elided; a second
-  aggregate, a bare column, or a non-leading distinct column brings it back. Byte-exact
-  vs sqlite3 3.50.4 (`tests/eqp_distinct_agg_btree.rs`). (Deferred: `GROUP BY`, where
-  sqlite places the node *after* the GROUP BY temp-b-tree; multi-argument `DISTINCT`,
-  which sqlite rejects at prepare time.)
+  aggregate, a bare column, or a non-leading distinct column brings it back. Under
+  `GROUP BY` the scan order serves the group key, so nothing is elided: each unique
+  distinct aggregate spills through its own b-tree *after* the `USE TEMP B-TREE FOR
+  GROUP BY` node, in result-column order (same coalescing); grouping a rowid table by
+  its own `INTEGER PRIMARY KEY` skips the GROUP-BY sorter and emits no node. Byte-exact
+  vs sqlite3 3.50.4 (`tests/eqp_distinct_agg_btree.rs`). (Deferred: multi-argument
+  `DISTINCT`, which sqlite rejects at prepare time; `min`/`max(DISTINCT)` on the SEARCH
+  path. The indexed-`GROUP BY` scan line itself — `SCAN t USING INDEX ia` — is a
+  pre-existing access-path rendering gap, independent of these nodes.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

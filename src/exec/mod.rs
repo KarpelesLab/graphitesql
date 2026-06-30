@@ -12929,7 +12929,7 @@ impl Connection {
                 && detail == alloc::format!("SCAN {label}")
                 && sel.group_by.is_empty()
             {
-                for fname in self.distinct_agg_btrees(sel, &meta) {
+                for fname in self.distinct_agg_btrees(sel, &meta, true) {
                     let id = *next_id;
                     *next_id += 1;
                     out.push((
@@ -13079,6 +13079,20 @@ impl Connection {
                 *next_id += 1;
                 out.push((id, parent, alloc::format!("USE TEMP B-TREE FOR {kind}")));
                 group_btree_suppresses_order = suppress;
+                // With grouping, each distinct aggregate spills through its own
+                // transient b-tree *after* the GROUP BY node (the scan order serves
+                // the group key, not the distinct values, so nothing is elided). The
+                // node order matches sqlite's: GROUP BY first, then the distinct
+                // aggregates in result-column order.
+                for fname in self.distinct_agg_btrees(sel, &meta, false) {
+                    let id = *next_id;
+                    *next_id += 1;
+                    out.push((
+                        id,
+                        parent,
+                        alloc::format!("USE TEMP B-TREE FOR {fname}(DISTINCT)"),
+                    ));
+                }
             }
         }
         // ORDER BY that we satisfy with an in-memory sort — unless the scan already
@@ -15468,7 +15482,12 @@ impl Connection {
     /// index or seek can deliver the distinct values pre-ordered, so SQLite emits a
     /// node for *every* distinct aggregate (none is elided) and graphite's scan-line
     /// choice already matches.
-    fn distinct_agg_btrees(&self, sel: &Select, meta: &TableMeta) -> Vec<String> {
+    ///
+    /// `elide` enables the ordered-scan elision (a lone distinct aggregate over the
+    /// scan's leading column). It applies only without `GROUP BY`: with grouping the
+    /// scan order serves the group key, not the distinct values, so every distinct
+    /// aggregate still spills (the caller passes `false`).
+    fn distinct_agg_btrees(&self, sel: &Select, meta: &TableMeta, elide: bool) -> Vec<String> {
         // (lowercase name, bare-argument column index) for each *unique* distinct
         // aggregate, in first-occurrence order. SQLite's `AggInfo` coalesces
         // identical aggregate calls, so `count(DISTINCT b)+count(DISTINCT b)` spills
@@ -15556,7 +15575,7 @@ impl Connection {
             meta.ipk
         };
         let bare_cols = total_cols.saturating_sub(agg_arg_cols);
-        if uniq.len() == 1 && !other_agg && bare_cols == 0 {
+        if elide && uniq.len() == 1 && !other_agg && bare_cols == 0 {
             if let (Some(arg), Some(l)) = (uniq[0].1, lead) {
                 if arg == l {
                     return Vec::new();

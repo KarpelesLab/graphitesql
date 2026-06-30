@@ -24,8 +24,14 @@
 //!     (`count(DISTINCT a), a`), or a non-leading distinct column (`count(DISTINCT b)`)
 //!     all defeat the elision and the node reappears.
 //!
-//! Deliberately left to a separate slice: `GROUP BY` (sqlite places the node *after*
-//! the GROUP BY temp-btree, not before); `min`/`max(DISTINCT)` (the SEARCH path);
+//! Under `GROUP BY`, the distinct values cannot ride the scan order (that order
+//! serves the group key), so nothing is elided: each unique distinct aggregate spills
+//! through its own transient b-tree, rendered *after* the `USE TEMP B-TREE FOR GROUP BY`
+//! node, in result-column order. The same coalescing applies. When the group key is the
+//! rowid (an `INTEGER PRIMARY KEY` grouped by itself) sqlite skips the GROUP-BY sorter
+//! entirely and emits no node at all.
+//!
+//! Deliberately left to a separate slice: `min`/`max(DISTINCT)` (the SEARCH path);
 //! multi-argument `DISTINCT` (sqlite rejects it at prepare time). Verified byte-exact
 //! against sqlite3 3.50.4, both the plan and the result value.
 
@@ -263,4 +269,50 @@ fn without_rowid_leading_pk_elides() {
     // Composite PK(a,b): a still leads, b does not.
     check(wor2, "SELECT count(DISTINCT a) FROM t");
     check(wor2, "SELECT count(DISTINCT b) FROM t");
+}
+
+/// Under `GROUP BY`, each unique distinct aggregate spills through its own b-tree
+/// *after* the GROUP-BY sorter node — nothing is elided, since the scan order serves
+/// the group key, not the distinct values.
+#[test]
+fn group_by_places_node_after_group_sorter() {
+    if !have_sqlite() {
+        return;
+    }
+    let dc = "CREATE TABLE t(a,b,c); INSERT INTO t VALUES(1,2,3),(1,5,6),(4,5,9);";
+    assert_eq!(
+        g_eqp(dc, "SELECT a, count(DISTINCT b) FROM t GROUP BY a"),
+        "SCAN t | USE TEMP B-TREE FOR GROUP BY | USE TEMP B-TREE FOR count(DISTINCT)"
+    );
+    for q in [
+        "SELECT a, count(DISTINCT b) FROM t GROUP BY a",
+        "SELECT a, count(DISTINCT b), sum(DISTINCT c) FROM t GROUP BY a",
+        "SELECT a, count(DISTINCT b), count(DISTINCT b) FROM t GROUP BY a",
+        "SELECT a, count(DISTINCT b), sum(c) FROM t GROUP BY a",
+        "SELECT a, count(DISTINCT b) FROM t GROUP BY a ORDER BY a",
+        "SELECT b, count(DISTINCT c) FROM t GROUP BY b",
+    ] {
+        check(dc, q);
+    }
+}
+
+/// Grouping a rowid table by its own `INTEGER PRIMARY KEY` lets sqlite skip the
+/// GROUP-BY sorter — and with it any distinct-aggregate node.
+#[test]
+fn group_by_rowid_key_emits_no_node() {
+    if !have_sqlite() {
+        return;
+    }
+    let ipk = "CREATE TABLE t(a INTEGER PRIMARY KEY,b,c); INSERT INTO t VALUES(1,2,3),(4,5,6);";
+    for q in [
+        "SELECT count(DISTINCT a) FROM t GROUP BY a",
+        "SELECT count(DISTINCT b) FROM t GROUP BY a",
+    ] {
+        let plan = g_eqp(ipk, q);
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "expected no temp-btree node grouping by rowid, got {plan}"
+        );
+        check(ipk, q);
+    }
 }
