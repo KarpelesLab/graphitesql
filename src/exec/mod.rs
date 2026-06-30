@@ -13101,8 +13101,16 @@ impl Connection {
         // the sort into it, emitting no separate ORDER BY node). When a seek walks
         // a *prefix* of the ORDER BY in order, only the trailing terms are sorted,
         // which sqlite reports as "LAST n TERM[S] OF ORDER BY".
+        //
+        // A bare aggregate query — aggregate functions with no GROUP BY — collapses
+        // the whole table to exactly one row, so any ORDER BY is a no-op and sqlite
+        // emits no sorter for it. (A window function makes the output per-row again,
+        // so it is excluded.)
+        let single_row_aggregate =
+            sel.group_by.is_empty() && self.has_aggregate(sel) && !window::has_window(sel);
         if !sel.order_by.is_empty()
             && !group_btree_suppresses_order
+            && !single_row_aggregate
             && self.order_satisfied_by_scan(sel, params).is_none()
         {
             let n = sel.order_by.len();

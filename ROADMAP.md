@@ -475,6 +475,16 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   `DISTINCT`, which sqlite rejects at prepare time; `min`/`max(DISTINCT)` on the SEARCH
   path. The indexed-`GROUP BY` scan line itself — `SCAN t USING INDEX ia` — is a
   pre-existing access-path rendering gap, independent of these nodes.)
+- **EQP bare-aggregate `ORDER BY` elision** — an aggregate query with **no `GROUP BY`**
+  (`SELECT count(*) FROM t ORDER BY 1`) collapses the table to exactly one row, so the
+  `ORDER BY` is a no-op and SQLite plans no sorter. `eqp_select` now suppresses its
+  `USE TEMP B-TREE FOR ORDER BY` node for that single-row shape (aggregate present, empty
+  `GROUP BY`, no window function), keyed off the shape alone — independent of `WHERE`,
+  the result-column count, or which column the irrelevant `ORDER BY` names; the min/max
+  SEARCH path elides too. A `GROUP BY` (multi-row) keeps the sorter, and a window function
+  is excluded (per-row output). Byte-exact vs sqlite3 3.50.4
+  (`tests/eqp_aggregate_order_by.rs`). (Still divergent, separate slices: the
+  `GROUP BY … ORDER BY` sorter-ordering reuse, and window-coroutine EQP rendering.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
