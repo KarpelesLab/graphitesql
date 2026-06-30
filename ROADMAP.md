@@ -501,6 +501,25 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   3.50.4 (`tests/eqp_group_order_fold.rs`). (Out of scope: expression grouping keys
   (`GROUP BY a+0`), and an `ORDER BY` ordinal over an *index-ordered* scan, where the
   access path — not this b-tree — provides the order.)
+- **EQP `ORDER BY` ordinal/alias over an index-ordered scan** — the previous fold's
+  out-of-scope sibling: an `ORDER BY` term written as a 1-based ordinal (`ORDER BY 1`)
+  or a bare output alias (`SELECT b AS x … ORDER BY x`) names the same column as if
+  written directly, so when an index-ordered access path (a full covering scan or a
+  `WHERE` seek) already yields that column in order, SQLite plans no sorter. graphite's
+  order-detection paths (`rowid_ordered_scan`, `order_index_scan`, `scan_order_prefix`,
+  `in_seek_order`, `seek_order_prefix`) only matched a directly-written `ORDER BY col`,
+  so the ordinal/alias forms spuriously emitted `USE TEMP B-TREE FOR ORDER BY` — and the
+  alias form even *missed* the covering index (`SCAN t` instead of `… USING COVERING
+  INDEX ib`). A shared `order_key_expr(sel, expr)` resolver now maps an ordinal/alias
+  term to its underlying result-column expression (SQLite resolves output names first)
+  before each path's column match runs, and the same resolution feeds the covering
+  checks (`index_covers_query`, `query_cols_covered`) so the index is recognised as
+  covering. The sorter elision, the partial mixed-direction "LAST n TERMS" label, and the
+  rowid/IPK ordinal all follow. Byte-exact vs sqlite3 3.50.4, plan and rows
+  (`tests/eqp_order_by_ordinal_scan.rs`). (Out of scope, pre-existing: an ordinal over
+  `SELECT *` (wildcard column map), and an alias that shadows a table column but projects
+  an *expression* — an executor alias-resolution corner. `EXPLAIN QUERY PLAN` also does
+  not range-check an out-of-range ordinal, unlike the executed path; pre-existing.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

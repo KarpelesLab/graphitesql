@@ -14879,7 +14879,7 @@ impl Connection {
         // id`, matching sqlite (which emits no temp b-tree for either). (In the
         // rowid-group case there is only the one term, checked above.)
         let term = &sel.order_by[0];
-        let (tbl, col) = match &term.expr {
+        let (tbl, col) = match order_key_expr(sel, &term.expr) {
             Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
             _ => return None,
         };
@@ -14955,7 +14955,7 @@ impl Connection {
             if term.nulls_first.is_some() {
                 return None;
             }
-            let (tbl, col_name) = match &term.expr {
+            let (tbl, col_name) = match order_key_expr(sel, &term.expr) {
                 Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => return None,
             };
@@ -15085,7 +15085,7 @@ impl Connection {
             if i >= idx.cols.len() || term.nulls_first.is_some() || term.descending != backward {
                 break;
             }
-            let (tbl, col_name) = match &term.expr {
+            let (tbl, col_name) = match order_key_expr(sel, &term.expr) {
                 Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => break,
             };
@@ -15214,7 +15214,12 @@ impl Connection {
                 }
             }
         }
-        sel.order_by.iter().all(|t| col_ok(&t.expr))
+        // A positional/alias `ORDER BY` term references the column it resolves to,
+        // not the literal ordinal; resolve it so an index that holds that column is
+        // still recognised as covering (`SELECT b FROM t ORDER BY 1`).
+        sel.order_by
+            .iter()
+            .all(|t| col_ok(order_key_expr(sel, &t.expr)))
     }
 
     /// Thorough covering test for a *full-table covering scan*: every column the
@@ -15255,7 +15260,7 @@ impl Connection {
             && sel
                 .order_by
                 .iter()
-                .all(|t| where_cols_covered(&t.expr, meta, idx_cols))
+                .all(|t| where_cols_covered(order_key_expr(sel, &t.expr), meta, idx_cols))
             && sel
                 .where_clause
                 .as_ref()
@@ -15977,7 +15982,7 @@ impl Connection {
         // rowid / IPK column of this table; its uniqueness makes trailing terms
         // irrelevant. A `COLLATE` wrapper is `Expr::Collate`, rejected by the match.
         let term = &sel.order_by[0];
-        let (tbl, ocol) = match &term.expr {
+        let (tbl, ocol) = match order_key_expr(sel, &term.expr) {
             Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
             _ => return None,
         };
@@ -16176,7 +16181,7 @@ impl Connection {
             if k >= walk_cols.len() || term.descending != descending || term.nulls_first.is_some() {
                 break;
             }
-            let (tbl, col_name) = match &term.expr {
+            let (tbl, col_name) = match order_key_expr(sel, &term.expr) {
                 Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => break,
             };
@@ -16208,7 +16213,7 @@ impl Connection {
             && idx.descending[prefix..].iter().all(|d| !d)
         {
             let term = &sel.order_by[k];
-            if let Expr::Column { table, column, .. } = &term.expr {
+            if let Expr::Column { table, column, .. } = order_key_expr(sel, &term.expr) {
                 let tbl_ok = table
                     .as_deref()
                     .is_none_or(|tn| tn.eq_ignore_ascii_case(label));
@@ -16240,7 +16245,7 @@ impl Connection {
             let mut rowid_used = false;
             let mut fully = true;
             for term in &sel.order_by {
-                let Expr::Column { table, column, .. } = &term.expr else {
+                let Expr::Column { table, column, .. } = order_key_expr(sel, &term.expr) else {
                     fully = false;
                     break;
                 };
@@ -28756,6 +28761,47 @@ fn positional_int(expr: &Expr) -> Option<i64> {
         Expr::Collate { expr, .. } | Expr::Paren(expr) => positional_int(expr),
         _ => None,
     }
+}
+
+/// The effective sort-key expression of an `ORDER BY` term, as the order-detection
+/// paths should see it. SQLite resolves a 1-based positional ordinal (`ORDER BY 2`)
+/// and a bare output alias (`SELECT a AS x … ORDER BY x`) to the underlying
+/// result-column expression *before* planning, so a scan that already yields that
+/// column in order needs no sorter. This returns that underlying expression when the
+/// term is such an ordinal or alias and the named result column is a plain
+/// expression; otherwise it returns the term unchanged (a directly-written column,
+/// or an ordinal/alias landing on a wildcard or out-of-range slot, for which the
+/// callers fall back to their own matching). The returned reference borrows from
+/// `sel`'s projection or from `e`, so it is valid for as long as both are.
+fn order_key_expr<'a>(sel: &'a Select, e: &'a Expr) -> &'a Expr {
+    // Positional ordinal → the n-th result column's expression.
+    if let Some(n) = positional_int(e) {
+        if let Ok(i) = usize::try_from(n) {
+            if let Some(i) = i.checked_sub(1) {
+                if let Some(ResultColumn::Expr { expr, .. }) = sel.columns.get(i) {
+                    return expr;
+                }
+            }
+        }
+        return e;
+    }
+    // Bare output alias → the matching result column's expression. SQLite resolves
+    // `ORDER BY` against output column names first, so an alias that shadows a table
+    // column still means the projected expression.
+    if let Expr::Column {
+        schema: None,
+        table: None,
+        column,
+        ..
+    } = e
+    {
+        if let Some(ResultColumn::Expr { expr, .. }) = sel.columns.iter().find(|rc| {
+            matches!(rc, ResultColumn::Expr { alias: Some(a), .. } if a.eq_ignore_ascii_case(column))
+        }) {
+            return expr;
+        }
+    }
+    e
 }
 
 /// Whether a projection has the exact shape `values_core` produces for a desugared
