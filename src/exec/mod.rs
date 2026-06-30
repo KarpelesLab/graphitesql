@@ -13936,15 +13936,15 @@ impl Connection {
                         }
                     }
                 }
-                // An *aggregate* CTE/derived body (a bare aggregate or a `GROUP BY`
-                // over a single base table) also can't flatten: SQLite materializes it
-                // as a `CO-ROUTINE <name>` whose child is the body's own plan, then the
-                // outer `{SCAN|SEARCH} <name>` plus at most one trailing temp-b-tree —
-                // the same wrapper as the compound case. Rendered only with a
-                // deterministic label, a single-base-table body with no compound /
-                // window / `ORDER BY` / `LIMIT` / nested subquery, no outer `WHERE`, and
-                // an outer shape `eqp_materialized_outer_render` accounts for. The body
-                // child is the body's own (already byte-exact) aggregate plan.
+                // An *aggregate* or *DISTINCT* CTE/derived body over a single base
+                // table also can't flatten: SQLite materializes it as a
+                // `CO-ROUTINE <name>` whose child is the body's own plan, then the outer
+                // `{SCAN|SEARCH} <name>` plus at most one trailing temp-b-tree — the same
+                // wrapper as the compound case. Rendered only with a deterministic
+                // label, a single-base-table body with no compound / window / `ORDER BY`
+                // / `LIMIT` / nested subquery, no outer `WHERE`, and an outer shape
+                // `eqp_materialized_outer_render` accounts for. The body child is the
+                // body's own (already byte-exact) aggregate / DISTINCT plan.
                 if let Some(name) = co_label {
                     let body_single_base_table = sub.from.as_ref().is_some_and(|f| {
                         f.joins.is_empty()
@@ -13955,7 +13955,8 @@ impl Connection {
                             && !self.is_view(&f.first.name)
                             && !self.is_virtual_table(&f.first.name)
                     });
-                    let renderable_aggregate_body = select_is_aggregate_query(sub)
+                    let renderable_aggregate_body = (select_is_aggregate_query(sub)
+                        || sub.distinct)
                         && body_single_base_table
                         && sub.compound.is_empty()
                         && sub.window_defs.is_empty()

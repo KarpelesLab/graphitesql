@@ -1,14 +1,15 @@
 //! `EXPLAIN QUERY PLAN` over a derived-table / CTE whose body is an *aggregate*
-//! (a bare aggregate or a `GROUP BY`). Such a body cannot be flattened into the
-//! outer plan, so SQLite materializes it as `CO-ROUTINE <label>` whose single child
-//! is the body's own plan, followed by the outer `{SCAN|SEARCH} <label>` (plus at
-//! most one trailing temp-b-tree) — the same wrapper it uses for a compound body.
+//! (a bare aggregate or a `GROUP BY`) or a `DISTINCT`. Such a body cannot be
+//! flattened into the outer plan, so SQLite materializes it as `CO-ROUTINE <label>`
+//! whose single child is the body's own plan, followed by the outer
+//! `{SCAN|SEARCH} <label>` (plus at most one trailing temp-b-tree) — the same wrapper
+//! it uses for a compound body.
 //!
-//! graphite previously declined any aggregate-body source with `EXPLAIN QUERY PLAN
-//! for this query shape`; it now renders the single-base-table case byte-exactly
-//! (the body child being the body's already-exact aggregate plan) and still declines
-//! a join/compound body or a source combined with another table. Verified vs the
-//! sqlite3 3.50.4 CLI.
+//! graphite previously declined any aggregate / DISTINCT body source with `EXPLAIN
+//! QUERY PLAN for this query shape`; it now renders the single-base-table case
+//! byte-exactly (the body child being the body's already-exact plan) and still
+//! declines a join/compound body or a source combined with another table. Verified
+//! vs the sqlite3 3.50.4 CLI.
 
 #![cfg(feature = "std")]
 
@@ -57,6 +58,13 @@ fn aggregate_body_coroutine_matches_sqlite() {
         "SELECT * FROM (SELECT count(*) FROM t) AS s ORDER BY 1",
         // A CTE reference resolves the same way (label = the CTE name).
         "WITH c AS (SELECT count(*) FROM t) SELECT * FROM c",
+        // A DISTINCT body materializes the same way — the body child is its own plan
+        // (a covering-index scan when the index satisfies DISTINCT, else a temp-btree).
+        "SELECT * FROM (SELECT DISTINCT b FROM t) AS s",
+        "SELECT * FROM (SELECT DISTINCT a,b FROM t) AS s",
+        "SELECT * FROM (SELECT DISTINCT c FROM t) AS s",
+        "SELECT x FROM (SELECT DISTINCT b AS x FROM t) AS s",
+        "WITH c AS (SELECT DISTINCT b FROM t) SELECT * FROM c",
     ] {
         assert_eq!(plan("sqlite3", BASE, q), plan(g, BASE, q), "plan for {q}");
     }

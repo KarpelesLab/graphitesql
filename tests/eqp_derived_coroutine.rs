@@ -167,9 +167,9 @@ fn non_flattenable_outer_shapes_decline() {
     // into the scan (see `flattenable_wildcard_over_base_table_matches_sqlite`).
     // Outside it: a *computed* inner projection (`a+1 AS aa`) has no base column to
     // seek on, an outer reference to a column the source does not output
-    // (`no such column` in sqlite) cannot resolve, and an inner join/DISTINCT/view/
-    // LIMIT each change the flattened plan — all decline cleanly rather than
-    // mis-render. (An inner *aggregate* body now renders as a CO-ROUTINE — see
+    // (`no such column` in sqlite) cannot resolve, and an inner join/view/LIMIT each
+    // change the flattened plan — all decline cleanly rather than mis-render. (An
+    // inner *aggregate* or *DISTINCT* body now renders as a CO-ROUTINE — see
     // `tests/eqp_aggregate_coroutine.rs`.)
     let g = env!("CARGO_BIN_EXE_graphitesql");
     let base = "CREATE TABLE t(a,b); CREATE INDEX it ON t(a); \
@@ -178,7 +178,6 @@ fn non_flattenable_outer_shapes_decline() {
         "SELECT * FROM (SELECT a+1 AS aa FROM t) AS s WHERE aa>0", // computed inner projection
         "SELECT b FROM (SELECT a AS aa FROM t) AS s", // outer ref not an output of the source
         "SELECT * FROM (SELECT * FROM t JOIN u ON t.a=u.x) AS s", // inner join
-        "SELECT * FROM (SELECT DISTINCT a FROM t) AS s", // inner DISTINCT
         "SELECT * FROM (SELECT * FROM v) AS s",       // inner view
         "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s", // inner LIMIT
     ] {
