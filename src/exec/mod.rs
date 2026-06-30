@@ -13034,60 +13034,97 @@ impl Connection {
                                 .where_clause
                                 .as_ref()
                                 .is_some_and(expr_has_subquery);
-                            // The outer query is a single bare reference to the
-                            // CTE with no grouping / DISTINCT / ORDER BY / compound
-                            // / subquery clause (each would add a plan node SQLite
-                            // sequences differently for a co-routine source). An
-                            // outer `WHERE` and a bare aggregate add no node.
-                            let outer_plain = sel.group_by.is_empty()
-                                && !sel.distinct
-                                && sel.having.is_none()
-                                && sel.order_by.is_empty()
-                                && sel.compound.is_empty()
+                            // The outer query over the materialized co-routine must
+                            // carry no compound and no expression-position subquery in
+                            // its projection / WHERE / HAVING (each would add or shift
+                            // a node). Beyond that, SQLite renders the access plus at
+                            // most ONE trailing temp-b-tree node, at the root level.
+                            let outer_base_ok = sel.compound.is_empty()
+                                && !window::has_window(sel)
                                 && !sel.columns.iter().any(|c| match c {
                                     ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
                                     ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => {
                                         false
                                     }
                                 })
-                                && !sel.where_clause.as_ref().is_some_and(expr_has_subquery);
-                            // The outer access over the materialized co-routine is
-                            // a `SCAN`, except a lone `min()`/`max()` aggregate seeks
-                            // one end and reads as `SEARCH {name}` (no index detail —
-                            // a co-routine has none). A `min(DISTINCT …)` argument
-                            // interposes a `USE TEMP B-TREE FOR min(DISTINCT)` node we
-                            // do not render, so that sub-case declines (keeps the
-                            // prior error; rows still match).
-                            let outer_minmax = coroutine_outer_minmax(sel);
-                            if is_recursive
-                                && rec_simple
-                                && outer_plain
-                                && outer_minmax != Some(true)
+                                && !sel.where_clause.as_ref().is_some_and(expr_has_subquery)
+                                && !sel.having.as_ref().is_some_and(expr_has_subquery);
+                            // The access keyword: a lone `min()`/`max()` aggregate
+                            // seeks one end and reads as `SEARCH` (the min/max
+                            // optimization, no index detail for a co-routine) — but
+                            // only without `GROUP BY`, which makes the extreme
+                            // per-group and keeps the `SCAN`. A `min(DISTINCT …)`
+                            // argument (interposing a `USE TEMP B-TREE FOR
+                            // min(DISTINCT)` node we do not render) declines.
+                            let minmax = coroutine_outer_minmax(sel);
+                            let has_group = !sel.group_by.is_empty();
+                            let has_having = sel.having.is_some();
+                            // The single trailing node, if any: an outer `GROUP BY`
+                            // (a co-routine is unordered, so it always sorts; a
+                            // `HAVING` rides along), a statement-level `DISTINCT`, or
+                            // an `ORDER BY` over a *non-aggregate* projection (a bare
+                            // aggregate is single-row, so SQLite elides the sort).
+                            // Any combination of these can fold or reorder the
+                            // sorter, so it declines. `None` outer_render = decline.
+                            let outer_render: Option<(&str, Option<&str>)> = if !outer_base_ok
+                                || minmax == Some(true)
                             {
-                                let co_id = *next_id;
-                                *next_id += 1;
-                                out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
-                                let setup_id = *next_id;
-                                *next_id += 1;
-                                out.push((setup_id, co_id, String::from("SETUP")));
-                                // The anchor names no CTE, so a normal recursion
-                                // renders its plan safely.
-                                self.eqp_select(&anchor, setup_id, next_id, out, params)?;
-                                let step_id = *next_id;
-                                *next_id += 1;
-                                out.push((step_id, co_id, String::from("RECURSIVE STEP")));
-                                let rec_scan = *next_id;
-                                *next_id += 1;
-                                out.push((rec_scan, step_id, alloc::format!("SCAN {name}")));
-                                let scan_id = *next_id;
-                                *next_id += 1;
-                                let outer_kw = if outer_minmax == Some(false) {
+                                None
+                            } else {
+                                let outer_kw = if !has_group && minmax == Some(false) {
                                     "SEARCH"
                                 } else {
                                     "SCAN"
                                 };
-                                out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
-                                return Ok(());
+                                match (has_group, sel.distinct, !sel.order_by.is_empty()) {
+                                    (false, false, false) if !has_having => Some((outer_kw, None)),
+                                    (true, false, false) => Some((outer_kw, Some("GROUP BY"))),
+                                    (false, true, false) if !has_having => {
+                                        Some((outer_kw, Some("DISTINCT")))
+                                    }
+                                    (false, false, true)
+                                        if !has_having && !self.has_aggregate(sel) =>
+                                    {
+                                        Some((outer_kw, Some("ORDER BY")))
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            if is_recursive && rec_simple {
+                                if let Some((outer_kw, trailing)) = outer_render {
+                                    let co_id = *next_id;
+                                    *next_id += 1;
+                                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                                    let setup_id = *next_id;
+                                    *next_id += 1;
+                                    out.push((setup_id, co_id, String::from("SETUP")));
+                                    // The anchor names no CTE, so a normal recursion
+                                    // renders its plan safely.
+                                    self.eqp_select(&anchor, setup_id, next_id, out, params)?;
+                                    let step_id = *next_id;
+                                    *next_id += 1;
+                                    out.push((step_id, co_id, String::from("RECURSIVE STEP")));
+                                    let rec_scan = *next_id;
+                                    *next_id += 1;
+                                    out.push((rec_scan, step_id, alloc::format!("SCAN {name}")));
+                                    let scan_id = *next_id;
+                                    *next_id += 1;
+                                    out.push((
+                                        scan_id,
+                                        parent,
+                                        alloc::format!("{outer_kw} {name}"),
+                                    ));
+                                    if let Some(lbl) = trailing {
+                                        let tid = *next_id;
+                                        *next_id += 1;
+                                        out.push((
+                                            tid,
+                                            parent,
+                                            alloc::format!("USE TEMP B-TREE FOR {lbl}"),
+                                        ));
+                                    }
+                                    return Ok(());
+                                }
                             }
                         }
                     }

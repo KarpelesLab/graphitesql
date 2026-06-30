@@ -481,8 +481,12 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   and reads as **`SEARCH c`** (no index detail — a co-routine has none); a second
   aggregate keeps the `SCAN`, and a `min(DISTINCT …)` (which interposes a
   `USE TEMP B-TREE FOR min(DISTINCT)` node) declines. `UNION` and `UNION ALL` are the
-  same plan. A join in the recursive arm (`FROM c, t` — a second scan child) and an
-  outer `ORDER BY`/`GROUP BY`/`DISTINCT` (each appends a temp-b-tree node) decline
+  same plan. A *single* outer `ORDER BY`, `GROUP BY`, or `DISTINCT` now also renders,
+  appending one root-level `USE TEMP B-TREE FOR ORDER BY`/`GROUP BY`/`DISTINCT` node
+  after the outer scan (the min/max `SEARCH` access applies independently, so
+  `DISTINCT max(n)` is `SEARCH c` plus the DISTINCT sorter). A join in the recursive
+  arm (`FROM c, t` — a second scan child), a *combination* of those outer clauses
+  (SQLite folds/reorders the temp-b-tree nodes), and `min(DISTINCT …)` decline
   cleanly, keeping the prior error rather than emitting a wrong plan; the executed
   rows always match (`tests/eqp_recursive_cte.rs`).
 - **Recursive-CTE base-anchor execution** — *executing* (not just `EXPLAIN`ing) a

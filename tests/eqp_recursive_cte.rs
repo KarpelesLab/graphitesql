@@ -19,11 +19,16 @@
 //! `VALUES(…)` body renders `SCAN CONSTANT ROW` and a `SELECT … FROM t` body renders
 //! `SCAN t`. `UNION` vs `UNION ALL` is the same plan.
 //!
+//! A single outer `ORDER BY`, `GROUP BY`, or `DISTINCT` appends one root-level
+//! `USE TEMP B-TREE FOR ORDER BY` / `GROUP BY` / `DISTINCT` node after the outer
+//! scan, and is rendered (the min/max `SEARCH` access still applies independently,
+//! so a `DISTINCT max(n)` is `SEARCH c` plus the DISTINCT sorter).
+//!
 //! Declined (graphite keeps its prior `Unsupported` error — never a wrong plan; the
 //! executed rows always match): a join in the recursive arm (`FROM c, t` — an extra
-//! scan child), an outer `ORDER BY` / `GROUP BY` / `DISTINCT` (each appends a temp
-//! b-tree node SQLite sequences after the outer scan), and any non-canonical arm
-//! split.
+//! scan child), a *combination* of outer ORDER BY / GROUP BY / DISTINCT (SQLite
+//! folds or reorders the temp-b-tree nodes), a `min(DISTINCT …)` (interposes its own
+//! `USE TEMP B-TREE FOR min(DISTINCT)` node), and any non-canonical arm split.
 
 #![cfg(feature = "std")]
 
@@ -229,15 +234,20 @@ fn recursive_cte_declines_unrenderable() {
     for q in [
         // A join in the recursive arm adds a second scan child under RECURSIVE STEP.
         "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c, t WHERE n<5) SELECT * FROM c",
-        // An outer ORDER BY appends a temp-b-tree node after the outer scan.
+        // A *combination* of grouping clauses can fold or reorder the single
+        // trailing sorter, so each combination declines (a lone ORDER BY / GROUP BY
+        // / DISTINCT renders — see `recursive_cte_renders_trailing_temp_btree`).
+        // GROUP BY + ORDER BY folds the ORDER BY into the grouping sorter.
         "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
-         SELECT * FROM c ORDER BY n DESC",
-        // An outer GROUP BY likewise.
+         SELECT n FROM c GROUP BY n ORDER BY n DESC",
+        // DISTINCT + ORDER BY likewise collapses to one node.
         "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
-         SELECT n FROM c GROUP BY n",
-        // An outer DISTINCT likewise.
+         SELECT DISTINCT n FROM c ORDER BY n",
+        // A bare `min()`/`max()` with an ORDER BY: SQLite elides the sort (single
+        // row) and reads `SEARCH c`, but our after-scan trailing logic only fires
+        // for a non-aggregate ORDER BY, so this declines rather than render.
         "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5) \
-         SELECT DISTINCT n FROM c",
+         SELECT max(n) FROM c ORDER BY 1",
         // A `min(DISTINCT …)` over the co-routine interposes a
         // `USE TEMP B-TREE FOR min(DISTINCT)` node before the `SEARCH c` that
         // graphite does not render, so it declines rather than emit a wrong plan.
@@ -254,4 +264,78 @@ fn recursive_cte_declines_unrenderable() {
         // The executed rows must still match regardless.
         assert_eq!(g_rows(D, q), sqlite_rows(D, q), "rows diverged for {q}");
     }
+}
+
+/// An outer `ORDER BY` / `GROUP BY` / `DISTINCT` over the co-routine appends a
+/// single `USE TEMP B-TREE FOR …` node at the root level (after the outer scan).
+/// The access keyword still follows the min/max optimization independently — a
+/// `DISTINCT max(n)` is `SEARCH c` plus the DISTINCT sorter.
+#[test]
+fn recursive_cte_renders_trailing_temp_btree() {
+    if !have_sqlite() {
+        return;
+    }
+    const BASE: &str =
+        "WITH RECURSIVE c(n,m) AS (SELECT 1,1 UNION ALL SELECT n+1,m*2 FROM c WHERE n<5) ";
+    let cases = [
+        // Outer ORDER BY over a non-aggregate projection → ORDER BY sorter.
+        (
+            "SELECT * FROM c ORDER BY n DESC",
+            "CO-ROUTINE c | SETUP | SCAN CONSTANT ROW | RECURSIVE STEP | SCAN c | SCAN c | \
+             USE TEMP B-TREE FOR ORDER BY",
+        ),
+        (
+            "SELECT n,m FROM c WHERE n>2 ORDER BY m",
+            "CO-ROUTINE c | SETUP | SCAN CONSTANT ROW | RECURSIVE STEP | SCAN c | SCAN c | \
+             USE TEMP B-TREE FOR ORDER BY",
+        ),
+        // Outer GROUP BY (HAVING rides along) → GROUP BY sorter; a per-group
+        // max() keeps the SCAN (the min/max seek does not apply with GROUP BY).
+        (
+            "SELECT n FROM c GROUP BY n",
+            "CO-ROUTINE c | SETUP | SCAN CONSTANT ROW | RECURSIVE STEP | SCAN c | SCAN c | \
+             USE TEMP B-TREE FOR GROUP BY",
+        ),
+        (
+            "SELECT count(*),n FROM c GROUP BY n HAVING count(*)>0",
+            "CO-ROUTINE c | SETUP | SCAN CONSTANT ROW | RECURSIVE STEP | SCAN c | SCAN c | \
+             USE TEMP B-TREE FOR GROUP BY",
+        ),
+        (
+            "SELECT max(n) FROM c GROUP BY m",
+            "CO-ROUTINE c | SETUP | SCAN CONSTANT ROW | RECURSIVE STEP | SCAN c | SCAN c | \
+             USE TEMP B-TREE FOR GROUP BY",
+        ),
+        // Statement-level DISTINCT → DISTINCT sorter (even over a single-row
+        // aggregate, SQLite still emits it).
+        (
+            "SELECT DISTINCT n FROM c",
+            "CO-ROUTINE c | SETUP | SCAN CONSTANT ROW | RECURSIVE STEP | SCAN c | SCAN c | \
+             USE TEMP B-TREE FOR DISTINCT",
+        ),
+        (
+            "SELECT DISTINCT count(*) FROM c",
+            "CO-ROUTINE c | SETUP | SCAN CONSTANT ROW | RECURSIVE STEP | SCAN c | SCAN c | \
+             USE TEMP B-TREE FOR DISTINCT",
+        ),
+        // DISTINCT over a lone max() keeps the min/max SEARCH access *and* adds the
+        // DISTINCT sorter — the two are independent.
+        (
+            "SELECT DISTINCT max(n) FROM c",
+            "CO-ROUTINE c | SETUP | SCAN CONSTANT ROW | RECURSIVE STEP | SCAN c | SEARCH c | \
+             USE TEMP B-TREE FOR DISTINCT",
+        ),
+    ];
+    for (tail, expected) in cases {
+        let q = alloc_concat(BASE, tail);
+        assert_eq!(g_eqp(D, &q), expected, "EQP mismatch for {q}");
+        assert_eq!(g_eqp(D, &q), sqlite_eqp(D, &q), "EQP vs sqlite for {q}");
+        assert_eq!(g_rows(D, &q), sqlite_rows(D, &q), "rows diverged for {q}");
+    }
+}
+
+fn alloc_concat(a: &str, b: &str) -> String {
+    let mut s = String::from(a);
+    s.push_str(b);
+    s
 }
