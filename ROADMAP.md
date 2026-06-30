@@ -204,8 +204,17 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   compound query — `SELECT … UNION/UNION ALL/INTERSECT/EXCEPT …` — renders the
   `COMPOUND QUERY` / `LEFT-MOST SUBQUERY` / per-arm-operator tree byte-exactly
   (3+ arms, per-arm WHERE seeks, a shared `WITH`, and a bare `LIMIT`/`OFFSET` all
-  carry through), while a trailing `ORDER BY` on the compound — SQLite's separate
-  `MERGE` plan — declines cleanly; a top-level multi-row `VALUES (…),(…),…` clause —
+  carry through); a trailing `ORDER BY` on the compound switches SQLite to its
+  separate `MERGE (<OP>)` plan, which graphite now renders for plain positional
+  terms (default null-ordering) that cover *all* output columns — each arm is
+  recursed with the `ORDER BY` pushed in and the arms combine left-associatively
+  under nested `MERGE` nodes (`LEFT` = accumulated head, `RIGHT` = next arm; every
+  operator including `UNION ALL` uses `MERGE` once an `ORDER BY` is present, a
+  whole-compound `LIMIT`/`OFFSET` and a per-arm `WHERE` `SEARCH` carry through);
+  a partial-cover `ORDER BY` (the merge appends a per-arm `USE TEMP B-TREE FOR LAST
+  TERM OF ORDER BY` for the uncovered columns), an explicit `COLLATE` (SQLite falls
+  to a CO-ROUTINE+materialize shape), an explicit `NULLS FIRST`/`LAST`, a named
+  term, and a `*` projection all decline cleanly; a top-level multi-row `VALUES (…),(…),…` clause —
   which graphite desugars to `UNION ALL` arms — folds into the single
   `SCAN N-ROW VALUES CLAUSE` node SQLite renders (a one-row `VALUES` stays
   `SCAN CONSTANT ROW`), and when such a clause is the left-most arm of, or an operand

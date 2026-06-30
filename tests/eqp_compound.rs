@@ -5,8 +5,10 @@
 //! B-TREE`, `EXCEPT USING TEMP B-TREE` — each parenting that arm's plan. graphite
 //! previously ignored the compound tail entirely and rendered only the first
 //! arm's `SCAN`. A trailing `ORDER BY` on the whole compound switches SQLite to a
-//! different `MERGE` plan we don't model, so it declines cleanly; a bare
-//! `LIMIT`/`OFFSET` keeps the plain tree.
+//! different `MERGE` plan — rendered for plain positional terms that cover all
+//! output columns (see `tests/eqp_merge_compound.rs`); a partial cover, an
+//! explicit `COLLATE`, a named term, or a `*` projection still decline here. A
+//! bare `LIMIT`/`OFFSET` (no `ORDER BY`) keeps the plain `COMPOUND QUERY` tree.
 //!
 //! A multi-row `VALUES (…),(…),…` clause desugars internally to `UNION ALL` arms,
 //! but SQLite folds them into a single `SCAN N-ROW VALUES CLAUSE` node (a one-row
@@ -120,13 +122,20 @@ fn values_clause_with_subquery_declines() {
 }
 
 #[test]
-fn order_by_on_a_compound_declines() {
-    // A trailing ORDER BY makes sqlite emit a `MERGE (UNION)` / `LEFT` / `RIGHT`
-    // tree that graphite doesn't model — it must decline cleanly, not mis-render.
+fn order_by_on_a_compound_partial_or_fragile_declines() {
+    // A trailing ORDER BY makes sqlite emit a `MERGE (<OP>)` tree. graphite renders
+    // it for plain positional terms covering all output columns (see
+    // `tests/eqp_merge_compound.rs`); the shapes below still decline cleanly rather
+    // than mis-render — a `*` projection (output column count unresolved), a partial
+    // cover (the merge appends a per-arm temp-b-tree), an explicit `COLLATE` (sqlite
+    // uses a CO-ROUTINE+materialize plan), and a named term (needs per-arm position
+    // translation).
     let g = env!("CARGO_BIN_EXE_graphitesql");
     for q in [
         "SELECT * FROM t UNION SELECT * FROM u ORDER BY 1",
-        "SELECT a FROM t EXCEPT SELECT x FROM u ORDER BY 1",
+        "SELECT a, b FROM t EXCEPT SELECT x, y FROM u ORDER BY 1",
+        "SELECT a FROM t UNION SELECT x FROM u ORDER BY 1 COLLATE NOCASE",
+        "SELECT a FROM t UNION SELECT x FROM u ORDER BY a",
     ] {
         let sql = format!("{BASE} EXPLAIN QUERY PLAN {q}");
         let got = run(g, &sql);

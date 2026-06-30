@@ -12896,6 +12896,48 @@ impl Connection {
         }
     }
 
+    /// Render the `MERGE (<OP>)` tree for a top-level compound carrying a trailing
+    /// `ORDER BY` (see the caller in [`Self::eqp_select`]). `arms[0..=hi]` are the
+    /// compound arms (already cloned with the `ORDER BY` pushed in and their own
+    /// compound tail / `LIMIT` cleared); `ops[i]` is the operator joining the
+    /// accumulated head `arms[0..=i]` with `arms[i+1]`. The combination is
+    /// left-associative: the outermost `MERGE` uses `ops[hi-1]`, its `LEFT` child is
+    /// the recursively built head over `arms[0..=hi-1]` and its `RIGHT` child is
+    /// `arms[hi]`. Node ids are allocated head-first so the depth-first, id-sorted
+    /// render order matches SQLite's.
+    #[allow(clippy::too_many_arguments)]
+    fn eqp_merge_build(
+        &self,
+        arms: &[Select],
+        ops: &[CompoundOp],
+        hi: usize,
+        parent: i64,
+        next_id: &mut i64,
+        out: &mut Vec<(i64, i64, String)>,
+        params: &Params,
+    ) -> Result<()> {
+        if hi == 0 {
+            return self.eqp_select(&arms[0], parent, next_id, out, params);
+        }
+        let detail = match ops[hi - 1] {
+            CompoundOp::Union => "MERGE (UNION)",
+            CompoundOp::UnionAll => "MERGE (UNION ALL)",
+            CompoundOp::Intersect => "MERGE (INTERSECT)",
+            CompoundOp::Except => "MERGE (EXCEPT)",
+        };
+        let merge_id = *next_id;
+        *next_id += 1;
+        out.push((merge_id, parent, String::from(detail)));
+        let left_id = *next_id;
+        *next_id += 1;
+        out.push((left_id, merge_id, String::from("LEFT")));
+        self.eqp_merge_build(arms, ops, hi - 1, left_id, next_id, out, params)?;
+        let right_id = *next_id;
+        *next_id += 1;
+        out.push((right_id, merge_id, String::from("RIGHT")));
+        self.eqp_select(&arms[hi], right_id, next_id, out, params)
+    }
+
     fn eqp_select(
         &self,
         sel: &Select,
@@ -12965,6 +13007,78 @@ impl Connection {
         // plain tree, so it is allowed).
         if !real_compound.is_empty() {
             if !sel.order_by.is_empty() {
+                // A trailing `ORDER BY` on the whole compound switches SQLite to a
+                // `MERGE (<OP>)` plan: each arm is rendered with the `ORDER BY`
+                // pushed in (so it can stream pre-sorted) and the arms are combined
+                // left-associatively under nested `MERGE` nodes whose `LEFT` child is
+                // the accumulated head and `RIGHT` child is the next arm. We render
+                // this only for plain positional terms with default null-ordering: a
+                // named term needs per-arm position translation, an explicit
+                // `COLLATE` takes SQLite to a different CO-ROUTINE+materialize shape,
+                // and an explicit `NULLS FIRST`/`LAST` diverges from our per-arm sort
+                // choice — those decline. A leading or interspersed `VALUES` arm
+                // (folded to a `SCAN N-ROW VALUES CLAUSE`) also declines.
+                //
+                // Additionally, the merge sorts each arm by the *whole* output row
+                // (a set operation must compare full rows), so when the `ORDER BY`
+                // covers only a prefix of the output columns SQLite appends a per-arm
+                // `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` for the rest. We only
+                // render when the positional terms cover *all* output columns (so the
+                // recursed per-arm plan needs no extra sort term); a partial cover
+                // declines. That needs a known column count, so a `*`/`t.*`
+                // projection (count unresolved here) declines too.
+                let ncols =
+                    if sel.columns.iter().any(|c| {
+                        matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_))
+                    }) {
+                        0
+                    } else {
+                        sel.columns.len()
+                    };
+                let mut covered = alloc::vec![false; ncols];
+                let positional = ncols >= 1
+                    && sel.order_by.iter().all(|t| {
+                        t.nulls_first.is_none()
+                            && match t.expr {
+                                Expr::Literal(Literal::Integer(n)) if n >= 1 => {
+                                    let i = n as usize;
+                                    if i <= ncols {
+                                        covered[i - 1] = true;
+                                    }
+                                    i <= ncols
+                                }
+                                _ => false,
+                            }
+                    })
+                    && covered.iter().all(|&c| c);
+                let no_values = sel.values_rows == 0
+                    && real_compound.iter().all(|(_, arm)| arm.values_rows == 0);
+                if positional && no_values {
+                    // The head arm is `sel` without its compound tail / whole-compound
+                    // `LIMIT`/`OFFSET`; it keeps `sel.order_by`. Each continuation arm
+                    // inherits the same `ORDER BY` and the shared `WITH` clause.
+                    let mut arms: Vec<Select> = Vec::with_capacity(real_compound.len() + 1);
+                    let mut first = sel.clone();
+                    first.compound = Vec::new();
+                    first.limit = None;
+                    first.offset = None;
+                    arms.push(first);
+                    let mut ops: Vec<CompoundOp> = Vec::with_capacity(real_compound.len());
+                    for (op, arm) in real_compound {
+                        ops.push(*op);
+                        let mut arm = arm.clone();
+                        if arm.ctes.is_empty() {
+                            arm.ctes = sel.ctes.clone();
+                        }
+                        arm.compound = Vec::new();
+                        arm.order_by = sel.order_by.clone();
+                        arm.limit = None;
+                        arm.offset = None;
+                        arms.push(arm);
+                    }
+                    let hi = arms.len() - 1;
+                    return self.eqp_merge_build(&arms, &ops, hi, parent, next_id, out, params);
+                }
                 return Err(Error::Unsupported(
                     "EXPLAIN QUERY PLAN for this query shape",
                 ));
