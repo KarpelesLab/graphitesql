@@ -12996,6 +12996,85 @@ impl Connection {
         if from.joins.is_empty() {
             if let Some((sub, co_label)) = derived {
                 let from_cte = from.first.subquery.is_none();
+                // A *recursive* CTE — a self-referential compound body — can't
+                // flatten. SQLite renders it as a `CO-ROUTINE <name>` whose two
+                // children are `SETUP` (the non-recursive anchor's plan) and
+                // `RECURSIVE STEP` (the recursive arm's plan, in which the
+                // self-reference reads as a plain `SCAN <name>` of the
+                // materialized table), followed by the outer `SCAN <name>`. We
+                // render the canonical two-arm shape — one anchor arm that does
+                // not name the CTE, one recursive arm whose `FROM` is a bare
+                // reference to it — when the outer query adds no further nodes.
+                if from_cte {
+                    if let Some(name) = co_label {
+                        if sub.compound.len() == 1
+                            && sub.order_by.is_empty()
+                            && sub.limit.is_none()
+                            && sub.offset.is_none()
+                        {
+                            let rec_arm = &sub.compound[0].1;
+                            let mut anchor = sub.clone();
+                            anchor.compound.clear();
+                            let is_recursive = !references_name_select(&anchor, name)
+                                && references_name_select(rec_arm, name);
+                            // The recursive arm's only source is the bare CTE
+                            // reference (no join, no alias, no subquery), and
+                            // neither it nor the outer query carries an
+                            // expression-position subquery that would add nodes.
+                            let rec_simple = rec_arm.from.as_ref().is_some_and(|f| {
+                                f.joins.is_empty()
+                                    && f.first.name.eq_ignore_ascii_case(name)
+                                    && f.first.subquery.is_none()
+                                    && f.first.tvf_args.is_none()
+                                    && f.first.alias.is_none()
+                            }) && !rec_arm.columns.iter().any(|c| match c {
+                                ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                                ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                            }) && !rec_arm
+                                .where_clause
+                                .as_ref()
+                                .is_some_and(expr_has_subquery);
+                            // The outer query is a single bare reference to the
+                            // CTE with no grouping / DISTINCT / ORDER BY / compound
+                            // / subquery clause (each would add a plan node SQLite
+                            // sequences differently for a co-routine source). An
+                            // outer `WHERE` and a bare aggregate add no node.
+                            let outer_plain = sel.group_by.is_empty()
+                                && !sel.distinct
+                                && sel.having.is_none()
+                                && sel.order_by.is_empty()
+                                && sel.compound.is_empty()
+                                && !sel.columns.iter().any(|c| match c {
+                                    ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                                    ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => {
+                                        false
+                                    }
+                                })
+                                && !sel.where_clause.as_ref().is_some_and(expr_has_subquery);
+                            if is_recursive && rec_simple && outer_plain {
+                                let co_id = *next_id;
+                                *next_id += 1;
+                                out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                                let setup_id = *next_id;
+                                *next_id += 1;
+                                out.push((setup_id, co_id, String::from("SETUP")));
+                                // The anchor names no CTE, so a normal recursion
+                                // renders its plan safely.
+                                self.eqp_select(&anchor, setup_id, next_id, out, params)?;
+                                let step_id = *next_id;
+                                *next_id += 1;
+                                out.push((step_id, co_id, String::from("RECURSIVE STEP")));
+                                let rec_scan = *next_id;
+                                *next_id += 1;
+                                out.push((rec_scan, step_id, alloc::format!("SCAN {name}")));
+                                let scan_id = *next_id;
+                                *next_id += 1;
+                                out.push((scan_id, parent, alloc::format!("SCAN {name}")));
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 let body_is_const_row = sub.from.is_none()
                     && sub.compound.is_empty()
                     && !select_no_from_has_subquery(sub);

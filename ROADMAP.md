@@ -466,6 +466,22 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   along. `DISTINCT` (separate distinct sorter), a `HAVING`/`ORDER BY` subquery (which
   reorders or renumbers the nodes), and a correlated/compound/join body all decline,
   unchanged from before (`tests/eqp_grouped_projection_scalar_subquery.rs`).
+- **EQP recursive CTE** — a `WITH RECURSIVE c(…) AS (<anchor> UNION[ ALL]
+  <recursive>) SELECT … FROM c` source now renders SQLite's `CO-ROUTINE c` subtree
+  byte-exactly: a `SETUP` child holding the non-recursive anchor arm's plan (recursed
+  normally — `SELECT <consts>`/`VALUES(…)` → `SCAN CONSTANT ROW`, `SELECT … FROM t` →
+  `SCAN t`), a `RECURSIVE STEP` child whose self-reference reads as a plain `SCAN c`
+  of the materialized table, then the outer `SCAN c`. Previously any such query
+  errored `EXPLAIN QUERY PLAN for this query shape`. `eqp_select` detects the
+  canonical two-arm split with the executor's own `references_name_select` (one
+  anchor arm that does not name the CTE, one recursive arm whose `FROM` is a bare
+  reference to it) and renders it when the outer query adds no further node (an outer
+  `WHERE` and a bare aggregate add none — a co-routine source is always a `SCAN`,
+  never a `SEARCH`). `UNION` and `UNION ALL` are the same plan. A join in the
+  recursive arm (`FROM c, t` — a second scan child) and an outer
+  `ORDER BY`/`GROUP BY`/`DISTINCT` (each appends a temp-b-tree node) decline cleanly,
+  keeping the prior error rather than emitting a wrong plan; the executed rows always
+  match (`tests/eqp_recursive_cte.rs`).
 - **EQP min/max optimization** — a query whose only aggregate is a single
   `min(X)`/`max(X)` (no `GROUP BY`/`HAVING`/`WHERE`/statement-level `DISTINCT`, no
   second aggregate; the call may be scalar-wrapped like `abs(min(a))`/`max(a)+1`)
