@@ -482,6 +482,18 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   `ORDER BY`/`GROUP BY`/`DISTINCT` (each appends a temp-b-tree node) decline cleanly,
   keeping the prior error rather than emitting a wrong plan; the executed rows always
   match (`tests/eqp_recursive_cte.rs`).
+- **Recursive-CTE base-anchor execution** — *executing* (not just `EXPLAIN`ing) a
+  recursive CTE whose body carried a base-table source — a base-table anchor
+  (`SELECT a FROM t UNION ALL …`), a single-row aggregate/filtered anchor, or a
+  base-table join in the recursive arm — used to crash with a stack overflow before
+  producing any row; the textbook `SELECT <const>` anchor sidestepped it, so the bug
+  lurked. Column-origin resolution was the fault: `named_source_origins_in` resolved a
+  `FROM c` reference by descending into the CTE body with `c` *still in scope*, so the
+  body's own self-reference re-entered the same path without end. A recursive body's
+  origins are conservatively `None` anyway, so the fix stops at a self-naming CTE
+  (returns `None`) and otherwise resolves the body with that CTE dropped from scope —
+  terminating while keeping sibling references resolvable. These cases now run and
+  match `sqlite3` 3.50.4 row-for-row (`tests/recursive_cte_base_anchor.rs`).
 - **EQP min/max optimization** — a query whose only aggregate is a single
   `min(X)`/`max(X)` (no `GROUP BY`/`HAVING`/`WHERE`/statement-level `DISTINCT`, no
   second aggregate; the call may be scalar-wrapped like `abs(min(a))`/`max(a)+1`)

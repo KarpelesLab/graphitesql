@@ -20807,7 +20807,22 @@ impl Connection {
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(&tref.name))
             {
-                let origins = self.subquery_column_origins_in(&c.select, ctes)?;
+                // A *recursive* CTE names itself in its own body; descending into
+                // it with `c` still in scope would recurse without end. Its column
+                // origins are conservative anyway (the documented `None` for a
+                // recursive body), so stop here. Otherwise resolve through the body
+                // with `c` removed from scope — a non-recursive CTE never names
+                // itself, and dropping it keeps sibling references resolvable while
+                // guaranteeing termination.
+                if references_name(&c.select, &c.name) {
+                    return None;
+                }
+                let inner: Vec<Cte> = ctes
+                    .iter()
+                    .filter(|x| !x.name.eq_ignore_ascii_case(&c.name))
+                    .cloned()
+                    .collect();
+                let origins = self.subquery_column_origins_in(&c.select, &inner)?;
                 let names: Vec<String> = if c.columns.is_empty() {
                     self.resolved_view_columns(&c.select)?
                         .into_iter()
