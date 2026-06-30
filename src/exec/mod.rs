@@ -13398,9 +13398,64 @@ impl Connection {
                 if outer_is_pure_wildcard && inner_is_base_table_scan {
                     return self.eqp_select(sub, parent, next_id, out, params);
                 }
+                // A *compound* CTE/derived body that carries at least one dedup set
+                // operator (`UNION` / `INTERSECT` / `EXCEPT`) cannot flatten into the
+                // outer plan: SQLite materializes it as a `CO-ROUTINE <name>` whose
+                // single child is the body's `COMPOUND QUERY` plan (recursed
+                // normally — `LEFT-MOST SUBQUERY` plus one operator node per arm,
+                // including any interspersed `UNION ALL`), followed by the outer
+                // query's `{SCAN|SEARCH} <name>` plus at most one trailing temp-b-tree
+                // node. We render this only when:
+                //  - the label is deterministic (a derived table's alias or the CTE
+                //    name — an unaliased derived table gets the codegen-fragile
+                //    `(subquery-N)` numbering, so it has none and declines);
+                //  - some arm is a dedup operator. A body whose every operator is
+                //    `UNION ALL` streams without a dedup b-tree and *flattens* to a
+                //    bare `COMPOUND QUERY` (no co-routine) — a codegen-fragile shape we
+                //    don't model — so it declines;
+                //  - the body has no `ORDER BY` (which would switch it to the
+                //    `MERGE (…)` plan the recursion declines anyway) and the outer
+                //    query adds no `WHERE` (a predicate pushes into the arms,
+                //    re-deriving their scans) beyond the nodes
+                //    `eqp_materialized_outer_render` accounts for.
+                if let Some(name) = co_label {
+                    let body_arm = sub.values_rows.saturating_sub(1).min(sub.compound.len());
+                    let real = &sub.compound[body_arm..];
+                    let any_dedup = real.iter().any(|(op, _)| {
+                        matches!(
+                            op,
+                            CompoundOp::Union | CompoundOp::Intersect | CompoundOp::Except
+                        )
+                    });
+                    if any_dedup && sub.order_by.is_empty() && sel.where_clause.is_none() {
+                        if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
+                        {
+                            let co_id = *next_id;
+                            *next_id += 1;
+                            out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                            // The body's `COMPOUND QUERY` subtree renders as the
+                            // co-routine node's child via the normal compound path.
+                            self.eqp_select(sub, co_id, next_id, out, params)?;
+                            let scan_id = *next_id;
+                            *next_id += 1;
+                            out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                            if let Some(lbl) = trailing {
+                                let tid = *next_id;
+                                *next_id += 1;
+                                out.push((
+                                    tid,
+                                    parent,
+                                    alloc::format!("USE TEMP B-TREE FOR {lbl}"),
+                                ));
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
                 // Any other shape (a narrowing/clause-bearing outer, a table-bearing
-                // body we can't prove flattenable, a compound body, or an outer query
-                // that emits extra nodes) is not one we render byte-exactly.
+                // body we can't prove flattenable, a `UNION ALL`-only compound body, or
+                // an outer query that emits extra nodes) is not one we render
+                // byte-exactly.
                 return Err(Error::Unsupported(
                     "EXPLAIN QUERY PLAN for this query shape",
                 ));

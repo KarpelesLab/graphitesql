@@ -225,7 +225,17 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   from the FROM-source's `SCAN N-ROW VALUES CLAUSE`) followed by the outer
   `SCAN c`/`SEARCH c` plus one optional trailing temp-b-tree (a single-row body is the
   singular `SCAN CONSTANT ROW`; a subquery-bearing row, a join across CTEs, and a
-  combination of outer clauses decline); an aggregate
+  combination of outer clauses decline); a *compound* body carrying at least one dedup
+  set operator — `SELECT * FROM (SELECT … UNION/INTERSECT/EXCEPT …) s` and
+  `WITH c AS (SELECT … UNION …) SELECT * FROM c` — likewise can't flatten, so it
+  materializes as `CO-ROUTINE {s|c}` whose single child is the body's `COMPOUND QUERY`
+  subtree (recursed normally — `LEFT-MOST SUBQUERY` plus one operator node per arm,
+  including any interspersed `UNION ALL`) followed by the outer `SCAN`/`SEARCH` plus one
+  optional trailing temp-b-tree (with `count(*)` keeping the `SCAN` and a lone `min`/`max`
+  switching to `SEARCH`); an unaliased derived table (SQLite numbers it `(subquery-N)`),
+  a `UNION ALL`-only body (it streams without a dedup b-tree and flattens to a bare
+  `COMPOUND QUERY`), and an outer `WHERE` (the predicate pushes into the arms,
+  re-deriving their scans) each decline cleanly; an aggregate
   `GROUP BY a ORDER BY a` answered by
   a covering index on `a` emits a bare `SCAN … USING COVERING INDEX` with **no**
   temp-btree node — the group-by access already yields the ORDER BY term in order, so
