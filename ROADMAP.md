@@ -473,6 +473,16 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   SCANned. The fix is one arm in the shared `collect_eq_constraints` (a NULL operand
   is excluded, staying the `col IS NULL` NULL-key seek), so the executor seek and the
   `eqp_access` label move in lockstep; `col IS NOT <const>` (a `!=`) stays a scan.
+  The `NOT INDEXED` planner hint is now honored in the *plan* (the executor already
+  honored it, so rows were always correct): SQLite forbids every *secondary* index on
+  that table, so a `WHERE` seek, covering scan, ORDER-BY index walk, and MULTI-INDEX OR
+  all collapse to a plain `SCAN`, the ORDER BY / GROUP BY / DISTINCT sorters re-appear,
+  and a lone `min`/`max` reads `SEARCH t` — while the rowid / INTEGER PRIMARY KEY seek
+  (the table's own clustered key) survives. EQP renders this for `SELECT`/`UPDATE`/
+  `DELETE` via `eqp_access_hinted` (collapses a secondary-index result to `SCAN`) plus
+  `order_index_scan` / `group_distinct_btree` honoring the hint; a WITHOUT ROWID table
+  is left to the ordinary path (SQLite still serves its clustered / covering-secondary
+  seek under the hint).
   A `WHERE` seek that pins a column to a *single value* now lets graphite elide a
   matching `ORDER BY` (no `USE TEMP B-TREE FOR ORDER BY`), as sqlite does, in two
   more cases feeding `order_satisfied_by_scan`. (1) A bare `rowid` / INTEGER

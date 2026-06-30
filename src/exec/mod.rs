@@ -12475,13 +12475,14 @@ impl Connection {
             }
             Statement::Delete(d) => {
                 let meta = self.table_meta(&d.table, None)?;
-                let detail = self.eqp_access(
+                let detail = self.eqp_access_hinted(
                     &d.table,
                     &d.table,
                     &meta,
                     d.where_clause.as_ref(),
                     None,
                     params,
+                    d.index_hint.as_ref(),
                 )?;
                 let access_id = next_id;
                 next_id += 1;
@@ -12509,13 +12510,14 @@ impl Connection {
             }
             Statement::Update(u) => {
                 let meta = self.table_meta(&u.table, None)?;
-                let detail = self.eqp_access(
+                let detail = self.eqp_access_hinted(
                     &u.table,
                     &u.table,
                     &meta,
                     u.where_clause.as_ref(),
                     None,
                     params,
+                    u.index_hint.as_ref(),
                 )?;
                 let access_id = next_id;
                 next_id += 1;
@@ -14030,6 +14032,20 @@ impl Connection {
         }
         // First source.
         let meta = self.table_meta(&from.first.name, from.first.alias.as_deref())?;
+        // `NOT INDEXED` forbids every index on this table, so SQLite plans a plain
+        // full `SCAN` (a lone `min`/`max` still reads one end and reads `SEARCH t`)
+        // with no index walk — a `WHERE` seek, covering scan, ORDER-BY index walk, and
+        // MULTI-INDEX OR all collapse to that scan, and the ORDER BY / GROUP BY /
+        // DISTINCT sorters re-appear. The executor already honors the hint (rows are
+        // unchanged); this brings the plan into lockstep. Only the no-join single-table
+        // case carries the hint here.
+        // A WITHOUT ROWID table is excluded: SQLite still serves its clustered-PK and
+        // even a covering secondary-index seek under the hint, which the ordinary
+        // `eqp_access` path already renders in lockstep — so only plain rowid tables
+        // take the collapse-to-SCAN handling here.
+        let hint_not_indexed = from.joins.is_empty()
+            && !meta.without_rowid
+            && matches!(from.first.index_hint, Some(IndexHint::NotIndexed));
         // A top-level OR of seekable disjuncts is a MULTI-INDEX OR plan (multiple
         // rows); otherwise a single SCAN/SEARCH node.
         // The single-table scan-line text, captured so the GROUP BY / DISTINCT
@@ -14037,6 +14053,7 @@ impl Connection {
         // case (no covering index, no seek to surprise the access order).
         let mut single_scan_detail: Option<String> = None;
         if from.joins.is_empty()
+            && !hint_not_indexed
             && self.eqp_or_plan(
                 &label,
                 &from.first.name,
@@ -14050,7 +14067,33 @@ impl Connection {
         {
             // rows already emitted
         } else {
-            let detail = if from.joins.is_empty() {
+            let detail = if hint_not_indexed {
+                // `NOT INDEXED`: no *secondary* index may be used, but the rowid /
+                // INTEGER PRIMARY KEY / WITHOUT ROWID PK seeks (the table's own
+                // clustered key) survive, and a lone `min`/`max` still reads one end
+                // (`SEARCH t`, no index detail). `eqp_access(not_indexed=true)` renders
+                // exactly those — every secondary-index seek collapses to a plain SCAN.
+                let lone_minmax = sel.where_clause.is_none()
+                    && sel.group_by.is_empty()
+                    && sel.having.is_none()
+                    && !sel.distinct
+                    && self.single_minmax_shape(sel, &meta).is_some();
+                if lone_minmax {
+                    alloc::format!("SEARCH {label}")
+                } else {
+                    // A rowid / IPK seek survives the hint; a secondary-index seek
+                    // collapses to a plain `SCAN`.
+                    self.eqp_access_hinted(
+                        &label,
+                        &from.first.name,
+                        &meta,
+                        sel.where_clause.as_ref(),
+                        Some(sel),
+                        params,
+                        from.first.index_hint.as_ref(),
+                    )?
+                }
+            } else if from.joins.is_empty() {
                 // A single `min(col)`/`max(col)` aggregate (no GROUP BY/HAVING/WHERE,
                 // no other aggregate) is the min/max optimization: sqlite seeks one
                 // end of an ordered scan and labels the access `SEARCH`. Checked
@@ -14283,7 +14326,8 @@ impl Connection {
         if single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str())
             && !self.distinct_is_noop(sel, &meta, &label)
         {
-            if let Some((kind, suppress)) = self.group_distinct_btree(sel, &meta, &from.first.name)
+            if let Some((kind, suppress)) =
+                self.group_distinct_btree(sel, &meta, &from.first.name, hint_not_indexed)
             {
                 let id = *next_id;
                 *next_id += 1;
@@ -14437,6 +14481,34 @@ impl Connection {
             out.push((search_id, idx_id, detail));
         }
         Ok(true)
+    }
+
+    /// [`eqp_access`](Self::eqp_access), then collapse a *secondary*-index seek to a
+    /// plain `SCAN` when the table carries a `NOT INDEXED` hint — the hint forbids
+    /// every secondary index (including an implicit `sqlite_autoindex_…` for a
+    /// non-integer PK / UNIQUE), but the rowid / INTEGER PRIMARY KEY seek (the table's
+    /// own clustered key) survives. A WITHOUT ROWID table is left untouched: SQLite
+    /// still serves its clustered-PK and even a covering secondary seek under the hint,
+    /// which the plain `eqp_access` render already matches.
+    #[allow(clippy::too_many_arguments)]
+    fn eqp_access_hinted(
+        &self,
+        label: &str,
+        table: &str,
+        meta: &TableMeta,
+        where_clause: Option<&Expr>,
+        sel: Option<&Select>,
+        params: &Params,
+        hint: Option<&IndexHint>,
+    ) -> Result<String> {
+        let acc = self.eqp_access(label, table, meta, where_clause, sel, params)?;
+        if !meta.without_rowid
+            && matches!(hint, Some(IndexHint::NotIndexed))
+            && (acc.contains("USING INDEX") || acc.contains("USING COVERING INDEX"))
+        {
+            return Ok(alloc::format!("SCAN {label}"));
+        }
+        Ok(acc)
     }
 
     /// The SCAN/SEARCH detail string for accessing one table given its WHERE.
@@ -16480,6 +16552,11 @@ impl Connection {
         if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
             return None;
         }
+        // `NOT INDEXED` forbids walking any index to satisfy the ORDER BY, so SQLite
+        // sorts (a temp b-tree) — never an index scan.
+        if matches!(t.index_hint, Some(IndexHint::NotIndexed)) {
+            return None;
+        }
         if sel.where_clause.is_some()
             || !sel.group_by.is_empty()
             || sel.having.is_some()
@@ -16866,6 +16943,7 @@ impl Connection {
         sel: &Select,
         meta: &TableMeta,
         tname: &str,
+        not_indexed: bool,
     ) -> Option<(&'static str, bool)> {
         if !sel.compound.is_empty() || meta.without_rowid {
             return None;
@@ -16921,14 +16999,18 @@ impl Connection {
         // A secondary index leading with the first key column makes sqlite walk it
         // (`SCAN t USING INDEX it`) rather than plain-scan — a scan-line shape
         // graphite does not emit for grouping. Decline so the plan never desyncs.
+        // Under `NOT INDEXED` no index may be walked, so sqlite always materializes the
+        // grouping b-tree — skip this bail.
         let first = key_cols[0];
-        if let Ok(indexes) = self.indexes_of(tname) {
-            for idx in indexes {
-                if idx.partial.is_none()
-                    && idx.key_exprs.is_none()
-                    && idx.cols.first() == Some(&first)
-                {
-                    return None;
+        if !not_indexed {
+            if let Ok(indexes) = self.indexes_of(tname) {
+                for idx in indexes {
+                    if idx.partial.is_none()
+                        && idx.key_exprs.is_none()
+                        && idx.cols.first() == Some(&first)
+                    {
+                        return None;
+                    }
                 }
             }
         }
