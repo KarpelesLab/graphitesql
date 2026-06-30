@@ -424,27 +424,34 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   — `covering_scan` declines rather than guess sqlite's cost-model choice. Both need
   separate EQP-side work and arise only from degenerate schemas.)
 - **EQP min/max optimization** — a query whose only aggregate is a single
-  `min(col)`/`max(col)` (no `GROUP BY`/`HAVING`/`WHERE`/`DISTINCT`, no second
-  aggregate, no other referenced column; the call may be scalar-wrapped like
-  `abs(min(a))`/`max(a)+1` or `min(DISTINCT a)`) reads one end of an ordered scan,
-  so SQLite renders the access as **`SEARCH`** rather than `SCAN` —
-  `SEARCH t USING COVERING INDEX ia` with a covering index on the column, a bare
-  `SEARCH t` over an unindexed (sole-referenced) column. graphite previously
-  labelled both `SCAN` (it still *executes* the aggregate over an ordinary covering
-  scan — one output row, so only the label differed and the value already matched).
-  `eqp_select` now recognises the shape via `minmax_search_detail` /
-  `is_single_minmax_column` and emits `SEARCH`, sharing `covering_scan`'s index
-  choice for the `USING COVERING INDEX` clause. A **`WITHOUT ROWID`** table is its
-  own clustered primary-key b-tree, so the same min/max reads
-  `SEARCH t USING PRIMARY KEY` — unless a secondary index covers the aggregated
-  column, in which case it prefers `… USING COVERING INDEX <name>`
-  (`minmax_covering_index`, which mirrors `covering_scan`'s index filter but works
-  regardless of rowid-ness). Byte-exact vs sqlite3 3.50.4
+  `min(X)`/`max(X)` (no `GROUP BY`/`HAVING`/`WHERE`/statement-level `DISTINCT`, no
+  second aggregate; the call may be scalar-wrapped like `abs(min(a))`/`max(a)+1`)
+  reads one end of an ordered scan, so SQLite renders the access as **`SEARCH`**
+  rather than `SCAN`. graphite previously labelled it `SCAN` (it still *executes*
+  the aggregate over an ordinary covering scan — one output row, so only the label
+  differed and the value already matched). `eqp_select` now recognises the shape via
+  `minmax_search_detail` / `single_minmax_shape` and emits the right `SEARCH` clause:
+  - a full index covering *every* referenced column → `SEARCH t USING COVERING
+    INDEX <name>` (the argument may be a bare column, an expression `min(a+1)`, or a
+    constant `min(1)`);
+  - else a bare column beside the aggregate (`min(a), b`) seeks the sole index that
+    *leads* with the aggregated column and reads the rest from the table by rowid →
+    `SEARCH t USING INDEX <name>` (non-covering);
+  - else a bare `SEARCH t`.
+  A **`WITHOUT ROWID`** table is its own clustered primary-key b-tree (it carries
+  every column), so a non-covering seek reads `SEARCH t USING PRIMARY KEY` — unless a
+  secondary index covers the aggregated column, preferred as `… USING COVERING
+  INDEX <name>`. For **`min(DISTINCT col)`** SQLite materializes the distinct values
+  in a `USE TEMP B-TREE FOR min(DISTINCT)` node *except* when the call is the sole
+  reference and its column **leads** the seek b-tree (a secondary index beginning
+  with it, or the first PRIMARY KEY column of a `WITHOUT ROWID` table) — then the
+  node is elided and graphite renders the bare covering/PRIMARY-KEY seek; every other
+  `DISTINCT` shape (non-leading column, extra reference, expression argument) is
+  declined to the ordinary access path. Byte-exact vs sqlite3 3.50.4
   (`tests/eqp_minmax_search.rs`). (Deferred, rendered differently by sqlite and out
-  of scope: a `WHERE` on another column or a bare column beside the aggregate
-  (`min(a), b`) — sqlite uses a *non-covering* `USING INDEX`; result `DISTINCT`
-  (sqlite adds `USE TEMP B-TREE FOR DISTINCT`); and `min(<expr>)` over a non-column
-  argument.)
+  of scope: a `WHERE` clause (sqlite serves the seek from the WHERE index); the
+  `DISTINCT` temp-b-tree shapes above; and the ambiguous case of ≥2 equally-covering
+  or ≥2 leading indexes, where sqlite's cost model picks one — graphite declines.)
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value

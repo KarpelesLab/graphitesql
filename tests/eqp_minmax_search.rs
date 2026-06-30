@@ -13,15 +13,20 @@
 //! expressions (`abs(min(a))`, `max(a)+1`) and may be `min(DISTINCT a)`. Verified
 //! byte-exact against sqlite3 3.50.4, both the plan and the result value.
 //!
-//! A `WITHOUT ROWID` table is its own clustered primary-key b-tree, so a single
-//! min/max reads `SEARCH t USING PRIMARY KEY` (or `… USING COVERING INDEX <name>`
-//! when a secondary index covers the aggregated column) — also recognised here.
+//! Additional referenced columns and expression/constant arguments are handled
+//! too. A bare column beside the aggregate (`min(a), b`) makes sqlite seek the one
+//! end of an index *leading* with the aggregated column and fetch the other column
+//! from the table by rowid (`SEARCH t USING INDEX ia`, non-covering); an expression
+//! or constant argument (`min(a+1)`, `min(1)`) keeps only the covering / bare forms.
+//! A `WITHOUT ROWID` table is its own clustered primary-key b-tree, so any
+//! non-covering seek reads `SEARCH t USING PRIMARY KEY`.
 //!
 //! Deliberately left to the ordinary access path (rendered differently by sqlite,
-//! deferred as out of scope): a `WHERE` on another column (sqlite uses a
-//! *non-covering* index), a bare column beside the aggregate (`min(a), b` — also
-//! non-covering), result `DISTINCT` (sqlite adds `USE TEMP B-TREE FOR DISTINCT`),
-//! and `min(<expr>)`.
+//! deferred as out of scope): a `WHERE` clause (sqlite serves the seek from the
+//! WHERE index); a second aggregate; a `HAVING`; and the `min(DISTINCT x)` shapes
+//! that sqlite renders with a `USE TEMP B-TREE FOR min(DISTINCT)` node — every
+//! `DISTINCT` case *except* a lone covered `min(DISTINCT col)`, whose node sqlite
+//! elides.
 
 #![cfg(feature = "std")]
 
@@ -173,6 +178,102 @@ fn non_minmax_aggregates_stay_scan() {
 }
 
 #[test]
+fn minmax_with_other_columns_seeks_non_covering() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    // A bare column beside the aggregate is *not* covered by the index on the
+    // aggregated column, so sqlite seeks one end of that index and reads the other
+    // column from the table (`SEARCH t USING INDEX ia`, no COVERING).
+    let d = "CREATE TABLE t(a, b, c); CREATE INDEX ia ON t(a); \
+             INSERT INTO t VALUES(5,1,1),(2,2,2),(8,3,3),(2,4,4),(NULL,9,9);";
+    for q in [
+        "SELECT min(a), b FROM t",
+        "SELECT max(a), c FROM t",
+        "SELECT min(a), b, c FROM t",
+        "SELECT min(a), abs(b) FROM t",
+        "SELECT max(a) AS m, b AS x FROM t",
+    ] {
+        check(d, q);
+    }
+    // A composite index that covers the extra column keeps the COVERING form; one
+    // that does not stays non-covering.
+    let dc = "CREATE TABLE t(a, b, c); CREATE INDEX iab ON t(a, b); \
+              INSERT INTO t VALUES(5,1,1),(2,2,2),(8,3,3);";
+    for q in ["SELECT min(a), b FROM t", "SELECT min(a), c FROM t"] {
+        check(dc, q);
+    }
+    // No index on the aggregated column → bare `SEARCH t` even beside another column.
+    let du = "CREATE TABLE t(a, b); INSERT INTO t VALUES(5,1),(2,2),(8,3);";
+    check(du, "SELECT min(a), b FROM t");
+}
+
+#[test]
+fn minmax_over_expression_or_constant_argument() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    // `min(<expr>)` still seeks one end (so `SEARCH`), but with no bare column it
+    // can only use a *covering* full index or read a bare scan — never the
+    // non-covering one-end seek.
+    let d = "CREATE TABLE t(a, b); CREATE INDEX ia ON t(a); \
+             INSERT INTO t VALUES(5,1),(2,2),(8,3),(2,4);";
+    for q in [
+        "SELECT min(a+1) FROM t",    // covering ia (only column a referenced)
+        "SELECT max(a*2) FROM t",    // covering ia
+        "SELECT min(a+1), b FROM t", // b uncovered, expr arg → bare SEARCH t
+        "SELECT min(b+1) FROM t",    // b unindexed → bare SEARCH t
+        "SELECT min(1) FROM t",      // constant arg → covering ia (nothing to cover)
+    ] {
+        check(d, q);
+    }
+}
+
+#[test]
+fn minmax_distinct_only_optimizes_the_elided_shape() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    // sqlite elides its `USE TEMP B-TREE FOR min(DISTINCT)` node only when the call
+    // is the sole result column and a covering index delivers the values — those
+    // stay byte-exact as `SEARCH … USING COVERING INDEX`.
+    let d = "CREATE TABLE t(a, b); CREATE INDEX ia ON t(a); \
+             INSERT INTO t VALUES(5,1),(2,2),(8,3),(2,4);";
+    for q in [
+        "SELECT min(DISTINCT a) FROM t",
+        "SELECT max(DISTINCT a) FROM t",
+        "SELECT abs(min(DISTINCT a)) FROM t",
+    ] {
+        check(d, q);
+    }
+    let dc = "CREATE TABLE t(a, b, c); CREATE INDEX iab ON t(a, b); \
+              INSERT INTO t VALUES(5,1,1),(2,2,2);";
+    check(dc, "SELECT min(DISTINCT a) FROM t");
+
+    // The elision needs the DISTINCT column to *lead* the seek b-tree. When it does
+    // not — a non-leading index column (`min(DISTINCT b)` over `(a, b)`), an extra
+    // reference (`min(DISTINCT a), a`), or no index at all — sqlite keeps the
+    // `USE TEMP B-TREE FOR min(DISTINCT)` node, which graphite cannot render. graphite
+    // declines those to the ordinary `SCAN t` rather than wrongly claiming a covering
+    // seek; this guards against the over-broad elision.
+    for q in [
+        "SELECT min(DISTINCT b) FROM t", // b is not the leading column of iab
+        "SELECT min(DISTINCT a), a FROM t", // a second reference to a
+    ] {
+        // The min/max optimization declines (no `SEARCH`); graphite falls to its
+        // ordinary access path, never a false one-end covering seek.
+        let plan = g_eqp(dc, q);
+        assert!(
+            plan.starts_with("SCAN"),
+            "expected SCAN decline for {q}, got {plan}"
+        );
+        assert_eq!(g_rows(dc, q), sqlite_rows(dc, q), "rows diverged for {q}");
+    }
+    let du = "CREATE TABLE t(a, b); INSERT INTO t VALUES(5,1),(2,2);";
+    assert_eq!(g_eqp(du, "SELECT min(DISTINCT a) FROM t"), "SCAN t");
+}
+
+#[test]
 fn minmax_over_without_rowid_reads_primary_key() {
     if Command::new("sqlite3").arg("--version").output().is_err() {
         return;
@@ -205,6 +306,30 @@ fn minmax_over_without_rowid_reads_primary_key() {
     for q in ["SELECT min(a) FROM t", "SELECT min(b) FROM t"] {
         check(di, q);
     }
+    // A bare column beside the aggregate never falls to a non-covering secondary
+    // index here — the clustered PK b-tree already carries every column, so the
+    // seek stays `USING PRIMARY KEY`.
+    let do_ = "CREATE TABLE t(a PRIMARY KEY, b, c) WITHOUT ROWID; CREATE INDEX ia ON t(a); \
+               INSERT INTO t VALUES(5,1,1),(2,2,2),(8,3,3);";
+    for q in ["SELECT min(a), b FROM t", "SELECT min(b), c FROM t"] {
+        check(do_, q);
+    }
+    // `min(DISTINCT <leading PK column>)` elides the temp-b-tree (the clustered PK
+    // already yields the column sorted) → `SEARCH t USING PRIMARY KEY`; a DISTINCT
+    // over a *non-leading* column keeps sqlite's `USE TEMP B-TREE FOR min(DISTINCT)`
+    // node, which graphite declines to the ordinary `SCAN t`.
+    let dd = "CREATE TABLE t(a, b, PRIMARY KEY(a, b)) WITHOUT ROWID; \
+              INSERT INTO t VALUES(5,1),(2,2),(8,3);";
+    check(dd, "SELECT min(DISTINCT a) FROM t");
+    let plan = g_eqp(dd, "SELECT min(DISTINCT b) FROM t");
+    assert!(
+        plan.starts_with("SCAN"),
+        "expected SCAN decline, got {plan}"
+    );
+    assert_eq!(
+        g_rows(dd, "SELECT min(DISTINCT b) FROM t"),
+        sqlite_rows(dd, "SELECT min(DISTINCT b) FROM t")
+    );
 }
 
 #[test]

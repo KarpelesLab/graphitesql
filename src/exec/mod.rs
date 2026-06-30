@@ -12875,7 +12875,7 @@ impl Connection {
                 // end of an ordered scan and labels the access `SEARCH`. Checked
                 // before the covering-`SCAN` branch (which a min/max query would
                 // otherwise match) so the label matches sqlite.
-                if let Some(d) = self.minmax_search_detail(sel, &meta, &label, params) {
+                if let Some(d) = self.minmax_search_detail(sel, &meta, &label) {
                     d
                 }
                 // `SELECT count(*)` answered by counting a full secondary index
@@ -15431,93 +15431,159 @@ impl Connection {
     /// unindexed column reads a bare `SEARCH <table>`. The `WHERE`-bearing case
     /// (which sqlite may serve from a *non-covering* index) is left to the
     /// ordinary access path.
-    fn minmax_search_detail(
-        &self,
-        sel: &Select,
-        meta: &TableMeta,
-        label: &str,
-        params: &Params,
-    ) -> Option<String> {
+    fn minmax_search_detail(&self, sel: &Select, meta: &TableMeta, label: &str) -> Option<String> {
         if sel.where_clause.is_some()
             || !sel.group_by.is_empty()
             || sel.having.is_some()
             || sel.distinct
         {
-            // A `WHERE` (sqlite may use a *non-covering* index) and `DISTINCT`
-            // (sqlite adds a `USE TEMP B-TREE FOR DISTINCT` line even over the
-            // single row) each render differently; leave those to the ordinary
+            // A `WHERE` (sqlite serves the seek from the WHERE clause's index) and
+            // `DISTINCT` (sqlite adds a `USE TEMP B-TREE FOR DISTINCT` line even
+            // over the single row), like a `HAVING` (which suppresses the seek and
+            // reads `SCAN`), each render differently; leave those to the ordinary
             // access path.
             return None;
         }
-        if !self.is_single_minmax_column(sel, meta) {
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty() {
             return None;
         }
-        // A `WITHOUT ROWID` table *is* its own clustered primary-key b-tree, so the
-        // min/max seek runs over the primary key (`SEARCH t USING PRIMARY KEY`)
-        // unless a secondary index covers the aggregated column — in which case
-        // sqlite seeks that smaller b-tree instead (`… USING COVERING INDEX <name>`).
+        let t = &from.first;
+        if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
+            return None;
+        }
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return None;
+        }
+        // `seek_col` is `Some(pos)` when the min/max argument is a bare table column
+        // (so a one-end seek can walk an index leading with it), `None` when it is
+        // an expression/constant (only a *covering* full index or a bare scan).
+        let (seek_col, arg_distinct, col_refs) = self.single_minmax_shape(sel, meta)?;
+        let usable = |i: &&IndexMeta| i.partial.is_none() && i.key_exprs.is_none();
+        let idxs = self.indexes_of(&t.name).ok()?;
+
+        // A full (non-partial, non-expression) index that covers *every* referenced
+        // column lets sqlite read the one end without touching the table. Exactly
+        // one covering index → unambiguous; two or more → sqlite's cost model picks
+        // one, which we do not replicate, so leave it `None`.
+        let mut covering = idxs
+            .iter()
+            .filter(|i| usable(i) && self.query_cols_covered(sel, meta, &i.cols));
+        let covering_name = covering
+            .next()
+            .filter(|_| covering.next().is_none())
+            .map(|c| &c.name);
+
+        // `min(DISTINCT x)` makes sqlite materialize the distinct values in a
+        // transient b-tree (`USE TEMP B-TREE FOR min(DISTINCT)`) — *except* the one
+        // case where the call is the sole result column and the b-tree it seeks
+        // already yields that column sorted (so the values arrive distinct for
+        // free), which elides the node. That holds only when the argument is the
+        // *leading* column of the seek structure: a secondary index that begins
+        // with it (covering, since it is the lone reference), or — for a
+        // `WITHOUT ROWID` table — the first primary-key column. A non-leading
+        // column (`min(DISTINCT b)` over an `(a, b)` index), an extra reference, or
+        // an expression argument all keep the temp-b-tree node, which graphite does
+        // not render, so those are left to the ordinary access path.
+        if arg_distinct {
+            let col = seek_col?;
+            if col_refs > 1 {
+                return None;
+            }
+            let mut leading = idxs
+                .iter()
+                .filter(|i| usable(i) && i.cols.first() == Some(&col));
+            if let Some(i) = leading.next() {
+                return match leading.next() {
+                    None => Some(alloc::format!(
+                        "SEARCH {label} USING COVERING INDEX {}",
+                        i.name
+                    )),
+                    Some(_) => None,
+                };
+            }
+            if meta.without_rowid && meta.pk_len > 0 && meta.storage_order.first() == Some(&col) {
+                return Some(alloc::format!("SEARCH {label} USING PRIMARY KEY"));
+            }
+            return None;
+        }
+
+        if let Some(name) = covering_name {
+            return Some(alloc::format!("SEARCH {label} USING COVERING INDEX {name}"));
+        }
+
+        // A `WITHOUT ROWID` table *is* its own clustered primary-key b-tree: it
+        // carries every column, so any non-covering one-end seek runs over the
+        // primary key rather than a secondary index.
         if meta.without_rowid {
-            return Some(match self.minmax_covering_index(sel, meta) {
-                Some(name) => alloc::format!("SEARCH {label} USING COVERING INDEX {name}"),
-                None => alloc::format!("SEARCH {label} USING PRIMARY KEY"),
-            });
+            return Some(alloc::format!("SEARCH {label} USING PRIMARY KEY"));
         }
-        Some(match self.covering_scan(sel, meta, params) {
-            Some((name, _, _)) => alloc::format!("SEARCH {label} USING COVERING INDEX {name}"),
-            // No covering index for the aggregated column — `min`/`max` over an
-            // unindexed (only-referenced) column still reads `SEARCH <table>`.
-            None => alloc::format!("SEARCH {label}"),
-        })
+
+        // Otherwise a bare-column min/max seeks one end of the sole ordinary index
+        // that *leads* with that column, reading the other referenced columns from
+        // the table by rowid (`SEARCH t USING INDEX <name>`, non-covering).
+        if let Some(col) = seek_col {
+            let mut leading = idxs
+                .iter()
+                .filter(|i| usable(i) && i.cols.first() == Some(&col));
+            if let Some(i) = leading.next() {
+                if leading.next().is_none() {
+                    return Some(alloc::format!("SEARCH {label} USING INDEX {}", i.name));
+                }
+            }
+        }
+
+        // No usable index — `min`/`max` still seeks one end of the (rowid-ordered)
+        // table, so the access is a bare `SEARCH <table>`.
+        Some(alloc::format!("SEARCH {label}"))
     }
 
-    /// The sole full (non-partial, non-expression) secondary index that covers the
-    /// columns `sel` references, by name — or `None` when there is none or the
-    /// choice is ambiguous (two or more cover it). Mirrors
-    /// [`covering_scan`](Self::covering_scan)'s index filter but works regardless of
-    /// the table's rowid-ness, so the `WITHOUT ROWID` min/max path can prefer a
-    /// covering secondary index over the clustered primary-key b-tree.
-    fn minmax_covering_index(&self, sel: &Select, meta: &TableMeta) -> Option<String> {
-        let t = &sel.from.as_ref()?.first;
-        let mut covering = self.indexes_of(&t.name).ok()?.into_iter().filter(|idx| {
-            idx.partial.is_none()
-                && idx.key_exprs.is_none()
-                && self.query_cols_covered(sel, meta, &idx.cols)
-        });
-        let chosen = covering.next()?;
-        if covering.next().is_some() {
-            return None;
-        }
-        Some(chosen.name)
-    }
-
-    /// True when `sel`'s result set holds exactly one aggregate call and it is a
-    /// single-argument `min`/`max` over a bare column of `meta`, with no *other*
-    /// column referenced anywhere in the result set. Scalar wrappers around the
-    /// call (`abs(min(a))`, `max(a)+1`) are allowed; a window function, a second
-    /// aggregate, a `*`/expression argument, a wildcard result column, or a bare
-    /// column outside the aggregate (`min(a), b`, which sqlite serves from a
-    /// *non-covering* index) disqualify it. The min/max optimization's structural
-    /// precondition — restricted to the covering / no-index cases that render
-    /// byte-identically to sqlite.
-    fn is_single_minmax_column(&self, sel: &Select, meta: &TableMeta) -> bool {
+    /// Structural precondition of SQLite's min/max optimization: `sel`'s result set
+    /// holds *exactly one* aggregate call and it is a single-argument `min`/`max`
+    /// (not `*`), with no window function. Scalar wrappers around the call
+    /// (`abs(min(a))`, `max(a)+1`, `1+min(a)`) and *additional* referenced columns
+    /// (`min(a), b`) are allowed — sqlite still seeks one end, only the covering-ness
+    /// of the access changes. A second aggregate (`min(a), max(a)`, `min(a),
+    /// count(*)`) or a windowed call disqualifies it.
+    ///
+    /// Returns `(seek_col, arg_distinct, col_refs)`:
+    /// * `seek_col` is `Some(pos)` when the min/max argument is a bare table column
+    ///   (its position in `meta.columns`, enabling a non-covering index seek),
+    ///   `None` when the argument is an expression or constant (`min(a+1)`, `min(1)`
+    ///   — only a covering full index or a bare scan);
+    /// * `arg_distinct` is the call's `DISTINCT` flag (`min(DISTINCT a)`);
+    /// * `col_refs` counts bare column references across the whole result set (the
+    ///   aggregate's own argument included), used to recognise the lone-column
+    ///   shape that elides sqlite's `USE TEMP B-TREE FOR min(DISTINCT)` node.
+    ///
+    /// `None` when the shape does not qualify. A `FILTER (WHERE …)` or in-aggregate
+    /// `ORDER BY` on the call also disqualifies it (both change sqlite's plan).
+    fn single_minmax_shape(
+        &self,
+        sel: &Select,
+        meta: &TableMeta,
+    ) -> Option<(Option<usize>, bool, usize)> {
         let mut agg_count = 0usize;
         let mut minmax_count = 0usize;
-        let mut minmax_col: Option<String> = None;
-        let mut other_column = false;
+        let mut minmax_arg_col: Option<String> = None;
+        let mut arg_distinct = false;
+        let mut col_refs = 0usize;
         let mut disqualified = false;
         for rc in &sel.columns {
             let ResultColumn::Expr { expr, .. } = rc else {
-                return false;
+                return None;
             };
             window::visit(expr, &mut |node| match node {
                 Expr::Function {
                     name,
+                    distinct,
                     args,
                     star,
+                    filter,
+                    order_by,
                     over,
-                    ..
                 } => {
-                    if over.is_some() {
+                    if over.is_some() || filter.is_some() || !order_by.is_empty() {
                         disqualified = true;
                         return;
                     }
@@ -15528,33 +15594,29 @@ impl Connection {
                             && (name.eq_ignore_ascii_case("min")
                                 || name.eq_ignore_ascii_case("max"))
                         {
+                            minmax_count += 1;
+                            arg_distinct = *distinct;
                             if let Expr::Column { column, .. } = &args[0] {
-                                minmax_count += 1;
-                                minmax_col = Some(column.clone());
+                                minmax_arg_col = Some(column.clone());
                             }
                         }
                     }
                 }
-                // Any column reference that is *not* the sole min/max argument means
-                // a non-covering plan (`SEARCH … USING INDEX`) — left to the
-                // ordinary path. `window::visit` also visits the aggregate's own
-                // argument column, so reconcile against `minmax_col` after the walk.
-                Expr::Column { column, .. } if minmax_col.as_deref() != Some(column.as_str()) => {
-                    other_column = true;
-                }
+                Expr::Column { .. } => col_refs += 1,
                 _ => {}
             });
         }
-        if disqualified || other_column || agg_count != 1 || minmax_count != 1 {
-            return false;
+        if disqualified || agg_count != 1 || minmax_count != 1 {
+            return None;
         }
-        match minmax_col {
-            Some(c) => meta
-                .columns
+        // A bare-column argument maps to its column position; a non-column argument
+        // (expression/constant) has no seek column.
+        let seek_col = minmax_arg_col.and_then(|c| {
+            meta.columns
                 .iter()
-                .any(|ci| ci.name.eq_ignore_ascii_case(&c)),
-            None => false,
-        }
+                .position(|ci| ci.name.eq_ignore_ascii_case(&c))
+        });
+        Some((seek_col, arg_distinct, col_refs))
     }
 
     /// `SELECT count(*) FROM <single rowid table>` can be answered by counting a
