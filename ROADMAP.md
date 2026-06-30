@@ -422,7 +422,21 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   index on the IPK still mislabels its EQP `USING COVERING INDEX` vs sqlite's bare
   `SCAN`, and two identical covering indexes leave both EQP and seek-order ambiguous
   — `covering_scan` declines rather than guess sqlite's cost-model choice. Both need
-  separate EQP-side work and arise only from degenerate schemas.)
+  separate EQP-side work and arise only from degenerate schemas.) A non-correlated
+  scalar `(SELECT …)` in the `WHERE` clause now renders its `SCALAR SUBQUERY N`
+  node — a sibling of the outer scan, numbered left-to-right, with the subquery
+  body's own plan recursed as its child, placed after the scan and before any
+  GROUP BY / ORDER BY sorter — where graphite previously emitted no node at all and
+  diverged on every such query. SQLite shares one sequential subquery id across CTE
+  materialisations and compound arms, so the numbering is only a clean `1..n` (all
+  we render) when the statement has no CTEs, the subqueries live solely in the
+  `WHERE` clause, and each is a non-correlated, non-compound scalar `(SELECT …)`
+  over base tables with no further nested subquery; everything else is declined,
+  leaving the pre-existing bare `SCAN` (a correlated body, `EXISTS`, `IN (SELECT)`,
+  a CTE/compound body that bumps the counter to `SCALAR SUBQUERY 2`, or a subquery
+  in the projection rather than the `WHERE`). Since sqlite *always* emits a node for
+  a scalar `WHERE` subquery, adding the correct one can only converge a plan, never
+  regress a passing one (`tests/eqp_where_scalar_subquery.rs`).
 - **EQP min/max optimization** — a query whose only aggregate is a single
   `min(X)`/`max(X)` (no `GROUP BY`/`HAVING`/`WHERE`/statement-level `DISTINCT`, no
   second aggregate; the call may be scalar-wrapped like `abs(min(a))`/`max(a)+1`)

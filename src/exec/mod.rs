@@ -12614,6 +12614,62 @@ impl Connection {
         ))
     }
 
+    /// The `WHERE`-clause scalar subqueries to render as `SCALAR SUBQUERY N`
+    /// child nodes of an `EXPLAIN QUERY PLAN`, in SQLite's numbering order, when
+    /// doing so is provably byte-exact — otherwise `None` (emit nothing, the
+    /// prior behaviour).
+    ///
+    /// SQLite assigns every subquery in a statement a sequential id and emits a
+    /// node for each (it never constant-folds one away: even `(SELECT 5)` becomes
+    /// `SCALAR SUBQUERY n` over a `SCAN CONSTANT ROW`). That id is *shared* with
+    /// CTE materialisations and compound arms, so it is only a clean `1..n` —
+    /// which is all we can predict — when the query has no CTEs, the subqueries
+    /// live solely in the `WHERE` clause (one anywhere else would shift the
+    /// count), and each is a non-correlated, non-compound scalar `(SELECT …)` over
+    /// base tables with no further nested subquery. `IN (SELECT …)` (a `LIST
+    /// SUBQUERY` with a bloom filter) and `EXISTS` (often `CORRELATED`) are
+    /// different node shapes we decline here. Because SQLite *always* emits a node
+    /// for such a subquery and we previously emitted none, adding the correct node
+    /// can only converge a plan or leave it diverging — never regress one.
+    fn eqp_where_scalar_subqueries<'a>(&self, sel: &'a Select) -> Option<Vec<&'a Select>> {
+        // A subquery in any non-WHERE clause would consume a subquery id and shift
+        // the numbering past what we can predict — decline the whole query.
+        let elsewhere = sel.columns.iter().any(|c| match c {
+            ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+            ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+        }) || sel.group_by.iter().any(expr_has_subquery)
+            || sel.having.as_ref().is_some_and(expr_has_subquery)
+            || sel.order_by.iter().any(|t| expr_has_subquery(&t.expr))
+            || sel.limit.as_ref().is_some_and(expr_has_subquery)
+            || sel.offset.as_ref().is_some_and(expr_has_subquery);
+        if elsewhere {
+            return None;
+        }
+        let where_expr = sel.where_clause.as_ref()?;
+        // Collect the WHERE subqueries in pre-order (SQLite's left-to-right
+        // numbering order) without descending into a subquery body, so this is
+        // exactly the top-level set. Any `IN (SELECT)` / `EXISTS` makes the set
+        // unrenderable here.
+        let mut subs: Vec<&Select> = Vec::new();
+        if !collect_where_scalar_subqueries(where_expr, &mut subs) || subs.is_empty() {
+            return None;
+        }
+        // Each body must render byte-exactly and leave the id counter at `1..n`: a
+        // plain scalar select over base tables — no join, no compound, no CTE,
+        // non-correlated (`vdbe_subquery_foldable`), and no further nested subquery.
+        for body in &subs {
+            if !body.compound.is_empty()
+                || !body.ctes.is_empty()
+                || body.from.as_ref().is_some_and(|f| !f.joins.is_empty())
+                || select_no_from_has_subquery(body)
+                || !self.vdbe_subquery_foldable(body)
+            {
+                return None;
+            }
+        }
+        Some(subs)
+    }
+
     fn eqp_select(
         &self,
         sel: &Select,
@@ -12957,6 +13013,27 @@ impl Connection {
             let id = *next_id;
             *next_id += 1;
             out.push((id, parent, detail));
+        }
+        // A non-correlated scalar subquery in the WHERE clause is computed once and
+        // rendered by SQLite as a `SCALAR SUBQUERY N` sibling of the scan node,
+        // numbered left-to-right, with the subquery body's plan as its child —
+        // placed after the scan and before any GROUP BY / ORDER BY sorter node.
+        // We only emit when the whole set is provably `1..n` (see
+        // `eqp_where_scalar_subqueries`); single-table queries only, so this runs
+        // before the join-folding below (which is a no-op when there are no joins).
+        if from.joins.is_empty() {
+            if let Some(subs) = self.eqp_where_scalar_subqueries(sel) {
+                for (i, body) in subs.iter().enumerate() {
+                    let scalar_id = *next_id;
+                    *next_id += 1;
+                    out.push((
+                        scalar_id,
+                        parent,
+                        alloc::format!("SCALAR SUBQUERY {}", i + 1),
+                    ));
+                    self.eqp_select(body, scalar_id, next_id, out, params)?;
+                }
+            }
         }
         // Fold each join in FROM order, tracking the accumulated left columns so
         // the rowid-seek decision (shared with the executor via `rowid_join_seek`)
@@ -25438,6 +25515,62 @@ fn expr_has_subquery(e: &Expr) -> bool {
         }
     });
     found
+}
+
+/// Collect, in pre-order, every scalar `(SELECT …)` subquery appearing directly
+/// in `e` (NOT descending into a subquery body — those are a separate numbering
+/// concern), preserving `e`'s lifetime so the bodies can be re-planned. Returns
+/// `false` if any `EXISTS` / `IN (SELECT)` form is present — those render as
+/// different (`CORRELATED` / `LIST SUBQUERY` + bloom-filter) nodes the caller
+/// does not model. Used by [`Self::eqp_where_scalar_subqueries`].
+fn collect_where_scalar_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Select>) -> bool {
+    match e {
+        Expr::Subquery(body) => {
+            out.push(body.as_ref());
+            true
+        }
+        Expr::Exists { .. } | Expr::InSelect { .. } => false,
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::Collate { expr, .. } => collect_where_scalar_subqueries(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_where_scalar_subqueries(left, out)
+                && collect_where_scalar_subqueries(right, out)
+        }
+        Expr::Function { args, .. } | Expr::RowValue(args) => {
+            args.iter().all(|a| collect_where_scalar_subqueries(a, out))
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_where_scalar_subqueries(expr, out)
+                && list.iter().all(|a| collect_where_scalar_subqueries(a, out))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_where_scalar_subqueries(expr, out)
+                && collect_where_scalar_subqueries(low, out)
+                && collect_where_scalar_subqueries(high, out)
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_none_or(|o| collect_where_scalar_subqueries(o, out))
+                && when_then.iter().all(|(w, t)| {
+                    collect_where_scalar_subqueries(w, out)
+                        && collect_where_scalar_subqueries(t, out)
+                })
+                && else_result
+                    .as_ref()
+                    .is_none_or(|el| collect_where_scalar_subqueries(el, out))
+        }
+        _ => true,
+    }
 }
 
 /// Reconstruct the `sql` text stored in `sqlite_schema` for a `CREATE` statement
