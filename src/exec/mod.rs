@@ -3125,6 +3125,24 @@ impl Connection {
         )
     }
 
+    /// For each base-table / view source in `from` (its first table and every
+    /// joined table), the source's label (alias or name) paired with its column
+    /// names. Used to resolve *unqualified* columns in a comma join's `WHERE`
+    /// equality so it can be promoted to a join `ON` (see
+    /// [`promote_comma_join_ons`]). Sources whose columns cannot be resolved
+    /// (a TVF, or an unresolvable subquery) are simply omitted — an unqualified
+    /// column owned only by such a source then stays unresolved and declines.
+    fn comma_join_table_columns(&self, from: &FromClause) -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        for tref in core::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.table)) {
+            if let Some(cols) = self.source_columns_of(tref) {
+                let label = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+                out.push((label, cols.into_iter().map(|(n, _)| n).collect()));
+            }
+        }
+        out
+    }
+
     /// The single name argument of a `PRAGMA foo(name)` / `PRAGMA foo = name`,
     /// or `None` for the bare argumentless form. SQLite coerces a numeric
     /// argument to its text form (so `PRAGMA index_info(1)` looks up an object
@@ -12787,8 +12805,13 @@ impl Connection {
     ) -> Result<()> {
         // Mirror run_core's comma-join → ON promotion so the plan reflects how the
         // query actually runs.
+        let promo_tables = sel
+            .from
+            .as_ref()
+            .map(|f| self.comma_join_table_columns(f))
+            .unwrap_or_default();
         let rewritten;
-        let sel = match promote_comma_join_ons(sel) {
+        let sel = match promote_comma_join_ons(sel, &promo_tables) {
             Some(r) => {
                 rewritten = r;
                 &rewritten
@@ -18004,9 +18027,15 @@ impl Connection {
         }
         // Promote `FROM a, b WHERE a.x = b.y` to an explicit join `ON` so the join
         // fold can seek/hash it (the equality stays in WHERE, so results are
-        // identical). All later uses of `sel` see the rewritten form.
+        // identical). All later uses of `sel` see the rewritten form. Unqualified
+        // equalities (`WHERE x = y`) resolve via each source's column names.
+        let promo_tables = sel
+            .from
+            .as_ref()
+            .map(|f| self.comma_join_table_columns(f))
+            .unwrap_or_default();
         let rewritten;
-        let sel = match promote_comma_join_ons(sel) {
+        let sel = match promote_comma_join_ons(sel, &promo_tables) {
             Some(r) => {
                 rewritten = r;
                 &rewritten
@@ -28414,7 +28443,7 @@ fn join_keys_of(v: &Value) -> Vec<JoinKey> {
 /// `ON` is a subset of `WHERE`, applied redundantly. Only a qualified
 /// `t.col = u.col` equality linking the joined table to an already-introduced one
 /// is promoted. Returns the rewritten `Select`, or `None` if nothing applied.
-fn promote_comma_join_ons(sel: &Select) -> Option<Select> {
+fn promote_comma_join_ons(sel: &Select, tables: &[(String, Vec<String>)]) -> Option<Select> {
     let from = sel.from.as_ref()?;
     let where_clause = sel.where_clause.as_ref()?;
     let promotable = |j: &Join| {
@@ -28434,7 +28463,7 @@ fn promote_comma_join_ons(sel: &Select) -> Option<Select> {
         if promotable(join) {
             if let Some(cond) = conjuncts
                 .iter()
-                .find_map(|c| eligible_join_equi(c, &jlabel, &available))
+                .find_map(|c| eligible_join_equi(c, &jlabel, &available, tables))
             {
                 new_joins[i].on = Some(cond);
                 changed = true;
@@ -28453,10 +28482,17 @@ fn promote_comma_join_ons(sel: &Select) -> Option<Select> {
     Some(new_sel)
 }
 
-/// A qualified `A.x = B.y` equality where one qualifier is `jlabel` and the other
-/// is in `available` — eligible to become a comma join's `ON`. Returns the cloned
-/// equality (with any enclosing parens stripped).
-fn eligible_join_equi(c: &Expr, jlabel: &str, available: &[String]) -> Option<Expr> {
+/// An `A.x = B.y` equality whose two columns belong to table `jlabel` and to some
+/// earlier (`available`) table — eligible to become a comma join's `ON`. Each side
+/// is resolved to its owning table: a qualified `t.x` directly, an *unqualified*
+/// `x` via `tables` (the unique source owning a column of that name, ambiguous or
+/// unknown → decline). Returns the cloned equality (enclosing parens stripped).
+fn eligible_join_equi(
+    c: &Expr,
+    jlabel: &str,
+    available: &[String],
+    tables: &[(String, Vec<String>)],
+) -> Option<Expr> {
     let mut c = c;
     while let Expr::Paren(inner) = c {
         c = inner;
@@ -28469,22 +28505,45 @@ fn eligible_join_equi(c: &Expr, jlabel: &str, available: &[String]) -> Option<Ex
         } => (left.as_ref(), right.as_ref()),
         _ => return None,
     };
-    let lt = column_qualifier(l)?;
-    let rt = column_qualifier(r)?;
+    let lt = resolve_col_table(l, tables)?;
+    let rt = resolve_col_table(r, tables)?;
     let here = |t: &str| t.eq_ignore_ascii_case(jlabel);
     let earlier = |t: &str| available.iter().any(|a| a.eq_ignore_ascii_case(t));
-    if (here(lt) && earlier(rt)) || (here(rt) && earlier(lt)) {
+    if (here(&lt) && earlier(&rt)) || (here(&rt) && earlier(&lt)) {
         Some(c.clone())
     } else {
         None
     }
 }
 
-/// The table qualifier of a qualified column reference (`t.col` → `t`).
-fn column_qualifier(e: &Expr) -> Option<&str> {
+/// The owning-table label of a column reference. A qualified `t.col` yields `t`
+/// directly (its existence is not re-checked, matching the pre-existing qualified
+/// path). An unqualified `col` is resolved against `tables` (label → column names):
+/// the unique source owning a column of that name, or `None` when zero or more than
+/// one own it (unknown / ambiguous — SQLite would itself reject the ambiguous case).
+fn resolve_col_table(e: &Expr, tables: &[(String, Vec<String>)]) -> Option<String> {
+    let mut e = e;
+    while let Expr::Paren(inner) = e {
+        e = inner;
+    }
     match e {
-        Expr::Column { table: Some(t), .. } => Some(t),
-        Expr::Paren(inner) => column_qualifier(inner),
+        Expr::Column { table: Some(t), .. } => Some(t.clone()),
+        Expr::Column {
+            table: None,
+            column,
+            ..
+        } => {
+            let mut found: Option<&str> = None;
+            for (lbl, cols) in tables {
+                if cols.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(lbl);
+                }
+            }
+            found.map(String::from)
+        }
         _ => None,
     }
 }

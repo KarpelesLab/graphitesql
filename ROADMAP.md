@@ -632,6 +632,26 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   between 1 and M`); ORDER BY is resolved before GROUP BY, so its term wins when both are
   out of range. Verified vs sqlite3 3.50.4 (`tests/eqp_positional_out_of_range.rs`). (A
   `SELECT *` projection still defers the count to the scan; unchanged.)
+- **Comma-join unqualified equi-predicate promotion** — `FROM t, u WHERE a = x`
+  (the implicit-join spelling with a bare-column equality) now seeks the inner table
+  by index just like the explicit `FROM t JOIN u ON a = x`, which already did.
+  `promote_comma_join_ons` rewrites a comma join to an `ON` so the join fold can
+  seek/hash it; it previously matched only a *qualified* `t.a = u.x` (via the column
+  qualifier), so an unqualified equality stayed a full nested-loop `SCAN` of the
+  inner table — diverging from SQLite's `SEARCH … USING INDEX`. The promotion now
+  resolves each bare column to its owning source by name (`comma_join_table_columns`
+  → `resolve_col_table`): the unique table holding a column of that name, declining
+  on an ambiguous or unknown name so SQLite's own "ambiguous column" error still
+  fires. Shared by `run_core` and `eqp_select`, so the executed access path and the
+  plan move together; results are unchanged (the equality stays in `WHERE`). Byte-
+  exact vs sqlite3 3.50.4 (plan and rows) for the two-table cases whose written
+  `FROM` order already matches SQLite's chosen order — secondary-index and INTEGER
+  PRIMARY KEY rowid seeks, reversed and mixed qualified/unqualified spellings,
+  aliased tables (`tests/comma_join_unqualified_seek.rs`). Out of scope (separate
+  optimizer capabilities, not this promotion, rows already correct): SQLite's cost-
+  based *join reordering* for 3+ tables, a *range* (`a > x`) join predicate, and
+  covering-index detection on a join's inner seek (a pre-existing divergence the
+  explicit-join form shares).
 - **ATTACH / multi-schema** — `ATTACH`/`DETACH`, schema-qualified read/write/DROP,
   TEMP tables, cross-database joins / views / transactions (see Track E).
 - **Error parity** — prepare-time column / aggregate / window / row-value
