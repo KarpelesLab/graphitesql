@@ -23,7 +23,10 @@
 //!  * `IN (SELECT …)` (a `LIST SUBQUERY` + `CREATE BLOOM FILTER`).
 //!  * a body that bumps the id counter past `1..n`: a CTE reference or a compound
 //!    (`UNION`) body (SQLite numbers these `SCALAR SUBQUERY 2`).
-//!  * a scalar subquery in the projection rather than the `WHERE` clause.
+//!  * a join inside the body (SQLite renders a multi-scan child we do not model).
+//!
+//! (A scalar subquery in the *projection* is rendered by the companion slice —
+//! `tests/eqp_projection_scalar_subquery.rs`.)
 
 #![cfg(feature = "std")]
 
@@ -176,8 +179,9 @@ fn where_scalar_subquery_declines_unrenderable() {
         "WITH cte AS (SELECT x FROM u) SELECT * FROM t WHERE a=(SELECT min(x) FROM cte)",
         // A compound (UNION) body bumps the counter too.
         "SELECT * FROM t WHERE a=(SELECT x FROM u UNION SELECT y FROM u)",
-        // A scalar subquery in the projection (not the WHERE clause).
-        "SELECT (SELECT count(*) FROM u), a FROM t",
+        // A join inside the body — SQLite renders the node with a multi-scan child
+        // we do not model, so the whole set is declined.
+        "SELECT * FROM t WHERE a=(SELECT count(*) FROM u, t t2)",
     ] {
         assert_eq!(
             g_eqp(D, q),

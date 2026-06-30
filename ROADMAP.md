@@ -436,7 +436,20 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   a CTE/compound body that bumps the counter to `SCALAR SUBQUERY 2`, or a subquery
   in the projection rather than the `WHERE`). Since sqlite *always* emits a node for
   a scalar `WHERE` subquery, adding the correct one can only converge a plan, never
-  regress a passing one (`tests/eqp_where_scalar_subquery.rs`).
+  regress a passing one (`tests/eqp_where_scalar_subquery.rs`). The same renders for
+  a scalar `(SELECT …)` in the **projection** (`SELECT (SELECT …), … FROM t`),
+  numbered `1..n` in column order — the only difference being sequencing: a
+  projection subquery is evaluated post-grouping, so SQLite places its node *after*
+  a `USE TEMP B-TREE FOR GROUP BY` sorter but *before* DISTINCT / ORDER BY. Our
+  single insertion point (right after the scan) matches the no-GROUP-BY shapes, so
+  GROUP BY / HAVING are declined; `DISTINCT` is declined too because graphite's
+  separate distinct sorter node does not fire when a projection column is a subquery
+  (emitting the scalar node there would leave the plan still missing the DISTINCT
+  node rather than byte-exact — we never render a node into a non-matching plan).
+  The two positions are mutually exclusive (each collector declines if the other
+  holds a subquery), so a subquery in *both* projection and WHERE — SQLite's
+  cross-position `SCALAR SUBQUERY 2` then `1` numbering — declines cleanly
+  (`tests/eqp_projection_scalar_subquery.rs`).
 - **EQP min/max optimization** — a query whose only aggregate is a single
   `min(X)`/`max(X)` (no `GROUP BY`/`HAVING`/`WHERE`/statement-level `DISTINCT`, no
   second aggregate; the call may be scalar-wrapped like `abs(min(a))`/`max(a)+1`)

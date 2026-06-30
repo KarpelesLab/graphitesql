@@ -12654,18 +12654,78 @@ impl Connection {
         if !collect_where_scalar_subqueries(where_expr, &mut subs) || subs.is_empty() {
             return None;
         }
-        // Each body must render byte-exactly and leave the id counter at `1..n`: a
-        // plain scalar select over base tables — no join, no compound, no CTE,
-        // non-correlated (`vdbe_subquery_foldable`), and no further nested subquery.
-        for body in &subs {
-            if !body.compound.is_empty()
-                || !body.ctes.is_empty()
-                || body.from.as_ref().is_some_and(|f| !f.joins.is_empty())
-                || select_no_from_has_subquery(body)
-                || !self.vdbe_subquery_foldable(body)
-            {
-                return None;
+        if !self.eqp_scalar_bodies_renderable(&subs) {
+            return None;
+        }
+        Some(subs)
+    }
+
+    /// Whether every collected scalar-subquery body renders byte-exactly and
+    /// leaves SQLite's id counter at a clean `1..n`: a plain scalar select over
+    /// base tables — no join, no compound, no CTE, non-correlated
+    /// (`vdbe_subquery_foldable`), and no further nested subquery. Shared by the
+    /// WHERE and projection collectors.
+    fn eqp_scalar_bodies_renderable(&self, subs: &[&Select]) -> bool {
+        subs.iter().all(|body| {
+            body.compound.is_empty()
+                && body.ctes.is_empty()
+                && body.from.as_ref().is_none_or(|f| f.joins.is_empty())
+                && !select_no_from_has_subquery(body)
+                && self.vdbe_subquery_foldable(body)
+        })
+    }
+
+    /// The projection (`SELECT`-list) scalar subqueries to render as `SCALAR
+    /// SUBQUERY N`, the result-column analogue of
+    /// [`Self::eqp_where_scalar_subqueries`].
+    ///
+    /// SQLite numbers and renders a projection subquery's node just like a WHERE
+    /// one, but *sequences* it differently: it is evaluated after grouping, so its
+    /// node sits *after* a `USE TEMP B-TREE FOR GROUP BY` sorter (yet still
+    /// *before* a DISTINCT / ORDER BY sorter). Our single insertion point — right
+    /// after the scan — matches SQLite only for the no-GROUP-BY shapes, so we
+    /// decline any GROUP BY / HAVING and render the remaining DISTINCT / ORDER BY /
+    /// LIMIT / plain cases. As with the WHERE form, the subqueries must live solely
+    /// in the projection (one in WHERE or a trailing clause would shift the shared
+    /// id counter), and each must be a non-correlated, non-compound scalar
+    /// `(SELECT …)` over base tables with no nested subquery. Numbered `1..n` in
+    /// left-to-right column order. SQLite always emits such a node where we emitted
+    /// none, so rendering the correct one can only converge a plan, never regress.
+    fn eqp_projection_scalar_subqueries<'a>(&self, sel: &'a Select) -> Option<Vec<&'a Select>> {
+        // A projection subquery is sequenced *after* the GROUP BY sorter — a
+        // different insertion point than ours — so decline any grouping / HAVING.
+        // Likewise decline `DISTINCT`: graphite's separate `USE TEMP B-TREE FOR
+        // DISTINCT` EQP node does not fire when a projection column is a subquery,
+        // so emitting the scalar node here would leave the plan still diverging
+        // (missing the DISTINCT sorter) rather than fully byte-exact.
+        if !sel.group_by.is_empty() || sel.having.is_some() || sel.distinct {
+            return None;
+        }
+        // Subqueries must appear only in the projection list; one in WHERE or a
+        // trailing clause would consume an id and shift the count off `1..n`.
+        let elsewhere = sel.where_clause.as_ref().is_some_and(expr_has_subquery)
+            || sel.order_by.iter().any(|t| expr_has_subquery(&t.expr))
+            || sel.limit.as_ref().is_some_and(expr_has_subquery)
+            || sel.offset.as_ref().is_some_and(expr_has_subquery);
+        if elsewhere {
+            return None;
+        }
+        // Collect projection subqueries left-to-right (SQLite's numbering order)
+        // without descending into a body. Any `IN (SELECT)` / `EXISTS` in a column
+        // makes the set unrenderable here.
+        let mut subs: Vec<&Select> = Vec::new();
+        for col in &sel.columns {
+            match col {
+                ResultColumn::Expr { expr, .. } => {
+                    if !collect_where_scalar_subqueries(expr, &mut subs) {
+                        return None;
+                    }
+                }
+                ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => {}
             }
+        }
+        if subs.is_empty() || !self.eqp_scalar_bodies_renderable(&subs) {
+            return None;
         }
         Some(subs)
     }
@@ -13014,15 +13074,21 @@ impl Connection {
             *next_id += 1;
             out.push((id, parent, detail));
         }
-        // A non-correlated scalar subquery in the WHERE clause is computed once and
-        // rendered by SQLite as a `SCALAR SUBQUERY N` sibling of the scan node,
-        // numbered left-to-right, with the subquery body's plan as its child —
-        // placed after the scan and before any GROUP BY / ORDER BY sorter node.
-        // We only emit when the whole set is provably `1..n` (see
-        // `eqp_where_scalar_subqueries`); single-table queries only, so this runs
-        // before the join-folding below (which is a no-op when there are no joins).
+        // A non-correlated scalar subquery in the WHERE clause or the projection is
+        // computed once and rendered by SQLite as a `SCALAR SUBQUERY N` sibling of
+        // the scan node, numbered left-to-right, with the subquery body's plan as
+        // its child. A WHERE subquery is placed before any GROUP BY / ORDER BY
+        // sorter; a projection subquery before DISTINCT / ORDER BY but after GROUP
+        // BY (so the projection form is declined when grouping is present — see the
+        // two collectors). Either way we only emit when the whole set is provably
+        // `1..n`; single-table queries only, so this runs before the join-folding
+        // below (which is a no-op when there are no joins). The two positions are
+        // mutually exclusive: each collector declines if the other holds a subquery.
         if from.joins.is_empty() {
-            if let Some(subs) = self.eqp_where_scalar_subqueries(sel) {
+            if let Some(subs) = self
+                .eqp_where_scalar_subqueries(sel)
+                .or_else(|| self.eqp_projection_scalar_subqueries(sel))
+            {
                 for (i, body) in subs.iter().enumerate() {
                     let scalar_id = *next_id;
                     *next_id += 1;
