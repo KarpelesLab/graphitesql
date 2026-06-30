@@ -29519,12 +29519,25 @@ fn collect_eq_constraints(
             left,
             right,
         } => {
+            // An explicit `COLLATE` on the value operand sets the comparison's
+            // collation; an index whose column collation differs cannot serve the
+            // seek (its key order is for a different collation), so SQLite scans —
+            // e.g. `b = 'x' COLLATE NOCASE` over a BINARY index on `b`. Emit the
+            // equality only when the comparison collation matches the column's, so the
+            // seek (and its rowid-order ORDER BY credit) stays sound.
+            let collation_ok = |ci: usize, val: &Expr| {
+                explicit_collation(val).is_none_or(|c| c == columns[ci].collation)
+            };
             if let (Some(ci), Some(v)) = (col_index(left, columns), const_value(right, params)) {
-                out.push((ci, v));
+                if collation_ok(ci, right) {
+                    out.push((ci, v));
+                }
             } else if let (Some(ci), Some(v)) =
                 (col_index(right, columns), const_value(left, params))
             {
-                out.push((ci, v));
+                if collation_ok(ci, left) {
+                    out.push((ci, v));
+                }
             }
         }
         // `col IS <non-null const>` selects exactly the rows `col = <const>` does (a
@@ -30395,6 +30408,17 @@ fn col_index(e: &Expr, columns: &[ColumnInfo]) -> Option<usize> {
         })
     } else {
         None
+    }
+}
+
+/// The explicit collation a top-level `COLLATE` wrapper applies to `e` (the seek-
+/// relevant collation of a comparison operand), or `None` when the value carries no
+/// explicit `COLLATE` (so the comparison uses the column's own collation).
+fn explicit_collation(e: &Expr) -> Option<crate::value::Collation> {
+    match e {
+        Expr::Collate { collation, .. } => crate::value::Collation::parse(collation),
+        Expr::Paren(inner) => explicit_collation(inner),
+        _ => None,
     }
 }
 

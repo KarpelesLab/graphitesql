@@ -476,7 +476,14 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   A *parenthesized* column — `(a) = 2`, `(b) > 10`, `(a) IN (1,2)`, `(b) IS NULL` —
   now seeks exactly as the bare column does (SQLite ignores the redundant parens);
   the fix unwraps `Expr::Paren` in the shared `col_index`, so every seek path and
-  `eqp_access` pick it up together.
+  `eqp_access` pick it up together. An equality whose explicit `COLLATE` *differs*
+  from the column's collation — `b = 'x' COLLATE NOCASE` over a BINARY index on `b` —
+  no longer seeks that index (its keys are ordered for a different collation), so
+  graphite SCANs as SQLite does; this also fixed a row-**ordering** bug, since the
+  mis-applied seek had wrongly credited its `(b, rowid)` walk for a sole `ORDER BY` on
+  the rowid (a NOCASE match spans several binary keys, so the rows are not in rowid
+  order). The check lives in the shared `collect_eq_constraints`, so the seek, the
+  EQP label, and the ORDER-BY credit stay in lockstep.
   The `NOT INDEXED` planner hint is now honored in the *plan* (the executor already
   honored it, so rows were always correct): SQLite forbids every *secondary* index on
   that table, so a `WHERE` seek, covering scan, ORDER-BY index walk, and MULTI-INDEX OR
