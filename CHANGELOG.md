@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/KarpelesLab/graphitesql/compare/v0.0.12...v0.0.13) - 2026-06-30
+
+### Added
+
+- *(eqp)* render WITHOUT ROWID min/max as SEARCH USING PRIMARY KEY
+- *(eqp)* render the min/max optimization as SEARCH
+- *(planner)* elide ORDER BY for single-value-pinned WHERE seeks
+- *(planner)* seek a WITHOUT ROWID secondary index for `col IS NULL`
+- *(planner)* seek the index for a `col IS NULL` constraint
+- *(eqp)* label aggregate-only seeks USING COVERING INDEX
+- *(eqp)* name aliased tables by alias and tag LEFT-JOIN inner side
+- *(eqp)* elide ORDER BY temp b-tree for a rowid IN-list seek (B-planner slice 12)
+- *(eqp)* seek the WITHOUT ROWID PRIMARY KEY for an IN-list / OR-chain
+- *(eqp)* collapse a same-column equality OR-chain to one index seek
+- *(eqp)* collapse a rowid-equality OR-chain to a single rowid seek
+- *(eqp)* plan a rowid-pinning DISTINCT as the no-op it is
+- *(eqp)* plain-scan a rowid GROUP BY and skip its redundant sort (B5b-1)
+- *(eqp)* elide equality-pinned ORDER BY terms on the seek path (B5b-1)
+- *(eqp)* serve a trailing rowid from a WHERE-seek index walk
+- *(eqp)* credit a named UNIQUE index for the trailing-rowid ORDER BY walk
+- *(eqp)* serve a trailing rowid term from the secondary-index walk
+- *(eqp)* skip the sort when ORDER BY leads with the rowid/IPK
+- *(eqp)* fold ORDER BY into the GROUP BY/DISTINCT temp b-tree
+- *(eqp)* emit USE TEMP B-TREE FOR GROUP BY / DISTINCT on a plain scan
+- *(eqp)* walk an index whose columns are a prefix of a longer ORDER BY
+- *(eqp)* render the COMPOUND QUERY tree for UNION/INTERSECT/EXCEPT
+- *(eqp)* render EXPLAIN QUERY PLAN over a CTE source
+- *(eqp)* flatten a wildcard derived table into the base-table scan
+- *(vdbe)* run an uncorrelated FROM-less EXISTS subquery inline (B5b-1)
+- *(vdbe)* run an uncorrelated FROM-less scalar subquery inline (B5b-1)
+- *(vdbe)* run a no-op ORDER BY over a FROM-less SELECT on the VDBE
+- *(json)* drive bare json_each/json_tree from WHERE json constraints
+- *(pragma)* drive bare pragma TVFs from WHERE arg constraints
+- *(vdbe)* run a FROM-less SELECT with LIMIT/OFFSET/DISTINCT on the VDBE
+- *(vdbe)* run a FROM-less SELECT with a WHERE clause on the VDBE
+- *(vdbe)* run more pure scalar functions on the VDBE
+- *(vdbe)* run the date/time scalar functions on the VDBE
+- *(alter)* reject DROP COLUMN that breaks a dependent view or trigger
+- *(alter)* propagate RENAME COLUMN into same-table qualified self-refs
+- *(alter)* detect UPDATE…FROM subquery trigger bodies on RENAME TABLE
+- *(alter)* propagate RENAME COLUMN into cross-object trigger bodies (A-rn3)
+- *(alter)* propagate RENAME COLUMN into a view's nested cross-source subquery
+- *(exec)* reject unknown/wrong-arity functions in expression-position subqueries
+- *(exec)* reject unknown columns over a NATURAL/USING join at prepare time
+- *(exec)* reject unknown columns over a derived-table join at prepare time
+- *(vdbe)* run a window over a NATURAL/USING join on the VDBE (B5c-4)
+- *(vdbe)* run a window function over a join containing a derived subquery
+- *(vdbe)* run SELECT */window over joins sharing a column or holding a view/TVF
+- *(vdbe)* run a window-function SELECT over a TVF source on the VDBE (B5b-1)
+- *(vdbe)* run a window-function SELECT over a view source on the VDBE (B5b-1)
+- *(vdbe)* run a view named directly as a FROM source on the VDBE (B5b-1)
+- *(vdbe)* resolve a view source's column affinity, fixing a derived-over-view divergence (B5b-1)
+- *(vdbe)* run a derived table whose body is a same-affinity compound on the VDBE (B5b-1)
+- *(vdbe)* run a derived table whose body is a plain join on the VDBE (B5b-1)
+- *(vdbe)* run a constant-argument table-valued function in a join on the VDBE (B5b-1)
+- *(vdbe)* run json_each/json_tree FROM sources on the VDBE (B5b-1)
+- *(vdbe)* run a single table-valued-function FROM source on the VDBE (B5b-1)
+- *(vdbe)* run a sibling-CTE FROM source on the VDBE (B5b-1)
+- *(vdbe)* resolve a GROUP BY output-alias on the VDBE (B5b-1)
+- *(vdbe)* run SELECT DISTINCT over a grouped query on the VDBE (B5b-1)
+- *(vdbe)* run a computed (non-column) GROUP BY key on the VDBE (B5b-1)
+- *(vdbe)* fold compound-bodied non-correlated subqueries (B5c-1)
+- *(vdbe)* fold nested non-correlated subqueries (B5c-1)
+- *(vdbe)* run a window over a VALUES derived/CTE source on the VDBE
+- *(vdbe)* run a window function over a CTE source on the VDBE
+- *(vdbe)* run a window function over a derived subquery on the VDBE
+- *(vdbe)* run a nested derived-table source on the VDBE
+- *(vdbe)* run a compound SELECT with CTEs on the VDBE
+- *(vdbe)* run a CTE FROM-source on the VDBE
+- *(vdbe)* run a constant/VALUES subquery source on the VDBE
+- *(vdbe)* track the min/max companion row for bare columns
+- *(vdbe)* represent bare columns on the general grouped path
+- *(vdbe)* emit a first-row representative for a bare column in grouped output
+- *(vdbe)* run two-argument group_concat/string_agg on the VDBE
+- *(vdbe)* run printf/format on the VDBE
+- *(vdbe)* run text LIKE pattern ESCAPE c on the VDBE
+
+### Documentation
+
+- record empirically-mapped name-resolution precedence for A-misc-1
+- clear done A-misc-2, sharpen A-misc-1 with clause-order precedence
+- collapse completed Track A/B narrative, expand remaining open work
+- note ALTER TABLE + cross-object propagation in the README
+- bump focused-suite count to 360+ in README status line
+- record printf '!' high-precision float-decode gap in ROADMAP
+
+### Fixed
+
+- *(vdbe)* walk a no-WHERE covering-index scan in key order
+- *(vdbe)* walk a multi-value IN seek in index-key order
+- *(vdbe)* walk secondary-index seeks in key order by deferring to the tree-walker
+- *(eqp)* never emit a LAST 0 TERMS temp-btree node
+- *(eqp)* decline EXPLAIN QUERY PLAN of a derived table joined to another source
+- *(eqp)* render CO-ROUTINE for an aliased constant-row derived table
+- *(exec)* reject a FROM-less wildcard projection at prepare time
+- *(pragma)* empty result for argumentless introspection PRAGMAs
+- *(cli)* print rows for the =arg form of query PRAGMAs
+- *(exec)* catch unresolved columns in correlated subquery bodies at prepare (A-prepare-correlated)
+- *(exec)* keep same-named columns from different databases distinct under *
+- *(parser)* accept a postfix COLLATE after a closed IN (…) construct
+- *(exec)* error on unrecognized pragma table-valued sources
+- *(exec)* reject positional GROUP BY resolving to an aggregate column
+- *(exec)* resolve signed/wrapped positional ORDER BY / GROUP BY ordinals
+- *(vdbe)* defer SELECT DISTINCT with an explicit COLLATE projection
+- *(vdbe)* defer min/max with an explicit COLLATE arg to the tree-walker
+- *(vdbe)* defer DISTINCT aggregate with an explicit COLLATE arg
+- *(alter)* keep a foreign key's parent column intact on RENAME COLUMN
+- *(alter)* rewrite renamed table in trigger WHEN guard and body subqueries
+- *(eval)* coerce a blob to a number via its bytes-as-text
+- *(value)* compare integers exactly, not through f64 (precision loss above 2^53)
+- *(func)* sum() result type follows numeric affinity, not storage class
+- *(vdbe)* defer negative/wrapped ORDER BY ordinals to the tree-walker
+- *(vdbe)* order GROUP BY output by the grouping keys
+- *(alter)* rename INSERT-INTO target in a trigger body on RENAME TABLE
+- *(window)* order grouped+windowed rows by the window like SQLite
+
 ## [0.0.12](https://github.com/KarpelesLab/graphitesql/compare/v0.0.11...v0.0.12) - 2026-06-28
 
 ### Added
