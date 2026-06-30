@@ -482,8 +482,10 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   graphite SCANs as SQLite does; this also fixed a row-**ordering** bug, since the
   mis-applied seek had wrongly credited its `(b, rowid)` walk for a sole `ORDER BY` on
   the rowid (a NOCASE match spans several binary keys, so the rows are not in rowid
-  order). The check lives in the shared `collect_eq_constraints`, so the seek, the
-  EQP label, and the ORDER-BY credit stay in lockstep.
+  order). The check lives in the shared `collect_eq_constraints` /
+  `collect_range_constraints` (a range bound and a `BETWEEN` bound get it per-bound,
+  so `b BETWEEN 'a' COLLATE NOCASE AND 'z'` keeps only the matching `b<'z'` bound, as
+  SQLite does), so the seek, the EQP label, and the ORDER-BY credit stay in lockstep.
   The `NOT INDEXED` planner hint is now honored in the *plan* (the executor already
   honored it, so rows were always correct): SQLite forbids every *secondary* index on
   that table, so a `WHERE` seek, covering scan, ORDER-BY index walk, and MULTI-INDEX OR

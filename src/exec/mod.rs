@@ -30363,12 +30363,23 @@ fn collect_range_constraints(
                 BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
             ) =>
         {
+            // A bound whose value carries an explicit `COLLATE` differing from the
+            // column's collation cannot seek that column's index (its keys order for a
+            // different collation), so SQLite ignores it for the seek — same rule as
+            // the equality collector.
+            let coll_ok = |ci: usize, val: &Expr| {
+                explicit_collation(val).is_none_or(|c| c == columns[ci].collation)
+            };
             if let (Some(ci), Some(v)) = (col_index(left, columns), const_value(right, params)) {
-                apply_bound(out.entry(ci).or_default(), *op, v);
+                if coll_ok(ci, right) {
+                    apply_bound(out.entry(ci).or_default(), *op, v);
+                }
             } else if let (Some(ci), Some(v)) =
                 (col_index(right, columns), const_value(left, params))
             {
-                apply_bound(out.entry(ci).or_default(), flip_cmp(*op), v);
+                if coll_ok(ci, left) {
+                    apply_bound(out.entry(ci).or_default(), flip_cmp(*op), v);
+                }
             }
         }
         Expr::Between {
@@ -30378,11 +30389,13 @@ fn collect_range_constraints(
             negated: false,
         } => {
             if let Some(ci) = col_index(expr, columns) {
+                let coll_ok =
+                    |val: &Expr| explicit_collation(val).is_none_or(|c| c == columns[ci].collation);
                 let b = out.entry(ci).or_default();
-                if let Some(v) = const_value(low, params) {
+                if let (Some(v), true) = (const_value(low, params), coll_ok(low)) {
                     apply_bound(b, BinaryOp::GtEq, v);
                 }
-                if let Some(v) = const_value(high, params) {
+                if let (Some(v), true) = (const_value(high, params), coll_ok(high)) {
                     apply_bound(b, BinaryOp::LtEq, v);
                 }
             }

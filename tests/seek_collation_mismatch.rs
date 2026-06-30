@@ -58,10 +58,16 @@ fn collation_mismatch_scans_matching_seeks() {
     }
     let g = env!("CARGO_BIN_EXE_graphitesql");
     // BINARY column / index: an explicit NOCASE differs → SCAN; BINARY (or absent) → SEARCH.
+    // Equality and range alike; a BETWEEN keeps only the bound whose collation matches.
     for q in [
         "SELECT * FROM t WHERE b='x' COLLATE NOCASE",
         "SELECT * FROM t WHERE b='x' COLLATE BINARY",
         "SELECT * FROM t WHERE b='x'",
+        "SELECT * FROM t WHERE b>'x' COLLATE NOCASE",
+        "SELECT * FROM t WHERE b>'x' COLLATE BINARY",
+        "SELECT * FROM t WHERE b>'x'",
+        "SELECT * FROM t WHERE b BETWEEN 'a' COLLATE NOCASE AND 'z'",
+        "SELECT * FROM t WHERE b BETWEEN 'a' AND 'z'",
     ] {
         assert_eq!(
             plan("sqlite3", BINARY_COL, q),
@@ -102,6 +108,14 @@ fn collation_mismatch_orders_rows_correctly() {
             "SELECT a,b FROM t WHERE b='x' COLLATE BINARY ORDER BY a",
         ),
         (BINARY_COL, "SELECT a,b FROM t WHERE b='x' ORDER BY a"),
+        (
+            BINARY_COL,
+            "SELECT a FROM t WHERE b>'x' COLLATE NOCASE ORDER BY a",
+        ),
+        (
+            BINARY_COL,
+            "SELECT a FROM t WHERE b BETWEEN 'a' COLLATE NOCASE AND 'z' ORDER BY a",
+        ),
         (
             NOCASE_COL,
             "SELECT a,b FROM t WHERE b='x' COLLATE BINARY ORDER BY a",
