@@ -1200,10 +1200,15 @@ tie/representative order), so they are perf/EQP-fidelity work, not correctness:
   computed value in SQLite (`SEARCH … (b=?)`); graphite `SCAN`s because the eq-
   collector requires a constant RHS. Needs the executor to evaluate the
   non-correlated subquery once, then seek (superset-safe; `eqp_access` mirrors it).
-- **B9f — `GLOB 'prefix*'` prefix-range seek.** SQLite rewrites a fixed-prefix `GLOB`
-  (always case-sensitive) into `col >= 'prefix' AND col < 'prefix⁺'` and seeks a
-  BINARY index; graphite scans. Must gate on the index's collation being BINARY (else
-  the EQP diverges on a NOCASE index) and handle the multi-byte prefix increment.
+- **B9f — `GLOB 'prefix*'` prefix-range seek. ✅ Done.** A fixed-prefix `GLOB`
+  (always case-sensitive / byte-based) now seeks `col >= 'prefix' AND col < 'prefix⁺'`
+  on a BINARY index and reads `SEARCH … (b>? AND b<?)`. Implemented as a `BinaryOp::Glob`
+  arm in the shared `collect_range_constraints` (so the executor range seek and
+  `eqp_access` move in lockstep), gated on the column's collation being BINARY; the
+  `glob_prefix_range` helper extracts the literal prefix (up to the first `*`/`?`/`[`)
+  and increments the last byte `< 0xFF` (dropping trailing `0xFF`; a non-UTF-8
+  increment drops the upper bound → still a valid superset). A leading wildcard scans;
+  the full GLOB is re-applied so results are exact.
 - **B9g — eq-prefix + trailing rowid range on a secondary index. ✅ Done.**
   `WHERE b=? AND a>?` (a the IPK) *and* the bare `rowid`/`_rowid_`/`oid` alias spelling
   now seek and render `SEARCH … USING INDEX ib (b=? AND rowid>?)`, bounding the

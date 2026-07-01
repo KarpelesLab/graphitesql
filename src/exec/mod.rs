@@ -30465,6 +30465,42 @@ fn flip_cmp(op: BinaryOp) -> BinaryOp {
     }
 }
 
+/// The `[lo, hi)` byte-range a fixed-prefix `GLOB` pattern seeks: `'abc*'` matches
+/// exactly the strings `>= 'abc'` and `< 'abd'`. The literal prefix is the run before
+/// the first GLOB metacharacter (`*`, `?`, `[`); an empty prefix (a leading wildcard)
+/// is unseekable → `None`. The upper bound increments the last byte `< 0xFF` and drops
+/// trailing `0xFF` bytes (so it dominates every string starting with the prefix); if
+/// every byte is `0xFF`, or the increment is not valid UTF-8, there is no upper bound
+/// (`hi = None`) and the seek runs from `lo` to the end — still a valid superset.
+fn glob_prefix_range(pat: &str) -> Option<(String, Option<String>)> {
+    let prefix: String = pat
+        .chars()
+        .take_while(|&c| c != '*' && c != '?' && c != '[')
+        .collect();
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut hi = prefix.clone().into_bytes();
+    loop {
+        match hi.last().copied() {
+            Some(0xFF) => {
+                hi.pop();
+            }
+            Some(b) => {
+                *hi.last_mut().unwrap() = b + 1;
+                break;
+            }
+            None => break,
+        }
+    }
+    let hi = if hi.is_empty() {
+        None
+    } else {
+        String::from_utf8(hi).ok()
+    };
+    Some((prefix, hi))
+}
+
 /// A range on the table's rowid expressed through a `rowid`/`_rowid_`/`oid` alias
 /// (`… AND rowid>?`) — the column-name range collector resolves the INTEGER PRIMARY
 /// KEY by its declared name, so the bare-alias spelling needs this separate walk.
@@ -30589,6 +30625,29 @@ fn collect_range_constraints(
                 }
                 if let (Some(v), true) = (const_value(high, params), coll_ok(high)) {
                     apply_bound(b, BinaryOp::LtEq, v);
+                }
+            }
+        }
+        // `col GLOB 'prefix*'` (SQLite's GLOB is always case-sensitive / byte-based)
+        // seeks the `[prefix, prefix⁺)` range on a BINARY index — the index orders keys
+        // by byte, matching GLOB. A NOCASE/RTRIM column can't serve it, so gate on the
+        // column's collation being BINARY. Superset-safe: `run_core` re-applies GLOB.
+        Expr::Binary {
+            op: BinaryOp::Glob,
+            left,
+            right,
+        } => {
+            if let (Some(ci), Some(Value::Text(pat))) =
+                (col_index(left, columns), const_value(right, params))
+            {
+                if columns[ci].collation == crate::value::Collation::Binary {
+                    if let Some((lo, hi)) = glob_prefix_range(&pat) {
+                        let b = out.entry(ci).or_default();
+                        apply_bound(b, BinaryOp::GtEq, Value::Text(lo));
+                        if let Some(hi) = hi {
+                            apply_bound(b, BinaryOp::Lt, Value::Text(hi));
+                        }
+                    }
                 }
             }
         }
