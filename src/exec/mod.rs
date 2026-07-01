@@ -14056,6 +14056,61 @@ impl Connection {
                         }
                     }
                 }
+                // A `LIMIT`/`OFFSET` body that does NOT flatten materializes as a
+                // CO-ROUTINE whose child is the body's own plan, then the outer
+                // `{SCAN|SEARCH} <name>` (+ optional trailing temp-b-tree). SQLite
+                // flattens a *bare* `LIMIT` body under a pure-wildcard / narrower /
+                // outer-`ORDER BY` outer (the pure-wildcard case is handled above; the
+                // narrower / outer-`ORDER BY` cases still decline), but takes the
+                // co-routine path once an `OFFSET`, an outer `WHERE`, or an outer
+                // aggregate is present (each changes the semantics vs a plain flatten).
+                if let Some(name) = co_label {
+                    let body_single_base_table = sub.from.as_ref().is_some_and(|f| {
+                        f.joins.is_empty()
+                            && f.first.subquery.is_none()
+                            && f.first.tvf_args.is_none()
+                            && self.lookup_cte(&f.first.name, None).is_none()
+                            && !is_cte_name(&f.first.name)
+                            && !self.is_view(&f.first.name)
+                            && !self.is_virtual_table(&f.first.name)
+                    });
+                    let limit_body = body_single_base_table
+                        && (sub.limit.is_some() || sub.offset.is_some())
+                        && sub.compound.is_empty()
+                        && sub.window_defs.is_empty()
+                        && !select_is_aggregate_query(sub)
+                        && !sub.distinct
+                        && !sub.columns.iter().any(|c| match c {
+                            ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                            ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                        })
+                        && !sub.where_clause.as_ref().is_some_and(expr_has_subquery);
+                    let non_flattenable = sub.offset.is_some()
+                        || sel.where_clause.is_some()
+                        || select_is_aggregate_query(sel);
+                    if limit_body && non_flattenable {
+                        if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
+                        {
+                            let co_id = *next_id;
+                            *next_id += 1;
+                            out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                            self.eqp_select(sub, co_id, next_id, out, params)?;
+                            let scan_id = *next_id;
+                            *next_id += 1;
+                            out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                            if let Some(lbl) = trailing {
+                                let tid = *next_id;
+                                *next_id += 1;
+                                out.push((
+                                    tid,
+                                    parent,
+                                    alloc::format!("USE TEMP B-TREE FOR {lbl}"),
+                                ));
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
                 // Any other shape (a narrowing/clause-bearing outer, a table-bearing
                 // body we can't prove flattenable, a `UNION ALL`-only compound body, or
                 // an outer query that emits extra nodes) is not one we render

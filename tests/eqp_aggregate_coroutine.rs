@@ -65,6 +65,14 @@ fn aggregate_body_coroutine_matches_sqlite() {
         "SELECT * FROM (SELECT DISTINCT c FROM t) AS s",
         "SELECT x FROM (SELECT DISTINCT b AS x FROM t) AS s",
         "WITH c AS (SELECT DISTINCT b FROM t) SELECT * FROM c",
+        // A non-flattenable LIMIT/OFFSET body (B9c): an OFFSET, an outer WHERE, or an
+        // outer aggregate takes the same CO-ROUTINE wrapper as an aggregate body.
+        "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s WHERE a>3",
+        "SELECT * FROM (SELECT * FROM t LIMIT 5 OFFSET 2) AS s",
+        "SELECT * FROM (SELECT * FROM t ORDER BY b LIMIT 5 OFFSET 1) AS s",
+        "SELECT count(*) FROM (SELECT * FROM t LIMIT 5) AS s",
+        "SELECT max(b) FROM (SELECT * FROM t LIMIT 5) AS s",
+        "WITH c AS (SELECT * FROM t LIMIT 5) SELECT * FROM c WHERE a>3",
     ] {
         assert_eq!(plan("sqlite3", BASE, q), plan(g, BASE, q), "plan for {q}");
     }
