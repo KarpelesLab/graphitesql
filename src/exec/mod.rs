@@ -11557,6 +11557,60 @@ impl Connection {
             }
         }
 
+        // The equality prefix consumed every *declared* index column, but a range on
+        // the table's rowid still seeks: the rowid is the implicit trailing key
+        // component of every secondary index entry, so `x=? AND rowid>?` bounds the
+        // `(x, rowid)` range `[eq…, lo] .. [eq…, hi]` (SQLite renders it the same way).
+        // Superset-safe — `run_core` re-applies the full `WHERE`.
+        if next_pos == idx_cols.len() {
+            if let Some(ipk) = meta.ipk {
+                let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                    alloc::collections::BTreeMap::new();
+                collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+                if let Some(b) = ranges.get(&ipk) {
+                    let mut colls = full_colls[..next_pos].to_vec();
+                    colls.push(crate::value::Collation::default());
+                    let mut lo_key = key.clone();
+                    let lo_inc = match b.lower.as_ref() {
+                        Some((v, inc)) => {
+                            lo_key.push(v.clone());
+                            *inc
+                        }
+                        None => true,
+                    };
+                    let mut hi_key = key.clone();
+                    let hi_inc = match b.upper.as_ref() {
+                        Some((v, inc)) => {
+                            hi_key.push(v.clone());
+                            *inc
+                        }
+                        None => true,
+                    };
+                    let rowids = crate::btree::index_range_rowids(
+                        self.backend.source(),
+                        root,
+                        Some((lo_key.as_slice(), lo_inc)),
+                        Some((hi_key.as_slice(), hi_inc)),
+                        &colls,
+                    )?;
+                    let encoding = self.backend.source().header().text_encoding;
+                    let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                    let mut out = Vec::new();
+                    for rid in rowids {
+                        if cur.seek(rid)? {
+                            let values =
+                                self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                            out.push(InputRow {
+                                values,
+                                rowid: Some(rid),
+                            });
+                        }
+                    }
+                    return Ok(Some(out));
+                }
+            }
+        }
+
         self.index_seek_fetch(meta, root, &key, &full_colls[..key.len()])
     }
 
@@ -14745,7 +14799,9 @@ impl Connection {
                     .map(|&c| alloc::format!("{}=?", meta.columns[c].name))
                     .collect::<Vec<_>>();
                 // A range on the column after the equality prefix is seeked too
-                // (matches the eq-prefix + range path in try_index_lookup).
+                // (matches the eq-prefix + range path in try_index_lookup). Once the
+                // prefix consumes every declared column, a range on the table's rowid
+                // (the index's implicit trailing key) still seeks — rendered `rowid>?`.
                 if let Some(&next_col) = idx_cols.get(matched.len()) {
                     let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
                         alloc::collections::BTreeMap::new();
@@ -14757,6 +14813,20 @@ impl Connection {
                         }
                         if b.upper.is_some() {
                             conds.push(alloc::format!("{name}<?"));
+                        }
+                    }
+                } else if matched.len() == idx_cols.len() {
+                    if let Some(ipk) = meta.ipk {
+                        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                            alloc::collections::BTreeMap::new();
+                        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+                        if let Some(b) = ranges.get(&ipk) {
+                            if b.lower.is_some() {
+                                conds.push(String::from("rowid>?"));
+                            }
+                            if b.upper.is_some() {
+                                conds.push(String::from("rowid<?"));
+                            }
                         }
                     }
                 }

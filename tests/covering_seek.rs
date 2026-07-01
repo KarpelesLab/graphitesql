@@ -100,10 +100,11 @@ fn residual_where_column_not_in_index_is_not_covered() {
         plan(&conn, "SELECT c FROM t WHERE c=5 AND b>0"),
         "SEARCH t USING INDEX ic (c=?)"
     );
-    // ...whereas a residual WHERE on a (rowid) stays covered.
+    // ...whereas a residual WHERE on a (rowid) stays covered, and the rowid range
+    // bounds the index's implicit trailing key (matching SQLite — see B9g).
     assert_eq!(
         plan(&conn, "SELECT c FROM t WHERE c=5 AND a>1"),
-        "SEARCH t USING COVERING INDEX ic (c=?)"
+        "SEARCH t USING COVERING INDEX ic (c=? AND rowid>?)"
     );
 }
 
