@@ -1199,15 +1199,13 @@ tie/representative order), so they are perf/EQP-fidelity work, not correctness:
   (always case-sensitive) into `col >= 'prefix' AND col < 'prefix⁺'` and seeks a
   BINARY index; graphite scans. Must gate on the index's collation being BINARY (else
   the EQP diverges on a NOCASE index) and handle the multi-byte prefix increment.
-- **B9g — eq-prefix + trailing rowid range on a secondary index.** *Done* for the
-  INTEGER-PRIMARY-KEY-column spelling: `WHERE b=? AND a>?` (a the IPK) now seeks and
-  renders `SEARCH … USING INDEX ib (b=? AND rowid>?)`, bounding the `(b, rowid)` index
-  range directly — the rowid is the index's implicit trailing key. Extended the
-  existing eq-prefix + next-column range seek (executor `try_index_lookup` +
-  `eqp_access`, in lockstep). *Residual:* the bare `rowid`-alias spelling
-  (`… AND rowid>?`) still renders `(b=?)` because `collect_range_constraints` resolves
-  by column name and the IPK column is `a` (rows stay correct via the WHERE re-apply);
-  needs rowid-alias range collection.
+- **B9g — eq-prefix + trailing rowid range on a secondary index. ✅ Done.**
+  `WHERE b=? AND a>?` (a the IPK) *and* the bare `rowid`/`_rowid_`/`oid` alias spelling
+  now seek and render `SEARCH … USING INDEX ib (b=? AND rowid>?)`, bounding the
+  `(b, rowid)` index range directly — the rowid is the index's implicit trailing key.
+  Extended the existing eq-prefix + next-column range seek (executor `try_index_lookup`
+  + `eqp_access`, in lockstep) with a `next_pos == idx_cols.len()` rowid-tail block,
+  and added a `rowid_alias_range` collector for the alias spelling.
 - **B9h — cost-model single-table index *choice*.** SQLite prefers, among indexes
   that share an equality prefix, the one whose walk does the most work: a composite
   `(b,c)` over `(b)` when a trailing range (`b=? AND c>?`) or a `GROUP BY`/`ORDER BY c`

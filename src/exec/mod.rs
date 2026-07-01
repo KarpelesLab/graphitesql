@@ -11562,52 +11562,53 @@ impl Connection {
         // component of every secondary index entry, so `x=? AND rowid>?` bounds the
         // `(x, rowid)` range `[eq…, lo] .. [eq…, hi]` (SQLite renders it the same way).
         // Superset-safe — `run_core` re-applies the full `WHERE`.
-        if next_pos == idx_cols.len() {
-            if let Some(ipk) = meta.ipk {
-                let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
-                    alloc::collections::BTreeMap::new();
-                collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
-                if let Some(b) = ranges.get(&ipk) {
-                    let mut colls = full_colls[..next_pos].to_vec();
-                    colls.push(crate::value::Collation::default());
-                    let mut lo_key = key.clone();
-                    let lo_inc = match b.lower.as_ref() {
-                        Some((v, inc)) => {
-                            lo_key.push(v.clone());
-                            *inc
-                        }
-                        None => true,
-                    };
-                    let mut hi_key = key.clone();
-                    let hi_inc = match b.upper.as_ref() {
-                        Some((v, inc)) => {
-                            hi_key.push(v.clone());
-                            *inc
-                        }
-                        None => true,
-                    };
-                    let rowids = crate::btree::index_range_rowids(
-                        self.backend.source(),
-                        root,
-                        Some((lo_key.as_slice(), lo_inc)),
-                        Some((hi_key.as_slice(), hi_inc)),
-                        &colls,
-                    )?;
-                    let encoding = self.backend.source().header().text_encoding;
-                    let mut cur = TableCursor::new(self.backend.source(), meta.root);
-                    let mut out = Vec::new();
-                    for rid in rowids {
-                        if cur.seek(rid)? {
-                            let values =
-                                self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
-                            out.push(InputRow {
-                                values,
-                                rowid: Some(rid),
-                            });
-                        }
+        if next_pos == idx_cols.len() && meta.ipk.is_some() {
+            let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                alloc::collections::BTreeMap::new();
+            collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+            let rowid_bound = meta
+                .ipk
+                .and_then(|ipk| ranges.remove(&ipk))
+                .or_else(|| rowid_alias_range(where_expr, meta, params));
+            if let Some(b) = rowid_bound {
+                let mut colls = full_colls[..next_pos].to_vec();
+                colls.push(crate::value::Collation::default());
+                let mut lo_key = key.clone();
+                let lo_inc = match b.lower.as_ref() {
+                    Some((v, inc)) => {
+                        lo_key.push(v.clone());
+                        *inc
                     }
-                    return Ok(Some(out));
+                    None => true,
+                };
+                let mut hi_key = key.clone();
+                let hi_inc = match b.upper.as_ref() {
+                    Some((v, inc)) => {
+                        hi_key.push(v.clone());
+                        *inc
+                    }
+                    None => true,
+                };
+                let rowids = crate::btree::index_range_rowids(
+                    self.backend.source(),
+                    root,
+                    Some((lo_key.as_slice(), lo_inc)),
+                    Some((hi_key.as_slice(), hi_inc)),
+                    &colls,
+                )?;
+                let encoding = self.backend.source().header().text_encoding;
+                let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                let mut out = Vec::new();
+                for rid in rowids {
+                    if cur.seek(rid)? {
+                        let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                        out.push(InputRow {
+                            values,
+                            rowid: Some(rid),
+                        });
+                    }
                 }
+                return Ok(Some(out));
             }
         }
 
@@ -14815,18 +14816,20 @@ impl Connection {
                             conds.push(alloc::format!("{name}<?"));
                         }
                     }
-                } else if matched.len() == idx_cols.len() {
-                    if let Some(ipk) = meta.ipk {
-                        let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
-                            alloc::collections::BTreeMap::new();
-                        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
-                        if let Some(b) = ranges.get(&ipk) {
-                            if b.lower.is_some() {
-                                conds.push(String::from("rowid>?"));
-                            }
-                            if b.upper.is_some() {
-                                conds.push(String::from("rowid<?"));
-                            }
+                } else if matched.len() == idx_cols.len() && meta.ipk.is_some() {
+                    let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                        alloc::collections::BTreeMap::new();
+                    collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+                    let rowid_bound = meta
+                        .ipk
+                        .and_then(|ipk| ranges.remove(&ipk))
+                        .or_else(|| rowid_alias_range(where_expr, meta, params));
+                    if let Some(b) = rowid_bound {
+                        if b.lower.is_some() {
+                            conds.push(String::from("rowid>?"));
+                        }
+                        if b.upper.is_some() {
+                            conds.push(String::from("rowid<?"));
                         }
                     }
                 }
@@ -30405,6 +30408,70 @@ fn flip_cmp(op: BinaryOp) -> BinaryOp {
         BinaryOp::GtEq => BinaryOp::LtEq,
         other => other,
     }
+}
+
+/// A range on the table's rowid expressed through a `rowid`/`_rowid_`/`oid` alias
+/// (`… AND rowid>?`) — the column-name range collector resolves the INTEGER PRIMARY
+/// KEY by its declared name, so the bare-alias spelling needs this separate walk.
+/// Returns the folded `RangeBound`, or `None` when no such bound is present. The
+/// alias must not be shadowed by a real column of that name.
+fn rowid_alias_range(e: &Expr, meta: &TableMeta, params: &Params) -> Option<RangeBound> {
+    fn is_rowid(x: &Expr, meta: &TableMeta) -> bool {
+        matches!(x, Expr::Column { column, .. }
+            if is_rowid_alias(column)
+                && !meta.columns.iter().any(|c| c.name.eq_ignore_ascii_case(column)))
+    }
+    fn walk(e: &Expr, meta: &TableMeta, params: &Params, out: &mut RangeBound, found: &mut bool) {
+        match e {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                walk(left, meta, params, out, found);
+                walk(right, meta, params, out, found);
+            }
+            Expr::Paren(inner) => walk(inner, meta, params, out, found),
+            Expr::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+                ) =>
+            {
+                if is_rowid(left, meta) {
+                    if let Some(v) = const_value(right, params) {
+                        apply_bound(out, *op, v);
+                        *found = true;
+                    }
+                } else if is_rowid(right, meta) {
+                    if let Some(v) = const_value(left, params) {
+                        apply_bound(out, flip_cmp(*op), v);
+                        *found = true;
+                    }
+                }
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated: false,
+            } if is_rowid(expr, meta) => {
+                if let Some(v) = const_value(low, params) {
+                    apply_bound(out, BinaryOp::GtEq, v);
+                    *found = true;
+                }
+                if let Some(v) = const_value(high, params) {
+                    apply_bound(out, BinaryOp::LtEq, v);
+                    *found = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut b = RangeBound::default();
+    let mut found = false;
+    walk(e, meta, params, &mut b, &mut found);
+    found.then_some(b)
 }
 
 /// Collect per-column range bounds (`<`/`<=`/`>`/`>=`/`BETWEEN`) from the

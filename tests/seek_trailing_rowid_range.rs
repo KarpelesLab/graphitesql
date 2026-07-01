@@ -3,9 +3,8 @@
 //! `SEARCH t USING INDEX ib (b=? AND rowid>?)`, because every secondary-index entry
 //! is keyed `(cols…, rowid)`. graphite used to render (and seek) only `(b=?)` and
 //! re-filter the rowid bound; it now bounds the `(b, rowid)` range directly, matching
-//! SQLite. The rowid range is expressed via the INTEGER PRIMARY KEY column (`a`); the
-//! bare `rowid`-alias spelling still renders `(b=?)` in EQP (rows stay correct via the
-//! WHERE re-apply) — a small follow-up. Verified vs the sqlite3 3.50.4 CLI.
+//! SQLite. The rowid range is expressed via the INTEGER PRIMARY KEY column (`a`) or a
+//! bare `rowid`/`_rowid_`/`oid` alias. Verified vs the sqlite3 3.50.4 CLI.
 
 #![cfg(feature = "std")]
 
@@ -56,6 +55,9 @@ fn trailing_rowid_range_plan_matches_sqlite() {
         "SELECT * FROM t WHERE b=1 AND a>0 AND a<9",
         "SELECT * FROM t WHERE b=1 AND a<9",
         "SELECT * FROM t WHERE b=1 AND a>=3",
+        "SELECT * FROM t WHERE b=1 AND rowid>5", // rowid alias
+        "SELECT * FROM t WHERE b=1 AND oid<9",   // oid alias
+        "SELECT * FROM t WHERE b=1 AND rowid BETWEEN 2 AND 8",
         "SELECT a FROM t WHERE b=1 AND a>0", // covering
         // No rowid range → plain prefix seek, unchanged.
         "SELECT * FROM t WHERE b=1",
