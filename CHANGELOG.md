@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/KarpelesLab/graphitesql/compare/v0.0.13...v0.0.14) - 2026-07-01
+
+### Added
+
+- *(planner)* seek a fixed-prefix GLOB range on a BINARY index (B9f)
+- *(eqp)* render a non-flattenable LIMIT/OFFSET derived/CTE body as a CO-ROUTINE (B9c)
+- *(planner)* seek a trailing rowid range via a rowid/oid alias too (B9g)
+- *(planner)* seek a trailing rowid range after an index equality prefix (B9g)
+- *(planner)* seek a parenthesized column like the bare column
+- *(eqp)* honor the NOT INDEXED hint in EXPLAIN QUERY PLAN
+- *(eqp)* flatten a bare-LIMIT derived/CTE body under a pure-wildcard outer in EXPLAIN QUERY PLAN
+- *(planner)* seek col IS <non-null constant> like an equality
+- *(eqp)* render a DISTINCT derived/CTE/view body as a CO-ROUTINE in EXPLAIN QUERY PLAN
+- *(eqp)* render an aggregate derived/CTE/view body as a CO-ROUTINE in EXPLAIN QUERY PLAN
+- *(eqp)* render a FROM-less scalar subquery in EXPLAIN QUERY PLAN
+- *(eqp)* render a scalar node for a row-value UPDATE SET subquery in EXPLAIN QUERY PLAN
+- *(eqp)* render a scalar subquery node for single-row INSERT VALUES in EXPLAIN QUERY PLAN
+- *(eqp)* render a scalar subquery node for UPDATE/DELETE in EXPLAIN QUERY PLAN
+- *(eqp)* flatten an aliased derived/CTE projection and validate outer refs in EXPLAIN QUERY PLAN
+- *(eqp)* flatten a source-alias-qualified derived/CTE projection in EXPLAIN QUERY PLAN
+- *(eqp)* flatten a narrower derived/CTE projection in EXPLAIN QUERY PLAN
+- *(eqp)* flatten a derived/CTE source through an outer WHERE
+- *(eqp)* serve a redundant NULLS ORDER BY from the index without a sorter
+- *(eqp)* render partial-cover ORDER BY on a compound MERGE plan
+- *(eqp)* resolve named ORDER BY terms in the compound MERGE plan
+- *(eqp)* render MERGE plan for a top-level compound with ORDER BY
+- *(eqp)* render a compound CTE/derived body as CO-ROUTINE over COMPOUND QUERY
+- *(eqp)* honor a MATERIALIZED CTE hint with a MATERIALIZE node
+- *(eqp)* render a multi-row VALUES CTE body as a CO-ROUTINE with SCAN N CONSTANT ROWS
+- *(eqp)* render a multi-row VALUES clause in FROM as a SCAN/SEARCH N-ROW VALUES CLAUSE node
+- *(eqp)* fold a multi-row VALUES clause into a single SCAN N-ROW VALUES CLAUSE node
+- *(eqp)* render outer ORDER BY/GROUP BY/DISTINCT temp-b-tree node for a recursive CTE
+- *(eqp)* render CO-ROUTINE plan for a recursive CTE
+- *(eqp)* render SCALAR SUBQUERY for a GROUP BY projection subquery
+- *(planner)* seek a comma join on an unqualified equi-predicate
+- *(eqp)* render SCALAR SUBQUERY for an ORDER BY scalar subquery
+- *(eqp)* render SCALAR SUBQUERY N for a scalar subquery in the projection
+- *(eqp)* render SCALAR SUBQUERY N for a non-correlated scalar WHERE subquery
+- *(planner)* elide the sorter for a WITHOUT ROWID filtered full-scan's order
+- *(planner)* elide the sorter for a WITHOUT ROWID PK-seek's ordered output
+- *(planner)* elide the sorter for a WITHOUT ROWID PK-ordered scan
+- *(eqp)* elide the ORDER BY sorter for an ordinal over SELECT *
+- *(eqp)* elide the ORDER BY sorter for an ordinal/alias over an index-ordered scan
+- *(eqp)* fold an ORDER BY into the GROUP BY / DISTINCT b-tree by ordinal or alias
+- *(eqp)* drop the ORDER BY sorter for a single-row bare aggregate
+- *(eqp)* place distinct-aggregate temp-b-trees after the GROUP BY sorter
+- *(eqp)* emit USE TEMP B-TREE FOR <f>(DISTINCT) for distinct aggregates
+- *(eqp)* generalize the min/max SEARCH optimization
+
+### Documentation
+
+- plan the remaining EQP-fidelity & access-path tracks (B9a–B9j)
+
+### Fixed
+
+- *(planner)* apply the COLLATE-mismatch seek check to range bounds too
+- *(planner)* don't index-seek an equality whose COLLATE differs from the column
+- *(eqp)* render a view source in EXPLAIN QUERY PLAN instead of crashing
+- *(eqp)* render SEARCH for a min/max outer over a recursive CTE
+- *(exec)* stop recursive-CTE column-origin resolution from overflowing
+- *(eqp)* range-check positional GROUP BY / ORDER BY terms on the plan path
+
 ## [0.0.13](https://github.com/KarpelesLab/graphitesql/compare/v0.0.12...v0.0.13) - 2026-06-30
 
 ### Added
