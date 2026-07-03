@@ -14593,9 +14593,24 @@ impl Connection {
         // clean single-table bare-`SCAN` case, placed after the SCAN line and
         // before any ORDER BY node — matching sqlite's node order.
         let mut group_btree_suppresses_order = false;
+        // The GROUP BY / DISTINCT temp-b-tree also materializes over an *unambiguous*
+        // access path that doesn't already yield the grouping order: a bare `SCAN`, or
+        // a rowid RANGE seek (`SEARCH … INTEGER PRIMARY KEY (rowid>?…)`), which returns
+        // rows in rowid order — never the group/distinct-key order — and, being the
+        // table's own clustered key, involves no secondary-index *choice* (so no
+        // cost-model divergence, unlike a secondary-index seek — see roadmap B9h). A
+        // rowid *equality* seek is a single row (grouping is a no-op), so it is
+        // excluded. `group_distinct_btree`'s own "a secondary index leads the first key
+        // column" guard still declines the shapes where sqlite would walk an index.
+        let rowid_range_seek = single_scan_detail.as_deref().is_some_and(|d| {
+            d.starts_with(&alloc::format!(
+                "SEARCH {label} USING INTEGER PRIMARY KEY (rowid"
+            )) && (d.contains('>') || d.contains('<'))
+        });
         // A no-op `DISTINCT` (its projection pins the rowid/IPK, so it removes
         // nothing) is planned by sqlite as if absent — no `FOR DISTINCT` node.
-        if single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str())
+        if (single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str())
+            || rowid_range_seek)
             && !self.distinct_is_noop(sel, &meta, &label)
         {
             if let Some((kind, suppress)) =

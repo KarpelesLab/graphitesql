@@ -1204,10 +1204,19 @@ tie/representative order), so they are perf/EQP-fidelity work, not correctness:
   over a `LIMIT` body still declines — SQLite full-sorts the materialized `LIMIT` rows,
   whereas pushing the ORDER BY down would render a partial `LAST TERM` index walk when
   the leading prefix is indexed. Boundary rules in the `eqp-derived-coroutine` memory.
-- **B9d — `SEARCH` + `GROUP BY`/`DISTINCT` temp-b-tree node.** graphite emits the
-  grouping b-tree only over a bare `SCAN`; under a `WHERE` seek it omits the node.
-  Entangled with B9h (SQLite often picks a *different* index whose walk serves the
-  grouping), so it should land together with the index-choice work.
+- **B9d — `SEARCH` + `GROUP BY`/`DISTINCT` temp-b-tree node. ◐ Unambiguous subset
+  done.** The grouping b-tree now also materializes over a **rowid *range* seek**
+  (`WHERE a>? GROUP BY c` → `SEARCH t USING INTEGER PRIMARY KEY (rowid>?)#USE TEMP
+  B-TREE FOR GROUP BY`, and the `DISTINCT` analogue) — the rowid is the table's own
+  clustered key, so there is no secondary-index *choice* and thus no cost-model
+  divergence; the seek returns rows in rowid order, never the group/distinct-key
+  order, so the b-tree is always needed. Gated in `eqp_select` on a
+  `SEARCH … INTEGER PRIMARY KEY (rowid>?/<?)` access line (a rowid *equality* seek is a
+  single row → excluded), reusing `group_distinct_btree`'s existing "a secondary index
+  leads the first key column → decline" guard. *Still open (folded into B9h):* the
+  same node under a **secondary-index** seek (`WHERE b=? GROUP BY c`), where SQLite may
+  pick a *different* composite index `(b,c)` whose walk serves the grouping — a
+  cost-model index-choice decision.
 - **B9e — `col = (scalar subquery)` seek. ✅ Done (SELECT).** `WHERE b = (SELECT …)`
   (and `>`/`<`/etc.) against a non-correlated scalar subquery now seeks — the executor
   folds the subquery to its value before the seek (`scan_source` single-table fast path),
@@ -1245,9 +1254,13 @@ tie/representative order), so they are perf/EQP-fidelity work, not correctness:
   longest-equality-prefix only. It also decides *whether* a no-WHERE query uses a
   covering scan at all (SQLite: narrow index beats a wide-row table scan, plain scan
   beats it on a 2-column table) — so the covering-scan row-order parity (formerly B9i)
-  rides here too. This changes the chosen access path, so it risks regressing the EQP
-  corpus and must be rolled out shape-by-shape with the full differential suite — the
-  single-table analogue of B1b.
+  rides here too, as does the **secondary-index** `SEARCH` + `GROUP BY`/`DISTINCT`
+  b-tree left open by B9d. This changes the chosen access path, so it risks regressing
+  the EQP corpus and must be rolled out shape-by-shape with the full differential suite
+  — the single-table analogue of B1b. **Confirmed deferred by design (2026-07-04):** the
+  pinned `sqlite3 3.50.4` oracle has no stat4, so its choices depend on row-width /
+  index-width / index-count heuristics graphite can't reproduce without diverging the
+  EQP corpus — same class as B1b/B4. Needs a stat4-enabled oracle to become tractable.
 - **B9i — covering-scan no-`ORDER BY` row order → subsumed by B9h (investigated
   2026-07-04, nothing to fix in isolation).** The original premise was wrong: graphite's
   covering read is *already* in index-walk order, and whenever graphite and SQLite pick
@@ -1261,12 +1274,22 @@ tie/representative order), so they are perf/EQP-fidelity work, not correctness:
   with two, so the plan **and** the emitted order differ. Reproducing it is pure cost
   modelling (row width, index width, number of indexes) — the same B9h/B4 problem, so
   the row-order parity rides on B9h, not a separate execution-order change.
-- **B9j — collation-aware index *selection* for a non-default-collation index.**
-  `collect_eq_constraints`/`collect_range_constraints` now compare an explicit
-  `COLLATE` to the *column's* collation (fixes the common bug); a `CREATE INDEX …
-  (b COLLATE NOCASE)` on a BINARY column plus a matching `COLLATE NOCASE` predicate
-  could seek that index, but graphite scans. Fully correct needs per-candidate-index
-  collation comparison threaded through every seek site.
+- **B9j — collation-aware index *selection* for a non-default-collation index.
+  Deferred (entangled, rows already correct).** `collect_eq_constraints` /
+  `collect_range_constraints` compare an explicit `COLLATE` to the *column's*
+  collation. When an index carries a *non-default* collation (`CREATE INDEX ib ON
+  t(b COLLATE NOCASE)` on a BINARY column), graphite is wrong in **both** directions vs
+  sqlite: `b='x' COLLATE NOCASE` should seek `ib` (graphite scans), and `b='x'` (BINARY
+  comparison) should *not* seek the NOCASE `ib` (graphite over-seeks it — rows still
+  correct via the WHERE re-apply, only EQP/perf). The correct model — an index serves a
+  comparison iff its per-column collation equals the comparison's *effective* collation
+  (explicit `COLLATE`, else the column's) — must be threaded into the index *selection*
+  at every one of the ~9 `collect_eq_constraints` call sites (the seek fast paths,
+  `eqp_access`, and `seek_order_prefix`'s ORDER-BY credit) in lockstep. The current
+  column-collation gate in the collector is itself an earlier ORDER-BY-ordering
+  correctness fix, so moving the check risks the extensive collation/seek/order suite
+  for a niche pattern with rows already correct. Deferred; a careful cross-cutting
+  refactor, not a quick slice.
 
 **Blocked / deferred by design:**
 - **B1b — cost-based join reordering.** graphite's per-cursor seek/bloom-filter
