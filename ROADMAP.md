@@ -1240,14 +1240,25 @@ tie/representative order), so they are perf/EQP-fidelity work, not correctness:
   `(b,c)` over `(b)` when a trailing range (`b=? AND c>?`) or a `GROUP BY`/`ORDER BY c`
   can ride the same walk; a *covering* index over a narrower one; the smallest
   covering index for `count(*)`; a covering index for an `IN` list. graphite picks by
-  longest-equality-prefix only. This changes the chosen access path, so it risks
-  regressing the EQP corpus and must be rolled out shape-by-shape with the full
-  differential suite — the single-table analogue of B1b.
-- **B9i — covering-scan / no-`ORDER BY` walk in index order.** A `SELECT DISTINCT b` /
-  covering scan with no `ORDER BY` emits rows in rowid order where SQLite walks the
-  index; the observable effect is the *representative* row a `DISTINCT`/`GROUP BY`
-  keeps under a non-BINARY collation. SQL leaves the order unspecified, so this is
-  low-priority parity polish, but it needs the covering read to walk the index b-tree.
+  longest-equality-prefix only. It also decides *whether* a no-WHERE query uses a
+  covering scan at all (SQLite: narrow index beats a wide-row table scan, plain scan
+  beats it on a 2-column table) — so the covering-scan row-order parity (formerly B9i)
+  rides here too. This changes the chosen access path, so it risks regressing the EQP
+  corpus and must be rolled out shape-by-shape with the full differential suite — the
+  single-table analogue of B1b.
+- **B9i — covering-scan no-`ORDER BY` row order → subsumed by B9h (investigated
+  2026-07-04, nothing to fix in isolation).** The original premise was wrong: graphite's
+  covering read is *already* in index-walk order, and whenever graphite and SQLite pick
+  the **same** covering index the rows already match (verified: `SELECT DISTINCT b`,
+  `GROUP BY b`, `DISTINCT b COLLATE NOCASE`, `DISTINCT b,c`). Every remaining
+  no-`ORDER BY` divergence is a *different access-path choice* — SQLite uses a covering
+  index (and its walk order) exactly where its cost model says the narrow index beats a
+  full-row table scan (`SELECT b`/`count(*)`/`DISTINCT rowid` over a wide table → covering;
+  over a narrow 2-column table → plain `SCAN t`), and picks the smallest of several
+  covering indexes. graphite either over-selects a single covering index or stands down
+  with two, so the plan **and** the emitted order differ. Reproducing it is pure cost
+  modelling (row width, index width, number of indexes) — the same B9h/B4 problem, so
+  the row-order parity rides on B9h, not a separate execution-order change.
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   `collect_eq_constraints`/`collect_range_constraints` now compare an explicit
   `COLLATE` to the *column's* collation (fixes the common bug); a `CREATE INDEX …
