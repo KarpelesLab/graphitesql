@@ -13861,6 +13861,16 @@ impl Connection {
                     && !sub.where_clause.as_ref().is_some_and(expr_has_subquery);
                 let inner_is_base_table_scan =
                     inner_base_scan_no_limit && sub.limit.is_none() && sub.offset.is_none();
+                // A bare `LIMIT` body (no `OFFSET`) also flattens under a *narrower*
+                // projection — SQLite substitutes the outer projection into the `LIMIT`
+                // body (`SELECT a FROM (SELECT * FROM t LIMIT 5)` → `SCAN t USING
+                // COVERING INDEX`). Only when the outer carries no `WHERE`: a predicate
+                // over a `LIMIT` body is filter-after-limit, which SQLite materializes
+                // as a `CO-ROUTINE` (handled below) rather than folding into the scan.
+                let inner_scan_flatten_ok = inner_is_base_table_scan
+                    || (inner_base_scan_no_limit
+                        && sub.offset.is_none()
+                        && sel.where_clause.is_none());
                 // A pure-wildcard outer over a single base-table body recurses into the
                 // body's own plan. A bare `LIMIT` body (no `OFFSET`) flattens the same
                 // way — SQLite renders just the body's `SCAN`/index walk, the `LIMIT`
@@ -13969,24 +13979,24 @@ impl Connection {
                     .is_none_or(|p| all_qualifiers_match(p, co_label));
                 if let (true, true, true, Some(rename)) = (
                     outer_general_flatten,
-                    inner_is_base_table_scan,
+                    inner_scan_flatten_ok,
                     outer_where_qualifiers_ok && !(outer_is_wildcard && sel.where_clause.is_none()),
-                    derived_map,
+                    derived_map.as_ref(),
                 ) {
-                    if outer_refs_resolve(&rename) {
+                    if outer_refs_resolve(rename) {
                         let mut merged = sub.clone();
                         if !outer_is_wildcard {
                             let mut cols = sel.columns.clone();
                             for c in &mut cols {
                                 if let ResultColumn::Expr { expr, .. } = c {
-                                    rewrite_flattened_column(expr, co_label, &rename);
+                                    rewrite_flattened_column(expr, co_label, rename);
                                 }
                             }
                             merged.columns = cols;
                         }
                         if let Some(pred) = &sel.where_clause {
                             let mut pred = pred.clone();
-                            rewrite_flattened_column(&mut pred, co_label, &rename);
+                            rewrite_flattened_column(&mut pred, co_label, rename);
                             merged.where_clause = Some(match merged.where_clause.take() {
                                 Some(inner) => Expr::Binary {
                                     op: BinaryOp::And,
@@ -13997,6 +14007,67 @@ impl Connection {
                             });
                         }
                         return self.eqp_select(&merged, parent, next_id, out, params);
+                    }
+                }
+                // A bare-`LIMIT` body (no `OFFSET`) under an outer `ORDER BY` (and no
+                // `WHERE`) flattens: SQLite pushes the outer projection + `ORDER BY` into
+                // the flattened scan (`SELECT * FROM (SELECT * FROM t LIMIT 5) ORDER BY b`
+                // → `SCAN t USING INDEX tb`). We merge the outer projection + `ORDER BY`
+                // into the `LIMIT` body and recurse — the body's own `eqp_select` renders
+                // the ORDER-BY index walk / temp-b-tree. Same name-soundness gate as the
+                // projection merge, plus every `ORDER BY` column must name a source output
+                // (a positional term needs no rename).
+                // Restricted to a *single* ORDER BY term: a lone term is either fully
+                // served by an index walk (`SCAN … USING INDEX`) or fully unsorted
+                // (`SCAN … + USE TEMP B-TREE FOR ORDER BY`), both matching SQLite's outer
+                // plan; a multi-term ORDER BY whose leading prefix is indexed but tail is
+                // not would render a partial-sort `LAST TERM` here while SQLite full-sorts
+                // the materialized `LIMIT` rows — so multi-term declines.
+                if outer_flattenable_proj
+                    && sel.order_by.len() == 1
+                    && sel.where_clause.is_none()
+                    && sel.group_by.is_empty()
+                    && sel.having.is_none()
+                    && !sel.distinct
+                    && sel.compound.is_empty()
+                    && (from_cte || sel.ctes.is_empty())
+                    && inner_base_scan_no_limit
+                    && sub.limit.is_some()
+                    && sub.offset.is_none()
+                    && !sel.columns.iter().any(|c| match c {
+                        ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                        ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                    })
+                    && !sel.order_by.iter().any(|t| expr_has_subquery(&t.expr))
+                    && sel
+                        .order_by
+                        .iter()
+                        .all(|t| all_qualifiers_match(&t.expr, co_label))
+                {
+                    if let Some(rename) = derived_map.as_ref() {
+                        let names: Vec<String> = rename.iter().map(|(o, _)| o.clone()).collect();
+                        let order_refs_ok = sel
+                            .order_by
+                            .iter()
+                            .all(|t| all_column_names_in(&t.expr, &names));
+                        if outer_refs_resolve(rename) && order_refs_ok {
+                            let mut merged = sub.clone();
+                            if !outer_is_wildcard {
+                                let mut cols = sel.columns.clone();
+                                for c in &mut cols {
+                                    if let ResultColumn::Expr { expr, .. } = c {
+                                        rewrite_flattened_column(expr, co_label, rename);
+                                    }
+                                }
+                                merged.columns = cols;
+                            }
+                            let mut order_by = sel.order_by.clone();
+                            for t in &mut order_by {
+                                rewrite_flattened_column(&mut t.expr, co_label, rename);
+                            }
+                            merged.order_by = order_by;
+                            return self.eqp_select(&merged, parent, next_id, out, params);
+                        }
                     }
                 }
                 // A *compound* CTE/derived body that carries at least one dedup set

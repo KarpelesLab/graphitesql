@@ -1192,16 +1192,18 @@ tie/representative order), so they are perf/EQP-fidelity work, not correctness:
   the windowed input; the `(subquery-N)` label is codegen-order-fragile (see the
   `schema-sql-canonicalization` note), so this needs a deterministic-numbering model
   before it can be byte-exact. Rows already correct.
-- **B9c — remaining derived/CTE `LIMIT`-body EQP paths.** The bare-`LIMIT` /
-  pure-wildcard flatten and the *non-flattenable* co-routine cases are now done: an
-  `OFFSET` body, an outer `WHERE`, or an outer aggregate over a `LIMIT` body
-  materializes as `CO-ROUTINE <name>` (body plan recursed) + the outer
-  `{SCAN|SEARCH} <name>`, via the same wrapper as an aggregate body. *Still open:* the
-  *flatten* variants SQLite applies — a **narrower projection** or an **outer
-  `ORDER BY`** over a bare-`LIMIT` body (`SELECT a FROM (SELECT * FROM t LIMIT 5)` →
-  `SCAN t USING COVERING INDEX`) — which need the projection / ordering merged into the
-  `LIMIT` body; those still decline. Boundary rules in the `eqp-derived-coroutine`
-  memory.
+- **B9c — remaining derived/CTE `LIMIT`-body EQP paths. ✅ Done.** The bare-`LIMIT`
+  pure-wildcard flatten, the *non-flattenable* co-routine cases (an `OFFSET` body, an
+  outer `WHERE`, or an outer aggregate over a `LIMIT` body → `CO-ROUTINE <name>` + the
+  outer `{SCAN|SEARCH} <name>`), AND the *flatten* variants are all done now: a
+  **narrower projection** over a bare-`LIMIT` body with no outer `WHERE` substitutes the
+  outer projection into the body (`SELECT a FROM (SELECT * FROM t LIMIT 5)` → `SCAN t
+  USING COVERING INDEX`), and a **single-term outer `ORDER BY`** pushes the projection +
+  ORDER BY into the body and recurses (`(… LIMIT 5) ORDER BY b` → `SCAN t USING INDEX
+  tb` / a full temp-b-tree if unindexed). *Residual:* a **multi-term** outer `ORDER BY`
+  over a `LIMIT` body still declines — SQLite full-sorts the materialized `LIMIT` rows,
+  whereas pushing the ORDER BY down would render a partial `LAST TERM` index walk when
+  the leading prefix is indexed. Boundary rules in the `eqp-derived-coroutine` memory.
 - **B9d — `SEARCH` + `GROUP BY`/`DISTINCT` temp-b-tree node.** graphite emits the
   grouping b-tree only over a bare `SCAN`; under a `WHERE` seek it omits the node.
   Entangled with B9h (SQLite often picks a *different* index whose walk serves the

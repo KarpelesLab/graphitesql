@@ -157,6 +157,14 @@ fn flattenable_wildcard_over_base_table_matches_sqlite() {
         "SELECT aa FROM (SELECT a AS aa FROM t) AS s WHERE aa<5",
         "SELECT * FROM (SELECT a AS aa FROM t) AS s WHERE aa>0",
         "SELECT s.aa FROM (SELECT a AS aa FROM t) AS s WHERE s.aa<5",
+        // A bare-`LIMIT` body (no OFFSET) also flattens under a narrower projection
+        // (no outer WHERE) and under a single-term outer ORDER BY (B9c-flatten).
+        "SELECT a FROM (SELECT * FROM t LIMIT 5) AS s",
+        "SELECT s.a FROM (SELECT * FROM t LIMIT 5) AS s",
+        "WITH c AS (SELECT * FROM t LIMIT 5) SELECT a FROM c",
+        "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s ORDER BY a",
+        "SELECT a FROM (SELECT * FROM t LIMIT 5) AS s ORDER BY a",
+        "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s ORDER BY b",
     ] {
         let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
         assert_eq!(run("sqlite3", &sql), run(g, &sql), "for {q}");
@@ -187,8 +195,11 @@ fn non_flattenable_outer_shapes_decline() {
         "SELECT b FROM (SELECT a AS aa FROM t) AS s", // outer ref not an output of the source
         "SELECT * FROM (SELECT * FROM t JOIN u ON t.a=u.x) AS s", // inner join
         "SELECT * FROM (SELECT * FROM v) AS s",       // inner view
-        "SELECT a FROM (SELECT * FROM t LIMIT 5) AS s", // narrower over a bare-LIMIT body (flatten TODO)
-        "SELECT a FROM (SELECT * FROM t LIMIT 5) AS s", // narrower outer over a LIMIT body
+        // A *multi-term* ORDER BY over a bare-LIMIT body still declines: SQLite
+        // full-sorts the materialized LIMIT rows, but pushing the ORDER BY into the
+        // body would render a partial index walk. (Single-term ORDER BY and a narrower
+        // projection over a bare-LIMIT body DO flatten — see the render test.)
+        "SELECT * FROM (SELECT * FROM t LIMIT 5) AS s ORDER BY a, b",
     ] {
         let sql = format!("{base} EXPLAIN QUERY PLAN {q}");
         let got = run(g, &sql);
