@@ -173,8 +173,8 @@ fn where_scalar_subquery_declines_unrenderable() {
         "SELECT * FROM t WHERE a=(SELECT x FROM u WHERE x=a)",
         // EXISTS → CORRELATED SCALAR SUBQUERY (a different node).
         "SELECT * FROM t WHERE EXISTS(SELECT 1 FROM u WHERE x=a)",
-        // IN (SELECT) → LIST SUBQUERY + CREATE BLOOM FILTER.
-        "SELECT * FROM t WHERE b IN (SELECT x FROM u)",
+        // (`b IN (SELECT x FROM u)` now renders LIST SUBQUERY + CREATE BLOOM FILTER —
+        // see B9a and `tests/eqp_in_subquery.rs`.)
         // A CTE reference bumps the id counter → SQLite numbers it 2.
         "WITH cte AS (SELECT x FROM u) SELECT * FROM t WHERE a=(SELECT min(x) FROM cte)",
         // A compound (UNION) body bumps the counter too.

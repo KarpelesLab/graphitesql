@@ -14358,6 +14358,45 @@ impl Connection {
                 }
             }
         }
+        // A single non-correlated `[NOT] IN (SELECT …)` in the WHERE renders a
+        // `LIST SUBQUERY 1` node (child = the body's plan, then a `CREATE BLOOM FILTER`
+        // sibling under it) after the scan. We render it only where the whole plan is
+        // provably byte-exact: graphite's access is a bare `SCAN {label}` — so there is
+        // no seek to diverge from SQLite's cost-model choice (an `… AND c=?` that
+        // graphite seeks makes the line a SEARCH and declines here, dodging the case
+        // where SQLite scans-plus-bloom where graphite would seek) — AND either the form
+        // is `NOT IN` (which never seeks the IN column) or the IN column is not seekable
+        // (so SQLite also scans; a positive `IN` on an indexed / rowid column, which
+        // SQLite SEARCHes per candidate, declines — that seek is roadmap B9a-seek).
+        if from.joins.is_empty()
+            && single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str())
+        {
+            if let Some((body, negated, operand)) = sel
+                .where_clause
+                .as_ref()
+                .and_then(|w| single_where_in_select(w))
+            {
+                let operand_is_rowid = matches!(operand, Expr::Column { column, .. }
+                    if is_rowid_alias(column)
+                        && !meta.columns.iter().any(|c| c.name.eq_ignore_ascii_case(column)));
+                let in_col_seekable = operand_is_rowid
+                    || col_index(operand, &meta.columns).is_some_and(|c| {
+                        meta.ipk == Some(c)
+                            || self
+                                .indexes_of(&from.first.name)
+                                .is_ok_and(|ixs| ixs.iter().any(|i| i.cols.first() == Some(&c)))
+                    });
+                if (negated || !in_col_seekable) && self.eqp_scalar_bodies_renderable(&[body]) {
+                    let list_id = *next_id;
+                    *next_id += 1;
+                    out.push((list_id, parent, String::from("LIST SUBQUERY 1")));
+                    self.eqp_select(body, list_id, next_id, out, params)?;
+                    let bloom_id = *next_id;
+                    *next_id += 1;
+                    out.push((bloom_id, list_id, String::from("CREATE BLOOM FILTER")));
+                }
+            }
+        }
         // Fold each join in FROM order, tracking the accumulated left columns so
         // the rowid-seek decision (shared with the executor via `rowid_join_seek`)
         // can print `SEARCH … USING INTEGER PRIMARY KEY (rowid=?)` in lockstep
@@ -27147,6 +27186,87 @@ fn collect_where_scalar_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Select>) -
         }
         _ => true,
     }
+}
+
+/// Collect every `[NOT] IN (SELECT …)` in `e` as `(body, negated, operand)`, setting
+/// `other` if any scalar `(SELECT …)` / `EXISTS` is present. Does NOT descend into a
+/// subquery body (that is the body's own plan). Lifetime-preserving (mirrors
+/// [`collect_where_scalar_subqueries`]) so the caller can hold the borrowed refs.
+fn collect_in_selects<'a>(
+    e: &'a Expr,
+    ins: &mut Vec<(&'a Select, bool, &'a Expr)>,
+    other: &mut bool,
+) {
+    match e {
+        Expr::Subquery(_) | Expr::Exists { .. } => *other = true,
+        Expr::InSelect {
+            expr,
+            select,
+            negated,
+        } => {
+            ins.push((select.as_ref(), *negated, expr.as_ref()));
+            collect_in_selects(expr, ins, other);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::Collate { expr, .. } => collect_in_selects(expr, ins, other),
+        Expr::Binary { left, right, .. } => {
+            collect_in_selects(left, ins, other);
+            collect_in_selects(right, ins, other);
+        }
+        Expr::Function { args, .. } | Expr::RowValue(args) => {
+            for a in args {
+                collect_in_selects(a, ins, other);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_in_selects(expr, ins, other);
+            for a in list {
+                collect_in_selects(a, ins, other);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_in_selects(expr, ins, other);
+            collect_in_selects(low, ins, other);
+            collect_in_selects(high, ins, other);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_in_selects(o, ins, other);
+            }
+            for (w, t) in when_then {
+                collect_in_selects(w, ins, other);
+                collect_in_selects(t, ins, other);
+            }
+            if let Some(el) = else_result {
+                collect_in_selects(el, ins, other);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The single `[NOT] IN (SELECT …)` subquery in `e`, as `(body, negated, operand)`,
+/// but only when it is the *sole* subquery anywhere in `e` (any scalar `(SELECT …)`,
+/// `EXISTS`, or a second `IN (SELECT)` returns `None`, so the shared subquery-id
+/// counter stays a clean `1`). Used to render a `LIST SUBQUERY 1` + `CREATE BLOOM
+/// FILTER` node.
+fn single_where_in_select(e: &Expr) -> Option<(&Select, bool, &Expr)> {
+    let mut ins = Vec::new();
+    let mut other = false;
+    collect_in_selects(e, &mut ins, &mut other);
+    if other || ins.len() != 1 {
+        return None;
+    }
+    ins.into_iter().next()
 }
 
 /// Reconstruct the `sql` text stored in `sqlite_schema` for a `CREATE` statement

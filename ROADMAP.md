@@ -1173,11 +1173,21 @@ plan **and** row differential parity vs the pinned `sqlite3 3.50.4`; the executo
 already returns correct rows for every one (B9i differs only in an SQL-unspecified
 tie/representative order), so they are perf/EQP-fidelity work, not correctness:
 
-- **B9a — `IN (SELECT …)` → `LIST SUBQUERY` + bloom filter.** A `WHERE col IN
-  (<non-correlated SELECT>)` seeks the outer table per candidate and materializes the
-  subquery as a `LIST SUBQUERY N` sibling with a `CREATE BLOOM FILTER` node; graphite
-  currently `SCAN`s and folds the `IN` in the tree-walker. Needs the list-materialize
-  + bloom EQP model (and, for the VDBE, the seek-per-value plan).
+- **B9a — `IN (SELECT …)` → `LIST SUBQUERY` + bloom filter.** ◐ **Partly done (EQP).**
+  A single non-correlated `[NOT] IN (SELECT …)` now renders `LIST SUBQUERY 1` (child =
+  the body's plan, then a `CREATE BLOOM FILTER` child) after the access, for the
+  *provably byte-exact* subset: graphite's access is a bare `SCAN` (so no seek to
+  diverge from SQLite's cost-model outer choice — an `… AND c=?` that graphite seeks
+  makes the line a SEARCH and declines, dodging the cases where SQLite scans-plus-bloom
+  where graphite would seek), and either the form is `NOT IN` or the IN column is not
+  seekable. This covers the common `NOT IN (SELECT …)`. *Still open (**B9a-seek**):* a
+  positive `IN` on an **indexed / rowid** column, which SQLite serves with a
+  per-candidate `SEARCH t (col=?)` — graphite folds the `IN` in the tree-walker and
+  scans, so it declines (no wrong node emitted). That needs the executor to evaluate
+  the non-correlated subquery to a value list and seek per value (the `find_in_constraint`
+  + `try_index_in` path already seeks a literal `IN` list), plus the outer-access EQP;
+  and a compound / correlated body (`CORRELATED LIST SUBQUERY`, shared-id bump) stays
+  deferred.
 - **B9b — window-function EQP.** `… OVER (…)` renders `CO-ROUTINE (subquery-N)` over
   the windowed input; the `(subquery-N)` label is codegen-order-fragile (see the
   `schema-sql-canonicalization` note), so this needs a deterministic-numbering model
