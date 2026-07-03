@@ -1196,10 +1196,19 @@ tie/representative order), so they are perf/EQP-fidelity work, not correctness:
   grouping b-tree only over a bare `SCAN`; under a `WHERE` seek it omits the node.
   Entangled with B9h (SQLite often picks a *different* index whose walk serves the
   grouping), so it should land together with the index-choice work.
-- **B9e — `col = (scalar subquery)` seek.** `WHERE b = (SELECT …)` seeks the once-
-  computed value in SQLite (`SEARCH … (b=?)`); graphite `SCAN`s because the eq-
-  collector requires a constant RHS. Needs the executor to evaluate the
-  non-correlated subquery once, then seek (superset-safe; `eqp_access` mirrors it).
+- **B9e — `col = (scalar subquery)` seek. ✅ Done (SELECT).** `WHERE b = (SELECT …)`
+  (and `>`/`<`/etc.) against a non-correlated scalar subquery now seeks — the executor
+  folds the subquery to its value before the seek (`scan_source` single-table fast path),
+  and `eqp_access` recognizes the shape *structurally* (a placeholder-literal rewrite,
+  `placeholder_fold_seek_where`) so `EXPLAIN` renders the `SEARCH` without running the
+  subquery — matching SQLite, which plans the seek without evaluating it (so even
+  `b=(SELECT 1/0)` plans a `SEARCH`; the query still errors at execution as in SQLite).
+  Secondary index + INTEGER PRIMARY KEY, equality + range. Superset-safe. *Residuals:*
+  a **bare-column** subquery (`(SELECT x FROM u)`) does not fold (dropping its affinity
+  would be unsound), so it stays a SCAN (rows correct); and a **DELETE/UPDATE** with a
+  subquery `WHERE` stays a SCAN (SQLite renders a two-pass `USING COVERING INDEX` the
+  `sel`-less `eqp_access` can't reproduce). A **correlated** body / `EXISTS` /
+  `IN (SELECT)` correctly do not seek.
 - **B9f — `GLOB 'prefix*'` prefix-range seek. ✅ Done.** A fixed-prefix `GLOB`
   (always case-sensitive / byte-based) now seeks `col >= 'prefix' AND col < 'prefix⁺'`
   on a BINARY index and reads `SEARCH … (b>? AND b<?)`. Implemented as a `BinaryOp::Glob`

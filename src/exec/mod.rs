@@ -776,24 +776,21 @@ impl Connection {
     /// reference — so the resulting literal has the same NONE affinity / BINARY
     /// collation the subquery operand would have had, making the substitution
     /// exact for the enclosing comparison.
+    /// The *structural* half of [`Self::eval_foldable_scalar`]: whether a scalar
+    /// subquery would fold to a literal — self-contained (non-correlated), a single
+    /// *computed* result column, and (for a compound) every arm computed — WITHOUT
+    /// running it. Used to recognize `col = (subquery)` as a seekable equality for
+    /// EXPLAIN QUERY PLAN, which SQLite plans without evaluating the subquery.
+    fn scalar_subquery_folds_structurally(&self, sel2: &Select) -> bool {
+        self.vdbe_subquery_foldable(sel2)
+            && sel2.columns.len() == 1
+            && matches!(&sel2.columns[0],
+                sql::ast::ResultColumn::Expr { expr, .. } if !is_bare_column_expr(expr))
+            && self.compound_arms_computed(sel2)
+    }
+
     fn eval_foldable_scalar(&self, sel2: &Select) -> Option<Value> {
-        if !self.vdbe_subquery_foldable(sel2) {
-            return None;
-        }
-        if sel2.columns.len() != 1 {
-            return None;
-        }
-        let sql::ast::ResultColumn::Expr { expr, .. } = &sel2.columns[0] else {
-            return None;
-        };
-        if is_bare_column_expr(expr) {
-            return None;
-        }
-        // A compound body's value is folded to a literal, so every additional arm
-        // must also project a COMPUTED column (NONE affinity / BINARY collation);
-        // a bare-column arm would carry that column's affinity, which the literal
-        // would drop — see `is_bare_column_expr` above for the base arm.
-        if !self.compound_arms_computed(sel2) {
+        if !self.scalar_subquery_folds_structurally(sel2) {
             return None;
         }
         let r = self.run_select(sel2, &Params::default()).ok()?;
@@ -804,6 +801,61 @@ impl Connection {
                 .cloned()
                 .unwrap_or(Value::Null),
         )
+    }
+
+    /// Rewrite a `WHERE` clause so that a *structurally-foldable* non-correlated
+    /// scalar subquery used as a comparison operand (`col = (SELECT …)`, `col > (…)`)
+    /// is replaced by a non-NULL placeholder literal — WITHOUT running it. The seek
+    /// constraint collectors then recognize the comparison as seekable, so
+    /// `eqp_access` renders the `SEARCH` SQLite plans (SQLite plans the seek without
+    /// evaluating the subquery; the executor evaluates it via `fold_subquery_expr`).
+    /// Descends only the `AND`/`(…)` spine and the seekable comparison operators, so a
+    /// subquery elsewhere (an `OR`, a projection) never spuriously enables a seek.
+    /// Returns `None` when nothing changed. The placeholder value is irrelevant — the
+    /// plan renders `col=?`/`col>?` and only the constrained *column* is used.
+    fn placeholder_fold_seek_where(&self, e: &Expr) -> Option<Expr> {
+        let mut changed = false;
+        let out = self.placeholder_fold_where_inner(e, &mut changed);
+        changed.then_some(out)
+    }
+
+    fn placeholder_fold_where_inner(&self, e: &Expr, changed: &mut bool) -> Expr {
+        let subq_placeholder = |s: &Expr, changed: &mut bool| -> Expr {
+            match s {
+                Expr::Subquery(sel2) if self.scalar_subquery_folds_structurally(sel2) => {
+                    *changed = true;
+                    Expr::Literal(Literal::Integer(0))
+                }
+                other => other.clone(),
+            }
+        };
+        match e {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(self.placeholder_fold_where_inner(left, changed)),
+                right: Box::new(self.placeholder_fold_where_inner(right, changed)),
+            },
+            Expr::Paren(inner) => {
+                Expr::Paren(Box::new(self.placeholder_fold_where_inner(inner, changed)))
+            }
+            Expr::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+                ) =>
+            {
+                Expr::Binary {
+                    op: *op,
+                    left: Box::new(subq_placeholder(left, changed)),
+                    right: Box::new(subq_placeholder(right, changed)),
+                }
+            }
+            other => other.clone(),
+        }
     }
 
     /// True when every *compound arm* of `sel2` (the `UNION`/… operands after the
@@ -14640,6 +14692,17 @@ impl Connection {
         let Some(where_expr) = where_clause else {
             return Ok(alloc::format!("SCAN {label}"));
         };
+        // A non-correlated scalar subquery used as a comparison operand
+        // (`col = (SELECT …)`) seeks the same as a constant would: SQLite evaluates it
+        // once and plans a `SEARCH`. Replace it with a placeholder literal (structurally,
+        // without running it — matching SQLite, which plans the seek without evaluating
+        // the subquery) so the constraint collectors below recognize the seek. The
+        // executor mirrors this by folding the subquery to its value before its seek.
+        // Restricted to a `SELECT` (`sel` present): a DELETE/UPDATE with a subquery
+        // `WHERE` is a two-pass plan SQLite renders `USING COVERING INDEX`, which the
+        // `sel`-less `eqp_access` can't reproduce, so it is left to its prior SCAN.
+        let folded = sel.and_then(|_| self.placeholder_fold_seek_where(where_expr));
+        let where_expr = folded.as_ref().unwrap_or(where_expr);
         // `INDEX` vs `COVERING INDEX` for a seek through `idx_cols`: the same
         // decision the executor's seek paths make via `seek_index_covers`.
         let index_kw = |idx_cols: &[usize]| -> &'static str {
@@ -20988,6 +21051,28 @@ impl Connection {
         // full WHERE is still applied by run_core, so the index only needs to
         // return a superset of matching rows.
         if from.joins.is_empty() {
+            // Fold a non-correlated scalar subquery used as a seek operand
+            // (`col = (SELECT …)`) to its value so the seek can use it — the same
+            // seek `eqp_access` renders. Only the seek *decision* uses the folded
+            // WHERE; `run_core` re-applies the original (superset-safe). A subquery
+            // that fails to fold (correlated / bare-column / erroring) is left in
+            // place and the query scans, exactly as before.
+            let seek_where;
+            let sel = match &sel.where_clause {
+                Some(w) => {
+                    let mut changed = false;
+                    let fw = self.fold_subquery_expr(w, &mut changed);
+                    if changed {
+                        let mut s = sel.clone();
+                        s.where_clause = Some(fw);
+                        seek_where = s;
+                        &seek_where
+                    } else {
+                        sel
+                    }
+                }
+                None => sel,
+            };
             let mut first_meta = self
                 .table_meta(&from.first.name, from.first.alias.as_deref())
                 .map_err(|e| {
