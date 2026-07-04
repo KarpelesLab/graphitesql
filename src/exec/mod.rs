@@ -14803,7 +14803,21 @@ impl Connection {
                         })
                     });
                 let nonseek_case = (negated || !in_col_seekable) && bare_scan;
-                if (nonseek_case || seek_is_in_col) && self.eqp_scalar_bodies_renderable(&[body]) {
+                // With a bare `SCAN` outer, a simple indexed-column subquery is
+                // evaluated by iterating that index (a single `… FOR IN-OPERATOR`
+                // node) rather than materializing a `LIST SUBQUERY` + bloom filter.
+                let in_op_node = if nonseek_case {
+                    self.in_operator_index_node(body)
+                } else {
+                    None
+                };
+                if let Some(node) = in_op_node {
+                    let n_id = *next_id;
+                    *next_id += 1;
+                    out.push((n_id, parent, node));
+                } else if (nonseek_case || seek_is_in_col)
+                    && self.eqp_scalar_bodies_renderable(&[body])
+                {
                     let list_id = *next_id;
                     *next_id += 1;
                     out.push((list_id, parent, String::from("LIST SUBQUERY 1")));
@@ -15114,6 +15128,103 @@ impl Connection {
             out.push((search_id, idx_id, detail));
         }
         Ok(true)
+    }
+
+    /// When an `[NOT] IN (SELECT …)` is evaluated by iterating an index on the
+    /// subquery's column instead of materializing its result, SQLite renders a
+    /// single `… FOR IN-OPERATOR` node (a child of the outer `SCAN`) in place of
+    /// the `LIST SUBQUERY` / `CREATE BLOOM FILTER` subtree. This happens for a
+    /// *simple* `SELECT <col> FROM <table> [ORDER BY …]` whose single projected
+    /// column is a plain column that is indexed: a secondary index leading with
+    /// the column renders `USING INDEX <name> FOR IN-OPERATOR`; the rowid /
+    /// INTEGER PRIMARY KEY renders `USING ROWID SEARCH ON TABLE <table> FOR
+    /// IN-OPERATOR`. Any `WHERE`/`GROUP BY`/`HAVING`/`DISTINCT`/`LIMIT`/`OFFSET`,
+    /// a join, a compound/CTE, an expression projection, or an unindexed column
+    /// disqualifies it (→ `None`, so the caller keeps the `LIST SUBQUERY` form).
+    fn in_operator_index_node(&self, body: &Select) -> Option<String> {
+        if body.distinct
+            || body.where_clause.is_some()
+            || !body.group_by.is_empty()
+            || body.having.is_some()
+            || body.limit.is_some()
+            || body.offset.is_some()
+            || !body.compound.is_empty()
+            || !body.ctes.is_empty()
+            || !body.window_defs.is_empty()
+        {
+            return None;
+        }
+        let from = body.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let tref = &from.first;
+        if tref.subquery.is_some()
+            || tref.tvf_args.is_some()
+            || tref.schema.is_some()
+            || self.is_bare_tvf(tref)
+            || self.is_view(&tref.name)
+        {
+            return None;
+        }
+        // A single plain-column projection (no expression, no `*`).
+        if body.columns.len() != 1 {
+            return None;
+        }
+        let ResultColumn::Expr { expr, .. } = &body.columns[0] else {
+            return None;
+        };
+        let mut proj = expr;
+        while let Expr::Paren(inner) = proj {
+            proj = inner;
+        }
+        let Expr::Column {
+            column,
+            table,
+            schema: None,
+            ..
+        } = proj
+        else {
+            return None;
+        };
+        let meta = self.table_meta(&tref.name, tref.alias.as_deref()).ok()?;
+        // A qualifier on the projected column must name the subquery's table.
+        if let Some(t) = table {
+            let qual = tref.alias.as_deref().unwrap_or(&tref.name);
+            if !t.eq_ignore_ascii_case(qual) {
+                return None;
+            }
+        }
+        let col_idx = meta
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(column));
+        // The rowid / INTEGER PRIMARY KEY of a rowid table → ROWID search form.
+        let is_rowid = !meta.without_rowid
+            && (col_idx == meta.ipk && col_idx.is_some()
+                || (is_rowid_alias(column) && col_idx.is_none()));
+        if is_rowid {
+            return Some(alloc::format!(
+                "USING ROWID SEARCH ON TABLE {} FOR IN-OPERATOR",
+                tref.name
+            ));
+        }
+        // A plain (non-partial, non-expression) secondary index leading with the
+        // column → index-iteration form. Only when the choice is *unambiguous*:
+        // if two or more plain indexes lead with the column, which one SQLite
+        // iterates is a cost-model tiebreak (index width / uniqueness) we can't
+        // reproduce against the stat1-only oracle, so defer to the `LIST SUBQUERY`
+        // form (its pre-existing render) rather than guess the wrong index name.
+        let ci = col_idx?;
+        let ixs = self.indexes_of(&tref.name).ok()?;
+        let mut leading = ixs.iter().filter(|i| {
+            i.partial.is_none() && i.key_exprs.is_none() && i.cols.first() == Some(&ci)
+        });
+        let ix = leading.next()?;
+        if leading.next().is_some() {
+            return None;
+        }
+        Some(alloc::format!("USING INDEX {} FOR IN-OPERATOR", ix.name))
     }
 
     /// [`eqp_access`](Self::eqp_access), then collapse a *secondary*-index seek to a

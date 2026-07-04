@@ -1244,14 +1244,18 @@ correct for all of these — perf/EQP-fidelity, not correctness):
   when the rendered access line *is* the IN column's seek (`(in_col=?)`), so a competing
   equality/range seek on a different column declines rather than mis-render. Verified vs
   sqlite3 3.50.4 (`eqp_in_subquery.rs`: EQP + row parity, rowid + secondary + empty list).
-  *Residual (separate, not B9a-seek):* a non-seekable / `NOT IN` whose subquery projects
-  an *indexed* column — SQLite renders `USING INDEX <ix> FOR IN-OPERATOR` rather than
-  `LIST SUBQUERY`+bloom; graphite still emits the bloom node there. Correlated / compound
-  bodies stay deferred (`CORRELATED LIST SUBQUERY`).
+  *`FOR IN-OPERATOR` (DONE 2026-07-05):* a scanned outer whose `[NOT] IN
+  (SELECT <col> FROM <table> [ORDER BY …])` projects a single *indexed* plain column now
+  renders SQLite's `USING INDEX <ix> FOR IN-OPERATOR` (secondary index) / `USING ROWID
+  SEARCH ON TABLE <t> FOR IN-OPERATOR` (rowid / INTEGER PRIMARY KEY) in place of the
+  `LIST SUBQUERY`+bloom subtree (`in_operator_index_node`, gated on a bare-`SCAN` outer +
+  a simple, WHERE/LIMIT/DISTINCT/GROUP/join/expression-free body). When two+ plain indexes
+  lead with the column the choice is a cost-model tiebreak we don't reproduce → it stays on
+  `LIST SUBQUERY` (`eqp_in_operator.rs`). Correlated / compound bodies stay deferred
+  (`CORRELATED LIST SUBQUERY`).
 
-With B9a-seek shipped, the only open EQP-fidelity threads are the `FOR IN-OPERATOR`
-render residual above and **B9b** (window EQP), now confirmed deferred by design —
-see below.
+With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread is **B9b**
+(window EQP), now confirmed deferred by design — see below.
 
 **Blocked / deferred by design:**
 - **B9h — cost-model single-table index *choice*.** SQLite prefers, among indexes
@@ -1496,10 +1500,12 @@ reasonable order:
 1. **B5b-2 — live storage cursors on the VDBE.** The largest remaining VDBE piece;
    it turns the materialized inner join into a seek-driven one and is the
    prerequisite for streaming correlated subqueries and windows. Perf/coverage,
-   parity-gated, low risk. **B5b-2a landed** (INNER-join inner rowid seek on an
-   INTEGER PRIMARY KEY — live `TableCursor::seek`, no inner materialization);
-   remaining sub-steps (in-interpreter seek opcodes, secondary-index / WITHOUT
-   ROWID seeks, N-table chains) tracked under §4's B5b-2 entry.
+   parity-gated, low risk. **B5b-2a–2d landed** (INNER *and* LEFT inner rowid seek on an
+   INTEGER PRIMARY KEY, compound-`ON` conjunct seek, and an N-table left-deep chain of
+   ipk seeks — live `TableCursor::seek`, no inner materialization); the remaining
+   sub-step is the in-interpreter `OpenRead`/`SeekRowid` opcodes (moving the seek into
+   bytecode — an architectural refactor with no user-visible behavior change), plus the
+   affinity-blocked secondary-index / `WITHOUT ROWID` seeks, tracked under §4's B5b-2 entry.
 2. **B5c-2 — correlated subqueries on the VDBE**, once B5b-2 lands the live-cursor
    machinery.
 3. **C9a → C9d — the concurrency story** (persistent read locks in `src/pager/`,
@@ -1512,10 +1518,13 @@ reasonable order:
    prepare pass for the lazy-validation gaps.
 6. **`EXPLAIN QUERY PLAN` fidelity (Track B) — essentially closed.** The whole B9
    cluster shipped in 2026-07 (B9a incl. the seekable-`IN` render, B9c–B9g, the B9d
-   subset). What remains is deferred by design: the cost-model index-choice items
-   (**B9h**, **B9j**), and **B9b** window EQP — whose co-routine body is itself the B9h
-   index choice (see §4). The lone open non-blocked residual is the `FOR IN-OPERATOR`
-   render node for a `NOT IN`/unindexed subquery over an indexed column.
+   subset), and the **`FOR IN-OPERATOR`** render node landed 2026-07-05 (a scanned
+   outer whose `[NOT] IN (SELECT <indexed-col> FROM <table>)` iterates the subquery
+   column's index — `USING INDEX <name>` / `USING ROWID SEARCH ON TABLE <t>` — instead
+   of a `LIST SUBQUERY`; an ambiguous multi-index choice stays on `LIST SUBQUERY`, a
+   cost-model tiebreak deliberately not chased). What remains is deferred by design:
+   the cost-model index-choice items (**B9h**, **B9j**), and **B9b** window EQP — whose
+   co-routine body is itself the B9h index choice (see §4).
 
 **Deferred / blocked** (documented in §4): **B1b** join reordering and **B4**
 `sqlite_stat4` (diverge from / unverifiable against the stat1-only oracle);
