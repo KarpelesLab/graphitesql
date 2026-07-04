@@ -1434,6 +1434,11 @@ impl Connection {
                 for (_, spec) in &sel.window_defs {
                     reject_window_in_windowspec(spec)?;
                 }
+                // A bad column in a window `PARTITION BY` / `ORDER BY` is a
+                // prepare-time `no such column` in SQLite, but this path bypasses
+                // `run_core`'s eager validators, so re-check it here (else the query
+                // would run and silently return rows over an empty/filtered input).
+                self.validate_window_over_columns(sel)?;
             }
             return self.run_window_vdbe(sel);
         }
@@ -20014,6 +20019,7 @@ impl Connection {
         if self.outer_scope.borrow().is_empty() {
             self.validate_nested_ambiguity(sel, &columns)?;
             self.validate_columns_exist(sel, &columns)?;
+            self.validate_window_over_columns(sel)?;
             self.validate_derived_columns(sel, &columns)?;
             self.validate_join_derived_columns(sel)?;
             // A column reference inside an expression-position subquery body that
@@ -21014,6 +21020,102 @@ impl Connection {
                     missing = column_missing(schema, table, column, quoted);
                 } else if !aliases.iter().any(|a| a.eq_ignore_ascii_case(column)) {
                     missing = column_missing(None, None, column, quoted);
+                }
+            });
+        }
+        match missing {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Eager `no such column` check for the `PARTITION BY` / `ORDER BY` terms of a
+    /// window `OVER` clause (and named `WINDOW …` definition).
+    /// [`Self::validate_columns_exist`] bails on any window query, so its column
+    /// references were resolved only lazily and missed over an empty/filtered
+    /// input. A window partition/order term binds strictly to a base column of the
+    /// `FROM` (never an output alias — `PARTITION BY <alias>` is `no such column`
+    /// in SQLite), so it resolves against the scanned source `columns` exactly like
+    /// the base-column targets. Conservatively limited to plain base-table / view
+    /// sources (a subquery / TVF / vtab / `NATURAL`/`USING` source bails, never a
+    /// false positive).
+    fn validate_window_over_columns(&self, sel: &Select) -> Result<()> {
+        if !window::has_window(sel) {
+            return Ok(());
+        }
+        let Some(from) = &sel.from else { return Ok(()) };
+        let mut srcs = alloc::vec![&from.first];
+        for j in &from.joins {
+            if j.natural || !j.using.is_empty() {
+                return Ok(());
+            }
+            srcs.push(&j.table);
+        }
+        // Resolve the base column set from schema metadata (no row scan, so the
+        // check is cheap even when the VDBE window path calls it before executing).
+        // Any source that can't be resolved from metadata alone — a subquery, TVF,
+        // schema-qualified, or virtual table — bails the whole check (never a false
+        // positive).
+        let mut columns: Vec<ColumnInfo> = Vec::new();
+        for s in &srcs {
+            if s.subquery.is_some()
+                || s.tvf_args.is_some()
+                || s.schema.is_some()
+                || s.name.is_empty()
+            {
+                return Ok(());
+            }
+            let Some(cols) = self.source_columns_of(s) else {
+                return Ok(());
+            };
+            let label = s.alias.clone().unwrap_or_else(|| s.name.clone());
+            for (name, _) in cols {
+                columns.push(ColumnInfo {
+                    name,
+                    table: label.clone(),
+                    schema: None,
+                    affinity: eval::Affinity::Blob,
+                    collation: crate::value::Collation::Binary,
+                    hidden: false,
+                });
+            }
+        }
+        let columns = &columns[..];
+        // Every window spec in play: the `WINDOW`-clause definitions plus each
+        // window function's inline `OVER (…)` spec found in the projection or the
+        // top-level `ORDER BY`. `window::visit` stops at nested subqueries (they
+        // validate their own specs), so only this query level is gathered.
+        let mut specs: Vec<WindowSpec> = sel.window_defs.iter().map(|(_, s)| s.clone()).collect();
+        let gather = |e: &Expr, specs: &mut Vec<WindowSpec>| {
+            window::visit(e, &mut |m| {
+                if let Expr::Function {
+                    over: Some(spec), ..
+                } = m
+                {
+                    specs.push(spec.clone());
+                }
+            });
+        };
+        for rc in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                gather(expr, &mut specs);
+            }
+        }
+        for t in &sel.order_by {
+            gather(&t.expr, &mut specs);
+        }
+        let mut parts: Vec<&Expr> = Vec::new();
+        for spec in &specs {
+            windowspec_parts(spec, &mut parts);
+        }
+        let mut missing: Option<Error> = None;
+        for e in parts {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
+                if missing.is_none() && !column_resolves_scoped(columns, schema, table, column) {
+                    missing = Some(eval::no_such_column(schema, table, column, quoted));
                 }
             });
         }
