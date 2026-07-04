@@ -1190,9 +1190,10 @@ correct for all of these — perf/EQP-fidelity, not correctness):
   an *indexed* column — SQLite renders `USING INDEX <ix> FOR IN-OPERATOR` rather than
   `LIST SUBQUERY`+bloom; graphite still emits the bloom node there. Correlated / compound
   bodies stay deferred (`CORRELATED LIST SUBQUERY`).
-- **B9b — window-function EQP.** `… OVER (…)` renders `CO-ROUTINE (subquery-N)` over the
-  windowed input; the `(subquery-N)` label is codegen-order-fragile, so this needs a
-  deterministic-numbering model before it can be byte-exact.
+
+With B9a-seek shipped, the only open EQP-fidelity threads are the `FOR IN-OPERATOR`
+render residual above and **B9b** (window EQP), now confirmed deferred by design —
+see below.
 
 **Blocked / deferred by design:**
 - **B9h — cost-model single-table index *choice*.** SQLite prefers, among indexes
@@ -1219,6 +1220,22 @@ correct for all of these — perf/EQP-fidelity, not correctness):
   current column-collation gate is itself an earlier ORDER-BY-ordering correctness fix,
   so relocating it risks the whole collation/seek/order suite for a niche pattern.
   Deferred; a careful cross-cutting refactor, not a quick slice.
+- **B9b — window-function EQP.** `SELECT …, <win>() OVER (…) FROM t` renders in SQLite
+  as `CO-ROUTINE (subquery-N)#<windowed-input plan>#SCAN (subquery-N)`. **Investigated
+  2026-07-04 and confirmed deferred by design** for two compounding reasons:
+  (1) the `(subquery-N)` label — while consistently `(subquery-2)` for a *single
+  top-level* window — nests for multiple windows (`(subquery-2)` wrapping
+  `(subquery-3)`) and shifts when the window sits inside a derived table
+  (`(subquery-1)` outer + `(subquery-3)` inner), i.e. it depends on SQLite's codegen
+  order (the standing "don't chase `(subquery-N)`" rule); and (2) more fundamentally,
+  the co-routine's *body* — the windowed-input scan — is exactly the **B9h** cost-model
+  index choice: SQLite picks the index that both covers the input's referenced columns
+  and serves the `PARTITION BY`/window-`ORDER BY` sort (`SELECT a, row_number() OVER
+  (ORDER BY b)` → `COVERING INDEX tb`; `SELECT b, sum(c) OVER (ORDER BY b)` →
+  `COVERING INDEX tbc`; `SELECT d, … ORDER BY b` → non-covering `INDEX tb`), which
+  graphite can't reproduce on a multi-index table without solving B9h. Rows are already
+  correct; only the plan differs. Blocked on B9h (+ a deterministic-numbering model for
+  the multi-window/nested cases).
 - **B1b — cost-based join reordering.** graphite's per-cursor seek/bloom-filter
   choices diverge from sqlite's cost-reordered plain scans *by design*; matching
   the EQP would mean abandoning often-cheaper access paths. Results already correct.
@@ -1431,12 +1448,12 @@ reasonable order:
 5. **Track A leftovers** — the `Expr::Column` enrichment (source span + schema
    field) that unblocks both **A-rn3-edge** and the 3-part-qualifier check, plus
    the statement-level prepare pass for the lazy-validation gaps.
-6. **B9a-seek / B9b — the last `EXPLAIN QUERY PLAN` fidelity slices** (Track B). The
-   rest of the B9 cluster (B9c–B9g, the B9d subset, the B9a EQP nodes) shipped in
-   2026-07; what's left is the positive-`IN`-on-indexed-column executor seek
-   (**B9a-seek**) and the fragile-numbering window EQP (**B9b**). The cost-model
-   index-choice items (**B9h**, **B9j**) are deferred by design — they need a
-   stat4-enabled oracle / a cross-cutting collation refactor (see §4).
+6. **`EXPLAIN QUERY PLAN` fidelity (Track B) — essentially closed.** The whole B9
+   cluster shipped in 2026-07 (B9a incl. the seekable-`IN` render, B9c–B9g, the B9d
+   subset). What remains is deferred by design: the cost-model index-choice items
+   (**B9h**, **B9j**), and **B9b** window EQP — whose co-routine body is itself the B9h
+   index choice (see §4). The lone open non-blocked residual is the `FOR IN-OPERATOR`
+   render node for a `NOT IN`/unindexed subquery over an indexed column.
 
 **Deferred / blocked** (documented in §4): **B1b** join reordering and **B4**
 `sqlite_stat4` (diverge from / unverifiable against the stat1-only oracle);
