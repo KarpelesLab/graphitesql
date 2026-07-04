@@ -1201,6 +1201,15 @@ gated on VDBE-vs-tree-walker parity, so it can't regress correctness):
     `ON` is re-evaluated after the seek (superset invariant), so the extra conjunct
     just filters the seeked row. Affinity-neutral (same `to_i64` rowid coercion).
     Verified vs the tree-walker and sqlite3 3.50.4.
+  - **B5b-2d — N-table left-deep chain of ipk seeks. DONE.** The single-join block
+    became a *fold*: the leftmost source is scanned, then each of up to three joins
+    seeks its ipk to a column already in the running prefix (`… JOIN t ON o.x=t.id
+    JOIN u ON o.z=u.uid` — a "star", or `… JOIN u ON t.id=u.uid` — chained off an
+    earlier seeked inner). Every seek is a unique rowid seek + full-`ON` re-check, so
+    the superset invariant holds per join and composes by induction → the whole chain
+    is affinity-safe. A 2+ chain must be all INNER (a single join may still be LEFT);
+    a 4th join, a non-ipk join, RIGHT/FULL, or a comma-join in the mix falls through
+    to the materialized path. Verified vs the tree-walker and sqlite3 3.50.4.
   - **Remaining:** in-*interpreter* `OpenRead`/`SeekRowid` opcodes over B5b-1's
     multi-cursor foundation (so the seek lives in bytecode, not row-assembly); seek
     by a **secondary index** / `WITHOUT ROWID` PK (*affinity-blocked*: `index_seek_rowids`
@@ -1208,7 +1217,8 @@ gated on VDBE-vs-tree-walker parity, so it can't regress correctness):
     `o.x = t.k` applies, so routing it risks a silent false-negative that would not
     fall back — needs the tree-walker's affinity machinery first); the bare-`rowid`-alias
     `ON` spelling (blocked on a pre-existing divergence — `t.rowid` in a join projection
-    already errors on the tree-walker); N-table chains.
+    already errors on the tree-walker); LEFT chains (null-propagation still owned by
+    the materialized path).
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT already seek; RIGHT/FULL still
   materialize the inner table.
 
