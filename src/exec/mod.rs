@@ -26894,6 +26894,10 @@ fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, Option<&str>,
                 walk_shallow_columns(a, f);
             }
         }
+        // The tested expression of `x [NOT] IN (SELECT …)` is a shallow column of
+        // *this* scope (the subquery body is validated separately); visit it so a
+        // bad LHS (`nope IN (SELECT …)`) is caught, like `InList`'s LHS.
+        Expr::InSelect { expr, .. } => walk_shallow_columns(expr, f),
         Expr::Between {
             expr, low, high, ..
         } => {
