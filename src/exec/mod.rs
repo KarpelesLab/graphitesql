@@ -21104,17 +21104,70 @@ impl Connection {
         for t in &sel.order_by {
             gather(&t.expr, &mut specs);
         }
-        let mut parts: Vec<&Expr> = Vec::new();
+        // Base-column targets with NO output-alias exemption: the projection exprs
+        // (`walk_shallow_columns` visits a window function's arguments and `FILTER`
+        // predicate), `WHERE`, each join `ON`, and every window spec's
+        // `PARTITION BY` / `ORDER BY` (which never bind to an output alias).
+        let mut strict: Vec<&Expr> = Vec::new();
+        for rc in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                strict.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            strict.push(w);
+        }
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                strict.push(on);
+            }
+        }
         for spec in &specs {
-            windowspec_parts(spec, &mut parts);
+            windowspec_parts(spec, &mut strict);
+        }
+        // `GROUP BY` / `HAVING` / the query's top-level `ORDER BY` may name an
+        // output alias with a bare identifier, which is not a base column.
+        let aliases: Vec<&str> = sel
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                ResultColumn::Expr { alias: Some(a), .. } => Some(a.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut clause_refs: Vec<&Expr> = Vec::new();
+        for g in &sel.group_by {
+            clause_refs.push(g);
+        }
+        if let Some(h) = &sel.having {
+            clause_refs.push(h);
+        }
+        for t in &sel.order_by {
+            clause_refs.push(&t.expr);
         }
         let mut missing: Option<Error> = None;
-        for e in parts {
+        for e in strict {
             if missing.is_some() {
                 break;
             }
             walk_shallow_columns(e, &mut |schema, table, column, quoted| {
                 if missing.is_none() && !column_resolves_scoped(columns, schema, table, column) {
+                    missing = Some(eval::no_such_column(schema, table, column, quoted));
+                }
+            });
+        }
+        for e in clause_refs {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
+                if missing.is_some() {
+                    return;
+                }
+                if table.is_none() && aliases.iter().any(|a| a.eq_ignore_ascii_case(column)) {
+                    return;
+                }
+                if !column_resolves_scoped(columns, schema, table, column) {
                     missing = Some(eval::no_such_column(schema, table, column, quoted));
                 }
             });

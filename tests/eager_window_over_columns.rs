@@ -40,13 +40,34 @@ fn window_over_column_validation_matches_sqlite() {
         // Bad column in an OVER clause → rejected (empty table, so caught eagerly).
         (empty, "SELECT sum(a) OVER (PARTITION BY zzz) FROM t"),
         (empty, "SELECT sum(a) OVER (ORDER BY zzz) FROM t"),
-        (empty, "SELECT sum(a) OVER (PARTITION BY a ORDER BY zzz) FROM t"),
-        (empty, "SELECT sum(a) OVER w FROM t WINDOW w AS (PARTITION BY zzz)"),
+        (
+            empty,
+            "SELECT sum(a) OVER (PARTITION BY a ORDER BY zzz) FROM t",
+        ),
+        (
+            empty,
+            "SELECT sum(a) OVER w FROM t WINDOW w AS (PARTITION BY zzz)",
+        ),
         (empty, "SELECT 1 + sum(a) OVER (PARTITION BY zzz) FROM t"),
         // An output alias is NOT a valid window partition/order term.
         (full, "SELECT a AS x, sum(b) OVER (PARTITION BY x) FROM t"),
+        // A bad column in a window function's argument, its FILTER, or the WHERE
+        // of a window query is likewise rejected at prepare time.
+        (empty, "SELECT sum(zzz) OVER () FROM t"),
+        (empty, "SELECT sum(a) FILTER(WHERE zzz > 0) OVER () FROM t"),
+        (
+            empty,
+            "SELECT count(*) OVER (PARTITION BY a ORDER BY b), sum(zzz) OVER () FROM t",
+        ),
+        (
+            empty,
+            "SELECT a FROM t WHERE zzz > 0 AND sum(a) OVER () > 0",
+        ),
         // Valid — must not be a false positive.
-        (full, "SELECT sum(a) OVER (PARTITION BY b ORDER BY a) FROM t"),
+        (
+            full,
+            "SELECT sum(a) OVER (PARTITION BY b ORDER BY a) FROM t",
+        ),
         (full, "SELECT sum(a) OVER (PARTITION BY a + 0) FROM t"),
         (full, "SELECT sum(b) OVER (PARTITION BY rowid) FROM t"),
         (full, "SELECT sum(b) OVER w FROM t WINDOW w AS (ORDER BY a)"),
@@ -54,7 +75,20 @@ fn window_over_column_validation_matches_sqlite() {
             full,
             "SELECT t.a, sum(d) OVER (PARTITION BY t.b) FROM t JOIN u ON t.a = u.c",
         ),
-        (full, "SELECT row_number() OVER (ORDER BY a), a FROM t ORDER BY a"),
+        (
+            full,
+            "SELECT row_number() OVER (ORDER BY a), a FROM t ORDER BY a",
+        ),
+        (full, "SELECT sum(a) FILTER(WHERE b > 0) OVER () FROM t"),
+        (
+            full,
+            "SELECT a AS x, sum(b) OVER (ORDER BY a) FROM t ORDER BY x",
+        ),
+        (full, "SELECT sum(a + b) OVER () FROM t"),
+        (
+            full,
+            "SELECT a, row_number() OVER (ORDER BY b) AS rn FROM t ORDER BY rn",
+        ),
     ];
     for (base, q) in cases {
         assert_eq!(
