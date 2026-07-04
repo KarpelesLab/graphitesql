@@ -789,6 +789,28 @@ impl Connection {
             && self.compound_arms_computed(sel2)
     }
 
+    /// Whether an `IN (SELECT …)` candidate subquery is foldable to a value list
+    /// *without running it* — the structural half of [`Self::eval_foldable_in_select`]
+    /// (which additionally runs the body). Used to plan the `IN` seek in
+    /// `eqp_access` without evaluating the subquery, mirroring the executor fold so
+    /// the EQP and the seek agree. A bare-column candidate needs a resolvable single
+    /// origin (for its affinity); a computed candidate needs every compound arm
+    /// computed too.
+    fn in_select_folds_structurally(&self, sel2: &Select) -> bool {
+        if !self.vdbe_subquery_foldable(sel2) || sel2.columns.len() != 1 {
+            return false;
+        }
+        let sql::ast::ResultColumn::Expr { expr, .. } = &sel2.columns[0] else {
+            return false;
+        };
+        if is_bare_column_expr(expr) {
+            self.subquery_column_origins(sel2)
+                .is_some_and(|o| !o.is_empty())
+        } else {
+            self.compound_arms_computed(sel2)
+        }
+    }
+
     fn eval_foldable_scalar(&self, sel2: &Select) -> Option<Value> {
         if !self.scalar_subquery_folds_structurally(sel2) {
             return None;
@@ -852,6 +874,25 @@ impl Connection {
                     op: *op,
                     left: Box::new(subq_placeholder(left, changed)),
                     right: Box::new(subq_placeholder(right, changed)),
+                }
+            }
+            // A positive `col IN (<foldable SELECT>)` seeks the `col` index per
+            // candidate value; SQLite plans the `SEARCH` without evaluating the
+            // subquery, so replace the candidate set with a single non-NULL
+            // placeholder literal — the constraint collectors then recognize the `IN`
+            // seek. The executor mirrors this by folding the subquery to its real
+            // value list (`eval_foldable_in_select`) before its `try_index_in` seek.
+            Expr::InSelect {
+                expr,
+                select,
+                negated: false,
+            } if self.in_select_folds_structurally(select) => {
+                *changed = true;
+                Expr::InList {
+                    expr: expr.clone(),
+                    list: alloc::vec![Expr::Literal(Literal::Integer(0))],
+                    negated: false,
+                    candidate_affinity: None,
                 }
             }
             other => other.clone(),
@@ -14431,17 +14472,17 @@ impl Connection {
         }
         // A single non-correlated `[NOT] IN (SELECT …)` in the WHERE renders a
         // `LIST SUBQUERY 1` node (child = the body's plan, then a `CREATE BLOOM FILTER`
-        // sibling under it) after the scan. We render it only where the whole plan is
-        // provably byte-exact: graphite's access is a bare `SCAN {label}` — so there is
-        // no seek to diverge from SQLite's cost-model choice (an `… AND c=?` that
-        // graphite seeks makes the line a SEARCH and declines here, dodging the case
-        // where SQLite scans-plus-bloom where graphite would seek) — AND either the form
-        // is `NOT IN` (which never seeks the IN column) or the IN column is not seekable
-        // (so SQLite also scans; a positive `IN` on an indexed / rowid column, which
-        // SQLite SEARCHes per candidate, declines — that seek is roadmap B9a-seek).
-        if from.joins.is_empty()
-            && single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str())
-        {
+        // sibling under it) after the access. It emits in two provably-byte-exact cases:
+        //  - `NOT IN` / an IN column that is *not* seekable → graphite's access is a
+        //    bare `SCAN {label}`, matching SQLite (which also scans);
+        //  - a positive `IN` on a *seekable* (rowid / index-leading) column → the
+        //    executor folds the subquery to a value list and seeks per candidate
+        //    (`try_index_in`), and `eqp_access`'s placeholder fold renders the matching
+        //    `SEARCH {label} … (col=?)` — but only when that access line *is* the IN
+        //    column's seek (a competing equality/range on another column would make
+        //    SQLite's cost-model choice diverge, so we require the rendered access to
+        //    seek the IN column exactly — `(in_col=?)`).
+        if from.joins.is_empty() {
             if let Some((body, negated, operand)) = sel
                 .where_clause
                 .as_ref()
@@ -14450,14 +14491,36 @@ impl Connection {
                 let operand_is_rowid = matches!(operand, Expr::Column { column, .. }
                     if is_rowid_alias(column)
                         && !meta.columns.iter().any(|c| c.name.eq_ignore_ascii_case(column)));
+                let in_col_idx = col_index(operand, &meta.columns);
                 let in_col_seekable = operand_is_rowid
-                    || col_index(operand, &meta.columns).is_some_and(|c| {
+                    || in_col_idx.is_some_and(|c| {
                         meta.ipk == Some(c)
                             || self
                                 .indexes_of(&from.first.name)
                                 .is_ok_and(|ixs| ixs.iter().any(|i| i.cols.first() == Some(&c)))
                     });
-                if (negated || !in_col_seekable) && self.eqp_scalar_bodies_renderable(&[body]) {
+                let bare_scan =
+                    single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str());
+                // The seek-column render tag: a rowid / INTEGER-PRIMARY-KEY IN reads
+                // `(rowid=?)` (the IPK column renders as `rowid` in the access line even
+                // when referenced by its declared name), a secondary-index IN reads
+                // `(col=?)`.
+                let in_col_tag =
+                    if operand_is_rowid || (in_col_idx.is_some() && in_col_idx == meta.ipk) {
+                        Some(alloc::string::String::from("rowid"))
+                    } else {
+                        in_col_idx.map(|c| meta.columns[c].name.clone())
+                    };
+                let seek_is_in_col = !negated
+                    && in_col_seekable
+                    && in_col_tag.as_deref().is_some_and(|nm| {
+                        single_scan_detail.as_deref().is_some_and(|d| {
+                            d.starts_with(alloc::format!("SEARCH {label}").as_str())
+                                && d.contains(alloc::format!("({nm}=?)").as_str())
+                        })
+                    });
+                let nonseek_case = (negated || !in_col_seekable) && bare_scan;
+                if (nonseek_case || seek_is_in_col) && self.eqp_scalar_bodies_renderable(&[body]) {
                     let list_id = *next_id;
                     *next_id += 1;
                     out.push((list_id, parent, String::from("LIST SUBQUERY 1")));

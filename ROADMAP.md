@@ -1175,14 +1175,21 @@ temp-b-tree node (**B9d** subset). Details live in Track A's EQP paragraph and t
 `eqp-derived-coroutine` / `planner-index-seeks` memories. Still open (rows already
 correct for all of these — perf/EQP-fidelity, not correctness):
 
-- **B9a-seek — positive `IN (SELECT …)` on an indexed/rowid column.** The `LIST
-  SUBQUERY` + `CREATE BLOOM FILTER` render for a non-correlated `NOT IN` / unindexed `IN`
-  is done (**B9a**); a positive `IN` on a *seekable* column, which SQLite serves with a
-  per-candidate `SEARCH t (col=?)`, still declines (graphite folds the `IN` in the
-  tree-walker and scans — no wrong node). Needs the executor to evaluate the
-  non-correlated subquery to a value list and seek per value (`find_in_constraint` /
-  `try_index_in` already seek a literal `IN` list), plus the outer-access EQP. A
-  compound / correlated body (`CORRELATED LIST SUBQUERY`) stays deferred.
+- **B9a-seek — positive `IN (SELECT …)` on an indexed/rowid column. DONE.** A
+  non-correlated positive `IN` on a *seekable* column (secondary-index leading col,
+  `INTEGER PRIMARY KEY` by name, or `rowid` alias) now renders SQLite's per-candidate
+  `SEARCH t … (col=?)` followed by `LIST SUBQUERY 1` → the body plan → `CREATE BLOOM
+  FILTER`, byte-exact. The executor already folds the non-correlated subquery to a value
+  list and seeks per value (`fold_subquery_expr` → `try_index_in`); this closed the EQP
+  side by teaching `eqp_access`'s placeholder fold to recognise a structurally-foldable
+  `IN (SELECT)` (`in_select_folds_structurally`) and emitting the `LIST SUBQUERY` only
+  when the rendered access line *is* the IN column's seek (`(in_col=?)`), so a competing
+  equality/range seek on a different column declines rather than mis-render. Verified vs
+  sqlite3 3.50.4 (`eqp_in_subquery.rs`: EQP + row parity, rowid + secondary + empty list).
+  *Residual (separate, not B9a-seek):* a non-seekable / `NOT IN` whose subquery projects
+  an *indexed* column — SQLite renders `USING INDEX <ix> FOR IN-OPERATOR` rather than
+  `LIST SUBQUERY`+bloom; graphite still emits the bloom node there. Correlated / compound
+  bodies stay deferred (`CORRELATED LIST SUBQUERY`).
 - **B9b — window-function EQP.** `… OVER (…)` renders `CO-ROUTINE (subquery-N)` over the
   windowed input; the `(subquery-N)` label is codegen-order-fragile, so this needs a
   deterministic-numbering model before it can be byte-exact.

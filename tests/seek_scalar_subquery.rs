@@ -8,10 +8,12 @@
 //! evaluates it, so even `b = (SELECT 1/0)` plans a `SEARCH`). Equality and range,
 //! secondary index and INTEGER PRIMARY KEY.
 //!
-//! A *correlated* body, `EXISTS`, `IN (SELECT)`, and a bare-column subquery
+//! A *correlated* body, `EXISTS`, and a bare-column subquery
 //! (`(SELECT x FROM u)` — folding it would drop the column's affinity) do NOT seek —
 //! the outer table stays a `SCAN`, and the full `WHERE` is re-applied so rows are
-//! exact regardless. Verified vs the sqlite3 3.50.4 CLI.
+//! exact regardless. (A non-correlated positive `IN (SELECT …)` on a seekable column
+//! *does* seek — that is B9a-seek, covered by `eqp_in_subquery.rs`.) Verified vs the
+//! sqlite3 3.50.4 CLI.
 
 #![cfg(feature = "std")]
 
@@ -75,14 +77,14 @@ fn scalar_subquery_operand_seeks_like_sqlite() {
 
 #[test]
 fn non_seekable_subquery_shapes_stay_scan() {
-    // A correlated / EXISTS / IN (SELECT) / bare-column subquery must not seek the
-    // outer table — graphite keeps the SCAN (results still correct via the WHERE
-    // re-apply). (SQLite renders extra CORRELATED / LIST SUBQUERY nodes graphite does
-    // not model, so we assert only that the outer access is not a SEARCH.)
+    // A correlated / EXISTS / bare-column subquery must not seek the outer table —
+    // graphite keeps the SCAN (results still correct via the WHERE re-apply). (SQLite
+    // renders extra CORRELATED nodes graphite does not model, so we assert only that
+    // the outer access is not a SEARCH.) A positive `IN (SELECT …)` on a seekable
+    // column *does* seek now (B9a-seek); that is asserted in `eqp_in_subquery.rs`.
     let g = env!("CARGO_BIN_EXE_graphitesql");
     for q in [
         "SELECT * FROM t WHERE b=(SELECT y FROM u WHERE x=t.a)", // correlated
-        "SELECT * FROM t WHERE b IN (SELECT x FROM u)",          // IN (SELECT)
         "SELECT * FROM t WHERE EXISTS(SELECT 1 FROM u WHERE x=b)", // correlated EXISTS
         "SELECT * FROM t WHERE b=(SELECT x FROM u)",             // bare-column projection
     ] {
