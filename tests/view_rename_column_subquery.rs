@@ -100,6 +100,14 @@ fn view_rename_column_subquery_matches_sqlite() {
         "CREATE TABLE t(a,b); CREATE TABLE other(id); \
          CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT id FROM other); \
          ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Scope-aware (A-rn3-edge): a correlated scalar subquery over another
+        // table that *also* owns `a` (so the name is not globally unique). The
+        // outer bare `a` and the correlated `t.a` bind to `t` and rewrite; the
+        // subquery's own `u.a` is untouched — matching SQLite's per-scope
+        // resolution.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT a, (SELECT c FROM u WHERE u.a=t.a) FROM t; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
     ];
     for sql in matching {
         assert_eq!(run("sqlite3", sql), run(g, sql), "for {sql}");
@@ -123,12 +131,15 @@ fn view_rename_column_subquery_matches_sqlite() {
              ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
             "CREATE VIEW v AS SELECT a FROM (SELECT a FROM t)",
         ),
-        // Scalar subquery over another table.
+        // Mixed scope (A-rn3-edge residual): the same bare `a` name binds to two
+        // different tables in one body — the outer `a` to `t`, the inner `a` to
+        // `u` — so a whole-text rewrite can't disambiguate without per-occurrence
+        // spans. graphite declines; SQLite rewrites just the inner one.
         (
             "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
-             CREATE VIEW v AS SELECT a, (SELECT c FROM u WHERE u.a=t.a) FROM t; \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-            "CREATE VIEW v AS SELECT a, (SELECT c FROM u WHERE u.a=t.a) FROM t",
+             CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT a FROM u); \
+             ALTER TABLE u RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+            "CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT a FROM u)",
         ),
     ];
     for (sql, unchanged) in bail {

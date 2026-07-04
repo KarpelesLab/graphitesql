@@ -977,21 +977,35 @@ exhausted for bounded (single-fix) work.
   `sqlite3Multiply128/160`) — a ~300-line table-heavy port for an obscure
   extension flag. Deferred as low-ROI; see [[printf-bang-float-decode]].
 
-- **A-rn3-edge — RENAME COLUMN in genuinely multi-table view/trigger bodies.**
-  The token rewrite already handles single-source-with-subqueries bodies and
+- **A-rn3-edge — RENAME COLUMN in genuinely multi-table view/trigger bodies.
+  Mostly DONE (scope-aware, no span refactor); only the *mixed* case residual.**
+  The token rewrite handles single-source-with-subqueries bodies and
   nested-subquery / cross-object reaches via the global-uniqueness provers
   (`view_global_unique_quals` / `trigger_global_unique_quals`): a bare `old` is
   rewritten when that column name is unique across *every* base source at any
-  nesting level. What remains is the genuinely **ambiguous** case — a bare ref to
-  a column that *several* in-scope base tables own, where only the occurrence in
-  the renamed table's scope should change. The rewrite currently bails (leaves the
-  body unchanged — never corrupts) because the AST has no per-column-ref span.
-  Two steps:
-  - **A-rn3-edge-1** *(enabling refactor)* — add a source span (byte range) to
-    `Expr::Column`. The sibling `schema` field it once shared with the now-landed
-    3-part qualifier check is already in place, so this is just the span.
-  - **A-rn3-edge-2** — use the span for scope-aware rename: resolve each bare ref
-    to its owning table and rewrite only the matching occurrences.
+  nesting level. The remaining case was a bare ref to a column that *several*
+  in-scope base tables own — where only the occurrence in the renamed table's
+  scope should change.
+  - **Solved without the span refactor** by a *scope-aware* fallback that runs
+    when the flat global-uniqueness check declines
+    (`scope_bare_old_decision` / `scope_bare_old_decision_trigger`, with the
+    shared `walk_own_scope_columns` / `resolve_bare_owner` /
+    `collect_bare_old_owners` / `resolve_exprs_bare_owners` machinery). It walks
+    the body with a scope stack and resolves each bare `old` innermost-scope-first
+    to its owning table: if *every* bare `old` binds to the renamed table it
+    rewrites all bare tokens; if *none* does, only the qualified `renamed.old`
+    refs rewrite; the AST need never grow a per-column-ref span. Covers views
+    (scalar / `EXISTS` / `IN (SELECT)` subqueries, joins, N-level nesting,
+    correlation) and trigger bodies (`INSERT … SELECT`/`VALUES`-subquery,
+    `UPDATE`/`DELETE` with the target as the outer scope, the `WHEN` guard).
+  - **Residual: the genuinely *mixed* body** — the *same* bare column name
+    binding to *different* tables in one statement (e.g.
+    `SELECT a FROM t WHERE a IN (SELECT a FROM u)` renaming `u.a`, where SQLite
+    rewrites only the inner `a`). That still needs per-occurrence source spans on
+    `Expr::Column`; the scope pass declines it and leaves the object
+    byte-identical (never a half-renamed body). Tests: the `bail` invariants in
+    `tests/rename_column_view_subquery.rs`, `tests/view_rename_column_subquery.rs`,
+    `tests/rename_column_trigger_subquery.rs`.
 
 - **A-prepare-correlated — prepare-time validation in correlated subquery bodies. DONE.**
   The eager (prepare-time, row-independent) validators cover the common scopes —
@@ -1445,9 +1459,10 @@ reasonable order:
    then OS file locks, the WAL `-shm` index, and a thread-safe `Connection`).
 4. **D2e-encoder / dbpage-2 / D5 / D6** — ecosystem surfaces; pick the unblocked
    ones (dbpage-2 is oracle-blocked, D2e-encoder needs the fts5 writer source).
-5. **Track A leftovers** — the `Expr::Column` enrichment (source span + schema
-   field) that unblocks both **A-rn3-edge** and the 3-part-qualifier check, plus
-   the statement-level prepare pass for the lazy-validation gaps.
+5. **Track A leftovers** — an `Expr::Column` source-span enrichment would let the
+   **A-rn3-edge** *mixed*-body residual rewrite per-occurrence (the rest of
+   A-rn3-edge is now done scope-aware, no span needed); plus the statement-level
+   prepare pass for the lazy-validation gaps.
 6. **`EXPLAIN QUERY PLAN` fidelity (Track B) — essentially closed.** The whole B9
    cluster shipped in 2026-07 (B9a incl. the seekable-`IN` render, B9c–B9g, the B9d
    subset). What remains is deferred by design: the cost-model index-choice items
@@ -1459,6 +1474,8 @@ reasonable order:
 `sqlite_stat4` (diverge from / unverifiable against the stat1-only oracle);
 **B1c** RIGHT/FULL inner seeks (correct via materialization); **D7** the C-API
 shim (needs `unsafe`; a sibling crate); **dbpage-2** (oracle-blocked); the
-**A-rn3-edge** ambiguous-ref case (needs per-column-ref spans); and the FTS5
-large-scale encoder sub-cases (need the fts5 writer source). Build-specific oracle
+**A-rn3-edge** *mixed*-body residual only (the same bare name binding to two
+tables in one statement — needs per-column-ref spans; the rest is done
+scope-aware); and the FTS5 large-scale encoder sub-cases (need the fts5 writer
+source). Build-specific oracle
 quirks we intentionally do NOT match are recorded in §6.

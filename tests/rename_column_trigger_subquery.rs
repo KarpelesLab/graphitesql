@@ -107,27 +107,37 @@ fn rename_column_rewrites_cross_object_trigger_refs() {
          ALTER TABLE t RENAME COLUMN a TO aa; \
          INSERT INTO t VALUES(7,1); UPDATE t SET b=2 WHERE aa=7; \
          SELECT sql FROM sqlite_schema WHERE name='tr'; SELECT aa,b FROM t ORDER BY aa",
+        // Scope-aware (A-rn3-edge): the body's `UPDATE u` target *also* owns an
+        // `a`, so the name is not globally unique — yet the only bare `a` reached
+        // is the subquery's, binding to `t`. The scope pass rewrites just that one;
+        // the `UPDATE u`'s own columns are untouched. Matches SQLite's per-scope
+        // resolution.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET c=1 WHERE c IN (SELECT a FROM t); END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
     }
 
-    // Bail invariant: when the renamed column name is *not* globally unique across
-    // the trigger's sources (here both `t` and `u` have an `a`), a bare ref could
-    // belong to another scope's table, so the global-uniqueness prover declines
-    // and leaves the stored trigger byte-identical — never a half-renamed body.
-    // SQLite does more here (it resolves each ref by scope), so this stays a known
-    // A-rn3-edge gap rather than a differential equality; the invariant only
-    // guards against a *wrong* (partial/corrupting) rewrite creeping in.
+    // Bail invariant: the remaining A-rn3-edge residual and the non-base-source
+    // shapes. graphite leaves the stored trigger byte-identical — never a
+    // half-renamed body. SQLite does more here (it resolves each ref by scope, or
+    // reaches through the CTE), so these stay known gaps rather than differential
+    // equalities; the invariant only guards against a *wrong* (partial/corrupting)
+    // rewrite creeping in.
     let bail = [
-        // Ambiguous: the subquery's table also owns an `a`.
+        // Mixed scope: the same bare `a` name binds to two different tables in one
+        // statement — the `UPDATE u` target's `a` in the `WHERE`, and the inner
+        // `t.a` in the subquery. Disambiguating them needs per-occurrence spans.
         (
             "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
              CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
-               UPDATE u SET c=1 WHERE c IN (SELECT a FROM t); END; \
+               UPDATE u SET c=1 WHERE a IN (SELECT a FROM t); END; \
              ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
             "CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
-               UPDATE u SET c=1 WHERE c IN (SELECT a FROM t); END",
+               UPDATE u SET c=1 WHERE a IN (SELECT a FROM t); END",
         ),
         // A CTE inside a body subquery is a non-base source the rewrite can't
         // reason about.

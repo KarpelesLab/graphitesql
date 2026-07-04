@@ -33222,16 +33222,24 @@ fn view_global_unique_quals(
     if !collect_select_base_sources(&cv.select, old, &mut srcs) {
         return None;
     }
-    // Only fire when the rename is globally unambiguous (`rewrite_bare`): then a
-    // bare `old` anywhere can resolve only to the renamed table, so the whole-text
-    // rewrite is complete and correct. When `old` is non-unique across the
-    // sources, a bare ref may belong to another scope's table — which a token
-    // rewrite can't tell apart without per-ref spans — so we bail entirely rather
-    // than do a partial (qualified-only) rewrite that would leave the view in a
-    // half-renamed, broken state. (That ambiguous case is the A-rn3-edge work.)
+    // Fast path: when the rename is globally unambiguous (`rewrite_bare`), a bare
+    // `old` anywhere can resolve only to the renamed table, so the whole-text
+    // rewrite is complete and correct.
+    //
+    // When `old` is owned by more than one source table the flat collection can't
+    // tell whether a bare ref belongs to the renamed table or another scope's
+    // table. Rather than bail outright we run a *scope-aware* pass
+    // ([`scope_bare_old_decision`]): if every bare `old` in the body binds
+    // (innermost-scope-first) to the renamed table we can still `rewrite_bare`
+    // safely; if none does, only the qualified `renamed.old` refs rewrite; only a
+    // genuinely *mixed* body (some bare `old` binding to the renamed table and
+    // some to another) still needs per-ref spans, so that one bails. (A-rn3-edge.)
     match global_unique_plan(&srcs, table, old, table_cols) {
         Some((quals, true)) => Some((quals, true)),
-        _ => None,
+        Some((quals, false)) => {
+            scope_bare_old_decision(&cv.select, table, old, table_cols).map(|rb| (quals, rb))
+        }
+        None => None,
     }
 }
 
@@ -33336,6 +33344,314 @@ fn global_unique_plan(
         }
     }
     Some((quals, count == 1))
+}
+
+/// Scope-aware decision for a RENAME COLUMN over a view/trigger body in which the
+/// renamed column name `old` is owned by more than one base-table source (so the
+/// flat [`global_unique_plan`] can't prove a whole-text `rewrite_bare` safe).
+///
+/// Returns `Some(true)` when *every* bare `old` reference in the body binds — by
+/// the usual innermost-scope-first rule — to the renamed `table`, so rewriting
+/// every bare `old` token is correct; `Some(false)` when *no* bare `old` binds to
+/// the renamed table, so only the qualified `table.old` refs need rewriting (the
+/// bare tokens belong to another scope and must be left alone); and `None` when
+/// the body is *mixed* (some bare `old` binds to the renamed table and some to
+/// another) — that case can only be rewritten per-occurrence with source spans,
+/// so the caller bails and leaves the object untouched. `None` is also returned
+/// for any reference that can't be resolved unambiguously (e.g. two sources in a
+/// single scope own `old`, which SQLite itself rejects as ambiguous).
+fn scope_bare_old_decision(
+    sel: &Select,
+    table: &str,
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<bool> {
+    let mut owners: Vec<String> = Vec::new();
+    let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
+    if !collect_bare_old_owners(sel, old, table_cols, &mut scopes, &mut owners) {
+        return None;
+    }
+    let renamed = owners.iter().any(|o| o.eq_ignore_ascii_case(table));
+    let other = owners.iter().any(|o| !o.eq_ignore_ascii_case(table));
+    if renamed && other {
+        None // mixed — needs per-ref spans
+    } else {
+        Some(renamed) // true = all bind to renamed; false = none reference it
+    }
+}
+
+/// Walk every column reference that belongs to `e`'s *own* scope: descend through
+/// all scalar sub-expressions — including the left-hand operand of an
+/// `x IN (SELECT …)` and the `PARTITION BY`/`ORDER BY` of an inline `OVER (…)`,
+/// which live in the current scope — but stop at a nested `SELECT` (scalar
+/// subquery / `EXISTS` / `IN (SELECT …)`), whose columns belong to that
+/// subquery's own scope and are resolved separately. The `match` is exhaustive on
+/// purpose (no `_` arm) so a newly added [`Expr`] variant that could hide a bare
+/// column forces this to be revisited rather than silently under-counted.
+fn walk_own_scope_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, &str)) {
+    match e {
+        Expr::Column { table, column, .. } => f(table.as_deref(), column),
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::Collate { expr, .. }
+        | Expr::InSelect { expr, .. } => walk_own_scope_columns(expr, f),
+        Expr::Binary { left, right, .. } => {
+            walk_own_scope_columns(left, f);
+            walk_own_scope_columns(right, f);
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            over,
+            ..
+        } => {
+            for a in args {
+                walk_own_scope_columns(a, f);
+            }
+            if let Some(flt) = filter {
+                walk_own_scope_columns(flt, f);
+            }
+            for t in order_by {
+                walk_own_scope_columns(&t.expr, f);
+            }
+            if let Some(spec) = over {
+                let mut parts: Vec<&Expr> = Vec::new();
+                windowspec_parts(spec, &mut parts);
+                for p in parts {
+                    walk_own_scope_columns(p, f);
+                }
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            walk_own_scope_columns(expr, f);
+            for a in list {
+                walk_own_scope_columns(a, f);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            walk_own_scope_columns(expr, f);
+            walk_own_scope_columns(low, f);
+            walk_own_scope_columns(high, f);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                walk_own_scope_columns(o, f);
+            }
+            for (w, t) in when_then {
+                walk_own_scope_columns(w, f);
+                walk_own_scope_columns(t, f);
+            }
+            if let Some(el) = else_result {
+                walk_own_scope_columns(el, f);
+            }
+        }
+        Expr::RowValue(items) => {
+            for it in items {
+                walk_own_scope_columns(it, f);
+            }
+        }
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Subquery(_) | Expr::Exists { .. } => {}
+    }
+}
+
+/// Resolve a bare column named `old` against the scope stack (outermost first,
+/// innermost last), returning the base table that owns it. The innermost scope
+/// with a source owning a column `old` wins (SQLite's binding rule, including
+/// correlation into an outer query). Returns `None` if a single scope has two
+/// sources owning `old` (ambiguous — SQLite errors) or no scope owns it.
+fn resolve_bare_owner(
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+    scopes: &[Vec<(String, Option<String>)>],
+) -> Option<String> {
+    let owns = |name: &str| -> bool {
+        table_cols
+            .iter()
+            .find(|(t, _)| t.eq_ignore_ascii_case(name))
+            .is_some_and(|(_, cols)| cols.iter().any(|c| c.eq_ignore_ascii_case(old)))
+    };
+    for scope in scopes.iter().rev() {
+        let mut owner: Option<&str> = None;
+        for (name, _alias) in scope {
+            if owns(name) {
+                if owner.is_some() {
+                    return None; // two sources own `old` in one scope → ambiguous
+                }
+                owner = Some(name);
+            }
+        }
+        if let Some(o) = owner {
+            return Some(o.to_string());
+        }
+    }
+    None
+}
+
+/// Resolve every bare `old` reference in `exprs` against the active scope stack
+/// `scopes` (own-scope columns only; nested `SELECT`s in the exprs are recursed
+/// into separately with their `FROM` pushed onto `scopes`), pushing each resolved
+/// owning table into `owners`. Returns `false` (bail) on any bare `old` that
+/// can't be resolved unambiguously. This is the shared core used both for a
+/// `SELECT`'s own expressions and for a trigger statement's `SET`/`WHERE`/… lists.
+fn resolve_exprs_bare_owners(
+    exprs: &[&Expr],
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+    scopes: &mut Vec<Vec<(String, Option<String>)>>,
+    owners: &mut Vec<String>,
+) -> bool {
+    let mut ok = true;
+    for e in exprs {
+        walk_own_scope_columns(e, &mut |tbl, col| {
+            if ok && tbl.is_none() && col.eq_ignore_ascii_case(old) {
+                match resolve_bare_owner(old, table_cols, scopes) {
+                    Some(owner) => owners.push(owner),
+                    None => ok = false,
+                }
+            }
+        });
+    }
+    if !ok {
+        return false;
+    }
+    let mut subs: Vec<&Select> = Vec::new();
+    for e in exprs {
+        collect_immediate_subselects(e, &mut subs);
+    }
+    for s in subs {
+        if !collect_bare_old_owners(s, old, table_cols, scopes, owners) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Walk `sel` and every nested expression subquery, pushing the owning table of
+/// each bare `old` reference into `owners`. `scopes` is the active scope stack;
+/// this select's `FROM` sources are pushed while its own expressions and their
+/// nested subqueries are visited, then popped. Returns `false` (bail) on any bare
+/// `old` that can't be resolved unambiguously. The body's shape has already been
+/// validated by [`collect_select_base_sources`], so every source here is a plain
+/// base table (no derived/TVF/NATURAL/USING/CTE/compound).
+fn collect_bare_old_owners(
+    sel: &Select,
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+    scopes: &mut Vec<Vec<(String, Option<String>)>>,
+    owners: &mut Vec<String>,
+) -> bool {
+    let mut scope: Vec<(String, Option<String>)> = Vec::new();
+    if let Some(from) = &sel.from {
+        scope.push((from.first.name.clone(), from.first.alias.clone()));
+        for j in &from.joins {
+            scope.push((j.table.name.clone(), j.table.alias.clone()));
+        }
+    }
+    scopes.push(scope);
+    let ok = resolve_exprs_bare_owners(&view_select_exprs(sel), old, table_cols, scopes, owners);
+    scopes.pop();
+    ok
+}
+
+/// Trigger counterpart of [`scope_bare_old_decision`]: decides, across a whole
+/// `CREATE TRIGGER` (its `WHEN` guard and every body statement), whether every
+/// bare `old` binds to the renamed `table` (`Some(true)` → rewrite bare),
+/// binds only elsewhere (`Some(false)` → qualified-only), or is *mixed* / can't be
+/// resolved (`None` → bail, leaving the trigger byte-identical). The body's shape
+/// has already been vetted by [`collect_trigger_stmt_base_sources`].
+fn scope_bare_old_decision_trigger(
+    ct: &crate::sql::ast::CreateTrigger,
+    table: &str,
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<bool> {
+    let mut owners: Vec<String> = Vec::new();
+    // WHEN guard: its subqueries have their own FROM scopes (a bare `old` directly
+    // in the guard has no table scope and would bail — conservative).
+    if let Some(w) = &ct.when {
+        let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
+        if !resolve_exprs_bare_owners(&[w], old, table_cols, &mut scopes, &mut owners) {
+            return None;
+        }
+    }
+    for stmt in &ct.body {
+        if !collect_trigger_stmt_bare_owners(stmt, old, table_cols, &mut owners) {
+            return None;
+        }
+    }
+    let renamed = owners.iter().any(|o| o.eq_ignore_ascii_case(table));
+    let other = owners.iter().any(|o| !o.eq_ignore_ascii_case(table));
+    if renamed && other {
+        None
+    } else {
+        Some(renamed)
+    }
+}
+
+/// Resolve the bare `old` references of a single trigger body statement, honouring
+/// each statement's scope: an `INSERT … SELECT`/`VALUES`-subquery/`SELECT` body has
+/// only the (sub)query's own `FROM` in scope, while an `UPDATE`/`DELETE`'s
+/// `SET`/`WHERE`/… expressions resolve against the written *target* table (plus any
+/// nested-subquery scopes). Mirrors [`collect_trigger_stmt_base_sources`]'s shape
+/// handling; the shapes here were already vetted by it.
+fn collect_trigger_stmt_bare_owners(
+    stmt: &Statement,
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+    owners: &mut Vec<String>,
+) -> bool {
+    use crate::sql::ast::InsertSource;
+    match stmt {
+        Statement::Select(sel) => {
+            let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
+            collect_bare_old_owners(sel, old, table_cols, &mut scopes, owners)
+        }
+        Statement::Insert(i) => match &i.source {
+            InsertSource::DefaultValues => true,
+            InsertSource::Values(rows) => {
+                let exprs: Vec<&Expr> = rows.iter().flatten().collect();
+                let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
+                resolve_exprs_bare_owners(&exprs, old, table_cols, &mut scopes, owners)
+            }
+            InsertSource::Select(sel) => {
+                let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
+                collect_bare_old_owners(sel, old, table_cols, &mut scopes, owners)
+            }
+        },
+        Statement::Update(u) => {
+            let mut scopes: Vec<Vec<(String, Option<String>)>> =
+                alloc::vec![alloc::vec![(u.table.clone(), u.alias.clone())]];
+            let mut exprs: Vec<&Expr> = Vec::new();
+            for (_, e) in &u.assignments {
+                exprs.push(e);
+            }
+            exprs.extend(u.where_clause.as_ref());
+            exprs.extend(u.order_by.iter().map(|t| &t.expr));
+            exprs.extend(u.limit.as_ref());
+            exprs.extend(u.offset.as_ref());
+            resolve_exprs_bare_owners(&exprs, old, table_cols, &mut scopes, owners)
+        }
+        Statement::Delete(d) => {
+            let mut scopes: Vec<Vec<(String, Option<String>)>> =
+                alloc::vec![alloc::vec![(d.table.clone(), d.alias.clone())]];
+            let mut exprs: Vec<&Expr> = Vec::new();
+            exprs.extend(d.where_clause.as_ref());
+            exprs.extend(d.order_by.iter().map(|t| &t.expr));
+            exprs.extend(d.limit.as_ref());
+            exprs.extend(d.offset.as_ref());
+            resolve_exprs_bare_owners(&exprs, old, table_cols, &mut scopes, owners)
+        }
+        _ => false,
+    }
 }
 
 /// Recursively gather every base-table source `(name, alias)` reachable from a
@@ -33482,12 +33798,16 @@ fn trigger_global_unique_quals(
             return None;
         }
     }
-    // Only fire when the rename is globally unambiguous; otherwise bail entirely
-    // rather than do a partial (qualified-only) rewrite — see
-    // [`view_global_unique_quals`] for the rationale.
+    // Globally-unique fast path, else the scope-aware fallback (A-rn3-edge) — see
+    // [`view_global_unique_quals`] / [`scope_bare_old_decision_trigger`] for the
+    // rationale; a genuinely mixed body still bails untouched.
     let (mut quals, bare) = match global_unique_plan(&srcs, table, old, table_cols) {
         Some((q, true)) => (q, true),
-        _ => return None,
+        Some((q, false)) => match scope_bare_old_decision_trigger(&ct, table, old, table_cols) {
+            Some(rb) => (q, rb),
+            None => return None,
+        },
+        None => return None,
     };
     if ct.table.eq_ignore_ascii_case(table) {
         quals.push(String::from("NEW"));
