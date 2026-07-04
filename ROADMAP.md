@@ -1195,10 +1195,19 @@ gated on VDBE-vs-tree-walker parity, so it can't regress correctness):
     order/content to the existing null-padding nested loop, but without scanning or
     materializing the inner table. Same narrow routing as 2a plus `JoinKind::Left`.
     Verified vs the tree-walker and sqlite3 3.50.4.
+  - **B5b-2c — compound `ON` seek. DONE.** The ipk equality no longer has to be the
+    *whole* `ON` — it may be one top-level `AND` conjunct (`… ON o.x = t.id AND
+    t.name = o.y`, in either order). That conjunct drives the rowid seek; the full
+    `ON` is re-evaluated after the seek (superset invariant), so the extra conjunct
+    just filters the seeked row. Affinity-neutral (same `to_i64` rowid coercion).
+    Verified vs the tree-walker and sqlite3 3.50.4.
   - **Remaining:** in-*interpreter* `OpenRead`/`SeekRowid` opcodes over B5b-1's
-    multi-cursor foundation (so the seek lives in bytecode, not row-assembly);
-    seek by a **secondary index** / `WITHOUT ROWID` PK; the bare-`rowid`-alias `ON`
-    spelling (blocked on a pre-existing divergence — `t.rowid` in a join projection
+    multi-cursor foundation (so the seek lives in bytecode, not row-assembly); seek
+    by a **secondary index** / `WITHOUT ROWID` PK (*affinity-blocked*: `index_seek_rowids`
+    compares raw keys with the index collation and skips the comparison-affinity that
+    `o.x = t.k` applies, so routing it risks a silent false-negative that would not
+    fall back — needs the tree-walker's affinity machinery first); the bare-`rowid`-alias
+    `ON` spelling (blocked on a pre-existing divergence — `t.rowid` in a join projection
     already errors on the tree-walker); N-table chains.
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT already seek; RIGHT/FULL still
   materialize the inner table.

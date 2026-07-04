@@ -23,7 +23,8 @@ fn sqlite3_available() -> bool {
 
 const SCHEMA: &str = "CREATE TABLE o(x, y TEXT);\
      INSERT INTO o VALUES(1,'a'),(2,'b'),(3,'c'),(NULL,'n'),(2,'b2'),(2.0,'real'),\
-       ('2','txt'),('2abc','junk'),(x'32','blob'),(2.5,'half'),(99,'miss'),(-1,'neg');\
+       ('2','txt'),('2abc','junk'),(x'32','blob'),(2.5,'half'),(99,'miss'),(-1,'neg'),\
+       (2,'two'),(5,'five');\
      CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);\
      INSERT INTO t VALUES(1,'one'),(2,'two'),(5,'five');";
 
@@ -49,6 +50,14 @@ const VDBE_QUERIES: &[&str] = &[
     "SELECT o.y FROM o LEFT JOIN t ON o.x = t.id WHERE t.name IS NULL ORDER BY o.y",
     "SELECT count(*), count(t.id) FROM o LEFT JOIN t ON o.x = t.id",
     "SELECT o.x, t.name FROM o LEFT JOIN t ON o.x = t.id ORDER BY o.y LIMIT 3 OFFSET 2",
+    // Compound `ON` (B5b-2c): the ipk equality is one `AND` conjunct — it drives
+    // the rowid seek, the whole `ON` is re-checked so the extra conjunct just
+    // filters the seeked row. The ipk-eq may be either conjunct.
+    "SELECT o.x, t.name FROM o JOIN t ON o.x = t.id AND t.name = o.y ORDER BY o.y",
+    "SELECT o.x, t.name FROM o JOIN t ON t.name = o.y AND o.x = t.id ORDER BY o.y",
+    "SELECT o.x, t.name FROM o JOIN t ON o.x = t.id AND t.name <> 'one' ORDER BY o.y",
+    "SELECT o.x, t.name FROM o LEFT JOIN t ON o.x = t.id AND t.name = o.y ORDER BY o.y",
+    "SELECT count(*) FROM o JOIN t ON o.x = t.id AND o.y = t.name",
 ];
 
 fn setup() -> Connection {

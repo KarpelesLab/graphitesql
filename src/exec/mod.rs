@@ -2070,21 +2070,15 @@ impl Connection {
                     .map(|_| inner_qual.clone())
                     .collect();
                 let ipk_name = inner_meta.columns[ipk].name.clone();
-                // The `ON` must be a single `Eq` (parens stripped) binding the
-                // inner ipk column on one side and a plain outer column on the
-                // other.
+                // The `ON` must contain (as one top-level `AND` conjunct, parens
+                // stripped) an `Eq` binding the inner ipk column on one side and a
+                // plain outer column on the other. Any additional conjuncts ride
+                // the superset invariant: the whole `ON` is re-evaluated after the
+                // seek, so an extra `AND t.name = o.y` just filters the seeked row.
                 let mut on_expr = on;
                 while let sql::ast::Expr::Paren(inner) = on_expr {
                     on_expr = inner;
                 }
-                let (l, r) = match on_expr {
-                    sql::ast::Expr::Binary {
-                        op: sql::ast::BinaryOp::Eq,
-                        left,
-                        right,
-                    } => (left.as_ref(), right.as_ref()),
-                    _ => break 'seek,
-                };
                 // A plain (optionally parenthesized) unqualified-schema column ref.
                 fn col_ref(mut e: &sql::ast::Expr) -> Option<(Option<&str>, &str)> {
                     while let sql::ast::Expr::Paren(i) = e {
@@ -2146,18 +2140,53 @@ impl Connection {
                     }
                     Some(matches[0])
                 };
-                let oc = if is_inner_ipk(l) {
-                    match outer_col_index(r) {
-                        Some(oc) => oc,
-                        None => break 'seek,
+                // Collect the top-level `AND` conjuncts of the `ON` (parens
+                // stripped), then find the first that is an `Eq` binding the inner
+                // ipk to an outer column — that conjunct drives the rowid seek.
+                fn and_conjuncts<'a>(e: &'a sql::ast::Expr, out: &mut Vec<&'a sql::ast::Expr>) {
+                    let mut e = e;
+                    while let sql::ast::Expr::Paren(i) = e {
+                        e = i;
                     }
-                } else if is_inner_ipk(r) {
-                    match outer_col_index(l) {
-                        Some(oc) => oc,
-                        None => break 'seek,
+                    if let sql::ast::Expr::Binary {
+                        op: sql::ast::BinaryOp::And,
+                        left,
+                        right,
+                    } = e
+                    {
+                        and_conjuncts(left, out);
+                        and_conjuncts(right, out);
+                    } else {
+                        out.push(e);
                     }
-                } else {
-                    break 'seek;
+                }
+                let mut conjuncts: Vec<&sql::ast::Expr> = Vec::new();
+                and_conjuncts(on_expr, &mut conjuncts);
+                let seek_key = conjuncts.iter().find_map(|c| {
+                    let mut c = *c;
+                    while let sql::ast::Expr::Paren(i) = c {
+                        c = i;
+                    }
+                    let sql::ast::Expr::Binary {
+                        op: sql::ast::BinaryOp::Eq,
+                        left,
+                        right,
+                    } = c
+                    else {
+                        return None;
+                    };
+                    let (l, r) = (left.as_ref(), right.as_ref());
+                    if is_inner_ipk(l) {
+                        outer_col_index(r)
+                    } else if is_inner_ipk(r) {
+                        outer_col_index(l)
+                    } else {
+                        None
+                    }
+                });
+                let oc = match seek_key {
+                    Some(oc) => oc,
+                    None => break 'seek,
                 };
                 // Combined schema (outer cols ++ inner cols), leftmost outermost.
                 let mut c_cols = o_cols.clone();
