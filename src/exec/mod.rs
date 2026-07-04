@@ -19298,8 +19298,40 @@ impl Connection {
     /// [`Self::validate_subquery_body_columns`].
     fn check_subquery_body_columns(&self, sub: &Select, outer_cols: &[ColumnInfo]) -> Result<()> {
         // A compound body carries its own per-arm scope rules — leave it to the
-        // lazy path rather than risk a wrong resolution here.
+        // lazy path rather than risk a wrong resolution here. The one exception is
+        // a fully `FROM`-less compound (every arm, head included, has no `FROM` and
+        // no further nesting) — a multi-row `VALUES` desugars to exactly this. Such
+        // an arm's column references can only bind to the enclosing scope (there is
+        // no local table), so they are safe to resolve eagerly, catching a bad
+        // column in a non-first `VALUES` row (`… IN (VALUES(1),(zzz))`) that the
+        // lazy path misses over an empty/filtered outer.
         if !sub.compound.is_empty() {
+            let from_less = sub.from.is_none()
+                && sub
+                    .compound
+                    .iter()
+                    .all(|(_, a)| a.from.is_none() && a.compound.is_empty());
+            if from_less {
+                let arms = core::iter::once(sub).chain(sub.compound.iter().map(|(_, a)| a));
+                for arm in arms {
+                    for rc in &arm.columns {
+                        let ResultColumn::Expr { expr, .. } = rc else {
+                            continue;
+                        };
+                        let mut missing: Option<Error> = None;
+                        walk_shallow_columns(expr, &mut |schema, table, column, quoted| {
+                            if missing.is_none()
+                                && !column_resolves_scoped(outer_cols, schema, table, column)
+                            {
+                                missing = Some(eval::no_such_column(schema, table, column, quoted));
+                            }
+                        });
+                        if let Some(e) = missing {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
         let params = Params::default();

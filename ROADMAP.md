@@ -1514,8 +1514,13 @@ reasonable order:
    ones (dbpage-2 is oracle-blocked, D2e-encoder needs the fts5 writer source).
 5. **Track A leftovers** — an `Expr::Column` source-span enrichment would let the
    **A-rn3-edge** *mixed*-body residual rewrite per-occurrence (the rest of
-   A-rn3-edge is now done scope-aware, no span needed); plus the statement-level
-   prepare pass for the lazy-validation gaps.
+   A-rn3-edge is now done scope-aware, no span needed). The statement-level prepare
+   pass for lazy-validation gaps is **essentially done**: a 2026-07 exhaustive
+   differential sweep (subqueries, derived tables, CTEs, USING/NATURAL, GROUP BY /
+   HAVING, ORDER-BY subqueries, compound arms, DML/RETURNING/upsert, INDEX/CHECK
+   expr — all over empty/filtered input) found only one residual, the FROM-less
+   multi-row `VALUES`-in-`IN` case, now closed too. Only compound bodies with
+   per-arm `FROM`s remain deliberately lazy.
 6. **`EXPLAIN QUERY PLAN` fidelity (Track B) — essentially closed.** The whole B9
    cluster shipped in 2026-07 (B9a incl. the seekable-`IN` render, B9c–B9g, the B9d
    subset), and the **`FOR IN-OPERATOR`** render node landed 2026-07-05 (a scanned
