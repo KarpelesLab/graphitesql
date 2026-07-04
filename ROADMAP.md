@@ -1188,6 +1188,13 @@ gated on VDBE-vs-tree-walker parity, so it can't regress correctness):
     declared column name — a bare `rowid` alias / compound `ON` / derived source
     defers); any unhandled projection falls through to the materialized path.
     Verified VDBE-vs-tree-walker and vs sqlite3 3.50.4 (`tests/vdbe_live_cursor.rs`).
+  - **B5b-2b — LEFT-join inner rowid seek. DONE.** The same seek serves a two-table
+    `… LEFT JOIN t ON o.x = t.<ipk>`: because the rowid seek is unique, each outer
+    row yields exactly one output row — the matched inner, or (on a NULL key, a seek
+    miss, or a failed `ON` re-check) the inner side null-padded. Identical row
+    order/content to the existing null-padding nested loop, but without scanning or
+    materializing the inner table. Same narrow routing as 2a plus `JoinKind::Left`.
+    Verified vs the tree-walker and sqlite3 3.50.4.
   - **Remaining:** in-*interpreter* `OpenRead`/`SeekRowid` opcodes over B5b-1's
     multi-cursor foundation (so the seek lives in bytecode, not row-assembly);
     seek by a **secondary index** / `WITHOUT ROWID` PK; the bare-`rowid`-alias `ON`

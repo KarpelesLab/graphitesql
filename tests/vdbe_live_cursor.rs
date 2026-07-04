@@ -40,6 +40,15 @@ const VDBE_QUERIES: &[&str] = &[
     "SELECT count(*), sum(t.id) FROM o JOIN t ON o.x = t.id",
     "SELECT t.name, count(*) FROM o JOIN t ON o.x = t.id GROUP BY t.name ORDER BY t.name",
     "SELECT o.y FROM o JOIN t ON (o.x) = (t.id) ORDER BY o.y", // parenthesized ON
+    // LEFT joins (B5b-2b): each outer row keeps exactly one output row, with the
+    // inner side null-padded on a NULL key, a seek miss, or a failed `ON`
+    // re-check (`= 2.5` seeks rowid 2 but 2.5 = 2 is false → null-padded).
+    "SELECT o.x, t.name FROM o LEFT JOIN t ON o.x = t.id ORDER BY o.y",
+    "SELECT o.x, t.name FROM o LEFT JOIN t ON t.id = o.x ORDER BY o.y",
+    "SELECT o.y, t.id, t.name FROM o LEFT JOIN t ON o.x = t.id ORDER BY o.y",
+    "SELECT o.y FROM o LEFT JOIN t ON o.x = t.id WHERE t.name IS NULL ORDER BY o.y",
+    "SELECT count(*), count(t.id) FROM o LEFT JOIN t ON o.x = t.id",
+    "SELECT o.x, t.name FROM o LEFT JOIN t ON o.x = t.id ORDER BY o.y LIMIT 3 OFFSET 2",
 ];
 
 fn setup() -> Connection {

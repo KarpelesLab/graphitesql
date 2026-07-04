@@ -1989,8 +1989,8 @@ impl Connection {
         // the `WHERE`, and reuse the single-cursor scan compiler. Every join must
         // be a plain `INNER`/`CROSS`/comma join (no `NATURAL`/`USING`/outer).
         if !from.joins.is_empty() {
-            // B5b-2 (live inner cursor): a two-table INNER equi-join whose `ON`
-            // binds the inner table's INTEGER PRIMARY KEY (`… JOIN t ON o.x =
+            // B5b-2 (live inner cursor): a two-table INNER or LEFT equi-join whose
+            // `ON` binds the inner table's INTEGER PRIMARY KEY (`… JOIN t ON o.x =
             // t.<ipk>`) seeks the single matching inner row with a *live* b-tree
             // cursor (`read_row` → `TableCursor::seek`) instead of materializing
             // and scanning the whole inner table. Only the outer table is scanned;
@@ -1998,15 +1998,23 @@ impl Connection {
             // rides the superset invariant: after the seek the full `ON` is
             // re-evaluated against the assembled row, so every rowid-coercion
             // corner (`= 2.5`, text/blob keys, `NULL`) is filtered exactly as the
-            // materialized cross-product would. Any shape outside this narrow
+            // materialized cross-product would. A LEFT join null-pads the inner
+            // side on any non-match (since the rowid seek is unique, each outer
+            // row yields exactly one output row). Any shape outside this narrow
             // window — or a projection the single-cursor compiler can't take —
-            // breaks out and falls through to the materialized inner-join path.
+            // breaks out and falls through to the materialized join path below.
             'seek: {
-                if !(from.joins.len() == 1
+                // INNER seeks and skips a miss; LEFT seeks and null-pads a miss.
+                // Both are single, non-NATURAL, non-USING two-table joins.
+                let is_left = from.joins.len() == 1
+                    && from.joins[0].kind == sql::ast::JoinKind::Left
+                    && !from.joins[0].natural
+                    && from.joins[0].using.is_empty();
+                let is_inner = from.joins.len() == 1
                     && from.joins[0].kind == sql::ast::JoinKind::Inner
                     && !from.joins[0].natural
-                    && from.joins[0].using.is_empty())
-                {
+                    && from.joins[0].using.is_empty();
+                if !(is_inner || is_left) {
                     break 'seek;
                 }
                 let j = &from.joins[0];
@@ -2192,14 +2200,27 @@ impl Connection {
                 // the tree-walker's rowid seek uses), seek it, then re-check the
                 // full `ON` so the result is a subset of the true cross-product.
                 let on_params = eval::Params::default();
+                let null_inner: Vec<Value> = (0..i_cols.len()).map(|_| Value::Null).collect();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
                 for orow in &o_rows {
+                    // On any non-match (NULL key, seek miss, or a failed `ON`
+                    // re-check), an INNER join drops the outer row while a LEFT
+                    // join emits it once with the inner side null-padded.
+                    let push_unmatched = |rows: &mut Vec<Vec<Value>>| {
+                        if is_left {
+                            let mut row = orow.clone();
+                            row.extend(null_inner.iter().cloned());
+                            rows.push(row);
+                        }
+                    };
                     let kv = &orow[oc];
                     if matches!(kv, Value::Null) {
+                        push_unmatched(&mut rows);
                         continue;
                     }
                     let rid = eval::to_i64(kv);
                     let Some(ivals) = self.read_row(&inner_meta, rid)? else {
+                        push_unmatched(&mut rows);
                         continue;
                     };
                     let mut row = orow.clone();
@@ -2211,6 +2232,8 @@ impl Connection {
                     let ctx = ir.ctx(&join_cols, &on_params).with_subqueries(self);
                     if eval::truth(&eval::eval(on_expr, &ctx)?) == Some(true) {
                         rows.push(row);
+                    } else {
+                        push_unmatched(&mut rows);
                     }
                 }
                 let result = vdbe::run_rows(&prog, &rows)?;
