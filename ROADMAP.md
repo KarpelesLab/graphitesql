@@ -1169,12 +1169,30 @@ gated on VDBE-vs-tree-walker parity, so it can't regress correctness):
   - **B5c-2b** — compile `Subquery`/`Exists`/`InSelect` that read an outer column.
 - **B5b-2 — seek-driven inner cursor over real storage (the big B8 step).** The
   nested-loop join currently materializes each table's rows into in-memory
-  row-sets. This step gives the VDBE interpreter **live storage cursors**
-  (`OpenRead` + a b-tree `TableCursor`) so the inner side is *seeked* by
-  rowid/PK/index instead of materialized — mirroring the tree-walker's inner-join
-  seeks. B5b-1's multi-cursor opcodes (`RewindC`/`ColumnC`/`NextC`) are the
-  foundation. This is the largest remaining VDBE piece and the prerequisite that
-  makes correlated-subquery (B5c-2) and window streaming worthwhile.
+  row-sets. This step gives the join a **live storage cursor** so the inner side
+  is *seeked* by rowid/PK/index instead of materialized — mirroring the
+  tree-walker's inner-join seeks. This is the largest remaining VDBE piece and the
+  prerequisite that makes correlated-subquery (B5c-2) and window streaming
+  worthwhile.
+  - **B5b-2a — INNER-join inner rowid seek (INTEGER PRIMARY KEY). DONE.** A
+    two-table `… JOIN t ON o.x = t.<ipk>` now seeks the single matching inner row
+    with a *live* b-tree cursor (`read_row` → `TableCursor::seek`) instead of
+    scanning + materializing the whole inner table; only the outer table is
+    scanned. Modelled on the outer-join *row-assembly* path (build the joined rows
+    in Rust, then reuse `compile_table_select`/`run_rows` for projection / WHERE /
+    ORDER BY / GROUP BY / DISTINCT / LIMIT). Correctness rides the superset
+    invariant: after the seek the full `ON` is re-evaluated against the assembled
+    row, so every rowid-coercion corner (`= 2.5`, text/blob keys, `NULL`, duplicate
+    outer keys) is filtered exactly as the materialized cross-product would.
+    Narrowly routed (single INNER `Eq`-on-ipk, both plain base tables, ipk by its
+    declared column name — a bare `rowid` alias / compound `ON` / derived source
+    defers); any unhandled projection falls through to the materialized path.
+    Verified VDBE-vs-tree-walker and vs sqlite3 3.50.4 (`tests/vdbe_live_cursor.rs`).
+  - **Remaining:** in-*interpreter* `OpenRead`/`SeekRowid` opcodes over B5b-1's
+    multi-cursor foundation (so the seek lives in bytecode, not row-assembly);
+    seek by a **secondary index** / `WITHOUT ROWID` PK; the bare-`rowid`-alias `ON`
+    spelling (blocked on a pre-existing divergence — `t.rowid` in a join projection
+    already errors on the tree-walker); N-table chains.
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT already seek; RIGHT/FULL still
   materialize the inner table.
 
@@ -1452,7 +1470,10 @@ reasonable order:
 1. **B5b-2 — live storage cursors on the VDBE.** The largest remaining VDBE piece;
    it turns the materialized inner join into a seek-driven one and is the
    prerequisite for streaming correlated subqueries and windows. Perf/coverage,
-   parity-gated, low risk.
+   parity-gated, low risk. **B5b-2a landed** (INNER-join inner rowid seek on an
+   INTEGER PRIMARY KEY — live `TableCursor::seek`, no inner materialization);
+   remaining sub-steps (in-interpreter seek opcodes, secondary-index / WITHOUT
+   ROWID seeks, N-table chains) tracked under §4's B5b-2 entry.
 2. **B5c-2 — correlated subqueries on the VDBE**, once B5b-2 lands the live-cursor
    machinery.
 3. **C9a → C9d — the concurrency story** (persistent read locks in `src/pager/`,

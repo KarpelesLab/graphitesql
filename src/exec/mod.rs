@@ -1989,6 +1989,236 @@ impl Connection {
         // the `WHERE`, and reuse the single-cursor scan compiler. Every join must
         // be a plain `INNER`/`CROSS`/comma join (no `NATURAL`/`USING`/outer).
         if !from.joins.is_empty() {
+            // B5b-2 (live inner cursor): a two-table INNER equi-join whose `ON`
+            // binds the inner table's INTEGER PRIMARY KEY (`… JOIN t ON o.x =
+            // t.<ipk>`) seeks the single matching inner row with a *live* b-tree
+            // cursor (`read_row` → `TableCursor::seek`) instead of materializing
+            // and scanning the whole inner table. Only the outer table is scanned;
+            // for each outer row the inner row is fetched by rowid. Correctness
+            // rides the superset invariant: after the seek the full `ON` is
+            // re-evaluated against the assembled row, so every rowid-coercion
+            // corner (`= 2.5`, text/blob keys, `NULL`) is filtered exactly as the
+            // materialized cross-product would. Any shape outside this narrow
+            // window — or a projection the single-cursor compiler can't take —
+            // breaks out and falls through to the materialized inner-join path.
+            'seek: {
+                if !(from.joins.len() == 1
+                    && from.joins[0].kind == sql::ast::JoinKind::Inner
+                    && !from.joins[0].natural
+                    && from.joins[0].using.is_empty())
+                {
+                    break 'seek;
+                }
+                let j = &from.joins[0];
+                // Both sides must be plain base tables: the inner side needs a live
+                // rowid b-tree, and a CTE/view/subquery/TVF has none.
+                let plain = |tr: &sql::ast::TableRef| -> bool {
+                    tr.subquery.is_none()
+                        && tr.tvf_args.is_none()
+                        && tr.schema.is_none()
+                        && !self.is_bare_tvf(tr)
+                };
+                if !plain(&from.first) || !plain(&j.table) {
+                    break 'seek;
+                }
+                // The inner name must resolve to a real rowid table with an
+                // INTEGER PRIMARY KEY (a same-named CTE/view shadows a base table).
+                if self.is_view(&j.table.name)
+                    || sel
+                        .ctes
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&j.table.name))
+                {
+                    break 'seek;
+                }
+                let inner_meta = match self.table_meta(&j.table.name, j.table.alias.as_deref()) {
+                    Ok(m) => m,
+                    Err(_) => break 'seek,
+                };
+                if inner_meta.without_rowid {
+                    break 'seek;
+                }
+                let Some(ipk) = inner_meta.ipk else {
+                    break 'seek;
+                };
+                let Some(on) = &j.on else { break 'seek };
+                // Outer schema + rows (the inner side is NOT scanned).
+                let (o_cols, o_tables, o_aff, o_coll, o_rows, _o_ids) = scan_one(&from.first)?;
+                // Inner schema — column metadata only, no row scan.
+                let inner_qual = j
+                    .table
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| j.table.name.clone());
+                let i_cols: Vec<String> =
+                    inner_meta.columns.iter().map(|c| c.name.clone()).collect();
+                let i_coll: Vec<crate::value::Collation> =
+                    inner_meta.columns.iter().map(|c| c.collation).collect();
+                let i_aff: Vec<eval::Affinity> =
+                    inner_meta.columns.iter().map(|c| c.affinity).collect();
+                let i_tables: Vec<String> = inner_meta
+                    .columns
+                    .iter()
+                    .map(|_| inner_qual.clone())
+                    .collect();
+                let ipk_name = inner_meta.columns[ipk].name.clone();
+                // The `ON` must be a single `Eq` (parens stripped) binding the
+                // inner ipk column on one side and a plain outer column on the
+                // other.
+                let mut on_expr = on;
+                while let sql::ast::Expr::Paren(inner) = on_expr {
+                    on_expr = inner;
+                }
+                let (l, r) = match on_expr {
+                    sql::ast::Expr::Binary {
+                        op: sql::ast::BinaryOp::Eq,
+                        left,
+                        right,
+                    } => (left.as_ref(), right.as_ref()),
+                    _ => break 'seek,
+                };
+                // A plain (optionally parenthesized) unqualified-schema column ref.
+                fn col_ref(mut e: &sql::ast::Expr) -> Option<(Option<&str>, &str)> {
+                    while let sql::ast::Expr::Paren(i) = e {
+                        e = i;
+                    }
+                    match e {
+                        sql::ast::Expr::Column {
+                            schema: None,
+                            table,
+                            column,
+                            ..
+                        } => Some((table.as_deref(), column.as_str())),
+                        _ => None,
+                    }
+                }
+                // Is `e` the inner ipk column, named by its declared column name?
+                // (A bare `rowid`/`_rowid_`/`oid` alias defers — the combined
+                // schema exposes the ipk under its declared name, so the `ON`
+                // re-check below could not resolve the alias.) Qualified with the
+                // inner qualifier, or bare and not also an outer column name.
+                let is_inner_ipk = |e: &sql::ast::Expr| -> bool {
+                    let Some((q, name)) = col_ref(e) else {
+                        return false;
+                    };
+                    if !name.eq_ignore_ascii_case(&ipk_name) {
+                        return false;
+                    }
+                    match q {
+                        Some(q) => q.eq_ignore_ascii_case(&inner_qual),
+                        None => !o_cols.iter().any(|c| c.eq_ignore_ascii_case(name)),
+                    }
+                };
+                // Resolve `e` to a single OUTER column index (qualified to the
+                // outer table, or bare-unambiguous across both tables).
+                let outer_qual = from
+                    .first
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| from.first.name.clone());
+                let outer_col_index = |e: &sql::ast::Expr| -> Option<usize> {
+                    let (q, name) = col_ref(e)?;
+                    if let Some(q) = q {
+                        if !q.eq_ignore_ascii_case(&outer_qual) {
+                            return None;
+                        }
+                    }
+                    let matches: Vec<usize> = o_cols
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.eq_ignore_ascii_case(name))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if matches.len() != 1 {
+                        return None;
+                    }
+                    // A bare name owned by both tables is ambiguous → defer.
+                    if q.is_none() && i_cols.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                        return None;
+                    }
+                    Some(matches[0])
+                };
+                let oc = if is_inner_ipk(l) {
+                    match outer_col_index(r) {
+                        Some(oc) => oc,
+                        None => break 'seek,
+                    }
+                } else if is_inner_ipk(r) {
+                    match outer_col_index(l) {
+                        Some(oc) => oc,
+                        None => break 'seek,
+                    }
+                } else {
+                    break 'seek;
+                };
+                // Combined schema (outer cols ++ inner cols), leftmost outermost.
+                let mut c_cols = o_cols.clone();
+                c_cols.extend(i_cols.iter().cloned());
+                let mut c_tables = o_tables.clone();
+                c_tables.extend(i_tables.iter().cloned());
+                let mut c_aff = o_aff.clone();
+                c_aff.extend(i_aff.iter().copied());
+                let mut c_coll = o_coll.clone();
+                c_coll.extend(i_coll.iter().copied());
+                let join_cols: Vec<ColumnInfo> = (0..c_cols.len())
+                    .map(|i| ColumnInfo {
+                        name: c_cols[i].clone(),
+                        table: c_tables[i].clone(),
+                        affinity: c_aff[i],
+                        collation: c_coll[i],
+                        schema: None,
+                        hidden: false,
+                    })
+                    .collect();
+                // An ambiguous bare column in the projection/WHERE defers so the
+                // tree-walker can reject it with "ambiguous column name".
+                if validate_unambiguous_columns(sel, &join_cols, &|t| t.into()).is_err() {
+                    break 'seek;
+                }
+                // Compile the projection/WHERE/ORDER BY/… over the assembled join
+                // rows. The `ON` is applied during assembly, so the original `sel`
+                // (not an ON-merged WHERE) is compiled — exactly like the
+                // outer-join assembly path. A shape the single-cursor compiler
+                // can't take falls through to the materialized path.
+                let prog = match vdbe::compile_table_select(
+                    sel, &c_cols, &c_tables, &c_aff, &c_coll, false,
+                ) {
+                    Ok(p) => p,
+                    Err(Error::Unsupported(_)) => break 'seek,
+                    Err(e) => return Err(e),
+                };
+                // Assemble the joined rows by seeking the inner table live, per
+                // outer row: coerce the outer key to a rowid (the same `to_i64`
+                // the tree-walker's rowid seek uses), seek it, then re-check the
+                // full `ON` so the result is a subset of the true cross-product.
+                let on_params = eval::Params::default();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for orow in &o_rows {
+                    let kv = &orow[oc];
+                    if matches!(kv, Value::Null) {
+                        continue;
+                    }
+                    let rid = eval::to_i64(kv);
+                    let Some(ivals) = self.read_row(&inner_meta, rid)? else {
+                        continue;
+                    };
+                    let mut row = orow.clone();
+                    row.extend(ivals.iter().cloned());
+                    let ir = InputRow {
+                        values: row.clone(),
+                        rowid: None,
+                    };
+                    let ctx = ir.ctx(&join_cols, &on_params).with_subqueries(self);
+                    if eval::truth(&eval::eval(on_expr, &ctx)?) == Some(true) {
+                        rows.push(row);
+                    }
+                }
+                let result = vdbe::run_rows(&prog, &rows)?;
+                return Ok(QueryResult {
+                    columns: prog.columns,
+                    rows: result,
+                });
+            }
             // A single two-table LEFT/RIGHT/FULL JOIN routes to the null-padding
             // nested loop below; otherwise only plain INNER joins are handled here
             // (NATURAL/USING fall back to the tree-walker).
