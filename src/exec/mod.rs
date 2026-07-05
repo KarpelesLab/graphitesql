@@ -17895,11 +17895,27 @@ impl Connection {
         if t.subquery.is_some() || t.tvf_args.is_some() || t.schema.is_some() {
             return None;
         }
-        if sel.where_clause.is_some() || window::has_window(sel) || meta.without_rowid {
+        if window::has_window(sel) || meta.without_rowid {
             return None;
         }
         if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
             return None;
+        }
+        // A `WHERE` that *seeks* an index is a `SEARCH`, owned by the `eqp_access`
+        // seek path (which runs after this in both the EQP chain and the executor).
+        // A covering *full* scan applies only when no seek does — `eqp_access`
+        // renders exactly a bare `SCAN {label}` in that case, so gate on it. (The
+        // executor reaches here only after its own seek attempts fail, so this keeps
+        // the two in lockstep.) A covering index must also hold every `WHERE` column,
+        // which `query_cols_covered` already checks below.
+        if let Some(w) = &sel.where_clause {
+            let label = t.alias.as_deref().unwrap_or(&t.name);
+            let acc = self
+                .eqp_access(label, &t.name, meta, Some(w), Some(sel), params)
+                .ok()?;
+            if acc != alloc::format!("SCAN {label}") {
+                return None;
+            }
         }
         // If the ORDER BY is already satisfied by a scan's natural order — the
         // rowid order of a table scan (`rowid_ordered_scan`) or an index walk
