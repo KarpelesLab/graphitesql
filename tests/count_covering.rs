@@ -1,9 +1,12 @@
 //! `SELECT count(*)` answered via a covering secondary index (roadmap B2b).
 //!
-//! When a single rowid table has exactly one full secondary index, sqlite (and
-//! graphitesql) counts that index's entries — `EXPLAIN QUERY PLAN` reports
-//! `SCAN t USING COVERING INDEX <name>`. With zero or multiple such indexes,
-//! graphitesql conservatively keeps the plain `SCAN t` plan (no guessing).
+//! `count(*)` is answered from a covering secondary index when that index's
+//! estimated row is *strictly narrower* than the table's (SQLite's
+//! `estimateTableWidth`/`estimateIndexWidth` cost model). `EXPLAIN QUERY PLAN`
+//! then reports `SCAN t USING COVERING INDEX <name>`, choosing the narrowest
+//! qualifying index (ties → the most-recently-created). An index no narrower than
+//! the table — e.g. the sole non-key column indexed on a two-column table — is
+//! not used, and the plan stays `SCAN t`.
 
 #![cfg(feature = "std")]
 
@@ -33,6 +36,25 @@ fn count(conn: &Connection, sql: &str) -> i64 {
 
 #[test]
 fn one_index_uses_covering_index_in_eqp() {
+    // The index (b + rowid = 2 units) is narrower than the 3-column table, so it
+    // is used to count. (On a two-column table it would tie the table and SCAN.)
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b, c)")
+        .unwrap();
+    c.execute("CREATE INDEX ib ON t(b)").unwrap();
+    c.execute("INSERT INTO t VALUES(1,10,100),(2,20,200)")
+        .unwrap();
+    assert_eq!(
+        detail(&c, "EXPLAIN QUERY PLAN SELECT count(*) FROM t"),
+        ["SCAN t USING COVERING INDEX ib"]
+    );
+}
+
+#[test]
+fn index_no_narrower_than_table_keeps_plain_scan() {
+    // On a two-column table, indexing the sole non-key column gives an index
+    // (b + rowid = 2) exactly as wide as the table (a + b = 2), so SQLite scans
+    // the table rather than the index.
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
         .unwrap();
@@ -40,8 +62,9 @@ fn one_index_uses_covering_index_in_eqp() {
     c.execute("INSERT INTO t VALUES(1,10),(2,20)").unwrap();
     assert_eq!(
         detail(&c, "EXPLAIN QUERY PLAN SELECT count(*) FROM t"),
-        ["SCAN t USING COVERING INDEX ib"]
+        ["SCAN t"]
     );
+    assert_eq!(count(&c, "SELECT count(*) FROM t"), 2);
 }
 
 #[test]
@@ -69,7 +92,7 @@ fn no_index_keeps_plain_scan() {
 }
 
 #[test]
-fn multiple_indexes_fall_back_to_plain_scan() {
+fn multiple_indexes_pick_cheapest_covering_index() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b, c)")
         .unwrap();
@@ -77,10 +100,11 @@ fn multiple_indexes_fall_back_to_plain_scan() {
     c.execute("CREATE INDEX ic ON t(c)").unwrap();
     c.execute("INSERT INTO t VALUES(1,10,100),(2,20,200)")
         .unwrap();
-    // Ambiguous index choice => keep the plain SCAN (no guessing).
+    // Both indexes are narrower than the table and equally wide, so SQLite counts
+    // the most-recently-created one (ic), matching its cost-model tie-break.
     assert_eq!(
         detail(&c, "EXPLAIN QUERY PLAN SELECT count(*) FROM t"),
-        ["SCAN t"]
+        ["SCAN t USING COVERING INDEX ic"]
     );
     assert_eq!(count(&c, "SELECT count(*) FROM t"), 2);
 }
@@ -88,10 +112,10 @@ fn multiple_indexes_fall_back_to_plain_scan() {
 #[test]
 fn count_correct_after_delete() {
     let mut c = Connection::open_memory().unwrap();
-    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
+    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b, c)")
         .unwrap();
     c.execute("CREATE INDEX ib ON t(b)").unwrap();
-    c.execute("INSERT INTO t VALUES(1,10),(2,20),(3,30),(4,40)")
+    c.execute("INSERT INTO t VALUES(1,10,1),(2,20,2),(3,30,3),(4,40,4)")
         .unwrap();
     assert_eq!(count(&c, "SELECT count(*) FROM t"), 4);
     c.execute("DELETE FROM t WHERE a IN (2,3)").unwrap();

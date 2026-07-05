@@ -124,7 +124,7 @@ fn order_by_rowid_keeps_table_scan() {
 }
 
 #[test]
-fn ambiguous_covering_indexes_keep_plain_scan() {
+fn two_covering_indexes_pick_cheapest() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b, c)")
         .unwrap();
@@ -132,10 +132,10 @@ fn ambiguous_covering_indexes_keep_plain_scan() {
     c.execute("CREATE INDEX ic ON t(c)").unwrap();
     c.execute("INSERT INTO t VALUES (1,10,100),(2,20,200)")
         .unwrap();
-    // count(*) is covered by both ib and ic; rather than guess sqlite's pick,
-    // graphite keeps the plain scan.
+    // count(*) is covered by both ib and ic; both are narrower than the table and
+    // equally wide, so SQLite's cost model counts the most-recently-created (ic).
     assert_eq!(
         plan(&c, "EXPLAIN QUERY PLAN SELECT count(*) FROM t"),
-        "SCAN t"
+        "SCAN t USING COVERING INDEX ic"
     );
 }

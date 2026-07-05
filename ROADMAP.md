@@ -1261,15 +1261,22 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
 - **B9h — cost-model single-table index *choice*.** SQLite prefers, among indexes
   sharing an equality prefix, the one whose walk does the most work (composite `(b,c)`
   over `(b)` for a trailing range / `GROUP BY`/`ORDER BY c`; a *covering* index over a
-  narrower one; the smallest covering index for `count(*)`/`IN`), and decides *whether*
-  a no-WHERE query covers at all (narrow index vs wide-row table scan). graphite picks
-  by longest-equality-prefix only. The covering-scan no-`ORDER BY` row-order parity
-  (investigated 2026-07-04 as B9i — graphite already walks index order, so it is *not* an
-  execution-order bug) and the secondary-index `SEARCH` + `GROUP BY`/`DISTINCT` b-tree
-  (left open by B9d) both ride here. **Deferred by design:** the pinned oracle has no
-  stat4, so its choices depend on row-width / index-width / index-count heuristics
-  graphite can't reproduce without diverging the EQP corpus — same class as B1b/B4;
-  needs a stat4-enabled oracle.
+  narrower one), and decides *whether* a no-WHERE query covers at all.
+  **The no-`WHERE` covering-scan choice is DONE (2026-07-05).** It turned out to be a
+  purely *structural* cost — not stat4-dependent — so it is exactly reproducible against
+  the pinned oracle: graphite now ports SQLite's `estimateTableWidth`/`estimateIndexWidth`
+  (`col_szest` + `logest` free fns) and uses a covering index for a no-`WHERE` scan /
+  `count(*)` only when its estimated row is *strictly narrower* than the table's, picking
+  the narrowest (ties → newest / highest rootpage). This fixed both the over-use
+  (`SELECT b,c` over a 2-col-index-on-a-3-col-table now `SCAN t`) and the under-use
+  (`count(*)` over ≥2 indexes now picks the cheapest instead of bailing), and the covered
+  scan's no-`ORDER BY` row order (index order) matches in lockstep (`covering_scan` +
+  `count_covering_index` delegate to the shared model; `tests/eqp_covering_index_cost.rs`,
+  `tests/count_covering.rs`). **Still open (rides here):** the composite-vs-narrow choice
+  *with* a WHERE equality prefix, covering-scan *with* a WHERE predicate on covered
+  columns (`SELECT b FROM t WHERE c>0` → covering `(b,c)`), and the secondary-index
+  `SEARCH` + `GROUP BY`/`DISTINCT` b-tree (left open by B9d). These are structural too and
+  now unblocked — a stat4 oracle is only needed for genuinely data-driven choices (B4).
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   `collect_eq_constraints` / `collect_range_constraints` compare an explicit `COLLATE`
   to the *column's* collation. When an index carries a *non-default* collation

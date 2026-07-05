@@ -17916,18 +17916,76 @@ impl Connection {
         if self.group_by_is_rowid(sel, meta, label) {
             return None;
         }
-        let mut covering = self.indexes_of(&t.name).ok()?.into_iter().filter(|idx| {
-            idx.partial.is_none()
-                && idx.key_exprs.is_none()
-                && self.query_cols_covered(sel, meta, &idx.cols)
-        });
-        let chosen = covering.next()?;
-        // Ambiguous (two or more covering indexes): keep the plain scan rather
-        // than guess which one sqlite's cost model would pick.
-        if covering.next().is_some() {
-            return None;
+        let covering: Vec<_> = self
+            .indexes_of(&t.name)
+            .ok()?
+            .into_iter()
+            .filter(|idx| {
+                idx.partial.is_none()
+                    && idx.key_exprs.is_none()
+                    && self.query_cols_covered(sel, meta, &idx.cols)
+            })
+            .collect();
+        // A `GROUP BY` / `DISTINCT` / `ORDER BY` query walks the index to produce
+        // its keys in order (avoiding a full sort — for a partial sort the index
+        // still supplies the leading terms), so SQLite reads from a covering index
+        // there *regardless* of width; only a bare projection is a pure width
+        // choice. (A fully sort-satisfying scan already bailed above via
+        // `order_satisfied_by_scan`.) For these we keep the conservative
+        // single-candidate rule — which index an ambiguous walk picks is the
+        // ordered-scan path's job.
+        if !sel.group_by.is_empty() || sel.distinct || !sel.order_by.is_empty() {
+            if covering.len() != 1 {
+                return None;
+            }
+            let chosen = covering.into_iter().next()?;
+            return Some((chosen.name, chosen.root, chosen.cols));
         }
+        // Plain no-`WHERE` projection: port SQLite's covering-scan cost choice
+        // (`estimateTableWidth` / `estimateIndexWidth`): the table's estimated row
+        // width is `Σ szEst(col) (+1 if no INTEGER PRIMARY KEY)`; an index's is
+        // `Σ szEst(key col) + 1` (the trailing rowid). A covering index is used only
+        // when its width (in `LogEst` units) is *strictly* less than the table's,
+        // and among the candidates the narrowest wins — ties broken by the
+        // most-recently-created index (highest rootpage; SQLite considers indexes
+        // newest-first and keeps the first of an equal cost). Verified against the
+        // sqlite3 3.50.4 planner.
+        let szests = self.table_col_szests(&t.name).unwrap_or_default();
+        let szest_of = |i: usize| szests.get(i).copied().unwrap_or(1);
+        let mut wtable: u32 = (0..meta.columns.len()).map(szest_of).sum();
+        if meta.ipk.is_none() {
+            wtable += 1;
+        }
+        let sz_tab = logest(u64::from(wtable) * 4);
+        let chosen = covering
+            .into_iter()
+            .map(|idx| {
+                let widx: u32 = idx.cols.iter().map(|&c| szest_of(c)).sum::<u32>() + 1;
+                (logest(u64::from(widx) * 4), idx)
+            })
+            .filter(|(sz_idx, _)| *sz_idx < sz_tab)
+            .min_by(|(sa, ia), (sb, ib)| sa.cmp(sb).then(ib.root.cmp(&ia.root)))?
+            .1;
         Some((chosen.name, chosen.root, chosen.cols))
+    }
+
+    /// The per-column [`col_szest`] estimates for a rowid table, aligned with its
+    /// declared column order (which matches `TableMeta::columns` for a rowid
+    /// table). Parses the stored `CREATE TABLE` for the raw declared type of each
+    /// column (an untyped column is `1`, not the `BLOB` fallback other paths use).
+    /// Returns an empty vector when the table can't be resolved, so callers fall
+    /// back to a size of `1` per column.
+    fn table_col_szests(&self, table: &str) -> Option<Vec<u32>> {
+        let obj = self.schema.table(table)?;
+        let Ok(Statement::CreateTable(ct)) = sql::parse_one(obj.sql.as_deref()?) else {
+            return None;
+        };
+        Some(
+            ct.columns
+                .iter()
+                .map(|c| col_szest(c.type_name.as_deref()))
+                .collect(),
+        )
     }
 
     /// SQLite's min/max optimization: a query whose only aggregate is a single
@@ -18311,18 +18369,13 @@ impl Connection {
         if meta.without_rowid {
             return None;
         }
-        // Exactly one full (non-partial, non-expression) secondary index.
-        let mut chosen: Option<(String, u32)> = None;
-        for idx in self.indexes_of(&t.name).ok()? {
-            if idx.partial.is_some() || idx.key_exprs.is_some() {
-                continue;
-            }
-            if chosen.is_some() {
-                return None; // ambiguous: more than one candidate
-            }
-            chosen = Some((idx.name, idx.root));
-        }
-        chosen
+        // A `count(*)` needs no columns, so every full secondary index "covers" it.
+        // The choice — and whether a covering scan is cheaper than a plain table
+        // scan at all — is the shared cost model in `covering_scan` (which picks the
+        // narrowest index strictly narrower than the table, or `None` so the caller
+        // `SCAN`s the table).
+        let (name, root, _) = self.covering_scan(sel, &meta, &Params::default())?;
+        Some((name, root))
     }
 
     /// Whether a single-table scan already yields rows in the query's `ORDER BY`
@@ -27011,6 +27064,70 @@ fn column_resolves_scoped(
             && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
             && schema_ok(c)
     })
+}
+
+/// SQLite's `sqlite3LogEst` — an integer approximation of `10*log2(x)`, the unit
+/// the query planner costs rows and row-widths in. Ported verbatim so a covering
+/// index's estimated width can be compared exactly the way SQLite does.
+fn logest(mut x: u64) -> i16 {
+    const A: [i16; 8] = [0, 2, 3, 5, 6, 7, 8, 9];
+    let mut y: i16 = 40;
+    if x < 8 {
+        if x < 2 {
+            return 0;
+        }
+        while x < 8 {
+            y -= 10;
+            x <<= 1;
+        }
+    } else {
+        while x > 255 {
+            y += 40;
+            x >>= 4;
+        }
+        while x > 15 {
+            y += 10;
+            x >>= 1;
+        }
+    }
+    A[(x & 7) as usize] + y - 10
+}
+
+/// The estimated per-column size SQLite records (`estimateTableWidth` via
+/// `sqlite3AffinityType`), scaled so an integer/real/numeric or untyped column is
+/// `1`. A `TEXT`/`BLOB`/`CLOB`/`CHAR` with no size is `5`; a sized `VARCHAR(k)` /
+/// `CHAR(k)` / `BLOB(k)` is `k/4 + 1` (capped at 255). Only TEXT/BLOB-affinity
+/// columns carry a size; numeric affinities are always `1`.
+fn col_szest(type_name: Option<&str>) -> u32 {
+    let Some(t) = type_name else { return 1 };
+    if t.trim().is_empty() {
+        return 1;
+    }
+    let up = t.to_ascii_uppercase();
+    // The first unsigned integer literal in `s`, if any.
+    fn first_uint(s: &str) -> Option<u32> {
+        let start = s.find(|c: char| c.is_ascii_digit())?;
+        let end = s[start..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map(|e| start + e)
+            .unwrap_or(s.len());
+        s[start..end].parse().ok()
+    }
+    let v: u32 = match eval::Affinity::from_type(Some(t)) {
+        // A size for a text column sits after the "CHAR" token (`VARCHAR(k)`,
+        // `CHAR(k)`); a bare `TEXT`/`CLOB` carries none → 16 (→ szEst 5).
+        eval::Affinity::Text => up
+            .rfind("CHAR")
+            .and_then(|p| first_uint(&up[p + 4..]))
+            .unwrap_or(16),
+        // A `BLOB(k)` size sits immediately after "BLOB("; a bare `BLOB` → 16.
+        eval::Affinity::Blob => match up.find("BLOB") {
+            Some(p) if up[p + 4..].starts_with('(') => first_uint(&up[p + 4..]).unwrap_or(16),
+            _ => 16,
+        },
+        _ => 0,
+    };
+    (v / 4 + 1).min(255)
 }
 
 fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, Option<&str>, &str, bool)) {
