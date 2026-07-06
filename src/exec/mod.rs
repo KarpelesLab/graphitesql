@@ -1244,9 +1244,16 @@ impl Connection {
         collect_isnull_cols(where_expr, &meta.columns, &mut isnull_cols);
         let pinned = |c: usize| eqs.iter().any(|(col, _)| *col == c) || isnull_cols.contains(&c);
 
-        // (1) A range after the pinned prefix of a plain secondary index. A range
-        //     on the rowid/IPK walks the table b-tree in rowid order instead, so
-        //     it never counts.
+        // (1) A range after the pinned prefix of a plain secondary index, or an
+        //     equality/`IS NULL` prefix that pins a *proper* non-empty prefix and
+        //     leaves at least one trailing index column unconstrained. In both
+        //     cases SQLite walks the index and orders the matched entries by that
+        //     trailing column — an order the VDBE's rowid-order scan does not
+        //     reproduce. A range on the rowid/IPK walks the table b-tree in rowid
+        //     order instead, so it never counts; and a *fully*-pinned prefix
+        //     (`k == cols.len()`) leaves only the implicit trailing rowid, whose
+        //     order is rowid order, so an equality seek on a single-column index —
+        //     or on every declared column of a composite one — stays on the VDBE.
         let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
             alloc::collections::BTreeMap::new();
         collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
@@ -1256,7 +1263,14 @@ impl Connection {
                 k += 1;
             }
             if let Some(&next) = idx.cols.get(k) {
+                // A range on the first unpinned column (not the rowid) spans keys.
                 if meta.ipk != Some(next) && ranges.contains_key(&next) {
+                    return Ok(true);
+                }
+                // A non-empty equality/`IS NULL` prefix with a real trailing index
+                // column left over: that column (`next`) orders the equal-prefix
+                // entries, so the index walk diverges from rowid order.
+                if k >= 1 {
                     return Ok(true);
                 }
             }

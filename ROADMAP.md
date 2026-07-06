@@ -523,9 +523,12 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   latent gap the differential corpus missed because it ORDER-BYs or doesn't
   project bare indexed columns. `run_select_vdbe` now defers exactly those shapes
   to the tree-walker (whose seek paths already walk the index in key order) via a
-  `vdbe_seek_returns_index_order` predicate; single-key seeks (`a=?`, `a IS NULL`,
-  one-element `IN`) keep rowid order and stay on the VDBE, and any explicit
-  `ORDER BY` makes the order access-path-independent so those stay too. This also
+  `vdbe_seek_returns_index_order` predicate; a *fully*-pinned seek — an equality
+  on a single-column index, or on every declared column of a composite one
+  (`a=?`, `a IS NULL`, one-element `IN`, `a=? AND b=?` over `(a,b)`) — leaves only
+  the implicit trailing rowid, whose order already is rowid order, so it keeps the
+  VDBE scan, and any explicit `ORDER BY` makes the order access-path-independent so
+  those stay too. This also
   lands a new covering plan, `try_isnotnull_covering`: `SELECT a … WHERE a IS NOT
   NULL` over an index on `a` now reads `USING COVERING INDEX a (a>?)` (NULLs sort
   first), while the near-full-table non-covering `SELECT *`/`SELECT b` stay a
@@ -545,6 +548,17 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   the VDBE; and the `ORDER BY a DESC` duplicate-key tiebreak — the VDBE's stable
   sort keeps equal-key rows in rowid order where SQLite's reverse index walk
   emits them in reverse-rowid order — an orthogonal DESC-sort quirk.)
+  A further follow-up closes the same divergence for a **plain equality prefix on
+  a composite index** — `WHERE a=?` over `(a,b)`, the single most common shape,
+  which the earlier passes missed because it isn't a range, an `IN`, or an `IS NOT
+  NULL`. SQLite walks the index, so within the equal-`a` group the rows arrive
+  ordered by the trailing key column `b` (then rowid); the VDBE's rowid scan does
+  not reproduce that. `vdbe_seek_returns_index_order` now also fires whenever a
+  plain secondary index has an equality/`IS NULL`-pinned *proper* prefix
+  (`0 < k < cols.len()`, i.e. at least one real trailing index column left
+  unconstrained), deferring to the tree-walker's index-order seek — covering and
+  non-covering, two- and three-column indexes, NULL-keyed prefixes. EQP and rows
+  byte-exact vs sqlite3 3.50.4 (`tests/vdbe_composite_seek_order.rs`).
   A second follow-up closes the same divergence for a **no-`WHERE` covering scan**:
   `SELECT a FROM t` (or `SELECT DISTINCT a`, composite `SELECT a,b` over `(a,b)`)
   with no `ORDER BY` is served by the tree-walker's `covering_scan` — reading the
