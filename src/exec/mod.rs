@@ -7440,7 +7440,13 @@ impl Connection {
                     continue; // partial index excludes this row
                 }
                 let key = self.index_key_bytes(idx, &meta, &index_values, rowid, params)?;
-                insert_index(self.backend.writer()?, idx.root, &key, &idx.collations)?;
+                insert_index(
+                    self.backend.writer()?,
+                    idx.root,
+                    &key,
+                    &idx.collations,
+                    idx.seek_descs(),
+                )?;
             }
             self.fire_triggers(
                 &ins.table,
@@ -8752,6 +8758,14 @@ impl Connection {
             }
         }
         let (cols, key_exprs, colls) = self.index_key_spec(&tmeta, ci)?;
+        // Per-column DESC flags for this build. Must match what later seeks/inserts
+        // pass (`IndexMeta::seek_descs`): only a plain column index has trustworthy
+        // directions; expression indexes build (and seek) all-ascending.
+        let descs: Vec<bool> = if key_exprs.is_none() {
+            ci.columns.iter().map(|t| t.descending).collect()
+        } else {
+            Vec::new()
+        };
         if key_exprs.is_some() && tmeta.without_rowid {
             return Err(Error::Unsupported(
                 "expression indexes on WITHOUT ROWID tables",
@@ -8820,7 +8834,13 @@ impl Connection {
             let root = create_index_root(w)?;
             for (row, &k) in rows.iter().zip(&keep) {
                 if k {
-                    insert_index(w, root, &wr_index_key(&cols, &pk_cols, row), &key_colls)?;
+                    insert_index(
+                        w,
+                        root,
+                        &wr_index_key(&cols, &pk_cols, row),
+                        &key_colls,
+                        &descs,
+                    )?;
                 }
             }
             root
@@ -8865,7 +8885,7 @@ impl Connection {
             let w = self.backend.writer()?;
             let root = create_index_root(w)?;
             for key in &keys {
-                insert_index(w, root, key, &colls)?;
+                insert_index(w, root, key, &colls, &descs)?;
             }
             root
         };
@@ -11362,7 +11382,7 @@ impl Connection {
             return Ok(None);
         }
         let records =
-            crate::btree::index_seek_records(self.backend.source(), meta.root, &key, &colls)?;
+            crate::btree::index_seek_records(self.backend.source(), meta.root, &key, &colls, &[])?;
         let mut out = Vec::with_capacity(records.len());
         for storage in records {
             let mut row = unpermute_row(meta, storage);
@@ -11424,6 +11444,7 @@ impl Connection {
                 meta.root,
                 &[key_val],
                 &[coll],
+                &[],
             )?;
             for storage in records {
                 let mut row = unpermute_row(meta, storage);
@@ -11482,6 +11503,7 @@ impl Connection {
             lower_arg,
             upper_arg,
             &colls,
+            &[],
         )?;
         let mut out = Vec::with_capacity(records.len());
         for storage in records {
@@ -11559,7 +11581,8 @@ impl Connection {
             if key.is_empty() {
                 continue;
             }
-            let records = crate::btree::index_seek_records(src, idx.root, &key, &colls)?;
+            let records =
+                crate::btree::index_seek_records(src, idx.root, &key, &colls, idx.seek_descs())?;
             let covering = self.wr_index_covers(idx, &pk, meta, sel, where_expr);
             return Ok(Some(
                 self.wr_index_rows(meta, idx, &pk, records, covering, params)?,
@@ -11629,7 +11652,8 @@ impl Connection {
                 let pk_key: Vec<Value> = (0..pk.len())
                     .map(|j| rec[idx.cols.len() + j].clone())
                     .collect();
-                for storage in crate::btree::index_seek_records(src, meta.root, &pk_key, &pk_colls)?
+                for storage in
+                    crate::btree::index_seek_records(src, meta.root, &pk_key, &pk_colls, &[])?
                 {
                     let mut row = unpermute_row(meta, storage);
                     self.compute_generated(meta, &mut row, params)?;
@@ -11685,6 +11709,12 @@ impl Connection {
             let Some(&lead) = idx.cols.first() else {
                 continue;
             };
+            // Range on a DESC leading column would need the value-space bounds
+            // swapped in key-sort space; defer that and fall back to a scan (still
+            // correct via `run_core`'s WHERE re-filter).
+            if idx.descending.first().copied().unwrap_or(false) {
+                continue;
+            }
             let Some(b) = ranges.get(&lead) else {
                 continue;
             };
@@ -11705,6 +11735,7 @@ impl Connection {
                 lower_arg,
                 upper_arg,
                 &colls,
+                idx.seek_descs(),
             )?;
             let covering = self.wr_index_covers(idx, &pk, meta, sel, where_expr);
             return Ok(Some(
@@ -11832,6 +11863,7 @@ impl Connection {
             Vec<Value>,
             Vec<crate::value::Collation>,
             Vec<usize>,
+            Vec<bool>,
             u64,
         )> = None;
         for idx in &indexes {
@@ -11870,20 +11902,28 @@ impl Connection {
                 .unwrap_or(u64::MAX - key.len() as u64);
             let better = match &best {
                 None => true,
-                Some((_, bk, _, _, be)) => est < *be || (est == *be && key.len() > bk.len()),
+                Some((_, bk, _, _, _, be)) => est < *be || (est == *be && key.len() > bk.len()),
             };
             if better {
-                // Carry the index's full collation vector so a trailing range on
-                // the column after the equality prefix can be seeked too.
-                best = Some((idx.root, key, idx.collations.clone(), idx.cols.clone(), est));
+                // Carry the index's full collation vector (and per-column DESC
+                // flags) so a trailing range on the column after the equality
+                // prefix can be seeked too, and so the prefix seek honors DESC.
+                best = Some((
+                    idx.root,
+                    key,
+                    idx.collations.clone(),
+                    idx.cols.clone(),
+                    idx.seek_descs().to_vec(),
+                    est,
+                ));
             }
         }
         // Plain column indexes take priority. If none applied, try a partial or
         // expression index whose eligibility we can prove from the `WHERE`
         // structure (see `partial_expr_seek`). This keeps plain-index behavior
         // byte-identical while extending seeks to the new index kinds.
-        let (root, key, full_colls, idx_cols) = match best {
-            Some((root, key, colls, idx_cols, _)) => (root, key, colls, idx_cols),
+        let (root, key, full_colls, idx_cols, full_descs) = match best {
+            Some((root, key, colls, idx_cols, descs, _)) => (root, key, colls, idx_cols, descs),
             None => {
                 return self.partial_expr_lookup(meta, table_name, sel, where_expr, params);
             }
@@ -11906,6 +11946,13 @@ impl Connection {
         // `[eq…, low] .. [eq…, high]`, matching SQLite (and reported the same way
         // by `eqp_access`). Falls through to the plain prefix seek otherwise.
         let next_pos = key.len();
+        // A range on the next index column. When that column is stored DESC, value
+        // order is reversed in key-sort space, so we (a) tell the b-tree the column
+        // is descending (`descs` covers `..=next_pos`), and (b) SWAP the value-space
+        // lower/upper bounds — the value lower bound becomes the stored-space upper
+        // bound and vice versa (inclusivity travels with its bound). See
+        // `prefix_cmp`'s per-column reversal.
+        let next_is_desc = full_descs.get(next_pos).copied().unwrap_or(false);
         if let Some(&next_col) = idx_cols.get(next_pos) {
             let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
                 alloc::collections::BTreeMap::new();
@@ -11913,8 +11960,15 @@ impl Connection {
             if let Some(b) = ranges.get(&next_col) {
                 let aff = meta.columns[next_col].affinity;
                 let colls = full_colls[..=next_pos].to_vec();
+                // Build the stored-space (lower, upper) key/inclusivity from the
+                // value-space bounds, swapping them for a DESC column.
+                let (val_lower, val_upper) = if next_is_desc {
+                    (b.upper.as_ref(), b.lower.as_ref())
+                } else {
+                    (b.lower.as_ref(), b.upper.as_ref())
+                };
                 let mut lo_key = key.clone();
-                let lo_inc = match b.lower.as_ref() {
+                let lo_inc = match val_lower {
                     Some((v, inc)) => {
                         lo_key.push(aff.coerce(v.clone()));
                         *inc
@@ -11922,19 +11976,24 @@ impl Connection {
                     None => true,
                 };
                 let mut hi_key = key.clone();
-                let hi_inc = match b.upper.as_ref() {
+                let hi_inc = match val_upper {
                     Some((v, inc)) => {
                         hi_key.push(aff.coerce(v.clone()));
                         *inc
                     }
                     None => true,
                 };
+                // The equality prefix may include DESC columns; include the ranged
+                // next column's stored direction too. Clamp for an auto/expression
+                // index whose `full_descs` is empty (all ascending).
+                let descs = &full_descs[..(next_pos + 1).min(full_descs.len())];
                 let rowids = crate::btree::index_range_rowids(
                     self.backend.source(),
                     root,
                     Some((lo_key.as_slice(), lo_inc)),
                     Some((hi_key.as_slice(), hi_inc)),
                     &colls,
+                    descs,
                 )?;
                 let encoding = self.backend.source().header().text_encoding;
                 let mut cur = TableCursor::new(self.backend.source(), meta.root);
@@ -11984,12 +12043,17 @@ impl Connection {
                     }
                     None => true,
                 };
+                // Equality prefix may include DESC columns; the trailing rowid
+                // component is always ascending (defaults false past the prefix).
+                // Clamp for an auto index whose `full_descs` is empty.
+                let descs = &full_descs[..next_pos.min(full_descs.len())];
                 let rowids = crate::btree::index_range_rowids(
                     self.backend.source(),
                     root,
                     Some((lo_key.as_slice(), lo_inc)),
                     Some((hi_key.as_slice(), hi_inc)),
                     &colls,
+                    descs,
                 )?;
                 let encoding = self.backend.source().header().text_encoding;
                 let mut cur = TableCursor::new(self.backend.source(), meta.root);
@@ -12007,20 +12071,27 @@ impl Connection {
             }
         }
 
-        self.index_seek_fetch(meta, root, &key, &full_colls[..key.len()])
+        let n = key.len();
+        // `full_descs` is empty for an auto/expression index (all ascending), so
+        // clamp — the b-tree defaults missing per-column flags to ascending.
+        let descs = &full_descs[..n.min(full_descs.len())];
+        self.index_seek_fetch(meta, root, &key, &full_colls[..n], descs)
     }
 
     /// Fetch table rows for an equality index seek: collect the matching rowids
     /// from the index, then read each row from the table b-tree. Returns a
-    /// superset (`run_core` re-applies the full `WHERE`).
+    /// superset (`run_core` re-applies the full `WHERE`). `descs` carries the
+    /// per-column `DESC` flags (empty ⇒ all ascending).
     fn index_seek_fetch(
         &self,
         meta: &TableMeta,
         root: u32,
         key: &[Value],
         colls: &[crate::value::Collation],
+        descs: &[bool],
     ) -> Result<Option<Vec<InputRow>>> {
-        let rowids = crate::btree::index_seek_rowids(self.backend.source(), root, key, colls)?;
+        let rowids =
+            crate::btree::index_seek_rowids(self.backend.source(), root, key, colls, descs)?;
         let encoding = self.backend.source().header().text_encoding;
         let mut cur = TableCursor::new(self.backend.source(), meta.root);
         let mut out = Vec::new();
@@ -12059,8 +12130,9 @@ impl Connection {
             if let Some((key, colls)) = self.partial_expr_seek(&idx, where_expr, meta, params)? {
                 // Expression indexes don't map keys back to table columns, so they
                 // are never a covering seek here; fetch table rows by rowid (a
-                // superset re-filtered by `run_core`).
-                return self.index_seek_fetch(meta, idx.root, &key, &colls);
+                // superset re-filtered by `run_core`). Expression-index keys seek
+                // all-ascending (`&[]`), matching how they are inserted.
+                return self.index_seek_fetch(meta, idx.root, &key, &colls, &[]);
             }
         }
         Ok(None)
@@ -12254,7 +12326,14 @@ impl Connection {
                 return Err(Error::Error(alloc::format!("no such index: {n}")));
             }
         }
-        let mut chosen: Option<(u32, RangeBound, crate::value::Collation, Vec<usize>)> = None;
+        #[allow(clippy::type_complexity)]
+        let mut chosen: Option<(
+            u32,
+            RangeBound,
+            crate::value::Collation,
+            Vec<usize>,
+            bool,
+        )> = None;
         for idx in &indexes {
             if let Some(IndexHint::IndexedBy(n)) = hint {
                 if !idx.name.eq_ignore_ascii_case(n) {
@@ -12267,25 +12346,38 @@ impl Connection {
             let Some(&lead) = idx.cols.first() else {
                 continue;
             };
+            // For a DESC leading column the value order is reversed in key-sort
+            // space, so the value-space bounds are SWAPPED below and the b-tree is
+            // told the column is descending.
+            let lead_desc = idx.descending.first().copied().unwrap_or(false);
             if let Some(b) = ranges.get(&lead) {
                 let coll = idx.collations.first().copied().unwrap_or_default();
                 let aff = meta.columns[lead].affinity;
-                let b = RangeBound {
-                    lower: b.lower.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i)),
-                    upper: b.upper.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i)),
+                let (lo, hi) = if lead_desc {
+                    (b.upper.as_ref(), b.lower.as_ref())
+                } else {
+                    (b.lower.as_ref(), b.upper.as_ref())
                 };
-                chosen = Some((idx.root, b, coll, idx.cols.clone()));
+                let b = RangeBound {
+                    lower: lo.map(|(v, i)| (aff.coerce(v.clone()), *i)),
+                    upper: hi.map(|(v, i)| (aff.coerce(v.clone()), *i)),
+                };
+                chosen = Some((idx.root, b, coll, idx.cols.clone(), lead_desc));
                 break;
             }
         }
         match chosen {
-            Some((root, bound, coll, idx_cols)) => {
+            Some((root, bound, coll, idx_cols, lead_desc)) => {
                 // Covering range seek: read from the index when it holds every
                 // referenced column (lockstep with `eqp_access`'s `COVERING INDEX`).
+                // The covering walk reads the whole index (a superset re-filtered by
+                // `run_core`), so its correctness is direction-independent.
                 if self.seek_index_covers(sel, meta, &idx_cols, where_expr) {
                     return Ok(Some(self.covering_seek_rows(meta, root, &idx_cols)?));
                 }
-                Ok(Some(self.range_seek_fetch(meta, root, &bound, coll)?))
+                Ok(Some(
+                    self.range_seek_fetch(meta, root, &bound, coll, lead_desc)?,
+                ))
             }
             None => {
                 // A3b: a partial or expression index whose key column / expression
@@ -12301,7 +12393,11 @@ impl Connection {
                     if let Some((bound, coll)) =
                         self.partial_expr_range(idx, where_expr, meta, params)
                     {
-                        return Ok(Some(self.range_seek_fetch(meta, idx.root, &bound, coll)?));
+                        // `partial_expr_range` only returns ASC-leading indexes
+                        // (DESC-leading partial ranges are deferred there).
+                        return Ok(Some(
+                            self.range_seek_fetch(meta, idx.root, &bound, coll, false)?,
+                        ));
                     }
                 }
                 Ok(None)
@@ -12405,21 +12501,31 @@ impl Connection {
 
     /// Walk an index between `bound`'s lower/upper keys (single leading column,
     /// under `coll`) and fetch each matching row from the table by rowid. Returns
-    /// a superset — `run_core` re-applies the full `WHERE`.
+    /// a superset — `run_core` re-applies the full `WHERE`. `lead_desc` is the
+    /// stored direction of the leading column; the caller has ALREADY swapped the
+    /// value-space bounds into stored-key order when it is `true`.
     fn range_seek_fetch(
         &self,
         meta: &TableMeta,
         root: u32,
         bound: &RangeBound,
         coll: crate::value::Collation,
+        lead_desc: bool,
     ) -> Result<Vec<InputRow>> {
         let colls = [coll];
+        let descs = [lead_desc];
         let lower_key = bound.lower.as_ref().map(|(v, _)| core::slice::from_ref(v));
         let upper_key = bound.upper.as_ref().map(|(v, _)| core::slice::from_ref(v));
         let lower = lower_key.map(|k| (k, bound.lower.as_ref().unwrap().1));
         let upper = upper_key.map(|k| (k, bound.upper.as_ref().unwrap().1));
-        let rowids =
-            crate::btree::index_range_rowids(self.backend.source(), root, lower, upper, &colls)?;
+        let rowids = crate::btree::index_range_rowids(
+            self.backend.source(),
+            root,
+            lower,
+            upper,
+            &colls,
+            &descs,
+        )?;
 
         let encoding = self.backend.source().header().text_encoding;
         let mut cur = TableCursor::new(self.backend.source(), meta.root);
@@ -12445,6 +12551,7 @@ impl Connection {
         meta: &TableMeta,
         root: u32,
         colls: &[crate::value::Collation],
+        descs: &[bool],
         keys: &[Vec<Value>],
     ) -> Result<Vec<InputRow>> {
         let src = self.backend.source();
@@ -12467,7 +12574,7 @@ impl Connection {
         });
         let mut rowids: Vec<i64> = Vec::new();
         for key in &keys {
-            for rid in crate::btree::index_seek_rowids(src, root, key, colls)? {
+            for rid in crate::btree::index_seek_rowids(src, root, key, colls, descs)? {
                 if !rowids.contains(&rid) {
                     rowids.push(rid);
                 }
@@ -12654,7 +12761,13 @@ impl Connection {
                             return Ok(Some(self.covering_seek_rows(meta, idx.root, &idx.cols)?));
                         }
                         let coll = idx.collations.first().copied().unwrap_or_default();
-                        return Ok(Some(self.in_seek_fetch(meta, idx.root, &[coll], &keys)?));
+                        return Ok(Some(self.in_seek_fetch(
+                            meta,
+                            idx.root,
+                            &[coll],
+                            idx.seek_descs(),
+                            &keys,
+                        )?));
                     }
                 }
                 // A3b: a partial index on the IN column with its predicate proven.
@@ -12664,7 +12777,13 @@ impl Connection {
                     }
                     if idx.cols.first() == Some(&col) && partial_pred_guaranteed(idx, where_expr) {
                         let coll = idx.collations.first().copied().unwrap_or_default();
-                        return Ok(Some(self.in_seek_fetch(meta, idx.root, &[coll], &keys)?));
+                        return Ok(Some(self.in_seek_fetch(
+                            meta,
+                            idx.root,
+                            &[coll],
+                            idx.seek_descs(),
+                            &keys,
+                        )?));
                     }
                 }
             }
@@ -12692,7 +12811,14 @@ impl Connection {
             }
             let coll = idx.collations.first().copied().unwrap_or_default();
             let keys: Vec<Vec<Value>> = values.iter().map(|v| alloc::vec![v.clone()]).collect();
-            return Ok(Some(self.in_seek_fetch(meta, idx.root, &[coll], &keys)?));
+            // Expression-index keys seek all-ascending (`&[]`), matching insert.
+            return Ok(Some(self.in_seek_fetch(
+                meta,
+                idx.root,
+                &[coll],
+                &[],
+                &keys,
+            )?));
         }
 
         Ok(None)
@@ -12713,6 +12839,12 @@ impl Connection {
                 }
             }
             if idx.partial.is_some() || idx.key_exprs.is_some() {
+                continue;
+            }
+            // A DESC leading column stores entries in reversed order; this helper's
+            // callers seek all-ascending (`&[]`). Skip it so they fall back to a
+            // scan rather than navigating the b-tree the wrong way. (Deferral.)
+            if idx.descending.first().copied().unwrap_or(false) {
                 continue;
             }
             if idx.cols.first() == Some(&col) {
@@ -12753,7 +12885,11 @@ impl Connection {
         let colls = [coll];
         for v in values {
             let key = [aff.coerce(v.clone())];
-            for rid in crate::btree::index_seek_rowids(self.backend.source(), root, &key, &colls)? {
+            // `leading_index_for` only returns ASC-leading indexes, so seek
+            // all-ascending (`&[]`).
+            for rid in
+                crate::btree::index_seek_rowids(self.backend.source(), root, &key, &colls, &[])?
+            {
                 if !rowids.contains(&rid) {
                     rowids.push(rid);
                 }
@@ -12822,8 +12958,15 @@ impl Connection {
         let colls = [coll];
         let lower = lo.as_ref().map(|(v, i)| (core::slice::from_ref(v), *i));
         let upper = hi.as_ref().map(|(v, i)| (core::slice::from_ref(v), *i));
-        let rowids =
-            crate::btree::index_range_rowids(self.backend.source(), root, lower, upper, &colls)?;
+        // `leading_index_for` only returns ASC-leading indexes (`&[]`).
+        let rowids = crate::btree::index_range_rowids(
+            self.backend.source(),
+            root,
+            lower,
+            upper,
+            &colls,
+            &[],
+        )?;
         Ok(Some(rowids))
     }
 
@@ -15427,6 +15570,11 @@ impl Connection {
                 let Some(&lead) = idx.cols.first() else {
                     continue;
                 };
+                // A DESC leading-column range seek is deferred (scan); keep in
+                // lockstep with `try_without_rowid_index_range`.
+                if idx.descending.first().copied().unwrap_or(false) {
+                    continue;
+                }
                 let Some(b) = ranges.get(&lead) else {
                     continue;
                 };
@@ -15522,6 +15670,8 @@ impl Connection {
                 // (matches the eq-prefix + range path in try_index_lookup). Once the
                 // prefix consumes every declared column, a range on the table's rowid
                 // (the index's implicit trailing key) still seeks — rendered `rowid>?`.
+                // The range on the column after the equality prefix seeks whether it
+                // is ASC or DESC (the DESC bounds are swapped in `try_index_lookup`).
                 if let Some(&next_col) = idx_cols.get(matched.len()) {
                     let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
                         alloc::collections::BTreeMap::new();
@@ -15978,7 +16128,7 @@ impl Connection {
         for (idx, keys) in indexes.iter().zip(&per_index) {
             clear_index(w, idx.root)?;
             for key in keys {
-                insert_index(w, idx.root, key, &idx.collations)?;
+                insert_index(w, idx.root, key, &idx.collations, idx.seek_descs())?;
             }
         }
         Ok(())
@@ -17428,10 +17578,30 @@ impl Connection {
                 .zip(cols.iter())
                 .take_while(|(a, b)| a == b)
                 .count();
-            let ordered = match_len.min(uniform_prefix);
+            let mut ordered = match_len.min(uniform_prefix);
+            // Restrict the ordered prefix to the run over which the walk's stored
+            // direction bears a UNIFORM relationship to the requested direction. A
+            // mixed-direction index (`a ASC, b DESC`) walked forward yields `a` up
+            // and `b` down, so it can serve `ORDER BY a, b DESC` (reverse=false) or
+            // its full reversal `ORDER BY a DESC, b` (reverse=true), but not a
+            // uniform-requested `ORDER BY a, b`. `reverse` is that relationship.
+            let mut reverse: Option<bool> = None;
+            for i in 0..ordered {
+                let stored_desc = idx.descending.get(i).copied().unwrap_or(false);
+                let this_reverse = stored_desc != sel.order_by[i].descending;
+                match reverse {
+                    None => reverse = Some(this_reverse),
+                    Some(r) if r != this_reverse => {
+                        ordered = i;
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
             if ordered == 0 {
                 continue;
             }
+            let descending = reverse.unwrap_or(false);
             let coll_ok =
                 (0..ordered).all(|i| idx.collations[i] == meta.columns[cols[i]].collation);
             if !coll_ok {
@@ -17511,11 +17681,22 @@ impl Connection {
         };
         let label = from.first.alias.as_deref().unwrap_or(&from.first.name);
         let order_cols = order_projection(&sel.columns, &meta.columns);
-        let backward = sel.order_by[0].descending;
+        // The forward walk yields column `i` in its STORED direction
+        // (`idx.descending[i]`). A term is served only when its (stored-dir vs
+        // requested-dir) relationship matches that of the first served term — a
+        // single physical walk cannot mix. `backward` is that uniform relationship.
+        let mut backward: Option<bool> = None;
         let mut k = 0usize;
         for (i, term) in sel.order_by.iter().enumerate() {
-            if i >= idx.cols.len() || !redundant_nulls(term) || term.descending != backward {
+            if i >= idx.cols.len() || !redundant_nulls(term) {
                 break;
+            }
+            let stored_desc = idx.descending.get(i).copied().unwrap_or(false);
+            let this_backward = stored_desc != term.descending;
+            match backward {
+                None => backward = Some(this_backward),
+                Some(b) if b != this_backward => break,
+                Some(_) => {}
             }
             let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
                 Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
@@ -18692,15 +18873,29 @@ impl Connection {
         };
         let walk_cols = &idx.cols[prefix..];
         let walk_colls = &idx.collations[prefix..];
+        // Per-walked-column stored direction. A DESC index column is stored (and
+        // walked) in reverse value order, so the walk satisfies an ORDER BY term
+        // on it only when the *relationship* between the stored direction and the
+        // requested direction is uniform across all walked terms. `reverse` is that
+        // uniform relationship: `true` means the physical walk yields the reverse
+        // of the desired order (the caller reverses the whole result once).
+        let walk_descs: &[bool] = idx.descending.get(prefix..).unwrap_or(&[]);
         // Count the leading ORDER BY terms the walk already produces: each must be a
-        // plain column of this table, in the walk's uniform direction (default
-        // NULLs), matching the next walked column under its own collation.
+        // plain column of this table, matching the next walked column under its own
+        // collation, with a uniform stored-direction relationship (default NULLs).
         let order_cols = order_projection(&sel.columns, &meta.columns);
-        let descending = sel.order_by[0].descending;
+        let mut reverse: Option<bool> = None;
         let mut k = 0;
         for term in &sel.order_by {
-            if k >= walk_cols.len() || term.descending != descending || !redundant_nulls(term) {
+            if k >= walk_cols.len() || !redundant_nulls(term) {
                 break;
+            }
+            let walk_desc = walk_descs.get(k).copied().unwrap_or(false);
+            let this_reverse = walk_desc != term.descending;
+            match reverse {
+                None => reverse = Some(this_reverse),
+                Some(r) if r != this_reverse => break,
+                Some(_) => {}
             }
             let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
                 Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
@@ -18721,6 +18916,9 @@ impl Connection {
             }
             k += 1;
         }
+        // The uniform walk direction relative to the request. `false` (no reverse
+        // needed) is the vacuous default when no term was consumed.
+        let descending = reverse.unwrap_or(false);
         // Trailing rowid: once the walk has consumed the index's whole key, it
         // continues in rowid order, so an ORDER BY term that is the INTEGER PRIMARY
         // KEY right after the full key is already ordered too. The rowid is stored
@@ -18761,6 +18959,9 @@ impl Connection {
         // only upgrades a not-yet-full result to a full skip; the partial label
         // computed above is otherwise left untouched.
         if k < sel.order_by.len() {
+            // `eff` is the uniform reverse relationship (walk-stored-dir vs
+            // requested-dir); a DESC-stored walked column flips it, so all
+            // non-constant terms must agree on it for a single walk to satisfy them.
             let mut eff: Option<bool> = None;
             let mut wp = 0usize;
             let mut rowid_used = false;
@@ -18793,8 +18994,11 @@ impl Connection {
                     fully = false;
                     break;
                 }
-                let d = *eff.get_or_insert(term.descending);
-                if term.descending != d {
+                // Stored direction of the next walked column (rowid trailing = ASC).
+                let walk_desc = walk_descs.get(wp).copied().unwrap_or(false);
+                let this_reverse = walk_desc != term.descending;
+                let d = *eff.get_or_insert(this_reverse);
+                if this_reverse != d {
                     fully = false;
                     break;
                 }
@@ -22019,7 +22223,8 @@ impl Connection {
                     }
                     return Ok((first_meta.columns, input_rows));
                 }
-                let rowids = crate::btree::index_range_rowids(src, s.root, None, None, &s.colls)?;
+                let rowids =
+                    crate::btree::index_range_rowids(src, s.root, None, None, &s.colls, &[])?;
                 let mut cur = TableCursor::new(src, first_meta.root);
                 let mut input_rows = Vec::with_capacity(rowids.len());
                 for rid in rowids {
@@ -23148,7 +23353,7 @@ impl Connection {
                     .affinity
                     .coerce(left[outer_col].clone())];
                 let records =
-                    crate::btree::index_seek_records(src, inner_meta.root, &key, &[coll])?;
+                    crate::btree::index_seek_records(src, inner_meta.root, &key, &[coll], &[])?;
                 for storage in records {
                     let mut inner = unpermute_row(inner_meta, storage);
                     self.compute_generated(inner_meta, &mut inner, params)?;
@@ -23217,7 +23422,8 @@ impl Connection {
                     .affinity
                     .coerce(left[outer_col].clone())];
                 let colls = [coll];
-                let rowids = crate::btree::index_seek_rowids(src, idx.root, &key, &colls)?;
+                let rowids =
+                    crate::btree::index_seek_rowids(src, idx.root, &key, &colls, idx.seek_descs())?;
                 for rid in rowids {
                     if cur.seek(rid)? {
                         let inner =
@@ -23532,7 +23738,9 @@ impl Connection {
             }
             let record = encode_record(&permute_row(meta, &values));
             let scolls = wr_storage_collations(meta);
-            insert_index(self.backend.writer()?, meta.root, &record, &scolls)?;
+            // WITHOUT ROWID clustered PK insert; DESC PKs are a documented
+            // deferral, so seek/insert stay all-ascending (`&[]`).
+            insert_index(self.backend.writer()?, meta.root, &record, &scolls, &[])?;
             affected += 1;
         }
         if affected > 0 {
@@ -23660,7 +23868,8 @@ impl Connection {
         let w = self.backend.writer()?;
         clear_index(w, meta.root)?;
         for rec in &records {
-            insert_index(w, meta.root, rec, &scolls)?;
+            // WITHOUT ROWID clustered PK (DESC PKs deferred): all-ascending (`&[]`).
+            insert_index(w, meta.root, rec, &scolls, &[])?;
         }
         Ok(())
     }
@@ -23698,6 +23907,7 @@ impl Connection {
                     idx.root,
                     &wr_index_key(&idx.cols, &pk_cols, &rows[i]),
                     &key_colls,
+                    idx.seek_descs(),
                 )?;
             }
         }
@@ -28974,6 +29184,23 @@ struct IndexMeta {
     /// direction of the constraint is not reconstructed here), so order-walk
     /// reasoning that depends on accurate directions must stand down for it.
     is_auto: bool,
+}
+
+impl IndexMeta {
+    /// Per-column `DESC` flags to hand the b-tree index writer/reader. Only a
+    /// regular named column index (`!is_auto`, `key_exprs.is_none()`) has
+    /// trustworthy per-column directions; for everything else (auto UNIQUE/PK,
+    /// expression indexes) we return `&[]`, which the writer treats as
+    /// all-ascending — keeping the insert side and the seek side self-consistent
+    /// and matching the pre-DESC behavior. An empty slice is the "no-op" case, so
+    /// a plain all-ascending index is byte-for-byte unchanged.
+    fn seek_descs(&self) -> &[bool] {
+        if !self.is_auto && self.key_exprs.is_none() {
+            &self.descending
+        } else {
+            &[]
+        }
+    }
 }
 
 impl Connection {

@@ -875,6 +875,27 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   column / wrong-arity aggregate / compound column-count mismatch — recursively
   over compound arms, derived-table and expression-position subqueries, while an
   unreferenced CTE body stays lazily accepted (`tests/fromless_wildcard.rs`).
+  **`DESC` index columns are now honored on disk (byte-compatible).** `IndexMeta`
+  already parsed a per-column `descending` flag (surfaced by `PRAGMA index_xinfo`),
+  but the btree comparison ignored it, so a `CREATE INDEX i ON t(a, b DESC)` stored
+  its entries *ascending* — the wrong walk/seek order (`SELECT b FROM t WHERE a=5`
+  came back ascending where sqlite walks the index descending) *and* a file-format
+  incompatibility. The index-writer comparisons now take a `descs: &[bool]` parallel
+  to the collations and reverse a `DESC` column's order in both `cmp_records` (build)
+  and `prefix_cmp` (seek/range); an empty `descs` means all-ascending, so every
+  non-DESC caller is unchanged. The flags are threaded from `IndexMeta::seek_descs()`
+  (a regular named column index only — auto UNIQUE/PK, expression, and WITHOUT ROWID
+  clustered-PK paths pass `&[]`, keeping insert and seek consistent per index root).
+  Range seeks on a `DESC` column swap the value-space lower/upper bounds into
+  key-sort order (executor + `eqp_access` in lockstep), and the `ORDER BY`-elision
+  provers (`order_index_scan` / `scan_order_prefix` / `seek_order_prefix`) compare
+  each walked column's stored direction to the requested one, so `(a, b DESC)` serves
+  `ORDER BY a, b DESC` with no sort but `ORDER BY a, b` keeps its temp b-tree —
+  matching sqlite. Verified byte-for-byte vs sqlite3 3.50.4 including the on-disk
+  guard: graphite writes DESC indexes to a real file, sqlite opens it, `PRAGMA
+  integrity_check` = `ok`, and cross-engine reads agree (`tests/desc_index.rs`).
+  (Deferred: a `DESC` *primary key* on a WITHOUT ROWID table's clustered b-tree still
+  stores ascending — the one remaining direction gap, documented in-code.)
 
 **Remaining — genuinely open work.** Ordered roughly easiest → hardest. These are
 the residuals left after the differential sweep; the surface is otherwise

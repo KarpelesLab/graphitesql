@@ -47,11 +47,12 @@ pub fn index_seek_rowids(
     root: u32,
     key: &[Value],
     colls: &[Collation],
+    descs: &[bool],
 ) -> Result<Vec<i64>> {
     let enc = src.header().text_encoding;
     let usable = src.usable_size();
     let mut out = Vec::new();
-    seek_prefix(src, root, key, enc, usable, colls, &mut out)?;
+    seek_prefix(src, root, key, enc, usable, colls, descs, &mut out)?;
     Ok(out)
 }
 
@@ -64,11 +65,12 @@ pub fn index_seek_records(
     root: u32,
     key: &[Value],
     colls: &[Collation],
+    descs: &[bool],
 ) -> Result<Vec<Vec<Value>>> {
     let enc = src.header().text_encoding;
     let usable = src.usable_size();
     let mut out = Vec::new();
-    seek_prefix_records(src, root, key, enc, usable, colls, &mut out)?;
+    seek_prefix_records(src, root, key, enc, usable, colls, descs, &mut out)?;
     Ok(out)
 }
 
@@ -84,13 +86,24 @@ pub fn index_range_rowids(
     lower: Option<(&[Value], bool)>,
     upper: Option<(&[Value], bool)>,
     colls: &[Collation],
+    descs: &[bool],
 ) -> Result<Vec<i64>> {
     let enc = src.header().text_encoding;
     let usable = src.usable_size();
     let mut out = Vec::new();
-    range_scan(src, root, lower, upper, enc, usable, colls, &mut |rec| {
-        out.push(rowid_of(&rec));
-    })?;
+    range_scan(
+        src,
+        root,
+        lower,
+        upper,
+        enc,
+        usable,
+        colls,
+        descs,
+        &mut |rec| {
+            out.push(rowid_of(&rec));
+        },
+    )?;
     Ok(out)
 }
 
@@ -103,21 +116,39 @@ pub fn index_range_records(
     lower: Option<(&[Value], bool)>,
     upper: Option<(&[Value], bool)>,
     colls: &[Collation],
+    descs: &[bool],
 ) -> Result<Vec<Vec<Value>>> {
     let enc = src.header().text_encoding;
     let usable = src.usable_size();
     let mut out = Vec::new();
-    range_scan(src, root, lower, upper, enc, usable, colls, &mut |rec| {
-        out.push(rec);
-    })?;
+    range_scan(
+        src,
+        root,
+        lower,
+        upper,
+        enc,
+        usable,
+        colls,
+        descs,
+        &mut |rec| {
+            out.push(rec);
+        },
+    )?;
     Ok(out)
 }
 
-/// Does `rec` satisfy the optional lower bound `(key, inclusive)`?
-fn passes_lower(lower: Option<(&[Value], bool)>, rec: &[Value], colls: &[Collation]) -> bool {
+/// Does `rec` satisfy the optional lower bound `(key, inclusive)`? "Lower" is in
+/// stored-key order; a DESC index column has its value order reversed here (via
+/// `descs`), so callers building bounds in value space must swap accordingly.
+fn passes_lower(
+    lower: Option<(&[Value], bool)>,
+    rec: &[Value],
+    colls: &[Collation],
+    descs: &[bool],
+) -> bool {
     match lower {
         None => true,
-        Some((lk, inc)) => match prefix_cmp(lk, rec, colls) {
+        Some((lk, inc)) => match prefix_cmp(lk, rec, colls, descs) {
             Ordering::Greater => false, // lower > rec ⇒ rec < lower
             Ordering::Equal => inc,     // rec == lower
             Ordering::Less => true,     // rec > lower
@@ -125,12 +156,18 @@ fn passes_lower(lower: Option<(&[Value], bool)>, rec: &[Value], colls: &[Collati
     }
 }
 
-/// Is `rec` past the optional upper bound `(key, inclusive)`? In ascending index
-/// order, the first `true` ends the scan.
-fn beyond_upper(upper: Option<(&[Value], bool)>, rec: &[Value], colls: &[Collation]) -> bool {
+/// Is `rec` past the optional upper bound `(key, inclusive)`? In stored-key
+/// order, the first `true` ends the scan. A DESC index column has its value
+/// order reversed here (via `descs`).
+fn beyond_upper(
+    upper: Option<(&[Value], bool)>,
+    rec: &[Value],
+    colls: &[Collation],
+    descs: &[bool],
+) -> bool {
     match upper {
         None => false,
-        Some((uk, inc)) => match prefix_cmp(uk, rec, colls) {
+        Some((uk, inc)) => match prefix_cmp(uk, rec, colls, descs) {
             Ordering::Less => true,     // upper < rec ⇒ rec > upper
             Ordering::Equal => !inc,    // rec == upper: past it only when exclusive
             Ordering::Greater => false, // rec < upper
@@ -149,6 +186,7 @@ fn range_scan(
     enc: TextEncoding,
     usable: usize,
     colls: &[Collation],
+    descs: &[bool],
     collect: &mut dyn FnMut(Vec<Value>),
 ) -> Result<bool> {
     let page = src.page(page_no)?;
@@ -162,10 +200,10 @@ fn range_scan(
         PageType::LeafIndex => {
             for i in 0..bt.num_cells() {
                 let rec = record(i)?;
-                if beyond_upper(upper, &rec, colls) {
+                if beyond_upper(upper, &rec, colls, descs) {
                     return Ok(false);
                 }
-                if passes_lower(lower, &rec, colls) {
+                if passes_lower(lower, &rec, colls, descs) {
                     collect(rec);
                 }
             }
@@ -183,15 +221,16 @@ fn range_scan(
                     enc,
                     usable,
                     colls,
+                    descs,
                     collect,
                 )? {
                     return Ok(false);
                 }
                 let rec = record(k)?;
-                if beyond_upper(upper, &rec, colls) {
+                if beyond_upper(upper, &rec, colls, descs) {
                     return Ok(false);
                 }
-                if passes_lower(lower, &rec, colls) {
+                if passes_lower(lower, &rec, colls, descs) {
                     collect(rec);
                 }
             }
@@ -204,6 +243,7 @@ fn range_scan(
                 enc,
                 usable,
                 colls,
+                descs,
                 collect,
             )
         }
@@ -213,6 +253,7 @@ fn range_scan(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seek_prefix(
     src: &dyn PageSource,
     page_no: u32,
@@ -220,6 +261,7 @@ fn seek_prefix(
     enc: TextEncoding,
     usable: usize,
     colls: &[Collation],
+    descs: &[bool],
     out: &mut Vec<i64>,
 ) -> Result<()> {
     let page = src.page(page_no)?;
@@ -233,7 +275,7 @@ fn seek_prefix(
         PageType::LeafIndex => {
             for i in 0..bt.num_cells() {
                 let rec = record(i)?;
-                match prefix_cmp(key, &rec, colls) {
+                match prefix_cmp(key, &rec, colls, descs) {
                     Ordering::Greater => continue,
                     Ordering::Equal => out.push(rowid_of(&rec)),
                     Ordering::Less => break, // sorted: no further matches on this leaf
@@ -245,16 +287,34 @@ fn seek_prefix(
             let n = bt.num_cells();
             let mut i = 0;
             // Skip cells strictly less than the key.
-            while i < n && prefix_cmp(key, &record(i)?, colls) == Ordering::Greater {
+            while i < n && prefix_cmp(key, &record(i)?, colls, descs) == Ordering::Greater {
                 i += 1;
             }
             // Matches < cell[i] live in its left child.
-            seek_prefix(src, bt.child_pointer(i)?, key, enc, usable, colls, out)?;
+            seek_prefix(
+                src,
+                bt.child_pointer(i)?,
+                key,
+                enc,
+                usable,
+                colls,
+                descs,
+                out,
+            )?;
             // Equal interior cells are themselves matches; descend the child to
             // their right for further matches.
-            while i < n && prefix_cmp(key, &record(i)?, colls) == Ordering::Equal {
+            while i < n && prefix_cmp(key, &record(i)?, colls, descs) == Ordering::Equal {
                 out.push(rowid_of(&record(i)?));
-                seek_prefix(src, bt.child_pointer(i + 1)?, key, enc, usable, colls, out)?;
+                seek_prefix(
+                    src,
+                    bt.child_pointer(i + 1)?,
+                    key,
+                    enc,
+                    usable,
+                    colls,
+                    descs,
+                    out,
+                )?;
                 i += 1;
             }
             Ok(())
@@ -265,6 +325,7 @@ fn seek_prefix(
 
 /// As [`seek_prefix`], but collects the full matching records instead of their
 /// trailing rowid — for `WITHOUT ROWID` table seeks.
+#[allow(clippy::too_many_arguments)]
 fn seek_prefix_records(
     src: &dyn PageSource,
     page_no: u32,
@@ -272,6 +333,7 @@ fn seek_prefix_records(
     enc: TextEncoding,
     usable: usize,
     colls: &[Collation],
+    descs: &[bool],
     out: &mut Vec<Vec<Value>>,
 ) -> Result<()> {
     let page = src.page(page_no)?;
@@ -285,7 +347,7 @@ fn seek_prefix_records(
         PageType::LeafIndex => {
             for i in 0..bt.num_cells() {
                 let rec = record(i)?;
-                match prefix_cmp(key, &rec, colls) {
+                match prefix_cmp(key, &rec, colls, descs) {
                     Ordering::Greater => continue,
                     Ordering::Equal => out.push(rec),
                     Ordering::Less => break,
@@ -296,13 +358,31 @@ fn seek_prefix_records(
         PageType::InteriorIndex => {
             let n = bt.num_cells();
             let mut i = 0;
-            while i < n && prefix_cmp(key, &record(i)?, colls) == Ordering::Greater {
+            while i < n && prefix_cmp(key, &record(i)?, colls, descs) == Ordering::Greater {
                 i += 1;
             }
-            seek_prefix_records(src, bt.child_pointer(i)?, key, enc, usable, colls, out)?;
-            while i < n && prefix_cmp(key, &record(i)?, colls) == Ordering::Equal {
+            seek_prefix_records(
+                src,
+                bt.child_pointer(i)?,
+                key,
+                enc,
+                usable,
+                colls,
+                descs,
+                out,
+            )?;
+            while i < n && prefix_cmp(key, &record(i)?, colls, descs) == Ordering::Equal {
                 out.push(record(i)?);
-                seek_prefix_records(src, bt.child_pointer(i + 1)?, key, enc, usable, colls, out)?;
+                seek_prefix_records(
+                    src,
+                    bt.child_pointer(i + 1)?,
+                    key,
+                    enc,
+                    usable,
+                    colls,
+                    descs,
+                    out,
+                )?;
                 i += 1;
             }
             Ok(())
@@ -311,11 +391,19 @@ fn seek_prefix_records(
     }
 }
 
-/// Compare a key against the leading columns of an index record.
-fn prefix_cmp(key: &[Value], rec: &[Value], colls: &[Collation]) -> Ordering {
+/// Compare a key against the leading columns of an index record. A `true` entry
+/// in `descs` (aligned with the columns) reverses that column's order, matching a
+/// `DESC` index column; an empty `descs` means all-ascending. The trailing rowid
+/// column is never in `descs` (always ascending).
+fn prefix_cmp(key: &[Value], rec: &[Value], colls: &[Collation], descs: &[bool]) -> Ordering {
     for (i, (k, r)) in key.iter().zip(rec.iter()).enumerate() {
         let c = colls.get(i).copied().unwrap_or_default();
         let o = cmp_values_coll(k, r, c);
+        let o = if descs.get(i).copied().unwrap_or(false) {
+            o.reverse()
+        } else {
+            o
+        };
         if o != Ordering::Equal {
             return o;
         }
@@ -347,9 +435,10 @@ pub fn insert_index(
     root: u32,
     record: &[u8],
     colls: &[Collation],
+    descs: &[bool],
 ) -> Result<()> {
     let rcell = build_index_rcell(wp, record)?;
-    if let Some(split) = insert_rec(wp, root, record, rcell, colls)? {
+    if let Some(split) = insert_rec(wp, root, record, rcell, colls, descs)? {
         grow_root(wp, root, split)?;
     }
     Ok(())
@@ -453,6 +542,7 @@ fn insert_rec(
     target: &[u8],
     rcell: Vec<u8>,
     colls: &[Collation],
+    descs: &[bool],
 ) -> Result<Option<IdxSplit>> {
     let enc = wp.header().text_encoding;
     let page = wp.page(page_no)?;
@@ -466,7 +556,7 @@ fn insert_rec(
             let mut entries = read_leaf(wp, &bt, usable)?;
             let mut pos = entries.len();
             for (i, (full, _)) in entries.iter().enumerate() {
-                match cmp_records(target, full, enc, colls)? {
+                match cmp_records(target, full, enc, colls, descs)? {
                     Ordering::Less => {
                         pos = i;
                         break;
@@ -504,7 +594,7 @@ fn insert_rec(
             let mut p = cells.len();
             let mut child = right;
             for (i, (c, full, _)) in cells.iter().enumerate() {
-                match cmp_records(target, full, enc, colls)? {
+                match cmp_records(target, full, enc, colls, descs)? {
                     Ordering::Less => {
                         p = i;
                         child = *c;
@@ -514,7 +604,7 @@ fn insert_rec(
                     Ordering::Greater => {}
                 }
             }
-            if let Some(s) = insert_rec(wp, child, target, rcell, colls)? {
+            if let Some(s) = insert_rec(wp, child, target, rcell, colls, descs)? {
                 if p < cells.len() {
                     let old = cells[p].clone();
                     cells[p] = (old.0, s.full, s.rcell);
@@ -597,12 +687,23 @@ fn rcells(entries: &[LeafEntry]) -> Vec<Vec<u8>> {
     entries.iter().map(|(_, c)| c.clone()).collect()
 }
 
-fn cmp_records(a: &[u8], b: &[u8], enc: TextEncoding, colls: &[Collation]) -> Result<Ordering> {
+fn cmp_records(
+    a: &[u8],
+    b: &[u8],
+    enc: TextEncoding,
+    colls: &[Collation],
+    descs: &[bool],
+) -> Result<Ordering> {
     let va = decode_record(a, enc)?;
     let vb = decode_record(b, enc)?;
     for (i, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
         let c = colls.get(i).copied().unwrap_or_default();
         let o = cmp_values_coll(x, y, c);
+        let o = if descs.get(i).copied().unwrap_or(false) {
+            o.reverse()
+        } else {
+            o
+        };
         if o != Ordering::Equal {
             return Ok(o);
         }
