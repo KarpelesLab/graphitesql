@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/KarpelesLab/graphitesql/compare/v0.0.14...v0.0.15) - 2026-07-06
+
+### Added
+
+- *(eqp)* render the FOR IN-OPERATOR node for an indexed IN-subquery
+- *(vdbe)* seek an N-table left-deep chain of ipk joins with live cursors (B5b-2d)
+- *(vdbe)* seek an INNER/LEFT rowid-join with a compound ON clause (B5b-2c)
+- *(vdbe)* seek the inner side of a LEFT rowid-join with a live cursor (B5b-2b)
+- *(vdbe)* seek the inner side of an INNER rowid-join with a live cursor (B5b-2a)
+- *(alter)* scope-aware RENAME COLUMN in multi-table view/trigger bodies (A-rn3-edge)
+- *(eqp)* render the SEARCH + LIST SUBQUERY for a seekable IN (SELECT) (B9a-seek)
+- *(eqp)* emit the GROUP BY/DISTINCT temp-b-tree over a rowid range seek (B9d subset)
+- *(eqp)* flatten a bare-LIMIT derived/CTE body under a narrower projection or single-term ORDER BY (B9c-flatten)
+- *(eqp)* render LIST SUBQUERY + BLOOM FILTER for a non-correlated IN (SELECT) (B9a)
+- *(planner)* seek col = (non-correlated scalar subquery) (B9e)
+
+### Documentation
+
+- defer B9b (window-function EQP) by design after investigation
+- trim completed B9 items from the roadmap
+- re-scope B9i (covering-scan row order) into B9h after investigation
+
+### Fixed
+
+- *(exec)* eagerly validate window function args, FILTER and WHERE too
+- *(exec)* eagerly reject a bad column in a window OVER PARTITION BY / ORDER BY
+- *(exec)* eagerly reject a bad column on the LHS of an IN (SELECT)
+- *(exec)* eagerly reject a bad column in a multi-row VALUES IN-list
+
+### Performance
+
+- *(planner)* read a covering index for a no-seek WHERE scan
+- *(planner)* port SQLite's covering-scan width cost model (B9h slice)
+
 ## [0.0.14](https://github.com/KarpelesLab/graphitesql/compare/v0.0.13...v0.0.14) - 2026-07-01
 
 ### Added
