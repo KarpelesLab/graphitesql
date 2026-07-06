@@ -15,7 +15,11 @@ fn sqlite3_available() -> bool {
 
 fn plan(bin: &str, base: &str, sql: &str) -> String {
     let full = format!("{base} EXPLAIN QUERY PLAN {sql}");
-    let out = Command::new(bin).arg(":memory:").arg(&full).output().unwrap();
+    let out = Command::new(bin)
+        .arg(":memory:")
+        .arg(&full)
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| !l.trim().is_empty() && !l.starts_with("QUERY PLAN"))
