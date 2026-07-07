@@ -45,6 +45,16 @@ pub trait Subqueries {
     /// Resolve a column against the enclosing (outer) query rows, if any are in
     /// scope. Returns `None` when there is no such outer column.
     fn resolve_outer(&self, table: Option<&str>, name: &str) -> Option<Value>;
+    /// The declared affinity of an outer (correlated) column, mirroring
+    /// [`Self::resolve_outer`]. A correlated reference carries its source column's
+    /// affinity, so a comparison against it in the subquery applies the correct
+    /// (two-column) comparison affinity — e.g. `text_col = outer_untyped_col` uses
+    /// BLOB (no coercion), not the TEXT-coerce-the-literal rule. `None` when there
+    /// is no such outer column.
+    fn resolve_outer_affinity(&self, table: Option<&str>, name: &str) -> Option<Affinity> {
+        let _ = (table, name);
+        None
+    }
     /// `last_insert_rowid()` — rowid of the most recently inserted row.
     fn last_insert_rowid(&self) -> i64 {
         0
@@ -481,8 +491,11 @@ pub(crate) fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Option<Affinity> {
             if is_rowid_alias(column) && ctx.rowid.is_some() {
                 return Some(Affinity::Integer);
             }
-            // An unresolved column name has no affinity to contribute.
-            None
+            // A correlated reference to an OUTER column carries that column's
+            // affinity (not "no affinity" like a literal), so a comparison against
+            // it inside the subquery applies the two-column comparison affinity.
+            ctx.subqueries
+                .and_then(|s| s.resolve_outer_affinity(table.as_deref(), column))
         }
         Expr::Cast { type_name, .. } => Some(Affinity::from_type(Some(type_name))),
         Expr::Paren(e) => expr_affinity(e, ctx),

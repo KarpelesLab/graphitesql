@@ -33435,6 +33435,37 @@ impl eval::Subqueries for Connection {
         }
         None
     }
+
+    fn resolve_outer_affinity(&self, table: Option<&str>, name: &str) -> Option<eval::Affinity> {
+        let scope = self.outer_scope.borrow();
+        for frame in scope.iter().rev() {
+            // A correlated rowid alias carries INTEGER affinity (mirrors the value
+            // path above); a real column of that name in the frame still wins.
+            if eval::is_rowid_alias(name) {
+                let qualifies = table.is_none_or(|t| {
+                    frame
+                        .columns
+                        .iter()
+                        .any(|c| c.table.eq_ignore_ascii_case(t))
+                });
+                let has_real = frame.columns.iter().any(|c| {
+                    c.name.eq_ignore_ascii_case(name)
+                        && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+                });
+                if qualifies && !has_real && frame.rowid.is_some() {
+                    return Some(eval::Affinity::Integer);
+                }
+            }
+            for col in &frame.columns {
+                if col.name.eq_ignore_ascii_case(name)
+                    && table.is_none_or(|t| col.table.eq_ignore_ascii_case(t))
+                {
+                    return Some(col.affinity);
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Whether a value is the given text (used to match `sqlite_schema` columns).
