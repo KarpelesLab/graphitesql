@@ -453,8 +453,18 @@ fn apply_modifier(p: &mut DateTime, m: &str, idx: usize) -> bool {
     // they handle it themselves below.
     let lower = m.to_ascii_lowercase();
     match lower.as_str() {
-        // Timezone modifiers: no tz database => treat as UTC no-ops.
-        "utc" | "localtime" => true,
+        // Timezone modifiers: no tz database, so the conversion is a value no-op.
+        // SQLite nonetheless recomputes the Julian day and clears the Y/M/D +
+        // clock fields (`computeJD` then `clearYMD_HMS_TZ`, or the `utc` guess
+        // loop's `memset`), which normalizes an out-of-range parsed field:
+        // `2024-02-30` -> `2024-03-01`, `2024-06-15 24:00:00` -> the next day. A
+        // bare value with no modifier keeps such fields verbatim, but a `utc`/
+        // `localtime` modifier forces the normalization — so match that here.
+        "utc" | "localtime" => {
+            p.compute_jd();
+            p.clear_ymd_hms_tz();
+            true
+        }
         "unixepoch" => {
             // Only valid as the first modifier, and only on a raw number.
             if idx > 1 || !p.raw_s {
