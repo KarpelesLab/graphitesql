@@ -1391,8 +1391,13 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   only a PARTIAL prefix (`SELECT a,b … ORDER BY a, b DESC` — `iab` orders `a`, sorts `b DESC`) is
   deferred by `order_index_scan` to `covering_scan`, but `order_index_scan` first returns a
   *non-covering* partial (`ia`) so sqlite's covering `iab` is missed (pre-existing, rows correct) —
-  the two paths need unifying. Also still open: `min(col)`/`max(col)` over an indexed column with
-  2+ indexes declines the index fast-path.
+  the two paths need unifying. Also still open (attempted 2026-07-07, reverted): `min(col)`/
+  `max(col)` over an indexed column with 2+ indexes declines the covering-index EQP (rows correct,
+  it renders a bare `SEARCH`). A naive "narrowest covering that leads with the column" pick handled
+  `min(a)` but regressed `min(b)` over `(a,b)` — sqlite reads a covering index for a *non-leading*
+  min/max column too, as a FULL covering scan (subject to the covering-scan width rule) rather than
+  a one-end seek, and the `min(DISTINCT …)` sub-path has its own leading logic. Matching it needs the
+  one-end-seek-vs-full-covering-scan cost distinction, not a single tiebreak — deferred.
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   `collect_eq_constraints` / `collect_range_constraints` compare an explicit `COLLATE`
   to the *column's* collation. When an index carries a *non-default* collation
