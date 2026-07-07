@@ -7552,8 +7552,6 @@ impl Connection {
                     Err(e) => return Err(e),
                 }
             }
-            self.check_fk_child(&ins.table, &meta, &values)?;
-
             // Resolve UNIQUE / PRIMARY KEY (incl. rowid) conflicts.
             let (conflicts, constraint_oc) =
                 self.find_conflicts(&ins.table, &meta, rowid, &values, None, params)?;
@@ -7638,6 +7636,13 @@ impl Connection {
             if self.raise_ignore.replace(false) {
                 continue;
             }
+            // The child-side foreign-key check runs only for a row that is actually
+            // inserted — AFTER a UNIQUE/PK conflict was resolved (an `OR IGNORE` /
+            // upsert `DO NOTHING` skip, or an `OR REPLACE` that first deleted the
+            // conflicting rows) and after a BEFORE trigger's `RAISE(IGNORE)`. SQLite
+            // checks uniqueness before the FK, so a row skipped by `OR IGNORE` never
+            // trips the FK; checking it up front reported a spurious violation.
+            self.check_fk_child(&ins.table, &meta, &index_values)?;
             let record = self.encode_table_record(&meta, &index_values);
             insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
             // `last_insert_rowid()` tracks the most recent insert (a later insert
