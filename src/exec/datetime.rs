@@ -40,12 +40,26 @@ struct DateTime {
     valid_ymd: bool,
     valid_hms: bool,
     valid_tz: bool,
-    raw_s: bool,  // the value came in as a bare number (for `unixepoch`)
-    subsec: bool, // a `subsec`/`subsecond` modifier was applied (render ms)
-    n_floor: i32, // days the day-of-month overflowed (for the `floor` modifier)
+    raw_s: bool,    // the value came in as a bare number (for `unixepoch`)
+    subsec: bool,   // a `subsec`/`subsecond` modifier was applied (render ms)
+    n_floor: i32,   // days the day-of-month overflowed (for the `floor` modifier)
+    is_error: bool, // an unrepresentable computation occurred (permanently NULL)
 }
 
 impl DateTime {
+    /// Port of `datetimeError`: mark the value permanently invalid. SQLite
+    /// `memset`s the struct and sets `isError`; once set nothing clears it, so
+    /// every render yields NULL even if a later modifier rebuilds an in-range
+    /// `ijd` from the reset (year-0) fields. This is why an out-of-range input
+    /// (a raw Julian-day number past year 9999, e.g. a Unix timestamp used
+    /// without `unixepoch`) stays NULL through any modifier chain.
+    fn datetime_error(&mut self) {
+        *self = DateTime {
+            is_error: true,
+            ..DateTime::default()
+        };
+    }
+
     fn clear_ymd_hms_tz(&mut self) {
         self.valid_ymd = false;
         self.valid_hms = false;
@@ -67,8 +81,7 @@ impl DateTime {
         // `validJulianDay` check in `is_date` rejects it. This also keeps the
         // intermediate products below from overflowing.
         if !(-4713..=9999).contains(&year) || self.raw_s {
-            self.ijd = i64::MIN;
-            self.valid_jd = true;
+            self.datetime_error();
             return;
         }
         if month <= 2 {
@@ -128,6 +141,12 @@ impl DateTime {
             self.y = 2000;
             self.m = 1;
             self.d = 1;
+        } else if !(0..=JD_MAX).contains(&self.ijd) {
+            // A valid-but-out-of-range JD (e.g. arithmetic ran past year 9999)
+            // is a permanent error, exactly as SQLite's `computeYMD` treats
+            // `!validJulianDay(iJD)`.
+            self.datetime_error();
+            return;
         } else {
             let z = ((self.ijd + 43_200_000) / 86_400_000) as i32;
             let mut a = ((z as f64 - 1_867_216.25) / 36_524.25) as i32;
@@ -159,6 +178,12 @@ impl DateTime {
         self.min = s / 60;
         self.s += (s - self.min * 60) as f64;
         self.valid_hms = true;
+        // Once the HMS has been derived from the JD, the value is no longer a
+        // "raw number in the seconds field": clear `raw_s` so a later
+        // `compute_jd` (after a modifier drops `valid_jd`) rebuilds from Y/M/D
+        // instead of tripping the `raw_s` guard and invalidating to NULL. This
+        // mirrors SQLite's `computeHMS`, which clears `p->rawS`.
+        self.raw_s = false;
     }
 
     fn compute_ymd_hms(&mut self) {
@@ -483,7 +508,9 @@ fn apply_modifier(p: &mut DateTime, m: &str, idx: usize) -> bool {
             true
         }
         "start of month" => {
-            p.compute_ymd();
+            // `compute_ymd_hms` (not just `compute_ymd`) so `raw_s` is cleared
+            // for a bare-number input, matching SQLite's `computeYMD_HMS` here.
+            p.compute_ymd_hms();
             p.d = 1;
             p.s = 0.0;
             p.min = 0;
@@ -495,7 +522,7 @@ fn apply_modifier(p: &mut DateTime, m: &str, idx: usize) -> bool {
             true
         }
         "start of year" => {
-            p.compute_ymd();
+            p.compute_ymd_hms();
             p.m = 1;
             p.d = 1;
             p.s = 0.0;
@@ -811,8 +838,10 @@ fn is_date(args: &[Value]) -> Option<DateTime> {
     // representable Julian-day window (year 0..=9999). This is a check on the
     // Julian day itself, not on Y/M/D: `datetime('9999-12-31 24:00:00')` is NULL
     // even though its stored day is 31, because the +24h pushes the JD past the
-    // ceiling. Mirrors `validJulianDay` in SQLite's `date.c`.
-    if !(0..=JD_MAX).contains(&p.ijd) {
+    // ceiling. Mirrors `validJulianDay` in SQLite's `date.c`. `is_error` is the
+    // sticky `datetimeError` flag — a modifier chain may have rebuilt an in-range
+    // `ijd` from the reset fields, but the value stays NULL.
+    if p.is_error || !(0..=JD_MAX).contains(&p.ijd) {
         return None;
     }
     // SQLite only re-derives Y/M/D from the Julian day in the no-modifier case
