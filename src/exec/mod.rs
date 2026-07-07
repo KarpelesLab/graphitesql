@@ -1387,6 +1387,11 @@ impl Connection {
                     if self.two_table_rowid_inner_swap(pf).is_some() {
                         return Err(Error::Unsupported("VDBE: two-table rowid-inner swap"));
                     }
+                    // Same reasoning for the secondary-index-inner swap: the drive
+                    // reorder is observable only without an explicit ORDER BY.
+                    if self.two_table_index_inner_swap(pf).is_some() {
+                        return Err(Error::Unsupported("VDBE: two-table index-inner swap"));
+                    }
                 }
             }
         }
@@ -15071,6 +15076,13 @@ impl Connection {
                 // table, and the join loop below renders `SEARCH <first> USING
                 // INTEGER PRIMARY KEY`.
                 alloc::format!("SCAN {}", eqp_label(&from.joins[0].table))
+            } else if self.two_table_index_inner_swap(from).is_some() {
+                // Cost-based two-table secondary-index-inner swap: same as the rowid
+                // swap but `from.first` is sought by a secondary index instead — the
+                // SECOND table still drives (scanned), so the outer SCAN node names
+                // it and the block below renders `SEARCH <first> USING [COVERING]
+                // INDEX <idx> (<col>=?)`.
+                alloc::format!("SCAN {}", eqp_label(&from.joins[0].table))
             } else {
                 // Joins run in FROM order as nested-loop scans (no reordering).
                 alloc::format!("SCAN {label}")
@@ -15222,6 +15234,35 @@ impl Connection {
                 alloc::format!(
                     "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
                     eqp_label(&from.first)
+                ),
+            ));
+        }
+        // Cost-based two-table secondary-index-inner swap (in lockstep with the
+        // executor): the SECOND table drives (SCAN node emitted above), `from.first`
+        // is the index-sought inner — `SEARCH <first> USING [COVERING] INDEX <idx>
+        // (<col>=?)`. `COVERING` iff every `from.first` column the query needs is in
+        // the index (matching sqlite's cost-model label).
+        else if let Some((_, first_meta, idx)) = self.two_table_index_inner_swap(from) {
+            let col = &first_meta.columns[idx.cols[0]].name;
+            let second_meta = self
+                .table_meta(
+                    &from.joins[0].table.name,
+                    from.joins[0].table.alias.as_deref(),
+                )
+                .ok();
+            let covering = second_meta
+                .as_ref()
+                .is_some_and(|sm| self.index_swap_covers(sel, from, &first_meta, sm, &idx));
+            let kind = if covering { "COVERING INDEX" } else { "INDEX" };
+            let id = *next_id;
+            *next_id += 1;
+            out.push((
+                id,
+                parent,
+                alloc::format!(
+                    "SEARCH {} USING {kind} {} ({col}=?)",
+                    eqp_label(&from.first),
+                    idx.name
                 ),
             ));
         }
@@ -22573,6 +22614,33 @@ impl Connection {
             return Ok((out_columns, input_rows));
         }
 
+        // Cost-based join-order (two-table secondary-index-inner swap): the
+        // secondary-index analogue of the rowid swap above. When driving from
+        // `from.first` cannot seek the second table on its join column but
+        // `from.first`'s own join column is the leading column of a usable
+        // secondary index, scan the second table and seek `from.first` by that
+        // index (matching sqlite's plan and row order). Mutually exclusive with the
+        // rowid swap (which requires `from.first`'s column to BE its rowid IPK).
+        // EXECUTION-only: columns/rows stay in DECLARED order.
+        if let Some((driver_join_local, first_meta, idx)) = self.two_table_index_inner_swap(from) {
+            let (out_columns, out_rows) = self.exec_two_table_index_inner_swap(
+                from,
+                &columns,
+                driver_join_local,
+                &first_meta,
+                &idx,
+                params,
+            )?;
+            let input_rows = out_rows
+                .into_iter()
+                .map(|values| InputRow {
+                    values,
+                    rowid: None,
+                })
+                .collect();
+            return Ok((out_columns, input_rows));
+        }
+
         // Fold each join in with a nested-loop, evaluating its ON predicate
         // against the columns accumulated so far plus the joined table's.
         for join in &from.joins {
@@ -23911,6 +23979,391 @@ impl Connection {
                 Value::Null | Value::Blob(_) => None,
             };
             if let Some(rid) = candidate {
+                if cur.seek(rid)? {
+                    let first_row =
+                        self.decode_full_row(first_meta, rid, &cur.payload()?, encoding)?;
+                    // Assemble in DECLARED order: first table's row, then driver's.
+                    let mut combined = first_row;
+                    combined.extend(driver.iter().cloned());
+                    let keep = match on {
+                        Some(on) => {
+                            let ctx = row_ctx(&combined, &out_columns, None, params);
+                            eval::truth(&eval::eval(on, &ctx)?) == Some(true)
+                        }
+                        None => true,
+                    };
+                    if keep {
+                        joined.push(combined);
+                    }
+                }
+            }
+        }
+        Ok((out_columns, joined))
+    }
+
+    /// Whether table `name` (with `meta`) can be *sought* by its local column
+    /// `local` — i.e. that column is the table's rowid INTEGER PRIMARY KEY, or the
+    /// *leading* column of a usable plain secondary index (non-partial,
+    /// non-expression). This is the "is the inner cheaply seekable" test the
+    /// forward index/rowid join paths already exploit; the secondary-index-inner
+    /// swap uses it to detect when the SECOND table is NOT seekable (so driving it
+    /// as the scan and seeking `from.first` is the right reorder).
+    fn is_local_col_seekable(&self, name: &str, meta: &TableMeta, local: usize) -> bool {
+        if meta.ipk == Some(local) {
+            return true;
+        }
+        self.indexes_of(name).is_ok_and(|ixs| {
+            ixs.iter().any(|i| {
+                i.partial.is_none() && i.key_exprs.is_none() && i.cols.first() == Some(&local)
+            })
+        })
+    }
+
+    /// Cost-based join-order decision for a *two-table* equi-join, the
+    /// secondary-index analogue of [`two_table_rowid_inner_swap`](Self::two_table_rowid_inner_swap):
+    /// when driving from `from.first` cannot seek the second table (it is not
+    /// rowid/index seekable on its join column) yet `from.first`'s own join column
+    /// is the *leading* column of a usable plain secondary index, prefer to SCAN the
+    /// second table and seek `from.first` by that index as the inner — matching
+    /// sqlite, which makes the seekable table the inner one. Reordering the drive
+    /// changes the output *row order* for an unordered query (rows come out in the
+    /// second table's scan order), so it must mirror sqlite exactly.
+    ///
+    /// Tightly gated — returns `Some((driver_join_local, first_meta, idx))` *only*
+    /// when ALL hold, else `None` (leave the join exactly as today):
+    /// - exactly two tables (`from.joins.len() == 1`);
+    /// - a plain `INNER` / comma / `CROSS` join with an `ON` (NATURAL/USING/outer
+    ///   never — those constrain or fix the order);
+    /// - both sources are plain base tables in `main` (no subquery/CTE/view/TVF,
+    ///   not schema-qualified);
+    /// - the `ON` is a single top-level `=` equating `from.first`'s join column with
+    ///   the second table's join column;
+    /// - `from.first`'s join column is NOT its own rowid IPK (that is the rowid
+    ///   slice's job — the two must never both fire) but IS the leading column of a
+    ///   usable plain secondary index on `from.first`;
+    /// - the second table's join column is NOT seekable (neither rowid IPK nor an
+    ///   index-leading column) — if it *were* seekable the existing forward
+    ///   index/rowid seek path already makes it the inner, so leave those alone.
+    ///
+    /// The returned `driver_join_local` is the *local* column index (within the
+    /// second table) whose value seeks `from.first`'s index; `idx` is that index on
+    /// `from.first`. The reorder is EXECUTION-only — produced columns and rows stay
+    /// in DECLARED order (`[first cols, second cols]`), see
+    /// [`exec_two_table_index_inner_swap`](Self::exec_two_table_index_inner_swap).
+    fn two_table_index_inner_swap(
+        &self,
+        from: &FromClause,
+    ) -> Option<(usize, TableMeta, IndexMeta)> {
+        if from.joins.len() != 1 {
+            return None;
+        }
+        let join = &from.joins[0];
+        // Plain INNER / comma / CROSS only — never LEFT/RIGHT/FULL/NATURAL/USING.
+        if !matches!(join.kind, JoinKind::Inner) || join.natural || !join.using.is_empty() {
+            return None;
+        }
+        let on = join.on.as_ref()?;
+        // Both sources must be plain base tables in `main`.
+        let is_plain_main = |tref: &TableRef| -> bool {
+            tref.subquery.is_none()
+                && tref.tvf_args.is_none()
+                && !self.is_bare_tvf(tref)
+                && tref.schema.is_none()
+                && self.lookup_cte(&tref.name, tref.alias.as_deref()).is_none()
+                && !self.is_view(&tref.name)
+                && self.unqualified_db(&tref.name) == DbRef::Main
+        };
+        let first_ref = &from.first;
+        let second_ref = &join.table;
+        if !is_plain_main(first_ref) || !is_plain_main(second_ref) {
+            return None;
+        }
+        let first_meta = self
+            .table_meta(&first_ref.name, first_ref.alias.as_deref())
+            .ok()?;
+        let second_meta = self
+            .table_meta(&second_ref.name, second_ref.alias.as_deref())
+            .ok()?;
+        // A WITHOUT ROWID `from.first` is seeked by its clustered PK, not the
+        // secondary-index machinery this slice reuses — leave it to other paths.
+        if first_meta.without_rowid {
+            return None;
+        }
+        // Resolve the `ON` `=` sides against the DECLARED `[first, second]` column
+        // layout (first's columns then second's).
+        let mut on = on;
+        while let Expr::Paren(inner) = on {
+            on = inner;
+        }
+        let first_width = first_meta.columns.len();
+        let mut combined = first_meta.columns.clone();
+        combined.extend(second_meta.columns.iter().cloned());
+        let (a, b) = match on {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => (col_index(left, &combined)?, col_index(right, &combined)?),
+            _ => return None,
+        };
+        // One side must be a `from.first` column, the other a second-table column.
+        let (first_local, second_local) = if a < first_width && b >= first_width {
+            (a, b - first_width)
+        } else if b < first_width && a >= first_width {
+            (b, a - first_width)
+        } else {
+            return None;
+        };
+        // `from.first`'s join column must NOT be its rowid IPK — that is the rowid
+        // slice (`two_table_rowid_inner_swap`); the two must be mutually exclusive.
+        if first_meta.ipk == Some(first_local) {
+            return None;
+        }
+        // `from.first`'s join column must be the LEADING column of a usable plain
+        // secondary index (non-partial, non-expression). Pick the first such index
+        // by catalog order for a deterministic choice matching the EQP emitter.
+        let idx = self
+            .indexes_of(&first_ref.name)
+            .ok()?
+            .into_iter()
+            .find(|i| {
+                i.partial.is_none() && i.key_exprs.is_none() && i.cols.first() == Some(&first_local)
+            })?;
+        // The second table's join column must NOT be seekable — if it is (rowid or
+        // index-leading), the existing forward seek path already makes it the inner,
+        // so leave that alone.
+        if self.is_local_col_seekable(&second_ref.name, &second_meta, second_local) {
+            return None;
+        }
+        Some((second_local, first_meta, idx))
+    }
+
+    /// Whether the chosen secondary index on `from.first` COVERS the query — every
+    /// `from.first` column the query needs is stored in the index (its key columns
+    /// plus the always-present rowid) — so the seek reads only the index b-tree and
+    /// sqlite renders `USING COVERING INDEX` (else `USING INDEX`). Used by the EQP
+    /// emitter in lockstep with the executor swap (the executor still reads the
+    /// table row, but the plan *label* must match sqlite's cost model). Conservative:
+    /// any construct whose `from.first`-column footprint we cannot enumerate exactly
+    /// (correlated subquery / EXISTS / IN-SELECT, window/aggregate `FILTER`/`OVER`,
+    /// a generated column on `from.first`) makes it report *not* covering, which is
+    /// the safe `USING INDEX` render.
+    fn index_swap_covers(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        first_meta: &TableMeta,
+        second_meta: &TableMeta,
+        idx: &IndexMeta,
+    ) -> bool {
+        // A generated column on `from.first` can never be proven covered.
+        if first_meta.generated.iter().any(|g| g.is_some()) {
+            return false;
+        }
+        let first_names: [&str; 2] = [&from.first.name, from.first.alias.as_deref().unwrap_or("")];
+        let second_names: [&str; 2] = [
+            &from.joins[0].table.name,
+            from.joins[0].table.alias.as_deref().unwrap_or(""),
+        ];
+        let idx_covers = |ci: usize| idx.cols.contains(&ci) || first_meta.ipk == Some(ci);
+        let is_first = |t: &str| {
+            first_names
+                .iter()
+                .any(|n| !n.is_empty() && n.eq_ignore_ascii_case(t))
+        };
+        let is_second = |t: &str| {
+            second_names
+                .iter()
+                .any(|n| !n.is_empty() && n.eq_ignore_ascii_case(t))
+        };
+        // Resolve one column reference; return `Some(false)` when it names an
+        // uncovered `from.first` column, `Some(true)` when it is covered or belongs
+        // to the second table / rowid, and `None` when we cannot decide (bail).
+        let resolve = |table: Option<&str>, column: &str| -> Option<bool> {
+            let in_first = first_meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(column));
+            let in_second = second_meta
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(column));
+            match table {
+                Some(t) if is_first(t) => match in_first {
+                    Some(ci) => Some(idx_covers(ci)),
+                    None => {
+                        // `first.rowid`/`_rowid_`/`oid` is covered (rowid always in idx).
+                        if matches!(
+                            column.to_ascii_lowercase().as_str(),
+                            "rowid" | "_rowid_" | "oid"
+                        ) {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    }
+                },
+                Some(t) if is_second(t) => Some(true),
+                Some(_) => None, // unknown qualifier
+                None => {
+                    // Unqualified: covered if it is not a `from.first` column, or a
+                    // covered one. Ambiguous (in both) → still fine as long as the
+                    // first-table copy is covered.
+                    match in_first {
+                        Some(ci) => Some(idx_covers(ci)),
+                        None => {
+                            if in_second {
+                                Some(true)
+                            } else if matches!(
+                                column.to_ascii_lowercase().as_str(),
+                                "rowid" | "_rowid_" | "oid"
+                            ) {
+                                // Bare rowid is ambiguous across two tables; bail.
+                                None
+                            } else {
+                                Some(true)
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        // Walk an expression; `false` means "found an uncovered/undecidable ref".
+        fn walk(e: &Expr, resolve: &dyn Fn(Option<&str>, &str) -> Option<bool>) -> bool {
+            match e {
+                Expr::Literal(_) | Expr::Parameter(_) => true,
+                Expr::Column { table, column, .. } => {
+                    resolve(table.as_deref(), column) == Some(true)
+                }
+                Expr::Unary { expr, .. }
+                | Expr::IsNull { expr, .. }
+                | Expr::Cast { expr, .. }
+                | Expr::Collate { expr, .. }
+                | Expr::Paren(expr) => walk(expr, resolve),
+                Expr::Binary { left, right, .. } => walk(left, resolve) && walk(right, resolve),
+                Expr::Between {
+                    expr, low, high, ..
+                } => walk(expr, resolve) && walk(low, resolve) && walk(high, resolve),
+                Expr::InList { expr, list, .. } => {
+                    walk(expr, resolve) && list.iter().all(|x| walk(x, resolve))
+                }
+                Expr::RowValue(items) => items.iter().all(|x| walk(x, resolve)),
+                Expr::Function {
+                    args, filter, over, ..
+                } => over.is_none() && filter.is_none() && args.iter().all(|x| walk(x, resolve)),
+                Expr::Case {
+                    operand,
+                    when_then,
+                    else_result,
+                } => {
+                    operand.as_deref().map(|o| walk(o, resolve)).unwrap_or(true)
+                        && when_then
+                            .iter()
+                            .all(|(w, t)| walk(w, resolve) && walk(t, resolve))
+                        && else_result
+                            .as_deref()
+                            .map(|x| walk(x, resolve))
+                            .unwrap_or(true)
+                }
+                // Any subquery / EXISTS / IN-SELECT: cannot enumerate its
+                // `from.first` footprint here — decline (report not-covering).
+                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. } => false,
+            }
+        }
+        // A wildcard over `from.first` references *all* its columns.
+        let all_first_covered = (0..first_meta.columns.len()).all(idx_covers);
+        for rc in &sel.columns {
+            match rc {
+                ResultColumn::Wildcard => {
+                    if !all_first_covered {
+                        return false;
+                    }
+                }
+                ResultColumn::TableWildcard(t) => {
+                    if is_first(t) && !all_first_covered {
+                        return false;
+                    }
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    if !walk(expr, &resolve) {
+                        return false;
+                    }
+                }
+            }
+        }
+        // The join `ON`, the WHERE, GROUP BY / HAVING, and ORDER BY all reference
+        // `from.first` too.
+        if let Some(on) = from.joins[0].on.as_ref() {
+            if !walk(on, &resolve) {
+                return false;
+            }
+        }
+        if let Some(w) = sel.where_clause.as_ref() {
+            if !walk(w, &resolve) {
+                return false;
+            }
+        }
+        if !sel.group_by.iter().all(|e| walk(e, &resolve)) {
+            return false;
+        }
+        if let Some(h) = sel.having.as_ref() {
+            if !walk(h, &resolve) {
+                return false;
+            }
+        }
+        if !sel.order_by.iter().all(|t| walk(&t.expr, &resolve)) {
+            return false;
+        }
+        let _ = idx;
+        true
+    }
+
+    /// Execute the reordered two-table join decided by
+    /// [`two_table_index_inner_swap`](Self::two_table_index_inner_swap): scan the
+    /// SECOND table as the driver and, for each driver row, seek `from.first` by its
+    /// leading secondary index to the driver row's join value. Output rows come out
+    /// in the second table's scan order (matching sqlite), but the produced columns
+    /// and every row stay in DECLARED order `[first cols, second cols]`, so `SELECT *`
+    /// / `t.*` expansion and the projection see the same layout as the unreordered
+    /// join. A non-unique index may fan out to several `from.first` rows per driver
+    /// row; each is emitted in the index's order (matching sqlite). The full `ON` is
+    /// re-evaluated on each assembled row (superset invariant).
+    fn exec_two_table_index_inner_swap(
+        &self,
+        from: &FromClause,
+        first_columns: &[ColumnInfo],
+        driver_join_local: usize,
+        first_meta: &TableMeta,
+        idx: &IndexMeta,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        let join = &from.joins[0];
+        let encoding = self.backend.source().header().text_encoding;
+        // Driver = the second table, scanned in its natural (rowid) order.
+        let (driver_columns, driver_rows) = self.resolve_join_source(&join.table, params)?;
+        // Declared output layout: `[first cols, second cols]`.
+        let mut out_columns = first_columns.to_vec();
+        out_columns.extend(driver_columns.iter().cloned());
+        let on = join.on.as_ref();
+        let lead = idx.cols[0];
+        let coll = idx.collations[0];
+        let src = self.backend.source();
+        let mut cur = TableCursor::new(self.backend.source(), first_meta.root);
+        let mut joined: Vec<Vec<Value>> = Vec::new();
+        for driver in &driver_rows {
+            // A NULL driver key never equi-joins; skip the seek (no inner match).
+            if matches!(driver[driver_join_local], Value::Null) {
+                continue;
+            }
+            // Coerce the key to the leading column's affinity, mirroring the forward
+            // `exec_index_join_seek` so the index comparison is identical.
+            let key = [first_meta.columns[lead]
+                .affinity
+                .coerce(driver[driver_join_local].clone())];
+            let colls = [coll];
+            let rowids =
+                crate::btree::index_seek_rowids(src, idx.root, &key, &colls, idx.seek_descs())?;
+            for rid in rowids {
                 if cur.seek(rid)? {
                     let first_row =
                         self.decode_full_row(first_meta, rid, &cur.payload()?, encoding)?;

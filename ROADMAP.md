@@ -1409,9 +1409,19 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   (only the driver's *iteration* order changes). EQP renders `SCAN <second> … SEARCH <first> USING
   INTEGER PRIMARY KEY` in lockstep, and `run_select_vdbe` defers the shape to the tree-walker unless
   an explicit `ORDER BY` makes the drive direction invisible. Byte-exact plan+rows vs sqlite3 3.50.4
-  (`tests/join_order_rowid_inner.rs`). **Still open (the rest of join order):** the general N-table
-  cost-based ordering (secondary-index vs scan cost, selectivity, WHERE-pushdown) — the full
-  `whereLoopAddBtree`/`wherePathSolver` port; this slice only covers the unambiguous rowid-inner case.
+  (`tests/join_order_rowid_inner.rs`). A **second slice** extends the same reorder to a
+  **secondary-index inner**: when `from.first`'s join column leads a plain secondary index (but is
+  NOT its rowid) and the second table's join column is not seekable at all, sqlite drives the
+  non-seekable second table (SCAN) and seeks `from.first` via its index (`SEARCH … USING [COVERING]
+  INDEX (col=?)`, fanning out in index order for a non-unique key). `two_table_index_inner_swap` /
+  `exec_two_table_index_inner_swap` mirror the rowid pair (declared column order preserved, EQP +
+  VDBE-defer in lockstep) and are mutually exclusive with it (`from.first`'s column is rowid → other
+  slice; is a secondary-index lead → this one) and never steal the forward inner-seek path (second
+  table seekable → declines). Byte-exact vs sqlite3 3.50.4 (`tests/join_order_index_inner.rs`).
+  **Still open (the rest of join order):** the general N-table cost-based ordering when BOTH sides
+  are seekable (secondary-index vs rowid vs scan cost, selectivity, WHERE-pushdown) — the full
+  `whereLoopAddBtree`/`wherePathSolver` port; these two slices cover only the unambiguous
+  one-side-seekable cases.
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   `collect_eq_constraints` / `collect_range_constraints` compare an explicit `COLLATE`
   to the *column's* collation. When an index carries a *non-default* collation
