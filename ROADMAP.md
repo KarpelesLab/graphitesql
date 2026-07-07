@@ -1494,7 +1494,7 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   stat4-driven planner would *diverge* the EQP corpus. Needs a stat4-enabled oracle.
 - **Extension-provided surface.** `PRAGMA collation_list` / `function_list` and the
   `regexp()` operator differ only because the local oracle is built with extensions
-  (`decimal`/`uint` collations, `regexp`, `sha3`, `geopoly`, `fts3`, …) that CI's
+  (`decimal`/`uint` collations, `regexp`, `sha3`, `fts3`, …) that CI's
   pinned build lacks; matching them would be differential-testing a compile-time
   option (see the `ci-vs-local-sqlite-icu` note). Not actionable.
 
@@ -1536,8 +1536,14 @@ injecting crash-recovery harness; and the **bounded LRU `pcache`** (C8c,
 trait, `best_index`/`filter` pushdown — **D1**); the **writable, persistent** vtab
 layer (**W1/W2**); the full **R-Tree** (**D3a–D3c**, byte-compatible nodes) and
 the full **FTS5** (**D2a–D2e**, read + write, sqlite-readable on disk, with the
-`tokenize=` option chain + diacritic folding); Rust scalar/aggregate **UDFs**
-(**D4**); the **`dbstat`** and read-only **`sqlite_dbpage`** (dbpage-1) vtabs. The
+`tokenize=` option chain + diacritic folding, and the complete
+maintenance/config command set); the full **geopoly** extension — the scalar
+geometry library (`geopoly_json/blob/area/bbox/ccw/regular/contains_point/
+overlap/within/svg/xform` + the `geopoly_group_bbox` aggregate) *and* the
+R-Tree-backed **geopoly virtual table** with spatial `geopoly_overlap`/`within`
+pushdown, byte-compatible and cross-engine round-tripping with sqlite3; Rust
+scalar/aggregate **UDFs** (**D4**); the **`dbstat`** and read-only
+**`sqlite_dbpage`** (dbpage-1) vtabs. The
 FTS5 **inverted-index read path** (**D2b-1/2/3**) is comprehensive: *every* `MATCH`
 shape (term / column-scoped / phrase / boolean / prefix / `NEAR`) is index-routed
 over single- *and* multi-segment indexes, including multi-leaf term pagination and
