@@ -2133,26 +2133,29 @@ impl Connection {
         if !from.joins.is_empty() {
             // B5b-2 (live inner cursor): a two-table INNER or LEFT equi-join whose
             // `ON` binds the inner table's INTEGER PRIMARY KEY (`… JOIN t ON o.x =
-            // t.<ipk>`) seeks the single matching inner row with a *live* b-tree
-            // cursor (`read_row` → `TableCursor::seek`) instead of materializing
-            // and scanning the whole inner table. Only the outer table is scanned;
-            // for each outer row the inner row is fetched by rowid. Correctness
-            // rides the superset invariant: after the seek the full `ON` is
-            // re-evaluated against the assembled row, so every rowid-coercion
-            // corner (`= 2.5`, text/blob keys, `NULL`) is filtered exactly as the
-            // materialized cross-product would. A LEFT join null-pads the inner
-            // side on any non-match (since the rowid seek is unique, each outer
-            // row yields exactly one output row). Any shape outside this narrow
-            // window — or a projection the single-cursor compiler can't take —
-            // breaks out and falls through to the materialized join path below.
+            // t.<ipk>`) — or a single-column UNIQUE (BINARY) secondary index
+            // (`… JOIN t ON o.x = t.<uniq>`) — seeks the single matching inner row
+            // with a *live* b-tree cursor (`read_row`/`index_seek_fetch` →
+            // `TableCursor::seek`) instead of materializing and scanning the whole
+            // inner table. Only the outer table is scanned; each inner row is
+            // fetched by rowid or by the unique-index seek. Correctness rides the
+            // superset invariant: after the seek the full `ON` is re-evaluated
+            // against the assembled row, so every coercion corner (`= 2.5`,
+            // text/blob keys, `NULL`) is filtered exactly as the materialized
+            // cross-product would. A LEFT join null-pads the inner side on any
+            // non-match (both seek kinds are unique, so each outer row yields
+            // exactly one output row). Any shape outside this narrow window — or a
+            // projection the single-cursor compiler can't take — breaks out and
+            // falls through to the materialized join path below.
             'seek: {
-                // The chain is a bounded left-deep sequence of ipk rowid seeks: the
+                // The chain is a bounded left-deep sequence of unique seeks: the
                 // leftmost source is scanned, and every joined table is fetched by
-                // seeking its INTEGER PRIMARY KEY (== rowid) to the value of a
-                // column already assembled in the running prefix. A single join may
-                // be INNER (skip a miss) or LEFT (null-pad a miss); a 2+ chain must
-                // be all INNER (a LEFT anywhere in a chain has null-propagation the
-                // materialized path below still owns). NATURAL/USING always defer.
+                // seeking its INTEGER PRIMARY KEY (== rowid) or a single-column
+                // UNIQUE index to the value of a column already assembled in the
+                // running prefix. A single join may be INNER (skip a miss) or LEFT
+                // (null-pad a miss); a 2+ chain must be all INNER (a LEFT anywhere
+                // in a chain has null-propagation the materialized path below still
+                // owns). NATURAL/USING always defer.
                 if from.joins.is_empty() || from.joins.len() > 3 {
                     break 'seek;
                 }
@@ -2214,6 +2217,19 @@ impl Connection {
                         out.push(e);
                     }
                 }
+                // How each joined table's single matching row is fetched live: by
+                // its rowid (INTEGER PRIMARY KEY) or by seeking a single-column
+                // UNIQUE secondary index.
+                #[derive(Clone)]
+                enum SeekVia {
+                    Rowid,
+                    Index {
+                        root: u32,
+                        aff: eval::Affinity,
+                        colls: Vec<crate::value::Collation>,
+                        descs: Vec<bool>,
+                    },
+                }
                 // Running combined schema + rows, seeded from the outer scan (the
                 // inner tables are never scanned — only seeked).
                 let (mut c_cols, mut c_tables, mut c_aff, mut c_coll, mut rows, _ids) =
@@ -2243,9 +2259,6 @@ impl Connection {
                     if inner_meta.without_rowid {
                         break 'seek;
                     }
-                    let Some(ipk) = inner_meta.ipk else {
-                        break 'seek;
-                    };
                     let Some(on) = &j.on else { break 'seek };
                     let inner_qual = j
                         .table
@@ -2254,20 +2267,62 @@ impl Connection {
                         .unwrap_or_else(|| j.table.name.clone());
                     let i_cols: Vec<String> =
                         inner_meta.columns.iter().map(|c| c.name.clone()).collect();
-                    let ipk_name = inner_meta.columns[ipk].name.clone();
                     let mut on_expr = on;
                     while let sql::ast::Expr::Paren(inner) = on_expr {
                         on_expr = inner;
                     }
-                    // Is `e` this inner's ipk, named by its declared column name?
+                    // Candidate inner seek columns, each paired with how its single
+                    // matching row is fetched:
+                    //  * the INTEGER PRIMARY KEY, seeked by rowid (`SeekVia::Rowid`);
+                    //  * any single-column UNIQUE, non-partial, plain-column index
+                    //    whose column *and* index collation are BINARY, seeked
+                    //    through the index (`SeekVia::Index`).
+                    // Uniqueness keeps the "≤ 1 inner row per outer row" invariant
+                    // the null-pad/re-check logic below relies on; the BINARY +
+                    // equal-affinity guard (applied where the key is matched) makes
+                    // the index seek return exactly the rows the re-checked `ON`
+                    // accepts, so it never drops a true match.
+                    let mut cands: Vec<(usize, SeekVia)> = Vec::new();
+                    if let Some(ipk) = inner_meta.ipk {
+                        cands.push((ipk, SeekVia::Rowid));
+                    }
+                    let inner_indexes = match self.indexes_of(&j.table.name) {
+                        Ok(v) => v,
+                        Err(_) => break 'seek,
+                    };
+                    for idx in &inner_indexes {
+                        if idx.unique
+                            && idx.partial.is_none()
+                            && idx.key_exprs.is_none()
+                            && idx.cols.len() == 1
+                            && idx.collations.first() == Some(&crate::value::Collation::Binary)
+                        {
+                            let ic = idx.cols[0];
+                            if Some(ic) != inner_meta.ipk
+                                && inner_meta.columns[ic].collation
+                                    == crate::value::Collation::Binary
+                            {
+                                cands.push((
+                                    ic,
+                                    SeekVia::Index {
+                                        root: idx.root,
+                                        aff: inner_meta.columns[ic].affinity,
+                                        colls: idx.collations.clone(),
+                                        descs: idx.seek_descs().to_vec(),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    // Is `e` the inner column `ci`, named by its declared column name?
                     // (A bare `rowid`/`_rowid_`/`oid` alias defers — the assembled
-                    // schema exposes the ipk under its declared name.) Qualified to
-                    // the inner, or bare and not shadowing a prefix column.
-                    let is_inner_ipk = |e: &sql::ast::Expr| -> bool {
+                    // schema exposes each column under its declared name.) Qualified
+                    // to the inner, or bare and not shadowing a prefix column.
+                    let is_inner_col = |e: &sql::ast::Expr, ci: usize| -> bool {
                         let Some((q, name)) = col_ref(e) else {
                             return false;
                         };
-                        if !name.eq_ignore_ascii_case(&ipk_name) {
+                        if !name.eq_ignore_ascii_case(&i_cols[ci]) {
                             return false;
                         }
                         match q {
@@ -2297,34 +2352,57 @@ impl Connection {
                         }
                         Some(matches[0])
                     };
-                    // The seek key is the prefix column bound to this inner's ipk by
-                    // one top-level `AND` conjunct of the `ON`.
+                    // The seek key is a prefix column bound to one candidate inner
+                    // column by a top-level `AND` conjunct `<inner col> = <prefix
+                    // col>`. The rowid candidate is preferred (it comes first and is
+                    // cheapest); an index candidate additionally requires equal
+                    // affinity on the two sides so the index seek and the `ON` `=`
+                    // agree exactly (the rowid seek coerces via `to_i64`, mirroring
+                    // SQLite's rowid rule, so it needs no such guard).
                     let mut conjuncts: Vec<&sql::ast::Expr> = Vec::new();
                     and_conjuncts(on_expr, &mut conjuncts);
-                    let seek_key = conjuncts.iter().find_map(|c| {
-                        let mut c = *c;
-                        while let sql::ast::Expr::Paren(i) = c {
-                            c = i;
-                        }
-                        let sql::ast::Expr::Binary {
-                            op: sql::ast::BinaryOp::Eq,
-                            left,
-                            right,
-                        } = c
-                        else {
-                            return None;
-                        };
-                        let (l, r) = (left.as_ref(), right.as_ref());
-                        if is_inner_ipk(l) {
-                            prefix_col_index(r)
-                        } else if is_inner_ipk(r) {
-                            prefix_col_index(l)
-                        } else {
-                            None
-                        }
+                    let resolved = cands.iter().find_map(|(ci, via)| {
+                        conjuncts.iter().find_map(|c| {
+                            let mut c = *c;
+                            while let sql::ast::Expr::Paren(i) = c {
+                                c = i;
+                            }
+                            let sql::ast::Expr::Binary {
+                                op: sql::ast::BinaryOp::Eq,
+                                left,
+                                right,
+                            } = c
+                            else {
+                                return None;
+                            };
+                            let (l, r) = (left.as_ref(), right.as_ref());
+                            let kc = if is_inner_col(l, *ci) {
+                                prefix_col_index(r)?
+                            } else if is_inner_col(r, *ci) {
+                                prefix_col_index(l)?
+                            } else {
+                                return None;
+                            };
+                            if let SeekVia::Index { aff, .. } = via {
+                                // Equal affinity *and* a BINARY outer key column: the
+                                // inner column and its index are already BINARY, so
+                                // requiring the outer side BINARY too makes the `ON`
+                                // `=` resolve to BINARY regardless of operand order,
+                                // matching the index seek exactly. A NOCASE (or other
+                                // non-BINARY) outer column would compare
+                                // case-insensitively while the seek stays BINARY,
+                                // dropping true matches — so it defers.
+                                if c_aff[kc] != *aff
+                                    || c_coll[kc] != crate::value::Collation::Binary
+                                {
+                                    return None;
+                                }
+                            }
+                            Some((kc, via.clone()))
+                        })
                     });
-                    let kc = match seek_key {
-                        Some(kc) => kc,
+                    let (kc, seek_via) = match resolved {
+                        Some(v) => v,
                         None => break 'seek,
                     };
                     // Combined schema up to and including this inner — used to
@@ -2362,8 +2440,28 @@ impl Connection {
                             push_unmatched(&mut next);
                             continue;
                         }
-                        let rid = eval::to_i64(kv);
-                        let Some(ivals) = self.read_row(&inner_meta, rid)? else {
+                        let fetched = match &seek_via {
+                            SeekVia::Rowid => self.read_row(&inner_meta, eval::to_i64(kv))?,
+                            SeekVia::Index {
+                                root,
+                                aff,
+                                colls,
+                                descs,
+                            } => {
+                                let key = alloc::vec![aff.coerce(kv.clone())];
+                                let hits = self
+                                    .index_seek_fetch(&inner_meta, *root, &key, colls, descs)?
+                                    .unwrap_or_default();
+                                // A UNIQUE single-column index yields ≤ 1 row for a
+                                // non-NULL key; more would mean the guard was wrong,
+                                // so bail to the materialized path.
+                                if hits.len() > 1 {
+                                    break 'seek;
+                                }
+                                hits.into_iter().next().map(|ir| ir.values)
+                            }
+                        };
+                        let Some(ivals) = fetched else {
                             push_unmatched(&mut next);
                             continue;
                         };
