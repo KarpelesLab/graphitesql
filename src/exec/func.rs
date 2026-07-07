@@ -20,7 +20,7 @@ const MAX_BLOB_LEN: usize = 1_000_000_000;
 pub fn is_aggregate(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "count" | "sum" | "total" | "avg" | "min" | "max" | "group_concat"
+        "count" | "sum" | "total" | "avg" | "min" | "max" | "group_concat" | "geopoly_group_bbox"
     )
 }
 
@@ -36,6 +36,9 @@ pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
         "json_group_array" | "jsonb_group_array" | "json_group_object" | "jsonb_group_object" => {
             true
         }
+        // geopoly_group_bbox has no scalar counterpart, so it is an aggregate at
+        // any argument count (the arity guard reports a wrong count).
+        "geopoly_group_bbox" => true,
         "min" | "max" => star || nargs == 1,
         _ => false,
     }
@@ -1040,6 +1043,126 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "timediff" => {
             arity(&lname, args, 2)?;
             super::datetime::timediff(&v[0], &v[1])
+        }
+        "geopoly_json" => {
+            arity(&lname, args, 1)?;
+            match crate::geopoly::parse_value(&v[0]) {
+                Some(p) => Value::Text(p.to_json()),
+                None => Value::Null,
+            }
+        }
+        "geopoly_blob" => {
+            arity(&lname, args, 1)?;
+            match crate::geopoly::parse_value(&v[0]) {
+                Some(p) => Value::Blob(p.to_blob()),
+                None => Value::Null,
+            }
+        }
+        "geopoly_area" => {
+            arity(&lname, args, 1)?;
+            match crate::geopoly::parse_value(&v[0]) {
+                Some(p) => Value::Real(p.area()),
+                None => Value::Null,
+            }
+        }
+        "geopoly_bbox" => {
+            arity(&lname, args, 1)?;
+            match crate::geopoly::parse_value(&v[0]) {
+                Some(p) => Value::Blob(p.bbox().to_blob()),
+                None => Value::Null,
+            }
+        }
+        "geopoly_ccw" => {
+            arity(&lname, args, 1)?;
+            match crate::geopoly::parse_value(&v[0]) {
+                Some(p) => Value::Blob(p.ccw().to_blob()),
+                None => Value::Null,
+            }
+        }
+        "geopoly_regular" => {
+            arity(&lname, args, 4)?;
+            // A NULL argument yields NULL (SQLite's `sqlite3_value_double`/`int`
+            // treat NULL as 0, but n<3 or r<=0 then returns NULL anyway; an
+            // explicit NULL check keeps the common cases NULL-clean).
+            if v.iter().any(|x| matches!(x, Value::Null)) {
+                Value::Null
+            } else {
+                let cx = eval::to_f64(&v[0]);
+                let cy = eval::to_f64(&v[1]);
+                let r = eval::to_f64(&v[2]);
+                let n = eval::to_i64(&v[3]);
+                match crate::geopoly::regular(cx, cy, r, n) {
+                    Some(p) => Value::Blob(p.to_blob()),
+                    None => Value::Null,
+                }
+            }
+        }
+        "geopoly_contains_point" => {
+            arity(&lname, args, 3)?;
+            match crate::geopoly::parse_value(&v[0]) {
+                Some(p) => {
+                    Value::Integer(p.contains_point(eval::to_f64(&v[1]), eval::to_f64(&v[2])))
+                }
+                None => Value::Null,
+            }
+        }
+        "geopoly_overlap" => {
+            arity(&lname, args, 2)?;
+            match (
+                crate::geopoly::parse_value(&v[0]),
+                crate::geopoly::parse_value(&v[1]),
+            ) {
+                (Some(p1), Some(p2)) => Value::Integer(crate::geopoly::overlap(&p1, &p2)),
+                _ => Value::Null,
+            }
+        }
+        "geopoly_within" => {
+            arity(&lname, args, 2)?;
+            match (
+                crate::geopoly::parse_value(&v[0]),
+                crate::geopoly::parse_value(&v[1]),
+            ) {
+                (Some(p1), Some(p2)) => Value::Integer(crate::geopoly::within(&p1, &p2)),
+                _ => Value::Null,
+            }
+        }
+        "geopoly_svg" => {
+            // geopoly_svg(X, ...) is variadic. With no arguments SQLite's
+            // implementation simply returns NULL (`if(argc<1) return;`) rather
+            // than raising an arity error.
+            if args.is_empty() {
+                return Ok(Value::Null);
+            }
+            match crate::geopoly::parse_value(&v[0]) {
+                Some(p) => {
+                    let extra: Vec<Option<String>> = v[1..]
+                        .iter()
+                        .map(|x| match x {
+                            Value::Null => None,
+                            other => Some(eval::to_text(other)),
+                        })
+                        .collect();
+                    Value::Text(p.to_svg(&extra))
+                }
+                None => Value::Null,
+            }
+        }
+        "geopoly_xform" => {
+            arity(&lname, args, 7)?;
+            match crate::geopoly::parse_value(&v[0]) {
+                Some(p) => Value::Blob(
+                    p.xform(
+                        eval::to_f64(&v[1]),
+                        eval::to_f64(&v[2]),
+                        eval::to_f64(&v[3]),
+                        eval::to_f64(&v[4]),
+                        eval::to_f64(&v[5]),
+                        eval::to_f64(&v[6]),
+                    )
+                    .to_blob(),
+                ),
+                None => Value::Null,
+            }
         }
         "printf" | "format" => super::datetime::printf(&v),
         _ => {

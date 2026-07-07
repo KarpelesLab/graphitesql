@@ -62,6 +62,7 @@ pub mod exec;
 pub mod format;
 #[cfg(feature = "fts5")]
 pub(crate) mod fts5_index;
+pub(crate) mod geopoly;
 pub mod pager;
 pub mod schema;
 pub mod sql;

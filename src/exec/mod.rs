@@ -29530,6 +29530,41 @@ impl Connection {
             });
         }
 
+        // `geopoly_group_bbox` folds the axis-aligned bounding box over every
+        // non-NULL polygon in the group (the union of each polygon's bbox),
+        // returning the enclosing CCW rectangle as a geopoly BLOB. A group with
+        // no valid polygon (all NULL / empty) yields NULL.
+        if lname == "geopoly_group_bbox" {
+            let mut acc: Option<(f32, f32, f32, f32)> = None;
+            for &i in group {
+                let ctx = rows[i].ctx(columns, params).with_subqueries(self);
+                let v = eval::eval(&args[0], &ctx)?;
+                // Each row contributes a bounding box (the polygon's, or an
+                // all-zero box for the SQLite "rc OK but no polygon" case);
+                // `Skip` rows leave the accumulator untouched, matching sqlite.
+                let (mnx, mxx, mny, mxy) = match crate::geopoly::bbox_step(&v) {
+                    crate::geopoly::BBoxStep::Poly(p) => p.bbox_coords(),
+                    crate::geopoly::BBoxStep::ZeroBox => (0.0, 0.0, 0.0, 0.0),
+                    crate::geopoly::BBoxStep::Skip => continue,
+                };
+                acc = Some(match acc {
+                    None => (mnx, mxx, mny, mxy),
+                    Some((amnx, amxx, amny, amxy)) => (
+                        if mnx < amnx { mnx } else { amnx },
+                        if mxx > amxx { mxx } else { amxx },
+                        if mny < amny { mny } else { amny },
+                        if mxy > amxy { mxy } else { amxy },
+                    ),
+                });
+            }
+            return Ok(match acc {
+                Some((mnx, mxx, mny, mxy)) => {
+                    Value::Blob(crate::geopoly::GeoPoly::from_bbox(mnx, mxx, mny, mxy).to_blob())
+                }
+                None => Value::Null,
+            });
+        }
+
         // Gather the (non-NULL for most) argument values across the group.
         let mut vals: Vec<Value> = Vec::new();
         let mut count_rows = 0usize; // for count(*)
