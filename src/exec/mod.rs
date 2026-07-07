@@ -6501,6 +6501,15 @@ impl Connection {
                         None => Value::Null,
                     })
                     .collect();
+                // SQLite re-checks the FK after applying the default value: unless
+                // the default key contains a NULL (MATCH SIMPLE ⇒ satisfied), it
+                // must itself reference an existing parent row, else the child now
+                // dangles and the statement fails.
+                if !defaults.iter().any(|v| matches!(v, Value::Null))
+                    && !self.parent_has_key(fk, &defaults)?
+                {
+                    return Err(Error::Constraint("FOREIGN KEY constraint failed".into()));
+                }
                 for rowid in matches {
                     self.update_child_key(&cmeta, child_table, rowid, &cpos, &defaults)?;
                 }
