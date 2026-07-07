@@ -19036,22 +19036,21 @@ impl Connection {
             {
                 return None;
             }
-            let mut seekable = indexes.iter().filter(|idx| {
-                idx.partial.is_none()
-                    && idx.key_exprs.is_none()
-                    && idx.cols.first().is_some_and(|c| {
-                        eqs.iter().any(|(col, _)| col == c) || is_null_cols.contains(c)
-                    })
-            });
-            let idx = seekable.next()?;
-            if seekable.next().is_some() {
-                return None;
-            }
-            let prefix = idx
-                .cols
-                .iter()
-                .take_while(|&&c| eqs.iter().any(|(col, _)| *col == c) || is_null_cols.contains(&c))
-                .count();
+            // Pick the exact index the executor's equality/`IS NULL`-prefix seek
+            // walks (via the shared `choose_seek_index`), with its pinned-prefix
+            // length, so the order credit is for the index that actually runs.
+            let (chosen, prefix) = self
+                .choose_seek_index(
+                    Some(sel),
+                    &meta,
+                    &t.name,
+                    where_expr,
+                    &eqs,
+                    &is_null_cols,
+                    None,
+                )
+                .ok()??;
+            let idx = indexes.iter().find(|i| i.root == chosen.root)?;
             (idx, prefix)
         } else {
             // Range seek (try_index_range). Guard so the chosen index is exactly the
@@ -19071,13 +19070,13 @@ impl Connection {
             {
                 return None;
             }
-            let mut seekable = indexes
-                .iter()
-                .filter(|idx| idx.cols.first().is_some_and(|c| ranges.contains_key(c)));
-            let idx = seekable.next()?;
-            if seekable.next().is_some() {
-                return None;
-            }
+            // Pick the exact index the executor's range seek walks (covering
+            // preference etc.), via the shared `choose_range_index`, so the order
+            // credit is for the index that actually runs.
+            let chosen = self
+                .choose_range_index(Some(sel), &meta, &t.name, where_expr, &ranges, None)
+                .ok()??;
+            let idx = indexes.iter().find(|i| i.root == chosen.root)?;
             (idx, 0)
         };
         let walk_cols = &idx.cols[prefix..];

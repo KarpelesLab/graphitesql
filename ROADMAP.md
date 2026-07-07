@@ -1354,10 +1354,20 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   rowid-range render share a second helper, `choose_range_index`, with the same
   covering-first / narrower / newest order (non-covering candidates keep first-encountered
   order — the deep-cost tiebreak isn't reproduced). Byte-exact plan+rows vs sqlite3 3.50.4
-  (`tests/eqp_range_covering.rs`). **Still open (rides here):** ORDER-BY elision for a
-  range-leading seek (`SELECT b … WHERE a>1 ORDER BY a` still emits `USE TEMP B-TREE` where
-  sqlite reads the index in `a`-order — a *pre-existing* elision gap, unchanged and not a
-  regression); the tiebreak among
+  (`tests/eqp_range_covering.rs`).
+  **ORDER-BY elision now credits the exact index the seek walks** (2026-07-07): with two or
+  more indexes able to seek the same equality/`IS NULL` prefix or leading range,
+  `seek_order_prefix` used to bail (it couldn't tell which index the executor picks) and
+  emit `USE TEMP B-TREE FOR ORDER BY`. It now asks the shared `choose_seek_index` /
+  `choose_range_index` for the exact index that runs, so `SELECT b FROM t WHERE a=? ORDER BY
+  b` and `SELECT b FROM t WHERE a>? ORDER BY a` over `ia(a)`+`iab(a,b)` elide the sort like
+  sqlite (covering `iab` supplies the order), both ASC and DESC. Rows verified byte-exact vs
+  sqlite3 3.50.4 across equality/range/IS-NULL shapes; a stale `tests/explain.rs` assertion
+  that expected a temp b-tree for `WHERE a=? ORDER BY id` (the rowid *is* in seek order) was
+  corrected to the sqlite plan. **Still open (rides here):** ORDER BY influencing the index
+  *choice* itself (`SELECT * … WHERE a=? ORDER BY b` — sqlite picks the wider `iab` because
+  it avoids the sort, graphite picks the narrower `ia` then sorts; rows correct) — needs the
+  sort-avoidance term in the cost model; the tiebreak among
   multiple *non-covering* indexes that share the same equality prefix (`ia`+`iab`+`iac`
   all on `a`), where sqlite's full LogEst row-cost is not reducible to narrower/newest/
   oldest (it picks the narrower `it_a` in one schema and the newer wider `iac` in another)

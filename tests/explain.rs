@@ -194,17 +194,15 @@ fn order_by_rowid_skips_temp_btree() {
         detail(&c, "EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY rowid"),
         ["SCAN t"]
     );
-    // The optimisation must not fire when anything reshapes the rows: a WHERE
-    // could pick a different access path, and a non-rowid key still needs a sort.
+    // A `WHERE a=?` seek walks its index in rowid order within the matched key, so
+    // `ORDER BY id` (the rowid) is already satisfied by the seek — no temp b-tree,
+    // matching sqlite (verified vs the CLI). A non-rowid key still needs a sort.
     assert_eq!(
         detail(
             &c,
             "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a=1 ORDER BY id"
         ),
-        [
-            "SEARCH t USING INDEX it_a (a=?)",
-            "USE TEMP B-TREE FOR ORDER BY"
-        ]
+        ["SEARCH t USING INDEX it_a (a=?)"]
     );
     // A non-indexed column still needs a sort.
     assert_eq!(
