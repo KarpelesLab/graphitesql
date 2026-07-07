@@ -1799,15 +1799,22 @@ fn replace(v: &[Value]) -> Result<Value> {
     if v.len() != 3 {
         return Err(wrong_arg_count("replace"));
     }
-    if v.iter().any(|x| matches!(x, Value::Null)) {
+    // SQLite short-circuits in a specific order: a NULL subject or a NULL pattern
+    // yields NULL, but an EMPTY pattern returns the subject (converted to text)
+    // *before* the replacement argument is examined — so `replace('ab','',NULL)`
+    // is `'ab'`, not NULL. Checking all three for NULL up front got this wrong.
+    if matches!(v[0], Value::Null) || matches!(v[1], Value::Null) {
         return Ok(Value::Null);
     }
     let s = c_text(&v[0]);
     let from = c_text(&v[1]);
-    let to = c_text(&v[2]);
     if from.is_empty() {
         return Ok(Value::Text(s));
     }
+    if matches!(v[2], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let to = c_text(&v[2]);
     Ok(Value::Text(s.replace(&from, &to)))
 }
 
