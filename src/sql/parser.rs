@@ -2017,7 +2017,7 @@ impl Parser {
             let oc = self.eat_conflict_clause();
             Ok(Some(TableConstraint::PrimaryKey(cols, oc)))
         } else if self.eat_kw("unique") {
-            let cols = self.paren_columns()?;
+            let cols = self.paren_columns_dir()?;
             let oc = self.eat_conflict_clause();
             Ok(Some(TableConstraint::Unique(cols, oc)))
         } else if self.eat_kw("check") {

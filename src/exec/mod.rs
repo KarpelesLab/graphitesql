@@ -5558,7 +5558,7 @@ impl Connection {
                 TableConstraint::PrimaryKey(cols, _) => {
                     cols.iter().map(|(n, _)| n.as_str()).collect()
                 }
-                TableConstraint::Unique(cols, _) => cols.iter().map(String::as_str).collect(),
+                TableConstraint::Unique(cols, _) => cols.iter().map(|(n, _)| n.as_str()).collect(),
                 _ => continue,
             };
             for name in names {
@@ -5638,7 +5638,7 @@ impl Connection {
             Vec::new()
         };
         let mut schema_rowid = next + 1;
-        for (n, (set, _)) in unique.iter().enumerate() {
+        for (n, (set, _, _)) in unique.iter().enumerate() {
             // The clustered PRIMARY KEY of a WITHOUT ROWID table gets no b-tree.
             if ct.without_rowid && *set == pk {
                 continue;
@@ -7719,7 +7719,7 @@ impl Connection {
                 continue;
             }
             let mut conflicted = false;
-            for (set, set_oc) in &meta.unique {
+            for (set, set_oc, _) in &meta.unique {
                 let new_tuple: Vec<&Value> = set.iter().map(|&i| &values[i]).collect();
                 if new_tuple.iter().any(|v| matches!(v, Value::Null)) {
                     continue; // a NULL makes the key distinct
@@ -7797,7 +7797,7 @@ impl Connection {
             }
         }
         // Inline UNIQUE / PRIMARY KEY constraint sets, in declaration order.
-        for (set, _) in &meta.unique {
+        for (set, _, _) in &meta.unique {
             if set.iter().any(|&i| matches!(values[i], Value::Null)) {
                 continue;
             }
@@ -7901,7 +7901,7 @@ impl Connection {
         if let Some(ipk) = meta.ipk {
             candidates.push((alloc::vec![ipk], false));
         }
-        for (set, _) in &meta.unique {
+        for (set, _, _) in &meta.unique {
             let mut s = set.clone();
             s.sort_unstable();
             candidates.push((s, false));
@@ -8762,7 +8762,7 @@ impl Connection {
         }
         let (cols, key_exprs, colls) = self.index_key_spec(&tmeta, ci)?;
         // Per-column DESC flags for this build. Must match what later seeks/inserts
-        // pass (`IndexMeta::seek_descs`): only a plain column index has trustworthy
+        // pass (`IndexMeta::seek_descs`): a plain column index has trustworthy
         // directions; expression indexes build (and seek) all-ascending.
         let descs: Vec<bool> = if key_exprs.is_none() {
             ci.columns.iter().map(|t| t.descending).collect()
@@ -10788,7 +10788,7 @@ impl Connection {
                             }
                         }
                         TableConstraint::Unique(n, _) => {
-                            for nm in n {
+                            for (nm, _) in n {
                                 if nm.eq_ignore_ascii_case(old) {
                                     *nm = new.clone();
                                 }
@@ -11151,7 +11151,9 @@ impl Connection {
                 TableConstraint::Check(e, _) if refs_dropped(e) => {
                     return Err(Error::Error(format!("{in_table}no such column: {name}")));
                 }
-                TableConstraint::Unique(n, _) if n.iter().any(|x| x.eq_ignore_ascii_case(name)) => {
+                TableConstraint::Unique(n, _)
+                    if n.iter().any(|(x, _)| x.eq_ignore_ascii_case(name)) =>
+                {
                     return Err(Error::Error(format!("{in_table}no such column: {name}")));
                 }
                 TableConstraint::ForeignKey(fk)
@@ -11748,19 +11750,25 @@ impl Connection {
             let Some(&lead) = idx.cols.first() else {
                 continue;
             };
-            // Range on a DESC leading column would need the value-space bounds
-            // swapped in key-sort space; defer that and fall back to a scan (still
-            // correct via `run_core`'s WHERE re-filter).
-            if idx.descending.first().copied().unwrap_or(false) {
-                continue;
-            }
             let Some(b) = ranges.get(&lead) else {
                 continue;
             };
             let aff = meta.columns[lead].affinity;
             let coll = idx.collations.first().copied().unwrap_or_default();
-            let lower = b.lower.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i));
-            let upper = b.upper.as_ref().map(|(v, i)| (aff.coerce(v.clone()), *i));
+            // When the leading index column is stored DESC, value order is reversed
+            // in key-sort space: swap the value-space lower/upper bounds so they
+            // become the stored-space lower/upper (inclusivity travels with its
+            // bound), and tell the b-tree the column is descending via
+            // `idx.seek_descs()`. See the rowid secondary-index range path and
+            // `prefix_cmp`'s per-column reversal.
+            let lead_desc = idx.descending.first().copied().unwrap_or(false);
+            let (val_lower, val_upper) = if lead_desc {
+                (b.upper.as_ref(), b.lower.as_ref())
+            } else {
+                (b.lower.as_ref(), b.upper.as_ref())
+            };
+            let lower = val_lower.map(|(v, i)| (aff.coerce(v.clone()), *i));
+            let upper = val_upper.map(|(v, i)| (aff.coerce(v.clone()), *i));
             let colls = [coll];
             let lower_arg = lower
                 .as_ref()
@@ -15609,15 +15617,14 @@ impl Connection {
                 let Some(&lead) = idx.cols.first() else {
                     continue;
                 };
-                // A DESC leading-column range seek is deferred (scan); keep in
-                // lockstep with `try_without_rowid_index_range`.
-                if idx.descending.first().copied().unwrap_or(false) {
-                    continue;
-                }
                 let Some(b) = ranges.get(&lead) else {
                     continue;
                 };
                 let name = &meta.columns[lead].name;
+                // A DESC leading column reverses value order, but the rendered
+                // predicate reads in value space; `try_without_rowid_index_range`
+                // swaps the bounds internally, so we stay in lockstep by rendering
+                // the same value-space `>?`/`<?` condition either way.
                 let cond = match (&b.lower, &b.upper) {
                     (Some(_), Some(_)) => alloc::format!("{name}>? AND {name}<?"),
                     (Some(_), None) => alloc::format!("{name}>?"),
@@ -15993,12 +16000,16 @@ impl Connection {
                 // Automatic index: its columns are the n-th UNIQUE/PK set.
                 None => {
                     if let Some(n) = autoindex_number(&obj.name, table) {
-                        if let Some((cols, _)) = tmeta.unique.get(n - 1) {
+                        if let Some((cols, _, descs)) = tmeta.unique.get(n - 1) {
                             let collations = self.col_collations(&tmeta, cols);
+                            // `descs` is populated per key column by
+                            // `collect_unique_sets` (all-false when ascending),
+                            // so the auto-index seeks in the same direction its
+                            // b-tree was written — see `IndexMeta::seek_descs`.
                             out.push(IndexMeta {
                                 name: obj.name.clone(),
                                 root: obj.rootpage,
-                                descending: alloc::vec![false; cols.len()],
+                                descending: descs.clone(),
                                 cols: cols.clone(),
                                 collations,
                                 partial: None,
@@ -26794,8 +26805,10 @@ struct TableMeta {
     /// CHECK constraints with their error-message label (name or source text).
     checks: Vec<(Expr, Option<String>)>,
     /// Column-index sets that must be UNIQUE (excludes the rowid IPK), each with
-    /// its declared `ON CONFLICT` action (default `Abort`).
-    unique: Vec<(Vec<usize>, OnConflict)>,
+    /// its declared `ON CONFLICT` action (default `Abort`) and per-column `DESC`
+    /// flags (aligned with the column positions; `true` = descending). The `DESC`
+    /// flags order the auto-created `sqlite_autoindex_*` b-tree.
+    unique: Vec<(Vec<usize>, OnConflict, Vec<bool>)>,
     ipk: Option<usize>,
     /// Per-column generated-column spec `(expr, stored)`, if the column is
     /// `… AS (expr) [STORED|VIRTUAL]`. `VIRTUAL` (stored = false) columns are not
@@ -29286,22 +29299,24 @@ struct IndexMeta {
     /// the inline-constraint `TableMeta::unique` sets do not cover.
     unique: bool,
     /// `true` for an automatic UNIQUE/PK index (no backing `CREATE INDEX` SQL).
-    /// Its `descending` flags are assumed ascending (the declared per-column
-    /// direction of the constraint is not reconstructed here), so order-walk
-    /// reasoning that depends on accurate directions must stand down for it.
+    /// Its `descending` flags are reconstructed from the source constraint's
+    /// per-column ASC/DESC (see `collect_unique_sets`), so they are trustworthy
+    /// and honoured by both the insert and the seek paths.
     is_auto: bool,
 }
 
 impl IndexMeta {
-    /// Per-column `DESC` flags to hand the b-tree index writer/reader. Only a
-    /// regular named column index (`!is_auto`, `key_exprs.is_none()`) has
-    /// trustworthy per-column directions; for everything else (auto UNIQUE/PK,
-    /// expression indexes) we return `&[]`, which the writer treats as
-    /// all-ascending — keeping the insert side and the seek side self-consistent
-    /// and matching the pre-DESC behavior. An empty slice is the "no-op" case, so
-    /// a plain all-ascending index is byte-for-byte unchanged.
+    /// Per-column `DESC` flags to hand the b-tree index writer/reader. A regular
+    /// named column index (`key_exprs.is_none()`) carries its columns' directions
+    /// directly; an automatic UNIQUE/PK index (`is_auto`) has its `descending`
+    /// reconstructed from the constraint (see `collect_unique_sets`), so both are
+    /// trustworthy. Only an *expression* index (`key_exprs.is_some()`) has no
+    /// per-column direction model, so it returns `&[]`, which the writer treats as
+    /// all-ascending — keeping the insert side and the seek side self-consistent.
+    /// An empty slice is the "no-op" case, so a plain all-ascending index is
+    /// byte-for-byte unchanged.
     fn seek_descs(&self) -> &[bool] {
-        if !self.is_auto && self.key_exprs.is_none() {
+        if self.key_exprs.is_none() {
             &self.descending
         } else {
             &[]
@@ -32199,7 +32214,7 @@ fn stat_prefix_cmp(
 }
 
 fn unique_match(meta: &TableMeta, a: &[Value], b: &[Value]) -> bool {
-    meta.unique.iter().any(|(set, _)| {
+    meta.unique.iter().any(|(set, _, _)| {
         set.iter().all(|&c| {
             !matches!(a[c], Value::Null)
                 && !matches!(b[c], Value::Null)
@@ -32241,7 +32256,7 @@ fn unique_index_conflict(tuples: &[Vec<Value>], colls: &[crate::value::Collation
 fn wr_unique_message(meta: &TableMeta, a: &[Value], b: &[Value]) -> String {
     meta.unique
         .iter()
-        .find(|(set, _)| {
+        .find(|(set, _, _)| {
             set.iter().all(|&c| {
                 !matches!(a[c], Value::Null)
                     && !matches!(b[c], Value::Null)
@@ -32249,7 +32264,7 @@ fn wr_unique_message(meta: &TableMeta, a: &[Value], b: &[Value]) -> String {
                         .is_eq()
             })
         })
-        .map(|(set, _)| {
+        .map(|(set, _, _)| {
             let cols = set
                 .iter()
                 .map(|&i| alloc::format!("{}.{}", meta.columns[i].table, meta.columns[i].name))
@@ -35682,39 +35697,56 @@ fn column_collation(col: &ColumnDef) -> crate::value::Collation {
 /// declaration order (column-level constraints first, in column order, then
 /// table-level constraints). This is exactly the order SQLite numbers its
 /// `sqlite_autoindex_<table>_<n>` automatic indexes.
-fn collect_unique_sets(ct: &CreateTable, ipk: Option<usize>) -> Vec<(Vec<usize>, OnConflict)> {
+fn collect_unique_sets(
+    ct: &CreateTable,
+    ipk: Option<usize>,
+) -> Vec<(Vec<usize>, OnConflict, Vec<bool>)> {
     let col_pos = |name: &str| {
         ct.columns
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(name))
     };
     // Each unique set carries its declared `ON CONFLICT` action (default `Abort`),
-    // applied when an INSERT/UPDATE without its own `OR <action>` violates it.
-    let mut unique: Vec<(Vec<usize>, OnConflict)> = Vec::new();
+    // applied when an INSERT/UPDATE without its own `OR <action>` violates it, and
+    // its per-column `DESC` flags (aligned with the positions) that order the
+    // auto-created `sqlite_autoindex_*` b-tree.
+    let mut unique: Vec<(Vec<usize>, OnConflict, Vec<bool>)> = Vec::new();
     for (i, c) in ct.columns.iter().enumerate() {
         for k in &c.constraints {
             match k {
-                ColumnConstraint::Unique(oc) => unique.push((alloc::vec![i], *oc)),
-                ColumnConstraint::PrimaryKey { on_conflict, .. } if Some(i) != ipk => {
-                    unique.push((alloc::vec![i], *on_conflict))
+                // A column-level `UNIQUE` has no direction syntax (always ASC).
+                ColumnConstraint::Unique(oc) => {
+                    unique.push((alloc::vec![i], *oc, alloc::vec![false]))
+                }
+                // A column-level `PRIMARY KEY [ASC|DESC]` on a non-rowid-alias
+                // column builds an auto UNIQUE index honouring the direction.
+                ColumnConstraint::PrimaryKey {
+                    on_conflict,
+                    descending,
+                    ..
+                } if Some(i) != ipk => {
+                    unique.push((alloc::vec![i], *on_conflict, alloc::vec![*descending]))
                 }
                 _ => {}
             }
         }
     }
     for tc in &ct.constraints {
-        let (names, oc): (Vec<&str>, OnConflict) = match tc {
-            TableConstraint::Unique(n, oc) => (n.iter().map(String::as_str).collect(), *oc),
+        let (cols, oc): (Vec<(&str, bool)>, OnConflict) = match tc {
+            TableConstraint::Unique(n, oc) => {
+                (n.iter().map(|(nm, d)| (nm.as_str(), *d)).collect(), *oc)
+            }
             TableConstraint::PrimaryKey(n, oc) => {
-                (n.iter().map(|(name, _)| name.as_str()).collect(), *oc)
+                (n.iter().map(|(nm, d)| (nm.as_str(), *d)).collect(), *oc)
             }
             _ => continue,
         };
-        let idxs: Option<Vec<usize>> = names.iter().map(|n| col_pos(n)).collect();
+        let idxs: Option<Vec<usize>> = cols.iter().map(|(n, _)| col_pos(n)).collect();
         if let Some(set) = idxs {
             // Skip a single-column PK that is the rowid alias.
             if !(set.len() == 1 && Some(set[0]) == ipk) {
-                unique.push((set, oc));
+                let descs: Vec<bool> = cols.iter().map(|(_, d)| *d).collect();
+                unique.push((set, oc, descs));
             }
         }
     }

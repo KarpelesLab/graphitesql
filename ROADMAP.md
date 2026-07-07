@@ -905,10 +905,25 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   three WITHOUT ROWID order-elision provers became direction-aware, so
   `ORDER BY a DESC` over `PRIMARY KEY(a DESC)` needs no sorter. Byte-verified vs
   sqlite3 3.50.4 (table-level, column-level, composite; `integrity_check` = `ok` +
-  cross-engine reads agree; `tests/desc_pk_without_rowid.rs`). (Deferred, orthogonal:
-  a range seek on a DESC leading PK column declines to a scan + WHERE re-filter — rows
-  correct — and `UNIQUE(col DESC)` auto-indexes stay ascending via the `is_auto`
-  exclusion, both mirroring the secondary-index deferrals.)
+  cross-engine reads agree; `tests/desc_pk_without_rowid.rs`).
+  **DESC is now honored in `UNIQUE(col DESC)` and rowid-table `PRIMARY KEY(col DESC)`
+  *auto*-indexes too — completing DESC direction across every index kind.**
+  `TableConstraint::Unique` was extended to carry per-column directions (like the PK
+  constraint), and `TableMeta.unique` now records a per-set `Vec<bool>`; the sole
+  `is_auto` index construction site (`indexes_of`) populates the index's `descending`
+  from it (table-level UNIQUE/PK from the declared directions, column-level UNIQUE from
+  all-ascending, column-level `PRIMARY KEY [DESC]` from its flag). With every auto-index
+  now supplying accurate directions, `seek_descs()` drops the `is_auto` exclusion (only
+  expression indexes, which have no direction model, still return `&[]`); insert and
+  seek share the one `IndexMeta`, so both sides stay consistent per root. Rowid-table
+  DESC-range and ORDER BY elision both directions now match sqlite (`SCAN … USING
+  COVERING INDEX`), and the WITHOUT ROWID secondary UNIQUE(DESC) leading-range path
+  gained the value-space bound swap (rows + `SEARCH … (b>?)` EQP match). Byte-verified
+  vs sqlite3 3.50.4 incl. the on-disk `integrity_check` = `ok` + cross-engine-read guard
+  (`tests/desc_auto_index.rs`). (Deferred, orthogonal and rows-correct: a range seek on
+  a DESC leading PK column of a WITHOUT ROWID table declines to scan + re-filter, and
+  `ORDER BY b DESC` on a WITHOUT ROWID DESC *secondary* index still emits a temp b-tree
+  rather than eliding it — the pre-existing WITHOUT ROWID partial-sorter gap.)
 
 **Remaining — genuinely open work.** Ordered roughly easiest → hardest. These are
 the residuals left after the differential sweep; the surface is otherwise

@@ -632,8 +632,10 @@ pub enum TableConstraint {
     /// declared direction as `(name, descending)` — `DESC` is significant for a
     /// `WITHOUT ROWID` table, whose clustered b-tree is ordered by the PK.
     PrimaryKey(Vec<(String, bool)>, OnConflict),
-    /// `UNIQUE (cols…) [ON CONFLICT <action>]`.
-    Unique(Vec<String>, OnConflict),
+    /// `UNIQUE (cols…) [ON CONFLICT <action>]`. Each column carries its declared
+    /// direction as `(name, descending)` — `DESC` is significant because the
+    /// auto-created UNIQUE index is ordered by these columns.
+    Unique(Vec<(String, bool)>, OnConflict),
     /// `CHECK (<expr>)`. The second field is the constraint's *label* (see
     /// [`ColumnConstraint::Check`]).
     Check(Expr, Option<String>),

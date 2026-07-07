@@ -362,8 +362,19 @@ fn table_constraint(c: &TableConstraint) -> String {
                 .join(", ");
             format!("PRIMARY KEY({rendered}){}", conflict_suffix(oc))
         }
-        TableConstraint::Unique(names, oc) => {
-            format!("UNIQUE({}){}", cols(names), conflict_suffix(oc))
+        TableConstraint::Unique(cols_dir, oc) => {
+            let rendered = cols_dir
+                .iter()
+                .map(|(n, desc)| {
+                    if *desc {
+                        format!("{} DESC", ident(n))
+                    } else {
+                        ident(n)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("UNIQUE({rendered}){}", conflict_suffix(oc))
         }
         TableConstraint::Check(e, _) => format!("CHECK ({})", expr(e)),
         TableConstraint::ForeignKey(fk) => format!(
