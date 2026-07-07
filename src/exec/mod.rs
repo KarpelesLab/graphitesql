@@ -6503,12 +6503,43 @@ impl Connection {
                     .collect();
                 // SQLite re-checks the FK after applying the default value: unless
                 // the default key contains a NULL (MATCH SIMPLE ⇒ satisfied), it
-                // must itself reference an existing parent row, else the child now
-                // dangles and the statement fails.
-                if !defaults.iter().any(|v| matches!(v, Value::Null))
-                    && !self.parent_has_key(fk, &defaults)?
-                {
-                    return Err(Error::Constraint("FOREIGN KEY constraint failed".into()));
+                // must reference a parent that still exists *after* this change,
+                // else the child dangles and the statement fails.
+                if !defaults.iter().any(|v| matches!(v, Value::Null)) {
+                    // Compare two FK keys under the parent columns' affinity /
+                    // collation, the same rule the child→parent match uses.
+                    let key_eq = |a: &[Value], b: &[Value]| -> bool {
+                        a.iter().zip(b).zip(parent_pos).all(|((av, bv), &pp)| {
+                            let (x, y) = eval::apply_comparison_affinity(
+                                av.clone(),
+                                Some(pmeta.columns[pp].affinity),
+                                bv.clone(),
+                                None,
+                            );
+                            crate::value::cmp_values_coll(&x, &y, pmeta.columns[pp].collation)
+                                == core::cmp::Ordering::Equal
+                        })
+                    };
+                    let valid = match new_parent {
+                        // UPDATE: the parent whose key was `old_key` now has the new
+                        // key. The default is valid if it names that new key, or a
+                        // *different* unchanged parent (`parent_has_key` still sees
+                        // the pre-write table, so exclude the row being changed).
+                        Some(np) => {
+                            let new_key: Vec<Value> =
+                                parent_pos.iter().map(|&p| np[p].clone()).collect();
+                            key_eq(&defaults, &new_key)
+                                || (self.parent_has_key(fk, &defaults)?
+                                    && !key_eq(&defaults, old_key))
+                        }
+                        // DELETE: the parent row is already removed (exec_delete_inner
+                        // reorders the delete ahead of this), so a plain existence
+                        // check reflects the post-delete state.
+                        None => self.parent_has_key(fk, &defaults)?,
+                    };
+                    if !valid {
+                        return Err(Error::Constraint("FOREIGN KEY constraint failed".into()));
+                    }
                 }
                 for rowid in matches {
                     self.update_child_key(&cmeta, child_table, rowid, &cpos, &defaults)?;
