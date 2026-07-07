@@ -1451,11 +1451,14 @@ fn str_map(v: &Value, f: impl Fn(&str) -> String) -> Value {
 
 /// A numeric argument to a math function: `None` for SQL `NULL`, else the value
 /// coerced to `f64` (SQLite applies REAL affinity to math-function arguments).
+/// Coerce a math-function argument to `f64` using SQLite's
+/// `sqlite3_value_numeric_type` rule: an INTEGER / REAL — or a text that is wholly
+/// numeric (`'4'`, `'  9  '`, `'2e2'`) — yields its numeric value, while a
+/// non-numeric text, a blob, or NULL yields `None` (so the caller returns SQL
+/// NULL). This is *not* the lax `to_f64`, which would turn `'abc'` or a blob into
+/// `0.0` and silently feed it to `sqrt`/`log`/`pow`/…
 fn real_arg(v: &Value) -> Option<f64> {
-    match v {
-        Value::Null => None,
-        other => Some(eval::to_f64(other)),
-    }
+    eval::to_number_strict(v).map(|n| eval::to_f64(&n))
 }
 
 /// Wrap a computed math result, matching SQLite's split between a *domain error*
