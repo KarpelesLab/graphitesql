@@ -150,3 +150,55 @@ fn recursive_cte_order_by_matches_sqlite() {
         assert_eq!(rows("sqlite3", q), rows(g, q), "mismatch for `{q}`");
     }
 }
+
+/// SQLite rejects a recursive term that is itself an aggregate or windowed query
+/// at prepare time (there is no fixed point to iterate to). graphite used to run
+/// such a query — looping to its runaway-recursion guard or producing wrong rows
+/// — and now raises the same prepare error. An aggregate confined to a subquery
+/// of the recursive term, or in the anchor, stays valid.
+#[test]
+fn recursive_cte_aggregate_window_rejected_like_sqlite() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let cases: &[&str] = &[
+        // aggregate in the recursive term → "recursive aggregate queries not supported"
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM c) SELECT * FROM c;",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT sum(n) FROM c) SELECT * FROM c;",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT max(n)+1 FROM c WHERE n<5) \
+         SELECT * FROM c;",
+        // GROUP BY makes the term aggregate too
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5 GROUP BY n) \
+         SELECT * FROM c;",
+        // UNION (distinct) form is rejected the same way
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION SELECT count(*) FROM c) SELECT * FROM c;",
+        // a LIMIT does not rescue an aggregate recursive term
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM c LIMIT 3) \
+         SELECT * FROM c;",
+        // window function → "cannot use window functions in recursive queries"
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT row_number() OVER () FROM c \
+         WHERE n<3) SELECT * FROM c;",
+        // window takes precedence over aggregate in the reported error
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT sum(n)+row_number() OVER () FROM c) \
+         SELECT * FROM c;",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT count(*) OVER () FROM c WHERE n<3) \
+         SELECT * FROM c;",
+        // a bare HAVING on a non-aggregate term keeps its own distinct error
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5 HAVING n>0) \
+         SELECT * FROM c;",
+        // --- still valid: aggregate in a subquery / the anchor, or DISTINCT ---
+        "CREATE TABLE t(x);INSERT INTO t VALUES(1),(2);\
+         WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+(SELECT count(*) FROM t) FROM c \
+         WHERE n<9) SELECT * FROM c;",
+        "CREATE TABLE t(x);INSERT INTO t VALUES(1),(2),(3);\
+         WITH RECURSIVE c(n) AS (SELECT count(*) FROM t UNION ALL SELECT n+1 FROM c WHERE n<5) \
+         SELECT * FROM c;",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT DISTINCT n+1 FROM c WHERE n<5) \
+         SELECT * FROM c;",
+    ];
+    for q in cases {
+        assert_eq!(rows("sqlite3", q), rows(g, q), "mismatch for `{q}`");
+    }
+}

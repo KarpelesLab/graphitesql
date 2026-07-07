@@ -10544,6 +10544,27 @@ impl Connection {
             }
         }
 
+        // SQLite rejects a recursive term that is itself an aggregate or windowed
+        // query — the recursion has no fixed point to iterate to — at prepare
+        // time, before any rows are produced. A window function takes precedence
+        // over an aggregate in the message. (An aggregate confined to a *subquery*
+        // of the recursive term, or in the anchor, is fine — `has_result_aggregate`
+        // / `has_window` only inspect the arm's own top-level result columns /
+        // `ORDER BY`, not nested SELECTs. A bare `HAVING` on a non-aggregate arm
+        // keeps its own distinct error, raised when the arm runs below.)
+        for s in &recursive {
+            if window::has_window(s) {
+                return Err(Error::Error(
+                    "cannot use window functions in recursive queries".into(),
+                ));
+            }
+            if self.has_result_aggregate(s) || !s.group_by.is_empty() {
+                return Err(Error::Error(
+                    "recursive aggregate queries not supported".into(),
+                ));
+            }
+        }
+
         // Evaluate the anchor (a compound of the anchor arms).
         let mut anchor_rows: Vec<Vec<Value>> = Vec::new();
         for a in &anchor {
