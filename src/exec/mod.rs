@@ -1362,6 +1362,34 @@ impl Connection {
         if select_has_schema_qualified_column(sel) {
             return Err(Error::Unsupported("VDBE: schema-qualified column"));
         }
+        // Cost-based two-table rowid-inner swap: when a two-table equi-join would
+        // be reordered to drive from the second table (seeking `from.first` by its
+        // cheaper rowid), the observable row order changes. The VDBE join paths do
+        // not model that reorder — defer such shapes to the tree-walker, which
+        // owns the reorder (`two_table_rowid_inner_swap`). Only the *unordered*
+        // case is observable: with an explicit `ORDER BY` the drive direction is
+        // invisible (the row *set* is identical, and both paths sort it the same),
+        // so the VDBE may run those directly. The comma form (`FROM u,v WHERE
+        // u.x=v.p`) has its equality promoted to an `ON` only later in `run_core`,
+        // so promote a copy here first to catch it too.
+        if sel.order_by.is_empty() {
+            if let Some(from) = &sel.from {
+                let promo_tables = self.comma_join_table_columns(from);
+                let promoted;
+                let check_sel = match promote_comma_join_ons(sel, &promo_tables) {
+                    Some(r) => {
+                        promoted = r;
+                        &promoted
+                    }
+                    None => sel,
+                };
+                if let Some(pf) = &check_sel.from {
+                    if self.two_table_rowid_inner_swap(pf).is_some() {
+                        return Err(Error::Unsupported("VDBE: two-table rowid-inner swap"));
+                    }
+                }
+            }
+        }
         // `PRAGMA case_sensitive_like = ON` makes the `LIKE` operator ASCII
         // case-sensitive, but the VDBE's `Like` op always folds case. Defer to the
         // tree-walker (which honors the flag via the `Subqueries` hook) whenever the
@@ -15036,6 +15064,13 @@ impl Connection {
                         params,
                     )?
                 }
+            } else if self.two_table_rowid_inner_swap(from).is_some() {
+                // Cost-based two-table rowid-inner swap (in lockstep with the
+                // executor): the SECOND table drives (scanned), `from.first` is the
+                // rowid-sought inner — so the outer SCAN node names the second
+                // table, and the join loop below renders `SEARCH <first> USING
+                // INTEGER PRIMARY KEY`.
+                alloc::format!("SCAN {}", eqp_label(&from.joins[0].table))
             } else {
                 // Joins run in FROM order as nested-loop scans (no reordering).
                 alloc::format!("SCAN {label}")
@@ -15173,11 +15208,28 @@ impl Connection {
                 }
             }
         }
+        // Cost-based two-table rowid-inner swap (in lockstep with the executor):
+        // when the drive is reordered to scan the SECOND table and seek
+        // `from.first` by rowid, the single inner node is `SEARCH <first> USING
+        // INTEGER PRIMARY KEY (rowid=?)` — the outer SCAN node (emitted above)
+        // already names the second table.
+        if self.two_table_rowid_inner_swap(from).is_some() {
+            let id = *next_id;
+            *next_id += 1;
+            out.push((
+                id,
+                parent,
+                alloc::format!(
+                    "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                    eqp_label(&from.first)
+                ),
+            ));
+        }
         // Fold each join in FROM order, tracking the accumulated left columns so
         // the rowid-seek decision (shared with the executor via `rowid_join_seek`)
         // can print `SEARCH … USING INTEGER PRIMARY KEY (rowid=?)` in lockstep
         // with how it actually runs.
-        if !from.joins.is_empty() {
+        else if !from.joins.is_empty() {
             let mut left_columns = self.resolve_join_source(&from.first, params)?.0;
             for join in &from.joins {
                 let label = eqp_label(&join.table);
@@ -22492,6 +22544,35 @@ impl Connection {
         // in joins.
         let (mut columns, mut rows) = self.resolve_join_source(&from.first, params)?;
 
+        // Cost-based join-order (two-table rowid-inner swap): when driving from
+        // `from.first` would seek the second table by a secondary index but
+        // driving from the second table instead seeks `from.first` by its cheaper
+        // rowid, prefer the latter (matching sqlite's plan and its row order).
+        // EXECUTION-only: the produced columns/rows stay in DECLARED order, so
+        // `SELECT *` and the projection are unaffected. Gated tightly by
+        // `two_table_rowid_inner_swap`; every other join shape falls through to
+        // the unchanged fold below.
+        if let Some((driver_join_local, first_meta, first_ipk)) =
+            self.two_table_rowid_inner_swap(from)
+        {
+            let _ = first_ipk;
+            let (out_columns, out_rows) = self.exec_two_table_rowid_inner_swap(
+                from,
+                &columns,
+                driver_join_local,
+                &first_meta,
+                params,
+            )?;
+            let input_rows = out_rows
+                .into_iter()
+                .map(|values| InputRow {
+                    values,
+                    rowid: None,
+                })
+                .collect();
+            return Ok((out_columns, input_rows));
+        }
+
         // Fold each join in with a nested-loop, evaluating its ON predicate
         // against the columns accumulated so far plus the joined table's.
         for join in &from.joins {
@@ -23691,6 +23772,165 @@ impl Connection {
             }
         }
         Ok((new_columns, joined))
+    }
+
+    /// Cost-based join-order decision for a *two-table* equi-join: when driving
+    /// from `from.first` would seek the inner table by a *secondary* index while
+    /// driving from the second table would instead seek `from.first` by its
+    /// cheaper rowid / INTEGER PRIMARY KEY, prefer the latter — matching sqlite,
+    /// which makes the rowid-seekable table the inner one (a rowid seek is
+    /// cheaper than a secondary-index seek). Reordering the drive changes the
+    /// output *row order* for an unordered query (rows come out in the second
+    /// table's scan order), so it must mirror sqlite exactly.
+    ///
+    /// Tightly gated — returns `Some((driver_join_local, first_meta, first_ipk))`
+    /// *only* when ALL hold, else `None` (leave the join exactly as today):
+    /// - exactly two tables (`from.joins.len() == 1`);
+    /// - a plain `INNER` / comma / `CROSS` join with an `ON` (NATURAL/USING/outer
+    ///   never — those constrain or fix the order);
+    /// - both sources are plain base tables in `main` (no subquery/CTE/view/TVF,
+    ///   not schema-qualified);
+    /// - the `ON` is a single top-level `=` equating `from.first`'s join column
+    ///   with the second table's join column, where `from.first`'s column IS
+    ///   `from.first`'s own rowid IPK and the second table's column is NOT its own
+    ///   rowid IPK (so the swap is unambiguously the rowid-inner one — if both are
+    ///   rowid, or neither, leave as-is).
+    ///
+    /// The returned `driver_join_local` is the *local* column index (within the
+    /// second table) whose value is used to seek `from.first` by rowid; `first_ipk`
+    /// is `from.first`'s IPK column index. The reorder is EXECUTION-only — the
+    /// produced columns and rows stay in DECLARED order (`[first cols, second
+    /// cols]`), see [`exec_two_table_rowid_inner_swap`](Self::exec_two_table_rowid_inner_swap).
+    fn two_table_rowid_inner_swap(&self, from: &FromClause) -> Option<(usize, TableMeta, usize)> {
+        if from.joins.len() != 1 {
+            return None;
+        }
+        let join = &from.joins[0];
+        // Plain INNER / comma / CROSS only — never LEFT/RIGHT/FULL/NATURAL/USING.
+        if !matches!(join.kind, JoinKind::Inner) || join.natural || !join.using.is_empty() {
+            return None;
+        }
+        let on = join.on.as_ref()?;
+        // Both sources must be plain base tables in `main`.
+        let is_plain_main = |tref: &TableRef| -> bool {
+            tref.subquery.is_none()
+                && tref.tvf_args.is_none()
+                && !self.is_bare_tvf(tref)
+                && tref.schema.is_none()
+                && self.lookup_cte(&tref.name, tref.alias.as_deref()).is_none()
+                && !self.is_view(&tref.name)
+                && self.unqualified_db(&tref.name) == DbRef::Main
+        };
+        let first_ref = &from.first;
+        let second_ref = &join.table;
+        if !is_plain_main(first_ref) || !is_plain_main(second_ref) {
+            return None;
+        }
+        let first_meta = self
+            .table_meta(&first_ref.name, first_ref.alias.as_deref())
+            .ok()?;
+        let second_meta = self
+            .table_meta(&second_ref.name, second_ref.alias.as_deref())
+            .ok()?;
+        // `from.first` must have a rowid IPK; the swap makes it the rowid inner.
+        let first_ipk = first_meta.ipk?;
+        // Resolve the `ON` `=` sides against the DECLARED `[first, second]` column
+        // layout (first's columns then second's).
+        let mut on = on;
+        while let Expr::Paren(inner) = on {
+            on = inner;
+        }
+        let first_width = first_meta.columns.len();
+        let mut combined = first_meta.columns.clone();
+        combined.extend(second_meta.columns.iter().cloned());
+        let (a, b) = match on {
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => (col_index(left, &combined)?, col_index(right, &combined)?),
+            _ => return None,
+        };
+        // One side must be `from.first`'s IPK, the other a second-table column.
+        let (first_side_ipk, second_local) = if a == first_ipk && b >= first_width {
+            (true, b - first_width)
+        } else if b == first_ipk && a >= first_width {
+            (true, a - first_width)
+        } else {
+            (false, 0)
+        };
+        if !first_side_ipk {
+            return None;
+        }
+        // The second table's join column must NOT be its own rowid IPK — else both
+        // sides are rowid and the swap is ambiguous; leave as-is.
+        if second_meta.ipk == Some(second_local) {
+            return None;
+        }
+        Some((second_local, first_meta, first_ipk))
+    }
+
+    /// Execute the reordered two-table join decided by
+    /// [`two_table_rowid_inner_swap`](Self::two_table_rowid_inner_swap): scan the
+    /// SECOND table as the driver and, for each driver row, seek `from.first` by
+    /// rowid (its IPK) to the driver row's join value. Output rows come out in the
+    /// second table's scan order (matching sqlite), but the produced columns and
+    /// every row stay in DECLARED order `[first cols, second cols]`, so `SELECT *`
+    /// / `t.*` expansion and the projection see the same layout as the unreordered
+    /// join. The full `ON` is re-evaluated on each assembled row (superset
+    /// invariant), so every rowid-coercion corner is filtered exactly as the
+    /// nested-loop path would.
+    fn exec_two_table_rowid_inner_swap(
+        &self,
+        from: &FromClause,
+        first_columns: &[ColumnInfo],
+        driver_join_local: usize,
+        first_meta: &TableMeta,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        let join = &from.joins[0];
+        let encoding = self.backend.source().header().text_encoding;
+        // Driver = the second table, scanned in its natural (rowid) order.
+        let (driver_columns, driver_rows) = self.resolve_join_source(&join.table, params)?;
+        // Declared output layout: `[first cols, second cols]`.
+        let mut out_columns = first_columns.to_vec();
+        out_columns.extend(driver_columns.iter().cloned());
+        let on = join.on.as_ref();
+        let mut cur = TableCursor::new(self.backend.source(), first_meta.root);
+        let mut joined: Vec<Vec<Value>> = Vec::new();
+        for driver in &driver_rows {
+            // Coerce the driver's join value to a candidate rowid for `from.first`.
+            let key = &driver[driver_join_local];
+            let candidate = match key {
+                Value::Integer(i) => Some(*i),
+                Value::Real(_) | Value::Text(_) => match eval::to_number(key) {
+                    Value::Integer(i) => Some(i),
+                    Value::Real(r) if r == (r as i64) as f64 => Some(r as i64),
+                    _ => None,
+                },
+                Value::Null | Value::Blob(_) => None,
+            };
+            if let Some(rid) = candidate {
+                if cur.seek(rid)? {
+                    let first_row =
+                        self.decode_full_row(first_meta, rid, &cur.payload()?, encoding)?;
+                    // Assemble in DECLARED order: first table's row, then driver's.
+                    let mut combined = first_row;
+                    combined.extend(driver.iter().cloned());
+                    let keep = match on {
+                        Some(on) => {
+                            let ctx = row_ctx(&combined, &out_columns, None, params);
+                            eval::truth(&eval::eval(on, &ctx)?) == Some(true)
+                        }
+                        None => true,
+                    };
+                    if keep {
+                        joined.push(combined);
+                    }
+                }
+            }
+        }
+        Ok((out_columns, joined))
     }
 
     /// Execute one rowid-seek join (decided by [`rowid_join_seek`](Self::rowid_join_seek)):

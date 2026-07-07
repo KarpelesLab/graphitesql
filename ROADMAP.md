@@ -1398,6 +1398,20 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   min/max column too, as a FULL covering scan (subject to the covering-scan width rule) rather than
   a one-end seek, and the `min(DISTINCT …)` sub-path has its own leading logic. Matching it needs the
   one-end-seek-vs-full-covering-scan cost distinction, not a single tiebreak — deferred.
+- **Cost-based JOIN ORDER — first slice DONE (2026-07-07).** graphite used to drive every join from
+  `from.first` in declaration order; sqlite reorders on cost. For a two-table equi-join where
+  `from.first`'s join column is its own INTEGER PRIMARY KEY (rowid) and the other side is a
+  secondary-index/scan column, sqlite drives from the OTHER table (SCAN) and seeks `from.first` by
+  ROWID (the cheapest inner) — a real *row-order* divergence for the unordered result, not just EQP.
+  `two_table_rowid_inner_swap` now detects exactly that shape (plain INNER/comma join, both base
+  tables, `from.first`'s rowid = a non-rowid column of the other) and `exec_two_table_rowid_inner_swap`
+  drives from the second table while keeping the output `ColumnInfo` / `SELECT *` in DECLARED order
+  (only the driver's *iteration* order changes). EQP renders `SCAN <second> … SEARCH <first> USING
+  INTEGER PRIMARY KEY` in lockstep, and `run_select_vdbe` defers the shape to the tree-walker unless
+  an explicit `ORDER BY` makes the drive direction invisible. Byte-exact plan+rows vs sqlite3 3.50.4
+  (`tests/join_order_rowid_inner.rs`). **Still open (the rest of join order):** the general N-table
+  cost-based ordering (secondary-index vs scan cost, selectivity, WHERE-pushdown) — the full
+  `whereLoopAddBtree`/`wherePathSolver` port; this slice only covers the unambiguous rowid-inner case.
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   `collect_eq_constraints` / `collect_range_constraints` compare an explicit `COLLATE`
   to the *column's* collation. When an index carries a *non-default* collation
