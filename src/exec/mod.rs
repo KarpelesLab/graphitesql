@@ -10601,7 +10601,9 @@ impl Connection {
                         ))
                     },
                 )?;
-                let coll = colls.get(idx).copied().unwrap_or_default();
+                // An explicit `COLLATE` on the term wins over the output column's.
+                let coll = explicit_collation(&term.expr)
+                    .unwrap_or_else(|| colls.get(idx).copied().unwrap_or_default());
                 keys.push((idx, term.descending, term.nulls_first, coll));
             }
             Some(keys)
@@ -17317,8 +17319,10 @@ impl Connection {
                             ordinal(i + 1),
                         ))
                     })?;
-                // The output column's collation (from the left SELECT) applies.
-                let coll = colls.get(idx).copied().unwrap_or_default();
+                // An explicit `COLLATE` on the ORDER BY term wins; otherwise the
+                // output column's collation (from the left SELECT) applies.
+                let coll = explicit_collation(&term.expr)
+                    .unwrap_or_else(|| colls.get(idx).copied().unwrap_or_default());
                 keys.push((idx, term.descending, term.nulls_first, coll));
             }
             result.rows.sort_by(|a, b| {
@@ -17801,9 +17805,27 @@ impl Connection {
         params: &Params,
     ) -> Vec<crate::value::Collation> {
         let ctx = row_ctx(&[], columns, None, params);
+        // An ORDER BY term that is a bare position (`ORDER BY 1`) or an output
+        // alias takes the collation of the *output column* it names — including an
+        // explicit `COLLATE` written on that column's projection (`SELECT a COLLATE
+        // NOCASE … ORDER BY 1`). An explicit `COLLATE` on the term itself still
+        // wins. Only when the term names no output column does its own expression
+        // collation apply (a bare source-column ref → that column's collation).
+        let labels = self.output_labels(sel, columns);
+        let out_colls = self.output_collations(sel, columns, params);
         sel.order_by
             .iter()
-            .map(|t| eval::key_collation(&t.expr, &ctx))
+            .map(|t| {
+                if let Some(c) = explicit_collation(&t.expr) {
+                    return c;
+                }
+                if let Some(idx) = resolve_order_index(&t.expr, &labels, out_colls.len()) {
+                    if let Some(c) = out_colls.get(idx) {
+                        return *c;
+                    }
+                }
+                eval::key_collation(&t.expr, &ctx)
+            })
             .collect()
     }
 

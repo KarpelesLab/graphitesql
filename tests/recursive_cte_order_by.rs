@@ -144,6 +144,10 @@ fn recursive_cte_order_by_matches_sqlite() {
          ORDER BY x LIMIT 9) SELECT * FROM c;",
         "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5 \
          ORDER BY 1 DESC LIMIT 20) SELECT * FROM c;",
+        // an explicit COLLATE on the recursive ORDER BY drives the priority queue
+        "WITH RECURSIVE c(s) AS (SELECT 'a' UNION ALL SELECT CASE s WHEN 'a' THEN 'C' \
+         WHEN 'C' THEN 'b' ELSE 'Z' END FROM c WHERE s<'y' ORDER BY 1 COLLATE NOCASE LIMIT 6) \
+         SELECT s FROM c;",
     ];
 
     for q in cases {
