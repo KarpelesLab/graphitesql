@@ -287,29 +287,28 @@ fn first_already_rowid_inner_optimal_unchanged() {
     // Here the SECOND table (`v`) is the rowid-seekable one and `u`'s join column
     // is only secondary-indexed. Driving from `from.first` (`u`) already seeks the
     // rowid inner (`v`) — the optimal drive — so the swap must NOT fire (it only
-    // fires when from.first is the rowid side). We assert the drive is NOT
-    // reordered: `u` is the driver (its SCAN node) and `v` the rowid-sought inner.
+    // fires when from.first is the rowid side): `u` stays the driver and `v` the
+    // rowid-sought inner.
     //
-    // NOTE: this shape has a *pre-existing* graphite/sqlite row-order divergence
-    // unrelated to this change — sqlite scans `u` via the ordered COVERING INDEX
-    // iu (rows out in x order), while graphite scans `u` in rowid order. That is
-    // the covering-index-scan-order gap, not the join reorder. So we compare
-    // graphite against its own un-swapped behavior (u-driver order), not sqlite.
+    // The driver `u` is itself covering-scanned via `iu` (only `u.x`, in the index,
+    // is referenced from `u`; `iu` is strictly narrower than the `u(x,y)` row), so
+    // `u`'s rows are visited in `x`-key order — the join-table covering-scan slice.
+    // Both plan and rows now match sqlite exactly on both VDBE modes.
     let setup = "CREATE TABLE u(x, y);\
                  CREATE INDEX iu ON u(x);\
                  CREATE TABLE v(p INTEGER PRIMARY KEY, q);\
                  INSERT INTO u VALUES(3,30),(1,10),(2,20);\
                  INSERT INTO v VALUES(2,200),(1,100),(3,300);";
+    let sql = "SELECT u.x,v.q FROM u JOIN v ON u.x=v.p";
+    assert_plan(setup, sql);
+    assert_rows(setup, sql);
     let c = graphite(setup, true);
-    let plan = graphite_plan(&c, "SELECT u.x,v.q FROM u JOIN v ON u.x=v.p");
+    let plan = graphite_plan(&c, sql);
     assert_eq!(
-        plan[0], "SCAN u",
-        "drive must stay on from.first (not swapped)"
+        plan[0], "SCAN u USING COVERING INDEX iu",
+        "u stays the driver, covering-scanned via iu"
     );
     assert_eq!(plan[1], "SEARCH v USING INTEGER PRIMARY KEY (rowid=?)");
-    // Rows follow `u`'s rowid scan order (3,1,2) — the un-reordered drive.
-    assert_eq!(
-        graphite_rows(&c, "SELECT u.x,v.q FROM u JOIN v ON u.x=v.p"),
-        "3|300\n1|100\n2|200",
-    );
+    // Rows follow `u`'s covering-index (x-key) order (1,2,3), matching sqlite.
+    assert_eq!(graphite_rows(&c, sql), "1|100\n2|200\n3|300");
 }

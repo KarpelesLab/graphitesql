@@ -1422,6 +1422,21 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   are seekable (secondary-index vs rowid vs scan cost, selectivity, WHERE-pushdown) — the full
   `whereLoopAddBtree`/`wherePathSolver` port; these two slices cover only the unambiguous
   one-side-seekable cases.
+- **Covering-index scan for a JOIN table — DONE (2026-07-07).** `covering_scan` bailed on any join,
+  so a table SCANNED inside a join always table-scanned in rowid order; sqlite reads it via a
+  covering index (index-key order) when one holds every referenced column of that table and is
+  narrower than the table — which changes the join's output ROW order. `resolve_join_scan_source` /
+  `scan_table_via_index` now apply the standard covering choice (`col_szest`/`logest` width gate,
+  narrowest → newest, via `join_scan_covering_index` + `table_cols_covered_by_index`) to the outer
+  driver, a scanned INNER of an INNER/CROSS join, and the swap-promoted driver of both join-order
+  slices — so `SELECT u.x,v.p FROM u CROSS JOIN v` visits `v` via `SCAN v USING COVERING INDEX iv`
+  and the rows come out in sqlite's order. An equi-hash inner is excluded (its output follows the
+  driver; sqlite renders `AUTOMATIC INDEX` there), OUTER null-extension is untouched, and the VDBE
+  defers these shapes unless an explicit `ORDER BY` hides the order. Byte-exact rows+plan vs sqlite3
+  3.50.4 (`tests/join_covering_scan.rs`). **Still open (EQP-only, rows correct):** sqlite renders a
+  `USE TEMP B-TREE FOR DISTINCT`/`GROUP BY` node for a DISTINCT/grouped join that graphite omits (its
+  node is single-table gated), and ORDER-BY elision doesn't yet recognise that a covering driver scan
+  supplies the order (a redundant temp b-tree, unchanged from before).
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   `collect_eq_constraints` / `collect_range_constraints` compare an explicit `COLLATE`
   to the *column's* collation. When an index carries a *non-default* collation

@@ -1208,6 +1208,70 @@ impl Connection {
             .is_some()
     }
 
+    /// True when the tree-walker would scan a table WITHIN a join via a covering
+    /// secondary index (the outer driver, or a plain-scanned inner) — reading that
+    /// table in index-key order, which the VDBE's rowid-order table scan cannot
+    /// reproduce, so the join's output row order differs. Used to defer such joins
+    /// to the tree-walker (which owns the covering-order scan). Only meaningful with
+    /// no `ORDER BY` (an explicit sort makes the order access-path-independent).
+    /// Mirrors the tree-walker's covering-scan choice for the driver and each
+    /// plain-scanned inner (an equi-hash inner is DRIVER-ordered, so it is excluded,
+    /// matching the executor's `inner_is_equi_hash` gate).
+    fn vdbe_join_covering_reorders(&self, sel: &Select) -> bool {
+        let Some(from) = sel.from.as_ref() else {
+            return false;
+        };
+        if from.joins.is_empty() {
+            return false;
+        }
+        // The driver (`from.first`) is always scanned.
+        if let Ok(meta) = self.table_meta(&from.first.name, from.first.alias.as_deref()) {
+            if self
+                .join_scan_covering_index(sel, from, &from.first, &meta)
+                .is_some()
+            {
+                return true;
+            }
+        }
+        // A plain-scanned inner (not an equi-hash, which is driver-ordered).
+        for join in &from.joins {
+            let inner_is_equi_hash = !join.natural
+                && join.using.is_empty()
+                && matches!(join.kind, JoinKind::Inner | JoinKind::Left)
+                && join.on.as_ref().is_some_and(|on| {
+                    // Approximate the executor's hash gate: detect the equi-join on
+                    // the two-table DECLARED column layout (`join_equi_cols` resolves
+                    // by position). Only exact for the first join, which is the
+                    // common two-table shape; a later join over-scoping to plain-scan
+                    // is safe (the guard only defers extra queries to the tree-walker).
+                    match (
+                        self.table_meta(&from.first.name, from.first.alias.as_deref()),
+                        self.table_meta(&join.table.name, join.table.alias.as_deref()),
+                    ) {
+                        (Ok(fm), Ok(jm)) => {
+                            let mut cols = fm.columns;
+                            let left_width = cols.len();
+                            cols.extend(jm.columns);
+                            join_equi_cols(on, &cols, left_width).is_some()
+                        }
+                        _ => false,
+                    }
+                });
+            if inner_is_equi_hash {
+                continue;
+            }
+            if let Ok(meta) = self.table_meta(&join.table.name, join.table.alias.as_deref()) {
+                if self
+                    .join_scan_covering_index(sel, from, &join.table, &meta)
+                    .is_some()
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn vdbe_seek_returns_index_order(&self, sel: &Select, params: &Params) -> Result<bool> {
         let Some(from) = sel.from.as_ref() else {
             return Ok(false);
@@ -1439,6 +1503,14 @@ impl Connection {
         // path; `covering_scan` already declines when a scan satisfies the sort.)
         if sel.order_by.is_empty() && self.vdbe_covering_scan_reorders(sel) {
             return Err(Error::Unsupported("VDBE: covering-index scan order"));
+        }
+        // Likewise for a JOIN whose driver or plain-scanned inner reads a covering
+        // secondary index — the table is visited in index-key order (changing the
+        // join's output row order), which the VDBE's rowid-order scan cannot
+        // reproduce. Defer to the tree-walker (which owns the covering-order join
+        // scan). Observable only without an `ORDER BY`.
+        if sel.order_by.is_empty() && self.vdbe_join_covering_reorders(sel) {
+            return Err(Error::Unsupported("VDBE: join covering-index scan order"));
         }
         // A window-function query (Track B5c-4): scan the single base table on the
         // VDBE (with `WHERE` applied and the rowid appended), then evaluate the
@@ -15074,18 +15146,29 @@ impl Connection {
                 // executor): the SECOND table drives (scanned), `from.first` is the
                 // rowid-sought inner — so the outer SCAN node names the second
                 // table, and the join loop below renders `SEARCH <first> USING
-                // INTEGER PRIMARY KEY`.
-                alloc::format!("SCAN {}", eqp_label(&from.joins[0].table))
+                // INTEGER PRIMARY KEY`. The driver may itself read a covering index.
+                self.eqp_join_scan_detail(
+                    sel,
+                    from,
+                    &from.joins[0].table,
+                    &eqp_label(&from.joins[0].table),
+                )
             } else if self.two_table_index_inner_swap(from).is_some() {
                 // Cost-based two-table secondary-index-inner swap: same as the rowid
                 // swap but `from.first` is sought by a secondary index instead — the
                 // SECOND table still drives (scanned), so the outer SCAN node names
                 // it and the block below renders `SEARCH <first> USING [COVERING]
                 // INDEX <idx> (<col>=?)`.
-                alloc::format!("SCAN {}", eqp_label(&from.joins[0].table))
+                self.eqp_join_scan_detail(
+                    sel,
+                    from,
+                    &from.joins[0].table,
+                    &eqp_label(&from.joins[0].table),
+                )
             } else {
-                // Joins run in FROM order as nested-loop scans (no reordering).
-                alloc::format!("SCAN {label}")
+                // Joins run in FROM order as nested-loop scans (no reordering). The
+                // driver may read a covering index (rows in index-key order).
+                self.eqp_join_scan_detail(sel, from, &from.first, &label)
             };
             if from.joins.is_empty() {
                 single_scan_detail = Some(detail.clone());
@@ -15346,7 +15429,18 @@ impl Connection {
                             ],
                             jcols,
                         ),
-                        None => (alloc::vec![alloc::format!("SCAN {label}")], jcols),
+                        // A plain-scanned inner (no automatic index) may itself read
+                        // a covering secondary index — rendered in lockstep with the
+                        // executor's covering-order inner scan. sqlite tags a LEFT
+                        // join's inner scan node with ` LEFT-JOIN` (as for its SEARCH
+                        // nodes above).
+                        None => (
+                            alloc::vec![alloc::format!(
+                                "{}{left_suffix}",
+                                self.eqp_join_scan_detail(sel, from, &join.table, &label)
+                            )],
+                            jcols,
+                        ),
                     }
                 };
                 for detail in details {
@@ -18500,6 +18594,312 @@ impl Connection {
             .min_by(|(sa, ia), (sb, ib)| sa.cmp(sb).then(ib.root.cmp(&ia.root)))?
             .1;
         Some((chosen.name, chosen.root, chosen.cols))
+    }
+
+    /// Choose a plain secondary index for scanning ONE table that participates in a
+    /// join (the outer driver, or a materialised/scanned inner) via a *covering*
+    /// index — reading the table's rows in index-key order instead of rowid order.
+    /// This is the join analogue of [`covering_scan`](Self::covering_scan): the same
+    /// covering rule (a non-partial, non-expression index that holds every column of
+    /// THAT table referenced anywhere in the query — projection / `ON` / `WHERE` /
+    /// `GROUP BY` / `HAVING` / `ORDER BY`; the rowid counts as covered) and the same
+    /// width gate (`logest`-width strictly less than the table's, narrowest wins,
+    /// ties → newest). Reordering the scan changes an unordered join's output ROW
+    /// ORDER, so it must mirror sqlite exactly — hence the tight gates.
+    ///
+    /// Gated to a plain base table in `main` (no subquery / TVF / CTE / view /
+    /// schema-qualified source), an ordinary rowid table (never `WITHOUT ROWID`),
+    /// with no generated columns and no window function in the query. Returns the
+    /// chosen [`IndexMeta`], or `None` to scan the table plainly (rowid order).
+    fn join_scan_covering_index(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        tref: &TableRef,
+        meta: &TableMeta,
+    ) -> Option<IndexMeta> {
+        // Only plain base tables in `main` — a derived/CTE/view/TVF source has no
+        // secondary index to walk, and a schema-qualified source is materialised
+        // through its own backend.
+        if tref.subquery.is_some()
+            || tref.tvf_args.is_some()
+            || self.is_bare_tvf(tref)
+            || tref.schema.is_some()
+            || self.lookup_cte(&tref.name, tref.alias.as_deref()).is_some()
+            || self.is_view(&tref.name)
+            || self.unqualified_db(&tref.name) != DbRef::Main
+        {
+            return None;
+        }
+        if meta.without_rowid || window::has_window(sel) {
+            return None;
+        }
+        // A generated column can never be proven covered (it is not stored in a
+        // secondary index).
+        if meta.generated.iter().any(|g| g.is_some()) {
+            return None;
+        }
+        let szests = self.table_col_szests(&tref.name).unwrap_or_default();
+        let szest_of = |i: usize| szests.get(i).copied().unwrap_or(1);
+        let mut wtable: u32 = (0..meta.columns.len()).map(szest_of).sum();
+        if meta.ipk.is_none() {
+            wtable += 1;
+        }
+        let sz_tab = logest(u64::from(wtable) * 4);
+        // Among the plain covering indexes that are strictly narrower than the
+        // table, pick the narrowest (ties → newest = highest rootpage), the exact
+        // cost choice `covering_scan` makes for a bare projection.
+        self.indexes_of(&tref.name)
+            .ok()?
+            .into_iter()
+            .filter(|idx| {
+                idx.partial.is_none()
+                    && idx.key_exprs.is_none()
+                    && self.table_cols_covered_by_index(sel, from, tref, meta, idx)
+            })
+            .map(|idx| {
+                let widx: u32 = idx.cols.iter().map(|&c| szest_of(c)).sum::<u32>() + 1;
+                (logest(u64::from(widx) * 4), idx)
+            })
+            .filter(|(sz_idx, _)| *sz_idx < sz_tab)
+            .min_by(|(sa, ia), (sb, ib)| sa.cmp(sb).then(ib.root.cmp(&ia.root)))
+            .map(|(_, idx)| idx)
+    }
+
+    /// The EQP scan-detail line for a join table `tref` scanned with label
+    /// `label`: `SCAN <label> USING COVERING INDEX <idx>` when
+    /// [`join_scan_covering_index`] picks one for it (kept in lockstep with the
+    /// executor's covering-order scan), else a plain `SCAN <label>`.
+    fn eqp_join_scan_detail(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        tref: &TableRef,
+        label: &str,
+    ) -> String {
+        if let Ok(meta) = self.table_meta(&tref.name, tref.alias.as_deref()) {
+            if let Some(idx) = self.join_scan_covering_index(sel, from, tref, &meta) {
+                return alloc::format!("SCAN {label} USING COVERING INDEX {}", idx.name);
+            }
+        }
+        alloc::format!("SCAN {label}")
+    }
+
+    /// Whether `idx` (a plain secondary index on `tref`, whose table is `meta`)
+    /// covers every column of THAT table the join query references — anywhere in
+    /// the projection, the join `ON` predicates, `WHERE`, `GROUP BY`, `HAVING`, and
+    /// `ORDER BY`. A column of another table, a literal, or the rowid is always
+    /// "covered" (the rowid is stored in every index record); only a `tref` column
+    /// missing from the index defeats it. Conservative: any construct whose
+    /// per-table column footprint cannot be enumerated exactly — a subquery /
+    /// EXISTS / IN-SELECT, a windowed / `FILTER` call, or a `tref` wildcard over an
+    /// uncovered column — reports *not* covered (the safe plain-scan render).
+    ///
+    /// Modelled on [`index_swap_covers`](Self::index_swap_covers) but generalised
+    /// to a single target table identified by name/alias, so it works for any table
+    /// in an N-table join, not just the two-table swap's `from.first`.
+    fn table_cols_covered_by_index(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        tref: &TableRef,
+        meta: &TableMeta,
+        idx: &IndexMeta,
+    ) -> bool {
+        let target_names: [&str; 2] = [&tref.name, tref.alias.as_deref().unwrap_or("")];
+        let is_target = |t: &str| {
+            target_names
+                .iter()
+                .any(|n| !n.is_empty() && n.eq_ignore_ascii_case(t))
+        };
+        let idx_covers = |ci: usize| idx.cols.contains(&ci) || meta.ipk == Some(ci);
+        // The names of every OTHER source in the join, so a bare column that also
+        // exists in another table stays ambiguous (→ bail) rather than being
+        // silently attributed to `tref`.
+        let mut other_names: Vec<String> = Vec::new();
+        let mut push_names = |t: &TableRef| {
+            if !is_target(&t.name) && t.alias.as_deref() != Some("") {
+                other_names.push(t.name.clone());
+                if let Some(a) = &t.alias {
+                    other_names.push(a.clone());
+                }
+            }
+        };
+        if !core::ptr::eq(&from.first, tref) {
+            push_names(&from.first);
+        }
+        for j in &from.joins {
+            if !core::ptr::eq(&j.table, tref) {
+                push_names(&j.table);
+            }
+        }
+        // Resolve one column ref: `Some(true)` covered / not this table / rowid,
+        // `Some(false)` an uncovered `tref` column, `None` cannot decide (bail).
+        let resolve = |table: Option<&str>, column: &str| -> Option<bool> {
+            let in_target = meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(column));
+            match table {
+                Some(t) if is_target(t) => match in_target {
+                    Some(ci) => Some(idx_covers(ci)),
+                    None => {
+                        if matches!(
+                            column.to_ascii_lowercase().as_str(),
+                            "rowid" | "_rowid_" | "oid"
+                        ) {
+                            Some(true) // rowid is always in the index record
+                        } else {
+                            None
+                        }
+                    }
+                },
+                // A qualified reference to a KNOWN other source: not our table.
+                Some(t) if other_names.iter().any(|n| n.eq_ignore_ascii_case(t)) => Some(true),
+                Some(_) => None, // unknown qualifier → bail
+                None => {
+                    // Unqualified: if it names a `tref` column it must be covered;
+                    // but if the same bare name also exists in another source it is
+                    // ambiguous here — bail rather than guess the owner.
+                    match in_target {
+                        Some(ci) => {
+                            let in_other = other_names.iter().any(|n| {
+                                self.table_meta(n, None).is_ok_and(|om| {
+                                    om.columns
+                                        .iter()
+                                        .any(|c| c.name.eq_ignore_ascii_case(column))
+                                })
+                            });
+                            if in_other {
+                                None
+                            } else {
+                                Some(idx_covers(ci))
+                            }
+                        }
+                        None => {
+                            if matches!(
+                                column.to_ascii_lowercase().as_str(),
+                                "rowid" | "_rowid_" | "oid"
+                            ) {
+                                None // bare rowid is ambiguous across sources → bail
+                            } else {
+                                Some(true) // some other table's column
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        fn walk(e: &Expr, resolve: &dyn Fn(Option<&str>, &str) -> Option<bool>) -> bool {
+            match e {
+                Expr::Literal(_) | Expr::Parameter(_) => true,
+                Expr::Column { table, column, .. } => {
+                    resolve(table.as_deref(), column) == Some(true)
+                }
+                Expr::Unary { expr, .. }
+                | Expr::IsNull { expr, .. }
+                | Expr::Cast { expr, .. }
+                | Expr::Collate { expr, .. }
+                | Expr::Paren(expr) => walk(expr, resolve),
+                Expr::Binary { left, right, .. } => walk(left, resolve) && walk(right, resolve),
+                Expr::Between {
+                    expr, low, high, ..
+                } => walk(expr, resolve) && walk(low, resolve) && walk(high, resolve),
+                Expr::InList { expr, list, .. } => {
+                    walk(expr, resolve) && list.iter().all(|x| walk(x, resolve))
+                }
+                Expr::RowValue(items) => items.iter().all(|x| walk(x, resolve)),
+                Expr::Function {
+                    args, filter, over, ..
+                } => over.is_none() && filter.is_none() && args.iter().all(|x| walk(x, resolve)),
+                Expr::Case {
+                    operand,
+                    when_then,
+                    else_result,
+                } => {
+                    operand.as_deref().map(|o| walk(o, resolve)).unwrap_or(true)
+                        && when_then
+                            .iter()
+                            .all(|(w, t)| walk(w, resolve) && walk(t, resolve))
+                        && else_result
+                            .as_deref()
+                            .map(|x| walk(x, resolve))
+                            .unwrap_or(true)
+                }
+                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. } => false,
+            }
+        }
+        let all_target_covered = (0..meta.columns.len()).all(idx_covers);
+        for rc in &sel.columns {
+            match rc {
+                ResultColumn::Wildcard => {
+                    if !all_target_covered {
+                        return false;
+                    }
+                }
+                ResultColumn::TableWildcard(t) => {
+                    if is_target(t) && !all_target_covered {
+                        return false;
+                    }
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    if !walk(expr, &resolve) {
+                        return false;
+                    }
+                }
+            }
+        }
+        for j in &from.joins {
+            if let Some(on) = j.on.as_ref() {
+                if !walk(on, &resolve) {
+                    return false;
+                }
+            }
+        }
+        if let Some(w) = sel.where_clause.as_ref() {
+            if !walk(w, &resolve) {
+                return false;
+            }
+        }
+        if !sel.group_by.iter().all(|e| walk(e, &resolve)) {
+            return false;
+        }
+        if let Some(h) = sel.having.as_ref() {
+            if !walk(h, &resolve) {
+                return false;
+            }
+        }
+        if !sel.order_by.iter().all(|t| walk(&t.expr, &resolve)) {
+            return false;
+        }
+        true
+    }
+
+    /// Scan a plain rowid table's rows in the key order of `idx` (a plain secondary
+    /// index on it): walk the index b-tree to enumerate rowids in key order, then
+    /// fetch each full declared-order row by rowid. Used to visit a join table via a
+    /// covering index (chosen by [`join_scan_covering_index`]) so an unordered
+    /// join's output row order matches sqlite's index-order scan. Returns full rows
+    /// (every column), so callers may treat it as a drop-in for the plain scan.
+    fn scan_table_via_index(&self, meta: &TableMeta, idx: &IndexMeta) -> Result<Vec<Vec<Value>>> {
+        let src = self.backend.source();
+        let encoding = src.header().text_encoding;
+        let rowids = crate::btree::index_range_rowids(
+            src,
+            idx.root,
+            None,
+            None,
+            &idx.collations,
+            idx.seek_descs(),
+        )?;
+        let mut cur = TableCursor::new(src, meta.root);
+        let mut out = Vec::with_capacity(rowids.len());
+        for rid in rowids {
+            if cur.seek(rid)? {
+                out.push(self.decode_full_row(meta, rid, &cur.payload()?, encoding)?);
+            }
+        }
+        Ok(out)
     }
 
     /// The per-column [`col_szest`] estimates for a rowid table, aligned with its
@@ -22582,8 +22982,13 @@ impl Connection {
         }
 
         // Join case: resolve the first source (CTE, view, or table), then fold
-        // in joins.
-        let (mut columns, mut rows) = self.resolve_join_source(&from.first, params)?;
+        // in joins. The driver is fully scanned; when a covering secondary index
+        // holds every `from.first` column the query needs, scan it in index order
+        // (matching sqlite's row order). When a swap below fires instead, the second
+        // table drives and these rows are discarded — only `columns` (metadata) is
+        // reused, which the covering reorder leaves unchanged.
+        let (mut columns, mut rows) =
+            self.resolve_join_scan_source(sel, from, &from.first, params)?;
 
         // Cost-based join-order (two-table rowid-inner swap): when driving from
         // `from.first` would seek the second table by a secondary index but
@@ -22598,6 +23003,7 @@ impl Connection {
         {
             let _ = first_ipk;
             let (out_columns, out_rows) = self.exec_two_table_rowid_inner_swap(
+                sel,
                 from,
                 &columns,
                 driver_join_local,
@@ -22624,6 +23030,7 @@ impl Connection {
         // EXECUTION-only: columns/rows stay in DECLARED order.
         if let Some((driver_join_local, first_meta, idx)) = self.two_table_index_inner_swap(from) {
             let (out_columns, out_rows) = self.exec_two_table_index_inner_swap(
+                sel,
                 from,
                 &columns,
                 driver_join_local,
@@ -22698,7 +23105,33 @@ impl Connection {
                 continue;
             }
 
-            let (jcols, jrows) = self.resolve_join_source(&join.table, params)?;
+            // The inner is materialised and nested-looped (no seek applied). When a
+            // covering secondary index holds every inner-table column the query
+            // needs AND the inner is a *plain* SCAN (not an equi-join for which
+            // sqlite builds an automatic hash index instead — see `covers_inner`),
+            // scan it in index order so the join's output row order matches sqlite's
+            // covering-index inner scan. An equi-hash inner produces rows in DRIVER
+            // order regardless of the inner's scan order, so reordering it there
+            // would diverge from sqlite (which renders AUTOMATIC INDEX, not a
+            // covering scan) — leave those in rowid order.
+            let inner_is_equi_hash = !join.natural
+                && join.using.is_empty()
+                && matches!(join.kind, JoinKind::Inner | JoinKind::Left)
+                && join.on.as_ref().is_some_and(|on| {
+                    let plain = self
+                        .resolve_join_source(&join.table, params)
+                        .map(|(c, _)| c);
+                    plain.is_ok_and(|jc| {
+                        let mut combined = columns.clone();
+                        combined.extend(jc);
+                        join_equi_cols(on, &combined, columns.len()).is_some()
+                    })
+                });
+            let (jcols, jrows) = if inner_is_equi_hash {
+                self.resolve_join_source(&join.table, params)?
+            } else {
+                self.resolve_join_scan_source(sel, from, &join.table, params)?
+            };
 
             let left_width = columns.len();
             // `NATURAL` / `USING` join columns, as `(left index, right local
@@ -23950,6 +24383,7 @@ impl Connection {
     /// nested-loop path would.
     fn exec_two_table_rowid_inner_swap(
         &self,
+        sel: &Select,
         from: &FromClause,
         first_columns: &[ColumnInfo],
         driver_join_local: usize,
@@ -23958,8 +24392,12 @@ impl Connection {
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         let join = &from.joins[0];
         let encoding = self.backend.source().header().text_encoding;
-        // Driver = the second table, scanned in its natural (rowid) order.
-        let (driver_columns, driver_rows) = self.resolve_join_source(&join.table, params)?;
+        // Driver = the second table, scanned in its natural (rowid) order — or in a
+        // covering secondary index's key order when one holds every second-table
+        // column the query needs (matching sqlite's covering-index scan of the
+        // driver, which then fixes the join's output row order).
+        let (driver_columns, driver_rows) =
+            self.resolve_join_scan_source(sel, from, &join.table, params)?;
         // Declared output layout: `[first cols, second cols]`.
         let mut out_columns = first_columns.to_vec();
         out_columns.extend(driver_columns.iter().cloned());
@@ -24328,8 +24766,10 @@ impl Connection {
     /// join. A non-unique index may fan out to several `from.first` rows per driver
     /// row; each is emitted in the index's order (matching sqlite). The full `ON` is
     /// re-evaluated on each assembled row (superset invariant).
+    #[allow(clippy::too_many_arguments)] // cohesive: the swap's inputs + the query
     fn exec_two_table_index_inner_swap(
         &self,
+        sel: &Select,
         from: &FromClause,
         first_columns: &[ColumnInfo],
         driver_join_local: usize,
@@ -24339,8 +24779,11 @@ impl Connection {
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         let join = &from.joins[0];
         let encoding = self.backend.source().header().text_encoding;
-        // Driver = the second table, scanned in its natural (rowid) order.
-        let (driver_columns, driver_rows) = self.resolve_join_source(&join.table, params)?;
+        // Driver = the second table, scanned in its natural (rowid) order — or in a
+        // covering secondary index's key order when one holds every second-table
+        // column the query needs (matching sqlite's covering-index driver scan).
+        let (driver_columns, driver_rows) =
+            self.resolve_join_scan_source(sel, from, &join.table, params)?;
         // Declared output layout: `[first cols, second cols]`.
         let mut out_columns = first_columns.to_vec();
         out_columns.extend(driver_columns.iter().cloned());
@@ -24516,6 +24959,48 @@ impl Connection {
                 .collect()
         };
         Ok((meta.columns, rows))
+    }
+
+    /// Resolve a join source that will be fully SCANNED (the outer driver, or a
+    /// materialised inner of an INNER/CROSS join) — like
+    /// [`resolve_join_source`](Self::resolve_join_source), but when the source is a
+    /// plain rowid base table for which [`join_scan_covering_index`] picks a covering
+    /// index, its rows are returned in that index's key order instead of rowid order.
+    /// This makes an unordered join's output row order match sqlite's covering-index
+    /// scan. `sel`/`from` provide the query's full column footprint for the covering
+    /// decision. Falls straight through to `resolve_join_source` for any source that
+    /// is not a covering-scannable base table.
+    fn resolve_join_scan_source(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        tref: &TableRef,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        // Only a plain `main` base table can carry a secondary index to walk; every
+        // other source short-circuits to the ordinary resolver. (The covering helper
+        // re-checks all of this, but skipping the meta lookup here keeps the common
+        // path cheap and avoids a spurious `table_meta` error for derived sources.)
+        if tref.subquery.is_none()
+            && tref.tvf_args.is_none()
+            && !self.is_bare_tvf(tref)
+            && tref.schema.is_none()
+            && self.lookup_cte(&tref.name, tref.alias.as_deref()).is_none()
+            && !self.is_view(&tref.name)
+            && self.unqualified_db(&tref.name) == DbRef::Main
+        {
+            if let Ok(meta) = self.table_meta(&tref.name, tref.alias.as_deref()) {
+                if let Some(idx) = self.join_scan_covering_index(sel, from, tref, &meta) {
+                    // Reuse `resolve_join_source` to obtain the correctly-stamped
+                    // ColumnInfo (schema origin, alias), then replace the rowid-order
+                    // rows with the covering-index-order ones.
+                    let (columns, _) = self.resolve_join_source(tref, params)?;
+                    let rows = self.scan_table_via_index(&meta, &idx)?;
+                    return Ok((columns, rows));
+                }
+            }
+        }
+        self.resolve_join_source(tref, params)
     }
 
     /// Scan a `WITHOUT ROWID` table's clustered index b-tree, decoding each entry
