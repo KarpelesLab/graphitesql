@@ -1686,6 +1686,19 @@ standard, not the build:
   `sqlite3_value_numeric_type` argument rule across every math function (non-numeric
   text / blob → NULL, not a coerced `0.0` — `tests/math_numeric_args.rs`,
   `tests/ceil_floor_trunc.rs`).
+- **Windowed `sum()` integer-vs-real type tag.** SQLite's window `sum()` keeps a
+  sticky `approx` flag — a REAL added to the sliding frame via `xStep` sets it, and
+  `xInverse` (removing one) never clears it — so once a REAL has been in the frame
+  the result stays REAL (`7.0`) even after it slides out into an all-integer frame.
+  graphite recomputes each frame independently, so an all-integer frame yields an
+  INTEGER (`7`). This is a *type-tag/display* divergence only (the numeric value is
+  identical), and the stickiness is per-frame-*type* in SQLite (forward-sliding
+  frames are sticky; `CURRENT ROW AND UNBOUNDED FOLLOWING` and `EXCLUDE` frames are
+  effectively per-frame), so reproducing it means porting SQLite's window.c
+  `xStep`/`xInverse` scheduling — high effort for a cosmetic tag. `avg`/`total` are
+  always REAL (no divergence); the window `ORDER BY … NULLS FIRST/LAST` *value* bug
+  in the same fuzzing sweep was a real wrong-result and is fixed
+  (`tests/window_order_nulls.rs`).
 - **`PRAGMA table_list` row order.** SQLite emits rows in its internal schema
   hash-table iteration order (e.g. a two-table db created `foo, bar` lists
   `bar, foo`; a view created last can sort ahead of earlier tables), which is
