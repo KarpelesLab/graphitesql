@@ -17697,6 +17697,11 @@ impl Connection {
             });
         }
         let descending: Vec<bool> = spec.order_by.iter().map(|t| t.descending).collect();
+        // The explicit `NULLS FIRST`/`LAST` per ORDER BY term (None ⇒ SQLite's
+        // default: NULLs first under ASC, last under DESC). Dropping this made a
+        // window `ORDER BY x NULLS LAST` (or `DESC NULLS FIRST`) place NULLs at
+        // the default end, so rank/frame results diverged from sqlite.
+        let ord_nulls: Vec<Option<bool>> = spec.order_by.iter().map(|t| t.nulls_first).collect();
         // The collation of each PARTITION BY / ORDER BY key (an explicit
         // `COLLATE`, else the expression's column collation, else BINARY), so
         // partitioning, ordering, and peer detection honor it like sqlite.
@@ -17736,7 +17741,13 @@ impl Connection {
             // Order the partition's rows (stable).
             let mut ordered = members.clone();
             ordered.sort_by(|&a, &b| {
-                cmp_keys_coll(&ord_keys[a], &ord_keys[b], &descending, &ord_colls)
+                cmp_keys_coll_nulls(
+                    &ord_keys[a],
+                    &ord_keys[b],
+                    &descending,
+                    &ord_nulls,
+                    &ord_colls,
+                )
             });
             self.fill_window_partition(
                 &lname,
@@ -33894,6 +33905,36 @@ fn cmp_keys_coll(
             y,
             desc.get(i).copied().unwrap_or(false),
             None,
+            colls
+                .get(i)
+                .copied()
+                .unwrap_or(crate::value::Collation::Binary),
+        );
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Like [`cmp_keys_coll`], but also honors each key's explicit `NULLS
+/// FIRST`/`LAST` (`nulls[i]`; `None` ⇒ SQLite's default placement). Used by the
+/// window-partition sort, where a `NULLS FIRST`/`LAST` on the window `ORDER BY`
+/// must move NULLs off their default end.
+fn cmp_keys_coll_nulls(
+    a: &[Value],
+    b: &[Value],
+    desc: &[bool],
+    nulls: &[Option<bool>],
+    colls: &[crate::value::Collation],
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        let o = cmp_order(
+            x,
+            y,
+            desc.get(i).copied().unwrap_or(false),
+            nulls.get(i).copied().flatten(),
             colls
                 .get(i)
                 .copied()
