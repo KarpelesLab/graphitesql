@@ -1637,8 +1637,15 @@ impl Parser {
             let _ = self.eat(&Token::Semicolon);
         }
         self.in_trigger_body = prev_in_body;
-        let body_error = self.trigger_body_err.take();
+        let mut body_error = self.trigger_body_err.take();
         self.trigger_body_err = prev_body_err;
+        // A trigger must have at least one step: an empty `BEGIN END` body is a
+        // `near "END": syntax error` in SQLite. Like the other body-grammar errors
+        // it is deferred (recorded, not thrown) so a missing-table / system-table /
+        // timing error on the target still outranks it. `self.pos` is at `END` here.
+        if body.is_empty() && body_error.is_none() {
+            body_error = Some(self.near_msg(self.pos));
+        }
         self.expect_kw("end")?;
         Ok(CreateTrigger {
             if_not_exists,
@@ -1771,15 +1778,22 @@ impl Parser {
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
+        let mut seen_constraint = false;
         loop {
             // SQLite requires the list to begin with a column definition: a table
             // constraint may only follow at least one column, so a leading
             // constraint keyword (`CREATE TABLE t(check(…))`) is a `near "KW"`
             // syntax error rather than a constraint-only table.
             if self.starts_table_constraint() && !columns.is_empty() {
+                seen_constraint = true;
                 if let Some(tc) = self.table_constraint()? {
                     constraints.push(tc);
                 }
+            } else if seen_constraint {
+                // Once a table constraint appears every following item must also be
+                // one: a column definition after a constraint (`CREATE TABLE t(a,
+                // CHECK(a>0), b)`) is a `near "<col>": syntax error` in SQLite.
+                return Err(self.err("column definition after a table constraint"));
             } else {
                 columns.push(self.column_def()?);
             }
