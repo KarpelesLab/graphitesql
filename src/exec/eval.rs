@@ -1591,10 +1591,15 @@ fn arithmetic(op: BinaryOp, l: Value, r: Value) -> Value {
 }
 
 fn shift_left(a: i64, b: i64) -> i64 {
-    if b <= -64 || b >= 64 {
+    if b < 0 {
+        // SQLite treats a left shift by a negative amount as a right shift by its
+        // magnitude — and crucially an *arithmetic* one (sign-extending, so
+        // `-1 << -2 == -1`, not the logical `0x3fff…`). Delegate to `shift_right`
+        // rather than shifting `a as u64`. `saturating_neg` guards `i64::MIN` (its
+        // magnitude is ≥ 64, which `shift_right` maps to -1/0 by sign).
+        shift_right(a, b.saturating_neg())
+    } else if b >= 64 {
         0
-    } else if b < 0 {
-        ((a as u64) >> (-b) as u32) as i64
     } else {
         ((a as u64) << b as u32) as i64
     }
