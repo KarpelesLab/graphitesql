@@ -703,9 +703,9 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 0)?;
             Value::Real(crate::util::float::PI)
         }
-        "ceil" | "ceiling" => math1(&lname, &v, crate::util::float::ceil)?,
-        "floor" => math1(&lname, &v, crate::util::float::floor)?,
-        "trunc" => math1(&lname, &v, crate::util::float::trunc)?,
+        "ceil" | "ceiling" => math_round_to_int(&lname, &v, crate::util::float::ceil)?,
+        "floor" => math_round_to_int(&lname, &v, crate::util::float::floor)?,
+        "trunc" => math_round_to_int(&lname, &v, crate::util::float::trunc)?,
         "sqrt" => math1(&lname, &v, crate::util::float::sqrt)?,
         "exp" => math1(&lname, &v, crate::util::float::exp)?,
         "ln" => math1(&lname, &v, crate::util::float::ln)?,
@@ -1485,6 +1485,24 @@ fn math1(name: &str, v: &[Value], f: impl Fn(f64) -> f64) -> Result<Value> {
         )));
     }
     Ok(math_finite(real_arg(&v[0]).map(f)))
+}
+
+/// `ceil`/`ceiling`/`floor`/`trunc`: SQLite dispatches on `sqlite3_value_numeric_type`
+/// — an INTEGER argument is returned UNCHANGED (so its exact value, incl. i64
+/// extremes, survives), a REAL is rounded to a REAL, and a non-numeric text / blob
+/// / NULL argument yields NULL. This differs from the other `math1` functions,
+/// which always coerce to a real (and read a blob's bytes as a number).
+fn math_round_to_int(name: &str, v: &[Value], f: impl Fn(f64) -> f64) -> Result<Value> {
+    if v.len() != 1 {
+        return Err(Error::Error(alloc::format!(
+            "wrong number of arguments to function {name}()"
+        )));
+    }
+    Ok(match eval::to_number_strict(&v[0]) {
+        Some(Value::Integer(i)) => Value::Integer(i),
+        Some(Value::Real(r)) => math_finite(Some(f(r))),
+        _ => Value::Null,
+    })
 }
 
 /// Parse the first argument of a JSON function as a document: `NULL` → `None`;

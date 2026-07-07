@@ -254,7 +254,7 @@ fn integral_real_to_int(r: f64) -> Option<Value> {
 /// Parse a value as a number only if it is *entirely* a valid numeric literal
 /// (no trailing junk), else `None`. Used for affinity coercion, where SQLite
 /// only converts text that fully looks like a number.
-fn to_number_strict(v: &Value) -> Option<Value> {
+pub(crate) fn to_number_strict(v: &Value) -> Option<Value> {
     match v {
         Value::Integer(_) | Value::Real(_) => Some(v.clone()),
         Value::Text(s) => {
