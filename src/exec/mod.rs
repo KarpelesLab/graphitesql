@@ -21600,13 +21600,22 @@ impl Connection {
         // projection first — `apply_windows` rewrites each window call to a `__winN`
         // column reference, which would otherwise name the output column `__winN`
         // instead of its source text (`sum(a) OVER ()`).
-        let window_labels = if window::has_window(sel) && !windowed_agg {
+        // A plain-window query is rewritten below (each `f(x) OVER …` call becomes
+        // a `__winN` column reference), after which `window::has_window` reports
+        // false — so the scan-order `ORDER BY` shortcut (`order_satisfied_by_scan`),
+        // which is guarded off for windowed queries, would wrongly fire. But these
+        // rows were materialized by the base scan in its own (rowid) order, NOT the
+        // index/ORDER-BY order that shortcut assumes, so applying it drops the sort
+        // and yields unsorted output. Remember the pre-rewrite window state and
+        // force the real sort in that case.
+        let is_plain_windowed = window::has_window(sel) && !windowed_agg;
+        let window_labels = if is_plain_windowed {
             Some(self.output_labels(sel, &columns))
         } else {
             None
         };
         let rewritten;
-        let sel = if window::has_window(sel) && !windowed_agg {
+        let sel = if is_plain_windowed {
             let mut w = self.apply_windows(sel, &mut columns, &mut rows, params)?;
             // Absent an explicit ORDER BY, match sqlite's window-induced row order.
             if w.order_by.is_empty() {
@@ -21662,7 +21671,16 @@ impl Connection {
         // just reversing for DESC — matching sqlite's plain SCAN with no temp
         // b-tree.
         if !sel.order_by.is_empty() {
-            match self.order_satisfied_by_scan(sel, params) {
+            // For a plain-window query the rows were produced by the base scan in
+            // rowid order (the window rewrite hid the window calls, so the scan-
+            // order shortcut can no longer tell), so always sort — never trust
+            // `order_satisfied_by_scan` here.
+            let scan_order = if is_plain_windowed {
+                None
+            } else {
+                self.order_satisfied_by_scan(sel, params)
+            };
+            match scan_order {
                 Some(true) => out.reverse(),
                 Some(false) => {}
                 None => {
