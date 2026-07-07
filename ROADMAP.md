@@ -1672,6 +1672,20 @@ standard, not the build:
   (`BINARY`/`NOCASE`/`RTRIM`, reverse-registration order) and does not implement
   `function_list`. Result-value semantics that *are* build-independent are pinned
   in `tests/value_semantics_diff.rs`.
+- **Transcendental precision for huge trig arguments.** `sin`/`cos` are last-ULP
+  off vs the oracle's libm from `~1e15` up (graphite's Taylor kernels differ from
+  glibc's correctly-rounded polynomial in the final bit), and beyond `~1e18` the
+  Cody–Waite π/2 reduction (a 3-term split) runs out of spare precision — `k =
+  round(x·2/π)` grows past what the split can absorb — so the reduced angle is no
+  longer `≤ π/4` and the kernels diverge. A Payne–Hanek reduction would keep the
+  argument in range, but since the kernels are *already* a ULP off where the
+  reduction is exact, huge-arg `sin`/`cos` could not be made byte-exact vs glibc
+  without reimplementing glibc's libm — an unbounded, zero-value port. `atan`'s
+  huge-argument path, by contrast, *is* fixed (any `|x| ≳ 2⁵³` rounds to exactly
+  ±π/2, so it is reproducible — `tests/atan_extreme.rs`), as is the
+  `sqlite3_value_numeric_type` argument rule across every math function (non-numeric
+  text / blob → NULL, not a coerced `0.0` — `tests/math_numeric_args.rs`,
+  `tests/ceil_floor_trunc.rs`).
 - **`PRAGMA table_list` row order.** SQLite emits rows in its internal schema
   hash-table iteration order (e.g. a two-table db created `foo, bar` lists
   `bar, foo`; a view created last can sort ahead of earlier tables), which is
