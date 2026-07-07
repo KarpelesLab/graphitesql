@@ -27529,22 +27529,32 @@ impl Connection {
             let ctx = EvalCtx::rowless(params).with_subqueries(self);
             Ok(eval::to_text(&eval::eval(&row[0], &ctx)?))
         };
-        // The `rank` configuration command: `INSERT INTO t(t, rank) VALUES('rank',
-        // '<rankfunc>')` sets the table's default ranking function. It is written
-        // through the special table-named column plus a second `rank` column that
-        // carries the function string (e.g. `bm25(10.0)`), so it is dispatched by
-        // the *column list* (`t, rank`), not the command word alone.
-        if ins.columns.len() == 2 && ins.columns[1].eq_ignore_ascii_case("rank") {
-            return self.fts5_rank_command(ins, rows, params);
-        }
         // A single-column write `t(t)` is a maintenance command; `t(t, rowid, cols)`
-        // is a `delete`. Peek the first row's command to decide.
+        // is a `delete`; `t(t, rank)` is a config command. Peek the first row's
+        // command word to decide.
         let first = match rows.first() {
             Some(r) if !r.is_empty() => cmd_of(r)?,
             _ => return Ok(None),
         };
+        // The `rank` configuration command: `INSERT INTO t(t, rank) VALUES('rank',
+        // '<rankfunc>')` sets the table's default ranking function — written through
+        // the table-named column plus a second `rank` column carrying the function
+        // string. (Other `(t, rank)` commands — the segment-tuning config words —
+        // fall through to the no-op arm below.)
+        if first == "rank" && ins.columns.len() == 2 && ins.columns[1].eq_ignore_ascii_case("rank")
+        {
+            return self.fts5_rank_command(ins, rows, params);
+        }
         let no_local = crate::vtab::fts5_no_local_content(arg_refs);
         match first.as_str() {
+            // Segment-tuning config values (`t(t, rank)` form) and the flush/merge
+            // maintenance commands have no effect on graphite's index: every write
+            // bulk-rebuilds a single compacted segment, so there is nothing to
+            // auto-merge, page-size, or flush. `integrity-check` verifies the index,
+            // which graphite keeps consistent by construction, so it always passes.
+            // SQLite accepts all of these silently, so no-op and report success.
+            "merge" | "flush" | "integrity-check" | "automerge" | "usermerge" | "crisismerge"
+            | "pgsz" | "hashsize" | "deletemerge" | "secure-delete" => Ok(Some(0)),
             "rebuild" | "optimize" => {
                 // All rows must be maintenance commands (mixed with a row insert is
                 // not a valid form).
@@ -27571,11 +27581,12 @@ impl Connection {
             }
             "delete-all" => {
                 if !no_local {
-                    return Err(Error::Error(format!(
+                    // SQLite names no table in this message.
+                    return Err(Error::Error(
                         "'delete-all' may only be used with a contentless or \
-                         external content fts5 table: {}",
-                        ins.table
-                    )));
+                         external content fts5 table"
+                            .into(),
+                    ));
                 }
                 let q = |s: &str| sql::print::ident(s);
                 self.execute(&format!(
@@ -27591,16 +27602,16 @@ impl Connection {
             }
             "delete" => {
                 if !no_local {
-                    // SQLite rejects `'delete'` on a self-content table.
-                    return Err(Error::Error(format!(
-                        "cannot use the 'delete' command with a self-content fts5 \
-                         table: {}",
-                        ins.table
-                    )));
+                    // SQLite rejects `'delete'` on a self-content table with a bare
+                    // `SQL logic error` (no descriptive text).
+                    return Err(Error::Error("SQL logic error".into()));
                 }
                 self.fts5_apply_delete_command(ins, rows, params, arg_refs)
             }
-            _ => Ok(None),
+            // Any other value written to the table-named command column is an
+            // unrecognized command — SQLite reports a bare `SQL logic error` (not a
+            // "no such column" over the hidden command column).
+            _ => Err(Error::Error("SQL logic error".into())),
         }
     }
 
