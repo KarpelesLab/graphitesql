@@ -378,11 +378,12 @@ fn missing_content_table_errors() {
     );
 }
 
-/// Direct content-modifying DML on an external-content table is declined (graphite
-/// implements the read side + `rebuild`; index-delta sync is a documented
-/// follow-up). We never silently drop the write.
+/// Direct content-modifying DML on an external-content table now keeps the index
+/// in sync (SQLite's trigger contract): `INSERT`/`'delete'`/`DELETE`/`UPDATE` add
+/// or subtract postings without touching the content table. (The dedicated
+/// differential coverage lives in `tests/fts5_contentless_write.rs`.)
 #[test]
-fn direct_dml_on_external_content_is_declined() {
+fn direct_dml_on_external_content_syncs_the_index() {
     let path = tmp_path("dml");
     let mut c = Connection::create(&path).unwrap();
     c.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, body)")
@@ -392,15 +393,21 @@ fn direct_dml_on_external_content_is_declined() {
     c.execute("CREATE VIRTUAL TABLE ft USING fts5(body, content='src', content_rowid='id')")
         .unwrap();
     c.execute("INSERT INTO ft(ft) VALUES('rebuild')").unwrap();
-    assert!(c
-        .execute("INSERT INTO ft(rowid, body) VALUES(5, 'phantom')")
-        .is_err());
-    assert!(c.execute("DELETE FROM ft WHERE rowid=1").is_err());
-    assert!(c.execute("UPDATE ft SET body='x' WHERE rowid=1").is_err());
-    // The `'delete'` maintenance command is likewise declined (index-delta sync).
-    assert!(c
-        .execute("INSERT INTO ft(ft, rowid, body) VALUES('delete', 1, 'hello world')")
-        .is_err());
+    // A direct INSERT indexes the supplied text under the given rowid.
+    c.execute("INSERT INTO src VALUES(5,'phantom')").unwrap();
+    c.execute("INSERT INTO ft(rowid, body) VALUES(5, 'phantom')")
+        .unwrap();
+    let r = c
+        .query("SELECT rowid FROM ft WHERE ft MATCH 'phantom'")
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    // The `'delete'` command subtracts the supplied tokens' postings.
+    c.execute("INSERT INTO ft(ft, rowid, body) VALUES('delete', 1, 'hello world')")
+        .unwrap();
+    let r = c
+        .query("SELECT rowid FROM ft WHERE ft MATCH 'hello'")
+        .unwrap();
+    assert_eq!(r.rows.len(), 0);
     drop(c);
     let _ = std::fs::remove_file(&path);
 }

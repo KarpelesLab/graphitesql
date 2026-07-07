@@ -104,6 +104,38 @@ fn fts5_match_columns(
     None
 }
 
+/// The fts5 table a `MATCH` operand refers to: the operand `t` in `t MATCH q` (a
+/// bare table reference) or the owning table of `t.col MATCH q`. Resolves the name
+/// through the current row's column set (so an alias maps to the real table name),
+/// falling back to the operand's own identifier. `None` when the operand is not a
+/// column/table reference.
+#[cfg(feature = "fts5")]
+fn fts5_match_operand_table(operand: &Expr, ctx: &EvalCtx) -> Option<alloc::string::String> {
+    let (table, column) = match operand {
+        Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
+        Expr::Paren(e) => return fts5_match_operand_table(e, ctx),
+        _ => return None,
+    };
+    // `t.col` → the table owning that column; bare `t` → the table named `t` in the
+    // row's column set (its `table` field holds the resolved base-table name).
+    if let Some(t) = table {
+        return Some(alloc::string::String::from(t));
+    }
+    ctx.columns
+        .iter()
+        .find(|c| c.table.eq_ignore_ascii_case(column))
+        .map(|c| c.table.clone())
+        .or_else(|| Some(alloc::string::String::from(column)))
+}
+
+/// Whether a `highlight`/`snippet` first argument names a contentless fts5 table.
+#[cfg(feature = "fts5")]
+fn fts5_operand_is_contentless(operand: &Expr, ctx: &EvalCtx) -> bool {
+    fts5_match_operand_table(operand, ctx)
+        .zip(ctx.subqueries)
+        .is_some_and(|(t, s)| s.fts5_is_contentless_table(&t))
+}
+
 /// Evaluate a scalar function call.
 pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Result<Value> {
     let lname = name.to_ascii_lowercase();
@@ -178,6 +210,21 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     Value::Null => Value::Null,
                     p => {
                         let q = eval::to_text(&p);
+                        // A contentless table keeps no column text, so `MATCH` can't
+                        // be re-checked from the (NULL) row — consult the index by
+                        // rowid instead. `fts5_match_operand_table` names the table
+                        // the operand refers to; the connection resolves whether it
+                        // is contentless and, if so, evaluates against the index.
+                        if let (Some(table), Some(rowid)) =
+                            (fts5_match_operand_table(&args[1], ctx), ctx.rowid)
+                        {
+                            if let Some(m) = ctx
+                                .subqueries
+                                .and_then(|s| s.fts5_contentless_match(&table, &q, rowid))
+                            {
+                                return Ok(Value::Integer(m as i64));
+                            }
+                        }
                         Value::Integer(crate::vtab::fts5_query_matches(&q, &cols, tok) as i64)
                     }
                 });
@@ -204,6 +251,11 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         // matched tokens wrapped, in scope for a `MATCH` query over an `fts5` table.
         #[cfg(feature = "fts5")]
         "highlight" if args.len() == 4 => {
+            // A contentless table stores no text, so there is nothing to render:
+            // `highlight`/`snippet` return NULL (matching SQLite).
+            if fts5_operand_is_contentless(&args[0], ctx) {
+                return Ok(Value::Null);
+            }
             let col = eval::to_i64(&eval::eval(&args[1], ctx)?);
             let open = eval::to_text(&eval::eval(&args[2], ctx)?);
             let close = eval::to_text(&eval::eval(&args[3], ctx)?);
@@ -223,6 +275,9 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         // trimmed end. In scope for a `MATCH` query over an `fts5` table.
         #[cfg(feature = "fts5")]
         "snippet" if args.len() == 6 => {
+            if fts5_operand_is_contentless(&args[0], ctx) {
+                return Ok(Value::Null);
+            }
             let col = eval::to_i64(&eval::eval(&args[1], ctx)?);
             let open = eval::to_text(&eval::eval(&args[2], ctx)?);
             let close = eval::to_text(&eval::eval(&args[3], ctx)?);

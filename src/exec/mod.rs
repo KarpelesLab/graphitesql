@@ -4974,6 +4974,7 @@ impl Connection {
         let is_backing = |name: &str| {
             [
                 "_data", "_node", "_rowid", "_parent", "_content", "_docsize", "_config", "_idx",
+                "_gpost",
             ]
             .iter()
             .any(|sfx| {
@@ -9125,8 +9126,8 @@ impl Connection {
             // documents live in the named content table.
             #[cfg(feature = "fts5")]
             {
-                let external = crate::vtab::fts5_external_content(&arg_refs).is_some();
-                self.fts5_create_storage(&cvt.name, cols.len(), external)?;
+                let no_local = crate::vtab::fts5_no_local_content(&arg_refs);
+                self.fts5_create_storage(&cvt.name, cols.len(), no_local)?;
             }
         } else if persistent {
             let coldefs = cols
@@ -9273,33 +9274,32 @@ impl Connection {
         // (graphite already writes a single compacted segment). Other commands fall
         // through to the usual column resolution (and its "no such column" error),
         // matching SQLite, which rejects `delete`/`delete-all` on a content table.
+        //
+        // The `'delete'`/`'delete-all'` commands take the same special-column form
+        // with extra columns: `INSERT INTO t(t, rowid, <cols…>) VALUES('delete', …)`
+        // removes a document's postings (contentless/external only); `INSERT INTO
+        // t(t) VALUES('delete-all')` clears the whole index. Both are handled in
+        // `fts5_special_command` when the first column is the table-named command
+        // column.
         #[cfg(feature = "fts5")]
         if module_name.eq_ignore_ascii_case("fts5")
-            && ins.columns.len() == 1
+            && !ins.columns.is_empty()
             && ins.columns[0].eq_ignore_ascii_case(&ins.table)
         {
-            let commands = rows
-                .iter()
-                .map(|row| {
-                    let ctx = EvalCtx::rowless(params).with_subqueries(self);
-                    Ok(eval::to_text(&eval::eval(&row[0], &ctx)?))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if commands
-                .iter()
-                .all(|c| matches!(c.as_str(), "rebuild" | "optimize"))
-            {
-                if commands.iter().any(|c| c == "rebuild") {
-                    self.fts5_rebuild_index(&ins.table)?;
-                }
-                return Ok(0);
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Some(n) = self.fts5_special_command(ins, rows, params, &arg_refs)? {
+                return Ok(n);
             }
         }
-        // An external-content fts5 table's index is maintained only by `rebuild`;
-        // decline any other direct write rather than silently rebuilding from the
-        // content table (which would drop the write).
+        // A direct write to an external-content or contentless fts5 table adds the
+        // supplied document's tokens to the index (SQLite's trigger contract), with
+        // no `_content` copy. Route it through the incremental posting path rather
+        // than the self-content bulk rebuild.
         #[cfg(feature = "fts5")]
-        self.fts5_reject_external_dml(&module_name, &ins.table)?;
+        let fts5_no_local = module_name.eq_ignore_ascii_case("fts5") && {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            crate::vtab::fts5_no_local_content(&arg_refs)
+        };
         // Map the (possibly explicit) column list onto declared column positions.
         // `None` marks a `rowid`/`_rowid_`/`oid` term (a vtab's hidden rowid),
         // whose value becomes the inserted row's explicit rowid.
@@ -9344,6 +9344,38 @@ impl Connection {
                 }
             }
             changes.push((rowid, values));
+        }
+        // External-content / contentless: apply each document's tokens to the
+        // private posting state and rebuild the index once. No `_content` write and
+        // no bulk rebuild; a document with no explicit rowid gets the next id
+        // (max-existing + 1, from `_docsize`), matching SQLite. Inserting the same
+        // rowid again is purely additive (union of terms; per-term positions from
+        // the latest insert), also matching SQLite — no UNIQUE conflict.
+        #[cfg(feature = "fts5")]
+        if fts5_no_local {
+            let docsize_meta = self.table_meta(&format!("{}_docsize", ins.table), None)?;
+            let mut next_auto = self
+                .scan_table(&docsize_meta)?
+                .iter()
+                .map(|(r, _)| *r)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let mut n = 0;
+            for (rowid, values) in &changes {
+                let rid = rowid.unwrap_or_else(|| {
+                    let r = next_auto;
+                    next_auto += 1;
+                    r
+                });
+                if rid >= next_auto {
+                    next_auto = rid + 1;
+                }
+                self.fts5_gpost_apply(&ins.table, rid, values, false)?;
+                n += 1;
+            }
+            self.fts5_rebuild_from_gpost(&ins.table)?;
+            return Ok(n);
         }
         let on_conflict = ins.on_conflict;
         let table = ins.table.clone();
@@ -9461,13 +9493,27 @@ impl Connection {
             return Err(Error::Unsupported("RETURNING on a virtual table"));
         }
         let (module_name, args, _) = self.vtab_meta(&del.table)?;
+        // Contentless fts5 rejects DELETE (it keeps no text to identify postings);
+        // external content allows it (old text is read from the content table).
         #[cfg(feature = "fts5")]
-        self.fts5_reject_external_dml(&module_name, &del.table)?;
+        if module_name.eq_ignore_ascii_case("fts5") {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if crate::vtab::fts5_is_contentless(&arg_refs) {
+                return Err(Error::Error(format!(
+                    "cannot DELETE from contentless fts5 table: {}",
+                    del.table
+                )));
+            }
+        }
         let (columns, rows) = self
             .try_virtual_table(&del.table, None, None)?
             .ok_or_else(|| Error::Error(format!("{} is not a virtual table", del.table)))?;
-        // Collect the matching rowids first (read-only), then persist.
+        // Collect the matching rows first (read-only), then persist. External-content
+        // deletes need the OLD column values (to subtract the right postings), so keep
+        // them alongside each victim rowid.
         let mut victims: Vec<i64> = Vec::new();
+        #[cfg(feature = "fts5")]
+        let mut victim_vals: Vec<Vec<Value>> = Vec::new();
         for r in &rows {
             if let Some(pred) = &del.where_clause {
                 let ctx = r.ctx(&columns, params).with_subqueries(self);
@@ -9479,6 +9525,21 @@ impl Connection {
                 r.rowid
                     .ok_or_else(|| Error::Error("virtual-table row has no rowid".into()))?,
             );
+            #[cfg(feature = "fts5")]
+            victim_vals.push(r.values.clone());
+        }
+        // External-content fts5: subtract each victim's (content-table) postings from
+        // the private posting state, then rebuild. No `_content`/content-table write.
+        #[cfg(feature = "fts5")]
+        if module_name.eq_ignore_ascii_case("fts5") {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if crate::vtab::fts5_external_content(&arg_refs).is_some() {
+                for (rid, vals) in victims.iter().zip(victim_vals.iter()) {
+                    self.fts5_gpost_apply(&del.table, *rid, vals, true)?;
+                }
+                self.fts5_rebuild_from_gpost(&del.table)?;
+                return Ok(victims.len());
+            }
         }
         // R-Tree with no aux columns: rebuild the node tree without the victims.
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -9522,8 +9583,18 @@ impl Connection {
             return Err(Error::Unsupported("UPDATE … FROM on a virtual table"));
         }
         let (module_name, args, schema) = self.vtab_meta(&upd.table)?;
+        // Contentless fts5 rejects UPDATE (no stored text to identify the old
+        // postings); external content allows it (old text from the content table).
         #[cfg(feature = "fts5")]
-        self.fts5_reject_external_dml(&module_name, &upd.table)?;
+        if module_name.eq_ignore_ascii_case("fts5") {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if crate::vtab::fts5_is_contentless(&arg_refs) {
+                return Err(Error::Error(format!(
+                    "cannot UPDATE contentless fts5 table: {}",
+                    upd.table
+                )));
+            }
+        }
         let col_names = schema.columns;
         // Resolve each SET target to a declared column position.
         let assigns: Vec<(usize, &Expr)> = upd
@@ -9542,6 +9613,10 @@ impl Connection {
             .ok_or_else(|| Error::Error(format!("{} is not a virtual table", upd.table)))?;
         // Compute the new (rowid, values) for each matching row first, then persist.
         let mut changes: Vec<(i64, Vec<Value>)> = Vec::new();
+        // Old (pre-update) column values per change, for fts5 external-content
+        // posting subtraction (the old text lives in the content table).
+        #[cfg(feature = "fts5")]
+        let mut old_vals: Vec<Vec<Value>> = Vec::new();
         for r in &rows {
             let ctx = r.ctx(&columns, params).with_subqueries(self);
             if let Some(pred) = &upd.where_clause {
@@ -9557,7 +9632,25 @@ impl Connection {
             let rowid = r
                 .rowid
                 .ok_or_else(|| Error::Error("virtual-table row has no rowid".into()))?;
+            #[cfg(feature = "fts5")]
+            old_vals.push(r.values.clone());
             changes.push((rowid, values));
+        }
+        // External-content fts5: UPDATE = subtract old postings (from the content
+        // table's old text) + add the new SET text under the (possibly changed)
+        // rowid, then rebuild. The content table itself is not modified — the caller
+        // keeps it in sync, exactly as SQLite's trigger contract requires.
+        #[cfg(feature = "fts5")]
+        if module_name.eq_ignore_ascii_case("fts5") {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if crate::vtab::fts5_external_content(&arg_refs).is_some() {
+                for ((old_rowid, new_values), old_values) in changes.iter().zip(old_vals.iter()) {
+                    self.fts5_gpost_apply(&upd.table, *old_rowid, old_values, true)?;
+                    self.fts5_gpost_apply(&upd.table, *old_rowid, new_values, false)?;
+                }
+                self.fts5_rebuild_from_gpost(&upd.table)?;
+                return Ok(changes.len());
+            }
         }
         // R-Tree with no aux columns: rebuild the node tree (delete old + insert
         // new; the `id` column may move the rowid).
@@ -9629,6 +9722,115 @@ impl Connection {
     /// non-empty. run_core re-applies the full WHERE to whatever this returns, so
     /// the result is a superset and never wrong; the rowid-ascending order matches
     /// the scan.
+    /// Resolve an fts5 `MATCH` query to the set of matching rowids from the segment
+    /// index (`_data`), or `Ok(None)` when the query shape isn't index-routable (the
+    /// caller then falls back to the document scan). This is the routing core shared
+    /// by `fts5_try_index_match` (which fetches the matched rows) and the contentless
+    /// `MATCH` re-check (which tests rowid membership, since a contentless row keeps
+    /// no text to re-tokenize).
+    ///
+    /// Routable shapes: a table-wide or column-scoped single bare term (`'word'` /
+    /// `'col : word'`), a K-term phrase (`'"t0 t1 …"'` / `'col : "…"'`), a two-term
+    /// `NEAR`, an N-operand bare-term boolean tree (`a AND b`, `(a OR b) NOT c`, …),
+    /// and a single prefix term (`'word*'` / `'col : word*'`).
+    #[cfg(feature = "fts5")]
+    fn fts5_index_match_rowids(
+        &self,
+        name: &str,
+        arg_refs: &[&str],
+        query: &str,
+    ) -> Result<Option<Vec<i64>>> {
+        let tok = crate::vtab::fts5_tok_config(arg_refs);
+        enum Routed {
+            AnyColumn(Vec<u8>),
+            InColumn(Vec<u8>, usize),
+            Phrase(Vec<Vec<u8>>),
+            PhraseInColumn(Vec<Vec<u8>>, usize),
+            Near(Vec<u8>, Vec<u8>, u32),
+            BoolTree(crate::vtab::Fts5BoolTree),
+            PrefixAnyColumn(Vec<u8>),
+            PrefixInColumn(Vec<u8>, usize),
+        }
+        // Resolve a column NAME to its position; a non-column name matches nothing —
+        // `Ok(None)` there yields the same empty set as the scan.
+        let resolve_col = |col: &str| -> Result<Option<usize>> {
+            Ok(self
+                .vtab_meta(name)?
+                .2
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(col)))
+        };
+        let routed = if let Some(t) = crate::vtab::fts5_single_bare_term(query, tok) {
+            Routed::AnyColumn(t)
+        } else if let Some((col, t)) = crate::vtab::fts5_single_bare_term_column(query, tok) {
+            match resolve_col(&col)? {
+                Some(ci) => Routed::InColumn(t, ci),
+                None => return Ok(None),
+            }
+        } else if let Some(terms) = crate::vtab::fts5_phrase_terms(query, tok) {
+            Routed::Phrase(terms)
+        } else if let Some((col, terms)) = crate::vtab::fts5_phrase_terms_column(query, tok) {
+            match resolve_col(&col)? {
+                Some(ci) => Routed::PhraseInColumn(terms, ci),
+                None => return Ok(None),
+            }
+        } else if let Some((a, b, n)) = crate::vtab::fts5_two_term_near(query, tok) {
+            Routed::Near(a, b, n as u32)
+        } else if let Some(tree) = crate::vtab::fts5_bare_term_bool_tree(query, tok) {
+            Routed::BoolTree(tree)
+        } else if let Some(p) = crate::vtab::fts5_single_prefix_term(query, tok) {
+            Routed::PrefixAnyColumn(p)
+        } else if let Some((col, p)) = crate::vtab::fts5_single_prefix_term_column(query, tok) {
+            match resolve_col(&col)? {
+                Some(ci) => Routed::PrefixInColumn(p, ci),
+                None => return Ok(None),
+            }
+        } else {
+            return Ok(None);
+        };
+        let dmeta = self.table_meta(&format!("{name}_data"), None)?;
+        let data: Vec<(i64, Vec<u8>)> = self
+            .scan_table(&dmeta)?
+            .into_iter()
+            .filter_map(|(rowid, mut values)| match values.drain(..).nth(1) {
+                Some(Value::Blob(b)) => Some((rowid, b)),
+                _ => None,
+            })
+            .collect();
+        // An empty index (only the averages [id 1] and structure [id 10] rows, no
+        // leaf pages) matches nothing — the leaf reader would return `None` for the
+        // absent leaves, which the caller would misread as "unservable". Short-circuit
+        // to an empty match set for any routable query.
+        let has_leaves = data.iter().any(|(id, _)| {
+            *id != crate::fts5_index::AVERAGES_ROWID && *id != crate::fts5_index::STRUCTURE_ROWID
+        });
+        if !has_leaves {
+            return Ok(Some(Vec::new()));
+        }
+        let rowids_opt = match &routed {
+            Routed::AnyColumn(term) => crate::fts5_index::lookup_term_rowids(&data, term),
+            Routed::InColumn(term, ci) => {
+                crate::fts5_index::lookup_term_rowids_in_column(&data, term, *ci)
+            }
+            Routed::Phrase(terms) => {
+                let refs: Vec<&[u8]> = terms.iter().map(Vec::as_slice).collect();
+                crate::fts5_index::lookup_phrase_rowids_k(&data, &refs)
+            }
+            Routed::PhraseInColumn(terms, ci) => {
+                let refs: Vec<&[u8]> = terms.iter().map(Vec::as_slice).collect();
+                crate::fts5_index::lookup_phrase_rowids_in_column_k(&data, &refs, *ci)
+            }
+            Routed::Near(a, b, n) => crate::fts5_index::lookup_near_rowids(&data, a, b, *n),
+            Routed::BoolTree(tree) => crate::fts5_index::lookup_bool_tree_rowids(&data, tree),
+            Routed::PrefixAnyColumn(p) => crate::fts5_index::lookup_prefix_rowids(&data, p),
+            Routed::PrefixInColumn(p, ci) => {
+                crate::fts5_index::lookup_prefix_rowids_in_column(&data, p, *ci)
+            }
+        };
+        Ok(rowids_opt)
+    }
+
     #[cfg(feature = "fts5")]
     fn fts5_try_index_match(
         &self,
@@ -9666,125 +9868,7 @@ impl Connection {
         if indexed.len() != ncols {
             return Ok(None);
         }
-        let tok = crate::vtab::fts5_tok_config(arg_refs);
-        // Index-routable shapes over the term reader:
-        //   * a TABLE-WIDE single bare term (`'word'`) — matches in ANY column;
-        //   * a COLUMN-SCOPED single bare term (`'col : word'`) — matches only in
-        //     the named column. The per-column positions in the term's doclist let
-        //     us keep exactly the postings carrying a hit in that column;
-        //   * a TABLE-WIDE K-term phrase (`'"t0 t1 …"'`, K ≥ 2) — the tokens occur
-        //     at CONSECUTIVE positions in some column;
-        //   * a COLUMN-SCOPED K-term phrase (`'col : "t0 t1 …"'`) — consecutive in
-        //     the named column.
-        //   * a TABLE-WIDE two-single-token bare-term `NEAR` group
-        //     (`'NEAR(a b, n)'`, default `n = 10`) — the two tokens occur within
-        //     `n + 1` positions of each other in some column.
-        // Resolve which (if any) applies; anything else stays on the scan.
-        enum Routed {
-            AnyColumn(Vec<u8>),
-            InColumn(Vec<u8>, usize),
-            /// A TABLE-WIDE K-term phrase (`'"t0 t1 …"'`, K ≥ 2) — the tokens occur
-            /// at CONSECUTIVE positions in some column. The 2-term `'"a b"'` is the
-            /// K = 2 instance.
-            Phrase(Vec<Vec<u8>>),
-            /// A COLUMN-SCOPED K-term phrase (`'col : "t0 t1 …"'`) — consecutive in
-            /// the named column.
-            PhraseInColumn(Vec<Vec<u8>>, usize),
-            /// A TABLE-WIDE two-single-token bare-term `NEAR` group
-            /// (`'NEAR(a b, n)'`, default `n = 10`) — the two tokens occur within
-            /// `n + 1` positions of each other in some column.
-            Near(Vec<u8>, Vec<u8>, u32),
-            /// An N-operand bare-term boolean TREE (`a AND b AND c`,
-            /// `(a OR b) AND NOT c`, the two-operand `a AND/OR/NOT b`, the
-            /// implicit-AND `a b c`, …) served by bottom-up doclist set-ops over
-            /// the leaves' rowid lists, exactly as the scan's `fts5_eval` walks it.
-            BoolTree(crate::vtab::Fts5BoolTree),
-            /// A TABLE-WIDE single bare prefix term (`'word*'`) — matches in ANY
-            /// column any document with an indexed term starting with the prefix.
-            PrefixAnyColumn(Vec<u8>),
-            /// A COLUMN-SCOPED single bare prefix term (`'col : word*'`) — restricted
-            /// to a prefix hit in the named column.
-            PrefixInColumn(Vec<u8>, usize),
-        }
-        // Resolve a column NAME to its position in the table's full column list (the
-        // same index the writer records positions under). A name that is not a
-        // column matches no document — but rather than build that empty result here,
-        // fall back to the scan (which yields the same empty set).
-        let resolve_col = |col: &str| -> Result<Option<usize>> {
-            Ok(self
-                .vtab_meta(name)?
-                .2
-                .columns
-                .iter()
-                .position(|c| c.eq_ignore_ascii_case(col)))
-        };
-        let routed = if let Some(t) = crate::vtab::fts5_single_bare_term(&query, tok) {
-            Routed::AnyColumn(t)
-        } else if let Some((col, t)) = crate::vtab::fts5_single_bare_term_column(&query, tok) {
-            match resolve_col(&col)? {
-                Some(ci) => Routed::InColumn(t, ci),
-                None => return Ok(None),
-            }
-        } else if let Some(terms) = crate::vtab::fts5_phrase_terms(&query, tok) {
-            Routed::Phrase(terms)
-        } else if let Some((col, terms)) = crate::vtab::fts5_phrase_terms_column(&query, tok) {
-            match resolve_col(&col)? {
-                Some(ci) => Routed::PhraseInColumn(terms, ci),
-                None => return Ok(None),
-            }
-        } else if let Some((a, b, n)) = crate::vtab::fts5_two_term_near(&query, tok) {
-            Routed::Near(a, b, n as u32)
-        } else if let Some(tree) = crate::vtab::fts5_bare_term_bool_tree(&query, tok) {
-            // Any boolean tree of table-wide bare terms (2 operands or N, with
-            // parentheses / mixed AND/OR/NOT). The single-bare-term shapes are
-            // already handled above, so this fires only for genuine boolean trees.
-            Routed::BoolTree(tree)
-        } else if let Some(p) = crate::vtab::fts5_single_prefix_term(&query, tok) {
-            Routed::PrefixAnyColumn(p)
-        } else if let Some((col, p)) = crate::vtab::fts5_single_prefix_term_column(&query, tok) {
-            match resolve_col(&col)? {
-                Some(ci) => Routed::PrefixInColumn(p, ci),
-                None => return Ok(None),
-            }
-        } else {
-            return Ok(None);
-        };
-        // Read the segment index (`_data`) and resolve the matching rowids. A `None`
-        // means the index shape isn't servable → fall back to the scan.
-        let dmeta = self.table_meta(&format!("{name}_data"), None)?;
-        let data: Vec<(i64, Vec<u8>)> = self
-            .scan_table(&dmeta)?
-            .into_iter()
-            .filter_map(|(rowid, mut values)| {
-                // `_data` is `(id INTEGER PRIMARY KEY, block BLOB)`; the id is the
-                // rowid, the block is the second column.
-                match values.drain(..).nth(1) {
-                    Some(Value::Blob(b)) => Some((rowid, b)),
-                    _ => None,
-                }
-            })
-            .collect();
-        let rowids_opt = match &routed {
-            Routed::AnyColumn(term) => crate::fts5_index::lookup_term_rowids(&data, term),
-            Routed::InColumn(term, ci) => {
-                crate::fts5_index::lookup_term_rowids_in_column(&data, term, *ci)
-            }
-            Routed::Phrase(terms) => {
-                let refs: Vec<&[u8]> = terms.iter().map(Vec::as_slice).collect();
-                crate::fts5_index::lookup_phrase_rowids_k(&data, &refs)
-            }
-            Routed::PhraseInColumn(terms, ci) => {
-                let refs: Vec<&[u8]> = terms.iter().map(Vec::as_slice).collect();
-                crate::fts5_index::lookup_phrase_rowids_in_column_k(&data, &refs, *ci)
-            }
-            Routed::Near(a, b, n) => crate::fts5_index::lookup_near_rowids(&data, a, b, *n),
-            Routed::BoolTree(tree) => crate::fts5_index::lookup_bool_tree_rowids(&data, tree),
-            Routed::PrefixAnyColumn(p) => crate::fts5_index::lookup_prefix_rowids(&data, p),
-            Routed::PrefixInColumn(p, ci) => {
-                crate::fts5_index::lookup_prefix_rowids_in_column(&data, p, *ci)
-            }
-        };
-        let rowids = match rowids_opt {
+        let rowids = match self.fts5_index_match_rowids(name, arg_refs, &query)? {
             Some(r) => r,
             None => return Ok(None),
         };
@@ -9821,6 +9905,11 @@ impl Connection {
         rowid: i64,
     ) -> Result<Option<Vec<Value>>> {
         let encoding = self.backend.source().header().text_encoding;
+        // Contentless (`content=''`): no stored text — every indexed column reads
+        // back as NULL. The rowid came from the doclist, so the row exists.
+        if crate::vtab::fts5_is_contentless(arg_refs) {
+            return Ok(Some(alloc::vec![Value::Null; ncols]));
+        }
         if let Some((content, rowid_col)) = crate::vtab::fts5_external_content(arg_refs) {
             let cmeta = self
                 .table_meta(&content, None)
@@ -10036,7 +10125,7 @@ impl Connection {
             #[cfg(feature = "fts5")]
             if cvt.module.eq_ignore_ascii_case("fts5")
                 && (self.schema.table(&format!("{name}_content")).is_some()
-                    || crate::vtab::fts5_external_content(&arg_refs).is_some())
+                    || crate::vtab::fts5_no_local_content(&arg_refs))
             {
                 // D2b-2: a single bare-term `MATCH` (`tbl MATCH 'word'`) reads the
                 // term's doclist from the segment index and fetches only those
@@ -10045,6 +10134,40 @@ impl Connection {
                 // can't serve identically. run_core re-applies the full WHERE, so
                 // the rows (rowid-ascending, like the scan) stay a valid superset.
                 if let Some(rows) = self.fts5_try_index_match(name, alias, &arg_refs, pushdown)? {
+                    return Ok(Some((columns, rows)));
+                }
+                // Contentless (`content=''`): no stored text, so a full scan yields
+                // one all-NULL row per live document (rowids from `_docsize`). A
+                // `MATCH` reaching here was not index-routable above — and a
+                // contentless table has no text to fall back on, so re-checking the
+                // (NULL) columns would silently UNDER-match. Decline such a query
+                // rather than return a wrong (subset) result.
+                if crate::vtab::fts5_is_contentless(&arg_refs) {
+                    if let Some((sel, params)) = pushdown {
+                        if let Some(e) = sel.where_clause.as_ref() {
+                            if self.fts5_where_has_unroutable_match(name, &arg_refs, e, params)? {
+                                return Err(Error::Unsupported(
+                                    "fts5: this MATCH query shape is not supported on a \
+                                     contentless table (no stored text to match against)",
+                                ));
+                            }
+                        }
+                    }
+                    let docsize_meta = self.table_meta(&format!("{name}_docsize"), None)?;
+                    let ncols = schema.columns.len();
+                    let mut ids: Vec<i64> = self
+                        .scan_table(&docsize_meta)?
+                        .iter()
+                        .map(|(r, _)| *r)
+                        .collect();
+                    ids.sort_unstable();
+                    let rows = ids
+                        .into_iter()
+                        .map(|rowid| InputRow {
+                            values: alloc::vec![Value::Null; ncols],
+                            rowid: Some(rowid),
+                        })
+                        .collect();
                     return Ok(Some((columns, rows)));
                 }
                 // The scan-based matcher tokenizes each document. For external
@@ -10617,6 +10740,7 @@ impl Connection {
         if matches!(d.kind, DropKind::Table) && self.is_virtual_table(&d.name) {
             for suffix in [
                 "_data", "_node", "_rowid", "_parent", "_content", "_docsize", "_config", "_idx",
+                "_gpost",
             ] {
                 let backing = format!("{}{suffix}", d.name);
                 if self.schema.table(&backing).is_some() {
@@ -11242,6 +11366,7 @@ impl Connection {
         // generic `<name>_data`, or an R-Tree's `_node`/`_rowid`/`_parent`.
         for suffix in [
             "_data", "_node", "_rowid", "_parent", "_content", "_docsize", "_config", "_idx",
+            "_gpost",
         ] {
             let backing_old = format!("{old}{suffix}");
             if self.schema.table(&backing_old).is_some() {
@@ -20213,6 +20338,38 @@ impl Connection {
         }
     }
 
+    /// Whether `where_expr` contains a `MATCH` over the fts5 table `name` whose
+    /// query shape the index router (`fts5_index_match_rowids`) cannot serve. Used
+    /// by the contentless scan path to decline such a query (no stored text to fall
+    /// back on) instead of silently under-matching.
+    #[cfg(feature = "fts5")]
+    fn fts5_where_has_unroutable_match(
+        &self,
+        name: &str,
+        arg_refs: &[&str],
+        where_expr: &Expr,
+        params: &Params,
+    ) -> Result<bool> {
+        let Some((query, operand)) = self.fts5_match_query(where_expr, params) else {
+            return Ok(false);
+        };
+        // The operand must name this table (a table-wide search) or one of its
+        // columns; a `col : …` embedded in the query string is handled by the router.
+        let names_table = operand.eq_ignore_ascii_case(name)
+            || self
+                .vtab_meta(name)?
+                .2
+                .columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&operand));
+        if !names_table {
+            return Ok(false);
+        }
+        Ok(self
+            .fts5_index_match_rowids(name, arg_refs, &query)?
+            .is_none())
+    }
+
     /// Build the per-query [`Fts5QueryCtx`] for an FTS5 `MATCH` query over a single
     /// `fts5` table that references `rank`/`bm25()`/`highlight()`, or `None`. The
     /// bm25 corpus is computed only when `rank`/`bm25()` is referenced —
@@ -27090,7 +27247,10 @@ impl Connection {
         if module_name.eq_ignore_ascii_case("fts5") {
             let args = self.vtab_meta(table)?.1;
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            if crate::vtab::fts5_external_content(&arg_refs).is_some() {
+            if crate::vtab::fts5_no_local_content(&arg_refs) {
+                // No-local-content tables maintain their index by direct-DML posting
+                // deltas (`fts5_rebuild_from_gpost`), not a bulk rebuild from a
+                // content copy.
                 return Ok(());
             }
             return self.fts5_rebuild_index(table);
@@ -27099,27 +27259,181 @@ impl Connection {
         Ok(())
     }
 
-    /// Reject direct content-modifying DML on an **external-content** fts5 table.
-    /// SQLite keeps such a table in sync with its content table via user triggers
-    /// that issue `INSERT`/`'delete'` commands against the fts5 index; graphite
-    /// implements the read side (`rebuild` + `MATCH` + column retrieval) but not the
-    /// incremental index-delta sync, so rather than silently rebuilding from the
-    /// content table (which would drop the direct write and produce wrong results),
-    /// it declines the write cleanly. The `rebuild`/`optimize` maintenance commands
-    /// are handled earlier and never reach here.
+    /// Handle an fts5 special-command INSERT whose first column is the hidden
+    /// table-named command column: `INSERT INTO t(t, …) VALUES('<cmd>', …)`.
+    /// Returns `Ok(Some(n))` when the row(s) were a recognized command (and thus
+    /// fully handled, no row inserted), or `Ok(None)` to fall through to a normal
+    /// insert (SQLite treats a non-command value in the command column as an error
+    /// via the usual path).
+    ///
+    /// Recognized commands:
+    /// * `rebuild` — rebuild the index from the content source (self/external).
+    /// * `optimize` — no-op (graphite already writes a single compacted segment).
+    /// * `delete` — `('delete', <rowid>, <old col values…>)`: subtract the supplied
+    ///   tokens' postings for `<rowid>` (contentless/external only).
+    /// * `delete-all` — clear the whole index (contentless/external only).
+    ///
+    /// `delete`/`delete-all` on a self-content table, and unknown commands, are a
+    /// hard error (matching SQLite's `SQL logic error` rejection).
     #[cfg(feature = "fts5")]
-    fn fts5_reject_external_dml(&self, module_name: &str, table: &str) -> Result<()> {
-        if module_name.eq_ignore_ascii_case("fts5") {
-            let args = self.vtab_meta(table)?.1;
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            if crate::vtab::fts5_external_content(&arg_refs).is_some() {
-                return Err(Error::Unsupported(
-                    "direct DML on an external-content fts5 table \
-                     (use the content table + INSERT INTO t(t) VALUES('rebuild'))",
-                ));
+    fn fts5_special_command(
+        &mut self,
+        ins: &Insert,
+        rows: &[Vec<Expr>],
+        params: &Params,
+        arg_refs: &[&str],
+    ) -> Result<Option<usize>> {
+        // The command is the value in the first (table-named) column of each row.
+        let cmd_of = |row: &[Expr]| -> Result<String> {
+            let ctx = EvalCtx::rowless(params).with_subqueries(self);
+            Ok(eval::to_text(&eval::eval(&row[0], &ctx)?))
+        };
+        // A single-column write `t(t)` is a maintenance command; `t(t, rowid, cols)`
+        // is a `delete`. Peek the first row's command to decide.
+        let first = match rows.first() {
+            Some(r) if !r.is_empty() => cmd_of(r)?,
+            _ => return Ok(None),
+        };
+        let no_local = crate::vtab::fts5_no_local_content(arg_refs);
+        match first.as_str() {
+            "rebuild" | "optimize" => {
+                // All rows must be maintenance commands (mixed with a row insert is
+                // not a valid form).
+                for row in rows {
+                    if !matches!(cmd_of(row)?.as_str(), "rebuild" | "optimize") {
+                        return Ok(None);
+                    }
+                }
+                let has_rebuild = rows
+                    .iter()
+                    .any(|r| cmd_of(r).map(|c| c == "rebuild").unwrap_or(false));
+                if !no_local {
+                    if has_rebuild {
+                        self.fts5_rebuild_index(&ins.table)?;
+                    }
+                } else if has_rebuild && crate::vtab::fts5_external_content(arg_refs).is_some() {
+                    // External rebuild: clear the private posting state and re-derive
+                    // it from the content table, so a subsequent direct write layers
+                    // on top of the content-derived postings — matching SQLite.
+                    // (A contentless `rebuild` is a no-op; `optimize` is always one.)
+                    self.fts5_rebuild_index_external_to_gpost(&ins.table)?;
+                }
+                Ok(Some(0))
+            }
+            "delete-all" => {
+                if !no_local {
+                    return Err(Error::Error(format!(
+                        "'delete-all' may only be used with a contentless or \
+                         external content fts5 table: {}",
+                        ins.table
+                    )));
+                }
+                let q = |s: &str| sql::print::ident(s);
+                self.execute(&format!(
+                    "DELETE FROM {}",
+                    q(&format!("{}_gpost", ins.table))
+                ))?;
+                self.execute(&format!(
+                    "DELETE FROM {}",
+                    q(&format!("{}_docsize", ins.table))
+                ))?;
+                self.fts5_rebuild_from_gpost(&ins.table)?;
+                Ok(Some(0))
+            }
+            "delete" => {
+                if !no_local {
+                    // SQLite rejects `'delete'` on a self-content table.
+                    return Err(Error::Error(format!(
+                        "cannot use the 'delete' command with a self-content fts5 \
+                         table: {}",
+                        ins.table
+                    )));
+                }
+                self.fts5_apply_delete_command(ins, rows, params, arg_refs)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Apply one or more `('delete', <rowid>, <old col values…>)` command rows to a
+    /// no-local-content table: subtract the supplied tokens' postings for each rowid
+    /// from the private posting state, then rebuild the segment index once. The
+    /// column layout mirrors the write column list `t(t, rowid, <fts cols…>)`.
+    #[cfg(feature = "fts5")]
+    fn fts5_apply_delete_command(
+        &mut self,
+        ins: &Insert,
+        rows: &[Vec<Expr>],
+        params: &Params,
+        _arg_refs: &[&str],
+    ) -> Result<Option<usize>> {
+        let (_m, _args, schema) = self.vtab_meta(&ins.table)?;
+        let ncols = schema.columns.len();
+        // Resolve the write column list (after the leading command column) onto
+        // (rowid marker | declared fts5 column position).
+        // ins.columns = [table-name, then rowid/_rowid_/oid and/or fts cols…].
+        let col_names = &schema.columns;
+        let target: Vec<Option<usize>> = ins.columns[1..]
+            .iter()
+            .map(
+                |name| match col_names.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+                    Some(p) => Ok(Some(p)),
+                    None if matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "rowid" | "_rowid_" | "oid"
+                    ) =>
+                    {
+                        Ok(None)
+                    }
+                    None => Err(Error::Error(format!("no such column: {name}"))),
+                },
+            )
+            .collect::<Result<_>>()?;
+        for row in rows {
+            // row[0] is the 'delete' literal; the rest align with `target`.
+            if row.len() != ins.columns.len() {
+                return Err(Error::Error(format!(
+                    "{} values for {} columns",
+                    row.len(),
+                    ins.columns.len()
+                )));
+            }
+            let mut values = alloc::vec![Value::Null; ncols];
+            let mut rowid = None;
+            for (j, expr) in row[1..].iter().enumerate() {
+                let ctx = EvalCtx::rowless(params).with_subqueries(self);
+                let v = eval::eval(expr, &ctx)?;
+                match target[j] {
+                    Some(col) => values[col] = v,
+                    None => rowid = Some(eval::to_i64(&v)),
+                }
+            }
+            // No rowid supplied ⇒ SQLite treats the missing rowid as NULL and the
+            // delete is a no-op that touches no postings; mirror that (rid absent).
+            if let Some(rid) = rowid {
+                self.fts5_gpost_apply(&ins.table, rid, &values, true)?;
             }
         }
-        Ok(())
+        self.fts5_rebuild_from_gpost(&ins.table)?;
+        Ok(Some(rows.len()))
+    }
+
+    /// Rebuild an external-content table's private posting state (`_gpost`) from its
+    /// content table: clear `_gpost`/`_docsize`, then apply each content document as
+    /// an insert. Used by the external `rebuild` command so later direct writes
+    /// compose with the content-derived postings.
+    #[cfg(feature = "fts5")]
+    fn fts5_rebuild_index_external_to_gpost(&mut self, name: &str) -> Result<()> {
+        let (_m, args, schema) = self.vtab_meta(name)?;
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let q = |s: &str| sql::print::ident(s);
+        self.execute(&format!("DELETE FROM {}", q(&format!("{name}_gpost"))))?;
+        self.execute(&format!("DELETE FROM {}", q(&format!("{name}_docsize"))))?;
+        let docs = self.fts5_load_documents(name, &schema.columns, &arg_refs)?;
+        for (rowid, values) in docs {
+            self.fts5_gpost_apply(name, rowid, &values, false)?;
+        }
+        self.fts5_rebuild_from_gpost(name)
     }
 
     /// Create an FTS5 table's storage: SQLite's shadow tables
@@ -27132,14 +27446,37 @@ impl Connection {
     /// An **external-content** table (`external = true`) stores no document copy,
     /// so its `_content` shadow is omitted — exactly matching sqlite's layout (four
     /// shadow tables: `_config`/`_docsize`/`_idx`/`_data`).
+    ///
+    /// A **contentless** table (`content=''`) keeps no document copy either, but
+    /// unlike external content it has no source table to rebuild from: its index is
+    /// maintained by direct-DML posting deltas kept in the graphite-private
+    /// `<name>_gpost` shadow (see `fts5_gpost_apply` / `fts5_rebuild_from_gpost`).
+    /// External-content tables also carry `<name>_gpost` so direct writes index the
+    /// *supplied* text (not the content table's), matching SQLite's trigger contract.
     #[cfg(feature = "fts5")]
-    fn fts5_create_storage(&mut self, name: &str, ncols: usize, external: bool) -> Result<()> {
+    fn fts5_create_storage(&mut self, name: &str, ncols: usize, no_local: bool) -> Result<()> {
         let content_cols: Vec<String> = (0..ncols).map(|c| format!("c{c}")).collect();
         let q = |s: &str| sql::print::ident(s);
-        let content_def = (!external).then(|| {
+        let content_def = (!no_local).then(|| {
             (
                 format!("{name}_content"),
                 format!("id INTEGER PRIMARY KEY, {}", content_cols.join(", ")),
+                "",
+            )
+        });
+        // The private posting-state shadow for a no-local-content table: one row per
+        // (rowid, column, term) with the term's positions (a varint list). The
+        // segment index (`_data`/`_idx`) is rebuilt from these rows after every
+        // direct write — this is how graphite reproduces SQLite's incremental
+        // (per-(rowid,term) last-write-wins, union across inserts, subtract-on-delete)
+        // contentless/external write semantics with its single-segment bulk writer.
+        // A normal rowid table (NOT `WITHOUT ROWID`, so `scan_table` can read it via
+        // the table btree) with a UNIQUE index over (rid, col, term) so
+        // `INSERT OR REPLACE` overwrites a term's positions in place.
+        let gpost_def = no_local.then(|| {
+            (
+                format!("{name}_gpost"),
+                "rid, col, term BLOB, pos BLOB, UNIQUE(rid, col, term)".to_string(),
                 "",
             )
         });
@@ -27165,7 +27502,11 @@ impl Connection {
                 "",
             ),
         ];
-        for (tname, cols, tail) in content_def.iter().chain(defs.iter()) {
+        for (tname, cols, tail) in content_def
+            .iter()
+            .chain(gpost_def.iter())
+            .chain(defs.iter())
+        {
             let sql = format!("CREATE TABLE {}({cols}){tail}", q(tname));
             let Statement::CreateTable(ct) = sql::parse_one(&sql)? else {
                 unreachable!("constructed a CREATE TABLE")
@@ -27362,6 +27703,231 @@ impl Connection {
             self.execute_params(
                 &format!("INSERT INTO {docsize_t} VALUES(?1,?2)"),
                 &pv(alloc::vec![Value::Integer(*rowid), Value::Blob(sz.clone())]),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Apply a direct-DML posting delta to a no-local-content (contentless or
+    /// external) fts5 table's private `<name>_gpost` state, then rebuild its
+    /// segment index from the updated postings. This reproduces SQLite's
+    /// incremental contentless/external write semantics:
+    ///
+    /// * **INSERT** (`op = Insert`): tokenize each supplied column; for every term
+    ///   that occurs, `INSERT OR REPLACE` its `(rid, col, term) → positions` row.
+    ///   A term already present for that `(rid, col)` from an earlier write is
+    ///   overwritten (last-write-wins per term); terms not in this write are left
+    ///   untouched (union across writes). The `_docsize` row is set to this
+    ///   write's per-column token counts (SQLite stores the latest insert's sizes).
+    /// * **DELETE** (`op = Delete`): tokenize each supplied column and REMOVE those
+    ///   `(rid, col, term)` rows — subtracting exactly the supplied tokens'
+    ///   postings for that rowid (SQLite trusts the caller-supplied old text; a
+    ///   wrong term subtracts the wrong posting, matching SQLite). The `_docsize`
+    ///   row for the rowid is removed.
+    ///
+    /// `values` are the fts5 column values in declared order (`ncols` long).
+    #[cfg(feature = "fts5")]
+    fn fts5_gpost_apply(
+        &mut self,
+        name: &str,
+        rowid: i64,
+        values: &[Value],
+        delete: bool,
+    ) -> Result<()> {
+        let (_m, args, schema) = self.vtab_meta(name)?;
+        let ncols = schema.columns.len();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let tok = crate::vtab::fts5_tok_config(&arg_refs);
+        let q = |s: &str| sql::print::ident(s);
+        let pv = |vals: Vec<Value>| Params {
+            positional: vals,
+            named: Vec::new(),
+        };
+        let gpost_t = q(&format!("{name}_gpost"));
+        let docsize_t = q(&format!("{name}_docsize"));
+        let mut sizes = alloc::vec![0u64; ncols];
+        for (c, size) in sizes.iter_mut().enumerate() {
+            let text = match values.get(c) {
+                Some(v) if !matches!(v, Value::Null) => eval::to_text(v),
+                _ => String::new(),
+            };
+            let toks = crate::vtab::fts5_tokenize(&text, tok);
+            *size = toks.len() as u64;
+            // Positions per distinct term in this column (ascending), varint-encoded.
+            let mut per_term: alloc::collections::BTreeMap<Vec<u8>, Vec<u32>> =
+                alloc::collections::BTreeMap::new();
+            for (pos, t) in toks.iter().enumerate() {
+                per_term
+                    .entry(t.as_bytes().to_vec())
+                    .or_default()
+                    .push(pos as u32);
+            }
+            for (term, positions) in per_term {
+                if delete {
+                    self.execute_params(
+                        &format!("DELETE FROM {gpost_t} WHERE rid=?1 AND col=?2 AND term=?3"),
+                        &pv(alloc::vec![
+                            Value::Integer(rowid),
+                            Value::Integer(c as i64),
+                            Value::Blob(term),
+                        ]),
+                    )?;
+                } else {
+                    let mut posbuf = Vec::new();
+                    for &p in &positions {
+                        let mut b = [0u8; 9];
+                        let n = crate::util::varint::encode(p as u64, &mut b);
+                        posbuf.extend_from_slice(&b[..n]);
+                    }
+                    self.execute_params(
+                        &format!("INSERT OR REPLACE INTO {gpost_t} VALUES(?1,?2,?3,?4)"),
+                        &pv(alloc::vec![
+                            Value::Integer(rowid),
+                            Value::Integer(c as i64),
+                            Value::Blob(term),
+                            Value::Blob(posbuf),
+                        ]),
+                    )?;
+                }
+            }
+        }
+        // Maintain `_docsize`: DELETE removes the row; INSERT sets this write's sizes.
+        self.execute_params(
+            &format!("DELETE FROM {docsize_t} WHERE id=?1"),
+            &pv(alloc::vec![Value::Integer(rowid)]),
+        )?;
+        if !delete {
+            let mut sz = Vec::new();
+            for &s in &sizes {
+                let mut b = [0u8; 9];
+                let n = crate::util::varint::encode(s, &mut b);
+                sz.extend_from_slice(&b[..n]);
+            }
+            self.execute_params(
+                &format!("INSERT INTO {docsize_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![Value::Integer(rowid), Value::Blob(sz)]),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remove every posting for `rowid` from a no-local-content table's `_gpost`
+    /// (and its `_docsize` row), regardless of term. Used by the `'delete-all'`
+    /// command (clear the whole index) via a per-rowid sweep is not needed —
+    /// `'delete-all'` truncates `_gpost` directly — but this is the per-row form a
+    /// future UPDATE-old-side could use. Currently unused beyond delete-all's bulk
+    /// clear, so delete-all is handled inline in `exec_vtab_insert`.
+    ///
+    /// Rebuild the `_data`/`_idx`/`_docsize` segment index of a no-local-content
+    /// fts5 table from the accumulated `<name>_gpost` postings. Groups the
+    /// `(rid, col, term)` rows into the `term → postings` shape and calls the same
+    /// bulk `build_segment` writer used by the content rebuild, so the on-disk index
+    /// is byte-compatible and `sqlite3`-readable/-MATCHable.
+    #[cfg(feature = "fts5")]
+    fn fts5_rebuild_from_gpost(&mut self, name: &str) -> Result<()> {
+        use crate::fts5_index::{self, IdxRow, Posting};
+        use alloc::collections::BTreeMap;
+        let (_m, _args, schema) = self.vtab_meta(name)?;
+        let ncols = schema.columns.len();
+
+        // term -> rowid -> per-column positions, gathered from `_gpost`.
+        let mut index: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u32>>>> = BTreeMap::new();
+        let mut col_totals = alloc::vec![0u64; ncols];
+        let gpost_meta = self.table_meta(&format!("{name}_gpost"), None)?;
+        for (_rk, row) in self.scan_table(&gpost_meta)? {
+            // Columns: rid, col, term, pos (WITHOUT ROWID → declared order).
+            let rid = eval::to_i64(&row[0]);
+            let col = eval::to_i64(&row[1]) as usize;
+            let term = match &row[2] {
+                Value::Blob(b) => b.clone(),
+                v => eval::to_text(v).into_bytes(),
+            };
+            let posbytes = match &row[3] {
+                Value::Blob(b) => b.clone(),
+                v => eval::to_text(v).into_bytes(),
+            };
+            if col >= ncols {
+                continue;
+            }
+            let mut positions = Vec::new();
+            let mut off = 0usize;
+            while off < posbytes.len() {
+                let Some((v, n)) = crate::util::varint::decode(&posbytes[off..]) else {
+                    break;
+                };
+                positions.push(v as u32);
+                off += n;
+            }
+            col_totals[col] += positions.len() as u64;
+            let cols = index
+                .entry(term)
+                .or_default()
+                .entry(rid)
+                .or_insert_with(|| alloc::vec![Vec::new(); ncols]);
+            cols[col] = positions;
+        }
+
+        // Per-document sizes come from `_docsize` (kept current by `fts5_gpost_apply`
+        // / delete-all), so bm25's average-length statistics match the live state.
+        let docsize_meta = self.table_meta(&format!("{name}_docsize"), None)?;
+        let mut doc_sizes: Vec<(i64, Vec<u64>)> = Vec::new();
+        for (rid, row) in self.scan_table(&docsize_meta)? {
+            let sz = match row.get(1) {
+                Some(Value::Blob(b)) => b.clone(),
+                _ => Vec::new(),
+            };
+            let mut sizes = alloc::vec![0u64; ncols];
+            let mut off = 0usize;
+            for s in sizes.iter_mut() {
+                let Some((v, n)) = crate::util::varint::decode(&sz[off..]) else {
+                    break;
+                };
+                *s = v;
+                off += n;
+            }
+            doc_sizes.push((rid, sizes));
+        }
+        doc_sizes.sort_by_key(|(r, _)| *r);
+        let n_docs = doc_sizes.len() as u64;
+
+        let terms: Vec<(Vec<u8>, Vec<Posting>)> = index
+            .into_iter()
+            .map(|(term, per_doc)| {
+                let postings = per_doc
+                    .into_iter()
+                    .map(|(rowid, cols)| Posting { rowid, cols })
+                    .collect();
+                (term, postings)
+            })
+            .collect();
+
+        let seg = fts5_index::build_segment(&terms, n_docs, &col_totals, &doc_sizes, 4050, 0);
+
+        let q = |s: &str| sql::print::ident(s);
+        let pv = |vals: Vec<Value>| Params {
+            positional: vals,
+            named: Vec::new(),
+        };
+        // `_data`/`_idx` are fully regenerated; `_docsize` is authoritative in the
+        // shadow already (do NOT clear it — it holds the live per-doc sizes).
+        self.execute(&format!("DELETE FROM {}", q(&format!("{name}_data"))))?;
+        self.execute(&format!("DELETE FROM {}", q(&format!("{name}_idx"))))?;
+        let data_t = q(&format!("{name}_data"));
+        for (id, block) in &seg.data {
+            self.execute_params(
+                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![Value::Integer(*id), Value::Blob(block.clone())]),
+            )?;
+        }
+        let idx_t = q(&format!("{name}_idx"));
+        for IdxRow { segid, term, pgno } in &seg.idx {
+            self.execute_params(
+                &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                &pv(alloc::vec![
+                    Value::Integer(*segid),
+                    Value::Blob(term.clone()),
+                    Value::Integer(*pgno)
+                ]),
             )?;
         }
         Ok(())
@@ -31664,6 +32230,40 @@ impl eval::Subqueries for Connection {
         }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         Some(crate::vtab::fts5_indexed_columns(&refs))
+    }
+    #[cfg(feature = "fts5")]
+    fn fts5_contentless_match(&self, table: &str, query: &str, rowid: i64) -> Option<bool> {
+        let (module, args, _) = self.vtab_meta(table).ok()?;
+        if !module.eq_ignore_ascii_case("fts5") {
+            return None;
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        if !crate::vtab::fts5_no_local_content(&refs) {
+            return None; // self-content keeps the indexed text → use the row-text path
+        }
+        // Consult the inverted index: a no-local-content row (contentless or external)
+        // matches iff its rowid is in the routed doclist for `query`. This is
+        // authoritative because the index is built from the caller-SUPPLIED text,
+        // which for external content can diverge from the content table's columns —
+        // re-checking against the content-table row text would give the wrong answer.
+        // An unroutable shape falls back to `None` for external (the content-text
+        // path still applies) but is a non-match for contentless (no text at all).
+        match self.fts5_index_match_rowids(table, &refs, query) {
+            Ok(Some(rowids)) => Some(rowids.contains(&rowid)),
+            _ if crate::vtab::fts5_is_contentless(&refs) => Some(false),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "fts5")]
+    fn fts5_is_contentless_table(&self, table: &str) -> bool {
+        let Ok((module, args, _)) = self.vtab_meta(table) else {
+            return false;
+        };
+        if !module.eq_ignore_ascii_case("fts5") {
+            return false;
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::vtab::fts5_is_contentless(&refs)
     }
     #[cfg(feature = "fts5")]
     fn fts5_tok(&self, table: &str) -> crate::vtab::Fts5Tok {

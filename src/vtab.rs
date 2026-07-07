@@ -3368,6 +3368,25 @@ pub(crate) fn fts5_external_content(args: &[&str]) -> Option<(String, String)> {
     Some((table, rowid))
 }
 
+/// Whether an `fts5` table is *contentless* (`content=''`): it stores no copy of
+/// the document columns — only the inverted index and rowids. Reading an indexed
+/// column back yields NULL (SQLite has nothing to return), and the index is kept
+/// current by direct DML (`INSERT`/`'delete'`) rather than a content source.
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_is_contentless(args: &[&str]) -> bool {
+    fts5_option_value(args, "content").is_some_and(|v| v.is_empty())
+}
+
+/// Whether an `fts5` table keeps NO local document copy — either *external
+/// content* (`content='<table>'`, columns read from that table) or *contentless*
+/// (`content=''`, columns read back as NULL). Both maintain their index by direct
+/// DML deltas (via `<name>_gpost`) instead of a bulk rebuild from a `_content`
+/// shadow. Self-content tables (no `content=` option) return `false`.
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_no_local_content(args: &[&str]) -> bool {
+    fts5_external_content(args).is_some() || fts5_is_contentless(args)
+}
+
 /// Parse an `fts5` table's `tokenize = '…'` option into a resolved [`Fts5Tok`].
 /// The value is a whitespace-separated tokenizer chain: an optional leading
 /// `porter` (⇒ Porter stemming, possibly wrapping a base tokenizer), then a base

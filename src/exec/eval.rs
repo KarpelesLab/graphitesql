@@ -126,6 +126,23 @@ pub trait Subqueries {
     fn fts5_tok(&self, _table: &str) -> crate::vtab::Fts5Tok {
         crate::vtab::Fts5Tok::default()
     }
+    /// Whether the document with `rowid` matches the full-text `query` in the
+    /// **contentless** `fts5` table `table`, evaluated against the inverted index
+    /// (a contentless row keeps no column text, so `MATCH` can't be re-checked from
+    /// the row like it is for a self/external-content table). Returns `None` when
+    /// `table` is not a contentless fts5 table (so the caller uses the column-text
+    /// path); `Some(true)`/`Some(false)` when it is.
+    #[cfg(feature = "fts5")]
+    fn fts5_contentless_match(&self, _table: &str, _query: &str, _rowid: i64) -> Option<bool> {
+        None
+    }
+    /// Whether `table` is a *contentless* (`content=''`) `fts5` table. Used by
+    /// `highlight`/`snippet` to return NULL (a contentless table stores no text to
+    /// render). `false` for a non-fts5 or non-contentless table.
+    #[cfg(feature = "fts5")]
+    fn fts5_is_contentless_table(&self, _table: &str) -> bool {
+        false
+    }
 }
 
 /// A column's type affinity (SQLite, `datatype3.html` §3).
