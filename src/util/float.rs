@@ -464,6 +464,13 @@ pub fn atan(x: f64) -> f64 {
     }
     let neg = x < 0.0;
     let mut a = abs(x);
+    // For any |x| ≳ 2⁵³ the true `atan(x)` is within half a ULP of ±π/2, so it
+    // rounds to exactly ±π/2. The half-angle reduction below squares `a`, which
+    // overflows to +∞ once |x| ≳ 1.3e154 (`a·a = +∞` ⇒ `a/(1+√(1+∞)) = 0`,
+    // collapsing the whole reduction to 0). Short-circuit that range directly.
+    if a > 1e154 {
+        return if neg { -PI / 2.0 } else { PI / 2.0 };
+    }
     let mut halvings = 0u32;
     while a > 0.1 {
         a = a / (1.0 + sqrt(1.0 + a * a));
