@@ -1426,6 +1426,15 @@ impl Connection {
         if select_has_schema_qualified_column(sel) {
             return Err(Error::Unsupported("VDBE: schema-qualified column"));
         }
+        // A table-qualified rowid alias (`t.rowid`) over a join needs each base
+        // table's per-table rowid, which the VDBE join compiler does not model.
+        // Defer to the tree-walker, which contributes hidden per-table rowid
+        // columns. (A single-table `t.rowid` is fine and handled elsewhere.)
+        if let Some(f) = &sel.from {
+            if !f.joins.is_empty() && select_references_qualified_rowid(sel) {
+                return Err(Error::Unsupported("VDBE: table-qualified rowid in a join"));
+            }
+        }
         // Cost-based two-table rowid-inner swap: when a two-table equi-join would
         // be reordered to drive from the second table (seeking `from.first` by its
         // cheaper rowid), the observable row order changes. The VDBE join paths do
@@ -23936,103 +23945,118 @@ impl Connection {
             return Ok((first_meta.columns, input_rows));
         }
 
+        // A table-qualified rowid alias (`t.rowid`) in a join needs each base
+        // table to contribute its rowid as a hidden tagged column so the reference
+        // resolves per-table (a joined row carries no single rowid). When that is in
+        // play, take the plain declaration-order fold path below (the cost-based
+        // swap/reorder paths bypass `fold_joins` and don't carry the hidden rowids)
+        // — the reorders only change an unordered join's row *order*, so forcing the
+        // declared order stays correct and any explicit ORDER BY re-sorts identically.
+        let with_rowid = select_references_qualified_rowid(sel);
+
         // Join case: resolve the first source (CTE, view, or table), then fold
         // in joins. The driver is fully scanned; when a covering secondary index
         // holds every `from.first` column the query needs, scan it in index order
         // (matching sqlite's row order). When a swap below fires instead, the second
         // table drives and these rows are discarded — only `columns` (metadata) is
         // reused, which the covering reorder leaves unchanged.
-        let (columns, rows) = self.resolve_join_scan_source(sel, from, &from.first, params)?;
+        let (columns, rows) =
+            self.resolve_join_scan_source_rowid(sel, from, &from.first, params, with_rowid)?;
 
-        // Cost-based join-order (two-table rowid-inner swap): when driving from
-        // `from.first` would seek the second table by a secondary index but
-        // driving from the second table instead seeks `from.first` by its cheaper
-        // rowid, prefer the latter (matching sqlite's plan and its row order).
-        // EXECUTION-only: the produced columns/rows stay in DECLARED order, so
-        // `SELECT *` and the projection are unaffected. Gated tightly by
-        // `two_table_rowid_inner_swap`; every other join shape falls through to
-        // the unchanged fold below.
-        if let Some((driver_join_local, first_meta, first_ipk)) =
-            self.two_table_rowid_inner_swap(from)
-        {
-            let _ = first_ipk;
-            let (out_columns, out_rows) = self.exec_two_table_rowid_inner_swap(
-                sel,
-                from,
-                &columns,
-                driver_join_local,
-                &first_meta,
-                params,
-            )?;
-            let input_rows = out_rows
-                .into_iter()
-                .map(|values| InputRow {
-                    values,
-                    rowid: None,
-                })
-                .collect();
-            return Ok((out_columns, input_rows));
-        }
+        if !with_rowid {
+            // Cost-based join-order (two-table rowid-inner swap): when driving from
+            // `from.first` would seek the second table by a secondary index but
+            // driving from the second table instead seeks `from.first` by its cheaper
+            // rowid, prefer the latter (matching sqlite's plan and its row order).
+            // EXECUTION-only: the produced columns/rows stay in DECLARED order, so
+            // `SELECT *` and the projection are unaffected. Gated tightly by
+            // `two_table_rowid_inner_swap`; every other join shape falls through to
+            // the unchanged fold below.
+            if let Some((driver_join_local, first_meta, first_ipk)) =
+                self.two_table_rowid_inner_swap(from)
+            {
+                let _ = first_ipk;
+                let (out_columns, out_rows) = self.exec_two_table_rowid_inner_swap(
+                    sel,
+                    from,
+                    &columns,
+                    driver_join_local,
+                    &first_meta,
+                    params,
+                )?;
+                let input_rows = out_rows
+                    .into_iter()
+                    .map(|values| InputRow {
+                        values,
+                        rowid: None,
+                    })
+                    .collect();
+                return Ok((out_columns, input_rows));
+            }
 
-        // Cost-based join-order (two-table secondary-index-inner swap): the
-        // secondary-index analogue of the rowid swap above. When driving from
-        // `from.first` cannot seek the second table on its join column but
-        // `from.first`'s own join column is the leading column of a usable
-        // secondary index, scan the second table and seek `from.first` by that
-        // index (matching sqlite's plan and row order). Mutually exclusive with the
-        // rowid swap (which requires `from.first`'s column to BE its rowid IPK).
-        // EXECUTION-only: columns/rows stay in DECLARED order.
-        if let Some((driver_join_local, first_meta, idx)) = self.two_table_index_inner_swap(from) {
-            let (out_columns, out_rows) = self.exec_two_table_index_inner_swap(
-                sel,
-                from,
-                &columns,
-                driver_join_local,
-                &first_meta,
-                &idx,
-                params,
-            )?;
-            let input_rows = out_rows
-                .into_iter()
-                .map(|values| InputRow {
-                    values,
-                    rowid: None,
-                })
-                .collect();
-            return Ok((out_columns, input_rows));
-        }
+            // Cost-based join-order (two-table secondary-index-inner swap): the
+            // secondary-index analogue of the rowid swap above. When driving from
+            // `from.first` cannot seek the second table on its join column but
+            // `from.first`'s own join column is the leading column of a usable
+            // secondary index, scan the second table and seek `from.first` by that
+            // index (matching sqlite's plan and row order). Mutually exclusive with the
+            // rowid swap (which requires `from.first`'s column to BE its rowid IPK).
+            // EXECUTION-only: columns/rows stay in DECLARED order.
+            if let Some((driver_join_local, first_meta, idx)) =
+                self.two_table_index_inner_swap(from)
+            {
+                let (out_columns, out_rows) = self.exec_two_table_index_inner_swap(
+                    sel,
+                    from,
+                    &columns,
+                    driver_join_local,
+                    &first_meta,
+                    &idx,
+                    params,
+                )?;
+                let input_rows = out_rows
+                    .into_iter()
+                    .map(|values| InputRow {
+                        values,
+                        rowid: None,
+                    })
+                    .collect();
+                return Ok((out_columns, input_rows));
+            }
 
-        // Cost-based join-order for THREE OR MORE plain-INNER `main` base tables:
-        // sqlite drives the join from a table it must SCAN and pulls the
-        // rowid-/index-seekable tables into the inner positions, so an unordered
-        // query's rows come out in the chosen driver's scan order. When
-        // `ntable_join_order` confidently matches sqlite's ordering it returns a
-        // permuted `FromClause` plus the column-slot remap back to DECLARED order.
-        // The fold runs on the permuted clause (so every inner is seeked in
-        // lockstep with how the EQP emitter renders it), then the columns and every
-        // row are remapped to declared order — so `SELECT *` / `t.*` and the
-        // projection see the unchanged declared layout; only the row ORDER changes.
-        if let Some((reordered, remap)) = self.ntable_join_order(sel, from) {
-            let (drv_columns, drv_rows) =
-                self.resolve_join_scan_source(sel, &reordered, &reordered.first, params)?;
-            let (exec_columns, exec_rows) =
-                self.fold_joins(sel, &reordered, drv_columns, drv_rows, params)?;
-            // Remap execution-order slots back to declared `FROM` order.
-            let out_columns: Vec<ColumnInfo> =
-                remap.iter().map(|&s| exec_columns[s].clone()).collect();
-            let input_rows = exec_rows
-                .into_iter()
-                .map(|row| InputRow {
-                    values: remap.iter().map(|&s| row[s].clone()).collect(),
-                    rowid: None,
-                })
-                .collect();
-            return Ok((out_columns, input_rows));
-        }
+            // Cost-based join-order for THREE OR MORE plain-INNER `main` base tables:
+            // sqlite drives the join from a table it must SCAN and pulls the
+            // rowid-/index-seekable tables into the inner positions, so an unordered
+            // query's rows come out in the chosen driver's scan order. When
+            // `ntable_join_order` confidently matches sqlite's ordering it returns a
+            // permuted `FromClause` plus the column-slot remap back to DECLARED order.
+            // The fold runs on the permuted clause (so every inner is seeked in
+            // lockstep with how the EQP emitter renders it), then the columns and every
+            // row are remapped to declared order — so `SELECT *` / `t.*` and the
+            // projection see the unchanged declared layout; only the row ORDER changes.
+            if let Some((reordered, remap)) = self.ntable_join_order(sel, from) {
+                let (drv_columns, drv_rows) =
+                    self.resolve_join_scan_source(sel, &reordered, &reordered.first, params)?;
+                let (exec_columns, exec_rows) =
+                    self.fold_joins(sel, &reordered, drv_columns, drv_rows, params)?;
+                // Remap execution-order slots back to declared `FROM` order.
+                let out_columns: Vec<ColumnInfo> =
+                    remap.iter().map(|&s| exec_columns[s].clone()).collect();
+                let input_rows = exec_rows
+                    .into_iter()
+                    .map(|row| InputRow {
+                        values: remap.iter().map(|&s| row[s].clone()).collect(),
+                        rowid: None,
+                    })
+                    .collect();
+                return Ok((out_columns, input_rows));
+            }
+        } // end `if !with_rowid`
 
         // Fold each join in with a nested-loop, evaluating its ON predicate
         // against the columns accumulated so far plus the joined table's.
-        let (columns, rows) = self.fold_joins(sel, from, columns, rows, params)?;
+        let (columns, rows) =
+            self.fold_joins_rowid(sel, from, columns, rows, params, with_rowid)?;
 
         let input_rows = rows
             .into_iter()
@@ -24058,9 +24082,27 @@ impl Connection {
         &self,
         sel: &Select,
         from: &FromClause,
+        columns: Vec<ColumnInfo>,
+        rows: Vec<Vec<Value>>,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        self.fold_joins_rowid(sel, from, columns, rows, params, false)
+    }
+
+    /// [`fold_joins`](Self::fold_joins) with the hidden per-table rowid option:
+    /// when `with_rowid` is set, each base rowid table folded in also contributes
+    /// a trailing hidden `rowid` column (see
+    /// [`resolve_join_source_rowid`](Self::resolve_join_source_rowid)), so a
+    /// table-qualified rowid alias resolves per-table. Hidden columns never take
+    /// part in `NATURAL`/`USING` matching.
+    fn fold_joins_rowid(
+        &self,
+        sel: &Select,
+        from: &FromClause,
         mut columns: Vec<ColumnInfo>,
         mut rows: Vec<Vec<Value>>,
         params: &Params,
+        with_rowid: bool,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         for join in &from.joins {
             // Roadmap B1a: when the inner table's join column is its rowid IPK,
@@ -24075,6 +24117,7 @@ impl Connection {
                     outer_col,
                     &inner_meta,
                     params,
+                    with_rowid,
                 )?;
                 columns = new_columns;
                 rows = joined;
@@ -24095,6 +24138,7 @@ impl Connection {
                     &inner_meta,
                     &idx,
                     params,
+                    with_rowid,
                 )?;
                 columns = new_columns;
                 rows = joined;
@@ -24140,9 +24184,9 @@ impl Connection {
                     })
                 });
             let (jcols, jrows) = if inner_is_equi_hash {
-                self.resolve_join_source(&join.table, params)?
+                self.resolve_join_source_rowid(&join.table, params, with_rowid)?
             } else {
-                self.resolve_join_scan_source(sel, from, &join.table, params)?
+                self.resolve_join_scan_source_rowid(sel, from, &join.table, params, with_rowid)?
             };
 
             let left_width = columns.len();
@@ -24150,15 +24194,17 @@ impl Connection {
             // index)` pairs: the join matches on equality of these and coalesces
             // each into the single left-side output column. `NATURAL` pairs every
             // commonly-named column; with no common column it degrades to a cross
-            // join (empty `pairs`), matching SQLite.
+            // join (empty `pairs`), matching SQLite. Hidden columns (the per-table
+            // rowid slots) never take part in the common-name matching.
             let pairs: Vec<(usize, usize)> = if join.natural {
                 jcols
                     .iter()
                     .enumerate()
+                    .filter(|(_, rc)| !rc.hidden)
                     .filter_map(|(rl, rc)| {
                         columns
                             .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(&rc.name))
+                            .position(|c| !c.hidden && c.name.eq_ignore_ascii_case(&rc.name))
                             .map(|li| (li, rl))
                     })
                     .collect()
@@ -24167,8 +24213,10 @@ impl Connection {
                 for name in &join.using {
                     let li = columns
                         .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(name));
-                    let rl = jcols.iter().position(|c| c.name.eq_ignore_ascii_case(name));
+                        .position(|c| !c.hidden && c.name.eq_ignore_ascii_case(name));
+                    let rl = jcols
+                        .iter()
+                        .position(|c| !c.hidden && c.name.eq_ignore_ascii_case(name));
                     match (li, rl) {
                         (Some(li), Some(rl)) => v.push((li, rl)),
                         _ => {
@@ -25225,11 +25273,18 @@ impl Connection {
         inner_meta: &TableMeta,
         idx: &IndexMeta,
         params: &Params,
+        with_rowid: bool,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         let encoding = self.backend.source().header().text_encoding;
         let mut new_columns = columns.to_vec();
         new_columns.extend(inner_meta.columns.iter().cloned());
-        let n_jcols = inner_meta.columns.len();
+        // Plain rowid base-table inner: contribute its hidden rowid slot when the
+        // query needs per-table rowids.
+        if with_rowid {
+            let label = join.table.alias.as_deref().unwrap_or(&join.table.name);
+            new_columns.push(hidden_rowid_col(label, Some(self.db_label(DbRef::Main))));
+        }
+        let n_jcols = new_columns.len() - columns.len();
         let on = join.on.as_ref();
         let is_left = matches!(join.kind, JoinKind::Left);
 
@@ -25256,6 +25311,9 @@ impl Connection {
                             self.decode_full_row(inner_meta, rid, &cur.payload()?, encoding)?;
                         let mut row = left.clone();
                         row.extend(inner);
+                        if with_rowid {
+                            row.push(Value::Integer(rid));
+                        }
                         let keep = match on {
                             Some(on) => {
                                 let ctx = row_ctx(&row, &new_columns, None, params);
@@ -26122,6 +26180,7 @@ impl Connection {
     /// inner table's b-tree, and combine. The full `ON` is re-evaluated on the
     /// fetched row so results are identical to the materialize/hash path. INNER
     /// drops an outer row with no inner match; LEFT NULL-extends it.
+    #[allow(clippy::too_many_arguments)]
     fn exec_rowid_join_seek(
         &self,
         join: &Join,
@@ -26130,11 +26189,18 @@ impl Connection {
         outer_col: usize,
         inner_meta: &TableMeta,
         params: &Params,
+        with_rowid: bool,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         let encoding = self.backend.source().header().text_encoding;
         let mut new_columns = columns.to_vec();
         new_columns.extend(inner_meta.columns.iter().cloned());
-        let n_jcols = inner_meta.columns.len();
+        // The inner is a plain rowid base table; contribute its hidden rowid slot
+        // when the query needs per-table rowids.
+        if with_rowid {
+            let label = join.table.alias.as_deref().unwrap_or(&join.table.name);
+            new_columns.push(hidden_rowid_col(label, Some(self.db_label(DbRef::Main))));
+        }
+        let n_jcols = new_columns.len() - columns.len();
         let on = join.on.as_ref();
         let is_left = matches!(join.kind, JoinKind::Left);
 
@@ -26160,6 +26226,9 @@ impl Connection {
                     let inner = self.decode_full_row(inner_meta, rid, &cur.payload()?, encoding)?;
                     let mut combined = left.clone();
                     combined.extend(inner);
+                    if with_rowid {
+                        combined.push(Value::Integer(rid));
+                    }
                     let keep = match on {
                         Some(on) => {
                             let ctx = row_ctx(&combined, &new_columns, None, params);
@@ -26187,6 +26256,23 @@ impl Connection {
         &self,
         tref: &TableRef,
         params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        self.resolve_join_source_rowid(tref, params, false)
+    }
+
+    /// Like [`resolve_join_source`](Self::resolve_join_source), but when
+    /// `with_rowid` is set and the source is a plain rowid base table (in any
+    /// database), appends a trailing *hidden* column named `rowid` (tagged with
+    /// the table's alias/name) carrying each row's integer rowid. This lets a
+    /// table-qualified rowid alias (`t.rowid`/`t._rowid_`/`t.oid`) resolve
+    /// per-table in a join (a joined row otherwise carries no single rowid). A
+    /// `WITHOUT ROWID` table and any non-base source (view/CTE/derived/TVF/vtab)
+    /// contribute no such column, so `t.rowid` there still errors like sqlite.
+    fn resolve_join_source_rowid(
+        &self,
+        tref: &TableRef,
+        params: &Params,
+        with_rowid: bool,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         if tref.tvf_args.is_some() || self.is_bare_tvf(tref) {
             return self.tvf_rows(tref, params);
@@ -26238,15 +26324,31 @@ impl Connection {
         for col in &mut meta.columns {
             col.schema = Some(db_label.clone());
         }
-        let rows = if meta.without_rowid {
-            self.scan_without_rowid(&meta)?
-        } else {
-            self.scan_table(&meta)?
-                .into_iter()
-                .map(|(_, v)| v)
-                .collect()
-        };
-        Ok((meta.columns, rows))
+        // A `WITHOUT ROWID` table has no rowid to contribute; a rowid table gets a
+        // trailing hidden `rowid` column when the query needs per-table rowids.
+        if meta.without_rowid || !with_rowid {
+            let rows = if meta.without_rowid {
+                self.scan_without_rowid(&meta)?
+            } else {
+                self.scan_table(&meta)?
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect()
+            };
+            return Ok((meta.columns, rows));
+        }
+        let mut columns = meta.columns.clone();
+        let label = tref.alias.as_deref().unwrap_or(&tref.name);
+        columns.push(hidden_rowid_col(label, Some(self.db_label(DbRef::Main))));
+        let rows = self
+            .scan_table(&meta)?
+            .into_iter()
+            .map(|(rowid, mut v)| {
+                v.push(Value::Integer(rowid));
+                v
+            })
+            .collect();
+        Ok((columns, rows))
     }
 
     /// Resolve a join source that will be fully SCANNED (the outer driver, or a
@@ -26265,11 +26367,31 @@ impl Connection {
         tref: &TableRef,
         params: &Params,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        self.resolve_join_scan_source_rowid(sel, from, tref, params, false)
+    }
+
+    /// [`resolve_join_scan_source`](Self::resolve_join_scan_source) with the same
+    /// hidden per-table rowid option as
+    /// [`resolve_join_source_rowid`](Self::resolve_join_source_rowid). When
+    /// `with_rowid` is set the covering-index-order reorder is skipped (it would
+    /// need to carry rowids in index order); the plain rowid-order scan — which
+    /// appends the hidden rowid — is used instead. This only affects an
+    /// unordered join's row *order* in the rare covering-scan + qualified-rowid
+    /// combination, and any explicit `ORDER BY` re-sorts identically.
+    fn resolve_join_scan_source_rowid(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        tref: &TableRef,
+        params: &Params,
+        with_rowid: bool,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         // Only a plain `main` base table can carry a secondary index to walk; every
         // other source short-circuits to the ordinary resolver. (The covering helper
         // re-checks all of this, but skipping the meta lookup here keeps the common
         // path cheap and avoids a spurious `table_meta` error for derived sources.)
-        if tref.subquery.is_none()
+        if !with_rowid
+            && tref.subquery.is_none()
             && tref.tvf_args.is_none()
             && !self.is_bare_tvf(tref)
             && tref.schema.is_none()
@@ -26288,7 +26410,7 @@ impl Connection {
                 }
             }
         }
-        self.resolve_join_source(tref, params)
+        self.resolve_join_source_rowid(tref, params, with_rowid)
     }
 
     /// Scan a `WITHOUT ROWID` table's clustered index b-tree, decoding each entry
@@ -30815,7 +30937,10 @@ fn validate_unambiguous_columns(
                 let n = columns
                     .iter()
                     .filter(|c| {
-                        c.name.eq_ignore_ascii_case(column)
+                        // Hidden per-table rowid slots never count toward ambiguity
+                        // (a real `rowid` column plus the hidden one is not a clash).
+                        !c.hidden
+                            && c.name.eq_ignore_ascii_case(column)
                             && table
                                 .as_deref()
                                 .is_none_or(|t| c.table.eq_ignore_ascii_case(t))
@@ -30847,8 +30972,12 @@ fn validate_unambiguous_columns(
         .any(|c| matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_)));
     if has_wildcard {
         for (i, a) in columns.iter().enumerate() {
+            if a.hidden {
+                continue;
+            }
             if let Some(b) = columns[i + 1..].iter().find(|b| {
-                a.name.eq_ignore_ascii_case(&b.name)
+                !b.hidden
+                    && a.name.eq_ignore_ascii_case(&b.name)
                     && a.table.eq_ignore_ascii_case(&b.table)
                     // Two same-named, same-table columns are only ambiguous when
                     // they share a database of origin: `SELECT * FROM t, aux.t`
@@ -31016,6 +31145,22 @@ fn col_szest(type_name: Option<&str>) -> u32 {
         _ => 0,
     };
     (v / 4 + 1).min(255)
+}
+
+/// The hidden per-table rowid column contributed by a base rowid table in a join
+/// (see [`Connection::resolve_join_source_rowid`]). Named
+/// `rowid`, tagged with the table's alias/name, INTEGER affinity, BINARY
+/// collation; `hidden` so `*`/`t.*` expansion and column-count skip it. A
+/// table-qualified rowid alias resolves to it in `EvalCtx::resolve_column`.
+fn hidden_rowid_col(table: &str, schema: Option<String>) -> ColumnInfo {
+    ColumnInfo {
+        name: alloc::string::String::from("rowid"),
+        table: table.to_string(),
+        schema,
+        affinity: eval::Affinity::Integer,
+        collation: crate::value::Collation::Binary,
+        hidden: true,
+    }
 }
 
 fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, Option<&str>, &str, bool)) {
@@ -31296,6 +31441,48 @@ fn select_has_schema_qualified_column(sel: &Select) -> bool {
         subs.push(operand);
     }
     hit || subs.into_iter().any(select_has_schema_qualified_column)
+}
+
+/// Whether `sel` references a *table-qualified* rowid alias anywhere in its own
+/// clauses (`t.rowid` / `t._rowid_` / `t.oid`). Used to decide, for a join, that
+/// each base table must contribute its rowid as a hidden tagged column so the
+/// qualified reference resolves per-table (a joined row carries no single rowid).
+/// Only this level's clauses are inspected — a nested subquery has its own FROM
+/// scope and resolves its own rowids independently.
+fn select_references_qualified_rowid(sel: &Select) -> bool {
+    let mut hit = false;
+    let mut check = |e: &Expr| {
+        walk_shallow_columns(e, &mut |_schema, table, column, _quoted| {
+            if table.is_some() && eval::is_rowid_alias(column) {
+                hit = true;
+            }
+        });
+    };
+    for c in &sel.columns {
+        if let ResultColumn::Expr { expr, .. } = c {
+            check(expr);
+        }
+    }
+    if let Some(from) = &sel.from {
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                check(on);
+            }
+        }
+    }
+    if let Some(w) = &sel.where_clause {
+        check(w);
+    }
+    for g in &sel.group_by {
+        check(g);
+    }
+    if let Some(h) = &sel.having {
+        check(h);
+    }
+    for o in &sel.order_by {
+        check(&o.expr);
+    }
+    hit
 }
 
 /// Resolve each direct column reference in `sel`'s own clauses against a stack of

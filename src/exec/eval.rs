@@ -370,14 +370,29 @@ impl<'a> EvalCtx<'a> {
         quoted: bool,
     ) -> Result<Value> {
         // Special rowid aliases (`rowid`/`_rowid_`/`oid`), optionally qualified
-        // by a table name in scope (`t.rowid`). A real column always wins, so
-        // only fall back to the rowid when no column matches.
+        // by a table name in scope (`t.rowid`). A real (non-hidden) column named
+        // exactly like the alias always wins, so only fall back to the rowid when
+        // no such real column matches.
         if is_rowid_alias(name)
             && !self.columns.iter().any(|col| {
-                col.name.eq_ignore_ascii_case(name)
+                !col.hidden
+                    && col.name.eq_ignore_ascii_case(name)
                     && table.is_none_or(|t| col.table.eq_ignore_ascii_case(t))
             })
         {
+            // In a join, each base table contributes its rowid as a hidden column
+            // named `rowid` tagged with the table's alias/name; a qualified rowid
+            // alias (`t.rowid`/`t._rowid_`/`t.oid`) resolves to that table's hidden
+            // rowid. (A `WITHOUT ROWID` table contributes none, so it still errors.)
+            for (i, col) in self.columns.iter().enumerate() {
+                if col.hidden
+                    && col.name.eq_ignore_ascii_case("rowid")
+                    && table.is_none_or(|t| col.table.eq_ignore_ascii_case(t))
+                {
+                    return Ok(self.row[i].clone());
+                }
+            }
+            // Single-table scan: the row carries one rowid in `self.rowid`.
             let qualifies = match table {
                 None => true,
                 Some(t) => self.columns.iter().any(|c| c.table.eq_ignore_ascii_case(t)),
