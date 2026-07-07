@@ -5838,14 +5838,77 @@ impl Connection {
                 name
             })
             .collect();
-        // Build and create the resolved table `name(col1,col2,…)`. SQLite stores
-        // the CTAS schema with `identPut` quoting (bare when safe) and no spaces
-        // after the commas, so mirror that to stay byte-identical.
-        let cols = deduped
+        // Each new column inherits a declared TYPE from the query's output: SQLite
+        // uses the affinity of a direct column reference (through aliases/views),
+        // rendered as its canonical short name (INTEGER→`INT`, TEXT→`TEXT`,
+        // REAL→`REAL`, NUMERIC→`NUM`, BLOB/none→no type); a computed expression or
+        // literal gets no type. This also gives the new table the right affinity.
+        // A compound query's per-column affinity is combined across arms by a
+        // fiddly internal rule, so only a plain (non-compound) SELECT propagates
+        // types; a compound leaves them blank (as before).
+        let ctas_params = Params::default();
+        let types: Vec<String> = if select.compound.is_empty() {
+            match self.scan_source(select, &ctas_params) {
+                Ok((src_cols, _)) => {
+                    let ctx = row_ctx(&[], &src_cols, None, &ctas_params).with_subqueries(self);
+                    let mut affs: Vec<Option<eval::Affinity>> = Vec::new();
+                    for col in &select.columns {
+                        match col {
+                            ResultColumn::Expr { expr, .. } => {
+                                affs.push(eval::expr_affinity(expr, &ctx));
+                            }
+                            ResultColumn::Wildcard => affs.extend(
+                                src_cols
+                                    .iter()
+                                    .filter(|c| !c.hidden)
+                                    .map(|c| Some(c.affinity)),
+                            ),
+                            ResultColumn::TableWildcard(t) => affs.extend(
+                                src_cols
+                                    .iter()
+                                    .filter(|c| !c.hidden && c.table.eq_ignore_ascii_case(t))
+                                    .map(|c| Some(c.affinity)),
+                            ),
+                        }
+                    }
+                    affs.iter()
+                        .map(|a| match a {
+                            Some(eval::Affinity::Integer) => "INT",
+                            Some(eval::Affinity::Text) => "TEXT",
+                            Some(eval::Affinity::Real) => "REAL",
+                            Some(eval::Affinity::Numeric) => "NUM",
+                            Some(eval::Affinity::Blob) | None => "",
+                        })
+                        .map(String::from)
+                        .collect()
+                }
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        // Build and create the resolved table. SQLite stores the CTAS schema with
+        // `identPut` quoting (bare when safe), a space before a non-empty type, and
+        // no spaces after the commas — and lays it out on one line for up to five
+        // columns, but one column per indented line (with a trailing newline before
+        // the closing paren) for six or more. Mirror both to stay byte-identical.
+        let coldefs: Vec<String> = deduped
             .iter()
-            .map(|c| crate::sql::print::ident_smart(c))
-            .collect::<Vec<_>>()
-            .join(",");
+            .enumerate()
+            .map(|(i, c)| {
+                let ty = types.get(i).map(String::as_str).unwrap_or("");
+                if ty.is_empty() {
+                    crate::sql::print::ident_smart(c)
+                } else {
+                    format!("{} {ty}", crate::sql::print::ident_smart(c))
+                }
+            })
+            .collect();
+        let cols = if coldefs.len() > 5 {
+            format!("\n  {}\n", coldefs.join(",\n  "))
+        } else {
+            coldefs.join(",")
+        };
         let create_sql = format!(
             "CREATE TABLE {}({cols})",
             crate::sql::print::ident_smart(&ct.name)

@@ -107,6 +107,98 @@ fn against_sqlite3() {
     );
 }
 
+/// The generated CTAS schema text: each column inherits a canonical declared type
+/// from the query's output affinity (a direct column ref keeps its source column's
+/// affinity — `INT`/`TEXT`/`REAL`/`NUM`, BLOB/none/expression → no type), and the
+/// column list is laid out on one line for ≤5 columns but one indented column per
+/// line for ≥6 — byte-for-byte like sqlite. The inherited type also gives the new
+/// table the right affinity.
+#[test]
+fn ctas_column_types_and_layout_match_sqlite() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let setup = "CREATE TABLE s(a INTEGER,b TEXT,c REAL,d BLOB,e NUMERIC,f VARCHAR(10),g);\
+                 INSERT INTO s DEFAULT VALUES;\
+                 CREATE TABLE t_star AS SELECT * FROM s;\
+                 CREATE TABLE t_expr AS SELECT a,b,a+1 AS x,upper(b) AS y,CAST(a AS TEXT) z FROM s;\
+                 CREATE TABLE t_small AS SELECT a,b,c FROM s;\
+                 CREATE TABLE t_five AS SELECT a,b,c,e,f FROM s;\
+                 CREATE VIEW v AS SELECT a,b FROM s;\
+                 CREATE TABLE t_view AS SELECT * FROM v;\
+                 CREATE TABLE t_lit AS SELECT 1 AS p,'q' AS q,3.5 AS r";
+    let names = ["t_star", "t_expr", "t_small", "t_five", "t_view", "t_lit"];
+
+    let path = std::env::temp_dir().join(format!("gsql-ctas-schema-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    let out = Command::new("sqlite3")
+        .arg(&path)
+        .arg(setup)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut g = Connection::open_memory().unwrap();
+    for s in setup.split(';') {
+        if !s.trim().is_empty() {
+            g.execute(s).unwrap();
+        }
+    }
+
+    let mut failures = Vec::new();
+    for n in names {
+        let q = format!("SELECT sql FROM sqlite_master WHERE name='{n}'");
+        let want = {
+            let o = Command::new("sqlite3").arg(&path).arg(&q).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        let got = rows_str(&g, &q);
+        if got != want {
+            failures.push(format!(
+                "  {n}\n    sqlite:   {want:?}\n    graphite: {got:?}"
+            ));
+        }
+    }
+    // Affinity of an inherited-type column: an INT column coerces inserted text.
+    let aff_q = "CREATE TABLE si(a INTEGER);INSERT INTO si VALUES(5);\
+                 CREATE TABLE di AS SELECT a FROM si;INSERT INTO di VALUES('42');\
+                 SELECT typeof(a) FROM di WHERE a=42;";
+    let want_aff = {
+        let o = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg(aff_q)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+    };
+    let mut g2 = Connection::open_memory().unwrap();
+    for s in aff_q.split(';') {
+        if !s.trim().is_empty() {
+            let _ = g2.execute(s);
+        }
+    }
+    let got_aff = rows_str(&g2, "SELECT typeof(a) FROM di WHERE a=42");
+    if got_aff != want_aff {
+        failures.push(format!(
+            "  affinity\n    sqlite:   {want_aff:?}\n    graphite: {got_aff:?}"
+        ));
+    }
+
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        failures.is_empty(),
+        "{} CTAS schema/affinity cases diverged:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 #[test]
 fn ctas_auto_renames_duplicate_columns() {
     // `CREATE TABLE … AS SELECT` auto-renames duplicate output column names (the
