@@ -1382,12 +1382,17 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   to `SCAN t` + a sort). It now picks the narrowest covering candidate (ties → newest), the same
   choice as a bare covering scan — so `SELECT a … GROUP BY a` / `SELECT DISTINCT a` over
   `ia(a)`+`iab(a,b)` reads `SCAN t USING COVERING INDEX ia` like sqlite. Byte-exact plan+rows
-  (`tests/eqp_group_distinct_covering.rs`). **Still open (same class):** the no-`WHERE`
-  `order_index_scan` path still first-picks among multiple order-satisfying indexes
-  (`SELECT a,b … ORDER BY a,b` over `ia`+`iab` chooses `ia` + a temp b-tree where sqlite reads the
-  covering `iab` in order — pre-existing, rows correct); it wants the same deterministic-chooser
-  treatment `seek_order_prefix` got. Also still open: `min(col)`/`max(col)` over an indexed column
-  with 2+ indexes declines the index fast-path.
+  (`tests/eqp_group_distinct_covering.rs`).
+  **The no-`WHERE` `order_index_scan` path now scores candidates instead of first-picking
+  (2026-07-07):** `SELECT a,b … ORDER BY a,b` over `ia(a)`+`iab(a,b)` now reads the covering
+  `iab` fully in order (was `ia` + a temp b-tree) — the key is `(sorted_suffix, !covering, width,
+  newest)`, so the index that orders the most terms wins, then covering, then narrower/newest
+  (`tests/eqp_order_index_choice.rs`). **Still open (same class):** a *covering* index that orders
+  only a PARTIAL prefix (`SELECT a,b … ORDER BY a, b DESC` — `iab` orders `a`, sorts `b DESC`) is
+  deferred by `order_index_scan` to `covering_scan`, but `order_index_scan` first returns a
+  *non-covering* partial (`ia`) so sqlite's covering `iab` is missed (pre-existing, rows correct) —
+  the two paths need unifying. Also still open: `min(col)`/`max(col)` over an indexed column with
+  2+ indexes declines the index fast-path.
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   `collect_eq_constraints` / `collect_range_constraints` compare an explicit `COLLATE`
   to the *column's* collation. When an index carries a *non-default* collation

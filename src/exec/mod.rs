@@ -17777,6 +17777,13 @@ impl Connection {
         // sort; a partial walk (`sorted_suffix > 0`) is taken only for the
         // NON-covering case (the covered one is `covering_scan` + `scan_order_
         // prefix`, which already reads in order).
+        // Score every qualifying index and keep the best rather than the first: an
+        // index that orders MORE of the `ORDER BY` (smaller `sorted_suffix`) wins,
+        // then a covering one (no table fetch), then narrower width, then newest —
+        // so `ORDER BY a, b` over `ia(a)`+`iab(a,b)` reads the covering `iab` fully
+        // in order instead of walking `ia` and sorting `b`, matching sqlite.
+        type OrderKey = (usize, bool, i16, core::cmp::Reverse<u32>);
+        let mut best: Option<(OrderKey, OrderIndexScan)> = None;
         for idx in self.indexes_of(&t.name).ok()? {
             if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
@@ -17841,17 +17848,28 @@ impl Connection {
             if sorted_suffix > 0 && covering {
                 continue;
             }
-            return Some(OrderIndexScan {
-                name: idx.name,
-                root: idx.root,
-                colls: idx.collations,
-                cols: idx.cols,
-                descending,
-                covering,
+            let key: OrderKey = (
                 sorted_suffix,
-            });
+                !covering,
+                self.index_seek_width(&t.name, &idx),
+                core::cmp::Reverse(idx.root),
+            );
+            if best.as_ref().is_none_or(|(bk, _)| key < *bk) {
+                best = Some((
+                    key,
+                    OrderIndexScan {
+                        name: idx.name,
+                        root: idx.root,
+                        colls: idx.collations,
+                        cols: idx.cols,
+                        descending,
+                        covering,
+                        sorted_suffix,
+                    },
+                ));
+            }
         }
-        None
+        best.map(|(_, s)| s)
     }
 
     /// For a no-`WHERE` query whose access is a covering-index scan
