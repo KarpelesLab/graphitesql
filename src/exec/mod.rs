@@ -28187,12 +28187,17 @@ impl Connection {
                 "",
             ),
         ];
+        // SQLite's fts5 names its shadow tables with a *single*-quoted string
+        // (its `CREATE TABLE '%q_data'(…)` idiom), not the double-quoted identifier
+        // form. Match that in the stored schema so `sqlite_master.sql` is
+        // byte-identical (graphite's parser accepts a quoted-string object name).
+        let qs = |s: &str| format!("'{}'", s.replace('\'', "''"));
         for (tname, cols, tail) in content_def
             .iter()
             .chain(gpost_def.iter())
             .chain(defs.iter())
         {
-            let sql = format!("CREATE TABLE {}({cols}){tail}", q(tname));
+            let sql = format!("CREATE TABLE {}({cols}){tail}", qs(tname));
             let Statement::CreateTable(ct) = sql::parse_one(&sql)? else {
                 unreachable!("constructed a CREATE TABLE")
             };
