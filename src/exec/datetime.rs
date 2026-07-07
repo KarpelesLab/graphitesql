@@ -1212,6 +1212,23 @@ fn iso_week_date(p: &DateTime) -> (i32, i32) {
 /// empty string, exactly as SQLite's `sqlite3_str` does on `SQLITE_TOOBIG`.
 const PRINTF_LIMIT: usize = 1_000_000_000;
 
+/// SQLite caps the fractional precision of the floating-point conversions
+/// (`%f`/`%e`/`%g`) at 1e8, independent of the 1e9 total-output ceiling: a
+/// `%.999999999f` of `1.0` renders `"1."` + 1e8 zeros (length 100000002), not
+/// ~1e9 digits. Clamping to the same value keeps graphite byte-identical *and*
+/// stops it from trying to materialize a billion digits (which hangs).
+const PRINTF_FLOAT_PRECISION_LIMIT: usize = 100_000_000;
+
+/// Truncate `s` to its first `prec` characters when a precision is given (used by
+/// the `%q`/`%Q`/`%w` SQL-escape conversions, whose precision counts *input*
+/// characters — the escaping that follows may then expand them).
+fn trunc_chars(s: String, prec: Option<usize>) -> String {
+    match prec {
+        Some(p) => s.chars().take(p).collect(),
+        None => s,
+    }
+}
+
 /// Insert `,` thousands separators into the integer part of a formatted number,
 /// preserving a leading sign (`+`/`-`/space) and any fractional `.xxx` tail.
 fn group_thousands(s: &str) -> String {
@@ -1352,7 +1369,10 @@ pub fn printf(args: &[Value]) -> Value {
                 i += 1;
                 let pv = eval::to_i64(&args.get(arg_idx).cloned().unwrap_or(Value::Null));
                 arg_idx += 1;
-                prec = Some(pv.max(0) as usize);
+                // SQLite uses the *magnitude* of a `.*` precision — a negative
+                // argument behaves like its absolute value (`%.*f` with -2 is
+                // `%.2f`), not like an omitted precision (C) nor a clamp to 0.
+                prec = Some(pv.unsigned_abs() as usize);
             } else {
                 let mut p = 0usize;
                 while let Some(d) = bytes.get(i).filter(|c| c.is_ascii_digit()) {
@@ -1382,6 +1402,14 @@ pub fn printf(args: &[Value]) -> Value {
             too_big = true;
             break;
         }
+        // SQLite clamps the fractional precision of the float conversions at 1e8
+        // (see `PRINTF_FLOAT_PRECISION_LIMIT`); a larger precision produces the
+        // same bytes as 1e8 rather than ~1e9 digits. Only the float arms are
+        // affected — integer/string precision keeps its meaning.
+        let prec = match conv {
+            'f' | 'e' | 'E' | 'g' | 'G' => prec.map(|p| p.min(PRINTF_FLOAT_PRECISION_LIMIT)),
+            _ => prec,
+        };
         // Whether this conversion zero-pads on the left of the numeric digits.
         let numeric = matches!(
             conv,
@@ -1422,7 +1450,7 @@ pub fn printf(args: &[Value]) -> Value {
                 // (e.g. 104 -> "104" -> '1'), not the code point. A NULL argument
                 // yields a single NUL byte (matching SQLite's `et_charx`).
                 let v = next(&mut arg_idx);
-                if matches!(v, Value::Null) {
+                let ch = if matches!(v, Value::Null) {
                     String::from('\0')
                 } else {
                     eval::to_text(&v)
@@ -1430,7 +1458,10 @@ pub fn printf(args: &[Value]) -> Value {
                         .next()
                         .map(String::from)
                         .unwrap_or_default()
-                }
+                };
+                // A precision repeats the character that many times (min once):
+                // `%.5c` of 'A' is "AAAAA", `%.0c` and a bare `%c` are one copy.
+                ch.repeat(prec.unwrap_or(1).max(1))
             }
             'f' => {
                 let f = eval::to_f64(&next(&mut arg_idx));
@@ -1458,6 +1489,13 @@ pub fn printf(args: &[Value]) -> Value {
                     nonfinite(f, plus, space)
                 } else {
                     let mut s = fmt_exp(f, prec.unwrap_or(6), conv == 'E', bang);
+                    // The `#` alt flag forces a decimal point even at precision 0
+                    // (`%#.0e` of 42 is "4.e+01"); `fmt_exp` omits it there.
+                    if alt && prec == Some(0) && !s.contains('.') {
+                        if let Some(epos) = s.find(['e', 'E']) {
+                            s.insert(epos, '.');
+                        }
+                    }
                     if bang {
                         s = strip_zeros_keep_one(&s);
                     }
@@ -1485,37 +1523,33 @@ pub fn printf(args: &[Value]) -> Value {
                 s
             }
             'q' => {
+                // The precision limits the number of *input* characters consumed
+                // (escaping is applied afterward, so each `'` still doubles), not
+                // the escaped-output length: `%.3q` of `a'bc` is `a''b`.
                 let v = next(&mut arg_idx);
-                let mut s = match v {
+                match v {
                     Value::Null => String::from("(NULL)"),
-                    other => eval::to_text(&other).replace('\'', "''"),
-                };
-                if let Some(pr) = prec {
-                    s = s.chars().take(pr).collect();
+                    other => trunc_chars(eval::to_text(&other), prec).replace('\'', "''"),
                 }
-                s
             }
             'Q' => {
+                // Like `%q`, precision limits input chars; the surrounding quotes
+                // are always added and never counted (`%.0Q` of `hi` is `''`).
                 let v = next(&mut arg_idx);
-                let mut s = match v {
+                match v {
                     Value::Null => String::from("NULL"),
-                    other => alloc::format!("'{}'", eval::to_text(&other).replace('\'', "''")),
-                };
-                if let Some(pr) = prec {
-                    s = s.chars().take(pr).collect();
+                    other => alloc::format!(
+                        "'{}'",
+                        trunc_chars(eval::to_text(&other), prec).replace('\'', "''")
+                    ),
                 }
-                s
             }
             'w' => {
                 let v = next(&mut arg_idx);
-                let mut s = match v {
+                match v {
                     Value::Null => String::from("(NULL)"),
-                    other => eval::to_text(&other).replace('"', "\"\""),
-                };
-                if let Some(pr) = prec {
-                    s = s.chars().take(pr).collect();
+                    other => trunc_chars(eval::to_text(&other), prec).replace('"', "\"\""),
                 }
-                s
             }
             _ => {
                 // Unknown conversion (e.g. `%y`): SQLite discards the directive
