@@ -15951,9 +15951,26 @@ impl Connection {
                 } else if let Some((_, inner_meta, idx)) = self.index_join_seek(join, &left_columns)
                 {
                     let col = &inner_meta.columns[idx.cols[0]].name;
+                    // `USING COVERING INDEX` iff the index holds every column of the
+                    // inner table the query needs (matching sqlite's cost label).
+                    let inner_names = [
+                        join.table.name.as_str(),
+                        join.table.alias.as_deref().unwrap_or(""),
+                    ];
+                    let kind = if self.join_seek_index_covers(
+                        sel,
+                        join_from,
+                        &inner_names,
+                        &inner_meta,
+                        &idx,
+                    ) {
+                        "COVERING INDEX"
+                    } else {
+                        "INDEX"
+                    };
                     (
                         alloc::vec![alloc::format!(
-                            "SEARCH {label} USING INDEX {} ({col}=?){left_suffix}",
+                            "SEARCH {label} USING {kind} {} ({col}=?){left_suffix}",
                             idx.name
                         )],
                         inner_meta.columns,
@@ -26005,6 +26022,103 @@ impl Connection {
     /// (correlated subquery / EXISTS / IN-SELECT, window/aggregate `FILTER`/`OVER`,
     /// a generated column on `from.first`) makes it report *not* covering, which is
     /// the safe `USING INDEX` render.
+    /// Whether a forward inner-seek's index `idx` (on the inner table
+    /// `inner_meta`, named/aliased `inner_names`) COVERS every column of that
+    /// table the query references anywhere — the label SQLite renders as `USING
+    /// COVERING INDEX` rather than `USING INDEX` for a join seek. Conservative:
+    /// any subquery in a scanned clause, a generated inner column, or a qualified
+    /// inner reference to an unknown column makes it `false` (so it renders the
+    /// plain `INDEX` and never over-claims `COVERING` vs the oracle).
+    fn join_seek_index_covers(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        inner_names: &[&str],
+        inner_meta: &TableMeta,
+        idx: &IndexMeta,
+    ) -> bool {
+        if inner_meta.generated.iter().any(|g| g.is_some()) {
+            return false;
+        }
+        let covered = |ci: usize| idx.cols.contains(&ci) || inner_meta.ipk == Some(ci);
+        let is_inner = |t: &str| {
+            inner_names
+                .iter()
+                .any(|n| !n.is_empty() && n.eq_ignore_ascii_case(t))
+        };
+        // Collect every column reference (and note any subquery, which we cannot
+        // resolve against the inner table) across the clauses that may reference it.
+        let mut refs: Vec<(Option<String>, String)> = Vec::new();
+        let mut has_subquery = false;
+        let mut collect = |node: &Expr| match node {
+            Expr::Column { table, column, .. } => refs.push((table.clone(), column.clone())),
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. } => has_subquery = true,
+            _ => {}
+        };
+        for rc in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = rc {
+                window::visit(expr, &mut collect);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            window::visit(w, &mut collect);
+        }
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                window::visit(on, &mut collect);
+            }
+        }
+        for t in &sel.order_by {
+            window::visit(&t.expr, &mut collect);
+        }
+        for gexpr in &sel.group_by {
+            window::visit(gexpr, &mut collect);
+        }
+        if let Some(h) = &sel.having {
+            window::visit(h, &mut collect);
+        }
+        if has_subquery {
+            return false;
+        }
+        // A wildcard that expands the inner table needs every inner column covered.
+        let all_covered = || (0..inner_meta.columns.len()).all(covered);
+        for rc in &sel.columns {
+            match rc {
+                ResultColumn::Wildcard if !all_covered() => return false,
+                ResultColumn::TableWildcard(t) if is_inner(t) && !all_covered() => return false,
+                _ => {}
+            }
+        }
+        // Every inner-owned column reference must be held by the index.
+        for (t, col) in &refs {
+            let in_inner = inner_meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col));
+            let is_rowid = matches!(
+                col.to_ascii_lowercase().as_str(),
+                "rowid" | "_rowid_" | "oid"
+            );
+            // A qualified ref names its table; an unqualified ref is the inner's
+            // only when its name is an inner column (a same-named column of another
+            // table would make the reference ambiguous, i.e. an invalid query).
+            let inner_owned = match t.as_deref() {
+                Some(tt) => is_inner(tt),
+                None => in_inner.is_some(),
+            };
+            if inner_owned {
+                match in_inner {
+                    Some(ci) if !covered(ci) => return false,
+                    // A qualified inner ref to a rowid alias is covered; any other
+                    // unresolved inner column defeats the covering claim.
+                    None if !is_rowid => return false,
+                    _ => {}
+                }
+            }
+        }
+        true
+    }
+
     fn index_swap_covers(
         &self,
         sel: &Select,
