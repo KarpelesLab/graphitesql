@@ -11903,6 +11903,79 @@ impl Connection {
         Ok(best.map(|(_, idx, matched)| (idx, matched)))
     }
 
+    /// Estimated key width of `idx` in `LogEst` units, for the covering-index
+    /// width tiebreak — the same model `covering_scan` / `choose_seek_index` use:
+    /// Σ szEst(key col) + 1 (the trailing rowid), then `logest(width * 4)`.
+    fn index_seek_width(&self, table_name: &str, idx: &IndexMeta) -> i16 {
+        let szests = self.table_col_szests(table_name).unwrap_or_default();
+        let w: u32 = idx
+            .cols
+            .iter()
+            .map(|&c| szests.get(c).copied().unwrap_or(1))
+            .sum::<u32>()
+            + 1;
+        logest(u64::from(w) * 4)
+    }
+
+    /// Pick the plain secondary index for a *range-leading* seek (a range bound on
+    /// the index's leading column), preferring a query-covering index over a
+    /// non-covering one (it skips the table b-tree lookup) and, among covering
+    /// candidates, the narrower one (ties → newest). Non-covering candidates keep
+    /// first-encountered order — sqlite's choice among several non-covering
+    /// same-prefix indexes is the full data/type-driven cost model, so we only add
+    /// the clear covering preference here. `try_index_range` and `eqp_access` both
+    /// call this so the executed seek and its EQP render never disagree.
+    fn choose_range_index(
+        &self,
+        sel: Option<&Select>,
+        meta: &TableMeta,
+        table_name: &str,
+        where_expr: &Expr,
+        ranges: &alloc::collections::BTreeMap<usize, RangeBound>,
+        hint: Option<&IndexHint>,
+    ) -> Result<Option<IndexMeta>> {
+        // Sort key, best (min) first: covering before non-covering (`!covering`),
+        // then — *only among covering* — narrower width and newest (`Reverse(root)`).
+        // Non-covering candidates all share the (true, 0, Reverse(0)) key, so the
+        // first-encountered one is kept.
+        type RangeKey = (bool, i16, core::cmp::Reverse<u32>);
+        let mut best: Option<IndexMeta> = None;
+        let mut best_key: Option<RangeKey> = None;
+        for idx in self.indexes_of(table_name)? {
+            if let Some(IndexHint::IndexedBy(n)) = hint {
+                if !idx.name.eq_ignore_ascii_case(n) {
+                    continue;
+                }
+            }
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
+                continue;
+            }
+            let Some(&lead) = idx.cols.first() else {
+                continue;
+            };
+            if !ranges.contains_key(&lead) {
+                continue;
+            }
+            let covering = sel
+                .map(|s| self.seek_index_covers(s, meta, &idx.cols, where_expr))
+                .unwrap_or(false);
+            let key: RangeKey = if covering {
+                (
+                    false,
+                    self.index_seek_width(table_name, &idx),
+                    core::cmp::Reverse(idx.root),
+                )
+            } else {
+                (true, 0, core::cmp::Reverse(0))
+            };
+            if best_key.is_none_or(|bk| key < bk) {
+                best_key = Some(key);
+                best = Some(idx);
+            }
+        }
+        Ok(best)
+    }
+
     /// The index metadata (root + indexed column positions) for `table`.
     /// Try to satisfy a single-table query with an index equality lookup instead
     /// of a full scan: pick the index whose longest leftmost column prefix is
@@ -12437,8 +12510,9 @@ impl Connection {
             }
         }
 
-        // Pick the first plain (non-partial, non-expression) index whose leading
-        // column has a range bound, honoring `INDEXED BY`.
+        // Choose a plain index whose leading column has a range bound, preferring
+        // a covering one (skips the table lookup); `eqp_access` renders the same
+        // pick via the shared `choose_range_index`, honoring `INDEXED BY`.
         let indexes = self.indexes_of(table_name)?;
         if let Some(IndexHint::IndexedBy(n)) = hint {
             if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
@@ -12453,37 +12527,27 @@ impl Connection {
             Vec<usize>,
             bool,
         )> = None;
-        for idx in &indexes {
-            if let Some(IndexHint::IndexedBy(n)) = hint {
-                if !idx.name.eq_ignore_ascii_case(n) {
-                    continue;
-                }
-            }
-            if idx.partial.is_some() || idx.key_exprs.is_some() {
-                continue;
-            }
-            let Some(&lead) = idx.cols.first() else {
-                continue;
-            };
+        if let Some(idx) =
+            self.choose_range_index(Some(sel), meta, table_name, where_expr, &ranges, hint)?
+        {
+            let lead = idx.cols[0];
             // For a DESC leading column the value order is reversed in key-sort
-            // space, so the value-space bounds are SWAPPED below and the b-tree is
-            // told the column is descending.
+            // space, so the value-space bounds are SWAPPED and the b-tree is told
+            // the column is descending.
             let lead_desc = idx.descending.first().copied().unwrap_or(false);
-            if let Some(b) = ranges.get(&lead) {
-                let coll = idx.collations.first().copied().unwrap_or_default();
-                let aff = meta.columns[lead].affinity;
-                let (lo, hi) = if lead_desc {
-                    (b.upper.as_ref(), b.lower.as_ref())
-                } else {
-                    (b.lower.as_ref(), b.upper.as_ref())
-                };
-                let b = RangeBound {
-                    lower: lo.map(|(v, i)| (aff.coerce(v.clone()), *i)),
-                    upper: hi.map(|(v, i)| (aff.coerce(v.clone()), *i)),
-                };
-                chosen = Some((idx.root, b, coll, idx.cols.clone(), lead_desc));
-                break;
-            }
+            let b = &ranges[&lead];
+            let coll = idx.collations.first().copied().unwrap_or_default();
+            let aff = meta.columns[lead].affinity;
+            let (lo, hi) = if lead_desc {
+                (b.upper.as_ref(), b.lower.as_ref())
+            } else {
+                (b.lower.as_ref(), b.upper.as_ref())
+            };
+            let bound = RangeBound {
+                lower: lo.map(|(v, i)| (aff.coerce(v.clone()), *i)),
+                upper: hi.map(|(v, i)| (aff.coerce(v.clone()), *i)),
+            };
+            chosen = Some((idx.root, bound, coll, idx.cols.clone(), lead_desc));
         }
         match chosen {
             Some((root, bound, coll, idx_cols, lead_desc)) => {
@@ -15891,19 +15955,30 @@ impl Connection {
                 }
             }
         }
-        for (&col, bound) in &ranges {
-            if let Some((idx_name, idx_cols)) = leading_index(col) {
-                let name = &meta.columns[col].name;
-                // SQLite's EQP renders bounds as `>`/`<` regardless of inclusivity.
-                let cond = match (&bound.lower, &bound.upper) {
-                    (Some(_), Some(_)) => alloc::format!("{name}>? AND {name}<?"),
-                    (Some(_), None) => alloc::format!("{name}>?"),
-                    (None, Some(_)) => alloc::format!("{name}<?"),
-                    (None, None) => continue,
-                };
-                let kw = index_kw(&idx_cols);
+        // Prefer a covering index for the range-leading seek — the SAME choice the
+        // executor's `try_index_range` makes via `choose_range_index`, so the plan
+        // matches what runs.
+        let range_hint = sel
+            .and_then(|s| s.from.as_ref())
+            .and_then(|f| f.first.index_hint.as_ref());
+        if let Some(idx) =
+            self.choose_range_index(sel, meta, table, where_expr, &ranges, range_hint)?
+        {
+            let lead = idx.cols[0];
+            let name = &meta.columns[lead].name;
+            let bound = &ranges[&lead];
+            // SQLite's EQP renders bounds as `>`/`<` regardless of inclusivity.
+            let cond = match (&bound.lower, &bound.upper) {
+                (Some(_), Some(_)) => alloc::format!("{name}>? AND {name}<?"),
+                (Some(_), None) => alloc::format!("{name}>?"),
+                (None, Some(_)) => alloc::format!("{name}<?"),
+                (None, None) => String::new(),
+            };
+            if !cond.is_empty() {
+                let kw = index_kw(&idx.cols);
                 return Ok(alloc::format!(
-                    "SEARCH {label} USING {kw} {idx_name} ({cond})"
+                    "SEARCH {label} USING {kw} {} ({cond})",
+                    idx.name
                 ));
             }
         }

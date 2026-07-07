@@ -1348,9 +1348,16 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   iab`, was `INDEX ia`) byte-exact vs sqlite3 3.50.4 in plan AND rows
   (`tests/eqp_seek_index_choice.rs`; one pre-ANALYZE assertion in `tests/analyze.rs`
   updated to the sqlite-correct index — newest among equal-width). Row order follows
-  automatically (composite seeks already execute in index order). **Still open (rides
-  here):** the same covering preference on a *range-leading* seek (`SELECT b … WHERE a>1`
-  → covering `(a,b)` — a separate range-index path, pre-existing gap); the tiebreak among
+  automatically (composite seeks already execute in index order).
+  **The same covering preference now applies to a *range-leading* seek too** (`SELECT b …
+  WHERE a>1` → `COVERING INDEX iab`, was `INDEX ia`): `try_index_range` and `eqp_access`'s
+  rowid-range render share a second helper, `choose_range_index`, with the same
+  covering-first / narrower / newest order (non-covering candidates keep first-encountered
+  order — the deep-cost tiebreak isn't reproduced). Byte-exact plan+rows vs sqlite3 3.50.4
+  (`tests/eqp_range_covering.rs`). **Still open (rides here):** ORDER-BY elision for a
+  range-leading seek (`SELECT b … WHERE a>1 ORDER BY a` still emits `USE TEMP B-TREE` where
+  sqlite reads the index in `a`-order — a *pre-existing* elision gap, unchanged and not a
+  regression); the tiebreak among
   multiple *non-covering* indexes that share the same equality prefix (`ia`+`iab`+`iac`
   all on `a`), where sqlite's full LogEst row-cost is not reducible to narrower/newest/
   oldest (it picks the narrower `it_a` in one schema and the newer wider `iac` in another)
