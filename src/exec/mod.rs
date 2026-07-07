@@ -8429,13 +8429,19 @@ impl Connection {
                     self.collect_returning(&del.returning, &meta, old, Some(*rowid), params)?;
                 }
             }
-            // Enforce referential actions on dependent child tables.
+            // Remove the parent row first, THEN enforce referential actions on the
+            // children. SQLite defers the child-side FK check to statement end, so
+            // an action that resolves to the just-deleted key (e.g. `ON DELETE SET
+            // DEFAULT` whose default names this very row) must see it already gone
+            // and fail — enforcing before the delete would wrongly find the parent
+            // still present. The action still matches children by the saved `old`
+            // key, so removing the parent first does not affect which rows it hits.
+            delete_table(self.backend.writer()?, meta.root, *rowid)?;
             if self.foreign_keys {
                 if let Some(old) = &old {
                     self.enforce_parent_change(&del.table, old, None, params)?;
                 }
             }
-            delete_table(self.backend.writer()?, meta.root, *rowid)?;
             deleted += 1;
             if let Some(old) = &old {
                 self.fire_triggers(
