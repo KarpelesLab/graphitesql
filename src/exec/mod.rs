@@ -25143,6 +25143,18 @@ impl Connection {
         let idx = indexes.into_iter().find(|i| {
             i.partial.is_none() && i.key_exprs.is_none() && i.cols.first() == Some(&inner_idx)
         })?;
+        // SQLite's `sqlite3IndexAffinityOk`: an index seek for `inner = outer` is
+        // only usable when the comparison's affinity is compatible with the index
+        // column's affinity — otherwise seeking the raw key would MISS matches an
+        // affinity-correct comparison finds. For two columns the comparison affinity
+        // is NUMERIC if either side is numeric (else BLOB); a NUMERIC comparison
+        // needs a numeric index column (a text/blob-stored index can't be numerically
+        // seeked). E.g. an INTEGER outer equated to an untyped inner index column
+        // (which stores its values as text) declines here — matching sqlite, which
+        // scans that table instead of a wrong-result index seek.
+        if !index_seek_affinity_ok(combined[outer].affinity, meta.columns[inner_idx].affinity) {
+            return None;
+        }
         Some((outer, meta, idx))
     }
 
@@ -25673,6 +25685,17 @@ impl Connection {
         // index-leading), the existing forward seek path already makes it the inner,
         // so leave that alone.
         if self.is_local_col_seekable(&second_ref.name, &second_meta, second_local) {
+            return None;
+        }
+        // The index seek must be affinity-sound (sqlite's `sqlite3IndexAffinityOk`):
+        // a NUMERIC comparison cannot seek a text/blob-stored index, so an INTEGER
+        // driver key against `from.first`'s untyped/TEXT index column would miss
+        // matches — decline the swap (keep the forward materialise, which filters
+        // with the correct affinity) exactly as the forward `index_join_seek` does.
+        if !index_seek_affinity_ok(
+            second_meta.columns[second_local].affinity,
+            first_meta.columns[first_local].affinity,
+        ) {
             return None;
         }
         Some((second_local, first_meta, idx))
@@ -31159,6 +31182,24 @@ fn logest(mut x: u64) -> i16 {
 /// `1`. A `TEXT`/`BLOB`/`CLOB`/`CHAR` with no size is `5`; a sized `VARCHAR(k)` /
 /// `CHAR(k)` / `BLOB(k)` is `k/4 + 1` (capped at 255). Only TEXT/BLOB-affinity
 /// columns carry a size; numeric affinities are always `1`.
+/// SQLite's `sqlite3IndexAffinityOk` for an equi-join `inner_col = outer_col`
+/// index seek: the comparison affinity of two columns is NUMERIC when either side
+/// is numeric (else BLOB); a NUMERIC comparison can only use a numeric-affinity
+/// index column (a text/blob-stored index cannot be numerically seeked), while a
+/// BLOB comparison always can. Returns whether the index seek is sound; when it is
+/// not, the caller declines the seek (scanning + affinity-correct filtering
+/// instead), matching sqlite — otherwise the raw-key seek would drop real matches
+/// (e.g. an INTEGER key seeking an untyped index that stores its values as text).
+fn index_seek_affinity_ok(outer: eval::Affinity, inner: eval::Affinity) -> bool {
+    use eval::Affinity::{Integer, Numeric, Real};
+    let is_numeric = |a| matches!(a, Numeric | Integer | Real);
+    if is_numeric(outer) || is_numeric(inner) {
+        is_numeric(inner)
+    } else {
+        true
+    }
+}
+
 fn col_szest(type_name: Option<&str>) -> u32 {
     let Some(t) = type_name else { return 1 };
     if t.trim().is_empty() {
