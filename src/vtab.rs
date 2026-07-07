@@ -3332,6 +3332,42 @@ pub(crate) fn fts5_indexed_columns(args: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// The value of an `fts5` `key = value` option, unquoted (one matching pair of
+/// surrounding `'…'` / `"…"` / `[…]` stripped), or `None` if no option with that
+/// key is present. Keys are matched case-insensitively.
+#[cfg(feature = "fts5")]
+fn fts5_option_value(args: &[&str], key: &str) -> Option<String> {
+    args.iter().find_map(|a| {
+        let (k, v) = a.split_once('=')?;
+        if !k.trim().eq_ignore_ascii_case(key) {
+            return None;
+        }
+        let v = v.trim();
+        let b = v.as_bytes();
+        // Strip one matching pair of surrounding quotes: `'…'`, `"…"`, or `[…]`.
+        let quoted = b.len() >= 2
+            && ((b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0]
+                || b[0] == b'[' && b[b.len() - 1] == b']');
+        let inner = if quoted { &v[1..v.len() - 1] } else { v };
+        Some(String::from(inner))
+    })
+}
+
+/// The external-content configuration of an `fts5` table, or `None` when the table
+/// stores its own documents. Returns `Some((content_table, content_rowid_col))`
+/// when a non-empty `content='<table>'` option is present. `content=''` is the
+/// *contentless* mode (not external content), so it returns `None`. The rowid
+/// column defaults to `rowid` when `content_rowid=` is omitted, matching SQLite.
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_external_content(args: &[&str]) -> Option<(String, String)> {
+    let table = fts5_option_value(args, "content")?;
+    if table.is_empty() {
+        return None; // contentless, not external content
+    }
+    let rowid = fts5_option_value(args, "content_rowid").unwrap_or_else(|| String::from("rowid"));
+    Some((table, rowid))
+}
+
 /// Parse an `fts5` table's `tokenize = '…'` option into a resolved [`Fts5Tok`].
 /// The value is a whitespace-separated tokenizer chain: an optional leading
 /// `porter` (⇒ Porter stemming, possibly wrapping a base tokenizer), then a base

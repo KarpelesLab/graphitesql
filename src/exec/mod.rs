@@ -9119,10 +9119,15 @@ impl Connection {
             let integer = cvt.module.eq_ignore_ascii_case("rtree_i32");
             self.rtree_create_storage(&cvt.name, n_coord, integer)?;
         } else if is_fts5 {
-            // FTS5 uses sqlite's five shadow tables (so the file round-trips
-            // through stock sqlite), not the generic `<name>_data` store.
+            // FTS5 uses sqlite's shadow tables (so the file round-trips through
+            // stock sqlite), not the generic `<name>_data` store. An external-
+            // content table (`content='<tbl>'`) keeps no `_content` copy — its
+            // documents live in the named content table.
             #[cfg(feature = "fts5")]
-            self.fts5_create_storage(&cvt.name, cols.len())?;
+            {
+                let external = crate::vtab::fts5_external_content(&arg_refs).is_some();
+                self.fts5_create_storage(&cvt.name, cols.len(), external)?;
+            }
         } else if persistent {
             let coldefs = cols
                 .iter()
@@ -9263,11 +9268,11 @@ impl Connection {
         let ncols = col_names.len();
         // FTS5 exposes a hidden column named after the table that accepts special
         // commands: `INSERT INTO t(t) VALUES('rebuild'|'optimize')` issues a
-        // maintenance command rather than inserting a row. graphite's `fts5` index
-        // is scan-based, so `rebuild` and `optimize` are no-ops (there is no
-        // separate index to rebuild); other commands fall through to the usual
-        // column resolution (and its "no such column" error), matching SQLite,
-        // which rejects `delete`/`delete-all` on an ordinary content table.
+        // maintenance command rather than inserting a row. `rebuild` scans the
+        // content source and rebuilds the inverted index; `optimize` is a no-op
+        // (graphite already writes a single compacted segment). Other commands fall
+        // through to the usual column resolution (and its "no such column" error),
+        // matching SQLite, which rejects `delete`/`delete-all` on a content table.
         #[cfg(feature = "fts5")]
         if module_name.eq_ignore_ascii_case("fts5")
             && ins.columns.len() == 1
@@ -9284,9 +9289,17 @@ impl Connection {
                 .iter()
                 .all(|c| matches!(c.as_str(), "rebuild" | "optimize"))
             {
+                if commands.iter().any(|c| c == "rebuild") {
+                    self.fts5_rebuild_index(&ins.table)?;
+                }
                 return Ok(0);
             }
         }
+        // An external-content fts5 table's index is maintained only by `rebuild`;
+        // decline any other direct write rather than silently rebuilding from the
+        // content table (which would drop the write).
+        #[cfg(feature = "fts5")]
+        self.fts5_reject_external_dml(&module_name, &ins.table)?;
         // Map the (possibly explicit) column list onto declared column positions.
         // `None` marks a `rowid`/`_rowid_`/`oid` term (a vtab's hidden rowid),
         // whose value becomes the inserted row's explicit rowid.
@@ -9448,6 +9461,8 @@ impl Connection {
             return Err(Error::Unsupported("RETURNING on a virtual table"));
         }
         let (module_name, args, _) = self.vtab_meta(&del.table)?;
+        #[cfg(feature = "fts5")]
+        self.fts5_reject_external_dml(&module_name, &del.table)?;
         let (columns, rows) = self
             .try_virtual_table(&del.table, None, None)?
             .ok_or_else(|| Error::Error(format!("{} is not a virtual table", del.table)))?;
@@ -9507,6 +9522,8 @@ impl Connection {
             return Err(Error::Unsupported("UPDATE … FROM on a virtual table"));
         }
         let (module_name, args, schema) = self.vtab_meta(&upd.table)?;
+        #[cfg(feature = "fts5")]
+        self.fts5_reject_external_dml(&module_name, &upd.table)?;
         let col_names = schema.columns;
         // Resolve each SET target to a declared column position.
         let assigns: Vec<(usize, &Expr)> = upd
@@ -9771,28 +9788,95 @@ impl Connection {
             Some(r) => r,
             None => return Ok(None),
         };
-        // Fetch exactly the matching `_content` rows, by rowid, ascending (the
-        // doclist is already ascending). Drop the leading `id` column.
-        let cmeta = self.table_meta(&format!("{name}_content"), None)?;
-        let encoding = self.backend.source().header().text_encoding;
+        // Fetch exactly the matching document rows, by rowid, ascending (the
+        // doclist is already ascending). For external content, the fts5 column
+        // values come from the content table by rowid; otherwise from `_content`.
+        let ncols = self.vtab_meta(name)?.2.columns.len();
         let mut rows = Vec::with_capacity(rowids.len());
-        let mut cur = TableCursor::new(self.backend.source(), cmeta.root);
         for rid in rowids {
-            if cur.seek(rid)? {
-                let mut values = self.decode_full_row(&cmeta, rid, &cur.payload()?, encoding)?;
-                if !values.is_empty() {
-                    values.remove(0);
-                }
+            if let Some(values) = self.fts5_fetch_doc(name, arg_refs, ncols, rid)? {
                 rows.push(InputRow {
                     values,
                     rowid: Some(rid),
                 });
             }
-            // A doclist rowid with no `_content` row can't happen for a consistent
-            // index; if it ever did, omitting it is still a valid superset (the
-            // scan wouldn't have produced it either).
+            // A doclist rowid with no content row is a stale index; SQLite raises
+            // "missing row" only when a COLUMN value is retrieved (handled in
+            // `fts5_fetch_doc`). Here (rowid-only routes) omitting it is a valid
+            // superset — the scan wouldn't have produced it either.
         }
         Ok(Some(rows))
+    }
+
+    /// Fetch one fts5 document's column values (in declared order, `ncols` long)
+    /// by rowid — from the external content table when `content='<tbl>'`, else from
+    /// this table's `<name>_content` shadow. Returns `Ok(None)` when the rowid is
+    /// absent from the content source (a stale index entry).
+    #[cfg(feature = "fts5")]
+    fn fts5_fetch_doc(
+        &self,
+        name: &str,
+        arg_refs: &[&str],
+        ncols: usize,
+        rowid: i64,
+    ) -> Result<Option<Vec<Value>>> {
+        let encoding = self.backend.source().header().text_encoding;
+        if let Some((content, rowid_col)) = crate::vtab::fts5_external_content(arg_refs) {
+            let cmeta = self
+                .table_meta(&content, None)
+                .map_err(|_| Error::Error(format!("no such table: main.{content}")))?;
+            let columns = &self.vtab_meta(name)?.2.columns;
+            let col_pos: Vec<usize> = columns
+                .iter()
+                .map(|c| {
+                    cmeta
+                        .columns
+                        .iter()
+                        .position(|cc| cc.name.eq_ignore_ascii_case(c))
+                        .ok_or_else(|| Error::Error(format!("no such column: T.{c}")))
+                })
+                .collect::<Result<_>>()?;
+            let use_rowid = matches!(
+                rowid_col.to_ascii_lowercase().as_str(),
+                "rowid" | "_rowid_" | "oid"
+            ) || cmeta
+                .ipk
+                .is_some_and(|i| cmeta.columns[i].name.eq_ignore_ascii_case(&rowid_col));
+            if use_rowid {
+                // The content_rowid IS the content table's rowid — a direct seek.
+                let mut cur = TableCursor::new(self.backend.source(), cmeta.root);
+                if cur.seek(rowid)? {
+                    let values = self.decode_full_row(&cmeta, rowid, &cur.payload()?, encoding)?;
+                    return Ok(Some(col_pos.iter().map(|&p| values[p].clone()).collect()));
+                }
+                return Ok(None);
+            }
+            // A non-rowid `content_rowid` column: scan for the row whose value
+            // matches (rare; external content normally aliases the rowid).
+            let rid_pos = cmeta
+                .columns
+                .iter()
+                .position(|cc| cc.name.eq_ignore_ascii_case(&rowid_col))
+                .ok_or_else(|| Error::Error(format!("no such column: T.{rowid_col}")))?;
+            for (_, values) in self.scan_table(&cmeta)? {
+                if eval::to_i64(&values[rid_pos]) == rowid {
+                    return Ok(Some(col_pos.iter().map(|&p| values[p].clone()).collect()));
+                }
+            }
+            return Ok(None);
+        }
+        // Self-content: seek the `<name>_content` shadow and drop the leading id.
+        let cmeta = self.table_meta(&format!("{name}_content"), None)?;
+        let mut cur = TableCursor::new(self.backend.source(), cmeta.root);
+        if cur.seek(rowid)? {
+            let mut values = self.decode_full_row(&cmeta, rowid, &cur.payload()?, encoding)?;
+            if !values.is_empty() {
+                values.remove(0);
+            }
+            values.truncate(ncols);
+            return Ok(Some(values));
+        }
+        Ok(None)
     }
 
     /// Produce the columns and rows of a virtual table used as a `FROM` source:
@@ -9944,11 +10028,15 @@ impl Connection {
             // A SQLite-written FTS5 keeps its documents in `<name>_content`
             // (`id, c0, c1, …`), with the inverted index in `<name>_data`/`_idx`.
             // graphite answers queries — including `MATCH` — from the documents via
-            // its scan-based matcher, so reading the content is sufficient.
-            // (graphite's own FTS5 has no `_content`; it stores docs in `_data`.)
+            // its scan-based matcher, so reading the content is sufficient. An
+            // external-content table (`content='<tbl>'`) has no `_content` shadow;
+            // its documents come from the named content table (via
+            // `fts5_load_documents`). (graphite's own non-sqlite FTS5 stores docs in
+            // `_data` and takes the generic backing path below.)
             #[cfg(feature = "fts5")]
             if cvt.module.eq_ignore_ascii_case("fts5")
-                && self.schema.table(&format!("{name}_content")).is_some()
+                && (self.schema.table(&format!("{name}_content")).is_some()
+                    || crate::vtab::fts5_external_content(&arg_refs).is_some())
             {
                 // D2b-2: a single bare-term `MATCH` (`tbl MATCH 'word'`) reads the
                 // term's doclist from the segment index and fetches only those
@@ -9959,19 +10047,15 @@ impl Connection {
                 if let Some(rows) = self.fts5_try_index_match(name, alias, &arg_refs, pushdown)? {
                     return Ok(Some((columns, rows)));
                 }
-                let cmeta = self.table_meta(&format!("{name}_content"), None)?;
+                // The scan-based matcher tokenizes each document. For external
+                // content, the fts5 column values (and rowids) come from the content
+                // table; otherwise from the `<name>_content` shadow.
                 let rows = self
-                    .scan_table(&cmeta)?
+                    .fts5_load_documents(name, &schema.columns, &arg_refs)?
                     .into_iter()
-                    .map(|(rowid, mut values)| {
-                        // Drop the leading `id` column; the rest are the fts5 columns.
-                        if !values.is_empty() {
-                            values.remove(0);
-                        }
-                        InputRow {
-                            values,
-                            rowid: Some(rowid),
-                        }
+                    .map(|(rowid, values)| InputRow {
+                        values,
+                        rowid: Some(rowid),
                     })
                     .collect();
                 return Ok(Some((columns, rows)));
@@ -26997,32 +27081,69 @@ impl Connection {
     }
 
     /// After a write to an FTS5 table, rebuild its inverted index from the
-    /// updated `<name>_content` documents. A no-op for every other module.
+    /// updated `<name>_content` documents. A no-op for every other module — and for
+    /// an external-content fts5 table, whose index is (re)built only by the explicit
+    /// `rebuild` command (direct DML on such a table is rejected up front, so this
+    /// is never reached for it).
     fn fts5_maybe_rebuild(&mut self, module_name: &str, table: &str) -> Result<()> {
         #[cfg(feature = "fts5")]
         if module_name.eq_ignore_ascii_case("fts5") {
+            let args = self.vtab_meta(table)?.1;
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if crate::vtab::fts5_external_content(&arg_refs).is_some() {
+                return Ok(());
+            }
             return self.fts5_rebuild_index(table);
         }
         let _ = (module_name, table);
         Ok(())
     }
 
-    /// Create an FTS5 table's storage: SQLite's five shadow tables
+    /// Reject direct content-modifying DML on an **external-content** fts5 table.
+    /// SQLite keeps such a table in sync with its content table via user triggers
+    /// that issue `INSERT`/`'delete'` commands against the fts5 index; graphite
+    /// implements the read side (`rebuild` + `MATCH` + column retrieval) but not the
+    /// incremental index-delta sync, so rather than silently rebuilding from the
+    /// content table (which would drop the direct write and produce wrong results),
+    /// it declines the write cleanly. The `rebuild`/`optimize` maintenance commands
+    /// are handled earlier and never reach here.
+    #[cfg(feature = "fts5")]
+    fn fts5_reject_external_dml(&self, module_name: &str, table: &str) -> Result<()> {
+        if module_name.eq_ignore_ascii_case("fts5") {
+            let args = self.vtab_meta(table)?.1;
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if crate::vtab::fts5_external_content(&arg_refs).is_some() {
+                return Err(Error::Unsupported(
+                    "direct DML on an external-content fts5 table \
+                     (use the content table + INSERT INTO t(t) VALUES('rebuild'))",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Create an FTS5 table's storage: SQLite's shadow tables
     /// (`_content`/`_docsize`/`_config`/`_idx`/`_data`) instead of graphite's
     /// generic `<name>_data` store, so a graphite-written FTS5 table is readable
     /// (and `MATCH`-able) by stock sqlite. `_content` holds the documents (same
     /// `(id, c0, c1, …)` shape graphite already reads); the inverted index in
     /// `_data`/`_idx` is rebuilt from `_content` on every write.
+    ///
+    /// An **external-content** table (`external = true`) stores no document copy,
+    /// so its `_content` shadow is omitted — exactly matching sqlite's layout (four
+    /// shadow tables: `_config`/`_docsize`/`_idx`/`_data`).
     #[cfg(feature = "fts5")]
-    fn fts5_create_storage(&mut self, name: &str, ncols: usize) -> Result<()> {
+    fn fts5_create_storage(&mut self, name: &str, ncols: usize, external: bool) -> Result<()> {
         let content_cols: Vec<String> = (0..ncols).map(|c| format!("c{c}")).collect();
         let q = |s: &str| sql::print::ident(s);
-        let defs = [
+        let content_def = (!external).then(|| {
             (
                 format!("{name}_content"),
                 format!("id INTEGER PRIMARY KEY, {}", content_cols.join(", ")),
                 "",
-            ),
+            )
+        });
+        let defs = [
             (
                 format!("{name}_docsize"),
                 "id INTEGER PRIMARY KEY, sz BLOB".to_string(),
@@ -27044,7 +27165,7 @@ impl Connection {
                 "",
             ),
         ];
-        for (tname, cols, tail) in &defs {
+        for (tname, cols, tail) in content_def.iter().chain(defs.iter()) {
             let sql = format!("CREATE TABLE {}({cols}){tail}", q(tname));
             let Statement::CreateTable(ct) = sql::parse_one(&sql)? else {
                 unreachable!("constructed a CREATE TABLE")
@@ -27075,6 +27196,84 @@ impl Connection {
         Ok(())
     }
 
+    /// Load the documents of an fts5 table as `(rowid, [fts5 col values…])`, the
+    /// fts5 column values in declared order (no leading id).
+    ///
+    /// For an **external-content** table (`content='<tbl>'`), this scans the named
+    /// content table and, for each row, projects the fts5 columns by NAME and reads
+    /// the fts5 rowid from the `content_rowid` column. An fts5 column absent from the
+    /// content table is a hard error (`no such column: T.<col>`), and a missing
+    /// content table is `no such table: main.<tbl>` — both matching SQLite's
+    /// `rebuild`. Otherwise the documents come from this table's own `<name>_content`
+    /// shadow (`id, c0, c1, …`), with the leading `id` dropped.
+    #[cfg(feature = "fts5")]
+    fn fts5_load_documents(
+        &self,
+        name: &str,
+        columns: &[String],
+        arg_refs: &[&str],
+    ) -> Result<Vec<(i64, Vec<Value>)>> {
+        if let Some((content, rowid_col)) = crate::vtab::fts5_external_content(arg_refs) {
+            let cmeta = self
+                .table_meta(&content, None)
+                .map_err(|_| Error::Error(format!("no such table: main.{content}")))?;
+            // Map each fts5 column to the content table's column position by name.
+            let col_pos: Vec<usize> = columns
+                .iter()
+                .map(|c| {
+                    cmeta
+                        .columns
+                        .iter()
+                        .position(|cc| cc.name.eq_ignore_ascii_case(c))
+                        .ok_or_else(|| Error::Error(format!("no such column: T.{c}")))
+                })
+                .collect::<Result<_>>()?;
+            // The content_rowid column: `rowid`/`_rowid_`/`oid` or the IPK column all
+            // resolve to the row's actual rowid; any other named column supplies the
+            // fts5 rowid from its (integer) value.
+            let use_rowid = matches!(
+                rowid_col.to_ascii_lowercase().as_str(),
+                "rowid" | "_rowid_" | "oid"
+            ) || cmeta
+                .ipk
+                .is_some_and(|i| cmeta.columns[i].name.eq_ignore_ascii_case(&rowid_col));
+            let rid_pos = if use_rowid {
+                None
+            } else {
+                Some(
+                    cmeta
+                        .columns
+                        .iter()
+                        .position(|cc| cc.name.eq_ignore_ascii_case(&rowid_col))
+                        .ok_or_else(|| Error::Error(format!("no such column: T.{rowid_col}")))?,
+                )
+            };
+            let mut docs = Vec::new();
+            for (rowid, values) in self.scan_table(&cmeta)? {
+                let rid = match rid_pos {
+                    None => rowid,
+                    Some(p) => eval::to_i64(&values[p]),
+                };
+                let doc: Vec<Value> = col_pos.iter().map(|&p| values[p].clone()).collect();
+                docs.push((rid, doc));
+            }
+            return Ok(docs);
+        }
+        // Self-content: the `<name>_content` shadow holds `(id, c0, c1, …)`.
+        let cmeta = self.table_meta(&format!("{name}_content"), None)?;
+        let docs = self
+            .scan_table(&cmeta)?
+            .into_iter()
+            .map(|(rowid, mut values)| {
+                if !values.is_empty() {
+                    values.remove(0);
+                }
+                (rowid, values)
+            })
+            .collect();
+        Ok(docs)
+    }
+
     /// Rebuild an FTS5 table's `%_data`/`%_idx`/`%_docsize` from the documents in
     /// `<name>_content` (a bulk rebuild, like the R-Tree). Tokenizes each column
     /// with the table's tokenizer and writes a byte-compatible segment index.
@@ -27087,8 +27286,11 @@ impl Connection {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let tok = crate::vtab::fts5_tok_config(&arg_refs);
 
-        let cmeta = self.table_meta(&format!("{name}_content"), None)?;
-        let docs = self.scan_table(&cmeta)?;
+        // `docs`: each document as `(rowid, [fts5 col values…])` — the fts5 column
+        // values in declared order (NO leading id). For an external-content table
+        // this reads from the named content table, keyed by its `content_rowid`;
+        // otherwise from this table's own `<name>_content` shadow.
+        let docs = self.fts5_load_documents(name, &schema.columns, &arg_refs)?;
 
         // term bytes -> rowid -> per-column positions
         let mut index: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u32>>>> = BTreeMap::new();
@@ -27097,7 +27299,7 @@ impl Connection {
         for (rowid, values) in &docs {
             let mut sizes = alloc::vec![0u64; ncols];
             for c in 0..ncols {
-                let text = match values.get(c + 1) {
+                let text = match values.get(c) {
                     Some(v) if !matches!(v, Value::Null) => eval::to_text(v),
                     _ => String::new(),
                 };
