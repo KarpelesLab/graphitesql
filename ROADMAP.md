@@ -1373,10 +1373,21 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   oldest (it picks the narrower `it_a` in one schema and the newer wider `iac` in another)
   — graphite keeps the covering-scan width-then-newest tiebreak, correct on the common and
   tested cases, divergent only on these unusual multi-same-prefix-index schemas (not a
-  regression); covering-scan *with* a WHERE predicate on
-  covered columns (`SELECT b FROM t WHERE c>0` → covering `(b,c)`); and the secondary-index
-  `SEARCH` + `GROUP BY`/`DISTINCT` b-tree (left open by B9d). These are structural too — a
+  regression); and covering-scan *with* a WHERE predicate on
+  covered columns (`SELECT b FROM t WHERE c>0` → covering `(b,c)`). These are structural too — a
   stat4 oracle is only needed for genuinely data-driven choices (B4).
+  **A `GROUP BY`/`DISTINCT` over a covered column now picks a covering index among several
+  (2026-07-07):** the index walk supplies the grouping/distinct order regardless of width, and
+  `covering_scan` used to *decline* whenever more than one index covered the query (falling back
+  to `SCAN t` + a sort). It now picks the narrowest covering candidate (ties → newest), the same
+  choice as a bare covering scan — so `SELECT a … GROUP BY a` / `SELECT DISTINCT a` over
+  `ia(a)`+`iab(a,b)` reads `SCAN t USING COVERING INDEX ia` like sqlite. Byte-exact plan+rows
+  (`tests/eqp_group_distinct_covering.rs`). **Still open (same class):** the no-`WHERE`
+  `order_index_scan` path still first-picks among multiple order-satisfying indexes
+  (`SELECT a,b … ORDER BY a,b` over `ia`+`iab` chooses `ia` + a temp b-tree where sqlite reads the
+  covering `iab` in order — pre-existing, rows correct); it wants the same deterministic-chooser
+  treatment `seek_order_prefix` got. Also still open: `min(col)`/`max(col)` over an indexed column
+  with 2+ indexes declines the index fast-path.
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   `collect_eq_constraints` / `collect_range_constraints` compare an explicit `COLLATE`
   to the *column's* collation. When an index carries a *non-default* collation

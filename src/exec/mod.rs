@@ -18351,14 +18351,16 @@ impl Connection {
         // still supplies the leading terms), so SQLite reads from a covering index
         // there *regardless* of width; only a bare projection is a pure width
         // choice. (A fully sort-satisfying scan already bailed above via
-        // `order_satisfied_by_scan`.) For these we keep the conservative
-        // single-candidate rule — which index an ambiguous walk picks is the
-        // ordered-scan path's job.
+        // `order_satisfied_by_scan`.) Among several covering candidates SQLite picks
+        // the narrowest (ties → newest), the same choice as a bare covering scan —
+        // so we pick deterministically here instead of declining on 2+.
         if !sel.group_by.is_empty() || sel.distinct || !sel.order_by.is_empty() {
-            if covering.len() != 1 {
-                return None;
-            }
-            let chosen = covering.into_iter().next()?;
+            let chosen = covering.into_iter().min_by_key(|idx| {
+                (
+                    self.index_seek_width(&t.name, idx),
+                    core::cmp::Reverse(idx.root),
+                )
+            })?;
             return Some((chosen.name, chosen.root, chosen.cols));
         }
         // Plain no-`WHERE` projection: port SQLite's covering-scan cost choice
