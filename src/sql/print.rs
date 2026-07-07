@@ -348,8 +348,19 @@ fn table_constraint(c: &TableConstraint) -> String {
             .join(", ")
     };
     match c {
-        TableConstraint::PrimaryKey(names, oc) => {
-            format!("PRIMARY KEY({}){}", cols(names), conflict_suffix(oc))
+        TableConstraint::PrimaryKey(cols_dir, oc) => {
+            let rendered = cols_dir
+                .iter()
+                .map(|(n, desc)| {
+                    if *desc {
+                        format!("{} DESC", ident(n))
+                    } else {
+                        ident(n)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("PRIMARY KEY({rendered}){}", conflict_suffix(oc))
         }
         TableConstraint::Unique(names, oc) => {
             format!("UNIQUE({}){}", cols(names), conflict_suffix(oc))

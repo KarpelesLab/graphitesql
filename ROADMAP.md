@@ -894,8 +894,21 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   matching sqlite. Verified byte-for-byte vs sqlite3 3.50.4 including the on-disk
   guard: graphite writes DESC indexes to a real file, sqlite opens it, `PRAGMA
   integrity_check` = `ok`, and cross-engine reads agree (`tests/desc_index.rs`).
-  (Deferred: a `DESC` *primary key* on a WITHOUT ROWID table's clustered b-tree still
-  stores ascending — the one remaining direction gap, documented in-code.)
+  **A `DESC` column in a WITHOUT ROWID table's PRIMARY KEY is now honored too**, so
+  DESC direction is complete across both secondary indexes and PK-clustered tables.
+  The table-level `TableConstraint::PrimaryKey` was extended to carry each column's
+  direction (`Vec<(String, bool)>`, matching the column-level `PRIMARY KEY DESC`);
+  the parser captures it, `print`/`sqlite_master.sql` round-trips `PRIMARY KEY(a DESC)`
+  as sqlite does, and `TableMeta.pk_descending` (aligned with `storage_order[..pk_len]`,
+  from either the column- or table-level declaration) threads through every clustered
+  `meta.root` insert and seek/scan — the same per-root consistency invariant. The
+  three WITHOUT ROWID order-elision provers became direction-aware, so
+  `ORDER BY a DESC` over `PRIMARY KEY(a DESC)` needs no sorter. Byte-verified vs
+  sqlite3 3.50.4 (table-level, column-level, composite; `integrity_check` = `ok` +
+  cross-engine reads agree; `tests/desc_pk_without_rowid.rs`). (Deferred, orthogonal:
+  a range seek on a DESC leading PK column declines to a scan + WHERE re-filter — rows
+  correct — and `UNIQUE(col DESC)` auto-indexes stay ascending via the `is_auto`
+  exclusion, both mirroring the secondary-index deferrals.)
 
 **Remaining — genuinely open work.** Ordered roughly easiest → hardest. These are
 the residuals left after the differential sweep; the surface is otherwise

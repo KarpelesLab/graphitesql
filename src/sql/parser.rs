@@ -2013,7 +2013,7 @@ impl Parser {
         };
         if self.eat_kw("primary") {
             self.expect_kw("key")?;
-            let cols = self.paren_columns()?;
+            let cols = self.paren_columns_dir()?;
             let oc = self.eat_conflict_clause();
             Ok(Some(TableConstraint::PrimaryKey(cols, oc)))
         } else if self.eat_kw("unique") {
@@ -2150,6 +2150,33 @@ impl Parser {
         }
         self.expect(&Token::RParen)?;
         Ok(names)
+    }
+
+    /// Like [`paren_columns`](Self::paren_columns) but keeps each column's
+    /// `ASC`/`DESC` direction as `(name, descending)`. Used for a table-level
+    /// `PRIMARY KEY`, whose per-column direction orders a `WITHOUT ROWID`
+    /// table's clustered b-tree.
+    fn paren_columns_dir(&mut self) -> Result<Vec<(String, bool)>> {
+        self.expect(&Token::LParen)?;
+        let mut cols = Vec::new();
+        loop {
+            let name = self.ident()?;
+            if self.eat_kw("collate") {
+                let _ = self.ident()?;
+            }
+            let descending = if self.eat_kw("desc") {
+                true
+            } else {
+                let _ = self.eat_kw("asc");
+                false
+            };
+            cols.push((name, descending));
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(cols)
     }
 
     fn create_index(&mut self, unique: bool) -> Result<CreateIndex> {

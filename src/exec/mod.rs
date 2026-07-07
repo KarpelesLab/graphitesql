@@ -5260,7 +5260,7 @@ impl Connection {
                 _ => None,
             })
             .flatten()
-            .map(String::as_str)
+            .map(|(n, _)| n.as_str())
             .collect();
         // SQLite processes PRIMARY KEY declarations sequentially (column-level
         // PKs precede table-level ones in source order), so the *first* declared
@@ -5290,7 +5290,7 @@ impl Connection {
             TableConstraint::PrimaryKey(cols, _) => Some(cols),
             _ => None,
         }) {
-            cols.iter().any(|name| is_generated_col(name))
+            cols.iter().any(|(name, _)| is_generated_col(name))
         } else {
             false
         };
@@ -5554,11 +5554,14 @@ impl Connection {
         }
         // Table-level PRIMARY KEY/UNIQUE column lists must name real columns.
         for tc in &ct.constraints {
-            let cols = match tc {
-                TableConstraint::PrimaryKey(cols, _) | TableConstraint::Unique(cols, _) => cols,
+            let names: Vec<&str> = match tc {
+                TableConstraint::PrimaryKey(cols, _) => {
+                    cols.iter().map(|(n, _)| n.as_str()).collect()
+                }
+                TableConstraint::Unique(cols, _) => cols.iter().map(String::as_str).collect(),
                 _ => continue,
             };
-            for name in cols {
+            for name in names {
                 if !ct.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
                     return Err(Error::Error(alloc::format!("no such column: {name}")));
                 }
@@ -6036,7 +6039,7 @@ impl Connection {
         }
         for c in &ct.constraints {
             if let TableConstraint::PrimaryKey(cols, _) = c {
-                return Ok(cols.clone());
+                return Ok(cols.iter().map(|(n, _)| n.clone()).collect());
             }
         }
         Ok(Vec::new())
@@ -10777,7 +10780,14 @@ impl Connection {
                 }
                 for tc in &mut ct.constraints {
                     match tc {
-                        TableConstraint::PrimaryKey(n, _) | TableConstraint::Unique(n, _) => {
+                        TableConstraint::PrimaryKey(n, _) => {
+                            for (nm, _) in n {
+                                if nm.eq_ignore_ascii_case(old) {
+                                    *nm = new.clone();
+                                }
+                            }
+                        }
+                        TableConstraint::Unique(n, _) => {
                             for nm in n {
                                 if nm.eq_ignore_ascii_case(old) {
                                     *nm = new.clone();
@@ -11065,7 +11075,7 @@ impl Connection {
             .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
             || ct.constraints.iter().any(|tc| {
                 matches!(tc, TableConstraint::PrimaryKey(n, _)
-                    if n.iter().any(|x| x.eq_ignore_ascii_case(name)))
+                    if n.iter().any(|(x, _)| x.eq_ignore_ascii_case(name)))
             });
         if pk_named {
             return Err(Error::Error(format!(
@@ -11381,8 +11391,21 @@ impl Connection {
         if key.is_empty() {
             return Ok(None);
         }
-        let records =
-            crate::btree::index_seek_records(self.backend.source(), meta.root, &key, &colls, &[])?;
+        // Seek the clustered PK b-tree with the same per-column directions it was
+        // written with, truncated to the seeked key prefix (`&[]` when all-asc).
+        let all_descs = meta.pk_descs();
+        let descs: &[bool] = if all_descs.is_empty() {
+            &[]
+        } else {
+            &all_descs[..key.len()]
+        };
+        let records = crate::btree::index_seek_records(
+            self.backend.source(),
+            meta.root,
+            &key,
+            &colls,
+            descs,
+        )?;
         let mut out = Vec::with_capacity(records.len());
         for storage in records {
             let mut row = unpermute_row(meta, storage);
@@ -11431,6 +11454,13 @@ impl Connection {
         }
         let coll = wr_storage_collations(meta)[0];
         let aff = meta.columns[lead].affinity;
+        // Leading-PK direction: an all-ascending PK passes `&[]`; a DESC leading
+        // PK seeks the b-tree with the same direction it was written with.
+        let lead_descs: &[bool] = if meta.pk_descs().is_empty() {
+            &[]
+        } else {
+            &meta.pk_descending[..1]
+        };
         let mut out = Vec::new();
         let mut seen: Vec<Value> = Vec::new();
         for v in &values {
@@ -11444,7 +11474,7 @@ impl Connection {
                 meta.root,
                 &[key_val],
                 &[coll],
-                &[],
+                lead_descs,
             )?;
             for storage in records {
                 let mut row = unpermute_row(meta, storage);
@@ -11480,6 +11510,13 @@ impl Connection {
         let Some(&lead) = pk.first() else {
             return Ok(None);
         };
+        // A range on a DESC leading PK column would need the value-space bounds
+        // swapped into key-sort space; mirroring the secondary-index DESC-range
+        // deferral in a139244, decline and fall back to a scan (still correct via
+        // `run_core`'s WHERE re-filter).
+        if meta.pk_descending.first().copied().unwrap_or(false) {
+            return Ok(None);
+        }
         let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
             alloc::collections::BTreeMap::new();
         collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
@@ -11648,12 +11685,14 @@ impl Connection {
             let src = self.backend.source();
             let pk_colls: Vec<crate::value::Collation> =
                 wr_storage_collations(meta)[..pk.len()].to_vec();
+            // Full-PK seek into the clustered b-tree: match its stored directions.
+            let pk_descs = meta.pk_descs().to_vec();
             for rec in &records {
                 let pk_key: Vec<Value> = (0..pk.len())
                     .map(|j| rec[idx.cols.len() + j].clone())
                     .collect();
                 for storage in
-                    crate::btree::index_seek_records(src, meta.root, &pk_key, &pk_colls, &[])?
+                    crate::btree::index_seek_records(src, meta.root, &pk_key, &pk_colls, &pk_descs)?
                 {
                     let mut row = unpermute_row(meta, storage);
                     self.compute_generated(meta, &mut row, params)?;
@@ -17191,21 +17230,25 @@ impl Connection {
         }
         let label = t.alias.as_deref().unwrap_or(&t.name);
         let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
-        if !meta.without_rowid || !meta.pk_all_asc {
+        if !meta.without_rowid {
             return None;
         }
-        // The ORDER BY must be a uniform-direction contiguous prefix of the
-        // PK-clustered storage order. `order_projection` resolves a `SELECT *`
-        // wildcard / positional ordinal to the column it names, as elsewhere; a
-        // `COLLATE`-wrapped term is an `Expr::Collate`, not a bare column, and bails
-        // — a bare `ORDER BY col` inherently uses the column's storage collation.
+        // The ORDER BY must be a contiguous prefix of the PK-clustered storage
+        // order, and every term's direction *relative to the stored column's
+        // direction* must be uniform: the b-tree walks in storage order, so a
+        // per-term requested/stored mismatch is `true` and all terms must agree
+        // (either all match the walk, or all reverse it — a single global
+        // reverse). `order_projection` resolves a `SELECT *` wildcard / positional
+        // ordinal to the column it names; a `COLLATE`-wrapped term is an
+        // `Expr::Collate`, not a bare column, and bails — a bare `ORDER BY col`
+        // inherently uses the column's storage collation.
         if sel.order_by.len() > meta.storage_order.len() {
             return None;
         }
         let order_cols = order_projection(&sel.columns, &meta.columns);
-        let dir = sel.order_by[0].descending;
+        let mut reverse: Option<bool> = None;
         for (i, term) in sel.order_by.iter().enumerate() {
-            if term.descending != dir || !redundant_nulls(term) {
+            if !redundant_nulls(term) {
                 return None;
             }
             let (tbl, col) = match order_key_expr(&order_cols, &term.expr) {
@@ -17221,8 +17264,16 @@ impl Connection {
             {
                 return None;
             }
+            // Stored direction of the storage-order column at position `i`: a PK
+            // column carries its declared `DESC`; trailing non-PK columns are
+            // stored ascending.
+            let stored_desc = meta.pk_descending.get(i).copied().unwrap_or(false);
+            let rev = term.descending != stored_desc;
+            if *reverse.get_or_insert(rev) != rev {
+                return None;
+            }
         }
-        Some(dir)
+        Some(reverse.unwrap_or(false))
     }
 
     /// The `WHERE`-seek analogue of [`without_rowid_ordered_scan`]: a leading-PK
@@ -17268,7 +17319,7 @@ impl Connection {
         }
         let label = t.alias.as_deref().unwrap_or(&t.name);
         let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
-        if !meta.without_rowid || !meta.pk_all_asc {
+        if !meta.without_rowid {
             return None;
         }
         let pk = &meta.storage_order[..meta.pk_len];
@@ -17328,14 +17379,21 @@ impl Connection {
             if const_cols.contains(&oc) {
                 continue; // constant column: contributes no ordering
             }
-            let d = *dir.get_or_insert(term.descending);
-            if term.descending != d || !redundant_nulls(term) {
+            if !redundant_nulls(term) {
                 return None;
             }
             while walk < storage.len() && const_cols.contains(&storage[walk]) {
                 walk += 1;
             }
             if walk >= storage.len() || storage[walk] != oc {
+                return None;
+            }
+            // Direction *relative to the stored column's direction*: the b-tree
+            // walks in storage order, so a match needs no reverse and a mismatch
+            // reverses. All terms must agree on that single global reverse flag.
+            let rev = term.descending != meta.storage_desc(walk);
+            let d = *dir.get_or_insert(rev);
+            if rev != d {
                 return None;
             }
             walk += 1;
@@ -17391,7 +17449,7 @@ impl Connection {
         }
         let label = t.alias.as_deref().unwrap_or(&t.name);
         let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
-        if !meta.without_rowid || !meta.pk_all_asc {
+        if !meta.without_rowid {
             return None;
         }
         let lead = *meta.storage_order[..meta.pk_len].first()?;
@@ -17467,8 +17525,11 @@ impl Connection {
             if walk >= storage.len() || storage[walk] != oc {
                 return None;
             }
-            let d = *dir.get_or_insert(term.descending);
-            if term.descending != d || !redundant_nulls(term) {
+            // Reverse iff the requested direction differs from the stored column's
+            // direction; all terms must agree on one global reverse flag.
+            let rev = term.descending != meta.storage_desc(walk);
+            let d = *dir.get_or_insert(rev);
+            if rev != d || !redundant_nulls(term) {
                 return None;
             }
             walk += 1;
@@ -23344,6 +23405,12 @@ impl Connection {
         let is_left = matches!(join.kind, JoinKind::Left);
         let lead = inner_meta.storage_order[0];
         let coll = wr_storage_collations(inner_meta)[0];
+        // Leading-PK direction of the inner clustered b-tree (`&[]` when all-asc).
+        let lead_descs: &[bool] = if inner_meta.pk_descs().is_empty() {
+            &[]
+        } else {
+            &inner_meta.pk_descending[..1]
+        };
         let src = self.backend.source();
         let mut joined: Vec<Vec<Value>> = Vec::new();
         for left in rows {
@@ -23352,8 +23419,13 @@ impl Connection {
                 let key = [inner_meta.columns[lead]
                     .affinity
                     .coerce(left[outer_col].clone())];
-                let records =
-                    crate::btree::index_seek_records(src, inner_meta.root, &key, &[coll], &[])?;
+                let records = crate::btree::index_seek_records(
+                    src,
+                    inner_meta.root,
+                    &key,
+                    &[coll],
+                    lead_descs,
+                )?;
                 for storage in records {
                     let mut inner = unpermute_row(inner_meta, storage);
                     self.compute_generated(inner_meta, &mut inner, params)?;
@@ -23738,9 +23810,17 @@ impl Connection {
             }
             let record = encode_record(&permute_row(meta, &values));
             let scolls = wr_storage_collations(meta);
-            // WITHOUT ROWID clustered PK insert; DESC PKs are a documented
-            // deferral, so seek/insert stay all-ascending (`&[]`).
-            insert_index(self.backend.writer()?, meta.root, &record, &scolls, &[])?;
+            // WITHOUT ROWID clustered PK insert: order the b-tree by the PK's
+            // declared per-column directions (`&[]` when all-ascending). Every
+            // seek/scan on `meta.root` passes the same slice (the per-root
+            // consistency invariant).
+            insert_index(
+                self.backend.writer()?,
+                meta.root,
+                &record,
+                &scolls,
+                meta.pk_descs(),
+            )?;
             affected += 1;
         }
         if affected > 0 {
@@ -23865,11 +23945,13 @@ impl Connection {
             .map(|r| encode_record(&permute_row(meta, &r)))
             .collect();
         let scolls = wr_storage_collations(meta);
+        let descs = meta.pk_descs().to_vec();
         let w = self.backend.writer()?;
         clear_index(w, meta.root)?;
         for rec in &records {
-            // WITHOUT ROWID clustered PK (DESC PKs deferred): all-ascending (`&[]`).
-            insert_index(w, meta.root, rec, &scolls, &[])?;
+            // WITHOUT ROWID clustered PK: honour the PK's per-column directions
+            // (same slice as every other insert/seek on this root).
+            insert_index(w, meta.root, rec, &scolls, &descs)?;
         }
         Ok(())
     }
@@ -26558,14 +26640,16 @@ impl Connection {
         let unique = collect_unique_sets(&ct, ipk);
 
         // WITHOUT ROWID: derive the PK-first storage order.
-        let (without_rowid, storage_order, pk_len, pk_all_asc) = if ct.without_rowid {
-            let pk = primary_key_positions(&ct);
-            if pk.is_empty() {
+        let (without_rowid, storage_order, pk_len, pk_descending) = if ct.without_rowid {
+            let pk_dir = primary_key_positions_dir(&ct);
+            if pk_dir.is_empty() {
                 return Err(Error::Error(format!(
                     "PRIMARY KEY missing on table {}",
                     ct.name
                 )));
             }
+            let pk: Vec<usize> = pk_dir.iter().map(|(p, _)| *p).collect();
+            let pk_descending: Vec<bool> = pk_dir.iter().map(|(_, d)| *d).collect();
             // Storage order: PK columns first, then the remaining *stored*
             // columns (VIRTUAL generated columns are never written).
             let mut order = pk.clone();
@@ -26576,9 +26660,9 @@ impl Connection {
                 }
             }
             let pk_len = pk.len();
-            (true, order, pk_len, !sql_has_desc_keyword(sql))
+            (true, order, pk_len, pk_descending)
         } else {
-            (false, Vec::new(), 0, true)
+            (false, Vec::new(), 0, Vec::new())
         };
 
         // STRICT tables: record each column's rigid type for write-time checking,
@@ -26615,7 +26699,7 @@ impl Connection {
             without_rowid,
             storage_order,
             pk_len,
-            pk_all_asc,
+            pk_descending,
             strict_types,
             autoincrement: ipk.is_some_and(|i| {
                 ct.columns[i].constraints.iter().any(|k| {
@@ -26725,12 +26809,13 @@ struct TableMeta {
     /// for ordinary rowid tables. `pk_len` is how many leading entries are PK.
     storage_order: Vec<usize>,
     pk_len: usize,
-    /// For a `WITHOUT ROWID` table, `true` when no PRIMARY KEY column is declared
-    /// `DESC`. graphite always stores a `WITHOUT ROWID` PK ascending (it drops a
-    /// declared key direction), so the PK-clustered ordered-scan optimisation only
-    /// applies — and only matches sqlite's plan — when the PK is all-ascending.
-    /// Always `true` for an ordinary rowid table (unused there).
-    pk_all_asc: bool,
+    /// For a `WITHOUT ROWID` table, each PRIMARY KEY column's declared `DESC` flag,
+    /// aligned with `storage_order[..pk_len]` (`true` = descending). The clustered
+    /// b-tree is ordered by the PK honouring these directions, so every insert and
+    /// every seek/scan on `root` passes this same slice to the index writer/reader
+    /// (via [`TableMeta::pk_descs`]) — the per-root consistency invariant. Empty
+    /// for an ordinary rowid table.
+    pk_descending: Vec<bool>,
     /// For a `STRICT` table, each column's rigid type and its declared type name
     /// (aligned with `columns`); `None` for an ordinary table. Drives write-time
     /// type checking.
@@ -27086,7 +27171,7 @@ fn schema_table_meta(label: &str) -> TableMeta {
         without_rowid: false,
         storage_order: Vec::new(),
         pk_len: 0,
-        pk_all_asc: true,
+        pk_descending: Vec::new(),
         strict_types: None,
         autoincrement: false,
     }
@@ -29032,6 +29117,27 @@ impl TableMeta {
     /// Whether column `i` is generated (STORED or VIRTUAL).
     fn is_generated(&self, i: usize) -> bool {
         self.generated[i].is_some()
+    }
+
+    /// Per-column `DESC` flags for the clustered PRIMARY KEY b-tree (`root`),
+    /// aligned with `storage_order[..pk_len]`. Handed to the b-tree index
+    /// writer/reader at *every* insert and seek/scan on `root`, so the on-disk
+    /// order matches SQLite and stays self-consistent. An all-ascending PK
+    /// returns `&[]` (the writer's "no-op" case), keeping such tables
+    /// byte-for-byte unchanged.
+    fn pk_descs(&self) -> &[bool] {
+        if self.pk_descending.iter().any(|&d| d) {
+            &self.pk_descending
+        } else {
+            &[]
+        }
+    }
+
+    /// The stored direction (`true` = descending) of the column at position `i`
+    /// in `storage_order`: a PK column (`i < pk_len`) carries its declared
+    /// `DESC`; trailing non-PK columns are stored ascending.
+    fn storage_desc(&self, i: usize) -> bool {
+        self.pk_descending.get(i).copied().unwrap_or(false)
     }
 }
 
@@ -35597,8 +35703,11 @@ fn collect_unique_sets(ct: &CreateTable, ipk: Option<usize>) -> Vec<(Vec<usize>,
         }
     }
     for tc in &ct.constraints {
-        let (names, oc) = match tc {
-            TableConstraint::Unique(n, oc) | TableConstraint::PrimaryKey(n, oc) => (n, *oc),
+        let (names, oc): (Vec<&str>, OnConflict) = match tc {
+            TableConstraint::Unique(n, oc) => (n.iter().map(String::as_str).collect(), *oc),
+            TableConstraint::PrimaryKey(n, oc) => {
+                (n.iter().map(|(name, _)| name.as_str()).collect(), *oc)
+            }
             _ => continue,
         };
         let idxs: Option<Vec<usize>> = names.iter().map(|n| col_pos(n)).collect();
@@ -35682,22 +35791,35 @@ fn unpermute_row(meta: &TableMeta, storage: Vec<Value>) -> Vec<Value> {
 /// The column positions of a table's PRIMARY KEY, in key order (column-level
 /// `PRIMARY KEY` or a table-level `PRIMARY KEY(...)`). Empty if none.
 fn primary_key_positions(ct: &CreateTable) -> Vec<usize> {
+    primary_key_positions_dir(ct)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// Like [`primary_key_positions`] but pairs each PK column position with its
+/// declared `DESC` flag (`true` = descending). The direction comes from a
+/// column-level `PRIMARY KEY DESC` or from each column's `ASC`/`DESC` in a
+/// table-level `PRIMARY KEY(col …)`. Used to order a `WITHOUT ROWID` table's
+/// clustered b-tree; secondary auto-indexes ignore it (a separate deferral).
+fn primary_key_positions_dir(ct: &CreateTable) -> Vec<(usize, bool)> {
     for (i, c) in ct.columns.iter().enumerate() {
-        if c.constraints
-            .iter()
-            .any(|k| matches!(k, ColumnConstraint::PrimaryKey { .. }))
-        {
-            return alloc::vec![i];
+        if let Some(descending) = c.constraints.iter().find_map(|k| match k {
+            ColumnConstraint::PrimaryKey { descending, .. } => Some(*descending),
+            _ => None,
+        }) {
+            return alloc::vec![(i, descending)];
         }
     }
     for tc in &ct.constraints {
-        if let TableConstraint::PrimaryKey(names, _) = tc {
-            let pos: Option<Vec<usize>> = names
+        if let TableConstraint::PrimaryKey(cols, _) = tc {
+            let pos: Option<Vec<(usize, bool)>> = cols
                 .iter()
-                .map(|n| {
+                .map(|(n, desc)| {
                     ct.columns
                         .iter()
                         .position(|c| c.name.eq_ignore_ascii_case(n))
+                        .map(|p| (p, *desc))
                 })
                 .collect();
             if let Some(pos) = pos {
@@ -35706,17 +35828,6 @@ fn primary_key_positions(ct: &CreateTable) -> Vec<usize> {
         }
     }
     Vec::new()
-}
-
-/// True if the `CREATE TABLE` text contains a standalone `DESC` keyword. Within a
-/// `CREATE TABLE` statement `DESC` can only appear as a column direction in a
-/// PRIMARY KEY / UNIQUE key list, so this conservatively flags a possibly-DESC
-/// PRIMARY KEY — the parser drops table-level key directions, so the AST alone
-/// cannot tell. Used to decline the `WITHOUT ROWID` PK-ordered-scan optimisation
-/// (a quoted column literally named `desc` only makes it over-conservative).
-fn sql_has_desc_keyword(sql: &str) -> bool {
-    sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|w| w.eq_ignore_ascii_case("desc"))
 }
 
 /// Parse the `<n>` from `sqlite_autoindex_<table>_<n>` (1-based), if `name` is an
@@ -35753,7 +35864,7 @@ fn find_integer_primary_key(ct: &CreateTable) -> Option<usize> {
     for tc in &ct.constraints {
         if let TableConstraint::PrimaryKey(cols, _) = tc {
             if cols.len() == 1 {
-                if let Some(i) = ct.columns.iter().position(|c| c.name == cols[0]) {
+                if let Some(i) = ct.columns.iter().position(|c| c.name == cols[0].0) {
                     if ct.columns[i]
                         .type_name
                         .as_deref()

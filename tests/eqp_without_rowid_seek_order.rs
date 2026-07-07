@@ -167,9 +167,8 @@ fn without_rowid_seek_serves_order() {
     }
 }
 
-/// A seek served by a *secondary* index, or a `DESC` PRIMARY KEY, is not elided:
-/// the walk is not the ascending PK order this slice models, so the sorter is
-/// kept (and the rows still come out right).
+/// A seek served by a *secondary* index is not elided: the walk is not the PK's
+/// clustered order this slice models, so the sorter is kept (rows still right).
 #[test]
 fn without_rowid_seek_declines_non_pk_order() {
     if !have_sqlite() {
@@ -184,13 +183,29 @@ fn without_rowid_seek_declines_non_pk_order() {
         g_rows(sec, "SELECT * FROM w WHERE y=2 ORDER BY x"),
         sqlite_rows(sec, "SELECT * FROM w WHERE y=2 ORDER BY x")
     );
-    // A `DESC` PRIMARY KEY: graphite stores it ascending, so the range seek's
-    // walk does not match a `DESC`-clustered storage — sorter kept, rows right.
+}
+
+/// A `DESC` PRIMARY KEY now orders the clustered b-tree descending (byte-compat
+/// with sqlite), so the PK-clustered walk yields `a` descending and the sorter is
+/// elided in *both* directions — matching sqlite's plan and rows exactly.
+#[test]
+fn without_rowid_desc_pk_order_elided() {
+    if !have_sqlite() {
+        return;
+    }
     let desc = "CREATE TABLE w(a,b, PRIMARY KEY(a DESC)) WITHOUT ROWID; \
-        INSERT INTO w VALUES(3,1),(1,2),(2,3);";
-    assert!(g_eqp(desc, "SELECT * FROM w WHERE a>1 ORDER BY a").contains("ORDER BY"));
-    assert_eq!(
-        g_rows(desc, "SELECT * FROM w WHERE a>1 ORDER BY a"),
-        sqlite_rows(desc, "SELECT * FROM w WHERE a>1 ORDER BY a")
-    );
+        INSERT INTO w VALUES(3,1),(1,2),(2,3),(5,7),(4,8);";
+    for q in [
+        "SELECT * FROM w WHERE a>1 ORDER BY a",
+        "SELECT * FROM w WHERE a>1 ORDER BY a DESC",
+        "SELECT a FROM w ORDER BY a",
+        "SELECT a FROM w ORDER BY a DESC",
+    ] {
+        assert!(
+            !g_eqp(desc, q).contains("ORDER BY"),
+            "expected no sorter for {q}, got {}",
+            g_eqp(desc, q)
+        );
+        assert_eq!(g_rows(desc, q), sqlite_rows(desc, q), "rows differ for {q}");
+    }
 }

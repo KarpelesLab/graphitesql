@@ -628,8 +628,10 @@ pub enum ColumnConstraint {
 /// A table-level constraint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableConstraint {
-    /// `PRIMARY KEY (cols…) [ON CONFLICT <action>]`.
-    PrimaryKey(Vec<String>, OnConflict),
+    /// `PRIMARY KEY (cols…) [ON CONFLICT <action>]`. Each column carries its
+    /// declared direction as `(name, descending)` — `DESC` is significant for a
+    /// `WITHOUT ROWID` table, whose clustered b-tree is ordered by the PK.
+    PrimaryKey(Vec<(String, bool)>, OnConflict),
     /// `UNIQUE (cols…) [ON CONFLICT <action>]`.
     Unique(Vec<String>, OnConflict),
     /// `CHECK (<expr>)`. The second field is the constraint's *label* (see
