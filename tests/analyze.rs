@@ -135,25 +135,27 @@ fn planner_prefers_selective_index() {
     // distinct value. After ANALYZE the planner must search via `i_sel`.
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(sel, dup)").unwrap();
-    // Create the non-selective index FIRST: without statistics the chooser would
-    // keep it (equal prefix length, first wins), so a pass proves stats decided.
+    // Create the non-selective index FIRST. Without statistics the chooser breaks
+    // the equal-prefix tie toward the NEWEST index (highest rootpage) — matching
+    // sqlite3 3.50.4 — so the later `i_sel` is chosen even pre-ANALYZE here.
     c.execute("CREATE INDEX i_dup ON t(dup)").unwrap();
     c.execute("CREATE INDEX i_sel ON t(sel)").unwrap();
     for i in 0..50 {
         c.execute(&format!("INSERT INTO t VALUES ({i}, 7)"))
             .unwrap();
     }
-    // Before ANALYZE: no stats, so the first-created index (i_dup) is chosen.
+    // Before ANALYZE: no stats, so the newest-created matching index (i_sel) is
+    // chosen (equal 1-column prefix, neither covers `SELECT *`) — as sqlite does.
     let pre = rows_str(
         &c,
         "EXPLAIN QUERY PLAN SELECT * FROM t WHERE sel = 5 AND dup = 7",
     );
     assert!(
-        pre.contains("i_dup"),
-        "pre-ANALYZE expected i_dup, got: {pre}"
+        pre.contains("i_sel"),
+        "pre-ANALYZE expected i_sel (newest tiebreak), got: {pre}"
     );
     c.execute("ANALYZE").unwrap();
-    // After ANALYZE: the selective index wins despite being created later.
+    // After ANALYZE: the selective index still wins (here it was already newest).
     let plan = rows_str(
         &c,
         "EXPLAIN QUERY PLAN SELECT * FROM t WHERE sel = 5 AND dup = 7",

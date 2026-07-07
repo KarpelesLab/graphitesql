@@ -11792,6 +11792,117 @@ impl Connection {
         Ok(None)
     }
 
+    /// Choose the secondary index a `col = const` / `col IS NULL` equality-prefix
+    /// seek should use, applying SQLite 3.50.4's cost tiebreaks. Shared by
+    /// [`try_index_lookup`](Self::try_index_lookup) (which performs the seek) and
+    /// [`eqp_access`](Self::eqp_access) (which reports it) so the two can never
+    /// disagree about the index name. Returns the chosen [`IndexMeta`] together
+    /// with the matched leading-prefix length, or `None` when no plain index seeks
+    /// the prefix.
+    ///
+    /// Candidate = a non-partial, non-expression index whose leading column(s) are
+    /// all equality/`IS NULL`-constrained (a `matched` prefix ≥ 1). The ordering,
+    /// best-first, mirrors what probing `sqlite3` 3.50.4 produces:
+    ///
+    /// 1. **`est` ascending** — the `sqlite_stat1` avg-eq at the matched prefix
+    ///    when statistics exist, else a sentinel (`u64::MAX - matched.len()`) that
+    ///    makes a *longer* matched prefix (more selective) win. Selectivity always
+    ///    dominates, so a stat-driven or longer-prefix choice is never overridden
+    ///    by the covering/width tiebreaks below (conservative: mixed stat/covering
+    ///    interactions keep the pre-existing selectivity behavior).
+    /// 2. At equal `est`, a **query-covering** index (holds every referenced column
+    ///    — or the rowid, present in every index record — so the table b-tree
+    ///    lookup is skipped) beats a non-covering one, even if wider.
+    /// 3. Among equal-`est` covering candidates, the **narrower** estimated key
+    ///    width wins (same `szEst`/`LogEst` width model as
+    ///    [`covering_scan`](Self::covering_scan)).
+    /// 4. Final tiebreak: the **newest** index (highest rootpage) — SQLite
+    ///    considers indexes newest-first and keeps the first of an equal cost.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn choose_seek_index(
+        &self,
+        sel: Option<&Select>,
+        meta: &TableMeta,
+        table_name: &str,
+        where_expr: &Expr,
+        eqs: &[(usize, Value)],
+        is_null_cols: &[usize],
+        hint: Option<&IndexHint>,
+    ) -> Result<Option<(IndexMeta, usize)>> {
+        let stats = self.stat1_map();
+        // Per-index estimated key width, in `LogEst` units, for the covering
+        // width tiebreak (identical model to `covering_scan`): Σ szEst(key col) + 1
+        // (the trailing rowid), then `logest(width * 4)`.
+        let szests = self.table_col_szests(table_name).unwrap_or_default();
+        let width_of = |idx: &IndexMeta| -> i16 {
+            let w: u32 = idx
+                .cols
+                .iter()
+                .map(|&c| szests.get(c).copied().unwrap_or(1))
+                .sum::<u32>()
+                + 1;
+            logest(u64::from(w) * 4)
+        };
+        // The ordering key for a candidate, compared best-first. `est` ascending is
+        // primary; then covering (false < true, so negate); then width ascending;
+        // then newest (root descending, so negate).
+        #[allow(clippy::type_complexity)]
+        let mut best: Option<(
+            (u64, bool, i16, core::cmp::Reverse<u32>),
+            IndexMeta,
+            usize,
+        )> = None;
+        for idx in self.indexes_of(table_name)? {
+            if let Some(IndexHint::IndexedBy(n)) = hint {
+                if !idx.name.eq_ignore_ascii_case(n) {
+                    continue;
+                }
+            }
+            if idx.partial.is_some() || idx.key_exprs.is_some() {
+                continue;
+            }
+            let mut matched = 0usize;
+            for &c in &idx.cols {
+                if eqs.iter().any(|(col, _)| *col == c) || is_null_cols.contains(&c) {
+                    matched += 1;
+                } else {
+                    break;
+                }
+            }
+            if matched == 0 {
+                continue;
+            }
+            let est = stats
+                .get(&idx.name)
+                .and_then(|s| s.get(matched).copied())
+                .unwrap_or(u64::MAX - matched as u64);
+            // A covering candidate holds every referenced column; `seek_index_covers`
+            // makes the same decision the render uses. Without an enclosing `SELECT`
+            // (DELETE/UPDATE/OR-disjunct) nothing covers.
+            let covering = sel
+                .map(|s| self.seek_index_covers(s, meta, &idx.cols, where_expr))
+                .unwrap_or(false);
+            let width = width_of(&idx);
+            // Sort key: est asc, covering-first (`!covering` asc), narrower width
+            // asc, newest (root desc). Width models sqlite's per-row index cost
+            // (a narrower index is cheaper to walk for the same matched rows), and
+            // ties fall to the newest index. `Ord` on the tuple with `min` picks
+            // the best. (A rare cost-model corner sqlite's full LogEst formula
+            // decides differently — a non-covering seek over an all-untyped-column
+            // table where the wider composite wins — is left as-is; it is not a
+            // regression and matching it needs the data/type-driven row-cost port.)
+            let key = (est, !covering, width, core::cmp::Reverse(idx.root));
+            let take = match &best {
+                None => true,
+                Some((bk, _, _)) => key < *bk,
+            };
+            if take {
+                best = Some((key, idx, matched));
+            }
+        }
+        Ok(best.map(|(_, idx, matched)| (idx, matched)))
+    }
+
     /// The index metadata (root + indexed column positions) for `table`.
     /// Try to satisfy a single-table query with an index equality lookup instead
     /// of a full scan: pick the index whose longest leftmost column prefix is
@@ -11892,89 +12003,50 @@ impl Connection {
             }
         }
 
-        // Choose the index to seek. Each candidate covers the longest leftmost
-        // prefix of the index's columns that the WHERE constrains by equality.
-        // With `ANALYZE` statistics we pick the most selective (fewest estimated
-        // rows); absent stats we fall back to the longest matched prefix.
-        let indexes = self.indexes_of(table_name)?;
         // `INDEXED BY name` must name a real index of this table.
         if let Some(IndexHint::IndexedBy(n)) = hint {
-            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
+            if !self
+                .indexes_of(table_name)?
+                .iter()
+                .any(|i| i.name.eq_ignore_ascii_case(n))
+            {
                 return Err(Error::Error(alloc::format!("no such index: {n}")));
             }
         }
-        let stats = self.stat1_map();
-        #[allow(clippy::type_complexity)]
-        let mut best: Option<(
-            u32,
-            Vec<Value>,
-            Vec<crate::value::Collation>,
-            Vec<usize>,
-            Vec<bool>,
-            u64,
-        )> = None;
-        for idx in &indexes {
-            // Honor `INDEXED BY`: consider only the named index.
-            if let Some(IndexHint::IndexedBy(n)) = hint {
-                if !idx.name.eq_ignore_ascii_case(n) {
-                    continue;
-                }
-            }
-            // A partial index covers only some rows; an expression index is keyed
-            // by computed values, not columns. Neither is used for a plain
-            // column-equality seek — leave those to the table scan.
-            if idx.partial.is_some() || idx.key_exprs.is_some() {
-                continue;
-            }
-            let mut key = Vec::new();
-            for &c in &idx.cols {
-                if let Some((_, v)) = eqs.iter().find(|(col, _)| *col == c) {
-                    key.push(meta.columns[c].affinity.coerce(v.clone()));
-                } else if is_null_cols.contains(&c) {
-                    // `col IS NULL`: a NULL index key, which the prefix seek
-                    // matches against the index's NULL-keyed entries.
-                    key.push(Value::Null);
-                } else {
-                    break;
-                }
-            }
-            if key.is_empty() {
-                continue;
-            }
-            // Estimated rows returned: the stat's avgEq at the matched prefix
-            // length when available, else a sentinel that prefers longer prefixes.
-            let est = stats
-                .get(&idx.name)
-                .and_then(|s| s.get(key.len()).copied())
-                .unwrap_or(u64::MAX - key.len() as u64);
-            let better = match &best {
-                None => true,
-                Some((_, bk, _, _, _, be)) => est < *be || (est == *be && key.len() > bk.len()),
-            };
-            if better {
-                // Carry the index's full collation vector (and per-column DESC
-                // flags) so a trailing range on the column after the equality
-                // prefix can be seeked too, and so the prefix seek honors DESC.
-                best = Some((
-                    idx.root,
-                    key,
-                    idx.collations.clone(),
-                    idx.cols.clone(),
-                    idx.seek_descs().to_vec(),
-                    est,
-                ));
+        // Choose the index to seek via the shared cost tiebreaks (kept in lockstep
+        // with `eqp_access`, which reports the same choice). Plain column indexes
+        // take priority; if none seeks the prefix, try a partial or expression
+        // index whose eligibility we can prove from the `WHERE` structure (see
+        // `partial_expr_seek`) — this keeps plain-index behavior byte-identical
+        // while extending seeks to the new index kinds.
+        let Some((idx, matched)) = self.choose_seek_index(
+            Some(sel),
+            meta,
+            table_name,
+            where_expr,
+            &eqs,
+            &is_null_cols,
+            hint,
+        )?
+        else {
+            return self.partial_expr_lookup(meta, table_name, sel, where_expr, params);
+        };
+        // Reconstruct the coerced seek key (with per-column collations/DESC flags)
+        // for the chosen index's matched leading prefix.
+        let mut key = Vec::with_capacity(matched);
+        for &c in &idx.cols[..matched] {
+            if let Some((_, v)) = eqs.iter().find(|(col, _)| *col == c) {
+                key.push(meta.columns[c].affinity.coerce(v.clone()));
+            } else {
+                // `col IS NULL`: a NULL index key, which the prefix seek matches
+                // against the index's NULL-keyed entries.
+                key.push(Value::Null);
             }
         }
-        // Plain column indexes take priority. If none applied, try a partial or
-        // expression index whose eligibility we can prove from the `WHERE`
-        // structure (see `partial_expr_seek`). This keeps plain-index behavior
-        // byte-identical while extending seeks to the new index kinds.
-        let (root, key, full_colls, idx_cols, full_descs) = match best {
-            Some((root, key, colls, idx_cols, descs, _)) => (root, key, colls, idx_cols, descs),
-            None => {
-                return self.partial_expr_lookup(meta, table_name, sel, where_expr, params);
-            }
-        };
+        let root = idx.root;
+        let full_colls = idx.collations.clone();
+        let idx_cols = idx.cols.clone();
+        let full_descs = idx.seek_descs().to_vec();
         if key.is_empty() {
             return Ok(None);
         }
@@ -15667,93 +15739,83 @@ impl Connection {
                 ));
             }
         }
-        // Index covering the longest leftmost prefix of equalities, preferring
-        // the most selective one when `ANALYZE` statistics are available (kept in
-        // step with the cost-based chooser in try_index_lookup).
-        let stats = self.stat1_map();
-        #[allow(clippy::type_complexity)]
-        let mut best: Option<(String, Vec<usize>, Vec<usize>, u64)> = None;
-        // Iterate the SAME index set `try_index_lookup` does (via `indexes_of`,
-        // which includes the implicit `sqlite_autoindex_*` PK/UNIQUE indexes) so
-        // the EQP reports the seek the executor actually performs — e.g. a
-        // non-integer PRIMARY KEY or UNIQUE column reads as `SEARCH … USING INDEX
-        // sqlite_autoindex_…`, not `SCAN`. Partial/expression indexes are handled
-        // by the separate fallback below.
-        for idx in self.indexes_of(table)? {
-            if idx.partial.is_some() || idx.key_exprs.is_some() {
-                continue;
-            }
-            let mut matched = Vec::new();
-            for &c in &idx.cols {
-                if eqs.iter().any(|(col, _)| *col == c) || is_null_cols.contains(&c) {
-                    matched.push(c);
-                } else {
-                    break;
-                }
-            }
-            if matched.is_empty() {
-                continue;
-            }
-            let est = stats
-                .get(&idx.name)
-                .and_then(|s| s.get(matched.len()).copied())
-                .unwrap_or(u64::MAX - matched.len() as u64);
-            let better = match &best {
-                None => true,
-                Some((_, bm, _, be)) => est < *be || (est == *be && matched.len() > bm.len()),
-            };
-            if better {
-                best = Some((idx.name.clone(), matched, idx.cols.clone(), est));
-            }
-        }
-        if let Some((idx_name, matched, idx_cols, _)) = best {
-            if !matched.is_empty() {
-                let mut conds = matched
-                    .iter()
-                    .map(|&c| alloc::format!("{}=?", meta.columns[c].name))
-                    .collect::<Vec<_>>();
-                // A range on the column after the equality prefix is seeked too
-                // (matches the eq-prefix + range path in try_index_lookup). Once the
-                // prefix consumes every declared column, a range on the table's rowid
-                // (the index's implicit trailing key) still seeks — rendered `rowid>?`.
-                // The range on the column after the equality prefix seeks whether it
-                // is ASC or DESC (the DESC bounds are swapped in `try_index_lookup`).
-                if let Some(&next_col) = idx_cols.get(matched.len()) {
-                    let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
-                        alloc::collections::BTreeMap::new();
-                    collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
-                    if let Some(b) = ranges.get(&next_col) {
-                        let name = &meta.columns[next_col].name;
-                        if b.lower.is_some() {
-                            conds.push(alloc::format!("{name}>?"));
-                        }
-                        if b.upper.is_some() {
-                            conds.push(alloc::format!("{name}<?"));
-                        }
+        // Index covering the longest leftmost prefix of equalities, chosen by the
+        // SAME cost tiebreaks the executor's seek uses (`choose_seek_index`), so
+        // the EQP reports exactly the index `try_index_lookup` will seek — covering
+        // beats non-covering, narrower covering wins, ties go to the newest index.
+        // The shared chooser iterates `indexes_of` (which includes the implicit
+        // `sqlite_autoindex_*` PK/UNIQUE indexes), so a non-integer PRIMARY KEY or
+        // UNIQUE column reads as `SEARCH … USING INDEX sqlite_autoindex_…`, not
+        // `SCAN`. Partial/expression indexes are handled by the separate fallback
+        // below. `sel` is threaded through so covering candidates are recognized
+        // (a `None` caller — DELETE/UPDATE/OR-disjunct — treats nothing as covering,
+        // matching the render, which never emits `COVERING INDEX` without a `sel`).
+        // An `INDEXED BY name` hint on the FROM table restricts the chooser to that
+        // one index, exactly as it does for the executor's seek (`NOT INDEXED` is
+        // handled by `eqp_access_hinted`, which collapses the seek to a SCAN after
+        // this, so it is not applied here).
+        let indexed_by = sel
+            .and_then(|s| s.from.as_ref())
+            .and_then(|f| f.first.index_hint.as_ref())
+            .filter(|h| matches!(h, IndexHint::IndexedBy(_)));
+        let chosen = self.choose_seek_index(
+            sel,
+            meta,
+            table,
+            where_expr,
+            &eqs,
+            &is_null_cols,
+            indexed_by,
+        )?;
+        if let Some((idx, matched_len)) = chosen {
+            let matched: Vec<usize> = idx.cols[..matched_len].to_vec();
+            let idx_name = &idx.name;
+            let idx_cols = &idx.cols;
+            let mut conds = matched
+                .iter()
+                .map(|&c| alloc::format!("{}=?", meta.columns[c].name))
+                .collect::<Vec<_>>();
+            // A range on the column after the equality prefix is seeked too
+            // (matches the eq-prefix + range path in try_index_lookup). Once the
+            // prefix consumes every declared column, a range on the table's rowid
+            // (the index's implicit trailing key) still seeks — rendered `rowid>?`.
+            // The range on the column after the equality prefix seeks whether it
+            // is ASC or DESC (the DESC bounds are swapped in `try_index_lookup`).
+            if let Some(&next_col) = idx_cols.get(matched.len()) {
+                let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                    alloc::collections::BTreeMap::new();
+                collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+                if let Some(b) = ranges.get(&next_col) {
+                    let name = &meta.columns[next_col].name;
+                    if b.lower.is_some() {
+                        conds.push(alloc::format!("{name}>?"));
                     }
-                } else if matched.len() == idx_cols.len() && meta.ipk.is_some() {
-                    let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
-                        alloc::collections::BTreeMap::new();
-                    collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
-                    let rowid_bound = meta
-                        .ipk
-                        .and_then(|ipk| ranges.remove(&ipk))
-                        .or_else(|| rowid_alias_range(where_expr, meta, params));
-                    if let Some(b) = rowid_bound {
-                        if b.lower.is_some() {
-                            conds.push(String::from("rowid>?"));
-                        }
-                        if b.upper.is_some() {
-                            conds.push(String::from("rowid<?"));
-                        }
+                    if b.upper.is_some() {
+                        conds.push(alloc::format!("{name}<?"));
                     }
                 }
-                let kw = index_kw(&idx_cols);
-                return Ok(alloc::format!(
-                    "SEARCH {label} USING {kw} {idx_name} ({})",
-                    conds.join(" AND ")
-                ));
+            } else if matched.len() == idx_cols.len() && meta.ipk.is_some() {
+                let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
+                    alloc::collections::BTreeMap::new();
+                collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+                let rowid_bound = meta
+                    .ipk
+                    .and_then(|ipk| ranges.remove(&ipk))
+                    .or_else(|| rowid_alias_range(where_expr, meta, params));
+                if let Some(b) = rowid_bound {
+                    if b.lower.is_some() {
+                        conds.push(String::from("rowid>?"));
+                    }
+                    if b.upper.is_some() {
+                        conds.push(String::from("rowid<?"));
+                    }
+                }
             }
+            let kw = index_kw(idx_cols);
+            return Ok(alloc::format!(
+                "SEARCH {label} USING {kw} {idx_name} ({})",
+                conds.join(" AND ")
+            ));
         }
 
         // Partial / expression equality seek — in lockstep with the same

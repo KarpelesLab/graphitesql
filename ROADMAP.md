@@ -1335,11 +1335,31 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   (`count(*)` over ≥2 indexes now picks the cheapest instead of bailing), and the covered
   scan's no-`ORDER BY` row order (index order) matches in lockstep (`covering_scan` +
   `count_covering_index` delegate to the shared model; `tests/eqp_covering_index_cost.rs`,
-  `tests/count_covering.rs`). **Still open (rides here):** the composite-vs-narrow choice
-  *with* a WHERE equality prefix, covering-scan *with* a WHERE predicate on covered
-  columns (`SELECT b FROM t WHERE c>0` → covering `(b,c)`), and the secondary-index
-  `SEARCH` + `GROUP BY`/`DISTINCT` b-tree (left open by B9d). These are structural too and
-  now unblocked — a stat4 oracle is only needed for genuinely data-driven choices (B4).
+  `tests/count_covering.rs`).
+  **The WHERE-*seek* index choice now prefers a covering index too (2026-07-07).** A
+  secondary-index equality/`IS NULL`-prefix seek (`try_index_lookup`) and its EQP render
+  (`eqp_access`) now share one `choose_seek_index` helper whose ordering key is
+  `(est, !covering, width, Reverse(root))`: a query-covering index (holds every referenced
+  column, or the rowid) beats a non-covering one even if wider (it skips the table b-tree
+  lookup); then the narrower `estimateIndexWidth` wins (same model as the covering scan —
+  a narrower index is cheaper to walk for the same matched rows); ties → newest. `est`
+  (stat selectivity / longer-prefix sentinel) stays primary, so ANALYZE and longer-prefix
+  choices are never overridden. This fixed `SELECT b/a,b … WHERE a=?` (now `COVERING INDEX
+  iab`, was `INDEX ia`) byte-exact vs sqlite3 3.50.4 in plan AND rows
+  (`tests/eqp_seek_index_choice.rs`; one pre-ANALYZE assertion in `tests/analyze.rs`
+  updated to the sqlite-correct index — newest among equal-width). Row order follows
+  automatically (composite seeks already execute in index order). **Still open (rides
+  here):** the same covering preference on a *range-leading* seek (`SELECT b … WHERE a>1`
+  → covering `(a,b)` — a separate range-index path, pre-existing gap); the tiebreak among
+  multiple *non-covering* indexes that share the same equality prefix (`ia`+`iab`+`iac`
+  all on `a`), where sqlite's full LogEst row-cost is not reducible to narrower/newest/
+  oldest (it picks the narrower `it_a` in one schema and the newer wider `iac` in another)
+  — graphite keeps the covering-scan width-then-newest tiebreak, correct on the common and
+  tested cases, divergent only on these unusual multi-same-prefix-index schemas (not a
+  regression); covering-scan *with* a WHERE predicate on
+  covered columns (`SELECT b FROM t WHERE c>0` → covering `(b,c)`); and the secondary-index
+  `SEARCH` + `GROUP BY`/`DISTINCT` b-tree (left open by B9d). These are structural too — a
+  stat4 oracle is only needed for genuinely data-driven choices (B4).
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   `collect_eq_constraints` / `collect_range_constraints` compare an explicit `COLLATE`
   to the *column's* collation. When an index carries a *non-default* collation
