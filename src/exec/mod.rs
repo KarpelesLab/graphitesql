@@ -27537,10 +27537,13 @@ impl Connection {
     /// Create an R-Tree's storage: the `_node`/`_rowid`/`_parent` shadow tables
     /// (byte-compatible with SQLite) plus an empty root node.
     fn rtree_create_storage(&mut self, name: &str, n_coord: usize, integer: bool) -> Result<()> {
+        // SQLite generates the shadow-table schema with no space after the commas
+        // (`(nodeno INTEGER PRIMARY KEY,data)`); match that so `sqlite_master.sql`
+        // is byte-identical.
         for (suffix, cols) in [
-            ("_node", "nodeno INTEGER PRIMARY KEY, data"),
-            ("_rowid", "rowid INTEGER PRIMARY KEY, nodeno"),
-            ("_parent", "nodeno INTEGER PRIMARY KEY, parentnode"),
+            ("_node", "nodeno INTEGER PRIMARY KEY,data"),
+            ("_rowid", "rowid INTEGER PRIMARY KEY,nodeno"),
+            ("_parent", "nodeno INTEGER PRIMARY KEY,parentnode"),
         ] {
             let sql = format!(
                 "CREATE TABLE {}({cols})",
@@ -27589,17 +27592,18 @@ impl Connection {
     /// `n_user` user columns), and an empty root node. The R-Tree indexes a 2-D
     /// bounding box, so `n_coord` is fixed at 4 (minX, maxX, minY, maxY).
     fn geopoly_create_storage(&mut self, name: &str, n_user: usize) -> Result<()> {
-        // `_rowid(rowid INTEGER PRIMARY KEY, nodeno, a0, a1, …, aN)`.
-        let mut rowid_cols = String::from("rowid INTEGER PRIMARY KEY, nodeno");
+        // `_rowid(rowid INTEGER PRIMARY KEY,nodeno,a0,a1,…,aN)` — no space after the
+        // commas, matching SQLite's shadow-table schema byte-for-byte.
+        let mut rowid_cols = String::from("rowid INTEGER PRIMARY KEY,nodeno");
         for k in 0..=n_user {
-            rowid_cols.push_str(&format!(", a{k}"));
+            rowid_cols.push_str(&format!(",a{k}"));
         }
         for (suffix, cols) in [
-            ("_node", "nodeno INTEGER PRIMARY KEY, data".to_string()),
+            ("_node", "nodeno INTEGER PRIMARY KEY,data".to_string()),
             ("_rowid", rowid_cols),
             (
                 "_parent",
-                "nodeno INTEGER PRIMARY KEY, parentnode".to_string(),
+                "nodeno INTEGER PRIMARY KEY,parentnode".to_string(),
             ),
         ] {
             let sql = format!(
