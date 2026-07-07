@@ -794,18 +794,24 @@ fn apply_ymd_offset(p: &mut DateTime, orig: &str) -> bool {
 /// Apply a `±HH:MM[:SS]` time-shift modifier.
 fn apply_time_shift(p: &mut DateTime, orig: &str) -> bool {
     let bytes = orig.as_bytes();
-    let sign = match bytes.first() {
-        Some(b'+') => 1.0,
-        Some(b'-') => -1.0,
-        _ => return false,
+    // The sign is optional: SQLite's `parseModifier` reaches this branch for
+    // `[+-]HH:MM[:SS[.FFF]]`, and a bare `HH:MM` (no sign) adds the time-of-day.
+    let (sign, rest) = match bytes.first() {
+        Some(b'+') => (1_i64, &orig[1..]),
+        Some(b'-') => (-1_i64, &orig[1..]),
+        _ => (1_i64, orig),
     };
     let mut tmp = DateTime::default();
-    if !parse_hh_mm_ss(&orig[1..], &mut tmp) {
+    if !parse_hh_mm_ss(rest, &mut tmp) {
         return false;
     }
-    let ms = tmp.h as i64 * 3_600_000 + tmp.min as i64 * 60_000 + (tmp.s * 1000.0 + 0.5) as i64;
+    // SQLite drops the whole-day part of the parsed time before applying it (it
+    // extracts the time-of-day from a Julian day), so `24:00` adds nothing and
+    // `24:30` adds 30 minutes.
+    let ms = (tmp.h as i64 * 3_600_000 + tmp.min as i64 * 60_000 + (tmp.s * 1000.0 + 0.5) as i64)
+        % 86_400_000;
     p.compute_jd();
-    p.ijd += (sign as i64) * ms;
+    p.ijd += sign * ms;
     p.clear_ymd_hms_tz();
     true
 }
