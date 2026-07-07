@@ -6818,6 +6818,15 @@ impl Connection {
         let result = self.run_trigger_bodies(&trigs, params);
         self.outer_scope.borrow_mut().truncate(base);
         self.trigger_depth.set(depth);
+        // A `RAISE(IGNORE)` inside an AFTER trigger stops that trigger program but
+        // has no effect on the row operation, which already completed — every row
+        // of the firing statement is still processed. Clear the flag so it does not
+        // leak into the NEXT row's BEFORE-trigger check (which would otherwise skip
+        // that row) or a later statement. A BEFORE / INSTEAD OF `RAISE(IGNORE)`
+        // must keep the flag set so the caller abandons the row operation.
+        if matches!(timing, TriggerTiming::After) {
+            self.raise_ignore.set(false);
+        }
         result.map(|()| true)
     }
 
