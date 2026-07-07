@@ -8779,7 +8779,7 @@ impl Connection {
                 Some(ipk) => eval::to_i64(&values[ipk]),
                 None => rowid,
             };
-            self.fire_triggers(
+            let before_fired = self.fire_triggers(
                 &upd.table,
                 TrigEvent::Update,
                 TriggerTiming::Before,
@@ -8792,6 +8792,26 @@ impl Connection {
             // A `BEFORE UPDATE` trigger's `RAISE(IGNORE)` leaves this row alone.
             if self.raise_ignore.replace(false) {
                 continue;
+            }
+            // A BEFORE UPDATE trigger may have modified this very row via a nested
+            // `UPDATE` (e.g. `UPDATE t SET b = NEW.a WHERE id = OLD.id`). SQLite
+            // keeps such changes to columns the main UPDATE does not itself SET,
+            // then overlays the SET assignments (already computed from the original
+            // row) on top. Re-read the row and merge: a SET column (and the rowid)
+            // keeps its computed value; every other column takes the possibly
+            // trigger-modified current value, after which generated columns are
+            // recomputed. Skipped when no BEFORE trigger ran, so the trigger-free
+            // path is unchanged (and an untouched row merges to a no-op anyway).
+            if before_fired {
+                if let Some(current) = self.read_row(&meta, rowid)? {
+                    for (i, col) in meta.columns.iter().enumerate() {
+                        let is_set = changed.iter().any(|c| c.eq_ignore_ascii_case(&col.name));
+                        if !is_set && meta.ipk != Some(i) {
+                            values[i] = current[i].clone();
+                        }
+                    }
+                    self.materialize_generated(&meta, &mut values, params)?;
+                }
             }
             // UNIQUE/PK conflict against any other row. `UPDATE OR IGNORE` skips
             // this row; `UPDATE OR REPLACE` deletes the conflicting rows first.
