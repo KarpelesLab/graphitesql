@@ -1367,7 +1367,7 @@ pub fn printf(args: &[Value]) -> Value {
         let mut width = 0usize;
         if bytes.get(i) == Some(&'*') {
             i += 1;
-            let wv = eval::to_i64(&args.get(arg_idx).cloned().unwrap_or(Value::Null));
+            let wv = eval::to_int_value(&args.get(arg_idx).cloned().unwrap_or(Value::Null));
             arg_idx += 1;
             if wv < 0 {
                 left = true;
@@ -1396,7 +1396,7 @@ pub fn printf(args: &[Value]) -> Value {
             i += 1;
             if bytes.get(i) == Some(&'*') {
                 i += 1;
-                let pv = eval::to_i64(&args.get(arg_idx).cloned().unwrap_or(Value::Null));
+                let pv = eval::to_int_value(&args.get(arg_idx).cloned().unwrap_or(Value::Null));
                 arg_idx += 1;
                 // SQLite uses the *magnitude* of a `.*` precision — a negative
                 // argument behaves like its absolute value (`%.*f` with -2 is
@@ -1445,30 +1445,30 @@ pub fn printf(args: &[Value]) -> Value {
             'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'e' | 'E' | 'g' | 'G'
         );
         let body = match conv {
-            'd' | 'i' => int_body(eval::to_i64(&next(&mut arg_idx)), prec, plus, space),
+            'd' | 'i' => int_body(eval::to_int_value(&next(&mut arg_idx)), prec, plus, space),
             'u' => int_unsigned(
-                eval::to_i64(&next(&mut arg_idx)) as u64,
+                eval::to_int_value(&next(&mut arg_idx)) as u64,
                 10,
                 false,
                 prec,
                 alt,
             ),
             'x' => int_unsigned(
-                eval::to_i64(&next(&mut arg_idx)) as u64,
+                eval::to_int_value(&next(&mut arg_idx)) as u64,
                 16,
                 false,
                 prec,
                 alt,
             ),
             'X' => int_unsigned(
-                eval::to_i64(&next(&mut arg_idx)) as u64,
+                eval::to_int_value(&next(&mut arg_idx)) as u64,
                 16,
                 true,
                 prec,
                 alt,
             ),
             'o' => int_unsigned(
-                eval::to_i64(&next(&mut arg_idx)) as u64,
+                eval::to_int_value(&next(&mut arg_idx)) as u64,
                 8,
                 false,
                 prec,

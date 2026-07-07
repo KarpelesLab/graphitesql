@@ -1859,6 +1859,24 @@ pub fn to_f64(v: &Value) -> f64 {
     number_as_f64(&to_number(v))
 }
 
+/// Coerce a value to an i64 the way SQLite's `sqlite3_value_int64`
+/// (`sqlite3VdbeIntValue`) does — the conversion used for a scalar function's
+/// *integer* argument (`char()`, `substr()` offsets, `zeroblob()`, `printf`
+/// `%d`, …). This differs from [`to_i64`] for text/blob operands: it takes the
+/// leading **integer** prefix (`sqlite3Atoi64`, stopping at `.`/`e`/any
+/// non-digit) rather than parsing a full floating-point literal. So `'1e3'`
+/// yields `1` here but `1000` via [`to_i64`]'s numeric parse. INTEGER and REAL
+/// values convert identically to [`to_i64`] (a real truncates toward zero).
+pub fn to_int_value(v: &Value) -> i64 {
+    match v {
+        Value::Integer(i) => *i,
+        Value::Real(r) => *r as i64,
+        Value::Text(s) => parse_int_prefix(s),
+        Value::Blob(b) => parse_int_prefix(&String::from_utf8_lossy(b)),
+        Value::Null => 0,
+    }
+}
+
 /// SQLite-compatible `sum()` over `vals` (the already-collected non-null inputs).
 ///
 /// The result is an exact INTEGER only when *every* value's numeric type is

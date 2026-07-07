@@ -183,7 +183,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             // SQLite coerces the argument to an integer (NULL/non-numeric text
             // become 0, reals truncate) and clamps N < 1 to a single byte — so
             // randomblob(NULL) is a 1-byte blob, not NULL.
-            let n = eval::to_i64(&eval::eval(&args[0], ctx)?);
+            let n = eval::to_int_value(&eval::eval(&args[0], ctx)?);
             let len = if n < 1 { 1 } else { n as usize };
             if len > MAX_BLOB_LEN {
                 return Err(Error::Error("string or blob too big".into()));
@@ -259,7 +259,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             if fts5_operand_is_contentless(&args[0], ctx) {
                 return Ok(Value::Null);
             }
-            let col = eval::to_i64(&eval::eval(&args[1], ctx)?);
+            let col = eval::to_int_value(&eval::eval(&args[1], ctx)?);
             let open = eval::to_text(&eval::eval(&args[2], ctx)?);
             let close = eval::to_text(&eval::eval(&args[3], ctx)?);
             // The column text is the current row's value for that column.
@@ -281,11 +281,11 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             if fts5_operand_is_contentless(&args[0], ctx) {
                 return Ok(Value::Null);
             }
-            let col = eval::to_i64(&eval::eval(&args[1], ctx)?);
+            let col = eval::to_int_value(&eval::eval(&args[1], ctx)?);
             let open = eval::to_text(&eval::eval(&args[2], ctx)?);
             let close = eval::to_text(&eval::eval(&args[3], ctx)?);
             let ellipsis = eval::to_text(&eval::eval(&args[4], ctx)?);
-            let ntokens = eval::to_i64(&eval::eval(&args[5], ctx)?);
+            let ntokens = eval::to_int_value(&eval::eval(&args[5], ctx)?);
             // A negative `col` auto-selects the best column, so pass every column's
             // text; the module bounds the slice by the table's declared columns.
             if let Ok(ntokens) = usize::try_from(ntokens) {
@@ -531,7 +531,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             match &v[0] {
                 Value::Null => Value::Null,
                 other => {
-                    let n = eval::to_i64(other).max(0) as usize;
+                    let n = eval::to_int_value(other).max(0) as usize;
                     if n > MAX_BLOB_LEN {
                         return Err(Error::Error("string or blob too big".into()));
                     }
@@ -795,7 +795,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             let flags = match v.get(1) {
                 None => 1,
                 Some(f) => {
-                    let n = eval::to_i64(f);
+                    let n = eval::to_int_value(f);
                     if !(1..=15).contains(&n) {
                         return Err(Error::Error(
                             "FLAGS parameter to json_valid() must be between 1 and 15".into(),
@@ -1090,7 +1090,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 let cx = eval::to_f64(&v[0]);
                 let cy = eval::to_f64(&v[1]);
                 let r = eval::to_f64(&v[2]);
-                let n = eval::to_i64(&v[3]);
+                let n = eval::to_int_value(&v[3]);
                 match crate::geopoly::regular(cx, cy, r, n) {
                     Some(p) => Value::Blob(p.to_blob()),
                     None => Value::Null,
@@ -1731,14 +1731,14 @@ fn substr(v: &[Value]) -> Result<Value> {
     // saturates so pathological i64 inputs (e.g. i64::MIN) cannot overflow,
     // matching SQLite's behaviour where the window collapses to empty or the
     // whole string.
-    let mut p1 = eval::to_i64(&v[1]);
+    let mut p1 = eval::to_int_value(&v[1]);
     let mut p2 = if v.len() == 3 {
         // `substr(x, p1, NULL)` returns NULL (the length argument is required
         // to be non-NULL to produce a value).
         if matches!(v[2], Value::Null) {
             return Ok(Value::Null);
         }
-        eval::to_i64(&v[2])
+        eval::to_int_value(&v[2])
     } else {
         1_000_000_000
     };
@@ -1828,7 +1828,7 @@ fn round(v: &[Value]) -> Result<Value> {
     }
     let x = eval::to_f64(&v[0]);
     let digits = if v.len() == 2 {
-        eval::to_i64(&v[1]).clamp(0, 30) as u32
+        eval::to_int_value(&v[1]).clamp(0, 30) as u32
     } else {
         0
     };
@@ -1968,7 +1968,7 @@ fn char_fn(v: &[Value]) -> Value {
         // Rust's UTF-8 `String`, so they too fall back to U+FFFD (SQLite emits
         // their raw 3-byte encoding — a faithful match would need invalid UTF-8,
         // which this engine's TEXT representation forbids).
-        let cp = eval::to_i64(x);
+        let cp = eval::to_int_value(x);
         let c = u32::try_from(cp)
             .ok()
             .and_then(char::from_u32)
