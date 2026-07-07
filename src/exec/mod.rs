@@ -20452,6 +20452,12 @@ impl Connection {
                 .collect();
             (corpus, index)
         });
+        // The configured default rank function (from the `_config` `rank` row), if
+        // any — only relevant when ranking is referenced (a bare `rank`/`ORDER BY
+        // rank`), so skip the shadow read otherwise.
+        let rank = select_mentions(sel, RANK)
+            .then(|| self.fts5_config_rank(&from.first.name))
+            .flatten();
         Some(Fts5QueryCtx {
             col_names,
             query,
@@ -20459,6 +20465,7 @@ impl Connection {
             indexed,
             tok,
             bm25,
+            rank,
         })
     }
 
@@ -27272,6 +27279,9 @@ impl Connection {
     /// * `delete` — `('delete', <rowid>, <old col values…>)`: subtract the supplied
     ///   tokens' postings for `<rowid>` (contentless/external only).
     /// * `delete-all` — clear the whole index (contentless/external only).
+    /// * `rank` — `('rank', '<rankfunc>')`: set the table's default ranking
+    ///   function (dispatched by the `(t, rank)` column list; see
+    ///   [`Self::fts5_rank_command`]).
     ///
     /// `delete`/`delete-all` on a self-content table, and unknown commands, are a
     /// hard error (matching SQLite's `SQL logic error` rejection).
@@ -27288,6 +27298,14 @@ impl Connection {
             let ctx = EvalCtx::rowless(params).with_subqueries(self);
             Ok(eval::to_text(&eval::eval(&row[0], &ctx)?))
         };
+        // The `rank` configuration command: `INSERT INTO t(t, rank) VALUES('rank',
+        // '<rankfunc>')` sets the table's default ranking function. It is written
+        // through the special table-named column plus a second `rank` column that
+        // carries the function string (e.g. `bm25(10.0)`), so it is dispatched by
+        // the *column list* (`t, rank`), not the command word alone.
+        if ins.columns.len() == 2 && ins.columns[1].eq_ignore_ascii_case("rank") {
+            return self.fts5_rank_command(ins, rows, params);
+        }
         // A single-column write `t(t)` is a maintenance command; `t(t, rowid, cols)`
         // is a `delete`. Peek the first row's command to decide.
         let first = match rows.first() {
@@ -27353,6 +27371,120 @@ impl Connection {
             }
             _ => Ok(None),
         }
+    }
+
+    /// The `rank` configuration command: `INSERT INTO t(t, rank) VALUES('rank',
+    /// '<rankfunc>')` stores `<rankfunc>` (e.g. `bm25(10.0)`) in the `_config`
+    /// shadow under key `rank`, so a later bare `rank` column / `ORDER BY rank`
+    /// evaluates that weighted function instead of the default `bm25()`. Matching
+    /// SQLite's `fts5SpecialCommand` / `sqlite3Fts5ConfigSetValue`:
+    ///
+    /// * the first column value must be the literal `'rank'` (else it is not this
+    ///   command — a plain unknown-command reject, `SQL logic error`);
+    /// * a `NULL` rank value is rejected (`SQL logic error`) — reset is via the
+    ///   value `'bm25()'` (stored verbatim; empty weights ⇒ default behaviour);
+    /// * the value must parse as `name(args)` ([`crate::vtab::fts5_parse_rank`]),
+    ///   else `SQL logic error`. The *function's* validity (does `name` exist,
+    ///   right arity) is NOT checked here — SQLite stores any well-formed string
+    ///   and only errors when a query actually evaluates `rank` (so
+    ///   `'nosuchfunc()'` sets fine and fails at `SELECT rank`).
+    ///
+    /// The value is upserted (last row wins for a multi-row command).
+    #[cfg(feature = "fts5")]
+    fn fts5_rank_command(
+        &mut self,
+        ins: &Insert,
+        rows: &[Vec<Expr>],
+        params: &Params,
+    ) -> Result<Option<usize>> {
+        let mut chosen: Option<String> = None;
+        for row in rows {
+            if row.len() != 2 {
+                return Ok(None); // not the `(t, rank)` two-value shape
+            }
+            let ctx = EvalCtx::rowless(params).with_subqueries(self);
+            let cmd = eval::eval(&row[0], &ctx)?;
+            // The command column must hold the literal 'rank'.
+            if !eval::to_text(&cmd).eq_ignore_ascii_case("rank") {
+                return Ok(None);
+            }
+            let ctx = EvalCtx::rowless(params).with_subqueries(self);
+            let val = eval::eval(&row[1], &ctx)?;
+            // A NULL rank value is a hard error (SQLite: SQL logic error). Reset is
+            // via the string 'bm25()', not NULL.
+            let s = match val {
+                Value::Null => {
+                    return Err(Error::Error("SQL logic error".into()));
+                }
+                v => eval::to_text(&v),
+            };
+            // Validate the shape (name(args)); the function's own validity is
+            // deferred to query time, matching SQLite.
+            if crate::vtab::fts5_parse_rank(&s).is_none() {
+                return Err(Error::Error("SQL logic error".into()));
+            }
+            chosen = Some(s);
+        }
+        let Some(value) = chosen else {
+            return Ok(None);
+        };
+        self.fts5_config_set(&ins.table, "rank", &value)?;
+        Ok(Some(0))
+    }
+
+    /// Upsert one `(k, v)` row into an fts5 table's `_config` shadow. Deletes any
+    /// existing row for `k` first (the shadow is `WITHOUT ROWID` keyed on `k`),
+    /// then inserts the new value, so a re-`rank` overwrites in place.
+    #[cfg(feature = "fts5")]
+    fn fts5_config_set(&mut self, table: &str, k: &str, v: &str) -> Result<()> {
+        let config = sql::print::ident(&format!("{table}_config"));
+        self.execute_params(
+            &format!("DELETE FROM {config} WHERE k = ?1"),
+            &Params {
+                positional: alloc::vec![Value::Text(k.into())],
+                named: Vec::new(),
+            },
+        )?;
+        self.execute_params(
+            &format!("INSERT INTO {config} VALUES(?1, ?2)"),
+            &Params {
+                positional: alloc::vec![Value::Text(k.into()), Value::Text(v.into())],
+                named: Vec::new(),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The configured default rank function of an fts5 table: the `_config` `rank`
+    /// row's value, parsed into `(function-name, weights)`. `None` when unset (or
+    /// unparseable — a well-formed string is guaranteed by `fts5_rank_command`, so
+    /// this only skips a legacy/foreign value). The weights are the numeric
+    /// argument list (`bm25(10.0)` ⇒ `[10.0]`, `bm25()` ⇒ `[]`), evaluated as
+    /// `SELECT <args>` exactly like SQLite's `fts5CursorFirst`.
+    #[cfg(feature = "fts5")]
+    fn fts5_config_rank(&self, table: &str) -> Option<(String, Vec<f64>)> {
+        let config = sql::print::ident(&format!("{table}_config"));
+        let res = self
+            .query(&format!("SELECT v FROM {config} WHERE k = 'rank'"))
+            .ok()?;
+        let value = match res.rows.first()?.first()? {
+            Value::Text(s) => s.clone(),
+            _ => return None,
+        };
+        let (name, args) = crate::vtab::fts5_parse_rank(&value)?;
+        // Evaluate the argument list into f64 weights via `SELECT <args>` — the
+        // same path SQLite uses to turn `zRankArgs` into rank-function arguments.
+        let weights = if args.trim().is_empty() {
+            Vec::new()
+        } else {
+            let row = self.query(&format!("SELECT {args}")).ok()?;
+            row.rows
+                .first()?
+                .iter()
+                .map(eval::to_f64)
+                .collect::<Vec<f64>>()
+        };
+        Some((name, weights))
     }
 
     /// Apply one or more `('delete', <rowid>, <old col values…>)` command rows to a
@@ -32204,6 +32336,24 @@ impl eval::Subqueries for Connection {
         Some(corpus.score(*index.get(&rowid)?, weights))
     }
     #[cfg(feature = "fts5")]
+    fn fts5_rank(&self, rowid: i64) -> Option<Result<f64>> {
+        let cell = self.fts5_rank.borrow();
+        let ctx = cell.as_ref()?;
+        let (corpus, index) = ctx.bm25.as_ref()?;
+        let doc = *index.get(&rowid)?;
+        // No configured rank ⇒ the default `bm25()` (all-1.0 weights).
+        let Some((name, weights)) = ctx.rank.as_ref() else {
+            return Some(Ok(corpus.score(doc, &[])));
+        };
+        // A configured non-`bm25` function is unsupported; SQLite would look it up
+        // as an fts5 auxiliary function and fail at query time. graphite ships only
+        // `bm25`, so mirror SQLite's `no such function: <name>`.
+        if !name.eq_ignore_ascii_case("bm25") {
+            return Some(Err(Error::Error(format!("no such function: {name}"))));
+        }
+        Some(Ok(corpus.score(doc, weights)))
+    }
+    #[cfg(feature = "fts5")]
     fn fts5_highlight(&self, col: usize, text: &str, open: &str, close: &str) -> Option<String> {
         let cell = self.fts5_rank.borrow();
         let ctx = cell.as_ref()?;
@@ -35707,6 +35857,11 @@ struct Fts5QueryCtx {
         crate::vtab::Fts5Bm25,
         alloc::collections::BTreeMap<i64, usize>,
     )>,
+    /// The table's configured default ranking function `(name, weights)` from the
+    /// `_config` `rank` row (set by `INSERT INTO t(t, rank) VALUES('rank', …)`), or
+    /// `None` for the built-in default `bm25()` (all-1.0 weights). Consulted by the
+    /// bare `rank` column / `ORDER BY rank`, not by an explicit `bm25(t, …)` call.
+    rank: Option<(String, Vec<f64>)>,
 }
 
 #[cfg(feature = "fts5")]

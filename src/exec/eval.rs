@@ -84,6 +84,16 @@ pub trait Subqueries {
     fn fts5_bm25(&self, _rowid: i64, _weights: &[f64]) -> Option<f64> {
         None
     }
+    /// The FTS5 bare `rank` column's value for the row with this `rowid`: the
+    /// table's configured default ranking function (set via `INSERT INTO t(t,
+    /// rank) VALUES('rank', …)`), or the default `bm25()` when unconfigured.
+    /// `None` when no `MATCH` over an `fts5` table is in scope (so `rank` falls
+    /// back to the usual unknown-column error); `Some(Err)` when the configured
+    /// rank function is invalid (e.g. `nosuchfunc()`), matching SQLite's deferred
+    /// `no such function` / arity error at query time.
+    fn fts5_rank(&self, _rowid: i64) -> Option<Result<f64>> {
+        None
+    }
     /// FTS5 `highlight(t, col, open, close)`: column `col`'s `text` with each
     /// matched token wrapped in `open`…`close`, when a `MATCH` over an `fts5` table
     /// is in scope. `None` otherwise.
@@ -391,11 +401,12 @@ impl<'a> EvalCtx<'a> {
                 return Ok(v);
             }
         }
-        // The FTS5 `rank` hidden column: the current row's relevance score, when a
+        // The FTS5 `rank` hidden column: the current row's relevance score under
+        // the table's configured (or default `bm25()`) ranking function, when a
         // `MATCH` query over an `fts5` table is in scope (else just an unknown name).
         if table.is_none() && name.eq_ignore_ascii_case("rank") {
-            if let Some(score) = self.rowid.and_then(|r| self.subqueries?.fts5_bm25(r, &[])) {
-                return Ok(Value::Real(score));
+            if let Some(score) = self.rowid.and_then(|r| self.subqueries?.fts5_rank(r)) {
+                return Ok(Value::Real(score?));
             }
         }
         Err(no_such_column(schema, table, name, quoted))

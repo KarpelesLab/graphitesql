@@ -3387,6 +3387,87 @@ pub(crate) fn fts5_no_local_content(args: &[&str]) -> bool {
     fts5_external_content(args).is_some() || fts5_is_contentless(args)
 }
 
+/// Parse an fts5 `rank` configuration string like `bm25(10.0)` or
+/// `bm25(2.0, 1.0)` into `(function-name, arguments-string)`, matching SQLite's
+/// `sqlite3Fts5ConfigParseRank` (`fts5_config.c`). The value must be a bareword
+/// function name, optional whitespace, `(`, a comma-separated argument list, and
+/// a closing `)`. The argument slice is the raw text between the parentheses
+/// (empty for `bm25()`); trailing text after `)` is ignored. Returns `None` for
+/// any malformed shape (SQLite reports `SQLITE_ERROR` → "SQL logic error"):
+/// missing name, missing `(`, or an unterminated / malformed argument list.
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_parse_rank(value: &str) -> Option<(String, String)> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    let skip_ws = |b: &[u8], mut i: usize| {
+        while i < b.len() && (b[i] as char).is_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    // A bareword: alphanumeric, `_`, or `.` (SQLite's `sqlite3Fts5IsBareword`).
+    let is_bareword = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.';
+    i = skip_ws(bytes, i);
+    let name_start = i;
+    while i < bytes.len() && is_bareword(bytes[i]) {
+        i += 1;
+    }
+    if i == name_start {
+        return None; // empty function name
+    }
+    let name = String::from(&value[name_start..i]);
+    i = skip_ws(bytes, i);
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return None; // no `(`
+    }
+    i += 1;
+    i = skip_ws(bytes, i);
+    let args_start = i;
+    // Scan a comma-separated argument list terminated by `)`. Each argument is a
+    // literal (number / quoted string / bareword); we only need to find the
+    // matching close paren while respecting single/double-quoted strings.
+    if i < bytes.len() && bytes[i] == b')' {
+        return Some((name, String::new())); // `bm25()`
+    }
+    loop {
+        // Skip one literal argument up to a `,` or `)` at the top level.
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\'' | b'"' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    // Consume until the matching quote (doubled quote = escape).
+                    loop {
+                        if i >= bytes.len() {
+                            return None; // unterminated string literal
+                        }
+                        if bytes[i] == quote {
+                            if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                                i += 2; // escaped quote
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                b',' | b')' => break,
+                _ => i += 1,
+            }
+        }
+        i = skip_ws(bytes, i);
+        match bytes.get(i) {
+            Some(b')') => {
+                let args = String::from(value[args_start..i].trim());
+                return Some((name, args));
+            }
+            Some(b',') => i += 1,
+            _ => return None, // unterminated / malformed argument list
+        }
+    }
+}
+
 /// Parse an `fts5` table's `tokenize = '…'` option into a resolved [`Fts5Tok`].
 /// The value is a whitespace-separated tokenizer chain: an optional leading
 /// `porter` (⇒ Porter stemming, possibly wrapping a base tokenizer), then a base
@@ -3482,6 +3563,37 @@ impl VTabModule for Fts5Module {
     type Cursor = Fts5Cursor;
 
     fn connect(&self, args: &[&str]) -> Result<VTabSchema> {
+        // Reject any unrecognized `key = value` column option, matching SQLite's
+        // `unrecognized option: "<name>"`. SQLite's fts5 recognizes exactly these
+        // option keywords (`fts5_config.c`); notably `rank` is NOT a CREATE option
+        // in this version (the default rank is configured via the special
+        // `INSERT INTO t(t, rank) VALUES('rank', …)` command instead). Column
+        // declarations (no `=`) are skipped by `column_name`.
+        for a in args {
+            if Fts5Module::column_name(a).is_some() {
+                continue; // a column declaration, not a `key = value` option
+            }
+            let Some((k, _)) = a.split_once('=') else {
+                continue;
+            };
+            let key = k.trim();
+            const KNOWN: &[&str] = &[
+                "prefix",
+                "tokenize",
+                "content",
+                "contentless_delete",
+                "content_rowid",
+                "columnsize",
+                "detail",
+                "tokendata",
+                "locale",
+            ];
+            if !KNOWN.iter().any(|o| key.eq_ignore_ascii_case(o)) {
+                return Err(Error::Error(alloc::format!(
+                    "unrecognized option: \"{key}\""
+                )));
+            }
+        }
         let columns: Vec<String> = args
             .iter()
             .filter_map(|a| Fts5Module::column_name(a))
@@ -4426,5 +4538,42 @@ mod tests {
                 (3, Value::Integer(12)),
             ]
         );
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn fts5_parse_rank_splits_name_and_args() {
+        let ok = |s: &str| fts5_parse_rank(s).unwrap();
+        // Name + a single argument, with the argument slice trimmed.
+        assert_eq!(
+            ok("bm25(10.0)"),
+            (String::from("bm25"), String::from("10.0"))
+        );
+        // Multiple comma-separated arguments preserve their internal spacing.
+        assert_eq!(
+            ok("bm25(2.0, 1.0)"),
+            (String::from("bm25"), String::from("2.0, 1.0"))
+        );
+        // Empty argument list (`bm25()` — the reset-to-default form).
+        assert_eq!(ok("bm25()"), (String::from("bm25"), String::new()));
+        // Surrounding whitespace and trailing text after `)` are ignored, matching
+        // SQLite's `sqlite3Fts5ConfigParseRank`.
+        assert_eq!(
+            ok("  bm25(5.0)  "),
+            (String::from("bm25"), String::from("5.0"))
+        );
+        assert_eq!(
+            ok("bm25(5.0)extra"),
+            (String::from("bm25"), String::from("5.0"))
+        );
+        // A quoted string argument is kept intact (the `)` inside is not a close).
+        assert_eq!(ok("f('a)b')"), (String::from("f"), String::from("'a)b'")));
+        // Malformed shapes are rejected (SQLite → SQLITE_ERROR).
+        assert!(fts5_parse_rank("bm25").is_none()); // no `(`
+        assert!(fts5_parse_rank("bm25(").is_none()); // unterminated
+        assert!(fts5_parse_rank("bm25(10.0").is_none()); // no close `)`
+        assert!(fts5_parse_rank("()").is_none()); // empty name
+        assert!(fts5_parse_rank("(10.0)").is_none()); // empty name
+        assert!(fts5_parse_rank("").is_none()); // empty
     }
 }
