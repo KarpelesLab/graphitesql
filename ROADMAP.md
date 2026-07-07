@@ -103,7 +103,9 @@ auto-truncate, INCREMENTAL reclaim), and the **WAL read *and* write** path
 BY`/`LIMIT`/`OFFSET`/`DISTINCT` and SELECT-list aliases; `INNER`/`LEFT`/`RIGHT`/
 `FULL`/cross/comma **joins** plus **`NATURAL`**/**`USING`** (column coalescing,
 affinity- and collation-aware keys), nested-loop + hash join; compound queries
-(`UNION`/`INTERSECT`/`EXCEPT`, collation-aware); (recursive) **CTEs**; correlated
+(`UNION`/`INTERSECT`/`EXCEPT`, collation-aware); (recursive) **CTEs** (with the
+recursive term's `ORDER BY`/`LIMIT` driving the work-queue extraction order —
+SQLite's depth-/breadth-first control); correlated
 subqueries, `[NOT] EXISTS`, `IN (SELECT)` with sqlite's candidate-column-affinity
 rule, derived tables; views & CTEs as sources (a view column inheriting its base
 column's affinity/collation); **window functions** (`ROWS`/`RANGE`/`GROUPS`,

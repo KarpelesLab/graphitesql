@@ -10486,7 +10486,9 @@ impl Connection {
             None => 0,
         };
         let compound = core::mem::take(&mut base.compound);
-        base.order_by.clear();
+        // The recursive-select's ORDER BY (if any) controls the work *queue* — see
+        // the priority-queue model below. Capture it before stripping the tail.
+        let rec_order = core::mem::take(&mut base.order_by);
         base.limit = None;
         base.offset = None;
         arms.push((None, base));
@@ -10551,11 +10553,42 @@ impl Connection {
         let body_cols = self.run_select(&anchor[0], params)?.columns;
         let columns = self.cte_columns(cte, &body_cols)?;
 
+        // Resolve the recursive term's ORDER BY. Like any compound ORDER BY, each
+        // term must name an output column — by 1-based position, or by the
+        // *intrinsic* result-column name of the recursive SELECT (`body_cols`),
+        // NOT the CTE's renamed columns — otherwise SQLite rejects it at prepare
+        // time. Resolving up front reproduces that error (`ORDER BY <cte-col>`, a
+        // base column, or an expression → "does not match any column …"), and the
+        // resulting sort keys drive the priority-queue extraction below.
+        // A sort key: (output-column index, descending, nulls-first, collation).
+        type SortKey = (usize, bool, Option<bool>, crate::value::Collation);
+        let rec_keys: Option<Vec<SortKey>> = if rec_order.is_empty() {
+            None
+        } else {
+            check_positional_terms(&[], &rec_order, body_cols.len())?;
+            let colls = {
+                let (cols, _) = self.scan_source(&anchor[0], params)?;
+                self.output_collations(&anchor[0], &cols, params)
+            };
+            let mut keys = Vec::with_capacity(rec_order.len());
+            for (i, term) in rec_order.iter().enumerate() {
+                let idx = resolve_order_index(&term.expr, &body_cols, body_cols.len()).ok_or_else(
+                    || {
+                        Error::Error(alloc::format!(
+                            "{} ORDER BY term does not match any column in the result set",
+                            ordinal(i + 1),
+                        ))
+                    },
+                )?;
+                let coll = colls.get(idx).copied().unwrap_or_default();
+                keys.push((idx, term.descending, term.nulls_first, coll));
+            }
+            Some(keys)
+        };
+
         if rec_distinct {
             dedup_rows(&mut anchor_rows);
         }
-        let mut all_rows = anchor_rows.clone();
-        let mut working = anchor_rows;
 
         // Push a working binding the recursive term resolves against; update it
         // each iteration. Guard against runaway recursion.
@@ -10565,59 +10598,151 @@ impl Connection {
             columns: columns.clone(),
             rows: Vec::new(),
         });
-        let mut guard = 0usize;
-        let result = loop {
-            guard += 1;
-            if guard > 1_000_000 {
-                self.cte_env.borrow_mut().truncate(slot);
-                return Err(Error::Error("recursive CTE did not terminate".into()));
-            }
-            // Bind the working set.
-            self.cte_env.borrow_mut()[slot].rows = working
-                .iter()
-                .cloned()
-                .map(|values| InputRow {
-                    values,
-                    rowid: None,
-                })
-                .collect();
 
-            let mut produced: Vec<Vec<Value>> = Vec::new();
-            for r in &recursive {
-                match self.run_select(r, params) {
-                    Ok(res) => produced.extend(res.rows),
-                    Err(e) => {
-                        self.cte_env.borrow_mut().truncate(slot);
-                        return Err(e);
-                    }
-                }
-            }
-            // Keep only genuinely new rows (for UNION; UNION ALL keeps all but
-            // still must terminate — SQLite requires the recursive query to
-            // eventually produce nothing).
-            let mut fresh: Vec<Vec<Value>> = Vec::new();
-            for row in produced {
-                if rec_distinct && all_rows.iter().any(|s| rows_equal(s, &row)) {
+        let mut all_rows: Vec<Vec<Value>>;
+        let result: Result<()> = if let Some(keys) = &rec_keys {
+            // Priority-queue model (recursive ORDER BY present). SQLite pulls one
+            // row at a time from the work queue — the one that sorts *first* under
+            // the ORDER BY — emits it, then runs the recursive term on just that
+            // row and enqueues the results. With no ORDER BY the queue is a FIFO
+            // (the breadth-first batch model below); an ORDER BY turns it into a
+            // priority queue (SQLite's documented depth-/breadth-first control).
+            let mut queue: Vec<Vec<Value>> = Vec::new();
+            let mut seen: Vec<Vec<Value>> = Vec::new();
+            for row in anchor_rows {
+                if rec_distinct && seen.iter().any(|s| rows_equal(s, &row)) {
                     continue;
                 }
-                fresh.push(row);
+                if rec_distinct {
+                    seen.push(row.clone());
+                }
+                queue.push(row);
             }
-            if fresh.is_empty() {
-                break Ok(());
-            }
-            all_rows.extend(fresh.iter().cloned());
-            working = fresh;
-            // Stop once the CTE's LIMIT (after OFFSET) is satisfied.
-            if let Some(lim) = rec_limit {
-                if all_rows.len() >= rec_offset.saturating_add(lim) {
+            all_rows = Vec::new();
+            let mut guard = 0usize;
+            loop {
+                if queue.is_empty() {
                     break Ok(());
                 }
+                guard += 1;
+                if guard > 1_000_000 {
+                    self.cte_env.borrow_mut().truncate(slot);
+                    return Err(Error::Error("recursive CTE did not terminate".into()));
+                }
+                // Extract the row that sorts first under the ORDER BY. Ties keep
+                // FIFO insertion order (`best` only advances on a strict Less).
+                let mut best = 0usize;
+                for i in 1..queue.len() {
+                    let mut less = false;
+                    for (idx, desc, nf, coll) in keys {
+                        let ord = cmp_order(&queue[i][*idx], &queue[best][*idx], *desc, *nf, *coll);
+                        if ord != core::cmp::Ordering::Equal {
+                            less = ord == core::cmp::Ordering::Less;
+                            break;
+                        }
+                    }
+                    if less {
+                        best = i;
+                    }
+                }
+                let row = queue.remove(best);
+                all_rows.push(row.clone());
+                // Stop once the CTE's LIMIT (after OFFSET), or the consuming
+                // query's LIMIT (+OFFSET), is satisfied.
+                if let Some(lim) = rec_limit {
+                    if all_rows.len() >= rec_offset.saturating_add(lim) {
+                        break Ok(());
+                    }
+                }
+                if let Some(cap) = outer_cap {
+                    if all_rows.len() >= cap {
+                        break Ok(());
+                    }
+                }
+                self.cte_env.borrow_mut()[slot].rows = alloc::vec![InputRow {
+                    values: row,
+                    rowid: None,
+                }];
+                let mut produced: Vec<Vec<Value>> = Vec::new();
+                for r in &recursive {
+                    match self.run_select(r, params) {
+                        Ok(res) => produced.extend(res.rows),
+                        Err(e) => {
+                            self.cte_env.borrow_mut().truncate(slot);
+                            return Err(e);
+                        }
+                    }
+                }
+                for prow in produced {
+                    if rec_distinct && seen.iter().any(|s| rows_equal(s, &prow)) {
+                        continue;
+                    }
+                    if rec_distinct {
+                        seen.push(prow.clone());
+                    }
+                    queue.push(prow);
+                }
             }
-            // Stop once the consuming query's LIMIT (+OFFSET) is satisfied — this
-            // terminates an otherwise-infinite recursion `SELECT … FROM rcte LIMIT k`.
-            if let Some(cap) = outer_cap {
-                if all_rows.len() >= cap {
+        } else {
+            // Breadth-first FIFO batch model — no recursive ORDER BY. Each pass
+            // runs the recursive term over the whole previous batch at once.
+            all_rows = anchor_rows.clone();
+            let mut working = anchor_rows;
+            let mut guard = 0usize;
+            loop {
+                guard += 1;
+                if guard > 1_000_000 {
+                    self.cte_env.borrow_mut().truncate(slot);
+                    return Err(Error::Error("recursive CTE did not terminate".into()));
+                }
+                // Bind the working set.
+                self.cte_env.borrow_mut()[slot].rows = working
+                    .iter()
+                    .cloned()
+                    .map(|values| InputRow {
+                        values,
+                        rowid: None,
+                    })
+                    .collect();
+
+                let mut produced: Vec<Vec<Value>> = Vec::new();
+                for r in &recursive {
+                    match self.run_select(r, params) {
+                        Ok(res) => produced.extend(res.rows),
+                        Err(e) => {
+                            self.cte_env.borrow_mut().truncate(slot);
+                            return Err(e);
+                        }
+                    }
+                }
+                // Keep only genuinely new rows (for UNION; UNION ALL keeps all but
+                // still must terminate — SQLite requires the recursive query to
+                // eventually produce nothing).
+                let mut fresh: Vec<Vec<Value>> = Vec::new();
+                for row in produced {
+                    if rec_distinct && all_rows.iter().any(|s| rows_equal(s, &row)) {
+                        continue;
+                    }
+                    fresh.push(row);
+                }
+                if fresh.is_empty() {
                     break Ok(());
+                }
+                all_rows.extend(fresh.iter().cloned());
+                working = fresh;
+                // Stop once the CTE's LIMIT (after OFFSET) is satisfied.
+                if let Some(lim) = rec_limit {
+                    if all_rows.len() >= rec_offset.saturating_add(lim) {
+                        break Ok(());
+                    }
+                }
+                // Stop once the consuming query's LIMIT (+OFFSET) is satisfied —
+                // this terminates an otherwise-infinite recursion
+                // `SELECT … FROM rcte LIMIT k`.
+                if let Some(cap) = outer_cap {
+                    if all_rows.len() >= cap {
+                        break Ok(());
+                    }
                 }
             }
         };
