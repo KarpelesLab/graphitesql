@@ -1483,17 +1483,19 @@ pub fn printf(args: &[Value]) -> Value {
             'c' => {
                 // SQLite's %c emits the first character of the argument's text
                 // (e.g. 104 -> "104" -> '1'), not the code point. A NULL argument
-                // yields a single NUL byte (matching SQLite's `et_charx`).
+                // OR an empty-string argument yields a single NUL byte (matching
+                // SQLite's `et_charx`, whose `buf[0]` defaults to 0).
                 let v = next(&mut arg_idx);
-                let ch = if matches!(v, Value::Null) {
-                    String::from('\0')
+                let text = if matches!(v, Value::Null) {
+                    String::new()
                 } else {
                     eval::to_text(&v)
-                        .chars()
-                        .next()
-                        .map(String::from)
-                        .unwrap_or_default()
                 };
+                let ch = text
+                    .chars()
+                    .next()
+                    .map(String::from)
+                    .unwrap_or_else(|| String::from('\0'));
                 // A precision repeats the character that many times (min once):
                 // `%.5c` of 'A' is "AAAAA", `%.0c` and a bare `%c` are one copy.
                 ch.repeat(prec.unwrap_or(1).max(1))

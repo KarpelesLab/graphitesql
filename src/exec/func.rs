@@ -528,16 +528,13 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "zeroblob" => {
             arity(&lname, args, 1)?;
-            match &v[0] {
-                Value::Null => Value::Null,
-                other => {
-                    let n = eval::to_int_value(other).max(0) as usize;
-                    if n > MAX_BLOB_LEN {
-                        return Err(Error::Error("string or blob too big".into()));
-                    }
-                    Value::Blob(alloc::vec![0u8; n])
-                }
+            // SQLite reads the length via `sqlite3_value_int64`, which maps NULL to
+            // 0 — so `zeroblob(NULL)` is an empty blob, not NULL.
+            let n = eval::to_int_value(&v[0]).max(0) as usize;
+            if n > MAX_BLOB_LEN {
+                return Err(Error::Error("string or blob too big".into()));
             }
+            Value::Blob(alloc::vec![0u8; n])
         }
         "quote" => {
             arity(&lname, args, 1)?;
