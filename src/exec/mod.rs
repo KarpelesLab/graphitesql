@@ -22027,9 +22027,29 @@ impl Connection {
                 n += 1;
             }
             let label = self.output_labels(sel, &[]).pop().unwrap_or_default();
+            // The single aggregate row is still subject to LIMIT / OFFSET:
+            // `count(*) … LIMIT 0` yields no rows, `… OFFSET 1` skips the row.
+            let ctx = EvalCtx::rowless(params).with_subqueries(self);
+            let offset = match &sel.offset {
+                Some(e) => must_be_int(eval::eval(e, &ctx)?)?.max(0) as usize,
+                None => 0,
+            };
+            let limit = match &sel.limit {
+                // A negative LIMIT means "no limit"; OFFSET still applies.
+                Some(e) => must_be_int(eval::eval(e, &ctx)?)?,
+                None => -1,
+            };
+            let mut rows = if offset >= 1 || limit == 0 {
+                Vec::new()
+            } else {
+                alloc::vec![alloc::vec![Value::Integer(n)]]
+            };
+            if limit >= 0 {
+                rows.truncate(limit as usize);
+            }
             return Ok(QueryResult {
                 columns: alloc::vec![label],
-                rows: alloc::vec![alloc::vec![Value::Integer(n)]],
+                rows,
             });
         }
 
