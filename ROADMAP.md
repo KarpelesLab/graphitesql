@@ -1433,10 +1433,18 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   and the rows come out in sqlite's order. An equi-hash inner is excluded (its output follows the
   driver; sqlite renders `AUTOMATIC INDEX` there), OUTER null-extension is untouched, and the VDBE
   defers these shapes unless an explicit `ORDER BY` hides the order. Byte-exact rows+plan vs sqlite3
-  3.50.4 (`tests/join_covering_scan.rs`). **Still open (EQP-only, rows correct):** sqlite renders a
-  `USE TEMP B-TREE FOR DISTINCT`/`GROUP BY` node for a DISTINCT/grouped join that graphite omits (its
-  node is single-table gated), and ORDER-BY elision doesn't yet recognise that a covering driver scan
-  supplies the order (a redundant temp b-tree, unchanged from before).
+  3.50.4 (`tests/join_covering_scan.rs`).
+- **JOIN EQP trailing-node parity — DONE (2026-07-07).** For a two-table single-INNER join whose
+  driver scan graphite renders (`from.first`, or the swap-promoted second table), the EXPLAIN QUERY
+  PLAN now matches sqlite's trailing temp-b-tree nodes: a `USE TEMP B-TREE FOR DISTINCT`/`GROUP BY`
+  is emitted after the join's SCAN/SEARCH nodes and *elided* exactly when the key is a leading prefix
+  of the driver's scan order (`join_group_distinct_clustered`), and a redundant `USE TEMP B-TREE FOR
+  ORDER BY` on the driver's own scan order (its rowid/IPK order, or a covering-index driver's leading
+  columns, ASC or DESC) is elided (`join_order_prefix`), a partial prefix reporting only the trailing
+  `LAST TERM OF ORDER BY`. Built on `join_driver_scan_order` / `join_key_column_identity`; EQP-only,
+  no execution/row change (verified). Deliberately declined (unchanged): LEFT/RIGHT/FULL, N>2-table,
+  and automatic-index/BLOOM-FILTER joins, `DISTINCT *`, and the wider covering-index *selection* for a
+  multi-column ORDER BY — none emit a wrong node (`tests/eqp_join_trailing_nodes.rs`).
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   `collect_eq_constraints` / `collect_range_constraints` compare an explicit `COLLATE`
   to the *column's* collation. When an index carries a *non-default* collation

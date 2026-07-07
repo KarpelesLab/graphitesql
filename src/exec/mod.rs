@@ -15528,6 +15528,74 @@ impl Connection {
                 }
             }
         }
+        // The join analogue of the single-table `group_distinct_btree` above: a
+        // two-table INNER join whose driver scan order does not already cluster the
+        // GROUP BY / DISTINCT key spills through a transient b-tree, placed after
+        // the join's SCAN/SEARCH nodes and before any ORDER BY node — exactly
+        // sqlite's placement. `join_group_distinct_clustered` returns true only when
+        // the key is a leading prefix of the driver's scan order (the C1/C2/E2
+        // shapes sqlite elides), in which case we emit nothing.
+        //
+        // Strictly scoped to the two-table single-INNER-join shapes
+        // `join_driver_scan_order` models (checked via `.is_some()`): only there do
+        // we know the driver and its scan order precisely enough to reproduce
+        // sqlite's *both* emit-and-elide decisions. A LEFT/RIGHT/FULL join, an
+        // N>2-table join, or a join whose driver scan order graphite renders
+        // differently (a BLOOM-FILTER automatic-index inner, a differing join
+        // order) is left with its previous behaviour — sqlite's node choice there
+        // depends on its own (already-divergent) driver analysis, so emitting a
+        // node here could add one sqlite does not (e.g. a LEFT join whose rowid
+        // driver clusters the key, which sqlite elides).
+        if !from.joins.is_empty() && self.join_driver_scan_order(sel, from).is_some() {
+            let kind = if !sel.group_by.is_empty() && !sel.distinct {
+                Some("GROUP BY")
+            } else if sel.distinct
+                && sel.group_by.is_empty()
+                // A wildcard-projection DISTINCT can't have its key enumerated —
+                // decline (leave graphite's current no-node behaviour) rather than
+                // guess.
+                && sel.columns.iter().all(|c| matches!(c, ResultColumn::Expr { .. }))
+            {
+                Some("DISTINCT")
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                if !self.join_group_distinct_clustered(sel, from) {
+                    let id = *next_id;
+                    *next_id += 1;
+                    out.push((id, parent, alloc::format!("USE TEMP B-TREE FOR {kind}")));
+                    // sqlite folds a GROUP BY query's ORDER BY into this grouping
+                    // sorter when every ORDER BY term is exactly the GROUP BY key
+                    // (same columns, in order) — the F1/F2 shapes emit only the
+                    // GROUP BY node. A DISTINCT b-tree is ascending-only, so a DESC
+                    // term keeps its own sort. Any foreign / aggregate / expression
+                    // ORDER BY term (F3/F4) leaves the ORDER BY node in place.
+                    if kind == "GROUP BY" && !sel.order_by.is_empty() {
+                        let key_ids: Vec<Option<(String, String)>> = sel
+                            .group_by
+                            .iter()
+                            .map(|e| self.join_key_column_identity(sel, from, e))
+                            .collect();
+                        let folds = key_ids.iter().all(|k| k.is_some())
+                            && sel.order_by.len() == key_ids.len()
+                            && sel.order_by.iter().enumerate().all(|(i, term)| {
+                                redundant_nulls(term)
+                                    && self
+                                        .join_key_column_identity(sel, from, &term.expr)
+                                        .zip(key_ids[i].as_ref())
+                                        .is_some_and(|((tt, tc), (kt, kc))| {
+                                            tt.eq_ignore_ascii_case(kt)
+                                                && tc.eq_ignore_ascii_case(kc)
+                                        })
+                            });
+                        if folds {
+                            group_btree_suppresses_order = true;
+                        }
+                    }
+                }
+            }
+        }
         // A projection scalar subquery in a GROUP BY query is sequenced by SQLite
         // *after* the grouping sorter (and any distinct-aggregate b-trees) but
         // *before* an ORDER BY sorter — a second insertion point, distinct from the
@@ -15562,17 +15630,35 @@ impl Connection {
         // so it is excluded.)
         let single_row_aggregate =
             sel.group_by.is_empty() && self.has_aggregate(sel) && !window::has_window(sel);
+        // For a two-table INNER join the driver's own scan order can already supply
+        // a leading prefix of the ORDER BY (its rowid order for an IPK driver, or
+        // its covering-index key order): sqlite then elides the whole sort (prefix
+        // == every term) or reports only the unsupplied trailing terms. Terms on
+        // the seeked inner, or beyond the driver's key, are not supplied and stay
+        // sorted. A GROUP BY reshapes the output (post-grouping order is the group
+        // key, not the driver scan), so the driver-prefix elision only applies to a
+        // non-grouped ORDER BY. `join_order_prefix` returns 0 for any shape it does
+        // not model, keeping the existing full sorter.
+        let join_supplied = if !from.joins.is_empty() && sel.group_by.is_empty() {
+            self.join_order_prefix(sel, from)
+        } else {
+            0
+        };
         if !sel.order_by.is_empty()
             && !group_btree_suppresses_order
             && !single_row_aggregate
             && self.order_satisfied_by_scan(sel, params).is_none()
+            && join_supplied < sel.order_by.len()
         {
             let n = sel.order_by.len();
             // Only the trailing terms are sorted when the access walks a prefix of
             // the ORDER BY in order: a non-covering index walk (mixed direction,
             // `order_index_scan.sorted_suffix`), a WHERE seek (`seek_order_prefix`),
-            // or a no-WHERE covering-index scan (`scan_order_prefix`).
-            let sorted = if let Some(s) = self.order_index_scan(sel) {
+            // a no-WHERE covering-index scan (`scan_order_prefix`), or — for a join
+            // — the driver scan supplying `join_supplied` leading terms.
+            let sorted = if join_supplied > 0 {
+                n - join_supplied.min(n)
+            } else if let Some(s) = self.order_index_scan(sel) {
                 s.sorted_suffix.min(n)
             } else if let Some((k, _)) = self.seek_order_prefix(sel, params) {
                 n - k.min(n)
@@ -18683,6 +18769,221 @@ impl Connection {
             }
         }
         alloc::format!("SCAN {label}")
+    }
+
+    /// The DRIVER (outer) table of a *two-table* join and the ordered list of
+    /// column identities its scan already yields, as `(driver_label, [(label,
+    /// colname), …])`. Mirrors exactly how the executor scans the driver:
+    ///  - a covering-index driver (`join_scan_covering_index`) yields rows in that
+    ///    index's key-column order, so the ordered columns are the index columns;
+    ///  - otherwise a plain / rowid scan yields rowid order, so the ordered column
+    ///    is the driver's INTEGER PRIMARY KEY (if any) — a table with no IPK has no
+    ///    query-visible scan-order column and yields an empty list.
+    ///
+    /// The driver is `from.joins[0].table` when a cost-based swap
+    /// (`two_table_rowid_inner_swap` / `two_table_index_inner_swap`) reorders the
+    /// plan to drive the second table, else `from.first`. Scoped to a single
+    /// `INNER` join of two plain `main` base tables — the shapes whose driver scan
+    /// order graphite renders in lockstep (`eqp_join_scan_detail`); any other shape
+    /// (N>2, LEFT/RIGHT/FULL, NATURAL/USING, derived/CTE/view/TVF source) returns
+    /// `None` so the caller keeps its unconditional sorter, never eliding a node
+    /// sqlite would keep.
+    fn join_driver_scan_order(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+    ) -> Option<(String, Vec<(String, String)>)> {
+        if from.joins.len() != 1 {
+            return None;
+        }
+        let join = &from.joins[0];
+        if !matches!(join.kind, JoinKind::Inner) || join.natural || !join.using.is_empty() {
+            return None;
+        }
+        // The driver is the second table under either cost-based swap, else the
+        // first source.
+        let driver: &TableRef = if self.two_table_rowid_inner_swap(from).is_some()
+            || self.two_table_index_inner_swap(from).is_some()
+        {
+            &join.table
+        } else {
+            &from.first
+        };
+        // Only a plain `main` base table has a scan order we can name.
+        if driver.subquery.is_some()
+            || driver.tvf_args.is_some()
+            || self.is_bare_tvf(driver)
+            || driver.schema.is_some()
+            || self
+                .lookup_cte(&driver.name, driver.alias.as_deref())
+                .is_some()
+            || self.is_view(&driver.name)
+            || self.unqualified_db(&driver.name) != DbRef::Main
+        {
+            return None;
+        }
+        let meta = self
+            .table_meta(&driver.name, driver.alias.as_deref())
+            .ok()?;
+        let label = eqp_label(driver);
+        // A covering-index driver scan yields the index-key column order; otherwise
+        // the rowid scan yields IPK order (or nothing nameable without an IPK).
+        let cols: Vec<(String, String)> =
+            if let Some(idx) = self.join_scan_covering_index(sel, from, driver, &meta) {
+                idx.cols
+                    .iter()
+                    .map(|&c| (label.clone(), meta.columns[c].name.clone()))
+                    .collect()
+            } else if let Some(ipk) = meta.ipk {
+                alloc::vec![(label.clone(), meta.columns[ipk].name.clone())]
+            } else {
+                Vec::new()
+            };
+        Some((label, cols))
+    }
+
+    /// Resolve one `ORDER BY` / `GROUP BY` / `DISTINCT` key expression to a
+    /// `(table_label, colname)` identity against a two-table join, using the same
+    /// output-alias / positional resolution as the single-table paths. Returns
+    /// `None` for any expression that is not a plain (un-`COLLATE`'d) column
+    /// reference, or whose bare name is ambiguous across the two sources.
+    fn join_key_column_identity(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        expr: &Expr,
+    ) -> Option<(String, String)> {
+        let join = &from.joins[0];
+        let first_meta = self
+            .table_meta(&from.first.name, from.first.alias.as_deref())
+            .ok()?;
+        let second_meta = self
+            .table_meta(&join.table.name, join.table.alias.as_deref())
+            .ok()?;
+        let first_label = eqp_label(&from.first);
+        let second_label = eqp_label(&join.table);
+        // Resolve an output alias / positional ordinal to the underlying expr, using
+        // the combined projection for wildcard ordinal expansion.
+        let mut combined = first_meta.columns.clone();
+        combined.extend(second_meta.columns.iter().cloned());
+        let proj = order_projection(&sel.columns, &combined);
+        let key = order_key_expr(&proj, expr);
+        let (tbl, col) = match key {
+            Expr::Column {
+                schema: None,
+                table,
+                column,
+                ..
+            } => (table.as_deref(), column.as_str()),
+            _ => return None,
+        };
+        let in_first = first_meta
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(col));
+        let in_second = second_meta
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(col));
+        match tbl {
+            Some(t) if t.eq_ignore_ascii_case(&first_label) && in_first => {
+                Some((first_label, col.to_string()))
+            }
+            Some(t) if t.eq_ignore_ascii_case(&second_label) && in_second => {
+                Some((second_label, col.to_string()))
+            }
+            Some(_) => None,
+            None => {
+                // A bare name present in both sources is ambiguous — decline.
+                if in_first && !in_second {
+                    Some((first_label, col.to_string()))
+                } else if in_second && !in_first {
+                    Some((second_label, col.to_string()))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Whether the DISTINCT / GROUP BY key of a two-table join is fully clustered
+    /// by the driver's scan order (a prefix of `join_driver_scan_order`), in which
+    /// case sqlite emits NO `USE TEMP B-TREE FOR {DISTINCT,GROUP BY}` node. Every
+    /// key column must map to a leading driver-order column, in order and without
+    /// gaps; any key column on the seeked inner (or an expression / ambiguous key)
+    /// means the driver order does not cluster the key → the b-tree stays.
+    fn join_group_distinct_clustered(&self, sel: &Select, from: &FromClause) -> bool {
+        let key_exprs: Vec<&Expr> = if !sel.group_by.is_empty() {
+            sel.group_by.iter().collect()
+        } else if sel.distinct {
+            let mut ks = Vec::with_capacity(sel.columns.len());
+            for rc in &sel.columns {
+                match rc {
+                    ResultColumn::Expr { expr, .. } => ks.push(expr),
+                    _ => return false, // wildcard → cannot enumerate the key
+                }
+            }
+            ks
+        } else {
+            return false;
+        };
+        if key_exprs.is_empty() {
+            return false;
+        }
+        let Some((_, driver_cols)) = self.join_driver_scan_order(sel, from) else {
+            return false;
+        };
+        if key_exprs.len() > driver_cols.len() {
+            return false;
+        }
+        for (i, e) in key_exprs.iter().enumerate() {
+            let Some((tbl, col)) = self.join_key_column_identity(sel, from, e) else {
+                return false;
+            };
+            let (dt, dc) = &driver_cols[i];
+            if !tbl.eq_ignore_ascii_case(dt) || !col.eq_ignore_ascii_case(dc) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// How many leading `ORDER BY` terms of a two-table join the driver's scan
+    /// order already supplies — the count of leading terms that map, in order and
+    /// uniform direction, onto the driver's leading scan-order columns. `0` means
+    /// the driver supplies none (full sort); `n == order_by.len()` means the whole
+    /// sort is elided; `0 < k < n` is a partial sort (`LAST … TERMS`). Direction is
+    /// free (sqlite walks the driver index / rowid either way) but must be uniform
+    /// across the matched prefix. Any term on the seeked inner, an expression, or a
+    /// non-driver-order column stops the prefix.
+    fn join_order_prefix(&self, sel: &Select, from: &FromClause) -> usize {
+        if sel.order_by.is_empty() {
+            return 0;
+        }
+        let Some((_, driver_cols)) = self.join_driver_scan_order(sel, from) else {
+            return 0;
+        };
+        let mut matched = 0usize;
+        let mut dir: Option<bool> = None;
+        for term in &sel.order_by {
+            if matched >= driver_cols.len() {
+                break;
+            }
+            let Some((tbl, col)) = self.join_key_column_identity(sel, from, &term.expr) else {
+                break;
+            };
+            let (dt, dc) = &driver_cols[matched];
+            if !tbl.eq_ignore_ascii_case(dt) || !col.eq_ignore_ascii_case(dc) {
+                break;
+            }
+            match dir {
+                None => dir = Some(term.descending),
+                Some(d) if d == term.descending => {}
+                Some(_) => break, // mixed direction breaks the uniform walk
+            }
+            matched += 1;
+        }
+        matched
     }
 
     /// Whether `idx` (a plain secondary index on `tref`, whose table is `meta`)
