@@ -499,6 +499,13 @@ pub(crate) fn expr_affinity(expr: &Expr, ctx: &EvalCtx) -> Option<Affinity> {
         }
         Expr::Cast { type_name, .. } => Some(Affinity::from_type(Some(type_name))),
         Expr::Paren(e) => expr_affinity(e, ctx),
+        // `COLLATE` changes only the collating sequence, not the affinity — so a
+        // `COLLATE`-wrapped column keeps its column affinity. Without this arm a
+        // typeless column (`c COLLATE NOCASE`) fell through to `None`, which
+        // wrongly flipped the "TEXT vs no-affinity *literal*" rule below on and
+        // coerced the other side (e.g. `text_col = none_col COLLATE NOCASE`
+        // spuriously matched `'1'` against `1`).
+        Expr::Collate { expr, .. } => expr_affinity(expr, ctx),
         // A scalar subquery contributes its single result column's affinity, so a
         // comparison like `1 = (SELECT textcol)` applies `combine(left,
         // candidate_col_aff)` exactly as SQLite does — the same rule `IN (SELECT)`
