@@ -1683,40 +1683,33 @@ fn compile_group_select(
         },
     };
 
-    // Resolve each ORDER BY term to an output-column expression where it is a
-    // bare ordinal or output alias (mirroring the scan path / tree-walker).
+    // Resolve each ORDER BY term to an output-column expression where it names one
+    // — by position, a result-column alias, or such a reference wrapped in
+    // `COLLATE`/parens (mirroring the tree-walker's `resolve_order_index`). SQLite
+    // matches an `ORDER BY` name against the result aliases FIRST, even when a base
+    // table column shares the name, so `SELECT b AS a FROM t ORDER BY a` sorts by
+    // `b`. An explicit `COLLATE` on the term sets the collation, else the resolved
+    // column's own collation applies.
+    let labels: Vec<String> = projections.iter().map(|(_, l)| l.clone()).collect();
     let mut key_specs: Vec<(Expr, SortKey)> = Vec::new();
     for term in &sel.order_by {
-        let expr = match &term.expr {
-            Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count => {
-                projections[*k as usize - 1].0.clone()
-            }
-            // Any other positional ordinal — out of range, or written with a
-            // unary `+`/`-`, parenthesis, or `COLLATE` wrapper SQLite still reads
-            // as a position (`ORDER BY -1`, `ORDER BY +2`) — is deferred to the
-            // tree-walker, which owns the exact range error and never sorts by a
-            // constant. (A bare in-range ordinal is accelerated above.)
-            _ if super::positional_int(&term.expr).is_some() => {
-                return Err(Error::Unsupported("VDBE: positional ORDER BY term"))
-            }
-            Expr::Column {
-                table: None,
-                column,
-                ..
-            } if !columns.iter().any(|c| c.eq_ignore_ascii_case(column))
-                && projections
-                    .iter()
-                    .any(|(_, l)| l.eq_ignore_ascii_case(column)) =>
-            {
-                projections
-                    .iter()
-                    .find(|(_, l)| l.eq_ignore_ascii_case(column))
-                    .map(|(e, _)| e.clone())
-                    .unwrap()
-            }
-            other => other.clone(),
+        // A positional ordinal that is not a bare, in-range integer literal — out
+        // of range, or wrapped in a unary `+`/`-`, parenthesis, or `COLLATE` that
+        // SQLite still reads as a position — defers to the tree-walker, which owns
+        // the exact range error and never sorts by a constant.
+        if super::positional_int(&term.expr).is_some()
+            && !matches!(&term.expr, Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count)
+        {
+            return Err(Error::Unsupported("VDBE: positional ORDER BY term"));
+        }
+        let expr = match super::resolve_order_index(&term.expr, &labels, count) {
+            Some(idx) => projections[idx].0.clone(),
+            None => term.expr.clone(),
         };
-        let collation = c.col_collation(&expr).unwrap_or_default();
+        let collation = c
+            .explicit_collation(&term.expr)
+            .or_else(|| c.col_collation(&expr))
+            .unwrap_or_default();
         key_specs.push((
             expr,
             SortKey {
@@ -2159,7 +2152,7 @@ pub fn compile_table_select(
     let ordering = !sel.order_by.is_empty();
     // Reserve contiguous sort-key registers (one per `ORDER BY` term).
     let key_specs = if ordering {
-        build_sort_keys(&c, sel, columns, &projections, count)?
+        build_sort_keys(&c, sel, &projections, count)?
     } else {
         Vec::new()
     };
@@ -2408,41 +2401,38 @@ fn expand_projections(
 fn build_sort_keys(
     c: &Compiler,
     sel: &Select,
-    columns: &[String],
     projections: &[(Expr, String)],
     count: usize,
 ) -> Result<Vec<(Expr, SortKey)>> {
+    let labels: Vec<String> = projections.iter().map(|(_, l)| l.clone()).collect();
     let mut key_specs: Vec<(Expr, SortKey)> = Vec::new();
     for term in &sel.order_by {
-        let expr = match &term.expr {
-            Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count => {
-                projections[*k as usize - 1].0.clone()
-            }
-            // Any other positional ordinal — out of range, or wrapped in a unary
-            // `+`/`-`, parenthesis, or `COLLATE` SQLite still reads as a position
-            // (`ORDER BY -1`) — is deferred to the tree-walker, which owns the
-            // exact range error and never sorts by a constant.
-            _ if super::positional_int(&term.expr).is_some() => {
-                return Err(Error::Unsupported("VDBE: positional ORDER BY term"))
-            }
-            Expr::Column {
-                table: None,
-                column,
-                ..
-            } if !columns.iter().any(|c| c.eq_ignore_ascii_case(column))
-                && projections
-                    .iter()
-                    .any(|(_, l)| l.eq_ignore_ascii_case(column)) =>
-            {
-                projections
-                    .iter()
-                    .find(|(_, l)| l.eq_ignore_ascii_case(column))
-                    .map(|(e, _)| e.clone())
-                    .unwrap()
-            }
-            other => other.clone(),
+        // A positional ordinal that is not a bare, in-range integer literal — out
+        // of range, or wrapped in a unary `+`/`-`, parenthesis, or `COLLATE` that
+        // SQLite still reads as a position (`ORDER BY -1`) — defers to the
+        // tree-walker, which owns the exact range error and never sorts by a
+        // constant.
+        if super::positional_int(&term.expr).is_some()
+            && !matches!(&term.expr, Expr::Literal(Literal::Integer(k)) if *k >= 1 && (*k as usize) <= count)
+        {
+            return Err(Error::Unsupported("VDBE: positional ORDER BY term"));
+        }
+        // Resolve the term to an output column where it names one — by position,
+        // a result-column alias, or such a reference wrapped in `COLLATE`/parens
+        // (`resolve_order_index` mirrors the tree-walker). SQLite matches an
+        // `ORDER BY` name against the result aliases FIRST, even when a base table
+        // column shares the name, so `SELECT b AS a FROM t ORDER BY a` sorts by
+        // `b`. The sort value comes from that output column's expression; an
+        // explicit `COLLATE` on the term still sets the collation, otherwise the
+        // resolved column's own collation applies.
+        let expr = match super::resolve_order_index(&term.expr, &labels, count) {
+            Some(idx) => projections[idx].0.clone(),
+            None => term.expr.clone(),
         };
-        let collation = c.col_collation(&expr).unwrap_or_default();
+        let collation = c
+            .explicit_collation(&term.expr)
+            .or_else(|| c.col_collation(&expr))
+            .unwrap_or_default();
         key_specs.push((
             expr,
             SortKey {
@@ -2553,7 +2543,7 @@ pub fn compile_join2(
     // scan. Reserve contiguous key registers (one per ORDER BY term).
     let ordering = !sel.order_by.is_empty();
     let key_specs = if ordering {
-        build_sort_keys(&c, sel, columns, &projections, count)?
+        build_sort_keys(&c, sel, &projections, count)?
     } else {
         Vec::new()
     };
@@ -3016,7 +3006,7 @@ pub fn compile_left_join2(
     // Reserve contiguous key registers (one per ORDER BY term).
     let ordering = !sel.order_by.is_empty();
     let key_specs = if ordering {
-        build_sort_keys(&c, sel, columns, &projections, count)?
+        build_sort_keys(&c, sel, &projections, count)?
     } else {
         Vec::new()
     };
@@ -3427,7 +3417,7 @@ pub fn compile_full_join2(
     // sorter; LIMIT/OFFSET then apply to the sorted emit loop, not the two passes.
     let ordering = !sel.order_by.is_empty();
     let key_specs = if ordering {
-        build_sort_keys(&c, sel, columns, &projections, count)?
+        build_sort_keys(&c, sel, &projections, count)?
     } else {
         Vec::new()
     };
@@ -3929,7 +3919,7 @@ pub fn compile_left_join_n(
     let matched_regs: Vec<usize> = (0..n_cursors - 1).map(|_| c.alloc()).collect();
     let ordering = !sel.order_by.is_empty();
     let key_specs = if ordering {
-        build_sort_keys(&c, sel, columns, &projections, count)?
+        build_sort_keys(&c, sel, &projections, count)?
     } else {
         Vec::new()
     };
