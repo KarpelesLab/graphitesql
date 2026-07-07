@@ -346,9 +346,9 @@ struct AggAcc {
     /// Parallel to `vals`: each collected value's `ORDER BY` key row (empty when
     /// the aggregate carries no `ORDER BY`).
     keys: Vec<Vec<Value>>,
-    /// Per-key `(descending, nulls_first)` sort directions, captured once on the
-    /// first ordered push (empty when unordered).
-    dirs: Vec<(bool, Option<bool>)>,
+    /// Per-key `(descending, nulls_first, collation)` sort specs, captured once on
+    /// the first ordered push (empty when unordered).
+    dirs: Vec<(bool, Option<bool>, Collation)>,
     /// The `group_concat`/`string_agg` separator, captured on the first folded
     /// value (`None` = the default `,`).
     sep: Option<String>,
@@ -381,6 +381,9 @@ pub struct AggOrderKey {
     pub descending: bool,
     /// Explicit `NULLS FIRST` (`Some(true)`) / `NULLS LAST` (`Some(false)`).
     pub nulls_first: Option<bool>,
+    /// The collation this key sorts under: an explicit `COLLATE` on the term, else
+    /// the key column's own collation, else `BINARY`.
+    pub collation: Collation,
 }
 
 /// A compiled VDBE program: the instruction stream and the register-file size.
@@ -775,10 +778,17 @@ fn compile_order_keys(c: &mut Compiler, order: &[OrderTerm]) -> Result<Vec<AggOr
         .iter()
         .map(|t| {
             let reg = c.compile_expr(&t.expr)?;
+            // An explicit `COLLATE` on the term wins; else the key column's own
+            // collation; else BINARY — matching the tree-walker's `key_collation`.
+            let collation = c
+                .explicit_collation(&t.expr)
+                .or_else(|| c.col_collation(&t.expr))
+                .unwrap_or_default();
             Ok(AggOrderKey {
                 reg,
                 descending: t.descending,
                 nulls_first: t.nulls_first,
+                collation,
             })
         })
         .collect()
@@ -5393,20 +5403,26 @@ fn push_order_key(acc: &mut AggAcc, order: &[AggOrderKey], regs: &[Value]) {
     if acc.dirs.is_empty() {
         acc.dirs = order
             .iter()
-            .map(|k| (k.descending, k.nulls_first))
+            .map(|k| (k.descending, k.nulls_first, k.collation))
             .collect();
     }
     acc.keys
         .push(order.iter().map(|k| regs[k.reg].clone()).collect());
 }
 
-/// Compare two `ORDER BY` key rows under the captured `(descending, nulls_first)`
-/// directions (BINARY collation), for sorting an ordered `group_concat`. NULL
-/// placement follows SQLite: by default NULLs sort first under `ASC` and last
-/// under `DESC`, overridable by explicit `NULLS FIRST`/`NULLS LAST`.
-fn cmp_key_rows(a: &[Value], b: &[Value], dirs: &[(bool, Option<bool>)]) -> core::cmp::Ordering {
+/// Compare two `ORDER BY` key rows under the captured
+/// `(descending, nulls_first, collation)` specs, for sorting an ordered
+/// `group_concat`. NULL placement follows SQLite: by default NULLs sort first
+/// under `ASC` and last under `DESC`, overridable by explicit `NULLS FIRST`/
+/// `NULLS LAST`; each key compares under its own collation (an explicit `COLLATE`,
+/// the key column's collation, else `BINARY`).
+fn cmp_key_rows(
+    a: &[Value],
+    b: &[Value],
+    dirs: &[(bool, Option<bool>, Collation)],
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
-    for (k, &(descending, nulls_first)) in dirs.iter().enumerate() {
+    for (k, &(descending, nulls_first, collation)) in dirs.iter().enumerate() {
         let (x, y) = (&a[k], &b[k]);
         let nulls_first = nulls_first.unwrap_or(!descending);
         let ord = match (x, y) {
@@ -5426,7 +5442,7 @@ fn cmp_key_rows(a: &[Value], b: &[Value], dirs: &[(bool, Option<bool>)]) -> core
                 };
             }
             _ => {
-                let base = crate::value::cmp_values_coll(x, y, crate::value::Collation::Binary);
+                let base = crate::value::cmp_values_coll(x, y, collation);
                 if descending {
                     base.reverse()
                 } else {
