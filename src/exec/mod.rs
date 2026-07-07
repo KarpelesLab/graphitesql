@@ -20100,8 +20100,10 @@ impl Connection {
 
     /// Build the per-query [`Fts5QueryCtx`] for an FTS5 `MATCH` query over a single
     /// `fts5` table that references `rank`/`bm25()`/`highlight()`, or `None`. The
-    /// bm25 corpus is computed (over `input_rows`, the whole scanned corpus) only
-    /// when `rank`/`bm25()` is referenced — `highlight()` needs just the query.
+    /// bm25 corpus is computed only when `rank`/`bm25()` is referenced —
+    /// `highlight()` needs just the query. Its statistics span the WHOLE table (a
+    /// fresh unfiltered scan), not the post-`MATCH` `input_rows`, because sqlite's
+    /// `avgdl`/`nHit` are whole-table denominators.
     #[cfg(feature = "fts5")]
     fn fts5_query_ctx(
         &self,
@@ -20144,7 +20146,22 @@ impl Connection {
             .cloned();
         // Score the corpus only when ranking is actually referenced.
         let bm25 = select_mentions(sel, RANK).then(|| {
-            let docs: Vec<Vec<String>> = input_rows
+            // SQLite's bm25 corpus statistics — `avgdl` (total tokens across the
+            // table / total row count) and each phrase's `nHit` (rows containing
+            // it) — span the WHOLE table, not just the rows that matched `MATCH`.
+            // `input_rows` here is the post-`MATCH` subset (the scan pushes the
+            // predicate down), so computing avgdl/nHit over it would use the wrong
+            // denominators and diverge from sqlite. Re-scan the fts5 table
+            // unfiltered for the corpus; fall back to the matched rows if that scan
+            // is unavailable (reproducing the prior behavior). Scoring still only
+            // reads matched rows — unmatched rows are never looked up by rowid.
+            let all_rows = self
+                .try_virtual_table(&from.first.name, from.first.alias.as_deref(), None)
+                .ok()
+                .flatten()
+                .map(|(_, rows)| rows);
+            let corpus_rows: &[InputRow] = all_rows.as_deref().unwrap_or(input_rows);
+            let docs: Vec<Vec<String>> = corpus_rows
                 .iter()
                 .map(|r| r.values.iter().map(eval::to_text).collect())
                 .collect();
@@ -20156,7 +20173,7 @@ impl Connection {
                 indexed.as_deref(),
                 tok,
             );
-            let index = input_rows
+            let index = corpus_rows
                 .iter()
                 .enumerate()
                 .filter_map(|(i, r)| Some((r.rowid?, i)))
