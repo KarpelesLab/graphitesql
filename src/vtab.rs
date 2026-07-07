@@ -582,6 +582,8 @@ impl VTabRegistry {
             .expect("fresh registry has no name collisions");
         reg.register("rtree_i32", Box::new(RTreeModule { integer: true }))
             .expect("fresh registry has no name collisions");
+        reg.register("geopoly", Box::new(GeopolyModule))
+            .expect("fresh registry has no name collisions");
         #[cfg(feature = "fts5")]
         reg.register("fts5", Box::new(Fts5Module))
             .expect("fresh registry has no name collisions");
@@ -1220,6 +1222,134 @@ impl VTabModule for RTreeModule {
                 Ok(id)
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in module: `geopoly` — a 2-D R-Tree indexing polygons by their
+// bounding box, plus the polygon and user columns stored as auxiliary data.
+// The spatial index reuses SQLite's byte-compatible `_node`/`_parent` shadow
+// format; the `_rowid` shadow is EXTENDED with one `aK` column per stored aux
+// column (`a0` = the `_shape` polygon BLOB, `a1..aN` = the user columns).
+// ---------------------------------------------------------------------------
+
+/// SQLite's [geopoly](https://www.sqlite.org/geopoly.html) virtual-table module.
+///
+/// `USING geopoly(<col>, <col>, …)` declares a `_shape` column (the polygon, a
+/// geopoly BLOB) followed by one column per name argument. It is a 2-D R-Tree
+/// keyed on each polygon's bounding box: the `_node`/`_parent` shadow tables use
+/// SQLite's byte-compatible node format (bbox + rowid), and the `_rowid` shadow
+/// carries the aux columns `a0` (`_shape`) … `aN` (user cols). Spatial queries
+/// (`geopoly_overlap`/`geopoly_within`) prune candidates by the query polygon's
+/// bounding box, then the exact predicate is re-applied.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GeopolyModule;
+
+/// Unused cursor — geopoly is persistent, so reads scan the shadow tables rather
+/// than a module cursor (see [`RTreeCursor`]).
+pub struct GeopolyCursor;
+/// Unused row type for [`GeopolyCursor`].
+pub struct GeopolyRow;
+
+impl VTabRow for GeopolyRow {
+    fn column(&self, _i: usize) -> Value {
+        Value::Null
+    }
+    fn rowid(&self) -> i64 {
+        0
+    }
+}
+
+impl VTabCursor for GeopolyCursor {
+    type Row = GeopolyRow;
+    fn next(&mut self) -> Result<Option<GeopolyRow>> {
+        Ok(None)
+    }
+}
+
+impl GeopolyModule {
+    /// The user-column name declared by one `USING geopoly(…)` argument: the
+    /// leading identifier, dropping any trailing type (SQLite keeps the declared
+    /// type, unlike rtree's aux columns).
+    fn arg_name(a: &str) -> &str {
+        let a = a.trim();
+        a.split_once(char::is_whitespace).map_or(a, |(n, _)| n)
+    }
+}
+
+impl VTabModule for GeopolyModule {
+    type Cursor = GeopolyCursor;
+
+    fn connect(&self, args: &[&str]) -> Result<VTabSchema> {
+        // Column 0 is `_shape` (untyped, holds the polygon BLOB); the remaining
+        // columns are the user arguments, keeping their declared type.
+        let mut cols: Vec<(String, String)> = alloc::vec![(String::from("_shape"), String::new())];
+        for a in args {
+            let a = a.trim();
+            let name = GeopolyModule::arg_name(a);
+            let ty = a
+                .split_once(char::is_whitespace)
+                .map_or(String::new(), |(_, t)| String::from(t.trim()));
+            cols.push((String::from(name), ty));
+        }
+        Ok(VTabSchema::typed(cols))
+    }
+
+    fn open(&self, _args: &[&str], _plan: &IndexPlan) -> Result<GeopolyCursor> {
+        Ok(GeopolyCursor)
+    }
+
+    fn persistent(&self) -> bool {
+        true
+    }
+
+    fn rowid_column(&self) -> Option<usize> {
+        // geopoly has no rowid-alias column; the rowid is implicit.
+        None
+    }
+
+    /// geopoly's `xBestIndex`: a rowid equality is `idxNum` 1 (`idxStr` `rowid`);
+    /// otherwise `idxNum` 4 (`idxStr` `fullscan`). The spatial-function plans
+    /// (`idxNum` 2/3 for `geopoly_overlap`/`geopoly_within`) are chosen by the
+    /// executor, which sees those function constraints directly — the generic
+    /// constraint collector this method receives does not.
+    fn best_index(&self, constraints: &[IndexConstraint]) -> Result<IndexPlan> {
+        let mut argv_index = alloc::vec![0u32; constraints.len()];
+        if let Some(i) = constraints
+            .iter()
+            .position(|c| c.usable && c.column == usize::MAX && c.op == ConstraintOp::Eq)
+        {
+            argv_index[i] = 1;
+            return Ok(IndexPlan {
+                idx_num: 1,
+                idx_str: Some(String::from("rowid")),
+                estimated_cost: 30.0,
+                argv_index,
+                omit: Vec::new(),
+                order_by_consumed: false,
+            });
+        }
+        Ok(IndexPlan {
+            idx_num: 4,
+            idx_str: Some(String::from("fullscan")),
+            estimated_cost: 2_147_483_647.0,
+            argv_index,
+            omit: Vec::new(),
+            order_by_consumed: false,
+        })
+    }
+
+    fn update(
+        &self,
+        _args: &[&str],
+        _change: VTabChange,
+        _store: &mut dyn VTabStore,
+    ) -> Result<i64> {
+        // geopoly writes go through the executor's node-format path (parallel to
+        // rtree), not this generic store-backed hook.
+        Err(Error::Error(String::from(
+            "geopoly: writes are handled by the executor",
+        )))
     }
 }
 

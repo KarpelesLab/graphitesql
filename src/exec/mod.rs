@@ -9179,7 +9179,13 @@ impl Connection {
         let is_fts5 = cvt.module.eq_ignore_ascii_case("fts5");
         #[cfg(not(feature = "fts5"))]
         let is_fts5 = false;
-        if let Some(n_coord) = rtree_n_coord {
+        let is_geopoly = cvt.module.eq_ignore_ascii_case("geopoly");
+        if is_geopoly {
+            // geopoly's `_rowid` carries one aux column per user argument (plus
+            // `a0` for the `_shape` BLOB); the node/parent shadows use the
+            // byte-compatible R-Tree format.
+            self.geopoly_create_storage(&cvt.name, cvt.args.len())?;
+        } else if let Some(n_coord) = rtree_n_coord {
             let integer = cvt.module.eq_ignore_ascii_case("rtree_i32");
             self.rtree_create_storage(&cvt.name, n_coord, integer)?;
         } else if is_fts5 {
@@ -9446,6 +9452,42 @@ impl Connection {
             .first()
             .cloned()
             .unwrap_or_else(|| String::from("rowid"));
+        // geopoly: parse each `_shape`, index its bounding box in the node tree,
+        // and store the polygon BLOB + user columns as `_rowid` aux columns.
+        if module_name.eq_ignore_ascii_case("geopoly") {
+            let mut existing: alloc::collections::BTreeSet<i64> =
+                self.geopoly_read_aux(&table)?.keys().copied().collect();
+            let mut next_auto = existing.iter().max().copied().unwrap_or(0) + 1;
+            let mut inserts: Vec<(RtreeCell, Vec<Value>)> = Vec::new();
+            let mut n = 0;
+            for (rowid, values) in &changes {
+                let rid = rowid.unwrap_or_else(|| {
+                    let r = next_auto;
+                    next_auto += 1;
+                    r
+                });
+                if rid >= next_auto {
+                    next_auto = rid + 1;
+                }
+                if existing.contains(&rid) {
+                    match on_conflict {
+                        OnConflict::Replace => {}
+                        OnConflict::Ignore => continue,
+                        _ => {
+                            return Err(Error::Constraint(format!(
+                                "UNIQUE constraint failed: {table}.rowid"
+                            )))
+                        }
+                    }
+                }
+                existing.insert(rid);
+                inserts.retain(|(c, _)| c.key != rid); // OR REPLACE within this batch
+                inserts.push(geopoly_row_cell(rid, values)?);
+                n += 1;
+            }
+            self.geopoly_apply(&table, inserts, &[])?;
+            return Ok(n);
+        }
         // R-Tree with no aux columns: store in SQLite's byte-compatible node tree.
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let rtree_nc = (module_name.eq_ignore_ascii_case("rtree")
@@ -9604,6 +9646,11 @@ impl Connection {
                 return Ok(victims.len());
             }
         }
+        // geopoly: rebuild the node tree (and `_rowid` aux) without the victims.
+        if module_name.eq_ignore_ascii_case("geopoly") {
+            self.geopoly_apply(&del.table, Vec::new(), &victims)?;
+            return Ok(victims.len());
+        }
         // R-Tree with no aux columns: rebuild the node tree without the victims.
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let rtree_nc = (module_name.eq_ignore_ascii_case("rtree")
@@ -9714,6 +9761,18 @@ impl Connection {
                 self.fts5_rebuild_from_gpost(&upd.table)?;
                 return Ok(changes.len());
             }
+        }
+        // geopoly: rebuild the node tree + `_rowid` aux (re-parse each new
+        // `_shape` for its bbox and normalized BLOB; the rowid is stable).
+        if module_name.eq_ignore_ascii_case("geopoly") {
+            let mut deletes = Vec::with_capacity(changes.len());
+            let mut inserts = Vec::with_capacity(changes.len());
+            for (rowid, values) in &changes {
+                deletes.push(*rowid);
+                inserts.push(geopoly_row_cell(*rowid, values)?);
+            }
+            self.geopoly_apply(&upd.table, inserts, &deletes)?;
+            return Ok(changes.len());
         }
         // R-Tree with no aux columns: rebuild the node tree (delete old + insert
         // new; the `id` column may move the rowid).
@@ -10126,6 +10185,25 @@ impl Connection {
         // scan that directly (run_core re-applies the full WHERE, so the rows are
         // a valid superset). Computed modules go through the cursor path below.
         if module.dyn_persistent() {
+            // geopoly keeps the polygon + user columns in `<name>_rowid`'s aux
+            // columns (`a0..aN`), the bounding box in the byte-compatible node
+            // tree. Read the aux columns for each entry, pruning candidates by any
+            // `geopoly_overlap`/`geopoly_within(_shape, Q)` in the WHERE (Q's bbox
+            // is a superset filter; `run_core` re-applies the exact predicate).
+            if cvt.module.eq_ignore_ascii_case("geopoly")
+                && self.schema.table(&format!("{name}_node")).is_some()
+            {
+                let bbox = match pushdown {
+                    Some((sel, params)) => sel
+                        .where_clause
+                        .as_ref()
+                        .and_then(|w| self.geopoly_query_bbox(w, &columns, params))
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let rows = self.scan_geopoly(name, &bbox)?;
+                return Ok(Some((columns, rows)));
+            }
             // An R-Tree written by SQLite keeps its entries in the `<name>_node`
             // b-tree of nodes (byte-compatible on-disk format), not graphite's
             // generic `<name>_data` backing table. Read the node tree directly so
@@ -13998,6 +14076,14 @@ impl Connection {
                 hidden: false,
             })
             .collect();
+        // geopoly's plan is driven by the spatial `geopoly_overlap`/`geopoly_within`
+        // functions (which the generic collector doesn't see) and a rowid equality,
+        // matching sqlite's `geopolyBestIndex`: rowid `=` → `1:rowid`, overlap →
+        // `2:rtree`, within → `3:rtree`, else a `4:fullscan`.
+        if cvt.module.eq_ignore_ascii_case("geopoly") {
+            let (num, s) = self.geopoly_eqp_plan(sel, params);
+            return Ok(alloc::format!("SCAN {label} VIRTUAL TABLE INDEX {num}:{s}"));
+        }
         // FTS5's plan is driven by `MATCH` (a desugared `match()` function the
         // generic constraint collector doesn't see) and `ORDER BY rank`, so report
         // it directly to match sqlite's `xBestIndex`: `MATCH` is `M<col>` (the
@@ -27392,6 +27478,20 @@ impl Connection {
 
     /// Replace an R-Tree's three shadow tables with a freshly bulk-built tree.
     fn rtree_write_build(&mut self, name: &str, build: &RtreeBuild) -> Result<()> {
+        self.rtree_write_build_aux(name, build, &alloc::collections::BTreeMap::new())
+    }
+
+    /// Replace an R-Tree's shadow tables with a freshly bulk-built tree, writing
+    /// per-rowid auxiliary column values into `_rowid`'s extra `a0..aN` columns
+    /// (the geopoly layout). An empty `aux` map yields the plain-rtree
+    /// `_rowid(rowid, nodeno)` rows unchanged, so this is byte-identical to the
+    /// no-aux path for plain rtree.
+    fn rtree_write_build_aux(
+        &mut self,
+        name: &str,
+        build: &RtreeBuild,
+        aux: &alloc::collections::BTreeMap<i64, Vec<Value>>,
+    ) -> Result<()> {
         let node_t = sql::print::ident(&format!("{name}_node"));
         let rowid_t = sql::print::ident(&format!("{name}_rowid"));
         let parent_t = sql::print::ident(&format!("{name}_parent"));
@@ -27412,9 +27512,17 @@ impl Connection {
             )?;
         }
         for (rowid, nodeno) in &build.rowids {
+            let mut vals = alloc::vec![Value::Integer(*rowid), Value::Integer(*nodeno)];
+            let mut placeholders = String::from("?1,?2");
+            if let Some(a) = aux.get(rowid) {
+                for (k, v) in a.iter().enumerate() {
+                    vals.push(v.clone());
+                    placeholders.push_str(&format!(",?{}", k + 3));
+                }
+            }
             self.execute_params(
-                &format!("INSERT INTO {rowid_t} VALUES(?1,?2)"),
-                &pv(alloc::vec![Value::Integer(*rowid), Value::Integer(*nodeno)]),
+                &format!("INSERT INTO {rowid_t} VALUES({placeholders})"),
+                &pv(vals),
             )?;
         }
         for (child, parent) in &build.parents {
@@ -27473,6 +27581,205 @@ impl Connection {
         entries.extend(inserts);
         let build = rtree_bulk_build(entries, n_coord, integer, self.rtree_node_size_for(n_coord));
         self.rtree_write_build(name, &build)
+    }
+
+    /// Create a geopoly table's storage: SQLite's byte-compatible
+    /// `_node`/`_parent` shadow tables plus a `_rowid` table EXTENDED with one
+    /// `aK` aux column per stored value (`a0` = the `_shape` BLOB, `a1..aN` = the
+    /// `n_user` user columns), and an empty root node. The R-Tree indexes a 2-D
+    /// bounding box, so `n_coord` is fixed at 4 (minX, maxX, minY, maxY).
+    fn geopoly_create_storage(&mut self, name: &str, n_user: usize) -> Result<()> {
+        // `_rowid(rowid INTEGER PRIMARY KEY, nodeno, a0, a1, …, aN)`.
+        let mut rowid_cols = String::from("rowid INTEGER PRIMARY KEY, nodeno");
+        for k in 0..=n_user {
+            rowid_cols.push_str(&format!(", a{k}"));
+        }
+        for (suffix, cols) in [
+            ("_node", "nodeno INTEGER PRIMARY KEY, data".to_string()),
+            ("_rowid", rowid_cols),
+            (
+                "_parent",
+                "nodeno INTEGER PRIMARY KEY, parentnode".to_string(),
+            ),
+        ] {
+            let sql = format!(
+                "CREATE TABLE {}({cols})",
+                sql::print::ident(&format!("{name}{suffix}"))
+            );
+            let Statement::CreateTable(ct) = sql::parse_one(&sql)? else {
+                unreachable!("constructed a CREATE TABLE")
+            };
+            self.exec_create_table(&ct, &sql)?;
+        }
+        let build = rtree_bulk_build(Vec::new(), 4, false, self.rtree_node_size_for(4));
+        self.rtree_write_build(name, &build)
+    }
+
+    /// Read a geopoly table's stored aux columns as a `rowid -> [a0, a1, …]` map.
+    fn geopoly_read_aux(
+        &self,
+        name: &str,
+    ) -> Result<alloc::collections::BTreeMap<i64, Vec<Value>>> {
+        let meta = self.table_meta(&format!("{name}_rowid"), None)?;
+        let mut out = alloc::collections::BTreeMap::new();
+        for (rowid, vals) in self.scan_table(&meta)? {
+            // `scan_table` yields every declared column (the `rowid` IPK filled
+            // from the rowid, then `nodeno`, then the `aK` aux columns), so drop
+            // the leading `rowid` and `nodeno` and keep the `aK` values.
+            let aux: Vec<Value> = vals.into_iter().skip(2).collect();
+            out.insert(rowid, aux);
+        }
+        Ok(out)
+    }
+
+    /// Apply inserts/deletes to a geopoly table: rebuild the node tree from the
+    /// surviving bbox cells and rewrite `_rowid` (with aux) accordingly. Each
+    /// insert carries its bbox cell and its aux values `[a0, a1, …]`.
+    fn geopoly_apply(
+        &mut self,
+        name: &str,
+        inserts: Vec<(RtreeCell, Vec<Value>)>,
+        deletes: &[i64],
+    ) -> Result<()> {
+        let mut entries = self.rtree_entries(name, 4, false)?;
+        let mut aux = self.geopoly_read_aux(name)?;
+        let removed: alloc::collections::BTreeSet<i64> = deletes
+            .iter()
+            .copied()
+            .chain(inserts.iter().map(|(c, _)| c.key))
+            .collect();
+        entries.retain(|c| !removed.contains(&c.key));
+        for r in &removed {
+            aux.remove(r);
+        }
+        for (cell, a) in inserts {
+            aux.insert(cell.key, a);
+            entries.push(cell);
+        }
+        let build = rtree_bulk_build(entries, 4, false, self.rtree_node_size_for(4));
+        self.rtree_write_build_aux(name, &build, &aux)
+    }
+
+    /// Scan a geopoly table, pruning candidate subtrees by `bbox` (query-polygon
+    /// bounds, as `(coord-column, op, value)` triples over the 4 bbox coords).
+    /// Yields one row per surviving entry: `[a0 (_shape), a1, …]` with its rowid.
+    /// The prune is a superset (the on-disk MBR rounds out), so `run_core` safely
+    /// re-applies the exact `WHERE`.
+    fn scan_geopoly(
+        &self,
+        name: &str,
+        bbox: &[(usize, ConstraintOp, f64)],
+    ) -> Result<Vec<InputRow>> {
+        let aux = self.geopoly_read_aux(name)?;
+        let candidates = self.scan_rtree_nodes(name, 4, false, bbox)?;
+        let mut out = Vec::with_capacity(candidates.len());
+        for r in candidates {
+            let Some(rowid) = r.rowid else { continue };
+            let values = aux.get(&rowid).cloned().unwrap_or_default();
+            out.push(InputRow {
+                values,
+                rowid: Some(rowid),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Derive the bounding-box prune for a geopoly query from a `WHERE` clause:
+    /// each top-level `geopoly_overlap(_shape, Q)` / `geopoly_within(_shape, Q)`
+    /// conjunct contributes Q's bounding box as four `(coord, op, value)` triples
+    /// requiring the stored MBR to overlap Q's box (`minX ≤ Qmaxx`, `maxX ≥
+    /// Qminx`, `minY ≤ Qmaxy`, `maxY ≥ Qminy`). This is a valid superset for both
+    /// predicates (containment implies overlap), so `run_core` re-applying the
+    /// exact function never drops or admits a wrong row. Returns `None` when no
+    /// such usable conjunct is present (a full scan).
+    fn geopoly_query_bbox(
+        &self,
+        where_expr: &Expr,
+        _columns: &[ColumnInfo],
+        params: &Params,
+    ) -> Option<Vec<(usize, ConstraintOp, f64)>> {
+        let mut conjuncts: Vec<&Expr> = Vec::new();
+        and_conjuncts(where_expr, &mut conjuncts);
+        let mut out: Vec<(usize, ConstraintOp, f64)> = Vec::new();
+        for e in conjuncts {
+            let Expr::Function { name, args, .. } = e else {
+                continue;
+            };
+            if !(name.eq_ignore_ascii_case("geopoly_overlap")
+                || name.eq_ignore_ascii_case("geopoly_within"))
+                || args.len() != 2
+            {
+                continue;
+            }
+            // The first argument must be this table's `_shape` column; the second a
+            // constant polygon we can evaluate now (a column reference errors in the
+            // rowless context and is skipped, leaving a safe full scan).
+            if !matches!(&args[0], Expr::Column { column, .. } if column.eq_ignore_ascii_case("_shape"))
+            {
+                continue;
+            }
+            let ctx = EvalCtx::rowless(params).with_subqueries(self);
+            let Ok(q) = eval::eval(&args[1], &ctx) else {
+                continue;
+            };
+            let Some(poly) = crate::geopoly::parse_value(&q) else {
+                continue;
+            };
+            let (qmnx, qmxx, qmny, qmxy) = poly.bbox_coords();
+            out.push((0, ConstraintOp::Le, f64::from(qmxx))); // minX ≤ Qmaxx
+            out.push((1, ConstraintOp::Ge, f64::from(qmnx))); // maxX ≥ Qminx
+            out.push((2, ConstraintOp::Le, f64::from(qmxy))); // minY ≤ Qmaxy
+            out.push((3, ConstraintOp::Ge, f64::from(qmny))); // maxY ≥ Qminy
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// The `(idxNum, idxStr)` geopoly's `xBestIndex` reports for `EXPLAIN QUERY
+    /// PLAN`, matching sqlite: a rowid equality wins (`1`,`rowid`), then a
+    /// `geopoly_overlap` (`2`,`rtree`), then a `geopoly_within` (`3`,`rtree`),
+    /// else a full scan (`4`,`fullscan`).
+    fn geopoly_eqp_plan(&self, sel: &Select, params: &Params) -> (i32, &'static str) {
+        let Some(where_expr) = sel.where_clause.as_ref() else {
+            return (4, "fullscan");
+        };
+        let mut conjuncts: Vec<&Expr> = Vec::new();
+        and_conjuncts(where_expr, &mut conjuncts);
+        let is_rowid = |e: &Expr| {
+            matches!(e, Expr::Column { column, .. }
+                if matches!(column.to_ascii_lowercase().as_str(), "rowid" | "_rowid_" | "oid"))
+        };
+        let mut has_overlap = false;
+        let mut has_within = false;
+        for e in &conjuncts {
+            match e {
+                Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left,
+                    right,
+                } if is_rowid(left) || is_rowid(right) => {
+                    let _ = params;
+                    return (1, "rowid");
+                }
+                Expr::Function { name, args, .. }
+                    if args.len() == 2
+                        && matches!(&args[0], Expr::Column { column, .. } if column.eq_ignore_ascii_case("_shape")) =>
+                {
+                    if name.eq_ignore_ascii_case("geopoly_overlap") {
+                        has_overlap = true;
+                    } else if name.eq_ignore_ascii_case("geopoly_within") {
+                        has_within = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if has_overlap {
+            (2, "rtree")
+        } else if has_within {
+            (3, "rtree")
+        } else {
+            (4, "fullscan")
+        }
     }
 
     /// After a write to an FTS5 table, rebuild its inverted index from the
@@ -35028,6 +35335,46 @@ fn rtree_cell_from_values(
         })
         .collect();
     Ok(RtreeCell { key: rowid, coords })
+}
+
+/// Turn a geopoly INSERT/UPDATE row (`[_shape, user1, …]`) into a bbox cell plus
+/// the aux tuple `[a0, a1, …]` stored in `_rowid`, mirroring SQLite's
+/// `geopolyUpdate`:
+///
+/// * a valid polygon (`_shape` is a geopoly BLOB or GeoJSON text) → `a0` is the
+///   normalized geopoly BLOB, the bbox is the polygon's exact f32 bounds (no
+///   directional rounding — the vertices are already f32), and `a1..aN` are the
+///   user column values;
+/// * text that never opens a `[` ring (e.g. `''`) → stored verbatim as `a0` with
+///   an all-zero bbox (SQLite's rc-OK-but-no-polygon path);
+/// * anything else (NULL, a number, a malformed BLOB, or a bracket-opened but
+///   malformed ring) → the error SQLite raises,
+///   `_shape does not contain a valid polygon`.
+fn geopoly_row_cell(rowid: i64, values: &[Value]) -> Result<(RtreeCell, Vec<Value>)> {
+    let shape = values.first().cloned().unwrap_or(Value::Null);
+    let (coords, a0) = match crate::geopoly::bbox_step(&shape) {
+        crate::geopoly::BBoxStep::Poly(p) => {
+            let (mnx, mxx, mny, mxy) = p.bbox_coords();
+            (
+                alloc::vec![
+                    f64::from(mnx),
+                    f64::from(mxx),
+                    f64::from(mny),
+                    f64::from(mxy)
+                ],
+                Value::Blob(p.to_blob()),
+            )
+        }
+        crate::geopoly::BBoxStep::ZeroBox => (alloc::vec![0.0, 0.0, 0.0, 0.0], shape),
+        crate::geopoly::BBoxStep::Skip => {
+            return Err(Error::Error(String::from(
+                "_shape does not contain a valid polygon",
+            )));
+        }
+    };
+    let mut aux = alloc::vec![a0];
+    aux.extend(values.iter().skip(1).cloned());
+    Ok((RtreeCell { key: rowid, coords }, aux))
 }
 
 /// Whether `e` is a `rowid` / `_rowid_` / `oid` reference (case-insensitive,
