@@ -1544,6 +1544,12 @@ fn compile_group_select(
     for term in &sel.order_by {
         collect_bare_columns(&term.expr, &mut bare_refs);
     }
+    // SQLite's single-min/max bare-column rule fires on exactly one min/max across
+    // projection + HAVING + ORDER BY — all of which the fold's companion tracks
+    // here. Under it, even a projected GROUP BY key follows the extreme row (so a
+    // group with numerically-equal but differently-typed keys prints the extreme
+    // row's representation), so grouping columns must become representatives too.
+    let single_minmax = super::single_minmax_arg(sel).is_some();
     let mut repr_cols: Vec<usize> = Vec::new();
     for (t, col) in &bare_refs {
         // A HAVING/ORDER-BY ref that doesn't name a real table column is an output
@@ -1551,8 +1557,10 @@ fn compile_group_select(
         let Ok(ci) = c.resolve_column(t.as_deref(), col) else {
             continue;
         };
-        // Grouping columns are bound to their key register below, not represented.
-        if key_col_indices.contains(&ci) {
+        // Grouping columns are normally bound to their key register below; but with
+        // a single min/max active the displayed key follows the companion row, so
+        // they become representatives instead.
+        if !single_minmax && key_col_indices.contains(&ci) {
             continue;
         }
         if !repr_cols.contains(&ci) {
@@ -1604,6 +1612,13 @@ fn compile_group_select(
             }
             GroupKeySpec::Col(ci) => *ci,
         };
+        // Under the single-min/max rule this column is a representative (bound to
+        // its repr register below), so it must NOT also bind to the stored-key
+        // register — that binding would shadow the repr one and print the group's
+        // key value instead of the extreme row's.
+        if single_minmax && repr_cols.contains(&ci) {
+            continue;
+        }
         c.bindings.push((
             Expr::Column {
                 schema: None,
@@ -1975,6 +1990,19 @@ fn compile_group_emit(
     // Classify each output column as a grouping-key reference or an aggregate.
     // Column refs resolve through `resolve_column` (qualifier-aware) so a join's
     // qualified `t.col` and ambiguous bare names are handled like the tree-walker.
+    // SQLite's single-min()/max() bare-column rule also governs the *displayed*
+    // GROUP BY key: `SELECT a, min(b) … GROUP BY a` shows `a` from the min(b) row,
+    // so when a group holds numerically-equal but differently-typed keys (`3` and
+    // `3.0`) the printed key follows the extreme row. Route the projected key
+    // column through the representative mechanism (which tracks the min/max
+    // companion) in that case. With no min/max the representative is the group's
+    // first-seen row, whose key value equals the stored key — so nothing changes;
+    // with 2+ min/max the companion is ambiguous (SQLite unspecified) and the
+    // stored key is kept.
+    // This plain path has no HAVING/ORDER BY, so the lone min/max (if any) is in
+    // the projection and its companion row is tracked by the fold. When present,
+    // the displayed GROUP BY key follows that row too (see the key branch below).
+    let single_minmax = super::single_minmax_arg(sel).is_some();
     let mut outputs: Vec<GroupOut> = Vec::new();
     let mut agg_specs: Vec<AggCallSpec> = Vec::new();
     let mut repr_cols: Vec<usize> = Vec::new();
@@ -1990,13 +2018,16 @@ fn compile_group_emit(
         } else if let Expr::Column { table, column, .. } = e {
             let ci = c.resolve_column(table.as_deref(), column)?;
             match group_cols.iter().position(|&g| g == ci) {
-                Some(k) => outputs.push(GroupOut::Key(k)),
-                // A non-grouped bare column. SQLite emits the value from the row
-                // that first creates the group (a "representative"). We capture it
-                // as an extra key-vector slot after the real keys; with exactly one
-                // min()/max() aggregate the fold instead tracks that aggregate's
-                // companion row (gated after the loop for >1 min/max).
-                None => {
+                // A group-key column normally emits the stored key value, but when
+                // a single min/max is active it must follow that extreme row (see
+                // above), so it becomes a representative like a non-grouped column.
+                Some(k) if !single_minmax => outputs.push(GroupOut::Key(k)),
+                // A non-grouped bare column (or a key column under the single
+                // min/max rule). SQLite emits the value from the group's
+                // representative row — the first-seen row, or the min()/max()
+                // companion when exactly one is present (tracked in the fold; >1
+                // is gated after the loop).
+                _ => {
                     let r = repr_cols.len();
                     repr_cols.push(ci);
                     outputs.push(GroupOut::Key(group_cols.len() + r));
