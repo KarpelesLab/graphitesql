@@ -1456,6 +1456,15 @@ impl Connection {
                     if self.two_table_index_inner_swap(pf).is_some() {
                         return Err(Error::Unsupported("VDBE: two-table index-inner swap"));
                     }
+                    // Cost-based N-table (≥3) reorder: the VDBE join compiler scans
+                    // sources in declaration order, so a reordered drive produces a
+                    // different (observable, unordered) row order — defer to the
+                    // tree-walker, which owns the reorder (`ntable_join_order`). With
+                    // an explicit ORDER BY the drive direction is invisible, so the
+                    // VDBE may run those directly.
+                    if self.ntable_join_order(check_sel, pf).is_some() {
+                        return Err(Error::Unsupported("VDBE: N-table cost-based join order"));
+                    }
                 }
             }
         }
@@ -14281,6 +14290,14 @@ impl Connection {
             }
         }
         let label = eqp_label(&from.first);
+        // Cost-based N-table (≥3) join reorder: when the executor drives the join in
+        // a permuted order (`ntable_join_order`), the EQP must render its SCAN/SEARCH
+        // nodes in that same execution order. Bind `join_from` to the permuted clause
+        // (else the declared one) and route every multi-table join-EQP branch through
+        // it, so both paths stay in lockstep. `ntable_join_order` fires only for
+        // `from.joins.len() >= 2`, so the single-table rendering is untouched.
+        let ntable_reordered = self.ntable_join_order(sel, from).map(|(f, _)| f);
+        let join_from: &FromClause = ntable_reordered.as_ref().unwrap_or(from);
         // A virtual table scans through its module, not a b-tree — render sqlite's
         // `VIRTUAL TABLE INDEX <n>:<str>` node and skip the regular-table planning
         // (which would otherwise parse the CREATE VIRTUAL TABLE as a CREATE TABLE
@@ -15166,9 +15183,15 @@ impl Connection {
                     &eqp_label(&from.joins[0].table),
                 )
             } else {
-                // Joins run in FROM order as nested-loop scans (no reordering). The
-                // driver may read a covering index (rows in index-key order).
-                self.eqp_join_scan_detail(sel, from, &from.first, &label)
+                // Joins run as nested-loop scans in `join_from` order — declaration
+                // order, or the cost-based N-table permutation. The driver may read a
+                // covering index (rows in index-key order).
+                self.eqp_join_scan_detail(
+                    sel,
+                    join_from,
+                    &join_from.first,
+                    &eqp_label(&join_from.first),
+                )
             };
             if from.joins.is_empty() {
                 single_scan_detail = Some(detail.clone());
@@ -15353,9 +15376,9 @@ impl Connection {
         // the rowid-seek decision (shared with the executor via `rowid_join_seek`)
         // can print `SEARCH … USING INTEGER PRIMARY KEY (rowid=?)` in lockstep
         // with how it actually runs.
-        else if !from.joins.is_empty() {
-            let mut left_columns = self.resolve_join_source(&from.first, params)?.0;
-            for join in &from.joins {
+        else if !join_from.joins.is_empty() {
+            let mut left_columns = self.resolve_join_source(&join_from.first, params)?.0;
+            for join in &join_from.joins {
                 let label = eqp_label(&join.table);
                 // SQLite tags the inner side of a LEFT join with a ` LEFT-JOIN`
                 // suffix on its SEARCH node (every seek kind), so the outer-row
@@ -15437,7 +15460,7 @@ impl Connection {
                         None => (
                             alloc::vec![alloc::format!(
                                 "{}{left_suffix}",
-                                self.eqp_join_scan_detail(sel, from, &join.table, &label)
+                                self.eqp_join_scan_detail(sel, join_from, &join.table, &label)
                             )],
                             jcols,
                         ),
@@ -23288,8 +23311,7 @@ impl Connection {
         // (matching sqlite's row order). When a swap below fires instead, the second
         // table drives and these rows are discarded — only `columns` (metadata) is
         // reused, which the covering reorder leaves unchanged.
-        let (mut columns, mut rows) =
-            self.resolve_join_scan_source(sel, from, &from.first, params)?;
+        let (columns, rows) = self.resolve_join_scan_source(sel, from, &from.first, params)?;
 
         // Cost-based join-order (two-table rowid-inner swap): when driving from
         // `from.first` would seek the second table by a secondary index but
@@ -23349,8 +23371,66 @@ impl Connection {
             return Ok((out_columns, input_rows));
         }
 
+        // Cost-based join-order for THREE OR MORE plain-INNER `main` base tables:
+        // sqlite drives the join from a table it must SCAN and pulls the
+        // rowid-/index-seekable tables into the inner positions, so an unordered
+        // query's rows come out in the chosen driver's scan order. When
+        // `ntable_join_order` confidently matches sqlite's ordering it returns a
+        // permuted `FromClause` plus the column-slot remap back to DECLARED order.
+        // The fold runs on the permuted clause (so every inner is seeked in
+        // lockstep with how the EQP emitter renders it), then the columns and every
+        // row are remapped to declared order — so `SELECT *` / `t.*` and the
+        // projection see the unchanged declared layout; only the row ORDER changes.
+        if let Some((reordered, remap)) = self.ntable_join_order(sel, from) {
+            let (drv_columns, drv_rows) =
+                self.resolve_join_scan_source(sel, &reordered, &reordered.first, params)?;
+            let (exec_columns, exec_rows) =
+                self.fold_joins(sel, &reordered, drv_columns, drv_rows, params)?;
+            // Remap execution-order slots back to declared `FROM` order.
+            let out_columns: Vec<ColumnInfo> =
+                remap.iter().map(|&s| exec_columns[s].clone()).collect();
+            let input_rows = exec_rows
+                .into_iter()
+                .map(|row| InputRow {
+                    values: remap.iter().map(|&s| row[s].clone()).collect(),
+                    rowid: None,
+                })
+                .collect();
+            return Ok((out_columns, input_rows));
+        }
+
         // Fold each join in with a nested-loop, evaluating its ON predicate
         // against the columns accumulated so far plus the joined table's.
+        let (columns, rows) = self.fold_joins(sel, from, columns, rows, params)?;
+
+        let input_rows = rows
+            .into_iter()
+            .map(|values| InputRow {
+                values,
+                rowid: None, // ambiguous across joined tables
+            })
+            .collect();
+        Ok((columns, input_rows))
+    }
+
+    /// Fold every `from.joins[i]` onto the already-materialised driver
+    /// (`columns`/`rows`, laid out as `from.first` then the joins folded so far)
+    /// with a nested loop, seeking the inner by rowid / secondary index /
+    /// clustered PK when its join column allows and otherwise materialising and
+    /// hash-probing it. The `ON` (or NATURAL/USING equality) gates each combined
+    /// row; LEFT/RIGHT/FULL emit the null-padded unmatched rows. Returns the
+    /// joined columns (in the given `from`'s layout) and rows. Shared by the
+    /// ordinary declaration-order join path and the N-table cost-based reorder
+    /// (which calls it on a permuted `FromClause` and remaps the result back to
+    /// declared column order — see [`ntable_join_order`](Self::ntable_join_order)).
+    fn fold_joins(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        mut columns: Vec<ColumnInfo>,
+        mut rows: Vec<Vec<Value>>,
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         for join in &from.joins {
             // Roadmap B1a: when the inner table's join column is its rowid IPK,
             // seek the one inner row by rowid per outer row instead of
@@ -23604,14 +23684,7 @@ impl Connection {
             rows = joined;
         }
 
-        let input_rows = rows
-            .into_iter()
-            .map(|values| InputRow {
-                values,
-                rowid: None, // ambiguous across joined tables
-            })
-            .collect();
-        Ok((columns, input_rows))
+        Ok((columns, rows))
     }
 
     /// Resolve one table reference in a join to its columns + row values,
@@ -24875,6 +24948,289 @@ impl Connection {
             return None;
         }
         Some((second_local, first_meta, idx))
+    }
+
+    /// Cost-based join-order search for THREE OR MORE tables (the N-table
+    /// generalisation of [`two_table_rowid_inner_swap`](Self::two_table_rowid_inner_swap)
+    /// / [`two_table_index_inner_swap`](Self::two_table_index_inner_swap)).
+    ///
+    /// sqlite chooses the drive order that minimises total cost: a table sought by
+    /// ROWID/INTEGER-PRIMARY-KEY is the cheapest inner, then a plain secondary-index
+    /// seek, then a full scan — so it pulls the seekable tables into the inner
+    /// positions and drives from a table it must scan. We model that with a greedy
+    /// "cheapest connected next" search rooted at each candidate driver (small N for
+    /// a hand-written query), scoring by the summed per-table access cost (rowid
+    /// seek `0` < index seek `1` < materialised scan `2`, weighted so the cheaper
+    /// inner always wins) and keeping the least-cost order (declaration order as the
+    /// tie-break — a stable choice that matches sqlite's, which we VERIFY on
+    /// asymmetric data in `tests/join_order_ntable.rs`).
+    ///
+    /// Returns `Some((reordered, remap))` — a permuted `FromClause` whose `first` is
+    /// the chosen driver and whose `joins` place each remaining table (carrying the
+    /// `ON` edge that connects it to the already-placed tables) in cost order, plus
+    /// `remap`: for each DECLARED column slot, the slot it occupies in the permuted
+    /// execution layout, so the caller can restore declared column order after the
+    /// fold. Returns `None` (leave declaration-order execution unchanged — rows may
+    /// then differ from sqlite, as today, which is preferable to a WRONG order) when
+    /// any gate fails or the chosen order is not the declaration order AND we cannot
+    /// place every table by a connecting equi-edge.
+    ///
+    /// Tightly gated — ALL must hold, else `None`:
+    /// - at least three tables (`from.joins.len() >= 2`);
+    /// - every join is a plain `INNER` / comma / `CROSS` with an `ON` (never
+    ///   LEFT/RIGHT/FULL/NATURAL/USING — those constrain or fix the order);
+    /// - every source is a plain base table in `main` (no subquery/CTE/view/TVF, not
+    ///   schema-qualified) with no `INDEXED BY` / `NOT INDEXED` hint;
+    /// - every `ON` is a single top-level `=` equating a column of one table with a
+    ///   column of another (a self-equality or a non-column side declines);
+    /// - the join graph is connected from the chosen driver (no cross-product step).
+    #[allow(clippy::type_complexity)]
+    fn ntable_join_order(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+    ) -> Option<(FromClause, Vec<usize>)> {
+        if from.joins.len() < 2 {
+            return None;
+        }
+        let is_plain_main = |tref: &TableRef| -> bool {
+            tref.subquery.is_none()
+                && tref.tvf_args.is_none()
+                && !self.is_bare_tvf(tref)
+                && tref.schema.is_none()
+                && tref.index_hint.is_none()
+                && self.lookup_cte(&tref.name, tref.alias.as_deref()).is_none()
+                && !self.is_view(&tref.name)
+                && self.unqualified_db(&tref.name) == DbRef::Main
+        };
+        // Collect every table reference in declared order (`first`, then each join's
+        // table) and verify each join is a plain INNER with an `ON`.
+        let trefs: Vec<&TableRef> = core::iter::once(&from.first)
+            .chain(from.joins.iter().map(|j| &j.table))
+            .collect();
+        for tref in &trefs {
+            if !is_plain_main(tref) {
+                return None;
+            }
+        }
+        for join in &from.joins {
+            if !matches!(join.kind, JoinKind::Inner) || join.natural || !join.using.is_empty() {
+                return None;
+            }
+            join.on.as_ref()?;
+        }
+        let n = trefs.len();
+        // Per-table metadata and the declared column layout, tracking each table's
+        // column block `[start, start+width)` so an `ON`'s global column index maps
+        // back to `(table, local)`.
+        let mut metas: Vec<TableMeta> = Vec::with_capacity(n);
+        let mut declared_cols: Vec<ColumnInfo> = Vec::new();
+        let mut block_start: Vec<usize> = Vec::with_capacity(n);
+        for tref in &trefs {
+            let meta = self.table_meta(&tref.name, tref.alias.as_deref()).ok()?;
+            block_start.push(declared_cols.len());
+            declared_cols.extend(meta.columns.iter().cloned());
+            metas.push(meta);
+        }
+        let owner_of = |global: usize| -> usize {
+            // The last block whose start is <= global owns the column.
+            block_start.iter().rposition(|&s| s <= global).unwrap_or(0)
+        };
+        // A `WHERE` restriction on a SINGLE table shifts sqlite's driver choice
+        // toward that table by its selectivity — a cost factor we do not model.
+        // Rather than risk a WRONG row order, decline whenever a top-level `WHERE`
+        // conjunct references columns of exactly one base table (a single-table
+        // restriction, not a pure cross-table equi-join) — leaving the join in
+        // declaration-order execution (its row order may then differ from sqlite,
+        // which is acceptable; only a wrong order is not). A conjunct referencing no
+        // resolvable column (a constant, or a column we cannot place) also declines,
+        // conservatively. Subqueries are walked shallowly, so an uncorrelated
+        // subquery restriction is treated as no-column → decline.
+        if let Some(w) = sel.where_clause.as_ref() {
+            let mut conjuncts: Vec<&Expr> = Vec::new();
+            and_conjuncts(w, &mut conjuncts);
+            for c in conjuncts {
+                let mut tables: Vec<usize> = Vec::new();
+                let mut unresolved = false;
+                walk_shallow_columns(c, &mut |_schema, table, column, quoted| {
+                    let cref = Expr::Column {
+                        schema: None,
+                        table: table.map(|t| t.to_string()),
+                        column: column.to_string(),
+                        quoted,
+                    };
+                    match col_index(&cref, &declared_cols) {
+                        Some(g) => {
+                            let t = owner_of(g);
+                            if !tables.contains(&t) {
+                                tables.push(t);
+                            }
+                        }
+                        None => unresolved = true,
+                    }
+                });
+                if unresolved {
+                    return None;
+                }
+                // A single-table restriction (exactly one table referenced) declines.
+                if tables.len() == 1 {
+                    return None;
+                }
+            }
+        }
+        // Extract each `ON` as an undirected equi-edge between two distinct tables,
+        // recording the join index whose `ON` it is (so the reordered clause reuses
+        // that exact predicate). A self-equality or a non-column side declines.
+        struct Edge {
+            a: usize,
+            b: usize,
+            join_idx: usize,
+        }
+        let mut edges: Vec<Edge> = Vec::with_capacity(from.joins.len());
+        for (ji, join) in from.joins.iter().enumerate() {
+            let mut on = join.on.as_ref()?;
+            while let Expr::Paren(inner) = on {
+                on = inner;
+            }
+            let (l, r) = match on {
+                Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left,
+                    right,
+                } => (
+                    col_index(left, &declared_cols)?,
+                    col_index(right, &declared_cols)?,
+                ),
+                _ => return None,
+            };
+            let (ta, tb) = (owner_of(l), owner_of(r));
+            if ta == tb {
+                return None;
+            }
+            edges.push(Edge {
+                a: ta,
+                b: tb,
+                join_idx: ji,
+            });
+        }
+        // Greedy cost-ordered placement from a given driver. Returns the placement
+        // order (table indices, driver first) each paired with the join index whose
+        // `ON` connects it, and the total cost — or `None` if the graph is not
+        // connected from this driver (a cross-product step).
+        let place_from = |driver: usize| -> Option<(Vec<(usize, Option<usize>)>, u64)> {
+            let mut placed = alloc::vec![false; n];
+            placed[driver] = true;
+            let mut order: Vec<(usize, Option<usize>)> = alloc::vec![(driver, None)];
+            // Accumulated left columns, in placement order, for the seek helpers.
+            let mut left_columns: Vec<ColumnInfo> = metas[driver].columns.clone();
+            let mut total: u64 = 0;
+            while order.len() < n {
+                // Among unplaced tables reachable by an edge to a placed table, pick
+                // the cheapest access; tie-break by earliest declared table index.
+                let mut best: Option<(u64, usize, usize)> = None; // (cost, table, join_idx)
+                for e in &edges {
+                    let (placed_side, cand) = if placed[e.a] && !placed[e.b] {
+                        (e.a, e.b)
+                    } else if placed[e.b] && !placed[e.a] {
+                        (e.b, e.a)
+                    } else {
+                        continue;
+                    };
+                    let _ = placed_side;
+                    // Synthesize an INNER `Join` whose inner is the CANDIDATE table
+                    // (carrying this edge's `ON`), evaluated against the accumulated
+                    // left columns, to reuse the exact seek predicates. The original
+                    // `from.joins[e.join_idx].table` may be the OTHER endpoint (when
+                    // this edge is being traversed from the opposite side), so the
+                    // table must be swapped in rather than reused as-is.
+                    let cand_join = Join {
+                        kind: JoinKind::Inner,
+                        table: trefs[cand].clone(),
+                        on: from.joins[e.join_idx].on.clone(),
+                        natural: false,
+                        using: Vec::new(),
+                    };
+                    // rowid seek `0` (cheapest) < secondary-index / clustered-PK seek
+                    // `1` < materialised scan `2`.
+                    let cost = if self.rowid_join_seek(&cand_join, &left_columns).is_some() {
+                        0
+                    } else if self.index_join_seek(&cand_join, &left_columns).is_some()
+                        || self
+                            .without_rowid_pk_join_seek(&cand_join, &left_columns)
+                            .is_some()
+                    {
+                        1
+                    } else {
+                        2
+                    };
+                    // Weight so a cheaper inner strictly dominates regardless of
+                    // declared position; tie-break to the earliest declared table.
+                    let key = (cost, cand as u64);
+                    match best {
+                        Some((bc, bt, _)) if (bc, bt as u64) <= key => {}
+                        _ => best = Some((cost, cand, e.join_idx)),
+                    }
+                }
+                let (cost, cand, join_idx) = best?; // not connected → decline
+                total += cost;
+                placed[cand] = true;
+                left_columns.extend(metas[cand].columns.iter().cloned());
+                order.push((cand, Some(join_idx)));
+            }
+            Some((order, total))
+        };
+        // Search every driver; keep the least-cost placement, tie-broken by the
+        // earliest driver (declaration order) so the choice is deterministic.
+        let mut best: Option<(u64, Vec<(usize, Option<usize>)>)> = None;
+        for driver in 0..n {
+            if let Some((order, cost)) = place_from(driver) {
+                match &best {
+                    Some((bc, _)) if *bc <= cost => {}
+                    _ => best = Some((cost, order)),
+                }
+            }
+        }
+        let (_, order) = best?;
+        // If the least-cost order IS the declaration order, leave the join to the
+        // ordinary declaration-order path (identical execution, no remap needed).
+        if order.iter().map(|&(t, _)| t).eq(0..n) {
+            return None;
+        }
+        // Build the permuted `FromClause`: driver as `first`, then each placed table
+        // as an INNER join carrying its connecting `ON`.
+        let clone_tref = |t: usize| trefs[t].clone();
+        let reordered = FromClause {
+            first: clone_tref(order[0].0),
+            joins: order[1..]
+                .iter()
+                .map(|&(t, ji)| {
+                    let ji = ji.expect("non-driver carries a join edge");
+                    Join {
+                        kind: JoinKind::Inner,
+                        table: clone_tref(t),
+                        on: from.joins[ji].on.clone(),
+                        natural: false,
+                        using: Vec::new(),
+                    }
+                })
+                .collect(),
+        };
+        // `remap[declared_slot] = execution_slot`. The execution layout is the
+        // tables in placement order; compute each placed table's execution block
+        // start, then map declared slot → execution slot column-by-column.
+        let mut exec_block_start = alloc::vec![0usize; n];
+        let mut acc = 0usize;
+        for &(t, _) in &order {
+            exec_block_start[t] = acc;
+            acc += metas[t].columns.len();
+        }
+        let mut remap: Vec<usize> = Vec::with_capacity(declared_cols.len());
+        for (t, meta) in metas.iter().enumerate() {
+            for local in 0..meta.columns.len() {
+                remap.push(exec_block_start[t] + local);
+            }
+        }
+        Some((reordered, remap))
     }
 
     /// Whether the chosen secondary index on `from.first` COVERS the query — every

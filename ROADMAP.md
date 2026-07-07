@@ -1418,10 +1418,20 @@ With B9a-seek and `FOR IN-OPERATOR` shipped, the only open EQP-fidelity thread i
   VDBE-defer in lockstep) and are mutually exclusive with it (`from.first`'s column is rowid → other
   slice; is a secondary-index lead → this one) and never steal the forward inner-seek path (second
   table seekable → declines). Byte-exact vs sqlite3 3.50.4 (`tests/join_order_index_inner.rs`).
-  **Still open (the rest of join order):** the general N-table cost-based ordering when BOTH sides
-  are seekable (secondary-index vs rowid vs scan cost, selectivity, WHERE-pushdown) — the full
-  `whereLoopAddBtree`/`wherePathSolver` port; these two slices cover only the unambiguous
-  one-side-seekable cases.
+  A **third slice** extends the reorder to **three-or-more-table plain-INNER joins**
+  (`ntable_join_order`): each `ON` becomes an undirected equi-edge, and a greedy
+  cheapest-connected-next search rooted at each candidate driver (rowid seek `0` < index/PK
+  seek `1` < scan `2`, ties → earliest-declared) picks the drive order, minimising inner cost.
+  Execution runs the shared `fold_joins` over a permuted `FromClause` then remaps rows/columns
+  back to DECLARED `FROM` order (so `SELECT *` is unchanged; only iteration order moves); EQP +
+  VDBE-defer stay in lockstep. `SELECT u.x,v.q,w.s FROM u JOIN v ON u.x=v.p JOIN w ON u.x=w.r` now
+  comes out in sqlite's driver order. Result set is never changed — a shape it can't confidently
+  match (a single-table WHERE restriction, whose selectivity shifts sqlite's driver) is left in
+  declaration-order execution rather than risk a wrong order (`tests/join_order_ntable.rs`).
+  **Still open (the rest of join order):** selectivity-driven ordering (a WHERE restriction picking
+  the driver), and projection-sensitive driver ties where sqlite's full cost picks a different but
+  equal-cost driver than the greedy (`SELECT w.s FROM u JOIN v … JOIN w …` — rows correct as a set,
+  order differs) — the full `whereLoopAddBtree`/`wherePathSolver` cost formula.
 - **Covering-index scan for a JOIN table — DONE (2026-07-07).** `covering_scan` bailed on any join,
   so a table SCANNED inside a join always table-scanned in rowid order; sqlite reads it via a
   covering index (index-key order) when one holds every referenced column of that table and is

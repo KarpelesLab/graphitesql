@@ -277,7 +277,20 @@ fn two_table_join_matches_tree_walker() {
         "SELECT emp.name, dep.dname, loc.city FROM emp JOIN dep ON emp.dept = dep.did \
          JOIN loc ON loc.dept = emp.dept JOIN dep d2 ON d2.did = emp.dept",
     ] {
-        let mut got = c.query_vdbe(q).unwrap().rows;
+        // An unordered N-table (≥3) inner join whose cost-based order differs from
+        // declaration order is deferred by the VDBE to the tree-walker (which owns
+        // the reorder, changing the observable row order). `query_vdbe` surfaces
+        // that as an `Unsupported` error rather than falling back silently — the
+        // deferral is the intended behaviour, so skip the VDBE-vs-tree comparison
+        // for those shapes (their rows are covered by the differential N-table
+        // suite). With an explicit ORDER BY the drive order is invisible and the
+        // VDBE runs them directly, so those still compare here.
+        let got_vdbe = match c.query_vdbe(q) {
+            Ok(r) => r.rows,
+            Err(e) if format!("{e:?}").contains("N-table cost-based join order") => continue,
+            Err(e) => panic!("query_vdbe failed on {q}: {e:?}"),
+        };
+        let mut got = got_vdbe;
         let mut want = c.query(q).unwrap().rows;
         let qu = q.to_ascii_uppercase();
         if qu.contains("GROUP BY") && !qu.contains("ORDER BY") {
