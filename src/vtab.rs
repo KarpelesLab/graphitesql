@@ -1757,12 +1757,8 @@ pub(crate) fn fts5_highlight(
     // `[fox] [fox]`, while a matched two-word phrase is one `[quick brown]`.
     let mut hits: Vec<(usize, usize)> = Vec::new();
     for term in &terms {
-        // Skip a term scoped to a different column.
-        if term.column.as_deref().is_some_and(|c| {
-            col_names
-                .get(col)
-                .is_none_or(|n| !n.eq_ignore_ascii_case(c))
-        }) {
+        // Skip a term whose column filter excludes this column.
+        if col_names.get(col).is_none_or(|n| !term.admits_column(n)) {
             continue;
         }
         for start in fts5_term_starts(term, &col_tokens, tok) {
@@ -1859,11 +1855,7 @@ pub(crate) fn fts5_snippet(
         if in_scope {
             let col_tokens: Vec<String> = spans.iter().map(|(t, _, _)| t.clone()).collect();
             for (ti, term) in terms.iter().enumerate() {
-                if term.column.as_deref().is_some_and(|c| {
-                    col_names
-                        .get(ci)
-                        .is_none_or(|nm| !nm.eq_ignore_ascii_case(c))
-                }) {
+                if col_names.get(ci).is_none_or(|nm| !term.admits_column(nm)) {
                     continue;
                 }
                 for start in fts5_term_starts(term, &col_tokens, tok) {
@@ -2018,14 +2010,41 @@ pub(crate) fn fts5_snippet(
     out
 }
 
+/// A single FTS5 column-set filter (`col:`, `{c0 c1 …}:`, or their negated
+/// `-col:` / `-{…}:` forms). It restricts the phrase it prefixes to a set of
+/// columns (or, when `negated`, to the complement of that set). A term admits a
+/// column `c` iff `names` contains `c` XOR `negated` — so `{a b}:` admits `a`/`b`
+/// and `-{a}:` admits every column except `a`. Comparison is case-insensitive.
+#[derive(Clone)]
+#[cfg(feature = "fts5")]
+struct Fts5ColSet {
+    /// The listed column names (raw; compared with `eq_ignore_ascii_case`).
+    names: Vec<String>,
+    /// Whether the filter selects the COMPLEMENT of `names` (the `-{…}:`/`-col:`
+    /// form) rather than the set itself.
+    negated: bool,
+}
+
+#[cfg(feature = "fts5")]
+impl Fts5ColSet {
+    /// Whether this filter admits the column named `col`.
+    fn admits(&self, col: &str) -> bool {
+        self.names.iter().any(|n| n.eq_ignore_ascii_case(col)) != self.negated
+    }
+}
+
 /// One term of an FTS5 query: a phrase of one or more consecutive tokens,
-/// optionally restricted to a named column (`col:token`), anchored to the start
-/// of the column (`^token`), and/or ending in a prefix token (`token*`).
+/// optionally restricted to a set of columns (`col:phrase`, `{c0 c1}:phrase`,
+/// and their negated forms), anchored to the start of the column (`^token`),
+/// and/or ending in a prefix token (`token*`).
 #[derive(Clone)]
 #[cfg(feature = "fts5")]
 struct Fts5Term {
-    /// The column the term is scoped to (`col:…`), or `None` for any column.
-    column: Option<String>,
+    /// The column-set filters constraining the term. Empty means "any column";
+    /// each filter must admit a column for the term to be searched there, so
+    /// nested filters (`{a b}:(c:x)`) intersect by appending. Built from the
+    /// `col:` / `{…}:` / `-…:` prefixes.
+    columns: Vec<Fts5ColSet>,
     /// The tokens that must appear consecutively and in order. A bare token is a
     /// one-element phrase; `"quick brown"` is a two-element phrase.
     phrase: Vec<String>,
@@ -2033,6 +2052,34 @@ struct Fts5Term {
     prefix: bool,
     /// Whether the phrase is anchored to the first token of the column (`^token`).
     anchored: bool,
+}
+
+#[cfg(feature = "fts5")]
+impl Fts5Term {
+    /// Whether the term is allowed to match in the column named `col` (every
+    /// column-set filter must admit it; an unfiltered term admits every column).
+    fn admits_column(&self, col: &str) -> bool {
+        self.columns.iter().all(|cs| cs.admits(col))
+    }
+
+    /// If the term is filtered to exactly ONE positive column (a lone,
+    /// non-negated single-name `col:` filter), its name — the only shape the
+    /// segment reader routes as a column-scoped lookup. Any braced set, negated
+    /// filter, or nested/intersected filter yields `None`.
+    fn single_column(&self) -> Option<&str> {
+        match self.columns.as_slice() {
+            [cs] if !cs.negated => match cs.names.as_slice() {
+                [name] => Some(name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether the term carries no column filter at all (matches any column).
+    fn any_column(&self) -> bool {
+        self.columns.is_empty()
+    }
 }
 
 /// The start offsets at which `term` matches in a column's `tokens`, honoring an
@@ -2116,8 +2163,10 @@ fn fts5_near_matches(phrases: &[(Vec<usize>, usize)], n: usize) -> bool {
     }
 }
 
-/// A lexed token of an FTS5 query: a boolean operator, a parenthesis, a term, or
-/// a `NEAR(phrase … , n)` group (its phrases and distance, default 10).
+/// A lexed token of an FTS5 query: a boolean operator, a parenthesis, a term, a
+/// `NEAR(phrase … , n)` group (its phrases and distance, default 10), a
+/// column-set filter (`{c0 c1}:` / `-{…}:` / `-col:`) that binds to the following
+/// primary, or a lex-time syntax error.
 #[cfg(feature = "fts5")]
 enum Fts5Lex {
     Or,
@@ -2127,6 +2176,12 @@ enum Fts5Lex {
     RParen,
     Term(Fts5Term),
     Near(Vec<Fts5Term>, usize),
+    /// A braced/negated column-set filter prefix; binds to the next primary in
+    /// the parser (`{a b}:phrase`, `-{a}:phrase`, `-col:phrase`).
+    ColFilter(Fts5ColSet),
+    /// A lex-time syntax error (e.g. an empty `{}:` or an unterminated brace),
+    /// mirroring SQLite's `fts5: syntax error`. Surfaced by `fts5_query_matches`.
+    Error(String),
 }
 
 /// Lex an FTS5 query string into operators, parentheses, and terms. `OR`/`AND`/
@@ -2155,6 +2210,118 @@ fn fts5_lex(pattern: &str, tok: Fts5Tok) -> Vec<Fts5Lex> {
             i += 1;
             continue;
         }
+        // A column-set filter that binds to the following primary:
+        //   `{c0 c1 …}:`  — restrict to the listed columns;
+        //   `-{c0 c1 …}:` — restrict to the COMPLEMENT of the listed columns;
+        //   `-col:`       — the negated single-column form.
+        // The leading `-` negates; a `{` opens a whitespace-separated name list,
+        // and a bare identifier (no brace) is the single-column form. In every
+        // case a `:` must follow the (closing brace of the) set.
+        {
+            let mut p = i;
+            let negated = chars[p] == '-';
+            if negated {
+                p += 1;
+                while p < n && chars[p].is_whitespace() {
+                    p += 1;
+                }
+            }
+            if p < n && chars[p] == '{' {
+                p += 1;
+                let mut names = Vec::new();
+                loop {
+                    while p < n && chars[p].is_whitespace() {
+                        p += 1;
+                    }
+                    if p < n && chars[p] == '}' {
+                        p += 1;
+                        break;
+                    }
+                    let start = p;
+                    while p < n
+                        && (chars[p].is_alphanumeric() || chars[p] == '_' || chars[p] == '.')
+                    {
+                        p += 1;
+                    }
+                    if p == start {
+                        // Neither a name nor the closing brace: `{}:` or `{a,b}` etc.
+                        out.push(Fts5Lex::Error(alloc::format!(
+                            "fts5: syntax error near \"{}\"",
+                            chars.get(p).copied().unwrap_or('}')
+                        )));
+                        return out;
+                    }
+                    names.push(chars[start..p].iter().collect::<String>());
+                }
+                // A `:` (optionally after whitespace) must follow the `}`.
+                let mut q = p;
+                while q < n && chars[q].is_whitespace() {
+                    q += 1;
+                }
+                if q < n && chars[q] == ':' {
+                    i = q + 1;
+                    while i < n && chars[i].is_whitespace() {
+                        i += 1;
+                    }
+                    if names.is_empty() {
+                        out.push(Fts5Lex::Error(String::from(
+                            "fts5: syntax error near \"}\"",
+                        )));
+                        return out;
+                    }
+                    // A column filter must bind to a phrase or `(`, not another
+                    // brace — SQLite rejects a chained `{a}:{b}:x` (`near "{"`).
+                    if i < n && chars[i] == '{' {
+                        out.push(Fts5Lex::Error(String::from(
+                            "fts5: syntax error near \"{\"",
+                        )));
+                        return out;
+                    }
+                    out.push(Fts5Lex::ColFilter(Fts5ColSet { names, negated }));
+                    continue;
+                }
+                // A `{…}` not followed by `:` is a syntax error; SQLite names the
+                // next token (a run of identifier chars, else the single character).
+                let mut e = q;
+                while e < n && (chars[e].is_alphanumeric() || chars[e] == '_') {
+                    e += 1;
+                }
+                let near: String = if e > q {
+                    chars[q..e].iter().collect()
+                } else {
+                    chars.get(q).copied().map(String::from).unwrap_or_default()
+                };
+                out.push(Fts5Lex::Error(alloc::format!(
+                    "fts5: syntax error near \"{near}\""
+                )));
+                return out;
+            }
+            // A leading `-` that is NOT a braced set: the negated single-column
+            // form `-col:`. Only treat it as a filter when a `col:` prefix follows;
+            // otherwise fall through (a bare `-` is an ordinary token char).
+            if negated {
+                let mut e = p;
+                while e < n && (chars[e].is_alphanumeric() || chars[e] == '_') {
+                    e += 1;
+                }
+                let mut c = e;
+                while c < n && chars[c].is_whitespace() {
+                    c += 1;
+                }
+                if e > p && c < n && chars[c] == ':' {
+                    let name: String = chars[p..e].iter().collect();
+                    i = c + 1;
+                    while i < n && chars[i].is_whitespace() {
+                        i += 1;
+                    }
+                    out.push(Fts5Lex::ColFilter(Fts5ColSet {
+                        names: alloc::vec![name],
+                        negated: true,
+                    }));
+                    continue;
+                }
+            }
+        }
         // An optional `column:` prefix: a run of identifier chars then a colon.
         // SQLite allows whitespace around the colon (`col : token` == `col:token`).
         let mut column = None;
@@ -2171,6 +2338,14 @@ fn fts5_lex(pattern: &str, tok: Fts5Tok) -> Vec<Fts5Lex> {
             i = k + 1;
             while i < n && chars[i].is_whitespace() {
                 i += 1;
+            }
+            // `col:` must bind to a phrase, not a brace — SQLite rejects the
+            // chained `a:{b}:x` shape (`near "{"`).
+            if i < n && chars[i] == '{' {
+                out.push(Fts5Lex::Error(String::from(
+                    "fts5: syntax error near \"{\"",
+                )));
+                return out;
             }
         }
         // A leading `^` anchors the term to the first token of the column.
@@ -2257,8 +2432,17 @@ fn fts5_lex(pattern: &str, tok: Fts5Tok) -> Vec<Fts5Lex> {
         // Diacritics ARE folded at the table's level so the query matches the docs.
         let phrase = fts5_tokenize(&text, Fts5Tok { stem: false, ..tok });
         if !phrase.is_empty() {
+            // An inline `col:` prefix is the single-column filter; the braced/negated
+            // forms come through as `ColFilter` tokens applied by the parser.
+            let columns = match column {
+                Some(name) => alloc::vec![Fts5ColSet {
+                    names: alloc::vec![name],
+                    negated: false,
+                }],
+                None => Vec::new(),
+            };
             out.push(Fts5Lex::Term(Fts5Term {
-                column,
+                columns,
                 phrase,
                 prefix,
                 anchored,
@@ -2336,8 +2520,11 @@ impl Fts5Parser<'_> {
         loop {
             match self.toks.get(self.pos) {
                 Some(Fts5Lex::And) => self.pos += 1,
-                // Juxtaposition (a term, NEAR group, or `(`) is an implicit AND.
-                Some(Fts5Lex::Term(_) | Fts5Lex::Near(..) | Fts5Lex::LParen) => {}
+                // Juxtaposition (a term, NEAR group, column filter, or `(`) is an
+                // implicit AND.
+                Some(
+                    Fts5Lex::Term(_) | Fts5Lex::Near(..) | Fts5Lex::LParen | Fts5Lex::ColFilter(_),
+                ) => {}
                 _ => break,
             }
             match self.parse_not() {
@@ -2380,20 +2567,48 @@ impl Fts5Parser<'_> {
                 self.pos += 1;
                 Some(q)
             }
+            // A column-set filter (`{a b}:`, `-{a}:`, `-col:`) binds to the
+            // immediately-following primary; the filter is pushed down onto every
+            // term/phrase within it (nested filters intersect by appending).
+            Some(Fts5Lex::ColFilter(cs)) => {
+                let cs = cs.clone();
+                self.pos += 1;
+                let mut inner = self.parse_primary()?;
+                fts5_apply_col_filter(&mut inner, &cs);
+                Some(inner)
+            }
             _ => None,
         }
     }
 }
 
-/// Whether a single term matches any in-scope column (respecting `col:` scoping
-/// and the `^` anchor).
+/// Push a column-set filter down onto every term and NEAR phrase in `q`,
+/// intersecting with any filter already present (nested `{a b}:(c:x)` — the
+/// inner `c:` and the outer `{a b}:` must both admit a column). This is how a
+/// braced/negated filter that prefixes a parenthesised sub-expression restricts
+/// all of its terms.
+#[cfg(feature = "fts5")]
+fn fts5_apply_col_filter(q: &mut Fts5Query, cs: &Fts5ColSet) {
+    match q {
+        Fts5Query::Term(t) => t.columns.push(cs.clone()),
+        Fts5Query::Near(phrases, _) => {
+            for p in phrases {
+                p.columns.push(cs.clone());
+            }
+        }
+        Fts5Query::And(a, b) | Fts5Query::Or(a, b) | Fts5Query::Not(a, b) => {
+            fts5_apply_col_filter(a, cs);
+            fts5_apply_col_filter(b, cs);
+        }
+    }
+}
+
+/// Whether a single term matches any in-scope column (respecting the term's
+/// `col:`/`{…}:` column-set filter and the `^` anchor).
 #[cfg(feature = "fts5")]
 fn fts5_term_matches(term: &Fts5Term, cols: &[(&str, Vec<String>)], tok: Fts5Tok) -> bool {
     cols.iter().any(|(name, tokens)| {
-        term.column
-            .as_deref()
-            .is_none_or(|c| name.eq_ignore_ascii_case(c))
-            && !fts5_term_starts(term, tokens, tok).is_empty()
+        term.admits_column(name) && !fts5_term_starts(term, tokens, tok).is_empty()
     })
 }
 
@@ -2406,7 +2621,12 @@ fn fts5_near_group_matches(
     cols: &[(&str, Vec<String>)],
     tok: Fts5Tok,
 ) -> bool {
-    cols.iter().any(|(_, tokens)| {
+    cols.iter().any(|(name, tokens)| {
+        // A column filter on the group (`{a}:NEAR(…)`, distributed to each phrase)
+        // restricts the whole proximity search to the admitted columns.
+        if !phrases.iter().all(|p| p.admits_column(name)) {
+            return false;
+        }
         let positioned: Vec<(Vec<usize>, usize)> = phrases
             .iter()
             .map(|p| (fts5_term_starts(p, tokens, tok), p.phrase.len()))
@@ -2427,14 +2647,72 @@ fn fts5_eval(query: &Fts5Query, cols: &[(&str, Vec<String>)], tok: Fts5Tok) -> b
     }
 }
 
+/// Collect every column name referenced by a `col:` / `{…}:` filter in the term.
+#[cfg(feature = "fts5")]
+fn fts5_term_filter_names<'a>(term: &'a Fts5Term, out: &mut Vec<&'a str>) {
+    for cs in &term.columns {
+        out.extend(cs.names.iter().map(String::as_str));
+    }
+}
+
+/// Validate a `MATCH` query `pattern` before it is run: report a lex-time syntax
+/// error (an empty/unterminated `{…}:` brace) or an unknown column named in any
+/// `col:` / `{…}:` filter, in SQLite's message form — `fts5: syntax error …` or
+/// `no such column: NAME`. `all_columns` is the table's FULL declared column list
+/// (indexed and `UNINDEXED`, since an `UNINDEXED` column is a valid filter target
+/// that simply matches nothing). Returns `None` when the query is well-formed.
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_query_column_error(
+    pattern: &str,
+    all_columns: &[String],
+    tok: Fts5Tok,
+) -> Option<String> {
+    let toks = fts5_lex(pattern, tok);
+    // A lex-time syntax error (malformed brace) is reported first, as SQLite does.
+    for t in &toks {
+        if let Fts5Lex::Error(msg) = t {
+            return Some(msg.clone());
+        }
+    }
+    let query = (Fts5Parser {
+        toks: &toks,
+        pos: 0,
+    })
+    .parse()?;
+    // Walk the tree collecting every filtered column name.
+    fn walk<'a>(q: &'a Fts5Query, names: &mut Vec<&'a str>) {
+        match q {
+            Fts5Query::Term(t) => fts5_term_filter_names(t, names),
+            Fts5Query::Near(phrases, _) => {
+                for p in phrases {
+                    fts5_term_filter_names(p, names);
+                }
+            }
+            Fts5Query::And(a, b) | Fts5Query::Or(a, b) | Fts5Query::Not(a, b) => {
+                walk(a, names);
+                walk(b, names);
+            }
+        }
+    }
+    let mut names = Vec::new();
+    walk(&query, &mut names);
+    for name in names {
+        if !all_columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+            return Some(alloc::format!("no such column: {name}"));
+        }
+    }
+    None
+}
+
 /// Whether the in-scope columns satisfy the FTS5 query `pattern`. `cols` is the
 /// `(name, text)` of each searchable column (one entry for a column-scoped
 /// `col MATCH …`, every column for a table-wide `tbl MATCH …`). The query
-/// supports bare tokens, `token*` prefixes, `"quoted phrases"`, `col:…` column
-/// filters, and the boolean operators `AND` (explicit or implicit by
-/// juxtaposition), `OR`, and `NOT` (binding tightest to loosest: `NOT`, `AND`,
-/// `OR`) with parentheses — matching SQLite's default precedence — and the
-/// `NEAR(p1 p2 …, n)` proximity group. A query with no tokens matches nothing.
+/// supports bare tokens, `token*` prefixes, `"quoted phrases"`, `col:…` /
+/// `{c0 c1}:…` column filters (and their negated `-col:` / `-{…}:` forms), and
+/// the boolean operators `AND` (explicit or implicit by juxtaposition), `OR`,
+/// and `NOT` (binding tightest to loosest: `NOT`, `AND`, `OR`) with parentheses —
+/// matching SQLite's default precedence — and the `NEAR(p1 p2 …, n)` proximity
+/// group. A query with no tokens matches nothing.
 #[cfg(feature = "fts5")]
 pub(crate) fn fts5_query_matches(pattern: &str, cols: &[(String, String)], tok: Fts5Tok) -> bool {
     let toks = fts5_lex(pattern, tok);
@@ -2476,7 +2754,7 @@ pub(crate) fn fts5_single_bare_term(pattern: &str, tok: Fts5Tok) -> Option<Vec<u
         [Fts5Lex::Term(t)] => t,
         _ => return None,
     };
-    if term.column.is_some() || term.prefix || term.anchored {
+    if !term.any_column() || term.prefix || term.anchored {
         return None;
     }
     // A bare word lexes to a one-token phrase; a quoted multi-word phrase does not.
@@ -2518,8 +2796,9 @@ pub(crate) fn fts5_single_bare_term_column(
         [Fts5Lex::Term(t)] => t,
         _ => return None,
     };
-    // Must be column-scoped, and otherwise a plain single-token bare word.
-    let column = term.column.clone()?;
+    // Must be scoped to exactly one positive column (a braced set/negated filter
+    // stays on the scan), and otherwise a plain single-token bare word.
+    let column = String::from(term.single_column()?);
     if term.prefix || term.anchored {
         return None;
     }
@@ -2579,7 +2858,7 @@ pub(crate) fn fts5_single_prefix_term(pattern: &str, tok: Fts5Tok) -> Option<Vec
         [Fts5Lex::Term(t)] => t,
         _ => return None,
     };
-    if term.column.is_some() {
+    if !term.any_column() {
         return None;
     }
     fts5_prefix_term_key(term, tok)
@@ -2599,7 +2878,7 @@ pub(crate) fn fts5_single_prefix_term_column(
         [Fts5Lex::Term(t)] => t,
         _ => return None,
     };
-    let column = term.column.clone()?;
+    let column = String::from(term.single_column()?);
     let key = fts5_prefix_term_key(term, tok)?;
     Some((column, key))
 }
@@ -2653,7 +2932,7 @@ pub(crate) fn fts5_phrase_terms(pattern: &str, tok: Fts5Tok) -> Option<Vec<Vec<u
         [Fts5Lex::Term(t)] => t,
         _ => return None,
     };
-    if term.column.is_some() {
+    if !term.any_column() {
         return None;
     }
     fts5_phrase_keys(term, tok)
@@ -2673,7 +2952,7 @@ pub(crate) fn fts5_phrase_terms_column(
         [Fts5Lex::Term(t)] => t,
         _ => return None,
     };
-    let column = term.column.clone()?;
+    let column = String::from(term.single_column()?);
     let keys = fts5_phrase_keys(term, tok)?;
     Some((column, keys))
 }
@@ -2739,7 +3018,7 @@ pub(crate) enum Fts5BoolOp {
 /// equals the indexed token. `None` for anything else.
 #[cfg(feature = "fts5")]
 fn fts5_bare_term_key(term: &Fts5Term, tok: Fts5Tok) -> Option<Vec<u8>> {
-    if term.column.is_some() || term.prefix || term.anchored {
+    if !term.any_column() || term.prefix || term.anchored {
         return None;
     }
     let [word] = term.phrase.as_slice() else {
@@ -2935,10 +3214,7 @@ pub(crate) fn fts5_bm25_corpus(
                 let name = col_names.get(ci);
                 if !searchable(ci)
                     || scope.is_some_and(|s| name.is_none_or(|nm| !nm.eq_ignore_ascii_case(s)))
-                    || term
-                        .column
-                        .as_deref()
-                        .is_some_and(|c| name.is_none_or(|nm| !nm.eq_ignore_ascii_case(c)))
+                    || name.is_none_or(|nm| !term.admits_column(nm))
                 {
                     continue;
                 }

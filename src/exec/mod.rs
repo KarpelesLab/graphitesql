@@ -9855,6 +9855,37 @@ impl Connection {
                 hidden: false,
             })
             .collect();
+        // Validate an FTS5 `MATCH` query's column filters once, before scanning:
+        // a `col:` / `{…}:` filter naming a non-existent column is a query error
+        // (`no such column: NAME`), and a malformed brace is a syntax error — both
+        // reported by SQLite at cursor-filter time, so even an empty table errors.
+        #[cfg(feature = "fts5")]
+        if cvt.module.eq_ignore_ascii_case("fts5") {
+            if let Some((sel, params)) = pushdown {
+                if let Some(where_expr) = sel.where_clause.as_ref() {
+                    if let Some((query, operand)) = self.fts5_match_query(where_expr, params) {
+                        // The MATCH operand must refer to this table (the table
+                        // itself, its alias, or one of its columns); validate the
+                        // query's `col:`/`{…}:` filters against its full declared
+                        // column list (`schema.columns`, indexed and UNINDEXED).
+                        let names_scope = operand.eq_ignore_ascii_case(name)
+                            || alias.is_some_and(|a| operand.eq_ignore_ascii_case(a))
+                            || schema
+                                .columns
+                                .iter()
+                                .any(|c| c.eq_ignore_ascii_case(&operand));
+                        if names_scope {
+                            let tok = crate::vtab::fts5_tok_config(&arg_refs);
+                            if let Some(msg) =
+                                crate::vtab::fts5_query_column_error(&query, &schema.columns, tok)
+                            {
+                                return Err(Error::Error(msg));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // A persistent module keeps its rows in the `<vtab>_data` backing table;
         // scan that directly (run_core re-applies the full WHERE, so the rows are
         // a valid superset). Computed modules go through the cursor path below.
@@ -37940,6 +37971,7 @@ fn find_integer_primary_key(ct: &CreateTable) -> Option<usize> {
 #[cfg(all(test, feature = "fts5", feature = "std"))]
 mod fts5_index_route_tests {
     use super::Connection;
+    use crate::error::Error;
     use crate::fts5_index::INDEX_ROUTE_HITS;
     use crate::value::Value;
     use core::sync::atomic::Ordering;
@@ -38045,7 +38077,7 @@ mod fts5_index_route_tests {
             "NEAR(quick fo*)",              // a prefix NEAR operand → stays on scan
             "fox AND NEAR(quick brown)",    // NEAR inside a boolean → stays on scan
             "\"quick brown\" OR bear",      // phrase operand → stays on scan
-            "title : quick OR fox",         // column-scoped operand → stays on scan
+            "body : quick OR fox",          // column-scoped operand → stays on scan
             "quick AND brown AND qui*",     // 3 operands, one a prefix → scan
             "(quick OR brown) AND fox*",    // parenthesized, one a prefix → scan
             "quick AND NEAR(brown fox, 2)", // a NEAR leaf in the tree → scan
@@ -38507,15 +38539,18 @@ mod fts5_index_route_tests {
         );
         assert_eq!(rows, [2, 3, 5]);
 
-        // A column filter naming a non-existent column matches nothing and stays on
-        // the scan (which also yields nothing).
+        // A column filter naming a non-existent column is a query error (matching
+        // sqlite's `no such column`), reported before any routing — the query never
+        // reaches the index or the scan.
         let before = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
-        let rows = ids(
-            &mut c,
-            "SELECT rowid FROM t WHERE t MATCH 'nope:fox' ORDER BY rowid",
+        let err = c
+            .query("SELECT rowid FROM t WHERE t MATCH 'nope:fox' ORDER BY rowid")
+            .expect_err("unknown-column filter must error");
+        assert!(
+            matches!(&err, Error::Error(m) if m.contains("no such column: nope")),
+            "{err:?}"
         );
         let after = INDEX_ROUTE_HITS.load(Ordering::Relaxed);
-        assert_eq!(after, before, "unknown-column filter must stay on the scan");
-        assert!(rows.is_empty());
+        assert_eq!(after, before, "an erroring query takes no index route");
     }
 }
