@@ -8516,6 +8516,10 @@ impl Connection {
         } else {
             del
         };
+        if self.is_dbpage_write_target(del.schema.as_deref(), &del.table) {
+            // SQLite's `sqlite_dbpage` xUpdate rejects a delete outright.
+            return Err(Error::Error("cannot delete".into()));
+        }
         if self.is_virtual_table(&del.table) {
             return self.exec_vtab_delete(del, params);
         }
@@ -8676,6 +8680,9 @@ impl Connection {
         } else {
             upd
         };
+        if self.is_dbpage_write_target(upd.schema.as_deref(), &upd.table) {
+            return self.exec_dbpage_update(upd, params);
+        }
         if self.is_virtual_table(&upd.table) {
             return self.exec_vtab_update(upd, params);
         }
@@ -27837,6 +27844,89 @@ impl Connection {
             });
         }
         Ok((columns, rows))
+    }
+
+    /// Whether a DML target names the eponymous *writable* `sqlite_dbpage` vtab.
+    /// Only the unqualified form (targeting the active `main` database) is a write
+    /// target — a schema-qualified `aux.sqlite_dbpage` write is rare and left to
+    /// the normal path (matching the read side's main-default). A real table of
+    /// that name (none can normally exist — `sqlite_` is reserved) shadows it.
+    fn is_dbpage_write_target(&self, schema: Option<&str>, table: &str) -> bool {
+        schema.is_none()
+            && table.eq_ignore_ascii_case("sqlite_dbpage")
+            && self.schema.table(table).is_none()
+    }
+
+    /// The columns of the `sqlite_dbpage` vtab, `(pgno INTEGER, data BLOB)`.
+    fn dbpage_columns(&self) -> Vec<ColumnInfo> {
+        use eval::Affinity::{Blob, Integer};
+        let col = |name: &str, affinity| ColumnInfo {
+            name: String::from(name),
+            table: String::from("sqlite_dbpage"),
+            affinity,
+            collation: crate::value::Collation::default(),
+            schema: None,
+            hidden: false,
+        };
+        alloc::vec![col("pgno", Integer), col("data", Blob)]
+    }
+
+    /// `UPDATE sqlite_dbpage SET data = <blob> WHERE pgno = …` — overwrite the raw
+    /// bytes of each matching page (SQLite's `dbpageUpdate`, minus the defensive-mode
+    /// gate graphite has no equivalent for). Assigning `pgno` is rejected ("cannot
+    /// insert" — a page cannot be relocated), and the assigned value must be a blob
+    /// exactly one page in size ("bad page value"). `RETURNING`/`FROM` are not
+    /// meaningful here and are rejected.
+    fn exec_dbpage_update(&mut self, upd: &Update, params: &Params) -> Result<usize> {
+        if !upd.returning.is_empty() || upd.from.is_some() || !upd.row_assignments.is_empty() {
+            return Err(Error::Unsupported("RETURNING / FROM on sqlite_dbpage"));
+        }
+        // Only `data` may be assigned; touching `pgno` moves a page, which SQLite's
+        // xUpdate reports as "cannot insert".
+        for (col, _) in &upd.assignments {
+            if col.eq_ignore_ascii_case("pgno") {
+                return Err(Error::Error("cannot insert".into()));
+            }
+            if !col.eq_ignore_ascii_case("data") {
+                return Err(Error::Error(format!("no such column: {col}")));
+            }
+        }
+        let cols = self.dbpage_columns();
+        let page_size = self.backend.source().header().page_size as usize;
+        let count = self.backend.source().page_count();
+        // First pass (reads only): find the pages WHERE selects and compute their
+        // new bytes; then a second pass writes them (so the read borrow is dropped
+        // before the writer borrow, and a mid-loop failure changes nothing).
+        let mut writes: Vec<(u32, Vec<u8>)> = Vec::new();
+        for pgno in 1..=count {
+            let data = self.backend.source().page(pgno)?.data().to_vec();
+            let row = alloc::vec![Value::Integer(pgno as i64), Value::Blob(data)];
+            let selected = match &upd.where_clause {
+                Some(w) => {
+                    let ctx = row_ctx(&row, &cols, Some(pgno as i64), params).with_subqueries(self);
+                    eval::truth(&eval::eval(w, &ctx)?) == Some(true)
+                }
+                None => true,
+            };
+            if !selected {
+                continue;
+            }
+            let mut new_data = row[1].clone();
+            for (_, expr) in &upd.assignments {
+                let ctx = row_ctx(&row, &cols, Some(pgno as i64), params).with_subqueries(self);
+                new_data = eval::eval(expr, &ctx)?;
+            }
+            match new_data {
+                Value::Blob(b) if b.len() == page_size => writes.push((pgno, b)),
+                _ => return Err(Error::Error("bad page value".into())),
+            }
+        }
+        let n = writes.len();
+        let w = self.backend.writer()?;
+        for (pgno, bytes) in writes {
+            w.write_page(pgno, bytes)?;
+        }
+        Ok(n)
     }
 
     fn scan_dbstat(
