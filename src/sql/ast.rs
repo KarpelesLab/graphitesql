@@ -131,6 +131,12 @@ pub struct WindowSpec {
     /// For `OVER window_name`, the referenced named window (resolved against the
     /// query's `WINDOW name AS (…)` definitions before computation).
     pub base_name: Option<String>,
+    /// `true` when the base window is referenced from a *parenthesized* spec
+    /// (`OVER (base …)`) rather than the bare `OVER base` form. Only the
+    /// parenthesized form may extend the base, and extending a base that already
+    /// carries a PARTITION/ORDER BY/frame is an error (SQLite's
+    /// `sqlite3WindowChain`); the bare form uses the base as-is.
+    pub base_parenthesized: bool,
 }
 
 /// A window frame: a mode (`ROWS`/`RANGE`/`GROUPS`), start/end bounds, and an

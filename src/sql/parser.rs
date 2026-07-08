@@ -2634,6 +2634,7 @@ impl Parser {
                 "partition" | "order" | "rows" | "range" | "groups"
             ) {
                 spec.base_name = Some(self.ident()?);
+                spec.base_parenthesized = true;
             }
         }
         if self.eat_kw("partition") {

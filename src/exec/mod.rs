@@ -34335,6 +34335,28 @@ fn resolve_window_ref(wexpr: &Expr, defs: &[(String, WindowSpec)]) -> Result<Exp
         .find(|(n, _)| n.eq_ignore_ascii_case(base))
         .map(|(_, s)| s)
         .ok_or_else(|| Error::Error(alloc::format!("no such window: {base}")))?;
+    // A *parenthesized* base reference (`OVER (base …)`) may extend the base only
+    // where the base leaves room: it cannot add a PARTITION BY, cannot add an
+    // ORDER BY when the base already has one, and cannot supply/override a frame
+    // when the base already carries one — SQLite's `sqlite3WindowChain`, checked
+    // in that order. The bare `OVER base` form uses the base verbatim and is
+    // exempt.
+    if spec.base_parenthesized {
+        let zerr = if !spec.partition_by.is_empty() {
+            Some("PARTITION clause")
+        } else if !def.order_by.is_empty() && !spec.order_by.is_empty() {
+            Some("ORDER BY clause")
+        } else if def.frame.is_some() {
+            Some("frame specification")
+        } else {
+            None
+        };
+        if let Some(zerr) = zerr {
+            return Err(Error::Error(alloc::format!(
+                "cannot override {zerr} of window: {base}"
+            )));
+        }
+    }
     // The named window provides PARTITION BY; the referencing use may add ORDER BY
     // and a frame when the base omits them.
     let effective = WindowSpec {
@@ -34346,6 +34368,7 @@ fn resolve_window_ref(wexpr: &Expr, defs: &[(String, WindowSpec)]) -> Result<Exp
         },
         frame: spec.frame.clone().or_else(|| def.frame.clone()),
         base_name: None,
+        base_parenthesized: false,
     };
     Ok(Expr::Function {
         name: name.clone(),
