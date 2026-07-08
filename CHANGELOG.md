@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/KarpelesLab/graphitesql/compare/v0.0.16...v0.1.0) - 2026-07-08
+
+### Added
+
+- *(storage)* store whole-number reals in REAL columns as int serials
+- *(exec)* UPDATE … FROM on WITHOUT ROWID tables + fix source-column stripping
+- *(exec)* support UPSERT and RETURNING on WITHOUT ROWID tables
+- *(cli)* implement the .read shell command
+- *(cli)* implement the .databases shell command
+- *(cli)* .tables/.indexes use sqlite's columnar list layout
+
+### Fixed
+
+- *(json)* decode backslash escapes in a quoted JSON path key
+- *(exec)* keep an AFTER UPDATE trigger's edit to a later row
+- *(exec)* reject unknown columns in a FROM-less SELECT at prepare time
+- *(exec)* compensated (Kahan) summation for sum/avg/total
+- *(func)* quote() truncates a text value at an embedded NUL
+- *(exec)* break compound ORDER BY ties on the remaining columns
+- *(exec)* auto rowid after a negative explicit rowid is max+1, not 1
+- *(exec)* BEFORE INSERT trigger sees rowid -1 for an auto row
+- *(exec)* targeted UPSERT updates the named conflict's row
+- *(exec)* reject illegal overrides of a base window's clauses
+- *(exec)* printf ! flag renders through the sqlite3FpDecode port
+
 ## [0.0.16](https://github.com/KarpelesLab/graphitesql/compare/v0.0.15...v0.0.16) - 2026-07-08
 
 ### Added
