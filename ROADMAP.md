@@ -258,9 +258,15 @@ result or declines to it — never a wrong answer), so this track is
   choice (SQLite picks the index that covers the input **and** serves the
   `PARTITION BY`/window-`ORDER BY`), so this is **blocked on B9h** (plus a
   deterministic model for the multi-window/nested `(subquery-N)` numbering).
-- **B4 — `sqlite_stat4` histograms.** The pinned oracle is built without
-  `SQLITE_ENABLE_STAT4`, so a stat4-driven planner would *diverge* the corpus.
-  **Needs a stat4-enabled oracle** before it can be verified.
+- **B4 — `sqlite_stat4` histograms.** *Generation done (2026-07-09).* `ANALYZE`
+  now emits byte-compatible `sqlite_stat4` (faithful `analyze.c` accumulator port
+  in `src/exec/stat4.rs`), verified 0-diff against a `-DSQLITE_ENABLE_STAT4`
+  oracle build across 300+ fuzzed schemas; a pre-existing `sqlite_stat1` avg-eq
+  divergence was fixed in the same pass. **Remaining:** consult stat4 in the
+  planner (range/eq selectivity, `whereRangeScanEst`-style) — deliberately not
+  wired in yet to keep the EQP-differential cost model green; needs its own
+  differential validation. (Verified with the STAT4 oracle in scratchpad; the
+  stat4-driven *planner* is the follow-up, not the data.)
 
 ### Track C — Storage engine, transactions, concurrency
 
@@ -331,11 +337,15 @@ the write target by qualifier, reads by the global `main → temp → attached` 
 
 ### CLI shell (`graphitesql`)
 
-The shell covers the common introspection/dump commands. Not yet implemented:
-`.output`/`.once` (output redirection — needs threading the writer through the
-result/dump printers), `.import` (CSV load), `.backup`, `.print`, `.show`, and the
-non-`list` `.mode`s. Peripheral (the SQL engine, not the shell, is the project's
-purpose) and outside the differential corpus, so lower priority.
+The shell covers the common introspection/dump commands, and as of 2026-07-09 the
+output/import layer: `.mode` (`list`/`csv`/`column`/`line`/`tabs`/`quote`/`insert`/
+`json`), `.separator`, `.nullvalue`, `.output`/`.once`, `.import` (CSV), `.echo`,
+`.changes` — all byte-verified against `sqlite3` 3.50.4. Still not implemented:
+`.backup` (needs an engine DB-copy/serialize API), `.bail` (observable only via the
+CLI error-message text, which graphite renders `Error:` rather than sqlite's
+`Parse error near line N`), `.print`, `.show`, and the `ascii`/`html`/`markdown`/
+`box`/`tcl` `.mode`s. Peripheral (the SQL engine, not the shell, is the project's
+purpose), so lower priority.
 
 ---
 
