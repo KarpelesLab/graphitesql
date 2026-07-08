@@ -23118,10 +23118,12 @@ impl Connection {
     /// keyword pseudo-column. So it only ever rejects a name that per-row
     /// evaluation would have rejected too — it just does so eagerly, like SQLite.
     fn validate_columns_exist(&self, sel: &Select, columns: &[ColumnInfo]) -> Result<()> {
-        let Some(from) = &sel.from else { return Ok(()) };
         if window::has_window(sel) {
             return Ok(());
         }
+        let Some(from) = &sel.from else {
+            return self.validate_no_from_columns(sel);
+        };
         // Every FROM source must be a plain, non-virtual base table/view, and every
         // join an ordinary `ON`/cross join (a `NATURAL`/`USING` join coalesces
         // columns, so `columns` would not list a name the body legitimately uses).
@@ -23271,6 +23273,89 @@ impl Connection {
                     missing = column_missing(schema, table, column, quoted);
                 } else if !aliases.iter().any(|a| a.eq_ignore_ascii_case(column)) {
                     missing = column_missing(None, None, column, quoted);
+                }
+            });
+        }
+        match missing {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The FROM-less arm of [`Self::validate_columns_exist`]: a `SELECT` with no
+    /// `FROM` has no columns in scope, so *any* column reference is `no such
+    /// column` — which SQLite reports at prepare time even when the reference sits
+    /// in a short-circuited branch (e.g. the never-taken arm of `IFNULL(1, zzz)`)
+    /// that the lazy per-row evaluator would skip. Runs only at the outermost
+    /// query (the caller's `outer_scope.is_empty()` gate), so a *correlated*
+    /// FROM-less subquery — which legitimately reads an enclosing FROM — is never
+    /// reached here. Output aliases remain referenceable from `GROUP BY` / `HAVING`
+    /// / `ORDER BY`; the `current_date`/`current_time`/`current_timestamp` keyword
+    /// pseudo-values resolve without a table (a `rowid` alias does not).
+    fn validate_no_from_columns(&self, sel: &Select) -> Result<()> {
+        // A `table.*` has no source to name.
+        for c in &sel.columns {
+            if let ResultColumn::TableWildcard(q) = c {
+                return Err(Error::Error(alloc::format!("no such table: {q}")));
+            }
+        }
+        let is_datetime_kw = |column: &str| {
+            matches!(
+                column.to_ascii_lowercase().as_str(),
+                "current_date" | "current_time" | "current_timestamp"
+            )
+        };
+        let aliases: Vec<&str> = sel
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                ResultColumn::Expr { alias: Some(a), .. } => Some(a.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut missing: Option<Error> = None;
+        // Projection and WHERE: an output alias is *not* visible here (SQLite
+        // rejects `SELECT 1 AS x, x`), so every column reference is missing.
+        let mut targets: Vec<&Expr> = Vec::new();
+        for c in &sel.columns {
+            if let ResultColumn::Expr { expr, .. } = c {
+                targets.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            targets.push(w);
+        }
+        for e in targets {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
+                if missing.is_none() && !is_datetime_kw(column) {
+                    missing = Some(eval::no_such_column(schema, table, column, quoted));
+                }
+            });
+        }
+        // GROUP BY / HAVING / ORDER BY may name an output alias.
+        let mut clause_refs: Vec<&Expr> = Vec::new();
+        for g in &sel.group_by {
+            clause_refs.push(g);
+        }
+        if let Some(h) = &sel.having {
+            clause_refs.push(h);
+        }
+        for o in &sel.order_by {
+            clause_refs.push(&o.expr);
+        }
+        for e in clause_refs {
+            if missing.is_some() {
+                break;
+            }
+            walk_shallow_columns(e, &mut |schema, table, column, quoted| {
+                if missing.is_some() || is_datetime_kw(column) {
+                    return;
+                }
+                if table.is_some() || !aliases.iter().any(|a| a.eq_ignore_ascii_case(column)) {
+                    missing = Some(eval::no_such_column(schema, table, column, quoted));
                 }
             });
         }
