@@ -260,11 +260,25 @@ impl Shell {
             ".quit" | ".exit" => return true,
             ".help" => print_help(),
             ".tables" => {
-                for obj in conn.schema().objects() {
-                    if obj.obj_type == graphitesql::schema::ObjectType::Table {
-                        println!("{}", obj.name);
-                    }
+                // Tables and views, excluding internal `sqlite_*`; an optional
+                // argument is used verbatim as a `LIKE` pattern on the name.
+                let mut sql = String::from(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'",
+                );
+                if let Some(pat) = arg {
+                    sql.push_str(&format!(" AND name LIKE '{}'", pat.replace('\'', "''")));
                 }
+                print_columnar(collect_names(conn, &sql));
+            }
+            ".indexes" | ".indices" => {
+                // Every index (including auto-created UNIQUE/PK indexes); an
+                // optional argument filters by owning table via `LIKE`.
+                let mut sql = String::from("SELECT name FROM sqlite_master WHERE type='index'");
+                if let Some(pat) = arg {
+                    sql.push_str(&format!(" AND tbl_name LIKE '{}'", pat.replace('\'', "''")));
+                }
+                print_columnar(collect_names(conn, &sql));
             }
             ".schema" => {
                 use graphitesql::schema::ObjectType;
@@ -302,7 +316,8 @@ impl Shell {
 
 fn print_help() {
     eprintln!(".help              Show this message");
-    eprintln!(".tables            List table names");
+    eprintln!(".tables [LIKE]     List table and view names");
+    eprintln!(".indexes [LIKE]    List index names");
     eprintln!(".schema [TABLE]    Show CREATE statements");
     eprintln!(".dump              Dump the database as SQL text");
     eprintln!(".headers on|off    Toggle column headers (default off)");
@@ -413,6 +428,47 @@ fn dump_database(conn: &Connection) {
         }
     }
     println!("COMMIT;");
+}
+
+/// Collect the single-column text results of `sql` (a name-listing query).
+fn collect_names(conn: &Connection, sql: &str) -> Vec<String> {
+    match conn.query(sql) {
+        Ok(r) => r
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Text(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Print names in SQLite's `.tables`/`.indexes` columnar layout: sorted (byte
+/// order), laid out column-major into `80/(maxlen+2)` columns each `maxlen` wide,
+/// left-justified, with a two-space gap between columns. Nothing is printed for an
+/// empty list.
+fn print_columnar(mut names: Vec<String>) {
+    if names.is_empty() {
+        return;
+    }
+    names.sort();
+    let maxlen = names.iter().map(String::len).max().unwrap_or(0);
+    let n_col = (80 / (maxlen + 2)).max(1);
+    let n_row = names.len().div_ceil(n_col);
+    for i in 0..n_row {
+        let mut line = String::new();
+        let mut j = i;
+        while j < names.len() {
+            if j >= n_row {
+                line.push_str("  ");
+            }
+            line.push_str(&format!("{:<maxlen$}", names[j]));
+            j += n_row;
+        }
+        println!("{line}");
+    }
 }
 
 /// The comma-separated output column names of a view, for SQLite's `.schema`
