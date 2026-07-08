@@ -17,6 +17,7 @@ pub mod datetime;
 pub mod eval;
 pub mod func;
 pub mod json;
+mod stat4;
 pub mod vdbe;
 mod window;
 
@@ -5290,29 +5291,62 @@ impl Connection {
 
         // Compute the new stat rows up front (read-only phase).
         let mut new_rows: Vec<(String, Option<String>, String)> = Vec::new();
+        // Accumulated `sqlite_stat4` rows: (tbl, idx, neq, nlt, ndlt, sample-bytes).
+        let mut stat4_rows: Vec<(String, String, String, String, String, Vec<u8>)> = Vec::new();
         for tname in &analyze {
             let meta = self.table_meta(tname, None)?;
-            let rows: Vec<Vec<Value>> = if meta.without_rowid {
-                self.scan_without_rowid(&meta)?
+            // Keep rowids for rowid tables — the STAT4 `sample` records reference the
+            // rowid, and the sample columns include it as the trailing entry.
+            let (rows, rowids): (Vec<Vec<Value>>, Vec<i64>) = if meta.without_rowid {
+                (self.scan_without_rowid(&meta)?, Vec::new())
             } else {
-                self.scan_table(&meta)?
-                    .into_iter()
-                    .map(|(_, v)| v)
-                    .collect()
+                let (rid, vals): (Vec<i64>, Vec<Vec<Value>>) =
+                    self.scan_table(&meta)?.into_iter().unzip();
+                (vals, rid)
             };
             let n = rows.len();
             let indexes = self.indexes_of(tname)?;
-            if indexes.is_empty() {
+            // A local helper to push one index's STAT4 samples.
+            let mut push_stat4 = |idx_name: &str, samples: Vec<crate::exec::stat4::Stat4Sample>| {
+                for s in samples {
+                    stat4_rows.push((
+                        tname.clone(),
+                        idx_name.to_string(),
+                        crate::exec::stat4::Stat4Sample::stat_string(&s.neq),
+                        crate::exec::stat4::Stat4Sample::stat_string(&s.nlt),
+                        crate::exec::stat4::Stat4Sample::stat_string(&s.ndlt),
+                        s.sample,
+                    ));
+                }
+            };
+            if indexes.is_empty() && !meta.without_rowid {
                 if n > 0 {
                     new_rows.push((tname.clone(), None, alloc::format!("{n}")));
                 }
-            } else {
+            } else if n > 0 {
                 for idx in &indexes {
-                    if n == 0 {
-                        continue; // SQLite records nothing for an empty index
-                    }
                     let stat = index_stat_string(&idx.cols, &idx.collations, &rows);
                     new_rows.push((tname.clone(), Some(idx.name.clone()), stat));
+                    // STAT4 samples for this index. Expression indexes are skipped
+                    // (SQLite records their column values via a different path).
+                    if idx.key_exprs.is_none() {
+                        let samples = if meta.without_rowid {
+                            self.stat4_for_wr_index(&meta, idx, &rows)
+                        } else {
+                            self.stat4_for_rowid_index(idx, &rows, &rowids)
+                        };
+                        push_stat4(&idx.name, samples);
+                    }
+                }
+                // The WITHOUT ROWID primary-key index is stored as the table b-tree
+                // (no `CREATE INDEX` object), so it is not in `indexes` above. SQLite
+                // records it (last in the index list) in both sqlite_stat1 and
+                // sqlite_stat4 under the *table* name; do the same.
+                if meta.without_rowid
+                    && let Some((stat, samples)) = self.stat4_for_wr_pk(&meta, &rows)
+                {
+                    new_rows.push((tname.clone(), Some(tname.clone()), stat));
+                    push_stat4(tname, samples);
                 }
             }
         }
@@ -5350,8 +5384,262 @@ impl Connection {
             ]);
             insert_table(self.backend.writer()?, stat_root, base + i as i64, &rec)?;
         }
+
+        // ---- sqlite_stat4 ---------------------------------------------------
+        // A STAT4-enabled sqlite writes both sqlite_stat1 and sqlite_stat4. Its
+        // `openStatTable` creates *both* catalog tables whenever `ANALYZE`
+        // processes any table (even when the result is empty), so mirror that:
+        // create/keep sqlite_stat4 whenever there is a table to analyze or the
+        // table already exists, then replace the analyzed tables' rows.
+        if !analyze.is_empty() || self.schema.table("sqlite_stat4").is_some() {
+            if self.schema.table("sqlite_stat4").is_none() {
+                const STAT4_SQL: &str = "CREATE TABLE sqlite_stat4(tbl,idx,neq,nlt,ndlt,sample)";
+                let Statement::CreateTable(ct) = sql::parse_one(STAT4_SQL)? else {
+                    unreachable!()
+                };
+                self.exec_create_table(&ct, STAT4_SQL)?;
+            }
+            let stat4_root = self.schema.table("sqlite_stat4").unwrap().rootpage;
+            let stat4_meta = self.table_meta("sqlite_stat4", None)?;
+            let victims: Vec<i64> = self
+                .scan_table(&stat4_meta)?
+                .into_iter()
+                .filter(
+                    |(_, vals)| matches!(&vals[0], Value::Text(t) if analyze.iter().any(|a| a == t)),
+                )
+                .map(|(rid, _)| rid)
+                .collect();
+            for rid in victims {
+                delete_table(self.backend.writer()?, stat4_root, rid)?;
+            }
+            let base4 = self.next_rowid(stat4_root)?;
+            for (i, (tbl, idx, neq, nlt, ndlt, sample)) in stat4_rows.into_iter().enumerate() {
+                let rec = encode_record(&[
+                    Value::Text(tbl),
+                    Value::Text(idx),
+                    Value::Text(neq),
+                    Value::Text(nlt),
+                    Value::Text(ndlt),
+                    Value::Blob(sample),
+                ]);
+                insert_table(self.backend.writer()?, stat4_root, base4 + i as i64, &rec)?;
+            }
+        }
+
         self.schema = Schema::read(self.backend.source())?;
         Ok(())
+    }
+
+    /// Build the `sqlite_stat4` samples for one plain-column index on a *rowid*
+    /// table, mirroring SQLite's STAT4 accumulator. `rows` are the table's rows in
+    /// arbitrary order with `rowids` aligned; the index entries are formed, sorted
+    /// into index-storage order (key columns honouring collation and `DESC`, then
+    /// rowid ascending), and fed to [`stat4::collect_samples`].
+    fn stat4_for_rowid_index(
+        &self,
+        idx: &IndexMeta,
+        rows: &[Vec<Value>],
+        rowids: &[i64],
+    ) -> Vec<crate::exec::stat4::Stat4Sample> {
+        use crate::exec::stat4::Stat4Entry;
+        let n_key = idx.cols.len();
+        // Sample columns = key columns followed by the trailing rowid.
+        let n_col = n_key + 1;
+        // Distinct-test columns: a UNIQUE index whose key columns are all NOT NULL
+        // is distinct on the key alone (`nKeyCol-1`); otherwise all but the
+        // trailing rowid (`nCol-1`).
+        let uniq_not_null = idx.unique && self.stat4_key_cols_not_null(idx).unwrap_or(false);
+        let n_col_test = if uniq_not_null {
+            n_key.saturating_sub(1)
+        } else {
+            n_col - 1
+        };
+
+        let mut entries: Vec<Stat4Entry> = rows
+            .iter()
+            .zip(rowids.iter())
+            .map(|(r, &rid)| {
+                let mut sample: Vec<Value> = idx.cols.iter().map(|&c| r[c].clone()).collect();
+                sample.push(Value::Integer(rid));
+                Stat4Entry { sample }
+            })
+            .collect();
+
+        // Sort into index-storage order: key columns (collation + DESC), then rowid
+        // ascending as the final tiebreak.
+        let colls = idx.collations.clone();
+        let descs = idx.descending.clone();
+        entries.sort_by(|a, b| {
+            for i in 0..n_key {
+                let coll = colls.get(i).copied().unwrap_or_default();
+                let mut ord = crate::value::cmp_values_coll(&a.sample[i], &b.sample[i], coll);
+                if descs.get(i).copied().unwrap_or(false) {
+                    ord = ord.reverse();
+                }
+                if ord != core::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            // Trailing rowid, always ascending.
+            crate::value::cmp_values(&a.sample[n_key], &b.sample[n_key])
+        });
+
+        // Comparison used for the distinct (`iChng`) test: leftmost `len` key
+        // columns under their collations (NULL == NULL). DESC does not affect
+        // equality.
+        let colls2 = idx.collations.clone();
+        crate::exec::stat4::collect_samples(&entries, n_col, n_col_test, move |a, b, len| {
+            for i in 0..len {
+                let coll = colls2.get(i).copied().unwrap_or_default();
+                let ord = crate::value::cmp_values_coll(&a[i], &b[i], coll);
+                if ord != core::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            core::cmp::Ordering::Equal
+        })
+    }
+
+    /// Whether every key column of `idx` is declared `NOT NULL` in its table.
+    fn stat4_key_cols_not_null(&self, idx: &IndexMeta) -> Option<bool> {
+        let obj = self
+            .schema
+            .objects()
+            .iter()
+            .find(|o| o.name == idx.name && o.obj_type == crate::schema::ObjectType::Index)?;
+        let meta = self.table_meta(&obj.tbl_name, None).ok()?;
+        Some(idx.cols.iter().all(|&c| meta.not_null[c].is_some()))
+    }
+
+    /// The primary-key column positions of a WITHOUT ROWID table, in key order.
+    fn wr_pk_cols(meta: &TableMeta) -> &[usize] {
+        &meta.storage_order[..meta.pk_len]
+    }
+
+    /// Build the STAT4 samples for a secondary index on a WITHOUT ROWID table. The
+    /// index's full stored columns are its declared key columns followed by any
+    /// primary-key columns not already present (SQLite's `pIdx->nColumn`). The
+    /// `sample` record holds those column values in that order.
+    fn stat4_for_wr_index(
+        &self,
+        meta: &TableMeta,
+        idx: &IndexMeta,
+        rows: &[Vec<Value>],
+    ) -> Vec<crate::exec::stat4::Stat4Sample> {
+        use crate::exec::stat4::Stat4Entry;
+        let pk = Self::wr_pk_cols(meta);
+        // Full column list: key columns, then PK columns not already in the key.
+        let mut full_cols: Vec<usize> = idx.cols.clone();
+        for &p in pk {
+            if !full_cols.contains(&p) {
+                full_cols.push(p);
+            }
+        }
+        let n_key = idx.cols.len();
+        let n_col = full_cols.len();
+        // Per full-column collation and DESC (only key columns carry a declared
+        // direction; the appended PK columns inherit the PK's direction, but they
+        // are only ever a tiebreak here and their bytes are plain either way).
+        let mut colls: Vec<crate::value::Collation> = idx.collations.clone();
+        let mut descs: Vec<bool> = idx.descending.clone();
+        for &p in &full_cols[n_key..] {
+            colls.push(meta.columns[p].collation);
+            // Match the PK column's declared direction for ordering.
+            let pki = pk.iter().position(|&x| x == p);
+            descs.push(
+                pki.and_then(|i| meta.pk_descending.get(i).copied())
+                    .unwrap_or(false),
+            );
+        }
+        // Distinct-test columns: a UNIQUE index all-NOT-NULL is unique on the key
+        // alone; otherwise all but the last stored column.
+        let uniq_not_null = idx.unique && idx.cols.iter().all(|&c| meta.not_null[c].is_some());
+        let n_col_test = if uniq_not_null {
+            n_key.saturating_sub(1)
+        } else {
+            n_col - 1
+        };
+
+        let mut entries: Vec<Stat4Entry> = rows
+            .iter()
+            .map(|r| {
+                let sample: Vec<Value> = full_cols.iter().map(|&c| r[c].clone()).collect();
+                Stat4Entry { sample }
+            })
+            .collect();
+
+        Self::sort_and_collect(&mut entries, n_col, n_col_test, &colls, &descs)
+    }
+
+    /// Build the STAT4 samples (and the sqlite_stat1 `stat` string) for the
+    /// primary-key index of a WITHOUT ROWID table, recorded under the table name.
+    fn stat4_for_wr_pk(
+        &self,
+        meta: &TableMeta,
+        rows: &[Vec<Value>],
+    ) -> Option<(String, Vec<crate::exec::stat4::Stat4Sample>)> {
+        use crate::exec::stat4::Stat4Entry;
+        let pk = Self::wr_pk_cols(meta);
+        if pk.is_empty() {
+            return None;
+        }
+        let n_col = pk.len();
+        let colls: Vec<crate::value::Collation> =
+            pk.iter().map(|&c| meta.columns[c].collation).collect();
+        let descs: Vec<bool> = meta.pk_descending.clone();
+        // The PK index is unique on the whole key and its columns are NOT NULL, so
+        // nColTest = nKeyCol - 1.
+        let n_col_test = n_col.saturating_sub(1);
+        let stat = index_stat_string(pk, &colls, rows);
+
+        let mut entries: Vec<Stat4Entry> = rows
+            .iter()
+            .map(|r| {
+                let sample: Vec<Value> = pk.iter().map(|&c| r[c].clone()).collect();
+                Stat4Entry { sample }
+            })
+            .collect();
+
+        let samples = Self::sort_and_collect(&mut entries, n_col, n_col_test, &colls, &descs);
+        Some((stat, samples))
+    }
+
+    /// Sort `entries` into index-storage order (the `n_col` stored columns
+    /// honouring per-column collation and `DESC`) and run the STAT4 accumulator.
+    /// Shared by the WITHOUT ROWID index and primary-key paths.
+    fn sort_and_collect(
+        entries: &mut [crate::exec::stat4::Stat4Entry],
+        n_col: usize,
+        n_col_test: usize,
+        colls: &[crate::value::Collation],
+        descs: &[bool],
+    ) -> Vec<crate::exec::stat4::Stat4Sample> {
+        entries.sort_by(|a, b| {
+            for i in 0..n_col {
+                let coll = colls.get(i).copied().unwrap_or_default();
+                let mut ord = crate::value::cmp_values_coll(&a.sample[i], &b.sample[i], coll);
+                // Only the leading key columns carry a meaningful DESC; the appended
+                // tiebreak PK columns also honour their direction.
+                if descs.get(i).copied().unwrap_or(false) {
+                    ord = ord.reverse();
+                }
+                if ord != core::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            core::cmp::Ordering::Equal
+        });
+        let colls2 = colls.to_vec();
+        crate::exec::stat4::collect_samples(entries, n_col, n_col_test, move |a, b, len| {
+            for i in 0..len {
+                let coll = colls2.get(i).copied().unwrap_or_default();
+                let ord = crate::value::cmp_values_coll(&a[i], &b[i], coll);
+                if ord != core::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            core::cmp::Ordering::Equal
+        })
     }
 
     // ---- DDL / DML ----------------------------------------------------------
@@ -36981,17 +37269,18 @@ fn index_key(cols: &[usize], values: &[Value], rowid: i64) -> Vec<u8> {
     encode_record(&key)
 }
 
-/// Whether rows `a` and `b` collide on any UNIQUE/PRIMARY KEY column set (all
-/// columns of the set equal and none NULL — NULLs are distinct, as in SQLite).
 /// Build the `sqlite_stat1` `stat` string for an index over `rows`: `nRow`
-/// followed by, for each leftmost prefix length `K`, `(nRow + dK/2) / dK` where
-/// `dK` is the number of distinct prefixes of length `K` (collation-aware).
+/// followed by, for each leftmost prefix length `K`, an estimate of how many
+/// rows an equality query on the first `K` columns matches. Matching SQLite's
+/// `statGet`, the estimate for `D` distinct prefixes is `I = (nRow + D - 1) / D`
+/// (i.e. `nRow/D` rounded up), except that an `I` of exactly 2 is pulled back to
+/// 1 when it is barely above 1.0 (`nRow*10 <= D*11`). Collation-aware.
 fn index_stat_string(
     cols: &[usize],
     colls: &[crate::value::Collation],
     rows: &[Vec<Value>],
 ) -> String {
-    let n = rows.len();
+    let n = rows.len() as u64;
     let mut tuples: Vec<Vec<Value>> = rows
         .iter()
         .map(|r| cols.iter().map(|&c| r[c].clone()).collect())
@@ -36999,13 +37288,16 @@ fn index_stat_string(
     tuples.sort_by(|a, b| stat_prefix_cmp(a, b, colls, cols.len()));
     let mut s = alloc::format!("{n}");
     for k in 1..=cols.len() {
-        let mut distinct = 1usize; // n > 0 guaranteed by the caller
+        let mut distinct = 1u64; // n > 0 guaranteed by the caller
         for w in tuples.windows(2) {
             if stat_prefix_cmp(&w[0], &w[1], colls, k) != core::cmp::Ordering::Equal {
                 distinct += 1;
             }
         }
-        let avg = (n + distinct / 2) / distinct;
+        let mut avg = n.div_ceil(distinct);
+        if avg == 2 && n * 10 <= distinct * 11 {
+            avg = 1;
+        }
         s.push(' ');
         s.push_str(&avg.to_string());
     }
