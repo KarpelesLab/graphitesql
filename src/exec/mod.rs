@@ -17708,6 +17708,28 @@ impl Connection {
                     .unwrap_or_else(|| colls.get(idx).copied().unwrap_or_default());
                 keys.push((idx, term.descending, term.nulls_first, coll));
             }
+            // A compound that deduplicates (any UNION / INTERSECT / EXCEPT arm)
+            // materializes its rows through a sorter keyed by the ORDER BY terms
+            // *followed by every remaining result column ascending* — that trailing
+            // key is what detects adjacent duplicates. So rows tied on the ORDER BY
+            // break by the other columns ascending (NULLs first), regardless of the
+            // ORDER BY's own direction. A pure UNION ALL chain does no dedup, so its
+            // ties keep input order (a stable sort). (A *mixed* chain that combines
+            // a dedup op with UNION ALL is sorted with plan-dependent tie order that
+            // graphite does not reproduce exactly — a narrow residual.)
+            let dedups = sel
+                .compound
+                .iter()
+                .any(|(op, _)| *op != CompoundOp::UnionAll);
+            if dedups {
+                let used: Vec<usize> = keys.iter().map(|(i, ..)| *i).collect();
+                for j in 0..result.columns.len() {
+                    if !used.contains(&j) {
+                        let coll = colls.get(j).copied().unwrap_or_default();
+                        keys.push((j, false, None, coll));
+                    }
+                }
+            }
             result.rows.sort_by(|a, b| {
                 for (idx, desc, nf, coll) in &keys {
                     let ord = cmp_order(&a[*idx], &b[*idx], *desc, *nf, *coll);
