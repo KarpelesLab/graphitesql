@@ -267,10 +267,22 @@ impl Shell {
                 }
             }
             ".schema" => {
+                use graphitesql::schema::ObjectType;
                 for obj in conn.schema().objects() {
                     if arg.is_none_or(|name| name == obj.name) {
                         if let Some(sql) = &obj.sql {
-                            println!("{sql};");
+                            let base = schema_create_line(sql);
+                            // SQLite's `.schema` annotates a view with its output
+                            // column names on a trailing comment line.
+                            if obj.obj_type == ObjectType::View {
+                                println!(
+                                    "{base}\n/* {}({}) */;",
+                                    obj.name,
+                                    view_columns(conn, &obj.name)
+                                );
+                            } else {
+                                println!("{base};");
+                            }
                         }
                     }
                 }
@@ -401,6 +413,27 @@ fn dump_database(conn: &Connection) {
         }
     }
     println!("COMMIT;");
+}
+
+/// The comma-separated output column names of a view, for SQLite's `.schema`
+/// `/* view(cols) */` annotation. Empty (so the comment is `/* v() */`) if the
+/// view cannot be introspected.
+fn view_columns(conn: &Connection, name: &str) -> String {
+    conn.query(&format!(
+        "SELECT name FROM pragma_table_info('{}')",
+        name.replace('\'', "''")
+    ))
+    .map(|r| {
+        r.rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Text(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+    .unwrap_or_default()
 }
 
 /// Rewrite a `CREATE TABLE` statement the way SQLite's shell prints it in
