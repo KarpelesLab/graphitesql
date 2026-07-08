@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/KarpelesLab/graphitesql/compare/v0.0.15...v0.0.16) - 2026-07-08
+
+### Added
+
+- *(cli)* .schema matches sqlite's printSchemaLine quirks
+- *(cli)* implement the .dump shell command
+- *(datetime)* accept a bare HH:MM[:SS] time-shift modifier
+- *(exec)* live-seek a joined table by a UNIQUE secondary index (B5b-2)
+- *(planner)* render USING COVERING INDEX for a covering join seek
+- *(exec)* thread the join rowid through the cost-based reorders
+- *(exec)* resolve a table-qualified rowid across a join
+- *(geopoly)* the geopoly virtual table (R-Tree-backed spatial index)
+- *(geopoly)* the geopoly scalar geometry functions and group_bbox
+- *(fts5)* accept the full set of maintenance/config commands
+- *(exec)* reject an aggregate/windowed recursive CTE term like sqlite
+- *(exec)* honour a recursive CTE's ORDER BY as a priority work-queue
+- *(fts5)* the rank config command and unrecognized-option rejection
+- *(fts5)* direct DML and the 'delete' command for external/contentless tables
+- *(fts5)* external-content tables (content=, content_rowid=)
+- *(fts5)* support the braced {col ...}: column-set MATCH filter
+- *(planner)* cost-based join order for three or more tables
+- *(planner)* match sqlite's DISTINCT/GROUP BY/ORDER BY plan nodes over joins
+- *(planner)* scan a join table via a covering index
+- *(planner)* drive a two-table join from the secondary-index-seek-inner side
+- *(planner)* drive a two-table join from the rowid-seek-inner side
+- *(planner)* choose the best ORDER BY index, not the first
+- *(planner)* pick a covering index for GROUP BY / DISTINCT among several
+- *(planner)* elide ORDER BY when the chosen seek index supplies the order
+- *(planner)* prefer a covering index for range-leading seeks
+- *(planner)* prefer a covering index for secondary-index seeks
+- *(btree)* honor DESC in UNIQUE and rowid-table primary-key auto-indexes
+- *(btree)* honor DESC primary key on WITHOUT ROWID tables
+- *(btree)* honor DESC index column order (byte-compatible)
+
+### Documentation
+
+- record window ORDER BY NULLS fix and windowed-sum type-tag residual
+- record math numeric-type/atan fixes and huge-arg trig residual
+- record the geopoly extension in ROADMAP Track D
+- record the min/max multi-index covering-EQP deferral
+
+### Fixed
+
+- *(exec)* read an integer-serialized REAL-column value back as a real
+- *(json)* json_tree root key/path follows sqlite's jsonEachPathLength
+- *(exec)* quote() renders a real at round-trip precision (port sqlite3FpDecode)
+- *(datetime)* utc/localtime modifier normalizes out-of-range fields
+- *(exec)* zeroblob(NULL) and printf %c of an empty string match sqlite
+- *(exec)* coerce integer function arguments like sqlite3_value_int64
+- *(exec)* COLLATE must not change comparison affinity
+- *(exec)* count(*) via an index honors LIMIT and OFFSET
+- *(parser)* reject a column after a table constraint and an empty trigger body
+- *(fk)* ON UPDATE SET DEFAULT re-checks against the post-update parents
+- *(fk)* delete the parent row before enforcing its ON DELETE actions
+- *(fk)* resolve a UNIQUE/PK conflict before the INSERT foreign-key check
+- *(fk)* ON … SET DEFAULT re-validates the default references a parent
+- *(trigger)* a BEFORE UPDATE trigger's changes to the updated row persist
+- *(trigger)* RAISE(IGNORE) in an AFTER trigger no longer skips later rows
+- *(vdbe)* GROUP BY key follows the single min/max row like other bare columns
+- *(datetime)* numeric Julian-Day argument with modifiers and out-of-range guard
+- *(func)* printf precision handling for %c, %q/%Q/%w, %#e, and huge floats
+- *(func)* replace() with an empty pattern ignores a NULL replacement
+- *(eval)* bit shift by a negative amount is an arithmetic shift the other way
+- *(window)* honor NULLS FIRST/LAST in a window ORDER BY
+- *(float)* atan of a very large argument returns ±π/2, not 0
+- *(func)* math functions NULL non-numeric arguments
+- *(func)* ceil/floor/trunc preserve integer type and NULL non-numerics
+- *(exec)* carry the outer column's affinity into a correlated comparison
+- *(exec)* decline an affinity-unsound index join seek (wrong results)
+- *(fts5)* name shadow tables with sqlite's single-quoted form
+- *(exec)* match sqlite's shadow-table schema (no space after commas)
+- *(exec)* give CREATE TABLE AS SELECT columns their inherited types
+- *(vdbe)* apply collation to an ordered aggregate's ORDER BY
+- *(vdbe)* resolve ORDER BY names to result aliases before base columns
+- *(exec)* honour explicit/inherited collation on ORDER BY terms
+- *(fts5)* match sqlite's bm25 score exactly (corpus-statistic correction)
+- *(window)* apply ORDER BY when a window's base table has an index
+- *(vdbe)* return index order for an equality prefix on a composite index
+
 ## [0.0.15](https://github.com/KarpelesLab/graphitesql/compare/v0.0.14...v0.0.15) - 2026-07-06
 
 ### Added
