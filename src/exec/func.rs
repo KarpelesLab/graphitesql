@@ -1200,7 +1200,10 @@ fn quote_value(v: &Value) -> String {
         Value::Real(r) if !r.is_finite() => {
             String::from(if *r < 0.0 { "-9.0e+999" } else { "9.0e+999" })
         }
-        Value::Real(r) => eval::format_real(*r),
+        // `quote()` renders a finite real at round-trip precision (`%!0.15g`,
+        // falling back to `%!0.20e`), unlike the 15-significant-digit column
+        // rendering `format_real` produces — so a dumped real reparses exactly.
+        Value::Real(r) => crate::util::fpdecode::quote_real(*r),
         Value::Text(s) => alloc::format!("'{}'", s.replace('\'', "''")),
         Value::Blob(b) => {
             // SQLite renders blob literals as `X'ABCD'` — uppercase `X` and
