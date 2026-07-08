@@ -9246,7 +9246,7 @@ impl Connection {
                     insert_index(
                         w,
                         root,
-                        &wr_index_key(&cols, &pk_cols, row),
+                        &wr_index_key(&cols, &pk_cols, &realify_columns_for_storage(&tmeta, row)),
                         &key_colls,
                         &descs,
                     )?;
@@ -9270,7 +9270,7 @@ impl Connection {
                         if ci.unique {
                             uniq.push(cols.iter().map(|&c| values[c].clone()).collect());
                         }
-                        index_key(&cols, values, *rowid)
+                        index_key(&cols, &realify_columns_for_storage(&tmeta, values), *rowid)
                     }
                     Some(exprs) => {
                         let ctx = row_ctx(values, &tmeta.columns, Some(*rowid), &no_params)
@@ -17334,7 +17334,11 @@ impl Connection {
         params: &Params,
     ) -> Result<Vec<u8>> {
         match &idx.key_exprs {
-            None => Ok(index_key(&idx.cols, values, rowid)),
+            None => Ok(index_key(
+                &idx.cols,
+                &realify_columns_for_storage(meta, values),
+                rowid,
+            )),
             Some(exprs) => {
                 let ctx = row_ctx(values, &meta.columns, Some(rowid), params).with_subqueries(self);
                 let mut key: Vec<Value> = exprs
@@ -27527,7 +27531,11 @@ impl Connection {
                 insert_index(
                     w,
                     idx.root,
-                    &wr_index_key(&idx.cols, &pk_cols, &rows[i]),
+                    &wr_index_key(
+                        &idx.cols,
+                        &pk_cols,
+                        &realify_columns_for_storage(meta, &rows[i]),
+                    ),
                     &key_colls,
                     idx.seek_descs(),
                 )?;
@@ -29706,13 +29714,17 @@ impl Connection {
     /// Encode a table record from `values`, omitting VIRTUAL generated columns
     /// (not stored) and nulling the rowid-aliased `INTEGER PRIMARY KEY`.
     fn encode_table_record(&self, meta: &TableMeta, values: &[Value]) -> Vec<u8> {
+        // A whole-number real in a REAL-affinity column stores with the compact
+        // integer serial type (SQLite's MEM_IntReal); `promote_real_columns` reads
+        // it back as REAL.
+        let realified = realify_columns_for_storage(meta, values);
         let stored: Vec<Value> = (0..meta.columns.len())
             .filter(|&i| !meta.is_virtual(i))
             .map(|i| {
                 if Some(i) == meta.ipk {
                     Value::Null
                 } else {
-                    values[i].clone()
+                    realified[i].clone()
                 }
             })
             .collect();
@@ -34875,6 +34887,39 @@ fn promote_real_columns(meta: &TableMeta, values: &mut [Value]) {
             }
         }
     }
+}
+
+/// The i64 SQLite stores a REAL value as, on disk, when it can (the write side of
+/// [`promote_real_columns`], modelling `MEM_IntReal`): a REAL-affinity column
+/// holding a whole-number real encodes with the compact integer serial type, not
+/// an 8-byte float. This is `sqlite3VdbeIntegerAffinity`: the real must round-trip
+/// through i64 exactly, and the integer must be neither `i64::MIN` nor `i64::MAX`
+/// (ticket #3922 — those bounds are excluded to keep overflow arithmetic safe).
+/// The value reads back as REAL via `promote_real_columns`, so this is a pure
+/// storage-encoding choice with no effect on results.
+fn real_intreal_i64(r: f64) -> Option<i64> {
+    if !r.is_finite() {
+        return None;
+    }
+    let ix = r as i64;
+    (r == ix as f64 && ix > i64::MIN && ix < i64::MAX).then_some(ix)
+}
+
+/// Substitute the compact integer serial encoding for a whole-number real in each
+/// REAL-affinity column, so a written record byte-matches SQLite (which stores
+/// such values as `MEM_IntReal`). Returns a copy; the in-memory row is untouched.
+fn realify_columns_for_storage(meta: &TableMeta, values: &[Value]) -> Vec<Value> {
+    let mut out = values.to_vec();
+    for (i, col) in meta.columns.iter().enumerate() {
+        if col.affinity == eval::Affinity::Real {
+            if let Value::Real(r) = out[i] {
+                if let Some(ix) = real_intreal_i64(r) {
+                    out[i] = Value::Integer(ix);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Split a `json_tree` root path (`$.a.b`, `$.a[2]`, `$[0]`) into the parent path
@@ -40563,9 +40608,13 @@ fn collect_unique_sets(
 /// Convert a `WITHOUT ROWID` row from declared column order to on-disk storage
 /// order (PK columns first, then the rest).
 fn permute_row(meta: &TableMeta, declared: &[Value]) -> Vec<Value> {
+    // permute_row feeds only the WITHOUT ROWID record encoders, so apply the same
+    // MEM_IntReal storage substitution as `encode_table_record`: a whole-number
+    // real in a REAL column is written with the compact integer serial type.
+    let realified = realify_columns_for_storage(meta, declared);
     meta.storage_order
         .iter()
-        .map(|&i| declared[i].clone())
+        .map(|&i| realified[i].clone())
         .collect()
 }
 
