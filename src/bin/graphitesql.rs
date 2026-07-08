@@ -13,10 +13,37 @@
 //! Interactive input accepts SQL statements terminated by `;` (across multiple
 //! lines) and a handful of `.dot` commands (`.help` lists them). Query results
 //! print in SQLite's default "list" mode: columns joined by `|`, one row per
-//! line.
+//! line. Other output modes (`.mode csv|column|line|tabs|quote|insert|json`),
+//! result redirection (`.output`/`.once`), CSV import (`.import`), and a handful
+//! of settings (`.separator`, `.nullvalue`, `.echo`, `.changes`) match the
+//! `sqlite3` shell byte-for-byte.
 
 use graphitesql::{Connection, QueryResult, Value};
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+
+/// Output rendering mode, mirroring the `sqlite3` shell's `.mode`. Only the
+/// modes the graphite shell supports are represented; an unknown mode is
+/// rejected like SQLite. `tabs` is `List` with a tab column separator, so it has
+/// no distinct variant here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// `list`/`tabs` — columns joined by the column separator, rows by the row
+    /// separator.
+    List,
+    /// `csv` — RFC-4180 quoting.
+    Csv,
+    /// `column` — left-justified fixed-width columns, two-space gaps.
+    Column,
+    /// `line` — one `name = value` per line, a blank line between rows.
+    Line,
+    /// `quote` — SQL literals separated by the column separator.
+    Quote,
+    /// `insert TABLE` — an `INSERT INTO TABLE VALUES(...)` per row.
+    Insert,
+    /// `json` — a JSON array of one object per row.
+    Json,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,7 +66,7 @@ fn main() {
         }
     };
 
-    let mut shell = Shell { headers: false };
+    let mut shell = Shell::new();
 
     if !scripts.is_empty() {
         // One-shot mode: run each argument batch, exiting non-zero on the first
@@ -68,12 +95,83 @@ fn open(path: &str) -> graphitesql::Result<Connection> {
     }
 }
 
+/// Where a shell writes query output. `.output FILE`/`.once FILE` redirect here.
+enum Sink {
+    /// The default: the process's standard output.
+    Stdout,
+    /// A file opened by `.output FILE`/`.once FILE` (or `/dev/null` for
+    /// `.output off`).
+    File(File),
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Sink::Stdout => io::stdout().write(buf),
+            Sink::File(f) => f.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Sink::Stdout => io::stdout().flush(),
+            Sink::File(f) => f.flush(),
+        }
+    }
+}
+
 struct Shell {
-    /// Whether to print a header row before query results (`.headers on`).
+    /// Whether to print a header row before query results (`.headers on`, or a
+    /// side effect of `.mode column`).
     headers: bool,
+    /// Set once `.headers on|off` is used explicitly; suppresses the implicit
+    /// header-on that `.mode column` would otherwise apply.
+    header_set: bool,
+    /// The active output mode (`.mode`). Defaults to `list`.
+    mode: Mode,
+    /// The column separator (`.separator COL` / mode default). `|` by default.
+    col_sep: String,
+    /// The row separator (`.separator … ROW` / mode default). `\n` by default,
+    /// `\r\n` for CSV.
+    row_sep: String,
+    /// The string printed for a NULL value (`.nullvalue`). Empty by default.
+    null_value: String,
+    /// The target table name for `.mode insert TABLE` (default `table`).
+    insert_table: String,
+    /// Echo each SQL statement group before running it (`.echo on`).
+    echo: bool,
+    /// Print a `changes: N   total_changes: M` line after each SQL group
+    /// (`.changes on`).
+    count_changes: bool,
+    /// Running total of rows changed by DML, for `.changes` `total_changes`.
+    total_changes: u64,
+    /// Rows changed by the most recent DML statement, for `.changes` `changes`.
+    last_changes: u64,
+    /// The current output sink; `.output`/`.once` redirect it.
+    out: Sink,
+    /// True while a `.once` redirect is active: the sink reverts to stdout after
+    /// the next SQL group that produces output.
+    once: bool,
 }
 
 impl Shell {
+    fn new() -> Self {
+        Shell {
+            headers: false,
+            header_set: false,
+            mode: Mode::List,
+            col_sep: String::from("|"),
+            row_sep: String::from("\n"),
+            null_value: String::new(),
+            insert_table: String::from("table"),
+            echo: false,
+            count_changes: false,
+            total_changes: 0,
+            last_changes: 0,
+            out: Sink::Stdout,
+            once: false,
+        }
+    }
+
     fn repl(&mut self, conn: &mut Connection, path: &str) {
         let interactive = io::stdin().is_terminal();
         if interactive {
@@ -119,9 +217,7 @@ impl Shell {
             // Execute once the accumulated input contains a complete statement.
             if buffer.trim_end().ends_with(';') {
                 let sql = std::mem::take(&mut buffer);
-                if let Err(e) = self.run_sql_batch(conn, &sql) {
-                    eprintln!("Error: {e}");
-                }
+                self.run_group(conn, &sql);
             }
         }
     }
@@ -152,12 +248,38 @@ impl Shell {
             buffer.push_str(&line);
             if buffer.trim_end().ends_with(';') {
                 let sql = std::mem::take(&mut buffer);
-                if let Err(e) = self.run_sql_batch(conn, &sql) {
-                    eprintln!("Error: {e}");
-                }
+                self.run_group(conn, &sql);
             }
         }
         false
+    }
+
+    /// Run one accumulated input group (which may hold several `;`-separated
+    /// statements): echo it if `.echo on`, execute it, then honor `.changes` and
+    /// the pending `.once` redirect exactly as SQLite's per-line handling does.
+    fn run_group(&mut self, conn: &mut Connection, sql: &str) {
+        if self.echo {
+            // SQLite echoes the input group verbatim (trailing newline trimmed).
+            let mut out = io::stdout();
+            let _ = writeln!(out, "{}", sql.trim_end_matches('\n'));
+        }
+        if let Err(e) = self.run_sql_batch(conn, sql) {
+            eprintln!("Error: {e}");
+        }
+        if self.count_changes {
+            let mut out = io::stdout();
+            let _ = writeln!(
+                out,
+                "changes: {}   total_changes: {}",
+                self.last_changes, self.total_changes
+            );
+        }
+        // A `.once FILE` redirect covers exactly the next output-producing SQL
+        // group, then reverts to stdout.
+        if self.once {
+            self.out = Sink::Stdout;
+            self.once = false;
+        }
     }
 
     /// Run one or more `;`-separated statements.
@@ -197,7 +319,7 @@ impl Shell {
                             .execute_returning(sql, &graphitesql::exec::eval::Params::default())?;
                         self.print_result(&result);
                     } else {
-                        conn.execute(sql)?;
+                        self.record_changes(conn.execute(sql)?);
                     }
                 }
                 Err(e) => return Err(e),
@@ -207,10 +329,18 @@ impl Shell {
             // via execute_returning and print the projected rows.
             let result =
                 conn.execute_returning(sql, &graphitesql::exec::eval::Params::default())?;
+            self.record_changes(result.rows.len());
             self.print_result(&result);
         } else {
             match conn.execute(sql) {
-                Ok(_) => {
+                Ok(n) => {
+                    // SQLite's `changes()`/`total_changes()` only count rows
+                    // modified by INSERT/UPDATE/DELETE; DDL and other statements
+                    // leave the counters untouched (the previous DML value
+                    // persists), so only record for DML here.
+                    if is_dml(sql) {
+                        self.record_changes(n);
+                    }
                     // `PRAGMA journal_mode = X` is a setter that still reports the
                     // resulting journal mode — SQLite prints it (e.g. `wal`, or
                     // `memory` for an in-memory database that cannot change it).
@@ -232,34 +362,269 @@ impl Shell {
         Ok(())
     }
 
-    fn print_result(&self, result: &QueryResult) {
-        let out = io::stdout();
-        let mut out = out.lock();
-        if self.headers {
-            let _ = writeln!(out, "{}", result.columns.join("|"));
+    /// Accumulate the row count of a DML statement into the `.changes` counters.
+    fn record_changes(&mut self, n: usize) {
+        self.last_changes = n as u64;
+        self.total_changes += n as u64;
+    }
+
+    /// Print a query result in the active output mode. A result with zero rows
+    /// prints nothing at all — not even a header — because the `sqlite3` CLI emits
+    /// headers/framing from its per-row callback, which never fires for an empty
+    /// result.
+    fn print_result(&mut self, result: &QueryResult) {
+        if result.rows.is_empty() {
+            return;
         }
-        // Write rows as bytes, not as a String: a BLOB column prints its raw
-        // bytes (which need not be valid UTF-8) in list mode, matching the
-        // sqlite3 CLI — e.g. `SELECT x'48656c6c6f'` prints `Hello`, not its hex.
+        match self.mode {
+            Mode::List => self.print_list(result),
+            Mode::Csv => self.print_csv(result),
+            Mode::Column => self.print_column(result),
+            Mode::Line => self.print_line(result),
+            Mode::Quote => self.print_quote(result),
+            Mode::Insert => self.print_insert(result),
+            Mode::Json => self.print_json(result),
+        }
+    }
+
+    /// List/tabs mode: header (optional) then one row per line, cells joined by
+    /// the column separator, terminated by the row separator. A NULL renders as
+    /// the `.nullvalue` string; TEXT/BLOB stop at the first NUL (C-string
+    /// semantics), matching the `sqlite3` CLI.
+    fn print_list(&mut self, result: &QueryResult) {
         let mut line: Vec<u8> = Vec::new();
+        if self.headers {
+            for (i, c) in result.columns.iter().enumerate() {
+                if i > 0 {
+                    line.extend_from_slice(self.col_sep.as_bytes());
+                }
+                line.extend_from_slice(c.as_bytes());
+            }
+            line.extend_from_slice(self.row_sep.as_bytes());
+        }
         for row in &result.rows {
-            line.clear();
             for (i, v) in row.iter().enumerate() {
                 if i > 0 {
-                    line.push(b'|');
+                    line.extend_from_slice(self.col_sep.as_bytes());
                 }
-                render_value_into(v, &mut line);
+                render_list_cell(v, &self.null_value, &mut line);
             }
-            line.push(b'\n');
-            let _ = out.write_all(&line);
+            line.extend_from_slice(self.row_sep.as_bytes());
         }
+        let _ = self.out.write_all(&line);
+    }
+
+    /// CSV mode: RFC-4180 quoting per field, `\r\n` row terminator (unless the
+    /// row separator was overridden). NULL renders as the `.nullvalue` string,
+    /// unquoted.
+    fn print_csv(&mut self, result: &QueryResult) {
+        let mut buf: Vec<u8> = Vec::new();
+        if self.headers {
+            for (i, c) in result.columns.iter().enumerate() {
+                if i > 0 {
+                    buf.extend_from_slice(self.col_sep.as_bytes());
+                }
+                csv_field(c.as_bytes(), &self.col_sep, &mut buf);
+            }
+            buf.extend_from_slice(self.row_sep.as_bytes());
+        }
+        for row in &result.rows {
+            for (i, v) in row.iter().enumerate() {
+                if i > 0 {
+                    buf.extend_from_slice(self.col_sep.as_bytes());
+                }
+                match v {
+                    Value::Null => buf.extend_from_slice(self.null_value.as_bytes()),
+                    _ => {
+                        let mut cell = Vec::new();
+                        render_text_cell(v, &mut cell);
+                        csv_field(&cell, &self.col_sep, &mut buf);
+                    }
+                }
+            }
+            buf.extend_from_slice(self.row_sep.as_bytes());
+        }
+        let _ = self.out.write_all(&buf);
+    }
+
+    /// Column mode: compute each column's display width as the max of its header
+    /// and cell widths (in characters), print a header + dashes row (when headers
+    /// are on), then left-justify each cell padded to its column width, joined by
+    /// two spaces. NULL uses the `.nullvalue` string.
+    fn print_column(&mut self, result: &QueryResult) {
+        let ncol = result.columns.len();
+        if ncol == 0 {
+            return;
+        }
+        // Cell text for every column of every row (as displayed).
+        let cells: Vec<Vec<String>> = result
+            .rows
+            .iter()
+            .map(|row| {
+                (0..ncol)
+                    .map(|i| match row.get(i) {
+                        Some(Value::Null) | None => self.null_value.clone(),
+                        Some(v) => display_cell(v),
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut width: Vec<usize> = result.columns.iter().map(|c| c.chars().count()).collect();
+        for row in &cells {
+            for (i, c) in row.iter().enumerate() {
+                let w = c.chars().count();
+                if w > width[i] {
+                    width[i] = w;
+                }
+            }
+        }
+        let mut out: Vec<u8> = Vec::new();
+        if self.headers {
+            for (i, c) in result.columns.iter().enumerate() {
+                pad_to(c, width[i], &mut out);
+                out.extend_from_slice(if i == ncol - 1 { b"\n" } else { b"  " });
+            }
+            for (i, &w) in width.iter().enumerate().take(ncol) {
+                out.extend(std::iter::repeat_n(b'-', w));
+                out.extend_from_slice(if i == ncol - 1 { b"\n" } else { b"  " });
+            }
+        }
+        for row in &cells {
+            for (i, c) in row.iter().enumerate() {
+                pad_to(c, width[i], &mut out);
+                out.extend_from_slice(if i == ncol - 1 { b"\n" } else { b"  " });
+            }
+        }
+        let _ = self.out.write_all(&out);
+    }
+
+    /// Line mode: for each row, one `<name> = <value>` per column (name
+    /// right-justified to the widest column name), a blank line between rows.
+    fn print_line(&mut self, result: &QueryResult) {
+        // SQLite's line mode right-justifies each column name to a width that is
+        // at least 5 (its floor) and at least the longest column name.
+        let width = result
+            .columns
+            .iter()
+            .map(|c| c.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(5);
+        let mut out: Vec<u8> = Vec::new();
+        for (r, row) in result.rows.iter().enumerate() {
+            if r > 0 {
+                out.push(b'\n');
+            }
+            for (i, name) in result.columns.iter().enumerate() {
+                let pad = width.saturating_sub(name.chars().count());
+                out.extend(std::iter::repeat_n(b' ', pad));
+                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(b" = ");
+                match row.get(i) {
+                    Some(Value::Null) | None => out.extend_from_slice(self.null_value.as_bytes()),
+                    Some(v) => render_text_cell(v, &mut out),
+                }
+                out.push(b'\n');
+            }
+        }
+        let _ = self.out.write_all(&out);
+    }
+
+    /// Quote mode: header (quoted) then rows of SQL literals joined by the column
+    /// separator. NULL → `NULL`, text → `'...'`, integers/reals as-is (reals via
+    /// `%!.20g`), blobs → `X'..'`.
+    fn print_quote(&mut self, result: &QueryResult) {
+        let mut out: Vec<u8> = Vec::new();
+        if self.headers {
+            for (i, c) in result.columns.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(self.col_sep.as_bytes());
+                }
+                let mut s = String::new();
+                quote_text(c, &mut s);
+                out.extend_from_slice(s.as_bytes());
+            }
+            out.extend_from_slice(self.row_sep.as_bytes());
+        }
+        for row in &result.rows {
+            for (i, v) in row.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(self.col_sep.as_bytes());
+                }
+                let mut s = String::new();
+                quote_value_with(v, real_inf, &mut s);
+                out.extend_from_slice(s.as_bytes());
+            }
+            out.extend_from_slice(self.row_sep.as_bytes());
+        }
+        let _ = self.out.write_all(&out);
+    }
+
+    /// Insert mode: an `INSERT INTO <table>(cols...) VALUES(...);` per row. The
+    /// column list is only emitted when headers are on (as SQLite does).
+    fn print_insert(&mut self, result: &QueryResult) {
+        let mut out: Vec<u8> = Vec::new();
+        // Insert mode quotes the table and column names with SQLite's
+        // keyword-aware rule (a bare identifier that is also a keyword — e.g.
+        // `NULL` — is quoted); `ident_smart` implements exactly that.
+        let table = graphitesql::sql::print::ident_smart(&self.insert_table);
+        let collist = if self.headers {
+            let cols = result
+                .columns
+                .iter()
+                .map(|c| graphitesql::sql::print::ident_smart(c))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("({cols})")
+        } else {
+            String::new()
+        };
+        for row in &result.rows {
+            let mut line = format!("INSERT INTO {table}{collist} VALUES(");
+            for (i, v) in row.iter().enumerate() {
+                if i > 0 {
+                    line.push(',');
+                }
+                quote_value_with(v, real_sentinel, &mut line);
+            }
+            line.push_str(");\n");
+            out.extend_from_slice(line.as_bytes());
+        }
+        let _ = self.out.write_all(&out);
+    }
+
+    /// JSON mode: a JSON array of objects, one object per row. NULL → `null`,
+    /// integers as digits, reals via `%!.20g` (`±9.0e+999` for infinities), text
+    /// and blobs via JSON string escaping.
+    fn print_json(&mut self, result: &QueryResult) {
+        let mut out: Vec<u8> = Vec::new();
+        out.push(b'[');
+        for (r, row) in result.rows.iter().enumerate() {
+            if r == 0 {
+                out.push(b'{');
+            } else {
+                out.extend_from_slice(b",\n{");
+            }
+            for (i, v) in row.iter().enumerate() {
+                let name = result.columns.get(i).map(String::as_str).unwrap_or("");
+                json_string(name.as_bytes(), &mut out);
+                out.push(b':');
+                json_value(v, &mut out);
+                if i + 1 < row.len() {
+                    out.push(b',');
+                }
+            }
+            out.push(b'}');
+        }
+        out.extend_from_slice(b"]\n");
+        let _ = self.out.write_all(&out);
     }
 
     /// Render an EXPLAIN QUERY PLAN result as SQLite's `QUERY PLAN` tree. The
     /// rows are `(id, parent, notused, detail)`; children link to their parent's
     /// `id` (top-level rows have parent 0). The last child of a node uses `` `-- ``
     /// (others `|--`), with `   ` / `|  ` continuation indent.
-    fn print_eqp_tree(&self, result: &QueryResult) {
+    fn print_eqp_tree(&mut self, result: &QueryResult) {
         let nodes: Vec<(i64, i64, String)> = result
             .rows
             .iter()
@@ -279,17 +644,17 @@ impl Shell {
                 Some((id, parent, detail))
             })
             .collect();
-        let out = io::stdout();
-        let mut out = out.lock();
+        let mut out: Vec<u8> = Vec::new();
         let _ = writeln!(out, "QUERY PLAN");
         render_eqp(&mut out, &nodes, 0, "");
+        let _ = self.out.write_all(&out);
     }
 
     /// Handle a `.dot` command. Returns `true` if the shell should exit.
     fn dot_command(&mut self, conn: &mut Connection, line: &str) -> bool {
-        let mut parts = line.split_whitespace();
-        let cmd = parts.next().unwrap_or("");
-        let arg = parts.next();
+        let args = tokenize_dot(line);
+        let cmd = args.first().map(String::as_str).unwrap_or("");
+        let arg = args.get(1).map(String::as_str);
         match cmd {
             ".quit" | ".exit" => return true,
             ".help" => print_help(),
@@ -336,11 +701,35 @@ impl Shell {
                 }
             }
             ".headers" => match arg {
-                Some("on") => self.headers = true,
-                Some("off") => self.headers = false,
-                _ => eprintln!("Usage: .headers on|off"),
+                Some(a) => {
+                    self.headers = boolean_value(a);
+                    self.header_set = true;
+                }
+                None => eprintln!("Usage: .headers on|off"),
             },
-            ".mode" => { /* accepted for compatibility; only list mode is supported */ }
+            ".mode" => self.set_mode(&args),
+            ".separator" => match (args.get(1), args.get(2)) {
+                (Some(col), row) => {
+                    self.col_sep = col.clone();
+                    if let Some(r) = row {
+                        self.row_sep = r.clone();
+                    }
+                }
+                _ => eprintln!("Usage: .separator COL ?ROW?"),
+            },
+            ".nullvalue" => match arg {
+                Some(v) => self.null_value = v.to_string(),
+                None => eprintln!("Usage: .nullvalue STRING"),
+            },
+            ".echo" => match arg {
+                Some(a) => self.echo = boolean_value(a),
+                None => eprintln!("Usage: .echo on|off"),
+            },
+            ".changes" => match arg {
+                Some(a) => self.count_changes = boolean_value(a),
+                None => eprintln!("Usage: .changes on|off"),
+            },
+            ".output" | ".once" => self.set_output(cmd, &args),
             ".databases" => {
                 // `<name>: <file-or-""> r/w` per attached database (from
                 // `PRAGMA database_list`). The shell opens read/write, and no
@@ -361,27 +750,318 @@ impl Shell {
                 }
             }
             ".dump" => dump_database(conn),
+            ".import" => self.import(conn, &args),
             ".read" => {
-                // The filename is the rest of the line (so paths may contain
-                // spaces), stripped of surrounding whitespace.
-                let file = line.strip_prefix(".read").map(str::trim).unwrap_or("");
-                if file.is_empty() {
-                    eprintln!("Usage: .read FILE");
-                } else {
-                    match std::fs::File::open(file) {
+                // The filename is the first token after `.read`.
+                match arg {
+                    None => eprintln!("Usage: .read FILE"),
+                    Some(file) => match File::open(file) {
                         Ok(f) => {
-                            let mut r = io::BufReader::new(f);
+                            let mut r = BufReader::new(f);
                             if self.feed_reader(conn, &mut r) {
                                 return true; // a `.quit` inside the file exits
                             }
                         }
                         Err(_) => eprintln!("Error: cannot open \"{file}\""),
-                    }
+                    },
                 }
             }
             other => eprintln!("Unknown command: {other}. Try \".help\"."),
         }
         false
+    }
+
+    /// Apply a `.mode` command. Mode names accept unambiguous prefixes (as
+    /// SQLite's `.mode col` does). Sets the mode-specific column/row separators
+    /// and, for `column`, enables headers unless `.headers` was set explicitly.
+    fn set_mode(&mut self, args: &[String]) {
+        // Positional args after `.mode`: the mode name, then (for insert) a table
+        // name. `--`-options are accepted-and-ignored for compatibility.
+        let mut positional = args[1..].iter().filter(|a| !a.starts_with('-'));
+        let Some(name) = positional.next() else {
+            // Bare `.mode` — leave the mode unchanged (SQLite reports it; we no-op
+            // to avoid a spurious differential line).
+            return;
+        };
+        let tabname = positional.next();
+        let m = name.to_ascii_lowercase();
+        let matches = |full: &str| !m.is_empty() && full.starts_with(m.as_str());
+        if matches("list") {
+            self.mode = Mode::List;
+            self.col_sep = String::from("|");
+            self.row_sep = String::from("\n");
+        } else if matches("csv") {
+            self.mode = Mode::Csv;
+            self.col_sep = String::from(",");
+            self.row_sep = String::from("\r\n");
+        } else if matches("columns") {
+            self.mode = Mode::Column;
+            if !self.header_set {
+                self.headers = true;
+            }
+            self.row_sep = String::from("\n");
+        } else if matches("lines") {
+            self.mode = Mode::Line;
+            self.row_sep = String::from("\n");
+        } else if matches("tabs") {
+            self.mode = Mode::List;
+            self.col_sep = String::from("\t");
+        } else if matches("quote") {
+            self.mode = Mode::Quote;
+            self.col_sep = String::from(",");
+            self.row_sep = String::from("\n");
+        } else if matches("insert") {
+            self.mode = Mode::Insert;
+            self.insert_table = tabname.cloned().unwrap_or_else(|| String::from("table"));
+        } else if matches("json") {
+            self.mode = Mode::Json;
+        } else {
+            eprintln!(
+                "Error: mode should be one of: ascii box column csv html insert \
+                 json line list markdown qbox quote table tabs tcl"
+            );
+        }
+    }
+
+    /// Apply `.output`/`.once`: redirect subsequent (or the next) SQL output to a
+    /// file. `.output` with no file (or `off`/`stdout`) reverts to stdout. Only
+    /// plain file targets are supported (no `-bom`/`-x`/pipe modes).
+    fn set_output(&mut self, cmd: &str, args: &[String]) {
+        let once = cmd == ".once";
+        // First non-option positional argument is the file target.
+        let target = args[1..].iter().find(|a| !a.starts_with('-'));
+        match target.map(String::as_str) {
+            None | Some("stdout") => {
+                self.out = Sink::Stdout;
+                self.once = false;
+            }
+            Some("off") => {
+                // `.output off` discards output.
+                match File::create("/dev/null") {
+                    Ok(f) => self.out = Sink::File(f),
+                    Err(_) => self.out = Sink::Stdout,
+                }
+                self.once = false;
+            }
+            Some(file) => match File::create(file) {
+                Ok(f) => {
+                    self.out = Sink::File(f);
+                    self.once = once;
+                }
+                Err(e) => {
+                    eprintln!("Error: cannot open \"{file}\": {e}");
+                    self.out = Sink::Stdout;
+                    self.once = false;
+                }
+            },
+        }
+    }
+
+    /// Implement `.import FILE TABLE`: read `FILE` field-by-field using the CSV
+    /// reader (respecting the current `.separator`/mode), then insert rows into
+    /// `TABLE`, creating it from the first row's field values as column names when
+    /// it does not already exist (matching the `sqlite3` shell). Column-count
+    /// mismatches emit the same `FILE:LINE: expected N columns…` warnings on
+    /// stderr as SQLite.
+    fn import(&mut self, conn: &mut Connection, args: &[String]) {
+        // Positional args: FILE then TABLE. `--csv`/`--ascii`/`--skip N` alter
+        // the separators; we support `--csv` and `--skip`.
+        let mut file: Option<&str> = None;
+        let mut table: Option<&str> = None;
+        let mut col_sep = self.col_sep.clone();
+        let mut row_sep = self.row_sep.clone();
+        let mut skip = 0usize;
+        let mut i = 1;
+        while i < args.len() {
+            let z = args[i].as_str();
+            let opt = z.strip_prefix("--").or_else(|| z.strip_prefix('-'));
+            match opt {
+                Some("csv") => {
+                    col_sep = String::from(",");
+                    row_sep = String::from("\n");
+                }
+                Some("skip") if i + 1 < args.len() => {
+                    skip = args[i + 1].parse().unwrap_or(0);
+                    i += 1;
+                }
+                Some(o) if z.starts_with('-') && !o.is_empty() => {
+                    // Unsupported option; ignore for forward-compat.
+                }
+                _ => {
+                    if file.is_none() {
+                        file = Some(z);
+                    } else if table.is_none() {
+                        table = Some(z);
+                    }
+                }
+            }
+            i += 1;
+        }
+        let (Some(file), Some(table)) = (file, table) else {
+            eprintln!(
+                "ERROR: missing {} argument. Usage:\n.import FILE TABLE",
+                if file.is_none() { "FILE" } else { "TABLE" }
+            );
+            return;
+        };
+        // When importing in CSV mode with the default `\r\n` output row
+        // separator, SQLite permanently switches the row separator to `\n` (so
+        // input and output separators need not be maintained separately). Mirror
+        // that persistent mutation before deriving the single-byte reader
+        // separators.
+        if self.mode == Mode::Csv && row_sep == "\r\n" {
+            self.row_sep = String::from("\n");
+            row_sep = String::from("\n");
+        }
+        // The reader needs single-byte separators; strip any leading `\r` of a
+        // `\r\n` row separator (SQLite also strips a trailing `\r` from each
+        // field so CRLF input parses correctly).
+        let col_sep = col_sep.bytes().next().unwrap_or(b',');
+        let row_sep = row_sep.bytes().next_back().unwrap_or(b'\n');
+        let data = match std::fs::read(file) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("Error: cannot open \"{file}\"");
+                return;
+            }
+        };
+        let mut reader = CsvReader::new(&data, col_sep, row_sep);
+        // Skip leading lines if requested.
+        for _ in 0..skip {
+            while reader.next_field().is_some() && reader.term == Term::Col {}
+        }
+        // Does the table exist? If not, create it from the first row's fields.
+        let exists = conn
+            .query(&format!(
+                "SELECT count(*) FROM pragma_table_info('{}')",
+                table.replace('\'', "''")
+            ))
+            .ok()
+            .and_then(|r| match r.rows.first().and_then(|row| row.first()) {
+                Some(Value::Integer(n)) => Some(*n > 0),
+                _ => None,
+            })
+            .unwrap_or(false);
+        if !exists {
+            let mut cols: Vec<String> = Vec::new();
+            while let Some(f) = reader.next_field() {
+                cols.push(String::from_utf8_lossy(&f).into_owned());
+                if reader.term != Term::Col {
+                    break;
+                }
+            }
+            if cols.is_empty() {
+                eprintln!("{file}: empty file");
+                return;
+            }
+            let coldefs = cols
+                .iter()
+                .map(|c| quote_ident_dq(c))
+                .collect::<Vec<_>>()
+                .join(",");
+            let create = format!("CREATE TABLE {}({coldefs})", quote_ident_dq(table));
+            if let Err(e) = conn.execute(&create) {
+                eprintln!("{create} failed:\n{e}");
+                return;
+            }
+        }
+        // Determine the target table's column count.
+        let ncol = conn
+            .query(&format!(
+                "SELECT count(*) FROM pragma_table_info('{}')",
+                table.replace('\'', "''")
+            ))
+            .ok()
+            .and_then(|r| match r.rows.first().and_then(|row| row.first()) {
+                Some(Value::Integer(n)) => Some(*n as usize),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if ncol == 0 {
+            return;
+        }
+        let qtable = quote_ident_dq(table);
+        loop {
+            let start_line = reader.line;
+            let mut fields: Vec<Option<Vec<u8>>> = Vec::with_capacity(ncol);
+            let mut got = 0usize;
+            let mut eof = false;
+            while got < ncol {
+                match reader.next_field() {
+                    None => {
+                        if got == 0 {
+                            eof = true;
+                        } else if got == ncol - 1 {
+                            // RFC-4180: EOF may stand in for the final terminator.
+                            fields.push(Some(Vec::new()));
+                            got += 1;
+                        }
+                        break;
+                    }
+                    Some(f) => {
+                        fields.push(Some(f));
+                        got += 1;
+                        if got < ncol && reader.term != Term::Col {
+                            // Fewer columns than expected: NULL-fill the rest.
+                            eprintln!(
+                                "{file}:{start_line}: expected {ncol} columns but found {got} - filling the rest with NULL"
+                            );
+                            while fields.len() < ncol {
+                                fields.push(None);
+                            }
+                            got = ncol;
+                            break;
+                        }
+                    }
+                }
+            }
+            if eof {
+                break;
+            }
+            if fields.is_empty() {
+                if reader.term == Term::Eof {
+                    break;
+                }
+                continue;
+            }
+            // Extra columns: consume and count them for the warning.
+            if reader.term == Term::Col {
+                let mut extra = got;
+                loop {
+                    reader.next_field();
+                    extra += 1;
+                    if reader.term != Term::Col {
+                        break;
+                    }
+                }
+                eprintln!(
+                    "{file}:{start_line}: expected {ncol} columns but found {extra} - extras ignored"
+                );
+            }
+            if fields.len() >= ncol {
+                let mut sql = format!("INSERT INTO {qtable} VALUES(");
+                for (j, f) in fields.iter().take(ncol).enumerate() {
+                    if j > 0 {
+                        sql.push(',');
+                    }
+                    match f {
+                        None => sql.push_str("NULL"),
+                        Some(bytes) => {
+                            sql.push('\'');
+                            sql.push_str(&String::from_utf8_lossy(bytes).replace('\'', "''"));
+                            sql.push('\'');
+                        }
+                    }
+                }
+                sql.push(')');
+                if let Err(e) = conn.execute(&sql) {
+                    eprintln!("{file}:{start_line}: INSERT failed: {e}");
+                }
+            }
+            if reader.term == Term::Eof {
+                break;
+            }
+        }
     }
 }
 
@@ -392,9 +1072,214 @@ fn print_help() {
     eprintln!(".schema [TABLE]    Show CREATE statements");
     eprintln!(".databases         List attached databases");
     eprintln!(".dump              Dump the database as SQL text");
+    eprintln!(".import FILE TABLE Import CSV data from FILE into TABLE");
     eprintln!(".read FILE         Execute SQL from FILE");
+    eprintln!(".mode MODE ?TABLE? Set output mode (list csv column line tabs quote insert json)");
+    eprintln!(".separator COL ?ROW?  Set column (and row) separators");
+    eprintln!(".nullvalue STRING  Set the string printed for NULL values");
+    eprintln!(".output ?FILE?     Redirect output to FILE (or back to stdout)");
+    eprintln!(".once FILE         Redirect the next query's output to FILE");
+    eprintln!(".echo on|off       Echo each SQL statement before running it");
+    eprintln!(".changes on|off    Show the number of rows changed by each statement");
     eprintln!(".headers on|off    Toggle column headers (default off)");
     eprintln!(".quit / .exit      Exit the shell");
+}
+
+/// The terminator that ended a CSV field read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Term {
+    /// The column separator (more fields follow on this row).
+    Col,
+    /// The row separator (end of this record).
+    Row,
+    /// End of input.
+    Eof,
+}
+
+/// A minimal CSV/DSV field reader mirroring the `sqlite3` shell's
+/// `csv_read_one_field`: unquoted fields end at the column or row separator (a
+/// trailing `\r` is stripped before a row separator); a `"`-quoted field lets
+/// `""` denote a literal `"` and may contain separators/newlines.
+struct CsvReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    col_sep: u8,
+    row_sep: u8,
+    /// The terminator of the most recently read field.
+    term: Term,
+    /// 1-based current line number (for warning messages).
+    line: usize,
+}
+
+impl<'a> CsvReader<'a> {
+    fn new(data: &'a [u8], col_sep: u8, row_sep: u8) -> Self {
+        CsvReader {
+            data,
+            pos: 0,
+            col_sep,
+            row_sep,
+            term: Term::Eof,
+            line: 1,
+        }
+    }
+
+    /// Read the next field, setting `self.term`. Returns `None` only at true EOF
+    /// (no field to read).
+    fn next_field(&mut self) -> Option<Vec<u8>> {
+        if self.pos >= self.data.len() {
+            self.term = Term::Eof;
+            return None;
+        }
+        let mut out = Vec::new();
+        let c = self.data[self.pos];
+        if c == b'"' {
+            self.pos += 1; // opening quote
+            loop {
+                if self.pos >= self.data.len() {
+                    self.term = Term::Eof;
+                    break;
+                }
+                let ch = self.data[self.pos];
+                self.pos += 1;
+                if ch == b'"' {
+                    if self.pos < self.data.len() && self.data[self.pos] == b'"' {
+                        out.push(b'"');
+                        self.pos += 1;
+                        continue;
+                    }
+                    // Closing quote: the next byte is the terminator.
+                    if self.pos >= self.data.len() {
+                        self.term = Term::Eof;
+                    } else {
+                        let t = self.data[self.pos];
+                        if t == self.col_sep {
+                            self.pos += 1;
+                            self.term = Term::Col;
+                        } else if t == self.row_sep {
+                            self.pos += 1;
+                            self.line += 1;
+                            self.term = Term::Row;
+                        } else if t == b'\r'
+                            && self.pos + 1 < self.data.len()
+                            && self.data[self.pos + 1] == self.row_sep
+                        {
+                            self.pos += 2;
+                            self.line += 1;
+                            self.term = Term::Row;
+                        } else {
+                            // Unexpected char after close quote: treat as row end.
+                            self.pos += 1;
+                            self.term = Term::Row;
+                        }
+                    }
+                    break;
+                }
+                if ch == self.row_sep {
+                    self.line += 1;
+                }
+                out.push(ch);
+            }
+        } else {
+            loop {
+                if self.pos >= self.data.len() {
+                    self.term = Term::Eof;
+                    break;
+                }
+                let ch = self.data[self.pos];
+                if ch == self.col_sep {
+                    self.pos += 1;
+                    self.term = Term::Col;
+                    break;
+                }
+                if ch == self.row_sep {
+                    self.pos += 1;
+                    self.line += 1;
+                    self.term = Term::Row;
+                    // Strip a trailing `\r` (CRLF handling).
+                    if out.last() == Some(&b'\r') {
+                        out.pop();
+                    }
+                    break;
+                }
+                out.push(ch);
+                self.pos += 1;
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Tokenize a `.dot` command line the way SQLite's shell does: split on
+/// whitespace; a single-quoted token is literal until the closing `'`; a
+/// double-quoted token honors backslash escapes (`\n`, `\t`, `\\`, `\"`, …).
+fn tokenize_dot(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let mut tok = Vec::new();
+        let delim = bytes[i];
+        if delim == b'\'' || delim == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != delim {
+                if delim == b'"' && bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    tok.push(unescape_byte(bytes[i]));
+                } else {
+                    tok.push(bytes[i]);
+                }
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1; // closing delim
+            }
+        } else {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                tok.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out.push(String::from_utf8_lossy(&tok).into_owned());
+    }
+    out
+}
+
+/// Map a backslash-escaped byte inside a double-quoted dot-command token to its
+/// literal value (`\n` → newline, etc.). Unknown escapes pass through.
+fn unescape_byte(c: u8) -> u8 {
+    match c {
+        b'a' => 0x07,
+        b'b' => 0x08,
+        b't' => b'\t',
+        b'n' => b'\n',
+        b'v' => 0x0b,
+        b'f' => 0x0c,
+        b'r' => b'\r',
+        other => other,
+    }
+}
+
+/// Parse a boolean argument the way SQLite's `booleanValue` does: `on`/`yes`/a
+/// non-zero number → true; `off`/`no`/zero → false. Anything else warns and is
+/// treated as false.
+fn boolean_value(s: &str) -> bool {
+    if let Ok(n) = s.parse::<i64>() {
+        return n != 0;
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "on" | "yes" => true,
+        "off" | "no" => false,
+        _ => {
+            eprintln!("ERROR: Not a boolean value: \"{s}\". Assuming \"no\".");
+            false
+        }
+    }
 }
 
 /// Emit the whole database as a stream of SQL text, matching `sqlite3`'s `.dump`:
@@ -595,6 +1480,12 @@ fn quote_ident_if_needed(name: &str) -> String {
     }
 }
 
+/// Always double-quote an identifier (used where SQLite unconditionally quotes,
+/// e.g. `.import`'s `CREATE TABLE`/`INSERT` targets).
+fn quote_ident_dq(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Render one value the way `.dump` does (distinct from list mode and from
 /// `quote()`): NULL bare, integers as-is, a real as SQLite's `%!.20g`
 /// (round-trip decimal), text single-quoted with `''` escaping, and a blob as
@@ -627,26 +1518,106 @@ fn dump_value_into(v: &Value, out: &mut String) {
     }
 }
 
-/// Render a value the way the `sqlite3` shell does in list mode, appending its
-/// bytes to `out` (NULL prints as the empty string).
-///
-/// A BLOB emits its raw bytes verbatim — they need not be valid UTF-8 — but, as
-/// the `sqlite3` CLI does, only up to the first NUL: list mode hands the blob to
-/// C string routines, so `x'410042'` prints as `A`, and `x'00ff'` prints as
-/// nothing.
-fn render_value_into(v: &Value, out: &mut Vec<u8>) {
+/// The finite `%!.20g` round-trip rendering of a real.
+fn real_g(r: f64) -> String {
+    graphitesql::util::fpdecode::format(
+        r,
+        20,
+        graphitesql::util::fpdecode::XType::Generic,
+        true,
+        false,
+    )
+}
+
+/// A real for JSON/insert modes: `%!.20g` when finite, else SQLite's
+/// `±9.0e+999` sentinel.
+fn real_sentinel(r: f64) -> String {
+    if r.is_finite() {
+        real_g(r)
+    } else if r < 0.0 {
+        String::from("-9.0e+999")
+    } else {
+        String::from("9.0e+999")
+    }
+}
+
+/// A real for `quote` mode: `%!.20g` when finite, else `Inf`/`-Inf` (what C's
+/// `%!.20g` renders for an infinity).
+fn real_inf(r: f64) -> String {
+    if r.is_finite() {
+        real_g(r)
+    } else if r < 0.0 {
+        String::from("-Inf")
+    } else {
+        String::from("Inf")
+    }
+}
+
+/// Render a value as an SQL literal for a given real-rendering policy (quote mode
+/// uses `Inf`/`-Inf` for non-finite reals; insert mode uses the `±9.0e+999`
+/// sentinel). NULL → `NULL`, integer → digits, text → `'...'` (quotes doubled),
+/// blob → `X'<hex>'`.
+fn quote_value_with(v: &Value, real: fn(f64) -> String, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("NULL"),
+        Value::Integer(i) => out.push_str(&i.to_string()),
+        Value::Real(r) => out.push_str(&real(*r)),
+        Value::Text(s) => quote_text(s, out),
+        Value::Blob(b) => {
+            out.push_str("X'");
+            for byte in b {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out.push('\'');
+        }
+    }
+}
+
+/// Render a text string as an SQL string literal (`'...'`, quotes doubled).
+fn quote_text(s: &str, out: &mut String) {
+    out.push('\'');
+    out.push_str(&s.replace('\'', "''"));
+    out.push('\'');
+}
+
+/// The plain display string of a scalar value in tabular modes (column/etc.):
+/// integers/text as-is, reals via the engine's canonical rendering, blobs as
+/// their raw bytes (lossily as text). NULL is handled by the caller.
+fn display_cell(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(r) => graphitesql::exec::eval::format_real(*r),
+        Value::Text(s) => {
+            let b = s.as_bytes();
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            String::from_utf8_lossy(&b[..end]).into_owned()
+        }
+        Value::Blob(b) => {
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            String::from_utf8_lossy(&b[..end]).into_owned()
+        }
+    }
+}
+
+/// Left-justify `s` into `out`, padded with spaces to `width` display
+/// characters. If `s` is already at least `width` chars, no padding is added.
+fn pad_to(s: &str, width: usize, out: &mut Vec<u8>) {
+    out.extend_from_slice(s.as_bytes());
+    let n = s.chars().count();
+    out.extend(std::iter::repeat_n(b' ', width.saturating_sub(n)));
+}
+
+/// Render a value's bytes for a CSV/line/list cell (not the NULL case — the
+/// caller substitutes `.nullvalue`). TEXT/BLOB stop at the first NUL, as the
+/// `sqlite3` CLI's C-string rendering does.
+fn render_text_cell(v: &Value, out: &mut Vec<u8>) {
     match v {
         Value::Null => {}
         Value::Integer(i) => out.extend_from_slice(i.to_string().as_bytes()),
-        // Use the engine's canonical real rendering (15 significant digits with
-        // `%g`-style fixed/exponential switching, `Inf`/`-Inf`, `0.0` for zero) so
-        // the shell matches the `sqlite3` CLI for large/small/special magnitudes —
-        // e.g. `1e18` -> `1.0e+18`, `1e400` -> `Inf`, `-0.0` -> `0.0`.
         Value::Real(r) => {
             out.extend_from_slice(graphitesql::exec::eval::format_real(*r).as_bytes())
         }
-        // Both TEXT and BLOB stop at the first NUL: list mode renders through C
-        // string routines, so `'A'||char(0)||'B'` and `x'410042'` both print `A`.
         Value::Text(s) => {
             let b = s.as_bytes();
             let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
@@ -656,6 +1627,165 @@ fn render_value_into(v: &Value, out: &mut Vec<u8>) {
             let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
             out.extend_from_slice(&b[..end]);
         }
+    }
+}
+
+/// Render a list-mode cell (NULL → the `.nullvalue` string, else `render_text_cell`).
+fn render_list_cell(v: &Value, null_value: &str, out: &mut Vec<u8>) {
+    match v {
+        Value::Null => out.extend_from_slice(null_value.as_bytes()),
+        _ => render_text_cell(v, out),
+    }
+}
+
+/// Append `field`'s CSV encoding to `out`, quoting per SQLite's rule: a field is
+/// `"`-quoted (with internal `"` doubled) if it is empty, contains any byte that
+/// needs quoting (control chars, space, `"`, `'`, or high bytes ≥ 0x80), or
+/// contains the (possibly multi-byte) column separator.
+fn csv_field(field: &[u8], col_sep: &str, out: &mut Vec<u8>) {
+    let needs = field.is_empty()
+        || field.iter().any(|&b| csv_needs_quote(b))
+        || (!col_sep.is_empty() && contains(field, col_sep.as_bytes()));
+    if needs {
+        out.push(b'"');
+        for &b in field {
+            if b == b'"' {
+                out.push(b'"');
+            }
+            out.push(b);
+        }
+        out.push(b'"');
+    } else {
+        out.extend_from_slice(field);
+    }
+}
+
+/// Whether `b` forces CSV quoting, per SQLite's `needCsvQuote[]` table: every
+/// byte `< 0x20`, space, `"`, `'`, and every byte `>= 0x7f`.
+fn csv_needs_quote(b: u8) -> bool {
+    b <= 0x20 || b == b'"' || b == b'\'' || b >= 0x7f
+}
+
+/// Whether `haystack` contains `needle` as a contiguous byte substring.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Append a JSON string literal (`"..."`) for `z`'s bytes, matching SQLite's
+/// `output_json_string`: `"`/`\` and the standard `\b\f\n\r\t` escapes, control
+/// bytes `<= 0x1f` and lone high bytes `>= 0x7f` as `\u00xx`. Valid UTF-8
+/// multibyte sequences pass through unescaped.
+fn json_string(z: &[u8], out: &mut Vec<u8>) {
+    out.push(b'"');
+    let mut i = 0;
+    while i < z.len() {
+        let c = z[i];
+        match c {
+            b'"' => {
+                out.extend_from_slice(b"\\\"");
+                i += 1;
+            }
+            b'\\' => {
+                out.extend_from_slice(b"\\\\");
+                i += 1;
+            }
+            0x08 => {
+                out.extend_from_slice(b"\\b");
+                i += 1;
+            }
+            0x0c => {
+                out.extend_from_slice(b"\\f");
+                i += 1;
+            }
+            b'\n' => {
+                out.extend_from_slice(b"\\n");
+                i += 1;
+            }
+            b'\r' => {
+                out.extend_from_slice(b"\\r");
+                i += 1;
+            }
+            b'\t' => {
+                out.extend_from_slice(b"\\t");
+                i += 1;
+            }
+            0x00..=0x1f => {
+                out.extend_from_slice(format!("\\u{c:04x}").as_bytes());
+                i += 1;
+            }
+            0x20..=0x7e => {
+                out.push(c);
+                i += 1;
+            }
+            _ => {
+                // A byte >= 0x7f: if it starts a valid UTF-8 sequence, copy the
+                // whole sequence verbatim; otherwise escape this byte as \u00xx.
+                match utf8_seq_len(z, i) {
+                    Some(len) => {
+                        out.extend_from_slice(&z[i..i + len]);
+                        i += len;
+                    }
+                    None => {
+                        out.extend_from_slice(format!("\\u{c:04x}").as_bytes());
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+    out.push(b'"');
+}
+
+/// If a valid UTF-8 multibyte sequence starts at `z[i]`, return its length
+/// (2..=4); otherwise `None`. Used by `json_string` to pass real text through
+/// unescaped while escaping stray high bytes (e.g. from blobs).
+fn utf8_seq_len(z: &[u8], i: usize) -> Option<usize> {
+    let c = z[i];
+    let len = match c {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return None,
+    };
+    if i + len > z.len() {
+        return None;
+    }
+    if z[i + 1..i + len]
+        .iter()
+        .all(|&b| (0x80..=0xbf).contains(&b))
+    {
+        std::str::from_utf8(&z[i..i + len]).ok().map(|_| len)
+    } else {
+        None
+    }
+}
+
+/// Render a value for JSON mode: NULL → `null`, integer → digits, real →
+/// `%!.20g` (`±9.0e+999` for infinities), text/blob → JSON string.
+fn json_value(v: &Value, out: &mut Vec<u8>) {
+    match v {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Integer(i) => out.extend_from_slice(i.to_string().as_bytes()),
+        Value::Real(r) => out.extend_from_slice(real_sentinel(*r).as_bytes()),
+        Value::Text(s) => json_string(s.as_bytes(), out),
+        Value::Blob(b) => json_string(b, out),
+    }
+}
+
+/// Recursively render the children of `parent` in an EXPLAIN QUERY PLAN tree.
+fn render_eqp(out: &mut dyn Write, nodes: &[(i64, i64, String)], parent: i64, prefix: &str) {
+    let children: Vec<&(i64, i64, String)> =
+        nodes.iter().filter(|(_, p, _)| *p == parent).collect();
+    let last_i = children.len().wrapping_sub(1);
+    for (i, (id, _, detail)) in children.iter().enumerate() {
+        let last = i == last_i;
+        let connector = if last { "`--" } else { "|--" };
+        let _ = writeln!(out, "{prefix}{connector}{detail}");
+        let child_prefix = format!("{prefix}{}", if last { "   " } else { "|  " });
+        render_eqp(out, nodes, *id, &child_prefix);
     }
 }
 
@@ -673,20 +1803,6 @@ fn returns_rows(sql: &str) -> bool {
     )
 }
 
-/// Recursively render the children of `parent` in an EXPLAIN QUERY PLAN tree.
-fn render_eqp(out: &mut dyn Write, nodes: &[(i64, i64, String)], parent: i64, prefix: &str) {
-    let children: Vec<&(i64, i64, String)> =
-        nodes.iter().filter(|(_, p, _)| *p == parent).collect();
-    let last_i = children.len().wrapping_sub(1);
-    for (i, (id, _, detail)) in children.iter().enumerate() {
-        let last = i == last_i;
-        let connector = if last { "`--" } else { "|--" };
-        let _ = writeln!(out, "{prefix}{connector}{detail}");
-        let child_prefix = format!("{prefix}{}", if last { "   " } else { "|  " });
-        render_eqp(out, nodes, *id, &child_prefix);
-    }
-}
-
 /// Whether `sql` is an `EXPLAIN QUERY PLAN …` statement (rendered as a tree).
 fn is_explain_query_plan(sql: &str) -> bool {
     let mut words = sql.split_whitespace();
@@ -697,6 +1813,22 @@ fn is_explain_query_plan(sql: &str) -> bool {
             .next()
             .is_some_and(|w| w.eq_ignore_ascii_case("query"))
         && words.next().is_some_and(|w| w.eq_ignore_ascii_case("plan"))
+}
+
+/// Whether `sql` is a data-modification statement (INSERT/UPDATE/DELETE/REPLACE,
+/// possibly `WITH`-prefixed) whose row count feeds SQLite's `changes()` /
+/// `total_changes()`. DDL and everything else leave those counters unchanged.
+fn is_dml(sql: &str) -> bool {
+    let lead = sql
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        lead.as_str(),
+        "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "WITH"
+    )
 }
 
 /// Whether `sql` contains a `RETURNING` keyword (as a whole word, outside string
