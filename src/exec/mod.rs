@@ -12508,6 +12508,7 @@ impl Connection {
                 for (j, &pc) in pk.iter().enumerate() {
                     values[pc] = rec[idx.cols.len() + j].clone();
                 }
+                promote_real_columns(meta, &mut values);
                 out.push(InputRow {
                     values,
                     rowid: None,
@@ -19071,6 +19072,7 @@ impl Connection {
             for (i, &mc) in idx_cols.iter().enumerate() {
                 values[mc] = rec[i].clone();
             }
+            promote_real_columns(meta, &mut values);
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Integer(rowid);
             }
@@ -24124,6 +24126,7 @@ impl Connection {
                         for (i, &mc) in s.cols.iter().enumerate() {
                             values[mc] = rec[i].clone();
                         }
+                        promote_real_columns(&first_meta, &mut values);
                         if let Some(ipk) = first_meta.ipk {
                             values[ipk] = Value::Integer(rowid);
                         }
@@ -29179,6 +29182,7 @@ impl Connection {
             }
             ri += 1;
         }
+        promote_real_columns(meta, &mut values);
         if let Some(ipk) = meta.ipk {
             values[ipk] = Value::Integer(rowid);
         }
@@ -34441,6 +34445,23 @@ fn json_each_children(
         }
         scalar => {
             json_emit_node(scalar, None, root_path, root_path, base_id, None, rows);
+        }
+    }
+}
+
+/// Promote each integer-serialized value sitting in a REAL-affinity column back
+/// to a real, as SQLite does when reading a column: an integer-valued real is
+/// stored using an integer serial type (the `MEM_IntReal` space optimization), so
+/// `100.0` in a `REAL` column is on disk as the integer `100`, and reading it must
+/// realify it (`typeof` = `real`, renders/compares as a float). Only strict REAL
+/// affinity promotes; NUMERIC keeps integers. Applied at every point a stored
+/// record — table row or covering-index record — is mapped onto declared columns.
+fn promote_real_columns(meta: &TableMeta, values: &mut [Value]) {
+    for (i, col) in meta.columns.iter().enumerate() {
+        if col.affinity == eval::Affinity::Real {
+            if let Value::Integer(n) = values[i] {
+                values[i] = Value::Real(n as f64);
+            }
         }
     }
 }
@@ -40150,6 +40171,9 @@ fn strip_schema_qualifier(sql: &str, schema: &str) -> Result<String> {
 }
 
 /// The inverse of [`permute_row`]: storage order back to declared column order.
+/// Only ever runs on a value read back from a `WITHOUT ROWID` clustered index, so
+/// it also realifies an integer-serialized `REAL`-column value (see
+/// [`promote_real_columns`]).
 fn unpermute_row(meta: &TableMeta, storage: Vec<Value>) -> Vec<Value> {
     let mut row = alloc::vec![Value::Null; meta.columns.len()];
     for (k, &col) in meta.storage_order.iter().enumerate() {
@@ -40157,6 +40181,7 @@ fn unpermute_row(meta: &TableMeta, storage: Vec<Value>) -> Vec<Value> {
             row[col] = v.clone();
         }
     }
+    promote_real_columns(meta, &mut row);
     row
 }
 
