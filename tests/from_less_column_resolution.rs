@@ -54,9 +54,9 @@ fn from_less_unknown_column_rejected_at_prepare() {
     // Valid FROM-less queries still run, byte-for-byte.
     let good = [
         "SELECT 1, 2.5, 'x', abs(-3), coalesce(NULL, 7);",
-        "SELECT 1 AS x ORDER BY x;",             // an output alias is visible in ORDER BY
+        "SELECT 1 AS x ORDER BY x;", // an output alias is visible in ORDER BY
         "SELECT IFNULL(1, 2), max(3, 4);",
-        "SELECT current_date IS NOT NULL;",      // date/time keyword needs no table
+        "SELECT current_date IS NOT NULL;", // date/time keyword needs no table
     ];
     for sql in good {
         let (so, _) = run("sqlite3", sql);

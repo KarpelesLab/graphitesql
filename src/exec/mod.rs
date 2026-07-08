@@ -8911,6 +8911,17 @@ impl Connection {
             prepared.push((rowid, old_row, values));
         }
 
+        // An AFTER UPDATE trigger firing for an *earlier* row may modify a *later*
+        // row of this same statement (e.g. `AFTER UPDATE … BEGIN UPDATE t SET
+        // b=b+1 WHERE a=NEW.a; END`). Those edits to columns this UPDATE does not
+        // itself SET must survive the later row's write, which would otherwise
+        // overlay its pass-1 snapshot. When such a trigger exists, re-read each row
+        // just before writing and merge, exactly as the BEFORE-trigger case does. A
+        // BEFORE UPDATE trigger fires for every row, so `before_fired` already
+        // covers its cross-row edits.
+        let has_after_update_trigger = !self
+            .triggers_for(&upd.table, TrigEvent::Update, TriggerTiming::After)?
+            .is_empty();
         let mut affected = 0;
         for (rowid, old_row, mut values) in prepared {
             // An UPDATE of the INTEGER PRIMARY KEY (the rowid) must leave it an
@@ -8978,9 +8989,10 @@ impl Connection {
             // row) on top. Re-read the row and merge: a SET column (and the rowid)
             // keeps its computed value; every other column takes the possibly
             // trigger-modified current value, after which generated columns are
-            // recomputed. Skipped when no BEFORE trigger ran, so the trigger-free
-            // path is unchanged (and an untouched row merges to a no-op anyway).
-            if before_fired {
+            // recomputed. Runs when a BEFORE trigger touched this row, or when an
+            // AFTER UPDATE trigger exists (a prior row's firing may have edited this
+            // one); the trigger-free path is unchanged (an untouched row is a no-op).
+            if before_fired || has_after_update_trigger {
                 if let Some(current) = self.read_row(&meta, rowid)? {
                     for (i, col) in meta.columns.iter().enumerate() {
                         let is_set = changed.iter().any(|c| c.eq_ignore_ascii_case(&col.name));
