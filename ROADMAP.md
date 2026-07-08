@@ -293,12 +293,18 @@ result or declines to it — never a wrong answer), so this track is
   variant on the `Collation` enum (invasive).
 - **D5 — `sqlite3_session`** changesets/patchsets for replication.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
+- **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
+  done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**
+  form is not: writing a page *beyond* EOF (`INSERT(count+1, …)`) grows the file
+  while leaving the header `page_count` unchanged — a deliberately inconsistent
+  state (file size ≠ header) that graphite's consistency-maintaining pager (which
+  truncates the file to `page_count` at commit) prevents by construction.
+  Reproducing it byte-for-byte would mean breaking that invariant to write a
+  malformed file for an operation that only ever produces one; parked as an
+  architectural boundary, not a blocker. (The read-side `WHERE schema='aux'`
+  redirect is likewise still open.)
 
-**Blocked by design / oracle:**
-- **dbpage-2 — writable `sqlite_dbpage`.** The pinned oracle's alt1 build refuses
-  every raw page write (`read-only`), so there is no engine to diff against.
-  Deferred until a writable-dbpage oracle exists. (The read-side `WHERE schema='aux'`
-  redirect is likewise deferred.)
+**Blocked by design:**
 - **D7 — C-API shim** (`libsqlite3`-compatible surface). Needs `extern "C"` + raw
   pointers, incompatible with `#![forbid(unsafe_code)]`; would live in a sibling
   crate that opts out.
@@ -432,7 +438,7 @@ work, each track independently shippable:
    then OS file locks (MSRV 1.89), the WAL `-shm` index, and a thread-safe
    `Connection`.
 4. **Ecosystem surfaces** — D2e-encoder (needs the fts5 writer source), D5
-   (`sqlite3_session`), D6 (async wasm VFS); dbpage-2 stays oracle-blocked.
+   (`sqlite3_session`), D6 (async wasm VFS); dbpage-2 UPDATE is done, its INSERT-grow an architectural boundary (see Track D).
 5. **Cost model (Track B)** — the selectivity-driven join order and remaining B9h
    index-choice items; B9b window EQP unblocks once B9h lands. **B4** stat4 needs a
    stat4-enabled oracle first.
@@ -444,5 +450,5 @@ work, each track independently shippable:
 reordering and **B4** `sqlite_stat4` (unverifiable against the stat1-only oracle);
 **B9j** collation-aware index selection; **B1c** RIGHT/FULL inner seeks (correct via
 materialization); **D7** the C-API shim (needs `unsafe`; a sibling crate);
-**dbpage-2** (oracle-blocked); the Track E cross-db qualified-subquery resolution;
+the Track E cross-db qualified-subquery resolution;
 and the FTS5 large-scale encoder sub-cases (need the fts5 writer source).
