@@ -281,6 +281,7 @@ impl Shell {
                 _ => eprintln!("Usage: .headers on|off"),
             },
             ".mode" => { /* accepted for compatibility; only list mode is supported */ }
+            ".dump" => dump_database(conn),
             other => eprintln!("Unknown command: {other}. Try \".help\"."),
         }
         false
@@ -291,8 +292,177 @@ fn print_help() {
     eprintln!(".help              Show this message");
     eprintln!(".tables            List table names");
     eprintln!(".schema [TABLE]    Show CREATE statements");
+    eprintln!(".dump              Dump the database as SQL text");
     eprintln!(".headers on|off    Toggle column headers (default off)");
     eprintln!(".quit / .exit      Exit the shell");
+}
+
+/// Emit the whole database as a stream of SQL text, matching `sqlite3`'s `.dump`:
+/// a `PRAGMA foreign_keys=OFF;` / `BEGIN TRANSACTION;` header, each table's
+/// `CREATE` followed by an `INSERT` per row, then the indexes/triggers/views, and
+/// a closing `COMMIT;`. Internal `sqlite_*` objects and the auto-created
+/// `sqlite_autoindex_*` indexes (which have no backing SQL) are skipped, as in
+/// SQLite.
+fn dump_database(conn: &Connection) {
+    println!("PRAGMA foreign_keys=OFF;");
+    println!("BEGIN TRANSACTION;");
+    // Pass 1: tables, each immediately followed by its data.
+    for obj in conn.schema().objects() {
+        if obj.obj_type != graphitesql::schema::ObjectType::Table {
+            continue;
+        }
+        if obj.name.starts_with("sqlite_") {
+            continue;
+        }
+        let Some(sql) = &obj.sql else { continue };
+        println!("{};", schema_create_line(sql));
+        // `INSERT ... VALUES(...)` targets only the stored columns — a generated
+        // column (`hidden` 2 = virtual, 3 = stored) has no value to write — so
+        // select exactly those, in declared order, rather than `SELECT *`.
+        let xinfo = format!(
+            "SELECT name FROM pragma_table_xinfo('{}') WHERE hidden NOT IN (2,3)",
+            obj.name.replace('\'', "''")
+        );
+        let col_names: Vec<String> = match conn.query(&xinfo) {
+            Ok(r) => r
+                .rows
+                .iter()
+                .filter_map(|row| match row.first() {
+                    Some(Value::Text(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            Err(_) => continue,
+        };
+        if col_names.is_empty() {
+            continue;
+        }
+        let select_list = col_names
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sel = format!(
+            "SELECT {select_list} FROM \"{}\"",
+            obj.name.replace('"', "\"\"")
+        );
+        if let Ok(result) = conn.query(&sel) {
+            for row in &result.rows {
+                let mut line = format!("INSERT INTO {} VALUES(", quote_ident_if_needed(&obj.name));
+                for (i, v) in row.iter().enumerate() {
+                    if i > 0 {
+                        line.push(',');
+                    }
+                    dump_value_into(v, &mut line);
+                }
+                line.push_str(");");
+                println!("{line}");
+            }
+        }
+    }
+    // AUTOINCREMENT tables keep a high-water mark in `sqlite_sequence`; SQLite
+    // dumps that table's rows (right after the user tables) so the sequence is
+    // restored on reload. There is no CREATE — it is auto-created on demand.
+    if conn.schema().table("sqlite_sequence").is_some() {
+        if let Ok(result) = conn.query("SELECT name, seq FROM sqlite_sequence") {
+            for row in &result.rows {
+                let mut line = String::from("INSERT INTO sqlite_sequence VALUES(");
+                for (i, v) in row.iter().enumerate() {
+                    if i > 0 {
+                        line.push(',');
+                    }
+                    dump_value_into(v, &mut line);
+                }
+                line.push_str(");");
+                println!("{line}");
+            }
+        }
+    }
+    // Pass 2: indexes, triggers, and views, after all table data. SQLite emits
+    // them `ORDER BY type COLLATE NOCASE DESC` — i.e. views, then triggers, then
+    // indexes — preserving creation (rowid) order within each type.
+    use graphitesql::schema::ObjectType;
+    let type_rank = |t: ObjectType| match t {
+        ObjectType::View => 0,
+        ObjectType::Trigger => 1,
+        ObjectType::Index => 2,
+        ObjectType::Table => 3,
+    };
+    let mut rest: Vec<_> = conn
+        .schema()
+        .objects()
+        .iter()
+        .filter(|o| !matches!(o.obj_type, ObjectType::Table) && !o.name.starts_with("sqlite_"))
+        .collect();
+    rest.sort_by_key(|o| type_rank(o.obj_type));
+    for obj in rest {
+        if let Some(sql) = &obj.sql {
+            println!("{sql};");
+        }
+    }
+    println!("COMMIT;");
+}
+
+/// Rewrite a `CREATE TABLE` statement the way SQLite's shell prints it in
+/// `.schema`/`.dump`: when the table name is quoted (`CREATE TABLE "…"` or
+/// `CREATE TABLE '…'`), it inserts `IF NOT EXISTS` (SQLite's `printSchemaLine`).
+/// Every other statement — a simple-named table, or an index/view/trigger — is
+/// emitted verbatim.
+fn schema_create_line(sql: &str) -> String {
+    let after = sql.strip_prefix("CREATE TABLE ");
+    match after {
+        Some(rest) if rest.starts_with('"') || rest.starts_with('\'') => {
+            format!("CREATE TABLE IF NOT EXISTS {rest}")
+        }
+        _ => sql.to_string(),
+    }
+}
+
+/// Quote an identifier for the `INSERT INTO <name>` line only when SQLite would:
+/// a name that is a plain identifier (letters, digits, `_`, not starting with a
+/// digit) is emitted bare; anything else is `"`-quoted with internal quotes
+/// doubled.
+fn quote_ident_if_needed(name: &str) -> String {
+    let plain = !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if plain {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+/// Render one value the way `.dump` does (distinct from list mode and from
+/// `quote()`): NULL bare, integers as-is, a real as SQLite's `%!.20g`
+/// (round-trip decimal), text single-quoted with `''` escaping, and a blob as
+/// `X'<lowercase hex>'`.
+fn dump_value_into(v: &Value, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("NULL"),
+        Value::Integer(i) => out.push_str(&i.to_string()),
+        Value::Real(r) if r.is_finite() => out.push_str(&graphitesql::util::fpdecode::format(
+            *r,
+            20,
+            graphitesql::util::fpdecode::XType::Generic,
+            true,
+            false,
+        )),
+        // A non-finite real dumps as SQLite's sentinel literal.
+        Value::Real(r) => out.push_str(if *r < 0.0 { "-9.0e+999" } else { "9.0e+999" }),
+        Value::Text(s) => {
+            out.push('\'');
+            out.push_str(&s.replace('\'', "''"));
+            out.push('\'');
+        }
+        Value::Blob(b) => {
+            out.push_str("X'");
+            for byte in b {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out.push('\'');
+        }
+    }
 }
 
 /// Render a value the way the `sqlite3` shell does in list mode, appending its
