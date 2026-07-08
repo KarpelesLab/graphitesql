@@ -1683,19 +1683,69 @@ fn parse_index(inner: &str) -> Option<Idx> {
 /// Parse an object-key path segment starting at `i`, returning `(key, next_i)`.
 /// Handles a bare identifier or a `"quoted"` key. A bare key may not be empty
 /// (so `$.` is a bad path).
+/// Read a `\uXXXX` escape's four hex digits starting at `bytes[at]`.
+fn json_path_hex4(bytes: &[u8], at: usize) -> Option<u32> {
+    let slice = bytes.get(at..at + 4)?;
+    let mut v = 0u32;
+    for &b in slice {
+        v = v * 16 + (b as char).to_digit(16)?;
+    }
+    Some(v)
+}
+
 fn parse_key(bytes: &[u8], i: usize) -> Option<(String, usize)> {
     if bytes.get(i) == Some(&b'"') {
-        // Quoted key: read until the closing quote.
+        // Quoted key: read until the closing (unescaped) quote, decoding JSON
+        // escapes. SQLite scans past `\<char>` when locating the close and then
+        // compares labels with escapes decoded (`jsonUnescapeOneChar`), so
+        // `$."a\"b"` selects the key `a"b`.
         let mut j = i + 1;
         let mut s = String::new();
-        while j < bytes.len() && bytes[j] != b'"' {
-            s.push(bytes[j] as char);
-            j += 1;
+        while let Some(&c) = bytes.get(j) {
+            match c {
+                b'"' => return Some((s, j + 1)),
+                b'\\' => {
+                    let e = *bytes.get(j + 1)?;
+                    j += 2;
+                    match e {
+                        b'"' => s.push('"'),
+                        b'\\' => s.push('\\'),
+                        b'/' => s.push('/'),
+                        b'b' => s.push('\u{08}'),
+                        b'f' => s.push('\u{0c}'),
+                        b'n' => s.push('\n'),
+                        b'r' => s.push('\r'),
+                        b't' => s.push('\t'),
+                        b'u' => {
+                            let hi = json_path_hex4(bytes, j)?;
+                            j += 4;
+                            let ch = if (0xD800..=0xDBFF).contains(&hi) {
+                                // A high surrogate consumes a following `\uXXXX`
+                                // low surrogate; a lone one becomes U+FFFD.
+                                if bytes.get(j) == Some(&b'\\') && bytes.get(j + 1) == Some(&b'u') {
+                                    let lo = json_path_hex4(bytes, j + 2)?;
+                                    j += 6;
+                                    char::from_u32(0x1_0000 + ((hi - 0xD800) << 10) + (lo - 0xDC00))
+                                        .unwrap_or('\u{FFFD}')
+                                } else {
+                                    '\u{FFFD}'
+                                }
+                            } else {
+                                char::from_u32(hi).unwrap_or('\u{FFFD}')
+                            };
+                            s.push(ch);
+                        }
+                        other => s.push(other as char),
+                    }
+                }
+                _ => {
+                    s.push(c as char);
+                    j += 1;
+                }
+            }
         }
-        if j >= bytes.len() {
-            return None;
-        }
-        Some((s, j + 1))
+        // Reached the end without a closing quote.
+        None
     } else {
         let start = i;
         let mut j = i;
