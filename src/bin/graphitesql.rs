@@ -126,6 +126,40 @@ impl Shell {
         }
     }
 
+    /// Process lines from `reader` exactly as the interactive loop does (minus the
+    /// prompts): a line beginning a fresh buffer with `.` is a dot-command, others
+    /// accumulate into an SQL statement that runs at each terminating `;`. Used by
+    /// the `.read` command. Returns `true` if a `.quit`/`.exit` was reached.
+    fn feed_reader(&mut self, conn: &mut Connection, reader: &mut impl BufRead) -> bool {
+        let mut buffer = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Error reading input: {e}");
+                    break;
+                }
+            }
+            let trimmed = line.trim();
+            if buffer.is_empty() && trimmed.starts_with('.') {
+                if self.dot_command(conn, trimmed) {
+                    return true;
+                }
+                continue;
+            }
+            buffer.push_str(&line);
+            if buffer.trim_end().ends_with(';') {
+                let sql = std::mem::take(&mut buffer);
+                if let Err(e) = self.run_sql_batch(conn, &sql) {
+                    eprintln!("Error: {e}");
+                }
+            }
+        }
+        false
+    }
+
     /// Run one or more `;`-separated statements.
     fn run_sql_batch(&mut self, conn: &mut Connection, sql: &str) -> graphitesql::Result<()> {
         for stmt in split_statements(sql) {
@@ -327,6 +361,24 @@ impl Shell {
                 }
             }
             ".dump" => dump_database(conn),
+            ".read" => {
+                // The filename is the rest of the line (so paths may contain
+                // spaces), stripped of surrounding whitespace.
+                let file = line.strip_prefix(".read").map(str::trim).unwrap_or("");
+                if file.is_empty() {
+                    eprintln!("Usage: .read FILE");
+                } else {
+                    match std::fs::File::open(file) {
+                        Ok(f) => {
+                            let mut r = io::BufReader::new(f);
+                            if self.feed_reader(conn, &mut r) {
+                                return true; // a `.quit` inside the file exits
+                            }
+                        }
+                        Err(_) => eprintln!("Error: cannot open \"{file}\""),
+                    }
+                }
+            }
             other => eprintln!("Unknown command: {other}. Try \".help\"."),
         }
         false
@@ -340,6 +392,7 @@ fn print_help() {
     eprintln!(".schema [TABLE]    Show CREATE statements");
     eprintln!(".databases         List attached databases");
     eprintln!(".dump              Dump the database as SQL text");
+    eprintln!(".read FILE         Execute SQL from FILE");
     eprintln!(".headers on|off    Toggle column headers (default off)");
     eprintln!(".quit / .exit      Exit the shell");
 }
