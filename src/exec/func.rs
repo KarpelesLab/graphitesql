@@ -1204,7 +1204,13 @@ fn quote_value(v: &Value) -> String {
         // falling back to `%!0.20e`), unlike the 15-significant-digit column
         // rendering `format_real` produces — so a dumped real reparses exactly.
         Value::Real(r) => crate::util::fpdecode::quote_real(*r),
-        Value::Text(s) => alloc::format!("'{}'", s.replace('\'', "''")),
+        Value::Text(s) => {
+            // SQLite's `quote()` reads the text through `sqlite3_value_text`, a
+            // NUL-terminated C string, so an embedded NUL truncates the rendered
+            // literal (the stored value keeps its full bytes). Match that.
+            let s = s.split('\0').next().unwrap_or("");
+            alloc::format!("'{}'", s.replace('\'', "''"))
+        }
         Value::Blob(b) => {
             // SQLite renders blob literals as `X'ABCD'` — uppercase `X` and
             // uppercase hex digits.
