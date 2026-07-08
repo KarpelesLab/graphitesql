@@ -7699,12 +7699,14 @@ impl Connection {
                 // SQLite.
                 let mut matched = None;
                 for up in &ins.upsert {
-                    if self.upsert_target_matches(&meta, up, &conflicts, &values, rowid, params)? {
-                        matched = Some(up);
+                    if let Some(target_row) =
+                        self.upsert_target_row(&meta, up, &conflicts, &values, rowid, params)?
+                    {
+                        matched = Some((up, target_row));
                         break;
                     }
                 }
-                if let Some(up) = matched {
+                if let Some((up, target_row)) = matched {
                     match &up.action {
                         UpsertAction::Nothing => continue, // skip the conflicting row
                         UpsertAction::Update {
@@ -7714,7 +7716,7 @@ impl Connection {
                             if self.upsert_do_update(
                                 &ins.table,
                                 &meta,
-                                conflicts[0],
+                                target_row,
                                 &values,
                                 assignments,
                                 where_clause.as_ref(),
@@ -8287,7 +8289,13 @@ impl Connection {
     /// collides with a conflicting row on the **target** columns — a conflict on
     /// a different unique index is a hard error, exactly as SQLite behaves.
     #[allow(clippy::too_many_arguments)]
-    fn upsert_target_matches(
+    /// If `up`'s `ON CONFLICT` target matches one of the `conflicts`, return the
+    /// rowid of the conflicting row *on that target* — the row the `DO UPDATE`
+    /// must edit. When the inserted row collides on several unique constraints,
+    /// this is not necessarily `conflicts[0]`: a bare (untargeted) clause updates
+    /// the first conflict, but `ON CONFLICT(cols)` must update the row that shares
+    /// those exact columns. Returns `None` when the target does not match.
+    fn upsert_target_row(
         &self,
         meta: &TableMeta,
         up: &Upsert,
@@ -8295,9 +8303,9 @@ impl Connection {
         values: &[Value],
         rowid: i64,
         params: &Params,
-    ) -> Result<bool> {
+    ) -> Result<Option<i64>> {
         if up.target.is_empty() {
-            return Ok(true);
+            return Ok(conflicts.first().copied());
         }
         // Resolve the target column names to column indices.
         let target_cols: Vec<usize> = up
@@ -8311,17 +8319,16 @@ impl Connection {
             })
             .collect::<Result<_>>()?;
         // The target names the rowid / INTEGER PRIMARY KEY: it matches when a
-        // conflicting row shares the candidate rowid.
+        // conflicting row shares the candidate rowid — which is that row's rowid.
         if let Some(ipk) = meta.ipk {
             if target_cols == [ipk] {
-                return Ok(conflicts.contains(&rowid));
+                return Ok(conflicts.contains(&rowid).then_some(rowid));
             }
         }
         // The conflict matches the target only if the proposed row equals some
         // conflicting row on every target column (NULLs never match — a NULL key
-        // is distinct, so it could not have produced this conflict). The target
-        // must also actually be a UNIQUE/PK constraint, but if the rows collide on
-        // those columns there necessarily is one.
+        // is distinct, so it could not have produced this conflict). That row's
+        // rowid is the one to update.
         for &er in conflicts {
             let Some(existing) = self.read_row(meta, er)? else {
                 continue;
@@ -8335,11 +8342,11 @@ impl Connection {
                     ) == core::cmp::Ordering::Equal
             });
             if collide {
-                return Ok(true);
+                return Ok(Some(er));
             }
         }
         let _ = params;
-        Ok(false)
+        Ok(None)
     }
 
     /// The key values for a row under `idx` (excluding the trailing rowid): the
