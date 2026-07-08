@@ -7502,11 +7502,6 @@ impl Connection {
         validate_upsert_columns(&meta, &ins.table, &upsert_target_db, &ins.upsert)?;
         self.validate_upsert_conflict_targets(&meta, &ins.table, &ins.upsert)?;
         if meta.without_rowid {
-            if !ins.upsert.is_empty() || !ins.returning.is_empty() {
-                return Err(Error::Unsupported(
-                    "UPSERT / RETURNING on WITHOUT ROWID tables",
-                ));
-            }
             return self.exec_insert_without_rowid(ins, &meta, &rows, is_default_values, params);
         }
         let n_cols = meta.columns.len();
@@ -8545,9 +8540,6 @@ impl Connection {
             }
         }
         if meta.without_rowid {
-            if !del.returning.is_empty() {
-                return Err(Error::Unsupported("RETURNING on WITHOUT ROWID tables"));
-            }
             return self.exec_delete_without_rowid(del, &meta, params);
         }
         let indexes = self.indexes_of(&del.table)?;
@@ -8725,9 +8717,6 @@ impl Connection {
             self.validate_dml_refs(&upd.table, &target_db, &meta.columns, &refs, &returning)?;
         }
         if meta.without_rowid {
-            if !upd.returning.is_empty() {
-                return Err(Error::Unsupported("RETURNING on WITHOUT ROWID tables"));
-            }
             if upd.from.is_some() {
                 return Err(Error::Unsupported("UPDATE … FROM on WITHOUT ROWID tables"));
             }
@@ -26958,6 +26947,41 @@ impl Connection {
                 }
             }
             if !collide.is_empty() {
+                // An `ON CONFLICT … DO …` upsert clause intercepts the conflict when
+                // it targets the constraint the row collides on (a bare `ON CONFLICT`
+                // absorbs any collision). WITHOUT ROWID rows have no rowid, so the
+                // target row is identified by position in the scanned set.
+                let mut matched = None;
+                for up in &ins.upsert {
+                    if let Some(ci) = wr_upsert_target(meta, up, &existing, &collide, &values) {
+                        matched = Some((up, ci));
+                        break;
+                    }
+                }
+                if let Some((up, ci)) = matched {
+                    match &up.action {
+                        UpsertAction::Nothing => continue, // skip the conflicting row
+                        UpsertAction::Update {
+                            assignments,
+                            where_clause,
+                        } => {
+                            if self.wr_upsert_do_update(
+                                &ins.table,
+                                meta,
+                                existing,
+                                ci,
+                                &values,
+                                assignments,
+                                where_clause.as_ref(),
+                                &ins.returning,
+                                params,
+                            )? {
+                                affected += 1;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 match ins.on_conflict {
                     oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
                         let m = self.wr_conflict_message(
@@ -26995,12 +27019,114 @@ impl Connection {
                 &scolls,
                 meta.pk_descs(),
             )?;
+            if !ins.returning.is_empty() {
+                self.collect_returning(&ins.returning, meta, &values, None, params)?;
+            }
             affected += 1;
         }
         if affected > 0 {
             self.rebuild_wr_indexes(meta, &ins.table)?;
         }
         Ok(affected)
+    }
+
+    /// Apply an `ON CONFLICT … DO UPDATE` action to the scanned WITHOUT ROWID row
+    /// at position `target` in `existing`. `proposed` is the row the `INSERT` would
+    /// have added, exposed to the `SET`/`WHERE` expressions as the `excluded`
+    /// pseudo-table. Rewrites the clustered table with the edited row in place
+    /// (indexes are rebuilt by the caller once the statement completes); returns
+    /// whether a row was actually updated (the optional `WHERE` can veto).
+    #[allow(clippy::too_many_arguments)]
+    fn wr_upsert_do_update(
+        &mut self,
+        table: &str,
+        meta: &TableMeta,
+        existing: Vec<Vec<Value>>,
+        target: usize,
+        proposed: &[Value],
+        assignments: &[(String, Expr)],
+        where_clause: Option<&Expr>,
+        returning: &[ResultColumn],
+        params: &Params,
+    ) -> Result<bool> {
+        let old_row = existing[target].clone();
+        // Column scope for the SET/WHERE expressions: the target table's columns,
+        // then the same columns again under the `excluded` table label.
+        let mut cols: Vec<ColumnInfo> = meta.columns.clone();
+        cols.extend(meta.columns.iter().map(|c| ColumnInfo {
+            name: c.name.clone(),
+            table: String::from("excluded"),
+            affinity: c.affinity,
+            collation: c.collation,
+            schema: None,
+            hidden: false,
+        }));
+        let mut new_row = old_row.clone();
+        {
+            let mut combined = old_row.clone();
+            combined.extend_from_slice(proposed);
+            let ctx = EvalCtx {
+                row: &combined,
+                columns: &cols,
+                rowid: None,
+                params,
+                anon_counter: core::cell::Cell::new(0),
+                subqueries: None,
+            }
+            .with_subqueries(self);
+            if let Some(w) = where_clause {
+                if eval::truth(&eval::eval(w, &ctx)?) != Some(true) {
+                    return Ok(false);
+                }
+            }
+            for (col, e) in assignments {
+                let pos = meta
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col))
+                    .ok_or_else(|| Error::Error(format!("no such column: {col}")))?;
+                if meta.is_generated(pos) {
+                    return Err(Error::Error(format!(
+                        "cannot UPDATE generated column \"{col}\""
+                    )));
+                }
+                new_row[pos] = eval::eval(e, &ctx)?;
+            }
+        }
+        apply_column_affinity(meta, &mut new_row);
+        self.materialize_generated(meta, &mut new_row, params)?;
+        // PRIMARY KEY columns are implicitly NOT NULL in a WITHOUT ROWID table.
+        for &c in &meta.storage_order[..meta.pk_len] {
+            if matches!(new_row[c], Value::Null) {
+                return Err(Error::Constraint(format!(
+                    "NOT NULL constraint failed: {}.{}",
+                    meta.columns[c].table, meta.columns[c].name
+                )));
+            }
+        }
+        check_not_null(meta, &new_row)?;
+        self.check_strict_types(meta, &new_row)?;
+        self.check_constraints(meta, &new_row, None, params)?;
+        // The updated row must not collide with any OTHER existing row on the PK,
+        // an inline UNIQUE, or a standalone unique index.
+        for (i, r) in existing.iter().enumerate() {
+            if i == target {
+                continue;
+            }
+            if unique_match(meta, r, &new_row)
+                || self.wr_index_collision(table, meta, r, &new_row, params)?
+            {
+                let m = self.wr_conflict_message(table, meta, r, &new_row, params)?;
+                return Err(Error::Constraint(m));
+            }
+        }
+        let mut rebuilt = existing;
+        rebuilt[target] = new_row.clone();
+        self.rewrite_without_rowid(meta, rebuilt.into_iter())?;
+        if !returning.is_empty() {
+            self.collect_returning(returning, meta, &new_row, None, params)?;
+        }
+        Ok(true)
     }
 
     /// DELETE from a WITHOUT ROWID table: keep non-matching rows, rebuild.
@@ -27024,6 +27150,9 @@ impl Connection {
             if keep {
                 kept.push(row);
             } else {
+                if !del.returning.is_empty() {
+                    self.collect_returning(&del.returning, meta, &row, None, params)?;
+                }
                 deleted += 1;
             }
         }
@@ -27044,6 +27173,9 @@ impl Connection {
         let all = self.scan_without_rowid(meta)?;
         let mut out = Vec::with_capacity(all.len());
         let mut affected = 0;
+        // RETURNING rows are held back until the post-update uniqueness check
+        // passes, so an aborted UPDATE emits nothing.
+        let mut returned: Vec<Vec<Value>> = Vec::new();
         for mut row in all {
             let matches = match &upd.where_clause {
                 Some(p) => {
@@ -27085,6 +27217,9 @@ impl Connection {
                 check_not_null(meta, &row)?;
                 self.check_strict_types(meta, &row)?;
                 self.check_constraints(meta, &row, None, params)?;
+                if !upd.returning.is_empty() {
+                    returned.push(row.clone());
+                }
                 affected += 1;
             }
             out.push(row);
@@ -27100,6 +27235,9 @@ impl Connection {
                     return Err(Error::Constraint(m));
                 }
             }
+        }
+        for r in &returned {
+            self.collect_returning(&upd.returning, meta, r, None, params)?;
         }
         if affected > 0 {
             self.rewrite_without_rowid(meta, out.into_iter())?;
@@ -36616,6 +36754,45 @@ fn stat_prefix_cmp(
         }
     }
     core::cmp::Ordering::Equal
+}
+
+/// Which scanned row (index into `existing`) an `ON CONFLICT … DO …` clause
+/// targets on a WITHOUT ROWID table, or `None` when the clause's target does not
+/// match this collision. A bare `ON CONFLICT` (no target) absorbs the first
+/// collision; `ON CONFLICT(cols)` matches the colliding row that shares those
+/// exact columns (NULLs never match — a NULL key is distinct). The WITHOUT ROWID
+/// analogue of [`Connection::upsert_target_row`], keyed by scan position rather
+/// than rowid.
+fn wr_upsert_target(
+    meta: &TableMeta,
+    up: &Upsert,
+    existing: &[Vec<Value>],
+    collide: &[usize],
+    values: &[Value],
+) -> Option<usize> {
+    if up.target.is_empty() {
+        return collide.first().copied();
+    }
+    let target_cols: Vec<usize> = up
+        .target
+        .iter()
+        .map(|name| {
+            meta.columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+        })
+        .collect::<Option<Vec<usize>>>()?;
+    collide.iter().copied().find(|&ci| {
+        target_cols.iter().all(|&c| {
+            !matches!(values[c], Value::Null)
+                && crate::value::cmp_values_coll(
+                    &existing[ci][c],
+                    &values[c],
+                    meta.columns[c].collation,
+                )
+                .is_eq()
+        })
+    })
 }
 
 fn unique_match(meta: &TableMeta, a: &[Value], b: &[Value]) -> bool {

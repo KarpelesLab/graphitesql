@@ -160,9 +160,10 @@ byte-exact vs the pinned `sqlite3` 3.50.4 oracle. Capability summary:
   LIMIT/OFFSET (incl. subquery operands).
 - **DML** — INSERT (multi-row, `DEFAULT VALUES`, `INSERT … SELECT` with snapshot
   semantics), UPSERT (`ON CONFLICT DO UPDATE/NOTHING`, `excluded.*`, partial-index
-  targets), `RETURNING`, UPDATE (simultaneous SET, `UPDATE … FROM`, row-value
-  `SET (a,b)=(…)` and `=(SELECT …)`), DELETE, all `OR <conflict>` clauses, and
-  `AS`-aliased UPDATE/DELETE targets.
+  targets — incl. on `WITHOUT ROWID` tables), `RETURNING` (INSERT/UPDATE/DELETE,
+  rowid and `WITHOUT ROWID` alike), UPDATE (simultaneous SET, `UPDATE … FROM`,
+  row-value `SET (a,b)=(…)` and `=(SELECT …)`), DELETE, all `OR <conflict>`
+  clauses, and `AS`-aliased UPDATE/DELETE targets.
 - **DDL** — CREATE/DROP/ALTER TABLE (ADD / DROP / RENAME COLUMN, RENAME TABLE),
   CREATE/DROP VIEW / INDEX / TRIGGER (BEFORE/AFTER/INSTEAD OF, WHEN, `RAISE`),
   STRICT and WITHOUT ROWID, generated columns (VIRTUAL/STORED), AUTOINCREMENT +
