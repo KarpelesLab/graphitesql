@@ -24808,7 +24808,7 @@ impl Connection {
                 if lname == "json_tree" {
                     // The root row carries the path's final component as its key and
                     // its parent path in the `path` column.
-                    let (parent_path, key) = split_json_path(&root_path);
+                    let (parent_path, key) = split_json_path(&root, &root_path, base_id as i64);
                     json_tree_walk(
                         target,
                         key,
@@ -34445,25 +34445,62 @@ fn json_each_children(
     }
 }
 
-/// Split a JSON path (`$.a.b`, `$.a[2]`, `$[0]`) into its parent path and the
-/// final component rendered as a `json_tree` root key (a text member name or an
-/// integer array index). The bare root `$` yields `("$", None)`.
-fn split_json_path(path: &str) -> (alloc::string::String, Option<Value>) {
-    if path.ends_with(']') {
-        if let Some(open) = path.rfind('[') {
-            if let Ok(i) = path[open + 1..path.len() - 1].parse::<i64>() {
-                return (String::from(&path[..open]), Some(Value::Integer(i)));
+/// Split a `json_tree` root path (`$.a.b`, `$.a[2]`, `$[0]`) into the parent path
+/// reported in the `path` column and the final component reported as the root
+/// `key`. The bare root `$` yields `("$", None)`.
+///
+/// This is a port of SQLite's `jsonEachPathLength`: the split is placed at the
+/// last `.`/`[` whose prefix resolves to a container whose *first* child is
+/// exactly the target node (`target_id` is that node's reported `id`). Only then
+/// does the trailing component become the key; otherwise the whole suffix after
+/// `$.` becomes the key and `path` collapses to `$`. So `json_tree(J,'$.b[0]')`
+/// reports `key=0, path=$.b`, but `json_tree(J,'$.b[2]')` — where `b[2]` is *not*
+/// the array's first element — reports `key='b[2]', path=$`, matching SQLite's
+/// (quirky but authoritative) behaviour.
+fn split_json_path(
+    root: &crate::exec::json::Json,
+    path: &str,
+    target_id: i64,
+) -> (alloc::string::String, Option<Value>) {
+    let bytes = path.as_bytes();
+    let mut j = bytes.len();
+    while j > 1 {
+        j -= 1;
+        if bytes[j] == b'[' || bytes[j] == b'.' {
+            if let Some((node, voff, _)) = crate::exec::json::navigate_with_offset(root, &path[..j])
+            {
+                if voff as i64 + node.jsonb_header_bytes() as i64 == target_id {
+                    break;
+                }
             }
         }
     }
-    if let Some(dot) = path.rfind('.') {
-        let name = path[dot + 1..].trim_matches('"');
-        return (
-            String::from(&path[..dot]),
-            Some(Value::Text(String::from(name))),
-        );
+    if j >= bytes.len() {
+        return (String::from(path), None); // the bare `$` root
     }
-    (String::from(path), None)
+    let parent = String::from(&path[..j]);
+    let key = if bytes[j] == b'[' {
+        // SQLite reads the leading integer with `sqlite3Atoi64`, which stops at
+        // the `]` — so a collapsed `$[1].c` yields key `1`, not the whole suffix.
+        let n: i64 = path[j + 1..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .fold(0, |acc, b| acc * 10 + (b - b'0') as i64);
+        Value::Integer(n)
+    } else {
+        // `bytes[j] == '.'`: SQLite strips a surrounding pair of quotes only when
+        // the character right after the `.` is a `"` (taking `n-3` bytes); any
+        // other suffix — including a collapsed multi-segment tail like `b."x y"` —
+        // is the raw remainder verbatim.
+        let rest = &path[j + 1..];
+        let name = if rest.as_bytes().first() == Some(&b'"') && rest.len() >= 2 {
+            &rest[1..rest.len() - 1]
+        } else {
+            rest
+        };
+        Value::Text(String::from(name))
+    };
+    (parent, Some(key))
 }
 
 /// A node's location in the document's JSONB blob, threaded through the
