@@ -316,18 +316,18 @@ for the whole statement, while a subquery/source reading the *original* main sti
 resolves there. `INSERT … SELECT`/`… VALUES ((SELECT …))` are pre-materialised in
 the original context before the swap.
 
-**Remaining:** the db-swap does not remap the qualifier→database mapping, so an
-UPDATE/DELETE on an attached-db table whose WHERE/SET contains a **schema-qualified
-subquery reference** (`UPDATE aux.u … WHERE a IN (SELECT a FROM main.t)`, or even
-the target's own `aux.u`) errors `no such table` — after the swap, `main` resolves
-to the swapped-in aux schema and `aux` to the swapped-out main. SELECT and simple
-(no-subquery) cross-db writes are fine. Also: an unqualified name present in both
-the active and an attached db binds to the active db (graphite) rather than `main`
-(sqlite). Both need either swap-aware resolution (invert the qualifier map during a
-swapped write, consulting `write_target`) or dropping the read-side swap entirely
-(resolve the write target by qualifier, reads by the global order) — a
-higher-risk refactor of a pervasive resolution path; deferred until something needs
-byte-exact parity there.
+A **schema-qualified** subquery reference in a cross-db write's WHERE/SET
+(`UPDATE aux.u … WHERE a IN (SELECT a FROM main.t)`, or the target's own `aux.u`)
+now resolves correctly: `resolve_db` inverts the swapped pair while the swap is
+live (a `swap_active` flag; qualified refs only — unqualified keeps the active
+slot).
+
+**Remaining:** an *unqualified* name present in **both** the active db and an
+attached one, referenced unqualified inside a cross-db write, binds to the active
+db (graphite) rather than `main` (sqlite). Realistic schemas qualify such
+references. A full fix would mean dropping the read-side swap entirely (resolve
+the write target by qualifier, reads by the global `main → temp → attached` order)
+— a larger refactor of the pervasive resolution path.
 
 ### CLI shell (`graphitesql`)
 

@@ -159,6 +159,16 @@ pub struct Connection {
     /// three-part column qualifier is validated against the target's real
     /// database name, not the swap-relative one `unqualified_db` would report.
     write_target: core::cell::Cell<DbRef>,
+    /// The database physically swapped into the active `main` slot for the
+    /// duration of a write to a non-main target (`Some(target)` only while that
+    /// swap is live — set *after* `swap_db`, cleared *before* the swap is undone,
+    /// so it is `None` during the pre-swap prematerialize window). Read by
+    /// [`resolve_db`](Self::resolve_db) to invert the qualifier→slot mapping for a
+    /// schema-qualified reference in the write's WHERE/SET (its subqueries): the
+    /// target's own name and `main` are physically exchanged by the swap, but the
+    /// name→slot lookup is not, so `main.t` / `aux.u` would otherwise resolve to
+    /// the wrong database.
+    swap_active: core::cell::Cell<Option<DbRef>>,
     /// Virtual-table modules registered on this connection, keyed by the name
     /// that follows `USING` in `CREATE VIRTUAL TABLE`. Seeded with the built-in
     /// `series` module; a public registration API is roadmap D4.
@@ -330,6 +340,7 @@ impl Connection {
             total_changes: core::cell::Cell::new(0),
             read_default: core::cell::Cell::new(DbRef::Main),
             write_target: core::cell::Cell::new(DbRef::Main),
+            swap_active: core::cell::Cell::new(None),
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
@@ -375,6 +386,7 @@ impl Connection {
             total_changes: core::cell::Cell::new(0),
             read_default: core::cell::Cell::new(DbRef::Main),
             write_target: core::cell::Cell::new(DbRef::Main),
+            swap_active: core::cell::Cell::new(None),
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
@@ -4400,7 +4412,13 @@ impl Connection {
                 // path still handles a source that lives in the target db.
                 let stmt = self.prematerialize_insert_source(stmt, params);
                 self.swap_db(other);
+                // Mark the swap live so `resolve_db` inverts the swapped pair for a
+                // schema-qualified reference in the write's WHERE/SET (its
+                // subqueries). Set only now — not during the prematerialize above,
+                // which runs unswapped.
+                let prev_swap = self.swap_active.replace(Some(other));
                 let r = self.exec_parsed(stmt, sql, params);
+                self.swap_active.set(prev_swap);
                 self.swap_db(other);
                 r
             }
@@ -27474,17 +27492,44 @@ impl Connection {
     /// unknown name is an error.
     fn resolve_db(&self, schema: Option<&str>) -> Result<DbRef> {
         match schema {
+            // An unqualified name resolves against the active `main` slot — which,
+            // during a write to a non-main target, is the swapped-in target. (An
+            // unqualified name that also lives in the original main is the separate
+            // Track-E residual, left as-is.)
             None => Ok(DbRef::Main),
-            Some(s) if s.eq_ignore_ascii_case("main") => Ok(DbRef::Main),
+            Some(s) if s.eq_ignore_ascii_case("main") => Ok(self.apply_swap(DbRef::Main)),
             Some(s) if s.eq_ignore_ascii_case("temp") || s.eq_ignore_ascii_case("temporary") => {
-                Ok(DbRef::Temp)
+                Ok(self.apply_swap(DbRef::Temp))
             }
             Some(s) => self
                 .attached
                 .iter()
                 .position(|d| d.name.eq_ignore_ascii_case(s))
                 .map(DbRef::Attached)
+                .map(|r| self.apply_swap(r))
                 .ok_or_else(|| Error::Error(alloc::format!("unknown database {s}"))),
+        }
+    }
+
+    /// During a write to a non-main target (`swap_active`), that database is
+    /// physically in the active `main` slot and the original main is in the
+    /// target's swapped-out slot — but the qualifier→slot lookup above is unchanged.
+    /// Exchange the two so a *qualified* reference resolves to the right physical
+    /// database: `main` → the target's old slot, the target's own name → `main`.
+    /// A no-op outside a live swap, or for any other database.
+    fn apply_swap(&self, raw: DbRef) -> DbRef {
+        match self.swap_active.get() {
+            None | Some(DbRef::Main) => raw,
+            Some(DbRef::Attached(i)) => match raw {
+                DbRef::Main => DbRef::Attached(i),
+                DbRef::Attached(j) if j == i => DbRef::Main,
+                other => other,
+            },
+            Some(DbRef::Temp) => match raw {
+                DbRef::Main => DbRef::Temp,
+                DbRef::Temp => DbRef::Main,
+                other => other,
+            },
         }
     }
 
