@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.17](https://github.com/KarpelesLab/graphitesql/compare/v0.0.16...v0.0.17) - 2026-07-08
+## [0.1.0](https://github.com/KarpelesLab/graphitesql/compare/v0.0.16...v0.1.0) - 2026-07-08
 
 ### Added
 
