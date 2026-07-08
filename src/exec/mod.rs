@@ -7611,6 +7611,9 @@ impl Connection {
             self.materialize_generated(&meta, &mut values, params)?;
 
             // Determine the rowid (explicit INTEGER PRIMARY KEY value or auto).
+            // `rowid_auto` records whether it was auto-assigned — a BEFORE INSERT
+            // trigger runs before the auto-assignment, so it must see -1 there.
+            let mut rowid_auto = false;
             let rowid = match meta.ipk {
                 Some(ipk) if !matches!(values[ipk], Value::Null) => {
                     // An INTEGER PRIMARY KEY *is* the rowid, so the supplied value
@@ -7635,6 +7638,7 @@ impl Connection {
                     r
                 }
                 _ => {
+                    rowid_auto = true;
                     let r = self.auto_rowid(meta.root, meta.autoincrement, next_auto)?;
                     // Advance sequentially when we stayed in range; if `auto_rowid`
                     // left the exhausted range (a random pick below the candidate),
@@ -7753,13 +7757,28 @@ impl Connection {
             }
 
             let index_values = values.clone();
+            // SQLite runs a BEFORE INSERT trigger *before* the rowid is
+            // auto-assigned, so `NEW.<rowid>` (an INTEGER PRIMARY KEY or the bare
+            // `rowid`/`_rowid_`/`oid`) reads back as -1 there when the row will
+            // take an auto rowid. An explicitly supplied rowid is visible as
+            // itself. Present that view to the trigger only; the real rowid is
+            // used for the actual insert below.
+            let (before_values, before_rowid) = if rowid_auto {
+                let mut bv = index_values.clone();
+                if let Some(ipk) = meta.ipk {
+                    bv[ipk] = Value::Integer(-1);
+                }
+                (bv, -1)
+            } else {
+                (index_values.clone(), rowid)
+            };
             self.fire_triggers(
                 &ins.table,
                 TrigEvent::Insert,
                 TriggerTiming::Before,
                 &meta.columns,
                 None,
-                Some((&index_values, rowid)),
+                Some((&before_values, before_rowid)),
                 params,
                 None,
             )?;
