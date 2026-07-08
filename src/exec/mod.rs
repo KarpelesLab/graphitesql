@@ -8717,9 +8717,6 @@ impl Connection {
             self.validate_dml_refs(&upd.table, &target_db, &meta.columns, &refs, &returning)?;
         }
         if meta.without_rowid {
-            if upd.from.is_some() {
-                return Err(Error::Unsupported("UPDATE … FROM on WITHOUT ROWID tables"));
-            }
             return self.exec_update_without_rowid(upd, &meta, params);
         }
         let indexes = self.indexes_of(&upd.table)?;
@@ -8737,11 +8734,15 @@ impl Connection {
                 // A from-only synthetic SELECT to reuse the join scanner. Its WHERE
                 // stays empty (the UPDATE's WHERE references the target too and is
                 // applied per target row below), so the scan is a plain superset.
+                // The `*` projection is essential: it marks every source column as
+                // needed, so `scan_source`'s covering-index optimization does not
+                // read from a narrow index (e.g. a PRIMARY KEY autoindex) that omits
+                // the columns the SET/WHERE expressions reference.
                 let synth = Select {
                     ctes: Vec::new(),
                     compound: Vec::new(),
                     distinct: false,
-                    columns: Vec::new(),
+                    columns: alloc::vec![ResultColumn::Wildcard],
                     from: Some(fc.clone()),
                     where_clause: None,
                     group_by: Vec::new(),
@@ -27170,71 +27171,166 @@ impl Connection {
         meta: &TableMeta,
         params: &Params,
     ) -> Result<usize> {
-        let all = self.scan_without_rowid(meta)?;
-        let mut out = Vec::with_capacity(all.len());
-        let mut affected = 0;
-        // RETURNING rows are held back until the post-update uniqueness check
-        // passes, so an aborted UPDATE emits nothing.
-        let mut returned: Vec<Vec<Value>> = Vec::new();
-        for mut row in all {
-            let matches = match &upd.where_clause {
-                Some(p) => {
-                    let ctx = row_ctx(&row, &meta.columns, None, params).with_subqueries(self);
-                    eval::truth(&eval::eval(p, &ctx)?) == Some(true)
-                }
-                None => true,
-            };
-            if matches {
-                // Assignments are simultaneous: evaluate every SET expression
-                // against the original row, not the progressively-mutated one.
-                let original = row.clone();
-                for (col, expr) in &upd.assignments {
-                    let pos = meta
-                        .columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(col))
-                        .ok_or_else(|| Error::Error(format!("no such column: {col}")))?;
-                    if meta.is_generated(pos) {
-                        return Err(Error::Error(format!(
-                            "cannot UPDATE generated column \"{col}\""
-                        )));
-                    }
-                    let ctx = row_ctx(&original, &meta.columns, None, params).with_subqueries(self);
-                    row[pos] = eval::eval(expr, &ctx)?;
-                }
-                if !upd.row_assignments.is_empty() {
-                    let ctx = row_ctx(&original, &meta.columns, None, params).with_subqueries(self);
-                    self.apply_row_subquery_assignments(
-                        &upd.row_assignments,
-                        &meta.columns,
-                        Some(meta),
-                        &ctx,
-                        &mut row,
-                    )?;
-                }
-                apply_column_affinity(meta, &mut row);
-                self.materialize_generated(meta, &mut row, params)?;
-                check_not_null(meta, &row)?;
-                self.check_strict_types(meta, &row)?;
-                self.check_constraints(meta, &row, None, params)?;
-                if !upd.returning.is_empty() {
-                    returned.push(row.clone());
-                }
-                affected += 1;
+        // UPDATE … FROM: materialize the extra tables once (mirrors the rowid
+        // path). Each target row joins to the first FROM-row combination passing
+        // WHERE, and that row's columns are visible to SET/WHERE.
+        let from_data: Option<(Vec<ColumnInfo>, Vec<Vec<Value>>)> = match &upd.from {
+            Some(fc) => {
+                // `*` marks all source columns as needed (see the rowid UPDATE …
+                // FROM path): without it, `scan_source` may satisfy the scan from a
+                // narrow covering index and drop the columns the SET/WHERE reference.
+                let synth = Select {
+                    ctes: Vec::new(),
+                    compound: Vec::new(),
+                    distinct: false,
+                    columns: alloc::vec![ResultColumn::Wildcard],
+                    from: Some(fc.clone()),
+                    where_clause: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    window_defs: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    values_rows: 0,
+                };
+                let (cols, rows) = self.scan_source(&synth, params)?;
+                Some((cols, rows.into_iter().map(|r| r.values).collect()))
             }
-            out.push(row);
-        }
-        // Reject duplicate primary keys or UNIQUE values produced by the update
-        // (inline constraints and standalone unique indexes alike).
-        for i in 0..out.len() {
-            for j in (i + 1)..out.len() {
-                if unique_match(meta, &out[i], &out[j])
-                    || self.wr_index_collision(&upd.table, meta, &out[i], &out[j], params)?
+            None => None,
+        };
+        let combined_columns: Vec<ColumnInfo> = match &from_data {
+            Some((cols, _)) => meta.columns.iter().chain(cols).cloned().collect(),
+            None => Vec::new(),
+        };
+        let all = self.scan_without_rowid(meta)?;
+        // `out` starts as the original rows and is updated in place, in scan
+        // order. SQLite updates a WITHOUT ROWID table one row at a time and checks
+        // uniqueness immediately after each write, so a *transient* duplicate — one
+        // that exists mid-statement even if the final rows are all distinct (e.g.
+        // swapping two UNIQUE values) — is rejected. Checking each new row against
+        // the current `out` state (earlier matches already updated, later ones
+        // still original) reproduces that; a batch check of only the final state
+        // would miss it.
+        let mut out = all.clone();
+        let mut affected = 0;
+        // RETURNING rows are held back until the update fully succeeds, so an
+        // aborted UPDATE emits nothing.
+        let mut returned: Vec<Vec<Value>> = Vec::new();
+        for i in 0..all.len() {
+            // Match the row (and, under FROM, capture the joined row that satisfies
+            // WHERE — those columns feed the SET expressions).
+            let (matches, matched_from) = match &from_data {
+                Some((_, from_rows)) => {
+                    // When several FROM rows match one target row, SQLite's WITHOUT
+                    // ROWID path updates the clustered row once per match, so the
+                    // LAST matching row wins (sqlite documents multi-match as
+                    // arbitrarily chosen; the recommended single-match case is
+                    // unaffected). This differs from the rowid path's first-match.
+                    let mut mf = None;
+                    for fr in from_rows {
+                        let mut combined = all[i].clone();
+                        combined.extend_from_slice(fr);
+                        let ok = match &upd.where_clause {
+                            Some(p) => {
+                                let ctx = row_ctx(&combined, &combined_columns, None, params)
+                                    .with_subqueries(self);
+                                eval::truth(&eval::eval(p, &ctx)?) == Some(true)
+                            }
+                            None => true,
+                        };
+                        if ok {
+                            mf = Some(fr.clone());
+                        }
+                    }
+                    (mf.is_some(), mf)
+                }
+                None => {
+                    let m = match &upd.where_clause {
+                        Some(p) => {
+                            let ctx =
+                                row_ctx(&all[i], &meta.columns, None, params).with_subqueries(self);
+                            eval::truth(&eval::eval(p, &ctx)?) == Some(true)
+                        }
+                        None => true,
+                    };
+                    (m, None)
+                }
+            };
+            if !matches {
+                continue;
+            }
+            // Assignments are simultaneous: evaluate every SET expression against
+            // the original row (extended with the matched FROM row), not the
+            // progressively-mutated one.
+            let original = all[i].clone();
+            let mut row = original.clone();
+            let (eval_row, eval_cols): (Vec<Value>, &[ColumnInfo]) = match &matched_from {
+                Some(fr) => {
+                    let mut c = original.clone();
+                    c.extend_from_slice(fr);
+                    (c, &combined_columns)
+                }
+                None => (original.clone(), &meta.columns),
+            };
+            for (col, expr) in &upd.assignments {
+                let pos = meta
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col))
+                    .ok_or_else(|| Error::Error(format!("no such column: {col}")))?;
+                if meta.is_generated(pos) {
+                    return Err(Error::Error(format!(
+                        "cannot UPDATE generated column \"{col}\""
+                    )));
+                }
+                let ctx = row_ctx(&eval_row, eval_cols, None, params).with_subqueries(self);
+                row[pos] = eval::eval(expr, &ctx)?;
+            }
+            if !upd.row_assignments.is_empty() {
+                let ctx = row_ctx(&eval_row, eval_cols, None, params).with_subqueries(self);
+                self.apply_row_subquery_assignments(
+                    &upd.row_assignments,
+                    eval_cols,
+                    Some(meta),
+                    &ctx,
+                    &mut row,
+                )?;
+            }
+            apply_column_affinity(meta, &mut row);
+            self.materialize_generated(meta, &mut row, params)?;
+            // PRIMARY KEY columns are implicitly NOT NULL in a WITHOUT ROWID table
+            // (a NULL would corrupt the clustered key); sqlite rejects an UPDATE
+            // that nulls one.
+            for &c in &meta.storage_order[..meta.pk_len] {
+                if matches!(row[c], Value::Null) {
+                    return Err(Error::Constraint(format!(
+                        "NOT NULL constraint failed: {}.{}",
+                        meta.columns[c].table, meta.columns[c].name
+                    )));
+                }
+            }
+            check_not_null(meta, &row)?;
+            self.check_strict_types(meta, &row)?;
+            self.check_constraints(meta, &row, None, params)?;
+            // Immediate uniqueness check against the current state of every OTHER
+            // row (see the note on `out` above): reject transient duplicates.
+            for (j, other) in out.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                if unique_match(meta, &row, other)
+                    || self.wr_index_collision(&upd.table, meta, &row, other, params)?
                 {
-                    let m = self.wr_conflict_message(&upd.table, meta, &out[i], &out[j], params)?;
+                    let m = self.wr_conflict_message(&upd.table, meta, &row, other, params)?;
                     return Err(Error::Constraint(m));
                 }
             }
+            if !upd.returning.is_empty() {
+                returned.push(row.clone());
+            }
+            out[i] = row;
+            affected += 1;
         }
         for r in &returned {
             self.collect_returning(&upd.returning, meta, r, None, params)?;

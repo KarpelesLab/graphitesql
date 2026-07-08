@@ -78,6 +78,83 @@ fn without_rowid_upsert_and_returning() {
 }
 
 #[test]
+fn update_from_reads_all_source_columns() {
+    // Regression: UPDATE … FROM materialized the source table through a covering
+    // index when the synthetic from-scan referenced no columns, so a source with
+    // a PRIMARY KEY (or any covering index) dropped the columns the SET/WHERE
+    // needed — the join matched nothing. Affects rowid and WITHOUT ROWID targets.
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let cases = [
+        // rowid target, integer-PK source (k is an INTEGER PRIMARY KEY / autoindex).
+        "CREATE TABLE t(a,b,c);INSERT INTO t VALUES(9,0,0);\
+         CREATE TABLE s(k PRIMARY KEY,v);INSERT INTO s VALUES(9,111);\
+         UPDATE t SET c=s.v FROM s WHERE s.k=t.a;SELECT * FROM t;",
+        // WITHOUT ROWID target, PK source.
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a)) WITHOUT ROWID;INSERT INTO t VALUES(9,0,0);\
+         CREATE TABLE s(k PRIMARY KEY,v);INSERT INTO s VALUES(9,111);\
+         UPDATE t SET c=s.v FROM s WHERE s.k=t.a;SELECT * FROM t;",
+        // Text-PK source (non-integer, standalone autoindex).
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a)) WITHOUT ROWID;INSERT INTO t VALUES('q',-1,9);\
+         CREATE TABLE s(k PRIMARY KEY,v);INSERT INTO s VALUES('q',1);\
+         UPDATE t SET c=s.v FROM s WHERE s.k=t.a;SELECT * FROM t;",
+        // Multi-column WITHOUT ROWID target with a single-match join.
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)) WITHOUT ROWID;INSERT INTO t VALUES(1,2,3);\
+         CREATE TABLE s(k PRIMARY KEY,v);INSERT INTO s VALUES(1,99);\
+         UPDATE t SET c=v FROM s WHERE s.k=t.a;SELECT * FROM t;",
+    ];
+    for sql in cases {
+        assert_eq!(out("sqlite3", sql), out(g, sql), "for `{sql}`");
+    }
+}
+
+#[test]
+fn without_rowid_update_constraints() {
+    // WITHOUT ROWID UPDATE must (a) reject a NULL in a PRIMARY KEY column (PK is
+    // implicitly NOT NULL — a NULL corrupts the clustered key) and (b) reject a
+    // *transient* UNIQUE duplicate, exactly like the rowid path and sqlite: a
+    // single UPDATE cannot swap two UNIQUE values even though the final rows are
+    // all distinct.
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    // These raise an error; compare the message body (the CLI wraps it differently).
+    let err_cases = [
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)) WITHOUT ROWID;INSERT INTO t VALUES(1,2,3);\
+         UPDATE t SET b=NULL WHERE a=1;",
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)) WITHOUT ROWID;INSERT INTO t VALUES(1,2,3);\
+         UPDATE t SET a=NULL WHERE a=1;",
+        "CREATE TABLE t(a PRIMARY KEY,c UNIQUE) WITHOUT ROWID;INSERT INTO t VALUES(1,1),(2,2);\
+         UPDATE t SET c=CASE WHEN c=1 THEN 2 ELSE 1 END;",
+    ];
+    for sql in err_cases {
+        let s = out("sqlite3", sql);
+        let e = Command::new(g).arg(":memory:").arg(sql).output().unwrap();
+        assert!(s.is_empty(), "sqlite should error for `{sql}`");
+        let se = String::from_utf8_lossy(&e.stderr);
+        assert!(
+            se.contains("constraint failed"),
+            "graphite should reject `{sql}`, got stderr=`{se}`"
+        );
+    }
+    // These succeed identically (non-transitive shift, non-PK NULL, self-same).
+    let ok_cases = [
+        "CREATE TABLE t(a PRIMARY KEY,c UNIQUE) WITHOUT ROWID;INSERT INTO t VALUES(1,1),(2,2);\
+         UPDATE t SET c=c+10;SELECT * FROM t ORDER BY a;",
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)) WITHOUT ROWID;INSERT INTO t VALUES(1,2,3);\
+         UPDATE t SET c=NULL WHERE a=1;SELECT * FROM t;",
+    ];
+    for sql in ok_cases {
+        assert_eq!(out("sqlite3", sql), out(g, sql), "for `{sql}`");
+    }
+}
+
+#[test]
 fn without_rowid_delete_update_returning() {
     if !sqlite3_available() {
         eprintln!("sqlite3 CLI not found; skipping");
