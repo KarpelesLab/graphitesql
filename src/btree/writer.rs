@@ -14,7 +14,7 @@
 //! the parent and growing a new root when the root itself splits. Index-tree
 //! maintenance is handled in Phase 7.
 
-use super::page::{payload_split, BtreePage, PageType};
+use super::page::{BtreePage, PageType, payload_split};
 use crate::error::{Error, Result};
 use crate::pager::{PageSource, WritePager};
 use crate::util::varint;
@@ -197,7 +197,7 @@ fn free_overflow_chain(wp: &mut WritePager, mut first: u32) -> Result<()> {
 /// Write `data` across a chain of overflow pages, returning the first page.
 pub(crate) fn write_overflow_chain(wp: &mut WritePager, data: &[u8]) -> Result<u32> {
     let cap = wp.usable_size() - 4; // bytes of payload per overflow page
-                                    // Allocate all pages first so we know each page's successor.
+    // Allocate all pages first so we know each page's successor.
     let n_pages = data.len().div_ceil(cap);
     let mut pages = Vec::with_capacity(n_pages);
     for _ in 0..n_pages {
@@ -510,10 +510,10 @@ fn write_cell_content_start(buf: &mut [u8], at: usize, content: usize, page_size
 mod tests {
     use super::*;
     use crate::btree::TableCursor;
-    use crate::format::record::{decode_record, encode_record};
     use crate::format::TextEncoding;
+    use crate::format::record::{decode_record, encode_record};
     use crate::value::Value;
-    use crate::vfs::{memory::MemoryVfs, OpenFlags, Vfs};
+    use crate::vfs::{OpenFlags, Vfs, memory::MemoryVfs};
 
     fn new_table_root(wp: &mut WritePager) -> u32 {
         // Allocate an empty leaf page to serve as a table root.

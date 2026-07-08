@@ -543,11 +543,7 @@ impl Parser<'_> {
         // out-of-range reads yield 0, matching the terminator.
         let z = |j: isize| -> u8 {
             let idx = start as isize + j;
-            if idx < 0 {
-                0
-            } else {
-                self.at(idx as usize)
-            }
+            if idx < 0 { 0 } else { self.at(idx as usize) }
         };
         let mut j = 0isize;
         let mut seen_dp = false;
@@ -668,11 +664,7 @@ pub(crate) fn overlap(p1: &GeoPoly, p2: &GeoPoly) -> i64 {
     let mut a_overlap = [0u8; 4];
     let mut need_sort = false;
     let mut r_x = if let Some(&first) = order.first() {
-        if events[first].x == 0.0 {
-            -1.0
-        } else {
-            0.0
-        }
+        if events[first].x == 0.0 { -1.0 } else { 0.0 }
     } else {
         0.0
     };
@@ -690,10 +682,10 @@ pub(crate) fn overlap(p1: &GeoPoly, p2: &GeoPoly) -> i64 {
             let mut prev: Option<usize> = None;
             let mut i_mask = 0usize;
             for &si in &active {
-                if let Some(pi) = prev {
-                    if segs[pi].y != segs[si].y {
-                        a_overlap[i_mask] = 1;
-                    }
+                if let Some(pi) = prev
+                    && segs[pi].y != segs[si].y
+                {
+                    a_overlap[i_mask] = 1;
                 }
                 i_mask ^= segs[si].side as usize;
                 prev = Some(si);

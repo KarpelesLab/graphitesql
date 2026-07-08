@@ -8,7 +8,7 @@
 #![cfg(feature = "std")]
 
 use graphitesql::pager::{PageSource, Pager, WritePager};
-use graphitesql::vfs::{std_file::StdVfs, OpenFlags, Vfs};
+use graphitesql::vfs::{OpenFlags, Vfs, std_file::StdVfs};
 use graphitesql::{Connection, Value};
 
 /// A per-PID, per-test scratch directory under `/tmp`, created fresh. The `tag`

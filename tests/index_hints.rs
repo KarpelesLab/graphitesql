@@ -49,9 +49,10 @@ fn indexed_by_uses_named_index() {
         5
     );
     // The hinted index must exist.
-    assert!(c
-        .query("SELECT * FROM t INDEXED BY no_such_index WHERE k = 1")
-        .is_err());
+    assert!(
+        c.query("SELECT * FROM t INDEXED BY no_such_index WHERE k = 1")
+            .is_err()
+    );
 }
 
 #[test]

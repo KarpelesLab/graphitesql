@@ -18,11 +18,12 @@ fn sqlite3_available() -> bool {
 #[test]
 fn without_rowid_missing_pk_message() {
     let mut c = Connection::open_memory().unwrap();
-    assert!(c
-        .execute("CREATE TABLE t(a, b) WITHOUT ROWID")
-        .unwrap_err()
-        .to_string()
-        .contains("PRIMARY KEY missing on table t"));
+    assert!(
+        c.execute("CREATE TABLE t(a, b) WITHOUT ROWID")
+            .unwrap_err()
+            .to_string()
+            .contains("PRIMARY KEY missing on table t")
+    );
     // A WITHOUT ROWID table with a PRIMARY KEY is still fine.
     c.execute("CREATE TABLE ok(a PRIMARY KEY, b) WITHOUT ROWID")
         .unwrap();
@@ -32,11 +33,12 @@ fn without_rowid_missing_pk_message() {
 fn rename_missing_column_is_quoted() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a)").unwrap();
-    assert!(c
-        .execute("ALTER TABLE t RENAME COLUMN nope TO x")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: \"nope\""));
+    assert!(
+        c.execute("ALTER TABLE t RENAME COLUMN nope TO x")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: \"nope\"")
+    );
 }
 
 #[test]

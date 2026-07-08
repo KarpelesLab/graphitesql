@@ -124,23 +124,26 @@ fn bare_without_a_constraint_or_with_a_nonequality_yields_no_rows() {
     let c = conn();
     // No `arg` constraint names no object → empty (not an error), like the
     // argument-less `PRAGMA table_info`.
-    assert!(c
-        .query("SELECT name FROM pragma_table_info")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query("SELECT name FROM pragma_table_info")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
     // A non-equality constraint does not drive the pragma → empty.
-    assert!(c
-        .query("SELECT name FROM pragma_table_info WHERE arg LIKE 't'")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query("SELECT name FROM pragma_table_info WHERE arg LIKE 't'")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
     // An unknown table name → empty.
-    assert!(c
-        .query("SELECT name FROM pragma_table_info WHERE arg='nonesuch'")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query("SELECT name FROM pragma_table_info WHERE arg='nonesuch'")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]

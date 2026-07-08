@@ -394,13 +394,15 @@ fn add_column_constraint_restrictions() {
     c.execute("CREATE TABLE t(a)").unwrap();
     c.execute("INSERT INTO t VALUES(1)").unwrap();
     assert!(c.execute("ALTER TABLE t ADD COLUMN b NOT NULL").is_err());
-    assert!(c
-        .execute("ALTER TABLE t ADD COLUMN b NOT NULL DEFAULT NULL")
-        .is_err());
+    assert!(
+        c.execute("ALTER TABLE t ADD COLUMN b NOT NULL DEFAULT NULL")
+            .is_err()
+    );
     // A non-NULL default fills existing rows, so it is allowed.
-    assert!(c
-        .execute("ALTER TABLE t ADD COLUMN b NOT NULL DEFAULT 0")
-        .is_ok());
+    assert!(
+        c.execute("ALTER TABLE t ADD COLUMN b NOT NULL DEFAULT 0")
+            .is_ok()
+    );
     assert_eq!(
         c.query("SELECT b FROM t").unwrap().rows[0][0],
         Value::Integer(0)

@@ -33,8 +33,10 @@ fn parenthesized_base_override_is_rejected() {
     let ordered = "WINDOW w AS (ORDER BY x)";
 
     // Frame override: the base already has a frame.
-    assert!(err(&c, &format!("SELECT sum(x) OVER (w) FROM t {framed}"))
-        .contains("cannot override frame specification of window: w"));
+    assert!(
+        err(&c, &format!("SELECT sum(x) OVER (w) FROM t {framed}"))
+            .contains("cannot override frame specification of window: w")
+    );
     assert!(err(
         &c,
         &format!(
@@ -43,17 +45,21 @@ fn parenthesized_base_override_is_rejected() {
     )
     .contains("cannot override frame specification of window: w"));
     // ORDER BY override: the base already has an ORDER BY.
-    assert!(err(
-        &c,
-        &format!("SELECT sum(x) OVER (w ORDER BY id) FROM t {ordered}")
-    )
-    .contains("cannot override ORDER BY clause of window: w"));
+    assert!(
+        err(
+            &c,
+            &format!("SELECT sum(x) OVER (w ORDER BY id) FROM t {ordered}")
+        )
+        .contains("cannot override ORDER BY clause of window: w")
+    );
     // PARTITION override always wins (checked first).
-    assert!(err(
-        &c,
-        &format!("SELECT sum(x) OVER (w PARTITION BY x) FROM t {ordered}")
-    )
-    .contains("cannot override PARTITION clause of window: w"));
+    assert!(
+        err(
+            &c,
+            &format!("SELECT sum(x) OVER (w PARTITION BY x) FROM t {ordered}")
+        )
+        .contains("cannot override PARTITION clause of window: w")
+    );
 }
 
 #[test]

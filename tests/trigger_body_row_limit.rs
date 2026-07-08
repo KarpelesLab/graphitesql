@@ -109,7 +109,9 @@ fn trigger_body_row_limit_parity() {
         "{t} CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET a=1 limit 1; END;"
     ));
     // INSTEAD OF / temp triggers reject it the same way.
-    same("CREATE VIEW v AS SELECT 1 a; CREATE TRIGGER tr INSTEAD OF INSERT ON v BEGIN DELETE FROM x ORDER BY 1; END;");
+    same(
+        "CREATE VIEW v AS SELECT 1 a; CREATE TRIGGER tr INSTEAD OF INSERT ON v BEGIN DELETE FROM x ORDER BY 1; END;",
+    );
 
     // Negative controls: the extension still parses at top level — but only
     // against a sqlite3 built with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT` (CI's

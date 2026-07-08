@@ -212,7 +212,7 @@ impl Pager {
 mod tests {
     use super::*;
     use crate::format::TextEncoding;
-    use crate::vfs::{memory::MemoryVfs, OpenFlags, Vfs};
+    use crate::vfs::{OpenFlags, Vfs, memory::MemoryVfs};
 
     /// Build a minimal but valid 2-page database in a MemoryVfs and return it.
     fn synthetic_db() -> (MemoryVfs, alloc::string::String) {

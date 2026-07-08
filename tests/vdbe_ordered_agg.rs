@@ -176,9 +176,10 @@ fn ordered_group_concat_over_join_runs_on_vdbe() {
 fn distinct_ordered_and_non_concat_ordered_defer() {
     let c = conn();
     // group_concat(DISTINCT … ORDER BY …) defers (VDBE errors) …
-    assert!(c
-        .query_vdbe("SELECT group_concat(DISTINCT s ORDER BY s) FROM t")
-        .is_err());
+    assert!(
+        c.query_vdbe("SELECT group_concat(DISTINCT s ORDER BY s) FROM t")
+            .is_err()
+    );
     // … and an ORDER BY on a non-concat aggregate defers too.
     assert!(c.query_vdbe("SELECT count(s ORDER BY s) FROM t").is_err());
     // The tree-walker fallback still answers correctly.

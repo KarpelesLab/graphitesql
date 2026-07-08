@@ -547,9 +547,10 @@ fn nested_loop_join_empty_side_yields_no_rows() {
     c.execute("INSERT INTO a VALUES(1),(2)").unwrap();
     c.execute("CREATE TABLE b(y)").unwrap();
     // Right side empty → no output, no panic.
-    assert!(c
-        .query_vdbe("SELECT a.x, b.y FROM a JOIN b ON 1=1")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query_vdbe("SELECT a.x, b.y FROM a JOIN b ON 1=1")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 }

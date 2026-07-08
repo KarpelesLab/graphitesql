@@ -33,17 +33,25 @@ fn insert_conflict_resolved_before_fk_check() {
         CREATE TABLE c(cid INTEGER PRIMARY KEY, pid REFERENCES p(id));INSERT INTO p VALUES(1),(2);";
     let cases = [
         // PK conflict + FK violation under OR IGNORE → skipped, no error
-        format!("{base}INSERT INTO c VALUES(6,2);INSERT OR IGNORE INTO c VALUES(6,4);SELECT * FROM c;"),
+        format!(
+            "{base}INSERT INTO c VALUES(6,2);INSERT OR IGNORE INTO c VALUES(6,4);SELECT * FROM c;"
+        ),
         // upsert DO NOTHING on the conflict, FK value dangling → skipped
-        format!("{base}INSERT INTO c VALUES(6,2);INSERT INTO c VALUES(6,4) ON CONFLICT(cid) DO NOTHING;SELECT * FROM c;"),
+        format!(
+            "{base}INSERT INTO c VALUES(6,2);INSERT INTO c VALUES(6,4) ON CONFLICT(cid) DO NOTHING;SELECT * FROM c;"
+        ),
         // pure FK violation, no conflict, OR IGNORE → still errors
         format!("{base}INSERT OR IGNORE INTO c VALUES(10,4);SELECT * FROM c;"),
         // plain INSERT FK violation → errors
         format!("{base}INSERT INTO c VALUES(10,4);SELECT * FROM c;"),
         // OR REPLACE deletes the conflict then inserts a valid FK → succeeds
-        format!("{base}INSERT INTO c VALUES(6,1);INSERT OR REPLACE INTO c VALUES(6,2);SELECT * FROM c;"),
+        format!(
+            "{base}INSERT INTO c VALUES(6,1);INSERT OR REPLACE INTO c VALUES(6,2);SELECT * FROM c;"
+        ),
         // OR REPLACE with a dangling FK → errors
-        format!("{base}INSERT INTO c VALUES(6,1);INSERT OR REPLACE INTO c VALUES(6,9);SELECT * FROM c;"),
+        format!(
+            "{base}INSERT INTO c VALUES(6,1);INSERT OR REPLACE INTO c VALUES(6,9);SELECT * FROM c;"
+        ),
     ];
     for sql in &cases {
         let (s_out, s_ok) = run("sqlite3", sql);

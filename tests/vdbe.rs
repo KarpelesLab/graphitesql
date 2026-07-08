@@ -368,9 +368,10 @@ fn two_table_join_matches_tree_walker() {
     }
     // A *bare* reference to a shared name is ambiguous: the VDBE bails so the
     // tree-walker resolves or rejects it identically.
-    assert!(c
-        .query_vdbe("SELECT id FROM p JOIN q ON p.id = q.id")
-        .is_err());
+    assert!(
+        c.query_vdbe("SELECT id FROM p JOIN q ON p.id = q.id")
+            .is_err()
+    );
     // LEFT joins are now handled (the router NULL-extends unmatched left rows);
     // the result matches the tree-walker. See `left_join_matches_tree_walker_and_sqlite3`
     // for the fuller battery. A RIGHT/FULL join still bails (NULL-extension of the
@@ -659,9 +660,10 @@ fn subquery_from_matches_tree_walker() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE u(a TEXT COLLATE NOCASE)").unwrap();
     c.execute("INSERT INTO u VALUES ('A')").unwrap();
-    assert!(c
-        .query_vdbe("SELECT a FROM (SELECT a FROM u) WHERE a = 'a'")
-        .is_err());
+    assert!(
+        c.query_vdbe("SELECT a FROM (SELECT a FROM u) WHERE a = 'a'")
+            .is_err()
+    );
 }
 
 #[test]
@@ -709,12 +711,14 @@ fn noncorrelated_scalar_and_exists_subqueries_fold_on_vdbe() {
     // the VDBE defers to the tree-walker (which is still correct). A scalar
     // subquery projecting a bare column is likewise left alone (it would carry
     // that column's affinity, which a plain literal would not).
-    assert!(c
-        .query_vdbe("SELECT v FROM t a WHERE v > (SELECT avg(v) FROM t b WHERE b.g = a.g)")
-        .is_err());
-    assert!(c
-        .query_vdbe("SELECT v FROM t WHERE g = (SELECT g FROM t WHERE v = 25)")
-        .is_err());
+    assert!(
+        c.query_vdbe("SELECT v FROM t a WHERE v > (SELECT avg(v) FROM t b WHERE b.g = a.g)")
+            .is_err()
+    );
+    assert!(
+        c.query_vdbe("SELECT v FROM t WHERE g = (SELECT g FROM t WHERE v = 25)")
+            .is_err()
+    );
 }
 
 #[test]
@@ -927,9 +931,10 @@ fn table_wildcard_over_join_matches_tree_walker() {
         assert_eq!(r.rows, want.rows, "rows diverged on {q}");
     }
     // An unknown qualifier still bails (the tree-walker rejects it identically).
-    assert!(c
-        .query_vdbe("SELECT x.* FROM t JOIN u ON u.t_id=t.id")
-        .is_err());
+    assert!(
+        c.query_vdbe("SELECT x.* FROM t JOIN u ON u.t_id=t.id")
+            .is_err()
+    );
 }
 
 #[test]

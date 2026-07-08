@@ -240,7 +240,10 @@ fn svg_xform() {
 #[test]
 fn group_bbox_aggregate() {
     diff_against_sqlite3(
-        &["CREATE TABLE t(g)", "INSERT INTO t VALUES('[[0,0],[1,0],[1,1],[0,1],[0,0]]'),('[[5,5],[6,5],[6,6],[5,6],[5,5]]')"],
+        &[
+            "CREATE TABLE t(g)",
+            "INSERT INTO t VALUES('[[0,0],[1,0],[1,1],[0,1],[0,0]]'),('[[5,5],[6,5],[6,6],[5,6],[5,5]]')",
+        ],
         &[
             // union of the two bboxes -> the enclosing rectangle
             "SELECT geopoly_json(geopoly_group_bbox(g)) FROM t",

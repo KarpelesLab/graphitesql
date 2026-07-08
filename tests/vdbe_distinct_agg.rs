@@ -281,8 +281,7 @@ fn distinct_aggregate_with_explicit_collate_over_group_by_matches_sqlite3() {
         .iter()
         .map(|r| r.iter().map(render).collect())
         .collect();
-    let setup =
-        "CREATE TABLE t(g INT, a TEXT);\nINSERT INTO t VALUES (1,'a'),(1,'A'),(1,'b'),(2,'x'),(2,'X');\n";
+    let setup = "CREATE TABLE t(g INT, a TEXT);\nINSERT INTO t VALUES (1,'a'),(1,'A'),(1,'b'),(2,'x'),(2,'X');\n";
     let out = Command::new("sqlite3")
         .arg(":memory:")
         .arg("-ascii")
@@ -357,8 +356,7 @@ fn min_max_with_explicit_collate_over_group_by_matches_sqlite3() {
         .iter()
         .map(|r| r.iter().map(render).collect())
         .collect();
-    let setup =
-        "CREATE TABLE t(g INT, a TEXT);\nINSERT INTO t VALUES (1,'B'),(1,'a'),(1,'C'),(2,'Z'),(2,'y');\n";
+    let setup = "CREATE TABLE t(g INT, a TEXT);\nINSERT INTO t VALUES (1,'B'),(1,'a'),(1,'C'),(2,'Z'),(2,'y');\n";
     let out = Command::new("sqlite3")
         .arg(":memory:")
         .arg("-ascii")

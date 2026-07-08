@@ -32,7 +32,9 @@ fn compound_column_count_mismatch_names_operator() {
     ] {
         assert_eq!(
             err(&c, sql),
-            format!("SELECTs to the left and right of {kw} do not have the same number of result columns"),
+            format!(
+                "SELECTs to the left and right of {kw} do not have the same number of result columns"
+            ),
             "{sql}"
         );
     }

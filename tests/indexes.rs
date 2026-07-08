@@ -169,11 +169,12 @@ fn index_equality_lookup_results() {
 
     // After deleting the row, the index lookup no longer finds it.
     c.execute("DELETE FROM t WHERE a = 150").unwrap();
-    assert!(c
-        .query("SELECT id FROM t WHERE a = 150")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query("SELECT id FROM t WHERE a = 150")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]

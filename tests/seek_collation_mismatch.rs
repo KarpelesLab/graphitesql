@@ -43,11 +43,9 @@ fn rows(bin: &str, base: &str, sql: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim_end().to_string()
 }
 
-const BINARY_COL: &str =
-    "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c); CREATE INDEX tb ON t(b); \
+const BINARY_COL: &str = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c); CREATE INDEX tb ON t(b); \
                           INSERT INTO t VALUES(1,'x',5),(2,'X',6),(3,'y',7),(4,'XX',8);";
-const NOCASE_COL: &str =
-    "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c); CREATE INDEX tb ON t(b); \
+const NOCASE_COL: &str = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c); CREATE INDEX tb ON t(b); \
      INSERT INTO t VALUES(1,'x',5),(2,'X',6),(3,'y',7);";
 
 #[test]

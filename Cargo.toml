@@ -1,7 +1,7 @@
 [package]
 name = "graphitesql"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.88"
 description = "A pure, safe, no_std Rust re-implementation of SQLite, compatible with the SQLite 3 file format."
 # Public domain, with the SQLite "blessing" in place of a legal notice.

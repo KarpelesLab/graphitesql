@@ -10,7 +10,7 @@
 #![cfg(feature = "std")]
 
 use graphitesql::pager::{AutoVacuum, WritePager};
-use graphitesql::vfs::{std_file::StdVfs, OpenFlags, Vfs};
+use graphitesql::vfs::{OpenFlags, Vfs, std_file::StdVfs};
 use std::process::Command;
 
 /// Whether a usable `sqlite3` CLI is on PATH (skip the oracle checks otherwise).

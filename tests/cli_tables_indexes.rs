@@ -53,12 +53,14 @@ fn tables_and_indexes_match_sqlite() {
         ddl.push_str(&format!("CREATE TABLE table_number_{i}(c);"));
     }
     ddl.push_str("CREATE VIEW v_short AS SELECT 1;CREATE INDEX ix ON apple(x);");
-    assert!(Command::new("sqlite3")
-        .arg(db)
-        .arg(&ddl)
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        Command::new("sqlite3")
+            .arg(db)
+            .arg(&ddl)
+            .status()
+            .unwrap()
+            .success()
+    );
 
     for dot in [".tables", ".indexes", ".tables table%", ".indexes apple"] {
         assert_eq!(

@@ -198,11 +198,12 @@ fn json_each_navigates_a_path_argument() {
         ]
     );
     // A path that does not resolve yields no rows.
-    assert!(c
-        .query("SELECT * FROM json_each('{\"a\":1}', '$.zzz')")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query("SELECT * FROM json_each('{\"a\":1}', '$.zzz')")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]
@@ -240,8 +241,10 @@ fn explain_query_plan_over_a_virtual_table() {
         "SCAN s VIRTUAL TABLE INDEX 0:"
     );
     // A pushed constraint shows in the index string (graphite's own plan number).
-    assert!(detail("EXPLAIN QUERY PLAN SELECT * FROM s WHERE value > 2")
-        .starts_with("SCAN s VIRTUAL TABLE INDEX "));
+    assert!(
+        detail("EXPLAIN QUERY PLAN SELECT * FROM s WHERE value > 2")
+            .starts_with("SCAN s VIRTUAL TABLE INDEX ")
+    );
 }
 
 #[test]

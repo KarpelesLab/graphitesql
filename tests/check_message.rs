@@ -20,22 +20,28 @@ fn unnamed_check_reports_verbatim_expression() {
         violation("CREATE TABLE t(a, CHECK(a>0))", "INSERT INTO t VALUES (-1)")
             .contains("CHECK constraint failed: a>0")
     );
-    assert!(violation(
-        "CREATE TABLE t(a, CHECK(a > 0))",
-        "INSERT INTO t VALUES (-1)"
-    )
-    .contains("CHECK constraint failed: a > 0"));
+    assert!(
+        violation(
+            "CREATE TABLE t(a, CHECK(a > 0))",
+            "INSERT INTO t VALUES (-1)"
+        )
+        .contains("CHECK constraint failed: a > 0")
+    );
     // A column-level CHECK, and the *failing* one of several.
-    assert!(violation(
-        "CREATE TABLE t(a CHECK(a<>5), b)",
-        "INSERT INTO t VALUES (5, 0)"
-    )
-    .contains("CHECK constraint failed: a<>5"));
-    assert!(violation(
-        "CREATE TABLE t(a, b, CHECK(a>0), CHECK(b>a))",
-        "INSERT INTO t VALUES (5, 1)"
-    )
-    .contains("CHECK constraint failed: b>a"));
+    assert!(
+        violation(
+            "CREATE TABLE t(a CHECK(a<>5), b)",
+            "INSERT INTO t VALUES (5, 0)"
+        )
+        .contains("CHECK constraint failed: a<>5")
+    );
+    assert!(
+        violation(
+            "CREATE TABLE t(a, b, CHECK(a>0), CHECK(b>a))",
+            "INSERT INTO t VALUES (5, 1)"
+        )
+        .contains("CHECK constraint failed: b>a")
+    );
 }
 
 #[test]
@@ -71,17 +77,21 @@ fn constraint_message_has_no_redundant_prefix() {
 
 #[test]
 fn named_check_reports_the_constraint_name() {
-    assert!(violation(
-        "CREATE TABLE t(a, CONSTRAINT ck CHECK(a>0))",
-        "INSERT INTO t VALUES (-1)",
-    )
-    .contains("CHECK constraint failed: ck"));
+    assert!(
+        violation(
+            "CREATE TABLE t(a, CONSTRAINT ck CHECK(a>0))",
+            "INSERT INTO t VALUES (-1)",
+        )
+        .contains("CHECK constraint failed: ck")
+    );
     // A named *column* constraint, too.
-    assert!(violation(
-        "CREATE TABLE t(a CONSTRAINT col_ck CHECK(a>0))",
-        "INSERT INTO t VALUES (-1)",
-    )
-    .contains("CHECK constraint failed: col_ck"));
+    assert!(
+        violation(
+            "CREATE TABLE t(a CONSTRAINT col_ck CHECK(a>0))",
+            "INSERT INTO t VALUES (-1)",
+        )
+        .contains("CHECK constraint failed: col_ck")
+    );
 }
 
 #[test]

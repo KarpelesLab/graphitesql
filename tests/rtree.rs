@@ -153,9 +153,10 @@ fn rejects_min_greater_than_max_and_bad_arity() {
     // min > max is rejected (like sqlite's "rtree constraint failed").
     assert!(c.execute("INSERT INTO r VALUES (1, 5, 2)").is_err());
     // An even column count (no id + 2N coordinates) is rejected.
-    assert!(c
-        .execute("CREATE VIRTUAL TABLE bad USING rtree(id, a)")
-        .is_err());
+    assert!(
+        c.execute("CREATE VIRTUAL TABLE bad USING rtree(id, a)")
+            .is_err()
+    );
 }
 
 #[test]
@@ -308,11 +309,12 @@ fn foreign_key_list_on_a_vtab_is_empty() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE VIRTUAL TABLE r USING rtree(id, a, b)")
         .unwrap();
-    assert!(c
-        .query("PRAGMA foreign_key_list(r)")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query("PRAGMA foreign_key_list(r)")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]
@@ -473,11 +475,12 @@ fn reads_sqlite_written_rtree_node_format() {
             .len()
             == 1
     );
-    assert!(c
-        .query("SELECT 1 FROM sqlite_master WHERE name='rt_data'")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query("SELECT 1 FROM sqlite_master WHERE name='rt_data'")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 
     let sqlite = |q: &str| {
         let o = Command::new("sqlite3").arg(&path).arg(q).output().unwrap();
@@ -596,7 +599,9 @@ fn graphite_written_rtree_is_read_by_sqlite3() {
     assert_eq!(chk("SELECT id FROM rt WHERE id=77"), "");
     assert_eq!(chk("SELECT maxx FROM rt WHERE id=12"), "999.0");
     assert_eq!(
-        chk("SELECT group_concat(id) FROM (SELECT id FROM rt WHERE minx>=40 AND minx<=43 ORDER BY id)"),
+        chk(
+            "SELECT group_concat(id) FROM (SELECT id FROM rt WHERE minx>=40 AND minx<=43 ORDER BY id)"
+        ),
         "40,41,42,43"
     );
     // The file uses sqlite's three shadow tables, with no `_data`.

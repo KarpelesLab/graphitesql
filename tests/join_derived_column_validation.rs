@@ -135,24 +135,29 @@ fn rowid_and_wildcard_rules() {
 fn does_not_reject_valid_references() {
     let c = conn();
     // Bare and qualified references that resolve, across a derived/base join.
-    assert!(c
-        .query("SELECT a FROM (SELECT a FROM t) x JOIN u ON x.a = u.c")
-        .is_ok());
-    assert!(c
-        .query("SELECT x.a, u.c FROM (SELECT a FROM t) x JOIN u ON x.a = u.c")
-        .is_ok());
+    assert!(
+        c.query("SELECT a FROM (SELECT a FROM t) x JOIN u ON x.a = u.c")
+            .is_ok()
+    );
+    assert!(
+        c.query("SELECT x.a, u.c FROM (SELECT a FROM t) x JOIN u ON x.a = u.c")
+            .is_ok()
+    );
     // An output alias is in scope for ORDER BY.
-    assert!(c
-        .query("SELECT a AS z FROM (SELECT a FROM t) x JOIN u ON x.a = u.c ORDER BY z")
-        .is_ok());
+    assert!(
+        c.query("SELECT a AS z FROM (SELECT a FROM t) x JOIN u ON x.a = u.c ORDER BY z")
+            .is_ok()
+    );
     // A view joined to a derived table resolves the view's columns.
-    assert!(c
-        .query("SELECT x.a FROM (SELECT a FROM t) x JOIN vt ON x.a = vt.a WHERE vt.b = 'q'")
-        .is_ok());
+    assert!(
+        c.query("SELECT x.a FROM (SELECT a FROM t) x JOIN vt ON x.a = vt.a WHERE vt.b = 'q'")
+            .is_ok()
+    );
     // Bare references resolving to either side.
-    assert!(c
-        .query("SELECT a, c FROM (SELECT a FROM t) x JOIN u ON x.a = u.c WHERE d = 'q'")
-        .is_ok());
+    assert!(
+        c.query("SELECT a, c FROM (SELECT a FROM t) x JOIN u ON x.a = u.c WHERE d = 'q'")
+            .is_ok()
+    );
 }
 
 #[test]

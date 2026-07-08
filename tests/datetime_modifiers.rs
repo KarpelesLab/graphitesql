@@ -323,14 +323,12 @@ fn modifiers_and_parsing_against_sqlite3() {
     for (expr, oracle) in CASES {
         // When the CLI is present, re-derive the oracle so the recorded value
         // can't silently drift from the real sqlite3.
-        if live {
-            if let Some(live_val) = sqlite_eval(expr) {
-                assert_eq!(
-                    &live_val, oracle,
-                    "recorded oracle for `{expr}` is stale: sqlite3 now says {live_val:?}, \
+        if live && let Some(live_val) = sqlite_eval(expr) {
+            assert_eq!(
+                &live_val, oracle,
+                "recorded oracle for `{expr}` is stale: sqlite3 now says {live_val:?}, \
                      test expects {oracle:?}"
-                );
-            }
+            );
         }
         match conn.query(&format!("SELECT {expr}")) {
             Ok(r) => {

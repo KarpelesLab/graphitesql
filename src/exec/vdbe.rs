@@ -615,10 +615,10 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
     }
     let halt = c.ops.len();
     c.ops.push(Op::Halt);
-    if let Some(at) = skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = halt;
-        }
+    if let Some(at) = skip
+        && let Op::IfFalse { target, .. } = &mut c.ops[at]
+    {
+        *target = halt;
     }
     Ok(Program {
         ops: c.ops,
@@ -726,10 +726,9 @@ fn expr_has_aggregate_or_window(e: &Expr) -> bool {
             over,
             ..
         } = node
+            && (over.is_some() || crate::exec::func::is_aggregate_call(name, args.len(), *star))
         {
-            if over.is_some() || crate::exec::func::is_aggregate_call(name, args.len(), *star) {
-                found = true;
-            }
+            found = true;
         }
     });
     found
@@ -743,21 +742,21 @@ fn expr_has_aggregate_or_window(e: &Expr) -> bool {
 pub(crate) fn reject_aggregate_or_window_in_predicates(sel: &Select) -> Result<()> {
     if let Some(from) = &sel.from {
         for j in &from.joins {
-            if let Some(on) = &j.on {
-                if expr_has_aggregate_or_window(on) {
-                    return Err(Error::Unsupported(
-                        "VDBE: aggregate/window in join ON predicate",
-                    ));
-                }
+            if let Some(on) = &j.on
+                && expr_has_aggregate_or_window(on)
+            {
+                return Err(Error::Unsupported(
+                    "VDBE: aggregate/window in join ON predicate",
+                ));
             }
         }
     }
-    if let Some(w) = &sel.where_clause {
-        if expr_has_aggregate_or_window(w) {
-            return Err(Error::Unsupported(
-                "VDBE: aggregate/window in WHERE predicate",
-            ));
-        }
+    if let Some(w) = &sel.where_clause
+        && expr_has_aggregate_or_window(w)
+    {
+        return Err(Error::Unsupported(
+            "VDBE: aggregate/window in WHERE predicate",
+        ));
     }
     Ok(())
 }
@@ -894,10 +893,10 @@ fn projections_have_explicit_collation(projections: &[(Expr, String)]) -> bool {
     let mut found = false;
     for (e, _) in projections {
         crate::exec::window::visit(e, &mut |node| {
-            if let Expr::Collate { collation, .. } = node {
-                if Collation::parse(collation).is_some_and(|c| c != Collation::Binary) {
-                    found = true;
-                }
+            if let Expr::Collate { collation, .. } = node
+                && Collation::parse(collation).is_some_and(|c| c != Collation::Binary)
+            {
+                found = true;
             }
         });
     }
@@ -1012,10 +1011,10 @@ fn compile_aggregate_select(
     }
     let next = c.ops.len();
     c.ops.push(Op::Next { target: body });
-    if let Some(at) = skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = next;
-        }
+    if let Some(at) = skip
+        && let Op::IfFalse { target, .. } = &mut c.ops[at]
+    {
+        *target = next;
     }
     let end = c.ops.len();
     if let Op::Rewind { target } = &mut c.ops[rewind] {
@@ -1316,25 +1315,25 @@ fn emit_group_fold(
                     *t = target;
                 }
             }
-            if let Some(at) = skip {
-                if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-                    *target = next_at[n - 1];
-                }
+            if let Some(at) = skip
+                && let Op::IfFalse { target, .. } = &mut c.ops[at]
+            {
+                *target = next_at[n - 1];
             }
         }
         None => {
             let next = c.ops.len();
             c.ops.push(Op::Next { target: body });
-            if let Some(at) = skip {
-                if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-                    *target = next;
-                }
+            if let Some(at) = skip
+                && let Op::IfFalse { target, .. } = &mut c.ops[at]
+            {
+                *target = next;
             }
             let end = c.ops.len();
-            if let Some(rw) = single_rewind {
-                if let Op::Rewind { target } = &mut c.ops[rw] {
-                    *target = end;
-                }
+            if let Some(rw) = single_rewind
+                && let Op::Rewind { target } = &mut c.ops[rw]
+            {
+                *target = end;
             }
         }
     }
@@ -1408,18 +1407,15 @@ fn compile_group_select(
                 column,
                 ..
             } = g
+                && !columns.iter().any(|n| n.eq_ignore_ascii_case(column))
+                && let Some((e, _)) = projections
+                    .iter()
+                    .find(|(_, l)| l.eq_ignore_ascii_case(column))
             {
-                if !columns.iter().any(|n| n.eq_ignore_ascii_case(column)) {
-                    if let Some((e, _)) = projections
-                        .iter()
-                        .find(|(_, l)| l.eq_ignore_ascii_case(column))
-                    {
-                        let mut aggs = Vec::new();
-                        collect_aggregates(e, &mut aggs);
-                        if aggs.is_empty() {
-                            return e.clone();
-                        }
-                    }
+                let mut aggs = Vec::new();
+                collect_aggregates(e, &mut aggs);
+                if aggs.is_empty() {
+                    return e.clone();
                 }
             }
             g.clone()
@@ -1873,10 +1869,10 @@ fn compile_group_select(
     }
     let gnext = c.ops.len();
     c.ops.push(Op::GroupNext { target: gbody });
-    if let Some(at) = having_skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = gnext;
-        }
+    if let Some(at) = having_skip
+        && let Op::IfFalse { target, .. } = &mut c.ops[at]
+    {
+        *target = gnext;
     }
     if let Some(at) = distinct_skip {
         // A duplicate group advances to the next without emitting (and without
@@ -1895,10 +1891,10 @@ fn compile_group_select(
     if let Op::GroupFinalize { target, .. } = &mut c.ops[gfin] {
         *target = gend;
     }
-    if let Some(at) = limit_done {
-        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
-            *target = gend;
-        }
+    if let Some(at) = limit_done
+        && let Op::DecrJumpZero { target, .. } = &mut c.ops[at]
+    {
+        *target = gend;
     }
 
     // Sorted emit loop for ORDER BY.
@@ -1933,24 +1929,24 @@ fn compile_group_select(
         if let Op::SorterRewind { target } = &mut c.ops[srewind] {
             *target = eend;
         }
-        if let Some(at) = eoffset {
-            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
-                *target = snext;
-            }
+        if let Some(at) = eoffset
+            && let Op::IfPosDecr { target, .. } = &mut c.ops[at]
+        {
+            *target = snext;
         }
-        if let Some(at) = elimit {
-            if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
-                *target = eend;
-            }
+        if let Some(at) = elimit
+            && let Op::DecrJumpZero { target, .. } = &mut c.ops[at]
+        {
+            *target = eend;
         }
     }
 
     // `LIMIT 0` jumps past the whole emit phase (here, just before Halt).
     let final_end = c.ops.len();
-    if let Some(at) = limit_skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = final_end;
-        }
+    if let Some(at) = limit_skip
+        && let Op::IfFalse { target, .. } = &mut c.ops[at]
+    {
+        *target = final_end;
     }
 
     c.ops.push(Op::Halt);
@@ -2290,34 +2286,34 @@ pub fn compile_table_select(
     }
     let next = c.ops.len();
     c.ops.push(Op::Next { target: body });
-    if let Some(at) = skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = next; // a filtered-out row advances to the next
-        }
+    if let Some(at) = skip
+        && let Op::IfFalse { target, .. } = &mut c.ops[at]
+    {
+        *target = next; // a filtered-out row advances to the next
     }
-    if let Some(at) = offset_skip {
-        if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
-            *target = next; // a skipped (offset) row advances to the next
-        }
+    if let Some(at) = offset_skip
+        && let Op::IfPosDecr { target, .. } = &mut c.ops[at]
+    {
+        *target = next; // a skipped (offset) row advances to the next
     }
-    if let Some(at) = distinct_skip {
-        if let Op::DistinctCheck { target, .. } = &mut c.ops[at] {
-            *target = next; // a duplicate row advances to the next
-        }
+    if let Some(at) = distinct_skip
+        && let Op::DistinctCheck { target, .. } = &mut c.ops[at]
+    {
+        *target = next; // a duplicate row advances to the next
     }
     let end = c.ops.len();
     if let Op::Rewind { target } = &mut c.ops[rewind] {
         *target = end;
     }
-    if let Some(at) = limit_skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = end;
-        }
+    if let Some(at) = limit_skip
+        && let Op::IfFalse { target, .. } = &mut c.ops[at]
+    {
+        *target = end;
     }
-    if let Some(at) = limit_done {
-        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
-            *target = end;
-        }
+    if let Some(at) = limit_done
+        && let Op::DecrJumpZero { target, .. } = &mut c.ops[at]
+    {
+        *target = end;
     }
     // Sorted emit loop: sort, then walk the sorter applying OFFSET then LIMIT.
     if ordering {
@@ -2345,15 +2341,15 @@ pub fn compile_table_select(
         if let Op::SorterRewind { target } = &mut c.ops[srewind] {
             *target = eend;
         }
-        if let Some(at) = eoffset {
-            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
-                *target = snext; // a skipped (offset) row advances to the next
-            }
+        if let Some(at) = eoffset
+            && let Op::IfPosDecr { target, .. } = &mut c.ops[at]
+        {
+            *target = snext; // a skipped (offset) row advances to the next
         }
-        if let Some(at) = elimit {
-            if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
-                *target = eend;
-            }
+        if let Some(at) = elimit
+            && let Op::DecrJumpZero { target, .. } = &mut c.ops[at]
+        {
+            *target = eend;
         }
     }
     c.ops.push(Op::Halt);
@@ -2697,10 +2693,10 @@ pub fn compile_join2(
             *target = eend;
         }
         // A skipped (OFFSET) ordered row advances to the next sorter row.
-        if let Some(at) = eoffset {
-            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
-                *target = snext;
-            }
+        if let Some(at) = eoffset
+            && let Op::IfPosDecr { target, .. } = &mut c.ops[at]
+        {
+            *target = snext;
         }
         elimit
     } else {
@@ -2718,32 +2714,32 @@ pub fn compile_join2(
         }
     }
     let inner_next = next_at[n - 1];
-    if let Some(at) = skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = inner_next;
-        }
+    if let Some(at) = skip
+        && let Op::IfFalse { target, .. } = &mut c.ops[at]
+    {
+        *target = inner_next;
     }
-    if let Some(at) = distinct_skip {
-        if let Op::DistinctCheck { target, .. } = &mut c.ops[at] {
-            *target = inner_next; // a duplicate row advances the innermost cursor
-        }
+    if let Some(at) = distinct_skip
+        && let Op::DistinctCheck { target, .. } = &mut c.ops[at]
+    {
+        *target = inner_next; // a duplicate row advances the innermost cursor
     }
-    if let Some(at) = offset_skip {
-        if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
-            *target = inner_next;
-        }
+    if let Some(at) = offset_skip
+        && let Op::IfPosDecr { target, .. } = &mut c.ops[at]
+    {
+        *target = inner_next;
     }
-    if let Some(at) = limit_done {
-        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
-            *target = end;
-        }
+    if let Some(at) = limit_done
+        && let Op::DecrJumpZero { target, .. } = &mut c.ops[at]
+    {
+        *target = end;
     }
     // The sorted emit loop's LIMIT halts the whole program (its OFFSET was
     // backpatched inline above).
-    if let Some(at) = elimit {
-        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
-            *target = end;
-        }
+    if let Some(at) = elimit
+        && let Op::DecrJumpZero { target, .. } = &mut c.ops[at]
+    {
+        *target = end;
     }
     Ok(Program {
         ops: c.ops,
@@ -2880,10 +2876,10 @@ pub fn compile_aggregate_join(
             *t = target;
         }
     }
-    if let Some(at) = skip {
-        if let Op::IfFalse { target, .. } = &mut c.ops[at] {
-            *target = next_at[n - 1];
-        }
+    if let Some(at) = skip
+        && let Op::IfFalse { target, .. } = &mut c.ops[at]
+    {
+        *target = next_at[n - 1];
     }
     // Finalize each slot into its output register, then emit the single row.
     for (slot, (kind, _, _, _, _, _)) in slots.iter().enumerate() {
@@ -3242,10 +3238,10 @@ pub fn compile_left_join2(
         if let Op::SorterRewind { target } = &mut c.ops[srewind] {
             *target = eend;
         }
-        if let Some(at) = eoffset {
-            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
-                *target = snext;
-            }
+        if let Some(at) = eoffset
+            && let Op::IfPosDecr { target, .. } = &mut c.ops[at]
+        {
+            *target = snext;
         }
         elimit
     } else {
@@ -3644,10 +3640,10 @@ pub fn compile_full_join2(
         if let Op::SorterRewind { target } = &mut c.ops[srewind] {
             *target = eend;
         }
-        if let Some(at) = eoffset {
-            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
-                *target = snext;
-            }
+        if let Some(at) = eoffset
+            && let Op::IfPosDecr { target, .. } = &mut c.ops[at]
+        {
+            *target = snext;
         }
         elimit
     } else {
@@ -4024,10 +4020,10 @@ pub fn compile_left_join_n(
         if let Op::SorterRewind { target } = &mut c.ops[srewind] {
             *target = eend;
         }
-        if let Some(at) = eoffset {
-            if let Op::IfPosDecr { target, .. } = &mut c.ops[at] {
-                *target = snext;
-            }
+        if let Some(at) = eoffset
+            && let Op::IfPosDecr { target, .. } = &mut c.ops[at]
+        {
+            *target = snext;
         }
         elimit
     } else {
@@ -4043,10 +4039,10 @@ pub fn compile_left_join_n(
             *target = end;
         }
     }
-    if let Some(at) = elimit {
-        if let Op::DecrJumpZero { target, .. } = &mut c.ops[at] {
-            *target = end;
-        }
+    if let Some(at) = elimit
+        && let Op::DecrJumpZero { target, .. } = &mut c.ops[at]
+    {
+        *target = end;
     }
     Ok(Program {
         ops: c.ops,
@@ -4135,14 +4131,13 @@ impl Compiler {
             if !c.eq_ignore_ascii_case(column) {
                 continue;
             }
-            if let Some(t) = table {
-                if !self
+            if let Some(t) = table
+                && !self
                     .tables
                     .get(i)
                     .is_some_and(|tn| tn.eq_ignore_ascii_case(t))
-                {
-                    continue;
-                }
+            {
+                continue;
             }
             if found.is_some() {
                 // A bare name matching two tables is ambiguous.
@@ -4152,20 +4147,20 @@ impl Compiler {
         }
         // A rowid alias (`rowid`/`_rowid_`/`oid`) resolves to the hidden rowid slot
         // of a single-table scan — unless a real column already shadows the name.
-        if found.is_none() {
-            if let Some(ri) = self.rowid_index {
-                let is_alias = matches!(
-                    column.to_ascii_lowercase().as_str(),
-                    "rowid" | "_rowid_" | "oid"
-                );
-                let table_ok = table.is_none_or(|t| {
-                    self.tables
-                        .first()
-                        .is_some_and(|tn| tn.eq_ignore_ascii_case(t))
-                });
-                if is_alias && table_ok {
-                    return Ok(ri);
-                }
+        if found.is_none()
+            && let Some(ri) = self.rowid_index
+        {
+            let is_alias = matches!(
+                column.to_ascii_lowercase().as_str(),
+                "rowid" | "_rowid_" | "oid"
+            );
+            let table_ok = table.is_none_or(|t| {
+                self.tables
+                    .first()
+                    .is_some_and(|tn| tn.eq_ignore_ascii_case(t))
+            });
+            if is_alias && table_ok {
+                return Ok(ri);
             }
         }
         found.ok_or(Error::Unsupported("VDBE: unresolved column reference"))
@@ -4697,10 +4692,10 @@ impl Compiler {
                 };
                 self.compile_expr_into(inner, dest)?;
                 let end = self.ops.len();
-                if let Some(at) = skip {
-                    if let Op::IfFalse { target, .. } = &mut self.ops[at] {
-                        *target = end;
-                    }
+                if let Some(at) = skip
+                    && let Op::IfFalse { target, .. } = &mut self.ops[at]
+                {
+                    *target = end;
                 }
                 Ok(())
             }
@@ -4861,8 +4856,8 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
     let mut out = Vec::new();
     let table_rows: &[Vec<Value>] = rowsets.first().copied().unwrap_or(&[]);
     let mut cursor: usize = 0; // index of the current row (single-cursor ops)
-                               // Per-cursor positions for the multi-cursor (nested-loop join) ops. A program
-                               // uses either the single-cursor ops or the multi-cursor ops, never both.
+    // Per-cursor positions for the multi-cursor (nested-loop join) ops. A program
+    // uses either the single-cursor ops or the multi-cursor ops, never both.
     let mut positions: Vec<usize> = alloc::vec![0; rowsets.len().max(1)];
     // Per-cursor "this is the NULL row" flags for LEFT JOIN null-padding; set by
     // `NullRow`, cleared by `RewindC`.
@@ -5226,17 +5221,17 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
                     // fall through without folding this row into the slot
                 } else if *kind == AggKind::CountStar {
                     agg[*slot].count += 1;
-                } else if let Some(r) = arg {
-                    if !matches!(regs[*r], Value::Null) {
-                        let v = regs[*r].clone();
-                        // A DISTINCT aggregate folds each distinct argument value
-                        // once: skip a value already collected for this slot
-                        // (BINARY equality — the non-BINARY case bails to the
-                        // tree-walker before compilation).
-                        if !*distinct || !agg[*slot].vals.iter().any(|p| distinct_eq(p, &v)) {
-                            agg[*slot].vals.push(v);
-                            push_order_key(&mut agg[*slot], order, &regs);
-                        }
+                } else if let Some(r) = arg
+                    && !matches!(regs[*r], Value::Null)
+                {
+                    let v = regs[*r].clone();
+                    // A DISTINCT aggregate folds each distinct argument value
+                    // once: skip a value already collected for this slot
+                    // (BINARY equality — the non-BINARY case bails to the
+                    // tree-walker before compilation).
+                    if !*distinct || !agg[*slot].vals.iter().any(|p| distinct_eq(p, &v)) {
+                        agg[*slot].vals.push(v);
+                        push_order_key(&mut agg[*slot], order, &regs);
                     }
                 }
             }
@@ -5314,18 +5309,18 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
                     }
                     if spec.kind == AggKind::CountStar {
                         groups[gi].1[j].count += 1;
-                    } else if let Some(r) = spec.arg {
-                        if !matches!(regs[r], Value::Null) {
-                            let v = regs[r].clone();
-                            // A DISTINCT aggregate folds each distinct argument
-                            // value once per group (BINARY equality; non-BINARY
-                            // bails before compilation).
-                            if !spec.distinct
-                                || !groups[gi].1[j].vals.iter().any(|p| distinct_eq(p, &v))
-                            {
-                                groups[gi].1[j].vals.push(v);
-                                push_order_key(&mut groups[gi].1[j], &spec.order, &regs);
-                            }
+                    } else if let Some(r) = spec.arg
+                        && !matches!(regs[r], Value::Null)
+                    {
+                        let v = regs[r].clone();
+                        // A DISTINCT aggregate folds each distinct argument
+                        // value once per group (BINARY equality; non-BINARY
+                        // bails before compilation).
+                        if !spec.distinct
+                            || !groups[gi].1[j].vals.iter().any(|p| distinct_eq(p, &v))
+                        {
+                            groups[gi].1[j].vals.push(v);
+                            push_order_key(&mut groups[gi].1[j], &spec.order, &regs);
                         }
                     }
                 }
@@ -5474,11 +5469,7 @@ fn cmp_key_rows(
             }
             _ => {
                 let base = crate::value::cmp_values_coll(x, y, collation);
-                if descending {
-                    base.reverse()
-                } else {
-                    base
-                }
+                if descending { base.reverse() } else { base }
             }
         };
         if ord != Ordering::Equal {

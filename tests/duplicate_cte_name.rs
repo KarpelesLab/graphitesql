@@ -47,12 +47,14 @@ fn duplicate_with_name_is_rejected() {
 
     // Distinct names, and a same name re-used in a nested WITH (separate scope),
     // are both legal.
-    assert!(c
-        .query("WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a JOIN b")
-        .is_ok());
-    assert!(c
-        .query("WITH a AS (SELECT 1) SELECT * FROM (WITH a AS (SELECT 2) SELECT 1)")
-        .is_ok());
+    assert!(
+        c.query("WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a JOIN b")
+            .is_ok()
+    );
+    assert!(
+        c.query("WITH a AS (SELECT 1) SELECT * FROM (WITH a AS (SELECT 2) SELECT 1)")
+            .is_ok()
+    );
 }
 
 #[test]

@@ -93,9 +93,11 @@ fn plain_trigger_stays_in_main() {
     c.execute("CREATE TABLE log(a)").unwrap();
     c.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.a); END")
         .unwrap();
-    assert!(names(&c, "SELECT name FROM sqlite_master")
-        .iter()
-        .any(|n| n == "tr"));
+    assert!(
+        names(&c, "SELECT name FROM sqlite_master")
+            .iter()
+            .any(|n| n == "tr")
+    );
     let temp = names(&c, "SELECT name FROM sqlite_temp_master");
     assert!(temp.is_empty(), "plain trigger leaked into temp: {temp:?}");
     c.execute("INSERT INTO t VALUES (7)").unwrap();

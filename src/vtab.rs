@@ -717,11 +717,7 @@ fn advance_to(start: i64, step: i64, target: i64) -> i64 {
         let r = delta % step128;
         // `delta` and `step128` have the same sign here (checked above), so the
         // quotient is positive; round up when there is a remainder.
-        if r != 0 {
-            q + 1
-        } else {
-            q
-        }
+        if r != 0 { q + 1 } else { q }
     };
     match i128::from(start).checked_add(k * step128) {
         Some(v) if v >= i128::from(i64::MIN) && v <= i128::from(i64::MAX) => v as i64,
@@ -1776,11 +1772,7 @@ fn fold_for(ch: char, level: u8) -> char {
         1 => fold_diacritic(ch),
         _ => {
             let f = fold_diacritic(ch);
-            if f != ch {
-                f
-            } else {
-                fold_diacritic2(ch)
-            }
+            if f != ch { f } else { fold_diacritic2(ch) }
         }
     }
 }
@@ -3800,7 +3792,7 @@ pub(crate) fn fts5vocab_args(
         _ => {
             return Err(Error::Error(alloc::string::String::from(
                 "fts5vocab: expected (fts5-table, type)",
-            )))
+            )));
         }
     };
     let form = form.to_ascii_lowercase();
@@ -4048,7 +4040,7 @@ mod tests {
             &doc,
             Fts5Tok::default()
         )); // not adjacent
-            // A `token*` prefix matches any token starting with it.
+        // A `token*` prefix matches any token starting with it.
         assert!(fts5_query_matches("fo*", &doc, Fts5Tok::default())); // fox
         assert!(fts5_query_matches("run*", &doc, Fts5Tok::default())); // runs
         assert!(!fts5_query_matches("cat*", &doc, Fts5Tok::default()));

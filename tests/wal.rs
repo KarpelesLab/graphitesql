@@ -8,7 +8,7 @@
 #![cfg(feature = "std")]
 
 use graphitesql::pager::{PageSource, WalReader};
-use graphitesql::vfs::{std_file::StdVfs, OpenFlags, Vfs};
+use graphitesql::vfs::{OpenFlags, Vfs, std_file::StdVfs};
 use graphitesql::{Connection, Value};
 
 fn fixture(name: &str) -> String {

@@ -149,9 +149,10 @@ fn positional_in_range_still_works() {
     // `*` expands so the count reflects the real width.
     assert_eq!(c.query("SELECT * FROM t ORDER BY 3").unwrap().rows.len(), 2);
     // An in-range positional GROUP BY is accepted (not rejected as out of range).
-    assert!(c
-        .query("SELECT a, count(*) FROM t GROUP BY 1 ORDER BY 1")
-        .is_ok());
+    assert!(
+        c.query("SELECT a, count(*) FROM t GROUP BY 1 ORDER BY 1")
+            .is_ok()
+    );
     // An ORDER BY *expression* (not a bare integer) is never positional.
     assert_eq!(
         c.query("SELECT 5 ORDER BY 1 + 1").unwrap().rows[0][0],

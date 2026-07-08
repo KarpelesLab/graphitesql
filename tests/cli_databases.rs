@@ -44,12 +44,14 @@ fn databases_matches_sqlite() {
     let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
     for f in [a, b] {
         let _ = std::fs::remove_file(f);
-        assert!(Command::new("sqlite3")
-            .arg(f)
-            .arg("CREATE TABLE t(x);")
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("sqlite3")
+                .arg(f)
+                .arg("CREATE TABLE t(x);")
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     // main only, and main + an attached database.

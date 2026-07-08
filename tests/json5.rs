@@ -168,7 +168,7 @@ fn json_valid_is_strict_rfc8259() {
     assert_eq!(int(&c, r#"SELECT json_valid('{"a":1,}')"#), 0); // trailing comma
     assert_eq!(int(&c, "SELECT json_valid('[1,2,]')"), 0); // trailing comma
     assert_eq!(int(&c, "SELECT json_valid('\"x\"')"), 1); // strict scalar
-                                                          // Strict JSON is valid; genuine garbage is invalid.
+    // Strict JSON is valid; genuine garbage is invalid.
     assert_eq!(int(&c, r#"SELECT json_valid('{"a":1}')"#), 1);
     assert_eq!(int(&c, "SELECT json_valid('[1,2]')"), 1);
     assert_eq!(int(&c, "SELECT json_valid('5')"), 1);

@@ -21,8 +21,8 @@ pub mod vdbe;
 mod window;
 
 use crate::btree::{
-    clear_index, clear_table, create_index_root, create_table_root, delete_table, free_tree,
-    insert_index, insert_table, table_has_empty_leaf, IndexCursor, TableCursor,
+    IndexCursor, TableCursor, clear_index, clear_table, create_index_root, create_table_root,
+    delete_table, free_tree, insert_index, insert_table, table_has_empty_leaf,
 };
 use crate::error::{Error, Result};
 use crate::format::record::{decode_record, encode_record};
@@ -607,11 +607,7 @@ impl Connection {
                 }
             }
         }
-        if changed {
-            Some(out)
-        } else {
-            None
-        }
+        if changed { Some(out) } else { None }
     }
 
     /// Recursively rebuild `e`, folding any foldable scalar/`EXISTS` subquery into
@@ -1066,21 +1062,21 @@ impl Connection {
     fn expr_positions_internal(&self, sel2: &Select, quals: &[String], cols: &[String]) -> bool {
         let ok = |e: &Expr| self.expr_internal(e, quals, cols);
         for rc in &sel2.columns {
-            if let sql::ast::ResultColumn::Expr { expr, .. } = rc {
-                if !ok(expr) {
-                    return false;
-                }
-            }
-        }
-        if let Some(w) = &sel2.where_clause {
-            if !ok(w) {
+            if let sql::ast::ResultColumn::Expr { expr, .. } = rc
+                && !ok(expr)
+            {
                 return false;
             }
         }
-        if let Some(h) = &sel2.having {
-            if !ok(h) {
-                return false;
-            }
+        if let Some(w) = &sel2.where_clause
+            && !ok(w)
+        {
+            return false;
+        }
+        if let Some(h) = &sel2.having
+            && !ok(h)
+        {
+            return false;
         }
         if !sel2.group_by.iter().all(&ok) {
             return false;
@@ -1090,22 +1086,22 @@ impl Connection {
         }
         if let Some(from) = &sel2.from {
             for j in &from.joins {
-                if let Some(on) = &j.on {
-                    if !ok(on) {
-                        return false;
-                    }
+                if let Some(on) = &j.on
+                    && !ok(on)
+                {
+                    return false;
                 }
             }
         }
-        if let Some(l) = &sel2.limit {
-            if !ok(l) {
-                return false;
-            }
+        if let Some(l) = &sel2.limit
+            && !ok(l)
+        {
+            return false;
         }
-        if let Some(o) = &sel2.offset {
-            if !ok(o) {
-                return false;
-            }
+        if let Some(o) = &sel2.offset
+            && !ok(o)
+        {
+            return false;
         }
         true
     }
@@ -1225,13 +1221,12 @@ impl Connection {
             return false;
         }
         // The driver (`from.first`) is always scanned.
-        if let Ok(meta) = self.table_meta(&from.first.name, from.first.alias.as_deref()) {
-            if self
+        if let Ok(meta) = self.table_meta(&from.first.name, from.first.alias.as_deref())
+            && self
                 .join_scan_covering_index(sel, from, &from.first, &meta)
                 .is_some()
-            {
-                return true;
-            }
+        {
+            return true;
         }
         // A plain-scanned inner (not an equi-hash, which is driver-ordered).
         for join in &from.joins {
@@ -1260,13 +1255,12 @@ impl Connection {
             if inner_is_equi_hash {
                 continue;
             }
-            if let Ok(meta) = self.table_meta(&join.table.name, join.table.alias.as_deref()) {
-                if self
+            if let Ok(meta) = self.table_meta(&join.table.name, join.table.alias.as_deref())
+                && self
                     .join_scan_covering_index(sel, from, &join.table, &meta)
                     .is_some()
-                {
-                    return true;
-                }
+            {
+                return true;
             }
         }
         false
@@ -1351,17 +1345,16 @@ impl Connection {
         // multiple keys.
         let multi = |vals: &[Value]| vals.iter().filter(|v| !matches!(v, Value::Null)).count() >= 2;
         // `col IN (…)` walked via a plain or a (pred-guaranteed) partial index.
-        if let Some((col, values)) = find_in_constraint(where_expr, &meta.columns, params) {
-            if multi(&values)
-                && meta.ipk != Some(col)
-                && indexes.iter().any(|idx| {
-                    idx.key_exprs.is_none()
-                        && idx.cols.first() == Some(&col)
-                        && (idx.partial.is_none() || partial_pred_guaranteed(idx, where_expr))
-                })
-            {
-                return Ok(true);
-            }
+        if let Some((col, values)) = find_in_constraint(where_expr, &meta.columns, params)
+            && multi(&values)
+            && meta.ipk != Some(col)
+            && indexes.iter().any(|idx| {
+                idx.key_exprs.is_none()
+                    && idx.cols.first() == Some(&col)
+                    && (idx.partial.is_none() || partial_pred_guaranteed(idx, where_expr))
+            })
+        {
+            return Ok(true);
         }
         // `<expr> IN (…)` walked via an expression index keyed by that expression.
         for idx in &indexes {
@@ -1374,10 +1367,10 @@ impl Connection {
             if !partial_pred_guaranteed(idx, where_expr) {
                 continue;
             }
-            if let Some(values) = find_expr_in_values(key_expr, where_expr, params) {
-                if multi(&values) {
-                    return Ok(true);
-                }
+            if let Some(values) = find_expr_in_values(key_expr, where_expr, params)
+                && multi(&values)
+            {
+                return Ok(true);
             }
         }
 
@@ -1414,10 +1407,10 @@ impl Connection {
         {
             return Err(Error::Unsupported("VDBE: non-main schema in scope"));
         }
-        if let Some(f) = &sel.from {
-            if f.first.schema.is_some() || f.joins.iter().any(|j| j.table.schema.is_some()) {
-                return Err(Error::Unsupported("VDBE: schema-qualified source"));
-            }
+        if let Some(f) = &sel.from
+            && (f.first.schema.is_some() || f.joins.iter().any(|j| j.table.schema.is_some()))
+        {
+            return Err(Error::Unsupported("VDBE: schema-qualified source"));
         }
         // A three-part `schema.table.column` reference needs the qualifier validated
         // against the source's actual database — the VDBE resolves by table/name
@@ -1430,10 +1423,11 @@ impl Connection {
         // table's per-table rowid, which the VDBE join compiler does not model.
         // Defer to the tree-walker, which contributes hidden per-table rowid
         // columns. (A single-table `t.rowid` is fine and handled elsewhere.)
-        if let Some(f) = &sel.from {
-            if !f.joins.is_empty() && select_references_qualified_rowid(sel) {
-                return Err(Error::Unsupported("VDBE: table-qualified rowid in a join"));
-            }
+        if let Some(f) = &sel.from
+            && !f.joins.is_empty()
+            && select_references_qualified_rowid(sel)
+        {
+            return Err(Error::Unsupported("VDBE: table-qualified rowid in a join"));
         }
         // Cost-based two-table rowid-inner swap: when a two-table equi-join would
         // be reordered to drive from the second table (seeking `from.first` by its
@@ -1445,35 +1439,35 @@ impl Connection {
         // so the VDBE may run those directly. The comma form (`FROM u,v WHERE
         // u.x=v.p`) has its equality promoted to an `ON` only later in `run_core`,
         // so promote a copy here first to catch it too.
-        if sel.order_by.is_empty() {
-            if let Some(from) = &sel.from {
-                let promo_tables = self.comma_join_table_columns(from);
-                let promoted;
-                let check_sel = match promote_comma_join_ons(sel, &promo_tables) {
-                    Some(r) => {
-                        promoted = r;
-                        &promoted
-                    }
-                    None => sel,
-                };
-                if let Some(pf) = &check_sel.from {
-                    if self.two_table_rowid_inner_swap(pf).is_some() {
-                        return Err(Error::Unsupported("VDBE: two-table rowid-inner swap"));
-                    }
-                    // Same reasoning for the secondary-index-inner swap: the drive
-                    // reorder is observable only without an explicit ORDER BY.
-                    if self.two_table_index_inner_swap(pf).is_some() {
-                        return Err(Error::Unsupported("VDBE: two-table index-inner swap"));
-                    }
-                    // Cost-based N-table (≥3) reorder: the VDBE join compiler scans
-                    // sources in declaration order, so a reordered drive produces a
-                    // different (observable, unordered) row order — defer to the
-                    // tree-walker, which owns the reorder (`ntable_join_order`). With
-                    // an explicit ORDER BY the drive direction is invisible, so the
-                    // VDBE may run those directly.
-                    if self.ntable_join_order(check_sel, pf).is_some() {
-                        return Err(Error::Unsupported("VDBE: N-table cost-based join order"));
-                    }
+        if sel.order_by.is_empty()
+            && let Some(from) = &sel.from
+        {
+            let promo_tables = self.comma_join_table_columns(from);
+            let promoted;
+            let check_sel = match promote_comma_join_ons(sel, &promo_tables) {
+                Some(r) => {
+                    promoted = r;
+                    &promoted
+                }
+                None => sel,
+            };
+            if let Some(pf) = &check_sel.from {
+                if self.two_table_rowid_inner_swap(pf).is_some() {
+                    return Err(Error::Unsupported("VDBE: two-table rowid-inner swap"));
+                }
+                // Same reasoning for the secondary-index-inner swap: the drive
+                // reorder is observable only without an explicit ORDER BY.
+                if self.two_table_index_inner_swap(pf).is_some() {
+                    return Err(Error::Unsupported("VDBE: two-table index-inner swap"));
+                }
+                // Cost-based N-table (≥3) reorder: the VDBE join compiler scans
+                // sources in declaration order, so a reordered drive produces a
+                // different (observable, unordered) row order — defer to the
+                // tree-walker, which owns the reorder (`ntable_join_order`). With
+                // an explicit ORDER BY the drive direction is invisible, so the
+                // VDBE may run those directly.
+                if self.ntable_join_order(check_sel, pf).is_some() {
+                    return Err(Error::Unsupported("VDBE: N-table cost-based join order"));
                 }
             }
         }
@@ -1631,7 +1625,7 @@ impl Connection {
                         _ => {
                             return Err(Error::Unsupported(
                                 "VDBE: positional GROUP BY out of range",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1996,8 +1990,8 @@ impl Connection {
                             (Some(li), Some(rl)) => v.push((li, rl)),
                             _ => {
                                 return Err(Error::Error(format!(
-                                "cannot join using column {name} - column not present in both tables"
-                            )))
+                                    "cannot join using column {name} - column not present in both tables"
+                                )));
                             }
                         }
                     }
@@ -3474,12 +3468,10 @@ impl Connection {
         // (notnull/dflt/pk are always 0/empty for a view).
         if let Some(vobj) = self.schema.objects().iter().find(|o| {
             o.obj_type == crate::schema::ObjectType::View && o.name.eq_ignore_ascii_case(&table)
-        }) {
-            if let Some(sql) = &vobj.sql {
-                if let Statement::CreateView(cv) = sql::parse_one(sql)? {
-                    return self.view_table_info(&cv, &table, extended);
-                }
-            }
+        }) && let Some(sql) = &vobj.sql
+            && let Statement::CreateView(cv) = sql::parse_one(sql)?
+        {
+            return self.view_table_info(&cv, &table, extended);
         }
         // A virtual table answers table_info with its module's declared columns
         // and (optionally) their types; notnull / default / pk are 0/empty (the
@@ -4920,7 +4912,7 @@ impl Connection {
             _ => {
                 return Err(Error::Unsupported(
                     "execute_returning expects INSERT/UPDATE/DELETE",
-                ))
+                ));
             }
         };
         if returning.is_empty() {
@@ -5102,18 +5094,19 @@ impl Connection {
         // 1. Tables (this also recreates their automatic indexes). Skip a vtab's
         //    backing table — its `CREATE VIRTUAL TABLE` recreates it.
         for (ty, name, sql) in &objs {
-            if *ty == ObjectType::Table && !is_backing(name) {
-                if let Some(s) = sql {
-                    tmp.execute(s)?;
-                }
+            if *ty == ObjectType::Table
+                && !is_backing(name)
+                && let Some(s) = sql
+            {
+                tmp.execute(s)?;
             }
         }
         // 2. Explicit secondary indexes (auto-indexes have no SQL).
         for (ty, _, sql) in &objs {
-            if *ty == ObjectType::Index {
-                if let Some(s) = sql {
-                    tmp.execute(s)?;
-                }
+            if *ty == ObjectType::Index
+                && let Some(s) = sql
+            {
+                tmp.execute(s)?;
             }
         }
         // 3. Re-insert every table's rows (before triggers exist, so none fire).
@@ -5147,17 +5140,17 @@ impl Connection {
         }
         // 4. Views, then 5. triggers (last, so loading data didn't fire them).
         for (ty, _, sql) in &objs {
-            if *ty == ObjectType::View {
-                if let Some(s) = sql {
-                    tmp.execute(s)?;
-                }
+            if *ty == ObjectType::View
+                && let Some(s) = sql
+            {
+                tmp.execute(s)?;
             }
         }
         for (ty, _, sql) in &objs {
-            if *ty == ObjectType::Trigger {
-                if let Some(s) = sql {
-                    tmp.execute(s)?;
-                }
+            if *ty == ObjectType::Trigger
+                && let Some(s) = sql
+            {
+                tmp.execute(s)?;
             }
         }
 
@@ -5422,12 +5415,11 @@ impl Connection {
                 let null_args: Vec<Expr> = core::iter::repeat_with(|| Expr::Literal(Literal::Null))
                     .take(args.len())
                     .collect();
-                if let Err(Error::Error(m)) = func::eval_scalar(name, &null_args, *star, &ctx) {
-                    if m.starts_with("no such function: ")
-                        || m.starts_with("wrong number of arguments to function ")
-                    {
-                        err = Some(Error::Error(m));
-                    }
+                if let Err(Error::Error(m)) = func::eval_scalar(name, &null_args, *star, &ctx)
+                    && (m.starts_with("no such function: ")
+                        || m.starts_with("wrong number of arguments to function "))
+                {
+                    err = Some(Error::Error(m));
                 }
             }
         });
@@ -5560,10 +5552,10 @@ impl Connection {
                 }
             }
             for k in &c.constraints {
-                if let ColumnConstraint::Collate(name) = k {
-                    if crate::value::Collation::parse(name).is_none() {
-                        return Err(Error::Error(format!("no such collation sequence: {name}")));
-                    }
+                if let ColumnConstraint::Collate(name) = k
+                    && crate::value::Collation::parse(name).is_none()
+                {
+                    return Err(Error::Error(format!("no such collation sequence: {name}")));
                 }
             }
         }
@@ -5690,34 +5682,34 @@ impl Connection {
                 // A generated column may *reference* its table's columns but not via
                 // a `table.col` qualifier; SQLite rejects the dotted form even though
                 // it resolves. (A CHECK accepts the same dotted reference.)
-                if let ColumnConstraint::Generated { expr, .. } = k {
-                    if has_resolved_dotted_ref(expr, &known, false, &ct.name) {
-                        return Err(Error::Error(
-                            "the \".\" operator prohibited in generated columns".into(),
-                        ));
-                    }
+                if let ColumnConstraint::Generated { expr, .. } = k
+                    && has_resolved_dotted_ref(expr, &known, false, &ct.name)
+                {
+                    return Err(Error::Error(
+                        "the \".\" operator prohibited in generated columns".into(),
+                    ));
                 }
                 // A column `DEFAULT` must be constant: SQLite allows literals,
                 // `CURRENT_*`, and (deterministic or not) function calls, but not a
                 // reference to any column. Reject at CREATE like sqlite.
-                if let ColumnConstraint::Default(e) = k {
-                    if unknown_column_ref(e, &[], false, None).is_some() {
-                        return Err(Error::Error(format!(
-                            "default value of column [{}] is not constant",
-                            c.name
-                        )));
-                    }
+                if let ColumnConstraint::Default(e) = k
+                    && unknown_column_ref(e, &[], false, None).is_some()
+                {
+                    return Err(Error::Error(format!(
+                        "default value of column [{}] is not constant",
+                        c.name
+                    )));
                 }
                 // A column-level FOREIGN KEY references exactly its own column, so
                 // it may name at most one parent column. SQLite rejects more at
                 // CREATE with this specific message.
-                if let ColumnConstraint::References(fk) = k {
-                    if fk.ref_columns.len() > 1 {
-                        return Err(Error::Error(format!(
-                            "foreign key on {} should reference only one column of table {}",
-                            c.name, fk.ref_table
-                        )));
-                    }
+                if let ColumnConstraint::References(fk) = k
+                    && fk.ref_columns.len() > 1
+                {
+                    return Err(Error::Error(format!(
+                        "foreign key on {} should reference only one column of table {}",
+                        c.name, fk.ref_table
+                    )));
                 }
             }
         }
@@ -6140,13 +6132,13 @@ impl Connection {
                 }
             }
         } else if p.name.eq_ignore_ascii_case("journal_mode") {
-            if let Some(e) = &p.value {
-                if pragma_text(e).eq_ignore_ascii_case("wal") {
-                    self.backend.writer()?.set_wal_mode()?;
-                }
-                // Other modes (delete/truncate/persist/memory/off) keep the
-                // rollback-journal path; switching back out of WAL is a no-op.
+            if let Some(e) = &p.value
+                && pragma_text(e).eq_ignore_ascii_case("wal")
+            {
+                self.backend.writer()?.set_wal_mode()?;
             }
+            // Other modes (delete/truncate/persist/memory/off) keep the
+            // rollback-journal path; switching back out of WAL is a no-op.
         } else if p.name.eq_ignore_ascii_case("wal_checkpoint") {
             self.backend.writer()?.checkpoint()?;
         } else if p.name.eq_ignore_ascii_case("user_version") {
@@ -6383,10 +6375,10 @@ impl Connection {
             let meta = self.table_meta(&obj.name, None)?;
             for (_, row) in self.scan_table(&meta)? {
                 for fk in &fks {
-                    if let Some(key) = self.child_key_values(&meta, fk, &row) {
-                        if !self.parent_has_key(fk, &key)? {
-                            return Err(Error::Constraint("FOREIGN KEY constraint failed".into()));
-                        }
+                    if let Some(key) = self.child_key_values(&meta, fk, &row)
+                        && !self.parent_has_key(fk, &key)?
+                    {
+                        return Err(Error::Constraint("FOREIGN KEY constraint failed".into()));
                     }
                 }
             }
@@ -7140,14 +7132,14 @@ impl Connection {
             }
             let produced = eval::Subqueries::rows(self, select, ctx)?;
             let first = produced.into_iter().next();
-            if let Some(r) = &first {
-                if r.len() != positions.len() {
-                    return Err(Error::Error(format!(
-                        "{} columns assigned {} values",
-                        positions.len(),
-                        r.len()
-                    )));
-                }
+            if let Some(r) = &first
+                && r.len() != positions.len()
+            {
+                return Err(Error::Error(format!(
+                    "{} columns assigned {} values",
+                    positions.len(),
+                    r.len()
+                )));
             }
             for (i, &pos) in positions.iter().enumerate() {
                 target[pos] = first.as_ref().map_or(Value::Null, |r| r[i].clone());
@@ -7288,16 +7280,16 @@ impl Connection {
             // projection keeps its dedicated path below — `eval` has no RAISE
             // handling, and SQLite resolves the rest of the row first anyway.
             for col in &sel.columns {
-                if let ResultColumn::Expr { expr, .. } = col {
-                    if !trigger_select_skip_eval(expr) {
-                        let _ = eval::eval(expr, &ctx)?;
-                    }
+                if let ResultColumn::Expr { expr, .. } = col
+                    && !trigger_select_skip_eval(expr)
+                {
+                    let _ = eval::eval(expr, &ctx)?;
                 }
             }
-            if let Some(w) = &sel.where_clause {
-                if eval::truth(&eval::eval(w, &ctx)?) != Some(true) {
-                    return Ok(());
-                }
+            if let Some(w) = &sel.where_clause
+                && eval::truth(&eval::eval(w, &ctx)?) != Some(true)
+            {
+                return Ok(());
             }
         }
         for col in &sel.columns {
@@ -7468,14 +7460,13 @@ impl Connection {
         // SQLite rejects a mismatch up front ("all VALUES must have the same
         // number of terms"); validate before any row is written so a short row
         // never half-completes the insert.
-        if let InsertSource::Values(rows) = &ins.source {
-            if let Some(first) = rows.first() {
-                if rows.iter().any(|r| r.len() != first.len()) {
-                    return Err(Error::Error(
-                        "all VALUES must have the same number of terms".into(),
-                    ));
-                }
-            }
+        if let InsertSource::Values(rows) = &ins.source
+            && let Some(first) = rows.first()
+            && rows.iter().any(|r| r.len() != first.len())
+        {
+            return Err(Error::Error(
+                "all VALUES must have the same number of terms".into(),
+            ));
         }
         let (rows, is_default_values) = match &ins.source {
             InsertSource::Values(rows) => (rows.clone(), false),
@@ -7536,7 +7527,7 @@ impl Connection {
                         return Err(Error::Error(format!(
                             "table {} has no column named {name}",
                             ins.table
-                        )))
+                        )));
                     }
                 }
             }
@@ -7547,10 +7538,10 @@ impl Connection {
         let mut next_auto = self.next_rowid(meta.root)?;
         // AUTOINCREMENT never reuses a rowid at or below the persisted high-water
         // mark, so seed the counter past it (a deleted maximum is not recycled).
-        if meta.autoincrement {
-            if let Some(seq) = self.sequence_value(&ins.table)? {
-                next_auto = next_auto.max(seq + 1);
-            }
+        if meta.autoincrement
+            && let Some(seq) = self.sequence_value(&ins.table)?
+        {
+            next_auto = next_auto.max(seq + 1);
         }
         let mut affected = 0;
         let mut replaced = false;
@@ -7688,7 +7679,7 @@ impl Connection {
                     Ok(()) => {}
                     Err(Error::Constraint(_)) if ins.on_conflict == OnConflict::Ignore => continue,
                     Err(Error::Constraint(m)) => {
-                        return Err(self.conflict_error(ins.on_conflict, &m))
+                        return Err(self.conflict_error(ins.on_conflict, &m));
                     }
                     Err(e) => return Err(e),
                 }
@@ -7897,10 +7888,10 @@ impl Connection {
                 subqueries: None,
             }
             .with_subqueries(self);
-            if let Some(w) = where_clause {
-                if eval::truth(&eval::eval(w, &ctx)?) != Some(true) {
-                    return Ok(false);
-                }
+            if let Some(w) = where_clause
+                && eval::truth(&eval::eval(w, &ctx)?) != Some(true)
+            {
+                return Ok(false);
             }
             for (col, e) in assignments {
                 let pos = meta
@@ -7922,10 +7913,10 @@ impl Connection {
         // integer: NULL or a non-integer value (after affinity) is a datatype
         // mismatch in SQLite — checked before NOT NULL, which would otherwise
         // mis-report a `SET ipk = NULL`.
-        if let Some(ipk) = meta.ipk {
-            if !matches!(values[ipk], Value::Integer(_)) {
-                return Err(Error::Error("datatype mismatch".into()));
-            }
+        if let Some(ipk) = meta.ipk
+            && !matches!(values[ipk], Value::Integer(_))
+        {
+            return Err(Error::Error("datatype mismatch".into()));
         }
         check_not_null(meta, &values)?;
         self.check_strict_types(meta, &values)?;
@@ -8156,13 +8147,12 @@ impl Connection {
             Err(_) => return bare,
         };
         // A rowid / INTEGER PRIMARY KEY collision.
-        if let Some(ipk) = meta.ipk {
-            if rows
+        if let Some(ipk) = meta.ipk
+            && rows
                 .iter()
                 .any(|(er, _)| *er == rowid && Some(*er) != exclude)
-            {
-                return alloc::format!("UNIQUE constraint failed: {}", qualify(&[ipk]));
-            }
+        {
+            return alloc::format!("UNIQUE constraint failed: {}", qualify(&[ipk]));
         }
         // Inline UNIQUE / PRIMARY KEY constraint sets, in declaration order.
         for (set, _, _) in &meta.unique {
@@ -8347,10 +8337,10 @@ impl Connection {
             .collect::<Result<_>>()?;
         // The target names the rowid / INTEGER PRIMARY KEY: it matches when a
         // conflicting row shares the candidate rowid — which is that row's rowid.
-        if let Some(ipk) = meta.ipk {
-            if target_cols == [ipk] {
-                return Ok(conflicts.contains(&rowid).then_some(rowid));
-            }
+        if let Some(ipk) = meta.ipk
+            && target_cols == [ipk]
+        {
+            return Ok(conflicts.contains(&rowid).then_some(rowid));
         }
         // The conflict matches the target only if the proposed row equals some
         // conflicting row on every target column (NULLs never match — a NULL key
@@ -8597,10 +8587,10 @@ impl Connection {
             // still present. The action still matches children by the saved `old`
             // key, so removing the parent first does not affect which rows it hits.
             delete_table(self.backend.writer()?, meta.root, *rowid)?;
-            if self.foreign_keys {
-                if let Some(old) = &old {
-                    self.enforce_parent_change(&del.table, old, None, params)?;
-                }
+            if self.foreign_keys
+                && let Some(old) = &old
+            {
+                self.enforce_parent_change(&del.table, old, None, params)?;
             }
             deleted += 1;
             if let Some(old) = &old {
@@ -8928,10 +8918,10 @@ impl Connection {
             // integer; NULL or a non-integer (after affinity) is a datatype
             // mismatch — a hard error checked before NOT NULL (which would else
             // mis-report `SET ipk = NULL`) and not skipped by UPDATE OR IGNORE.
-            if let Some(ipk) = meta.ipk {
-                if !matches!(values[ipk], Value::Integer(_)) {
-                    return Err(Error::Error("datatype mismatch".into()));
-                }
+            if let Some(ipk) = meta.ipk
+                && !matches!(values[ipk], Value::Integer(_))
+            {
+                return Err(Error::Error("datatype mismatch".into()));
             }
             // NOT NULL / CHECK / STRICT-type constraints. `UPDATE OR IGNORE` skips
             // a row that violates one rather than failing the statement.
@@ -8952,7 +8942,7 @@ impl Connection {
                     Ok(()) => {}
                     Err(Error::Constraint(_)) if upd.on_conflict == OnConflict::Ignore => continue,
                     Err(Error::Constraint(m)) => {
-                        return Err(self.conflict_error(upd.on_conflict, &m))
+                        return Err(self.conflict_error(upd.on_conflict, &m));
                     }
                     Err(e) => return Err(e),
                 }
@@ -8992,16 +8982,16 @@ impl Connection {
             // recomputed. Runs when a BEFORE trigger touched this row, or when an
             // AFTER UPDATE trigger exists (a prior row's firing may have edited this
             // one); the trigger-free path is unchanged (an untouched row is a no-op).
-            if before_fired || has_after_update_trigger {
-                if let Some(current) = self.read_row(&meta, rowid)? {
-                    for (i, col) in meta.columns.iter().enumerate() {
-                        let is_set = changed.iter().any(|c| c.eq_ignore_ascii_case(&col.name));
-                        if !is_set && meta.ipk != Some(i) {
-                            values[i] = current[i].clone();
-                        }
+            if (before_fired || has_after_update_trigger)
+                && let Some(current) = self.read_row(&meta, rowid)?
+            {
+                for (i, col) in meta.columns.iter().enumerate() {
+                    let is_set = changed.iter().any(|c| c.eq_ignore_ascii_case(&col.name));
+                    if !is_set && meta.ipk != Some(i) {
+                        values[i] = current[i].clone();
                     }
-                    self.materialize_generated(&meta, &mut values, params)?;
                 }
+                self.materialize_generated(&meta, &mut values, params)?;
             }
             // UNIQUE/PK conflict against any other row. `UPDATE OR IGNORE` skips
             // this row; `UPDATE OR REPLACE` deletes the conflicting rows first.
@@ -9229,7 +9219,7 @@ impl Connection {
                 let tuples: Vec<Vec<Value>> = rows
                     .iter()
                     .zip(&keep)
-                    .filter(|(_, &k)| k)
+                    .filter(|&(_, &k)| k)
                     .map(|(row, _)| cols.iter().map(|&c| row[c].clone()).collect())
                     .collect();
                 if unique_index_conflict(&tuples, &colls) {
@@ -9704,7 +9694,7 @@ impl Connection {
                         _ => {
                             return Err(Error::Constraint(format!(
                                 "UNIQUE constraint failed: {table}.rowid"
-                            )))
+                            )));
                         }
                     }
                 }
@@ -9750,7 +9740,7 @@ impl Connection {
                         _ => {
                             return Err(Error::Constraint(format!(
                                 "UNIQUE constraint failed: {table}.{id_col}"
-                            )))
+                            )));
                         }
                     }
                 }
@@ -9786,16 +9776,16 @@ impl Connection {
                         let v = values.get(rowid_col?)?;
                         (!matches!(v, Value::Null)).then(|| eval::to_i64(v))
                     });
-                    if let Some(id) = effective {
-                        if existing.contains(&id) {
-                            match on_conflict {
-                                OnConflict::Replace => {}
-                                OnConflict::Ignore => continue,
-                                _ => {
-                                    return Err(Error::Constraint(format!(
-                                        "UNIQUE constraint failed: {table}.{id_col}"
-                                    )))
-                                }
+                    if let Some(id) = effective
+                        && existing.contains(&id)
+                    {
+                        match on_conflict {
+                            OnConflict::Replace => {}
+                            OnConflict::Ignore => continue,
+                            _ => {
+                                return Err(Error::Constraint(format!(
+                                    "UNIQUE constraint failed: {table}.{id_col}"
+                                )));
                             }
                         }
                     }
@@ -9957,10 +9947,10 @@ impl Connection {
         let mut old_vals: Vec<Vec<Value>> = Vec::new();
         for r in &rows {
             let ctx = r.ctx(&columns, params).with_subqueries(self);
-            if let Some(pred) = &upd.where_clause {
-                if eval::truth(&eval::eval(pred, &ctx)?) != Some(true) {
-                    continue;
-                }
+            if let Some(pred) = &upd.where_clause
+                && eval::truth(&eval::eval(pred, &ctx)?) != Some(true)
+            {
+                continue;
             }
             // Every SET RHS evaluates against the original row (simultaneous).
             let mut values = r.values.clone();
@@ -10383,29 +10373,27 @@ impl Connection {
         // (`no such column: NAME`), and a malformed brace is a syntax error — both
         // reported by SQLite at cursor-filter time, so even an empty table errors.
         #[cfg(feature = "fts5")]
-        if cvt.module.eq_ignore_ascii_case("fts5") {
-            if let Some((sel, params)) = pushdown {
-                if let Some(where_expr) = sel.where_clause.as_ref() {
-                    if let Some((query, operand)) = self.fts5_match_query(where_expr, params) {
-                        // The MATCH operand must refer to this table (the table
-                        // itself, its alias, or one of its columns); validate the
-                        // query's `col:`/`{…}:` filters against its full declared
-                        // column list (`schema.columns`, indexed and UNINDEXED).
-                        let names_scope = operand.eq_ignore_ascii_case(name)
-                            || alias.is_some_and(|a| operand.eq_ignore_ascii_case(a))
-                            || schema
-                                .columns
-                                .iter()
-                                .any(|c| c.eq_ignore_ascii_case(&operand));
-                        if names_scope {
-                            let tok = crate::vtab::fts5_tok_config(&arg_refs);
-                            if let Some(msg) =
-                                crate::vtab::fts5_query_column_error(&query, &schema.columns, tok)
-                            {
-                                return Err(Error::Error(msg));
-                            }
-                        }
-                    }
+        if cvt.module.eq_ignore_ascii_case("fts5")
+            && let Some((sel, params)) = pushdown
+            && let Some(where_expr) = sel.where_clause.as_ref()
+            && let Some((query, operand)) = self.fts5_match_query(where_expr, params)
+        {
+            // The MATCH operand must refer to this table (the table
+            // itself, its alias, or one of its columns); validate the
+            // query's `col:`/`{…}:` filters against its full declared
+            // column list (`schema.columns`, indexed and UNINDEXED).
+            let names_scope = operand.eq_ignore_ascii_case(name)
+                || alias.is_some_and(|a| operand.eq_ignore_ascii_case(a))
+                || schema
+                    .columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&operand));
+            if names_scope {
+                let tok = crate::vtab::fts5_tok_config(&arg_refs);
+                if let Some(msg) =
+                    crate::vtab::fts5_query_column_error(&query, &schema.columns, tok)
+                {
+                    return Err(Error::Error(msg));
                 }
             }
         }
@@ -10512,15 +10500,14 @@ impl Connection {
                 // (NULL) columns would silently UNDER-match. Decline such a query
                 // rather than return a wrong (subset) result.
                 if crate::vtab::fts5_is_contentless(&arg_refs) {
-                    if let Some((sel, params)) = pushdown {
-                        if let Some(e) = sel.where_clause.as_ref() {
-                            if self.fts5_where_has_unroutable_match(name, &arg_refs, e, params)? {
-                                return Err(Error::Unsupported(
-                                    "fts5: this MATCH query shape is not supported on a \
+                    if let Some((sel, params)) = pushdown
+                        && let Some(e) = sel.where_clause.as_ref()
+                        && self.fts5_where_has_unroutable_match(name, &arg_refs, e, params)?
+                    {
+                        return Err(Error::Unsupported(
+                            "fts5: this MATCH query shape is not supported on a \
                                      contentless table (no stored text to match against)",
-                                ));
-                            }
-                        }
+                        ));
                     }
                     let docsize_meta = self.table_meta(&format!("{name}_docsize"), None)?;
                     let ncols = schema.columns.len();
@@ -10642,10 +10629,12 @@ impl Connection {
                 let mut out = alloc::vec::Vec::new();
                 for r in &refs {
                     let rl = r.to_ascii_lowercase();
-                    if let Some(j) = lname.iter().position(|n| *n == rl) {
-                        if j != i && used[j] && !out.contains(&j) {
-                            out.push(j);
-                        }
+                    if let Some(j) = lname.iter().position(|n| *n == rl)
+                        && j != i
+                        && used[j]
+                        && !out.contains(&j)
+                    {
+                        out.push(j);
                     }
                 }
                 out
@@ -10661,10 +10650,11 @@ impl Connection {
                 let mut order = alloc::vec::Vec::new();
                 for r in s {
                     let rl = r.to_ascii_lowercase();
-                    if let Some(j) = lname.iter().position(|n| *n == rl) {
-                        if used[j] && !order.contains(&j) {
-                            order.push(j);
-                        }
+                    if let Some(j) = lname.iter().position(|n| *n == rl)
+                        && used[j]
+                        && !order.contains(&j)
+                    {
+                        order.push(j);
                     }
                 }
                 order
@@ -11041,15 +11031,15 @@ impl Connection {
                 all_rows.push(row.clone());
                 // Stop once the CTE's LIMIT (after OFFSET), or the consuming
                 // query's LIMIT (+OFFSET), is satisfied.
-                if let Some(lim) = rec_limit {
-                    if all_rows.len() >= rec_offset.saturating_add(lim) {
-                        break Ok(());
-                    }
+                if let Some(lim) = rec_limit
+                    && all_rows.len() >= rec_offset.saturating_add(lim)
+                {
+                    break Ok(());
                 }
-                if let Some(cap) = outer_cap {
-                    if all_rows.len() >= cap {
-                        break Ok(());
-                    }
+                if let Some(cap) = outer_cap
+                    && all_rows.len() >= cap
+                {
+                    break Ok(());
                 }
                 self.cte_env.borrow_mut()[slot].rows = alloc::vec![InputRow {
                     values: row,
@@ -11123,18 +11113,18 @@ impl Connection {
                 all_rows.extend(fresh.iter().cloned());
                 working = fresh;
                 // Stop once the CTE's LIMIT (after OFFSET) is satisfied.
-                if let Some(lim) = rec_limit {
-                    if all_rows.len() >= rec_offset.saturating_add(lim) {
-                        break Ok(());
-                    }
+                if let Some(lim) = rec_limit
+                    && all_rows.len() >= rec_offset.saturating_add(lim)
+                {
+                    break Ok(());
                 }
                 // Stop once the consuming query's LIMIT (+OFFSET) is satisfied —
                 // this terminates an otherwise-infinite recursion
                 // `SELECT … FROM rcte LIMIT k`.
-                if let Some(cap) = outer_cap {
-                    if all_rows.len() >= cap {
-                        break Ok(());
-                    }
+                if let Some(cap) = outer_cap
+                    && all_rows.len() >= cap
+                {
+                    break Ok(());
                 }
             }
         };
@@ -11293,13 +11283,13 @@ impl Connection {
                         return Err(Error::Error(format!(
                             "use DROP VIEW to delete view {}",
                             d.name
-                        )))
+                        )));
                     }
                     (DropKind::View, ObjectType::Table) => {
                         return Err(Error::Error(format!(
                             "use DROP TABLE to delete table {}",
                             d.name
-                        )))
+                        )));
                     }
                     _ => {}
                 }
@@ -11380,13 +11370,14 @@ impl Connection {
                 "table {display} may not be {verb}"
             )));
         }
-        if name.len() >= 7 && name[..7].eq_ignore_ascii_case("sqlite_") {
-            if let Some(obj) = self.schema.table(name) {
-                return Err(Error::Error(alloc::format!(
-                    "table {} may not be {verb}",
-                    obj.name
-                )));
-            }
+        if name.len() >= 7
+            && name[..7].eq_ignore_ascii_case("sqlite_")
+            && let Some(obj) = self.schema.table(name)
+        {
+            return Err(Error::Error(alloc::format!(
+                "table {} may not be {verb}",
+                obj.name
+            )));
         }
         Ok(())
     }
@@ -12096,23 +12087,23 @@ impl Connection {
                     }
                 }
                 crate::schema::ObjectType::View => {
-                    if let Some(vsql) = &obj.sql {
-                        if let Some(r) = view_drop_break_ref(vsql, &a.table, name, &table_cols) {
-                            return Err(Error::Error(format!(
-                                "error in view {} after drop column: no such column: {r}",
-                                obj.name
-                            )));
-                        }
+                    if let Some(vsql) = &obj.sql
+                        && let Some(r) = view_drop_break_ref(vsql, &a.table, name, &table_cols)
+                    {
+                        return Err(Error::Error(format!(
+                            "error in view {} after drop column: no such column: {r}",
+                            obj.name
+                        )));
                     }
                 }
                 crate::schema::ObjectType::Trigger => {
-                    if let Some(tsql) = &obj.sql {
-                        if let Some(r) = trigger_drop_break_ref(tsql, &a.table, name, &table_cols) {
-                            return Err(Error::Error(format!(
-                                "error in trigger {} after drop column: no such column: {r}",
-                                obj.name
-                            )));
-                        }
+                    if let Some(tsql) = &obj.sql
+                        && let Some(r) = trigger_drop_break_ref(tsql, &a.table, name, &table_cols)
+                    {
+                        return Err(Error::Error(format!(
+                            "error in trigger {} after drop column: no such column: {r}",
+                            obj.name
+                        )));
                     }
                 }
                 _ => {}
@@ -12211,10 +12202,10 @@ impl Connection {
         let mut ok = cur.first()?;
         while ok {
             let cols = decode_record(&cur.payload()?, encoding)?;
-            if let Some(Value::Text(name)) = cols.get(1) {
-                if names.iter().any(|n| n == name) {
-                    out.push(cur.rowid()?);
-                }
+            if let Some(Value::Text(name)) = cols.get(1)
+                && names.iter().any(|n| n == name)
+            {
+                out.push(cur.rowid()?);
             }
             ok = cur.next()?;
         }
@@ -12459,17 +12450,17 @@ impl Connection {
         }
         let pk: Vec<usize> = meta.storage_order[..meta.pk_len].to_vec();
         let indexes = self.indexes_of(table_name)?;
-        if let Some(IndexHint::IndexedBy(n)) = hint {
-            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
-                return Err(Error::Error(alloc::format!("no such index: {n}")));
-            }
+        if let Some(IndexHint::IndexedBy(n)) = hint
+            && !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n))
+        {
+            return Err(Error::Error(alloc::format!("no such index: {n}")));
         }
         let src = self.backend.source();
         for idx in &indexes {
-            if let Some(IndexHint::IndexedBy(n)) = hint {
-                if !idx.name.eq_ignore_ascii_case(n) {
-                    continue;
-                }
+            if let Some(IndexHint::IndexedBy(n)) = hint
+                && !idx.name.eq_ignore_ascii_case(n)
+            {
+                continue;
             }
             if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
@@ -12605,16 +12596,16 @@ impl Connection {
         }
         let pk: Vec<usize> = meta.storage_order[..meta.pk_len].to_vec();
         let indexes = self.indexes_of(table_name)?;
-        if let Some(IndexHint::IndexedBy(n)) = hint {
-            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
-                return Err(Error::Error(alloc::format!("no such index: {n}")));
-            }
+        if let Some(IndexHint::IndexedBy(n)) = hint
+            && !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n))
+        {
+            return Err(Error::Error(alloc::format!("no such index: {n}")));
         }
         for idx in &indexes {
-            if let Some(IndexHint::IndexedBy(n)) = hint {
-                if !idx.name.eq_ignore_ascii_case(n) {
-                    continue;
-                }
+            if let Some(IndexHint::IndexedBy(n)) = hint
+                && !idx.name.eq_ignore_ascii_case(n)
+            {
+                continue;
             }
             if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
@@ -12725,10 +12716,10 @@ impl Connection {
             usize,
         )> = None;
         for idx in self.indexes_of(table_name)? {
-            if let Some(IndexHint::IndexedBy(n)) = hint {
-                if !idx.name.eq_ignore_ascii_case(n) {
-                    continue;
-                }
+            if let Some(IndexHint::IndexedBy(n)) = hint
+                && !idx.name.eq_ignore_ascii_case(n)
+            {
+                continue;
             }
             if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
@@ -12814,10 +12805,10 @@ impl Connection {
         let mut best: Option<IndexMeta> = None;
         let mut best_key: Option<RangeKey> = None;
         for idx in self.indexes_of(table_name)? {
-            if let Some(IndexHint::IndexedBy(n)) = hint {
-                if !idx.name.eq_ignore_ascii_case(n) {
-                    continue;
-                }
+            if let Some(IndexHint::IndexedBy(n)) = hint
+                && !idx.name.eq_ignore_ascii_case(n)
+            {
+                continue;
             }
             if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
@@ -12874,37 +12865,36 @@ impl Connection {
         // column, and is cheaper than any secondary index. `INDEXED BY` names a
         // specific index, so it forbids this fast path. (`run_core` re-applies the
         // full WHERE, so the seeked rows are a valid superset.)
-        if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
-            if let Some(mut rowids) =
+        if !matches!(hint, Some(IndexHint::IndexedBy(_)))
+            && let Some(mut rowids) =
                 rowid_seek_constraint(where_expr, &meta.columns, meta.ipk, params)
-            {
-                // When a sole `ORDER BY` on the rowid/IPK is satisfied by walking the
-                // values in ascending rowid order (`in_seek_order`), seek them sorted
-                // so `run_core` can elide the temp b-tree (it reverses for DESC). The
-                // recogniser is in lockstep with this sort — both key off the same
-                // `find_in_constraint` IPK `IN`/OR shape.
-                if self.in_seek_order(sel, params).is_some() {
-                    rowids.sort_unstable();
-                }
-                let encoding = self.backend.source().header().text_encoding;
-                let mut cur = TableCursor::new(self.backend.source(), meta.root);
-                let mut out = Vec::new();
-                let mut seen: Vec<i64> = Vec::new();
-                for rid in rowids {
-                    if seen.contains(&rid) {
-                        continue;
-                    }
-                    seen.push(rid);
-                    if cur.seek(rid)? {
-                        let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
-                        out.push(InputRow {
-                            values,
-                            rowid: Some(rid),
-                        });
-                    }
-                }
-                return Ok(Some(out));
+        {
+            // When a sole `ORDER BY` on the rowid/IPK is satisfied by walking the
+            // values in ascending rowid order (`in_seek_order`), seek them sorted
+            // so `run_core` can elide the temp b-tree (it reverses for DESC). The
+            // recogniser is in lockstep with this sort — both key off the same
+            // `find_in_constraint` IPK `IN`/OR shape.
+            if self.in_seek_order(sel, params).is_some() {
+                rowids.sort_unstable();
             }
+            let encoding = self.backend.source().header().text_encoding;
+            let mut cur = TableCursor::new(self.backend.source(), meta.root);
+            let mut out = Vec::new();
+            let mut seen: Vec<i64> = Vec::new();
+            for rid in rowids {
+                if seen.contains(&rid) {
+                    continue;
+                }
+                seen.push(rid);
+                if cur.seek(rid)? {
+                    let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                    out.push(InputRow {
+                        values,
+                        rowid: Some(rid),
+                    });
+                }
+            }
+            return Ok(Some(out));
         }
         let mut eqs: Vec<(usize, Value)> = Vec::new();
         collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
@@ -12929,34 +12919,32 @@ impl Connection {
         // integer (e.g. `id = 5.5` seeks rowid 5, then gets filtered out).
         // The rowid (INTEGER PRIMARY KEY) is not a named index, so `INDEXED BY`
         // forbids this fast path.
-        if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
-            if let Some(ipk) = meta.ipk {
-                if let Some((_, v)) = eqs.iter().find(|(c, _)| *c == ipk) {
-                    let rid = eval::to_i64(v);
-                    let encoding = self.backend.source().header().text_encoding;
-                    let mut cur = TableCursor::new(self.backend.source(), meta.root);
-                    let mut out = Vec::new();
-                    if cur.seek(rid)? {
-                        let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
-                        out.push(InputRow {
-                            values,
-                            rowid: Some(rid),
-                        });
-                    }
-                    return Ok(Some(out));
-                }
+        if !matches!(hint, Some(IndexHint::IndexedBy(_)))
+            && let Some(ipk) = meta.ipk
+            && let Some((_, v)) = eqs.iter().find(|(c, _)| *c == ipk)
+        {
+            let rid = eval::to_i64(v);
+            let encoding = self.backend.source().header().text_encoding;
+            let mut cur = TableCursor::new(self.backend.source(), meta.root);
+            let mut out = Vec::new();
+            if cur.seek(rid)? {
+                let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                out.push(InputRow {
+                    values,
+                    rowid: Some(rid),
+                });
             }
+            return Ok(Some(out));
         }
 
         // `INDEXED BY name` must name a real index of this table.
-        if let Some(IndexHint::IndexedBy(n)) = hint {
-            if !self
+        if let Some(IndexHint::IndexedBy(n)) = hint
+            && !self
                 .indexes_of(table_name)?
                 .iter()
                 .any(|i| i.name.eq_ignore_ascii_case(n))
-            {
-                return Err(Error::Error(alloc::format!("no such index: {n}")));
-            }
+        {
+            return Err(Error::Error(alloc::format!("no such index: {n}")));
         }
         // Choose the index to seek via the shared cost tiebreaks (kept in lockstep
         // with `eqp_access`, which reports the same choice). Plain column indexes
@@ -13186,10 +13174,10 @@ impl Connection {
     ) -> Result<Option<Vec<InputRow>>> {
         let hint = sel.from.as_ref().and_then(|f| f.first.index_hint.as_ref());
         for idx in self.indexes_of(table_name)? {
-            if let Some(IndexHint::IndexedBy(n)) = hint {
-                if !idx.name.eq_ignore_ascii_case(n) {
-                    continue;
-                }
+            if let Some(IndexHint::IndexedBy(n)) = hint
+                && !idx.name.eq_ignore_ascii_case(n)
+            {
+                continue;
             }
             if let Some((key, colls)) = self.partial_expr_seek(&idx, where_expr, meta, params)? {
                 // Expression indexes don't map keys back to table columns, so they
@@ -13237,10 +13225,10 @@ impl Connection {
         and_conjuncts(where_expr, &mut conjuncts);
 
         // A partial predicate must be guaranteed by a top-level conjunct.
-        if let Some(pred) = &idx.partial {
-            if !conjuncts.iter().any(|c| expr_eq_modulo_parens(c, pred)) {
-                return Ok(None);
-            }
+        if let Some(pred) = &idx.partial
+            && !conjuncts.iter().any(|c| expr_eq_modulo_parens(c, pred))
+        {
+            return Ok(None);
         }
 
         match &idx.key_exprs {
@@ -13335,50 +13323,46 @@ impl Connection {
         // integer bounds are taken (a non-integer literal falls to the scan); the
         // returned span is a superset, so the boundary rows are filtered by the
         // re-applied WHERE.
-        if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
-            if let Some(ipk) = meta.ipk {
-                if let Some(b) = ranges.get(&ipk) {
-                    let int_bound = |o: &Option<(Value, bool)>| match o {
-                        Some((Value::Integer(i), _)) => Some(*i),
-                        None => None,
-                        _ => Some(i64::MAX), // sentinel: a non-integer bound disables it
-                    };
-                    let lo = int_bound(&b.lower);
-                    let hi = int_bound(&b.upper);
-                    // Disable when a present bound is non-integer (sentinel hit on
-                    // the wrong side).
-                    let lo_ok =
-                        b.lower.is_none() || matches!(b.lower, Some((Value::Integer(_), _)));
-                    let hi_ok =
-                        b.upper.is_none() || matches!(b.upper, Some((Value::Integer(_), _)));
-                    if lo_ok && hi_ok {
-                        let start = lo.unwrap_or(i64::MIN);
-                        let stop = hi.unwrap_or(i64::MAX);
-                        let encoding = self.backend.source().header().text_encoding;
-                        let mut cur = TableCursor::new(self.backend.source(), meta.root);
-                        let mut out = Vec::new();
-                        let mut ok = if start == i64::MIN {
-                            cur.first()?
-                        } else {
-                            cur.seek(start)?;
-                            cur.is_valid()
-                        };
-                        while ok {
-                            let rid = cur.rowid()?;
-                            if rid > stop {
-                                break;
-                            }
-                            let values =
-                                self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
-                            out.push(InputRow {
-                                values,
-                                rowid: Some(rid),
-                            });
-                            ok = cur.next()?;
-                        }
-                        return Ok(Some(out));
+        if !matches!(hint, Some(IndexHint::IndexedBy(_)))
+            && let Some(ipk) = meta.ipk
+            && let Some(b) = ranges.get(&ipk)
+        {
+            let int_bound = |o: &Option<(Value, bool)>| match o {
+                Some((Value::Integer(i), _)) => Some(*i),
+                None => None,
+                _ => Some(i64::MAX), // sentinel: a non-integer bound disables it
+            };
+            let lo = int_bound(&b.lower);
+            let hi = int_bound(&b.upper);
+            // Disable when a present bound is non-integer (sentinel hit on
+            // the wrong side).
+            let lo_ok = b.lower.is_none() || matches!(b.lower, Some((Value::Integer(_), _)));
+            let hi_ok = b.upper.is_none() || matches!(b.upper, Some((Value::Integer(_), _)));
+            if lo_ok && hi_ok {
+                let start = lo.unwrap_or(i64::MIN);
+                let stop = hi.unwrap_or(i64::MAX);
+                let encoding = self.backend.source().header().text_encoding;
+                let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                let mut out = Vec::new();
+                let mut ok = if start == i64::MIN {
+                    cur.first()?
+                } else {
+                    cur.seek(start)?;
+                    cur.is_valid()
+                };
+                while ok {
+                    let rid = cur.rowid()?;
+                    if rid > stop {
+                        break;
                     }
+                    let values = self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                    out.push(InputRow {
+                        values,
+                        rowid: Some(rid),
+                    });
+                    ok = cur.next()?;
                 }
+                return Ok(Some(out));
             }
         }
 
@@ -13386,10 +13370,10 @@ impl Connection {
         // a covering one (skips the table lookup); `eqp_access` renders the same
         // pick via the shared `choose_range_index`, honoring `INDEXED BY`.
         let indexes = self.indexes_of(table_name)?;
-        if let Some(IndexHint::IndexedBy(n)) = hint {
-            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
-                return Err(Error::Error(alloc::format!("no such index: {n}")));
-            }
+        if let Some(IndexHint::IndexedBy(n)) = hint
+            && !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n))
+        {
+            return Err(Error::Error(alloc::format!("no such index: {n}")));
         }
         #[allow(clippy::type_complexity)]
         let mut chosen: Option<(
@@ -13440,10 +13424,10 @@ impl Connection {
                 // WHERE guarantees). Always a non-covering fetch — `eqp_access`
                 // mirrors this in its partial/expression range fallback.
                 for idx in &indexes {
-                    if let Some(IndexHint::IndexedBy(n)) = hint {
-                        if !idx.name.eq_ignore_ascii_case(n) {
-                            continue;
-                        }
+                    if let Some(IndexHint::IndexedBy(n)) = hint
+                        && !idx.name.eq_ignore_ascii_case(n)
+                    {
+                        continue;
                     }
                     if let Some((bound, coll)) =
                         self.partial_expr_range(idx, where_expr, meta, params)
@@ -13525,16 +13509,16 @@ impl Connection {
         hint: Option<&IndexHint>,
     ) -> Result<Option<(String, u32, Vec<usize>)>> {
         let indexes = self.indexes_of(table_name)?;
-        if let Some(IndexHint::IndexedBy(n)) = hint {
-            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
-                return Err(Error::Error(alloc::format!("no such index: {n}")));
-            }
+        if let Some(IndexHint::IndexedBy(n)) = hint
+            && !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n))
+        {
+            return Err(Error::Error(alloc::format!("no such index: {n}")));
         }
         let mut qualifying = indexes.iter().filter(|idx| {
-            if let Some(IndexHint::IndexedBy(n)) = hint {
-                if !idx.name.eq_ignore_ascii_case(n) {
-                    return false;
-                }
+            if let Some(IndexHint::IndexedBy(n)) = hint
+                && !idx.name.eq_ignore_ascii_case(n)
+            {
+                return false;
             }
             idx.partial.is_none()
                 && idx.key_exprs.is_none()
@@ -13666,10 +13650,10 @@ impl Connection {
         }
         let mut conjuncts = Vec::new();
         and_conjuncts(where_expr, &mut conjuncts);
-        if let Some(pred) = &idx.partial {
-            if !conjuncts.iter().any(|c| expr_eq_modulo_parens(c, pred)) {
-                return None;
-            }
+        if let Some(pred) = &idx.partial
+            && !conjuncts.iter().any(|c| expr_eq_modulo_parens(c, pred))
+        {
+            return None;
         }
         let coll = idx.collations.first().copied().unwrap_or_default();
         match &idx.key_exprs {
@@ -13750,10 +13734,10 @@ impl Connection {
             return Ok(None);
         }
         let indexes = self.indexes_of(table_name)?;
-        if let Some(IndexHint::IndexedBy(n)) = hint {
-            if !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n)) {
-                return Err(Error::Error(alloc::format!("no such index: {n}")));
-            }
+        if let Some(IndexHint::IndexedBy(n)) = hint
+            && !indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n))
+        {
+            return Err(Error::Error(alloc::format!("no such index: {n}")));
         }
         let by_name = |idx: &IndexMeta| match hint {
             Some(IndexHint::IndexedBy(n)) => idx.name.eq_ignore_ascii_case(n),
@@ -13776,30 +13760,29 @@ impl Connection {
                 let aff = meta.columns[col].affinity;
 
                 // Rowid IN-list: seek the table b-tree directly for each value.
-                if !matches!(hint, Some(IndexHint::IndexedBy(_))) {
-                    if let Some(ipk) = meta.ipk {
-                        if col == ipk {
-                            let mut cur = TableCursor::new(self.backend.source(), meta.root);
-                            let mut out = Vec::new();
-                            let mut seen: Vec<i64> = Vec::new();
-                            for v in &values {
-                                let rid = eval::to_i64(v);
-                                if seen.contains(&rid) {
-                                    continue;
-                                }
-                                seen.push(rid);
-                                if cur.seek(rid)? {
-                                    let values =
-                                        self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
-                                    out.push(InputRow {
-                                        values,
-                                        rowid: Some(rid),
-                                    });
-                                }
-                            }
-                            return Ok(Some(out));
+                if !matches!(hint, Some(IndexHint::IndexedBy(_)))
+                    && let Some(ipk) = meta.ipk
+                    && col == ipk
+                {
+                    let mut cur = TableCursor::new(self.backend.source(), meta.root);
+                    let mut out = Vec::new();
+                    let mut seen: Vec<i64> = Vec::new();
+                    for v in &values {
+                        let rid = eval::to_i64(v);
+                        if seen.contains(&rid) {
+                            continue;
+                        }
+                        seen.push(rid);
+                        if cur.seek(rid)? {
+                            let values =
+                                self.decode_full_row(meta, rid, &cur.payload()?, encoding)?;
+                            out.push(InputRow {
+                                values,
+                                rowid: Some(rid),
+                            });
                         }
                     }
+                    return Ok(Some(out));
                 }
 
                 let keys: Vec<Vec<Value>> = values
@@ -13888,10 +13871,10 @@ impl Connection {
         hint: Option<&IndexHint>,
     ) -> Result<Option<(u32, crate::value::Collation)>> {
         for idx in &self.indexes_of(table_name)? {
-            if let Some(IndexHint::IndexedBy(n)) = hint {
-                if !idx.name.eq_ignore_ascii_case(n) {
-                    continue;
-                }
+            if let Some(IndexHint::IndexedBy(n)) = hint
+                && !idx.name.eq_ignore_ascii_case(n)
+            {
+                continue;
             }
             if idx.partial.is_some() || idx.key_exprs.is_some() {
                 continue;
@@ -14143,17 +14126,15 @@ impl Connection {
                     && d.limit.is_none()
                     && d.offset.is_none()
                     && d.returning.is_empty()
-                {
-                    if let Some(body) = d
+                    && let Some(body) = d
                         .where_clause
                         .as_ref()
                         .and_then(|w| self.eqp_dml_scalar_subquery(&[w]))
-                    {
-                        let sid = next_id;
-                        next_id += 1;
-                        details.push((sid, 0, String::from("SCALAR SUBQUERY 1")));
-                        self.eqp_select(body, sid, &mut next_id, &mut details, params)?;
-                    }
+                {
+                    let sid = next_id;
+                    next_id += 1;
+                    details.push((sid, 0, String::from("SCALAR SUBQUERY 1")));
+                    self.eqp_select(body, sid, &mut next_id, &mut details, params)?;
                 }
             }
             Statement::Update(u) => {
@@ -15027,8 +15008,7 @@ impl Connection {
                 .iter()
                 .any(|c| c.name.eq_ignore_ascii_case(&from.first.name))
             && self.is_view(&from.first.name)
-        {
-            if let Some(view_select) = self
+            && let Some(view_select) = self
                 .schema
                 .objects()
                 .iter()
@@ -15041,19 +15021,18 @@ impl Connection {
                     Ok(Statement::CreateView(cv)) => Some(cv.select),
                     _ => None,
                 })
-            {
-                let mut rewritten = sel.clone();
-                if let Some(f) = rewritten.from.as_mut() {
-                    let view_name = f.first.name.clone();
-                    f.first.subquery = Some(view_select);
-                    // Keep the view name as the source's bind qualifier so a
-                    // `v.col` reference still resolves once flattened.
-                    if f.first.alias.is_none() {
-                        f.first.alias = Some(view_name);
-                    }
+        {
+            let mut rewritten = sel.clone();
+            if let Some(f) = rewritten.from.as_mut() {
+                let view_name = f.first.name.clone();
+                f.first.subquery = Some(view_select);
+                // Keep the view name as the source's bind qualifier so a
+                // `v.col` reference still resolves once flattened.
+                if f.first.alias.is_none() {
+                    f.first.alias = Some(view_name);
                 }
-                return self.eqp_select(&rewritten, parent, next_id, out, params);
             }
+            return self.eqp_select(&rewritten, parent, next_id, out, params);
         }
         let label = eqp_label(&from.first);
         // Cost-based N-table (≥3) join reorder: when the executor drives the join in
@@ -15119,286 +15098,540 @@ impl Connection {
             && sel.ctes.iter().any(|c| {
                 c.name.eq_ignore_ascii_case(&from.first.name) && c.materialized == Some(true)
             });
-        if from.joins.is_empty() {
-            if let Some((sub, co_label)) = derived {
-                let from_cte = from.first.subquery.is_none();
-                // An explicit `MATERIALIZED` hint renders a `MATERIALIZE <name>`
-                // node whose child is the body's plan (recursed normally),
-                // followed by the outer query's `{SCAN|SEARCH} <name>` plus one
-                // optional trailing temp-b-tree node — the same outer shape as the
-                // co-routine paths, just a forced materialization of any body.
-                if from_cte && cte_forces_materialize {
-                    if let Some(name) = co_label {
-                        // A pure *multi-row* `VALUES` body materializes as
-                        // `SCAN {N} CONSTANT ROWS` — the CTE-materialization phrasing,
-                        // NOT the FROM-source's `SCAN {N}-ROW VALUES CLAUSE` the body
-                        // would otherwise recurse into. A single-row `VALUES(…)`
-                        // recurses to the correct singular `SCAN CONSTANT ROW`. A
-                        // subquery-bearing row would need a `SCALAR SUBQUERY` node we
-                        // don't model, so decline rather than mis-render.
-                        let body_arm = sub.values_rows.saturating_sub(1).min(sub.compound.len());
-                        let body_pure_values = body_arm >= 1
-                            && body_arm == sub.compound.len()
-                            && !values_clause_has_subquery(sub, body_arm);
-                        let body_values_with_subquery = sub.values_rows >= 1
-                            && !body_pure_values
-                            && values_clause_has_subquery(sub, body_arm);
-                        if body_values_with_subquery {
-                            return Err(Error::Unsupported(
-                                "EXPLAIN QUERY PLAN for this query shape",
-                            ));
-                        }
-                        if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
-                        {
-                            let mat_id = *next_id;
-                            *next_id += 1;
-                            out.push((mat_id, parent, alloc::format!("MATERIALIZE {name}")));
-                            if body_pure_values {
-                                let rid = *next_id;
-                                *next_id += 1;
-                                out.push((
-                                    rid,
-                                    mat_id,
-                                    alloc::format!("SCAN {} CONSTANT ROWS", sub.values_rows),
-                                ));
-                            } else {
-                                self.eqp_select(sub, mat_id, next_id, out, params)?;
-                            }
-                            let scan_id = *next_id;
-                            *next_id += 1;
-                            out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
-                            if let Some(lbl) = trailing {
-                                let tid = *next_id;
-                                *next_id += 1;
-                                out.push((
-                                    tid,
-                                    parent,
-                                    alloc::format!("USE TEMP B-TREE FOR {lbl}"),
-                                ));
-                            }
-                            return Ok(());
-                        }
-                    }
+        if from.joins.is_empty()
+            && let Some((sub, co_label)) = derived
+        {
+            let from_cte = from.first.subquery.is_none();
+            // An explicit `MATERIALIZED` hint renders a `MATERIALIZE <name>`
+            // node whose child is the body's plan (recursed normally),
+            // followed by the outer query's `{SCAN|SEARCH} <name>` plus one
+            // optional trailing temp-b-tree node — the same outer shape as the
+            // co-routine paths, just a forced materialization of any body.
+            if from_cte
+                && cte_forces_materialize
+                && let Some(name) = co_label
+            {
+                // A pure *multi-row* `VALUES` body materializes as
+                // `SCAN {N} CONSTANT ROWS` — the CTE-materialization phrasing,
+                // NOT the FROM-source's `SCAN {N}-ROW VALUES CLAUSE` the body
+                // would otherwise recurse into. A single-row `VALUES(…)`
+                // recurses to the correct singular `SCAN CONSTANT ROW`. A
+                // subquery-bearing row would need a `SCALAR SUBQUERY` node we
+                // don't model, so decline rather than mis-render.
+                let body_arm = sub.values_rows.saturating_sub(1).min(sub.compound.len());
+                let body_pure_values = body_arm >= 1
+                    && body_arm == sub.compound.len()
+                    && !values_clause_has_subquery(sub, body_arm);
+                let body_values_with_subquery = sub.values_rows >= 1
+                    && !body_pure_values
+                    && values_clause_has_subquery(sub, body_arm);
+                if body_values_with_subquery {
+                    return Err(Error::Unsupported(
+                        "EXPLAIN QUERY PLAN for this query shape",
+                    ));
                 }
-                // A *multi-row* `VALUES` clause as a derived `FROM` source is the
-                // values clause itself — SQLite reads it directly (no co-routine,
-                // unlike a one-row `VALUES` or a flattening sub-SELECT) as a single
-                // `{SCAN|SEARCH} N-ROW VALUES CLAUSE` node plus the outer query's
-                // one optional trailing temp-b-tree node. (A subquery in any row
-                // switches it to the plural `SCAN N CONSTANT ROWS` shape, so decline
-                // via `values_clause_has_subquery`.)
-                if !from_cte {
-                    let value_arm_count = sub.values_rows.saturating_sub(1).min(sub.compound.len());
-                    let pure_values = value_arm_count >= 1
-                        && value_arm_count == sub.compound.len()
-                        && !values_clause_has_subquery(sub, value_arm_count);
-                    if pure_values {
-                        if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
-                        {
-                            let id = *next_id;
-                            *next_id += 1;
-                            out.push((
-                                id,
-                                parent,
-                                alloc::format!("{outer_kw} {}-ROW VALUES CLAUSE", sub.values_rows),
-                            ));
-                            if let Some(lbl) = trailing {
-                                let tid = *next_id;
-                                *next_id += 1;
-                                out.push((
-                                    tid,
-                                    parent,
-                                    alloc::format!("USE TEMP B-TREE FOR {lbl}"),
-                                ));
-                            }
-                            return Ok(());
-                        }
+                if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel) {
+                    let mat_id = *next_id;
+                    *next_id += 1;
+                    out.push((mat_id, parent, alloc::format!("MATERIALIZE {name}")));
+                    if body_pure_values {
+                        let rid = *next_id;
+                        *next_id += 1;
+                        out.push((
+                            rid,
+                            mat_id,
+                            alloc::format!("SCAN {} CONSTANT ROWS", sub.values_rows),
+                        ));
+                    } else {
+                        self.eqp_select(sub, mat_id, next_id, out, params)?;
                     }
-                }
-                // A *recursive* CTE — a self-referential compound body — can't
-                // flatten. SQLite renders it as a `CO-ROUTINE <name>` whose two
-                // children are `SETUP` (the non-recursive anchor's plan) and
-                // `RECURSIVE STEP` (the recursive arm's plan, in which the
-                // self-reference reads as a plain `SCAN <name>` of the
-                // materialized table), followed by the outer `SCAN <name>`. We
-                // render the canonical two-arm shape — one anchor arm that does
-                // not name the CTE, one recursive arm whose `FROM` is a bare
-                // reference to it — when the outer query adds no further nodes.
-                if from_cte {
-                    if let Some(name) = co_label {
-                        if sub.compound.len() == 1
-                            && sub.order_by.is_empty()
-                            && sub.limit.is_none()
-                            && sub.offset.is_none()
-                        {
-                            let rec_arm = &sub.compound[0].1;
-                            let mut anchor = sub.clone();
-                            anchor.compound.clear();
-                            let is_recursive = !references_name_select(&anchor, name)
-                                && references_name_select(rec_arm, name);
-                            // The recursive arm's only source is the bare CTE
-                            // reference (no join, no alias, no subquery), and
-                            // neither it nor the outer query carries an
-                            // expression-position subquery that would add nodes.
-                            let rec_simple = rec_arm.from.as_ref().is_some_and(|f| {
-                                f.joins.is_empty()
-                                    && f.first.name.eq_ignore_ascii_case(name)
-                                    && f.first.subquery.is_none()
-                                    && f.first.tvf_args.is_none()
-                                    && f.first.alias.is_none()
-                            }) && !rec_arm.columns.iter().any(|c| match c {
-                                ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
-                                ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
-                            }) && !rec_arm
-                                .where_clause
-                                .as_ref()
-                                .is_some_and(expr_has_subquery);
-                            // The access keyword plus at most ONE trailing
-                            // temp-b-tree node SQLite renders for the outer query over
-                            // the materialized co-routine (shared with the multi-row
-                            // `VALUES`-in-`FROM` path). `None` = decline.
-                            let outer_render = self.eqp_materialized_outer_render(sel);
-                            if is_recursive && rec_simple {
-                                if let Some((outer_kw, trailing)) = outer_render {
-                                    let co_id = *next_id;
-                                    *next_id += 1;
-                                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
-                                    let setup_id = *next_id;
-                                    *next_id += 1;
-                                    out.push((setup_id, co_id, String::from("SETUP")));
-                                    // The anchor names no CTE, so a normal recursion
-                                    // renders its plan safely.
-                                    self.eqp_select(&anchor, setup_id, next_id, out, params)?;
-                                    let step_id = *next_id;
-                                    *next_id += 1;
-                                    out.push((step_id, co_id, String::from("RECURSIVE STEP")));
-                                    let rec_scan = *next_id;
-                                    *next_id += 1;
-                                    out.push((rec_scan, step_id, alloc::format!("SCAN {name}")));
-                                    let scan_id = *next_id;
-                                    *next_id += 1;
-                                    out.push((
-                                        scan_id,
-                                        parent,
-                                        alloc::format!("{outer_kw} {name}"),
-                                    ));
-                                    if let Some(lbl) = trailing {
-                                        let tid = *next_id;
-                                        *next_id += 1;
-                                        out.push((
-                                            tid,
-                                            parent,
-                                            alloc::format!("USE TEMP B-TREE FOR {lbl}"),
-                                        ));
-                                    }
-                                    return Ok(());
-                                }
-                            }
-                        }
+                    let scan_id = *next_id;
+                    *next_id += 1;
+                    out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                    if let Some(lbl) = trailing {
+                        let tid = *next_id;
+                        *next_id += 1;
+                        out.push((tid, parent, alloc::format!("USE TEMP B-TREE FOR {lbl}")));
                     }
+                    return Ok(());
                 }
-                // A *multi-row* `VALUES` clause as a CTE body cannot flatten into
-                // the outer plan: SQLite materializes it as a `CO-ROUTINE <name>`
-                // whose single child is `SCAN {N} CONSTANT ROWS` (note the plural
-                // "CONSTANT ROWS" phrasing — distinct from the `SCAN {N}-ROW VALUES
-                // CLAUSE` node a `VALUES`-in-`FROM` source folds to), followed by the
-                // outer query's `{SCAN|SEARCH} <name>` plus one optional trailing
-                // temp-b-tree node. A single-row body falls through to the
-                // `body_is_const_row` path below (`SCAN CONSTANT ROW`, singular).
-                if from_cte {
-                    if let Some(name) = co_label {
-                        let value_arm_count =
-                            sub.values_rows.saturating_sub(1).min(sub.compound.len());
-                        let pure_values = value_arm_count >= 1
-                            && value_arm_count == sub.compound.len()
-                            && !values_clause_has_subquery(sub, value_arm_count);
-                        if pure_values {
-                            if let Some((outer_kw, trailing)) =
-                                self.eqp_materialized_outer_render(sel)
-                            {
-                                let co_id = *next_id;
-                                *next_id += 1;
-                                out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
-                                let rows_id = *next_id;
-                                *next_id += 1;
-                                out.push((
-                                    rows_id,
-                                    co_id,
-                                    alloc::format!("SCAN {} CONSTANT ROWS", sub.values_rows),
-                                ));
-                                let scan_id = *next_id;
-                                *next_id += 1;
-                                out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
-                                if let Some(lbl) = trailing {
-                                    let tid = *next_id;
-                                    *next_id += 1;
-                                    out.push((
-                                        tid,
-                                        parent,
-                                        alloc::format!("USE TEMP B-TREE FOR {lbl}"),
-                                    ));
-                                }
-                                return Ok(());
-                            }
-                        }
+            }
+            // A *multi-row* `VALUES` clause as a derived `FROM` source is the
+            // values clause itself — SQLite reads it directly (no co-routine,
+            // unlike a one-row `VALUES` or a flattening sub-SELECT) as a single
+            // `{SCAN|SEARCH} N-ROW VALUES CLAUSE` node plus the outer query's
+            // one optional trailing temp-b-tree node. (A subquery in any row
+            // switches it to the plural `SCAN N CONSTANT ROWS` shape, so decline
+            // via `values_clause_has_subquery`.)
+            if !from_cte {
+                let value_arm_count = sub.values_rows.saturating_sub(1).min(sub.compound.len());
+                let pure_values = value_arm_count >= 1
+                    && value_arm_count == sub.compound.len()
+                    && !values_clause_has_subquery(sub, value_arm_count);
+                if pure_values
+                    && let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
+                {
+                    let id = *next_id;
+                    *next_id += 1;
+                    out.push((
+                        id,
+                        parent,
+                        alloc::format!("{outer_kw} {}-ROW VALUES CLAUSE", sub.values_rows),
+                    ));
+                    if let Some(lbl) = trailing {
+                        let tid = *next_id;
+                        *next_id += 1;
+                        out.push((tid, parent, alloc::format!("USE TEMP B-TREE FOR {lbl}")));
                     }
+                    return Ok(());
                 }
-                let body_is_const_row = sub.from.is_none()
-                    && sub.compound.is_empty()
-                    && !select_no_from_has_subquery(sub);
-                let outer_adds_no_nodes = !sel.distinct
-                    && sel.compound.is_empty()
-                    && sel.group_by.is_empty()
-                    && sel.having.is_none()
-                    && sel.order_by.is_empty()
-                    && !sel.columns.iter().any(|c| match c {
+            }
+            // A *recursive* CTE — a self-referential compound body — can't
+            // flatten. SQLite renders it as a `CO-ROUTINE <name>` whose two
+            // children are `SETUP` (the non-recursive anchor's plan) and
+            // `RECURSIVE STEP` (the recursive arm's plan, in which the
+            // self-reference reads as a plain `SCAN <name>` of the
+            // materialized table), followed by the outer `SCAN <name>`. We
+            // render the canonical two-arm shape — one anchor arm that does
+            // not name the CTE, one recursive arm whose `FROM` is a bare
+            // reference to it — when the outer query adds no further nodes.
+            if from_cte
+                && let Some(name) = co_label
+                && sub.compound.len() == 1
+                && sub.order_by.is_empty()
+                && sub.limit.is_none()
+                && sub.offset.is_none()
+            {
+                let rec_arm = &sub.compound[0].1;
+                let mut anchor = sub.clone();
+                anchor.compound.clear();
+                let is_recursive =
+                    !references_name_select(&anchor, name) && references_name_select(rec_arm, name);
+                // The recursive arm's only source is the bare CTE
+                // reference (no join, no alias, no subquery), and
+                // neither it nor the outer query carries an
+                // expression-position subquery that would add nodes.
+                let rec_simple =
+                    rec_arm.from.as_ref().is_some_and(|f| {
+                        f.joins.is_empty()
+                            && f.first.name.eq_ignore_ascii_case(name)
+                            && f.first.subquery.is_none()
+                            && f.first.tvf_args.is_none()
+                            && f.first.alias.is_none()
+                    }) && !rec_arm.columns.iter().any(|c| match c {
                         ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
                         ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
-                    })
-                    && !sel.where_clause.as_ref().is_some_and(expr_has_subquery);
-                if let (Some(label), true, true) =
-                    (co_label, body_is_const_row, outer_adds_no_nodes)
+                    }) && !rec_arm.where_clause.as_ref().is_some_and(expr_has_subquery);
+                // The access keyword plus at most ONE trailing
+                // temp-b-tree node SQLite renders for the outer query over
+                // the materialized co-routine (shared with the multi-row
+                // `VALUES`-in-`FROM` path). `None` = decline.
+                let outer_render = self.eqp_materialized_outer_render(sel);
+                if is_recursive
+                    && rec_simple
+                    && let Some((outer_kw, trailing)) = outer_render
                 {
                     let co_id = *next_id;
                     *next_id += 1;
-                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {label}")));
-                    // The body renders as its `SCAN CONSTANT ROW` child of the
-                    // co-routine node.
+                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                    let setup_id = *next_id;
+                    *next_id += 1;
+                    out.push((setup_id, co_id, String::from("SETUP")));
+                    // The anchor names no CTE, so a normal recursion
+                    // renders its plan safely.
+                    self.eqp_select(&anchor, setup_id, next_id, out, params)?;
+                    let step_id = *next_id;
+                    *next_id += 1;
+                    out.push((step_id, co_id, String::from("RECURSIVE STEP")));
+                    let rec_scan = *next_id;
+                    *next_id += 1;
+                    out.push((rec_scan, step_id, alloc::format!("SCAN {name}")));
+                    let scan_id = *next_id;
+                    *next_id += 1;
+                    out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                    if let Some(lbl) = trailing {
+                        let tid = *next_id;
+                        *next_id += 1;
+                        out.push((tid, parent, alloc::format!("USE TEMP B-TREE FOR {lbl}")));
+                    }
+                    return Ok(());
+                }
+            }
+            // A *multi-row* `VALUES` clause as a CTE body cannot flatten into
+            // the outer plan: SQLite materializes it as a `CO-ROUTINE <name>`
+            // whose single child is `SCAN {N} CONSTANT ROWS` (note the plural
+            // "CONSTANT ROWS" phrasing — distinct from the `SCAN {N}-ROW VALUES
+            // CLAUSE` node a `VALUES`-in-`FROM` source folds to), followed by the
+            // outer query's `{SCAN|SEARCH} <name>` plus one optional trailing
+            // temp-b-tree node. A single-row body falls through to the
+            // `body_is_const_row` path below (`SCAN CONSTANT ROW`, singular).
+            if from_cte && let Some(name) = co_label {
+                let value_arm_count = sub.values_rows.saturating_sub(1).min(sub.compound.len());
+                let pure_values = value_arm_count >= 1
+                    && value_arm_count == sub.compound.len()
+                    && !values_clause_has_subquery(sub, value_arm_count);
+                if pure_values
+                    && let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
+                {
+                    let co_id = *next_id;
+                    *next_id += 1;
+                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                    let rows_id = *next_id;
+                    *next_id += 1;
+                    out.push((
+                        rows_id,
+                        co_id,
+                        alloc::format!("SCAN {} CONSTANT ROWS", sub.values_rows),
+                    ));
+                    let scan_id = *next_id;
+                    *next_id += 1;
+                    out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                    if let Some(lbl) = trailing {
+                        let tid = *next_id;
+                        *next_id += 1;
+                        out.push((tid, parent, alloc::format!("USE TEMP B-TREE FOR {lbl}")));
+                    }
+                    return Ok(());
+                }
+            }
+            let body_is_const_row =
+                sub.from.is_none() && sub.compound.is_empty() && !select_no_from_has_subquery(sub);
+            let outer_adds_no_nodes = !sel.distinct
+                && sel.compound.is_empty()
+                && sel.group_by.is_empty()
+                && sel.having.is_none()
+                && sel.order_by.is_empty()
+                && !sel.columns.iter().any(|c| match c {
+                    ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                    ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                })
+                && !sel.where_clause.as_ref().is_some_and(expr_has_subquery);
+            if let (Some(label), true, true) = (co_label, body_is_const_row, outer_adds_no_nodes) {
+                let co_id = *next_id;
+                *next_id += 1;
+                out.push((co_id, parent, alloc::format!("CO-ROUTINE {label}")));
+                // The body renders as its `SCAN CONSTANT ROW` child of the
+                // co-routine node.
+                self.eqp_select(sub, co_id, next_id, out, params)?;
+                let scan_id = *next_id;
+                *next_id += 1;
+                out.push((scan_id, parent, alloc::format!("SCAN {label}")));
+                return Ok(());
+            }
+            // A *flattenable* body: SQLite merges the subquery into the outer
+            // plan (`FROM (SELECT * FROM t)` reads as a plain `SCAN t`). When the
+            // outer is a bare `SELECT *` over the source with no other clauses,
+            // `SELECT * FROM (<body>)` is plan-equivalent to `<body>` itself, so
+            // we render it by recursing into the body under the SAME parent (no
+            // `CO-ROUTINE` wrapper, no outer `SCAN`). We restrict to the
+            // provably-equivalent subset:
+            //  - a *pure-wildcard* outer with no `WHERE`. A narrower projection
+            //    (`SELECT a FROM …`) would re-derive the covering-index choice
+            //    after the merge, and an outer `WHERE` pushes into the flattened
+            //    scan (turning a `SCAN` into a `SEARCH`) — neither is captured by
+            //    recursing into the raw body. (A `WITH` clause on the outer is
+            //    expected for a CTE reference and adds no node when its only
+            //    reference is the single flattened source; a derived table keeps
+            //    the original `no outer CTE` requirement.)
+            //  - a body that is a single *base-table* scan: no inner join
+            //    (SQLite cost-reorders those, diverging from our plan), no inner
+            //    CTE/view/vtab/subquery source, and no aggregate / `DISTINCT` /
+            //    compound / window / `LIMIT`/`OFFSET` (each makes SQLite
+            //    materialize a `CO-ROUTINE` instead). An inner `WHERE` /
+            //    `ORDER BY` is fine — the same planner renders it identically. An
+            //    inner projection/`WHERE` subquery would add `SCALAR SUBQUERY`
+            //    nodes we don't model, so it is excluded.
+            let outer_is_pure_wildcard = matches!(sel.columns.as_slice(), [ResultColumn::Wildcard])
+                && sel.where_clause.is_none()
+                && (from_cte || sel.ctes.is_empty())
+                && outer_adds_no_nodes;
+            let inner_base_scan_no_limit = sub.from.as_ref().is_some_and(|f| {
+                f.joins.is_empty()
+                    && f.first.subquery.is_none()
+                    && f.first.tvf_args.is_none()
+                    && self.lookup_cte(&f.first.name, None).is_none()
+                    && !is_cte_name(&f.first.name)
+                    && !self.is_view(&f.first.name)
+                    && !self.is_virtual_table(&f.first.name)
+            }) && sub.ctes.is_empty()
+                && !select_is_aggregate_query(sub)
+                && !sub.distinct
+                && sub.compound.is_empty()
+                && sub.window_defs.is_empty()
+                && !sub.columns.iter().any(|c| match c {
+                    ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                    ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                })
+                && !sub.where_clause.as_ref().is_some_and(expr_has_subquery);
+            let inner_is_base_table_scan =
+                inner_base_scan_no_limit && sub.limit.is_none() && sub.offset.is_none();
+            // A bare `LIMIT` body (no `OFFSET`) also flattens under a *narrower*
+            // projection — SQLite substitutes the outer projection into the `LIMIT`
+            // body (`SELECT a FROM (SELECT * FROM t LIMIT 5)` → `SCAN t USING
+            // COVERING INDEX`). Only when the outer carries no `WHERE`: a predicate
+            // over a `LIMIT` body is filter-after-limit, which SQLite materializes
+            // as a `CO-ROUTINE` (handled below) rather than folding into the scan.
+            let inner_scan_flatten_ok = inner_is_base_table_scan
+                || (inner_base_scan_no_limit && sub.offset.is_none() && sel.where_clause.is_none());
+            // A pure-wildcard outer over a single base-table body recurses into the
+            // body's own plan. A bare `LIMIT` body (no `OFFSET`) flattens the same
+            // way — SQLite renders just the body's `SCAN`/index walk, the `LIMIT`
+            // adding no plan node (`SELECT * FROM (SELECT * FROM t LIMIT 5)` →
+            // `SCAN t`, `(… ORDER BY b LIMIT 5)` → `SCAN t USING INDEX tb`). An
+            // `OFFSET` body materializes as a `CO-ROUTINE` instead, so it is excluded
+            // and declines (as does a narrower / `WHERE`-bearing outer over a `LIMIT`
+            // body — those need separate merge handling).
+            if outer_is_pure_wildcard && inner_base_scan_no_limit && sub.offset.is_none() {
+                return self.eqp_select(sub, parent, next_id, out, params);
+            }
+            // The general flatten: the outer may *narrow* the projection (`SELECT a`
+            // / `SELECT a,b` instead of `*`) and/or carry a `WHERE`. SQLite folds the
+            // derived table away, so the outer projection picks the access path
+            // (`SELECT a` over an indexed table → a COVERING-INDEX scan) and the
+            // outer predicate tightens a `SCAN` into a `SEARCH`. We reproduce it by
+            // rebuilding the inner body with the outer projection substituted and the
+            // outer predicate ANDed in, then recursing — `eqp_select` re-derives the
+            // covering-index / seek from the merged body exactly — but only when the
+            // merge is provably name-sound:
+            //  - the inner projection's output columns are *knowable* and each
+            //    maps to a base column we can substitute: all *bare columns*
+            //    (aliased or not — `a AS aa` maps the output `aa` back to base `a`),
+            //    or a single `*` / all `t.*` over the base table (output names are
+            //    the base table's columns). A computed `a+1 AS x` projection has no
+            //    base column to seek on, so the merge declines.
+            //  - every outer projection column is a bare `Column`, and the outer
+            //    projection/predicate reference only names the source actually
+            //    outputs (else SQLite raises `no such column`, so we decline). A
+            //    wildcard outer keeps the body's own projection. A qualifier may be
+            //    the derived source's own alias / CTE name (`co_label`) — it refers
+            //    to the source itself, so it is *stripped* on merge (`s.a` → `a`);
+            //    any *other* qualifier would not resolve, so the merge declines.
+            // The outer must still add no other nodes and the body be a single
+            // base-table scan (same gate as the pure-wildcard case).
+            let bind_matches = |table: &Option<String>| {
+                table
+                    .as_deref()
+                    .is_none_or(|t| co_label.is_some_and(|b| t.eq_ignore_ascii_case(b)))
+            };
+            let outer_is_wildcard = matches!(sel.columns.as_slice(), [ResultColumn::Wildcard]);
+            let outer_proj_bare_columns = !sel.columns.is_empty()
+                && sel.columns.iter().all(|c| match c {
+                    ResultColumn::Expr { expr, alias, .. } => {
+                        alias.is_none()
+                            && matches!(expr, Expr::Column { table, .. } if bind_matches(table))
+                    }
+                    ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                });
+            let outer_flattenable_proj = outer_is_wildcard || outer_proj_bare_columns;
+            let outer_general_flatten =
+                outer_flattenable_proj && (from_cte || sel.ctes.is_empty()) && outer_adds_no_nodes;
+            // The derived source's `(output_name, base_column)` map. For a bare-
+            // column inner each `[base] AS [out]` pair maps the output back to its
+            // base column; for a `*` / `t.*` inner the outputs *are* the base
+            // table's columns (identity pairs). A computed inner projection has no
+            // base column, so it yields `None` and the merge declines.
+            let inner_bare_cols: Option<Vec<(String, String)>> = sub
+                .columns
+                .iter()
+                .map(|c| match c {
+                    ResultColumn::Expr {
+                        expr: Expr::Column { column, .. },
+                        alias,
+                        ..
+                    } => Some((
+                        alias.clone().unwrap_or_else(|| column.clone()),
+                        column.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            let inner_all_wildcard = !sub.columns.is_empty()
+                && sub
+                    .columns
+                    .iter()
+                    .all(|c| matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_)));
+            let derived_map: Option<Vec<(String, String)>> = inner_bare_cols.or_else(|| {
+                inner_all_wildcard
+                    .then(|| {
+                        sub.from
+                            .as_ref()
+                            .and_then(|f| self.table_meta(&f.first.name, None).ok())
+                            .map(|m| {
+                                m.columns
+                                    .iter()
+                                    .map(|c| (c.name.clone(), c.name.clone()))
+                                    .collect()
+                            })
+                    })
+                    .flatten()
+            });
+            let outer_refs_resolve = |map: &[(String, String)]| {
+                let names: Vec<String> = map.iter().map(|(o, _)| o.clone()).collect();
+                sel.columns.iter().all(|c| match c {
+                    ResultColumn::Expr { expr, .. } => all_column_names_in(expr, &names),
+                    ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => true,
+                }) && sel
+                    .where_clause
+                    .as_ref()
+                    .is_none_or(|p| all_column_names_in(p, &names))
+            };
+            let outer_where_qualifiers_ok = sel
+                .where_clause
+                .as_ref()
+                .is_none_or(|p| all_qualifiers_match(p, co_label));
+            if let (true, true, true, Some(rename)) = (
+                outer_general_flatten,
+                inner_scan_flatten_ok,
+                outer_where_qualifiers_ok && !(outer_is_wildcard && sel.where_clause.is_none()),
+                derived_map.as_ref(),
+            ) && outer_refs_resolve(rename)
+            {
+                let mut merged = sub.clone();
+                if !outer_is_wildcard {
+                    let mut cols = sel.columns.clone();
+                    for c in &mut cols {
+                        if let ResultColumn::Expr { expr, .. } = c {
+                            rewrite_flattened_column(expr, co_label, rename);
+                        }
+                    }
+                    merged.columns = cols;
+                }
+                if let Some(pred) = &sel.where_clause {
+                    let mut pred = pred.clone();
+                    rewrite_flattened_column(&mut pred, co_label, rename);
+                    merged.where_clause = Some(match merged.where_clause.take() {
+                        Some(inner) => Expr::Binary {
+                            op: BinaryOp::And,
+                            left: Box::new(inner),
+                            right: Box::new(pred),
+                        },
+                        None => pred,
+                    });
+                }
+                return self.eqp_select(&merged, parent, next_id, out, params);
+            }
+            // A bare-`LIMIT` body (no `OFFSET`) under an outer `ORDER BY` (and no
+            // `WHERE`) flattens: SQLite pushes the outer projection + `ORDER BY` into
+            // the flattened scan (`SELECT * FROM (SELECT * FROM t LIMIT 5) ORDER BY b`
+            // → `SCAN t USING INDEX tb`). We merge the outer projection + `ORDER BY`
+            // into the `LIMIT` body and recurse — the body's own `eqp_select` renders
+            // the ORDER-BY index walk / temp-b-tree. Same name-soundness gate as the
+            // projection merge, plus every `ORDER BY` column must name a source output
+            // (a positional term needs no rename).
+            // Restricted to a *single* ORDER BY term: a lone term is either fully
+            // served by an index walk (`SCAN … USING INDEX`) or fully unsorted
+            // (`SCAN … + USE TEMP B-TREE FOR ORDER BY`), both matching SQLite's outer
+            // plan; a multi-term ORDER BY whose leading prefix is indexed but tail is
+            // not would render a partial-sort `LAST TERM` here while SQLite full-sorts
+            // the materialized `LIMIT` rows — so multi-term declines.
+            if outer_flattenable_proj
+                && sel.order_by.len() == 1
+                && sel.where_clause.is_none()
+                && sel.group_by.is_empty()
+                && sel.having.is_none()
+                && !sel.distinct
+                && sel.compound.is_empty()
+                && (from_cte || sel.ctes.is_empty())
+                && inner_base_scan_no_limit
+                && sub.limit.is_some()
+                && sub.offset.is_none()
+                && !sel.columns.iter().any(|c| match c {
+                    ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
+                    ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
+                })
+                && !sel.order_by.iter().any(|t| expr_has_subquery(&t.expr))
+                && sel
+                    .order_by
+                    .iter()
+                    .all(|t| all_qualifiers_match(&t.expr, co_label))
+                && let Some(rename) = derived_map.as_ref()
+            {
+                let names: Vec<String> = rename.iter().map(|(o, _)| o.clone()).collect();
+                let order_refs_ok = sel
+                    .order_by
+                    .iter()
+                    .all(|t| all_column_names_in(&t.expr, &names));
+                if outer_refs_resolve(rename) && order_refs_ok {
+                    let mut merged = sub.clone();
+                    if !outer_is_wildcard {
+                        let mut cols = sel.columns.clone();
+                        for c in &mut cols {
+                            if let ResultColumn::Expr { expr, .. } = c {
+                                rewrite_flattened_column(expr, co_label, rename);
+                            }
+                        }
+                        merged.columns = cols;
+                    }
+                    let mut order_by = sel.order_by.clone();
+                    for t in &mut order_by {
+                        rewrite_flattened_column(&mut t.expr, co_label, rename);
+                    }
+                    merged.order_by = order_by;
+                    return self.eqp_select(&merged, parent, next_id, out, params);
+                }
+            }
+            // A *compound* CTE/derived body that carries at least one dedup set
+            // operator (`UNION` / `INTERSECT` / `EXCEPT`) cannot flatten into the
+            // outer plan: SQLite materializes it as a `CO-ROUTINE <name>` whose
+            // single child is the body's `COMPOUND QUERY` plan (recursed
+            // normally — `LEFT-MOST SUBQUERY` plus one operator node per arm,
+            // including any interspersed `UNION ALL`), followed by the outer
+            // query's `{SCAN|SEARCH} <name>` plus at most one trailing temp-b-tree
+            // node. We render this only when:
+            //  - the label is deterministic (a derived table's alias or the CTE
+            //    name — an unaliased derived table gets the codegen-fragile
+            //    `(subquery-N)` numbering, so it has none and declines);
+            //  - some arm is a dedup operator. A body whose every operator is
+            //    `UNION ALL` streams without a dedup b-tree and *flattens* to a
+            //    bare `COMPOUND QUERY` (no co-routine) — a codegen-fragile shape we
+            //    don't model — so it declines;
+            //  - the body has no `ORDER BY` (which would switch it to the
+            //    `MERGE (…)` plan the recursion declines anyway) and the outer
+            //    query adds no `WHERE` (a predicate pushes into the arms,
+            //    re-deriving their scans) beyond the nodes
+            //    `eqp_materialized_outer_render` accounts for.
+            if let Some(name) = co_label {
+                let body_arm = sub.values_rows.saturating_sub(1).min(sub.compound.len());
+                let real = &sub.compound[body_arm..];
+                let any_dedup = real.iter().any(|(op, _)| {
+                    matches!(
+                        op,
+                        CompoundOp::Union | CompoundOp::Intersect | CompoundOp::Except
+                    )
+                });
+                if any_dedup
+                    && sub.order_by.is_empty()
+                    && sel.where_clause.is_none()
+                    && let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
+                {
+                    let co_id = *next_id;
+                    *next_id += 1;
+                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                    // The body's `COMPOUND QUERY` subtree renders as the
+                    // co-routine node's child via the normal compound path.
                     self.eqp_select(sub, co_id, next_id, out, params)?;
                     let scan_id = *next_id;
                     *next_id += 1;
-                    out.push((scan_id, parent, alloc::format!("SCAN {label}")));
+                    out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                    if let Some(lbl) = trailing {
+                        let tid = *next_id;
+                        *next_id += 1;
+                        out.push((tid, parent, alloc::format!("USE TEMP B-TREE FOR {lbl}")));
+                    }
                     return Ok(());
                 }
-                // A *flattenable* body: SQLite merges the subquery into the outer
-                // plan (`FROM (SELECT * FROM t)` reads as a plain `SCAN t`). When the
-                // outer is a bare `SELECT *` over the source with no other clauses,
-                // `SELECT * FROM (<body>)` is plan-equivalent to `<body>` itself, so
-                // we render it by recursing into the body under the SAME parent (no
-                // `CO-ROUTINE` wrapper, no outer `SCAN`). We restrict to the
-                // provably-equivalent subset:
-                //  - a *pure-wildcard* outer with no `WHERE`. A narrower projection
-                //    (`SELECT a FROM …`) would re-derive the covering-index choice
-                //    after the merge, and an outer `WHERE` pushes into the flattened
-                //    scan (turning a `SCAN` into a `SEARCH`) — neither is captured by
-                //    recursing into the raw body. (A `WITH` clause on the outer is
-                //    expected for a CTE reference and adds no node when its only
-                //    reference is the single flattened source; a derived table keeps
-                //    the original `no outer CTE` requirement.)
-                //  - a body that is a single *base-table* scan: no inner join
-                //    (SQLite cost-reorders those, diverging from our plan), no inner
-                //    CTE/view/vtab/subquery source, and no aggregate / `DISTINCT` /
-                //    compound / window / `LIMIT`/`OFFSET` (each makes SQLite
-                //    materialize a `CO-ROUTINE` instead). An inner `WHERE` /
-                //    `ORDER BY` is fine — the same planner renders it identically. An
-                //    inner projection/`WHERE` subquery would add `SCALAR SUBQUERY`
-                //    nodes we don't model, so it is excluded.
-                let outer_is_pure_wildcard =
-                    matches!(sel.columns.as_slice(), [ResultColumn::Wildcard])
-                        && sel.where_clause.is_none()
-                        && (from_cte || sel.ctes.is_empty())
-                        && outer_adds_no_nodes;
-                let inner_base_scan_no_limit = sub.from.as_ref().is_some_and(|f| {
+            }
+            // An *aggregate* or *DISTINCT* CTE/derived body over a single base
+            // table also can't flatten: SQLite materializes it as a
+            // `CO-ROUTINE <name>` whose child is the body's own plan, then the outer
+            // `{SCAN|SEARCH} <name>` plus at most one trailing temp-b-tree — the same
+            // wrapper as the compound case. Rendered only with a deterministic
+            // label, a single-base-table body with no compound / window / `ORDER BY`
+            // / `LIMIT` / nested subquery, no outer `WHERE`, and an outer shape
+            // `eqp_materialized_outer_render` accounts for. The body child is the
+            // body's own (already byte-exact) aggregate / DISTINCT plan.
+            if let Some(name) = co_label {
+                let body_single_base_table = sub.from.as_ref().is_some_and(|f| {
                     f.joins.is_empty()
                         && f.first.subquery.is_none()
                         && f.first.tvf_args.is_none()
@@ -15406,399 +15639,96 @@ impl Connection {
                         && !is_cte_name(&f.first.name)
                         && !self.is_view(&f.first.name)
                         && !self.is_virtual_table(&f.first.name)
-                }) && sub.ctes.is_empty()
-                    && !select_is_aggregate_query(sub)
-                    && !sub.distinct
+                });
+                let renderable_aggregate_body = (select_is_aggregate_query(sub) || sub.distinct)
+                    && body_single_base_table
                     && sub.compound.is_empty()
                     && sub.window_defs.is_empty()
+                    && sub.order_by.is_empty()
+                    && sub.limit.is_none()
+                    && sub.offset.is_none()
                     && !sub.columns.iter().any(|c| match c {
                         ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
                         ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
                     })
                     && !sub.where_clause.as_ref().is_some_and(expr_has_subquery);
-                let inner_is_base_table_scan =
-                    inner_base_scan_no_limit && sub.limit.is_none() && sub.offset.is_none();
-                // A bare `LIMIT` body (no `OFFSET`) also flattens under a *narrower*
-                // projection — SQLite substitutes the outer projection into the `LIMIT`
-                // body (`SELECT a FROM (SELECT * FROM t LIMIT 5)` → `SCAN t USING
-                // COVERING INDEX`). Only when the outer carries no `WHERE`: a predicate
-                // over a `LIMIT` body is filter-after-limit, which SQLite materializes
-                // as a `CO-ROUTINE` (handled below) rather than folding into the scan.
-                let inner_scan_flatten_ok = inner_is_base_table_scan
-                    || (inner_base_scan_no_limit
-                        && sub.offset.is_none()
-                        && sel.where_clause.is_none());
-                // A pure-wildcard outer over a single base-table body recurses into the
-                // body's own plan. A bare `LIMIT` body (no `OFFSET`) flattens the same
-                // way — SQLite renders just the body's `SCAN`/index walk, the `LIMIT`
-                // adding no plan node (`SELECT * FROM (SELECT * FROM t LIMIT 5)` →
-                // `SCAN t`, `(… ORDER BY b LIMIT 5)` → `SCAN t USING INDEX tb`). An
-                // `OFFSET` body materializes as a `CO-ROUTINE` instead, so it is excluded
-                // and declines (as does a narrower / `WHERE`-bearing outer over a `LIMIT`
-                // body — those need separate merge handling).
-                if outer_is_pure_wildcard && inner_base_scan_no_limit && sub.offset.is_none() {
-                    return self.eqp_select(sub, parent, next_id, out, params);
-                }
-                // The general flatten: the outer may *narrow* the projection (`SELECT a`
-                // / `SELECT a,b` instead of `*`) and/or carry a `WHERE`. SQLite folds the
-                // derived table away, so the outer projection picks the access path
-                // (`SELECT a` over an indexed table → a COVERING-INDEX scan) and the
-                // outer predicate tightens a `SCAN` into a `SEARCH`. We reproduce it by
-                // rebuilding the inner body with the outer projection substituted and the
-                // outer predicate ANDed in, then recursing — `eqp_select` re-derives the
-                // covering-index / seek from the merged body exactly — but only when the
-                // merge is provably name-sound:
-                //  - the inner projection's output columns are *knowable* and each
-                //    maps to a base column we can substitute: all *bare columns*
-                //    (aliased or not — `a AS aa` maps the output `aa` back to base `a`),
-                //    or a single `*` / all `t.*` over the base table (output names are
-                //    the base table's columns). A computed `a+1 AS x` projection has no
-                //    base column to seek on, so the merge declines.
-                //  - every outer projection column is a bare `Column`, and the outer
-                //    projection/predicate reference only names the source actually
-                //    outputs (else SQLite raises `no such column`, so we decline). A
-                //    wildcard outer keeps the body's own projection. A qualifier may be
-                //    the derived source's own alias / CTE name (`co_label`) — it refers
-                //    to the source itself, so it is *stripped* on merge (`s.a` → `a`);
-                //    any *other* qualifier would not resolve, so the merge declines.
-                // The outer must still add no other nodes and the body be a single
-                // base-table scan (same gate as the pure-wildcard case).
-                let bind_matches = |table: &Option<String>| {
-                    table
-                        .as_deref()
-                        .is_none_or(|t| co_label.is_some_and(|b| t.eq_ignore_ascii_case(b)))
-                };
-                let outer_is_wildcard = matches!(sel.columns.as_slice(), [ResultColumn::Wildcard]);
-                let outer_proj_bare_columns = !sel.columns.is_empty()
-                    && sel.columns.iter().all(|c| match c {
-                        ResultColumn::Expr { expr, alias, .. } => {
-                            alias.is_none()
-                                && matches!(expr, Expr::Column { table, .. } if bind_matches(table))
-                        }
-                        ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
-                    });
-                let outer_flattenable_proj = outer_is_wildcard || outer_proj_bare_columns;
-                let outer_general_flatten = outer_flattenable_proj
-                    && (from_cte || sel.ctes.is_empty())
-                    && outer_adds_no_nodes;
-                // The derived source's `(output_name, base_column)` map. For a bare-
-                // column inner each `[base] AS [out]` pair maps the output back to its
-                // base column; for a `*` / `t.*` inner the outputs *are* the base
-                // table's columns (identity pairs). A computed inner projection has no
-                // base column, so it yields `None` and the merge declines.
-                let inner_bare_cols: Option<Vec<(String, String)>> = sub
-                    .columns
-                    .iter()
-                    .map(|c| match c {
-                        ResultColumn::Expr {
-                            expr: Expr::Column { column, .. },
-                            alias,
-                            ..
-                        } => Some((
-                            alias.clone().unwrap_or_else(|| column.clone()),
-                            column.clone(),
-                        )),
-                        _ => None,
-                    })
-                    .collect();
-                let inner_all_wildcard = !sub.columns.is_empty()
-                    && sub.columns.iter().all(|c| {
-                        matches!(c, ResultColumn::Wildcard | ResultColumn::TableWildcard(_))
-                    });
-                let derived_map: Option<Vec<(String, String)>> = inner_bare_cols.or_else(|| {
-                    inner_all_wildcard
-                        .then(|| {
-                            sub.from
-                                .as_ref()
-                                .and_then(|f| self.table_meta(&f.first.name, None).ok())
-                                .map(|m| {
-                                    m.columns
-                                        .iter()
-                                        .map(|c| (c.name.clone(), c.name.clone()))
-                                        .collect()
-                                })
-                        })
-                        .flatten()
-                });
-                let outer_refs_resolve = |map: &[(String, String)]| {
-                    let names: Vec<String> = map.iter().map(|(o, _)| o.clone()).collect();
-                    sel.columns.iter().all(|c| match c {
-                        ResultColumn::Expr { expr, .. } => all_column_names_in(expr, &names),
-                        ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => true,
-                    }) && sel
-                        .where_clause
-                        .as_ref()
-                        .is_none_or(|p| all_column_names_in(p, &names))
-                };
-                let outer_where_qualifiers_ok = sel
-                    .where_clause
-                    .as_ref()
-                    .is_none_or(|p| all_qualifiers_match(p, co_label));
-                if let (true, true, true, Some(rename)) = (
-                    outer_general_flatten,
-                    inner_scan_flatten_ok,
-                    outer_where_qualifiers_ok && !(outer_is_wildcard && sel.where_clause.is_none()),
-                    derived_map.as_ref(),
-                ) {
-                    if outer_refs_resolve(rename) {
-                        let mut merged = sub.clone();
-                        if !outer_is_wildcard {
-                            let mut cols = sel.columns.clone();
-                            for c in &mut cols {
-                                if let ResultColumn::Expr { expr, .. } = c {
-                                    rewrite_flattened_column(expr, co_label, rename);
-                                }
-                            }
-                            merged.columns = cols;
-                        }
-                        if let Some(pred) = &sel.where_clause {
-                            let mut pred = pred.clone();
-                            rewrite_flattened_column(&mut pred, co_label, rename);
-                            merged.where_clause = Some(match merged.where_clause.take() {
-                                Some(inner) => Expr::Binary {
-                                    op: BinaryOp::And,
-                                    left: Box::new(inner),
-                                    right: Box::new(pred),
-                                },
-                                None => pred,
-                            });
-                        }
-                        return self.eqp_select(&merged, parent, next_id, out, params);
-                    }
-                }
-                // A bare-`LIMIT` body (no `OFFSET`) under an outer `ORDER BY` (and no
-                // `WHERE`) flattens: SQLite pushes the outer projection + `ORDER BY` into
-                // the flattened scan (`SELECT * FROM (SELECT * FROM t LIMIT 5) ORDER BY b`
-                // → `SCAN t USING INDEX tb`). We merge the outer projection + `ORDER BY`
-                // into the `LIMIT` body and recurse — the body's own `eqp_select` renders
-                // the ORDER-BY index walk / temp-b-tree. Same name-soundness gate as the
-                // projection merge, plus every `ORDER BY` column must name a source output
-                // (a positional term needs no rename).
-                // Restricted to a *single* ORDER BY term: a lone term is either fully
-                // served by an index walk (`SCAN … USING INDEX`) or fully unsorted
-                // (`SCAN … + USE TEMP B-TREE FOR ORDER BY`), both matching SQLite's outer
-                // plan; a multi-term ORDER BY whose leading prefix is indexed but tail is
-                // not would render a partial-sort `LAST TERM` here while SQLite full-sorts
-                // the materialized `LIMIT` rows — so multi-term declines.
-                if outer_flattenable_proj
-                    && sel.order_by.len() == 1
+                if renderable_aggregate_body
                     && sel.where_clause.is_none()
-                    && sel.group_by.is_empty()
-                    && sel.having.is_none()
-                    && !sel.distinct
-                    && sel.compound.is_empty()
-                    && (from_cte || sel.ctes.is_empty())
-                    && inner_base_scan_no_limit
-                    && sub.limit.is_some()
-                    && sub.offset.is_none()
-                    && !sel.columns.iter().any(|c| match c {
+                    && let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
+                {
+                    let co_id = *next_id;
+                    *next_id += 1;
+                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                    self.eqp_select(sub, co_id, next_id, out, params)?;
+                    let scan_id = *next_id;
+                    *next_id += 1;
+                    out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                    if let Some(lbl) = trailing {
+                        let tid = *next_id;
+                        *next_id += 1;
+                        out.push((tid, parent, alloc::format!("USE TEMP B-TREE FOR {lbl}")));
+                    }
+                    return Ok(());
+                }
+            }
+            // A `LIMIT`/`OFFSET` body that does NOT flatten materializes as a
+            // CO-ROUTINE whose child is the body's own plan, then the outer
+            // `{SCAN|SEARCH} <name>` (+ optional trailing temp-b-tree). SQLite
+            // flattens a *bare* `LIMIT` body under a pure-wildcard / narrower /
+            // outer-`ORDER BY` outer (the pure-wildcard case is handled above; the
+            // narrower / outer-`ORDER BY` cases still decline), but takes the
+            // co-routine path once an `OFFSET`, an outer `WHERE`, or an outer
+            // aggregate is present (each changes the semantics vs a plain flatten).
+            if let Some(name) = co_label {
+                let body_single_base_table = sub.from.as_ref().is_some_and(|f| {
+                    f.joins.is_empty()
+                        && f.first.subquery.is_none()
+                        && f.first.tvf_args.is_none()
+                        && self.lookup_cte(&f.first.name, None).is_none()
+                        && !is_cte_name(&f.first.name)
+                        && !self.is_view(&f.first.name)
+                        && !self.is_virtual_table(&f.first.name)
+                });
+                let limit_body = body_single_base_table
+                    && (sub.limit.is_some() || sub.offset.is_some())
+                    && sub.compound.is_empty()
+                    && sub.window_defs.is_empty()
+                    && !select_is_aggregate_query(sub)
+                    && !sub.distinct
+                    && !sub.columns.iter().any(|c| match c {
                         ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
                         ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
                     })
-                    && !sel.order_by.iter().any(|t| expr_has_subquery(&t.expr))
-                    && sel
-                        .order_by
-                        .iter()
-                        .all(|t| all_qualifiers_match(&t.expr, co_label))
+                    && !sub.where_clause.as_ref().is_some_and(expr_has_subquery);
+                let non_flattenable = sub.offset.is_some()
+                    || sel.where_clause.is_some()
+                    || select_is_aggregate_query(sel);
+                if limit_body
+                    && non_flattenable
+                    && let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
                 {
-                    if let Some(rename) = derived_map.as_ref() {
-                        let names: Vec<String> = rename.iter().map(|(o, _)| o.clone()).collect();
-                        let order_refs_ok = sel
-                            .order_by
-                            .iter()
-                            .all(|t| all_column_names_in(&t.expr, &names));
-                        if outer_refs_resolve(rename) && order_refs_ok {
-                            let mut merged = sub.clone();
-                            if !outer_is_wildcard {
-                                let mut cols = sel.columns.clone();
-                                for c in &mut cols {
-                                    if let ResultColumn::Expr { expr, .. } = c {
-                                        rewrite_flattened_column(expr, co_label, rename);
-                                    }
-                                }
-                                merged.columns = cols;
-                            }
-                            let mut order_by = sel.order_by.clone();
-                            for t in &mut order_by {
-                                rewrite_flattened_column(&mut t.expr, co_label, rename);
-                            }
-                            merged.order_by = order_by;
-                            return self.eqp_select(&merged, parent, next_id, out, params);
-                        }
+                    let co_id = *next_id;
+                    *next_id += 1;
+                    out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
+                    self.eqp_select(sub, co_id, next_id, out, params)?;
+                    let scan_id = *next_id;
+                    *next_id += 1;
+                    out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
+                    if let Some(lbl) = trailing {
+                        let tid = *next_id;
+                        *next_id += 1;
+                        out.push((tid, parent, alloc::format!("USE TEMP B-TREE FOR {lbl}")));
                     }
+                    return Ok(());
                 }
-                // A *compound* CTE/derived body that carries at least one dedup set
-                // operator (`UNION` / `INTERSECT` / `EXCEPT`) cannot flatten into the
-                // outer plan: SQLite materializes it as a `CO-ROUTINE <name>` whose
-                // single child is the body's `COMPOUND QUERY` plan (recursed
-                // normally — `LEFT-MOST SUBQUERY` plus one operator node per arm,
-                // including any interspersed `UNION ALL`), followed by the outer
-                // query's `{SCAN|SEARCH} <name>` plus at most one trailing temp-b-tree
-                // node. We render this only when:
-                //  - the label is deterministic (a derived table's alias or the CTE
-                //    name — an unaliased derived table gets the codegen-fragile
-                //    `(subquery-N)` numbering, so it has none and declines);
-                //  - some arm is a dedup operator. A body whose every operator is
-                //    `UNION ALL` streams without a dedup b-tree and *flattens* to a
-                //    bare `COMPOUND QUERY` (no co-routine) — a codegen-fragile shape we
-                //    don't model — so it declines;
-                //  - the body has no `ORDER BY` (which would switch it to the
-                //    `MERGE (…)` plan the recursion declines anyway) and the outer
-                //    query adds no `WHERE` (a predicate pushes into the arms,
-                //    re-deriving their scans) beyond the nodes
-                //    `eqp_materialized_outer_render` accounts for.
-                if let Some(name) = co_label {
-                    let body_arm = sub.values_rows.saturating_sub(1).min(sub.compound.len());
-                    let real = &sub.compound[body_arm..];
-                    let any_dedup = real.iter().any(|(op, _)| {
-                        matches!(
-                            op,
-                            CompoundOp::Union | CompoundOp::Intersect | CompoundOp::Except
-                        )
-                    });
-                    if any_dedup && sub.order_by.is_empty() && sel.where_clause.is_none() {
-                        if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
-                        {
-                            let co_id = *next_id;
-                            *next_id += 1;
-                            out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
-                            // The body's `COMPOUND QUERY` subtree renders as the
-                            // co-routine node's child via the normal compound path.
-                            self.eqp_select(sub, co_id, next_id, out, params)?;
-                            let scan_id = *next_id;
-                            *next_id += 1;
-                            out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
-                            if let Some(lbl) = trailing {
-                                let tid = *next_id;
-                                *next_id += 1;
-                                out.push((
-                                    tid,
-                                    parent,
-                                    alloc::format!("USE TEMP B-TREE FOR {lbl}"),
-                                ));
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
-                // An *aggregate* or *DISTINCT* CTE/derived body over a single base
-                // table also can't flatten: SQLite materializes it as a
-                // `CO-ROUTINE <name>` whose child is the body's own plan, then the outer
-                // `{SCAN|SEARCH} <name>` plus at most one trailing temp-b-tree — the same
-                // wrapper as the compound case. Rendered only with a deterministic
-                // label, a single-base-table body with no compound / window / `ORDER BY`
-                // / `LIMIT` / nested subquery, no outer `WHERE`, and an outer shape
-                // `eqp_materialized_outer_render` accounts for. The body child is the
-                // body's own (already byte-exact) aggregate / DISTINCT plan.
-                if let Some(name) = co_label {
-                    let body_single_base_table = sub.from.as_ref().is_some_and(|f| {
-                        f.joins.is_empty()
-                            && f.first.subquery.is_none()
-                            && f.first.tvf_args.is_none()
-                            && self.lookup_cte(&f.first.name, None).is_none()
-                            && !is_cte_name(&f.first.name)
-                            && !self.is_view(&f.first.name)
-                            && !self.is_virtual_table(&f.first.name)
-                    });
-                    let renderable_aggregate_body = (select_is_aggregate_query(sub)
-                        || sub.distinct)
-                        && body_single_base_table
-                        && sub.compound.is_empty()
-                        && sub.window_defs.is_empty()
-                        && sub.order_by.is_empty()
-                        && sub.limit.is_none()
-                        && sub.offset.is_none()
-                        && !sub.columns.iter().any(|c| match c {
-                            ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
-                            ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
-                        })
-                        && !sub.where_clause.as_ref().is_some_and(expr_has_subquery);
-                    if renderable_aggregate_body && sel.where_clause.is_none() {
-                        if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
-                        {
-                            let co_id = *next_id;
-                            *next_id += 1;
-                            out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
-                            self.eqp_select(sub, co_id, next_id, out, params)?;
-                            let scan_id = *next_id;
-                            *next_id += 1;
-                            out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
-                            if let Some(lbl) = trailing {
-                                let tid = *next_id;
-                                *next_id += 1;
-                                out.push((
-                                    tid,
-                                    parent,
-                                    alloc::format!("USE TEMP B-TREE FOR {lbl}"),
-                                ));
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
-                // A `LIMIT`/`OFFSET` body that does NOT flatten materializes as a
-                // CO-ROUTINE whose child is the body's own plan, then the outer
-                // `{SCAN|SEARCH} <name>` (+ optional trailing temp-b-tree). SQLite
-                // flattens a *bare* `LIMIT` body under a pure-wildcard / narrower /
-                // outer-`ORDER BY` outer (the pure-wildcard case is handled above; the
-                // narrower / outer-`ORDER BY` cases still decline), but takes the
-                // co-routine path once an `OFFSET`, an outer `WHERE`, or an outer
-                // aggregate is present (each changes the semantics vs a plain flatten).
-                if let Some(name) = co_label {
-                    let body_single_base_table = sub.from.as_ref().is_some_and(|f| {
-                        f.joins.is_empty()
-                            && f.first.subquery.is_none()
-                            && f.first.tvf_args.is_none()
-                            && self.lookup_cte(&f.first.name, None).is_none()
-                            && !is_cte_name(&f.first.name)
-                            && !self.is_view(&f.first.name)
-                            && !self.is_virtual_table(&f.first.name)
-                    });
-                    let limit_body = body_single_base_table
-                        && (sub.limit.is_some() || sub.offset.is_some())
-                        && sub.compound.is_empty()
-                        && sub.window_defs.is_empty()
-                        && !select_is_aggregate_query(sub)
-                        && !sub.distinct
-                        && !sub.columns.iter().any(|c| match c {
-                            ResultColumn::Expr { expr, .. } => expr_has_subquery(expr),
-                            ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => false,
-                        })
-                        && !sub.where_clause.as_ref().is_some_and(expr_has_subquery);
-                    let non_flattenable = sub.offset.is_some()
-                        || sel.where_clause.is_some()
-                        || select_is_aggregate_query(sel);
-                    if limit_body && non_flattenable {
-                        if let Some((outer_kw, trailing)) = self.eqp_materialized_outer_render(sel)
-                        {
-                            let co_id = *next_id;
-                            *next_id += 1;
-                            out.push((co_id, parent, alloc::format!("CO-ROUTINE {name}")));
-                            self.eqp_select(sub, co_id, next_id, out, params)?;
-                            let scan_id = *next_id;
-                            *next_id += 1;
-                            out.push((scan_id, parent, alloc::format!("{outer_kw} {name}")));
-                            if let Some(lbl) = trailing {
-                                let tid = *next_id;
-                                *next_id += 1;
-                                out.push((
-                                    tid,
-                                    parent,
-                                    alloc::format!("USE TEMP B-TREE FOR {lbl}"),
-                                ));
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
-                // Any other shape (a narrowing/clause-bearing outer, a table-bearing
-                // body we can't prove flattenable, a `UNION ALL`-only compound body, or
-                // an outer query that emits extra nodes) is not one we render
-                // byte-exactly.
-                return Err(Error::Unsupported(
-                    "EXPLAIN QUERY PLAN for this query shape",
-                ));
             }
+            // Any other shape (a narrowing/clause-bearing outer, a table-bearing
+            // body we can't prove flattenable, a `UNION ALL`-only compound body, or
+            // an outer query that emits extra nodes) is not one we render
+            // byte-exactly.
+            return Err(Error::Unsupported(
+                "EXPLAIN QUERY PLAN for this query shape",
+            ));
         }
         // A subquery/CTE/view source that survives to here is combined with a join —
         // SQLite cost-reorders such plans (BLOOM FILTER / AUTOMATIC COVERING INDEX /
@@ -15999,22 +15929,21 @@ impl Connection {
         // runs before the join-folding below (which is a no-op when there are no
         // joins). The three positions are mutually exclusive: each collector declines
         // if another clause holds a subquery.
-        if from.joins.is_empty() {
-            if let Some(subs) = self
+        if from.joins.is_empty()
+            && let Some(subs) = self
                 .eqp_where_scalar_subqueries(sel)
                 .or_else(|| self.eqp_projection_scalar_subqueries(sel))
                 .or_else(|| self.eqp_orderby_scalar_subqueries(sel))
-            {
-                for (i, body) in subs.iter().enumerate() {
-                    let scalar_id = *next_id;
-                    *next_id += 1;
-                    out.push((
-                        scalar_id,
-                        parent,
-                        alloc::format!("SCALAR SUBQUERY {}", i + 1),
-                    ));
-                    self.eqp_select(body, scalar_id, next_id, out, params)?;
-                }
+        {
+            for (i, body) in subs.iter().enumerate() {
+                let scalar_id = *next_id;
+                *next_id += 1;
+                out.push((
+                    scalar_id,
+                    parent,
+                    alloc::format!("SCALAR SUBQUERY {}", i + 1),
+                ));
+                self.eqp_select(body, scalar_id, next_id, out, params)?;
             }
         }
         // A single non-correlated `[NOT] IN (SELECT …)` in the WHERE renders a
@@ -16029,67 +15958,65 @@ impl Connection {
         //    column's seek (a competing equality/range on another column would make
         //    SQLite's cost-model choice diverge, so we require the rendered access to
         //    seek the IN column exactly — `(in_col=?)`).
-        if from.joins.is_empty() {
-            if let Some((body, negated, operand)) = sel
+        if from.joins.is_empty()
+            && let Some((body, negated, operand)) = sel
                 .where_clause
                 .as_ref()
                 .and_then(|w| single_where_in_select(w))
-            {
-                let operand_is_rowid = matches!(operand, Expr::Column { column, .. }
+        {
+            let operand_is_rowid = matches!(operand, Expr::Column { column, .. }
                     if is_rowid_alias(column)
                         && !meta.columns.iter().any(|c| c.name.eq_ignore_ascii_case(column)));
-                let in_col_idx = col_index(operand, &meta.columns);
-                let in_col_seekable = operand_is_rowid
-                    || in_col_idx.is_some_and(|c| {
-                        meta.ipk == Some(c)
-                            || self
-                                .indexes_of(&from.first.name)
-                                .is_ok_and(|ixs| ixs.iter().any(|i| i.cols.first() == Some(&c)))
-                    });
-                let bare_scan =
-                    single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str());
-                // The seek-column render tag: a rowid / INTEGER-PRIMARY-KEY IN reads
-                // `(rowid=?)` (the IPK column renders as `rowid` in the access line even
-                // when referenced by its declared name), a secondary-index IN reads
-                // `(col=?)`.
-                let in_col_tag =
-                    if operand_is_rowid || (in_col_idx.is_some() && in_col_idx == meta.ipk) {
-                        Some(alloc::string::String::from("rowid"))
-                    } else {
-                        in_col_idx.map(|c| meta.columns[c].name.clone())
-                    };
-                let seek_is_in_col = !negated
-                    && in_col_seekable
-                    && in_col_tag.as_deref().is_some_and(|nm| {
-                        single_scan_detail.as_deref().is_some_and(|d| {
-                            d.starts_with(alloc::format!("SEARCH {label}").as_str())
-                                && d.contains(alloc::format!("({nm}=?)").as_str())
-                        })
-                    });
-                let nonseek_case = (negated || !in_col_seekable) && bare_scan;
-                // With a bare `SCAN` outer, a simple indexed-column subquery is
-                // evaluated by iterating that index (a single `… FOR IN-OPERATOR`
-                // node) rather than materializing a `LIST SUBQUERY` + bloom filter.
-                let in_op_node = if nonseek_case {
-                    self.in_operator_index_node(body)
-                } else {
-                    None
-                };
-                if let Some(node) = in_op_node {
-                    let n_id = *next_id;
-                    *next_id += 1;
-                    out.push((n_id, parent, node));
-                } else if (nonseek_case || seek_is_in_col)
-                    && self.eqp_scalar_bodies_renderable(&[body])
-                {
-                    let list_id = *next_id;
-                    *next_id += 1;
-                    out.push((list_id, parent, String::from("LIST SUBQUERY 1")));
-                    self.eqp_select(body, list_id, next_id, out, params)?;
-                    let bloom_id = *next_id;
-                    *next_id += 1;
-                    out.push((bloom_id, list_id, String::from("CREATE BLOOM FILTER")));
-                }
+            let in_col_idx = col_index(operand, &meta.columns);
+            let in_col_seekable = operand_is_rowid
+                || in_col_idx.is_some_and(|c| {
+                    meta.ipk == Some(c)
+                        || self
+                            .indexes_of(&from.first.name)
+                            .is_ok_and(|ixs| ixs.iter().any(|i| i.cols.first() == Some(&c)))
+                });
+            let bare_scan =
+                single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str());
+            // The seek-column render tag: a rowid / INTEGER-PRIMARY-KEY IN reads
+            // `(rowid=?)` (the IPK column renders as `rowid` in the access line even
+            // when referenced by its declared name), a secondary-index IN reads
+            // `(col=?)`.
+            let in_col_tag = if operand_is_rowid || (in_col_idx.is_some() && in_col_idx == meta.ipk)
+            {
+                Some(alloc::string::String::from("rowid"))
+            } else {
+                in_col_idx.map(|c| meta.columns[c].name.clone())
+            };
+            let seek_is_in_col = !negated
+                && in_col_seekable
+                && in_col_tag.as_deref().is_some_and(|nm| {
+                    single_scan_detail.as_deref().is_some_and(|d| {
+                        d.starts_with(alloc::format!("SEARCH {label}").as_str())
+                            && d.contains(alloc::format!("({nm}=?)").as_str())
+                    })
+                });
+            let nonseek_case = (negated || !in_col_seekable) && bare_scan;
+            // With a bare `SCAN` outer, a simple indexed-column subquery is
+            // evaluated by iterating that index (a single `… FOR IN-OPERATOR`
+            // node) rather than materializing a `LIST SUBQUERY` + bloom filter.
+            let in_op_node = if nonseek_case {
+                self.in_operator_index_node(body)
+            } else {
+                None
+            };
+            if let Some(node) = in_op_node {
+                let n_id = *next_id;
+                *next_id += 1;
+                out.push((n_id, parent, node));
+            } else if (nonseek_case || seek_is_in_col) && self.eqp_scalar_bodies_renderable(&[body])
+            {
+                let list_id = *next_id;
+                *next_id += 1;
+                out.push((list_id, parent, String::from("LIST SUBQUERY 1")));
+                self.eqp_select(body, list_id, next_id, out, params)?;
+                let bloom_id = *next_id;
+                *next_id += 1;
+                out.push((bloom_id, list_id, String::from("CREATE BLOOM FILTER")));
             }
         }
         // Cost-based two-table rowid-inner swap (in lockstep with the executor):
@@ -16310,28 +16237,26 @@ impl Connection {
         if (single_scan_detail.as_deref() == Some(alloc::format!("SCAN {label}").as_str())
             || rowid_range_seek)
             && !self.distinct_is_noop(sel, &meta, &label)
-        {
-            if let Some((kind, suppress)) =
+            && let Some((kind, suppress)) =
                 self.group_distinct_btree(sel, &meta, &from.first.name, hint_not_indexed)
-            {
+        {
+            let id = *next_id;
+            *next_id += 1;
+            out.push((id, parent, alloc::format!("USE TEMP B-TREE FOR {kind}")));
+            group_btree_suppresses_order = suppress;
+            // With grouping, each distinct aggregate spills through its own
+            // transient b-tree *after* the GROUP BY node (the scan order serves
+            // the group key, not the distinct values, so nothing is elided). The
+            // node order matches sqlite's: GROUP BY first, then the distinct
+            // aggregates in result-column order.
+            for fname in self.distinct_agg_btrees(sel, &meta, false) {
                 let id = *next_id;
                 *next_id += 1;
-                out.push((id, parent, alloc::format!("USE TEMP B-TREE FOR {kind}")));
-                group_btree_suppresses_order = suppress;
-                // With grouping, each distinct aggregate spills through its own
-                // transient b-tree *after* the GROUP BY node (the scan order serves
-                // the group key, not the distinct values, so nothing is elided). The
-                // node order matches sqlite's: GROUP BY first, then the distinct
-                // aggregates in result-column order.
-                for fname in self.distinct_agg_btrees(sel, &meta, false) {
-                    let id = *next_id;
-                    *next_id += 1;
-                    out.push((
-                        id,
-                        parent,
-                        alloc::format!("USE TEMP B-TREE FOR {fname}(DISTINCT)"),
-                    ));
-                }
+                out.push((
+                    id,
+                    parent,
+                    alloc::format!("USE TEMP B-TREE FOR {fname}(DISTINCT)"),
+                ));
             }
         }
         // The join analogue of the single-table `group_distinct_btree` above: a
@@ -16366,38 +16291,37 @@ impl Connection {
             } else {
                 None
             };
-            if let Some(kind) = kind {
-                if !self.join_group_distinct_clustered(sel, from) {
-                    let id = *next_id;
-                    *next_id += 1;
-                    out.push((id, parent, alloc::format!("USE TEMP B-TREE FOR {kind}")));
-                    // sqlite folds a GROUP BY query's ORDER BY into this grouping
-                    // sorter when every ORDER BY term is exactly the GROUP BY key
-                    // (same columns, in order) — the F1/F2 shapes emit only the
-                    // GROUP BY node. A DISTINCT b-tree is ascending-only, so a DESC
-                    // term keeps its own sort. Any foreign / aggregate / expression
-                    // ORDER BY term (F3/F4) leaves the ORDER BY node in place.
-                    if kind == "GROUP BY" && !sel.order_by.is_empty() {
-                        let key_ids: Vec<Option<(String, String)>> = sel
-                            .group_by
-                            .iter()
-                            .map(|e| self.join_key_column_identity(sel, from, e))
-                            .collect();
-                        let folds = key_ids.iter().all(|k| k.is_some())
-                            && sel.order_by.len() == key_ids.len()
-                            && sel.order_by.iter().enumerate().all(|(i, term)| {
-                                redundant_nulls(term)
-                                    && self
-                                        .join_key_column_identity(sel, from, &term.expr)
-                                        .zip(key_ids[i].as_ref())
-                                        .is_some_and(|((tt, tc), (kt, kc))| {
-                                            tt.eq_ignore_ascii_case(kt)
-                                                && tc.eq_ignore_ascii_case(kc)
-                                        })
-                            });
-                        if folds {
-                            group_btree_suppresses_order = true;
-                        }
+            if let Some(kind) = kind
+                && !self.join_group_distinct_clustered(sel, from)
+            {
+                let id = *next_id;
+                *next_id += 1;
+                out.push((id, parent, alloc::format!("USE TEMP B-TREE FOR {kind}")));
+                // sqlite folds a GROUP BY query's ORDER BY into this grouping
+                // sorter when every ORDER BY term is exactly the GROUP BY key
+                // (same columns, in order) — the F1/F2 shapes emit only the
+                // GROUP BY node. A DISTINCT b-tree is ascending-only, so a DESC
+                // term keeps its own sort. Any foreign / aggregate / expression
+                // ORDER BY term (F3/F4) leaves the ORDER BY node in place.
+                if kind == "GROUP BY" && !sel.order_by.is_empty() {
+                    let key_ids: Vec<Option<(String, String)>> = sel
+                        .group_by
+                        .iter()
+                        .map(|e| self.join_key_column_identity(sel, from, e))
+                        .collect();
+                    let folds = key_ids.iter().all(|k| k.is_some())
+                        && sel.order_by.len() == key_ids.len()
+                        && sel.order_by.iter().enumerate().all(|(i, term)| {
+                            redundant_nulls(term)
+                                && self
+                                    .join_key_column_identity(sel, from, &term.expr)
+                                    .zip(key_ids[i].as_ref())
+                                    .is_some_and(|((tt, tc), (kt, kc))| {
+                                        tt.eq_ignore_ascii_case(kt) && tc.eq_ignore_ascii_case(kc)
+                                    })
+                        });
+                    if folds {
+                        group_btree_suppresses_order = true;
                     }
                 }
             }
@@ -16409,18 +16333,18 @@ impl Connection {
         // (the join fold handles the multi-table shapes). Numbered `1..n` in
         // left-to-right column order; the set is provably `1..n` (no subquery in any
         // other clause), so emitting it can only converge the plan.
-        if from.joins.is_empty() {
-            if let Some(subs) = self.eqp_grouped_projection_scalar_subqueries(sel) {
-                for (i, body) in subs.iter().enumerate() {
-                    let scalar_id = *next_id;
-                    *next_id += 1;
-                    out.push((
-                        scalar_id,
-                        parent,
-                        alloc::format!("SCALAR SUBQUERY {}", i + 1),
-                    ));
-                    self.eqp_select(body, scalar_id, next_id, out, params)?;
-                }
+        if from.joins.is_empty()
+            && let Some(subs) = self.eqp_grouped_projection_scalar_subqueries(sel)
+        {
+            for (i, body) in subs.iter().enumerate() {
+                let scalar_id = *next_id;
+                *next_id += 1;
+                out.push((
+                    scalar_id,
+                    parent,
+                    alloc::format!("SCALAR SUBQUERY {}", i + 1),
+                ));
+                self.eqp_select(body, scalar_id, next_id, out, params)?;
             }
         }
         // ORDER BY that we satisfy with an in-memory sort — unless the scan already
@@ -16751,13 +16675,13 @@ impl Connection {
             // seeks the clustered b-tree per value (try_without_rowid_pk_in). As in the
             // rowid/secondary-index IN branch, a NULL list entry doesn't change the
             // plan label — sqlite still reports the seek (the NULL just never matches).
-            if let Some((col, _)) = find_in_constraint(where_expr, &meta.columns, params) {
-                if pk.first() == Some(&col) {
-                    return Ok(alloc::format!(
-                        "SEARCH {label} USING PRIMARY KEY ({}=?)",
-                        meta.columns[col].name
-                    ));
-                }
+            if let Some((col, _)) = find_in_constraint(where_expr, &meta.columns, params)
+                && pk.first() == Some(&col)
+            {
+                return Ok(alloc::format!(
+                    "SEARCH {label} USING PRIMARY KEY ({}=?)",
+                    meta.columns[col].name
+                ));
             }
             // Else a range bound on the leading PK column (try_without_rowid_pk_range).
             if let Some(&lead) = pk.first() {
@@ -16875,12 +16799,12 @@ impl Connection {
             ));
         }
         // Rowid equality wins, as in try_index_lookup.
-        if let Some(ipk) = meta.ipk {
-            if eqs.iter().any(|(c, _)| *c == ipk) {
-                return Ok(alloc::format!(
-                    "SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"
-                ));
-            }
+        if let Some(ipk) = meta.ipk
+            && eqs.iter().any(|(c, _)| *c == ipk)
+        {
+            return Ok(alloc::format!(
+                "SEARCH {label} USING INTEGER PRIMARY KEY (rowid=?)"
+            ));
         }
         // Index covering the longest leftmost prefix of equalities, chosen by the
         // SAME cost tiebreaks the executor's seek uses (`choose_seek_index`), so
@@ -17015,22 +16939,22 @@ impl Connection {
         let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
             alloc::collections::BTreeMap::new();
         collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
-        if let Some(ipk) = meta.ipk {
-            if let Some(b) = ranges.get(&ipk) {
-                let lo_int = b.lower.is_none() || matches!(b.lower, Some((Value::Integer(_), _)));
-                let hi_int = b.upper.is_none() || matches!(b.upper, Some((Value::Integer(_), _)));
-                if lo_int && hi_int {
-                    let cond = match (&b.lower, &b.upper) {
-                        (Some(_), Some(_)) => "rowid>? AND rowid<?",
-                        (Some(_), None) => "rowid>?",
-                        (None, Some(_)) => "rowid<?",
-                        (None, None) => "",
-                    };
-                    if !cond.is_empty() {
-                        return Ok(alloc::format!(
-                            "SEARCH {label} USING INTEGER PRIMARY KEY ({cond})"
-                        ));
-                    }
+        if let Some(ipk) = meta.ipk
+            && let Some(b) = ranges.get(&ipk)
+        {
+            let lo_int = b.lower.is_none() || matches!(b.lower, Some((Value::Integer(_), _)));
+            let hi_int = b.upper.is_none() || matches!(b.upper, Some((Value::Integer(_), _)));
+            if lo_int && hi_int {
+                let cond = match (&b.lower, &b.upper) {
+                    (Some(_), Some(_)) => "rowid>? AND rowid<?",
+                    (Some(_), None) => "rowid>?",
+                    (None, Some(_)) => "rowid<?",
+                    (None, None) => "",
+                };
+                if !cond.is_empty() {
+                    return Ok(alloc::format!(
+                        "SEARCH {label} USING INTEGER PRIMARY KEY ({cond})"
+                    ));
                 }
             }
         }
@@ -17143,23 +17067,22 @@ impl Connection {
             if !matches!(hint, Some(IndexHint::NotIndexed)) {
                 let mut isnotnull_cols: Vec<usize> = Vec::new();
                 collect_isnotnull_cols(where_expr, &meta.columns, &mut isnotnull_cols);
-                if let Some(s) = sel {
-                    if !isnotnull_cols.is_empty() {
-                        if let Some((name, _, idx_cols)) = self.isnotnull_covering_index(
-                            meta,
-                            table,
-                            s,
-                            where_expr,
-                            &isnotnull_cols,
-                            hint,
-                        )? {
-                            let lead = idx_cols[0];
-                            return Ok(alloc::format!(
-                                "SEARCH {label} USING COVERING INDEX {name} ({}>?)",
-                                meta.columns[lead].name
-                            ));
-                        }
-                    }
+                if let Some(s) = sel
+                    && !isnotnull_cols.is_empty()
+                    && let Some((name, _, idx_cols)) = self.isnotnull_covering_index(
+                        meta,
+                        table,
+                        s,
+                        where_expr,
+                        &isnotnull_cols,
+                        hint,
+                    )?
+                {
+                    let lead = idx_cols[0];
+                    return Ok(alloc::format!(
+                        "SEARCH {label} USING COVERING INDEX {name} ({}>?)",
+                        meta.columns[lead].name
+                    ));
                 }
             }
         }
@@ -17215,25 +17138,25 @@ impl Connection {
                 }
                 // Automatic index: its columns are the n-th UNIQUE/PK set.
                 None => {
-                    if let Some(n) = autoindex_number(&obj.name, table) {
-                        if let Some((cols, _, descs)) = tmeta.unique.get(n - 1) {
-                            let collations = self.col_collations(&tmeta, cols);
-                            // `descs` is populated per key column by
-                            // `collect_unique_sets` (all-false when ascending),
-                            // so the auto-index seeks in the same direction its
-                            // b-tree was written — see `IndexMeta::seek_descs`.
-                            out.push(IndexMeta {
-                                name: obj.name.clone(),
-                                root: obj.rootpage,
-                                descending: descs.clone(),
-                                cols: cols.clone(),
-                                collations,
-                                partial: None,
-                                key_exprs: None,
-                                unique: true,
-                                is_auto: true,
-                            });
-                        }
+                    if let Some(n) = autoindex_number(&obj.name, table)
+                        && let Some((cols, _, descs)) = tmeta.unique.get(n - 1)
+                    {
+                        let collations = self.col_collations(&tmeta, cols);
+                        // `descs` is populated per key column by
+                        // `collect_unique_sets` (all-false when ascending),
+                        // so the auto-index seeks in the same direction its
+                        // b-tree was written — see `IndexMeta::seek_descs`.
+                        out.push(IndexMeta {
+                            name: obj.name.clone(),
+                            root: obj.rootpage,
+                            descending: descs.clone(),
+                            cols: cols.clone(),
+                            collations,
+                            partial: None,
+                            key_exprs: None,
+                            unique: true,
+                            is_auto: true,
+                        });
                     }
                 }
             }
@@ -17771,11 +17694,7 @@ impl Connection {
                     e,
                     &EvalCtx::rowless(params).with_subqueries(self),
                 )?)?;
-                if n < 0 {
-                    None
-                } else {
-                    Some(n as usize)
-                }
+                if n < 0 { None } else { Some(n as usize) }
             }
             None => None,
         };
@@ -17898,21 +17817,20 @@ impl Connection {
         // ORDER BY value plus/minus the offset, so SQLite requires exactly one
         // ORDER BY expression — neither zero nor several. ROWS/GROUPS offsets
         // are positional and carry no such requirement.
-        if let Some(frame) = &spec.frame {
-            if frame.mode == FrameMode::Range
-                && (matches!(
-                    frame.start,
-                    FrameBound::Preceding(_) | FrameBound::Following(_)
-                ) || matches!(
-                    frame.end,
-                    FrameBound::Preceding(_) | FrameBound::Following(_)
-                ))
-                && spec.order_by.len() != 1
-            {
-                return Err(Error::Error(
-                    "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression".into(),
-                ));
-            }
+        if let Some(frame) = &spec.frame
+            && frame.mode == FrameMode::Range
+            && (matches!(
+                frame.start,
+                FrameBound::Preceding(_) | FrameBound::Following(_)
+            ) || matches!(
+                frame.end,
+                FrameBound::Preceding(_) | FrameBound::Following(_)
+            ))
+            && spec.order_by.len() != 1
+        {
+            return Err(Error::Error(
+                "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression".into(),
+            ));
         }
         let lname = name.to_ascii_lowercase();
         let n = rows.len();
@@ -17921,12 +17839,12 @@ impl Connection {
         // aggregate used as a window function — `sum(x) OVER …` — falls through to
         // the aggregate path). SQLite rejects a wrong count: `row_number(1)`,
         // `lag()`, `ntile()`, `nth_value(1)` are all "wrong number of arguments".
-        if let Some((lo, hi)) = builtin_window_arity(&lname) {
-            if args.len() < lo || args.len() > hi {
-                return Err(Error::Error(alloc::format!(
-                    "wrong number of arguments to function {lname}()"
-                )));
-            }
+        if let Some((lo, hi)) = builtin_window_arity(&lname)
+            && (args.len() < lo || args.len() > hi)
+        {
+            return Err(Error::Error(alloc::format!(
+                "wrong number of arguments to function {lname}()"
+            )));
         }
 
         // Per-row partition keys, order keys, argument values, and FILTER mask.
@@ -18205,7 +18123,7 @@ impl Connection {
                         _ => {
                             return Err(Error::Error(
                                 "second argument to nth_value must be a positive integer".into(),
-                            ))
+                            ));
                         }
                     };
                     // nth row within the (post-EXCLUDE) frame (1-based).
@@ -18251,10 +18169,10 @@ impl Connection {
                 if let Some(c) = explicit_collation(&t.expr) {
                     return c;
                 }
-                if let Some(idx) = resolve_order_index(&t.expr, &labels, out_colls.len()) {
-                    if let Some(c) = out_colls.get(idx) {
-                        return *c;
-                    }
+                if let Some(idx) = resolve_order_index(&t.expr, &labels, out_colls.len())
+                    && let Some(c) = out_colls.get(idx)
+                {
+                    return *c;
                 }
                 eval::key_collation(&t.expr, &ctx)
             })
@@ -18625,10 +18543,10 @@ impl Connection {
         let walk_start = if eq_prefix > 0 {
             eq_prefix
         } else {
-            if let Some((col, _)) = find_in_constraint(where_expr, &meta.columns, params) {
-                if pk.first() == Some(&col) {
-                    return None;
-                }
+            if let Some((col, _)) = find_in_constraint(where_expr, &meta.columns, params)
+                && pk.first() == Some(&col)
+            {
+                return None;
             }
             let lead = *pk.first()?;
             let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
@@ -19339,15 +19257,13 @@ impl Connection {
         // Under `NOT INDEXED` no index may be walked, so sqlite always materializes the
         // grouping b-tree — skip this bail.
         let first = key_cols[0];
-        if !not_indexed {
-            if let Ok(indexes) = self.indexes_of(tname) {
-                for idx in indexes {
-                    if idx.partial.is_none()
-                        && idx.key_exprs.is_none()
-                        && idx.cols.first() == Some(&first)
-                    {
-                        return None;
-                    }
+        if !not_indexed && let Ok(indexes) = self.indexes_of(tname) {
+            for idx in indexes {
+                if idx.partial.is_none()
+                    && idx.key_exprs.is_none()
+                    && idx.cols.first() == Some(&first)
+                {
+                    return None;
                 }
             }
         }
@@ -19627,10 +19543,10 @@ impl Connection {
         tref: &TableRef,
         label: &str,
     ) -> String {
-        if let Ok(meta) = self.table_meta(&tref.name, tref.alias.as_deref()) {
-            if let Some(idx) = self.join_scan_covering_index(sel, from, tref, &meta) {
-                return alloc::format!("SCAN {label} USING COVERING INDEX {}", idx.name);
-            }
+        if let Ok(meta) = self.table_meta(&tref.name, tref.alias.as_deref())
+            && let Some(idx) = self.join_scan_covering_index(sel, from, tref, &meta)
+        {
+            return alloc::format!("SCAN {label} USING COVERING INDEX {}", idx.name);
         }
         alloc::format!("SCAN {label}")
     }
@@ -19935,11 +19851,7 @@ impl Connection {
                                         .any(|c| c.name.eq_ignore_ascii_case(column))
                                 })
                             });
-                            if in_other {
-                                None
-                            } else {
-                                Some(idx_covers(ci))
-                            }
+                            if in_other { None } else { Some(idx_covers(ci)) }
                         }
                         None => {
                             if matches!(
@@ -20015,24 +19927,24 @@ impl Connection {
             }
         }
         for j in &from.joins {
-            if let Some(on) = j.on.as_ref() {
-                if !walk(on, &resolve) {
-                    return false;
-                }
-            }
-        }
-        if let Some(w) = sel.where_clause.as_ref() {
-            if !walk(w, &resolve) {
+            if let Some(on) = j.on.as_ref()
+                && !walk(on, &resolve)
+            {
                 return false;
             }
+        }
+        if let Some(w) = sel.where_clause.as_ref()
+            && !walk(w, &resolve)
+        {
+            return false;
         }
         if !sel.group_by.iter().all(|e| walk(e, &resolve)) {
             return false;
         }
-        if let Some(h) = sel.having.as_ref() {
-            if !walk(h, &resolve) {
-                return false;
-            }
+        if let Some(h) = sel.having.as_ref()
+            && !walk(h, &resolve)
+        {
+            return false;
         }
         if !sel.order_by.iter().all(|t| walk(&t.expr, &resolve)) {
             return false;
@@ -20209,12 +20121,14 @@ impl Connection {
             meta.ipk
         };
         let bare_cols = total_cols.saturating_sub(agg_arg_cols);
-        if elide && uniq.len() == 1 && !other_agg && bare_cols == 0 {
-            if let (Some(arg), Some(l)) = (uniq[0].1, lead) {
-                if arg == l {
-                    return Vec::new();
-                }
-            }
+        if elide
+            && uniq.len() == 1
+            && !other_agg
+            && bare_cols == 0
+            && let (Some(arg), Some(l)) = (uniq[0].1, lead)
+            && arg == l
+        {
+            return Vec::new();
         }
         uniq.into_iter().map(|(n, _)| n).collect()
     }
@@ -20314,10 +20228,10 @@ impl Connection {
             let mut leading = idxs
                 .iter()
                 .filter(|i| usable(i) && i.cols.first() == Some(&col));
-            if let Some(i) = leading.next() {
-                if leading.next().is_none() {
-                    return Some(alloc::format!("SEARCH {label} USING INDEX {}", i.name));
-                }
+            if let Some(i) = leading.next()
+                && leading.next().is_none()
+            {
+                return Some(alloc::format!("SEARCH {label} USING INDEX {}", i.name));
             }
         }
 
@@ -21094,10 +21008,10 @@ impl Connection {
         // HAVING in a non-aggregate query is itself rejected ("HAVING clause on
         // a non-aggregate query") ahead of any arity check, so only validate the
         // HAVING expression in a genuine aggregate context.
-        if let Some(h) = &sel.having {
-            if !sel.group_by.is_empty() || self.has_result_aggregate(sel) {
-                check(h)?;
-            }
+        if let Some(h) = &sel.having
+            && (!sel.group_by.is_empty() || self.has_result_aggregate(sel))
+        {
+            check(h)?;
         }
         for g in &sel.group_by {
             check(g)?;
@@ -21137,10 +21051,10 @@ impl Connection {
         }
         // As with the arity check, HAVING in a non-aggregate query is rejected by
         // its own placement error first, so only resolve it in an aggregate context.
-        if let Some(h) = &sel.having {
-            if !sel.group_by.is_empty() || self.has_result_aggregate(sel) {
-                self.reject_unresolved_functions(h)?;
-            }
+        if let Some(h) = &sel.having
+            && (!sel.group_by.is_empty() || self.has_result_aggregate(sel))
+        {
+            self.reject_unresolved_functions(h)?;
         }
         for g in &sel.group_by {
             self.reject_unresolved_functions(g)?;
@@ -21878,10 +21792,10 @@ impl Connection {
                 ) {
                     if let (Some(la), Some(ra)) =
                         (self.row_arity(left, cols), self.row_arity(right, cols))
+                        && (la > 1 || ra > 1)
+                        && la != ra
                     {
-                        if (la > 1 || ra > 1) && la != ra {
-                            return Err(Error::Error("row value misused".into()));
-                        }
+                        return Err(Error::Error("row value misused".into()));
                     }
                     self.walk_row_value_misuse_operand(left, cols)?;
                     self.walk_row_value_misuse_operand(right, cols)?;
@@ -21898,10 +21812,10 @@ impl Connection {
                     self.row_arity(expr, cols),
                     self.row_arity(low, cols),
                     self.row_arity(high, cols),
-                ) {
-                    if (ea > 1 || la > 1 || ha > 1) && (ea != la || ea != ha) {
-                        return Err(Error::Error("row value misused".into()));
-                    }
+                ) && (ea > 1 || la > 1 || ha > 1)
+                    && (ea != la || ea != ha)
+                {
+                    return Err(Error::Error("row value misused".into()));
                 }
                 self.walk_row_value_misuse_operand(expr, cols)?;
                 self.walk_row_value_misuse_operand(low, cols)?;
@@ -22126,28 +22040,28 @@ impl Connection {
                     None => None,
                 }
             };
-            if let Some(vsel) = vsel {
-                if let Ok(result) = self.run_select_vdbe(vsel) {
-                    // The VDBE compiles a *known* scalar call without re-checking
-                    // its arity, and never evaluates it over zero rows — so a
-                    // wrong-arity call (`abs(a,b)`) would slip through silently
-                    // where SQLite rejects it at prepare time. A VDBE success means
-                    // every column resolved, so an unresolved-function fault is now
-                    // the sole possible error and is safe to surface here without
-                    // masking a missing column.
-                    self.reject_unresolved_functions_in_select(sel)?;
-                    // A scalar call inside an expression-position subquery is
-                    // likewise compiled without an arity recheck and may never
-                    // execute (empty / fully-filtered outer table), so validate
-                    // those too. The scan scope isn't materialized yet here, but
-                    // an uncorrelated FROM-less subquery — the only shape the
-                    // const arm inlines — is column-clean regardless of it, so an
-                    // empty scope checks exactly those and safely skips anything
-                    // correlated (no false positive, missing-column precedence
-                    // preserved).
-                    self.reject_unresolved_functions_in_subqueries(sel, &[])?;
-                    return Ok(result);
-                }
+            if let Some(vsel) = vsel
+                && let Ok(result) = self.run_select_vdbe(vsel)
+            {
+                // The VDBE compiles a *known* scalar call without re-checking
+                // its arity, and never evaluates it over zero rows — so a
+                // wrong-arity call (`abs(a,b)`) would slip through silently
+                // where SQLite rejects it at prepare time. A VDBE success means
+                // every column resolved, so an unresolved-function fault is now
+                // the sole possible error and is safe to surface here without
+                // masking a missing column.
+                self.reject_unresolved_functions_in_select(sel)?;
+                // A scalar call inside an expression-position subquery is
+                // likewise compiled without an arity recheck and may never
+                // execute (empty / fully-filtered outer table), so validate
+                // those too. The scan scope isn't materialized yet here, but
+                // an uncorrelated FROM-less subquery — the only shape the
+                // const arm inlines — is column-clean regardless of it, so an
+                // empty scope checks exactly those and safely skips anything
+                // correlated (no false positive, missing-column precedence
+                // preserved).
+                self.reject_unresolved_functions_in_subqueries(sel, &[])?;
+                return Ok(result);
             }
         }
         // Promote `FROM a, b WHERE a.x = b.y` to an explicit join `ON` so the join
@@ -22344,11 +22258,11 @@ impl Connection {
         // on a non-aggregate query SQLite emits `HAVING clause on a non-aggregate
         // query` first (see below), so defer both window checks to a genuine
         // aggregate context (a GROUP BY or a result-column aggregate).
-        if let Some(h) = &sel.having {
-            if !sel.group_by.is_empty() || self.has_result_aggregate(sel) {
-                reject_misused_window(h)?;
-                reject_window_without_over(h)?;
-            }
+        if let Some(h) = &sel.having
+            && (!sel.group_by.is_empty() || self.has_result_aggregate(sel))
+        {
+            reject_misused_window(h)?;
+            reject_window_without_over(h)?;
         }
 
         // An aggregate function in the WHERE clause is a misuse: WHERE filters
@@ -22535,10 +22449,10 @@ impl Connection {
         let sel = if is_plain_windowed {
             let mut w = self.apply_windows(sel, &mut columns, &mut rows, params)?;
             // Absent an explicit ORDER BY, match sqlite's window-induced row order.
-            if w.order_by.is_empty() {
-                if let Some(order) = self.window_output_order(sel)? {
-                    w.order_by = order;
-                }
+            if w.order_by.is_empty()
+                && let Some(order) = self.window_output_order(sel)?
+            {
+                w.order_by = order;
             }
             rewritten = w;
             &rewritten
@@ -22638,11 +22552,7 @@ impl Connection {
                     e,
                     &EvalCtx::rowless(params).with_subqueries(self),
                 )?)?;
-                if n < 0 {
-                    None
-                } else {
-                    Some(n as usize)
-                }
+                if n < 0 { None } else { Some(n as usize) }
             }
             None => None,
         };
@@ -23044,7 +22954,7 @@ impl Connection {
                         _ => {
                             return Err(Error::Unsupported(
                                 "VDBE window: USING column not in both sources",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -23161,10 +23071,10 @@ impl Connection {
         // A `table.*` whose qualifier names no FROM source is `no such table: X`
         // in SQLite, statically — a star qualifier is never an alias or ordinal.
         for c in &sel.columns {
-            if let ResultColumn::TableWildcard(q) = c {
-                if !labels.iter().any(|l| l.eq_ignore_ascii_case(q)) {
-                    return Err(Error::Error(alloc::format!("no such table: {q}")));
-                }
+            if let ResultColumn::TableWildcard(q) = c
+                && !labels.iter().any(|l| l.eq_ignore_ascii_case(q))
+            {
+                return Err(Error::Error(alloc::format!("no such table: {q}")));
             }
         }
         let mut targets: Vec<&Expr> = Vec::new();
@@ -23564,10 +23474,10 @@ impl Connection {
         // `tbl.*` whose qualifier names no source is `no such table: X`, statically
         // (a star qualifier is never an alias-of-an-alias or an ordinal).
         for c in &sel.columns {
-            if let ResultColumn::TableWildcard(q) = c {
-                if !qual_ok(q) {
-                    return Err(Error::Error(alloc::format!("no such table: {q}")));
-                }
+            if let ResultColumn::TableWildcard(q) = c
+                && !qual_ok(q)
+            {
+                return Err(Error::Error(alloc::format!("no such table: {q}")));
             }
         }
         // Whether a reference resolves to a derived-table column. A schema-qualified
@@ -23576,10 +23486,10 @@ impl Connection {
             if schema.is_some() {
                 return true;
             }
-            if let Some(t) = table {
-                if !qual_ok(t) {
-                    return false;
-                }
+            if let Some(t) = table
+                && !qual_ok(t)
+            {
+                return false;
             }
             columns.iter().any(|c| c.name.eq_ignore_ascii_case(column))
         };
@@ -23712,10 +23622,10 @@ impl Connection {
         }
         // A `tbl.*` whose qualifier names no source is `no such table: X`.
         for c in &sel.columns {
-            if let ResultColumn::TableWildcard(q) = c {
-                if !scope.iter().any(|s| s.label.eq_ignore_ascii_case(q)) {
-                    return Err(Error::Error(alloc::format!("no such table: {q}")));
-                }
+            if let ResultColumn::TableWildcard(q) = c
+                && !scope.iter().any(|s| s.label.eq_ignore_ascii_case(q))
+            {
+                return Err(Error::Error(alloc::format!("no such table: {q}")));
             }
         }
         let is_rowid_kw =
@@ -23855,20 +23765,20 @@ impl Connection {
                 // A qualified ref is only ours to judge when it names the target; a
                 // qualifier naming another `FROM` source / `OLD` / `NEW` is resolved
                 // elsewhere.
-                if let Some(q) = tbl {
-                    if !q.eq_ignore_ascii_case(table) {
-                        return;
-                    }
+                if let Some(q) = tbl
+                    && !q.eq_ignore_ascii_case(table)
+                {
+                    return;
                 }
                 // The database qualifier is checked before the rowid/pseudo-column
                 // shortcut (`bad.t.rowid` is just as wrong as `bad.t.col`): in
                 // `WHERE`/`SET` it must name the target's database; in `RETURNING`
                 // it is never allowed.
-                if let Some(sch) = schema {
-                    if !(allow_schema && sch.eq_ignore_ascii_case(target_db)) {
-                        *missing = Some(eval::no_such_column(schema, tbl, col, quoted));
-                        return;
-                    }
+                if let Some(sch) = schema
+                    && !(allow_schema && sch.eq_ignore_ascii_case(target_db))
+                {
+                    *missing = Some(eval::no_such_column(schema, tbl, col, quoted));
+                    return;
                 }
                 if matches!(
                     col.to_ascii_lowercase().as_str(),
@@ -24005,18 +23915,18 @@ impl Connection {
         // full-scan regardless of the hint. Accept an explicit index by name or an
         // `sqlite_autoindex_<table>_*` implicit index (lenient on the exact number).
         for tref in core::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.table)) {
-            if let Some(IndexHint::IndexedBy(name)) = &tref.index_hint {
-                if self.schema.table(&tref.name).is_some() {
-                    let auto_prefix =
-                        alloc::format!("sqlite_autoindex_{}_", tref.name.to_ascii_lowercase());
-                    let known = self
-                        .schema
-                        .indexes_on(&tref.name)
-                        .any(|o| o.name.eq_ignore_ascii_case(name))
-                        || name.to_ascii_lowercase().starts_with(&auto_prefix);
-                    if !known {
-                        return Err(Error::Error(alloc::format!("no such index: {name}")));
-                    }
+            if let Some(IndexHint::IndexedBy(name)) = &tref.index_hint
+                && self.schema.table(&tref.name).is_some()
+            {
+                let auto_prefix =
+                    alloc::format!("sqlite_autoindex_{}_", tref.name.to_ascii_lowercase());
+                let known = self
+                    .schema
+                    .indexes_on(&tref.name)
+                    .any(|o| o.name.eq_ignore_ascii_case(name))
+                    || name.to_ascii_lowercase().starts_with(&auto_prefix);
+                if !known {
+                    return Err(Error::Error(alloc::format!("no such index: {name}")));
                 }
             }
         }
@@ -24124,48 +24034,47 @@ impl Connection {
             return Ok((columns, input));
         }
         // A derived-table subquery used as the sole source.
-        if from.joins.is_empty() {
-            if let Some(sub) = &from.first.subquery {
-                let (columns, rows) =
-                    self.run_subquery_source(sub, from.first.alias.as_deref(), params)?;
-                let input = rows
-                    .into_iter()
-                    .map(|values| InputRow {
-                        values,
-                        rowid: None,
-                    })
-                    .collect();
-                return Ok((columns, input));
-            }
+        if from.joins.is_empty()
+            && let Some(sub) = &from.first.subquery
+        {
+            let (columns, rows) =
+                self.run_subquery_source(sub, from.first.alias.as_deref(), params)?;
+            let input = rows
+                .into_iter()
+                .map(|values| InputRow {
+                    values,
+                    rowid: None,
+                })
+                .collect();
+            return Ok((columns, input));
         }
         // A `WITH` common table expression used as the sole source.
-        if from.joins.is_empty() {
-            if let Some((columns, rows)) =
+        if from.joins.is_empty()
+            && let Some((columns, rows)) =
                 self.lookup_cte(&from.first.name, from.first.alias.as_deref())
-            {
-                return Ok((columns, rows));
-            }
+        {
+            return Ok((columns, rows));
         }
         // A view as the sole source: run its SELECT in place.
-        if from.joins.is_empty() {
-            if let Some((columns, rows)) =
+        if from.joins.is_empty()
+            && let Some((columns, rows)) =
                 self.try_view(&from.first.name, from.first.alias.as_deref(), params)?
-            {
-                return Ok((columns, rows));
-            }
+        {
+            return Ok((columns, rows));
         }
         // A virtual table as the sole source: drain its module's cursor, pushing
         // the query's WHERE constraints into the module (it may restrict what it
         // produces; run_core still re-applies the full WHERE, so this is a
         // superset — never wrong).
-        if from.joins.is_empty() && from.first.schema.is_none() {
-            if let Some((columns, rows)) = self.try_virtual_table(
+        if from.joins.is_empty()
+            && from.first.schema.is_none()
+            && let Some((columns, rows)) = self.try_virtual_table(
                 &from.first.name,
                 from.first.alias.as_deref(),
                 Some((sel, params)),
-            )? {
-                return Ok((columns, rows));
-            }
+            )?
+        {
+            return Ok((columns, rows));
         }
 
         // Single-table fast path. Try an index-driven equality lookup first; the
@@ -24625,8 +24534,8 @@ impl Connection {
                         (Some(li), Some(rl)) => v.push((li, rl)),
                         _ => {
                             return Err(Error::Error(format!(
-                            "cannot join using column {name} - column not present in both tables"
-                        )))
+                                "cannot join using column {name} - column not present in both tables"
+                            )));
                         }
                     }
                 }
@@ -25273,40 +25182,39 @@ impl Connection {
         // The names come from the body's output, or the explicit `WITH name(cols…)`
         // rename. A base table of the same name is shadowed by the CTE, matching the
         // outer scan's own CTE-before-table precedence.
-        if tref.schema.is_none() {
-            if let Some(c) = ctes
+        if tref.schema.is_none()
+            && let Some(c) = ctes
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(&tref.name))
-            {
-                // A *recursive* CTE names itself in its own body; descending into
-                // it with `c` still in scope would recurse without end. Its column
-                // origins are conservative anyway (the documented `None` for a
-                // recursive body), so stop here. Otherwise resolve through the body
-                // with `c` removed from scope — a non-recursive CTE never names
-                // itself, and dropping it keeps sibling references resolvable while
-                // guaranteeing termination.
-                if references_name(&c.select, &c.name) {
-                    return None;
-                }
-                let inner: Vec<Cte> = ctes
-                    .iter()
-                    .filter(|x| !x.name.eq_ignore_ascii_case(&c.name))
-                    .cloned()
-                    .collect();
-                let origins = self.subquery_column_origins_in(&c.select, &inner)?;
-                let names: Vec<String> = if c.columns.is_empty() {
-                    self.resolved_view_columns(&c.select)?
-                        .into_iter()
-                        .map(|(n, _)| n)
-                        .collect()
-                } else {
-                    c.columns.clone()
-                };
-                if names.len() != origins.len() {
-                    return None;
-                }
-                return Some(names.into_iter().zip(origins).collect());
+        {
+            // A *recursive* CTE names itself in its own body; descending into
+            // it with `c` still in scope would recurse without end. Its column
+            // origins are conservative anyway (the documented `None` for a
+            // recursive body), so stop here. Otherwise resolve through the body
+            // with `c` removed from scope — a non-recursive CTE never names
+            // itself, and dropping it keeps sibling references resolvable while
+            // guaranteeing termination.
+            if references_name(&c.select, &c.name) {
+                return None;
             }
+            let inner: Vec<Cte> = ctes
+                .iter()
+                .filter(|x| !x.name.eq_ignore_ascii_case(&c.name))
+                .cloned()
+                .collect();
+            let origins = self.subquery_column_origins_in(&c.select, &inner)?;
+            let names: Vec<String> = if c.columns.is_empty() {
+                self.resolved_view_columns(&c.select)?
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect()
+            } else {
+                c.columns.clone()
+            };
+            if names.len() != origins.len() {
+                return None;
+            }
+            return Some(names.into_iter().zip(origins).collect());
         }
         // A view source resolves through its stored body: the view's output columns
         // carry their defining expressions' `(affinity, collation)`, so a derived
@@ -25905,29 +25813,29 @@ impl Connection {
                 },
                 Value::Null | Value::Blob(_) => None,
             };
-            if let Some(rid) = candidate {
-                if cur.seek(rid)? {
-                    let mut first_row =
-                        self.decode_full_row(first_meta, rid, &cur.payload()?, encoding)?;
-                    debug_assert_eq!(first_row.len(), first_user_width);
-                    // Assemble in DECLARED order: first table's user row, its hidden
-                    // rowid (the seeked `rid`), then the driver's row (whose own hidden
-                    // rowid already trails it).
-                    if with_rowid {
-                        first_row.push(Value::Integer(rid));
+            if let Some(rid) = candidate
+                && cur.seek(rid)?
+            {
+                let mut first_row =
+                    self.decode_full_row(first_meta, rid, &cur.payload()?, encoding)?;
+                debug_assert_eq!(first_row.len(), first_user_width);
+                // Assemble in DECLARED order: first table's user row, its hidden
+                // rowid (the seeked `rid`), then the driver's row (whose own hidden
+                // rowid already trails it).
+                if with_rowid {
+                    first_row.push(Value::Integer(rid));
+                }
+                let mut combined = first_row;
+                combined.extend(driver.iter().cloned());
+                let keep = match on {
+                    Some(on) => {
+                        let ctx = row_ctx(&combined, &out_columns, None, params);
+                        eval::truth(&eval::eval(on, &ctx)?) == Some(true)
                     }
-                    let mut combined = first_row;
-                    combined.extend(driver.iter().cloned());
-                    let keep = match on {
-                        Some(on) => {
-                            let ctx = row_ctx(&combined, &out_columns, None, params);
-                            eval::truth(&eval::eval(on, &ctx)?) == Some(true)
-                        }
-                        None => true,
-                    };
-                    if keep {
-                        joined.push(combined);
-                    }
+                    None => true,
+                };
+                if keep {
+                    joined.push(combined);
                 }
             }
         }
@@ -26617,23 +26525,23 @@ impl Connection {
         }
         // The join `ON`, the WHERE, GROUP BY / HAVING, and ORDER BY all reference
         // `from.first` too.
-        if let Some(on) = from.joins[0].on.as_ref() {
-            if !walk(on, &resolve) {
-                return false;
-            }
+        if let Some(on) = from.joins[0].on.as_ref()
+            && !walk(on, &resolve)
+        {
+            return false;
         }
-        if let Some(w) = sel.where_clause.as_ref() {
-            if !walk(w, &resolve) {
-                return false;
-            }
+        if let Some(w) = sel.where_clause.as_ref()
+            && !walk(w, &resolve)
+        {
+            return false;
         }
         if !sel.group_by.iter().all(|e| walk(e, &resolve)) {
             return false;
         }
-        if let Some(h) = sel.having.as_ref() {
-            if !walk(h, &resolve) {
-                return false;
-            }
+        if let Some(h) = sel.having.as_ref()
+            && !walk(h, &resolve)
+        {
+            return false;
         }
         if !sel.order_by.iter().all(|t| walk(&t.expr, &resolve)) {
             return false;
@@ -26775,25 +26683,25 @@ impl Connection {
                 Value::Null | Value::Blob(_) => None,
             };
             let mut matched = false;
-            if let Some(rid) = candidate {
-                if cur.seek(rid)? {
-                    let inner = self.decode_full_row(inner_meta, rid, &cur.payload()?, encoding)?;
-                    let mut combined = left.clone();
-                    combined.extend(inner);
-                    if with_rowid {
-                        combined.push(Value::Integer(rid));
+            if let Some(rid) = candidate
+                && cur.seek(rid)?
+            {
+                let inner = self.decode_full_row(inner_meta, rid, &cur.payload()?, encoding)?;
+                let mut combined = left.clone();
+                combined.extend(inner);
+                if with_rowid {
+                    combined.push(Value::Integer(rid));
+                }
+                let keep = match on {
+                    Some(on) => {
+                        let ctx = row_ctx(&combined, &new_columns, None, params);
+                        eval::truth(&eval::eval(on, &ctx)?) == Some(true)
                     }
-                    let keep = match on {
-                        Some(on) => {
-                            let ctx = row_ctx(&combined, &new_columns, None, params);
-                            eval::truth(&eval::eval(on, &ctx)?) == Some(true)
-                        }
-                        None => true,
-                    };
-                    if keep {
-                        joined.push(combined);
-                        matched = true;
-                    }
+                    None => true,
+                };
+                if keep {
+                    joined.push(combined);
+                    matched = true;
                 }
             }
             // LEFT: emit the outer row NULL-extended when nothing matched.
@@ -26943,17 +26851,15 @@ impl Connection {
             && self.lookup_cte(&tref.name, tref.alias.as_deref()).is_none()
             && !self.is_view(&tref.name)
             && self.unqualified_db(&tref.name) == DbRef::Main
+            && let Ok(meta) = self.table_meta(&tref.name, tref.alias.as_deref())
+            && let Some(idx) = self.join_scan_covering_index(sel, from, tref, &meta)
         {
-            if let Ok(meta) = self.table_meta(&tref.name, tref.alias.as_deref()) {
-                if let Some(idx) = self.join_scan_covering_index(sel, from, tref, &meta) {
-                    // Reuse `resolve_join_source` to obtain the correctly-stamped
-                    // ColumnInfo (schema origin, alias), then replace the rowid-order
-                    // rows with the covering-index-order ones.
-                    let (columns, _) = self.resolve_join_source(tref, params)?;
-                    let rows = self.scan_table_via_index(&meta, &idx)?;
-                    return Ok((columns, rows));
-                }
-            }
+            // Reuse `resolve_join_source` to obtain the correctly-stamped
+            // ColumnInfo (schema origin, alias), then replace the rowid-order
+            // rows with the covering-index-order ones.
+            let (columns, _) = self.resolve_join_source(tref, params)?;
+            let rows = self.scan_table_via_index(&meta, &idx)?;
+            return Ok((columns, rows));
         }
         self.resolve_join_source_rowid(tref, params, with_rowid)
     }
@@ -27211,10 +27117,10 @@ impl Connection {
                 subqueries: None,
             }
             .with_subqueries(self);
-            if let Some(w) = where_clause {
-                if eval::truth(&eval::eval(w, &ctx)?) != Some(true) {
-                    return Ok(false);
-                }
+            if let Some(w) = where_clause
+                && eval::truth(&eval::eval(w, &ctx)?) != Some(true)
+            {
+                return Ok(false);
             }
             for (col, e) in assignments {
                 let pos = meta
@@ -27603,12 +27509,11 @@ impl Connection {
     /// missing-object message (so an unrelated `no such column: …` is untouched).
     fn qualify_missing(schema: Option<&str>, name: &str, e: Error) -> Error {
         let Some(q) = schema else { return e };
-        if let Error::Error(m) = &e {
-            if let Some(prefix) = m.strip_suffix(&alloc::format!(": {name}")) {
-                if prefix.starts_with("no such ") {
-                    return Error::Error(alloc::format!("{prefix}: {q}.{name}"));
-                }
-            }
+        if let Error::Error(m) = &e
+            && let Some(prefix) = m.strip_suffix(&alloc::format!(": {name}"))
+            && prefix.starts_with("no such ")
+        {
+            return Error::Error(alloc::format!("{prefix}: {q}.{name}"));
         }
         e
     }
@@ -27644,10 +27549,10 @@ impl Connection {
     /// The database an *unqualified* table name resolves to: the `temp` database
     /// when it holds the table (temp shadows main), else `main`.
     fn unqualified_db(&self, name: &str) -> DbRef {
-        if let Some(t) = &self.temp_db {
-            if t.schema.table(name).is_some() {
-                return DbRef::Temp;
-            }
+        if let Some(t) = &self.temp_db
+            && t.schema.table(name).is_some()
+        {
+            return DbRef::Temp;
         }
         // Inside a cross-database view read, unqualified names resolve in the
         // view's own database (when it has the table) before falling back to
@@ -29655,16 +29560,13 @@ impl Connection {
                     column,
                     ..
                 } = node
-                {
-                    if let Some(j) = meta
+                    && let Some(j) = meta
                         .columns
                         .iter()
                         .position(|c| c.name.eq_ignore_ascii_case(column))
-                    {
-                        if eval_set[j] {
-                            deps[i].push(j);
-                        }
-                    }
+                    && eval_set[j]
+                {
+                    deps[i].push(j);
                 }
             });
         }
@@ -29840,14 +29742,13 @@ impl Connection {
                 // A positional `GROUP BY N` — including the signed / parenthesized /
                 // `COLLATE`-wrapped forms SQLite folds (`GROUP BY +1`) — names the
                 // N-th output column.
-                if let Some(n) = positional_int(g) {
-                    if let Some(ResultColumn::Expr { expr, .. }) = usize::try_from(n)
+                if let Some(n) = positional_int(g)
+                    && let Some(ResultColumn::Expr { expr, .. }) = usize::try_from(n)
                         .ok()
                         .filter(|&n| n >= 1)
                         .and_then(|n| sel.columns.get(n - 1))
-                    {
-                        return expr.clone();
-                    }
+                {
+                    return expr.clone();
                 }
                 g.clone()
             })
@@ -30195,14 +30096,13 @@ impl Connection {
                 // A positional `GROUP BY N` — including the signed / parenthesized /
                 // `COLLATE`-wrapped forms SQLite folds (`GROUP BY +1`) — names the
                 // N-th output column.
-                if let Some(n) = positional_int(g) {
-                    if let Some(ResultColumn::Expr { expr, .. }) = usize::try_from(n)
+                if let Some(n) = positional_int(g)
+                    && let Some(ResultColumn::Expr { expr, .. }) = usize::try_from(n)
                         .ok()
                         .filter(|&n| n >= 1)
                         .and_then(|n| sel.columns.get(n - 1))
-                    {
-                        return expr.clone();
-                    }
+                {
+                    return expr.clone();
                 }
                 g.clone()
             })
@@ -30968,18 +30868,16 @@ impl Connection {
                 if let Expr::Function {
                     over: Some(spec), ..
                 } = n
-                {
-                    if spec
+                    && (spec
                         .partition_by
                         .iter()
                         .any(|e| expr_contains_agg(e, &is_agg))
                         || spec
                             .order_by
                             .iter()
-                            .any(|o| expr_contains_agg(&o.expr, &is_agg))
-                    {
-                        found = true;
-                    }
+                            .any(|o| expr_contains_agg(&o.expr, &is_agg)))
+                {
+                    found = true;
                 }
             });
         }
@@ -31130,8 +31028,8 @@ impl Connection {
             // Storage order: PK columns first, then the remaining *stored*
             // columns (VIRTUAL generated columns are never written).
             let mut order = pk.clone();
-            for (i, gen) in generated.iter().enumerate() {
-                let is_virtual = matches!(gen, Some((_, false)));
+            for (i, g) in generated.iter().enumerate() {
+                let is_virtual = matches!(g, Some((_, false)));
                 if !pk.contains(&i) && !is_virtual {
                     order.push(i);
                 }
@@ -31354,14 +31252,12 @@ fn alias_substituted(sel: &Select, columns: &[ColumnInfo]) -> Option<Select> {
             alias: Some(name),
             ..
         } = c
-        {
-            if !columns
+            && !columns
                 .iter()
                 .any(|col| col.name.eq_ignore_ascii_case(name))
-                && !aliases.iter().any(|(a, _)| a.eq_ignore_ascii_case(name))
-            {
-                aliases.push((name.clone(), expr.clone()));
-            }
+            && !aliases.iter().any(|(a, _)| a.eq_ignore_ascii_case(name))
+        {
+            aliases.push((name.clone(), expr.clone()));
         }
     }
     if aliases.is_empty() {
@@ -31376,10 +31272,9 @@ fn alias_substituted(sel: &Select, columns: &[ColumnInfo]) -> Option<Select> {
                 column,
                 ..
             } = n
+                && aliases.iter().any(|(a, _)| a.eq_ignore_ascii_case(column))
             {
-                if aliases.iter().any(|(a, _)| a.eq_ignore_ascii_case(column)) {
-                    found = true;
-                }
+                found = true;
             }
         });
         found
@@ -32509,15 +32404,12 @@ fn generated_column_loop(columns: &[ColumnDef]) -> Option<String> {
                 column,
                 ..
             } = node
-            {
-                if let Some(j) = columns
+                && let Some(j) = columns
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(column))
-                {
-                    if gen_expr[j].is_some() {
-                        deps[i].push(j);
-                    }
-                }
+                && gen_expr[j].is_some()
+            {
+                deps[i].push(j);
             }
         });
     }
@@ -32543,10 +32435,11 @@ fn generated_column_loop(columns: &[ColumnDef]) -> Option<String> {
     }
     let mut state = alloc::vec![0u8; n];
     for i in 0..n {
-        if gen_expr[i].is_some() && state[i] == 0 {
-            if let Some(name) = dfs(i, columns, &deps, &mut state) {
-                return Some(name);
-            }
+        if gen_expr[i].is_some()
+            && state[i] == 0
+            && let Some(name) = dfs(i, columns, &deps, &mut state)
+        {
+            return Some(name);
         }
     }
     None
@@ -32608,13 +32501,11 @@ fn has_resolved_dotted_ref(
             column,
             ..
         } = n
+            && q.eq_ignore_ascii_case(self_table)
+            && (known.iter().any(|c| c.eq_ignore_ascii_case(column))
+                || (allow_rowid && eval::is_rowid_alias(column)))
         {
-            if q.eq_ignore_ascii_case(self_table)
-                && (known.iter().any(|c| c.eq_ignore_ascii_case(column))
-                    || (allow_rowid && eval::is_rowid_alias(column)))
-            {
-                found = true;
-            }
+            found = true;
         }
     });
     found
@@ -32706,10 +32597,10 @@ fn validate_upsert_columns(
         }
         // The conflict-target WHERE is a partial-index predicate — target columns
         // (and a three-part db qualifier) only, never `excluded`.
-        if let Some(w) = &up.target_where {
-            if let Some(c) = upsert_expr_unknown_column(w, &known, table, target_db, false) {
-                return Err(Error::Error(alloc::format!("no such column: {c}")));
-            }
+        if let Some(w) = &up.target_where
+            && let Some(c) = upsert_expr_unknown_column(w, &known, table, target_db, false)
+        {
+            return Err(Error::Error(alloc::format!("no such column: {c}")));
         }
         if let UpsertAction::Update {
             assignments,
@@ -32726,10 +32617,10 @@ fn validate_upsert_columns(
                     return Err(Error::Error(alloc::format!("no such column: {col}")));
                 }
             }
-            if let Some(w) = where_clause {
-                if let Some(c) = upsert_expr_unknown_column(w, &known, table, target_db, true) {
-                    return Err(Error::Error(alloc::format!("no such column: {c}")));
-                }
+            if let Some(w) = where_clause
+                && let Some(c) = upsert_expr_unknown_column(w, &known, table, target_db, true)
+            {
+                return Err(Error::Error(alloc::format!("no such column: {c}")));
             }
         }
     }
@@ -32762,10 +32653,10 @@ fn expr_has_subquery(e: &Expr) -> bool {
 fn all_qualifiers_match(e: &Expr, bind: Option<&str>) -> bool {
     let mut ok = true;
     window::visit(e, &mut |n| {
-        if let Expr::Column { table: Some(q), .. } = n {
-            if !bind.is_some_and(|b| q.eq_ignore_ascii_case(b)) {
-                ok = false;
-            }
+        if let Expr::Column { table: Some(q), .. } = n
+            && !bind.is_some_and(|b| q.eq_ignore_ascii_case(b))
+        {
+            ok = false;
         }
     });
     ok
@@ -32779,10 +32670,10 @@ fn all_qualifiers_match(e: &Expr, bind: Option<&str>) -> bool {
 fn all_column_names_in(e: &Expr, names: &[String]) -> bool {
     let mut ok = true;
     window::visit(e, &mut |n| {
-        if let Expr::Column { column, .. } = n {
-            if !names.iter().any(|nm| nm.eq_ignore_ascii_case(column)) {
-                ok = false;
-            }
+        if let Expr::Column { column, .. } = n
+            && !names.iter().any(|nm| nm.eq_ignore_ascii_case(column))
+        {
+            ok = false;
         }
     });
     ok
@@ -32858,10 +32749,10 @@ fn visit_columns_mut(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
 fn rewrite_flattened_column(e: &mut Expr, bind: Option<&str>, rename: &[(String, String)]) {
     visit_columns_mut(e, &mut |c| {
         if let Expr::Column { table, column, .. } = c {
-            if let Some(b) = bind {
-                if table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(b)) {
-                    *table = None;
-                }
+            if let Some(b) = bind
+                && table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(b))
+            {
+                *table = None;
             }
             if let Some((_, base)) = rename.iter().find(|(o, _)| o.eq_ignore_ascii_case(column)) {
                 *column = base.clone();
@@ -33028,7 +32919,7 @@ fn canonical_schema_sql(prefix: &str, sql_text: &str) -> String {
 /// `CREATE`, any `TEMP`/`TEMPORARY`/`UNIQUE` modifier, the object-type keyword,
 /// and an optional `IF NOT EXISTS`. Returns `None` if the head doesn't match.
 fn schema_sql_name_offset(sql_text: &str) -> Option<usize> {
-    use crate::sql::token::{tokenize, Token};
+    use crate::sql::token::{Token, tokenize};
     let toks = tokenize(sql_text).ok()?;
     let kw = |t: &Token, k: &str| matches!(t, Token::Word(w) if w.eq_ignore_ascii_case(k));
     let mut i = 0;
@@ -33121,10 +33012,10 @@ fn first_aggregate_call_name(e: &Expr) -> Option<String> {
             over,
             ..
         } = n
+            && over.is_none()
+            && func::is_aggregate_call(name, args.len(), *star)
         {
-            if over.is_none() && func::is_aggregate_call(name, args.len(), *star) {
-                found = Some(name.clone());
-            }
+            found = Some(name.clone());
         }
     });
     found
@@ -33174,10 +33065,10 @@ fn first_window_call_name(e: &Expr) -> Option<String> {
         if found.is_some() {
             return;
         }
-        if let Expr::Function { name, over, .. } = n {
-            if over.is_some() {
-                found = Some(name.to_ascii_lowercase());
-            }
+        if let Expr::Function { name, over, .. } = n
+            && over.is_some()
+        {
+            found = Some(name.to_ascii_lowercase());
         }
     });
     found
@@ -33314,10 +33205,9 @@ fn reject_star_argument(e: &Expr) -> Result<()> {
         if let Expr::Function {
             name, star: true, ..
         } = n
+            && !name.eq_ignore_ascii_case("count")
         {
-            if !name.eq_ignore_ascii_case("count") {
-                found = Some(name.clone());
-            }
+            found = Some(name.clone());
         }
     });
     match found {
@@ -33552,10 +33442,11 @@ fn reject_filter_on_non_aggregate(
             over,
             ..
         } = n
+            && filter.is_some()
+            && over.is_none()
+            && !is_agg(name, args.len(), *star)
         {
-            if filter.is_some() && over.is_none() && !is_agg(name, args.len(), *star) {
-                found = Some(name.clone());
-            }
+            found = Some(name.clone());
         }
     });
     match found {
@@ -33628,13 +33519,13 @@ fn reject_aggregate_in_filter(e: &Expr, is_agg: &dyn Fn(&str, usize, bool) -> bo
 fn expr_is_nondeterministic(e: &Expr) -> bool {
     let mut found = false;
     window::visit(e, &mut |n| {
-        if let Expr::Function { name, .. } = n {
-            if matches!(
+        if let Expr::Function { name, .. } = n
+            && matches!(
                 name.to_ascii_lowercase().as_str(),
                 "random" | "randomblob" | "last_insert_rowid" | "changes" | "total_changes"
-            ) {
-                found = true;
-            }
+            )
+        {
+            found = true;
         }
     });
     found
@@ -34146,10 +34037,11 @@ impl eval::Subqueries for Connection {
                     c.name.eq_ignore_ascii_case(name)
                         && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
                 });
-                if qualifies && !has_real {
-                    if let Some(r) = frame.rowid {
-                        return Some(Value::Integer(r));
-                    }
+                if qualifies
+                    && !has_real
+                    && let Some(r) = frame.rowid
+                {
+                    return Some(Value::Integer(r));
                 }
             }
             for (i, col) in frame.columns.iter().enumerate() {
@@ -34430,11 +34322,11 @@ fn cte_mask_from_seeds(seeds: &[alloc::string::String], ctes: &[Cte]) -> alloc::
     let mark =
         |refs: &[alloc::string::String], used: &mut [bool], stack: &mut alloc::vec::Vec<usize>| {
             for r in refs {
-                if let Some(i) = names.iter().position(|n| n == r) {
-                    if !used[i] {
-                        used[i] = true;
-                        stack.push(i);
-                    }
+                if let Some(i) = names.iter().position(|n| n == r)
+                    && !used[i]
+                {
+                    used[i] = true;
+                    stack.push(i);
                 }
             }
         };
@@ -34696,11 +34588,7 @@ pub(crate) fn cmp_order(
         }
         (false, false) => {
             let ord = crate::value::cmp_values_coll(a, b, coll);
-            if descending {
-                ord.reverse()
-            } else {
-                ord
-            }
+            if descending { ord.reverse() } else { ord }
         }
     }
 }
@@ -34881,10 +34769,10 @@ fn json_each_children(
 /// record — table row or covering-index record — is mapped onto declared columns.
 fn promote_real_columns(meta: &TableMeta, values: &mut [Value]) {
     for (i, col) in meta.columns.iter().enumerate() {
-        if col.affinity == eval::Affinity::Real {
-            if let Value::Integer(n) = values[i] {
-                values[i] = Value::Real(n as f64);
-            }
+        if col.affinity == eval::Affinity::Real
+            && let Value::Integer(n) = values[i]
+        {
+            values[i] = Value::Real(n as f64);
         }
     }
 }
@@ -34911,12 +34799,11 @@ fn real_intreal_i64(r: f64) -> Option<i64> {
 fn realify_columns_for_storage(meta: &TableMeta, values: &[Value]) -> Vec<Value> {
     let mut out = values.to_vec();
     for (i, col) in meta.columns.iter().enumerate() {
-        if col.affinity == eval::Affinity::Real {
-            if let Value::Real(r) = out[i] {
-                if let Some(ix) = real_intreal_i64(r) {
-                    out[i] = Value::Integer(ix);
-                }
-            }
+        if col.affinity == eval::Affinity::Real
+            && let Value::Real(r) = out[i]
+            && let Some(ix) = real_intreal_i64(r)
+        {
+            out[i] = Value::Integer(ix);
         }
     }
     out
@@ -34943,13 +34830,11 @@ fn split_json_path(
     let mut j = bytes.len();
     while j > 1 {
         j -= 1;
-        if bytes[j] == b'[' || bytes[j] == b'.' {
-            if let Some((node, voff, _)) = crate::exec::json::navigate_with_offset(root, &path[..j])
-            {
-                if voff as i64 + node.jsonb_header_bytes() as i64 == target_id {
-                    break;
-                }
-            }
+        if (bytes[j] == b'[' || bytes[j] == b'.')
+            && let Some((node, voff, _)) = crate::exec::json::navigate_with_offset(root, &path[..j])
+            && voff as i64 + node.jsonb_header_bytes() as i64 == target_id
+        {
+            break;
         }
     }
     if j >= bytes.len() {
@@ -35352,10 +35237,10 @@ fn window_aggregate(lname: &str, star: bool, frame: &[&Vec<Value>]) -> Result<Va
         if star {
             continue;
         }
-        if let Some(v) = row.first() {
-            if !matches!(v, Value::Null) {
-                vals.push(v.clone());
-            }
+        if let Some(v) = row.first()
+            && !matches!(v, Value::Null)
+        {
+            vals.push(v.clone());
         }
     }
     Ok(match lname {
@@ -35472,11 +35357,7 @@ fn pragma_atoi(s: &str) -> i64 {
             i += 1;
         }
     }
-    if neg {
-        v.wrapping_neg()
-    } else {
-        v
-    }
+    if neg { v.wrapping_neg() } else { v }
 }
 
 /// Interpret a header-cookie `PRAGMA` argument (`user_version`, `application_id`)
@@ -35769,10 +35650,9 @@ fn collect_vtab_constraints(
                     }
                 } else if let (Some(ci), Some(v)) =
                     (col_index(right, columns), const_value(left, params))
+                    && let Some(cop) = binop_to_constraint(flip_cmp(*op))
                 {
-                    if let Some(cop) = binop_to_constraint(flip_cmp(*op)) {
-                        push(ci, cop, v);
-                    }
+                    push(ci, cop, v);
                 }
             }
             Expr::Between {
@@ -35864,10 +35744,9 @@ fn collect_eq_constraints(
                 }
             } else if let (Some(ci), Some(v)) =
                 (col_index(right, columns), const_value(left, params))
+                && collation_ok(ci, left)
             {
-                if collation_ok(ci, left) {
-                    out.push((ci, v));
-                }
+                out.push((ci, v));
             }
         }
         // `col IS <non-null const>` selects exactly the rows `col = <const>` does (a
@@ -35886,10 +35765,9 @@ fn collect_eq_constraints(
                 }
             } else if let (Some(ci), Some(v)) =
                 (col_index(right, columns), const_value(left, params))
+                && !matches!(v, Value::Null)
             {
-                if !matches!(v, Value::Null) {
-                    out.push((ci, v));
-                }
+                out.push((ci, v));
             }
         }
         _ => {}
@@ -36063,14 +35941,13 @@ fn promote_comma_join_ons(sel: &Select, tables: &[(String, Vec<String>)]) -> Opt
     let mut changed = false;
     for (i, join) in from.joins.iter().enumerate() {
         let jlabel = label(&join.table);
-        if promotable(join) {
-            if let Some(cond) = conjuncts
+        if promotable(join)
+            && let Some(cond) = conjuncts
                 .iter()
                 .find_map(|c| eligible_join_equi(c, &jlabel, &available, tables))
-            {
-                new_joins[i].on = Some(cond);
-                changed = true;
-            }
+        {
+            new_joins[i].on = Some(cond);
+            changed = true;
         }
         available.push(jlabel);
     }
@@ -36776,11 +36653,11 @@ fn rowid_alias_range(e: &Expr, meta: &TableMeta, params: &Params) -> Option<Rang
                         apply_bound(out, *op, v);
                         *found = true;
                     }
-                } else if is_rowid(right, meta) {
-                    if let Some(v) = const_value(left, params) {
-                        apply_bound(out, flip_cmp(*op), v);
-                        *found = true;
-                    }
+                } else if is_rowid(right, meta)
+                    && let Some(v) = const_value(left, params)
+                {
+                    apply_bound(out, flip_cmp(*op), v);
+                    *found = true;
                 }
             }
             Expr::Between {
@@ -36846,10 +36723,9 @@ fn collect_range_constraints(
                 }
             } else if let (Some(ci), Some(v)) =
                 (col_index(right, columns), const_value(left, params))
+                && coll_ok(ci, left)
             {
-                if coll_ok(ci, left) {
-                    apply_bound(out.entry(ci).or_default(), flip_cmp(*op), v);
-                }
+                apply_bound(out.entry(ci).or_default(), flip_cmp(*op), v);
             }
         }
         Expr::Between {
@@ -36881,15 +36757,13 @@ fn collect_range_constraints(
         } => {
             if let (Some(ci), Some(Value::Text(pat))) =
                 (col_index(left, columns), const_value(right, params))
+                && columns[ci].collation == crate::value::Collation::Binary
+                && let Some((lo, hi)) = glob_prefix_range(&pat)
             {
-                if columns[ci].collation == crate::value::Collation::Binary {
-                    if let Some((lo, hi)) = glob_prefix_range(&pat) {
-                        let b = out.entry(ci).or_default();
-                        apply_bound(b, BinaryOp::GtEq, Value::Text(lo));
-                        if let Some(hi) = hi {
-                            apply_bound(b, BinaryOp::Lt, Value::Text(hi));
-                        }
-                    }
+                let b = out.entry(ci).or_default();
+                apply_bound(b, BinaryOp::GtEq, Value::Text(lo));
+                if let Some(hi) = hi {
+                    apply_bound(b, BinaryOp::Lt, Value::Text(hi));
                 }
             }
         }
@@ -37307,12 +37181,11 @@ fn redundant_nulls(term: &OrderTerm) -> bool {
 fn order_key_expr<'a>(columns: &'a [ResultColumn], e: &'a Expr) -> &'a Expr {
     // Positional ordinal → the n-th result column's expression.
     if let Some(n) = positional_int(e) {
-        if let Ok(i) = usize::try_from(n) {
-            if let Some(i) = i.checked_sub(1) {
-                if let Some(ResultColumn::Expr { expr, .. }) = columns.get(i) {
-                    return expr;
-                }
-            }
+        if let Ok(i) = usize::try_from(n)
+            && let Some(i) = i.checked_sub(1)
+            && let Some(ResultColumn::Expr { expr, .. }) = columns.get(i)
+        {
+            return expr;
         }
         return e;
     }
@@ -37325,13 +37198,11 @@ fn order_key_expr<'a>(columns: &'a [ResultColumn], e: &'a Expr) -> &'a Expr {
         column,
         ..
     } = e
-    {
-        if let Some(ResultColumn::Expr { expr, .. }) = columns.iter().find(|rc| {
+        && let Some(ResultColumn::Expr { expr, .. }) = columns.iter().find(|rc| {
             matches!(rc, ResultColumn::Expr { alias: Some(a), .. } if a.eq_ignore_ascii_case(column))
         }) {
             return expr;
         }
-    }
     e
 }
 
@@ -37424,23 +37295,23 @@ fn ordinal(n: usize) -> alloc::string::String {
 /// out-of-range term the `ORDER BY` one is reported.
 fn check_positional_terms(group_by: &[Expr], order_by: &[OrderTerm], ncols: usize) -> Result<()> {
     for (i, t) in order_by.iter().enumerate() {
-        if let Some(n) = positional_int(&t.expr) {
-            if n < 1 || (n as u64) > ncols as u64 {
-                return Err(Error::Error(alloc::format!(
-                    "{} ORDER BY term out of range - should be between 1 and {ncols}",
-                    ordinal(i + 1),
-                )));
-            }
+        if let Some(n) = positional_int(&t.expr)
+            && (n < 1 || (n as u64) > ncols as u64)
+        {
+            return Err(Error::Error(alloc::format!(
+                "{} ORDER BY term out of range - should be between 1 and {ncols}",
+                ordinal(i + 1),
+            )));
         }
     }
     for (i, g) in group_by.iter().enumerate() {
-        if let Some(n) = positional_int(g) {
-            if n < 1 || (n as u64) > ncols as u64 {
-                return Err(Error::Error(alloc::format!(
-                    "{} GROUP BY term out of range - should be between 1 and {ncols}",
-                    ordinal(i + 1),
-                )));
-            }
+        if let Some(n) = positional_int(g)
+            && (n < 1 || (n as u64) > ncols as u64)
+        {
+            return Err(Error::Error(alloc::format!(
+                "{} GROUP BY term out of range - should be between 1 and {ncols}",
+                ordinal(i + 1),
+            )));
         }
     }
     Ok(())
@@ -37661,11 +37532,7 @@ fn single_minmax_arg(sel: &Select) -> Option<(bool, Expr)> {
     for term in &sel.order_by {
         collect(&term.expr);
     }
-    if hits.len() == 1 {
-        hits.pop()
-    } else {
-        None
-    }
+    if hits.len() == 1 { hits.pop() } else { None }
 }
 
 /// Whether `expr` contains an aggregate-function call, using a caller-supplied
@@ -38585,14 +38452,12 @@ fn trigger_select_skip_eval(e: &Expr) -> bool {
             over,
             ..
         } = n
-        {
-            if name.eq_ignore_ascii_case("raise")
+            && (name.eq_ignore_ascii_case("raise")
                 || over.is_some()
                 || is_builtin_window_function(&name.to_ascii_lowercase())
-                || func::is_aggregate_call(name, args.len(), *star)
-            {
-                skip = true;
-            }
+                || func::is_aggregate_call(name, args.len(), *star))
+        {
+            skip = true;
         }
     });
     skip
@@ -38603,12 +38468,11 @@ fn qualify_trigger_missing_table(e: Error, schema: Option<&str>) -> Error {
     if sch.eq_ignore_ascii_case("temp") {
         return e;
     }
-    if let Error::Error(msg) = &e {
-        if let Some(name) = msg.strip_prefix("no such table: ") {
-            if !name.contains('.') {
-                return Error::Error(format!("no such table: {sch}.{name}"));
-            }
-        }
+    if let Error::Error(msg) = &e
+        && let Some(name) = msg.strip_prefix("no such table: ")
+        && !name.contains('.')
+    {
+        return Error::Error(format!("no such table: {sch}.{name}"));
     }
     e
 }
@@ -38886,10 +38750,10 @@ fn validate_view_select_only_table(
     // A result-column alias equal to `old` can't be told apart from a real
     // column reference by a token rewrite — bail (at every nesting level).
     for rc in &sel.columns {
-        if let ResultColumn::Expr { alias: Some(a), .. } = rc {
-            if a.eq_ignore_ascii_case(old) {
-                return false;
-            }
+        if let ResultColumn::Expr { alias: Some(a), .. } = rc
+            && a.eq_ignore_ascii_case(old)
+        {
+            return false;
         }
     }
     // Recurse into every nested expression subquery; each must, in turn,
@@ -39098,14 +38962,13 @@ fn view_multi_source_quals(
     // A subquery anywhere could reach another table (breaking the analysis); a
     // result alias equal to `old` would be wrongly renamed.
     for rc in &sel.columns {
-        if let ResultColumn::Expr { expr, alias, .. } = rc {
-            if expr_has_subquery(expr)
+        if let ResultColumn::Expr { expr, alias, .. } = rc
+            && (expr_has_subquery(expr)
                 || alias
                     .as_deref()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(old))
-            {
-                return None;
-            }
+                    .is_some_and(|a| a.eq_ignore_ascii_case(old)))
+        {
+            return None;
         }
     }
     for e in sel
@@ -39218,10 +39081,10 @@ fn collect_select_base_sources(
         }
     }
     for rc in &sel.columns {
-        if let ResultColumn::Expr { alias: Some(a), .. } = rc {
-            if a.eq_ignore_ascii_case(old) {
-                return false;
-            }
+        if let ResultColumn::Expr { alias: Some(a), .. } = rc
+            && a.eq_ignore_ascii_case(old)
+        {
+            return false;
         }
     }
     let mut subs: Vec<&Select> = Vec::new();
@@ -39249,12 +39112,11 @@ fn global_unique_plan(
     }
     let mut quals: Vec<String> = alloc::vec![table.to_string()];
     for (n, a) in srcs {
-        if n.eq_ignore_ascii_case(table) {
-            if let Some(a) = a {
-                if !quals.iter().any(|q| q.eq_ignore_ascii_case(a)) {
-                    quals.push(a.clone());
-                }
-            }
+        if n.eq_ignore_ascii_case(table)
+            && let Some(a) = a
+            && !quals.iter().any(|q| q.eq_ignore_ascii_case(a))
+        {
+            quals.push(a.clone());
         }
     }
     let has_old = |name: &str| -> Option<bool> {
@@ -39756,15 +39618,14 @@ fn select_single_source_ok(sel: &Select, table: &str) -> bool {
     if !sel.ctes.is_empty() || !sel.compound.is_empty() {
         return false;
     }
-    if let Some(from) = &sel.from {
-        if !from.joins.is_empty()
+    if let Some(from) = &sel.from
+        && (!from.joins.is_empty()
             || from.first.subquery.is_some()
             || from.first.tvf_args.is_some()
             || from.first.alias.is_some()
-            || !from.first.name.eq_ignore_ascii_case(table)
-        {
-            return false;
-        }
+            || !from.first.name.eq_ignore_ascii_case(table))
+    {
+        return false;
     }
     let mut ok = true;
     for rc in &sel.columns {
@@ -40066,7 +39927,7 @@ fn first_bound_column_ref(
                         _ if depth == 0
                             && (kw(&toks[k].token, "where") || kw(&toks[k].token, "from")) =>
                         {
-                            break
+                            break;
                         }
                         Token::Word(_) | Token::Ident(_)
                             if matches!(toks.get(k + 1).map(|t| &t.token), Some(Token::Eq)) =>
@@ -40754,18 +40615,15 @@ fn find_integer_primary_key(ct: &CreateTable) -> Option<usize> {
     }
     // Table-level single-column PRIMARY KEY over an INTEGER column.
     for tc in &ct.constraints {
-        if let TableConstraint::PrimaryKey(cols, _) = tc {
-            if cols.len() == 1 {
-                if let Some(i) = ct.columns.iter().position(|c| c.name == cols[0].0) {
-                    if ct.columns[i]
-                        .type_name
-                        .as_deref()
-                        .is_some_and(|t| t.eq_ignore_ascii_case("integer"))
-                    {
-                        return Some(i);
-                    }
-                }
-            }
+        if let TableConstraint::PrimaryKey(cols, _) = tc
+            && cols.len() == 1
+            && let Some(i) = ct.columns.iter().position(|c| c.name == cols[0].0)
+            && ct.columns[i]
+                .type_name
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("integer"))
+        {
+            return Some(i);
         }
     }
     None

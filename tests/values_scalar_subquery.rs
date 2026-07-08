@@ -35,11 +35,12 @@ fn values_as_scalar_subquery() {
         Value::Integer(1)
     );
     // A multi-column VALUES used as a scalar is the same error as a SELECT.
-    assert!(c
-        .query("SELECT (VALUES(1,2))")
-        .unwrap_err()
-        .to_string()
-        .contains("sub-select returns 2 columns"));
+    assert!(
+        c.query("SELECT (VALUES(1,2))")
+            .unwrap_err()
+            .to_string()
+            .contains("sub-select returns 2 columns")
+    );
 }
 
 #[test]

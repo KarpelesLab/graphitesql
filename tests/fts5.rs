@@ -163,9 +163,10 @@ fn explicit_duplicate_rowid_is_rejected() {
     c.execute("INSERT INTO t(rowid, x) VALUES (1, 'a')")
         .unwrap();
     // A plain INSERT with the same rowid fails and leaves the row untouched.
-    assert!(c
-        .execute("INSERT INTO t(rowid, x) VALUES (1, 'b')")
-        .is_err());
+    assert!(
+        c.execute("INSERT INTO t(rowid, x) VALUES (1, 'b')")
+            .is_err()
+    );
     assert_eq!(rows(&c, "SELECT x FROM t"), [vec![text("a")]]);
     // OR IGNORE skips the conflicting row.
     c.execute("INSERT OR IGNORE INTO t(rowid, x) VALUES (1, 'b')")
@@ -177,9 +178,10 @@ fn explicit_duplicate_rowid_is_rejected() {
     assert_eq!(rows(&c, "SELECT x FROM t"), [vec![text("b")]]);
     // A duplicate within a single multi-row INSERT also fails.
     c.execute("DELETE FROM t").unwrap();
-    assert!(c
-        .execute("INSERT INTO t(rowid, x) VALUES (1, 'a'), (1, 'b')")
-        .is_err());
+    assert!(
+        c.execute("INSERT INTO t(rowid, x) VALUES (1, 'a'), (1, 'b')")
+            .is_err()
+    );
 }
 
 #[test]

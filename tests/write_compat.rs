@@ -10,7 +10,7 @@
 use graphitesql::btree::{create_table_root, insert_table};
 use graphitesql::format::encode_record;
 use graphitesql::pager::WritePager;
-use graphitesql::vfs::{std_file::StdVfs, OpenFlags, Vfs};
+use graphitesql::vfs::{OpenFlags, Vfs, std_file::StdVfs};
 use graphitesql::{Connection, Value};
 use std::process::Command;
 

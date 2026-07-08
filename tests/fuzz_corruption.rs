@@ -18,7 +18,7 @@
 
 use graphitesql::Connection;
 use std::io::Write;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -110,11 +110,7 @@ fn open_no_panic(bytes: &[u8], tag: &str) -> bool {
 
 fn page_size_of(base: &[u8]) -> usize {
     let raw = u16::from_be_bytes([base[16], base[17]]) as usize;
-    if raw <= 1 {
-        65536
-    } else {
-        raw
-    }
+    if raw <= 1 { 65536 } else { raw }
 }
 
 #[test]

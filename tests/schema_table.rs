@@ -61,9 +61,10 @@ fn schema_columns_and_types() {
 fn schema_catalog_is_read_only() {
     let mut c = setup();
     assert!(c.execute("DELETE FROM sqlite_master").is_err());
-    assert!(c
-        .execute("INSERT INTO sqlite_schema VALUES('x','y','z',1,'w')")
-        .is_err());
+    assert!(
+        c.execute("INSERT INTO sqlite_schema VALUES('x','y','z',1,'w')")
+            .is_err()
+    );
     assert!(c.execute("UPDATE sqlite_master SET name='z'").is_err());
     // The catalog is intact after the rejected writes.
     let r = c.query("SELECT count(*) FROM sqlite_master").unwrap();

@@ -183,12 +183,14 @@ fn geopoly_overlap_selects_intersecting_rows() {
         [vec![Value::Text("A".into())], vec![Value::Text("B".into())]]
     );
     // A window far from every polygon returns nothing (pruned + re-checked).
-    assert!(rows(
-        &c,
-        "SELECT label FROM geo \
+    assert!(
+        rows(
+            &c,
+            "SELECT label FROM geo \
          WHERE geopoly_overlap(_shape,'[[500,500],[501,500],[501,501],[500,501],[500,500]]')"
-    )
-    .is_empty());
+        )
+        .is_empty()
+    );
 }
 
 #[test]
@@ -223,12 +225,14 @@ fn update_reindexes_shape_and_columns() {
         ]]
     );
     // The shrunk polygon no longer overlaps a window that only met the old box.
-    assert!(rows(
-        &c,
-        "SELECT label FROM geo \
+    assert!(
+        rows(
+            &c,
+            "SELECT label FROM geo \
          WHERE rowid=1 AND geopoly_overlap(_shape,'[[8,8],[9,8],[9,9],[8,9],[8,8]]')"
-    )
-    .is_empty());
+        )
+        .is_empty()
+    );
 }
 
 #[test]
@@ -265,11 +269,12 @@ fn explicit_and_implicit_rowids() {
         ]
     );
     // Reusing an existing rowid is a UNIQUE conflict.
-    assert!(c
-        .execute(&format!(
+    assert!(
+        c.execute(&format!(
             "INSERT INTO geo(rowid,_shape,l) VALUES(42,'{C}','z')"
         ))
-        .is_err());
+        .is_err()
+    );
 }
 
 #[test]
@@ -278,15 +283,18 @@ fn invalid_shape_is_rejected_or_stored_verbatim() {
     c.execute("CREATE VIRTUAL TABLE geo USING geopoly(l)")
         .unwrap();
     // A NULL / numeric / bracket-opened-but-malformed `_shape` is an error.
-    assert!(c
-        .execute("INSERT INTO geo(_shape,l) VALUES(NULL,'n')")
-        .is_err());
-    assert!(c
-        .execute("INSERT INTO geo(_shape,l) VALUES(3.14,'f')")
-        .is_err());
-    assert!(c
-        .execute("INSERT INTO geo(_shape,l) VALUES('[[0,0],[1',x'')")
-        .is_err());
+    assert!(
+        c.execute("INSERT INTO geo(_shape,l) VALUES(NULL,'n')")
+            .is_err()
+    );
+    assert!(
+        c.execute("INSERT INTO geo(_shape,l) VALUES(3.14,'f')")
+            .is_err()
+    );
+    assert!(
+        c.execute("INSERT INTO geo(_shape,l) VALUES('[[0,0],[1',x'')")
+            .is_err()
+    );
     // Text that never opens a ring is stored verbatim with a zero bbox.
     c.execute("INSERT INTO geo(_shape,l) VALUES('','e')")
         .unwrap();

@@ -83,16 +83,24 @@ fn trigger_system_table_parity() {
     same("CREATE TRIGGER IF NOT EXISTS tr AFTER INSERT ON sqlite_master BEGIN SELECT 1; END;");
 
     // A body qualifier does not pre-empt the system-table error.
-    same("CREATE TABLE u(b); CREATE TRIGGER tr AFTER INSERT ON sqlite_master BEGIN INSERT INTO main.u VALUES(1); END;");
+    same(
+        "CREATE TABLE u(b); CREATE TRIGGER tr AFTER INSERT ON sqlite_master BEGIN INSERT INTO main.u VALUES(1); END;",
+    );
 
     // A non-schema `sqlite_` table is a system table only when it exists.
-    same("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT); CREATE TRIGGER tr AFTER INSERT ON sqlite_sequence BEGIN SELECT 1; END;");
+    same(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT); CREATE TRIGGER tr AFTER INSERT ON sqlite_sequence BEGIN SELECT 1; END;",
+    );
     same("CREATE TRIGGER tr AFTER INSERT ON sqlite_sequence BEGIN SELECT 1; END;");
     same("CREATE TRIGGER tr AFTER INSERT ON sqlite_foo BEGIN SELECT 1; END;");
 
     // The duplicate-name error still outranks the system-table error.
-    same("CREATE TABLE x(a); CREATE TRIGGER tr AFTER INSERT ON x BEGIN SELECT 1; END; CREATE TRIGGER tr AFTER INSERT ON sqlite_master BEGIN SELECT 1; END;");
+    same(
+        "CREATE TABLE x(a); CREATE TRIGGER tr AFTER INSERT ON x BEGIN SELECT 1; END; CREATE TRIGGER tr AFTER INSERT ON sqlite_master BEGIN SELECT 1; END;",
+    );
 
     // Regression: a trigger on an ordinary table still builds and fires.
-    same("CREATE TABLE t(a, b); CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET b=1; END; INSERT INTO t(a) VALUES(7); SELECT b FROM t;");
+    same(
+        "CREATE TABLE t(a, b); CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET b=1; END; INSERT INTO t(a) VALUES(7); SELECT b FROM t;",
+    );
 }

@@ -175,8 +175,7 @@ fn covering_index_elides_node() {
     if !have_sqlite() {
         return;
     }
-    let di =
-        "CREATE TABLE t(a,b,c); CREATE INDEX ia ON t(a); INSERT INTO t VALUES(1,2,3),(1,5,6),(4,5,9);";
+    let di = "CREATE TABLE t(a,b,c); CREATE INDEX ia ON t(a); INSERT INTO t VALUES(1,2,3),(1,5,6),(4,5,9);";
     // a is covered/ordered by ia -> no node.
     let plan = g_eqp(di, "SELECT count(DISTINCT a) FROM t");
     assert!(
@@ -257,8 +256,7 @@ fn without_rowid_leading_pk_elides() {
     }
     let wor =
         "CREATE TABLE t(a,b,c,PRIMARY KEY(a)) WITHOUT ROWID; INSERT INTO t VALUES(1,2,3),(4,5,6);";
-    let wor2 =
-        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)) WITHOUT ROWID; INSERT INTO t VALUES(1,2,3),(4,5,6);";
+    let wor2 = "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)) WITHOUT ROWID; INSERT INTO t VALUES(1,2,3),(4,5,6);";
     let plan = g_eqp(wor, "SELECT count(DISTINCT a) FROM t");
     assert!(
         !plan.contains("TEMP B-TREE"),

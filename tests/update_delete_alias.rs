@@ -95,13 +95,21 @@ fn update_delete_alias_parity() {
     }
 
     // Alias as the qualifier in SET, WHERE, ORDER BY.
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=x.a*10 WHERE x.a=1; SELECT a,b FROM t ORDER BY a;");
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); DELETE FROM t AS x WHERE x.a=1; SELECT a,b FROM t ORDER BY a;");
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=x.a*10 WHERE x.a=1; SELECT a,b FROM t ORDER BY a;",
+    );
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); DELETE FROM t AS x WHERE x.a=1; SELECT a,b FROM t ORDER BY a;",
+    );
     // The `ORDER BY … LIMIT` on the UPDATE/DELETE itself needs the update/delete-
     // limit extension — only compared when the local sqlite3 has it (CI's does not).
     if sqlite3_has_update_delete_limit() {
-        same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=x.b+1 WHERE x.a>0 ORDER BY x.a LIMIT 1; SELECT a,b FROM t ORDER BY a;");
-        same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4),(5,6); DELETE FROM t AS x WHERE x.a>0 ORDER BY x.a DESC LIMIT 1; SELECT a,b FROM t ORDER BY a;");
+        same(
+            "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=x.b+1 WHERE x.a>0 ORDER BY x.a LIMIT 1; SELECT a,b FROM t ORDER BY a;",
+        );
+        same(
+            "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4),(5,6); DELETE FROM t AS x WHERE x.a>0 ORDER BY x.a DESC LIMIT 1; SELECT a,b FROM t ORDER BY a;",
+        );
     }
 
     // The real table name no longer resolves once an alias is given.
@@ -116,38 +124,64 @@ fn update_delete_alias_parity() {
     same("CREATE TABLE t(a,b); DELETE FROM t AS x WHERE x.nope=1;");
 
     // The `rowid` family resolves through the alias.
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET b=x.rowid WHERE x.a=1; SELECT a,b FROM t;");
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET b=x.rowid WHERE x.a=1; SELECT a,b FROM t;",
+    );
 
     // RETURNING quirk: it resolves against the real name, not the alias.
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET b=99 WHERE x.a=1 RETURNING t.a;");
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET b=99 WHERE x.a=1 RETURNING x.a;");
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); DELETE FROM t AS x WHERE x.a=1 RETURNING t.b;");
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET b=99 WHERE x.a=1 RETURNING t.a;",
+    );
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET b=99 WHERE x.a=1 RETURNING x.a;",
+    );
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); DELETE FROM t AS x WHERE x.a=1 RETURNING t.b;",
+    );
 
     // RETURNING forbids a `TABLE.*` wildcard (bare `*` is fine) for all three
     // statement kinds.
     same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2) RETURNING t.*;");
     same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2) RETURNING *;");
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET b=3 WHERE x.a=1 RETURNING x.*;");
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); DELETE FROM t AS x WHERE x.a=1 RETURNING t.*;");
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET b=3 WHERE x.a=1 RETURNING x.*;",
+    );
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); DELETE FROM t AS x WHERE x.a=1 RETURNING t.*;",
+    );
 
     // Correlated subquery in the SET/WHERE may reference the alias.
-    same("CREATE TABLE t(a,b); CREATE TABLE u(k,v); INSERT INTO t VALUES(1,0),(2,0); INSERT INTO u VALUES(1,11),(2,22); UPDATE t AS x SET b=(SELECT v FROM u WHERE u.k=x.a); SELECT a,b FROM t ORDER BY a;");
-    same("CREATE TABLE t(a,b); CREATE TABLE u(k); INSERT INTO t VALUES(1,2),(3,4); INSERT INTO u VALUES(1); DELETE FROM t AS x WHERE EXISTS(SELECT 1 FROM u WHERE u.k=x.a); SELECT a,b FROM t ORDER BY a;");
+    same(
+        "CREATE TABLE t(a,b); CREATE TABLE u(k,v); INSERT INTO t VALUES(1,0),(2,0); INSERT INTO u VALUES(1,11),(2,22); UPDATE t AS x SET b=(SELECT v FROM u WHERE u.k=x.a); SELECT a,b FROM t ORDER BY a;",
+    );
+    same(
+        "CREATE TABLE t(a,b); CREATE TABLE u(k); INSERT INTO t VALUES(1,2),(3,4); INSERT INTO u VALUES(1); DELETE FROM t AS x WHERE EXISTS(SELECT 1 FROM u WHERE u.k=x.a); SELECT a,b FROM t ORDER BY a;",
+    );
 
     // A subquery that re-binds the alias name shadows the target (left alone).
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=(SELECT max(b) FROM t AS x) WHERE x.a=1; SELECT a,b FROM t ORDER BY a;");
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=(SELECT max(b) FROM t AS x) WHERE x.a=1; SELECT a,b FROM t ORDER BY a;",
+    );
 
     // Row-value assignment from a subquery, qualified by the alias in WHERE.
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET (a,b)=(SELECT 9,8) WHERE x.a=1; SELECT a,b FROM t;");
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS x SET (a,b)=(SELECT 9,8) WHERE x.a=1; SELECT a,b FROM t;",
+    );
 
     // WITHOUT ROWID target.
-    same("CREATE TABLE t(a PRIMARY KEY,b) WITHOUT ROWID; INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=x.a*2 WHERE x.a=1; SELECT a,b FROM t ORDER BY a;");
+    same(
+        "CREATE TABLE t(a PRIMARY KEY,b) WITHOUT ROWID; INSERT INTO t VALUES(1,2),(3,4); UPDATE t AS x SET b=x.a*2 WHERE x.a=1; SELECT a,b FROM t ORDER BY a;",
+    );
 
     // Schema-qualified target with an alias.
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE main.t AS x SET b=x.a*3 WHERE x.a=1; SELECT a,b FROM t;");
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE main.t AS x SET b=x.a*3 WHERE x.a=1; SELECT a,b FROM t;",
+    );
 
     // An alias that collides with a column name still resolves correctly.
-    same("CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS b SET a=b.a+1 WHERE b.b=2; SELECT a,b FROM t;");
+    same(
+        "CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); UPDATE t AS b SET a=b.a+1 WHERE b.b=2; SELECT a,b FROM t;",
+    );
 
     // A bare (no `AS`) alias is a syntax error, same as SQLite.
     same("CREATE TABLE t(a,b); UPDATE t x SET b=1;");

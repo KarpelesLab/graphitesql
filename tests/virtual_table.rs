@@ -100,9 +100,10 @@ fn duplicate_and_if_not_exists() {
     conn.execute("CREATE VIRTUAL TABLE v USING series(1, 5)")
         .unwrap();
     // A bare re-create is an error.
-    assert!(conn
-        .execute("CREATE VIRTUAL TABLE v USING series(1, 9)")
-        .is_err());
+    assert!(
+        conn.execute("CREATE VIRTUAL TABLE v USING series(1, 9)")
+            .is_err()
+    );
     // IF NOT EXISTS makes it a silent no-op; the original definition stands.
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS v USING series(1, 9)")
         .unwrap();
@@ -125,9 +126,10 @@ fn unknown_module_is_rejected() {
 fn bad_arguments_fail_at_create() {
     let mut conn = Connection::open_memory().unwrap();
     // The series module validates its integer args at connect time.
-    assert!(conn
-        .execute("CREATE VIRTUAL TABLE v USING series(notanint)")
-        .is_err());
+    assert!(
+        conn.execute("CREATE VIRTUAL TABLE v USING series(notanint)")
+            .is_err()
+    );
     // And the table must not have been created.
     let names = rows(&conn, "SELECT name FROM sqlite_master WHERE name='v'");
     assert!(names.is_empty());

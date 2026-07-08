@@ -340,9 +340,10 @@ fn unknown_collation_rejected_at_create() {
         .unwrap_err();
     assert!(format!("{e}").contains("no such collation sequence"), "{e}");
     // Also inside an expression index and a later key position.
-    assert!(c
-        .execute("CREATE INDEX j ON t((a || b) COLLATE zzz)")
-        .is_err());
+    assert!(
+        c.execute("CREATE INDEX j ON t((a || b) COLLATE zzz)")
+            .is_err()
+    );
     assert!(c.execute("CREATE INDEX k ON t(a, b COLLATE qux)").is_err());
 
     // The built-in collations (case-insensitive) are accepted and usable.

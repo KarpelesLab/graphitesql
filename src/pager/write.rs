@@ -314,10 +314,10 @@ impl WritePager {
     /// `PRAGMA user_version=…`) is still flushed by `commit`, which otherwise
     /// short-circuits when no pages changed.
     pub fn header_mut(&mut self) -> &mut DatabaseHeader {
-        if !self.overlay.contains_key(&1) {
-            if let Ok(p) = self.read_page(1) {
-                self.overlay.insert(1, p);
-            }
+        if !self.overlay.contains_key(&1)
+            && let Ok(p) = self.read_page(1)
+        {
+            self.overlay.insert(1, p);
         }
         &mut self.header
     }
@@ -341,10 +341,10 @@ impl WritePager {
             return Ok(bytes.clone());
         }
         // In WAL mode, the newest version of a page may live in the WAL.
-        if let Some(w) = &self.wal {
-            if let Some(bytes) = w.frames.get(&number) {
-                return Ok(bytes.clone());
-            }
+        if let Some(w) = &self.wal
+            && let Some(bytes) = w.frames.get(&number)
+        {
+            return Ok(bytes.clone());
         }
         if number == 0 || number > self.disk_pages {
             return Err(Error::Corrupt(format!("page {number} out of range")));
@@ -352,10 +352,8 @@ impl WritePager {
         // Only trust the cache while we hold a write lock; otherwise a foreign
         // writer could have changed the file out from under it (see method docs).
         let cacheable = self.held >= crate::vfs::LockLevel::Reserved;
-        if cacheable {
-            if let Some(bytes) = self.read_cache.borrow_mut().get(number) {
-                return Ok(bytes.as_ref().clone());
-            }
+        if cacheable && let Some(bytes) = self.read_cache.borrow_mut().get(number) {
+            return Ok(bytes.as_ref().clone());
         }
         let mut buf = vec![0u8; self.page_size];
         self.file
@@ -873,18 +871,17 @@ impl WritePager {
                 let bt = BtreePage::parse(Page::from_bytes(holder, bytes.clone()))?;
                 let mut fixed = false;
                 for i in 0..bt.num_cells() {
-                    if let Some(off) = bt.cell_overflow_offset(i, usable as usize)? {
-                        if u32::from_be_bytes([
+                    if let Some(off) = bt.cell_overflow_offset(i, usable as usize)?
+                        && u32::from_be_bytes([
                             bytes[off],
                             bytes[off + 1],
                             bytes[off + 2],
                             bytes[off + 3],
                         ]) == old
-                        {
-                            bytes[off..off + 4].copy_from_slice(&new.to_be_bytes());
-                            fixed = true;
-                            break;
-                        }
+                    {
+                        bytes[off..off + 4].copy_from_slice(&new.to_be_bytes());
+                        fixed = true;
+                        break;
                     }
                 }
                 if !fixed {
@@ -914,10 +911,10 @@ impl WritePager {
         if self.overlay.contains_key(&n) {
             return true;
         }
-        if let Some(w) = &self.wal {
-            if w.frames.contains_key(&n) {
-                return true;
-            }
+        if let Some(w) = &self.wal
+            && w.frames.contains_key(&n)
+        {
+            return true;
         }
         n >= 1 && n <= self.disk_pages
     }
@@ -940,10 +937,10 @@ impl WritePager {
                             crate::btree::cursor::read_payload(self, bt.data(), &cell.payload)?;
                         let cols = crate::format::record::decode_record(&full, enc)?;
                         // sqlite_schema column 3 is `rootpage`.
-                        if let Some(crate::value::Value::Integer(r)) = cols.get(3) {
-                            if *r > 0 {
-                                out.push(*r as u32);
-                            }
+                        if let Some(crate::value::Value::Integer(r)) = cols.get(3)
+                            && *r > 0
+                        {
+                            out.push(*r as u32);
                         }
                     }
                 }
@@ -1728,7 +1725,7 @@ fn write_empty_leaf_header(page: &mut [u8], offset: usize, page_size: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::{memory::MemoryVfs, OpenFlags, Vfs};
+    use crate::vfs::{OpenFlags, Vfs, memory::MemoryVfs};
 
     fn mem_wp() -> WritePager {
         let vfs = MemoryVfs::new();

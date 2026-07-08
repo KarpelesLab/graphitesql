@@ -116,9 +116,10 @@ fn strict_enforced_on_update_and_combined_without_rowid() {
     assert!(c.execute("INSERT INTO u VALUES('x', 'b')").is_err());
     assert!(c.execute("UPDATE u SET v = 9 WHERE k = 1").is_ok()); // 9 -> text '9'
     let mut c = Connection::open_memory().unwrap();
-    assert!(c
-        .execute("CREATE TABLE w(k INTEGER PRIMARY KEY) WITHOUT ROWID, STRICT")
-        .is_ok());
+    assert!(
+        c.execute("CREATE TABLE w(k INTEGER PRIMARY KEY) WITHOUT ROWID, STRICT")
+            .is_ok()
+    );
 }
 
 #[test]

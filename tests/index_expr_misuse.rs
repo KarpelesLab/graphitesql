@@ -117,5 +117,7 @@ fn index_expr_misuse_parity() {
     same("CREATE TABLE t(a,b); CREATE INDEX i ON t(nope) WHERE random()>0;");
 
     // Regression: valid (non-aggregate) indexes still build.
-    same("CREATE TABLE t(a,b); CREATE INDEX i1 ON t(a) WHERE b>0; CREATE INDEX i2 ON t(abs(b)); CREATE INDEX i3 ON t(lower(a)) WHERE b IS NOT NULL; SELECT count(*) FROM sqlite_schema WHERE type='index';");
+    same(
+        "CREATE TABLE t(a,b); CREATE INDEX i1 ON t(a) WHERE b>0; CREATE INDEX i2 ON t(abs(b)); CREATE INDEX i3 ON t(lower(a)) WHERE b IS NOT NULL; SELECT count(*) FROM sqlite_schema WHERE type='index';",
+    );
 }

@@ -56,11 +56,7 @@ impl PageType {
     }
 
     fn header_len(self) -> usize {
-        if self.is_leaf() {
-            8
-        } else {
-            12
-        }
+        if self.is_leaf() { 8 } else { 12 }
     }
 }
 

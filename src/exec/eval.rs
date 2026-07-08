@@ -407,10 +407,8 @@ impl<'a> EvalCtx<'a> {
                 None => true,
                 Some(t) => self.columns.iter().any(|c| c.table.eq_ignore_ascii_case(t)),
             };
-            if qualifies {
-                if let Some(r) = self.rowid {
-                    return Ok(Value::Integer(r));
-                }
+            if qualifies && let Some(r) = self.rowid {
+                return Ok(Value::Integer(r));
             }
         }
         for (i, col) in self.columns.iter().enumerate() {
@@ -421,18 +419,19 @@ impl<'a> EvalCtx<'a> {
             }
         }
         // Fall back to an enclosing query's row (a correlated reference).
-        if let Some(s) = self.subqueries {
-            if let Some(v) = s.resolve_outer(table, name) {
-                return Ok(v);
-            }
+        if let Some(s) = self.subqueries
+            && let Some(v) = s.resolve_outer(table, name)
+        {
+            return Ok(v);
         }
         // The FTS5 `rank` hidden column: the current row's relevance score under
         // the table's configured (or default `bm25()`) ranking function, when a
         // `MATCH` query over an `fts5` table is in scope (else just an unknown name).
-        if table.is_none() && name.eq_ignore_ascii_case("rank") {
-            if let Some(score) = self.rowid.and_then(|r| self.subqueries?.fts5_rank(r)) {
-                return Ok(Value::Real(score?));
-            }
+        if table.is_none()
+            && name.eq_ignore_ascii_case("rank")
+            && let Some(score) = self.rowid.and_then(|r| self.subqueries?.fts5_rank(r))
+        {
+            return Ok(Value::Real(score?));
         }
         Err(no_such_column(schema, table, name, quoted))
     }
@@ -1620,11 +1619,7 @@ fn shift_right(a: i64, b: i64) -> i64 {
     } else if b < 0 {
         shift_left(a, -b)
     } else if b >= 64 {
-        if a < 0 {
-            -1
-        } else {
-            0
-        }
+        if a < 0 { -1 } else { 0 }
     } else {
         a >> b as u32
     }
@@ -2142,11 +2137,7 @@ pub fn format_real(r: f64) -> String {
         alloc::format!("0.{frac}")
     };
 
-    if neg {
-        alloc::format!("-{body}")
-    } else {
-        body
-    }
+    if neg { alloc::format!("-{body}") } else { body }
 }
 
 // ---- LIKE / GLOB ------------------------------------------------------------
@@ -2190,17 +2181,15 @@ fn like_rec(p: &[char], t: &[char], esc: Option<char>, cs: bool) -> bool {
     // matches only the empty remainder, exactly as SQLite does. This is why
     // `'ab' LIKE 'a_' ESCAPE '_'` is false (the `_` is the escape char, not a
     // single-character wildcard) while `'a' LIKE 'a_' ESCAPE '_'` is true.
-    if let Some(e) = esc {
-        if p[0] == e {
-            return match p.get(1) {
-                Some(&lit) => {
-                    !t.is_empty()
-                        && like_char_eq(lit, t[0], cs)
-                        && like_rec(&p[2..], &t[1..], esc, cs)
-                }
-                None => t.is_empty(),
-            };
-        }
+    if let Some(e) = esc
+        && p[0] == e
+    {
+        return match p.get(1) {
+            Some(&lit) => {
+                !t.is_empty() && like_char_eq(lit, t[0], cs) && like_rec(&p[2..], &t[1..], esc, cs)
+            }
+            None => t.is_empty(),
+        };
     }
     match p[0] {
         '%' => {
@@ -2322,7 +2311,7 @@ mod tests {
         assert!(glob_match("a*", "apple"));
         assert!(glob_match("a[pq]ple", "apple"));
         assert!(!glob_match("A*", "apple")); // case-sensitive
-                                             // A `]` as the first class member is literal, not the terminator.
+        // A `]` as the first class member is literal, not the terminator.
         assert!(glob_match("a[]]c", "a]c"));
         assert!(glob_match("[]]", "]"));
         assert!(glob_match("[^]]", "x"));

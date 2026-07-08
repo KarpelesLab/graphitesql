@@ -44,12 +44,14 @@ fn schema_matches_sqlite() {
         CREATE VIEW v1 AS SELECT id,a FROM t;\
         CREATE VIEW v2 AS SELECT a AS x, b+1 AS y, c FROM t;\
         CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;";
-    assert!(Command::new("sqlite3")
-        .arg(db)
-        .arg(schema_sql)
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        Command::new("sqlite3")
+            .arg(db)
+            .arg(schema_sql)
+            .status()
+            .unwrap()
+            .success()
+    );
     assert_eq!(schema("sqlite3", db), schema(g, db));
     let _ = std::fs::remove_file(db);
 }

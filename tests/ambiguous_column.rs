@@ -29,9 +29,10 @@ fn ambiguous_bare_reference_is_rejected() {
     // ...consumed only by GROUP BY (the VDBE grouped path must defer this too).
     assert!(c.query("SELECT a FROM x, y GROUP BY a").is_err());
     // ...consumed only by HAVING.
-    assert!(c
-        .query("SELECT b, c FROM x, y GROUP BY b, c HAVING a > 0")
-        .is_err());
+    assert!(
+        c.query("SELECT b, c FROM x, y GROUP BY b, c HAVING a > 0")
+            .is_err()
+    );
 }
 
 #[test]
@@ -91,9 +92,10 @@ fn shared_name_with_distinct_qualifiers_over_a_join_is_fine() {
         2
     );
     // Aliased self-join referenced by alias is fine.
-    assert!(c
-        .query("SELECT t1.id FROM a t1 JOIN a t2 ON t1.id = t2.id")
-        .is_ok());
+    assert!(
+        c.query("SELECT t1.id FROM a t1 JOIN a t2 ON t1.id = t2.id")
+            .is_ok()
+    );
 }
 
 #[test]
@@ -108,17 +110,20 @@ fn subquery_reference_to_ambiguous_outer_from_is_rejected() {
     c.execute("CREATE TABLE w(d, e)").unwrap();
     assert!(c.query("SELECT (SELECT a) FROM x, y").is_err());
     assert!(c.query("SELECT (SELECT a FROM w) FROM x, y").is_err());
-    assert!(c
-        .query("SELECT 1 FROM x, y WHERE EXISTS(SELECT 1 FROM w WHERE d = a)")
-        .is_err());
-    assert!(c
-        .query("SELECT 1 FROM x, y WHERE b IN (SELECT d FROM w WHERE e = a)")
-        .is_err());
+    assert!(
+        c.query("SELECT 1 FROM x, y WHERE EXISTS(SELECT 1 FROM w WHERE d = a)")
+            .is_err()
+    );
+    assert!(
+        c.query("SELECT 1 FROM x, y WHERE b IN (SELECT d FROM w WHERE e = a)")
+            .is_err()
+    );
     // The inner SELECT's own FROM is ambiguous, caught even though the empty
     // outer `w` means it would never execute.
-    assert!(c
-        .query("SELECT * FROM w WHERE d IN (SELECT a FROM x, y)")
-        .is_err());
+    assert!(
+        c.query("SELECT * FROM w WHERE d IN (SELECT a FROM x, y)")
+            .is_err()
+    );
 }
 
 #[test]
@@ -132,12 +137,14 @@ fn subquery_reference_that_binds_locally_or_uniquely_is_fine() {
     // A correlated reference to an outer column that is unique is fine.
     c.execute("CREATE TABLE emp(id, dept_id, sal)").unwrap();
     c.execute("CREATE TABLE dept(id, dname)").unwrap();
-    assert!(c
-        .query("SELECT (SELECT dname FROM dept WHERE id = e.dept_id) FROM emp e")
-        .is_ok());
-    assert!(c
-        .query(
+    assert!(
+        c.query("SELECT (SELECT dname FROM dept WHERE id = e.dept_id) FROM emp e")
+            .is_ok()
+    );
+    assert!(
+        c.query(
             "SELECT sal FROM emp e WHERE sal > (SELECT avg(sal) FROM emp WHERE dept_id = e.dept_id)"
         )
-        .is_ok());
+        .is_ok()
+    );
 }

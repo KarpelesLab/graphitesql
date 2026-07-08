@@ -8,11 +8,7 @@
 
 /// Absolute value.
 pub fn abs(x: f64) -> f64 {
-    if x < 0.0 {
-        -x
-    } else {
-        x
-    }
+    if x < 0.0 { -x } else { x }
 }
 
 /// Truncate toward zero.
@@ -30,11 +26,7 @@ pub fn trunc(x: f64) -> f64 {
 /// Largest integer `<= x`.
 pub fn floor(x: f64) -> f64 {
     let t = trunc(x);
-    if t > x {
-        t - 1.0
-    } else {
-        t
-    }
+    if t > x { t - 1.0 } else { t }
 }
 
 /// Round half away from zero (SQLite's `round()` rule).
@@ -75,11 +67,7 @@ pub fn fmod(x: f64, y: f64) -> f64 {
         }
         a -= scaled;
     }
-    if sign {
-        -a
-    } else {
-        a
-    }
+    if sign { -a } else { a }
 }
 
 /// Integer power `base^exp` for small non-negative `exp` (used by `round(x, n)`).
@@ -258,7 +246,7 @@ pub fn exp(x: f64) -> f64 {
     }
     let k = round(x * INV_LN2);
     let r = (x - k * LN2_HI) - k * LN2_LO; // |r| <= ln2/2 ≈ 0.347
-                                           // Taylor for exp(r) - 1: sum_{n>=1} r^n / n!
+    // Taylor for exp(r) - 1: sum_{n>=1} r^n / n!
     let mut term = r;
     let mut sum = r;
     for n in 2..18 {

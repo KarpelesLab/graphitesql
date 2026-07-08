@@ -76,12 +76,14 @@ fn dump_matches_sqlite() {
         let db = dir.join(format!("gsql_dump_{uniq}_{name}.db"));
         let db = db.to_str().unwrap();
         let _ = std::fs::remove_file(db);
-        assert!(Command::new("sqlite3")
-            .arg(db)
-            .arg(schema)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("sqlite3")
+                .arg(db)
+                .arg(schema)
+                .status()
+                .unwrap()
+                .success()
+        );
         assert_eq!(
             dump("sqlite3", db),
             dump(g, db),

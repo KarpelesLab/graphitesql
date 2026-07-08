@@ -45,29 +45,33 @@ fn unknown_do_update_column_is_rejected() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a PRIMARY KEY, b)").unwrap();
     // Unknown assigned (target) column.
-    assert!(c
-        .execute("INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET z=1")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: z"));
+    assert!(
+        c.execute("INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET z=1")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: z")
+    );
     // Unknown column in an assignment value.
-    assert!(c
-        .execute("INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=zz")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: zz"));
+    assert!(
+        c.execute("INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=zz")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: zz")
+    );
     // Unknown column behind the `excluded.` qualifier, reported qualified.
-    assert!(c
-        .execute("INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=excluded.nope")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: excluded.nope"));
+    assert!(
+        c.execute("INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=excluded.nope")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: excluded.nope")
+    );
     // Unknown column in the update `WHERE`.
-    assert!(c
-        .execute("INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=1 WHERE qq>0")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: qq"));
+    assert!(
+        c.execute("INSERT INTO t VALUES(1,2) ON CONFLICT(a) DO UPDATE SET b=1 WHERE qq>0")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: qq")
+    );
 }
 
 #[test]
@@ -121,11 +125,12 @@ fn three_part_qualifier_on_a_temp_upsert_target_uses_temp() {
     c.execute("INSERT INTO t VALUES(1,2)").unwrap();
     c.execute("INSERT INTO t VALUES(1,5) ON CONFLICT(a) DO UPDATE SET b=temp.t.b")
         .unwrap();
-    assert!(c
-        .execute("INSERT INTO t VALUES(1,5) ON CONFLICT(a) DO UPDATE SET b=main.t.b")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: main.t.b"));
+    assert!(
+        c.execute("INSERT INTO t VALUES(1,5) ON CONFLICT(a) DO UPDATE SET b=main.t.b")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: main.t.b")
+    );
 }
 
 #[test]

@@ -321,9 +321,9 @@ impl<'a> Tokenizer<'a> {
 
     fn quoted_ident(&mut self, quote: u8) -> Result<Token> {
         self.pos += 1; // opening quote
-                       // Accumulate by slicing the (UTF-8) source between escapes; the only
-                       // split points are the ASCII quote bytes, which are never inside a
-                       // multi-byte code point, so every slice is a valid `&str`.
+        // Accumulate by slicing the (UTF-8) source between escapes; the only
+        // split points are the ASCII quote bytes, which are never inside a
+        // multi-byte code point, so every slice is a valid `&str`.
         let mut s = String::new();
         let mut seg = self.pos;
         loop {

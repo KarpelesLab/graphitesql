@@ -1218,11 +1218,7 @@ fn day_of_year(p: &DateTime) -> i64 {
 /// ISO weekday of `p`: Monday = 1 … Sunday = 7.
 fn iso_weekday(p: &DateTime) -> i32 {
     let wd = ((p.ijd + 129_600_000) / 86_400_000 % 7) as i32; // 0 = Sunday
-    if wd == 0 {
-        7
-    } else {
-        wd
-    }
+    if wd == 0 { 7 } else { wd }
 }
 
 /// ISO 8601 week-date `(year, week)` for `p`. Week 1 is the week (Mon–Sun)
@@ -1559,10 +1555,12 @@ pub fn printf(args: &[Value]) -> Value {
                     let mut s = fmt_exp(f, prec.unwrap_or(6), conv == 'E', false);
                     // The `#` alt flag forces a decimal point even at precision 0
                     // (`%#.0e` of 42 is "4.e+01"); `fmt_exp` omits it there.
-                    if alt && prec == Some(0) && !s.contains('.') {
-                        if let Some(epos) = s.find(['e', 'E']) {
-                            s.insert(epos, '.');
-                        }
+                    if alt
+                        && prec == Some(0)
+                        && !s.contains('.')
+                        && let Some(epos) = s.find(['e', 'E'])
+                    {
+                        s.insert(epos, '.');
                     }
                     with_sign(s, plus, space)
                 }

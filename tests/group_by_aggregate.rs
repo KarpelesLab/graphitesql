@@ -47,9 +47,10 @@ fn aggregate_in_group_by_is_rejected() {
 
     // Aggregates stay legal in HAVING and ORDER BY, and a plain / positional
     // GROUP BY is unaffected.
-    assert!(c
-        .query("SELECT a, sum(b) FROM t GROUP BY a HAVING sum(b) > 4 ORDER BY sum(b) DESC")
-        .is_ok());
+    assert!(
+        c.query("SELECT a, sum(b) FROM t GROUP BY a HAVING sum(b) > 4 ORDER BY sum(b) DESC")
+            .is_ok()
+    );
     assert!(c.query("SELECT a FROM t GROUP BY a").is_ok());
     assert!(c.query("SELECT a, count(*) FROM t GROUP BY 1").is_ok());
 }

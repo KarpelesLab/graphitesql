@@ -233,13 +233,15 @@ fn unique_constraint_on_wr() {
         "sqlite_autoindex_t_2"
     );
     // sqlite enforces the UNIQUE via the index we wrote.
-    assert!(!Command::new("sqlite3")
-        .arg(&path)
-        .arg("INSERT INTO t VALUES ('z','a@x',9);")
-        .output()
-        .unwrap()
-        .status
-        .success());
+    assert!(
+        !Command::new("sqlite3")
+            .arg(&path)
+            .arg("INSERT INTO t VALUES ('z','a@x',9);")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
     cleanup(&path);
 }
 

@@ -123,8 +123,7 @@ fn storage_affinity_matches_sqlite3() {
     let path = std::env::temp_dir().join(format!("gsql-storeaff-{}.db", std::process::id()));
     let path = path.to_string_lossy().into_owned();
     let _ = std::fs::remove_file(&path);
-    let setup =
-        "CREATE TABLE x(id INTEGER PRIMARY KEY, i INTEGER, r REAL, n NUMERIC, t TEXT, b BLOB);\
+    let setup = "CREATE TABLE x(id INTEGER PRIMARY KEY, i INTEGER, r REAL, n NUMERIC, t TEXT, b BLOB);\
         INSERT INTO x(i,r,n,t,b) VALUES ('123','4.5','6',7,8.5);\
         INSERT INTO x(i,r,n,t,b) VALUES (9.0,9,'10.0',11.5,'12');\
         INSERT INTO x(i,r,n,t,b) VALUES ('x','y','3.14','z','w');\

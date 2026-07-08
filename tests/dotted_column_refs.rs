@@ -20,31 +20,35 @@ fn sqlite3_available() -> bool {
 #[test]
 fn generated_column_rejects_dotted_self_reference() {
     let mut c = Connection::open_memory().unwrap();
-    assert!(c
-        .execute("CREATE TABLE t(a, b AS (t.a))")
-        .unwrap_err()
-        .to_string()
-        .contains("the \".\" operator prohibited in generated columns"));
+    assert!(
+        c.execute("CREATE TABLE t(a, b AS (t.a))")
+            .unwrap_err()
+            .to_string()
+            .contains("the \".\" operator prohibited in generated columns")
+    );
     // Nested inside a function call still counts as a resolved dotted reference.
     let mut c = Connection::open_memory().unwrap();
-    assert!(c
-        .execute("CREATE TABLE t(a, b AS (abs(t.a)))")
-        .unwrap_err()
-        .to_string()
-        .contains("the \".\" operator prohibited in generated columns"));
+    assert!(
+        c.execute("CREATE TABLE t(a, b AS (abs(t.a)))")
+            .unwrap_err()
+            .to_string()
+            .contains("the \".\" operator prohibited in generated columns")
+    );
     // A wrong qualifier / unknown column is a "no such column", reported qualified.
     let mut c = Connection::open_memory().unwrap();
-    assert!(c
-        .execute("CREATE TABLE t(a, b AS (other.a))")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: other.a"));
+    assert!(
+        c.execute("CREATE TABLE t(a, b AS (other.a))")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: other.a")
+    );
     let mut c = Connection::open_memory().unwrap();
-    assert!(c
-        .execute("CREATE TABLE t(a, b AS (t.nope))")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: t.nope"));
+    assert!(
+        c.execute("CREATE TABLE t(a, b AS (t.nope))")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: t.nope")
+    );
     // A bare resolved reference is fine.
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a, b AS (a + 1))").unwrap();
@@ -57,38 +61,43 @@ fn check_accepts_dotted_self_reference() {
     c.execute("CREATE TABLE t(a, b, CHECK(t.a > 0))").unwrap();
     // But a foreign qualifier is still an unknown column.
     let mut c = Connection::open_memory().unwrap();
-    assert!(c
-        .execute("CREATE TABLE t(a, CHECK(other.a > 0))")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: other.a"));
+    assert!(
+        c.execute("CREATE TABLE t(a, CHECK(other.a > 0))")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: other.a")
+    );
 }
 
 #[test]
 fn index_key_rejects_dotted_self_reference() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a, b)").unwrap();
-    assert!(c
-        .execute("CREATE INDEX i ON t(t.a)")
-        .unwrap_err()
-        .to_string()
-        .contains("the \".\" operator prohibited in index expressions"));
-    assert!(c
-        .execute("CREATE INDEX i ON t(abs(t.a))")
-        .unwrap_err()
-        .to_string()
-        .contains("the \".\" operator prohibited in index expressions"));
+    assert!(
+        c.execute("CREATE INDEX i ON t(t.a)")
+            .unwrap_err()
+            .to_string()
+            .contains("the \".\" operator prohibited in index expressions")
+    );
+    assert!(
+        c.execute("CREATE INDEX i ON t(abs(t.a))")
+            .unwrap_err()
+            .to_string()
+            .contains("the \".\" operator prohibited in index expressions")
+    );
     // Foreign / unknown qualifier → no such column (qualified).
-    assert!(c
-        .execute("CREATE INDEX i ON t(other.a)")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: other.a"));
-    assert!(c
-        .execute("CREATE INDEX i ON t(t.nope)")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: t.nope"));
+    assert!(
+        c.execute("CREATE INDEX i ON t(other.a)")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: other.a")
+    );
+    assert!(
+        c.execute("CREATE INDEX i ON t(t.nope)")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: t.nope")
+    );
     // A legitimate expression index still builds.
     c.execute("CREATE INDEX ok ON t(abs(a), b)").unwrap();
 }
@@ -99,16 +108,18 @@ fn partial_where_accepts_dotted_self_reference() {
     c.execute("CREATE TABLE t(a, b)").unwrap();
     // The predicate tolerates the dotted form, like a CHECK.
     c.execute("CREATE INDEX i ON t(a) WHERE t.b > 0").unwrap();
-    assert!(c
-        .execute("CREATE INDEX j ON t(a) WHERE other.b > 0")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: other.b"));
-    assert!(c
-        .execute("CREATE INDEX k ON t(a) WHERE t.nope > 0")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: t.nope"));
+    assert!(
+        c.execute("CREATE INDEX j ON t(a) WHERE other.b > 0")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: other.b")
+    );
+    assert!(
+        c.execute("CREATE INDEX k ON t(a) WHERE t.nope > 0")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: t.nope")
+    );
 }
 
 #[test]

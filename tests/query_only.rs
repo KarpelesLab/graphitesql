@@ -126,10 +126,10 @@ fn matches_sqlite_cli() {
                         return r.to_string();
                     }
                 }
-                if let Some(rest) = line.strip_prefix("Runtime error near line ") {
-                    if let Some(idx) = rest.find(": ") {
-                        return rest[idx + 2..].to_string();
-                    }
+                if let Some(rest) = line.strip_prefix("Runtime error near line ")
+                    && let Some(idx) = rest.find(": ")
+                {
+                    return rest[idx + 2..].to_string();
                 }
                 line.to_string()
             })

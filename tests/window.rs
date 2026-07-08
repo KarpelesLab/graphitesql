@@ -312,13 +312,16 @@ fn ntile_and_nth_value_require_positive_integer_arg() {
     );
     // Valid: ntile truncates a real, nth_value accepts an integral real / text.
     assert!(c.query("SELECT ntile(2) OVER (ORDER BY x) FROM t").is_ok());
-    assert!(c
-        .query("SELECT ntile(2.9) OVER (ORDER BY x) FROM t")
-        .is_ok());
-    assert!(c
-        .query("SELECT nth_value(x, 2.0) OVER (ORDER BY x) FROM t")
-        .is_ok());
-    assert!(c
-        .query("SELECT nth_value(x, '2') OVER (ORDER BY x) FROM t")
-        .is_ok());
+    assert!(
+        c.query("SELECT ntile(2.9) OVER (ORDER BY x) FROM t")
+            .is_ok()
+    );
+    assert!(
+        c.query("SELECT nth_value(x, 2.0) OVER (ORDER BY x) FROM t")
+            .is_ok()
+    );
+    assert!(
+        c.query("SELECT nth_value(x, '2') OVER (ORDER BY x) FROM t")
+            .is_ok()
+    );
 }

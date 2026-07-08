@@ -28,23 +28,26 @@ fn conn() -> Connection {
 fn explicit_qualifier_is_echoed_in_the_message() {
     let c = conn();
     // Bare reference → bare name.
-    assert!(c
-        .query("SELECT a FROM t, t")
-        .unwrap_err()
-        .to_string()
-        .contains("ambiguous column name: a"));
+    assert!(
+        c.query("SELECT a FROM t, t")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous column name: a")
+    );
     // `table.column` reference → `t.a`.
-    assert!(c
-        .query("SELECT t.a FROM t, t")
-        .unwrap_err()
-        .to_string()
-        .contains("ambiguous column name: t.a"));
+    assert!(
+        c.query("SELECT t.a FROM t, t")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous column name: t.a")
+    );
     // `schema.table.column` reference → `main.t.a`.
-    assert!(c
-        .query("SELECT main.t.a FROM t, t")
-        .unwrap_err()
-        .to_string()
-        .contains("ambiguous column name: main.t.a"));
+    assert!(
+        c.query("SELECT main.t.a FROM t, t")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous column name: main.t.a")
+    );
 }
 
 #[test]

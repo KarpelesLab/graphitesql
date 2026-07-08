@@ -64,9 +64,10 @@ fn default_and_or_abort_still_error_on_conflict() {
     let mut c = setup();
     assert!(c.execute("UPDATE t SET u=20 WHERE a=1").is_err());
     assert!(c.execute("UPDATE OR ABORT t SET u=20 WHERE a=1").is_err());
-    assert!(c
-        .execute("UPDATE OR ROLLBACK t SET u=20 WHERE a=1")
-        .is_err());
+    assert!(
+        c.execute("UPDATE OR ROLLBACK t SET u=20 WHERE a=1")
+            .is_err()
+    );
     // Nothing changed.
     assert_eq!(pairs(&c), [(1, 10), (2, 20), (3, 30)]);
 }

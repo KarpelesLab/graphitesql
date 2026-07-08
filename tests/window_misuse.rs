@@ -54,13 +54,15 @@ fn window_aggregate_in_where_or_having_is_misuse() {
     }
 
     // Valid window usage in the SELECT list and ORDER BY still works.
-    assert!(c
-        .query("SELECT a, sum(b) OVER () FROM t ORDER BY a")
-        .is_ok());
+    assert!(
+        c.query("SELECT a, sum(b) OVER () FROM t ORDER BY a")
+            .is_ok()
+    );
     assert!(c.query("SELECT a FROM t ORDER BY sum(b) OVER ()").is_ok());
-    assert!(c
-        .query("SELECT avg(a) OVER (PARTITION BY b) FROM t")
-        .is_ok());
+    assert!(
+        c.query("SELECT avg(a) OVER (PARTITION BY b) FROM t")
+            .is_ok()
+    );
 }
 
 /// Run a statement through the method that accepts it (`query` for `SELECT`,

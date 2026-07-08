@@ -216,10 +216,10 @@ impl Shell {
                     // `memory` for an in-memory database that cannot change it).
                     // The side effect ran through execute(); read the mode back via
                     // the getter and print it, matching SQLite's output.
-                    if let Some(getter) = pragma_setter_result_query(sql) {
-                        if let Ok(result) = conn.query(&getter) {
-                            self.print_result(&result);
-                        }
+                    if let Some(getter) = pragma_setter_result_query(sql)
+                        && let Ok(result) = conn.query(&getter)
+                    {
+                        self.print_result(&result);
                     }
                 }
                 Err(graphitesql::Error::Unsupported(m)) if m.contains("use query()") => {
@@ -317,20 +317,20 @@ impl Shell {
             ".schema" => {
                 use graphitesql::schema::ObjectType;
                 for obj in conn.schema().objects() {
-                    if arg.is_none_or(|name| name == obj.name) {
-                        if let Some(sql) = &obj.sql {
-                            let base = schema_create_line(sql);
-                            // SQLite's `.schema` annotates a view with its output
-                            // column names on a trailing comment line.
-                            if obj.obj_type == ObjectType::View {
-                                println!(
-                                    "{base}\n/* {}({}) */;",
-                                    obj.name,
-                                    view_columns(conn, &obj.name)
-                                );
-                            } else {
-                                println!("{base};");
-                            }
+                    if arg.is_none_or(|name| name == obj.name)
+                        && let Some(sql) = &obj.sql
+                    {
+                        let base = schema_create_line(sql);
+                        // SQLite's `.schema` annotates a view with its output
+                        // column names on a trailing comment line.
+                        if obj.obj_type == ObjectType::View {
+                            println!(
+                                "{base}\n/* {}({}) */;",
+                                obj.name,
+                                view_columns(conn, &obj.name)
+                            );
+                        } else {
+                            println!("{base};");
                         }
                     }
                 }
@@ -463,19 +463,19 @@ fn dump_database(conn: &Connection) {
     // AUTOINCREMENT tables keep a high-water mark in `sqlite_sequence`; SQLite
     // dumps that table's rows (right after the user tables) so the sequence is
     // restored on reload. There is no CREATE — it is auto-created on demand.
-    if conn.schema().table("sqlite_sequence").is_some() {
-        if let Ok(result) = conn.query("SELECT name, seq FROM sqlite_sequence") {
-            for row in &result.rows {
-                let mut line = String::from("INSERT INTO sqlite_sequence VALUES(");
-                for (i, v) in row.iter().enumerate() {
-                    if i > 0 {
-                        line.push(',');
-                    }
-                    dump_value_into(v, &mut line);
+    if conn.schema().table("sqlite_sequence").is_some()
+        && let Ok(result) = conn.query("SELECT name, seq FROM sqlite_sequence")
+    {
+        for row in &result.rows {
+            let mut line = String::from("INSERT INTO sqlite_sequence VALUES(");
+            for (i, v) in row.iter().enumerate() {
+                if i > 0 {
+                    line.push(',');
                 }
-                line.push_str(");");
-                println!("{line}");
+                dump_value_into(v, &mut line);
             }
+            line.push_str(");");
+            println!("{line}");
         }
     }
     // Pass 2: indexes, triggers, and views, after all table data. SQLite emits

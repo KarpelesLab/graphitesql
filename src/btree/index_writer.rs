@@ -15,15 +15,15 @@
 //! `DELETE`/`UPDATE` rebuilds the affected index ([`free_tree`] + repopulate),
 //! which is simple and keeps `integrity_check` happy at some cost in work.
 
-use super::page::{payload_split, BtreePage, PageType};
+use super::page::{BtreePage, PageType, payload_split};
 use super::writer::{page_one_prefix, write_overflow_chain};
 use crate::btree::cursor::read_payload;
 use crate::error::{Error, Result};
-use crate::format::record::decode_record;
 use crate::format::TextEncoding;
+use crate::format::record::decode_record;
 use crate::pager::{PageSource, WritePager};
 use crate::util::varint;
-use crate::value::{cmp_values_coll, Collation, Value};
+use crate::value::{Collation, Value, cmp_values_coll};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;

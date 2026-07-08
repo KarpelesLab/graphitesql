@@ -8,7 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::sql::ast::*;
-use crate::sql::token::{tokenize, Spanned, Token};
+use crate::sql::token::{Spanned, Token, tokenize};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -656,23 +656,23 @@ impl Parser {
         // clause — `ORDER BY` taking precedence over `LIMIT` — and the operator it
         // should have come after. graphite otherwise left the operator unconsumed
         // and reported a bare `near "UNION": syntax error`.
-        if !outer.order_by.is_empty() || outer.limit.is_some() {
-            if let Some(op) = self.compound_op() {
-                let clause = if outer.order_by.is_empty() {
-                    "LIMIT"
-                } else {
-                    "ORDER BY"
-                };
-                let op = match op {
-                    CompoundOp::Union => "UNION",
-                    CompoundOp::UnionAll => "UNION ALL",
-                    CompoundOp::Intersect => "INTERSECT",
-                    CompoundOp::Except => "EXCEPT",
-                };
-                return Err(Error::Parse(alloc::format!(
-                    "{clause} clause should come after {op} not before"
-                )));
-            }
+        if (!outer.order_by.is_empty() || outer.limit.is_some())
+            && let Some(op) = self.compound_op()
+        {
+            let clause = if outer.order_by.is_empty() {
+                "LIMIT"
+            } else {
+                "ORDER BY"
+            };
+            let op = match op {
+                CompoundOp::Union => "UNION",
+                CompoundOp::UnionAll => "UNION ALL",
+                CompoundOp::Intersect => "INTERSECT",
+                CompoundOp::Except => "EXCEPT",
+            };
+            return Err(Error::Parse(alloc::format!(
+                "{clause} clause should come after {op} not before"
+            )));
         }
         Ok(outer)
     }
@@ -919,10 +919,11 @@ impl Parser {
         // and we fall through to parse the expression normally.
         if let Some(Token::Word(_)) | Some(Token::Ident(_)) = self.peek() {
             let save = self.pos;
-            if let Ok(name) = self.ident() {
-                if self.eat(&Token::Dot) && self.eat(&Token::Star) {
-                    return Ok(ResultColumn::TableWildcard(name));
-                }
+            if let Ok(name) = self.ident()
+                && self.eat(&Token::Dot)
+                && self.eat(&Token::Star)
+            {
+                return Ok(ResultColumn::TableWildcard(name));
             }
             self.pos = save; // not a table.* ; reparse as expression
         }
@@ -950,10 +951,10 @@ impl Parser {
     fn opt_alias(&mut self) -> Result<Option<String>> {
         if self.eat_kw("as") {
             // After AS the alias may be an identifier or a string literal.
-            if let Some(Token::Str(_)) = self.peek() {
-                if let Some(Token::Str(s)) = self.advance() {
-                    return Ok(Some(s));
-                }
+            if let Some(Token::Str(_)) = self.peek()
+                && let Some(Token::Str(s)) = self.advance()
+            {
+                return Ok(Some(s));
             }
             return Ok(Some(self.ident()?));
         }
@@ -3454,18 +3455,20 @@ mod tests {
 
     #[test]
     fn create_table_and_index() {
-        let Statement::CreateTable(ct) =
-            one("CREATE TABLE IF NOT EXISTS t(a INTEGER PRIMARY KEY, b TEXT NOT NULL, c REAL DEFAULT 0)")
-        else {
+        let Statement::CreateTable(ct) = one(
+            "CREATE TABLE IF NOT EXISTS t(a INTEGER PRIMARY KEY, b TEXT NOT NULL, c REAL DEFAULT 0)",
+        ) else {
             panic!()
         };
         assert!(ct.if_not_exists);
         assert_eq!(ct.columns.len(), 3);
         assert_eq!(ct.columns[0].type_name.as_deref(), Some("INTEGER"));
-        assert!(ct.columns[0]
-            .constraints
-            .iter()
-            .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. })));
+        assert!(
+            ct.columns[0]
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
+        );
 
         let Statement::CreateIndex(ci) = one("CREATE UNIQUE INDEX idx ON t(b, c DESC)") else {
             panic!()
@@ -3500,10 +3503,12 @@ mod tests {
         };
         assert_eq!(ct.columns.len(), 4); // id, pid, qty, name
         assert_eq!(ct.columns[0].name, "id");
-        assert!(ct.columns[2]
-            .constraints
-            .iter()
-            .any(|c| matches!(c, ColumnConstraint::NotNull(_))));
+        assert!(
+            ct.columns[2]
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::NotNull(_)))
+        );
         // The column-level REFERENCES on `pid` is captured with its action.
         let pid_fk = ct.columns[1]
             .constraints
@@ -3517,14 +3522,16 @@ mod tests {
         assert_eq!(pid_fk.on_delete, FkAction::Cascade);
         // Table constraints: the UNIQUE and the table-level FOREIGN KEY.
         assert_eq!(ct.constraints.len(), 2);
-        assert!(ct
-            .constraints
-            .iter()
-            .any(|c| matches!(c, TableConstraint::Unique(..))));
-        assert!(ct
-            .constraints
-            .iter()
-            .any(|c| matches!(c, TableConstraint::ForeignKey(_))));
+        assert!(
+            ct.constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::Unique(..)))
+        );
+        assert!(
+            ct.constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::ForeignKey(_)))
+        );
     }
 
     #[test]

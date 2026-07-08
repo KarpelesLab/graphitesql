@@ -425,9 +425,9 @@ impl SegWriter {
     fn add_term(&mut self, term: &str, postings: &[Posting]) {
         let key = term_key(term);
         let doclist = encode_doclist(postings); // whole doclist (deltas from rowid 0)
-                                                // FTS5 decides per whole term UNIT (record + its full doclist): if it does
-                                                // not fit the current leaf, flush; then if it still does not fit an (now
-                                                // fresh) leaf, the doclist is streamed across leaves.
+        // FTS5 decides per whole term UNIT (record + its full doclist): if it does
+        // not fit the current leaf, flush; then if it still does not fit an (now
+        // fresh) leaf, the doclist is streamed across leaves.
         let rec = self.term_record(&key);
         if !self.body.is_empty()
             && 4 + self.body.len() + rec.len() + doclist.len() + self.pgidx_with() >= self.pgsz

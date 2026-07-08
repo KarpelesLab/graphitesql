@@ -44,12 +44,11 @@ fn run(bin: &str, sql: &str) -> String {
         // Strip a trailing extended-result-code like " (19)" that the stock CLI
         // appends to runtime errors; the graphite CLI does not render it.
         let mut t = t.to_string();
-        if t.ends_with(')') {
-            if let Some(open) = t.rfind(" (") {
-                if t[open + 2..t.len() - 1].chars().all(|c| c.is_ascii_digit()) {
-                    t.truncate(open);
-                }
-            }
+        if t.ends_with(')')
+            && let Some(open) = t.rfind(" (")
+            && t[open + 2..t.len() - 1].chars().all(|c| c.is_ascii_digit())
+        {
+            t.truncate(open);
         }
         lines.push(t);
     }

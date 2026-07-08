@@ -356,9 +356,10 @@ fn scalar_subquery_must_return_one_column() {
         "{e}"
     );
     // In a WHERE/comparison position too.
-    assert!(c
-        .query("SELECT * FROM (SELECT 1) WHERE (SELECT 1, 2)")
-        .is_err());
+    assert!(
+        c.query("SELECT * FROM (SELECT 1) WHERE (SELECT 1, 2)")
+            .is_err()
+    );
     // `SELECT *` over a multi-column table in scalar position is rejected.
     c.execute("CREATE TABLE t(a, b)").unwrap();
     c.execute("INSERT INTO t VALUES (1, 2)").unwrap();

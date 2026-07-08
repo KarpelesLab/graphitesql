@@ -17,18 +17,20 @@ fn sqlite3_available() -> bool {
 fn unknown_column_in_partial_predicate_is_rejected() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a, b)").unwrap();
-    assert!(c
-        .execute("CREATE INDEX i ON t(a) WHERE unknown_col > 0")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: unknown_col"));
+    assert!(
+        c.execute("CREATE INDEX i ON t(a) WHERE unknown_col > 0")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: unknown_col")
+    );
     // The bad reference is found even when nested inside a function call and ANDed
     // with a valid term.
-    assert!(c
-        .execute("CREATE INDEX i ON t(a) WHERE a > 0 AND abs(nope) < 5")
-        .unwrap_err()
-        .to_string()
-        .contains("no such column: nope"));
+    assert!(
+        c.execute("CREATE INDEX i ON t(a) WHERE a > 0 AND abs(nope) < 5")
+            .unwrap_err()
+            .to_string()
+            .contains("no such column: nope")
+    );
 }
 
 #[test]

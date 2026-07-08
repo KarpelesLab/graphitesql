@@ -157,14 +157,13 @@ fn matches_sqlite_cli() {
             .trim_end()
             .to_string();
         // A step-time CLI error carries a trailing result code, e.g. `… (20)`.
-        if let Some(open) = line.rfind(" (") {
-            if line.ends_with(')')
-                && line[open + 2..line.len() - 1]
-                    .chars()
-                    .all(|c| c.is_ascii_digit())
-            {
-                line.truncate(open);
-            }
+        if let Some(open) = line.rfind(" (")
+            && line.ends_with(')')
+            && line[open + 2..line.len() - 1]
+                .chars()
+                .all(|c| c.is_ascii_digit())
+        {
+            line.truncate(open);
         }
         line
     };

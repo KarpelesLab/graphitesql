@@ -71,15 +71,17 @@ fn nondeterministic_functions_are_rejected_where_sqlite_rejects_them() {
     let mut c = Connection::open_memory().unwrap();
     // Generated columns.
     assert!(c.execute("CREATE TABLE g(a, b AS (random()))").is_err());
-    assert!(c
-        .execute("CREATE TABLE g(a, b AS (randomblob(4)))")
-        .is_err());
+    assert!(
+        c.execute("CREATE TABLE g(a, b AS (randomblob(4)))")
+            .is_err()
+    );
     // Index expressions and partial-index predicates.
     c.execute("CREATE TABLE t(a)").unwrap();
     assert!(c.execute("CREATE INDEX i1 ON t(random())").is_err());
-    assert!(c
-        .execute("CREATE INDEX i2 ON t(a) WHERE random() > 0")
-        .is_err());
+    assert!(
+        c.execute("CREATE INDEX i2 ON t(a) WHERE random() > 0")
+            .is_err()
+    );
     // A deterministic expression index is still fine.
     c.execute("CREATE INDEX i3 ON t(a + 1)").unwrap();
 }

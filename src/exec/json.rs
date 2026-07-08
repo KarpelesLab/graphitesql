@@ -119,10 +119,10 @@ impl Json {
     /// `±9.0e+999` (whereas a JSON-literal `9e999` round-trips verbatim through
     /// [`serialize`](Self::serialize)). `json_quote` only ever sees a scalar.
     pub fn quote(&self) -> String {
-        if let Json::Real(r, _) = self {
-            if r.is_infinite() {
-                return String::from(if *r < 0.0 { "-9.0e+999" } else { "9.0e+999" });
-            }
+        if let Json::Real(r, _) = self
+            && r.is_infinite()
+        {
+            return String::from(if *r < 0.0 { "-9.0e+999" } else { "9.0e+999" });
         }
         self.serialize()
     }
@@ -1285,10 +1285,8 @@ impl Parser<'_> {
         let Ok(tok) = core::str::from_utf8(&self.bytes[start..self.pos]) else {
             return Err(start);
         };
-        if !is_real {
-            if let Ok(i) = tok.parse::<i64>() {
-                return Ok(Json::Int(i, None));
-            }
+        if !is_real && let Ok(i) = tok.parse::<i64>() {
+            return Ok(Json::Int(i, None));
         }
         // `f64::parse` rejects a leading `+` and a leading/trailing `.`; build a
         // normalized form so JSON5 numbers like `+.5` / `5.` parse.
@@ -1856,10 +1854,10 @@ pub fn set_path(root: &mut Json, path: &str, value: Json, mode: SetMode) -> Opti
     // so a no-op leaf (e.g. an out-of-range index) leaves the document — and the
     // would-be intermediates — unchanged, exactly as SQLite does.
     let mut work = root.clone();
-    if let Some(cur) = walk_to_parent_creating(&mut work, &segs) {
-        if write_leaf(cur, last, value, mode) {
-            *root = work;
-        }
+    if let Some(cur) = walk_to_parent_creating(&mut work, &segs)
+        && write_leaf(cur, last, value, mode)
+    {
+        *root = work;
     }
     Some(())
 }
@@ -1924,10 +1922,10 @@ pub fn remove_path(root: &mut Json, path: &str) -> Option<()> {
     match (cur, last) {
         (Json::Object(m), Seg::Key(k)) => m.retain(|(kk, _, _)| kk != k),
         (Json::Array(a), Seg::Index(idx)) => {
-            if let Some(n) = idx.resolve_read(a.len()) {
-                if n < a.len() {
-                    a.remove(n);
-                }
+            if let Some(n) = idx.resolve_read(a.len())
+                && n < a.len()
+            {
+                a.remove(n);
             }
         }
         _ => {}

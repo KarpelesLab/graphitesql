@@ -220,13 +220,11 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                         // is contentless and, if so, evaluates against the index.
                         if let (Some(table), Some(rowid)) =
                             (fts5_match_operand_table(&args[1], ctx), ctx.rowid)
-                        {
-                            if let Some(m) = ctx
+                            && let Some(m) = ctx
                                 .subqueries
                                 .and_then(|s| s.fts5_contentless_match(&table, &q, rowid))
-                            {
-                                return Ok(Value::Integer(m as i64));
-                            }
+                        {
+                            return Ok(Value::Integer(m as i64));
                         }
                         Value::Integer(crate::vtab::fts5_query_matches(&q, &cols, tok) as i64)
                     }
@@ -1624,12 +1622,11 @@ fn json_extract(root: &super::json::Json, paths: &[Value], jsonb: bool) -> Resul
 /// embedded as parsed JSON — mirroring SQLite's JSON subtype propagation — rather
 /// than quoted as a string.
 pub(crate) fn arg_to_json(val: &Value, expr: Option<&Expr>) -> super::json::Json {
-    if let (Value::Text(s), Some(e)) = (val, expr) {
-        if produces_json(e) {
-            if let Some(j) = super::json::parse(s) {
-                return j;
-            }
-        }
+    if let (Value::Text(s), Some(e)) = (val, expr)
+        && produces_json(e)
+        && let Some(j) = super::json::parse(s)
+    {
+        return j;
     }
     super::json::value_to_json(val)
 }
@@ -1904,11 +1901,7 @@ pub(crate) fn round_half_away(x: f64, n: u32) -> f64 {
         out
     };
     let mag: f64 = s2.parse().unwrap_or(ax);
-    if neg {
-        -mag
-    } else {
-        mag
-    }
+    if neg { -mag } else { mag }
 }
 
 fn scalar_min_max(v: &[Value], want_min: bool) -> Result<Value> {

@@ -22,11 +22,12 @@ fn having_without_group_by_over_aggregate() {
             .rows[0][0],
         Value::Integer(3)
     );
-    assert!(c
-        .query("SELECT count(*) FROM t HAVING count(*) > 5")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query("SELECT count(*) FROM t HAVING count(*) > 5")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
     assert_eq!(
         c.query("SELECT sum(a) FROM t HAVING max(a) = 3")
             .unwrap()

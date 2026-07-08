@@ -3,7 +3,7 @@
 
 #![cfg(feature = "std")]
 
-use graphitesql::{Connection, Value, TARGET_SQLITE_VERSION};
+use graphitesql::{Connection, TARGET_SQLITE_VERSION, Value};
 
 #[test]
 fn sqlite_version_matches_target() {

@@ -7,12 +7,12 @@
 
 #![cfg(feature = "std")]
 
+use graphitesql::Value;
 use graphitesql::btree::{IndexCursor, TableCursor};
-use graphitesql::format::{decode_record, TextEncoding};
+use graphitesql::format::{TextEncoding, decode_record};
 use graphitesql::pager::Pager;
 use graphitesql::schema::{ObjectType, Schema};
-use graphitesql::vfs::{std_file::StdVfs, OpenFlags, Vfs};
-use graphitesql::Value;
+use graphitesql::vfs::{OpenFlags, Vfs, std_file::StdVfs};
 
 fn fixture(name: &str) -> String {
     format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
@@ -51,7 +51,7 @@ fn reads_big_db_with_many_pages() {
     let pager = open_pager("big.db");
     assert_eq!(pager.page_size(), 4096);
     assert_eq!(pager.page_count(), 15); // confirmed via `PRAGMA page_count`
-                                        // Reading the last page must succeed; reading past it must fail.
+    // Reading the last page must succeed; reading past it must fail.
     assert!(pager.page(15).is_ok());
     assert!(pager.page(16).is_err());
 }

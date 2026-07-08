@@ -78,23 +78,28 @@ fn does_not_reject_valid_references() {
     c.execute("CREATE TABLE t(a, b)").unwrap();
     c.execute("INSERT INTO t VALUES (1, 2)").unwrap();
     // Plain, aliased, qualified, wildcard, and output-alias references all resolve.
-    assert!(c
-        .query("SELECT a, b FROM (SELECT a, b FROM t) WHERE a = 1")
-        .is_ok());
-    assert!(c
-        .query("SELECT x FROM (SELECT a AS x FROM t) WHERE x = 1")
-        .is_ok());
-    assert!(c
-        .query("SELECT a FROM (SELECT a FROM t) d WHERE d.a = 1")
-        .is_ok());
+    assert!(
+        c.query("SELECT a, b FROM (SELECT a, b FROM t) WHERE a = 1")
+            .is_ok()
+    );
+    assert!(
+        c.query("SELECT x FROM (SELECT a AS x FROM t) WHERE x = 1")
+            .is_ok()
+    );
+    assert!(
+        c.query("SELECT a FROM (SELECT a FROM t) d WHERE d.a = 1")
+            .is_ok()
+    );
     assert!(c.query("SELECT * FROM (SELECT a FROM t)").is_ok());
-    assert!(c
-        .query("SELECT a + b AS s FROM (SELECT a, b FROM t) ORDER BY s")
-        .is_ok());
+    assert!(
+        c.query("SELECT a + b AS s FROM (SELECT a, b FROM t) ORDER BY s")
+            .is_ok()
+    );
     // A derived `SELECT *` exposes every base column by name.
-    assert!(c
-        .query("SELECT b FROM (SELECT * FROM t) WHERE a = 1")
-        .is_ok());
+    assert!(
+        c.query("SELECT b FROM (SELECT * FROM t) WHERE a = 1")
+            .is_ok()
+    );
     // A VALUES-derived table exposes column1, column2, ….
     assert!(c.query("SELECT column1 FROM (VALUES (1), (2))").is_ok());
 }

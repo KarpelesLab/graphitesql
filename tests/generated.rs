@@ -139,12 +139,14 @@ fn generated_against_sqlite3() {
 fn table_must_have_a_non_generated_column() {
     // SQLite rejects a table whose every column is generated.
     let mut c = Connection::open_memory().unwrap();
-    assert!(c
-        .execute("CREATE TABLE t(x INT GENERATED ALWAYS AS (1) VIRTUAL)")
-        .is_err());
-    assert!(c
-        .execute("CREATE TABLE t(a AS (1) STORED, b AS (2) STORED)")
-        .is_err());
+    assert!(
+        c.execute("CREATE TABLE t(x INT GENERATED ALWAYS AS (1) VIRTUAL)")
+            .is_err()
+    );
+    assert!(
+        c.execute("CREATE TABLE t(a AS (1) STORED, b AS (2) STORED)")
+            .is_err()
+    );
     // A single real column alongside generated ones is fine.
     assert!(c.execute("CREATE TABLE t(a, b AS (a + 1))").is_ok());
 }
@@ -154,36 +156,43 @@ fn generated_column_cannot_be_in_primary_key() {
     // SQLite rejects a generated column in the PRIMARY KEY, declared either
     // column-level or in a table-level PRIMARY KEY (…).
     let mut c = Connection::open_memory().unwrap();
-    assert!(c
-        .execute("CREATE TABLE t(a, b AS (a + 1) PRIMARY KEY)")
-        .is_err());
-    assert!(c
-        .execute("CREATE TABLE t(a, b AS (a + 1), PRIMARY KEY(b))")
-        .is_err());
-    assert!(c
-        .execute("CREATE TABLE t(a, b AS (a + 1), PRIMARY KEY(a, b))")
-        .is_err());
+    assert!(
+        c.execute("CREATE TABLE t(a, b AS (a + 1) PRIMARY KEY)")
+            .is_err()
+    );
+    assert!(
+        c.execute("CREATE TABLE t(a, b AS (a + 1), PRIMARY KEY(b))")
+            .is_err()
+    );
+    assert!(
+        c.execute("CREATE TABLE t(a, b AS (a + 1), PRIMARY KEY(a, b))")
+            .is_err()
+    );
     // A real column as PK alongside a generated column is fine.
-    assert!(c
-        .execute("CREATE TABLE t(a, b AS (a + 1) STORED, PRIMARY KEY(a))")
-        .is_ok());
+    assert!(
+        c.execute("CREATE TABLE t(a, b AS (a + 1) STORED, PRIMARY KEY(a))")
+            .is_ok()
+    );
 }
 
 #[test]
 fn generated_column_rejects_default_and_double_as() {
     let mut c = Connection::open_memory().unwrap();
     // DEFAULT on a generated column is rejected.
-    assert!(c
-        .execute("CREATE TABLE t(a, b AS (a + 1) DEFAULT 5)")
-        .is_err());
+    assert!(
+        c.execute("CREATE TABLE t(a, b AS (a + 1) DEFAULT 5)")
+            .is_err()
+    );
     // Two generation expressions on one column is rejected.
-    assert!(c
-        .execute("CREATE TABLE t(a, b AS (a + 1) AS (a + 2))")
-        .is_err());
+    assert!(
+        c.execute("CREATE TABLE t(a, b AS (a + 1) AS (a + 2))")
+            .is_err()
+    );
     // A DEFAULT on a *real* column next to a generated one is fine.
-    assert!(c
-        .execute("CREATE TABLE t(a DEFAULT 5, b AS (a + 1))")
-        .is_ok());
+    assert!(
+        c.execute("CREATE TABLE t(a DEFAULT 5, b AS (a + 1))")
+            .is_ok()
+    );
 }
 
 /// A bare `INSERT … VALUES`/`SELECT` (no column list) targets only the

@@ -87,11 +87,12 @@ fn a_valid_probability_returns_the_operand() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a)").unwrap();
     // Empty table: a valid call prepares cleanly and yields no rows (no error).
-    assert!(c
-        .query("SELECT likelihood(a, 0.5) FROM t")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query("SELECT likelihood(a, 0.5) FROM t")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
     // With a row, the operand passes through unchanged.
     assert_eq!(scalar("SELECT likelihood(42, 0.5)"), Value::Integer(42));
     assert_eq!(scalar("SELECT likelihood(7, 1.0)"), Value::Integer(7));

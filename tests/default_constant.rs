@@ -31,11 +31,12 @@ fn column_referencing_default_is_rejected() {
     }
     // The same rule applies to ALTER TABLE … ADD COLUMN.
     c.execute("CREATE TABLE u(a)").unwrap();
-    assert!(c
-        .execute("ALTER TABLE u ADD COLUMN b DEFAULT (a)")
-        .unwrap_err()
-        .to_string()
-        .contains("default value of column [b] is not constant"));
+    assert!(
+        c.execute("ALTER TABLE u ADD COLUMN b DEFAULT (a)")
+            .unwrap_err()
+            .to_string()
+            .contains("default value of column [b] is not constant")
+    );
 }
 
 #[test]

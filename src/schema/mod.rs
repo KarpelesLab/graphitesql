@@ -50,7 +50,7 @@ impl ObjectType {
             other => {
                 return Err(Error::Corrupt(format!(
                     "unknown schema object type {other:?}"
-                )))
+                )));
             }
         })
     }
@@ -144,7 +144,7 @@ fn parse_schema_row(cols: &[Value]) -> Result<SchemaObject> {
         _ => {
             return Err(Error::Corrupt(
                 "sqlite_schema rootpage not an integer".into(),
-            ))
+            ));
         }
     };
     let sql = match &cols[4] {

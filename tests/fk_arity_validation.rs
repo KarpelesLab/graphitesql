@@ -25,27 +25,30 @@ fn sqlite3_available() -> bool {
 fn fk_column_count_mismatch_is_rejected() {
     let mut c = Connection::open_memory().unwrap();
     // table-level: 1 child vs 2 parent columns.
-    assert!(c
-        .execute("CREATE TABLE t(a, b, FOREIGN KEY(a) REFERENCES x(y,z))")
-        .unwrap_err()
-        .to_string()
-        .contains("number of columns in foreign key does not match"));
+    assert!(
+        c.execute("CREATE TABLE t(a, b, FOREIGN KEY(a) REFERENCES x(y,z))")
+            .unwrap_err()
+            .to_string()
+            .contains("number of columns in foreign key does not match")
+    );
     // table-level: 2 child vs 1 parent column.
-    assert!(c
-        .execute("CREATE TABLE t(a, b, FOREIGN KEY(a,b) REFERENCES x(y))")
-        .unwrap_err()
-        .to_string()
-        .contains("number of columns in foreign key does not match"));
+    assert!(
+        c.execute("CREATE TABLE t(a, b, FOREIGN KEY(a,b) REFERENCES x(y))")
+            .unwrap_err()
+            .to_string()
+            .contains("number of columns in foreign key does not match")
+    );
 }
 
 #[test]
 fn column_level_fk_references_one_column() {
     let mut c = Connection::open_memory().unwrap();
-    assert!(c
-        .execute("CREATE TABLE t(a REFERENCES x(y,z))")
-        .unwrap_err()
-        .to_string()
-        .contains("foreign key on a should reference only one column of table x"));
+    assert!(
+        c.execute("CREATE TABLE t(a REFERENCES x(y,z))")
+            .unwrap_err()
+            .to_string()
+            .contains("foreign key on a should reference only one column of table x")
+    );
 }
 
 #[test]

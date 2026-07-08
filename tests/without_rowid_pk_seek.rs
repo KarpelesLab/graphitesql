@@ -40,11 +40,12 @@ fn leading_pk_equality_seeks_the_primary_key() {
         Value::Text("b".into())
     );
     // A missing key returns nothing; a present one, exactly its row.
-    assert!(c
-        .query("SELECT n FROM w WHERE id=9")
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        c.query("SELECT n FROM w WHERE id=9")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]

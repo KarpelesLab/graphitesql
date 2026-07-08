@@ -100,9 +100,10 @@ fn does_not_reject_valid_coalesced_references() {
     // A view side and a derived side resolve their own columns.
     assert!(c.query("SELECT b FROM vt NATURAL JOIN u").is_ok());
     assert!(c.query("SELECT vt.a, u.b FROM vt JOIN u USING (g)").is_ok());
-    assert!(c
-        .query("SELECT q.a FROM (SELECT a FROM t) q NATURAL JOIN u")
-        .is_ok());
+    assert!(
+        c.query("SELECT q.a FROM (SELECT a FROM t) q NATURAL JOIN u")
+            .is_ok()
+    );
     // A genuinely *ambiguous* bare name (shared but not coalesced) is NOT a missing
     // column — this check stays silent and the ambiguity validator reports it.
     assert_eq!(

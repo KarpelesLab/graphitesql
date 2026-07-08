@@ -198,7 +198,8 @@ fn indexed_by_nonexistent_index_errors() {
     // An implicit UNIQUE/PK auto-index name is accepted.
     c.execute("CREATE TABLE u(k UNIQUE, v)").unwrap();
     c.execute("INSERT INTO u VALUES (1,2)").unwrap();
-    assert!(c
-        .query("SELECT v FROM u INDEXED BY sqlite_autoindex_u_1 WHERE k=1")
-        .is_ok());
+    assert!(
+        c.query("SELECT v FROM u INDEXED BY sqlite_autoindex_u_1 WHERE k=1")
+            .is_ok()
+    );
 }

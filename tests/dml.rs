@@ -80,7 +80,7 @@ fn pragma_table_info_and_page_size() {
     // id: pk=1, notnull=1 (INTEGER PRIMARY KEY)
     assert_eq!(info.rows[0][1], Value::Text("id".into()));
     assert_eq!(info.rows[0][5], Value::Integer(1)); // pk
-                                                    // name: notnull=1
+    // name: notnull=1
     assert_eq!(info.rows[1][3], Value::Integer(1));
     // n: default '7'
     assert_eq!(info.rows[2][4], Value::Text("7".into()));
@@ -97,7 +97,7 @@ fn not_null_constraint_enforced() {
     // A NULL into a NOT NULL column is rejected.
     assert!(c.execute("INSERT INTO t(name) VALUES (NULL)").is_err());
     assert!(c.execute("INSERT INTO t(note) VALUES ('x')").is_err()); // name omitted -> NULL
-                                                                     // A valid row is accepted; nullable columns may be NULL.
+    // A valid row is accepted; nullable columns may be NULL.
     c.execute("INSERT INTO t(name) VALUES ('ok')").unwrap();
     assert_eq!(
         c.query("SELECT count(*) FROM t").unwrap().rows[0][0],
@@ -182,13 +182,15 @@ fn check_constraints_enforced() {
     c.execute("INSERT INTO t(qty, kind) VALUES (5, 'ok')")
         .unwrap();
     // Column-level CHECK violation.
-    assert!(c
-        .execute("INSERT INTO t(qty, kind) VALUES (0, 'ok')")
-        .is_err());
+    assert!(
+        c.execute("INSERT INTO t(qty, kind) VALUES (0, 'ok')")
+            .is_err()
+    );
     // Table-level CHECK violation.
-    assert!(c
-        .execute("INSERT INTO t(qty, kind) VALUES (5, 'bad')")
-        .is_err());
+    assert!(
+        c.execute("INSERT INTO t(qty, kind) VALUES (5, 'bad')")
+            .is_err()
+    );
     // UPDATE into a violating state is rejected.
     assert!(c.execute("UPDATE t SET qty = -2 WHERE id = 1").is_err());
     assert_eq!(
@@ -205,9 +207,10 @@ fn unique_constraint_and_conflict_clauses() {
     c.execute("INSERT INTO t(email, n) VALUES ('a', 1)")
         .unwrap();
     // Duplicate UNIQUE value is rejected by default (ABORT).
-    assert!(c
-        .execute("INSERT INTO t(email, n) VALUES ('a', 2)")
-        .is_err());
+    assert!(
+        c.execute("INSERT INTO t(email, n) VALUES ('a', 2)")
+            .is_err()
+    );
     // OR IGNORE silently skips the conflicting row (0 rows affected).
     assert_eq!(
         c.execute("INSERT OR IGNORE INTO t(email, n) VALUES ('a', 3)")
@@ -231,9 +234,10 @@ fn unique_constraint_and_conflict_clauses() {
         Value::Integer(v) => v,
         _ => panic!(),
     };
-    assert!(c
-        .execute(&format!("INSERT INTO t(id, email) VALUES ({some_id}, 'c')"))
-        .is_err());
+    assert!(
+        c.execute(&format!("INSERT INTO t(id, email) VALUES ({some_id}, 'c')"))
+            .is_err()
+    );
 }
 
 #[test]

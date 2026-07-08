@@ -26,21 +26,27 @@ fn trigger_target_kind_is_enforced() {
 
     let err = |c: &mut Connection, sql: &str| c.execute(sql).unwrap_err().to_string();
 
-    assert!(err(
-        &mut c,
-        "CREATE TRIGGER t1 INSTEAD OF INSERT ON tbl BEGIN SELECT 1; END"
-    )
-    .contains("cannot create INSTEAD OF trigger on table: tbl"));
-    assert!(err(
-        &mut c,
-        "CREATE TRIGGER t2 BEFORE INSERT ON vw BEGIN SELECT 1; END"
-    )
-    .contains("cannot create BEFORE trigger on view: vw"));
-    assert!(err(
-        &mut c,
-        "CREATE TRIGGER t3 AFTER INSERT ON vw BEGIN SELECT 1; END"
-    )
-    .contains("cannot create AFTER trigger on view: vw"));
+    assert!(
+        err(
+            &mut c,
+            "CREATE TRIGGER t1 INSTEAD OF INSERT ON tbl BEGIN SELECT 1; END"
+        )
+        .contains("cannot create INSTEAD OF trigger on table: tbl")
+    );
+    assert!(
+        err(
+            &mut c,
+            "CREATE TRIGGER t2 BEFORE INSERT ON vw BEGIN SELECT 1; END"
+        )
+        .contains("cannot create BEFORE trigger on view: vw")
+    );
+    assert!(
+        err(
+            &mut c,
+            "CREATE TRIGGER t3 AFTER INSERT ON vw BEGIN SELECT 1; END"
+        )
+        .contains("cannot create AFTER trigger on view: vw")
+    );
 
     // The valid combinations still succeed.
     c.execute("CREATE TRIGGER ok1 INSTEAD OF INSERT ON vw BEGIN SELECT 1; END")

@@ -212,12 +212,14 @@ fn recursive_cte_limit_terminates_and_bounds() {
 fn cte_explicit_column_count_must_match() {
     let c = Connection::open_memory().unwrap();
     // Explicit column list longer/shorter than the body is rejected, like SQLite.
-    assert!(c
-        .query("WITH tt(a, b, c) AS (VALUES(1, 2)) SELECT * FROM tt")
-        .is_err());
-    assert!(c
-        .query("WITH tt(a) AS (VALUES(1, 2)) SELECT * FROM tt")
-        .is_err());
+    assert!(
+        c.query("WITH tt(a, b, c) AS (VALUES(1, 2)) SELECT * FROM tt")
+            .is_err()
+    );
+    assert!(
+        c.query("WITH tt(a) AS (VALUES(1, 2)) SELECT * FROM tt")
+            .is_err()
+    );
     // A matching count (or no explicit list) is fine.
     assert_eq!(
         ints(&c, "WITH tt(a, b) AS (VALUES(7, 8)) SELECT a + b FROM tt"),
@@ -281,17 +283,26 @@ fn infinite_recursive_cte_bounded_by_outer_limit() {
         vec![1, 2, 3, 4, 5]
     );
     assert_eq!(
-        ints(&c, "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s) SELECT n FROM s LIMIT 3 OFFSET 2"),
+        ints(
+            &c,
+            "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s) SELECT n FROM s LIMIT 3 OFFSET 2"
+        ),
         vec![3, 4, 5]
     );
     assert_eq!(
-        ints(&c, "WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+2 FROM s) SELECT n*10 FROM s LIMIT 3"),
+        ints(
+            &c,
+            "WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+2 FROM s) SELECT n*10 FROM s LIMIT 3"
+        ),
         vec![0, 20, 40]
     );
     // A WHERE on the outer query is NOT a 1:1 stream, so the cap doesn't apply —
     // this recursion terminates via its own predicate and is unaffected.
     assert_eq!(
-        ints(&c, "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<100) SELECT n FROM s WHERE n%2=0 LIMIT 3"),
+        ints(
+            &c,
+            "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<100) SELECT n FROM s WHERE n%2=0 LIMIT 3"
+        ),
         vec![2, 4, 6]
     );
 }

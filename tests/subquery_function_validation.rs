@@ -84,9 +84,10 @@ fn does_not_reject_valid_or_unverifiable_subqueries() {
     // Valid scalar calls inside a subquery are not rejected.
     assert!(c.query("SELECT (SELECT abs(c) FROM u) FROM t").is_ok());
     assert!(c.query("SELECT (SELECT upper(b)) FROM t").is_ok());
-    assert!(c
-        .query("SELECT a FROM t WHERE a IN (SELECT abs(c) FROM u)")
-        .is_ok());
+    assert!(
+        c.query("SELECT a FROM t WHERE a IN (SELECT abs(c) FROM u)")
+            .is_ok()
+    );
     // An aggregate in the subquery is not a scalar call (no false "no such function").
     assert!(c.query("SELECT (SELECT max(c) FROM u) FROM t").is_ok());
     // A subquery whose own column does not resolve is a `no such column`, NOT a
@@ -98,9 +99,10 @@ fn does_not_reject_valid_or_unverifiable_subqueries() {
         "no such column: zzz"
     );
     // A compound subquery body cannot be verified clean, so it is left alone too.
-    assert!(c
-        .query("SELECT a FROM t WHERE a IN (SELECT nope(c) FROM u UNION SELECT c FROM u)")
-        .is_ok());
+    assert!(
+        c.query("SELECT a FROM t WHERE a IN (SELECT nope(c) FROM u UNION SELECT c FROM u)")
+            .is_ok()
+    );
 }
 
 #[test]

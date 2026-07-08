@@ -84,12 +84,14 @@ fn real_column_integer_serial_reads_as_real() {
         let _ = std::fs::remove_file(db);
         // Build the database with sqlite3 so whole-number reals get the compact
         // integer serial encoding.
-        assert!(Command::new("sqlite3")
-            .arg(db)
-            .arg(schema)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("sqlite3")
+                .arg(db)
+                .arg(schema)
+                .status()
+                .unwrap()
+                .success()
+        );
         for q in *queries {
             assert_eq!(
                 run("sqlite3", db, q),

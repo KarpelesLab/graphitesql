@@ -10,7 +10,7 @@
 #![cfg(feature = "std")]
 
 use graphitesql::Connection;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// Run `sql` and assert it does not panic. Returns whether it parsed/ran `Ok`.
 fn run_no_panic(c: &Connection, sql: &str, tag: &str) -> bool {

@@ -397,7 +397,8 @@ fn reopen_clean(db: &str) -> Vec<Vec<String>> {
 /// file regardless of WAL/`-shm` interop.
 fn reopen_finalize(db: &str) -> Vec<Vec<String>> {
     let vfs = StdVfs::new();
-    let got = {
+
+    {
         let mut c = Connection::open_vfs(&vfs, db).unwrap();
         assert_eq!(
             rows(&c, "PRAGMA integrity_check"),
@@ -409,8 +410,7 @@ fn reopen_finalize(db: &str) -> Vec<Vec<String>> {
         // to replay graphite's WAL (and so the -wal can be removed).
         let _ = c.execute("PRAGMA wal_checkpoint");
         got
-    };
-    got
+    }
 }
 
 /// Assert the recovered rows are a *consistent* snapshot: exactly the pre- or

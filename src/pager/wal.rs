@@ -26,8 +26,8 @@
 
 use super::{Page, PageSource};
 use crate::error::{Error, Result};
-use crate::format::header::HEADER_LEN;
 use crate::format::DatabaseHeader;
+use crate::format::header::HEADER_LEN;
 use crate::vfs::File;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
