@@ -307,6 +307,25 @@ impl Shell {
                 _ => eprintln!("Usage: .headers on|off"),
             },
             ".mode" => { /* accepted for compatibility; only list mode is supported */ }
+            ".databases" => {
+                // `<name>: <file-or-""> r/w` per attached database (from
+                // `PRAGMA database_list`). The shell opens read/write, and no
+                // transaction is active while a dot-command runs, so the mode is
+                // always `r/w` with no transaction annotation here.
+                if let Ok(r) = conn.query("PRAGMA database_list") {
+                    for row in &r.rows {
+                        let name = match row.get(1) {
+                            Some(Value::Text(s)) => s.as_str(),
+                            _ => "",
+                        };
+                        let file = match row.get(2) {
+                            Some(Value::Text(s)) if !s.is_empty() => s.as_str(),
+                            _ => "\"\"",
+                        };
+                        println!("{name}: {file} r/w");
+                    }
+                }
+            }
             ".dump" => dump_database(conn),
             other => eprintln!("Unknown command: {other}. Try \".help\"."),
         }
@@ -319,6 +338,7 @@ fn print_help() {
     eprintln!(".tables [LIKE]     List table and view names");
     eprintln!(".indexes [LIKE]    List index names");
     eprintln!(".schema [TABLE]    Show CREATE statements");
+    eprintln!(".databases         List attached databases");
     eprintln!(".dump              Dump the database as SQL text");
     eprintln!(".headers on|off    Toggle column headers (default off)");
     eprintln!(".quit / .exit      Exit the shell");
