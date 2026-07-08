@@ -3975,10 +3975,17 @@ impl Connection {
         // key order, those not already index keys) for a WITHOUT ROWID table.
         if extended {
             if tmeta.without_rowid {
-                let key_cids: Vec<i64> = keys.iter().map(|(cid, ..)| *cid).collect();
+                // A PK column already among the key columns is only a duplicate —
+                // and thus dropped from the trailing auxiliary list — when the
+                // collations also match (SQLite's `isDupColumn`). A PK column that
+                // overlaps a key column under a *different* collation is appended.
                 let mut seqno = keys.len();
                 for &pcid in &tmeta.storage_order[..tmeta.pk_len] {
-                    if key_cids.contains(&(pcid as i64)) {
+                    let pk_coll = tmeta.columns[pcid].collation;
+                    if keys
+                        .iter()
+                        .any(|(cid, _, _, coll)| *cid == pcid as i64 && *coll == pk_coll)
+                    {
                         continue;
                     }
                     rows.push(alloc::vec![
@@ -5528,29 +5535,22 @@ impl Connection {
     ) -> Vec<crate::exec::stat4::Stat4Sample> {
         use crate::exec::stat4::Stat4Entry;
         let pk = Self::wr_pk_cols(meta);
-        // Full column list: key columns, then PK columns not already in the key.
+        // Full column list: key columns, then the trailing PK columns not already
+        // in the key (SQLite's collation-aware `isDupColumn` dedup — the same
+        // shape the on-disk index records use, see `wr_trailing_pk`).
+        let (trailing_pk, trailing_colls, trailing_descs) =
+            wr_trailing_pk(&idx.cols, &idx.collations, pk, meta);
         let mut full_cols: Vec<usize> = idx.cols.clone();
-        for &p in pk {
-            if !full_cols.contains(&p) {
-                full_cols.push(p);
-            }
-        }
+        full_cols.extend_from_slice(&trailing_pk);
         let n_key = idx.cols.len();
         let n_col = full_cols.len();
         // Per full-column collation and DESC (only key columns carry a declared
         // direction; the appended PK columns inherit the PK's direction, but they
         // are only ever a tiebreak here and their bytes are plain either way).
         let mut colls: Vec<crate::value::Collation> = idx.collations.clone();
+        colls.extend(trailing_colls);
         let mut descs: Vec<bool> = idx.descending.clone();
-        for &p in &full_cols[n_key..] {
-            colls.push(meta.columns[p].collation);
-            // Match the PK column's declared direction for ordering.
-            let pki = pk.iter().position(|&x| x == p);
-            descs.push(
-                pki.and_then(|i| meta.pk_descending.get(i).copied())
-                    .unwrap_or(false),
-            );
-        }
+        descs.extend(trailing_descs);
         // Distinct-test columns: a UNIQUE index all-NOT-NULL is unique on the key
         // alone; otherwise all but the last stored column.
         let uniq_not_null = idx.unique && idx.cols.iter().all(|&c| meta.not_null[c].is_some());
@@ -9540,8 +9540,18 @@ impl Connection {
                 }
             }
             let pk_cols = tmeta.storage_order[..tmeta.pk_len].to_vec();
+            // SQLite dedups PK columns already in the index key (same collation);
+            // the appended trailing PK carries the PK's own collation and DESC.
+            let (trailing_pk, trailing_colls, trailing_descs) =
+                wr_trailing_pk(&cols, &colls, &pk_cols, &tmeta);
             let mut key_colls = colls.clone();
-            key_colls.extend(self.col_collations(&tmeta, &pk_cols));
+            key_colls.extend(trailing_colls);
+            let mut key_descs = if descs.iter().any(|&d| d) {
+                descs.clone()
+            } else {
+                Vec::new()
+            };
+            wr_extend_descs(&mut key_descs, &colls, &trailing_descs);
             let w = self.backend.writer()?;
             let root = create_index_root(w)?;
             for (row, &k) in rows.iter().zip(&keep) {
@@ -9549,9 +9559,13 @@ impl Connection {
                     insert_index(
                         w,
                         root,
-                        &wr_index_key(&cols, &pk_cols, &realify_columns_for_storage(&tmeta, row)),
+                        &wr_index_key(
+                            &cols,
+                            &trailing_pk,
+                            &realify_columns_for_storage(&tmeta, row),
+                        ),
                         &key_colls,
-                        &descs,
+                        &key_descs,
                     )?;
                 }
             }
@@ -12830,10 +12844,13 @@ impl Connection {
     }
 
     /// Build rows from a WITHOUT ROWID secondary index's seeked/scanned records.
-    /// Each record is `(indexed cols…, PK cols…)`: when `covering`, reconstruct
-    /// the referenced columns straight from it (the rest are unreferenced, left
-    /// NULL); otherwise the trailing PK columns seek the clustered b-tree for the
-    /// full row.
+    /// Each record is `(indexed cols…, trailing PK cols…)`, where the trailing PK
+    /// is deduplicated against the index key columns (SQLite's `isDupColumn`; see
+    /// [`wr_trailing_pk`]) — so a PK column that overlaps an index key column
+    /// appears only in the key part, not repeated at the tail. When `covering`,
+    /// reconstruct the referenced columns straight from the record (the rest are
+    /// unreferenced, left NULL); otherwise the PK columns (read from wherever they
+    /// live in the record) seek the clustered b-tree for the full row.
     fn wr_index_rows(
         &self,
         meta: &TableMeta,
@@ -12843,6 +12860,18 @@ impl Connection {
         covering: bool,
         params: &Params,
     ) -> Result<Vec<InputRow>> {
+        // Where each PK column's value lives inside a record: overlapping PK
+        // columns are found among the leading index-key columns; the rest are the
+        // trailing (deduped) PK columns, in order after the index key.
+        let (trailing_pk, ..) = wr_trailing_pk(&idx.cols, &idx.collations, pk, meta);
+        let pk_slot = |pc: usize| -> usize {
+            if let Some(t) = trailing_pk.iter().position(|&c| c == pc) {
+                idx.cols.len() + t
+            } else {
+                // Overlaps a key column with the same collation: read it there.
+                idx.cols.iter().position(|&c| c == pc).unwrap_or(0)
+            }
+        };
         let mut out = Vec::with_capacity(records.len());
         if covering {
             for rec in &records {
@@ -12850,8 +12879,8 @@ impl Connection {
                 for (i, &mc) in idx.cols.iter().enumerate() {
                     values[mc] = rec[i].clone();
                 }
-                for (j, &pc) in pk.iter().enumerate() {
-                    values[pc] = rec[idx.cols.len() + j].clone();
+                for &pc in pk {
+                    values[pc] = rec[pk_slot(pc)].clone();
                 }
                 promote_real_columns(meta, &mut values);
                 out.push(InputRow {
@@ -12866,9 +12895,7 @@ impl Connection {
             // Full-PK seek into the clustered b-tree: match its stored directions.
             let pk_descs = meta.pk_descs().to_vec();
             for rec in &records {
-                let pk_key: Vec<Value> = (0..pk.len())
-                    .map(|j| rec[idx.cols.len() + j].clone())
-                    .collect();
+                let pk_key: Vec<Value> = pk.iter().map(|&pc| rec[pk_slot(pc)].clone()).collect();
                 for storage in
                     crate::btree::index_seek_records(src, meta.root, &pk_key, &pk_colls, &pk_descs)?
                 {
@@ -27728,8 +27755,6 @@ impl Connection {
         }
         let rows = self.scan_without_rowid(meta)?;
         let pk_cols = meta.storage_order[..meta.pk_len].to_vec();
-        let pk_colls: Vec<crate::value::Collation> =
-            pk_cols.iter().map(|&c| meta.columns[c].collation).collect();
         // Precompute partial-index membership before the writer borrow.
         let mut keep: Vec<Vec<usize>> = Vec::with_capacity(indexes.len());
         for idx in &indexes {
@@ -27743,8 +27768,15 @@ impl Connection {
         }
         let w = self.backend.writer()?;
         for (idx, ks) in indexes.iter().zip(&keep) {
+            // SQLite dedups PK columns already in the key (same collation); the
+            // key bytes, comparison collations, and DESC flags must all reflect
+            // that trailing-PK shape (see `wr_trailing_pk`).
+            let (trailing_pk, trailing_colls, trailing_descs) =
+                wr_trailing_pk(&idx.cols, &idx.collations, &pk_cols, meta);
             let mut key_colls = idx.collations.clone();
-            key_colls.extend(pk_colls.iter().copied());
+            key_colls.extend(trailing_colls);
+            let mut descs = idx.seek_descs().to_vec();
+            wr_extend_descs(&mut descs, &idx.collations, &trailing_descs);
             clear_index(w, idx.root)?;
             for &i in ks {
                 insert_index(
@@ -27752,11 +27784,11 @@ impl Connection {
                     idx.root,
                     &wr_index_key(
                         &idx.cols,
-                        &pk_cols,
+                        &trailing_pk,
                         &realify_columns_for_storage(meta, &rows[i]),
                     ),
                     &key_colls,
-                    idx.seek_descs(),
+                    &descs,
                 )?;
             }
         }
@@ -37424,11 +37456,81 @@ fn wr_unique_message(meta: &TableMeta, a: &[Value], b: &[Value]) -> String {
 }
 
 /// An index record for a `WITHOUT ROWID` table: the indexed columns followed by
-/// the table's PRIMARY KEY columns (which make the entry unique), as SQLite does.
-fn wr_index_key(cols: &[usize], pk_cols: &[usize], values: &[Value]) -> Vec<u8> {
+/// the table's *trailing* PRIMARY KEY columns (which make the entry unique), as
+/// SQLite does. `trailing_pk` is the PK column list already deduplicated against
+/// the index key columns (see [`wr_trailing_pk`]): a PK column that is also an
+/// index key column with the *same* collation is not repeated, matching SQLite's
+/// `isDupColumn` logic in `sqlite3CreateIndex`. Repeating it would produce a key
+/// shape (`a, c, a, b`) that SQLite never writes, so the resulting index fails
+/// `PRAGMA integrity_check` and is unreadable by SQLite.
+fn wr_index_key(cols: &[usize], trailing_pk: &[usize], values: &[Value]) -> Vec<u8> {
     let mut key: Vec<Value> = cols.iter().map(|&p| values[p].clone()).collect();
-    key.extend(pk_cols.iter().map(|&p| values[p].clone()));
+    key.extend(trailing_pk.iter().map(|&p| values[p].clone()));
     encode_record(&key)
+}
+
+/// The trailing PRIMARY KEY columns appended to a `WITHOUT ROWID` secondary
+/// index key, with their collations and stored DESC directions — SQLite's
+/// PK-append dedup from `sqlite3CreateIndex`/`isDupColumn`. A PK column that is
+/// already one of the index's key columns *with the same collation* is dropped
+/// (it is already in the key); one that overlaps a key column but under a
+/// different collation is kept. The kept PK columns preserve PK key order and
+/// carry the PK's per-column collation and DESC (matching how SQLite reloads the
+/// index's sort order from the PK on schema load).
+///
+/// `idx_cols`/`idx_colls` are the index's own key columns and their collations;
+/// `pk_cols` is `storage_order[..pk_len]`; `meta` supplies PK collations/descs.
+fn wr_trailing_pk(
+    idx_cols: &[usize],
+    idx_colls: &[crate::value::Collation],
+    pk_cols: &[usize],
+    meta: &TableMeta,
+) -> (Vec<usize>, Vec<crate::value::Collation>, Vec<bool>) {
+    let mut cols = Vec::new();
+    let mut colls = Vec::new();
+    let mut descs = Vec::new();
+    for (i, &pc) in pk_cols.iter().enumerate() {
+        let pk_coll = meta.columns[pc].collation;
+        // isDupColumn: same column *and* same collation ⇒ already in the key.
+        let dup = idx_cols
+            .iter()
+            .zip(idx_colls.iter())
+            .any(|(&c, &coll)| c == pc && coll == pk_coll);
+        if dup {
+            continue;
+        }
+        cols.push(pc);
+        colls.push(pk_coll);
+        descs.push(meta.pk_descending.get(i).copied().unwrap_or(false));
+    }
+    (cols, colls, descs)
+}
+
+/// Extend a WITHOUT ROWID secondary index's per-key-column DESC flags with the
+/// trailing PK columns' directions, for handing to the b-tree writer/reader.
+///
+/// The b-tree treats an empty `descs` as all-ascending, so when neither the
+/// index columns nor the trailing PK columns are DESC we keep `descs` empty
+/// (the byte-for-byte no-op case). Only when some column is DESC do we
+/// materialize a full-length vector: the index columns' own directions
+/// (`idx.seek_descs()`, which is empty ⇒ all-ascending for `idx_colls.len()`
+/// columns) followed by the trailing PK directions.
+fn wr_extend_descs(
+    descs: &mut Vec<bool>,
+    idx_colls: &[crate::value::Collation],
+    trailing_descs: &[bool],
+) {
+    if trailing_descs.iter().all(|&d| !d) {
+        // No DESC trailing PK column: the trailing part is ascending, so just
+        // reuse the index columns' own flags (possibly empty ⇒ all-ascending).
+        return;
+    }
+    if descs.is_empty() {
+        // The index columns were all ascending (empty slice); pad them out so
+        // the trailing DESC flags line up with the right key positions.
+        descs.extend(core::iter::repeat_n(false, idx_colls.len()));
+    }
+    descs.extend_from_slice(trailing_descs);
 }
 
 #[derive(Clone)]
