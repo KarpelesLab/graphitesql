@@ -7634,7 +7634,20 @@ impl Connection {
                 }
                 _ => {
                     rowid_auto = true;
-                    let r = self.auto_rowid(meta.root, meta.autoincrement, next_auto)?;
+                    // The candidate is the largest rowid currently in the table + 1.
+                    // For a plain rowid table that is the live b-tree maximum, read
+                    // fresh so it reflects explicit rowids inserted earlier in this
+                    // same multi-row statement — including negative ones (an
+                    // explicit `-1` into an otherwise-empty table makes the next auto
+                    // rowid `0`, not `1`). `next_auto`'s monotonic floor is correct
+                    // only for AUTOINCREMENT, which never reuses a rowid at or below
+                    // its persisted high-water mark.
+                    let cand = if meta.autoincrement {
+                        next_auto
+                    } else {
+                        self.next_rowid(meta.root)?
+                    };
+                    let r = self.auto_rowid(meta.root, meta.autoincrement, cand)?;
                     // Advance sequentially when we stayed in range; if `auto_rowid`
                     // left the exhausted range (a random pick below the candidate),
                     // keep the counter saturated so each further row re-enters that
