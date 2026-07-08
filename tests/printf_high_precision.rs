@@ -2,7 +2,11 @@
 //! digits and pad any further requested digits with zeros — matching the sqlite3
 //! 3.50.4 CLI, whose float renderer is not C's. C would expose the true trailing
 //! digits (`%.20f` of 0.1 → `0.10000000000000000555`); sqlite (and now graphite)
-//! emit `0.10000000000000000000`. The `!` flag lifts the 16-digit cap.
+//! emit `0.10000000000000000000`. The `!` (alt-form-2) flag lifts the cap to
+//! SQLite's `mxRound = 26` — but still through SQLite's own `sqlite3FpDecode`
+//! decimal machinery (ported in `util::fpdecode`), NOT C's exact-f64 expansion —
+//! so `%!.20f` of 0.1 is `0.1000000000000000055`, matching the CLI (see
+//! `printf_bang_fpdecode.rs`).
 
 #![cfg(feature = "std")]
 

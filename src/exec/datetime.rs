@@ -1517,14 +1517,23 @@ pub fn printf(args: &[Value]) -> Value {
                 let f = if f == 0.0 { 0.0 } else { f };
                 if !f.is_finite() {
                     nonfinite(f, plus, space)
+                } else if bang {
+                    // The `!` (alt-form-2) flag renders through the port of
+                    // SQLite's own `FpDecode` machinery (mxRound = 26), which
+                    // strips trailing zeros and honours `#` itself.
+                    let body = crate::util::fpdecode::format(
+                        f,
+                        prec.unwrap_or(6) as i32,
+                        crate::util::fpdecode::XType::Float,
+                        true,
+                        alt,
+                    );
+                    with_sign(body, plus, space)
                 } else {
                     let p = prec.unwrap_or(6);
-                    let mut s = fixed(f, p, bang);
+                    let mut s = fixed(f, p, false);
                     if alt && p == 0 && !s.contains('.') {
                         s.push('.');
-                    }
-                    if bang {
-                        s = strip_zeros_keep_one(&s);
                     }
                     with_sign(s, plus, space)
                 }
@@ -1534,17 +1543,26 @@ pub fn printf(args: &[Value]) -> Value {
                 let f = if f == 0.0 { 0.0 } else { f };
                 if !f.is_finite() {
                     nonfinite(f, plus, space)
+                } else if bang {
+                    let mut body = crate::util::fpdecode::format(
+                        f,
+                        prec.unwrap_or(6) as i32,
+                        crate::util::fpdecode::XType::Exp,
+                        true,
+                        alt,
+                    );
+                    if conv == 'E' {
+                        body = body.replace('e', "E");
+                    }
+                    with_sign(body, plus, space)
                 } else {
-                    let mut s = fmt_exp(f, prec.unwrap_or(6), conv == 'E', bang);
+                    let mut s = fmt_exp(f, prec.unwrap_or(6), conv == 'E', false);
                     // The `#` alt flag forces a decimal point even at precision 0
                     // (`%#.0e` of 42 is "4.e+01"); `fmt_exp` omits it there.
                     if alt && prec == Some(0) && !s.contains('.') {
                         if let Some(epos) = s.find(['e', 'E']) {
                             s.insert(epos, '.');
                         }
-                    }
-                    if bang {
-                        s = strip_zeros_keep_one(&s);
                     }
                     with_sign(s, plus, space)
                 }
@@ -1553,9 +1571,21 @@ pub fn printf(args: &[Value]) -> Value {
                 let f = eval::to_f64(&next(&mut arg_idx));
                 if !f.is_finite() {
                     nonfinite(f, plus, space)
+                } else if bang {
+                    let mut body = crate::util::fpdecode::format(
+                        f,
+                        prec.unwrap_or(6) as i32,
+                        crate::util::fpdecode::XType::Generic,
+                        true,
+                        alt,
+                    );
+                    if conv == 'G' {
+                        body = body.replace('e', "E");
+                    }
+                    with_sign(body, plus, space)
                 } else {
                     with_sign(
-                        fmt_general(f, prec.unwrap_or(6), conv == 'G', alt, bang),
+                        fmt_general(f, prec.unwrap_or(6), conv == 'G', alt, false),
                         plus,
                         space,
                     )
