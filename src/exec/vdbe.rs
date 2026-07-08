@@ -5503,15 +5503,11 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
         AggKind::CountStar => Value::Integer(star),
         AggKind::Count => Value::Integer(vals.len() as i64),
         AggKind::Sum => eval::sum_values(&vals)?,
-        AggKind::Total => Value::Real(vals.iter().map(eval::to_f64).sum()),
-        AggKind::Avg => {
-            if vals.is_empty() {
-                Value::Null
-            } else {
-                let sum: f64 = vals.iter().map(eval::to_f64).sum();
-                Value::Real(sum / vals.len() as f64)
-            }
-        }
+        AggKind::Total => Value::Real(eval::total_value(&vals)),
+        AggKind::Avg => match eval::avg_value(&vals) {
+            Some(r) => Value::Real(r),
+            None => Value::Null,
+        },
         AggKind::Min => vals
             .into_iter()
             .reduce(|a, b| {

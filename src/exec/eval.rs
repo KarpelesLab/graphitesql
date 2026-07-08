@@ -1887,32 +1887,176 @@ pub fn to_int_value(v: &Value) -> i64 {
 /// real-valued or non-numeric, makes the result REAL. An all-integer sum that
 /// overflows `i64` is the "integer overflow" error, exactly as SQLite reports
 /// for both plain and windowed `sum()`. An empty input is NULL.
+/// The running quantities SQLite's `sum`/`avg`/`total` maintain over the
+/// non-NULL inputs (`sumStep`): an exact integer sum, frozen the moment a
+/// non-integer input appears or the integer sum overflows; whether the result
+/// must be approximate (any of those happened); and a Kahan–Babuška–Neumaier
+/// compensated double sum of *every* value. The compensated sum is why a large
+/// cancellation keeps small contributions — `sum(1e308, 3, -1e308)` is `3.0`,
+/// not `0.0`.
+struct SumAccum {
+    i_sum: i64,
+    ovrfl: bool,
+    approx: bool,
+    r_sum: f64,
+    r_err: f64,
+}
+
+/// One Kahan–Babuška–Neumaier step: `rSum += r` with the correction term `rErr`
+/// recovering the low-order bits the plain add drops when magnitudes differ.
+fn kbn_step(a: &mut SumAccum, r: f64) {
+    let s = a.r_sum;
+    let t = s + r;
+    if crate::util::float::abs(s) > crate::util::float::abs(r) {
+        a.r_err += (s - t) + r;
+    } else {
+        a.r_err += (r - t) + s;
+    }
+    a.r_sum = t;
+}
+
+/// Add a possibly-large integer to the compensated sum. A magnitude ≥ 2^52 is
+/// split into a high part (a multiple of 2^14) and a small remainder so each
+/// piece converts to a double exactly — SQLite's `kahanBabuskaNeumaierStepInt64`.
+fn kbn_step_i64(a: &mut SumAccum, v: i64) {
+    if v <= -4_503_599_627_370_496 || v >= 4_503_599_627_370_496 {
+        let sm = v % 16_384;
+        kbn_step(a, (v - sm) as f64);
+        kbn_step(a, sm as f64);
+    } else {
+        kbn_step(a, v as f64);
+    }
+}
+
+/// Seed the compensated sum from the exact integer running sum when the first
+/// non-integer (or an overflow) forces the approximate path — SQLite's
+/// `kahanBabuskaNeumaierInit`, with the same 2^52 split for exactness.
+fn kbn_init(a: &mut SumAccum, v: i64) {
+    if v <= -4_503_599_627_370_496 || v >= 4_503_599_627_370_496 {
+        let sm = v % 16_384;
+        a.r_sum = (v - sm) as f64;
+        a.r_err = sm as f64;
+    } else {
+        a.r_sum = v as f64;
+        a.r_err = 0.0;
+    }
+}
+
+/// Faithful port of SQLite's `sumStep`: keep an exact integer running sum until
+/// the first non-integer input or an integer overflow, then switch to a
+/// Kahan–Babuška–Neumaier compensated double sum seeded from that integer sum.
+/// This is why `sum(9223372036854775807, -9223372036854775808, 2.5)` is `1.5`
+/// (the integers cancel exactly to -1) and `sum(1e308, 3, -1e308)` is `3.0`.
+/// The numeric type SQLite assigns each argument (`sqlite3_value_numeric_type`)
+/// decides integer-vs-real, not the storage class: a pure-integer text `'1'`
+/// stays exact, while `'1.5'`, `'1e2'`, an out-of-range integer string, or
+/// non-numeric text each force the approximate path. NULLs are pre-filtered.
+fn accumulate(vals: &[Value]) -> SumAccum {
+    let mut a = SumAccum {
+        i_sum: 0,
+        ovrfl: false,
+        approx: false,
+        r_sum: 0.0,
+        r_err: 0.0,
+    };
+    for v in vals {
+        let is_int = matches!(to_number_strict(v), Some(Value::Integer(_)));
+        if !a.approx {
+            if is_int {
+                let iv = match to_number_strict(v) {
+                    Some(Value::Integer(i)) => i,
+                    _ => 0,
+                };
+                match a.i_sum.checked_add(iv) {
+                    Some(x) => a.i_sum = x,
+                    None => {
+                        // Integer overflow: freeze the exact sum, seed the
+                        // compensated sum from it, and continue approximately.
+                        a.ovrfl = true;
+                        let seed = a.i_sum;
+                        kbn_init(&mut a, seed);
+                        a.approx = true;
+                        kbn_step_i64(&mut a, iv);
+                    }
+                }
+            } else {
+                let seed = a.i_sum;
+                kbn_init(&mut a, seed);
+                a.approx = true;
+                kbn_step(&mut a, to_f64(v));
+            }
+        } else if is_int {
+            kbn_step_i64(
+                &mut a,
+                match to_number_strict(v) {
+                    Some(Value::Integer(i)) => i,
+                    _ => 0,
+                },
+            );
+        } else {
+            // A real input after an integer overflow rescues the sum: SQLite
+            // clears the overflow flag, so `sum` yields a REAL rather than error.
+            a.ovrfl = false;
+            kbn_step(&mut a, to_f64(v));
+        }
+    }
+    a
+}
+
+/// The finalized compensated real: `rSum + rErr`, but only when `rErr` is finite
+/// (SQLite drops it when it has itself overflowed to ±∞ or NaN — its
+/// `sqlite3IsOverflow` test — leaving the ±∞ `rSum` alone).
+fn kbn_result(a: &SumAccum) -> f64 {
+    if a.r_err.is_finite() {
+        a.r_sum + a.r_err
+    } else {
+        a.r_sum
+    }
+}
+
+/// `sum(X)` — an INTEGER when every non-NULL input is an integer and the sum
+/// fits i64, a REAL (compensated) once any input is non-integer, an "integer
+/// overflow" error when an all-integer sum leaves i64, and NULL for no rows.
 pub fn sum_values(vals: &[Value]) -> Result<Value> {
     if vals.is_empty() {
         return Ok(Value::Null);
     }
-    // The numeric type SQLite assigns each argument (`sqlite3_value_numeric_type`)
-    // decides integer-vs-real, not the storage class: a pure-integer *text* like
-    // `'1'` keeps the running sum exact, while `'1.5'`, `'1e2'`, an out-of-range
-    // integer string, or non-numeric text each force a REAL result.
-    let exact_int = vals
-        .iter()
-        .all(|v| matches!(to_number_strict(v), Some(Value::Integer(_))));
-    if exact_int {
-        let mut acc: i64 = 0;
-        for v in vals {
-            let i = match to_number_strict(v) {
-                Some(Value::Integer(i)) => i,
-                _ => 0,
-            };
-            acc = acc
-                .checked_add(i)
-                .ok_or_else(|| Error::Error("integer overflow".into()))?;
-        }
-        Ok(Value::Integer(acc))
+    let a = accumulate(vals);
+    if !a.approx {
+        Ok(Value::Integer(a.i_sum))
+    } else if a.ovrfl {
+        // An integer overflow that no later real input rescued is an error.
+        Err(Error::Error("integer overflow".into()))
     } else {
-        Ok(Value::Real(vals.iter().map(to_f64).sum()))
+        Ok(Value::Real(kbn_result(&a)))
     }
+}
+
+/// `total(X)` — always a REAL. Uses the compensated sum when any input is
+/// non-integer (or the integer sum overflowed), else the exact integer sum cast
+/// to double. Never errors on overflow (unlike `sum`).
+pub fn total_value(vals: &[Value]) -> f64 {
+    let a = accumulate(vals);
+    if a.approx {
+        kbn_result(&a)
+    } else {
+        a.i_sum as f64
+    }
+}
+
+/// `avg(X)` — REAL, or `None` for no non-NULL rows. The dividend follows the same
+/// exact-vs-compensated choice as [`total_value`].
+pub fn avg_value(vals: &[Value]) -> Option<f64> {
+    if vals.is_empty() {
+        return None;
+    }
+    let a = accumulate(vals);
+    let r = if a.approx {
+        kbn_result(&a)
+    } else {
+        a.i_sum as f64
+    };
+    Some(r / vals.len() as f64)
 }
 
 /// The raw bytes of a value's text representation, used by `||`. A blob

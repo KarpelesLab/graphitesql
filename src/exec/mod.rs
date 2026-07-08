@@ -30738,15 +30738,11 @@ impl Connection {
                 }
             }
             "sum" => eval::sum_values(&vals)?,
-            "total" => Value::Real(vals.iter().map(eval::to_f64).sum()),
-            "avg" => {
-                if vals.is_empty() {
-                    Value::Null
-                } else {
-                    let sum: f64 = vals.iter().map(eval::to_f64).sum();
-                    Value::Real(sum / vals.len() as f64)
-                }
-            }
+            "total" => Value::Real(eval::total_value(&vals)),
+            "avg" => match eval::avg_value(&vals) {
+                Some(r) => Value::Real(r),
+                None => Value::Null,
+            },
             "min" => vals
                 .into_iter()
                 .reduce(|a, b| {
@@ -35229,15 +35225,11 @@ fn window_aggregate(lname: &str, star: bool, frame: &[&Vec<Value>]) -> Result<Va
             }
         }
         "sum" => eval::sum_values(&vals)?,
-        "total" => Value::Real(vals.iter().map(eval::to_f64).sum()),
-        "avg" => {
-            if vals.is_empty() {
-                Value::Null
-            } else {
-                let sum: f64 = vals.iter().map(eval::to_f64).sum();
-                Value::Real(sum / vals.len() as f64)
-            }
-        }
+        "total" => Value::Real(eval::total_value(&vals)),
+        "avg" => match eval::avg_value(&vals) {
+            Some(r) => Value::Real(r),
+            None => Value::Null,
+        },
         "min" => vals
             .into_iter()
             .reduce(|a, b| {
