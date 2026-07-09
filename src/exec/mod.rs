@@ -30093,8 +30093,16 @@ impl Connection {
             })
             .collect();
 
-        let seg =
-            fts5_index::build_segment(&terms, docs.len() as u64, &col_totals, &doc_sizes, 4050, 0);
+        let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
+        let seg = fts5_index::build_segment_prefixed(
+            &terms,
+            docs.len() as u64,
+            &col_totals,
+            &doc_sizes,
+            4050,
+            0,
+            &prefixes,
+        );
 
         let q = |s: &str| sql::print::ident(s);
         let pv = |vals: Vec<Value>| Params {
@@ -30251,8 +30259,10 @@ impl Connection {
     fn fts5_rebuild_from_gpost(&mut self, name: &str) -> Result<()> {
         use crate::fts5_index::{self, IdxRow, Posting};
         use alloc::collections::BTreeMap;
-        let (_m, _args, schema) = self.vtab_meta(name)?;
+        let (_m, args, schema) = self.vtab_meta(name)?;
         let ncols = schema.columns.len();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
 
         // term -> rowid -> per-column positions, gathered from `_gpost`.
         let mut index: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u32>>>> = BTreeMap::new();
@@ -30325,7 +30335,15 @@ impl Connection {
             })
             .collect();
 
-        let seg = fts5_index::build_segment(&terms, n_docs, &col_totals, &doc_sizes, 4050, 0);
+        let seg = fts5_index::build_segment_prefixed(
+            &terms,
+            n_docs,
+            &col_totals,
+            &doc_sizes,
+            4050,
+            0,
+            &prefixes,
+        );
 
         let q = |s: &str| sql::print::ident(s);
         let pv = |vals: Vec<Value>| Params {

@@ -3475,6 +3475,44 @@ fn fts5_option_value(args: &[&str], key: &str) -> Option<String> {
     })
 }
 
+/// The configured prefix-index character lengths of an `fts5` table, in declared
+/// order (prefix index `i` → stored key prefix byte `'1' + i`). sqlite accepts a
+/// space- or comma-separated list inside one `prefix='…'` directive and also
+/// accumulates across several `prefix=` directives, so both are gathered here.
+/// Values must be 1..=999 (sqlite's `prefix length out of range`); malformed or
+/// out-of-range entries are dropped rather than erroring (the table was already
+/// accepted at CREATE time).
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_prefix_lengths(args: &[&str]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for a in args {
+        let Some((k, v)) = a.split_once('=') else {
+            continue;
+        };
+        if !k.trim().eq_ignore_ascii_case("prefix") {
+            continue;
+        }
+        let v = v.trim();
+        let b = v.as_bytes();
+        let quoted = b.len() >= 2
+            && ((b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0]
+                || b[0] == b'[' && b[b.len() - 1] == b']');
+        let inner = if quoted { &v[1..v.len() - 1] } else { v };
+        for tok in inner.split([' ', ',', '\t']) {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            if let Ok(n) = tok.parse::<usize>()
+                && (1..=999).contains(&n)
+            {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
 /// The external-content configuration of an `fts5` table, or `None` when the table
 /// stores its own documents. Returns `Some((content_table, content_rowid_col))`
 /// when a non-empty `content='<table>'` option is present. `content=''` is the

@@ -295,6 +295,16 @@ impl SegWriter {
 
     fn add_term(&mut self, term: &[u8], postings: &[Posting]) {
         let key = term_key(term);
+        self.add_key(&key, postings);
+    }
+
+    /// Append a term whose FULL stored key (index-prefix byte + term bytes) is
+    /// already built. The main index calls [`add_term`] (key = `'0'` + term); the
+    /// prefix indexes call this directly with a `'1'`/`'2'`/… prefix byte. Keys
+    /// must arrive in ascending order across the whole segment (main `'0'` terms
+    /// first, then each prefix index in turn), matching sqlite's single merged
+    /// term stream.
+    fn add_key(&mut self, key: &[u8], postings: &[Posting]) {
         let dl = doclist(postings);
         // Port of `fts5WriteAppendTerm`'s leaf-fill boundary. sqlite decides to end
         // the current leaf purely from the header + committed pgidx + the FULL
@@ -309,7 +319,7 @@ impl SegWriter {
         {
             self.flush();
         }
-        let rec = self.term_record(&key);
+        let rec = self.term_record(key);
         // Whether the whole doclist fits on the current leaf, measured AFTER this
         // term's record + pgidx entry are accounted for (sqlite's hash-flush guard
         // `pgsz >= (pBuf->n + pPgidx->n + nDoclist + 1)`, i.e. the `+ 1` folded into
@@ -320,11 +330,11 @@ impl SegWriter {
         let fits_whole = 4 + self.body.len() + rec.len() + pgidx_after + dl.len() < self.pgsz;
         self.term_offsets.push(4 + self.body.len());
         if self.leaf_first_term.is_none() {
-            self.leaf_first_term = Some(key.clone());
+            self.leaf_first_term = Some(key.to_vec());
         }
-        self.leaf_last_term = Some(key.clone());
+        self.leaf_last_term = Some(key.to_vec());
         self.body.extend_from_slice(&rec);
-        self.prev_term_key = Some(key);
+        self.prev_term_key = Some(key.to_vec());
         if fits_whole {
             self.body.extend_from_slice(&dl);
             return;
@@ -530,6 +540,9 @@ pub(crate) struct Segment {
 /// over `n_docs` documents with `ncols` columns. `col_totals[c]` is the total
 /// token count in column `c` across all documents; `doc_sizes` is per-document
 /// `(rowid, per-column token counts)`. `cookie` is the `%_config` change count.
+///
+/// This builds ONLY the main terms index (no prefix indexes). Callers that
+/// configured `prefix='…'` use [`build_segment_prefixed`].
 pub(crate) fn build_segment(
     terms: &[(Vec<u8>, Vec<Posting>)],
     n_docs: u64,
@@ -538,11 +551,120 @@ pub(crate) fn build_segment(
     pgsz: usize,
     cookie: u32,
 ) -> Segment {
+    build_segment_prefixed(terms, n_docs, col_totals, doc_sizes, pgsz, cookie, &[])
+}
+
+/// The number of BYTES occupied by the first `n_char` unicode characters of the
+/// UTF-8 term `t`, or `None` when `t` has fewer than `n_char` characters — the
+/// port of sqlite's `sqlite3Fts5IndexCharlenToBytelen` (`fts5_index.c`). A `None`
+/// result means the term is too short to contribute to that prefix index.
+fn prefix_bytelen(t: &[u8], n_char: usize) -> Option<usize> {
+    let mut n = 0usize;
+    for i in 0..n_char {
+        if n >= t.len() {
+            return None; // fewer than n_char chars
+        }
+        if t[n] >= 0xc0 {
+            n += 1;
+            if n >= t.len() {
+                return None;
+            }
+            while t[n] & 0xc0 == 0x80 {
+                n += 1;
+                if n >= t.len() {
+                    // A final multi-byte character that runs to the end of the
+                    // term still counts as the n_char-th character.
+                    if i + 1 == n_char {
+                        break;
+                    }
+                    return None;
+                }
+            }
+        } else {
+            n += 1;
+        }
+    }
+    Some(n)
+}
+
+/// Merge several full terms' postings into one prefix term's doclist. `groups`
+/// are the per-full-term posting slices sharing this prefix, in ascending term
+/// order (so within a rowid the earlier term's positions come first). Postings
+/// are unioned by rowid; per column the positions are merged and sorted (a
+/// document listing the prefix once per contributing term keeps every position),
+/// matching sqlite's hash-merge of the several `'N'`-prefixed doclists.
+fn merge_prefix_postings(groups: &[&[Posting]]) -> Vec<Posting> {
+    use alloc::collections::BTreeMap;
+    // rowid -> per-column positions (kept sorted+deduplicated per column).
+    let mut by_rowid: BTreeMap<i64, Vec<Vec<u32>>> = BTreeMap::new();
+    for postings in groups {
+        for p in *postings {
+            let entry = by_rowid
+                .entry(p.rowid)
+                .or_insert_with(|| alloc::vec![Vec::new(); p.cols.len()]);
+            if entry.len() < p.cols.len() {
+                entry.resize(p.cols.len(), Vec::new());
+            }
+            for (c, positions) in p.cols.iter().enumerate() {
+                entry[c].extend_from_slice(positions);
+            }
+        }
+    }
+    by_rowid
+        .into_iter()
+        .map(|(rowid, mut cols)| {
+            for col in &mut cols {
+                col.sort_unstable();
+                col.dedup();
+            }
+            Posting { rowid, cols }
+        })
+        .collect()
+}
+
+/// Build the segment index for the main terms index plus, for each configured
+/// prefix length in `prefixes` (character counts, in declared order), a prefix
+/// index. sqlite writes all of a bulk rebuild's indexes into a SINGLE segment
+/// (segid 1): the merged term stream is the main `'0'`-prefixed terms followed by
+/// each prefix index's terms keyed `'1'`, `'2'`, … (the prefix byte is
+/// `FTS5_MAIN_PREFIX + i + 1`). A prefix index's term for byte-prefix `p` is the
+/// merge of every main term's doclist whose term starts with `p` (positions
+/// preserved). Since `'0' < '1' < '2' < …`, appending main terms then each prefix
+/// index in turn yields the globally ascending key order the writer requires.
+pub(crate) fn build_segment_prefixed(
+    terms: &[(Vec<u8>, Vec<Posting>)],
+    n_docs: u64,
+    col_totals: &[u64],
+    doc_sizes: &[(i64, Vec<u64>)],
+    pgsz: usize,
+    cookie: u32,
+    prefixes: &[usize],
+) -> Segment {
+    use alloc::collections::BTreeMap;
     let segid = 1;
     let (leaves, idx, dlidx) = {
         let mut w = SegWriter::new(pgsz.max(16), segid);
         for (term, postings) in terms {
             w.add_term(term, postings);
+        }
+        // Each prefix index i is keyed with byte MAIN_PREFIX + i + 1 ('1', '2', …).
+        for (i, &n_char) in prefixes.iter().enumerate() {
+            let idx_byte = MAIN_PREFIX + (i as u8) + 1;
+            // Group full terms by their n_char-character byte-prefix (BTreeMap keeps
+            // the prefixes ascending, matching the required key order).
+            let mut groups: BTreeMap<&[u8], Vec<&[Posting]>> = BTreeMap::new();
+            for (term, postings) in terms {
+                if let Some(nb) = prefix_bytelen(term, n_char) {
+                    groups.entry(&term[..nb]).or_default().push(postings);
+                }
+            }
+            for (pfx, parts) in groups {
+                let merged = merge_prefix_postings(&parts);
+                let mut key = Vec::with_capacity(pfx.len() + 1);
+                key.push(idx_byte);
+                key.extend_from_slice(pfx);
+                w.add_key(&key, &merged);
+            }
         }
         if terms.is_empty() {
             (Vec::new(), Vec::new(), Vec::new())
