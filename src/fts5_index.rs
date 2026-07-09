@@ -12,8 +12,12 @@
 //! `tests/fts5_segment.rs`. Functional `MATCH` compatibility needs a structurally
 //! valid index, not byte-identical pages, so the leaf-fill heuristic here is the
 //! simple `pgsz` rule (sqlite's exact heuristic differs at some page sizes — that
-//! only affects byte-identity, not readability). Large single-term doclists that
-//! would need a doclist-index page are not yet emitted.
+//! only affects byte-identity, not readability). A single term whose doclist
+//! spills onto `FTS5_MIN_DLIDX_SIZE`+ term-less continuation leaves DOES get a
+//! doclist-index (`dlidx`) b-tree — see [`SegWriter::finish_term_dlidx`] — which
+//! sqlite's `integrity-check` requires; without it a large-scale index is rejected
+//! as corrupt. That path is byte-verified against the sqlite oracle in
+//! `tests/fts5_scale.rs`.
 //!
 //! Wired into the executor: `fts5_create_storage` builds the five shadow tables,
 //! the vtab store's backing table is `_content` for fts5, and `fts5_rebuild_index`
@@ -50,6 +54,29 @@ pub(crate) const STRUCTURE_ROWID: i64 = 10;
 /// The `%_data` rowid of leaf page `pgno` in segment `segid` (height 0).
 pub(crate) fn segment_leaf_rowid(segid: i64, pgno: i64) -> i64 {
     (segid << 37) | pgno
+}
+
+/// `fts5_dri(segid, dlidx=1, height, pgno)` — the `%_data` rowid of a
+/// doclist-index page. The rowid layout is
+/// `segid<<37 | dlidx<<36 | height<<31 | pgno`
+/// (`FTS5_DATA_PAGE_B=31`, `FTS5_DATA_HEIGHT_B=5`, `FTS5_DATA_DLI_B=1`).
+pub(crate) fn dlidx_rowid(segid: i64, height: i64, pgno: i64) -> i64 {
+    (segid << 37) | (1 << 36) | (height << 31) | pgno
+}
+
+/// `FTS5_MIN_DLIDX_SIZE` — a term's doclist gets a doclist-index only when it
+/// spills onto at least this many term-less continuation leaves.
+const MIN_DLIDX_SIZE: usize = 4;
+
+/// The first rowid recorded on a doclist-index page: skip the flag byte and the
+/// leaf/child pgno varint, then read the rowid varint (matches sqlite's
+/// `fts5DlidxExtractFirstRowid`). `0` if the page is malformed/too short.
+fn dlidx_first_rowid(page: &[u8]) -> i64 {
+    let mut pos = 1usize; // skip flag byte
+    if read_varint(page, &mut pos).is_none() {
+        return 0;
+    }
+    read_varint(page, &mut pos).unwrap_or(0) as i64
 }
 
 /// Append the sqlite varint encoding of `v` to `out`.
@@ -152,6 +179,10 @@ pub(crate) struct IdxRow {
     pub pgno: i64,
 }
 
+/// A [`SegWriter::finish`] result: the leaf pages, the `%_idx` rows, and the
+/// doclist-index `%_data` pages `(rowid, block)`.
+type SegParts = (Vec<Vec<u8>>, Vec<IdxRow>, Vec<(i64, Vec<u8>)>);
+
 /// The streaming leaf writer (see the module doc and `tests/fts5_segment.rs`).
 struct SegWriter {
     pgsz: usize,
@@ -167,6 +198,13 @@ struct SegWriter {
     leaf_last_term: Option<Vec<u8>>,
     prev_leaf_last_term: Option<Vec<u8>>,
     pgno: i64,
+    /// Accumulated doclist-index `%_data` pages `(rowid, block)` for terms whose
+    /// doclists spilled onto `MIN_DLIDX_SIZE`+ term-less continuation leaves.
+    dlidx_data: Vec<(i64, Vec<u8>)>,
+    /// While streaming one term's doclist, `(leaf_pgno, first_absolute_rowid)` for
+    /// each CONTINUATION leaf (the leaves after the term-start leaf that begin a
+    /// new doclist entry at their `first_rowid_off`). Cleared per term.
+    span_pages: Vec<(i64, i64)>,
 }
 
 impl SegWriter {
@@ -185,6 +223,8 @@ impl SegWriter {
             leaf_last_term: None,
             prev_leaf_last_term: None,
             pgno: 1,
+            dlidx_data: Vec::new(),
+            span_pages: Vec::new(),
         }
     }
 
@@ -276,7 +316,12 @@ impl SegWriter {
             self.body.extend_from_slice(&dl);
             return;
         }
-        // Stream the doclist across leaves.
+        // Stream the doclist across leaves. The term starts on the current
+        // in-progress leaf (`self.pgno`); every later leaf its doclist spills onto
+        // is a term-less CONTINUATION leaf. Record the first absolute rowid on each
+        // such leaf so a doclist-index can be built if there are enough of them.
+        let term_start_leaf = self.pgno;
+        self.span_pages.clear();
         self.prev_rowid = 0;
         for p in postings {
             if self.leaf_size() > self.pgsz && !self.body.is_empty() {
@@ -284,6 +329,11 @@ impl SegWriter {
             }
             if self.term_offsets.is_empty() && self.first_rowid_off == 0 {
                 self.first_rowid_off = 4 + self.body.len();
+                // This posting's rowid becomes the first (absolute) rowid on a
+                // fresh continuation leaf. Record `(pgno, rowid)` for the dlidx.
+                if self.pgno != term_start_leaf {
+                    self.span_pages.push((self.pgno, p.rowid));
+                }
             }
             let pl = poslist(p);
             let size_len = varint::decode(&pl).map(|(_, n)| n).unwrap_or(1);
@@ -297,11 +347,143 @@ impl SegWriter {
                 self.body.push(b);
             }
         }
+        self.finish_term_dlidx(term_start_leaf);
     }
 
-    fn finish(mut self) -> (Vec<Vec<u8>>, Vec<IdxRow>) {
+    /// After a spanning term's doclist is fully written, emit a doclist-index for
+    /// it if it spilled onto `MIN_DLIDX_SIZE`+ term-less continuation leaves, and
+    /// set the dlidx flag on that term's `%_idx` entry (the b-tree page).
+    ///
+    /// A doclist-index is a small b-tree of its own (`FTS5_DLIDX_ROWID` pages),
+    /// built here as a faithful port of sqlite's `fts5WriteDlidxAppend`. Level 0
+    /// maps each continuation leaf that BEGINS a rowid to that first rowid; a
+    /// continuation leaf with no rowid of its own (a pure poslist tail) contributes
+    /// a `0x00` padding byte. When a level's page fills to `pgsz` it is flushed
+    /// (flag byte `0x01`, "not the root") and a copy of the appended rowid is
+    /// cascaded up to the next level of the hierarchy.
+    fn finish_term_dlidx(&mut self, term_start_leaf: i64) {
+        // `span_pages` holds `(leaf_pgno, first_rowid)` for every continuation leaf
+        // that begins a rowid. Below `MIN_DLIDX_SIZE` term-less leaves, no dlidx.
+        if self.span_pages.is_empty() {
+            return;
+        }
+        let last_leaf = self.span_pages.last().map(|&(pg, _)| pg).unwrap_or(0);
+        let n_empty = (last_leaf - term_start_leaf) as usize;
+        if n_empty < MIN_DLIDX_SIZE {
+            self.span_pages.clear();
+            return;
+        }
+        let span = core::mem::take(&mut self.span_pages);
+        let pgsz = self.pgsz;
+        // One accumulator per b-tree level. `pgno` is the page number this level is
+        // currently writing (level 0 starts at the term-start leaf, matching
+        // sqlite's `aDlidx[0].pgno = pPage->pgno`); `prev`/`prev_valid` drive the
+        // rowid delta encoding.
+        struct DlidxLvl {
+            buf: Vec<u8>,
+            pgno: i64,
+            prev: i64,
+            prev_valid: bool,
+        }
+        let new_lvl = |pgno: i64| DlidxLvl {
+            buf: Vec::new(),
+            pgno,
+            prev: 0,
+            prev_valid: false,
+        };
+        let mut lvls: Vec<DlidxLvl> = alloc::vec![new_lvl(term_start_leaf)];
+        // Emitted pages `(height, pgno, bytes)`.
+        let mut out: Vec<(i64, i64, Vec<u8>)> = Vec::new();
+
+        // Port of `fts5WriteDlidxAppend`: record one rowid, cascading up levels as
+        // pages fill. `leaf_pgno` is the level-0 leaf (used only to seed a fresh
+        // level-0 page's pgno reference). Before each level-0 append, emit one
+        // `0x00` padding byte for every intervening term-less leaf that carried NO
+        // rowid of its own (a gap in the recorded leaf pgnos).
+        let mut prev_leaf = term_start_leaf;
+        for &(leaf_pgno, rowid) in &span {
+            for _ in 0..(leaf_pgno - prev_leaf - 1).max(0) {
+                lvls[0].buf.push(0x00);
+            }
+            prev_leaf = leaf_pgno;
+            let mut i = 0usize;
+            let mut b_done = false;
+            while !b_done {
+                if i >= lvls.len() {
+                    lvls.push(new_lvl(0));
+                }
+                if lvls[i].buf.len() >= pgsz {
+                    // Page full: flush it (flag 0x01 = not the root) and grow the
+                    // hierarchy so level i+1 exists.
+                    lvls[i].buf[0] = 0x01;
+                    let flushed = core::mem::take(&mut lvls[i].buf);
+                    let flushed_pgno = lvls[i].pgno;
+                    out.push((i as i64, flushed_pgno, flushed.clone()));
+                    if i + 1 >= lvls.len() {
+                        lvls.push(new_lvl(0));
+                    }
+                    // If the parent level is empty, this flushed node was the root;
+                    // seed the new parent with the flushed page's first rowid.
+                    if lvls[i + 1].buf.is_empty() {
+                        let first = dlidx_first_rowid(&flushed);
+                        lvls[i + 1].pgno = flushed_pgno;
+                        let parent = &mut lvls[i + 1];
+                        parent.buf.push(0x00);
+                        put_varint(&mut parent.buf, flushed_pgno as u64);
+                        put_varint(&mut parent.buf, first as u64);
+                        parent.prev = first;
+                        parent.prev_valid = true;
+                    }
+                    lvls[i].prev_valid = false;
+                    lvls[i].pgno += 1;
+                } else {
+                    b_done = true;
+                }
+                if lvls[i].prev_valid {
+                    let d = (rowid - lvls[i].prev) as u64;
+                    put_varint(&mut lvls[i].buf, d);
+                } else {
+                    // Fresh page for this level: [flag=!bDone][pgno-ref][rowid].
+                    let ref_pgno = if i == 0 { leaf_pgno } else { lvls[i - 1].pgno };
+                    let flag = u8::from(!b_done);
+                    let lvl = &mut lvls[i];
+                    lvl.buf.push(flag);
+                    put_varint(&mut lvl.buf, ref_pgno as u64);
+                    put_varint(&mut lvl.buf, rowid as u64);
+                }
+                lvls[i].prev = rowid;
+                lvls[i].prev_valid = true;
+                i += 1;
+            }
+        }
+        // Flush every still-open page. The highest non-empty level's open page is
+        // the root (flag 0x00); any lower open page is non-root (0x01).
+        let top = lvls.iter().rposition(|l| !l.buf.is_empty()).unwrap_or(0);
+        for (i, lvl) in lvls.iter_mut().enumerate() {
+            if lvl.buf.is_empty() {
+                continue;
+            }
+            let mut page = core::mem::take(&mut lvl.buf);
+            page[0] = if i == top { 0x00 } else { 0x01 };
+            out.push((i as i64, lvl.pgno, page));
+        }
+        for (height, pgno, page) in out {
+            self.dlidx_data
+                .push((dlidx_rowid(self.segid, height, pgno), page));
+        }
+        // Mark the dlidx flag on the `%_idx` entry for the term-start leaf.
+        let want = term_start_leaf << 1;
+        for row in self.idx.iter_mut() {
+            if row.pgno == want {
+                row.pgno |= 1;
+                break;
+            }
+        }
+    }
+
+    fn finish(mut self) -> SegParts {
         self.flush();
-        (self.leaves, self.idx)
+        (self.leaves, self.idx, self.dlidx_data)
     }
 }
 
@@ -344,13 +526,13 @@ pub(crate) fn build_segment(
     cookie: u32,
 ) -> Segment {
     let segid = 1;
-    let (leaves, idx) = {
+    let (leaves, idx, dlidx) = {
         let mut w = SegWriter::new(pgsz.max(16), segid);
         for (term, postings) in terms {
             w.add_term(term, postings);
         }
         if terms.is_empty() {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         } else {
             w.finish()
         }
@@ -370,6 +552,8 @@ pub(crate) fn build_segment(
     for (i, leaf) in leaves.iter().enumerate() {
         data.push((segment_leaf_rowid(segid, i as i64 + 1), leaf.clone()));
     }
+    // Doclist-index pages (dlidx=1 rowids) for spanning terms, if any.
+    data.extend(dlidx);
 
     let docsize = doc_sizes
         .iter()
@@ -1614,6 +1798,251 @@ mod tests {
             rowid,
             cols: cols.iter().map(|c| c.to_vec()).collect(),
         }
+    }
+
+    /// All doclist-index `%_data` pages `(dlidx-rowid, block)` in a segment, in
+    /// rowid order.
+    fn dlidx_pages(seg: &Segment) -> Vec<(i64, Vec<u8>)> {
+        let mut out: Vec<(i64, Vec<u8>)> = seg
+            .data
+            .iter()
+            .filter(|(id, _)| (*id & (1 << 36)) != 0)
+            .map(|(id, b)| (*id, b.clone()))
+            .collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
+    /// `(terms, n_docs, col_totals, doc_sizes)` — the four `build_segment` inputs.
+    type Corpus = (
+        Vec<(Vec<u8>, Vec<Posting>)>,
+        u64,
+        Vec<u64>,
+        Vec<(i64, Vec<u64>)>,
+    );
+
+    /// A single-column corpus of `n` documents (rowids `1..=n`), each the same
+    /// single token `tok`, plus the token totals/doc-sizes `build_segment` wants.
+    fn single_token_corpus(tok: &[u8], n: i64) -> Corpus {
+        let postings: Vec<Posting> = (1..=n).map(|r| p(r, &[&[0]])).collect();
+        let terms = vec![(tok.to_vec(), postings)];
+        let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![1])).collect();
+        (terms, n as u64, vec![n as u64], doc_sizes)
+    }
+
+    /// A term whose doclist fits inside a single leaf gets NO doclist-index.
+    #[test]
+    fn dlidx_absent_when_doclist_fits_one_leaf() {
+        let (terms, ndoc, tot, sizes) = single_token_corpus(b"shared", 50);
+        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0);
+        assert!(dlidx_pages(&seg).is_empty());
+        // The single `%_idx` entry has no dlidx flag.
+        assert_eq!(seg.idx.len(), 1);
+        assert_eq!(seg.idx[0].pgno & 1, 0);
+    }
+
+    /// A doclist that spills onto a few (< MIN_DLIDX_SIZE) continuation leaves is
+    /// still too small for a doclist-index.
+    #[test]
+    fn dlidx_absent_below_threshold() {
+        // ~3 leaves total: term-start + 2 continuation (< 4), so no dlidx.
+        let (terms, ndoc, tot, sizes) = single_token_corpus(b"shared", 2500);
+        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0);
+        let leaves = leaves_of(&seg);
+        assert!(leaves.len() >= 2, "expected a multi-leaf spill");
+        assert!(
+            dlidx_pages(&seg).is_empty(),
+            "fewer than {MIN_DLIDX_SIZE} continuation leaves must not add a dlidx"
+        );
+        assert_eq!(seg.idx.iter().filter(|r| r.pgno & 1 == 1).count(), 0);
+        // Still fully decodable.
+        assert_eq!(decode(&seg, b"shared").unwrap().len(), 2500);
+    }
+
+    /// A single term whose doclist spills onto MIN_DLIDX_SIZE+ continuation leaves
+    /// emits a doclist-index page whose BYTES equal what sqlite 3.50.4 writes for
+    /// the same corpus at pgsz=4050 (captured from the FTS5 oracle). The `%_idx`
+    /// entry for the term-start leaf gets the dlidx (low) bit set, and the page is
+    /// stored at the dlidx rowid `segid<<37 | 1<<36 | 0<<31 | leaf`.
+    #[test]
+    fn dlidx_bytes_match_sqlite_6000_docs() {
+        let (terms, ndoc, tot, sizes) = single_token_corpus(b"shared", 6000);
+        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0);
+        // sqlite 3.50.4: 5 leaves, one dlidx page X'00028A438A458A458A45' at
+        // dlidx pgno 1, `%_idx` entry X''|leaf=1|dli=1.
+        assert_eq!(leaves_of(&seg).len(), 5);
+        let dl = dlidx_pages(&seg);
+        assert_eq!(dl.len(), 1);
+        assert_eq!(dl[0].0, dlidx_rowid(1, 0, 1));
+        assert_eq!(dl[0].1, hex("00028A438A458A458A45"));
+        assert_eq!(seg.idx.len(), 1);
+        assert_eq!(seg.idx[0].pgno, (1 << 1) | 1); // leaf 1, dlidx flag set
+        assert!(seg.idx[0].term.is_empty());
+        // The doclist still round-trips through the reader (all 6000 rowids).
+        let got = decode(&seg, b"shared").unwrap();
+        assert_eq!(got.len(), 6000);
+        assert_eq!(got.first().unwrap().rowid, 1);
+        assert_eq!(got.last().unwrap().rowid, 6000);
+    }
+
+    /// Same shape, one leaf larger: sqlite's dlidx grows by exactly one rowid-delta
+    /// entry (X'8A45'), still byte-identical.
+    #[test]
+    fn dlidx_bytes_match_sqlite_8000_docs() {
+        let (terms, ndoc, tot, sizes) = single_token_corpus(b"shared", 8000);
+        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0);
+        assert_eq!(leaves_of(&seg).len(), 6);
+        let dl = dlidx_pages(&seg);
+        assert_eq!(dl.len(), 1);
+        assert_eq!(dl[0].0, dlidx_rowid(1, 0, 1));
+        assert_eq!(dl[0].1, hex("00028A438A458A458A458A45"));
+        assert_eq!(seg.idx[0].pgno & 1, 1);
+        assert_eq!(decode(&seg, b"shared").unwrap().len(), 8000);
+    }
+
+    /// Decode a run of hex digit pairs into bytes (test helper).
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Walk one dlidx b-tree page (height 0 leaf-index page), yielding
+    /// `(leaf_pgno, first_rowid)` for every entry, following sqlite's
+    /// `fts5DlidxLvlNext`: `[flag][firstPgno][firstRowid]` then, per following
+    /// leaf, either a `0x00` (a rowid-less leaf → advance pgno, no entry) or a
+    /// varint rowid-delta.
+    fn dlidx_level_entries(page: &[u8]) -> Vec<(i64, i64)> {
+        let mut out = Vec::new();
+        let mut pos = 1usize; // skip flag
+        let mut pgno = read_varint(page, &mut pos).unwrap() as i64;
+        let mut rowid = read_varint(page, &mut pos).unwrap() as i64;
+        out.push((pgno, rowid));
+        while pos < page.len() {
+            // Skip rowid-less leaves (0x00 padding), counting each as a page.
+            while pos < page.len() && page[pos] == 0 {
+                pgno += 1;
+                pos += 1;
+            }
+            if pos >= page.len() {
+                break;
+            }
+            let d = read_varint(page, &mut pos).unwrap() as i64;
+            pgno += 1;
+            rowid += d;
+            out.push((pgno, rowid));
+        }
+        out
+    }
+
+    /// Fetch a dlidx page `(segid=1, height, pgno)` from a segment, or `None`.
+    fn dlidx_page(seg: &Segment, height: i64, pgno: i64) -> Option<&[u8]> {
+        let rid = dlidx_rowid(1, height, pgno);
+        seg.data
+            .iter()
+            .find(|(id, _)| *id == rid)
+            .map(|(_, b)| b.as_slice())
+    }
+
+    /// The first rowid physically written on each segment LEAF (from its
+    /// `first_rowid_off` header, read as an absolute varint), keyed by leaf pgno.
+    /// Continuation leaves that carry no whole rowid (`first_rowid_off == 0`) are
+    /// omitted.
+    fn leaf_first_rowids(seg: &Segment) -> alloc::collections::BTreeMap<i64, i64> {
+        let mut out = alloc::collections::BTreeMap::new();
+        for (id, blob) in &seg.data {
+            // Height-0 leaf pages: no dlidx bit, id > structure rowid.
+            if *id <= STRUCTURE_ROWID || (*id & (1 << 36)) != 0 {
+                continue;
+            }
+            let pgno = *id & 0x7fff_ffff;
+            let fro = u16::from_be_bytes([blob[0], blob[1]]) as usize;
+            if fro == 0 {
+                continue;
+            }
+            let mut pos = fro;
+            if let Some(r) = read_varint(blob, &mut pos) {
+                out.insert(pgno, r as i64);
+            }
+        }
+        out
+    }
+
+    /// A term whose doclist is enormous at a tiny page size builds a MULTI-LEVEL
+    /// doclist-index (height-0 index pages plus a height-1 root). The whole dlidx
+    /// b-tree must be internally consistent: walking it top-down recovers exactly
+    /// the `(leaf_pgno → first_rowid)` map of the segment's leaves, and the doclist
+    /// still round-trips through the reader.
+    #[test]
+    fn dlidx_multi_level_is_consistent() {
+        // 4000 rowids spaced 1000 apart so deltas are multi-byte; pgsz 64 forces
+        // many small leaves AND a dlidx large enough to need a second level.
+        let postings: Vec<Posting> = (1..=4000).map(|i| p(i * 1000, &[&[0]])).collect();
+        let terms = vec![(b"w".to_vec(), postings)];
+        let sizes: Vec<(i64, Vec<u64>)> = (1..=4000).map(|i| (i * 1000, vec![1])).collect();
+        let seg = build_segment(&terms, 4000, &[4000], &sizes, 64, 0);
+
+        // There must be more than one height-0 index page and exactly one root at
+        // height 1 (this is what makes it a MULTI-level dlidx).
+        let n_h0 = seg
+            .data
+            .iter()
+            .filter(|(id, _)| (*id & (1 << 36)) != 0 && ((*id >> 31) & 0x1f) == 0)
+            .count();
+        let n_h1 = seg
+            .data
+            .iter()
+            .filter(|(id, _)| (*id & (1 << 36)) != 0 && ((*id >> 31) & 0x1f) == 1)
+            .count();
+        assert!(
+            n_h0 > 1,
+            "expected multiple height-0 dlidx pages, got {n_h0}"
+        );
+        assert_eq!(n_h1, 1, "expected exactly one height-1 root");
+
+        // Walk the root: each entry points to a height-0 page (by pgno) whose first
+        // rowid equals the root's recorded rowid for it.
+        let root = dlidx_page(&seg, 1, 1).expect("root at height 1, pgno 1");
+        let root_entries = dlidx_level_entries(root);
+        let mut leaf_index: alloc::collections::BTreeMap<i64, i64> =
+            alloc::collections::BTreeMap::new();
+        for &(child_pgno, root_rowid) in &root_entries {
+            let child = dlidx_page(&seg, 0, child_pgno)
+                .unwrap_or_else(|| panic!("height-0 dlidx page {child_pgno} referenced by root"));
+            let entries = dlidx_level_entries(child);
+            assert_eq!(
+                entries[0].1, root_rowid,
+                "root's rowid for child {child_pgno} must equal that child's first rowid"
+            );
+            for (leaf_pgno, rowid) in entries {
+                leaf_index.insert(leaf_pgno, rowid);
+            }
+        }
+
+        // The dlidx's (leaf → first rowid) map must exactly match the leaves' own
+        // first rowids (every indexed leaf, same rowid).
+        let actual = leaf_first_rowids(&seg);
+        for (&leaf_pgno, &rowid) in &leaf_index {
+            assert_eq!(
+                actual.get(&leaf_pgno),
+                Some(&rowid),
+                "dlidx entry for leaf {leaf_pgno} must match the leaf's first rowid"
+            );
+        }
+        // The dlidx indexes exactly the continuation leaves that begin a rowid at
+        // their `first_rowid_off` — i.e. every leaf EXCEPT the term-start leaf,
+        // whose first rowid is inline right after the term record (so its header
+        // `first_rowid_off` is 0 and it is not in `actual`). Both sets therefore
+        // cover leaves 2..N and must be identical.
+        assert_eq!(leaf_index.len(), actual.len());
+        assert_eq!(leaf_index.keys().next(), Some(&2));
+
+        // And the whole doclist still decodes to all 4000 rowids in order.
+        let got = decode(&seg, b"w").unwrap();
+        assert_eq!(got.len(), 4000);
+        assert_eq!(got.first().unwrap().rowid, 1000);
+        assert_eq!(got.last().unwrap().rowid, 4_000_000);
     }
 
     #[test]
