@@ -292,10 +292,18 @@ result or declines to it — never a wrong answer), so this track is
 
 ### Track C — Storage engine, transactions, concurrency
 
-- **C8c-leftover — read-cache for read-only connections.** The `WritePager` read
-  cache is active only inside a write txn; a pure read-only connection over a
-  read-write file falls back to direct (bounded) disk reads. Coherent caching there
-  needs a statement-level change-counter revalidation hook from the exec layer.
+- **C8c — read-cache for read-only connections. DONE (2026-07-09).** The
+  `WritePager` clean-page cache now serves the read-only path too, gated by a
+  change-counter validity token: `read_cache_token` records the page-1 change
+  counter the cached pages were read under, and `revalidate_read_cache()` (called
+  at the `query_params` read-statement boundary via `revalidate_read_caches`)
+  re-reads the on-disk counter directly and drops the cache if a foreign in-process
+  `Connection` committed (sqlite bumps the counter per commit) — no-op under a
+  write lock and in WAL mode. Additive (results byte-identical); verified with two
+  in-process connections (`tests/c8c_readonly_cache.rs`: sees a foreign commit on
+  the next statement, repeat reads served from cache). Orthogonal residual: a
+  foreign commit that *grows* the file still errors "page N out of range" on the
+  read-only path (`page_count` frozen at open) — unrelated to the cache.
 - **C9a — persistent read locks. DONE (2026-07-09).** `WritePager::begin_read_txn`/
   `end_read_txn` hold a persistent `Shared` lock for an open read transaction, and
   `Connection::ensure_read_txn_lock` acquires it at the **first read within** an
