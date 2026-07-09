@@ -351,13 +351,17 @@ result or declines to it — never a wrong answer), so this track is
   corpus went from 62 leaves divergent to byte-identical. (Note: FTS5 3.50.4 has
   **no** `height>0` interior `%_data` pages — that form was removed; a
   high-frequency term's "interior" structure is its doclist-index, and the
-  per-segment term index is the plain `%_idx` table.) **Remaining:** a corpus with
-  enough distinct terms that sqlite flushes multiple segments + `optimize`-MERGEs
-  them spills poslists on a different boundary than graphite's single-pass build
-  (`>= nReq` merge fill vs `fts5FlushOneHash`), so a spanning term in a *merged*
-  index drifts a few bytes/leaf — inherent to graphite building one segment;
-  stays integrity-clean + MATCH-correct. The deeper fix is the same **incremental
-  multi-segment automerge** write path (also the O(rows²)-bulk-load perf residual).
+  per-segment term index is the plain `%_idx` table.) *Incremental multi-segment
+  writes + automerge done (2026-07-09, 633c8f1):* each autocommit INSERT now
+  appends a level-0 segment (updating the STRUCTURE + averages record) instead of
+  rebuilding, and crossing the 16-segment crisis threshold merges the level into
+  the next with sqlite's promote-down cascade — byte-identical `%_data`/`%_idx`/
+  `%_docsize`/STRUCTURE vs sqlite across insert sequences through recurring crises,
+  fixing both the O(rows²) bulk-load and the multi-segment byte-parity residual.
+  **Remaining:** explicit `BEGIN`/`SAVEPOINT` transactions, deletes/updates
+  (tombstones), prefix indexes, and spanning-dlidx segments still fall back to the
+  single-segment bulk rebuild (never wrong, just not incremental) — extending the
+  incremental path to those is the follow-up.
 - **D4-leftover — window UDFs + custom collations.** The latter needs a user
   variant on the `Collation` enum (invasive).
 - **D5 — `sqlite3_session`** changesets/patchsets for replication.
