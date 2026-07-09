@@ -380,10 +380,14 @@ result or declines to it — never a wrong answer), so this track is
   and replays it as parameterized DML under a `SAVEPOINT`, with sqlite's default
   conflict dispositions (NOTFOUND/DATA→OMIT; CONFLICT/CONSTRAINT→ABORT+`ROLLBACK
   TO`) — verified round-trip and differentially vs a `sesapply` oracle (incl.
-  conflicts), and graphite applies sqlite-generated changesets. **Remaining:**
-  `WITHOUT ROWID`/composite/no-PK tables, patchsets, changeset invert/concat/
-  rebase, custom conflict handlers, per-table attach, indirect changes, and
-  streaming.
+  conflicts), and graphite applies sqlite-generated changesets. *PK shapes
+  broadened (2026-07-09, ad4e196):* gen + apply now byte-verified for non-integer
+  single PKs (TEXT/BLOB/REAL), composite PKs (incl. reordered — the header carries
+  sqlite's 1-based PK ordinal per column), and `WITHOUT ROWID` tables (12.4k
+  fuzzed oracle checks, 0 diffs); a no-declared-PK table stays unrecorded → empty
+  changeset, matching sqlite's default. **Remaining:** patchsets, changeset
+  invert/concat/rebase, custom conflict handlers, per-table attach, indirect
+  changes, and streaming.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**
