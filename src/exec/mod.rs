@@ -2812,6 +2812,20 @@ impl Connection {
             });
         }
 
+        // Single source. A plain rowid base table streams from a *live* b-tree
+        // cursor (B5b-2 / B8): the same `compile_table_select` program runs, but
+        // cursor 0's `Rewind`/`Column`/`Next` pull one decoded row at a time from a
+        // `TableCursor` instead of over a materialized row-set. This is purely a
+        // row-source swap — projection, `WHERE`, `ORDER BY`, `LIMIT`, `DISTINCT`,
+        // aggregate and `GROUP BY` handling are byte-identical to the materialized
+        // path. Anything not a plain rowid base table (a subquery / CTE / view /
+        // TVF source, a `WITHOUT ROWID` table, an index hint, a schema qualifier,
+        // or an unresolved `t.*` qualifier) returns `None` and takes the
+        // materialized path below unchanged.
+        if let Some(result) = self.try_live_single_scan(sel, from)? {
+            return Ok(result);
+        }
+
         // Single source — a plain table or a derived table (`scan_one` materializes
         // a safe FROM subquery, an in-scope CTE, or a table-valued function source).
         let (col_names, col_tables, col_aff, col_coll, mut rows, rowids) = scan_one(&from.first)?;
@@ -2853,6 +2867,100 @@ impl Connection {
             columns: prog.columns,
             rows: result,
         })
+    }
+
+    /// Attempt to run a single-source `SELECT … FROM <one rowid table> [WHERE …]`
+    /// through the VDBE over a *live* b-tree cursor (B5b-2 / B8), returning
+    /// `Ok(Some(result))` on success. Returns `Ok(None)` — deferring to the
+    /// materialized single-source path — for anything that is not a plain rowid
+    /// base table: a `FROM` subquery / in-scope CTE / view / table-valued function,
+    /// a `WITHOUT ROWID` table, an `INDEXED BY` / `NOT INDEXED` hint, a
+    /// schema-qualified source, or a `t.*` whose qualifier doesn't name this table.
+    ///
+    /// The row source is the only thing that changes: the exact same
+    /// `compile_table_select` program runs, but cursor 0's `Rewind`/`Column`/`Next`
+    /// stream one decoded row at a time from [`LiveScanCursor`] rather than reading
+    /// a pre-materialized `Vec`. Every other stage (projection, `WHERE`,
+    /// `ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, aggregates, `GROUP BY`) is byte-
+    /// identical to [`run_rows`](vdbe::run_rows), so the result matches the
+    /// materialized path, the tree-walker, and SQLite.
+    fn try_live_single_scan(&self, sel: &Select, from: &FromClause) -> Result<Option<QueryResult>> {
+        let tr = &from.first;
+        // Only a plain named base table qualifies. A subquery / TVF / in-scope CTE
+        // / view / schema-qualified / index-hinted source takes the materialized
+        // path (which resolves each of those); mirror `scan_one`'s guards.
+        if tr.subquery.is_some()
+            || tr.tvf_args.is_some()
+            || tr.schema.is_some()
+            || tr.index_hint.is_some()
+            || self.is_bare_tvf(tr)
+        {
+            return Ok(None);
+        }
+        if sel
+            .ctes
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&tr.name))
+        {
+            return Ok(None);
+        }
+        if self.is_view(&tr.name) {
+            return Ok(None);
+        }
+        // Resolve the table; a missing/renamed table or one the VDBE can't model
+        // defers to the materialized path (which errors identically).
+        let meta = match self.table_meta(&tr.name, tr.alias.as_deref()) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        // A `WITHOUT ROWID` table has no rowid b-tree cursor of this shape; the
+        // materialized path handles it (and its `rowid` references defer further).
+        if meta.without_rowid {
+            return Ok(None);
+        }
+        // The same per-column metadata `scan_one` derives for a base table.
+        let col_names: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+        let qualifier = tr.alias.clone().unwrap_or_else(|| tr.name.clone());
+        let col_tables: Vec<String> = meta.columns.iter().map(|_| qualifier.clone()).collect();
+        let col_aff: Vec<eval::Affinity> = meta.columns.iter().map(|c| c.affinity).collect();
+        let col_coll: Vec<crate::value::Collation> =
+            meta.columns.iter().map(|c| c.collation).collect();
+        // A rowid table carries a hidden trailing rowid so `rowid`/`_rowid_`/`oid`
+        // resolves (compiled into the program via `has_rowid`).
+        let has_rowid = true;
+        // A `t.*` projection is only handled when its qualifier names this table;
+        // any other qualifier defers so the tree-walker can resolve or reject it.
+        for rc in &sel.columns {
+            if let sql::ast::ResultColumn::TableWildcard(q) = rc {
+                let matches = q.eq_ignore_ascii_case(&tr.name)
+                    || tr
+                        .alias
+                        .as_deref()
+                        .is_some_and(|a| q.eq_ignore_ascii_case(a));
+                if !matches {
+                    return Ok(None);
+                }
+            }
+        }
+        let prog = match vdbe::compile_table_select(
+            sel,
+            &col_names,
+            &col_tables,
+            &col_aff,
+            &col_coll,
+            has_rowid,
+        ) {
+            Ok(p) => p,
+            // A shape `compile_table_select` can't emit falls back to the
+            // materialized path, which either handles it or defers identically.
+            Err(_) => return Ok(None),
+        };
+        let mut src = LiveScanCursor::new(self, &meta, has_rowid);
+        let rows = vdbe::run_live_scan(&prog, &mut src)?;
+        Ok(Some(QueryResult {
+            columns: prog.columns,
+            rows,
+        }))
     }
 
     /// Run a compound `SELECT` (`UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`)
@@ -32305,6 +32413,76 @@ impl Connection {
             }
         }
         Ok(())
+    }
+}
+
+/// A live b-tree cursor over a single rowid table, presented to the VDBE as
+/// cursor 0's [`vdbe::Cursor0Source`] (B5b-2 / B8). Each `Rewind` / `Next`
+/// advances the underlying [`TableCursor`] and decodes exactly one row on demand
+/// (via [`Connection::decode_full_row`]), so a `SELECT … FROM t [WHERE …]` streams
+/// rows straight from storage instead of materializing the whole table up front.
+/// The decoded row is cached in `current` between the `Column` reads of one loop
+/// iteration; when the scan appends a hidden rowid (`has_rowid`), it is pushed as
+/// the trailing value exactly as the materialized path does.
+struct LiveScanCursor<'a> {
+    conn: &'a Connection,
+    meta: &'a TableMeta,
+    encoding: crate::format::TextEncoding,
+    has_rowid: bool,
+    cur: TableCursor<'a>,
+    /// The current decoded row (empty before the first `Rewind` or past EOF).
+    current: Vec<Value>,
+}
+
+impl<'a> LiveScanCursor<'a> {
+    fn new(conn: &'a Connection, meta: &'a TableMeta, has_rowid: bool) -> LiveScanCursor<'a> {
+        let encoding = conn.backend.source().header().text_encoding;
+        LiveScanCursor {
+            conn,
+            meta,
+            encoding,
+            has_rowid,
+            cur: TableCursor::new(conn.backend.source(), meta.root),
+            current: Vec::new(),
+        }
+    }
+
+    /// Decode the row at the current cursor position into `current`, appending the
+    /// hidden trailing rowid when the scan carries one.
+    fn load_current(&mut self) -> Result<()> {
+        let rowid = self.cur.rowid()?;
+        let mut values =
+            self.conn
+                .decode_full_row(self.meta, rowid, &self.cur.payload()?, self.encoding)?;
+        if self.has_rowid {
+            values.push(Value::Integer(rowid));
+        }
+        self.current = values;
+        Ok(())
+    }
+}
+
+impl vdbe::Cursor0Source for LiveScanCursor<'_> {
+    fn rewind(&mut self) -> Result<bool> {
+        if self.cur.first()? {
+            self.load_current()?;
+            Ok(true)
+        } else {
+            self.current = Vec::new();
+            Ok(false)
+        }
+    }
+    fn advance(&mut self) -> Result<bool> {
+        if self.cur.next()? {
+            self.load_current()?;
+            Ok(true)
+        } else {
+            self.current = Vec::new();
+            Ok(false)
+        }
+    }
+    fn column(&self, col: usize) -> Value {
+        self.current.get(col).cloned().unwrap_or(Value::Null)
     }
 }
 

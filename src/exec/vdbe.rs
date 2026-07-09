@@ -4839,6 +4839,57 @@ pub fn run(program: &Program) -> Result<Vec<Vec<Value>>> {
     run_rows(program, &[])
 }
 
+/// The row source backing cursor 0's single-cursor ops (`Rewind` / `Column` /
+/// `Next`). A single-table scan drives these three ops; the interpreter reads the
+/// current row through this trait so the same program runs over either a
+/// materialized row-set ([`MaterializedCursor0`]) or a *live* b-tree cursor that
+/// decodes rows lazily (B5b-2 / B8 — implemented in `exec::mod`). The multi-cursor
+/// join ops (`RewindC` / `ColumnC` / `NextC`) never use this trait; they index
+/// `rowsets` directly, and a live-scan program emits only single-cursor ops.
+pub trait Cursor0Source {
+    /// Position at the first row. Returns `false` when the source is empty (the
+    /// `Rewind` op then jumps over the loop body).
+    fn rewind(&mut self) -> Result<bool>;
+    /// Advance to the next row. Returns `false` once past the last row (the `Next`
+    /// op then falls through and ends the loop).
+    fn advance(&mut self) -> Result<bool>;
+    /// The value of column `col` of the current row (the hidden trailing rowid
+    /// slot included, when the scan appends one). Out-of-range reads yield `NULL`.
+    fn column(&self, col: usize) -> Value;
+}
+
+/// A [`Cursor0Source`] over an already-materialized row-set — the classic path
+/// used by [`run_rows`] / [`run_rows_multi`]. Cheap positional indexing; no I/O.
+pub struct MaterializedCursor0<'a> {
+    rows: &'a [Vec<Value>],
+    pos: usize,
+}
+
+impl<'a> MaterializedCursor0<'a> {
+    /// Wrap a materialized row-set as cursor 0's source.
+    pub fn new(rows: &'a [Vec<Value>]) -> Self {
+        MaterializedCursor0 { rows, pos: 0 }
+    }
+}
+
+impl Cursor0Source for MaterializedCursor0<'_> {
+    fn rewind(&mut self) -> Result<bool> {
+        self.pos = 0;
+        Ok(!self.rows.is_empty())
+    }
+    fn advance(&mut self) -> Result<bool> {
+        self.pos += 1;
+        Ok(self.pos < self.rows.len())
+    }
+    fn column(&self, col: usize) -> Value {
+        self.rows
+            .get(self.pos)
+            .and_then(|r| r.get(col))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+}
+
 /// Run a compiled program over `table_rows` (the materialized rows of the single
 /// table the program scans, if any). A program counter walks the instruction
 /// array so jumps and the `Rewind`/`Next` loop can branch; `Column` reads from
@@ -4847,15 +4898,40 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
     run_rows_multi(program, &[table_rows])
 }
 
+/// Run a compiled single-cursor program driving cursor 0 from a live row source
+/// (a b-tree cursor, B5b-2 / B8) instead of a materialized row-set. Only the
+/// single-cursor `Rewind` / `Column` / `Next` ops read from `src`; a program that
+/// emits multi-cursor join ops must use [`run_rows_multi`] with materialized
+/// row-sets. The projection, filter, sort, DISTINCT, LIMIT, aggregate and
+/// GROUP BY machinery is shared verbatim with [`run_rows_multi`].
+pub fn run_live_scan(program: &Program, src: &mut dyn Cursor0Source) -> Result<Vec<Vec<Value>>> {
+    run_rows_multi_impl(program, &[], src)
+}
+
 /// Run a compiled program over several cursors' materialized row-sets (the
 /// nested-loop join path, B5b): `rowsets[i]` is cursor `i`'s rows. Cursor 0 also
 /// backs the single-cursor `Rewind`/`Column`/`Next` opcodes, so the single-table
 /// entry point [`run_rows`] is just this with one row-set.
 pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Vec<Vec<Value>>> {
+    // Cursor 0's single-cursor ops read from a materialized view over `rowsets[0]`;
+    // the multi-cursor join ops still index `rowsets` directly.
+    let mut c0 = MaterializedCursor0::new(rowsets.first().copied().unwrap_or(&[]));
+    run_rows_multi_impl(program, rowsets, &mut c0)
+}
+
+/// Shared interpreter body for both the materialized ([`run_rows_multi`]) and the
+/// live-cursor ([`run_live_scan`]) entry points. Cursor 0's single-cursor ops
+/// (`Rewind` / `Column` / `Next`) read through `c0`; the multi-cursor join ops
+/// (`RewindC` / `ColumnC` / `NextC`) index `rowsets`. A single program uses one
+/// family or the other, never both — a live-scan program passes an empty
+/// `rowsets`.
+fn run_rows_multi_impl(
+    program: &Program,
+    rowsets: &[&[Vec<Value>]],
+    c0: &mut dyn Cursor0Source,
+) -> Result<Vec<Vec<Value>>> {
     let mut regs: Vec<Value> = alloc::vec![Value::Null; program.n_registers];
     let mut out = Vec::new();
-    let table_rows: &[Vec<Value>] = rowsets.first().copied().unwrap_or(&[]);
-    let mut cursor: usize = 0; // index of the current row (single-cursor ops)
     // Per-cursor positions for the multi-cursor (nested-loop join) ops. A program
     // uses either the single-cursor ops or the multi-cursor ops, never both.
     let mut positions: Vec<usize> = alloc::vec![0; rowsets.len().max(1)];
@@ -4894,21 +4970,15 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
         pc += 1;
         match op {
             Op::Rewind { target } => {
-                cursor = 0;
-                if table_rows.is_empty() {
+                if !c0.rewind()? {
                     pc = *target;
                 }
             }
             Op::Column { col, dest } => {
-                regs[*dest] = table_rows
-                    .get(cursor)
-                    .and_then(|r| r.get(*col))
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                regs[*dest] = c0.column(*col);
             }
             Op::Next { target } => {
-                cursor += 1;
-                if cursor < table_rows.len() {
+                if c0.advance()? {
                     pc = *target;
                 }
             }
