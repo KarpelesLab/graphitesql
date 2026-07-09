@@ -30368,6 +30368,13 @@ impl Connection {
         // the stored-column count means columns added by ALTER use their default.
         let mut ri = 0usize;
         for (i, def) in meta.defaults.iter().enumerate() {
+            // A corrupt schema can leave `defaults` longer than the declared
+            // column count (`values` is sized to `meta.columns`); stop rather
+            // than index past the row so a malformed database errors/degrades
+            // gracefully instead of panicking.
+            if i >= n {
+                break;
+            }
             if meta.is_virtual(i) {
                 continue;
             }
@@ -30379,7 +30386,9 @@ impl Connection {
             ri += 1;
         }
         promote_real_columns(meta, &mut values);
-        if let Some(ipk) = meta.ipk {
+        if let Some(ipk) = meta.ipk
+            && ipk < n
+        {
             values[ipk] = Value::Integer(rowid);
         }
         self.compute_generated(meta, &mut values, &p)?;
