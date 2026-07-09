@@ -316,13 +316,14 @@ result or declines to it — never a wrong answer), so this track is
   ~8000 docs before). *Multi-term leaf-fill done (2026-07-09):* ported sqlite's
   `fts5WriteAppendTerm` split rule (`4 + body + pgidx + nTerm + 2 >= pgsz`, full
   uncompressed term length), so multi-term segments are now byte-identical up to
-  ~37 leaves incl. variable-length terms. Remaining: **prefix indexes**
-  (`prefix='2 3'`) — the rebuild path builds only the main index, never the
-  `0x31`/`0x32` prefix-index segments (functionally correct via main-index scan,
-  bytes differ; needs an exec-layer change); and segment-b-tree interior
-  (`height > 0`) pages. Related perf residual: the FTS5 write path does a full
-  single-segment rebuild per row write (O(rows²) bulk load) — sqlite's incremental
-  multi-segment automerge is the real fix; correctness/integrity are unaffected.
+  ~37 leaves incl. variable-length terms. *Prefix indexes done (2026-07-09):*
+  the rebuild now emits a prefix-index segment per configured `prefix=` length
+  (keyed `FTS5_MAIN_PREFIX + i + 1`), byte-identical for `'1'`/`'2 3'`/`'1 2 3'`/…
+  incl. unicode/multi-column/contentless. Remaining: segment-b-tree interior
+  (`height > 0`) pages (only for very large single segments). Related perf
+  residual: the FTS5 write path does a full single-segment rebuild per row write
+  (O(rows²) bulk load) — sqlite's incremental multi-segment automerge is the real
+  fix; correctness/integrity are unaffected.
 - **D4-leftover — window UDFs + custom collations.** The latter needs a user
   variant on the `Collation` enum (invasive).
 - **D5 — `sqlite3_session`** changesets/patchsets for replication.
