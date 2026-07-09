@@ -2942,34 +2942,21 @@ impl Connection {
                 }
             }
         }
-        // The live single-table scan supplies a `SubqueryEval` callback, so it opts
-        // into compiling a *correlated* scalar / `EXISTS` subquery to a callback op
-        // (B5c-2) that re-evaluates it per outer row through the tree-walker. A
-        // non-correlated subquery was already folded to a constant in
-        // `run_select_vdbe` before this point, so only the correlated (and other
-        // unfoldable) ones reach the callback — where the result matches the
-        // tree-walker exactly.
-        let prog = match vdbe::compile_table_select_opts(
+        let prog = match vdbe::compile_table_select(
             sel,
             &col_names,
             &col_tables,
             &col_aff,
             &col_coll,
             has_rowid,
-            true,
         ) {
             Ok(p) => p,
             // A shape `compile_table_select` can't emit falls back to the
             // materialized path, which either handles it or defers identically.
             Err(_) => return Ok(None),
         };
-        let eval = LiveSubqueryEval {
-            conn: self,
-            columns: &meta.columns,
-            rowid_index: has_rowid.then_some(meta.columns.len()),
-        };
         let mut src = LiveScanCursor::new(self, &meta, has_rowid);
-        let rows = vdbe::run_live_scan_with_subqueries(&prog, &mut src, &eval)?;
+        let rows = vdbe::run_live_scan(&prog, &mut src)?;
         Ok(Some(QueryResult {
             columns: prog.columns,
             rows,
@@ -32522,77 +32509,6 @@ impl vdbe::Cursor0Source for LiveScanCursor<'_> {
     }
     fn column(&self, col: usize) -> Value {
         self.current.get(col).cloned().unwrap_or(Value::Null)
-    }
-}
-
-/// The [`vdbe::SubqueryEval`] callback for the live single-table scan (B5c-2): it
-/// re-evaluates a *correlated* subquery per outer row by pushing that row as an
-/// outer frame and re-running the subquery through the tree-walker — the exact
-/// same mechanism the tree-walker uses for its own correlated subqueries
-/// (`with_outer_frame` → `run_select`), so the value matches the tree-walker and
-/// SQLite. The subquery's own body re-enters `run_core` with a non-empty
-/// `outer_scope`, so it uses the tree-walker (not a nested VDBE), and an
-/// outer-qualified reference resolves against this frame via `resolve_outer`.
-struct LiveSubqueryEval<'a> {
-    conn: &'a Connection,
-    /// Column metadata for the outer scan's visible columns (index-aligned with
-    /// the current cursor row's leading slots), tagged with the table qualifier.
-    columns: &'a [ColumnInfo],
-    /// The cursor row index of the hidden trailing rowid (== number of visible
-    /// columns), when the scan carries one.
-    rowid_index: Option<usize>,
-}
-
-impl LiveSubqueryEval<'_> {
-    /// Read the current outer row (visible column values + optional rowid) from the
-    /// live cursor and run `body` with that row pushed as an outer frame. Restores
-    /// the frame on every exit, mirroring [`Connection::with_outer_frame`].
-    fn with_frame<T>(
-        &self,
-        cur: &dyn vdbe::Cursor0Source,
-        body: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        let row: Vec<Value> = (0..self.columns.len()).map(|i| cur.column(i)).collect();
-        let rowid = self.rowid_index.and_then(|i| match cur.column(i) {
-            Value::Integer(r) => Some(r),
-            _ => None,
-        });
-        self.conn.outer_scope.borrow_mut().push(OuterFrame {
-            columns: self.columns.to_vec(),
-            row,
-            rowid,
-        });
-        let out = body();
-        self.conn.outer_scope.borrow_mut().pop();
-        out
-    }
-}
-
-impl vdbe::SubqueryEval for LiveSubqueryEval<'_> {
-    fn scalar(&self, sel: &Select, cur: &dyn vdbe::Cursor0Source) -> Result<Value> {
-        self.with_frame(cur, || {
-            let params = Params::default();
-            let r = self.conn.run_select(sel, &params)?;
-            // A scalar subquery must yield exactly one column (SQLite rejects
-            // `(SELECT 1, 2)` at prepare); mirror the tree-walker's `scalar`.
-            if r.columns.len() > 1 {
-                return Err(Error::Error(alloc::format!(
-                    "sub-select returns {} columns - expected 1",
-                    r.columns.len()
-                )));
-            }
-            Ok(r.rows
-                .first()
-                .and_then(|row| row.first())
-                .cloned()
-                .unwrap_or(Value::Null))
-        })
-    }
-    fn exists(&self, sel: &Select, cur: &dyn vdbe::Cursor0Source) -> Result<bool> {
-        self.with_frame(cur, || {
-            let params = Params::default();
-            Ok(!self.conn.run_select(sel, &params)?.rows.is_empty())
-        })
     }
 }
 
