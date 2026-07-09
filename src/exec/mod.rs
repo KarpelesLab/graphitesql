@@ -13267,6 +13267,80 @@ impl Connection {
         scan < seek
     }
 
+    /// Range analogue of [`Self::full_scan_beats_seek`]: decide whether sqlite
+    /// renders `SCAN` instead of a range `SEARCH` on the chosen NON-COVERING
+    /// index. The matched-row estimate `n_out` is the STAT4 `whereRangeScanEst`
+    /// output (a LogEst, fed directly — no lossy round-trip through a row count).
+    /// `n_bounds` is the number of present range bounds (1 for `>`/`<`, 2 for a
+    /// two-sided range).
+    ///
+    /// This replicates the relevant slice of sqlite's `whereLoopAddBtree` +
+    /// `whereLoopFindLesser` + `wherePathSolver`. Both loops' `(rRun, nOut)` are
+    /// computed the way sqlite does — the full scan's `nOut` is `rSize` reduced by
+    /// one LogEst per range term (`whereLoopOutputAdjust`, `pLoop->nOut--` for a
+    /// non-EQ term) — and the same domination test decides the winner:
+    ///   * scan dominates seek (`scan.rRun<=seek.rRun && scan.nOut<=seek.nOut`) →
+    ///     the seek is discarded, so `SCAN`;
+    ///   * otherwise both survive and `wherePathSolver` keeps the lower `rRun`
+    ///     (`SEARCH` on a tie, since the seek has the smaller `nOut`).
+    ///
+    /// (The covering case — where a rejected covering seek falls back to a plain
+    /// table scan — is handled by the caller, which excludes covering indexes; see
+    /// the note in `choose_range_index`.)
+    fn full_scan_beats_range(
+        &self,
+        table_name: &str,
+        meta: &TableMeta,
+        n_out: i16,
+        idx_width: i16,
+        n_bounds: i16,
+    ) -> bool {
+        if meta.without_rowid {
+            return false;
+        }
+        let Some(n_row) = self.table_stat1_rows(table_name) else {
+            return false;
+        };
+        if n_row == 0 {
+            return false;
+        }
+        let r_size = logest(n_row); // LogEst(nRow)
+        let r_log_size = est_log(r_size);
+
+        // Table row width (szTabRow) = LogEst(Σ szEst(col) * 4), plus a +1 for the
+        // implicit rowid ONLY when the table has no INTEGER PRIMARY KEY column
+        // (sqlite's `estimateTableWidth`: `if( pTab->iPKey<0 ) wTable++`).
+        let szests = self.table_col_szests(table_name).unwrap_or_default();
+        let mut w_tab: u32 = szests.iter().copied().sum::<u32>();
+        if meta.ipk.is_none() {
+            w_tab += 1;
+        }
+        let sz_tab_row = logest(u64::from(w_tab) * 4).max(1) as i32;
+        let sz_idx_row = idx_width as i32;
+
+        // Full-scan loop: rRun = rSize + 16 - 2 (STAT4), nOut = rSize reduced by
+        // one LogEst per range term (whereLoopOutputAdjust's `pLoop->nOut--`).
+        let scan_run = r_size + 14;
+        let scan_out = r_size - n_bounds;
+
+        // Non-covering index-seek loop: rCostIdx = LogEstAdd(rLogSize, nOut + 1 +
+        // 15*szIdx/szTab), then + (nOut + 16) for the per-matched-row table lookup.
+        let per_row = 1 + (15 * sz_idx_row) / sz_tab_row;
+        let r_cost_idx = logest_add(r_log_size, n_out + per_row as i16);
+        let seek_run = logest_add(r_cost_idx, n_out + 16);
+        let seek_out = n_out;
+
+        // whereLoopFindLesser: the earlier-inserted full scan discards the seek
+        // template when it is no worse on BOTH cost and output rows.
+        if scan_run <= seek_run && scan_out <= seek_out {
+            return true;
+        }
+        // Otherwise both survive; the solver keeps the lower rRun. On a tie the
+        // seek wins (its smaller nOut lowers the downstream path cost), so the
+        // scan wins only strictly.
+        scan_run < seek_run
+    }
+
     /// The table's estimated row count from `sqlite_stat1` (the leading integer
     /// of any index row for `table`, all of which share the table's row count),
     /// or `None` when the table has no `sqlite_stat1` data.
@@ -13379,6 +13453,12 @@ impl Connection {
         type RangeKey = (bool, i16, core::cmp::Reverse<u32>);
         let mut best: Option<IndexMeta> = None;
         let mut best_key: Option<RangeKey> = None;
+        // Number of plain range-leading candidate indexes: the scan-vs-seek gate
+        // below only fires when there is exactly one, since sqlite's choice among
+        // several range-leading indexes is the full cost model this planner does
+        // not port (it may prefer a *different, more selective* index rather than
+        // fall back to a scan).
+        let mut n_candidates = 0usize;
         for idx in self.indexes_of(table_name)? {
             if let Some(IndexHint::IndexedBy(n)) = hint
                 && !idx.name.eq_ignore_ascii_case(n)
@@ -13394,6 +13474,7 @@ impl Connection {
             if !ranges.contains_key(&lead) {
                 continue;
             }
+            n_candidates += 1;
             let covering = sel
                 .map(|s| self.seek_index_covers(s, meta, &idx.cols, where_expr))
                 .unwrap_or(false);
@@ -13411,7 +13492,127 @@ impl Connection {
                 best = Some(idx);
             }
         }
+
+        // Scan-vs-search for a range seek — the range analogue of the equality
+        // branch in `choose_seek_index`. When the chosen NON-COVERING index's
+        // STAT4 range estimate (a faithful `whereRangeScanEst`) says the bound
+        // selects a large fraction of the table, the per-matched-row table lookup
+        // makes a full scan cheaper, so sqlite renders `SCAN`, not `SEARCH`.
+        // Returning `None` routes both `try_index_range` and `eqp_access` onto
+        // their scan paths. Gated exactly like the equality case: only with STAT4
+        // data (so no-stats / stat1-only databases are byte-identical to today),
+        // only for a non-covering plain index, and only inside an enclosing
+        // `SELECT` (a DELETE/UPDATE keeps its row-visiting seek).
+        //
+        // The covering case is deliberately excluded: when sqlite's cost model
+        // rejects a *covering* range seek it falls back to a plain table `SCAN t`,
+        // but graphite's separate covering-scan optimization would still render
+        // `SCAN … USING COVERING INDEX` there (a pre-existing, orthogonal
+        // divergence that also shows up on a WHERE-less `SELECT <indexed-col>`).
+        // Restricting to non-covering keeps this change from interacting with
+        // that path, so no new diffs are introduced.
+        //
+        // Also skip the gate under an `INDEXED BY` hint (which forces the seek —
+        // sqlite never falls back to a scan) and when more than one range-leading
+        // index competes (sqlite may seek a different, more selective one).
+        if let Some(idx) = &best
+            && sel.is_some()
+            && n_candidates == 1
+            && !matches!(hint, Some(IndexHint::IndexedBy(_)))
+        {
+            let lead = idx.cols[0];
+            let covering = sel
+                .map(|s| self.seek_index_covers(s, meta, &idx.cols, where_expr))
+                .unwrap_or(false);
+            let bound = &ranges[&lead];
+            let n_bounds = (bound.lower.is_some() as i16) + (bound.upper.is_some() as i16);
+            if !covering && let Some(n_out) = self.stat4_range_est(idx, bound) {
+                let width = self.index_seek_width(table_name, idx);
+                if self.full_scan_beats_range(table_name, meta, n_out, width, n_bounds) {
+                    return Ok(None);
+                }
+            }
+        }
         Ok(best)
+    }
+
+    /// STAT4-driven range selectivity estimate for `idx` when its leading key
+    /// column has the range bound `bound`. Builds the lower/upper probe values
+    /// (swapping them for a DESC leading column, as sqlite does) and runs the
+    /// `nEq == 0` STAT4 path of `whereRangeScanEst` (`stat4::range_scan_est`),
+    /// returning the estimated output-row count as a **LogEst** (`pLoop->nOut`) —
+    /// or `None` when no stat4 samples exist for the index or neither bound has a
+    /// known literal value.
+    ///
+    /// The LogEst arithmetic that follows the sample lookup (`LogEst(iUpper -
+    /// iLower)`, the same-sample 4× discount, the per-extracted-bound `nOut--`,
+    /// and the final `if(nNew<nOut) nOut=nNew`) is ported verbatim from
+    /// `whereRangeScanEst` so the resulting estimate matches sqlite 3.50.4. Since
+    /// every present literal bound is extracted from the samples here, the
+    /// post-block `whereRangeAdjust` / closed-range −20 (which only apply to
+    /// bounds sqlite could *not* extract) never fire — matching sqlite.
+    fn stat4_range_est(&self, idx: &IndexMeta, bound: &RangeBound) -> Option<i16> {
+        if idx.cols.is_empty() {
+            return None;
+        }
+        let ai_row_est = self.stat1_map();
+        let ai_row_est = ai_row_est.get(&idx.name)?;
+        let (samples, n_sample_col) = self.stat4_samples(&idx.name)?;
+        if n_sample_col == 0 {
+            return None;
+        }
+        let n_key_col = idx.cols.len();
+        let colls = &idx.collations;
+        let descs = &idx.descending;
+        let lead_desc = idx.descending.first().copied().unwrap_or(false);
+        // A DESC leading column reverses value order in key space, so the value-
+        // space bounds swap roles (sqlite's `SWAP(pLower, pUpper)`).
+        let (lower, upper) = if lead_desc {
+            (bound.upper.clone(), bound.lower.clone())
+        } else {
+            (bound.lower.clone(), bound.upper.clone())
+        };
+        if lower.is_none() && upper.is_none() {
+            return None;
+        }
+        let r = crate::exec::stat4::range_scan_est(
+            samples,
+            n_sample_col,
+            n_key_col,
+            ai_row_est,
+            lower,
+            upper,
+            colls,
+            descs,
+        )?;
+
+        // Port of the LogEst tail of whereRangeScanEst (nEq == 0 branch). `nOut`
+        // starts at LogEst(nRowEst0) — the index's row count — since with nEq == 0
+        // the pre-range estimate is the whole index. Each bound the sampler could
+        // extract decrements nOut by 1 LogEst (sqlite's `nOut--`).
+        let mut n_out: i16 = logest(r.n_row_est0.max(1));
+        n_out -= (r.lower_extracted as i16) + (r.upper_extracted as i16);
+
+        // nNew = LogEst(iUpper - iLower), minus 20 (÷4) when both bounds resolved
+        // to the same sample (the STAT4 "same sample" tuning); LogEst(2) when the
+        // span collapsed. Then `if(nNew<nOut) nOut=nNew`.
+        let n_new: i16 = if r.i_upper > r.i_lower {
+            let mut nn = logest(r.i_upper - r.i_lower);
+            if r.same_sample {
+                nn -= 20;
+            }
+            nn
+        } else {
+            10 // LogEst(2)
+        };
+        if n_new < n_out {
+            n_out = n_new;
+        }
+        // With both literal bounds extracted, the post-#ifdef whereRangeAdjust and
+        // closed-range −20 operate on already-cleared pLower/pUpper (no-ops), and
+        // the trailing `nOut -= (pLower!=0)+(pUpper!=0)` subtracts 0. So `n_out`
+        // above is sqlite's final `pLoop->nOut`.
+        Some(n_out)
     }
 
     /// The index metadata (root + indexed column positions) for `table`.

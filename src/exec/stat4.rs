@@ -460,16 +460,20 @@ fn record_compare(
     core::cmp::Ordering::Equal
 }
 
-/// Port of `whereKeyStats(pIdx, pRec, roundUp=0, aStat)`: binary-search the
-/// samples for the `n_field`-field probe `rec` and return `(a0, a1)` where `a1`
-/// is the estimated nEq for the probe.
+/// Port of `whereKeyStats(pIdx, pRec, roundUp, aStat)`: binary-search the
+/// samples for the `n_field`-field probe `rec` and return `(a0, a1, i)` where
+/// `a1` is the estimated nEq for the probe and `i` is the index of the first
+/// sample `>= rec` (the `whereRangeScanEst` "same sample" discount keys off it).
+/// `round_up` mirrors SQLite's parameter: on an interpolated gap it uses
+/// `2*gap/3` when true, `gap/3` when false.
 fn where_key_stats(
     idx: &Stat4Index,
     rec: &[Value],
     colls: &[crate::value::Collation],
     descs: &[bool],
     n_field: usize,
-) -> (u64, u64) {
+    round_up: bool,
+) -> (u64, u64, usize) {
     let a_sample = &idx.samples;
     let n_sample = a_sample.len();
     let mut i_col = 0usize;
@@ -515,7 +519,7 @@ fn where_key_stats(
     let i = (i_sample / n_field as i64) as usize;
 
     if res == 0 {
-        (a_sample[i].n_lt[i_col], a_sample[i].n_eq[i_col])
+        (a_sample[i].n_lt[i_col], a_sample[i].n_eq[i_col], i)
     } else {
         let i_upper = if i >= n_sample {
             idx.n_row_est0
@@ -523,9 +527,9 @@ fn where_key_stats(
             a_sample[i].n_lt[i_col]
         };
         let i_gap = i_upper.saturating_sub(i_lower);
-        let i_gap = i_gap / 3; // roundUp = 0
+        let i_gap = if round_up { (i_gap * 2) / 3 } else { i_gap / 3 };
         let a1 = idx.a_avg_eq.get(n_field - 1).copied().unwrap_or(1);
-        (i_lower + i_gap, a1)
+        (i_lower + i_gap, a1, i)
     }
 }
 
@@ -563,8 +567,118 @@ pub(crate) fn equal_scan_est(
     if n_field >= n_sample_col {
         return Some(1);
     }
-    let (_, a1) = where_key_stats(&idx, rec, colls, descs, n_field);
+    let (_, a1, _) = where_key_stats(&idx, rec, colls, descs, n_field, false);
     Some(a1)
+}
+
+/// The value-level result of the STAT4 branch of `whereRangeScanEst` for a range
+/// on the **leading** index column (`nEq == 0`): the estimated number of index
+/// rows below the lower and upper bounds, and whether both bounds resolved to the
+/// same sample (SQLite's `iLwrIdx == iUprIdx` 4×-selectivity discount).
+///
+/// The caller turns `(i_lower, i_upper)` into a LogEst row estimate exactly as
+/// SQLite does (`LogEst(iUpper - iLower)`, minus 20 when `same_sample`).
+pub(crate) struct RangeStat4 {
+    pub i_lower: u64,
+    pub i_upper: u64,
+    pub same_sample: bool,
+    /// `nRowEst0`: the index's estimated row count — the entry value of `nOut`
+    /// for the `nEq == 0` range (the whole index before the bounds apply).
+    pub n_row_est0: u64,
+    /// Whether the lower / upper bound value could be resolved against the
+    /// samples (always true here for a present literal bound). Mirrors sqlite's
+    /// "bound extracted" flag that drives the per-bound `nOut--` and decides
+    /// whether the post-block `whereRangeAdjust` applies.
+    pub lower_extracted: bool,
+    pub upper_extracted: bool,
+}
+
+/// Port of the `nEq == 0` STAT4 path of `whereRangeScanEst` (`where.c`,
+/// `SQLITE_ENABLE_STAT4`): estimate the number of index rows between a lower and
+/// an upper bound on the index's leading key column using the `sqlite_stat4`
+/// samples. `lower`/`upper` are `(value, inclusive)` pairs — `>`/`>=` for the
+/// lower, `<`/`<=` for the upper — already in index-column value space (a DESC
+/// leading column swaps them, as SQLite does). Either may be absent.
+///
+/// Returns `None` when there are no samples. For `nEq == 0` SQLite seeds
+/// `iLower = 0` and `iUpper = nRowEst0`, then refines each present bound via
+/// `whereKeyStats` (`roundUp = 0` for the lower, `1` for the upper), applying the
+/// same `WO_GT|WO_LE` mask that decides whether the probe's own `nEq` band is
+/// included.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn range_scan_est(
+    samples: Vec<LoadedSample>,
+    n_sample_col: usize,
+    n_key_col: usize,
+    ai_row_est: &[u64],
+    lower: Option<(Value, bool)>,
+    upper: Option<(Value, bool)>,
+    colls: &[crate::value::Collation],
+    descs: &[bool],
+) -> Option<RangeStat4> {
+    if samples.is_empty() {
+        return None;
+    }
+    if n_sample_col == 0 {
+        return None;
+    }
+    let n_row0 = ai_row_est.first().copied().unwrap_or(0);
+    let mut idx = Stat4Index {
+        samples,
+        n_sample_col,
+        n_row_est0: n_row0,
+        a_avg_eq: alloc::vec![1; n_sample_col],
+    };
+    idx.compute_avg_eq(ai_row_est, n_key_col);
+
+    // nEq == 0: the bounds span the whole index, [0, nRowEst0).
+    let mut i_lower: u64 = 0;
+    let mut i_upper: u64 = idx.n_row_est0;
+    let mut i_lwr_idx: i64 = -2;
+    let mut i_upr_idx: i64 = -1;
+    let mut lower_extracted = false;
+    let mut upper_extracted = false;
+
+    // Improve iLower using the lower bound ($L). whereKeyStats is called with
+    // roundUp = 0; a[0] is nLt for the probe and a[1] its nEq band. The band is
+    // added when the operator is one of WO_GT | WO_LE (i.e. `> x`, whose matches
+    // start strictly after x's equal band, or `<= x`). For a single-column probe
+    // the vector-size branch never widens the mask.
+    if let Some((v, inclusive)) = lower {
+        let rec = [v];
+        let (a0, a1, i) = where_key_stats(&idx, &rec, colls, descs, 1, false);
+        // mask = WO_GT|WO_LE; the lower bound is `> x` (exclusive) or `>= x`
+        // (inclusive). Only the exclusive `>` matches WO_GT here.
+        let i_new = a0 + if !inclusive { a1 } else { 0 };
+        if i_new > i_lower {
+            i_lower = i_new;
+        }
+        i_lwr_idx = i as i64;
+        lower_extracted = true;
+    }
+
+    // Improve iUpper using the upper bound ($U). whereKeyStats with roundUp = 1.
+    // The upper bound is `< y` (exclusive) or `<= y` (inclusive); WO_LE matches
+    // the inclusive `<=`, so its equal band is added.
+    if let Some((v, inclusive)) = upper {
+        let rec = [v];
+        let (a0, a1, i) = where_key_stats(&idx, &rec, colls, descs, 1, true);
+        let i_new = a0 + if inclusive { a1 } else { 0 };
+        if i_new < i_upper {
+            i_upper = i_new;
+        }
+        i_upr_idx = i as i64;
+        upper_extracted = true;
+    }
+
+    Some(RangeStat4 {
+        i_lower,
+        i_upper,
+        same_sample: i_lwr_idx == i_upr_idx,
+        n_row_est0: idx.n_row_est0,
+        lower_extracted,
+        upper_extracted,
+    })
 }
 
 /// Run the STAT4 accumulator over one index's `entries` (already in index-storage
