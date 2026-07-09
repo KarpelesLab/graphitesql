@@ -15,7 +15,7 @@ use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 /// Shared, mutable file storage. Cloning shares the same underlying bytes, which
 /// is how the VFS and any open handles see each other's writes.
@@ -64,7 +64,7 @@ impl Vfs for MemoryVfs {
         Ok(Box::new(MemoryFile {
             bytes: entry.bytes,
             locks: entry.locks,
-            level: LockLevel::Unlocked,
+            level: Cell::new(LockLevel::Unlocked),
         }))
     }
 
@@ -83,8 +83,9 @@ pub struct MemoryFile {
     bytes: SharedBytes,
     /// Lock state shared with every other handle to the same path.
     locks: SharedLocks,
-    /// The lock level this handle currently holds.
-    level: LockLevel,
+    /// The lock level this handle currently holds. A `Cell` so `lock`/`unlock`
+    /// can take `&self` (see [`File::lock`]).
+    level: Cell<LockLevel>,
 }
 
 impl Drop for MemoryFile {
@@ -93,7 +94,7 @@ impl Drop for MemoryFile {
         // frees the file for others.
         self.locks
             .borrow_mut()
-            .release(self.level, LockLevel::Unlocked);
+            .release(self.level.get(), LockLevel::Unlocked);
     }
 }
 
@@ -137,18 +138,18 @@ impl File for MemoryFile {
         Ok(self.bytes.borrow().len() as u64)
     }
 
-    fn lock(&mut self, level: LockLevel) -> Result<()> {
-        self.locks.borrow_mut().acquire(self.level, level)?;
-        if level > self.level {
-            self.level = level;
+    fn lock(&self, level: LockLevel) -> Result<()> {
+        self.locks.borrow_mut().acquire(self.level.get(), level)?;
+        if level > self.level.get() {
+            self.level.set(level);
         }
         Ok(())
     }
 
-    fn unlock(&mut self, level: LockLevel) -> Result<()> {
-        self.locks.borrow_mut().release(self.level, level);
-        if level < self.level {
-            self.level = level;
+    fn unlock(&self, level: LockLevel) -> Result<()> {
+        self.locks.borrow_mut().release(self.level.get(), level);
+        if level < self.level.get() {
+            self.level.set(level);
         }
         Ok(())
     }

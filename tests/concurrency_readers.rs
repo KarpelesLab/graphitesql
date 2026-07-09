@@ -49,8 +49,8 @@ fn assert_reader_sharing(mut open: impl FnMut() -> Box<dyn File>) {
         w.unlock(LockLevel::Unlocked).unwrap();
     }
 
-    let mut r1 = open();
-    let mut r2 = open();
+    let r1 = open();
+    let r2 = open();
     let mut writer = open();
 
     // (a) Two readers both take SHARED at the same time and read correctly.
@@ -91,7 +91,7 @@ fn assert_reader_sharing(mut open: impl FnMut() -> Box<dyn File>) {
     writer.unlock(LockLevel::Unlocked).unwrap();
 
     // The exclusive write landed and is visible to a fresh reader.
-    let mut fresh = open();
+    let fresh = open();
     fresh.lock(LockLevel::Shared).unwrap();
     let mut b3 = [0u8; 8];
     fresh.read_exact_at(&mut b3, 0).unwrap();
@@ -132,7 +132,7 @@ fn many_readers_coexist_and_block_exclusive() {
 
     // A would-be writer can take SHARED+RESERVED alongside the five readers, but
     // EXCLUSIVE is refused until every one of them drains.
-    let mut writer = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
+    let writer = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
     writer.lock(LockLevel::Shared).unwrap();
     writer.lock(LockLevel::Reserved).unwrap();
 
@@ -154,9 +154,9 @@ fn reserved_is_exclusive_among_writers_but_readers_continue() {
     let vfs = MemoryVfs::new();
     vfs.open("db", OpenFlags::READ_WRITE_CREATE).unwrap();
 
-    let mut a = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
-    let mut b = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
-    let mut reader = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
+    let a = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
+    let b = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
+    let reader = vfs.open("db", OpenFlags::READ_WRITE).unwrap();
 
     a.lock(LockLevel::Shared).unwrap();
     a.lock(LockLevel::Reserved).unwrap();

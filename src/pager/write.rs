@@ -30,7 +30,7 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 /// The 8-byte magic that opens every SQLite-format rollback journal.
 ///
@@ -111,7 +111,11 @@ pub struct WritePager {
     /// `Reserved` on its first staged page and upgrades to `Exclusive` while
     /// flushing at commit, so a second writer to the same file gets
     /// [`Error::Busy`](crate::Error::Busy). Released on commit/rollback.
-    held: crate::vfs::LockLevel,
+    ///
+    /// A `Cell` because the persistent read lock is taken lazily on the `&self`
+    /// read path ([`begin_read_txn`](Self::begin_read_txn)) — the first `SELECT`
+    /// inside an explicit transaction acquires `Shared` through a shared borrow.
+    held: Cell<crate::vfs::LockLevel>,
     /// Whether an explicit read transaction is open on this connection. When set,
     /// the pager holds a persistent `Shared` lock for the whole read transaction
     /// (taken by [`begin_read_txn`](Self::begin_read_txn)) rather than only
@@ -120,8 +124,9 @@ pub struct WritePager {
     /// until the reader ends its transaction, matching SQLite's locking model
     /// (`pager.c` `PAGER_SHARED` held across a read txn). Multiple such readers
     /// still coexist (`Shared` is a counted lock). Cleared and the lock released
-    /// by [`end_read_txn`](Self::end_read_txn).
-    read_txn: bool,
+    /// by [`end_read_txn`](Self::end_read_txn). A `Cell` for the same `&self`
+    /// reason as [`held`](Self::held).
+    read_txn: Cell<bool>,
     /// Open savepoints (innermost last); each snapshots the staged state so
     /// `ROLLBACK TO` can restore it.
     savepoints: Vec<Savepoint>,
@@ -218,8 +223,8 @@ impl WritePager {
             overlay: BTreeMap::new(),
             wal_file,
             wal,
-            held: crate::vfs::LockLevel::Unlocked,
-            read_txn: false,
+            held: Cell::new(crate::vfs::LockLevel::Unlocked),
+            read_txn: Cell::new(false),
             savepoints: Vec::new(),
             secure_delete: false,
             read_cache: RefCell::new(PageCache::new(pcache::DEFAULT_CACHE_SIZE, page_size)),
@@ -304,8 +309,8 @@ impl WritePager {
             overlay: BTreeMap::new(),
             wal_file,
             wal: None,
-            held: crate::vfs::LockLevel::Unlocked,
-            read_txn: false,
+            held: Cell::new(crate::vfs::LockLevel::Unlocked),
+            read_txn: Cell::new(false),
             savepoints: Vec::new(),
             secure_delete: false,
             read_cache: RefCell::new(PageCache::new(
@@ -363,7 +368,7 @@ impl WritePager {
         }
         // Only trust the cache while we hold a write lock; otherwise a foreign
         // writer could have changed the file out from under it (see method docs).
-        let cacheable = self.held >= crate::vfs::LockLevel::Reserved;
+        let cacheable = self.held.get() >= crate::vfs::LockLevel::Reserved;
         if cacheable && let Some(bytes) = self.read_cache.borrow_mut().get(number) {
             return Ok(bytes.as_ref().clone());
         }
@@ -439,13 +444,18 @@ impl WritePager {
     /// Returns [`Error::Busy`] if a foreign writer already holds `Pending`/
     /// `Exclusive` on the file (a reader cannot start while a writer is draining
     /// readers, matching SQLite).
-    pub fn begin_read_txn(&mut self) -> Result<()> {
+    ///
+    /// Takes `&self`: the SQL read path (`SELECT`) runs through `&self`, and the
+    /// C9a rule is to acquire the persistent lock lazily at the *first* read
+    /// inside an explicit transaction. The lock state lives in `Cell`s and the
+    /// `File::lock` trait method takes `&self`, so this needs no mutable borrow.
+    pub fn begin_read_txn(&self) -> Result<()> {
         use crate::vfs::LockLevel;
-        if self.held < LockLevel::Shared {
+        if self.held.get() < LockLevel::Shared {
             self.file.lock(LockLevel::Shared)?;
-            self.held = LockLevel::Shared;
+            self.held.set(LockLevel::Shared);
         }
-        self.read_txn = true;
+        self.read_txn.set(true);
         Ok(())
     }
 
@@ -458,12 +468,16 @@ impl WritePager {
     /// `Reserved`/`Exclusive`), the lock is left to the write path's
     /// commit/rollback (`release_locks`) — ending the read side must not strand a
     /// half-committed writer. Idempotent when no read transaction is open.
-    pub fn end_read_txn(&mut self) {
+    ///
+    /// Takes `&self` (the lock state is interior-mutable) so the exec layer can
+    /// release a read-only explicit transaction's lock on COMMIT/ROLLBACK without
+    /// a mutable pager borrow.
+    pub fn end_read_txn(&self) {
         use crate::vfs::LockLevel;
-        self.read_txn = false;
-        if self.held == LockLevel::Shared {
+        self.read_txn.set(false);
+        if self.held.get() == LockLevel::Shared {
             let _ = self.file.unlock(LockLevel::Unlocked);
-            self.held = LockLevel::Unlocked;
+            self.held.set(LockLevel::Unlocked);
             // A foreign writer may now change the file, so anything cached under
             // the read lock must not be served to a later read.
             self.read_cache.borrow_mut().clear();
@@ -473,7 +487,7 @@ impl WritePager {
     /// Whether an explicit read transaction (persistent `Shared` lock) is open.
     /// Read-only accessor for tests and the exec layer's txn bookkeeping.
     pub fn in_read_txn(&self) -> bool {
-        self.read_txn
+        self.read_txn.get()
     }
 
     /// Take the write-intent (`RESERVED`) lock on the main file before staging
@@ -481,12 +495,12 @@ impl WritePager {
     /// [`Error::Busy`] rather than corrupting it. Idempotent within a transaction.
     fn acquire_write_intent(&mut self) -> Result<()> {
         use crate::vfs::LockLevel;
-        let entry = self.held;
-        if self.held < LockLevel::Shared {
+        let entry = self.held.get();
+        if self.held.get() < LockLevel::Shared {
             self.file.lock(LockLevel::Shared)?;
-            self.held = LockLevel::Shared;
+            self.held.set(LockLevel::Shared);
         }
-        if self.held < LockLevel::Reserved {
+        if self.held.get() < LockLevel::Reserved {
             if let Err(e) = self.file.lock(LockLevel::Reserved) {
                 // A rejected first write must not keep the SHARED lock it just
                 // took, or it would block the current writer from committing.
@@ -495,7 +509,7 @@ impl WritePager {
                 }
                 return Err(e);
             }
-            self.held = LockLevel::Reserved;
+            self.held.set(LockLevel::Reserved);
             // Entering a write transaction: a foreign connection over the same
             // VFS may have committed since we last held a lock, so anything in
             // the clean read cache could be stale. Drop it; pages are re-read
@@ -509,9 +523,9 @@ impl WritePager {
     fn acquire_exclusive(&mut self) -> Result<()> {
         use crate::vfs::LockLevel;
         self.acquire_write_intent()?;
-        if self.held < LockLevel::Exclusive {
+        if self.held.get() < LockLevel::Exclusive {
             self.file.lock(LockLevel::Exclusive)?;
-            self.held = LockLevel::Exclusive;
+            self.held.set(LockLevel::Exclusive);
         }
         Ok(())
     }
@@ -520,10 +534,10 @@ impl WritePager {
     /// (`Shared`) lock as well as any write (`Reserved`/`Exclusive`) lock.
     fn release_locks(&mut self) {
         use crate::vfs::LockLevel;
-        self.read_txn = false;
-        if self.held != LockLevel::Unlocked {
+        self.read_txn.set(false);
+        if self.held.get() != LockLevel::Unlocked {
             let _ = self.file.unlock(LockLevel::Unlocked);
-            self.held = LockLevel::Unlocked;
+            self.held.set(LockLevel::Unlocked);
             // Once unlocked, a foreign writer may change the file, so anything
             // we cached under the lock must not be served to a later read.
             self.read_cache.borrow_mut().clear();

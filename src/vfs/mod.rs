@@ -186,15 +186,19 @@ pub trait File {
     /// Acquire (or upgrade to) the given lock level, returning
     /// [`Error::Busy`] if an incompatible lock is held.
     ///
-    /// The built-in VFSs enforce the [`LockState`] rules across all handles to a
-    /// path within the process; the default here is a no-op success for trivial
-    /// or host-provided files that do their own coordination.
-    fn lock(&mut self, _level: LockLevel) -> Result<()> {
+    /// Takes `&self` so the pager's `&self` read path can lazily take the
+    /// persistent `SHARED` lock of an open read transaction (ROADMAP C9a); the
+    /// per-handle lock level is tracked with interior mutability. The built-in
+    /// VFSs enforce the [`LockState`] rules across all handles to a path within
+    /// the process; the default here is a no-op success for trivial or
+    /// host-provided files that do their own coordination.
+    fn lock(&self, _level: LockLevel) -> Result<()> {
         Ok(())
     }
 
     /// Release down to the given lock level. Never fails for the built-in VFSs.
-    fn unlock(&mut self, _level: LockLevel) -> Result<()> {
+    /// Takes `&self` for the same reason as [`lock`](File::lock).
+    fn unlock(&self, _level: LockLevel) -> Result<()> {
         Ok(())
     }
 }

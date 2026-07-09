@@ -8,6 +8,7 @@ use super::{File, LockLevel, LockState, OpenFlags, Vfs};
 use crate::error::{Error, Result};
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
+use core::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -62,7 +63,7 @@ impl Vfs for StdVfs {
         Ok(Box::new(StdFile {
             inner: Mutex::new(file),
             locks: locks_for(path),
-            level: LockLevel::Unlocked,
+            level: Cell::new(LockLevel::Unlocked),
         }))
     }
 
@@ -84,8 +85,9 @@ pub struct StdFile {
     inner: Mutex<fs::File>,
     /// The process-shared lock state for this file's path.
     locks: Arc<Mutex<LockState>>,
-    /// The lock level this handle currently holds.
-    level: LockLevel,
+    /// The lock level this handle currently holds. A `Cell` so `lock`/`unlock`
+    /// can take `&self` (see [`File::lock`]).
+    level: Cell<LockLevel>,
 }
 
 impl StdFile {
@@ -101,7 +103,7 @@ impl StdFile {
 impl Drop for StdFile {
     fn drop(&mut self) {
         if let Ok(mut s) = self.locks.lock() {
-            s.release(self.level, LockLevel::Unlocked);
+            s.release(self.level.get(), LockLevel::Unlocked);
         }
     }
 }
@@ -133,28 +135,28 @@ impl File for StdFile {
         self.with(|f| Ok(f.metadata()?.len()))
     }
 
-    fn lock(&mut self, level: LockLevel) -> Result<()> {
+    fn lock(&self, level: LockLevel) -> Result<()> {
         let mut s = self
             .locks
             .lock()
             .map_err(|_| Error::Io("lock state poisoned".into()))?;
-        s.acquire(self.level, level)?;
+        s.acquire(self.level.get(), level)?;
         drop(s);
-        if level > self.level {
-            self.level = level;
+        if level > self.level.get() {
+            self.level.set(level);
         }
         Ok(())
     }
 
-    fn unlock(&mut self, level: LockLevel) -> Result<()> {
+    fn unlock(&self, level: LockLevel) -> Result<()> {
         let mut s = self
             .locks
             .lock()
             .map_err(|_| Error::Io("lock state poisoned".into()))?;
-        s.release(self.level, level);
+        s.release(self.level.get(), level);
         drop(s);
-        if level < self.level {
-            self.level = level;
+        if level < self.level.get() {
+            self.level.set(level);
         }
         Ok(())
     }

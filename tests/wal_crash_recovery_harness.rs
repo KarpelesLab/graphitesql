@@ -208,12 +208,12 @@ impl File for FaultFile {
         }
         self.inner.size()
     }
-    fn lock(&mut self, level: LockLevel) -> graphitesql::Result<()> {
+    fn lock(&self, level: LockLevel) -> graphitesql::Result<()> {
         // Locking is process-local bookkeeping, not disk state: let it through even
         // after the crash so the writer's teardown does not panic.
         self.inner.lock(level)
     }
-    fn unlock(&mut self, level: LockLevel) -> graphitesql::Result<()> {
+    fn unlock(&self, level: LockLevel) -> graphitesql::Result<()> {
         self.inner.unlock(level)
     }
 }

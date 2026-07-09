@@ -61,8 +61,8 @@ fn readers_hold_shared_and_block_a_writers_commit() {
     let vfs = MemoryVfs::new();
     seed_db(&vfs, "db");
 
-    let mut r1 = open_pager(&vfs, "db");
-    let mut r2 = open_pager(&vfs, "db");
+    let r1 = open_pager(&vfs, "db");
+    let r2 = open_pager(&vfs, "db");
     let mut w = open_pager(&vfs, "db");
 
     // (1) Both readers open a read transaction: each takes the persistent SHARED
@@ -110,7 +110,7 @@ fn ending_a_read_txn_releases_the_shared_lock() {
     let vfs = MemoryVfs::new();
     seed_db(&vfs, "db");
 
-    let mut r = open_pager(&vfs, "db");
+    let r = open_pager(&vfs, "db");
     let mut w = open_pager(&vfs, "db");
 
     r.begin_read_txn().unwrap();
@@ -134,7 +134,7 @@ fn begin_and_end_read_txn_are_idempotent() {
     let vfs = MemoryVfs::new();
     seed_db(&vfs, "db");
 
-    let mut r = open_pager(&vfs, "db");
+    let r = open_pager(&vfs, "db");
     // end before begin: no-op, no lock held afterwards.
     r.end_read_txn();
     assert!(!r.in_read_txn());

@@ -91,10 +91,10 @@ impl File for RetainFile {
     fn size(&self) -> graphitesql::Result<u64> {
         self.inner.size()
     }
-    fn lock(&mut self, level: LockLevel) -> graphitesql::Result<()> {
+    fn lock(&self, level: LockLevel) -> graphitesql::Result<()> {
         self.inner.lock(level)
     }
-    fn unlock(&mut self, level: LockLevel) -> graphitesql::Result<()> {
+    fn unlock(&self, level: LockLevel) -> graphitesql::Result<()> {
         self.inner.unlock(level)
     }
 }

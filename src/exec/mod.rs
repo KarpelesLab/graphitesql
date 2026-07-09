@@ -2968,10 +2968,33 @@ impl Connection {
         Ok(result)
     }
 
+    /// Acquire the persistent read (`Shared`) lock on the main database's pager
+    /// when a read runs *inside an explicit transaction* (`BEGIN …` or an open
+    /// `SAVEPOINT`), matching SQLite's DEFERRED transaction semantics (ROADMAP
+    /// C9a): `BEGIN` alone takes no lock; the lock is taken at the **first read**
+    /// within the transaction and held until COMMIT/ROLLBACK, so a concurrent
+    /// writer's commit-time upgrade to `Exclusive` BUSYs until this reader ends.
+    ///
+    /// A no-op for autocommit reads (no open transaction never blocks a writer)
+    /// and for a read-only backend (no pager to lock). Idempotent — safe to call
+    /// on every read; the pager only takes the lock once. Runs through `&self`:
+    /// the pager's lock state is interior-mutable.
+    fn ensure_read_txn_lock(&self) -> Result<()> {
+        if (self.in_tx || self.open_savepoints > 0)
+            && let Backend::Write(w) = &self.backend
+        {
+            w.begin_read_txn()?;
+        }
+        Ok(())
+    }
+
     /// Like [`query`](Self::query) but with bound parameters.
     pub fn query_params(&self, sql: &str, params: &Params) -> Result<QueryResult> {
         match sql::parse_one(sql)? {
-            Statement::Select(sel) => self.run_select(&sel, params),
+            Statement::Select(sel) => {
+                self.ensure_read_txn_lock()?;
+                self.run_select(&sel, params)
+            }
             Statement::Pragma(p) => self.run_pragma(&p),
             Statement::Explain { query_plan, stmt } => {
                 if query_plan {
