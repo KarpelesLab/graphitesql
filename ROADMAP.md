@@ -310,10 +310,10 @@ result or declines to it — never a wrong answer), so this track is
 
 ### Track D — Virtual tables & ecosystem extensions
 
-- **D2b-leftover (perf-only).** Two `MATCH` shapes still fall back to the
-  `_content` scan (results correct): a ≥3-phrase `NEAR`, and a single very-high-
-  frequency term whose segment uses doclist-index / interior (`height > 0`) pages
-  (only reached by a term spanning ~16+ leaves).
+- **D2b-leftover (perf-only).** A ≥3-phrase `NEAR` still falls back to the
+  `_content` scan (results correct). The high-frequency-term case is **no longer a
+  fallback** — a spanning term's doclist-index segment is served via the index
+  route (pinned by `high_frequency_spanning_term_takes_index_route`).
 - **D2e-encoder — byte-identical FTS5 at large scale.** *Doclist-index done
   (2026-07-09):* ported sqlite's `fts5WriteDlidxAppend`, so a term whose doclist
   spills onto ≥ `FTS5_MIN_DLIDX_SIZE` continuation leaves now emits byte-identical
@@ -325,11 +325,19 @@ result or declines to it — never a wrong answer), so this track is
   ~37 leaves incl. variable-length terms. *Prefix indexes done (2026-07-09):*
   the rebuild now emits a prefix-index segment per configured `prefix=` length
   (keyed `FTS5_MAIN_PREFIX + i + 1`), byte-identical for `'1'`/`'2 3'`/`'1 2 3'`/…
-  incl. unicode/multi-column/contentless. Remaining: segment-b-tree interior
-  (`height > 0`) pages (only for very large single segments). Related perf
-  residual: the FTS5 write path does a full single-segment rebuild per row write
-  (O(rows²) bulk load) — sqlite's incremental multi-segment automerge is the real
-  fix; correctness/integrity are unaffected.
+  incl. unicode/multi-column/contentless. *Doclist spill fixed (2026-07-09):* the
+  spill onto term-less continuation leaves now keeps position varints whole
+  (sqlite never splits a varint) and writes absolute first-rowids — a spanning
+  corpus went from 62 leaves divergent to byte-identical. (Note: FTS5 3.50.4 has
+  **no** `height>0` interior `%_data` pages — that form was removed; a
+  high-frequency term's "interior" structure is its doclist-index, and the
+  per-segment term index is the plain `%_idx` table.) **Remaining:** a corpus with
+  enough distinct terms that sqlite flushes multiple segments + `optimize`-MERGEs
+  them spills poslists on a different boundary than graphite's single-pass build
+  (`>= nReq` merge fill vs `fts5FlushOneHash`), so a spanning term in a *merged*
+  index drifts a few bytes/leaf — inherent to graphite building one segment;
+  stays integrity-clean + MATCH-correct. The deeper fix is the same **incremental
+  multi-segment automerge** write path (also the O(rows²)-bulk-load perf residual).
 - **D4-leftover — window UDFs + custom collations.** The latter needs a user
   variant on the `Collation` enum (invasive).
 - **D5 — `sqlite3_session`** changesets/patchsets for replication.
