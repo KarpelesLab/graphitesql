@@ -285,17 +285,17 @@ result or declines to it — never a wrong answer), so this track is
   cache is active only inside a write txn; a pure read-only connection over a
   read-write file falls back to direct (bounded) disk reads. Coherent caching there
   needs a statement-level change-counter revalidation hook from the exec layer.
-- **C9a — persistent read locks.** *Pager primitive done (2026-07-09):*
-  `WritePager::begin_read_txn`/`end_read_txn` now hold a persistent `Shared` lock
-  for an open read transaction (readers coexist via the counted `Shared`; a
-  writer's commit-time `Exclusive` upgrade `BUSY`s until readers drain), verified
-  with two in-process `WritePager`s. **Remaining — the exec-layer hook:** wire
-  `begin_read_txn` at the *first read within* an explicit transaction (to match
-  sqlite's *deferred* `BEGIN` — locking eagerly at `BEGIN` would diverge and would
-  push the write path to upgrade from an already-held `Shared`) and rely on
-  `commit()`/`rollback()` (which clear the flag) to release. Needs a two-connection
-  differential test of the deferred semantics before landing — a small but
-  lock-state-sensitive change, deliberately kept separate from the primitive.
+- **C9a — persistent read locks. DONE (2026-07-09).** `WritePager::begin_read_txn`/
+  `end_read_txn` hold a persistent `Shared` lock for an open read transaction, and
+  `Connection::ensure_read_txn_lock` acquires it at the **first read within** an
+  explicit transaction (matching sqlite's *deferred* `BEGIN` — not eagerly at
+  `BEGIN`, so two bare `BEGIN`s don't wrongly block each other's later write).
+  Readers coexist via the counted `Shared`; a writer's commit-time `Exclusive`
+  upgrade `BUSY`s until readers drain. To let the `&self` read path take the lock,
+  `File::lock`/`unlock` became `&self` with a `Cell<LockLevel>` per handle (no
+  `unsafe`); the write-path `Shared→Reserved→Exclusive` upgrade is unchanged.
+  Verified with two in-process `Connection`s (`tests/c9a_connection_locks.rs`),
+  including the deferred guard and autocommit-never-blocks.
 - **C9b — OS-level cross-process file locks** (`std::fs::File::lock`, wants MSRV
   1.89) behind the std VFS.
 - **C9c — the WAL `-shm` wal-index** for multi-connection WAL readers.
