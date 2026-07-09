@@ -213,9 +213,14 @@ result or declines to it — never a wrong answer), so this track is
 
 - **B5b-2 — seek-driven inner cursor over real storage** *(the largest remaining
   VDBE piece)*. Inner rowid seeks (INNER + LEFT, single & N-table left-deep chain,
-  compound-`ON`) already run over a live `TableCursor`. Remaining: the
+  compound-`ON`) already run over a live `TableCursor`. *Single-table live scan
+  done (2026-07-09, 52116a2):* a plain rowid base-table `SELECT` routed through the
+  VDBE now streams rows from a live `TableCursor` in the interpreter via a
+  `Cursor0Source` trait (`rewind`/`advance`/`column`) instead of materializing —
+  additive, result-identical to the tree-walker + sqlite, falls back for
+  WITHOUT ROWID / subquery / view / join / hinted sources. Remaining: the
   in-*interpreter* `OpenRead`/`SeekRowid` opcodes over B5b-1's multi-cursor
-  foundation (move the seek into bytecode — an internal refactor, no behavior
+  foundation (move the *seek* into bytecode — an internal refactor, no behavior
   change); and seek by a **secondary index** / `WITHOUT ROWID` PK, which is
   *affinity-blocked* (`index_seek_rowids` compares raw keys with the index
   collation and skips the comparison-affinity that `o.x = t.k` applies — routing
