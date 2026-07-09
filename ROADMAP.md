@@ -388,9 +388,12 @@ result or declines to it — never a wrong answer), so this track is
   changeset, matching sqlite's default. *invert + concat done (2026-07-09,
   c754e28):* `graphitesql::Changeset::invert`/`concat` are pure byte transforms
   matching `sqlite3changeset_invert`/`_concat` (34.6k fuzzed oracle checks, 0
-  diffs, incl. concat's 256-bucket coalescing hash and all PK shapes).
-  **Remaining:** patchsets, changeset rebase, custom conflict handlers, per-table
-  attach, indirect changes, and streaming.
+  diffs, incl. concat's 256-bucket coalescing hash and all PK shapes). *Patchsets
+  done (2026-07-09, 69bcc71):* `Connection::session_patchset()` emits the `'P'`
+  patchset variant (omits old non-PK values; DELETE = PK only; UPDATE = PK +
+  changed new) via a shared serializer, byte-verified vs a `sqlite3session_patchset`
+  oracle. **Remaining:** changeset rebase, custom conflict handlers, per-table
+  attach, indirect changes, and streaming — the niche tail of the session API.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**
