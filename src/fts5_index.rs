@@ -127,19 +127,21 @@ fn poslist(p: &Posting) -> Vec<u8> {
     out
 }
 
-/// A term's doclist: `[first rowid][ (rowid delta)(poslist) ]*` (deltas from 0).
-fn doclist(postings: &[Posting]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut prev = 0i64;
-    for (i, p) in postings.iter().enumerate() {
-        put_varint(
-            &mut out,
-            (if i == 0 { p.rowid } else { p.rowid - prev }) as u64,
-        );
-        out.extend_from_slice(&poslist(p));
-        prev = p.rowid;
+/// Port of sqlite's `fts5PoslistPrefix`: the byte length of the largest run of
+/// WHOLE varints at the start of `buf` whose total length is `<= n_max`. The first
+/// varint is always included (even if it alone exceeds `n_max`), matching sqlite's
+/// `ret = varint_len(buf[0]); if( ret < n_max ){ … }`. `n_max` may be ≤ 0.
+fn poslist_prefix(buf: &[u8], n_max: isize) -> usize {
+    let mut ret = varint::decode(buf).map(|(_, n)| n).unwrap_or(1);
+    if (ret as isize) < n_max {
+        while let Some((_, i)) = varint::decode(&buf[ret..]) {
+            if (ret + i) as isize > n_max {
+                break;
+            }
+            ret += i;
+        }
     }
-    out
+    ret
 }
 
 /// The '0'-prefixed key stored for a term.
@@ -205,6 +207,13 @@ struct SegWriter {
     /// each CONTINUATION leaf (the leaves after the term-start leaf that begin a
     /// new doclist entry at their `first_rowid_off`). Cleared per term.
     span_pages: Vec<(i64, i64)>,
+    /// True while the next rowid written to the current leaf will be the FIRST
+    /// rowid on that leaf (sqlite's `bFirstRowidInPage`). A first-in-page rowid is
+    /// stored ABSOLUTE and sets the leaf's `first_rowid_off` pointer.
+    first_rowid_in_page: bool,
+    /// True while the next rowid is the FIRST of the current doclist (sqlite's
+    /// `bFirstRowidInDoclist`). A first-in-doclist rowid is stored ABSOLUTE.
+    first_rowid_in_doclist: bool,
 }
 
 impl SegWriter {
@@ -225,11 +234,9 @@ impl SegWriter {
             pgno: 1,
             dlidx_data: Vec::new(),
             span_pages: Vec::new(),
+            first_rowid_in_page: true,
+            first_rowid_in_doclist: true,
         }
-    }
-
-    fn leaf_size(&self) -> usize {
-        4 + self.body.len() + pgidx(&self.term_offsets).len()
     }
 
     fn finish_leaf(&self) -> Vec<u8> {
@@ -264,6 +271,8 @@ impl SegWriter {
         self.prev_term_key = None;
         self.prev_rowid = 0;
         self.pgno += 1;
+        // sqlite's `fts5WriteFlushLeaf`: the fresh leaf holds no terms or rowids.
+        self.first_rowid_in_page = true;
     }
 
     fn term_record(&self, key: &[u8]) -> Vec<u8> {
@@ -293,6 +302,68 @@ impl SegWriter {
         pgidx(&self.term_offsets).len()
     }
 
+    /// Port of the rowid step of sqlite's `fts5FlushOneHash` doclist writer — the
+    /// single-pass bulk-build path graphite's one-shot segment build mirrors (NOT the
+    /// incremental-merge `fts5WriteAppendRowid`, which sqlite only reaches when a
+    /// large corpus is flushed into several segments and later compacted). Appends
+    /// one doclist rowid. A rowid that is the FIRST on its leaf (`bFirstRowidInPage`)
+    /// is stored ABSOLUTE, its byte offset becomes the leaf's `first_rowid_off`
+    /// header pointer, and — on a term-less continuation leaf — it seeds a
+    /// doclist-index entry; a rowid that is first-in-doclist is also ABSOLUTE; every
+    /// other rowid is a delta from the previous. `fts5FlushOneHash` does NOT
+    /// flush-check before the rowid — a fresh leaf is only ever reached from the
+    /// poslist-spill loop below, which flushes and re-arms `first_rowid_in_page`.
+    fn append_rowid(&mut self, rowid: i64, term_start_leaf: i64) {
+        if self.first_rowid_in_page {
+            self.first_rowid_off = 4 + self.body.len();
+            if self.pgno != term_start_leaf {
+                self.span_pages.push((self.pgno, rowid));
+            }
+        }
+        if self.first_rowid_in_doclist || self.first_rowid_in_page {
+            put_varint(&mut self.body, rowid as u64);
+        } else {
+            put_varint(&mut self.body, (rowid - self.prev_rowid) as u64);
+        }
+        self.prev_rowid = rowid;
+        self.first_rowid_in_doclist = false;
+        self.first_rowid_in_page = false;
+    }
+
+    /// Port of the poslist step of sqlite's `fts5FlushOneHash` doclist writer. `data`
+    /// is one posting's position-list (`size` varint + content bytes). If it fits
+    /// whole on the current leaf (`buf.n + pgidx.n + nCopy <= pgsz`) it is copied in
+    /// one go; otherwise it is broken into sections, each the largest run of WHOLE
+    /// varints fitting the remaining page space (`fts5PoslistPrefix`), with a leaf
+    /// flush whenever the page reaches `pgsz`.
+    fn append_poslist_data(&mut self, data: &[u8]) {
+        let n_copy = data.len();
+        if 4 + self.body.len() + self.pgidx_len() + n_copy <= self.pgsz {
+            self.body.extend_from_slice(data);
+            return;
+        }
+        let mut i_pos = 0usize;
+        loop {
+            let n_space = self.pgsz as isize - (4 + self.body.len() + self.pgidx_len()) as isize;
+            let n = if (n_copy - i_pos) as isize <= n_space {
+                n_copy - i_pos
+            } else {
+                // `fts5PoslistPrefix`: the largest whole-varint prefix of the
+                // remaining poslist whose byte length is `<= n_space` (always at least
+                // the first varint). `n_space` may be small/≤0 here.
+                poslist_prefix(&data[i_pos..], n_space)
+            };
+            self.body.extend_from_slice(&data[i_pos..i_pos + n]);
+            i_pos += n;
+            if 4 + self.body.len() + self.pgidx_len() >= self.pgsz {
+                self.flush();
+            }
+            if i_pos >= n_copy {
+                break;
+            }
+        }
+    }
+
     fn add_term(&mut self, term: &[u8], postings: &[Posting]) {
         let key = term_key(term);
         self.add_key(&key, postings);
@@ -305,7 +376,6 @@ impl SegWriter {
     /// first, then each prefix index in turn), matching sqlite's single merged
     /// term stream.
     fn add_key(&mut self, key: &[u8], postings: &[Posting]) {
-        let dl = doclist(postings);
         // Port of `fts5WriteAppendTerm`'s leaf-fill boundary. sqlite decides to end
         // the current leaf purely from the header + committed pgidx + the FULL
         // (uncompressed) term length + a fixed 2-byte slack — the doclist size is
@@ -320,14 +390,6 @@ impl SegWriter {
             self.flush();
         }
         let rec = self.term_record(key);
-        // Whether the whole doclist fits on the current leaf, measured AFTER this
-        // term's record + pgidx entry are accounted for (sqlite's hash-flush guard
-        // `pgsz >= (pBuf->n + pPgidx->n + nDoclist + 1)`, i.e. the `+ 1` folded into
-        // a strict `<`).
-        let mut probe = self.term_offsets.clone();
-        probe.push(4 + self.body.len());
-        let pgidx_after = pgidx(&probe).len();
-        let fits_whole = 4 + self.body.len() + rec.len() + pgidx_after + dl.len() < self.pgsz;
         self.term_offsets.push(4 + self.body.len());
         if self.leaf_first_term.is_none() {
             self.leaf_first_term = Some(key.to_vec());
@@ -335,40 +397,24 @@ impl SegWriter {
         self.leaf_last_term = Some(key.to_vec());
         self.body.extend_from_slice(&rec);
         self.prev_term_key = Some(key.to_vec());
-        if fits_whole {
-            self.body.extend_from_slice(&dl);
-            return;
-        }
-        // Stream the doclist across leaves. The term starts on the current
-        // in-progress leaf (`self.pgno`); every later leaf its doclist spills onto
-        // is a term-less CONTINUATION leaf. Record the first absolute rowid on each
-        // such leaf so a doclist-index can be built if there are enough of them.
+        // sqlite's `fts5WriteAppendTerm` clears `bFirstRowidInPage` after writing a
+        // term: the leaf's `first_rowid_off` pointer is set ONLY on a term-less
+        // continuation leaf, so a rowid written right after a term on this page is
+        // NOT the page's recorded "first rowid" (it stays 0 for the term-start leaf).
+        // It also arms `bFirstRowidInDoclist` for this term's first rowid.
+        self.first_rowid_in_page = false;
+        self.first_rowid_in_doclist = true;
+        // Stream the doclist through the `fts5FlushOneHash` ports (`append_rowid` +
+        // `append_poslist_data`): each posting's rowid then its position-list data,
+        // flushing whole leaves as the page fills so a doclist that overflows the page
+        // spills onto term-less CONTINUATION leaves — and, when it spills far enough,
+        // gets a doclist-index.
         let term_start_leaf = self.pgno;
         self.span_pages.clear();
         self.prev_rowid = 0;
         for p in postings {
-            if self.leaf_size() > self.pgsz && !self.body.is_empty() {
-                self.flush();
-            }
-            if self.term_offsets.is_empty() && self.first_rowid_off == 0 {
-                self.first_rowid_off = 4 + self.body.len();
-                // This posting's rowid becomes the first (absolute) rowid on a
-                // fresh continuation leaf. Record `(pgno, rowid)` for the dlidx.
-                if self.pgno != term_start_leaf {
-                    self.span_pages.push((self.pgno, p.rowid));
-                }
-            }
-            let pl = poslist(p);
-            let size_len = varint::decode(&pl).map(|(_, n)| n).unwrap_or(1);
-            put_varint(&mut self.body, (p.rowid - self.prev_rowid) as u64);
-            self.body.extend_from_slice(&pl[..size_len]);
-            self.prev_rowid = p.rowid;
-            for &b in &pl[size_len..] {
-                if self.leaf_size() >= self.pgsz {
-                    self.flush();
-                }
-                self.body.push(b);
-            }
+            self.append_rowid(p.rowid, term_start_leaf);
+            self.append_poslist_data(&poslist(p));
         }
         self.finish_term_dlidx(term_start_leaf);
     }
@@ -2033,6 +2079,38 @@ mod tests {
         assert_eq!(dl[0].1, hex("00028A438A458A458A458A45"));
         assert_eq!(seg.idx[0].pgno & 1, 1);
         assert_eq!(decode(&seg, b"shared").unwrap().len(), 8000);
+    }
+
+    /// A MATCH on a high-frequency term whose doclist spills across many term-less
+    /// continuation leaves AND carries a doclist-index must be served by the segment
+    /// index route — NOT bailed to the `_content` scan. This pins the read side: the
+    /// term-less continuation leaves parse cleanly (their `first_rowid_off` header
+    /// pointer + rowid-less pages), so `lookup_term_rowids` returns every rowid and
+    /// bumps [`INDEX_ROUTE_HITS`], and the extra dlidx `%_data` pages (rowids outside
+    /// the leaf pgno range) do not confuse the leaf gather.
+    #[test]
+    fn high_frequency_spanning_term_takes_index_route() {
+        let (terms, ndoc, tot, sizes) = single_token_corpus(b"shared", 8000);
+        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0);
+        // The segment spills onto MIN_DLIDX_SIZE+ continuation leaves and has a dlidx.
+        assert!(leaves_of(&seg).len() > MIN_DLIDX_SIZE);
+        assert_eq!(dlidx_pages(&seg).len(), 1);
+        assert_eq!(
+            seg.idx[0].pgno & 1,
+            1,
+            "term-start leaf carries a dlidx flag"
+        );
+
+        let before = INDEX_ROUTE_HITS.load(core::sync::atomic::Ordering::Relaxed);
+        let rowids = lookup_term_rowids(&seg.data, b"shared")
+            .expect("a dlidx-bearing single-segment index must be servable, not scanned");
+        assert_eq!(rowids.len(), 8000);
+        assert_eq!(*rowids.first().unwrap(), 1);
+        assert_eq!(*rowids.last().unwrap(), 8000);
+        assert!(
+            INDEX_ROUTE_HITS.load(core::sync::atomic::Ordering::Relaxed) > before,
+            "the high-frequency spanning term must take the index route, not scan _content"
+        );
     }
 
     /// Decode a run of hex digit pairs into bytes (test helper).
