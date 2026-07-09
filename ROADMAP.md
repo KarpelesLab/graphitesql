@@ -267,10 +267,17 @@ result or declines to it — never a wrong answer), so this track is
   `whereKeyStats`/`whereEqualScanEst`/`initAvgEq`), so a rare-value equality flips
   to the selective index — narrowed (only when the index has stat1+stat4 and the
   matched leading prefix is fully bound) so no ANALYZE-less plan moves and the EQP
-  corpus stays green. **Remaining:** `whereRangeScanEst` (range selectivity) and
-  the index-vs-full-`SCAN` `rRun` cost comparison — these need the `whereLoopAddBtree`
-  WhereLoop machinery graphite doesn't yet model, and would ripple across the
-  SCAN-vs-SEARCH EQP corpus; the biggest single remaining planner item.
+  corpus stays green. *Equality scan-vs-search done (2391bf4)* and *range
+  selectivity done (3317535):* the index-vs-full-`SCAN` `rRun` comparison
+  (`full_scan_beats_seek`/`full_scan_beats_range`, LogEst ports of
+  `whereLoopAddBtree`/`whereLoopFindLesser`/`wherePathSolver`) now full-scans an
+  unselective non-covering equality **or** leading range at sqlite's exact
+  boundary, and `whereRangeScanEst`'s STAT4 branch estimates range rows from the
+  samples — all gated to stat4-backed non-covering single-candidate cases so the
+  EQP corpus stays byte-identical. **Remaining:** the full multi-loop **join-order
+  path solver** (choosing among several candidate indexes / ordering >1 table by
+  cost) — graphite still ports only the single-table scan-vs-seek leaf; this is
+  the biggest single remaining planner item.
 
 ### Track C — Storage engine, transactions, concurrency
 
