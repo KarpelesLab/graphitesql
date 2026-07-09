@@ -13115,6 +13115,10 @@ impl Connection {
             IndexMeta,
             usize,
         )> = None;
+        // For the winning candidate, remember whether the estimate came from
+        // sqlite_stat4 samples (`Some(matched_rows)`), whether it covers, and its
+        // key width — the inputs to the scan-vs-seek cost comparison below.
+        let mut best_stat4: Option<(u64, bool, i16)> = None;
         for idx in self.indexes_of(table_name)? {
             if let Some(IndexHint::IndexedBy(n)) = hint
                 && !idx.name.eq_ignore_ascii_case(n)
@@ -13146,12 +13150,10 @@ impl Connection {
             // samples — exactly what sqlite's `whereEqualScanEst` does. Only the
             // stat1-present branch is touched, so databases without ANALYZE keep
             // the sentinel behaviour byte-for-byte.
-            let est = if let Some(ai_row_est) = stat1_row {
+            let stat4_est = stat1_row.and_then(|ai_row_est| {
                 self.stat4_equal_est(&idx, matched, eqs, is_null_cols, ai_row_est)
-                    .unwrap_or(est)
-            } else {
-                est
-            };
+            });
+            let est = stat4_est.unwrap_or(est);
             // A covering candidate holds every referenced column; `seek_index_covers`
             // makes the same decision the render uses. Without an enclosing `SELECT`
             // (DELETE/UPDATE/OR-disjunct) nothing covers.
@@ -13174,9 +13176,114 @@ impl Connection {
             };
             if take {
                 best = Some((key, idx, matched));
+                best_stat4 = stat4_est.map(|e| (e, covering, width));
             }
         }
-        Ok(best.map(|(_, idx, matched)| (idx, matched)))
+        let Some((_, idx, matched)) = best else {
+            return Ok(None);
+        };
+        // Scan-vs-search: sqlite compares the full-table-scan cost against the
+        // index-seek cost and picks the cheaper. When the chosen index is
+        // NON-COVERING and its stat4 estimate says the equality matches a large
+        // fraction of the table, the per-matched-row table lookup makes a full
+        // scan cheaper — sqlite renders `SCAN`, not `SEARCH`. Only fire when the
+        // estimate is stat4-backed (so no-stats / stat1-only tables are byte-
+        // identical to before) and the index is non-covering (a covering seek
+        // needs no table lookup, so a scan never wins). Returning `None` routes
+        // both `try_index_lookup` and `eqp_access` to their SCAN paths.
+        //
+        // Restricted to an enclosing `SELECT` (`sel` present): a DELETE/UPDATE
+        // plans under `WHERE_ONEPASS_DESIRED`, where sqlite's full-scan-via-index
+        // cost branch is suppressed and the row-visiting seek is kept regardless
+        // of selectivity — so those keep their prior always-SEARCH behavior.
+        if let Some((est_rows, covering, width)) = best_stat4
+            && sel.is_some()
+            && !covering
+            && self.full_scan_beats_seek(table_name, meta, est_rows, width)
+        {
+            return Ok(None);
+        }
+        Ok(Some((idx, matched)))
+    }
+
+    /// Port of sqlite's full-table-scan vs non-covering-index-seek cost
+    /// comparison (`whereLoopAddBtree`): returns true when a full table scan is
+    /// no more expensive than seeking `est_rows` rows through a non-covering
+    /// index of LogEst key-width `idx_width`, requiring one table lookup per
+    /// matched row.
+    ///
+    /// Both costs are computed in LogEst units exactly as sqlite does. The full
+    /// scan (rowid table, STAT4 present) costs `rRun = rSize + 14`. The index seek
+    /// costs `rCostIdx = LogEstAdd(rLogSize, nOut + 1 + 15*szIdxRow/szTabRow)`, then
+    /// `rRun = LogEstAdd(rCostIdx, nOut + 16)` for the per-row table lookups — where
+    /// `rSize = LogEst(nRow)`, `rLogSize = estLog(rSize)`, `nOut = LogEst(est_rows)`.
+    /// Only reached with STAT4 data, so the `-2` STAT4 scan discount always applies.
+    ///
+    /// The scan wins only when its `rRun` is strictly lower than the seek's: on a
+    /// `rRun` tie both loops survive `whereLoopFindLesser` (neither dominates — the
+    /// seek has the smaller `nOut`) and `wherePathSolver` then keeps the seek because
+    /// its lower output row count yields the lower downstream path cost. So a tie
+    /// goes to the SEARCH, matching sqlite.
+    fn full_scan_beats_seek(
+        &self,
+        table_name: &str,
+        meta: &TableMeta,
+        est_rows: u64,
+        idx_width: i16,
+    ) -> bool {
+        // WITHOUT ROWID tables never seek a secondary index in this planner, and
+        // sqlite's IPK-scan cost model above is rowid-specific; restrict to rowid
+        // tables (the only ones this branch can be reached for).
+        if meta.without_rowid {
+            return false;
+        }
+        // nRow: the table's row count from stat1 (the index row's leading value).
+        // Without it there is no scan cost to compare, so keep the seek.
+        let Some(n_row) = self.table_stat1_rows(table_name) else {
+            return false;
+        };
+        if n_row == 0 {
+            return false;
+        }
+        let r_size = logest(n_row); // LogEst(nRow)
+        let r_log_size = est_log(r_size);
+        let n_out = logest(est_rows.max(1)); // LogEst(matched rows)
+
+        // Table row width (szTabRow) = LogEst((Σ szEst(col) + 1) * 4).
+        let szests = self.table_col_szests(table_name).unwrap_or_default();
+        let w_tab: u32 = szests.iter().copied().sum::<u32>() + 1;
+        let sz_tab_row = logest(u64::from(w_tab) * 4).max(1) as i32;
+        // The index key width is passed in already as LogEst((Σ szEst(key)+1)*4).
+        let sz_idx_row = idx_width as i32;
+
+        // Full-scan cost (rowid IPK, STAT4 present): rSize + 16 - 2.
+        let scan = r_size + 14;
+
+        // Non-covering index-seek cost.
+        let per_row = 1 + (15 * sz_idx_row) / sz_tab_row;
+        let r_cost_idx = logest_add(r_log_size, n_out + per_row as i16);
+        let seek = logest_add(r_cost_idx, n_out + 16);
+
+        scan < seek
+    }
+
+    /// The table's estimated row count from `sqlite_stat1` (the leading integer
+    /// of any index row for `table`, all of which share the table's row count),
+    /// or `None` when the table has no `sqlite_stat1` data.
+    fn table_stat1_rows(&self, table: &str) -> Option<u64> {
+        self.schema.table("sqlite_stat1")?;
+        let meta = self.table_meta("sqlite_stat1", None).ok()?;
+        let rows = self.scan_table(&meta).ok()?;
+        for (_, vals) in rows {
+            if let Some(Value::Text(tbl)) = vals.first()
+                && tbl == table
+                && let Some(Value::Text(stat)) = vals.get(2)
+                && let Some(n) = stat.split_whitespace().next().and_then(|t| t.parse().ok())
+            {
+                return Some(n);
+            }
+        }
+        None
     }
 
     /// STAT4-driven equality selectivity estimate for `idx` when its leading
@@ -32353,6 +32460,37 @@ fn column_resolves_scoped(
             && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
             && schema_ok(c)
     })
+}
+
+/// SQLite's `sqlite3LogEstAdd(a, b)` — the LogEst of the sum of two values whose
+/// LogEsts are `a` and `b` (i.e. `LogEst(2^(a/10) + 2^(b/10))`). Ported verbatim
+/// from `where.c` so index-seek and full-scan costs add exactly as SQLite's.
+fn logest_add(a: i16, b: i16) -> i16 {
+    const X: [i16; 32] = [
+        10, 10, 9, 9, 8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2,
+        2, 2,
+    ];
+    if a >= b {
+        if a > b + 49 {
+            a
+        } else if a > b + 31 {
+            a + 1
+        } else {
+            a + X[(a - b) as usize]
+        }
+    } else if b > a + 49 {
+        b
+    } else if b > a + 31 {
+        b + 1
+    } else {
+        b + X[(b - a) as usize]
+    }
+}
+
+/// SQLite's `estLog(N)` — an estimate of `log2(N)` in LogEst units, used to price
+/// the cost of one binary-search seek into an index/table (`where.c`).
+fn est_log(n: i16) -> i16 {
+    if n <= 10 { 0 } else { logest(n as u64) - 33 }
 }
 
 /// SQLite's `sqlite3LogEst` — an integer approximation of `10*log2(x)`, the unit
