@@ -287,24 +287,37 @@ impl SegWriter {
         rec
     }
 
-    fn pgidx_with(&self) -> usize {
-        let mut probe = self.term_offsets.clone();
-        probe.push(4 + self.body.len());
-        pgidx(&probe).len()
+    /// Current serialized page-index footer length (bytes already committed for
+    /// the terms on the in-progress leaf) — sqlite's `pPage->pgidx.n`.
+    fn pgidx_len(&self) -> usize {
+        pgidx(&self.term_offsets).len()
     }
 
     fn add_term(&mut self, term: &[u8], postings: &[Posting]) {
         let key = term_key(term);
         let dl = doclist(postings);
-        let rec = self.term_record(&key);
-        if !self.body.is_empty()
-            && 4 + self.body.len() + rec.len() + dl.len() + self.pgidx_with() >= self.pgsz
+        // Port of `fts5WriteAppendTerm`'s leaf-fill boundary. sqlite decides to end
+        // the current leaf purely from the header + committed pgidx + the FULL
+        // (uncompressed) term length + a fixed 2-byte slack — the doclist size is
+        // NOT part of this decision (overflow past the page is handled by streaming
+        // the doclist across continuation leaves, below). `key.len()` is the stored
+        // term length INCLUDING the 0x30 main-index prefix byte, matching sqlite's
+        // `nTerm` (the hash/merge term is stored prefixed).
+        //   if( (pPage->buf.n + pPgidx->n + nTerm + 2) >= pgsz ) flush-if-buf.n>4
+        if 4 + self.body.len() + self.pgidx_len() + key.len() + 2 >= self.pgsz
+            && !self.body.is_empty()
         {
             self.flush();
         }
         let rec = self.term_record(&key);
-        let fits_whole =
-            4 + self.body.len() + rec.len() + dl.len() + self.pgidx_with() <= self.pgsz;
+        // Whether the whole doclist fits on the current leaf, measured AFTER this
+        // term's record + pgidx entry are accounted for (sqlite's hash-flush guard
+        // `pgsz >= (pBuf->n + pPgidx->n + nDoclist + 1)`, i.e. the `+ 1` folded into
+        // a strict `<`).
+        let mut probe = self.term_offsets.clone();
+        probe.push(4 + self.body.len());
+        let pgidx_after = pgidx(&probe).len();
+        let fits_whole = 4 + self.body.len() + rec.len() + pgidx_after + dl.len() < self.pgsz;
         self.term_offsets.push(4 + self.body.len());
         if self.leaf_first_term.is_none() {
             self.leaf_first_term = Some(key.clone());
