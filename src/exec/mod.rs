@@ -252,6 +252,13 @@ pub trait AggregateFunction {
 /// [`Connection::register_aggregate_function`].
 pub type AggregateFactory = Box<dyn Fn() -> Box<dyn AggregateFunction>>;
 
+/// One FTS5 incremental DELETE/UPDATE change: `(rowid, old fts5-column values,
+/// new fts5-column values?)`. `None` new values ⇒ a pure delete; `Some(v)` ⇒ an
+/// UPDATE (tombstone the old terms, insert the new). See
+/// [`Executor::fts5_incremental_delete`].
+#[cfg(feature = "fts5")]
+type Fts5Change = (i64, Vec<Value>, Option<Vec<Value>>);
+
 /// Initial seed for a connection's `random()` generator. Under `std` it mixes
 /// the wall clock so repeated invocations of the binary produce different
 /// sequences; `no_std` builds, lacking any entropy source, fall back to a fixed
@@ -10435,6 +10442,28 @@ impl Connection {
                 Ok(victims.len())
             },
         )?;
+        // Self-content fts5 in AUTOCOMMIT: service the delete incrementally by
+        // appending one tombstone segment (byte-identical to sqlite), falling back
+        // to the bulk rebuild otherwise. `victim_vals` are the old fts5-column
+        // values (leading rowid dropped by try_virtual_table for fts5).
+        #[cfg(feature = "fts5")]
+        if module_name.eq_ignore_ascii_case("fts5")
+            && !victims.is_empty()
+            && !self.in_tx
+            && self.open_savepoints == 0
+        {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if !crate::vtab::fts5_no_local_content(&arg_refs) {
+                let changes: Vec<(i64, Vec<Value>, Option<Vec<Value>>)> = victims
+                    .iter()
+                    .zip(victim_vals.iter())
+                    .map(|(rid, vals)| (*rid, vals.clone(), None))
+                    .collect();
+                if self.fts5_incremental_delete(&del.table, &changes)? {
+                    return Ok(deleted);
+                }
+            }
+        }
         self.fts5_maybe_rebuild(&module_name, &del.table)?;
         Ok(deleted)
     }
@@ -10577,6 +10606,27 @@ impl Connection {
                 Ok(changes.len())
             },
         )?;
+        // Self-content fts5 in AUTOCOMMIT: service the UPDATE incrementally as a
+        // delete-then-insert of each row in one appended segment (tombstones for
+        // the old terms + insert postings for the new), byte-identical to sqlite.
+        #[cfg(feature = "fts5")]
+        if module_name.eq_ignore_ascii_case("fts5")
+            && !changes.is_empty()
+            && !self.in_tx
+            && self.open_savepoints == 0
+        {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if !crate::vtab::fts5_no_local_content(&arg_refs) {
+                let inc: Vec<(i64, Vec<Value>, Option<Vec<Value>>)> = changes
+                    .iter()
+                    .zip(old_vals.iter())
+                    .map(|((rid, newv), oldv)| (*rid, oldv.clone(), Some(newv.clone())))
+                    .collect();
+                if self.fts5_incremental_delete(&upd.table, &inc)? {
+                    return Ok(updated);
+                }
+            }
+        }
         self.fts5_maybe_rebuild(&module_name, &upd.table)?;
         Ok(updated)
     }
@@ -30661,6 +30711,242 @@ impl Connection {
         Ok(true)
     }
 
+    /// Try to service a self-content fts5 DELETE (and DELETE-then-INSERT of an
+    /// UPDATE) INCREMENTALLY — appending ONE fresh level-0 segment that carries the
+    /// deleted documents' terms as DELETE markers (sqlite's tombstone: a poslist
+    /// written `size2 = 1`) and, for an UPDATE, the new documents' insert postings
+    /// merged into the same term stream — byte-identical to sqlite's
+    /// `fts5FlushOneHash` delete path — instead of the single-segment bulk rebuild.
+    ///
+    /// `changes` is `(rowid, old_values, new_values?)`: `new_values = None` is a
+    /// pure delete; `Some(v)` is an UPDATE (delete the old row's terms, insert the
+    /// new row's terms under the same rowid). `old_values`/`new_values` are the
+    /// fts5 column values in declared order.
+    ///
+    /// Returns `Ok(true)` when it fully handled the write, or `Ok(false)` to fall
+    /// back to [`fts5_rebuild_index`]. Only the autocommit, non-prefix, single-leaf
+    /// (non-spanning) case is taken; anything structurally surprising bails so the
+    /// index is never wrong — at worst it is today's single compacted segment.
+    #[cfg(feature = "fts5")]
+    fn fts5_incremental_delete(&mut self, name: &str, changes: &[Fts5Change]) -> Result<bool> {
+        use crate::fts5_index::{self, IdxRow, Posting, SegStructure};
+        use alloc::collections::{BTreeMap, BTreeSet};
+        if changes.is_empty() {
+            return Ok(true);
+        }
+        let (_module, args, schema) = self.vtab_meta(name)?;
+        let ncols = schema.columns.len();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // Prefix indexes complicate the merged term stream; keep the write path to
+        // the main-index case and let prefix tables rebuild.
+        let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
+        if !prefixes.is_empty() {
+            return Ok(false);
+        }
+        let tok = crate::vtab::fts5_tok_config(&arg_refs);
+
+        // The current live corpus (post-mutation content) drives the averages and
+        // the docsize set; the segment we append is derived purely from `changes`.
+        let docs = self.fts5_load_documents(name, &schema.columns, &arg_refs)?;
+
+        // Build the merged term map for the appended segment: each deleted (old)
+        // document contributes DELETE markers for every term it contained, and each
+        // updated document also contributes INSERT postings for its new terms. A
+        // `(term, rowid)` pair present as BOTH (a term the old and new row share)
+        // collapses to the INSERT posting (sqlite writes the live entry, no
+        // tombstone), matching a hash flush where the last write for a docid wins.
+        let mut term_map: BTreeMap<Vec<u8>, BTreeMap<i64, Posting>> = BTreeMap::new();
+        let mut new_doc_sizes: Vec<(i64, Vec<u64>)> = Vec::new();
+        let mut deleted_rowids: BTreeSet<i64> = BTreeSet::new();
+        for (rowid, old_values, new_values) in changes {
+            deleted_rowids.insert(*rowid);
+            // DELETE markers for the OLD document's terms (positionless, del=true).
+            for c in 0..ncols {
+                let text = match old_values.get(c) {
+                    Some(v) if !matches!(v, Value::Null) => eval::to_text(v),
+                    _ => String::new(),
+                };
+                for tk in crate::vtab::fts5_tokenize(&text, tok) {
+                    let key = tk.as_bytes().to_vec();
+                    term_map
+                        .entry(key)
+                        .or_default()
+                        .entry(*rowid)
+                        .or_insert(Posting {
+                            rowid: *rowid,
+                            cols: alloc::vec![Vec::new(); ncols],
+                            del: true,
+                        });
+                }
+            }
+            // INSERT postings for the NEW document's terms (UPDATE only). A new
+            // term overrides any delete marker recorded above for the same
+            // `(term, rowid)`; a term the new row keeps needs its live positions.
+            if let Some(new_values) = new_values {
+                let mut sizes = alloc::vec![0u64; ncols];
+                // Accumulate this new doc's per-(term,col) positions first, so a
+                // term appearing in several columns produces one posting.
+                let mut per_term: BTreeMap<Vec<u8>, Vec<Vec<u32>>> = BTreeMap::new();
+                for (c, size) in sizes.iter_mut().enumerate() {
+                    let text = match new_values.get(c) {
+                        Some(v) if !matches!(v, Value::Null) => eval::to_text(v),
+                        _ => String::new(),
+                    };
+                    let toks = crate::vtab::fts5_tokenize(&text, tok);
+                    *size = toks.len() as u64;
+                    for (pos, tk) in toks.iter().enumerate() {
+                        per_term
+                            .entry(tk.as_bytes().to_vec())
+                            .or_insert_with(|| alloc::vec![Vec::new(); ncols])[c]
+                            .push(pos as u32);
+                    }
+                }
+                for (key, cols) in per_term {
+                    let by_rowid = term_map.entry(key).or_default();
+                    // If this `(term, rowid)` already has a DELETE marker (the old
+                    // row contained the term), keep `del = true` and attach the new
+                    // positions — sqlite's hash keeps `bDel` set for a docid that
+                    // was deleted then re-written, so its size field is
+                    // `content_len*2 + 1`. A term new to this rowid inserts clean.
+                    match by_rowid.get_mut(rowid) {
+                        Some(existing) => existing.cols = cols,
+                        None => {
+                            by_rowid.insert(
+                                *rowid,
+                                Posting {
+                                    rowid: *rowid,
+                                    cols,
+                                    del: false,
+                                },
+                            );
+                        }
+                    }
+                }
+                new_doc_sizes.push((*rowid, sizes));
+            }
+        }
+        // The appended segment's ascending term stream.
+        let terms: Vec<(Vec<u8>, Vec<Posting>)> = term_map
+            .into_iter()
+            .map(|(term, per_doc)| (term, per_doc.into_values().collect()))
+            .collect();
+        if terms.is_empty() {
+            // Deleting rows that contributed no tokens (all-NULL/empty docs): the
+            // segment would be empty, which sqlite still writes but with a
+            // structurally different (0-term) shape; fall back to stay exact.
+            return Ok(false);
+        }
+
+        // Read the current STRUCTURE record, or bail if unrecognized.
+        let struct_blob = self
+            .query(&format!(
+                "SELECT block FROM {} WHERE id={}",
+                sql::print::ident(&format!("{name}_data")),
+                fts5_index::STRUCTURE_ROWID
+            ))?
+            .rows
+            .into_iter()
+            .next()
+            .and_then(|r| match r.into_iter().next() {
+                Some(Value::Blob(b)) => Some(b),
+                _ => None,
+            });
+        let mut structure = match &struct_blob {
+            Some(b) => match SegStructure::parse(b) {
+                Some(s) => s,
+                None => return Ok(false),
+            },
+            None => return Ok(false), // no index to tombstone against → rebuild
+        };
+
+        // Build the appended tombstone/mixed segment with a fresh segid.
+        let segid = structure.allocate_segid();
+        let block = fts5_index::build_segment_block(&terms, &new_doc_sizes, 4050, segid, &prefixes);
+        // A spanning (doclist-index) segment is out of this slice; fall back so we
+        // never write a subtly wrong index.
+        if block.data.iter().any(|(id, _)| (*id & (1 << 36)) != 0) {
+            return Ok(false);
+        }
+
+        structure.append_level0(segid, block.n_leaves);
+        // A crisis merge here would have to reconcile tombstones against the older
+        // segments (fts5IndexMerge with delete markers) — not ported. Fall back to
+        // the bulk rebuild whenever appending this segment reaches the threshold.
+        const CRISIS: usize = 16;
+        if structure.levels.iter().any(|l| l.segs.len() >= CRISIS) {
+            return Ok(false);
+        }
+
+        // Global averages over the WHOLE live corpus (nRow + per-column totals).
+        let (_all_terms, col_totals, _all_sizes) = self.fts5_tokenize_docs(&docs, ncols, tok);
+
+        let q = |s: &str| sql::print::ident(s);
+        let pv = |vals: Vec<Value>| Params {
+            positional: vals,
+            named: Vec::new(),
+        };
+        let data_t = q(&format!("{name}_data"));
+
+        // Averages (id 1). Unlike a fresh empty index (which carries an EMPTY
+        // averages record), a table deleted down to zero rows via tombstones keeps
+        // the record present as `nRow=0` followed by per-column zeros — sqlite only
+        // omits it before the first document is ever written. So encode it
+        // unconditionally here (0 docs → `00 00…`).
+        let avg = fts5_index::encode_averages_full(docs.len() as u64, &col_totals);
+        self.execute_params(
+            &format!("INSERT OR REPLACE INTO {data_t} VALUES(?1,?2)"),
+            &pv(alloc::vec![
+                Value::Integer(fts5_index::AVERAGES_ROWID),
+                Value::Blob(avg)
+            ]),
+        )?;
+        // Structure record (id 10).
+        self.execute_params(
+            &format!("INSERT OR REPLACE INTO {data_t} VALUES(?1,?2)"),
+            &pv(alloc::vec![
+                Value::Integer(fts5_index::STRUCTURE_ROWID),
+                Value::Blob(structure.encode())
+            ]),
+        )?;
+        // Append the new segment's leaf `%_data` rows and `%_idx` rows.
+        for (id, block_bytes) in &block.data {
+            self.execute_params(
+                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![
+                    Value::Integer(*id),
+                    Value::Blob(block_bytes.clone())
+                ]),
+            )?;
+        }
+        let idx_t = q(&format!("{name}_idx"));
+        for IdxRow { segid, term, pgno } in &block.idx {
+            self.execute_params(
+                &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                &pv(alloc::vec![
+                    Value::Integer(*segid),
+                    Value::Blob(term.clone()),
+                    Value::Integer(*pgno)
+                ]),
+            )?;
+        }
+        // `_docsize`: delete each mutated rowid's old row, then (for UPDATEs) write
+        // the new one. A pure delete leaves the rowid absent.
+        let docsize_t = q(&format!("{name}_docsize"));
+        for rid in &deleted_rowids {
+            self.execute_params(
+                &format!("DELETE FROM {docsize_t} WHERE id=?1"),
+                &pv(alloc::vec![Value::Integer(*rid)]),
+            )?;
+        }
+        for (rowid, sz) in fts5_index::build_docsize(&new_doc_sizes) {
+            self.execute_params(
+                &format!("INSERT INTO {docsize_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![Value::Integer(rowid), Value::Blob(sz)]),
+            )?;
+        }
+        Ok(true)
+    }
+
     /// Tokenize `docs` (each `(rowid, [fts5 col values in declared order])`) into
     /// the inverted-index inputs the segment builder consumes: the ascending
     /// `terms` (term bytes → per-doc postings), the per-column total token counts,
@@ -30704,7 +30990,11 @@ impl Connection {
             .map(|(term, per_doc)| {
                 let postings = per_doc
                     .into_iter()
-                    .map(|(rowid, cols)| Posting { rowid, cols })
+                    .map(|(rowid, cols)| Posting {
+                        rowid,
+                        cols,
+                        del: false,
+                    })
                     .collect();
                 (term, postings)
             })
@@ -30963,7 +31253,11 @@ impl Connection {
             .map(|(term, per_doc)| {
                 let postings = per_doc
                     .into_iter()
-                    .map(|(rowid, cols)| Posting { rowid, cols })
+                    .map(|(rowid, cols)| Posting {
+                        rowid,
+                        cols,
+                        del: false,
+                    })
                     .collect();
                 (term, postings)
             })

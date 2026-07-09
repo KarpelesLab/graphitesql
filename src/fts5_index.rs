@@ -88,9 +88,16 @@ fn put_varint(out: &mut Vec<u8>, v: u64) {
 
 /// One document's contribution to a term: its rowid and, per column, the sorted
 /// token positions (`cols[c]` empty if the term does not occur in column `c`).
+///
+/// A `del` posting is a DELETE marker (sqlite's tombstone): it carries no
+/// positions and its poslist is written as `size2 = 1` (content length 0 with the
+/// low delete-flag bit set), shadowing an older segment's entry for `rowid` when
+/// the segments are later merged. See [`poslist`].
 pub(crate) struct Posting {
     pub rowid: i64,
     pub cols: Vec<Vec<u32>>,
+    /// True for a delete marker (tombstone). Normal insert postings are `false`.
+    pub del: bool,
 }
 
 /// `[ (first offset + 2), (delta + 2)… ]` for one column's positions.
@@ -108,7 +115,14 @@ fn collist(positions: &[u32]) -> Vec<u8> {
 }
 
 /// A posting's position list: `[size][col0 collist]([0x01][col][collist])*`,
-/// where `size` is the content byte length × 2. Positions are per-column.
+/// where `size` is `content_len × 2 + delete_flag` (sqlite's `nPos = nSz*2 +
+/// bDel`, see `fts5HashAddPoslistSize`). Positions are per-column.
+///
+/// A DELETE marker (`p.del`) sets the low bit. A pure tombstone (old row's term,
+/// no new positions) is `size2 = 1` with no content. An UPDATE that re-inserts a
+/// term the old row also had keeps `del = true` AND carries the new positions:
+/// `size2 = content_len*2 + 1` followed by the content — exactly how sqlite's hash
+/// flush encodes a docid that was deleted then re-written in one transaction.
 fn poslist(p: &Posting) -> Vec<u8> {
     let mut content = Vec::new();
     for (c, positions) in p.cols.iter().enumerate() {
@@ -122,7 +136,7 @@ fn poslist(p: &Posting) -> Vec<u8> {
         content.extend_from_slice(&collist(positions));
     }
     let mut out = Vec::new();
-    put_varint(&mut out, (content.len() as u64) * 2);
+    put_varint(&mut out, (content.len() as u64) * 2 + u64::from(p.del));
     out.extend_from_slice(&content);
     out
 }
@@ -590,6 +604,21 @@ pub(crate) fn encode_averages(n_rows: u64, col_totals: &[u64]) -> Vec<u8> {
     out
 }
 
+/// Encode the `%_data` AVERAGES record ALWAYS as `nRow` followed by each column's
+/// total token count — even for `n_rows == 0` (`00 00…`). Used by the incremental
+/// DELETE path: a table tombstoned down to zero rows keeps its averages record
+/// present (sqlite only omits it before the first document is ever written),
+/// unlike [`encode_averages`], which returns empty for a fresh, never-populated
+/// index.
+pub(crate) fn encode_averages_full(n_rows: u64, col_totals: &[u64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_varint(&mut out, n_rows);
+    for &t in col_totals {
+        put_varint(&mut out, t);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Incremental (multi-segment) write support — the structure-record model.
 //
@@ -890,7 +919,11 @@ fn merge_prefix_postings(groups: &[&[Posting]]) -> Vec<Posting> {
                 col.sort_unstable();
                 col.dedup();
             }
-            Posting { rowid, cols }
+            Posting {
+                rowid,
+                cols,
+                del: false,
+            }
         })
         .collect()
 }
@@ -2267,6 +2300,7 @@ mod tests {
         Posting {
             rowid,
             cols: cols.iter().map(|c| c.to_vec()).collect(),
+            del: false,
         }
     }
 
