@@ -14,11 +14,12 @@
 //! * A session is attached to a database (currently always `main`) and, via
 //!   [`Session::attach`], to every table in it.
 //! * As the connection runs `INSERT`/`UPDATE`/`DELETE` on an attached table,
-//!   the session records the change, keyed by the row's primary key. Only the
-//!   **first** operation on a given row within the session's lifetime is
-//!   remembered (its op and the row's *original* values); subsequent edits to
-//!   the same row are folded in at changeset time by reading the row's current
-//!   value from the database. This reproduces SQLite's coalescing rules:
+//!   the session records the change, keyed by the row's **primary key** (which
+//!   may be a single column or several — see below). Only the **first**
+//!   operation on a given row within the session's lifetime is remembered (its
+//!   op and the row's *original* values); subsequent edits to the same row are
+//!   folded in at changeset time by reading the row's current value from the
+//!   database. This reproduces SQLite's coalescing rules:
 //!   * `INSERT` then `UPDATE` of the same row → a single `INSERT` of the final
 //!     values.
 //!   * `INSERT` then `DELETE` of the same row → nothing.
@@ -28,14 +29,23 @@
 //!   walks the attached tables and produces the blob. An empty session yields
 //!   an empty changeset ([`Session::is_empty`]).
 //!
-//! # Scope (first slice)
+//! # Scope
 //!
-//! The recorder currently tracks **rowid tables whose primary key is a single
-//! `INTEGER PRIMARY KEY` column** (the common case). Changes to `WITHOUT
-//! ROWID` tables, tables with a composite or non-integer primary key, and
-//! tables with no primary key are not yet recorded; such tables simply do not
-//! contribute to the changeset. Values of every storage class
-//! (INTEGER/REAL/TEXT/BLOB/NULL) are supported.
+//! The recorder tracks tables that have a declared **PRIMARY KEY**, matching
+//! the shapes SQLite's session module records under its default configuration:
+//!
+//! * a single `INTEGER PRIMARY KEY` (rowid alias),
+//! * a single non-integer primary key (`TEXT`/`BLOB`/`REAL`/numeric),
+//! * a **composite** primary key (`PRIMARY KEY(a, b, …)`),
+//! * a `WITHOUT ROWID` table (whose primary key *is* the row key).
+//!
+//! A table **with no declared primary key** (an implicit-rowid table) is *not*
+//! recorded — exactly as SQLite's session module skips it under the default
+//! configuration (the `_rowid_`-keyed behaviour is only enabled by the
+//! opt-in `SQLITE_SESSION_OBJCONFIG_ROWID` object flag, which the changeset
+//! API does not turn on). Such a table simply does not contribute to the
+//! changeset. Values of every storage class (INTEGER/REAL/TEXT/BLOB/NULL) are
+//! supported.
 
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -71,17 +81,44 @@ pub(crate) enum ChangeOp {
     Delete,
 }
 
-/// One tracked row change. `pk` is the row's primary-key (integer) value, used
-/// both to look up the current row at changeset time and to compute the bucket
-/// hash. `old` holds the row's values as they were *before* the first change:
-/// the full old row for `UPDATE`/`DELETE`, and (for byte-compatibility with
-/// SQLite, which stores only the PK for an `INSERT`) an all-`Null`-but-PK row
-/// for `INSERT`.
+/// One tracked row change. `pk` holds the row's primary-key column values (in
+/// column order, only the PK columns), used both to look up the current row at
+/// changeset time and to compute the bucket hash. `old` holds the row's values
+/// as they were *before* the first change: the full old row for `UPDATE`/
+/// `DELETE`, and (for byte-compatibility with SQLite, which stores only the PK
+/// for an `INSERT`) an all-`Null`-but-PK row for `INSERT` (never emitted — the
+/// live row is re-read for an insert at changeset time).
 #[derive(Clone, Debug)]
 struct Change {
     op: ChangeOp,
-    pk: i64,
+    pk: Vec<Value>,
     old: Vec<Value>,
+}
+
+/// Hash one primary-key value into `h` following SQLite's `sessionPreupdateHash`
+/// (type byte, then the value's bytes). A `NULL` PK value contributes only its
+/// type byte here; the presence of a NULL PK is handled by the caller (which
+/// skips such rows, matching SQLite).
+fn hash_pk_value(h: u32, v: &Value) -> u32 {
+    match v {
+        Value::Null => TableChanges::hash_append(h, u32::from(T_NULL)),
+        Value::Integer(i) => {
+            let h = TableChanges::hash_append(h, u32::from(T_INT));
+            TableChanges::hash_i64(h, *i)
+        }
+        Value::Real(r) => {
+            let h = TableChanges::hash_append(h, u32::from(T_FLOAT));
+            TableChanges::hash_i64(h, r.to_bits() as i64)
+        }
+        Value::Text(s) => {
+            let h = TableChanges::hash_append(h, u32::from(T_TEXT));
+            TableChanges::hash_blob(h, s.as_bytes())
+        }
+        Value::Blob(b) => {
+            let h = TableChanges::hash_append(h, u32::from(T_BLOB));
+            TableChanges::hash_blob(h, b)
+        }
+    }
 }
 
 /// Per-table recorded changes, laid out to reproduce SQLite's hash-bucket
@@ -93,8 +130,11 @@ struct TableChanges {
     name: String,
     /// Number of columns.
     ncol: usize,
-    /// Per-column primary-key flag (aligned with columns).
-    pk_flags: Vec<bool>,
+    /// Per-column primary-key marker (aligned with columns), matching SQLite's
+    /// `abPK`: `0` for a non-PK column, else the column's **1-based position
+    /// within the primary key** (as `PRAGMA table_xinfo`'s `pk` column reports).
+    /// A single-column PK is `1`; `PRIMARY KEY(b, a)` marks `b`→`1`, `a`→`2`.
+    pk_flags: Vec<u8>,
     /// Hash buckets. Each bucket is a LIFO chain (newest first), matching
     /// SQLite's linked-list prepend, holding the change for each distinct row.
     buckets: Vec<Vec<Change>>,
@@ -103,7 +143,7 @@ struct TableChanges {
 }
 
 impl TableChanges {
-    fn new(name: String, ncol: usize, pk_flags: Vec<bool>) -> TableChanges {
+    fn new(name: String, ncol: usize, pk_flags: Vec<u8>) -> TableChanges {
         TableChanges {
             name,
             ncol,
@@ -128,13 +168,30 @@ impl TableChanges {
         Self::hash_append(h, ((u >> 32) & 0xFFFF_FFFF) as u32)
     }
 
-    /// Bucket index for an integer primary key: `type-byte` then the value,
-    /// mod the bucket count. Mirrors `sessionPreupdateHash` for a table with
-    /// an explicit (non-rowid) integer primary key.
-    fn bucket(&self, pk: i64) -> usize {
-        let h = Self::hash_append(0, u32::from(T_INT));
-        let h = Self::hash_i64(h, pk);
-        (h % self.buckets.len() as u32) as usize
+    /// Hash a blob byte-by-byte (`sessionHashAppendBlob`).
+    #[inline]
+    fn hash_blob(mut h: u32, bytes: &[u8]) -> u32 {
+        for &b in bytes {
+            h = Self::hash_append(h, u32::from(b));
+        }
+        h
+    }
+
+    /// Raw hash of a primary-key tuple (type byte + value for each PK column),
+    /// before reduction modulo the bucket count. Mirrors `sessionPreupdateHash`
+    /// / `sessionChangeHash` for a table with an explicit (non-rowid) primary
+    /// key of one or more columns.
+    fn hash_pk(pk: &[Value]) -> u32 {
+        let mut h = 0u32;
+        for v in pk {
+            h = hash_pk_value(h, v);
+        }
+        h
+    }
+
+    /// Bucket index for a primary-key tuple, mod the bucket count.
+    fn bucket(&self, pk: &[Value]) -> usize {
+        (Self::hash_pk(pk) % self.buckets.len() as u32) as usize
     }
 
     /// Grow (or first-allocate) the bucket array following SQLite's
@@ -150,9 +207,7 @@ impl TableChanges {
             for bucket in &self.buckets {
                 // Iterate head→tail (as stored), prepending into the new bucket.
                 for change in bucket {
-                    let h = Self::hash_append(0, u32::from(T_INT));
-                    let h = Self::hash_i64(h, change.pk);
-                    let idx = (h % new_n as u32) as usize;
+                    let idx = (Self::hash_pk(&change.pk) % new_n as u32) as usize;
                     new_buckets[idx].insert(0, change.clone());
                 }
             }
@@ -161,14 +216,13 @@ impl TableChanges {
     }
 
     /// Record one row operation, applying SQLite's coalescing.
-    fn record(&mut self, op: ChangeOp, pk: i64, old: Vec<Value>) {
+    fn record(&mut self, op: ChangeOp, pk: Vec<Value>, old: Vec<Value>) {
         self.maybe_grow();
-        let idx = self.bucket(pk);
-        if let Some(existing) = self.buckets[idx].iter().position(|c| c.pk == pk) {
+        let idx = self.bucket(&pk);
+        if self.buckets[idx].iter().any(|c| pk_eq(&c.pk, &pk)) {
             // A change already exists for this row: SQLite keeps the original
             // op and original old.* values, folding later edits in at
             // changeset time via the live row read. Nothing to update here.
-            let _ = existing;
             return;
         }
         self.nentry += 1;
@@ -179,6 +233,26 @@ impl TableChanges {
     fn is_empty(&self) -> bool {
         self.nentry == 0
     }
+}
+
+/// Compare two primary-key tuples for the session's row-identity test. Values
+/// must match in both storage class and content (SQLite's `sessionPreupdateEqual`
+/// / `sessionChangeEqual` compares the raw serialized bytes, so e.g. an integer
+/// `1` and a real `1.0` are distinct keys).
+fn pk_eq(a: &[Value], b: &[Value]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).all(|(x, y)| match (x, y) {
+        (Value::Null, Value::Null) => true,
+        (Value::Integer(i), Value::Integer(j)) => i == j,
+        // Compare reals by their bit pattern (the serialized form), matching
+        // SQLite's byte comparison of the stored record.
+        (Value::Real(i), Value::Real(j)) => i.to_bits() == j.to_bits(),
+        (Value::Text(i), Value::Text(j)) => i == j,
+        (Value::Blob(i), Value::Blob(j)) => i == j,
+        _ => false,
+    })
 }
 
 /// Shared recorder state. Held by both the [`Session`] and (while active) the
@@ -195,21 +269,28 @@ pub(crate) struct SessionState {
 }
 
 impl SessionState {
-    /// Called from the write path for a single-row operation on a rowid table
-    /// with a single integer primary key. `op`, the pk value, and the row's
-    /// old values (for UPDATE/DELETE) are recorded. For an INSERT, `old` should
-    /// carry the PK in the PK column and `Null` elsewhere (SQLite stores only
-    /// the PK for an insert's original record).
+    /// Called from the write path for a single-row operation on a table with a
+    /// declared primary key. `op`, the row's primary-key column values (`pk`,
+    /// in column order — only the PK columns), and the row's old values (for
+    /// UPDATE/DELETE) are recorded. For an INSERT, `old` is ignored (only the
+    /// PK matters — the live row is re-read at changeset time).
+    ///
+    /// A row whose primary key contains a `NULL` is ignored, matching SQLite
+    /// (which records no change for such a row).
     pub(crate) fn record(
         &mut self,
         table: &str,
         ncol: usize,
-        pk_flags: &[bool],
+        pk_flags: &[u8],
         op: ChangeOp,
-        pk: i64,
+        pk: Vec<Value>,
         old: Vec<Value>,
     ) {
         if !self.enabled {
+            return;
+        }
+        // SQLite skips rows whose primary key contains a NULL value.
+        if pk.iter().any(|v| matches!(v, Value::Null)) {
             return;
         }
         let tbl = match self.tables.iter_mut().position(|t| t.name == table) {
@@ -332,12 +413,12 @@ fn append_value(out: &mut Vec<u8>, v: &Value) {
 }
 
 /// Serialize the recorded changes into a changeset blob, given a callback that
-/// reads the *current* values of a row by its primary key from table `name`
-/// (returning `None` if the row no longer exists). This is called by
-/// [`crate::Connection::session_changeset`], which supplies the live read.
+/// reads the *current* values of a row by its primary-key column values from
+/// table `name` (returning `None` if the row no longer exists). This is called
+/// by [`crate::Connection::session_changeset`], which supplies the live read.
 pub(crate) fn serialize(
     state: &SessionState,
-    mut read_row: impl FnMut(&str, i64) -> Option<Vec<Value>>,
+    mut read_row: impl FnMut(&str, &[Value]) -> Option<Vec<Value>>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     for tbl in &state.tables {
@@ -348,9 +429,9 @@ pub(crate) fn serialize(
         let hdr_start = out.len();
         out.push(b'T');
         append_varint(&mut out, tbl.ncol as u64);
-        for &pk in &tbl.pk_flags {
-            out.push(u8::from(pk));
-        }
+        // The PK-flag bytes are SQLite's `abPK` verbatim: 0 for a non-PK column,
+        // else the column's 1-based position within the primary key.
+        out.extend_from_slice(&tbl.pk_flags);
         out.extend_from_slice(tbl.name.as_bytes());
         out.push(0);
 
@@ -363,7 +444,7 @@ pub(crate) fn serialize(
                 //   absent:   INSERT → nothing; UPDATE/DELETE → DELETE
                 // This is what makes DELETE-then-INSERT of the same row emit an
                 // UPDATE, and INSERT-then-DELETE emit nothing.
-                let current = read_row(&tbl.name, change.pk);
+                let current = read_row(&tbl.name, &change.pk);
                 match (change.op, current) {
                     (ChangeOp::Insert, Some(row)) => {
                         out.push(OP_INSERT);
@@ -412,7 +493,7 @@ fn append_delete(out: &mut Vec<u8>, old: &[Value]) {
 /// record (changed columns present, unchanged as `OMIT`). Returns `false`
 /// (writing nothing) if no non-PK column changed — matching SQLite, which
 /// rewinds the buffer for a no-op update.
-fn append_update(out: &mut Vec<u8>, old: &[Value], new: &[Value], pk_flags: &[bool]) -> bool {
+fn append_update(out: &mut Vec<u8>, old: &[Value], new: &[Value], pk_flags: &[u8]) -> bool {
     let start = out.len();
     out.push(OP_UPDATE);
     out.push(0);
@@ -421,7 +502,7 @@ fn append_update(out: &mut Vec<u8>, old: &[Value], new: &[Value], pk_flags: &[bo
     let mut new_rec = Vec::new();
     let mut changed_any = false;
     for i in 0..ncol {
-        let is_pk = pk_flags.get(i).copied().unwrap_or(false);
+        let is_pk = pk_flags.get(i).copied().unwrap_or(0) != 0;
         let changed = old[i] != new[i];
         if changed {
             changed_any = true;
@@ -471,7 +552,8 @@ pub(crate) struct ChangeRecord {
 pub(crate) struct TableChangeset {
     pub(crate) name: String,
     pub(crate) ncol: usize,
-    pub(crate) pk_flags: Vec<bool>,
+    /// SQLite's `abPK` bytes (0 = non-PK; else 1-based PK ordinal).
+    pub(crate) pk_flags: Vec<u8>,
     pub(crate) changes: Vec<ChangeRecord>,
 }
 
@@ -604,7 +686,7 @@ pub(crate) fn parse_changeset(data: &[u8]) -> Result<Vec<TableChangeset>> {
                 }
                 let mut pk_flags = Vec::with_capacity(ncol);
                 for _ in 0..ncol {
-                    pk_flags.push(r.u8()? != 0);
+                    pk_flags.push(r.u8()?);
                 }
                 // NUL-terminated table name.
                 let start = r.pos;
@@ -705,18 +787,48 @@ mod tests {
         st.record(
             "t",
             2,
-            &[true, false],
+            &[1, 0],
             ChangeOp::Insert,
-            1,
+            alloc::vec![Value::Integer(1)],
             alloc::vec![Value::Integer(1), Value::Null],
         );
         let out = serialize(&st, |_, pk| {
-            assert_eq!(pk, 1);
+            assert_eq!(pk, [Value::Integer(1)]);
             Some(alloc::vec![Value::Integer(1), Value::Integer(2)])
         });
         assert_eq!(
             hex(&out),
             "5402010074001200010000000000000001010000000000000002"
+        );
+    }
+
+    /// A composite-PK INSERT of (1, 2, 3) into `t(a,b,c, PRIMARY KEY(a,b))`.
+    #[test]
+    fn composite_insert_matches_oracle() {
+        let mut st = SessionState {
+            enabled: true,
+            tables: Vec::new(),
+        };
+        st.record(
+            "t",
+            3,
+            &[1, 2, 0],
+            ChangeOp::Insert,
+            alloc::vec![Value::Integer(1), Value::Integer(2)],
+            alloc::vec![Value::Integer(1), Value::Integer(2), Value::Null],
+        );
+        let out = serialize(&st, |_, pk| {
+            assert_eq!(pk, [Value::Integer(1), Value::Integer(2)]);
+            Some(alloc::vec![
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3)
+            ])
+        });
+        assert_eq!(
+            hex(&out),
+            "540301020074001200010000000000000001\
+             010000000000000002010000000000000003"
         );
     }
 }

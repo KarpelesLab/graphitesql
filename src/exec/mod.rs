@@ -7206,29 +7206,135 @@ impl Connection {
     /// supported table shape (a rowid table with a single `INTEGER PRIMARY KEY`).
     pub fn session_changeset(&self, session: &crate::session::Session) -> Result<Vec<u8>> {
         // Snapshot the recorded changes, then serialize with a live row reader.
-        // `serialize` calls back into `read_row` by table name + pk value.
+        // `serialize` calls back into the closure by table name + the row's
+        // primary-key column values, and expects the row's current full column
+        // values (visible columns, declared order) or `None` if it is gone.
         let state = session.state.borrow();
         // The closure reads live rows; the first error it hits is captured here
         // and surfaced after serialization.
         let mut err: Option<Error> = None;
-        let bytes =
-            crate::session::serialize(&state, |table, pk| match self.table_meta(table, None) {
-                Ok(meta) => match self.read_row(&meta, pk) {
-                    Ok(row) => row,
-                    Err(e) => {
-                        err.get_or_insert(e);
-                        None
-                    }
-                },
+        let bytes = crate::session::serialize(&state, |table, pk| {
+            match self.session_read_row_by_pk(table, pk) {
+                Ok(row) => row,
                 Err(e) => {
                     err.get_or_insert(e);
                     None
                 }
-            });
+            }
+        });
         if let Some(e) = err {
             return Err(e);
         }
         Ok(bytes)
+    }
+
+    /// Read the current full row (visible columns, declared order) of `table`
+    /// whose primary-key columns equal `pk` (the PK column values, in column
+    /// order). Returns `None` if no such row exists. Used by
+    /// [`session_changeset`](Self::session_changeset) to re-read the live value
+    /// of a recorded row at changeset time.
+    ///
+    /// This runs a `SELECT <cols> FROM t WHERE pk1 IS ?1 AND …` through the
+    /// normal query engine, so it works uniformly for every supported PK shape
+    /// (single/ composite/ non-integer/ WITHOUT ROWID) — mirroring SQLite's
+    /// `sessionSelectStmt`, which likewise selects by the primary-key columns.
+    fn session_read_row_by_pk(&self, table: &str, pk: &[Value]) -> Result<Option<Vec<Value>>> {
+        let meta = self.table_meta(table, None)?;
+        let Some((_, pk_positions)) = self.session_pk_layout(table, &meta)? else {
+            // No declared PK — not a recorded shape; treat as "row not found".
+            return Ok(None);
+        };
+        if pk_positions.len() != pk.len() {
+            return Ok(None);
+        }
+        let quote = |n: &str| alloc::format!("\"{}\"", n.replace('"', "\"\""));
+        let visible: Vec<&ColumnInfo> = meta.columns.iter().filter(|c| !c.hidden).collect();
+        let cols_sql: Vec<String> = visible.iter().map(|c| quote(&c.name)).collect();
+        let mut wheres: Vec<String> = Vec::with_capacity(pk.len());
+        let mut positional: Vec<Value> = Vec::with_capacity(pk.len());
+        for (pos, val) in pk_positions.iter().zip(pk) {
+            if *pos >= visible.len() {
+                return Ok(None);
+            }
+            positional.push(val.clone());
+            wheres.push(alloc::format!(
+                "{} IS ?{}",
+                quote(&visible[*pos].name),
+                positional.len()
+            ));
+        }
+        let sql = alloc::format!(
+            "SELECT {} FROM {} WHERE {}",
+            cols_sql.join(","),
+            quote(table),
+            wheres.join(" AND ")
+        );
+        let params = Params {
+            positional,
+            named: Vec::new(),
+        };
+        let res = self.query_params(&sql, &params)?;
+        Ok(res.rows.into_iter().next())
+    }
+
+    /// The session primary-key layout for `table`: per-visible-column PK flags
+    /// (SQLite's `abPK`) and the PK column positions in column order. Returns
+    /// `None` if the table has no declared primary key (the session module does
+    /// not record such tables under its default configuration).
+    ///
+    /// For a single `INTEGER PRIMARY KEY` this is just that column; for a
+    /// composite / non-integer / `WITHOUT ROWID` key it is every primary-key
+    /// column, in declared order — exactly the columns SQLite flags as PK.
+    fn session_pk_layout(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+    ) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+        let visible_ncol = meta.columns.iter().filter(|c| !c.hidden).count();
+        // A single INTEGER PRIMARY KEY (rowid alias) is recorded directly: it is
+        // the sole PK column, so its `abPK` byte is 1.
+        if let Some(ipk) = meta.ipk {
+            if ipk >= visible_ncol {
+                return Ok(None);
+            }
+            let flags: Vec<u8> = (0..visible_ncol).map(|i| u8::from(i == ipk)).collect();
+            return Ok(Some((flags, alloc::vec![ipk])));
+        }
+        // Otherwise re-derive the PK columns from the table's DDL. This covers a
+        // composite PK, a non-integer single PK, and a WITHOUT ROWID table.
+        let obj = match self.schema.table(table) {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        let Some(sql) = obj.sql.as_ref() else {
+            return Ok(None);
+        };
+        let Statement::CreateTable(ct) = sql::parse_one(sql)? else {
+            return Ok(None);
+        };
+        // `primary_key_positions` returns the PK columns in PRIMARY-KEY-clause
+        // order. That order is the 1-based PK ordinal SQLite's `abPK`/table_xinfo
+        // `pk` reports (so `PRIMARY KEY(b, a)` gives b→1, a→2). Build the per-
+        // column ordinal byte array from it, keeping non-PK columns at 0.
+        let pk_decl = primary_key_positions(&ct);
+        if pk_decl.is_empty() {
+            return Ok(None);
+        }
+        let mut flags: Vec<u8> = alloc::vec![0u8; visible_ncol];
+        for (ordinal, &pos) in pk_decl.iter().enumerate() {
+            if pos < visible_ncol {
+                flags[pos] = (ordinal + 1) as u8;
+            }
+        }
+        // The session hashes and stores primary-key *values* in column order (it
+        // iterates columns 0..nCol and picks out the PK-flagged ones), regardless
+        // of the PRIMARY KEY clause order. So the value positions are the flagged
+        // columns in ascending column order.
+        let pk_positions: Vec<usize> = (0..visible_ncol).filter(|i| flags[*i] != 0).collect();
+        if pk_positions.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((flags, pk_positions)))
     }
 
     /// Apply a changeset blob (as produced by
@@ -7298,24 +7404,21 @@ impl Connection {
                 Err(_) => continue,
             };
 
-            // First slice: only a single-INTEGER-PK rowid table whose layout
-            // matches the changeset header. Otherwise skip (schema mismatch).
-            let Some(ipk) = meta.ipk else { continue };
-            if meta.without_rowid {
+            // Resolve the table's primary-key layout (single/composite/non-int/
+            // WITHOUT ROWID). A table with no declared primary key is skipped.
+            let Some((expected_pk, _)) = self.session_pk_layout(&tbl.name, &meta)? else {
                 continue;
-            }
+            };
             let cols: Vec<&ColumnInfo> = meta.columns.iter().filter(|c| !c.hidden).collect();
-            if cols.len() != tbl.ncol || ipk >= tbl.ncol {
-                continue;
-            }
-            let expected_pk: Vec<bool> = (0..tbl.ncol).map(|i| i == ipk).collect();
-            if expected_pk != tbl.pk_flags {
+            // The changeset header's column count and PK-flag layout must match
+            // the live table, otherwise skip (schema mismatch), matching sqlite.
+            if cols.len() != tbl.ncol || expected_pk != tbl.pk_flags {
                 continue;
             }
             let col_names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
 
             for change in &tbl.changes {
-                self.apply_one_change(&tbl.name, &col_names, ipk, change)?;
+                self.apply_one_change(&tbl.name, &col_names, &tbl.pk_flags, change)?;
             }
         }
         Ok(())
@@ -7328,12 +7431,13 @@ impl Connection {
         &mut self,
         table: &str,
         col_names: &[String],
-        ipk: usize,
+        pk_flags: &[u8],
         change: &crate::session::ChangeRecord,
     ) -> Result<()> {
         let quote = |n: &str| alloc::format!("\"{}\"", n.replace('"', "\"\""));
         let qtable = quote(table);
         let ncol = col_names.len();
+        let is_pk = |i: usize| pk_flags.get(i).copied().unwrap_or(0) != 0;
 
         match change.op {
             crate::session::ChangeOp::Insert => {
@@ -7367,10 +7471,10 @@ impl Connection {
                 let mut positional: Vec<Value> = Vec::new();
                 for (i, name) in col_names.iter().enumerate() {
                     let old = &change.old[i];
-                    if i == ipk {
+                    if is_pk(i) {
                         let v = old.clone().unwrap_or(Value::Null);
                         positional.push(v);
-                        wheres.push(alloc::format!("{}=?{}", quote(name), positional.len()));
+                        wheres.push(alloc::format!("{} IS ?{}", quote(name), positional.len()));
                     } else if let Some(v) = old {
                         positional.push(v.clone());
                         wheres.push(alloc::format!("{} IS ?{}", quote(name), positional.len()));
@@ -7394,7 +7498,7 @@ impl Connection {
                 let mut positional: Vec<Value> = Vec::new();
 
                 for (i, name) in col_names.iter().enumerate() {
-                    if i != ipk
+                    if !is_pk(i)
                         && let Some(v) = &change.new[i]
                     {
                         positional.push(v.clone());
@@ -7407,10 +7511,10 @@ impl Connection {
                 }
                 for (i, name) in col_names.iter().enumerate() {
                     let old = &change.old[i];
-                    if i == ipk {
+                    if is_pk(i) {
                         let v = old.clone().unwrap_or(Value::Null);
                         positional.push(v);
-                        wheres.push(alloc::format!("{}=?{}", quote(name), positional.len()));
+                        wheres.push(alloc::format!("{} IS ?{}", quote(name), positional.len()));
                     } else if let Some(v) = old {
                         positional.push(v.clone());
                         wheres.push(alloc::format!("{} IS ?{}", quote(name), positional.len()));
@@ -7433,51 +7537,132 @@ impl Connection {
         }
     }
 
-    /// Write-path hook: when a session is active and `table` is a rowid table
-    /// with a single `INTEGER PRIMARY KEY`, record the row operation. A no-op
-    /// when no session is active (the common case) or the table's shape is not
-    /// yet supported. `old_row` is the row's values before the change (for
-    /// UPDATE/DELETE); for an INSERT it is ignored and only the PK is stored.
+    /// Write-path hook: when a session is active and `table` has a declared
+    /// primary key, record the row operation. A no-op when no session is active
+    /// (the common case) or the table has no primary key (an implicit-rowid
+    /// table — which SQLite's session module also skips by default).
+    ///
+    /// `rowid` fills the `INTEGER PRIMARY KEY` slot for a rowid table (whose PK
+    /// value is the rowid); it is ignored for a non-integer / composite /
+    /// `WITHOUT ROWID` key. `old_row` / `new_row` are the row's full visible
+    /// column values (declared order) before / after the change:
+    ///
+    /// * INSERT: `new_row` = the inserted row; `old_row` = `None`.
+    /// * DELETE: `old_row` = the removed row; `new_row` = `None`.
+    /// * UPDATE: `old_row` and `new_row` = the pre- and post-update rows.
+    ///
+    /// An UPDATE is recorded exactly as SQLite's pre-update hook does it — as a
+    /// change keyed by the *old* primary key (op = UPDATE) plus one keyed by the
+    /// *new* primary key (op = INSERT). When the PK is unchanged both key the
+    /// same row and the second call coalesces away, leaving a plain UPDATE; when
+    /// the PK changes they key different rows, yielding a DELETE of the old key
+    /// (its live row is gone) and an INSERT of the new key.
     fn record_session_change(
         &self,
         table: &str,
         meta: &TableMeta,
         op: crate::session::ChangeOp,
-        pk: i64,
+        rowid: i64,
         old_row: Option<&[Value]>,
+        new_row: Option<&[Value]>,
     ) {
-        let cell = self.session.borrow();
-        let Some(state) = cell.as_ref() else {
-            return;
-        };
-        // First slice: only a rowid table with a single INTEGER PRIMARY KEY.
-        let Some(ipk) = meta.ipk else {
-            return;
-        };
-        if meta.without_rowid {
+        if self.session.borrow().is_none() {
             return;
         }
-        let visible: Vec<&ColumnInfo> = meta.columns.iter().filter(|c| !c.hidden).collect();
-        let ncol = visible.len();
-        if ipk >= ncol {
+        // Resolve the primary-key layout (per-column flags + PK positions).
+        let Ok(Some((pk_flags, pk_positions))) = self.session_pk_layout(table, meta) else {
             return;
-        }
-        let pk_flags: Vec<bool> = (0..ncol).map(|i| i == ipk).collect();
-        let old = match op {
-            crate::session::ChangeOp::Insert => {
-                // SQLite stores only the PK in an insert's original record.
-                let mut row = alloc::vec![Value::Null; ncol];
-                row[ipk] = Value::Integer(pk);
-                row
+        };
+        let ncol = pk_flags.len();
+
+        // Extract this row's primary-key values (column order). For an INTEGER
+        // PRIMARY KEY column (a rowid alias) use the row's own value when it is a
+        // concrete integer (so an UPDATE that changes the rowid keys correctly on
+        // both the old and new value); fall back to the passed `rowid` when the
+        // stored slot is NULL (e.g. an auto-assigned INSERT).
+        let pk_values = |row: &[Value]| -> Option<Vec<Value>> {
+            if row.len() < ncol {
+                return None;
             }
-            _ => match old_row {
-                Some(r) if r.len() >= ncol => r[..ncol].to_vec(),
-                _ => return,
-            },
+            let mut out = Vec::with_capacity(pk_positions.len());
+            for &p in &pk_positions {
+                let v = if Some(p) == meta.ipk {
+                    match &row[p] {
+                        Value::Integer(i) => Value::Integer(*i),
+                        _ => Value::Integer(rowid),
+                    }
+                } else {
+                    row[p].clone()
+                };
+                out.push(v);
+            }
+            Some(out)
         };
-        state
-            .borrow_mut()
-            .record(table, ncol, &pk_flags, op, pk, old);
+
+        match op {
+            crate::session::ChangeOp::Insert => {
+                let Some(row) = new_row else { return };
+                let Some(pk) = pk_values(row) else { return };
+                // SQLite stores only the PK in an insert's original record; the
+                // live row is re-read at changeset time. `old` here is unused.
+                let old = alloc::vec![Value::Null; ncol];
+                self.session
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .record(table, ncol, &pk_flags, op, pk, old);
+            }
+            crate::session::ChangeOp::Delete => {
+                let Some(row) = old_row else { return };
+                if row.len() < ncol {
+                    return;
+                }
+                let Some(pk) = pk_values(row) else { return };
+                self.session.borrow().as_ref().unwrap().borrow_mut().record(
+                    table,
+                    ncol,
+                    &pk_flags,
+                    op,
+                    pk,
+                    row[..ncol].to_vec(),
+                );
+            }
+            crate::session::ChangeOp::Update => {
+                let (Some(oldr), Some(newr)) = (old_row, new_row) else {
+                    return;
+                };
+                if oldr.len() < ncol || newr.len() < ncol {
+                    return;
+                }
+                let (Some(old_pk), Some(new_pk)) = (pk_values(oldr), pk_values(newr)) else {
+                    return;
+                };
+                {
+                    let cell = self.session.borrow();
+                    let state = cell.as_ref().unwrap();
+                    // Change keyed by the OLD primary key (op = UPDATE).
+                    state.borrow_mut().record(
+                        table,
+                        ncol,
+                        &pk_flags,
+                        crate::session::ChangeOp::Update,
+                        old_pk,
+                        oldr[..ncol].to_vec(),
+                    );
+                    // Change keyed by the NEW primary key (op = INSERT). If the
+                    // PK did not change this coalesces into the UPDATE above.
+                    state.borrow_mut().record(
+                        table,
+                        ncol,
+                        &pk_flags,
+                        crate::session::ChangeOp::Insert,
+                        new_pk,
+                        alloc::vec![Value::Null; ncol],
+                    );
+                }
+            }
+        }
     }
 
     /// Store a `CREATE TRIGGER` in `sqlite_schema` (type `trigger`, no b-tree).
@@ -8541,6 +8726,7 @@ impl Connection {
                                     crate::session::ChangeOp::Delete,
                                     cr,
                                     Some(&old),
+                                    None,
                                 );
                             }
                             self.delete_row_cascade(&ins.table, &meta, cr, params)?;
@@ -8595,6 +8781,7 @@ impl Connection {
                 crate::session::ChangeOp::Insert,
                 rowid,
                 None,
+                Some(&index_values),
             );
             // `last_insert_rowid()` tracks the most recent insert (a later insert
             // from an AFTER trigger overwrites this, matching SQLite).
@@ -8766,6 +8953,14 @@ impl Connection {
         let record = self.encode_table_record(meta, &new_full);
         delete_table(self.backend.writer()?, meta.root, existing_rowid)?;
         insert_table(self.backend.writer()?, meta.root, new_rowid, &record)?;
+        self.record_session_change(
+            table,
+            meta,
+            crate::session::ChangeOp::Update,
+            existing_rowid,
+            Some(&old_row),
+            Some(&new_full),
+        );
         self.fire_triggers(
             table,
             TrigEvent::Update,
@@ -9460,6 +9655,7 @@ impl Connection {
                     crate::session::ChangeOp::Delete,
                     *rowid,
                     Some(old),
+                    None,
                 );
             }
             if self.foreign_keys
@@ -9911,6 +10107,7 @@ impl Connection {
                 crate::session::ChangeOp::Update,
                 rowid,
                 Some(&old_row),
+                Some(&new_full),
             );
             self.fire_triggers(
                 &upd.table,
@@ -28580,6 +28777,22 @@ impl Connection {
                     OnConflict::Ignore => continue,
                     OnConflict::Replace => {
                         // Rebuild without the conflicting row(s), then insert.
+                        // Record each removed row as a session DELETE (a same-PK
+                        // REPLACE coalesces DELETE+INSERT into an UPDATE; a
+                        // different-PK conflict yields a DELETE + this INSERT).
+                        if self.session.borrow().is_some() {
+                            for &ci in &collide {
+                                let old = existing[ci].clone();
+                                self.record_session_change(
+                                    &ins.table,
+                                    meta,
+                                    crate::session::ChangeOp::Delete,
+                                    0,
+                                    Some(&old),
+                                    None,
+                                );
+                            }
+                        }
                         let kept: Vec<Vec<Value>> = existing
                             .into_iter()
                             .enumerate()
@@ -28603,6 +28816,14 @@ impl Connection {
                 &scolls,
                 meta.pk_descs(),
             )?;
+            self.record_session_change(
+                &ins.table,
+                meta,
+                crate::session::ChangeOp::Insert,
+                0,
+                None,
+                Some(&values),
+            );
             if !ins.returning.is_empty() {
                 self.collect_returning(&ins.returning, meta, &values, None, params)?;
             }
@@ -28704,6 +28925,14 @@ impl Connection {
                 return Err(Error::Constraint(m));
             }
         }
+        self.record_session_change(
+            table,
+            meta,
+            crate::session::ChangeOp::Update,
+            0,
+            Some(&old_row),
+            Some(&new_row),
+        );
         let mut rebuilt = existing;
         rebuilt[target] = new_row.clone();
         self.rewrite_without_rowid(meta, rebuilt.into_iter())?;
@@ -28737,6 +28966,14 @@ impl Connection {
                 if !del.returning.is_empty() {
                     self.collect_returning(&del.returning, meta, &row, None, params)?;
                 }
+                self.record_session_change(
+                    &del.table,
+                    meta,
+                    crate::session::ChangeOp::Delete,
+                    0,
+                    Some(&row),
+                    None,
+                );
                 deleted += 1;
             }
         }
@@ -28912,6 +29149,14 @@ impl Connection {
             if !upd.returning.is_empty() {
                 returned.push(row.clone());
             }
+            self.record_session_change(
+                &upd.table,
+                meta,
+                crate::session::ChangeOp::Update,
+                0,
+                Some(&original),
+                Some(&row),
+            );
             out[i] = row;
             affected += 1;
         }

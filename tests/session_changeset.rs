@@ -535,3 +535,239 @@ fn apply_vs_oracle_happy_and_conflicts() {
         "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c); INSERT INTO t VALUES(3,'EXISTING',0);",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Broader primary-key shapes: composite, non-integer single, WITHOUT ROWID.
+//
+// SQLite's session module records any table with a declared PRIMARY KEY (under
+// its default configuration) — keyed by every PK column, with the changeset's
+// per-column PK-flag bytes carrying each PK column's 1-based ordinal. These
+// tests assert graphite reproduces that byte-for-byte (via the oracle when
+// configured) and round-trips through apply.
+// ---------------------------------------------------------------------------
+
+/// Round-trip helper for an arbitrary table `t`, ordering the dump by *all*
+/// columns so tables without a single scalar `a` key still compare
+/// deterministically.
+fn roundtrip_order(setup: &str, dml: &str, order_by: &str) {
+    use graphitesql::Value;
+    let dump = |conn: &Connection| -> String {
+        let r = conn
+            .query(&format!("SELECT * FROM t ORDER BY {order_by}"))
+            .unwrap();
+        let mut out = String::new();
+        for row in &r.rows {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|v| match v {
+                    Value::Null => "NULL".to_string(),
+                    Value::Integer(i) => format!("{i}"),
+                    Value::Real(f) => format!("R{f}"),
+                    Value::Text(t) => format!("'{t}'"),
+                    Value::Blob(b) => format!(
+                        "x'{}'",
+                        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+                    ),
+                })
+                .collect();
+            out.push_str(&cells.join("|"));
+            out.push('\n');
+        }
+        out
+    };
+
+    let mut a = Connection::open_memory().unwrap();
+    a.execute_batch(setup).unwrap();
+    let session = a.create_session();
+    session.attach();
+    a.execute_batch(dml).unwrap();
+    let cs = a.session_changeset(&session).unwrap();
+    let post_a = dump(&a);
+
+    let mut b = Connection::open_memory().unwrap();
+    b.execute_batch(setup).unwrap();
+    b.changeset_apply(&cs).unwrap();
+    let post_b = dump(&b);
+
+    assert_eq!(post_a, post_b, "round-trip\n setup={setup}\n dml={dml}");
+}
+
+#[test]
+fn composite_pk_insert() {
+    check(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b));",
+        "INSERT INTO t VALUES(1,2,3);",
+        Some("540301020074001200010000000000000001010000000000000002010000000000000003"),
+    );
+}
+
+#[test]
+fn composite_pk_update_nonkey() {
+    check(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)); INSERT INTO t VALUES(1,2,3);",
+        "UPDATE t SET c=99 WHERE a=1;",
+        None,
+    );
+}
+
+#[test]
+fn composite_pk_update_key_is_delete_insert() {
+    // Changing a PK column is recorded as DELETE(old key) + INSERT(new key).
+    check(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)); INSERT INTO t VALUES(1,2,3);",
+        "UPDATE t SET a=99 WHERE a=1;",
+        None,
+    );
+}
+
+#[test]
+fn composite_pk_reordered_flags() {
+    // PRIMARY KEY(b,a): the PK-flag bytes carry ordinals a→2, b→1.
+    check(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(b,a));",
+        "INSERT INTO t VALUES(9,8,7);",
+        Some("540302010074001200010000000000000009010000000000000008010000000000000007"),
+    );
+}
+
+#[test]
+fn composite_pk_delete() {
+    check(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)); INSERT INTO t VALUES(1,2,3);",
+        "DELETE FROM t WHERE a=1;",
+        None,
+    );
+}
+
+#[test]
+fn text_pk_insert() {
+    check(
+        "CREATE TABLE t(a TEXT PRIMARY KEY,b);",
+        "INSERT INTO t VALUES('k',5);",
+        Some("540201007400120003016b010000000000000005"),
+    );
+}
+
+#[test]
+fn blob_pk_insert_update_delete() {
+    check(
+        "CREATE TABLE t(a BLOB PRIMARY KEY,b);",
+        "INSERT INTO t VALUES(x'aa',1); UPDATE t SET b=2 WHERE a=x'aa'; INSERT INTO t VALUES(x'bb',3); DELETE FROM t WHERE a=x'bb';",
+        None,
+    );
+}
+
+#[test]
+fn real_pk_insert() {
+    check(
+        "CREATE TABLE t(a REAL PRIMARY KEY,b);",
+        "INSERT INTO t VALUES(1.5,7);",
+        None,
+    );
+}
+
+#[test]
+fn without_rowid_insert_update_delete() {
+    check(
+        "CREATE TABLE t(a TEXT PRIMARY KEY,b) WITHOUT ROWID; INSERT INTO t VALUES('k',5);",
+        "UPDATE t SET b=50 WHERE a='k';",
+        None,
+    );
+    check(
+        "CREATE TABLE t(a TEXT PRIMARY KEY,b) WITHOUT ROWID;",
+        "INSERT INTO t VALUES('k',5); INSERT INTO t VALUES('m',6); DELETE FROM t WHERE a='m';",
+        None,
+    );
+}
+
+#[test]
+fn without_rowid_composite() {
+    check(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)) WITHOUT ROWID;",
+        "INSERT INTO t VALUES(1,2,3),(1,4,5);",
+        None,
+    );
+    check(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)) WITHOUT ROWID; INSERT INTO t VALUES(1,2,3);",
+        "UPDATE t SET c=9 WHERE a=1 AND b=2;",
+        None,
+    );
+}
+
+#[test]
+fn no_primary_key_is_not_recorded() {
+    // A table with no declared PRIMARY KEY produces an empty changeset — exactly
+    // as SQLite's session module skips it under the default configuration.
+    check(
+        "CREATE TABLE t(a,b);",
+        "INSERT INTO t VALUES(1,2); UPDATE t SET b=3 WHERE a=1;",
+        Some(""),
+    );
+}
+
+#[test]
+fn composite_pk_roundtrip() {
+    roundtrip_order(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)); INSERT INTO t VALUES(1,2,3),(1,4,5);",
+        "INSERT INTO t VALUES(2,2,'z'); UPDATE t SET c=99 WHERE a=1 AND b=2; DELETE FROM t WHERE a=1 AND b=4;",
+        "a,b",
+    );
+}
+
+#[test]
+fn composite_pk_roundtrip_key_change() {
+    roundtrip_order(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)); INSERT INTO t VALUES(1,2,3);",
+        "UPDATE t SET a=9 WHERE a=1 AND b=2;",
+        "a,b",
+    );
+}
+
+#[test]
+fn text_pk_roundtrip() {
+    roundtrip_order(
+        "CREATE TABLE t(a TEXT PRIMARY KEY,b,c); INSERT INTO t VALUES('x',1,2),('y',3,4);",
+        "INSERT INTO t VALUES('z',5,6); UPDATE t SET b=99 WHERE a='x'; DELETE FROM t WHERE a='y';",
+        "a",
+    );
+}
+
+#[test]
+fn without_rowid_roundtrip() {
+    roundtrip_order(
+        "CREATE TABLE t(a TEXT PRIMARY KEY,b,c) WITHOUT ROWID; INSERT INTO t VALUES('x',1,2),('y',3,4);",
+        "INSERT INTO t VALUES('z',5,6); UPDATE t SET c=99 WHERE a='x'; DELETE FROM t WHERE a='y';",
+        "a",
+    );
+}
+
+#[test]
+fn without_rowid_composite_roundtrip() {
+    roundtrip_order(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)) WITHOUT ROWID; INSERT INTO t VALUES(1,2,3),(1,4,5);",
+        "INSERT INTO t VALUES(2,1,'q'); UPDATE t SET c=88 WHERE a=1 AND b=2; DELETE FROM t WHERE a=1 AND b=4;",
+        "a,b",
+    );
+}
+
+#[test]
+fn apply_vs_oracle_broader_shapes() {
+    // Composite PK: happy path.
+    check_apply(
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)); INSERT INTO t VALUES(1,2,3),(1,4,5);",
+        "INSERT INTO t VALUES(2,2,9); UPDATE t SET c=99 WHERE a=1 AND b=2; DELETE FROM t WHERE a=1 AND b=4;",
+        "CREATE TABLE t(a,b,c,PRIMARY KEY(a,b)); INSERT INTO t VALUES(1,2,3),(1,4,5);",
+    );
+    // Non-integer single PK.
+    check_apply(
+        "CREATE TABLE t(a TEXT PRIMARY KEY,b,c); INSERT INTO t VALUES('x',1,2);",
+        "INSERT INTO t VALUES('y',3,4); UPDATE t SET b=9 WHERE a='x';",
+        "CREATE TABLE t(a TEXT PRIMARY KEY,b,c); INSERT INTO t VALUES('x',1,2);",
+    );
+    // WITHOUT ROWID.
+    check_apply(
+        "CREATE TABLE t(a TEXT PRIMARY KEY,b,c) WITHOUT ROWID; INSERT INTO t VALUES('x',1,2);",
+        "INSERT INTO t VALUES('y',3,4); UPDATE t SET c=9 WHERE a='x'; DELETE FROM t WHERE a='x';",
+        "CREATE TABLE t(a TEXT PRIMARY KEY,b,c) WITHOUT ROWID; INSERT INTO t VALUES('x',1,2);",
+    );
+}
