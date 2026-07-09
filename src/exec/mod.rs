@@ -26461,6 +26461,126 @@ impl Connection {
         Ok((new_columns, joined))
     }
 
+    /// The LogEst full-*scan* `rRun` for `table_name` when it is the join's
+    /// driver — sqlite's `whereLoopAddBtree` full-table-scan cost `rSize + 16 -
+    /// 2*(has STAT4)`, where `rSize = LogEst(nRow)`. `nOut` of a driver scan is
+    /// `rSize` (no single-table WHERE restriction is modelled here — the callers
+    /// only fire on a bare equi-join). Returns `None` without `sqlite_stat1` data
+    /// (no stats ⇒ no cost swap, keeping the no-analyze plan byte-identical).
+    fn join_scan_cost(&self, table_name: &str) -> Option<(i16, i16)> {
+        let n_row = self.table_stat1_rows(table_name)?;
+        if n_row == 0 {
+            return None;
+        }
+        let r_size = logest(n_row);
+        // STAT4 discount (−2) applies when the table has any STAT4 samples.
+        let has_stat4 = self
+            .indexes_of(table_name)
+            .ok()
+            .into_iter()
+            .flatten()
+            .any(|idx| self.stat4_samples(&idx.name).is_some());
+        let scan_run = r_size + 16 - if has_stat4 { 2 } else { 0 };
+        Some((scan_run, r_size))
+    }
+
+    /// The LogEst `(rRun, nOut)` of seeking `meta`/`table_name` by its local join
+    /// column `local` as a join *inner* — sqlite's `whereLoopAddBtreeIndex`
+    /// equality cost for a `col = <outer-column>` seek (a non-constant RHS, so
+    /// STAT4 is not probed and the estimate rests on `sqlite_stat1`). Returns
+    /// `None` when `local` is not cheaply seekable (not the rowid IPK, not the
+    /// leading column of a usable plain secondary index) or `sqlite_stat1` is
+    /// absent — in which case there is no cost to compare and the caller keeps the
+    /// declaration-order plan.
+    ///
+    /// rowid/IPK seek: `nOut = 0` (LogEst(1), a unique row); IPK type ⇒ `rCostIdx
+    /// = LogEstAdd(rLogSize, nOut + 16)` and no per-row table lookup (`WHERE_IPK`),
+    /// so `rRun = rCostIdx`. Secondary-index seek: `nOut = aiRowLogEst[1]` (the
+    /// stat1 average rows per distinct leading key, exactly sqlite's `nOut +=
+    /// aiRowLogEst[1] - aiRowLogEst[0]` starting from `rSize = aiRowLogEst[0]`);
+    /// `rCostIdx = LogEstAdd(rLogSize, nOut + 1 + 15*szIdx/szTab)`, then the
+    /// non-covering table lookup `rRun = LogEstAdd(rCostIdx, nOut + 16)`.
+    fn join_seek_cost(
+        &self,
+        table_name: &str,
+        meta: &TableMeta,
+        local: usize,
+    ) -> Option<(i16, i16)> {
+        let n_row = self.table_stat1_rows(table_name)?;
+        if n_row == 0 {
+            return None;
+        }
+        let r_size = logest(n_row);
+        let r_log_size = est_log(r_size);
+        // rowid IPK seek: unique row, no per-row table lookup.
+        if meta.ipk == Some(local) && !meta.without_rowid {
+            let n_out: i16 = 0; // LogEst(1)
+            let r_cost_idx = logest_add(r_log_size, n_out + 16);
+            return Some((r_cost_idx, n_out));
+        }
+        // Leading column of a usable plain secondary index (non-partial,
+        // non-expression) — the seek path `index_join_seek` exploits.
+        let idx = self.indexes_of(table_name).ok()?.into_iter().find(|i| {
+            i.partial.is_none() && i.key_exprs.is_none() && i.cols.first() == Some(&local)
+        })?;
+        // nOut = aiRowLogEst[1] (average rows per distinct leading key). Without a
+        // second stat1 value there is no per-value estimate, so decline.
+        let stats = self.stat1_map();
+        let ai = stats.get(&idx.name)?;
+        let n_out = logest(*ai.get(1)?.max(&1));
+        // Table + index row widths (szTabRow / szIdxRow), as in `full_scan_beats_seek`.
+        let szests = self.table_col_szests(table_name).unwrap_or_default();
+        let w_tab: u32 = szests.iter().copied().sum::<u32>() + 1;
+        let sz_tab_row = logest(u64::from(w_tab) * 4).max(1) as i32;
+        let sz_idx_row = self.index_seek_width(table_name, &idx) as i32;
+        let per_row = 1 + (15 * sz_idx_row) / sz_tab_row;
+        let r_cost_idx = logest_add(r_log_size, n_out + per_row as i16);
+        let r_run = logest_add(r_cost_idx, n_out + 16);
+        Some((r_run, n_out))
+    }
+
+    /// Whether sqlite's cost model prefers driving the *second* table of a
+    /// two-table equi-join (scanning it, seeking `from.first` as the inner) over
+    /// driving `from.first`. Only meaningful — and only consulted — when BOTH join
+    /// columns are cheaply seekable (else one of the existing one-sided swaps, or
+    /// the declaration-order fold, already makes the seekable side the inner).
+    ///
+    /// Computes the LogEst path cost each way with the exact `wherePathSolver`
+    /// recurrence — driving `D` (scan) then seeking inner `I` costs `LogEstAdd(
+    /// scanRun(D), seekRun(I) + scanOut(D) )` (the inner seek repeated once per
+    /// driver row) — and returns `true` only when driving the second is STRICTLY
+    /// cheaper (a tie keeps declaration order, matching sqlite's `wherePathSolver`,
+    /// which discards a new path that is no better than the incumbent). Returns
+    /// `false` whenever either side's cost is unavailable (no `sqlite_stat1`), so a
+    /// no-analyze database is byte-identical to today.
+    fn two_table_second_drives_cheaper(
+        &self,
+        first_name: &str,
+        first_meta: &TableMeta,
+        first_local: usize,
+        second_name: &str,
+        second_meta: &TableMeta,
+        second_local: usize,
+    ) -> bool {
+        let (Some((first_scan_run, first_scan_out)), Some((second_scan_run, second_scan_out))) = (
+            self.join_scan_cost(first_name),
+            self.join_scan_cost(second_name),
+        ) else {
+            return false;
+        };
+        let (Some((first_seek_run, _)), Some((second_seek_run, _))) = (
+            self.join_seek_cost(first_name, first_meta, first_local),
+            self.join_seek_cost(second_name, second_meta, second_local),
+        ) else {
+            return false;
+        };
+        // Driving `from.first` (scan), seeking the second table as the inner.
+        let drive_first = logest_add(first_scan_run, second_seek_run + first_scan_out);
+        // Driving the second table (scan), seeking `from.first` as the inner.
+        let drive_second = logest_add(second_scan_run, first_seek_run + second_scan_out);
+        drive_second < drive_first
+    }
+
     /// Cost-based join-order decision for a *two-table* equi-join: when driving
     /// from `from.first` would seek the inner table by a *secondary* index while
     /// driving from the second table would instead seek `from.first` by its
@@ -26550,8 +26670,24 @@ impl Connection {
             return None;
         }
         // The second table's join column must NOT be its own rowid IPK — else both
-        // sides are rowid and the swap is ambiguous; leave as-is.
+        // sides are rowid-seekable and which one is the inner is a COST decision:
+        // sqlite drives whichever table it must scan the fewest rows of. Without
+        // stats (`two_table_second_drives_cheaper` ⇒ false) keep the historical
+        // behaviour (leave as declaration order, `from.first` drives); with stats,
+        // fire the swap (drive the second, seek `from.first` by rowid) only when
+        // the LogEst path cost of driving the second is strictly lower.
         if second_meta.ipk == Some(second_local) {
+            let first_local = first_ipk;
+            if self.two_table_second_drives_cheaper(
+                &first_ref.name,
+                &first_meta,
+                first_local,
+                &second_ref.name,
+                &second_meta,
+                second_local,
+            ) {
+                return Some((second_local, first_meta, first_ipk));
+            }
             return None;
         }
         Some((second_local, first_meta, first_ipk))
@@ -26769,12 +26905,6 @@ impl Connection {
             .find(|i| {
                 i.partial.is_none() && i.key_exprs.is_none() && i.cols.first() == Some(&first_local)
             })?;
-        // The second table's join column must NOT be seekable — if it is (rowid or
-        // index-leading), the existing forward seek path already makes it the inner,
-        // so leave that alone.
-        if self.is_local_col_seekable(&second_ref.name, &second_meta, second_local) {
-            return None;
-        }
         // The index seek must be affinity-sound (sqlite's `sqlite3IndexAffinityOk`):
         // a NUMERIC comparison cannot seek a text/blob-stored index, so an INTEGER
         // driver key against `from.first`'s untyped/TEXT index column would miss
@@ -26784,6 +26914,27 @@ impl Connection {
             second_meta.columns[second_local].affinity,
             first_meta.columns[first_local].affinity,
         ) {
+            return None;
+        }
+        // When the second table's join column is ALSO seekable (rowid or
+        // index-leading), which table is the inner is a COST decision. Without
+        // stats keep the historical behaviour: the existing forward seek path makes
+        // the second table the inner (declaration order drives `from.first`), so
+        // decline here. With stats, fire this swap (drive the second, seek
+        // `from.first` by its index) only when the LogEst path cost of driving the
+        // second is strictly lower — matching sqlite, which drives the table it
+        // scans the fewest rows of.
+        if self.is_local_col_seekable(&second_ref.name, &second_meta, second_local) {
+            if self.two_table_second_drives_cheaper(
+                &first_ref.name,
+                &first_meta,
+                first_local,
+                &second_ref.name,
+                &second_meta,
+                second_local,
+            ) {
+                return Some((second_local, first_meta, idx));
+            }
             return None;
         }
         Some((second_local, first_meta, idx))
@@ -26954,82 +27105,141 @@ impl Connection {
         }
         // Greedy cost-ordered placement from a given driver. Returns the placement
         // order (table indices, driver first) each paired with the join index whose
-        // `ON` connects it, and the total cost — or `None` if the graph is not
-        // connected from this driver (a cross-product step).
-        let place_from = |driver: usize| -> Option<(Vec<(usize, Option<usize>)>, u64)> {
-            let mut placed = alloc::vec![false; n];
-            placed[driver] = true;
-            let mut order: Vec<(usize, Option<usize>)> = alloc::vec![(driver, None)];
-            // Accumulated left columns, in placement order, for the seek helpers.
-            let mut left_columns: Vec<ColumnInfo> = metas[driver].columns.clone();
-            let mut total: u64 = 0;
-            while order.len() < n {
-                // Among unplaced tables reachable by an edge to a placed table, pick
-                // the cheapest access; tie-break by earliest declared table index.
-                let mut best: Option<(u64, usize, usize)> = None; // (cost, table, join_idx)
-                for e in &edges {
-                    let (placed_side, cand) = if placed[e.a] && !placed[e.b] {
-                        (e.a, e.b)
-                    } else if placed[e.b] && !placed[e.a] {
-                        (e.b, e.a)
-                    } else {
-                        continue;
-                    };
-                    let _ = placed_side;
-                    // Synthesize an INNER `Join` whose inner is the CANDIDATE table
-                    // (carrying this edge's `ON`), evaluated against the accumulated
-                    // left columns, to reuse the exact seek predicates. The original
-                    // `from.joins[e.join_idx].table` may be the OTHER endpoint (when
-                    // this edge is being traversed from the opposite side), so the
-                    // table must be swapped in rather than reused as-is.
-                    let cand_join = Join {
-                        kind: JoinKind::Inner,
-                        table: trefs[cand].clone(),
-                        on: from.joins[e.join_idx].on.clone(),
-                        natural: false,
-                        using: Vec::new(),
-                    };
-                    // rowid seek `0` (cheapest) < secondary-index / clustered-PK seek
-                    // `1` < materialised scan `2`.
-                    let cost = if self.rowid_join_seek(&cand_join, &left_columns).is_some() {
-                        0
-                    } else if self.index_join_seek(&cand_join, &left_columns).is_some()
-                        || self
-                            .without_rowid_pk_join_seek(&cand_join, &left_columns)
-                            .is_some()
-                    {
-                        1
-                    } else {
-                        2
-                    };
-                    // Weight so a cheaper inner strictly dominates regardless of
-                    // declared position; tie-break to the earliest declared table.
-                    let key = (cost, cand as u64);
-                    match best {
-                        Some((bc, bt, _)) if (bc, bt as u64) <= key => {}
-                        _ => best = Some((cost, cand, e.join_idx)),
+        // `ON` connects it, the COARSE tie-break cost (rowid `0` < index/PK `1` <
+        // scan `2`, summed — the historical ordering key), and, when every table's
+        // LogEst cost is available (`sqlite_stat1` present for all), the true LogEst
+        // `wherePathSolver` path cost for driver selection. `None` if the graph is
+        // not connected from this driver (a cross-product step).
+        //
+        // The greedy *ordering* of the inners is unchanged (coarse cost, matching the
+        // corpus-verified "seekable tables pulled inner" heuristic). Only the DRIVER
+        // choice becomes LogEst-cost-aware: with stats sqlite drives the table it
+        // scans the fewest rows of, so a large declared-first table no longer wins by
+        // default. The LogEst total is `LogEstAdd`-accumulated exactly as
+        // `wherePathSolver`: seed `rUnsort = scanRun(driver)`, path rows `= scanOut`,
+        // then per inner `rUnsort = LogEstAdd(seekRun + pathRows, rUnsort)` and
+        // `pathRows += seekOut`.
+        let place_from =
+            |driver: usize| -> Option<(Vec<(usize, Option<usize>)>, u64, Option<i16>)> {
+                let mut placed = alloc::vec![false; n];
+                placed[driver] = true;
+                let mut order: Vec<(usize, Option<usize>)> = alloc::vec![(driver, None)];
+                // Accumulated left columns, in placement order, for the seek helpers.
+                let mut left_columns: Vec<ColumnInfo> = metas[driver].columns.clone();
+                let mut total: u64 = 0;
+                // LogEst path accumulation for the driver's scan (None if no stats
+                // for the driver ⇒ the whole LogEst total is unavailable → driver
+                // selection stays on the coarse key, byte-identical to before).
+                let driver_name = &trefs[driver].name;
+                let mut log_state: Option<(i16, i16)> = self.join_scan_cost(driver_name);
+                while order.len() < n {
+                    // Among unplaced tables reachable by an edge to a placed table,
+                    // pick the cheapest access; tie-break by earliest declared table.
+                    let mut best: Option<(u64, usize, usize)> = None; // (cost, table, join_idx)
+                    for e in &edges {
+                        let (placed_side, cand) = if placed[e.a] && !placed[e.b] {
+                            (e.a, e.b)
+                        } else if placed[e.b] && !placed[e.a] {
+                            (e.b, e.a)
+                        } else {
+                            continue;
+                        };
+                        let _ = placed_side;
+                        // Synthesize an INNER `Join` whose inner is the CANDIDATE table
+                        // (carrying this edge's `ON`), evaluated against the accumulated
+                        // left columns, to reuse the exact seek predicates. The original
+                        // `from.joins[e.join_idx].table` may be the OTHER endpoint (when
+                        // this edge is being traversed from the opposite side), so the
+                        // table must be swapped in rather than reused as-is.
+                        let cand_join = Join {
+                            kind: JoinKind::Inner,
+                            table: trefs[cand].clone(),
+                            on: from.joins[e.join_idx].on.clone(),
+                            natural: false,
+                            using: Vec::new(),
+                        };
+                        // rowid seek `0` (cheapest) < secondary-index / clustered-PK
+                        // seek `1` < materialised scan `2`.
+                        let cost = if self.rowid_join_seek(&cand_join, &left_columns).is_some() {
+                            0
+                        } else if self.index_join_seek(&cand_join, &left_columns).is_some()
+                            || self
+                                .without_rowid_pk_join_seek(&cand_join, &left_columns)
+                                .is_some()
+                        {
+                            1
+                        } else {
+                            2
+                        };
+                        // Weight so a cheaper inner strictly dominates regardless of
+                        // declared position; tie-break to the earliest declared table.
+                        let key = (cost, cand as u64);
+                        match best {
+                            Some((bc, bt, _)) if (bc, bt as u64) <= key => {}
+                            _ => best = Some((cost, cand, e.join_idx)),
+                        }
                     }
+                    let (cost, cand, join_idx) = best?; // not connected → decline
+                    total += cost;
+                    // Fold the placed inner into the LogEst path cost (if still live).
+                    // The inner's join column is the endpoint of this edge on `cand`;
+                    // resolve it to a local column index for the seek-cost estimate.
+                    if let Some((r_unsort, path_rows)) = log_state {
+                        // Resolve `cand`'s join-column local index from the edge's ON.
+                        let cand_local = ntable_edge_local(
+                            &from.joins[join_idx],
+                            cand,
+                            &block_start,
+                            &declared_cols,
+                        );
+                        log_state = match cand_local.and_then(|local| {
+                            self.join_seek_cost(&trefs[cand].name, &metas[cand], local)
+                        }) {
+                            Some((seek_run, seek_out)) => {
+                                let new_unsort =
+                                    logest_add(seek_run.saturating_add(path_rows), r_unsort);
+                                Some((new_unsort, path_rows.saturating_add(seek_out)))
+                            }
+                            // A non-seekable / stats-less inner: the LogEst total is
+                            // unavailable, so fall back to the coarse driver key.
+                            None => None,
+                        };
+                    }
+                    placed[cand] = true;
+                    left_columns.extend(metas[cand].columns.iter().cloned());
+                    order.push((cand, Some(join_idx)));
                 }
-                let (cost, cand, join_idx) = best?; // not connected → decline
-                total += cost;
-                placed[cand] = true;
-                left_columns.extend(metas[cand].columns.iter().cloned());
-                order.push((cand, Some(join_idx)));
-            }
-            Some((order, total))
-        };
-        // Search every driver; keep the least-cost placement, tie-broken by the
-        // earliest driver (declaration order) so the choice is deterministic.
-        let mut best: Option<(u64, Vec<(usize, Option<usize>)>)> = None;
-        for driver in 0..n {
-            if let Some((order, cost)) = place_from(driver) {
-                match &best {
-                    Some((bc, _)) if *bc <= cost => {}
-                    _ => best = Some((cost, order)),
-                }
+                Some((order, total, log_state.map(|(run, _)| run)))
+            };
+        // Search every driver; keep the least-cost placement. The primary key is the
+        // LogEst path cost WHEN available for every driver (so the smallest-scan
+        // driver wins, matching sqlite with stats); otherwise the coarse total. The
+        // earliest driver (declaration order) breaks ties, a deterministic choice
+        // that matches sqlite's `wherePathSolver` incumbent-keeps-on-tie rule.
+        // Precompute all placements so we can tell whether EVERY driver has a LogEst
+        // cost (mixing LogEst and coarse across drivers would be incomparable).
+        let placements: Vec<(usize, Vec<(usize, Option<usize>)>, u64, Option<i16>)> = (0..n)
+            .filter_map(|driver| {
+                place_from(driver).map(|(order, coarse, logcost)| (driver, order, coarse, logcost))
+            })
+            .collect();
+        let use_logest = !placements.is_empty() && placements.iter().all(|p| p.3.is_some());
+        let mut best: Option<(i64, u64, Vec<(usize, Option<usize>)>)> = None;
+        for (_, order, coarse, logcost) in placements {
+            // Primary comparison key: LogEst path cost (if usable) else the coarse
+            // total lifted into the same slot; the coarse total is the secondary key
+            // so a LogEst tie still prefers the historical (cheaper-inner) ordering.
+            let primary: i64 = if use_logest {
+                logcost.expect("checked all Some") as i64
+            } else {
+                coarse as i64
+            };
+            match &best {
+                Some((bp, bc, _)) if (*bp, *bc) <= (primary, coarse) => {}
+                _ => best = Some((primary, coarse, order)),
             }
         }
-        let (_, order) = best?;
+        let (_, _, order) = best?;
         // If the least-cost order IS the declaration order, leave the join to the
         // ordinary declaration-order path (identical execution, no remap needed).
         if order.iter().map(|&(t, _)| t).eq(0..n) {
@@ -37758,6 +37968,47 @@ fn col_index(e: &Expr, columns: &[ColumnInfo]) -> Option<usize> {
                     .as_deref()
                     .is_none_or(|t| c.table.eq_ignore_ascii_case(t))
         })
+    } else {
+        None
+    }
+}
+
+/// Resolve, for the N-table join-order cost model, the *local* column index within
+/// candidate table `cand` of the join column the `join`'s top-level `=` `ON` binds
+/// to it. `block_start[t]` is table `t`'s column-block start in `declared_cols`.
+/// Returns `None` when the `ON` is not a single `=` of two resolvable columns or
+/// neither side belongs to `cand` (the caller then abandons its LogEst estimate).
+fn ntable_edge_local(
+    join: &Join,
+    cand: usize,
+    block_start: &[usize],
+    declared_cols: &[ColumnInfo],
+) -> Option<usize> {
+    let mut on = join.on.as_ref()?;
+    while let Expr::Paren(inner) = on {
+        on = inner;
+    }
+    let (l, r) = match on {
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => (
+            col_index(left, declared_cols)?,
+            col_index(right, declared_cols)?,
+        ),
+        _ => return None,
+    };
+    let start = block_start[cand];
+    let end = block_start
+        .get(cand + 1)
+        .copied()
+        .unwrap_or(declared_cols.len());
+    let in_cand = |g: usize| g >= start && g < end;
+    if in_cand(l) {
+        Some(l - start)
+    } else if in_cand(r) {
+        Some(r - start)
     } else {
         None
     }
