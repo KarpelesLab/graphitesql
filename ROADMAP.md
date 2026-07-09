@@ -226,10 +226,16 @@ result or declines to it — never a wrong answer), so this track is
   collation and skips the comparison-affinity that `o.x = t.k` applies — routing
   it risks a silent false-negative that wouldn't fall back; needs the tree-walker's
   affinity machinery threaded in first).
-- **B5c-2 — correlated subqueries on the VDBE.** Any subquery reading an outer
-  column defers today. (a) thread the outer row into the subquery's register frame;
-  (b) compile `Subquery`/`Exists`/`InSelect` that read an outer column. Best done
-  after B5b-2 lands the live-cursor machinery.
+- **B5c-2 — correlated subqueries on the VDBE. DONE (2026-07-09).** A correlated
+  scalar `(SELECT … WHERE inner = outer.k)` (equality/range, aggregate inner,
+  correlated rowid, NULL outer key, empty/multi-row inner) and correlated
+  `EXISTS`/`NOT EXISTS` now run on the VDBE over a live single-table scan:
+  `Op::CorrelatedScalar`/`CorrelatedExists` + a `SubqueryEval` callback that pushes
+  the current outer row as an `OuterFrame` and re-runs the subquery through the
+  tree-walker's `run_select`/`with_outer_frame` — byte-identical. Opt-in per compile
+  (`compile_table_select_opts(allow_correlated)`; only `try_live_single_scan` sets
+  it), so all other paths defer as before. **Remaining:** `IN (SELECT …correlated)`
+  and correlated subqueries over joins/materialized paths still fall back.
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).
 
