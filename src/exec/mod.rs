@@ -8333,6 +8333,66 @@ impl Connection {
         map
     }
 
+    /// Load the `sqlite_stat4` samples for one index (by name), in storage
+    /// order, decoding each `sample` record and parsing its `neq`/`nlt`/`ndlt`
+    /// integer lists. Returns `(samples, n_sample_col)` or `None` when there are
+    /// no stat4 rows for the index (or the table is absent/unreadable). Used by
+    /// the cost-based index chooser to refine an equality selectivity estimate.
+    fn stat4_samples(
+        &self,
+        idx_name: &str,
+    ) -> Option<(Vec<crate::exec::stat4::LoadedSample>, usize)> {
+        self.schema.table("sqlite_stat4")?;
+        let meta = self.table_meta("sqlite_stat4", None).ok()?;
+        let rows = self.scan_table(&meta).ok()?;
+        let encoding = self.backend.source().header().text_encoding;
+        let parse_list = |s: &str| -> Vec<u64> {
+            s.split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect()
+        };
+        let mut out: Vec<crate::exec::stat4::LoadedSample> = Vec::new();
+        let mut n_sample_col = 0usize;
+        // sqlite_stat4 columns: (tbl, idx, neq, nlt, ndlt, sample).
+        for (_, vals) in rows {
+            let Some(Value::Text(name)) = vals.get(1) else {
+                continue;
+            };
+            if name != idx_name {
+                continue;
+            }
+            let (Some(Value::Text(neq)), Some(Value::Text(nlt)), Some(Value::Text(ndlt))) =
+                (vals.get(2), vals.get(3), vals.get(4))
+            else {
+                continue;
+            };
+            let sample_bytes = match vals.get(5) {
+                Some(Value::Blob(b)) => b.as_slice(),
+                _ => continue,
+            };
+            let Ok(sample) = crate::format::record::decode_record(sample_bytes, encoding) else {
+                continue;
+            };
+            let n_eq = parse_list(neq);
+            let n_lt = parse_list(nlt);
+            let n_dlt = parse_list(ndlt);
+            if n_eq.is_empty() || n_lt.len() != n_eq.len() || n_dlt.len() != n_eq.len() {
+                continue;
+            }
+            n_sample_col = n_sample_col.max(sample.len().max(n_eq.len()));
+            out.push(crate::exec::stat4::LoadedSample {
+                n_lt,
+                n_eq,
+                n_dlt,
+                sample,
+            });
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some((out, n_sample_col))
+    }
+
     /// Rowids of existing rows that conflict with a candidate row on the rowid
     /// or any UNIQUE/PRIMARY KEY column set (NULLs are considered distinct).
     fn find_conflicts(
@@ -13075,10 +13135,23 @@ impl Connection {
             if matched == 0 {
                 continue;
             }
-            let est = stats
-                .get(&idx.name)
+            let stat1_row = stats.get(&idx.name);
+            let est = stat1_row
                 .and_then(|s| s.get(matched).copied())
                 .unwrap_or(u64::MAX - matched as u64);
+            // STAT4 refinement: when this index has stat1 statistics *and*
+            // sqlite_stat4 samples, and the whole matched leading prefix is
+            // equality- (or `IS NULL`-) constrained by *known* values, replace
+            // the stat1 average-eq estimate with the value-specific one from the
+            // samples — exactly what sqlite's `whereEqualScanEst` does. Only the
+            // stat1-present branch is touched, so databases without ANALYZE keep
+            // the sentinel behaviour byte-for-byte.
+            let est = if let Some(ai_row_est) = stat1_row {
+                self.stat4_equal_est(&idx, matched, eqs, is_null_cols, ai_row_est)
+                    .unwrap_or(est)
+            } else {
+                est
+            };
             // A covering candidate holds every referenced column; `seek_index_covers`
             // makes the same decision the render uses. Without an enclosing `SELECT`
             // (DELETE/UPDATE/OR-disjunct) nothing covers.
@@ -13104,6 +13177,61 @@ impl Connection {
             }
         }
         Ok(best.map(|(_, idx, matched)| (idx, matched)))
+    }
+
+    /// STAT4-driven equality selectivity estimate for `idx` when its leading
+    /// `matched` columns are all equality- or `IS NULL`-constrained by known
+    /// values. Builds the probe record from those constraints and runs sqlite's
+    /// `whereEqualScanEst` (`stat4::equal_scan_est`) against the index's
+    /// `sqlite_stat4` samples. Returns the value-specific estimated row count, or
+    /// `None` when no stat4 samples exist for the index or the probe cannot be
+    /// formed (leaving the caller on its stat1 average-eq estimate).
+    ///
+    /// `ai_row_est` is the index's `sqlite_stat1` integer list (`[nRow, avgEq_1,
+    /// …]`), used by `initAvgEq` for the non-matching-sample fallback.
+    fn stat4_equal_est(
+        &self,
+        idx: &IndexMeta,
+        matched: usize,
+        eqs: &[(usize, Value)],
+        is_null_cols: &[usize],
+        ai_row_est: &[u64],
+    ) -> Option<u64> {
+        // Build the probe: the value bound to each of the leading `matched` index
+        // key columns, in index-column order. A column constrained by `IS NULL`
+        // probes with NULL; otherwise the `col = value` constant.
+        let mut rec: Vec<Value> = Vec::with_capacity(matched);
+        for &c in idx.cols.iter().take(matched) {
+            if let Some((_, v)) = eqs.iter().find(|(col, _)| *col == c) {
+                rec.push(v.clone());
+            } else if is_null_cols.contains(&c) {
+                rec.push(Value::Null);
+            } else {
+                return None;
+            }
+        }
+        if rec.is_empty() {
+            return None;
+        }
+        let (samples, n_sample_col) = self.stat4_samples(&idx.name)?;
+        // Guard: the sample record must have at least as many columns as the
+        // probe (it always does — key cols + trailing rowid/pk), and the probe
+        // must not exceed the key columns (we only equality-probe key columns).
+        if n_sample_col == 0 || rec.len() > n_sample_col {
+            return None;
+        }
+        let n_key_col = idx.cols.len();
+        let colls = &idx.collations;
+        let descs = &idx.descending;
+        crate::exec::stat4::equal_scan_est(
+            samples,
+            n_sample_col,
+            n_key_col,
+            ai_row_est,
+            &rec,
+            colls,
+            descs,
+        )
     }
 
     /// Estimated key width of `idx` in `LogEst` units, for the covering-index

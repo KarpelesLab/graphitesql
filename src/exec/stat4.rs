@@ -348,6 +348,225 @@ impl StatAccum {
     }
 }
 
+// ---------------------------------------------------------------------------
+// STAT4 *consumption* (planner side): estimate the row count an equality
+// constraint selects, faithfully porting SQLite's `initAvgEq`, `whereKeyStats`
+// and `whereEqualScanEst` (analyze.c / where.c, `SQLITE_ENABLE_STAT4`).
+// ---------------------------------------------------------------------------
+
+/// One decoded `sqlite_stat4` sample for a single index, in `sqlite_stat4`
+/// storage order (which is index-key order). `n_lt`/`n_eq`/`n_dlt` are the
+/// per-prefix statistics; `sample` are the decoded sample-column values.
+pub(crate) struct LoadedSample {
+    pub n_lt: Vec<u64>,
+    pub n_eq: Vec<u64>,
+    pub n_dlt: Vec<u64>,
+    pub sample: Vec<Value>,
+}
+
+/// All STAT4 data the estimator needs for one index, plus the derived
+/// `aAvgEq[]`/`nRowEst0` (`loadStat4` + `initAvgEq`).
+struct Stat4Index {
+    samples: Vec<LoadedSample>,
+    /// `nSampleCol` = key cols + trailing rowid/pk cols (== sample.len()).
+    n_sample_col: usize,
+    /// `nRowEst0`: non-logarithmic number of rows in the index.
+    n_row_est0: u64,
+    /// `aAvgEq[]`: average nEq for keys not represented by a sample.
+    a_avg_eq: Vec<u64>,
+}
+
+impl Stat4Index {
+    /// Port of `initAvgEq`: compute `aAvgEq[]` and `nRowEst0` from the loaded
+    /// samples and stat1's integer list `[nRow, avgEq_1, …]` (`ai_row_est`, may
+    /// be short/empty). `n_key_col` is the number of index key columns (excludes
+    /// the trailing rowid/pk).
+    fn compute_avg_eq(&mut self, ai_row_est: &[u64], n_key_col: usize) {
+        let n_sample = self.samples.len();
+        if n_sample == 0 {
+            return;
+        }
+        let final_idx = n_sample - 1;
+        let mut n_col = 1usize;
+        if self.n_sample_col > 1 {
+            n_col = self.n_sample_col - 1;
+            if let Some(slot) = self.a_avg_eq.get_mut(n_col) {
+                *slot = 1;
+            }
+        }
+        for i_col in 0..n_col {
+            let mut n_sample_i = n_sample;
+            let n_row: u64;
+            let n_dist100: i64;
+            let row_est_next = if i_col < n_key_col {
+                ai_row_est.get(i_col + 1).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            if ai_row_est.is_empty() || i_col >= n_key_col || row_est_next == 0 {
+                n_row = self.samples[final_idx].n_lt[i_col];
+                n_dist100 = 100 * self.samples[final_idx].n_dlt[i_col] as i64;
+                n_sample_i -= 1;
+            } else {
+                n_row = ai_row_est[0];
+                n_dist100 = (100 * ai_row_est[0] as i64) / row_est_next as i64;
+            }
+            self.n_row_est0 = n_row;
+
+            let mut sum_eq: u64 = 0;
+            let mut n_sum100: i64 = 0;
+            for i in 0..n_sample_i {
+                if i == n_sample - 1
+                    || self.samples[i].n_dlt[i_col] != self.samples[i + 1].n_dlt[i_col]
+                {
+                    sum_eq += self.samples[i].n_eq[i_col];
+                    n_sum100 += 100;
+                }
+            }
+            let mut avg_eq: u64 = 0;
+            if n_dist100 > n_sum100 && sum_eq < n_row {
+                avg_eq = (100 * (n_row - sum_eq)) / (n_dist100 - n_sum100) as u64;
+            }
+            if avg_eq == 0 {
+                avg_eq = 1;
+            }
+            if let Some(slot) = self.a_avg_eq.get_mut(i_col) {
+                *slot = avg_eq;
+            }
+        }
+    }
+}
+
+/// Compare a stat4 `sample` record (its first `n` decoded values) against a
+/// probe `rec`, applying each column's collation and DESC flag — a value-level
+/// port of `sqlite3VdbeRecordCompare` restricted to the leading `n` fields.
+fn record_compare(
+    sample: &[Value],
+    rec: &[Value],
+    n: usize,
+    colls: &[crate::value::Collation],
+    descs: &[bool],
+) -> core::cmp::Ordering {
+    for i in 0..n {
+        let coll = colls.get(i).copied().unwrap_or_default();
+        let mut ord = crate::value::cmp_values_coll(&sample[i], &rec[i], coll);
+        if descs.get(i).copied().unwrap_or(false) {
+            ord = ord.reverse();
+        }
+        if ord != core::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    core::cmp::Ordering::Equal
+}
+
+/// Port of `whereKeyStats(pIdx, pRec, roundUp=0, aStat)`: binary-search the
+/// samples for the `n_field`-field probe `rec` and return `(a0, a1)` where `a1`
+/// is the estimated nEq for the probe.
+fn where_key_stats(
+    idx: &Stat4Index,
+    rec: &[Value],
+    colls: &[crate::value::Collation],
+    descs: &[bool],
+    n_field: usize,
+) -> (u64, u64) {
+    let a_sample = &idx.samples;
+    let n_sample = a_sample.len();
+    let mut i_col = 0usize;
+    let mut i_min = 0i64;
+    let mut i_sample = (n_sample * n_field) as i64;
+    let mut i_lower: u64 = 0;
+    let mut res;
+    loop {
+        let i_test = (i_min + i_sample) / 2;
+        let i_samp = (i_test / n_field as i64) as usize;
+        let n = if i_samp > 0 {
+            let mut nn = (i_test as usize % n_field) + 1;
+            while nn < n_field {
+                if a_sample[i_samp - 1].n_lt[nn - 1] != a_sample[i_samp].n_lt[nn - 1] {
+                    break;
+                }
+                nn += 1;
+            }
+            nn
+        } else {
+            i_test as usize + 1
+        };
+        res = match record_compare(&a_sample[i_samp].sample, rec, n, colls, descs) {
+            core::cmp::Ordering::Less => -1i32,
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Greater => 1,
+        };
+        if res < 0 {
+            i_lower = a_sample[i_samp].n_lt[n - 1] + a_sample[i_samp].n_eq[n - 1];
+            i_min = i_test + 1;
+        } else if res == 0 && n < n_field {
+            i_lower = a_sample[i_samp].n_lt[n - 1];
+            i_min = i_test + 1;
+            res = -1;
+        } else {
+            i_sample = i_test;
+            i_col = n - 1;
+        }
+        if res == 0 || i_min >= i_sample {
+            break;
+        }
+    }
+    let i = (i_sample / n_field as i64) as usize;
+
+    if res == 0 {
+        (a_sample[i].n_lt[i_col], a_sample[i].n_eq[i_col])
+    } else {
+        let i_upper = if i >= n_sample {
+            idx.n_row_est0
+        } else {
+            a_sample[i].n_lt[i_col]
+        };
+        let i_gap = i_upper.saturating_sub(i_lower);
+        let i_gap = i_gap / 3; // roundUp = 0
+        let a1 = idx.a_avg_eq.get(n_field - 1).copied().unwrap_or(1);
+        (i_lower + i_gap, a1)
+    }
+}
+
+/// Port of `whereEqualScanEst`: estimate the number of rows selected by the
+/// equality prefix `rec` (all `rec.len()` fields equality-constrained) using
+/// the index's stat4 samples. Returns `None` when no estimate is possible (no
+/// samples). `n_key_col` = number of index key columns; `ai_row_est` = stat1's
+/// integer list for this index (`[nRow, avgEq_1, …]`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn equal_scan_est(
+    samples: Vec<LoadedSample>,
+    n_sample_col: usize,
+    n_key_col: usize,
+    ai_row_est: &[u64],
+    rec: &[Value],
+    colls: &[crate::value::Collation],
+    descs: &[bool],
+) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let n_field = rec.len().min(n_sample_col);
+    if n_field == 0 {
+        return None;
+    }
+    let n_row0 = ai_row_est.first().copied().unwrap_or(0);
+    let mut idx = Stat4Index {
+        samples,
+        n_sample_col,
+        n_row_est0: n_row0,
+        a_avg_eq: alloc::vec![1; n_sample_col],
+    };
+    idx.compute_avg_eq(ai_row_est, n_key_col);
+    // whereEqualScanEst: if nEq >= nColumn the estimate is 1.
+    if n_field >= n_sample_col {
+        return Some(1);
+    }
+    let (_, a1) = where_key_stats(&idx, rec, colls, descs, n_field);
+    Some(a1)
+}
+
 /// Run the STAT4 accumulator over one index's `entries` (already in index-storage
 /// order) and return the finished samples in `sqlite_stat4` row order. `n_col` is
 /// the number of sample columns (key + rowid/pk); `n_col_test` is the number of
