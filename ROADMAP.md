@@ -274,10 +274,16 @@ result or declines to it — never a wrong answer), so this track is
   unselective non-covering equality **or** leading range at sqlite's exact
   boundary, and `whereRangeScanEst`'s STAT4 branch estimates range rows from the
   samples — all gated to stat4-backed non-covering single-candidate cases so the
-  EQP corpus stays byte-identical. **Remaining:** the full multi-loop **join-order
-  path solver** (choosing among several candidate indexes / ordering >1 table by
-  cost) — graphite still ports only the single-table scan-vs-seek leaf; this is
-  the biggest single remaining planner item.
+  EQP corpus stays byte-identical. *Join-order path solver done (7493118):* a
+  bounded LogEst `wherePathSolver`/`whereLoopAddBtree` port (`join_scan_cost`/
+  `join_seek_cost`/`two_table_second_drives_cheaper`/`ntable_join_order`) now
+  picks the join **driver** by cost — `big JOIN small` drives `small`, 3/4-table
+  hubs drive the smallest table — matching the oracle, stats-gated so no-ANALYZE
+  plans are byte-identical. **Remaining (small):** the tail-table access *label*
+  in 3+-table plans (sqlite renders `BLOOM FILTER`/`AUTOMATIC COVERING INDEX` for
+  the tail vs graphite's index seek — a separate rendering track, result/order
+  unaffected); and choosing among several *candidate indexes on one table* by
+  full WhereLoop cost (only the scan-vs-seek leaf + driver order are ported).
 
 ### Track C — Storage engine, transactions, concurrency
 
