@@ -306,12 +306,16 @@ result or declines to it — never a wrong answer), so this track is
   spills onto ≥ `FTS5_MIN_DLIDX_SIZE` continuation leaves now emits byte-identical
   `dlidx` pages and sets the term's `%_idx` dlidx bit — graphite's file is
   integrity-clean and sqlite-readable at scale (was rejected as "malformed" at
-  ~8000 docs before). Remaining: the multi-term leaf-fill boundary still diverges
-  from sqlite's split heuristic (self-consistent + integrity-clean, just not
-  byte-identical), and segment-b-tree interior (`height > 0`) pages. Related
-  perf residual: the FTS5 write path does a full single-segment rebuild per row
-  write (O(rows²) bulk load) — sqlite's incremental multi-segment automerge is the
-  real fix; correctness/integrity are unaffected.
+  ~8000 docs before). *Multi-term leaf-fill done (2026-07-09):* ported sqlite's
+  `fts5WriteAppendTerm` split rule (`4 + body + pgidx + nTerm + 2 >= pgsz`, full
+  uncompressed term length), so multi-term segments are now byte-identical up to
+  ~37 leaves incl. variable-length terms. Remaining: **prefix indexes**
+  (`prefix='2 3'`) — the rebuild path builds only the main index, never the
+  `0x31`/`0x32` prefix-index segments (functionally correct via main-index scan,
+  bytes differ; needs an exec-layer change); and segment-b-tree interior
+  (`height > 0`) pages. Related perf residual: the FTS5 write path does a full
+  single-segment rebuild per row write (O(rows²) bulk load) — sqlite's incremental
+  multi-segment automerge is the real fix; correctness/integrity are unaffected.
 - **D4-leftover — window UDFs + custom collations.** The latter needs a user
   variant on the `Collation` enum (invasive).
 - **D5 — `sqlite3_session`** changesets/patchsets for replication.
