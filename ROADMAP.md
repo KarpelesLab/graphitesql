@@ -259,14 +259,18 @@ result or declines to it — never a wrong answer), so this track is
   `PARTITION BY`/window-`ORDER BY`), so this is **blocked on B9h** (plus a
   deterministic model for the multi-window/nested `(subquery-N)` numbering).
 - **B4 — `sqlite_stat4` histograms.** *Generation done (2026-07-09).* `ANALYZE`
-  now emits byte-compatible `sqlite_stat4` (faithful `analyze.c` accumulator port
-  in `src/exec/stat4.rs`), verified 0-diff against a `-DSQLITE_ENABLE_STAT4`
-  oracle build across 300+ fuzzed schemas; a pre-existing `sqlite_stat1` avg-eq
-  divergence was fixed in the same pass. **Remaining:** consult stat4 in the
-  planner (range/eq selectivity, `whereRangeScanEst`-style) — deliberately not
-  wired in yet to keep the EQP-differential cost model green; needs its own
-  differential validation. (Verified with the STAT4 oracle in scratchpad; the
-  stat4-driven *planner* is the follow-up, not the data.)
+  emits byte-compatible `sqlite_stat4` (faithful `analyze.c` accumulator port in
+  `src/exec/stat4.rs`), verified 0-diff against a `-DSQLITE_ENABLE_STAT4` oracle
+  across 300+ fuzzed schemas; a pre-existing `sqlite_stat1` avg-eq divergence was
+  fixed in the same pass. *Planner-use — equality done (2026-07-09):* the index
+  chooser now consults stat4 samples for `col = ?` selectivity (ports
+  `whereKeyStats`/`whereEqualScanEst`/`initAvgEq`), so a rare-value equality flips
+  to the selective index — narrowed (only when the index has stat1+stat4 and the
+  matched leading prefix is fully bound) so no ANALYZE-less plan moves and the EQP
+  corpus stays green. **Remaining:** `whereRangeScanEst` (range selectivity) and
+  the index-vs-full-`SCAN` `rRun` cost comparison — these need the `whereLoopAddBtree`
+  WhereLoop machinery graphite doesn't yet model, and would ripple across the
+  SCAN-vs-SEARCH EQP corpus; the biggest single remaining planner item.
 
 ### Track C — Storage engine, transactions, concurrency
 
@@ -291,10 +295,17 @@ result or declines to it — never a wrong answer), so this track is
   `_content` scan (results correct): a ≥3-phrase `NEAR`, and a single very-high-
   frequency term whose segment uses doclist-index / interior (`height > 0`) pages
   (only reached by a term spanning ~16+ leaves).
-- **D2e-encoder — byte-identical FTS5 at large scale.** Structural validity holds;
-  exact-byte parity past a few leaves needs the fts5 writer source for the split
-  heuristics (spanning-doclist-then-paginated-terms fill boundary, doclist-index
-  pages, segment-b-tree interior pages).
+- **D2e-encoder — byte-identical FTS5 at large scale.** *Doclist-index done
+  (2026-07-09):* ported sqlite's `fts5WriteDlidxAppend`, so a term whose doclist
+  spills onto ≥ `FTS5_MIN_DLIDX_SIZE` continuation leaves now emits byte-identical
+  `dlidx` pages and sets the term's `%_idx` dlidx bit — graphite's file is
+  integrity-clean and sqlite-readable at scale (was rejected as "malformed" at
+  ~8000 docs before). Remaining: the multi-term leaf-fill boundary still diverges
+  from sqlite's split heuristic (self-consistent + integrity-clean, just not
+  byte-identical), and segment-b-tree interior (`height > 0`) pages. Related
+  perf residual: the FTS5 write path does a full single-segment rebuild per row
+  write (O(rows²) bulk load) — sqlite's incremental multi-segment automerge is the
+  real fix; correctness/integrity are unaffected.
 - **D4-leftover — window UDFs + custom collations.** The latter needs a user
   variant on the `Collation` enum (invasive).
 - **D5 — `sqlite3_session`** changesets/patchsets for replication.
