@@ -8,9 +8,35 @@ use super::{File, LockLevel, LockState, OpenFlags, Vfs};
 use crate::error::{Error, Result};
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
-use core::cell::Cell;
+use core::sync::atomic::{AtomicU8, Ordering};
 use std::collections::HashMap;
 use std::fs;
+
+/// The current lock level of a [`StdFile`] handle, behind an atomic so `lock`/
+/// `unlock` can update it through `&self` (see [`File::lock`]) while keeping the
+/// public `StdFile` `Send + Sync + RefUnwindSafe` — a `Cell` here would silently
+/// make `StdFile` neither (an observable, semver-breaking auto-trait regression).
+struct AtomicLockLevel(AtomicU8);
+
+impl AtomicLockLevel {
+    fn new(level: LockLevel) -> Self {
+        AtomicLockLevel(AtomicU8::new(level as u8))
+    }
+
+    fn get(&self) -> LockLevel {
+        match self.0.load(Ordering::Relaxed) {
+            0 => LockLevel::Unlocked,
+            1 => LockLevel::Shared,
+            2 => LockLevel::Reserved,
+            3 => LockLevel::Pending,
+            _ => LockLevel::Exclusive,
+        }
+    }
+
+    fn set(&self, level: LockLevel) {
+        self.0.store(level as u8, Ordering::Relaxed);
+    }
+}
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -63,7 +89,7 @@ impl Vfs for StdVfs {
         Ok(Box::new(StdFile {
             inner: Mutex::new(file),
             locks: locks_for(path),
-            level: Cell::new(LockLevel::Unlocked),
+            level: AtomicLockLevel::new(LockLevel::Unlocked),
         }))
     }
 
@@ -85,9 +111,9 @@ pub struct StdFile {
     inner: Mutex<fs::File>,
     /// The process-shared lock state for this file's path.
     locks: Arc<Mutex<LockState>>,
-    /// The lock level this handle currently holds. A `Cell` so `lock`/`unlock`
-    /// can take `&self` (see [`File::lock`]).
-    level: Cell<LockLevel>,
+    /// The lock level this handle currently holds. Atomic so `lock`/`unlock` can
+    /// take `&self` (see [`File::lock`]) without making `StdFile` `!Sync`.
+    level: AtomicLockLevel,
 }
 
 impl StdFile {
@@ -166,6 +192,14 @@ impl File for StdFile {
 mod tests {
     use super::*;
     use alloc::format;
+
+    // `StdFile` is public API and was `Send + Sync + RefUnwindSafe` in 0.1.0.
+    // A `Cell`-based lock level silently regresses those auto-traits (and would
+    // block a thread-safe `Connection`); this compile-time check guards it.
+    const _: fn() = || {
+        fn assert<T: Send + Sync + std::panic::RefUnwindSafe + std::panic::UnwindSafe>() {}
+        assert::<StdFile>();
+    };
 
     fn temp_path(name: &str) -> String {
         let mut p = std::env::temp_dir();
