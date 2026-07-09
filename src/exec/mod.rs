@@ -231,6 +231,15 @@ pub struct Connection {
     /// tree-walker. The result is identical either way; this only chooses which
     /// engine produces it.
     use_vdbe: core::cell::Cell<bool>,
+    /// The active change-tracking session's shared recorder, if a [`Session`]
+    /// has been created on this connection (roadmap D5). `None` when no session
+    /// is active, in which case the write-path hook
+    /// ([`record_session_change`](Self::record_session_change)) is a no-op.
+    /// Shared with the caller's [`Session`] via reference counting so DML pushes
+    /// changes into the session the caller holds.
+    session: core::cell::RefCell<
+        Option<alloc::rc::Rc<core::cell::RefCell<crate::session::SessionState>>>,
+    >,
 }
 
 /// A user-defined scalar function: it receives its evaluated argument values and
@@ -363,6 +372,7 @@ impl Connection {
             #[cfg(feature = "fts5")]
             fts5_rank: core::cell::RefCell::new(None),
             use_vdbe: core::cell::Cell::new(true),
+            session: core::cell::RefCell::new(None),
         })
     }
 
@@ -409,6 +419,7 @@ impl Connection {
             #[cfg(feature = "fts5")]
             fts5_rank: core::cell::RefCell::new(None),
             use_vdbe: core::cell::Cell::new(true),
+            session: core::cell::RefCell::new(None),
         })
     }
 
@@ -7171,6 +7182,102 @@ impl Connection {
         }
     }
 
+    /// Create a change-tracking [`Session`](crate::Session) on this connection
+    /// (roadmap D5). Call [`Session::attach`](crate::Session::attach) to begin
+    /// recording, run some `INSERT`/`UPDATE`/`DELETE`, then
+    /// [`Session::changeset`](Self::session_changeset) — reached through the
+    /// connection — to obtain the SQLite-compatible changeset blob.
+    ///
+    /// Only one session is active at a time; creating a new one replaces any
+    /// previous session's recorder on this connection.
+    pub fn create_session(&self) -> crate::session::Session {
+        let state = alloc::rc::Rc::new(core::cell::RefCell::new(
+            crate::session::SessionState::default(),
+        ));
+        *self.session.borrow_mut() = Some(state.clone());
+        crate::session::Session::new(state)
+    }
+
+    /// Produce the changeset blob for `session`, reading the current values of
+    /// changed rows live from the database (so coalesced inserts/updates carry
+    /// their final values). Mirrors `sqlite3session_changeset`.
+    ///
+    /// The blob is byte-compatible with SQLite's session extension for the
+    /// supported table shape (a rowid table with a single `INTEGER PRIMARY KEY`).
+    pub fn session_changeset(&self, session: &crate::session::Session) -> Result<Vec<u8>> {
+        // Snapshot the recorded changes, then serialize with a live row reader.
+        // `serialize` calls back into `read_row` by table name + pk value.
+        let state = session.state.borrow();
+        // The closure reads live rows; the first error it hits is captured here
+        // and surfaced after serialization.
+        let mut err: Option<Error> = None;
+        let bytes =
+            crate::session::serialize(&state, |table, pk| match self.table_meta(table, None) {
+                Ok(meta) => match self.read_row(&meta, pk) {
+                    Ok(row) => row,
+                    Err(e) => {
+                        err.get_or_insert(e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    err.get_or_insert(e);
+                    None
+                }
+            });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(bytes)
+    }
+
+    /// Write-path hook: when a session is active and `table` is a rowid table
+    /// with a single `INTEGER PRIMARY KEY`, record the row operation. A no-op
+    /// when no session is active (the common case) or the table's shape is not
+    /// yet supported. `old_row` is the row's values before the change (for
+    /// UPDATE/DELETE); for an INSERT it is ignored and only the PK is stored.
+    fn record_session_change(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        op: crate::session::ChangeOp,
+        pk: i64,
+        old_row: Option<&[Value]>,
+    ) {
+        let cell = self.session.borrow();
+        let Some(state) = cell.as_ref() else {
+            return;
+        };
+        // First slice: only a rowid table with a single INTEGER PRIMARY KEY.
+        let Some(ipk) = meta.ipk else {
+            return;
+        };
+        if meta.without_rowid {
+            return;
+        }
+        let visible: Vec<&ColumnInfo> = meta.columns.iter().filter(|c| !c.hidden).collect();
+        let ncol = visible.len();
+        if ipk >= ncol {
+            return;
+        }
+        let pk_flags: Vec<bool> = (0..ncol).map(|i| i == ipk).collect();
+        let old = match op {
+            crate::session::ChangeOp::Insert => {
+                // SQLite stores only the PK in an insert's original record.
+                let mut row = alloc::vec![Value::Null; ncol];
+                row[ipk] = Value::Integer(pk);
+                row
+            }
+            _ => match old_row {
+                Some(r) if r.len() >= ncol => r[..ncol].to_vec(),
+                _ => return,
+            },
+        };
+        state
+            .borrow_mut()
+            .record(table, ncol, &pk_flags, op, pk, old);
+    }
+
     /// Store a `CREATE TRIGGER` in `sqlite_schema` (type `trigger`, no b-tree).
     fn exec_create_trigger(&mut self, ct: &CreateTrigger, sql_text: &str) -> Result<()> {
         // A schema-qualified `CREATE TRIGGER aux.tr …` stores its SQL bare-named.
@@ -8218,6 +8325,22 @@ impl Connection {
                         // triggers (sqlite gates those on `recursive_triggers`, off
                         // by default, and `delete_row_cascade` fires none).
                         for cr in conflicts {
+                            // Record the replace-delete as a session change (its
+                            // old values), matching SQLite's preupdate DELETE: a
+                            // same-PK REPLACE then coalesces DELETE+INSERT into an
+                            // UPDATE; a different-PK (UNIQUE) conflict yields a
+                            // DELETE of that row plus this INSERT.
+                            if self.session.borrow().is_some()
+                                && let Ok(Some(old)) = self.read_row(&meta, cr)
+                            {
+                                self.record_session_change(
+                                    &ins.table,
+                                    &meta,
+                                    crate::session::ChangeOp::Delete,
+                                    cr,
+                                    Some(&old),
+                                );
+                            }
                             self.delete_row_cascade(&ins.table, &meta, cr, params)?;
                         }
                         replaced = true;
@@ -8264,6 +8387,13 @@ impl Connection {
             self.check_fk_child(&ins.table, &meta, &index_values)?;
             let record = self.encode_table_record(&meta, &index_values);
             insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
+            self.record_session_change(
+                &ins.table,
+                &meta,
+                crate::session::ChangeOp::Insert,
+                rowid,
+                None,
+            );
             // `last_insert_rowid()` tracks the most recent insert (a later insert
             // from an AFTER trigger overwrites this, matching SQLite).
             self.last_insert_rowid.set(rowid);
@@ -9121,6 +9251,15 @@ impl Connection {
             // still present. The action still matches children by the saved `old`
             // key, so removing the parent first does not affect which rows it hits.
             delete_table(self.backend.writer()?, meta.root, *rowid)?;
+            if let Some(old) = &old {
+                self.record_session_change(
+                    &del.table,
+                    &meta,
+                    crate::session::ChangeOp::Delete,
+                    *rowid,
+                    Some(old),
+                );
+            }
             if self.foreign_keys
                 && let Some(old) = &old
             {
@@ -9564,6 +9703,13 @@ impl Connection {
             let record = self.encode_table_record(&meta, &new_full);
             delete_table(self.backend.writer()?, meta.root, rowid)?;
             insert_table(self.backend.writer()?, meta.root, new_rowid, &record)?;
+            self.record_session_change(
+                &upd.table,
+                &meta,
+                crate::session::ChangeOp::Update,
+                rowid,
+                Some(&old_row),
+            );
             self.fire_triggers(
                 &upd.table,
                 TrigEvent::Update,

@@ -65,12 +65,14 @@ pub(crate) mod fts5_index;
 pub(crate) mod geopoly;
 pub mod pager;
 pub mod schema;
+pub mod session;
 pub mod sql;
 pub mod vfs;
 pub mod vtab;
 
 pub use error::{Error, Result};
 pub use exec::{AggregateFactory, AggregateFunction, Connection, QueryResult, ScalarFunction};
+pub use session::Session;
 
 /// The version of the SQLite file format graphitesql targets.
 ///
