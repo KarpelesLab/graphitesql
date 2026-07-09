@@ -358,10 +358,15 @@ result or declines to it — never a wrong answer), so this track is
   the next with sqlite's promote-down cascade — byte-identical `%_data`/`%_idx`/
   `%_docsize`/STRUCTURE vs sqlite across insert sequences through recurring crises,
   fixing both the O(rows²) bulk-load and the multi-segment byte-parity residual.
-  **Remaining:** explicit `BEGIN`/`SAVEPOINT` transactions, deletes/updates
-  (tombstones), prefix indexes, and spanning-dlidx segments still fall back to the
-  single-segment bulk rebuild (never wrong, just not incremental) — extending the
-  incremental path to those is the follow-up.
+  *Incremental DELETE/UPDATE via tombstones done (2026-07-09, 35d5ec8):* a
+  self-content DELETE/UPDATE in autocommit appends one level-0 tombstone segment
+  (`nPos = content_len*2 + bDel`) — byte-identical vs sqlite for delete-one/many,
+  delete-then-insert, UPDATE (incl. the shared-term `size2` case), multi-column,
+  interleaved, and delete-all. **Remaining:** deletes that cross the 16-segment
+  crisis threshold (tombstone-reconciling crisis merge not ported), explicit
+  `BEGIN`/`SAVEPOINT` transactions, prefix indexes, and spanning-dlidx segments
+  still fall back to the single-segment bulk rebuild (never wrong, just not
+  incremental) — those are the remaining follow-ups.
 - **D4-leftover — window UDFs + custom collations.** The latter needs a user
   variant on the `Collation` enum (invasive).
 - **D5 — `sqlite3_session`** changesets/patchsets for replication.
