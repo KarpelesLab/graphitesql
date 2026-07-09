@@ -324,7 +324,15 @@ result or declines to it — never a wrong answer), so this track is
   including the deferred guard and autocommit-never-blocks.
 - **C9b — OS-level cross-process file locks** (`std::fs::File::lock`, wants MSRV
   1.89) behind the std VFS.
-- **C9c — the WAL `-shm` wal-index** for multi-connection WAL readers.
+- **C9c — the WAL wal-index for multi-connection WAL readers. DONE (2026-07-09,
+  3560126).** A process-local, coherent `SharedWalIndex` (append log + `mx_frame`
+  high-water + pinned-reader marks, path-keyed like `locks_for`) shared by all
+  connections over one file: connection B sees A's committed WAL frames on its next
+  statement, an open read txn keeps its snapshot (repeatable read), checkpoint
+  folds the log and only resets the WAL when no sibling reader is pinned, and
+  `PRAGMA integrity_check` stays clean. Exposed via an additive `File::wal_index()`
+  trait method. Process-local only (no cross-process `-shm`, consistent with the
+  existing lock model) — a host needing multi-process WAL supplies its own VFS.
 - **C9d — a thread-safe `Connection`** (`Send`/`Sync`, or a documented per-thread
   model).
 
