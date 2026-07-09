@@ -16,6 +16,7 @@
 //! b-tree cursors and schema reader work over it unchanged.
 
 use super::pcache::{self, PageCache};
+use super::wal::{SharedWalIndex, WalSnapshot};
 use super::{Page, PageSource};
 use crate::btree::page::{BtreePage, PageType};
 use crate::btree::ptrmap::{self, PtrmapType};
@@ -170,24 +171,53 @@ struct Savepoint {
     page_count: u32,
 }
 
-/// Live WAL state: the committed frames overlaid on the main file plus the
-/// append cursor, running checksum, salts, and last-commit page count.
+/// Per-connection live WAL state. Committed frames now live in a **shared**
+/// [`SharedWalIndex`] (keyed by path in the VFS) so multiple in-process
+/// `Connection`s over the same file read WAL frames coherently (ROADMAP C9c):
+///
+/// * A reader pins [`snapshot`](WalRuntime::snapshot) (the shared index's
+///   high-water mark at read-transaction start) and resolves every page against
+///   frames ≤ that snapshot — so a concurrent writer's later commits are invisible
+///   until the reader ends its transaction (repeatable read, `wal.c`'s `mxFrame`).
+/// * A writer appends its committed frames to both the `-wal` file and the shared
+///   index under the write-intent lock, so the next reader of any other connection
+///   sees them.
+///
+/// [`salt`](WalRuntime::salt) and the append cursor for *this* connection's writes
+/// are seeded from the shared index at commit time, so two connections writing in
+/// turn produce one continuous, checksum-consistent WAL.
 struct WalRuntime {
-    /// Committed frame contents (page number → page bytes).
-    frames: BTreeMap<u32, Vec<u8>>,
-    /// Byte offset in the `-wal` file at which the next frame is appended.
-    offset: u64,
-    /// Running checksum after the last appended frame (or the WAL header).
-    cksum: (u32, u32),
-    /// The two 4-byte salts written into the WAL header and every frame.
+    /// The process-shared wal-index for this file (all connections share it).
+    index: SharedWalIndex,
+    /// This connection's pinned read snapshot: the frame high-water mark and the
+    /// generation it was captured under. Refreshed to the latest commit at each
+    /// autocommit statement boundary, but held fixed (pinned) while a read
+    /// transaction is open. A `Cell` because the read path and the read-txn
+    /// begin/end hooks run through `&self`.
+    snapshot: Cell<WalSnapshot>,
+    /// The exact `mx_frame` this connection registered as a pinned reader in the
+    /// shared index, or `None` if it has no open read transaction. Tracked
+    /// separately from [`snapshot`](WalRuntime::snapshot) so that a read-then-write
+    /// transaction (whose snapshot advances at commit) still unregisters the mark
+    /// it originally registered. A `Cell` for the same `&self` reason as
+    /// [`snapshot`](WalRuntime::snapshot).
+    registered_mark: Cell<Option<u32>>,
+    /// Database size in pages at [`snapshot`](WalRuntime::snapshot) (cached from
+    /// the newest visible commit frame, or the main file if none). A `Cell` so the
+    /// autocommit snapshot refresh through `&self` can update it.
+    db_size: Cell<u32>,
+    /// This connection's WAL salts (used when it is the one appending frames).
     salt: [u8; 8],
-    /// Database size in pages recorded by the last commit frame.
-    db_size: u32,
 }
 
 const WAL_MAGIC_LE: u32 = 0x377f_0682; // little-endian checksum variant
 const WAL_HDR_LEN: usize = 32;
 const WAL_FRAME_HDR_LEN: usize = 24;
+
+/// One frame written during a WAL commit, staged for publication into the shared
+/// wal-index after the `-wal` file is synced: `(page_no, commit_db_size, bytes,
+/// next append offset, running checksum)`.
+type AppendedFrame = (u32, u32, Vec<u8>, u64, (u32, u32));
 
 impl WritePager {
     /// Open an existing database file for writing. Replays the journal first if a
@@ -220,17 +250,19 @@ impl WritePager {
             ));
         }
         let pages = (file_size / page_size as u64) as u32;
-        // If the database is in WAL mode and the -wal file carries committed
-        // frames, load them so reads see the latest data after a reopen.
+        // If the database is in WAL mode, attach to the shared wal-index for this
+        // path. Seed it from the `-wal` file if it is still empty (first open of
+        // this file in the process); otherwise adopt whatever a sibling connection
+        // has already published, so reads are coherent across connections.
         let wal = if header.read_version == 2 {
             match wal_file.as_mut() {
-                Some(w) => Self::load_wal(w.as_mut(), page_size)?,
+                Some(w) => Self::attach_wal(w.as_mut(), page_size)?,
                 None => None,
             }
         } else {
             None
         };
-        let page_count = wal.as_ref().map(|w| w.db_size).unwrap_or(pages);
+        let page_count = wal.as_ref().map(|w| w.db_size.get()).unwrap_or(pages);
         Ok(WritePager {
             file,
             journal,
@@ -393,11 +425,29 @@ impl WritePager {
         if let Some(bytes) = self.overlay.get(&number) {
             return Ok(bytes.clone());
         }
-        // In WAL mode, the newest version of a page may live in the WAL.
-        if let Some(w) = &self.wal
-            && let Some(bytes) = w.frames.get(&number)
-        {
-            return Ok(bytes.clone());
+        // In WAL mode, the newest committed version of a page (up to this
+        // connection's pinned snapshot) may live in the shared wal-index; any page
+        // ≤ the snapshot db size that is *not* in the WAL comes from the main file
+        // (checkpoint guarantees it is there). A sibling connection may have grown
+        // or checkpointed the main file since this connection last synced its
+        // `disk_pages`, so bound the read by the snapshot db size and read the
+        // bytes straight from the file (bypassing the possibly-stale `disk_pages`
+        // and the clean read cache, which is not the read authority in WAL mode).
+        if let Some(w) = &self.wal {
+            if let Some(bytes) = w
+                .index
+                .with(|ix| ix.find_frame(number, w.snapshot.get().mx_frame))
+            {
+                return Ok(bytes);
+            }
+            let db_size = w.db_size.get();
+            if number == 0 || number > db_size {
+                return Err(Error::Corrupt(format!("page {number} out of range")));
+            }
+            let mut buf = vec![0u8; self.page_size];
+            self.file
+                .read_exact_at(&mut buf, (number as u64 - 1) * self.page_size as u64)?;
+            return Ok(buf);
         }
         if number == 0 || number > self.disk_pages {
             return Err(Error::Corrupt(format!("page {number} out of range")));
@@ -452,9 +502,33 @@ impl WritePager {
     /// read per statement (itself cached once the token is set), which is far
     /// cheaper than re-reading every page of every statement from disk.
     pub fn revalidate_read_cache(&self) {
-        // Under a write lock the writer already owns coherency; in WAL mode the
-        // change counter is not the read authority. Leave the cache as-is.
-        if self.held.get() >= crate::vfs::LockLevel::Reserved || self.wal.is_some() {
+        // In WAL mode the shared wal-index — not the change counter — is the read
+        // authority. Advance this connection's read snapshot to the latest commit
+        // so an autocommit statement sees a sibling connection's committed WAL
+        // frames (ROADMAP C9c). A pinned reader (open read transaction) keeps its
+        // fixed snapshot for repeatable read; a writer owns coherency through its
+        // lock. Then leave the clean read cache alone (it is bypassed in WAL mode).
+        if let Some(w) = &self.wal {
+            if self.held.get() < crate::vfs::LockLevel::Reserved
+                && w.registered_mark.get().is_none()
+            {
+                let snap = w.index.with(|ix| ix.snapshot());
+                w.snapshot.set(snap);
+                // The snapshot db size comes from the newest visible WAL commit;
+                // if the WAL was reset (checkpointed) it has none, so fall back to
+                // the *current* main-file page count (a sibling may have grown or
+                // checkpointed it since this connection last synced `disk_pages`).
+                let db = w
+                    .index
+                    .with(|ix| ix.snapshot_db_size(snap.mx_frame))
+                    .or_else(|| self.main_file_page_count())
+                    .unwrap_or(self.disk_pages);
+                w.db_size.set(db);
+            }
+            return;
+        }
+        // Under a write lock the writer already owns coherency.
+        if self.held.get() >= crate::vfs::LockLevel::Reserved {
             return;
         }
         let current = match self.disk_change_counter() {
@@ -473,6 +547,19 @@ impl WritePager {
             self.read_cache.borrow_mut().clear();
             self.read_cache_token.set(Some(current));
         }
+    }
+
+    /// The current number of pages in the **main** database file, read fresh from
+    /// its size. Used in WAL mode to bound reads that fall through to the main
+    /// file after a sibling connection has grown or checkpointed it (so a stale
+    /// per-connection `disk_pages` does not reject a page that now exists).
+    /// Returns `None` if the size cannot be read or is not a page multiple.
+    fn main_file_page_count(&self) -> Option<u32> {
+        let size = self.file.size().ok()?;
+        if self.page_size == 0 || size % self.page_size as u64 != 0 {
+            return None;
+        }
+        Some((size / self.page_size as u64) as u32)
     }
 
     /// Read the database change counter (page 1, bytes 24–27, big-endian) straight
@@ -565,6 +652,27 @@ impl WritePager {
             self.file.lock(LockLevel::Shared)?;
             self.held.set(LockLevel::Shared);
         }
+        // In WAL mode, pin a stable snapshot for the whole read transaction and
+        // register it with the shared index so a concurrent checkpoint cannot drop
+        // the frames this reader still needs (`wal.c`'s per-reader mxFrame). Only
+        // the *first* read inside the transaction pins it (idempotent thereafter).
+        if let Some(w) = &self.wal
+            && w.registered_mark.get().is_none()
+        {
+            let snap = w.index.with(|ix| {
+                let s = ix.snapshot();
+                ix.register_reader(s.mx_frame);
+                s
+            });
+            w.snapshot.set(snap);
+            w.db_size.set(
+                w.index
+                    .with(|ix| ix.snapshot_db_size(snap.mx_frame))
+                    .or_else(|| self.main_file_page_count())
+                    .unwrap_or(self.disk_pages),
+            );
+            w.registered_mark.set(Some(snap.mx_frame));
+        }
         self.read_txn.set(true);
         Ok(())
     }
@@ -585,6 +693,15 @@ impl WritePager {
     pub fn end_read_txn(&self) {
         use crate::vfs::LockLevel;
         self.read_txn.set(false);
+        // Release this connection's pinned WAL reader mark so a checkpoint may now
+        // reset the WAL. The next autocommit statement re-snapshots at the latest
+        // commit.
+        if let Some(w) = &self.wal
+            && let Some(mark) = w.registered_mark.get()
+        {
+            w.index.with(|ix| ix.unregister_reader(mark));
+            w.registered_mark.set(None);
+        }
         if self.held.get() == LockLevel::Shared {
             let _ = self.file.unlock(LockLevel::Unlocked);
             self.held.set(LockLevel::Unlocked);
@@ -651,6 +768,15 @@ impl WritePager {
     fn release_locks(&mut self) {
         use crate::vfs::LockLevel;
         self.read_txn.set(false);
+        // Drop this connection's pinned WAL reader mark (if any) so a checkpoint
+        // may now reset the WAL, and so the next autocommit statement re-snapshots
+        // at the latest commit. Mirrors the unpin in `end_read_txn`.
+        if let Some(w) = &self.wal
+            && let Some(mark) = w.registered_mark.get()
+        {
+            w.index.with(|ix| ix.unregister_reader(mark));
+            w.registered_mark.set(None);
+        }
         if self.held.get() != LockLevel::Unlocked {
             let _ = self.file.unlock(LockLevel::Unlocked);
             self.held.set(LockLevel::Unlocked);
@@ -1117,7 +1243,9 @@ impl WritePager {
             return true;
         }
         if let Some(w) = &self.wal
-            && w.frames.contains_key(&n)
+            && w.index
+                .with(|ix| ix.find_frame(n, w.snapshot.get().mx_frame))
+                .is_some()
         {
             return true;
         }
@@ -1267,7 +1395,7 @@ impl WritePager {
         // The durable page count is the last WAL commit's in WAL mode, else the
         // main file's.
         self.page_count = match &self.wal {
-            Some(w) => w.db_size,
+            Some(w) => w.db_size.get(),
             None => self.disk_pages,
         };
         self.savepoints.clear();
@@ -1461,12 +1589,23 @@ impl WritePager {
         let salt = (self.header.change_counter as u64)
             .wrapping_mul(0x9E37_79B9)
             .to_be_bytes();
+        // Attach to (and reset) the shared wal-index for this path so sibling
+        // connections observe the fresh, empty WAL.
+        let index = self
+            .wal_file
+            .as_ref()
+            .and_then(|w| w.wal_index())
+            .unwrap_or_default();
+        let snapshot = index.with(|ix| {
+            ix.reset(salt);
+            ix.snapshot()
+        });
         self.wal = Some(WalRuntime {
-            frames: BTreeMap::new(),
-            offset: 0,
-            cksum: (0, 0),
+            index,
+            snapshot: Cell::new(snapshot),
+            registered_mark: Cell::new(None),
+            db_size: Cell::new(self.page_count),
             salt,
-            db_size: self.page_count,
         });
         Ok(true)
     }
@@ -1487,54 +1626,71 @@ impl WritePager {
         let page_size = self.page_size;
         let pages: Vec<(u32, Vec<u8>)> =
             self.overlay.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let new_count = self.page_count;
         let wal = self.wal.as_mut().expect("wal mode");
-        let salt = wal.salt;
+        let index = wal.index.clone();
         let file = self.wal_file.as_mut().expect("wal file");
 
-        // Write the 32-byte WAL header if this is the first frame after a reset.
-        if wal.offset == 0 {
-            let mut hdr = [0u8; WAL_HDR_LEN];
-            hdr[0..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
-            hdr[4..8].copy_from_slice(&3_007_000u32.to_be_bytes()); // format version
-            hdr[8..12].copy_from_slice(&(page_size as u32).to_be_bytes());
-            hdr[12..16].copy_from_slice(&0u32.to_be_bytes()); // checkpoint sequence
-            hdr[16..24].copy_from_slice(&salt);
-            let (h0, h1) = super::wal::checksum(false, 0, 0, &hdr[0..24]);
-            hdr[24..28].copy_from_slice(&h0.to_be_bytes());
-            hdr[28..32].copy_from_slice(&h1.to_be_bytes());
-            file.write_all_at(&hdr, 0)?;
-            wal.offset = WAL_HDR_LEN as u64;
-            wal.cksum = (h0, h1);
-        }
+        // Continue whatever the shared index already published (a sibling
+        // connection may have written the header and earlier frames); if the WAL
+        // is empty, we write the header and start fresh under *our* salts. Reading
+        // the shared writer state under the write-intent lock is safe: WAL writers
+        // serialize on that lock.
+        let (mut offset, mut cksum, salt) = match index.with(|ix| ix.writer_state()) {
+            Some((off, ck, salt, _ps)) => (off, ck, salt),
+            None => {
+                let salt = wal.salt;
+                let mut hdr = [0u8; WAL_HDR_LEN];
+                hdr[0..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
+                hdr[4..8].copy_from_slice(&3_007_000u32.to_be_bytes()); // format version
+                hdr[8..12].copy_from_slice(&(page_size as u32).to_be_bytes());
+                hdr[12..16].copy_from_slice(&0u32.to_be_bytes()); // checkpoint sequence
+                hdr[16..24].copy_from_slice(&salt);
+                let (h0, h1) = super::wal::checksum(false, 0, 0, &hdr[0..24]);
+                hdr[24..28].copy_from_slice(&h0.to_be_bytes());
+                hdr[28..32].copy_from_slice(&h1.to_be_bytes());
+                file.write_all_at(&hdr, 0)?;
+                (WAL_HDR_LEN as u64, (h0, h1), salt)
+            }
+        };
 
-        let (mut s0, mut s1) = wal.cksum;
         let n = pages.len();
         let frame_len = WAL_FRAME_HDR_LEN + page_size;
+        // Frames written this commit, to publish into the shared index after sync:
+        // (page_no, commit_db_size, bytes, next append offset, running checksum).
+        let mut appended: Vec<AppendedFrame> = Vec::with_capacity(n);
         for (i, (page_no, data)) in pages.iter().enumerate() {
             // The last frame of the commit carries the post-commit db size.
-            let db_size = if i + 1 == n { self.page_count } else { 0 };
+            let db_size = if i + 1 == n { new_count } else { 0 };
             let mut fhdr = [0u8; WAL_FRAME_HDR_LEN];
             fhdr[0..4].copy_from_slice(&page_no.to_be_bytes());
             fhdr[4..8].copy_from_slice(&db_size.to_be_bytes());
             fhdr[8..16].copy_from_slice(&salt);
-            let (c0, c1) = super::wal::checksum(false, s0, s1, &fhdr[0..8]);
+            let (c0, c1) = super::wal::checksum(false, cksum.0, cksum.1, &fhdr[0..8]);
             let (c0, c1) = super::wal::checksum(false, c0, c1, data);
             fhdr[16..20].copy_from_slice(&c0.to_be_bytes());
             fhdr[20..24].copy_from_slice(&c1.to_be_bytes());
             let mut frame = Vec::with_capacity(frame_len);
             frame.extend_from_slice(&fhdr);
             frame.extend_from_slice(data);
-            file.write_all_at(&frame, wal.offset)?;
-            wal.offset += frame_len as u64;
-            s0 = c0;
-            s1 = c1;
+            file.write_all_at(&frame, offset)?;
+            offset += frame_len as u64;
+            cksum = (c0, c1);
+            appended.push((*page_no, db_size, data.clone(), offset, cksum));
         }
         file.sync()?;
-        wal.cksum = (s0, s1);
-        wal.db_size = self.page_count;
-        for (page_no, data) in pages {
-            wal.frames.insert(page_no, data);
-        }
+
+        // Publish the durable frames into the shared wal-index and refresh this
+        // connection's snapshot to include its own writes.
+        wal.salt = salt;
+        let snapshot = index.with(|ix| {
+            for (page_no, db_size, data, next_off, ck) in appended {
+                ix.append(page_no, db_size, salt, data, next_off, ck, page_size as u32);
+            }
+            ix.snapshot()
+        });
+        wal.snapshot.set(snapshot);
+        wal.db_size.set(new_count);
         self.overlay.clear();
         self.savepoints.clear();
         // WAL writers serialize via the write-intent lock taken in write_page;
@@ -1543,42 +1699,76 @@ impl WritePager {
         Ok(())
     }
 
-    /// Checkpoint: write all WAL frames back into the main database file, reset
-    /// the `-wal` file, and keep WAL mode active with fresh salts.
+    /// Checkpoint: fold all committed WAL frames into the main database file, and
+    /// — if no other in-process reader is still pinned to an older WAL snapshot —
+    /// reset the `-wal` file and shared index with fresh salts. If a sibling reader
+    /// *is* pinned, the frames are still backfilled into the main file (safe: the
+    /// main file catches up) but the WAL log is left intact so that reader keeps
+    /// resolving the frames its snapshot needs, matching `wal.c`'s "checkpoint
+    /// cannot pass an active reader" rule.
     pub fn checkpoint(&mut self) -> Result<()> {
         let Some(wal) = self.wal.as_mut() else {
             return Ok(());
         };
         let page_size = self.page_size as u64;
-        let frames: Vec<(u32, Vec<u8>)> = wal.frames.iter().map(|(k, v)| (*k, v.clone())).collect();
-        let db_size = wal.db_size;
+        let index = wal.index.clone();
+        let salt = wal.salt;
+        // Snapshot the full log and decide whether it is safe to reset.
+        let (frames, full_db_size, can_reset) = index.with(|ix| {
+            let mx = ix.mx_frame();
+            // Safe to reset only when every pinned reader is already at the full
+            // high-water mark (they need nothing that a reset would drop). This
+            // connection's own snapshot does not block a reset — it is refreshed
+            // below to the post-checkpoint state.
+            let others_ok = ix.min_reader_mark().map(|m| m >= mx).unwrap_or(true);
+            (ix.checkpoint_pages(), ix.full_db_size(), others_ok)
+        });
+        if frames.is_empty() {
+            return Ok(());
+        }
         for (page_no, data) in &frames {
             self.file
                 .write_all_at(data, (*page_no as u64 - 1) * page_size)?;
         }
-        self.file.truncate(db_size as u64 * page_size)?;
+        self.file.truncate(full_db_size as u64 * page_size)?;
         self.file.sync()?;
-        self.disk_pages = db_size;
+        self.disk_pages = full_db_size;
         // The checkpoint rewrote the main file; drop the clean read cache.
         self.read_cache.borrow_mut().clear();
-        // Reset the WAL: empty it and restart with a new salt.
-        if let Some(w) = self.wal_file.as_mut() {
-            w.truncate(0)?;
-            w.sync()?;
+
+        if can_reset {
+            // No pinned sibling reader needs the WAL: empty it and restart with a
+            // fresh salt so subsequent writes begin a new WAL generation.
+            if let Some(w) = self.wal_file.as_mut() {
+                w.truncate(0)?;
+                w.sync()?;
+            }
+            let new_salt = {
+                let mut s = salt;
+                let v = u32::from_be_bytes([s[0], s[1], s[2], s[3]]).wrapping_add(1);
+                s[0..4].copy_from_slice(&v.to_be_bytes());
+                s
+            };
+            let snapshot = index.with(|ix| {
+                ix.reset(new_salt);
+                ix.snapshot()
+            });
+            self.wal = Some(WalRuntime {
+                index,
+                snapshot: Cell::new(snapshot),
+                registered_mark: Cell::new(None),
+                db_size: Cell::new(full_db_size),
+                salt: new_salt,
+            });
+        } else {
+            // A sibling reader is still pinned; keep the WAL log intact. This
+            // connection now reads from the freshly-checkpointed main file, so pin
+            // its snapshot at the current high-water mark (its own reads see the
+            // WAL frames it just backfilled, which equal the main file).
+            let wal = self.wal.as_mut().expect("wal mode");
+            wal.db_size.set(full_db_size);
+            wal.snapshot.set(index.with(|ix| ix.snapshot()));
         }
-        let new_salt = {
-            let mut s = wal.salt;
-            let v = u32::from_be_bytes([s[0], s[1], s[2], s[3]]).wrapping_add(1);
-            s[0..4].copy_from_slice(&v.to_be_bytes());
-            s
-        };
-        self.wal = Some(WalRuntime {
-            frames: BTreeMap::new(),
-            offset: 0,
-            cksum: (0, 0),
-            salt: new_salt,
-            db_size,
-        });
         Ok(())
     }
 
@@ -1604,42 +1794,59 @@ impl WritePager {
         // The whole file was rewritten; drop the clean read cache.
         self.read_cache.borrow_mut().clear();
         // Reset any WAL: its frames now refer to the pre-VACUUM image.
-        if self.wal.is_some() {
-            if let Some(w) = self.wal_file.as_mut() {
-                w.truncate(0)?;
-                w.sync()?;
+        if let Some(w) = self.wal.as_ref() {
+            let index = w.index.clone();
+            if let Some(f) = self.wal_file.as_mut() {
+                f.truncate(0)?;
+                f.sync()?;
             }
             self.header.read_version = 2;
             self.header.write_version = 2;
+            let salt = (count as u64).wrapping_mul(0x9E37_79B9).to_be_bytes();
+            let snapshot = index.with(|ix| {
+                ix.reset(salt);
+                ix.snapshot()
+            });
             self.wal = Some(WalRuntime {
-                frames: BTreeMap::new(),
-                offset: 0,
-                cksum: (0, 0),
-                salt: (count as u64).wrapping_mul(0x9E37_79B9).to_be_bytes(),
-                db_size: count,
+                index,
+                snapshot: Cell::new(snapshot),
+                registered_mark: Cell::new(None),
+                db_size: Cell::new(count),
+                salt,
             });
         }
         Ok(())
     }
 
-    /// Load committed frames from an existing `-wal` file (used on open). Returns
-    /// the runtime state positioned to append after the last valid frame, or
-    /// `None` if the WAL is empty/invalid.
-    fn load_wal(wal: &mut dyn File, page_size: usize) -> Result<Option<WalRuntime>> {
+    /// Attach to the shared wal-index for this database (used on open, ROADMAP
+    /// C9c). The **on-disk `-wal` is authoritative**: it is always parsed to
+    /// establish the committed state (so a reopen after a crash trusts the disk,
+    /// not a stale in-memory index). The shared index is then reconciled — adopted
+    /// as-is when it already matches the disk (a live sibling published it in
+    /// lockstep), or reseeded from the disk otherwise. Returns the per-connection
+    /// [`WalRuntime`] with a fresh read snapshot, or `None` if there is no
+    /// committed WAL data.
+    fn attach_wal(wal: &mut dyn File, page_size: usize) -> Result<Option<WalRuntime>> {
+        let index = wal.wal_index().unwrap_or_default();
+
+        // Parse the on-disk `-wal` (authoritative committed state).
         let size = wal.size()?;
         if size < WAL_HDR_LEN as u64 {
-            return Ok(None);
+            // No on-disk WAL. If a sibling has a live in-memory index (e.g. an
+            // in-memory VFS whose truncate keeps the bytes but the index holds the
+            // committed frames), adopt it; otherwise there is nothing to attach.
+            return Self::attach_from_index_only(index);
         }
         let mut hdr = [0u8; WAL_HDR_LEN];
         wal.read_exact_at(&mut hdr, 0)?;
         let magic = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
         if magic & 0xFFFF_FFFE != WAL_MAGIC_LE {
-            return Ok(None);
+            return Self::attach_from_index_only(index);
         }
         let big_endian = (magic & 1) == 1;
         let wal_ps = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
         if wal_ps != page_size {
-            return Ok(None);
+            return Self::attach_from_index_only(index);
         }
         let mut salt = [0u8; 8];
         salt.copy_from_slice(&hdr[16..24]);
@@ -1647,16 +1854,18 @@ impl WritePager {
         if h0 != u32::from_be_bytes([hdr[24], hdr[25], hdr[26], hdr[27]])
             || h1 != u32::from_be_bytes([hdr[28], hdr[29], hdr[30], hdr[31]])
         {
-            return Ok(None);
+            return Self::attach_from_index_only(index);
         }
         let frame_len = WAL_FRAME_HDR_LEN + page_size;
         let (mut s0, mut s1) = (h0, h1);
         let mut off = WAL_HDR_LEN as u64;
-        let mut frames: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-        let mut pending: Vec<(u32, Vec<u8>)> = Vec::new();
-        let mut db_size = 0u32;
+        // Every valid frame in commit order: (page_no, commit_db_size, data).
+        let mut log: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+        // The count/offset/cksum as of the last *committed* frame.
+        let mut committed_len = 0usize;
         let mut committed_off = WAL_HDR_LEN as u64;
         let mut committed_cksum = (h0, h1);
+        let mut db_size = 0u32;
         while off + frame_len as u64 <= size {
             let mut fhdr = [0u8; WAL_FRAME_HDR_LEN];
             wal.read_exact_at(&mut fhdr, off)?;
@@ -1676,26 +1885,63 @@ impl WritePager {
             s1 = c1;
             let page_no = u32::from_be_bytes([fhdr[0], fhdr[1], fhdr[2], fhdr[3]]);
             let commit = u32::from_be_bytes([fhdr[4], fhdr[5], fhdr[6], fhdr[7]]);
-            pending.push((page_no, page));
+            log.push((page_no, commit, page));
             off += frame_len as u64;
             if commit != 0 {
-                for (p, d) in pending.drain(..) {
-                    frames.insert(p, d);
-                }
-                db_size = commit;
+                committed_len = log.len();
                 committed_off = off;
                 committed_cksum = (s0, s1);
+                db_size = commit;
             }
         }
-        if frames.is_empty() {
+        if committed_len == 0 {
+            // The on-disk WAL has no complete commit. Do not adopt a stale index —
+            // the disk is authoritative and says nothing is committed.
+            return Ok(None);
+        }
+        // Drop any trailing frames past the last commit (torn/uncommitted tail).
+        log.truncate(committed_len);
+        let snapshot = index.with(|ix| {
+            // Reconcile: keep the shared index only if it already matches the disk
+            // exactly (same salt and same committed extent — a live sibling
+            // published it). Otherwise the disk is authoritative: reseed.
+            let matches_disk = ix.writer_state().is_some_and(|(off, _, s, ps)| {
+                off == committed_off && s == salt && ps == page_size as u32
+            });
+            if !matches_disk {
+                ix.seed(log, salt, committed_off, committed_cksum, page_size as u32);
+            }
+            ix.snapshot()
+        });
+        Ok(Some(WalRuntime {
+            index,
+            snapshot: Cell::new(snapshot),
+            registered_mark: Cell::new(None),
+            db_size: Cell::new(db_size),
+            salt,
+        }))
+    }
+
+    /// Attach purely from a live in-memory shared index when the on-disk `-wal`
+    /// carries no parseable committed state (e.g. a `MemoryVfs` whose `-wal` bytes
+    /// were reset but whose shared index still holds the sibling's frames).
+    /// Returns `None` if the index is also empty.
+    fn attach_from_index_only(index: SharedWalIndex) -> Result<Option<WalRuntime>> {
+        let (snapshot, db_size, salt) = index.with(|ix| {
+            let snap = ix.snapshot();
+            let db = ix.snapshot_db_size(snap.mx_frame).unwrap_or(0);
+            let salt = ix.writer_state().map(|(_, _, s, _)| s).unwrap_or([0; 8]);
+            (snap, db, salt)
+        });
+        if db_size == 0 {
             return Ok(None);
         }
         Ok(Some(WalRuntime {
-            frames,
-            offset: committed_off,
-            cksum: committed_cksum,
+            index,
+            snapshot: Cell::new(snapshot),
+            registered_mark: Cell::new(None),
+            db_size: Cell::new(db_size),
             salt,
-            db_size,
         }))
     }
 
@@ -1895,7 +2141,15 @@ impl PageSource for WritePager {
         self.header.usable_size() as usize
     }
     fn page_count(&self) -> u32 {
-        self.page_count
+        // In WAL mode, reads see the snapshot's page count (which a sibling's
+        // commit may have advanced beyond this connection's own logical count).
+        // While a write transaction is staged (overlay non-empty) the logical
+        // count is authoritative — the writer is mid-transaction over its own
+        // pages. Outside WAL, the logical count as before.
+        match &self.wal {
+            Some(w) if self.overlay.is_empty() => w.db_size.get(),
+            _ => self.page_count,
+        }
     }
     fn revalidate_cache(&self) {
         self.revalidate_read_cache();

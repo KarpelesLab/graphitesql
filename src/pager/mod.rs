@@ -28,7 +28,7 @@ pub mod pcache;
 pub mod wal;
 pub mod write;
 pub use pcache::PageCache;
-pub use wal::WalReader;
+pub use wal::{SharedWalIndex, WalIndex, WalReader, WalSnapshot};
 pub use write::{AutoVacuum, WritePager};
 
 /// A single database page: its number and its raw bytes.

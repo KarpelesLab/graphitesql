@@ -201,6 +201,25 @@ pub trait File {
     fn unlock(&self, _level: LockLevel) -> Result<()> {
         Ok(())
     }
+
+    /// The shared **wal-index** for this file's path, if the VFS provides one
+    /// (ROADMAP C9c).
+    ///
+    /// In WAL mode the newest committed version of a page may live in the `-wal`
+    /// file; a coherent page→latest-frame map lets *multiple* in-process
+    /// `Connection`s reading the same file each resolve the correct latest
+    /// committed frame, and lets a reader hold a stable snapshot across a
+    /// concurrent writer's commits. The built-in VFSs return a per-path handle
+    /// (shared by every open handle to the same path, exactly like the
+    /// [`LockState`] registry); a host-provided file that does its own WAL
+    /// coordination — or any non-`-wal` file — returns `None` (the default), in
+    /// which case the pager falls back to a private per-connection index.
+    ///
+    /// This is called on the `-wal` companion file handle, which is the natural
+    /// per-path carrier for the index.
+    fn wal_index(&self) -> Option<crate::pager::SharedWalIndex> {
+        None
+    }
 }
 
 /// A virtual file system: opens, deletes, and probes files by name.

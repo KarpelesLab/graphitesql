@@ -29,6 +29,10 @@ type SharedLocks = Rc<RefCell<LockState>>;
 struct FileEntry {
     bytes: SharedBytes,
     locks: SharedLocks,
+    /// The shared wal-index for this path (ROADMAP C9c), shared by every open
+    /// handle to it so multiple in-process connections resolve WAL frames
+    /// coherently. Lazily populated by the pager on first WAL use.
+    wal_index: crate::pager::SharedWalIndex,
 }
 
 /// An in-memory virtual file system.
@@ -56,6 +60,7 @@ impl Vfs for MemoryVfs {
                 let e = FileEntry {
                     bytes: Rc::new(RefCell::new(Vec::new())),
                     locks: Rc::new(RefCell::new(LockState::default())),
+                    wal_index: crate::pager::SharedWalIndex::new(),
                 };
                 files.insert(String::from(path), e.clone());
                 e
@@ -64,6 +69,7 @@ impl Vfs for MemoryVfs {
         Ok(Box::new(MemoryFile {
             bytes: entry.bytes,
             locks: entry.locks,
+            wal_index: entry.wal_index,
             level: Cell::new(LockLevel::Unlocked),
         }))
     }
@@ -83,6 +89,9 @@ pub struct MemoryFile {
     bytes: SharedBytes,
     /// Lock state shared with every other handle to the same path.
     locks: SharedLocks,
+    /// The shared wal-index for this path (ROADMAP C9c), shared with every other
+    /// handle to the same path so in-process connections read WAL coherently.
+    wal_index: crate::pager::SharedWalIndex,
     /// The lock level this handle currently holds. A `Cell` so `lock`/`unlock`
     /// can take `&self` (see [`File::lock`]).
     level: Cell<LockLevel>,
@@ -152,6 +161,10 @@ impl File for MemoryFile {
             self.level.set(level);
         }
         Ok(())
+    }
+
+    fn wal_index(&self) -> Option<crate::pager::SharedWalIndex> {
+        Some(self.wal_index.clone())
     }
 }
 

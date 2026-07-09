@@ -57,6 +57,24 @@ fn locks_for(path: &str) -> Arc<Mutex<LockState>> {
     reg.entry(path.to_string()).or_default().clone()
 }
 
+/// Process-global registry of per-path wal-indexes (ROADMAP C9c). Real files are
+/// process-global, so every `StdFile` handle to the same `-wal` path shares one
+/// wal-index, letting multiple in-process `Connection`s read WAL frames
+/// coherently. Like [`lock_registry`], this is process-local coordination (no
+/// cross-process `-shm`); a host needing multi-process WAL supplies its own VFS.
+fn wal_index_registry() -> &'static Mutex<HashMap<String, crate::pager::SharedWalIndex>> {
+    static REG: OnceLock<Mutex<HashMap<String, crate::pager::SharedWalIndex>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The shared wal-index for `path`, creating it on first use.
+fn wal_index_for(path: &str) -> crate::pager::SharedWalIndex {
+    let mut reg = wal_index_registry()
+        .lock()
+        .expect("wal-index registry poisoned");
+    reg.entry(path.to_string()).or_default().clone()
+}
+
 /// A virtual file system over the real local file system.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StdVfs;
@@ -89,6 +107,7 @@ impl Vfs for StdVfs {
         Ok(Box::new(StdFile {
             inner: Mutex::new(file),
             locks: locks_for(path),
+            wal_index: wal_index_for(path),
             level: AtomicLockLevel::new(LockLevel::Unlocked),
         }))
     }
@@ -111,6 +130,8 @@ pub struct StdFile {
     inner: Mutex<fs::File>,
     /// The process-shared lock state for this file's path.
     locks: Arc<Mutex<LockState>>,
+    /// The process-shared wal-index for this file's path (ROADMAP C9c).
+    wal_index: crate::pager::SharedWalIndex,
     /// The lock level this handle currently holds. Atomic so `lock`/`unlock` can
     /// take `&self` (see [`File::lock`]) without making `StdFile` `!Sync`.
     level: AtomicLockLevel,
@@ -185,6 +206,10 @@ impl File for StdFile {
             self.level.set(level);
         }
         Ok(())
+    }
+
+    fn wal_index(&self) -> Option<crate::pager::SharedWalIndex> {
+        Some(self.wal_index.clone())
     }
 }
 
