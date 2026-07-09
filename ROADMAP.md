@@ -227,9 +227,16 @@ result or declines to it — never a wrong answer), so this track is
   it risks a silent false-negative that wouldn't fall back; needs the tree-walker's
   affinity machinery threaded in first).
 - **B5c-2 — correlated subqueries on the VDBE.** Any subquery reading an outer
-  column defers today. (a) thread the outer row into the subquery's register frame;
-  (b) compile `Subquery`/`Exists`/`InSelect` that read an outer column. Best done
-  after B5b-2 lands the live-cursor machinery.
+  column defers to the tree-walker today. *Attempted and reverted (2026-07-09,
+  revert 0623182):* a runtime callback re-running the subquery per outer row
+  cannot replicate sqlite's **PREPARE-time validation** — an invalid subquery over
+  a zero-row outer scan (`(SELECT 1,2)`, `(SELECT unknown.col)` over an empty
+  table) is never evaluated, so graphite silently accepted what sqlite rejects
+  (regressed `row_value_misuse` + `subquery_body_columns`, caught by CI). The redo
+  must **validate the subquery body at compile time** (resolve every column against
+  the scope, check scalar arity) and route only provably-valid correlated
+  subqueries, bailing the rest to the tree-walker. Low priority — no user-visible
+  benefit (results already match via the tree-walker).
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).
 
