@@ -771,3 +771,179 @@ fn apply_vs_oracle_broader_shapes() {
         "CREATE TABLE t(a TEXT PRIMARY KEY,b,c) WITHOUT ROWID; INSERT INTO t VALUES('x',1,2);",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Changeset → changeset transforms: `Changeset::invert` / `Changeset::concat`
+// (roadmap D5). Byte-literal assertions always run; when `GRAPHITE_CSTOOL`
+// points at the C `cstool` oracle (amalgamation with SQLITE_ENABLE_SESSION),
+// the differential half also runs. `cstool` usage:
+//   cstool invert <hex>            -> hex of sqlite3changeset_invert
+//   cstool concat <hexA> <hexB>    -> hex of sqlite3changeset_concat
+// ---------------------------------------------------------------------------
+
+use graphitesql::Changeset;
+
+/// Ask the cstool oracle for `invert`/`concat` of hex changeset(s), or `None`
+/// if the oracle binary is not configured.
+fn cstool(args: &[&str]) -> Option<String> {
+    let bin = std::env::var("GRAPHITE_CSTOOL").ok()?;
+    let out = Command::new(bin).args(args).output().expect("run cstool");
+    assert!(
+        out.status.success(),
+        "cstool {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Assert `Changeset::invert(cs)` equals `expect` (byte literal) and, when the
+/// oracle is configured, the oracle's invert too.
+fn check_invert(cs_hex: &str, expect: &str) {
+    let cs: Vec<u8> = (0..cs_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&cs_hex[i..i + 2], 16).unwrap())
+        .collect();
+    let got = hex(&Changeset::invert(&cs).unwrap());
+    assert_eq!(got, expect, "invert byte-literal mismatch");
+    if let Some(oracle) = cstool(&["invert", cs_hex]) {
+        assert_eq!(got, oracle, "invert vs oracle mismatch");
+    }
+}
+
+/// Assert `Changeset::concat(a, b)` equals `expect` and, when configured, the
+/// oracle's concat too.
+fn check_concat(a_hex: &str, b_hex: &str, expect: &str) {
+    let dec = |h: &str| -> Vec<u8> {
+        (0..h.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
+            .collect()
+    };
+    let got = hex(&Changeset::concat(&dec(a_hex), &dec(b_hex)).unwrap());
+    assert_eq!(got, expect, "concat byte-literal mismatch");
+    if let Some(oracle) = cstool(&["concat", a_hex, b_hex]) {
+        assert_eq!(got, oracle, "concat vs oracle mismatch");
+    }
+}
+
+#[test]
+fn invert_insert_becomes_delete() {
+    // INSERT (1,2) -> DELETE (1,2): only the op byte 0x12 -> 0x09 changes.
+    check_invert(
+        "5402010074001200010000000000000001010000000000000002",
+        "5402010074000900010000000000000001010000000000000002",
+    );
+}
+
+#[test]
+fn invert_delete_becomes_insert() {
+    check_invert(
+        "5402010074000900010000000000000001010000000000000007",
+        "5402010074001200010000000000000001010000000000000007",
+    );
+}
+
+#[test]
+fn invert_update_swaps_old_and_new() {
+    // UPDATE b: 2 -> 9 inverts to 9 -> 2 (PK unchanged, unchanged col omitted).
+    check_invert(
+        "540301000074001700010000000000000001010000000000000002000001000000000000000900",
+        "540301000074001700010000000000000001010000000000000009000001000000000000000200",
+    );
+}
+
+#[test]
+fn concat_insert_then_update_is_insert_of_final() {
+    check_concat(
+        "540301000074001200010000000000000001010000000000000002010000000000000003",
+        "540301000074001700010000000000000001010000000000000002000001000000000000000900",
+        "540301000074001200010000000000000001010000000000000009010000000000000003",
+    );
+}
+
+#[test]
+fn concat_update_then_delete_is_delete_of_original() {
+    check_concat(
+        "540301000074001700010000000000000001010000000000000002000001000000000000000900",
+        "540301000074000900010000000000000001010000000000000009010000000000000003",
+        "540301000074000900010000000000000001010000000000000002010000000000000003",
+    );
+}
+
+#[test]
+fn concat_delete_then_insert_is_update() {
+    check_concat(
+        "540301000074000900010000000000000001010000000000000002010000000000000003",
+        "540301000074001200010000000000000001010000000000000005010000000000000006",
+        "54030100007400170001000000000000000101000000000000000201000000000000000300010000000000000005010000000000000006",
+    );
+}
+
+#[test]
+fn concat_insert_then_delete_is_nothing() {
+    // A: INSERT (1,2,3); B: DELETE (1,2,3) -> empty changeset.
+    check_concat(
+        "540301000074001200010000000000000001010000000000000002010000000000000003",
+        "540301000074000900010000000000000001010000000000000002010000000000000003",
+        "",
+    );
+}
+
+#[test]
+fn invert_roundtrip_apply_undoes_original() {
+    // Applying invert(cs) after cs restores the pre-cs state.
+    let setup =
+        "CREATE TABLE t(a INTEGER PRIMARY KEY,b,c); INSERT INTO t VALUES(1,10,100),(2,20,200);";
+    let cs = make_changeset(
+        setup,
+        "INSERT INTO t VALUES(3,30,300); UPDATE t SET b=99 WHERE a=1; DELETE FROM t WHERE a=2;",
+    );
+    let inv = Changeset::invert(&cs).unwrap();
+
+    let mut conn = Connection::open_memory().unwrap();
+    conn.execute_batch(setup).unwrap();
+    let before = dump_t(&conn);
+    conn.changeset_apply(&cs).unwrap();
+    conn.changeset_apply(&inv).unwrap();
+    assert_eq!(dump_t(&conn), before, "invert did not round-trip");
+}
+
+#[test]
+fn concat_apply_equals_sequential_apply() {
+    let setup =
+        "CREATE TABLE t(a INTEGER PRIMARY KEY,b,c); INSERT INTO t VALUES(1,10,100),(2,20,200);";
+    let a = make_changeset(
+        setup,
+        "UPDATE t SET b=11 WHERE a=1; INSERT INTO t VALUES(3,30,300);",
+    );
+
+    // Record B on the state after A.
+    let mut conn = Connection::open_memory().unwrap();
+    conn.execute_batch(setup).unwrap();
+    conn.changeset_apply(&a).unwrap();
+    let sess = conn.create_session();
+    sess.attach();
+    conn.execute_batch(
+        "UPDATE t SET c=999 WHERE a=1; DELETE FROM t WHERE a=2; UPDATE t SET b=33 WHERE a=3;",
+    )
+    .unwrap();
+    let b = conn.session_changeset(&sess).unwrap();
+
+    let cat = Changeset::concat(&a, &b).unwrap();
+
+    // apply(concat) vs apply(a) then apply(b).
+    let via_cat = {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute_batch(setup).unwrap();
+        c.changeset_apply(&cat).unwrap();
+        dump_t(&c)
+    };
+    let via_seq = {
+        let mut c = Connection::open_memory().unwrap();
+        c.execute_batch(setup).unwrap();
+        c.changeset_apply(&a).unwrap();
+        c.changeset_apply(&b).unwrap();
+        dump_t(&c)
+    };
+    assert_eq!(via_cat, via_seq, "concat apply != sequential apply");
+}

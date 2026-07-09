@@ -749,6 +749,624 @@ pub(crate) fn parse_changeset(data: &[u8]) -> Result<Vec<TableChangeset>> {
     Ok(tables)
 }
 
+// ---------------------------------------------------------------------------
+// Changeset → changeset transforms: `invert` and `concat`.
+//
+// These are *pure* byte transforms over the changeset format — they need no
+// database and no exec-layer support. They reproduce SQLite's
+// `sqlite3changeset_invert` and `sqlite3changeset_concat` (the latter via an
+// in-memory change-group), byte-for-byte.
+// ---------------------------------------------------------------------------
+
+/// Length in bytes of the serialized field beginning at `a[0]` (SQLite's
+/// `sessionSerialLen`). The leading byte is the type marker: `0x00` (omitted)
+/// and `0xFF` (an internal "undefined" marker, never present in a well-formed
+/// changeset but handled for completeness) are one byte; `T_NULL` is one byte;
+/// `T_INT`/`T_FLOAT` are nine (type + 8-byte payload); text/blob are the type
+/// byte, a varint length, and that many payload bytes.
+fn serial_len(a: &[u8]) -> Result<usize> {
+    let e = *a.first().ok_or_else(|| corrupt("truncated record field"))?;
+    match e {
+        0x00 | 0xFF | T_NULL => Ok(1),
+        T_INT | T_FLOAT => {
+            if a.len() < 9 {
+                return Err(corrupt("truncated int/float field"));
+            }
+            Ok(9)
+        }
+        T_TEXT | T_BLOB => {
+            // Read the varint length starting at a[1], then add its own byte
+            // count plus the type byte and payload.
+            let mut r = Reader::new(a);
+            r.pos = 1;
+            let n = r.varint()? as usize;
+            let nvar = r.pos - 1;
+            r.pos
+                .checked_add(n)
+                .filter(|e| *e <= a.len())
+                .ok_or_else(|| corrupt("truncated text/blob field"))?;
+            Ok(1 + nvar + n)
+        }
+        other => Err(corrupt(&alloc::format!(
+            "unknown changeset value type {other}"
+        ))),
+    }
+}
+
+/// Split the record of `ncol` serialized fields at the start of `a` into a
+/// vector of per-field byte slices, and return them together with the total
+/// number of bytes consumed. Each slice includes the field's type byte and any
+/// payload (an omitted field is the single byte `0x00`).
+fn split_record(a: &[u8], ncol: usize) -> Result<(Vec<&[u8]>, usize)> {
+    let mut fields = Vec::with_capacity(ncol);
+    let mut off = 0usize;
+    for _ in 0..ncol {
+        let n = serial_len(&a[off..])?;
+        fields.push(&a[off..off + n]);
+        off += n;
+    }
+    Ok((fields, off))
+}
+
+/// A parsed table header from a changeset: the `'T'`-record's column count,
+/// `abPK` flag bytes, and name — plus the full serialized header bytes (from
+/// the `'T'` byte through the name's NUL terminator) so it can be re-emitted
+/// verbatim.
+struct TableHdr {
+    ncol: usize,
+    pk_flags: Vec<u8>,
+    name: Vec<u8>,
+    /// The verbatim header bytes `T <ncol-varint> <abPK…> <name> 00`.
+    raw: Vec<u8>,
+}
+
+/// Read a `'T'` table header at the reader's current position (which must be on
+/// the `'T'` byte). Advances past the NUL-terminated name.
+fn read_table_hdr(r: &mut Reader<'_>) -> Result<TableHdr> {
+    let start = r.pos;
+    let t = r.u8()?;
+    debug_assert_eq!(t, b'T');
+    let ncol = r.varint()? as usize;
+    if ncol == 0 {
+        return Err(corrupt("table has zero columns"));
+    }
+    let mut pk_flags = Vec::with_capacity(ncol);
+    for _ in 0..ncol {
+        pk_flags.push(r.u8()?);
+    }
+    let name_start = r.pos;
+    loop {
+        if r.u8()? == 0 {
+            break;
+        }
+    }
+    let name = r.data[name_start..r.pos - 1].to_vec();
+    let raw = r.data[start..r.pos].to_vec();
+    Ok(TableHdr {
+        ncol,
+        pk_flags,
+        name,
+        raw,
+    })
+}
+
+/// Invert a changeset, mirroring `sqlite3changeset_invert`.
+///
+/// `INSERT` records become `DELETE` and vice-versa (op byte flipped, indirect
+/// flag and the record copied verbatim). For an `UPDATE`, the op and indirect
+/// flag are preserved and the two records are rebuilt: the inverted **old.\***
+/// record takes the primary-key columns from the original old.\* record and the
+/// other columns from the original new.\* record; the inverted **new.\*** record
+/// copies the original old.\* record except the primary-key columns, which
+/// become the "undefined"/omitted marker. Table headers pass through unchanged.
+///
+/// Returns [`crate::error::Error::Corrupt`] if `changeset` is not a well-formed
+/// changeset.
+pub(crate) fn invert(changeset: &[u8]) -> Result<Vec<u8>> {
+    let mut r = Reader::new(changeset);
+    let mut out = Vec::with_capacity(changeset.len());
+    let mut ncol = 0usize;
+    let mut pk_flags: Vec<u8> = Vec::new();
+
+    while !r.eof() {
+        match r.peek()? {
+            b'T' => {
+                let hdr = read_table_hdr(&mut r)?;
+                out.extend_from_slice(&hdr.raw);
+                ncol = hdr.ncol;
+                pk_flags = hdr.pk_flags;
+            }
+            op @ (OP_INSERT | OP_DELETE) => {
+                r.u8()?;
+                let indirect = r.u8()?;
+                let (_, consumed) = split_record(&r.data[r.pos..], ncol)?;
+                let rec = r.take(consumed)?;
+                out.push(if op == OP_INSERT {
+                    OP_DELETE
+                } else {
+                    OP_INSERT
+                });
+                out.push(indirect);
+                out.extend_from_slice(rec);
+            }
+            OP_UPDATE => {
+                r.u8()?;
+                let indirect = r.u8()?;
+                let (old, n_old) = {
+                    let (f, n) = split_record(&r.data[r.pos..], ncol)?;
+                    (f.into_iter().map(<[u8]>::to_vec).collect::<Vec<_>>(), n)
+                };
+                r.pos += n_old;
+                let (new, n_new) = {
+                    let (f, n) = split_record(&r.data[r.pos..], ncol)?;
+                    (f.into_iter().map(<[u8]>::to_vec).collect::<Vec<_>>(), n)
+                };
+                r.pos += n_new;
+
+                out.push(OP_UPDATE);
+                out.push(indirect);
+                // New old.*: PK columns from old old.*, others from old new.*.
+                for i in 0..ncol {
+                    let is_pk = pk_flags.get(i).copied().unwrap_or(0) != 0;
+                    out.extend_from_slice(if is_pk { &old[i] } else { &new[i] });
+                }
+                // New new.*: old old.* except PK columns → omitted (0x00).
+                for (i, field) in old.iter().enumerate().take(ncol) {
+                    let is_pk = pk_flags.get(i).copied().unwrap_or(0) != 0;
+                    if is_pk {
+                        out.push(T_OMIT);
+                    } else {
+                        out.extend_from_slice(field);
+                    }
+                }
+            }
+            other => {
+                return Err(corrupt(&alloc::format!(
+                    "unexpected marker byte {other:#x}"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+// --- concat (in-memory change-group) --------------------------------------
+
+/// One coalesced change held in a [`ConcatTable`]'s hash: its op, indirect
+/// flag, and the raw record bytes. For `INSERT`/`DELETE` the record is the
+/// single value vector; for `UPDATE` it is the old.\* record followed by the
+/// new.\* record (`2 * ncol` fields).
+#[derive(Clone)]
+struct ConcatChange {
+    op: u8,
+    indirect: u8,
+    record: Vec<u8>,
+}
+
+/// Per-table hash of coalesced changes for [`concat`], reproducing SQLite's
+/// change-group bucket layout so the output order is byte-identical.
+struct ConcatTable {
+    ncol: usize,
+    pk_flags: Vec<u8>,
+    /// Table name (used to match a later changeset's header to this table).
+    name: Vec<u8>,
+    /// Verbatim table-header bytes, emitted before this table's changes.
+    hdr: Vec<u8>,
+    /// Hash buckets; each bucket is a LIFO chain (newest first).
+    buckets: Vec<Vec<ConcatChange>>,
+    nentry: usize,
+}
+
+impl ConcatTable {
+    fn new(hdr: &TableHdr) -> ConcatTable {
+        ConcatTable {
+            ncol: hdr.ncol,
+            pk_flags: hdr.pk_flags.clone(),
+            name: hdr.name.clone(),
+            hdr: hdr.raw.clone(),
+            buckets: Vec::new(),
+            nentry: 0,
+        }
+    }
+
+    /// Hash the primary-key fields of `record` into a bucket index, mirroring
+    /// SQLite's `sessionChangeHash` (which hashes only the PK columns, using the
+    /// same append steps as the recorder's [`TableChanges::hash_pk`]).
+    fn hash(&self, record: &[u8], nbucket: usize) -> Result<usize> {
+        let mut h = 0u32;
+        let mut off = 0usize;
+        for i in 0..self.ncol {
+            let n = serial_len(&record[off..])?;
+            let field = &record[off..off + n];
+            if self.pk_flags.get(i).copied().unwrap_or(0) != 0 {
+                let ty = field[0];
+                h = TableChanges::hash_append(h, u32::from(ty));
+                match ty {
+                    T_INT | T_FLOAT => {
+                        let mut a = [0u8; 8];
+                        a.copy_from_slice(&field[1..9]);
+                        h = TableChanges::hash_i64(h, i64::from_be_bytes(a));
+                    }
+                    T_TEXT | T_BLOB => {
+                        // Skip the varint length; hash only the payload bytes.
+                        let mut rr = Reader::new(field);
+                        rr.pos = 1;
+                        let nb = rr.varint()? as usize;
+                        h = TableChanges::hash_blob(h, &field[rr.pos..rr.pos + nb]);
+                    }
+                    // T_NULL contributes only its type byte (already appended).
+                    _ => {}
+                }
+            }
+            off += n;
+        }
+        Ok((h % nbucket as u32) as usize)
+    }
+
+    /// Whether two records refer to the same row (equal PK fields), comparing
+    /// the raw serialized bytes as SQLite's `sessionChangeEqual` does.
+    fn pk_equal(&self, a: &[u8], b: &[u8]) -> Result<bool> {
+        let mut oa = 0usize;
+        let mut ob = 0usize;
+        for i in 0..self.ncol {
+            let na = serial_len(&a[oa..])?;
+            let nb = serial_len(&b[ob..])?;
+            if self.pk_flags.get(i).copied().unwrap_or(0) != 0
+                && (na != nb || a[oa..oa + na] != b[ob..ob + nb])
+            {
+                return Ok(false);
+            }
+            oa += na;
+            ob += nb;
+        }
+        Ok(true)
+    }
+
+    /// Grow (or first-allocate) the bucket array, mirroring `sessionGrowHash`:
+    /// allocate 256 buckets on the first entry, then double whenever the entry
+    /// count reaches half the bucket count, rehashing (prepend, LIFO).
+    fn maybe_grow(&mut self) -> Result<()> {
+        let n = self.buckets.len();
+        if n == 0 || self.nentry >= n / 2 {
+            let new_n = if n == 0 { 256 } else { n * 2 };
+            let mut nb: Vec<Vec<ConcatChange>> = (0..new_n).map(|_| Vec::new()).collect();
+            for bucket in &self.buckets {
+                for change in bucket {
+                    let idx = self.hash(&change.record, new_n)?;
+                    nb[idx].insert(0, change.clone());
+                }
+            }
+            self.buckets = nb;
+        }
+        Ok(())
+    }
+
+    /// Add one change (op/indirect/record) to the hash, coalescing with any
+    /// existing change for the same row per SQLite's `sessionChangeMerge`.
+    fn add(&mut self, op: u8, indirect: u8, record: Vec<u8>) -> Result<()> {
+        self.maybe_grow()?;
+        let nbucket = self.buckets.len();
+        let idx = self.hash(&record, nbucket)?;
+        // Remove any existing change for this row (may be re-linked below).
+        let existing = {
+            let mut found = None;
+            for (j, c) in self.buckets[idx].iter().enumerate() {
+                if self.pk_equal(&c.record, &record)? {
+                    found = Some(j);
+                    break;
+                }
+            }
+            found.map(|j| {
+                self.nentry -= 1;
+                self.buckets[idx].remove(j)
+            })
+        };
+
+        let merged = self.merge(existing, op, indirect, record)?;
+        if let Some(c) = merged {
+            self.buckets[idx].insert(0, c);
+            self.nentry += 1;
+        }
+        Ok(())
+    }
+
+    /// Coalesce an existing change (if any) with the incoming one, returning the
+    /// merged change or `None` if the pair annihilates. Reproduces
+    /// `sessionChangeMerge`'s changeset (non-patchset, non-rebase) rules.
+    fn merge(
+        &self,
+        existing: Option<ConcatChange>,
+        op2: u8,
+        indirect2: u8,
+        rec2: Vec<u8>,
+    ) -> Result<Option<ConcatChange>> {
+        let Some(pexist) = existing else {
+            return Ok(Some(ConcatChange {
+                op: op2,
+                indirect: indirect2,
+                record: rec2,
+            }));
+        };
+        let op1 = pexist.op;
+        // Unsupported / discard-op2 combinations keep the existing change.
+        if (op1 == OP_INSERT && op2 == OP_INSERT)
+            || (op1 == OP_UPDATE && op2 == OP_INSERT)
+            || (op1 == OP_DELETE && op2 == OP_UPDATE)
+            || (op1 == OP_DELETE && op2 == OP_DELETE)
+        {
+            return Ok(Some(pexist));
+        }
+        // INSERT then DELETE → annihilate.
+        if op1 == OP_INSERT && op2 == OP_DELETE {
+            return Ok(None);
+        }
+
+        // Every remaining merge sets the new indirect flag to the AND of the two
+        // (SQLite: `bIndirect && pExist->bIndirect`).
+        let indirect = u8::from(indirect2 != 0 && pexist.indirect != 0);
+
+        let (op, record) = if op1 == OP_INSERT {
+            // INSERT + UPDATE → INSERT of merged new values. The INSERT record
+            // is a full row; the UPDATE's new.* record (second half of rec2)
+            // supplies changed columns.
+            debug_assert!(op2 == OP_UPDATE);
+            let (_, half) = split_record(&rec2, self.ncol)?;
+            let new_part = &rec2[half..];
+            let mut out = Vec::new();
+            self.merge_record(&mut out, &pexist.record, new_part)?;
+            (OP_INSERT, out)
+        } else if op1 == OP_DELETE {
+            // DELETE + INSERT → UPDATE from the deleted row to the inserted row.
+            debug_assert!(op2 == OP_INSERT);
+            let mut out = Vec::new();
+            let ok = self.merge_update(&mut out, &pexist.record, None, &rec2, None)?;
+            if !ok {
+                return Ok(None);
+            }
+            (OP_UPDATE, out)
+        } else if op2 == OP_UPDATE {
+            // UPDATE + UPDATE. SQLite calls
+            //   sessionMergeUpdate(aRec, aExist, aExist.new, aRec.new)
+            // where the merged old.* prefers the *existing* (earlier) change's
+            // old value and the merged new.* prefers the *incoming* change's new
+            // value — see `merge_update`, which always prefers its "two" record.
+            debug_assert!(op1 == OP_UPDATE);
+            let (_, half_e) = split_record(&pexist.record, self.ncol)?;
+            let (exist_old, exist_new) = pexist.record.split_at(half_e);
+            let (_, half_i) = split_record(&rec2, self.ncol)?;
+            let (in_old, in_new) = rec2.split_at(half_i);
+            let mut out = Vec::new();
+            // old1 = incoming.old, old2 = existing.old (prefer existing.old);
+            // new1 = existing.new, new2 = incoming.new (prefer incoming.new).
+            let ok =
+                self.merge_update(&mut out, in_old, Some(exist_old), exist_new, Some(in_new))?;
+            if !ok {
+                return Ok(None);
+            }
+            (OP_UPDATE, out)
+        } else {
+            // UPDATE + DELETE → DELETE of the original row.
+            debug_assert!(op1 == OP_UPDATE && op2 == OP_DELETE);
+            let (_, half1) = split_record(&pexist.record, self.ncol)?;
+            let old1 = &pexist.record[..half1];
+            let mut out = Vec::new();
+            self.merge_record(&mut out, &rec2, old1)?;
+            (OP_DELETE, out)
+        };
+
+        Ok(Some(ConcatChange {
+            op,
+            indirect,
+            record,
+        }))
+    }
+
+    /// Merge two single records field-by-field: take the right field when it is
+    /// present (non-`0x00`), else the left. Mirrors `sessionMergeRecord`.
+    fn merge_record(&self, out: &mut Vec<u8>, left: &[u8], right: &[u8]) -> Result<()> {
+        let mut lo = 0usize;
+        let mut ro = 0usize;
+        for _ in 0..self.ncol {
+            let nl = serial_len(&left[lo..])?;
+            let nr = serial_len(&right[ro..])?;
+            if right[ro] != 0 {
+                out.extend_from_slice(&right[ro..ro + nr]);
+            } else {
+                out.extend_from_slice(&left[lo..lo + nl]);
+            }
+            lo += nl;
+            ro += nr;
+        }
+        Ok(())
+    }
+
+    /// Merge two UPDATE changes on the same row, writing the combined old.\* and
+    /// new.\* records. Mirrors `sessionMergeUpdate` (changeset form). Returns
+    /// `false` (writing nothing) when the merged update has no effective change.
+    fn merge_update(
+        &self,
+        out: &mut Vec<u8>,
+        old1: &[u8],
+        old2: Option<&[u8]>,
+        new1: &[u8],
+        new2: Option<&[u8]>,
+    ) -> Result<bool> {
+        let start = out.len();
+
+        // old.* vector.
+        let mut co1 = 0usize;
+        let mut co2 = 0usize;
+        let mut cn1 = 0usize;
+        let mut cn2 = 0usize;
+        let mut required = false;
+        for i in 0..self.ncol {
+            let old = merge_value(old1, &mut co1, old2, &mut co2)?;
+            let new = merge_value(new1, &mut cn1, new2, &mut cn2)?;
+            let is_pk = self.pk_flags.get(i).copied().unwrap_or(0) != 0;
+            if is_pk || old != new {
+                if !is_pk {
+                    required = true;
+                }
+                out.extend_from_slice(old);
+            } else {
+                out.push(T_OMIT);
+            }
+        }
+        if !required {
+            out.truncate(start);
+            return Ok(false);
+        }
+
+        // new.* vector.
+        let mut co1 = 0usize;
+        let mut co2 = 0usize;
+        let mut cn1 = 0usize;
+        let mut cn2 = 0usize;
+        for i in 0..self.ncol {
+            let old = merge_value(old1, &mut co1, old2, &mut co2)?;
+            let new = merge_value(new1, &mut cn1, new2, &mut cn2)?;
+            let is_pk = self.pk_flags.get(i).copied().unwrap_or(0) != 0;
+            if is_pk || old == new {
+                out.push(T_OMIT);
+            } else {
+                out.extend_from_slice(new);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Advance through two parallel records, returning the field to use for the
+/// current column: the "two" field if present (non-`0x00`), else the "one"
+/// field. Both cursors advance past their current field. Mirrors
+/// `sessionMergeValue`. When `two` is `None`, always yields the "one" field.
+fn merge_value<'a>(
+    one: &'a [u8],
+    co: &mut usize,
+    two: Option<&'a [u8]>,
+    ct: &mut usize,
+) -> Result<&'a [u8]> {
+    let n1 = serial_len(&one[*co..])?;
+    let f1 = &one[*co..*co + n1];
+    let mut ret: Option<&[u8]> = None;
+    if let Some(two) = two {
+        let n2 = serial_len(&two[*ct..])?;
+        let f2 = &two[*ct..*ct + n2];
+        if f2[0] != 0 {
+            ret = Some(f2);
+        }
+        *ct += n2;
+    }
+    *co += n1;
+    Ok(ret.unwrap_or(f1))
+}
+
+/// Read every change of a changeset into the per-table concat hashes,
+/// preserving table first-encounter order across the whole call. `tables` is
+/// keyed by table name.
+fn concat_absorb(changeset: &[u8], tables: &mut Vec<ConcatTable>) -> Result<()> {
+    let mut r = Reader::new(changeset);
+    let mut cur: Option<usize> = None;
+    while !r.eof() {
+        match r.peek()? {
+            b'T' => {
+                let hdr = read_table_hdr(&mut r)?;
+                let idx = tables.iter().position(|t| t.name == hdr.name);
+                cur = Some(match idx {
+                    Some(i) => {
+                        // A later changeset must agree on shape.
+                        if tables[i].ncol != hdr.ncol || tables[i].pk_flags != hdr.pk_flags {
+                            return Err(corrupt("incompatible table definition in concat"));
+                        }
+                        i
+                    }
+                    None => {
+                        tables.push(ConcatTable::new(&hdr));
+                        tables.len() - 1
+                    }
+                });
+            }
+            op @ (OP_INSERT | OP_DELETE | OP_UPDATE) => {
+                let ti = cur.ok_or_else(|| corrupt("change record before any table header"))?;
+                let ncol = tables[ti].ncol;
+                r.u8()?;
+                let indirect = r.u8()?;
+                let nfields = if op == OP_UPDATE { ncol * 2 } else { ncol };
+                let (_, consumed) = split_record(&r.data[r.pos..], nfields)?;
+                let record = r.take(consumed)?.to_vec();
+                tables[ti].add(op, indirect, record)?;
+            }
+            other => {
+                return Err(corrupt(&alloc::format!(
+                    "unexpected marker byte {other:#x}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Concatenate two changesets, mirroring `sqlite3changeset_concat`: the result
+/// is equivalent to applying `a` and then `b`. Per-table, per-row changes are
+/// coalesced exactly as an in-memory change-group would (INSERT+UPDATE→INSERT,
+/// INSERT+DELETE→nothing, UPDATE+UPDATE→UPDATE, UPDATE+DELETE→DELETE,
+/// DELETE+INSERT→UPDATE, and the "unsupported, discard the second" cases).
+///
+/// Returns [`crate::error::Error::Corrupt`] if either input is malformed or the
+/// two disagree on a table's column count or primary-key layout.
+pub(crate) fn concat(a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
+    let mut tables: Vec<ConcatTable> = Vec::new();
+    concat_absorb(a, &mut tables)?;
+    concat_absorb(b, &mut tables)?;
+
+    let mut out = Vec::new();
+    for tbl in &tables {
+        if tbl.nentry == 0 {
+            continue;
+        }
+        out.extend_from_slice(&tbl.hdr);
+        for bucket in &tbl.buckets {
+            for change in bucket {
+                out.push(change.op);
+                out.push(change.indirect);
+                out.extend_from_slice(&change.record);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Byte-transform entry points for changesets: [`Changeset::invert`] and
+/// [`Changeset::concat`], mirroring SQLite's `sqlite3changeset_invert` and
+/// `sqlite3changeset_concat`. This is a zero-sized namespace type — the
+/// transforms need no database state.
+#[derive(Debug, Clone, Copy)]
+pub struct Changeset;
+
+impl Changeset {
+    /// Return the inverse of `changeset`: applying the inverse undoes applying
+    /// the original. Mirrors `sqlite3changeset_invert` — `INSERT`↔`DELETE`, and
+    /// an `UPDATE`'s old and new values are swapped (primary-key columns
+    /// unchanged); table headers pass through.
+    ///
+    /// # Errors
+    /// [`crate::error::Error::Corrupt`] if `changeset` is malformed.
+    pub fn invert(changeset: &[u8]) -> Result<Vec<u8>> {
+        invert(changeset)
+    }
+
+    /// Concatenate two changesets into one whose effect equals applying `a`
+    /// then `b`. Mirrors `sqlite3changeset_concat`: per-table, per-row changes
+    /// are coalesced exactly as an in-memory change-group would.
+    ///
+    /// # Errors
+    /// [`crate::error::Error::Corrupt`] if either input is malformed or they
+    /// disagree on a table's shape.
+    pub fn concat(a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
+        concat(a, b)
+    }
+}
+
 /// Compile-time check on the public [`Session`] type's auto-traits.
 ///
 /// [`Session`] shares its recorder with the connection through `Rc<RefCell<…>>`,
@@ -760,6 +1378,23 @@ const _: () = {
     fn assert_clone<T: Clone>() {}
     fn checks() {
         assert_clone::<Session>();
+    }
+    let _ = checks;
+};
+
+/// Compile-time check on the public [`Changeset`] namespace type's auto-traits.
+///
+/// Unlike [`Session`], [`Changeset`] is a stateless zero-sized handle over pure
+/// byte transforms, so it is `Send`/`Sync`/`Copy` — these assertions pin that
+/// down so a future field addition cannot silently take those away.
+const _: () = {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    fn assert_copy<T: Copy>() {}
+    fn checks() {
+        assert_send::<Changeset>();
+        assert_sync::<Changeset>();
+        assert_copy::<Changeset>();
     }
     let _ = checks;
 };
