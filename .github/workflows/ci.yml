@@ -59,6 +59,14 @@ jobs:
   test:
     name: Test suite
     runs-on: ubuntu-latest
+    # The suite links 200+ separate test binaries. On the 7 GB ubuntu-latest
+    # runner, linking them all with full debuginfo can exhaust memory and crash
+    # `ld` with SIGBUS ("ld terminated with signal 7 [Bus error]"). Dropping
+    # debuginfo for the test profile cuts linker memory + artifact size sharply
+    # (local dev keeps full debuginfo); cap build jobs so peak link concurrency
+    # stays bounded.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -85,7 +93,7 @@ jobs:
       - name: Show sqlite3 version
         run: sqlite3 --version
       - name: cargo test --all-features
-        run: cargo test --all-features
+        run: cargo test --all-features --jobs 2
 
   no_std:
     name: no_std build
