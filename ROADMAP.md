@@ -278,11 +278,17 @@ result or declines to it — never a wrong answer), so this track is
   cache is active only inside a write txn; a pure read-only connection over a
   read-write file falls back to direct (bounded) disk reads. Coherent caching there
   needs a statement-level change-counter revalidation hook from the exec layer.
-- **C9a — persistent read locks.** The `Vfs` lock model is done and verified
-  (readers coexist; `Reserved` admits under readers; `Exclusive` BUSYs until
-  readers drain). Missing is pager-owned: the pager takes `Shared` only transiently,
-  so "multiple readers across an open read txn block a writer" isn't yet observable
-  at the `Connection` layer. Needs a persistent read-lock policy in `src/pager/`.
+- **C9a — persistent read locks.** *Pager primitive done (2026-07-09):*
+  `WritePager::begin_read_txn`/`end_read_txn` now hold a persistent `Shared` lock
+  for an open read transaction (readers coexist via the counted `Shared`; a
+  writer's commit-time `Exclusive` upgrade `BUSY`s until readers drain), verified
+  with two in-process `WritePager`s. **Remaining — the exec-layer hook:** wire
+  `begin_read_txn` at the *first read within* an explicit transaction (to match
+  sqlite's *deferred* `BEGIN` — locking eagerly at `BEGIN` would diverge and would
+  push the write path to upgrade from an already-held `Shared`) and rely on
+  `commit()`/`rollback()` (which clear the flag) to release. Needs a two-connection
+  differential test of the deferred semantics before landing — a small but
+  lock-state-sensitive change, deliberately kept separate from the primitive.
 - **C9b — OS-level cross-process file locks** (`std::fs::File::lock`, wants MSRV
   1.89) behind the std VFS.
 - **C9c — the WAL `-shm` wal-index** for multi-connection WAL readers.
