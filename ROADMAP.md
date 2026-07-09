@@ -369,7 +369,15 @@ result or declines to it — never a wrong answer), so this track is
   incremental) — those are the remaining follow-ups.
 - **D4-leftover — window UDFs + custom collations.** The latter needs a user
   variant on the `Collation` enum (invasive).
-- **D5 — `sqlite3_session`** changesets/patchsets for replication.
+- **D5 — `sqlite3_session`** changesets/patchsets for replication. *Changeset
+  generation done (2026-07-09, 80a5281):* `Connection::create_session()` /
+  `Session::attach()`/`is_empty()` / `Connection::session_changeset()` produce a
+  byte-compatible changeset (verified vs an `SQLITE_ENABLE_SESSION` oracle across
+  ~78k fuzzed sequences: all storage classes, coalescing, hash-bucket order,
+  `INSERT OR REPLACE`). Records single-`INTEGER PRIMARY KEY` rowid tables only; the
+  write hook is a no-op when no session is active. **Remaining:** `WITHOUT ROWID`/
+  composite/no-PK tables, patchsets, `changeset_apply`/invert, per-table attach,
+  indirect changes, and streaming.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**
