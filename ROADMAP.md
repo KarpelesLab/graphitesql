@@ -385,9 +385,12 @@ result or declines to it — never a wrong answer), so this track is
   single PKs (TEXT/BLOB/REAL), composite PKs (incl. reordered — the header carries
   sqlite's 1-based PK ordinal per column), and `WITHOUT ROWID` tables (12.4k
   fuzzed oracle checks, 0 diffs); a no-declared-PK table stays unrecorded → empty
-  changeset, matching sqlite's default. **Remaining:** patchsets, changeset
-  invert/concat/rebase, custom conflict handlers, per-table attach, indirect
-  changes, and streaming.
+  changeset, matching sqlite's default. *invert + concat done (2026-07-09,
+  c754e28):* `graphitesql::Changeset::invert`/`concat` are pure byte transforms
+  matching `sqlite3changeset_invert`/`_concat` (34.6k fuzzed oracle checks, 0
+  diffs, incl. concat's 256-bucket coalescing hash and all PK shapes).
+  **Remaining:** patchsets, changeset rebase, custom conflict handlers, per-table
+  attach, indirect changes, and streaming.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**
