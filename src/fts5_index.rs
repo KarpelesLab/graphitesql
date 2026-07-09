@@ -185,6 +185,11 @@ pub(crate) struct IdxRow {
 /// doclist-index `%_data` pages `(rowid, block)`.
 type SegParts = (Vec<Vec<u8>>, Vec<IdxRow>, Vec<(i64, Vec<u8>)>);
 
+/// The tokenized inputs the segment builder consumes for a document set: the
+/// ascending `terms` (term bytes → per-doc postings), each column's total token
+/// count, and the per-document `(rowid, per-column token counts)`.
+pub(crate) type TokenizedDocs = (Vec<(Vec<u8>, Vec<Posting>)>, Vec<u64>, Vec<(i64, Vec<u64>)>);
+
 /// The streaming leaf writer (see the module doc and `tests/fts5_segment.rs`).
 struct SegWriter {
     pgsz: usize,
@@ -571,6 +576,228 @@ fn structure(n_leaves: i64, cookie: u32) -> Vec<u8> {
     out
 }
 
+/// Encode the `%_data` AVERAGES record (rowid [`AVERAGES_ROWID`]): empty when
+/// `n_rows == 0`, else `nRow` followed by each column's total token count. Shared
+/// by the bulk builder and the incremental append.
+pub(crate) fn encode_averages(n_rows: u64, col_totals: &[u64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if n_rows > 0 {
+        put_varint(&mut out, n_rows);
+        for &t in col_totals {
+            put_varint(&mut out, t);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Incremental (multi-segment) write support — the structure-record model.
+//
+// sqlite's fts5 appends a NEW level-0 segment per write transaction rather than
+// rebuilding the whole index. The on-disk `%_data` STRUCTURE record (rowid
+// [`STRUCTURE_ROWID`]) tracks the current shape: a config cookie, a write
+// counter, and per level `{nMerge, [ {iSegid, pgnoFirst, pgnoLast} … ]}`. These
+// helpers parse and re-emit that record so the executor can append, promote, and
+// crisis-merge exactly like `fts5_index.c` — see `SegStructure`.
+
+/// One segment reference inside a level of the [`SegStructure`] record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StructSeg {
+    pub segid: i64,
+    pub pgno_first: i64,
+    pub pgno_last: i64,
+}
+
+impl StructSeg {
+    /// Segment size in leaf pages (`fts5SegmentSize`).
+    fn size(&self) -> i64 {
+        1 + self.pgno_last - self.pgno_first
+    }
+}
+
+/// One level of the [`SegStructure`] record: a merge counter and its segments,
+/// newest last (level 0 is the youngest data).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StructLevel {
+    pub n_merge: i64,
+    pub segs: Vec<StructSeg>,
+}
+
+/// The parsed `%_data` STRUCTURE record (`fts5StructureRead`/`Write`): the config
+/// cookie, the running write counter (total leaf pages ever flushed), and the
+/// per-level segment lists. The port of `Fts5Structure`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SegStructure {
+    pub cookie: u32,
+    pub write_counter: u64,
+    pub levels: Vec<StructLevel>,
+}
+
+impl SegStructure {
+    /// Parse a raw STRUCTURE-record blob, or `None` if malformed/unsupported.
+    pub(crate) fn parse(buf: &[u8]) -> Option<SegStructure> {
+        if buf.len() < 4 {
+            return None;
+        }
+        let cookie = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let mut pos = 4usize;
+        let n_level = read_varint(buf, &mut pos)?;
+        let n_segment = read_varint(buf, &mut pos)?;
+        let write_counter = read_varint(buf, &mut pos)?;
+        let mut levels = Vec::with_capacity(n_level as usize);
+        let mut total = 0u64;
+        for _ in 0..n_level {
+            let n_merge = read_varint(buf, &mut pos)? as i64;
+            let n_seg = read_varint(buf, &mut pos)?;
+            let mut segs = Vec::with_capacity(n_seg as usize);
+            for _ in 0..n_seg {
+                let segid = read_varint(buf, &mut pos)? as i64;
+                let pgno_first = read_varint(buf, &mut pos)? as i64;
+                let pgno_last = read_varint(buf, &mut pos)? as i64;
+                segs.push(StructSeg {
+                    segid,
+                    pgno_first,
+                    pgno_last,
+                });
+            }
+            total += n_seg;
+            levels.push(StructLevel { n_merge, segs });
+        }
+        if total != n_segment {
+            return None;
+        }
+        Some(SegStructure {
+            cookie,
+            write_counter,
+            levels,
+        })
+    }
+
+    /// Re-emit the record byte-for-byte in `fts5StructureWrite` form.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = self.cookie.to_be_bytes().to_vec();
+        let n_segment: u64 = self.levels.iter().map(|l| l.segs.len() as u64).sum();
+        put_varint(&mut out, self.levels.len() as u64);
+        put_varint(&mut out, n_segment);
+        put_varint(&mut out, self.write_counter);
+        for lvl in &self.levels {
+            put_varint(&mut out, lvl.n_merge as u64);
+            put_varint(&mut out, lvl.segs.len() as u64);
+            for s in &lvl.segs {
+                put_varint(&mut out, s.segid as u64);
+                put_varint(&mut out, s.pgno_first as u64);
+                put_varint(&mut out, s.pgno_last as u64);
+            }
+        }
+        out
+    }
+
+    /// Allocate the lowest unused positive segid (`fts5AllocateSegid`): the
+    /// smallest id not currently held by any segment in any level.
+    pub(crate) fn allocate_segid(&self) -> i64 {
+        let mut used = alloc::collections::BTreeSet::new();
+        for lvl in &self.levels {
+            for s in &lvl.segs {
+                if s.segid > 0 {
+                    used.insert(s.segid);
+                }
+            }
+        }
+        let mut id = 1;
+        while used.contains(&id) {
+            id += 1;
+        }
+        id
+    }
+
+    /// Append a freshly-written level-0 segment (`iSegid`, `n_leaves` pages) and
+    /// run the post-append promote — the `fts5FlushOneHash` tail. `n_leaves`
+    /// also advances the write counter. This is the below-threshold path;
+    /// crisis-merge (16+ segments on a level) is handled by the caller.
+    pub(crate) fn append_level0(&mut self, segid: i64, n_leaves: i64) {
+        if self.levels.is_empty() {
+            self.levels.push(StructLevel {
+                n_merge: 0,
+                segs: Vec::new(),
+            });
+        }
+        self.levels[0].segs.push(StructSeg {
+            segid,
+            pgno_first: 1,
+            pgno_last: n_leaves,
+        });
+        self.write_counter += n_leaves as u64;
+        self.promote(0);
+    }
+
+    /// Run `fts5StructurePromote` for a level `i_lvl` that just received a merged
+    /// segment (crisis/auto merge output), a no-op when the level is out of range.
+    pub(crate) fn promote_after_merge(&mut self, i_lvl: usize) {
+        if i_lvl < self.levels.len() {
+            self.promote(i_lvl);
+        }
+    }
+
+    /// Port of `fts5StructurePromote`: after a segment is written to `i_lvl`,
+    /// possibly move it (or, via promote-to, pull equal-or-smaller segments from
+    /// higher levels down) so each level holds like-sized segments. Faithful to
+    /// the two conditions in the C source.
+    fn promote(&mut self, i_lvl: usize) {
+        if self.levels[i_lvl].segs.is_empty() {
+            return;
+        }
+        let sz_seg = self.levels[i_lvl].segs.last().unwrap().size();
+
+        // Condition (a): a NON-EMPTY lower level whose largest segment is >= the
+        // just-written one → promote the new segment DOWN into that lower level.
+        let mut i_tst: isize = i_lvl as isize - 1;
+        while i_tst >= 0 && self.levels[i_tst as usize].segs.is_empty() {
+            i_tst -= 1;
+        }
+        let mut i_promote = i_lvl;
+        let mut sz_promote = sz_seg;
+        if i_tst >= 0 {
+            let tst = &self.levels[i_tst as usize];
+            let sz_max = tst.segs.iter().map(|s| s.size()).max().unwrap_or(0);
+            if sz_max >= sz_seg {
+                i_promote = i_tst as usize;
+                sz_promote = sz_max;
+            }
+        }
+        self.promote_to(i_promote, sz_promote);
+    }
+
+    /// Port of `fts5StructurePromoteTo`: while `aLevel[iPromote].nMerge==0`, pull
+    /// segments no larger than `sz_promote` from the levels ABOVE down into
+    /// `iPromote` (newest first within each source level).
+    fn promote_to(&mut self, i_promote: usize, sz_promote: i64) {
+        if self.levels[i_promote].n_merge != 0 {
+            return;
+        }
+        let mut il = i_promote + 1;
+        while il < self.levels.len() {
+            if self.levels[il].n_merge != 0 {
+                return;
+            }
+            // Iterate source segments newest-first (index high→low). sqlite's
+            // `fts5StructureExtendLevel(bInsert=1)` inserts each promoted segment
+            // at the FRONT of the target level (memmove existing right), so a
+            // promoted segment precedes the level's prior (newer-appended) ones.
+            let mut is = self.levels[il].segs.len();
+            while is > 0 {
+                is -= 1;
+                let sz = self.levels[il].segs[is].size();
+                if sz > sz_promote {
+                    return;
+                }
+                let seg = self.levels[il].segs.remove(is);
+                self.levels[i_promote].segs.insert(0, seg);
+            }
+            il += 1;
+        }
+    }
+}
+
 /// The result of building a segment index from a document set.
 pub(crate) struct Segment {
     /// `%_data` rows `(id, block)`: averages (id 1), structure (id 10), leaves.
@@ -686,38 +913,8 @@ pub(crate) fn build_segment_prefixed(
     cookie: u32,
     prefixes: &[usize],
 ) -> Segment {
-    use alloc::collections::BTreeMap;
     let segid = 1;
-    let (leaves, idx, dlidx) = {
-        let mut w = SegWriter::new(pgsz.max(16), segid);
-        for (term, postings) in terms {
-            w.add_term(term, postings);
-        }
-        // Each prefix index i is keyed with byte MAIN_PREFIX + i + 1 ('1', '2', …).
-        for (i, &n_char) in prefixes.iter().enumerate() {
-            let idx_byte = MAIN_PREFIX + (i as u8) + 1;
-            // Group full terms by their n_char-character byte-prefix (BTreeMap keeps
-            // the prefixes ascending, matching the required key order).
-            let mut groups: BTreeMap<&[u8], Vec<&[Posting]>> = BTreeMap::new();
-            for (term, postings) in terms {
-                if let Some(nb) = prefix_bytelen(term, n_char) {
-                    groups.entry(&term[..nb]).or_default().push(postings);
-                }
-            }
-            for (pfx, parts) in groups {
-                let merged = merge_prefix_postings(&parts);
-                let mut key = Vec::with_capacity(pfx.len() + 1);
-                key.push(idx_byte);
-                key.extend_from_slice(pfx);
-                w.add_key(&key, &merged);
-            }
-        }
-        if terms.is_empty() {
-            (Vec::new(), Vec::new(), Vec::new())
-        } else {
-            w.finish()
-        }
-    };
+    let (leaves, idx, dlidx) = build_segment_leaves(terms, pgsz, segid, prefixes);
 
     let mut data: Vec<(i64, Vec<u8>)> = Vec::new();
     // Averages (id 1): empty when there are no documents, else [nRow, per-col].
@@ -736,7 +933,14 @@ pub(crate) fn build_segment_prefixed(
     // Doclist-index pages (dlidx=1 rowids) for spanning terms, if any.
     data.extend(dlidx);
 
-    let docsize = doc_sizes
+    let docsize = build_docsize(doc_sizes);
+    Segment { data, idx, docsize }
+}
+
+/// Encode the per-document `%_docsize` rows (`(rowid, per-column token counts as a
+/// varint list)`) — shared by the bulk builder and the incremental append path.
+pub(crate) fn build_docsize(doc_sizes: &[(i64, Vec<u64>)]) -> Vec<(i64, Vec<u8>)> {
+    doc_sizes
         .iter()
         .map(|(rowid, sizes)| {
             let mut sz = Vec::new();
@@ -745,9 +949,93 @@ pub(crate) fn build_segment_prefixed(
             }
             (*rowid, sz)
         })
-        .collect();
+        .collect()
+}
 
-    Segment { data, idx, docsize }
+/// Build ONLY the leaf pages, `%_idx` rows, and doclist-index pages for a segment
+/// with the given `segid` (the main `'0'` terms followed by each prefix index).
+/// This is the segid-parameterized core shared by [`build_segment_prefixed`] (the
+/// bulk single-segment rebuild, always `segid = 1`) and the incremental
+/// level-0-append path (which allocates a fresh segid). It carries no
+/// averages/structure record — those are index-global and owned by the caller.
+fn build_segment_leaves(
+    terms: &[(Vec<u8>, Vec<Posting>)],
+    pgsz: usize,
+    segid: i64,
+    prefixes: &[usize],
+) -> SegParts {
+    use alloc::collections::BTreeMap;
+    let mut w = SegWriter::new(pgsz.max(16), segid);
+    for (term, postings) in terms {
+        w.add_term(term, postings);
+    }
+    // Each prefix index i is keyed with byte MAIN_PREFIX + i + 1 ('1', '2', …).
+    for (i, &n_char) in prefixes.iter().enumerate() {
+        let idx_byte = MAIN_PREFIX + (i as u8) + 1;
+        // Group full terms by their n_char-character byte-prefix (BTreeMap keeps
+        // the prefixes ascending, matching the required key order).
+        let mut groups: BTreeMap<&[u8], Vec<&[Posting]>> = BTreeMap::new();
+        for (term, postings) in terms {
+            if let Some(nb) = prefix_bytelen(term, n_char) {
+                groups.entry(&term[..nb]).or_default().push(postings);
+            }
+        }
+        for (pfx, parts) in groups {
+            let merged = merge_prefix_postings(&parts);
+            let mut key = Vec::with_capacity(pfx.len() + 1);
+            key.push(idx_byte);
+            key.extend_from_slice(pfx);
+            w.add_key(&key, &merged);
+        }
+    }
+    if terms.is_empty() {
+        (Vec::new(), Vec::new(), Vec::new())
+    } else {
+        w.finish()
+    }
+}
+
+/// The `%_data`/`%_idx`/`%_docsize` rows for ONE segment written with a given
+/// segid — the incremental-append (and crisis-merge) product. Unlike [`Segment`]
+/// it carries NO averages/structure record (those are index-global, owned by the
+/// caller which merges the [`SegStructure`]).
+pub(crate) struct SegmentBlock {
+    /// Leaf `%_data` rows `(rowid, block)` for this segid (rowid = segid<<37|pgno).
+    pub data: Vec<(i64, Vec<u8>)>,
+    /// `%_idx` rows (each carries this segment's segid).
+    pub idx: Vec<IdxRow>,
+    /// `%_docsize` rows for this write's documents.
+    pub docsize: Vec<(i64, Vec<u8>)>,
+    /// Number of leaf pages (= pgnoLast for the structure record).
+    pub n_leaves: i64,
+}
+
+/// Build the `%_data`/`%_idx`/`%_docsize` rows for a single segment with `segid`
+/// from `terms` (sorted ascending by raw term bytes) and this write's
+/// `doc_sizes`, honoring configured `prefixes`. Used both to APPEND a fresh
+/// level-0 segment (incremental write) and to write the merged output of a
+/// crisis-merge (a fresh segid over the whole corpus). The leaf CONTENT is
+/// identical to what [`build_segment_prefixed`] produces — only the segid (and so
+/// the `%_data` rowids / `%_idx` segid column) differs.
+pub(crate) fn build_segment_block(
+    terms: &[(Vec<u8>, Vec<Posting>)],
+    doc_sizes: &[(i64, Vec<u64>)],
+    pgsz: usize,
+    segid: i64,
+    prefixes: &[usize],
+) -> SegmentBlock {
+    let (leaves, idx, dlidx) = build_segment_leaves(terms, pgsz, segid, prefixes);
+    let mut data: Vec<(i64, Vec<u8>)> = Vec::new();
+    for (i, leaf) in leaves.iter().enumerate() {
+        data.push((segment_leaf_rowid(segid, i as i64 + 1), leaf.clone()));
+    }
+    data.extend(dlidx);
+    SegmentBlock {
+        data,
+        idx,
+        docsize: build_docsize(doc_sizes),
+        n_leaves: leaves.len() as i64,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1890,6 +2178,90 @@ pub(crate) fn lookup_bool_tree_rowids(
 mod tests {
     use super::*;
     use alloc::{format, string::ToString, vec};
+
+    #[test]
+    fn segstructure_roundtrips_and_allocates_segid() {
+        // A two-segment level-0 record (sqlite's 2-insert shape).
+        let raw = &[
+            0x00, 0x00, 0x00, 0x00, // cookie
+            0x01, // nLevel
+            0x02, // nSegment
+            0x02, // wc
+            0x00, // level0 nMerge
+            0x02, // level0 nSeg
+            0x01, 0x01, 0x01, // seg{1,1,1}
+            0x02, 0x01, 0x01, // seg{2,1,1}
+        ];
+        let s = SegStructure::parse(raw).unwrap();
+        assert_eq!(s.levels.len(), 1);
+        assert_eq!(s.levels[0].segs.len(), 2);
+        assert_eq!(s.write_counter, 2);
+        // Byte-exact re-emit.
+        assert_eq!(s.encode(), raw);
+        // Lowest unused segid is 3.
+        assert_eq!(s.allocate_segid(), 3);
+    }
+
+    #[test]
+    fn segstructure_append_and_promote_down() {
+        // Empty index → append one level-0 segment.
+        let mut s = SegStructure {
+            cookie: 0,
+            write_counter: 0,
+            levels: Vec::new(),
+        };
+        s.append_level0(1, 1);
+        assert_eq!(s.levels.len(), 1);
+        assert_eq!(
+            s.levels[0].segs,
+            vec![StructSeg {
+                segid: 1,
+                pgno_first: 1,
+                pgno_last: 1
+            }]
+        );
+        assert_eq!(s.write_counter, 1);
+
+        // Simulate the post-crisis state: level0 empty, one size-1 seg at level1.
+        // Appending a new size-1 seg to level0 must promote the level-1 seg DOWN
+        // and place it BEFORE the freshly appended one (sqlite's front-insert).
+        let mut s = SegStructure {
+            cookie: 0,
+            write_counter: 16,
+            levels: vec![
+                StructLevel {
+                    n_merge: 0,
+                    segs: Vec::new(),
+                },
+                StructLevel {
+                    n_merge: 0,
+                    segs: vec![StructSeg {
+                        segid: 17,
+                        pgno_first: 1,
+                        pgno_last: 1,
+                    }],
+                },
+            ],
+        };
+        s.append_level0(1, 1); // new seg id 1
+        assert_eq!(
+            s.levels[0].segs,
+            vec![
+                StructSeg {
+                    segid: 17,
+                    pgno_first: 1,
+                    pgno_last: 1
+                },
+                StructSeg {
+                    segid: 1,
+                    pgno_first: 1,
+                    pgno_last: 1
+                },
+            ],
+            "promoted-down segment precedes the newly appended one"
+        );
+        assert!(s.levels[1].segs.is_empty());
+    }
 
     fn p(rowid: i64, cols: &[&[u32]]) -> Posting {
         Posting {

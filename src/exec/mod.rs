@@ -29880,6 +29880,15 @@ impl Connection {
                 // content copy.
                 return Ok(());
             }
+            // In AUTOCOMMIT, a single INSERT statement is its own transaction, so
+            // sqlite appends exactly one new level-0 segment for its new rows —
+            // reproduce that incrementally (byte-identical multi-segment layout).
+            // Inside an explicit BEGIN/SAVEPOINT the whole transaction flushes as
+            // ONE segment at commit; graphite would append per statement, so fall
+            // back to the single-segment bulk rebuild there (unchanged behavior).
+            if !self.in_tx && self.open_savepoints == 0 && self.fts5_incremental_write(table)? {
+                return Ok(());
+            }
             return self.fts5_rebuild_index(table);
         }
         let _ = (module_name, table);
@@ -30387,25 +30396,289 @@ impl Connection {
     /// `<name>_content` (a bulk rebuild, like the R-Tree). Tokenizes each column
     /// with the table's tokenizer and writes a byte-compatible segment index.
     #[cfg(feature = "fts5")]
-    fn fts5_rebuild_index(&mut self, name: &str) -> Result<()> {
-        use crate::fts5_index::{self, IdxRow, Posting};
-        use alloc::collections::BTreeMap;
+    /// Try to service a self-content fts5 write INCREMENTALLY — appending a fresh
+    /// level-0 segment for this transaction's new documents (and crisis-merging
+    /// when a level reaches 16 segments), byte-identical to sqlite's
+    /// `fts5FlushOneHash` path — instead of the single-segment bulk rebuild.
+    ///
+    /// Returns `Ok(true)` when it fully handled the write, or `Ok(false)` to fall
+    /// back to [`fts5_rebuild_index`]. It only takes the incremental path for the
+    /// PURE-INSERT case (new rowids added, none removed or edited): the delta is
+    /// exactly the content rows not yet present in `_docsize`. Deletes/updates
+    /// (which sqlite services with tombstones — not yet ported) fall back, as does
+    /// a prefix-indexed table with a spanning (dlidx) segment or any structurally
+    /// surprising state, so the result is never wrong — at worst it is today's
+    /// single compacted segment.
+    #[cfg(feature = "fts5")]
+    fn fts5_incremental_write(&mut self, name: &str) -> Result<bool> {
+        use crate::fts5_index::{self, IdxRow, SegStructure};
         let (_module, args, schema) = self.vtab_meta(name)?;
         let ncols = schema.columns.len();
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // Prefix indexes complicate the merged term stream across segments; the
+        // read path handles multi-segment prefix unions, but keep the WRITE path
+        // to the well-characterized main-index case and let prefix tables rebuild.
+        let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
+        if !prefixes.is_empty() {
+            return Ok(false);
+        }
         let tok = crate::vtab::fts5_tok_config(&arg_refs);
 
-        // `docs`: each document as `(rowid, [fts5 col values…])` — the fts5 column
-        // values in declared order (NO leading id). For an external-content table
-        // this reads from the named content table, keyed by its `content_rowid`;
-        // otherwise from this table's own `<name>_content` shadow.
+        // Current live documents (content) and the set already in the index
+        // (`_docsize` has one row per indexed doc).
         let docs = self.fts5_load_documents(name, &schema.columns, &arg_refs)?;
+        let live: alloc::collections::BTreeSet<i64> = docs.iter().map(|(r, _)| *r).collect();
+        let indexed: alloc::collections::BTreeSet<i64> = self
+            .query(&format!(
+                "SELECT id FROM {}",
+                sql::print::ident(&format!("{name}_docsize"))
+            ))?
+            .rows
+            .iter()
+            .filter_map(|r| r.first().map(eval::to_i64))
+            .collect();
 
-        // term bytes -> rowid -> per-column positions
+        // Any indexed doc that is no longer live is a DELETE or an UPDATE
+        // (update = delete+insert of the same rowid). Both need tombstone
+        // semantics — fall back to the bulk rebuild.
+        if indexed.iter().any(|id| !live.contains(id)) {
+            return Ok(false);
+        }
+        // The new documents to append (content rows not yet indexed), in rowid
+        // order — exactly one transaction's worth in autocommit.
+        let new_docs: Vec<(i64, Vec<Value>)> = docs
+            .iter()
+            .filter(|(r, _)| !indexed.contains(r))
+            .cloned()
+            .collect();
+        if new_docs.is_empty() {
+            // Nothing changed the index (e.g. a re-INSERT of existing rows is a
+            // constraint error handled elsewhere); leave the index untouched.
+            return Ok(true);
+        }
+
+        // Read the current STRUCTURE record and running averages, or start empty.
+        let struct_blob = self
+            .query(&format!(
+                "SELECT block FROM {} WHERE id={}",
+                sql::print::ident(&format!("{name}_data")),
+                fts5_index::STRUCTURE_ROWID
+            ))?
+            .rows
+            .into_iter()
+            .next()
+            .and_then(|r| match r.into_iter().next() {
+                Some(Value::Blob(b)) => Some(b),
+                _ => None,
+            });
+        let mut structure = match &struct_blob {
+            Some(b) => match SegStructure::parse(b) {
+                Some(s) => s,
+                None => return Ok(false), // unrecognized record → safe rebuild
+            },
+            None => SegStructure {
+                cookie: 0,
+                write_counter: 0,
+                levels: Vec::new(),
+            },
+        };
+
+        // Build the appended segment for JUST the new docs, with a fresh segid.
+        let segid = structure.allocate_segid();
+        let (terms, _new_totals, new_doc_sizes) = self.fts5_tokenize_docs(&new_docs, ncols, tok);
+        let block = fts5_index::build_segment_block(&terms, &new_doc_sizes, 4050, segid, &prefixes);
+        // A segment with a doclist-index (spanning) page — `%_data` rowid with the
+        // dlidx bit (1<<36) set — is a rarer shape whose multi-segment `%_idx`
+        // flag interaction is out of this slice; fall back so we never write a
+        // subtly wrong index. (Bare single-doc inserts never span.)
+        if block.data.iter().any(|(id, _)| (*id & (1 << 36)) != 0) {
+            return Ok(false);
+        }
+
+        structure.append_level0(segid, block.n_leaves);
+        // Crisis-merge: while a level holds >= 16 segments, merge it into one
+        // segment at the next level (fresh segid), then promote. The merged
+        // segment's leaf bytes equal a full rebuild over that level's documents;
+        // since every level-0 doc is live here (pure inserts), rebuild from the
+        // whole live corpus with the merged segid.
+        let did_crisis =
+            self.fts5_crisis_merge(name, &mut structure, ncols, tok, &prefixes, &docs)?;
+
+        // Global averages: nRow + per-column token totals over the WHOLE live
+        // corpus (sqlite keeps this running; recompute from all live docs).
+        let (_all_terms, col_totals, _all_sizes) = self.fts5_tokenize_docs(&docs, ncols, tok);
+
+        let q = |s: &str| sql::print::ident(s);
+        let pv = |vals: Vec<Value>| Params {
+            positional: vals,
+            named: Vec::new(),
+        };
+        let data_t = q(&format!("{name}_data"));
+
+        // Averages (id 1): nRow + per-column token totals over the whole corpus.
+        let avg = fts5_index::encode_averages(docs.len() as u64, &col_totals);
+        self.execute_params(
+            &format!("INSERT OR REPLACE INTO {data_t} VALUES(?1,?2)"),
+            &pv(alloc::vec![
+                Value::Integer(fts5_index::AVERAGES_ROWID),
+                Value::Blob(avg)
+            ]),
+        )?;
+        // Structure record (id 10).
+        self.execute_params(
+            &format!("INSERT OR REPLACE INTO {data_t} VALUES(?1,?2)"),
+            &pv(alloc::vec![
+                Value::Integer(fts5_index::STRUCTURE_ROWID),
+                Value::Blob(structure.encode())
+            ]),
+        )?;
+
+        if !did_crisis {
+            // Append the new segment's leaf/dlidx `%_data` rows and `%_idx` rows.
+            for (id, block_bytes) in &block.data {
+                self.execute_params(
+                    &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                    &pv(alloc::vec![
+                        Value::Integer(*id),
+                        Value::Blob(block_bytes.clone())
+                    ]),
+                )?;
+            }
+            let idx_t = q(&format!("{name}_idx"));
+            for IdxRow { segid, term, pgno } in &block.idx {
+                self.execute_params(
+                    &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                    &pv(alloc::vec![
+                        Value::Integer(*segid),
+                        Value::Blob(term.clone()),
+                        Value::Integer(*pgno)
+                    ]),
+                )?;
+            }
+        }
+        // `_docsize` gains one row per new document (crisis-merge leaves docsize
+        // rows untouched — they are per-doc, not per-segment).
+        let docsize_t = q(&format!("{name}_docsize"));
+        for (rowid, sz) in &block.docsize {
+            self.execute_params(
+                &format!("INSERT INTO {docsize_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![Value::Integer(*rowid), Value::Blob(sz.clone())]),
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// While any level of `structure` holds >= 16 segments (the crisis threshold),
+    /// merge that level's segments into a single fresh-segid segment at the next
+    /// level and promote — the port of `fts5IndexCrisismerge`. The merged segment's
+    /// leaves are rebuilt from `docs` (the whole live corpus; valid because the
+    /// incremental path only runs for pure inserts, so every level-0 doc is live).
+    /// Rewrites the `%_data`/`%_idx` segment rows in place. Returns whether a merge
+    /// occurred (in which case the caller must NOT also append the level-0 block —
+    /// it was consumed by the merge).
+    #[cfg(feature = "fts5")]
+    fn fts5_crisis_merge(
+        &mut self,
+        name: &str,
+        structure: &mut crate::fts5_index::SegStructure,
+        ncols: usize,
+        tok: crate::vtab::Fts5Tok,
+        prefixes: &[usize],
+        docs: &[(i64, Vec<Value>)],
+    ) -> Result<bool> {
+        use crate::fts5_index::{self, IdxRow};
+        const CRISIS: usize = 16;
+        if structure.levels.is_empty() || structure.levels[0].segs.len() < CRISIS {
+            return Ok(false);
+        }
+        // A crisis merge at level 0 with 16 single-page segments collapses the
+        // whole corpus into ONE segment. Higher-level cascades (a merged segment
+        // itself triggering another crisis) do not arise for the 1-page-per-insert
+        // shape this slice targets; if the merged level would still be in crisis,
+        // fall back to the bulk rebuild to stay correct.
+        let merged_segid = structure.allocate_segid();
+        let (terms, _totals, doc_sizes) = self.fts5_tokenize_docs(docs, ncols, tok);
+        let block =
+            fts5_index::build_segment_block(&terms, &doc_sizes, 4050, merged_segid, prefixes);
+
+        // Replace level 0 with an empty level, add the merged segment at level 1,
+        // then promote. This mirrors fts5IndexMergeLevel + fts5StructurePromote
+        // for the single-crisis case.
+        structure.levels[0].segs.clear();
+        structure.levels[0].n_merge = 0;
+        if structure.levels.len() < 2 {
+            structure.levels.push(crate::fts5_index::StructLevel {
+                n_merge: 0,
+                segs: Vec::new(),
+            });
+        }
+        structure.levels[1].segs.push(crate::fts5_index::StructSeg {
+            segid: merged_segid,
+            pgno_first: 1,
+            pgno_last: block.n_leaves,
+        });
+        structure.promote_after_merge(1);
+        // If the promote did not clear a subsequent crisis, bail to rebuild.
+        if structure.levels.iter().any(|l| l.segs.len() >= CRISIS) {
+            return Ok(false);
+        }
+
+        // Rewrite all segment `%_data`/`%_idx` rows: clear existing leaf/idx rows,
+        // write the single merged segment.
+        let q = |s: &str| sql::print::ident(s);
+        let pv = |vals: Vec<Value>| Params {
+            positional: vals,
+            named: Vec::new(),
+        };
+        // Delete every leaf/dlidx `%_data` row (id > STRUCTURE_ROWID) and all idx.
+        self.execute(&format!(
+            "DELETE FROM {} WHERE id>{}",
+            q(&format!("{name}_data")),
+            fts5_index::STRUCTURE_ROWID
+        ))?;
+        self.execute(&format!("DELETE FROM {}", q(&format!("{name}_idx"))))?;
+        let data_t = q(&format!("{name}_data"));
+        for (id, block_bytes) in &block.data {
+            self.execute_params(
+                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![
+                    Value::Integer(*id),
+                    Value::Blob(block_bytes.clone())
+                ]),
+            )?;
+        }
+        let idx_t = q(&format!("{name}_idx"));
+        for IdxRow { segid, term, pgno } in &block.idx {
+            self.execute_params(
+                &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                &pv(alloc::vec![
+                    Value::Integer(*segid),
+                    Value::Blob(term.clone()),
+                    Value::Integer(*pgno)
+                ]),
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// Tokenize `docs` (each `(rowid, [fts5 col values in declared order])`) into
+    /// the inverted-index inputs the segment builder consumes: the ascending
+    /// `terms` (term bytes → per-doc postings), the per-column total token counts,
+    /// and the per-document `(rowid, per-column token counts)`. Shared by the bulk
+    /// rebuild and the incremental level-0 append.
+    #[cfg(feature = "fts5")]
+    fn fts5_tokenize_docs(
+        &self,
+        docs: &[(i64, Vec<Value>)],
+        ncols: usize,
+        tok: crate::vtab::Fts5Tok,
+    ) -> crate::fts5_index::TokenizedDocs {
+        use crate::fts5_index::Posting;
+        use alloc::collections::BTreeMap;
         let mut index: BTreeMap<Vec<u8>, BTreeMap<i64, Vec<Vec<u32>>>> = BTreeMap::new();
         let mut col_totals = alloc::vec![0u64; ncols];
         let mut doc_sizes: Vec<(i64, Vec<u64>)> = Vec::new();
-        for (rowid, values) in &docs {
+        for (rowid, values) in docs {
             let mut sizes = alloc::vec![0u64; ncols];
             for c in 0..ncols {
                 let text = match values.get(c) {
@@ -30415,9 +30688,9 @@ impl Connection {
                 let toks = crate::vtab::fts5_tokenize(&text, tok);
                 sizes[c] = toks.len() as u64;
                 col_totals[c] += toks.len() as u64;
-                for (pos, tok) in toks.iter().enumerate() {
+                for (pos, tk) in toks.iter().enumerate() {
                     index
-                        .entry(tok.as_bytes().to_vec())
+                        .entry(tk.as_bytes().to_vec())
                         .or_default()
                         .entry(*rowid)
                         .or_insert_with(|| alloc::vec![Vec::new(); ncols])[c]
@@ -30436,6 +30709,23 @@ impl Connection {
                 (term, postings)
             })
             .collect();
+        (terms, col_totals, doc_sizes)
+    }
+
+    #[cfg(feature = "fts5")]
+    fn fts5_rebuild_index(&mut self, name: &str) -> Result<()> {
+        use crate::fts5_index::{self, IdxRow};
+        let (_module, args, schema) = self.vtab_meta(name)?;
+        let ncols = schema.columns.len();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let tok = crate::vtab::fts5_tok_config(&arg_refs);
+
+        // `docs`: each document as `(rowid, [fts5 col values…])` — the fts5 column
+        // values in declared order (NO leading id). For an external-content table
+        // this reads from the named content table, keyed by its `content_rowid`;
+        // otherwise from this table's own `<name>_content` shadow.
+        let docs = self.fts5_load_documents(name, &schema.columns, &arg_refs)?;
+        let (terms, col_totals, doc_sizes) = self.fts5_tokenize_docs(&docs, ncols, tok);
 
         let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
         let seg = fts5_index::build_segment_prefixed(
