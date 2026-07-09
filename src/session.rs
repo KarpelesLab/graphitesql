@@ -42,6 +42,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+use crate::error::Result;
 use crate::value::Value;
 
 /// Changeset op-code for an inserted row (`SQLITE_INSERT`).
@@ -445,6 +446,225 @@ fn append_update(out: &mut Vec<u8>, old: &[Value], new: &[Value], pk_flags: &[bo
     }
     out.extend_from_slice(&new_rec);
     true
+}
+
+// ---------------------------------------------------------------------------
+// Changeset parsing (the read side, consumed by `Connection::changeset_apply`).
+// ---------------------------------------------------------------------------
+
+/// One parsed change record from a changeset: its op and the old/new field
+/// vectors. Each vector has one entry per table column; a `None` entry is the
+/// changeset's "field omitted" marker (`0x00`) — present for the `old.*` record
+/// of an `INSERT` (all columns) and for unchanged non-PK columns of an
+/// `UPDATE`. `DELETE`/`INSERT` carry a full record in `old`/`new` respectively.
+#[derive(Debug, Clone)]
+pub(crate) struct ChangeRecord {
+    pub(crate) op: ChangeOp,
+    /// `old.*` values (present for UPDATE/DELETE; empty for INSERT).
+    pub(crate) old: Vec<Option<Value>>,
+    /// `new.*` values (present for UPDATE/INSERT; empty for DELETE).
+    pub(crate) new: Vec<Option<Value>>,
+}
+
+/// One table's worth of parsed changes from a changeset.
+#[derive(Debug, Clone)]
+pub(crate) struct TableChangeset {
+    pub(crate) name: String,
+    pub(crate) ncol: usize,
+    pub(crate) pk_flags: Vec<bool>,
+    pub(crate) changes: Vec<ChangeRecord>,
+}
+
+/// Cursor over a changeset byte buffer.
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8]) -> Reader<'a> {
+        Reader { data, pos: 0 }
+    }
+
+    fn eof(&self) -> bool {
+        self.pos >= self.data.len()
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        let b = *self
+            .data
+            .get(self.pos)
+            .ok_or_else(|| corrupt("unexpected end of changeset"))?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn peek(&self) -> Result<u8> {
+        self.data
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| corrupt("unexpected end of changeset"))
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|e| *e <= self.data.len())
+            .ok_or_else(|| corrupt("truncated changeset field"))?;
+        let s = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(s)
+    }
+
+    /// Read a SQLite varint (the same encoding `append_varint` writes). Returns
+    /// the value; supports the full 1..=9 byte range.
+    fn varint(&mut self) -> Result<u64> {
+        let mut result: u64 = 0;
+        for i in 0..9 {
+            let byte = self.u8()?;
+            if i == 8 {
+                // Ninth byte contributes all 8 bits.
+                result = (result << 8) | u64::from(byte);
+                return Ok(result);
+            }
+            result = (result << 7) | u64::from(byte & 0x7f);
+            if byte & 0x80 == 0 {
+                return Ok(result);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Read one changeset value (type byte then payload). A `0x00` type byte is
+    /// the "field omitted" marker and yields `None`.
+    fn value(&mut self) -> Result<Option<Value>> {
+        let t = self.u8()?;
+        match t {
+            T_OMIT => Ok(None),
+            T_NULL => Ok(Some(Value::Null)),
+            T_INT => {
+                let bytes = self.take(8)?;
+                let mut a = [0u8; 8];
+                a.copy_from_slice(bytes);
+                Ok(Some(Value::Integer(i64::from_be_bytes(a))))
+            }
+            T_FLOAT => {
+                let bytes = self.take(8)?;
+                let mut a = [0u8; 8];
+                a.copy_from_slice(bytes);
+                Ok(Some(Value::Real(f64::from_bits(u64::from_be_bytes(a)))))
+            }
+            T_TEXT => {
+                let n = self.varint()? as usize;
+                let bytes = self.take(n)?;
+                let s = core::str::from_utf8(bytes)
+                    .map_err(|_| corrupt("non-UTF-8 text in changeset"))?;
+                Ok(Some(Value::Text(String::from(s))))
+            }
+            T_BLOB => {
+                let n = self.varint()? as usize;
+                let bytes = self.take(n)?;
+                Ok(Some(Value::Blob(bytes.to_vec())))
+            }
+            other => Err(corrupt(&alloc::format!(
+                "unknown changeset value type {other}"
+            ))),
+        }
+    }
+
+    /// Read `ncol` values (a full record), each possibly omitted.
+    fn record(&mut self, ncol: usize) -> Result<Vec<Option<Value>>> {
+        let mut out = Vec::with_capacity(ncol);
+        for _ in 0..ncol {
+            out.push(self.value()?);
+        }
+        Ok(out)
+    }
+}
+
+fn corrupt(msg: &str) -> crate::error::Error {
+    crate::error::Error::Corrupt(alloc::format!("changeset: {msg}"))
+}
+
+/// Parse a changeset blob into per-table change groups. Supports the format
+/// [`serialize`] produces (`'T'` table headers followed by `INSERT`/`UPDATE`/
+/// `DELETE` change records). An empty blob yields an empty vector.
+pub(crate) fn parse_changeset(data: &[u8]) -> Result<Vec<TableChangeset>> {
+    let mut r = Reader::new(data);
+    let mut tables: Vec<TableChangeset> = Vec::new();
+    while !r.eof() {
+        let marker = r.peek()?;
+        match marker {
+            b'T' => {
+                r.u8()?; // consume 'T'
+                let ncol = r.varint()? as usize;
+                if ncol == 0 {
+                    return Err(corrupt("table has zero columns"));
+                }
+                let mut pk_flags = Vec::with_capacity(ncol);
+                for _ in 0..ncol {
+                    pk_flags.push(r.u8()? != 0);
+                }
+                // NUL-terminated table name.
+                let start = r.pos;
+                loop {
+                    let b = r.u8()?;
+                    if b == 0 {
+                        break;
+                    }
+                }
+                let name_bytes = &r.data[start..r.pos - 1];
+                let name = String::from(
+                    core::str::from_utf8(name_bytes)
+                        .map_err(|_| corrupt("non-UTF-8 table name"))?,
+                );
+                tables.push(TableChangeset {
+                    name,
+                    ncol,
+                    pk_flags,
+                    changes: Vec::new(),
+                });
+            }
+            OP_INSERT | OP_UPDATE | OP_DELETE => {
+                let tbl = tables
+                    .last_mut()
+                    .ok_or_else(|| corrupt("change record before any table header"))?;
+                let ncol = tbl.ncol;
+                let op = r.u8()?;
+                let _indirect = r.u8()?;
+                let rec = match op {
+                    OP_INSERT => ChangeRecord {
+                        op: ChangeOp::Insert,
+                        old: Vec::new(),
+                        new: r.record(ncol)?,
+                    },
+                    OP_DELETE => ChangeRecord {
+                        op: ChangeOp::Delete,
+                        old: r.record(ncol)?,
+                        new: Vec::new(),
+                    },
+                    _ => {
+                        // UPDATE: old record then new record.
+                        let old = r.record(ncol)?;
+                        let new = r.record(ncol)?;
+                        ChangeRecord {
+                            op: ChangeOp::Update,
+                            old,
+                            new,
+                        }
+                    }
+                };
+                tbl.changes.push(rec);
+            }
+            other => {
+                return Err(corrupt(&alloc::format!(
+                    "unexpected marker byte {other:#x}"
+                )));
+            }
+        }
+    }
+    Ok(tables)
 }
 
 /// Compile-time check on the public [`Session`] type's auto-traits.
