@@ -112,6 +112,16 @@ pub struct WritePager {
     /// flushing at commit, so a second writer to the same file gets
     /// [`Error::Busy`](crate::Error::Busy). Released on commit/rollback.
     held: crate::vfs::LockLevel,
+    /// Whether an explicit read transaction is open on this connection. When set,
+    /// the pager holds a persistent `Shared` lock for the whole read transaction
+    /// (taken by [`begin_read_txn`](Self::begin_read_txn)) rather than only
+    /// transiently per page. This makes the reader visible to a concurrent writer
+    /// on the same file: the writer's commit-time upgrade to `Exclusive` BUSYs
+    /// until the reader ends its transaction, matching SQLite's locking model
+    /// (`pager.c` `PAGER_SHARED` held across a read txn). Multiple such readers
+    /// still coexist (`Shared` is a counted lock). Cleared and the lock released
+    /// by [`end_read_txn`](Self::end_read_txn).
+    read_txn: bool,
     /// Open savepoints (innermost last); each snapshots the staged state so
     /// `ROLLBACK TO` can restore it.
     savepoints: Vec<Savepoint>,
@@ -209,6 +219,7 @@ impl WritePager {
             wal_file,
             wal,
             held: crate::vfs::LockLevel::Unlocked,
+            read_txn: false,
             savepoints: Vec::new(),
             secure_delete: false,
             read_cache: RefCell::new(PageCache::new(pcache::DEFAULT_CACHE_SIZE, page_size)),
@@ -294,6 +305,7 @@ impl WritePager {
             wal_file,
             wal: None,
             held: crate::vfs::LockLevel::Unlocked,
+            read_txn: false,
             savepoints: Vec::new(),
             secure_delete: false,
             read_cache: RefCell::new(PageCache::new(
@@ -405,6 +417,65 @@ impl WritePager {
         Ok(())
     }
 
+    /// Begin an explicit read transaction: acquire a **persistent** `Shared`
+    /// (read) lock and hold it until [`end_read_txn`](Self::end_read_txn).
+    ///
+    /// The pager otherwise only touches `Shared` on the path to a write lock;
+    /// pure reads are served without holding one. That is fine for autocommit
+    /// reads, but an *open* read transaction (`BEGIN; SELECT …`) must keep the
+    /// database's committed snapshot stable and — like SQLite — make itself
+    /// visible to a concurrent writer, so the writer's commit-time upgrade to
+    /// `Exclusive` BUSYs until this reader finishes. This method installs that
+    /// persistent lock.
+    ///
+    /// - Idempotent: calling it again inside the same read transaction is a no-op.
+    /// - If a *write* lock is already held (a read followed by a write in the same
+    ///   transaction, or a write transaction that also reads), the existing
+    ///   `Reserved`/`Exclusive` lock already excludes other writers, so this just
+    ///   records that a read transaction is open without weakening the lock.
+    /// - Multiple connections may hold the persistent `Shared` lock at once
+    ///   (`Shared` is a counted lock); readers never block each other.
+    ///
+    /// Returns [`Error::Busy`] if a foreign writer already holds `Pending`/
+    /// `Exclusive` on the file (a reader cannot start while a writer is draining
+    /// readers, matching SQLite).
+    pub fn begin_read_txn(&mut self) -> Result<()> {
+        use crate::vfs::LockLevel;
+        if self.held < LockLevel::Shared {
+            self.file.lock(LockLevel::Shared)?;
+            self.held = LockLevel::Shared;
+        }
+        self.read_txn = true;
+        Ok(())
+    }
+
+    /// End an explicit read transaction opened by
+    /// [`begin_read_txn`](Self::begin_read_txn), releasing the persistent
+    /// `Shared` lock so a waiting writer can now upgrade to `Exclusive`.
+    ///
+    /// Only the read-transaction bookkeeping and a *pure* `Shared` lock are
+    /// dropped here. If the transaction turned into a write (the pager now holds
+    /// `Reserved`/`Exclusive`), the lock is left to the write path's
+    /// commit/rollback (`release_locks`) — ending the read side must not strand a
+    /// half-committed writer. Idempotent when no read transaction is open.
+    pub fn end_read_txn(&mut self) {
+        use crate::vfs::LockLevel;
+        self.read_txn = false;
+        if self.held == LockLevel::Shared {
+            let _ = self.file.unlock(LockLevel::Unlocked);
+            self.held = LockLevel::Unlocked;
+            // A foreign writer may now change the file, so anything cached under
+            // the read lock must not be served to a later read.
+            self.read_cache.borrow_mut().clear();
+        }
+    }
+
+    /// Whether an explicit read transaction (persistent `Shared` lock) is open.
+    /// Read-only accessor for tests and the exec layer's txn bookkeeping.
+    pub fn in_read_txn(&self) -> bool {
+        self.read_txn
+    }
+
     /// Take the write-intent (`RESERVED`) lock on the main file before staging
     /// changes, so a concurrent writer to the same file is rejected with
     /// [`Error::Busy`] rather than corrupting it. Idempotent within a transaction.
@@ -445,9 +516,11 @@ impl WritePager {
         Ok(())
     }
 
-    /// Drop all write locks at the end of a transaction.
+    /// Drop all locks at the end of a transaction — the persistent read
+    /// (`Shared`) lock as well as any write (`Reserved`/`Exclusive`) lock.
     fn release_locks(&mut self) {
         use crate::vfs::LockLevel;
+        self.read_txn = false;
         if self.held != LockLevel::Unlocked {
             let _ = self.file.unlock(LockLevel::Unlocked);
             self.held = LockLevel::Unlocked;
