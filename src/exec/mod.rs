@@ -3096,8 +3096,34 @@ impl Connection {
         Ok(())
     }
 
+    /// Statement-boundary coherency hook (ROADMAP C8c-2): revalidate every
+    /// backend's read cache against the current on-disk change counter before a
+    /// read statement touches any page.
+    ///
+    /// A pure read-only connection over a read-write file caches clean pages keyed
+    /// by the database change counter; another in-process `Connection` may commit
+    /// between statements and bump that counter. Calling `revalidate_cache` once
+    /// per statement drops the cache exactly when the file changed, so the reader
+    /// always sees the newest committed data while still reusing cached pages when
+    /// nothing changed. A no-op for write backends (a writer owns coherency through
+    /// its lock) and for snapshot sources. Runs through `&self` (the cache state is
+    /// interior-mutable). Covers the main database and every attached/temp one, so
+    /// a cross-database read is coherent too.
+    fn revalidate_read_caches(&self) {
+        self.backend.source().revalidate_cache();
+        if let Some(t) = &self.temp_db {
+            t.backend.source().revalidate_cache();
+        }
+        for d in &self.attached {
+            d.backend.source().revalidate_cache();
+        }
+    }
+
     /// Like [`query`](Self::query) but with bound parameters.
     pub fn query_params(&self, sql: &str, params: &Params) -> Result<QueryResult> {
+        // Statement boundary: drop any read cache that a foreign commit has made
+        // stale, so this statement sees the newest committed data (ROADMAP C8c-2).
+        self.revalidate_read_caches();
         match sql::parse_one(sql)? {
             Statement::Select(sel) => {
                 self.ensure_read_txn_lock()?;

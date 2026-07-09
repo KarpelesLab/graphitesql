@@ -55,6 +55,13 @@ pub struct PageCache {
     capacity: usize,
     /// Monotonic recency clock; each access takes the next value.
     clock: u64,
+    /// Number of [`get`](Self::get) calls served from a resident page. Purely
+    /// observational (used by tests to prove the cache is doing work); never
+    /// affects behavior.
+    hits: u64,
+    /// Number of [`get`](Self::get) calls that missed and had to be read from
+    /// disk by the caller. Observational only.
+    misses: u64,
 }
 
 impl PageCache {
@@ -68,6 +75,8 @@ impl PageCache {
             map: BTreeMap::new(),
             capacity: capacity_for(cache_size, page_size),
             clock: 0,
+            hits: 0,
+            misses: 0,
         }
     }
 
@@ -102,9 +111,25 @@ impl PageCache {
     /// Look up page `number`, marking it most-recently-used on a hit.
     pub fn get(&mut self, number: u32) -> Option<Rc<Vec<u8>>> {
         let t = self.tick();
-        let entry = self.map.get_mut(&number)?;
-        entry.last_used = t;
-        Some(Rc::clone(&entry.data))
+        match self.map.get_mut(&number) {
+            Some(entry) => {
+                entry.last_used = t;
+                self.hits = self.hits.wrapping_add(1);
+                Some(Rc::clone(&entry.data))
+            }
+            None => {
+                self.misses = self.misses.wrapping_add(1);
+                None
+            }
+        }
+    }
+
+    /// Cumulative `(hits, misses)` since the cache was created. A *hit* is a
+    /// [`get`](Self::get) served from a resident page; a *miss* is a `get` that
+    /// found nothing (the caller then reads from disk). Observational only —
+    /// used by tests to prove repeated same-page reads avoid disk.
+    pub fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
     }
 
     /// Insert (or refresh) page `number` with `data`, evicting the

@@ -85,6 +85,17 @@ pub trait PageSource {
     fn usable_size(&self) -> usize;
     /// Total number of pages.
     fn page_count(&self) -> u32;
+
+    /// Statement-boundary hook: revalidate any internal read cache against the
+    /// current on-disk state before a new statement reads pages (ROADMAP C8c-2).
+    ///
+    /// A read-only connection over a read-write file caches clean pages keyed by
+    /// the database change counter; another in-process `Connection` may commit
+    /// between statements and bump that counter, so the cache must be dropped when
+    /// it changes. The exec layer calls this once at the start of each read
+    /// statement. The default is a no-op — sources without a coherency-sensitive
+    /// cache (an immutable snapshot, or a source with no cache) need do nothing.
+    fn revalidate_cache(&self) {}
 }
 
 impl PageSource for Pager {

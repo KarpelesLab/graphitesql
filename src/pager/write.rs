@@ -142,6 +142,24 @@ pub struct WritePager {
     /// evicted page is simply re-read from disk. Wrapped in a `RefCell` because
     /// `read_page` takes `&self`.
     read_cache: RefCell<PageCache>,
+    /// Coherency token for the clean read cache **on the read-only path** (ROADMAP
+    /// C8c-2): the database change counter (page 1, bytes 24–27) that the cached
+    /// clean pages were read under.
+    ///
+    /// A pure read-only connection holds no write lock, so — unlike a writer — it
+    /// cannot assume the on-disk pages are stable between statements: another
+    /// in-process `Connection` may commit and bump the change counter. Caching is
+    /// therefore only sound while that counter is unchanged. The token is
+    /// established/re-checked at a statement boundary by
+    /// [`revalidate_read_cache`](Self::revalidate_read_cache): if page 1's on-disk
+    /// counter differs from this token, the cache is stale and is dropped before
+    /// the statement reads anything.
+    ///
+    /// `None` means "not yet validated this statement" — the read cache is not
+    /// trusted until a revalidation stamps a token. The write path never consults
+    /// this field (it clears the cache on lock transitions instead). A `Cell`
+    /// because the read path runs through `&self`.
+    read_cache_token: Cell<Option<u32>>,
 }
 
 /// A snapshot of the pager's staged state captured by `SAVEPOINT`.
@@ -228,6 +246,7 @@ impl WritePager {
             savepoints: Vec::new(),
             secure_delete: false,
             read_cache: RefCell::new(PageCache::new(pcache::DEFAULT_CACHE_SIZE, page_size)),
+            read_cache_token: Cell::new(None),
         })
     }
 
@@ -317,6 +336,7 @@ impl WritePager {
                 pcache::DEFAULT_CACHE_SIZE,
                 page_size as usize,
             )),
+            read_cache_token: Cell::new(None),
         };
         // Page 1: db header (0..100) + an empty table-leaf b-tree at offset 100.
         let mut page1 = vec![0u8; page_size as usize];
@@ -347,12 +367,28 @@ impl WritePager {
     /// the cache, so the cache only ever holds — and only ever returns — clean
     /// on-disk pages; a dirty page is therefore never evictable from it.
     ///
-    /// The cache is only consulted while this connection holds a write lock on the
-    /// file (i.e. inside its own write transaction). With no lock held, a *foreign*
-    /// connection over the same VFS may have committed under us, so the cache could
-    /// be stale: we then read straight from disk and keep the cache cold. Within a
-    /// write transaction this connection is the only writer (it holds at least
-    /// `Reserved`), so the on-disk clean pages cannot change beneath the cache.
+    /// # Coherency
+    ///
+    /// The clean read cache is trusted under exactly two regimes, both of which
+    /// guarantee the cached bytes still match the file:
+    ///
+    /// * **Write transaction** — this connection holds a write lock (`Reserved`+),
+    ///   so it is the only writer and the on-disk clean pages cannot change beneath
+    ///   the cache. The cache is cleared on every lock transition (see
+    ///   `acquire_write_intent` and `release_locks`).
+    /// * **Read-only, validated** — this connection holds no write lock, but a
+    ///   statement boundary has just confirmed (via
+    ///   [`revalidate_read_cache`](Self::revalidate_read_cache)) that page 1's
+    ///   on-disk change counter still equals the token the cache was populated
+    ///   under. A foreign `Connection` bumps that counter on every commit, so an
+    ///   unchanged counter means no foreign write has landed since the cache was
+    ///   filled. The token is `Some` only while that invariant holds; the next
+    ///   statement re-checks and drops the cache if it changed.
+    ///
+    /// With neither regime active (`read_cache_token` is `None` and no write lock),
+    /// the cache is bypassed and the page is read straight from disk, exactly as
+    /// before — the read-only path stays correct even if the exec layer never calls
+    /// the revalidation hook.
     pub fn read_page(&self, number: u32) -> Result<Vec<u8>> {
         if let Some(bytes) = self.overlay.get(&number) {
             return Ok(bytes.clone());
@@ -366,9 +402,11 @@ impl WritePager {
         if number == 0 || number > self.disk_pages {
             return Err(Error::Corrupt(format!("page {number} out of range")));
         }
-        // Only trust the cache while we hold a write lock; otherwise a foreign
-        // writer could have changed the file out from under it (see method docs).
-        let cacheable = self.held.get() >= crate::vfs::LockLevel::Reserved;
+        // Trust the cache under a write lock (we are the only writer) or on the
+        // read-only path once a statement boundary has stamped a still-valid
+        // change-counter token (see method docs).
+        let cacheable = self.held.get() >= crate::vfs::LockLevel::Reserved
+            || self.read_cache_token.get().is_some();
         if cacheable && let Some(bytes) = self.read_cache.borrow_mut().get(number) {
             return Ok(bytes.as_ref().clone());
         }
@@ -383,6 +421,69 @@ impl WritePager {
             return Ok(data.as_ref().clone());
         }
         Ok(buf)
+    }
+
+    /// Revalidate the clean read cache against the database's on-disk **change
+    /// counter** (page 1, bytes 24–27) at a statement boundary, for the read-only
+    /// path (ROADMAP C8c-2).
+    ///
+    /// A pure read-only connection holds no write lock, so between statements a
+    /// foreign in-process `Connection` may commit and rewrite pages under it. The
+    /// change counter is SQLite's monotonic "the file changed" token: it is bumped
+    /// on every commit. This method reads that counter directly from disk and:
+    ///
+    /// * if it differs from the token the cache was populated under (or the cache
+    ///   was never validated), **drops the entire cache** and re-stamps the token,
+    ///   so the upcoming statement re-reads fresh pages from disk;
+    /// * if it is unchanged, leaves the cache intact — the cached clean pages are
+    ///   still byte-identical to the file, so the statement may reuse them.
+    ///
+    /// Either way, after this call `read_cache_token` is `Some(current counter)`,
+    /// which is what enables the cache for the duration of the statement (see
+    /// [`read_page`](Self::read_page)). Call it once at the start of each read
+    /// statement, before any page is read.
+    ///
+    /// A no-op while a write lock is held: a writer owns the file and manages the
+    /// cache through its lock transitions, so the read-only token must not
+    /// interfere. In WAL mode the change counter is not the authority for reads
+    /// (the WAL is), so this also leaves the cache untouched there.
+    ///
+    /// Reading page 1 goes through [`read_page`](Self::read_page); costing one page
+    /// read per statement (itself cached once the token is set), which is far
+    /// cheaper than re-reading every page of every statement from disk.
+    pub fn revalidate_read_cache(&self) {
+        // Under a write lock the writer already owns coherency; in WAL mode the
+        // change counter is not the read authority. Leave the cache as-is.
+        if self.held.get() >= crate::vfs::LockLevel::Reserved || self.wal.is_some() {
+            return;
+        }
+        let current = match self.disk_change_counter() {
+            Some(c) => c,
+            // Could not read the counter (e.g. an empty/absent page 1): fall back
+            // to the always-correct uncached path by clearing the token.
+            None => {
+                self.read_cache_token.set(None);
+                self.read_cache.borrow_mut().clear();
+                return;
+            }
+        };
+        if self.read_cache_token.get() != Some(current) {
+            // The file changed under us (or this is the first statement): the
+            // cached clean pages may be stale, so drop them and re-stamp.
+            self.read_cache.borrow_mut().clear();
+            self.read_cache_token.set(Some(current));
+        }
+    }
+
+    /// Read the database change counter (page 1, bytes 24–27, big-endian) straight
+    /// from disk, bypassing the cache. Returns `None` if page 1 cannot be read.
+    fn disk_change_counter(&self) -> Option<u32> {
+        if self.disk_pages == 0 {
+            return None;
+        }
+        let mut hdr = [0u8; 28];
+        self.file.read_exact_at(&mut hdr, 0).ok()?;
+        Some(be32(&hdr, 24))
     }
 
     /// Reconfigure the bounded clean-page read cache from a `cache_size` value
@@ -403,6 +504,15 @@ impl WritePager {
     #[doc(hidden)]
     pub fn resident_clean_pages(&self) -> usize {
         self.read_cache.borrow().len()
+    }
+
+    /// Cumulative `(hits, misses)` of the clean read cache since this pager was
+    /// opened. A hit is a page served from cache; a miss is one that had to be
+    /// read from disk. Read-only accessor used by tests to prove repeated
+    /// same-page reads within a statement avoid disk; not part of the stable API.
+    #[doc(hidden)]
+    pub fn read_cache_stats(&self) -> (u64, u64) {
+        self.read_cache.borrow().stats()
     }
 
     /// The number of dirty (staged, not-yet-committed) pages held in the overlay.
@@ -479,8 +589,11 @@ impl WritePager {
             let _ = self.file.unlock(LockLevel::Unlocked);
             self.held.set(LockLevel::Unlocked);
             // A foreign writer may now change the file, so anything cached under
-            // the read lock must not be served to a later read.
+            // the read lock must not be served to a later read. Force the next
+            // read-only statement to re-validate the change counter before it
+            // trusts the cache again.
             self.read_cache.borrow_mut().clear();
+            self.read_cache_token.set(None);
         }
     }
 
@@ -513,8 +626,11 @@ impl WritePager {
             // Entering a write transaction: a foreign connection over the same
             // VFS may have committed since we last held a lock, so anything in
             // the clean read cache could be stale. Drop it; pages are re-read
-            // from disk and re-cached fresh under the write lock.
+            // from disk and re-cached fresh under the write lock. Also drop the
+            // read-only coherency token so the read-only cache regime does not
+            // shadow the write-lock regime while the lock is held.
             self.read_cache.borrow_mut().clear();
+            self.read_cache_token.set(None);
         }
         Ok(())
     }
@@ -539,8 +655,10 @@ impl WritePager {
             let _ = self.file.unlock(LockLevel::Unlocked);
             self.held.set(LockLevel::Unlocked);
             // Once unlocked, a foreign writer may change the file, so anything
-            // we cached under the lock must not be served to a later read.
+            // we cached under the lock must not be served to a later read. Force
+            // the next read-only statement to re-validate before trusting it.
             self.read_cache.borrow_mut().clear();
+            self.read_cache_token.set(None);
         }
     }
 
@@ -1778,6 +1896,9 @@ impl PageSource for WritePager {
     }
     fn page_count(&self) -> u32 {
         self.page_count
+    }
+    fn revalidate_cache(&self) {
+        self.revalidate_read_cache();
     }
 }
 
