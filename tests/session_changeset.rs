@@ -947,3 +947,178 @@ fn concat_apply_equals_sequential_apply() {
     };
     assert_eq!(via_cat, via_seq, "concat apply != sequential apply");
 }
+
+// ---------------------------------------------------------------------------
+// Patchset generation (`Connection::session_patchset`) and apply.
+//
+// A patchset is the changeset format with the old, non-PK values omitted: the
+// table-header op byte is 'P' (0x50) not 'T' (0x54); a DELETE record carries
+// only the PK columns; an UPDATE record carries a single record (PK + changed
+// new values, no old.* half). INSERT records are byte-identical. The byte
+// literals below were verified against SQLite 3.50.4's `sqlite3session_patchset`.
+// ---------------------------------------------------------------------------
+
+/// Build a patchset for `dml` over `setup` (via a graphite session).
+fn make_patchset(setup: &str, dml: &str) -> Vec<u8> {
+    let mut a = Connection::open_memory().unwrap();
+    a.execute_batch(setup).unwrap();
+    let session = a.create_session();
+    session.attach();
+    a.execute_batch(dml).unwrap();
+    a.session_patchset(&session).unwrap()
+}
+
+fn patchset_hex(setup: &str, dml: &str) -> String {
+    hex(&make_patchset(setup, dml))
+}
+
+#[test]
+fn patchset_insert_bytes() {
+    // Byte-identical to the changeset except the 'P' header (0x50 vs 0x54).
+    assert_eq!(
+        patchset_hex(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b);",
+            "INSERT INTO t VALUES(1,2);"
+        ),
+        "5002010074001200010000000000000001010000000000000002"
+    );
+}
+
+#[test]
+fn patchset_update_bytes() {
+    // Single record: PK present, changed col present, unchanged col 0x00.
+    assert_eq!(
+        patchset_hex(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c); INSERT INTO t VALUES(1,2,3);",
+            "UPDATE t SET b=20 WHERE a=1;"
+        ),
+        "50030100007400170001000000000000000101000000000000001400"
+    );
+}
+
+#[test]
+fn patchset_delete_bytes() {
+    // DELETE carries only the PK column.
+    assert_eq!(
+        patchset_hex(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c); INSERT INTO t VALUES(1,2,3);",
+            "DELETE FROM t WHERE a=1;"
+        ),
+        "500301000074000900010000000000000001"
+    );
+}
+
+#[test]
+fn patchset_composite_update_bytes() {
+    assert_eq!(
+        patchset_hex(
+            "CREATE TABLE t(a,b,c, PRIMARY KEY(a,b)); INSERT INTO t VALUES(1,2,3);",
+            "UPDATE t SET c=30 WHERE a=1;"
+        ),
+        "50030102007400170001000000000000000101000000000000000201000000000000001e"
+    );
+}
+
+#[test]
+fn patchset_composite_delete_bytes() {
+    assert_eq!(
+        patchset_hex(
+            "CREATE TABLE t(a,b,c, PRIMARY KEY(a,b)); INSERT INTO t VALUES(1,2,3);",
+            "DELETE FROM t WHERE a=1;"
+        ),
+        "500301020074000900010000000000000001010000000000000002"
+    );
+}
+
+#[test]
+fn patchset_without_rowid_delete_bytes() {
+    // WITHOUT ROWID `PRIMARY KEY(b,a)`: abPK marks b->1, a->2 in column order.
+    // Verified: 'P' 03 <abPK 02 01 00> 't\0' DELETE 00 <pk a=1> <pk b=2>.
+    assert_eq!(
+        patchset_hex(
+            "CREATE TABLE t(a,b,c, PRIMARY KEY(b,a)) WITHOUT ROWID; INSERT INTO t VALUES(1,2,3);",
+            "DELETE FROM t WHERE a=1;"
+        ),
+        "500302010074000900010000000000000001010000000000000002"
+    );
+}
+
+#[test]
+fn patchset_is_empty_when_no_changes() {
+    let conn = Connection::open_memory().unwrap();
+    let session = conn.create_session();
+    session.attach();
+    assert_eq!(conn.session_patchset(&session).unwrap(), Vec::<u8>::new());
+}
+
+/// Round-trip a patchset: run `dml` on DB_A (recording), then apply the
+/// patchset to a fresh DB_B holding DB_A's pre-DML state. DB_B must end up
+/// identical to DB_A. `changeset_apply` accepts patchsets too.
+fn patchset_roundtrip(setup: &str, dml: &str) {
+    let mut a = Connection::open_memory().unwrap();
+    a.execute_batch(setup).unwrap();
+    let session = a.create_session();
+    session.attach();
+    a.execute_batch(dml).unwrap();
+    let ps = a.session_patchset(&session).unwrap();
+    let post_a = dump_t(&a);
+
+    let mut b = Connection::open_memory().unwrap();
+    b.execute_batch(setup).unwrap();
+    b.changeset_apply(&ps).unwrap();
+    let post_b = dump_t(&b);
+
+    assert_eq!(
+        post_a, post_b,
+        "patchset round-trip mismatch\n setup={setup}\n dml={dml}"
+    );
+}
+
+#[test]
+fn patchset_apply_roundtrip_insert() {
+    patchset_roundtrip(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c); INSERT INTO t VALUES(1,'x',1.5);",
+        "INSERT INTO t VALUES(3,'z',x'aabb');",
+    );
+}
+
+#[test]
+fn patchset_apply_roundtrip_update() {
+    patchset_roundtrip(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c); INSERT INTO t VALUES(1,'x',1.5),(2,'y',NULL);",
+        "UPDATE t SET b='X2', c=9.5 WHERE a=1;",
+    );
+}
+
+#[test]
+fn patchset_apply_roundtrip_delete() {
+    patchset_roundtrip(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c); INSERT INTO t VALUES(1,'x',1.5),(2,'y',NULL);",
+        "DELETE FROM t WHERE a=2;",
+    );
+}
+
+#[test]
+fn patchset_apply_roundtrip_mixed() {
+    patchset_roundtrip(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c); INSERT INTO t VALUES(1,'x',1.5),(2,'y',NULL);",
+        "INSERT INTO t VALUES(3,'z',7); UPDATE t SET b='X2' WHERE a=1; DELETE FROM t WHERE a=2;",
+    );
+}
+
+#[test]
+fn patchset_apply_roundtrip_composite() {
+    patchset_roundtrip(
+        "CREATE TABLE t(a,b,c, PRIMARY KEY(a,b)); INSERT INTO t VALUES(1,10,100),(2,20,200);",
+        "INSERT INTO t VALUES(3,30,300); UPDATE t SET c=999 WHERE a=1; DELETE FROM t WHERE a=2;",
+    );
+}
+
+#[test]
+fn patchset_apply_roundtrip_without_rowid() {
+    patchset_roundtrip(
+        "CREATE TABLE t(a,b,c, PRIMARY KEY(b,a)) WITHOUT ROWID; \
+         INSERT INTO t VALUES(1,10,100),(2,20,200);",
+        "INSERT INTO t VALUES(3,30,300); UPDATE t SET c=999 WHERE a=1; DELETE FROM t WHERE a=2;",
+    );
+}

@@ -418,6 +418,31 @@ fn append_value(out: &mut Vec<u8>, v: &Value) {
 /// by [`crate::Connection::session_changeset`], which supplies the live read.
 pub(crate) fn serialize(
     state: &SessionState,
+    read_row: impl FnMut(&str, &[Value]) -> Option<Vec<Value>>,
+) -> Vec<u8> {
+    serialize_impl(state, false, read_row)
+}
+
+/// Serialize the recorded changes into a **patchset** blob (mirrors
+/// `sqlite3session_patchset`). A patchset is the changeset format with three
+/// differences: the table-header op byte is `'P'` (not `'T'`); a `DELETE`
+/// record carries **only** the primary-key columns (each PK field verbatim,
+/// non-PK columns omitted entirely — not even a `0x00` placeholder); and an
+/// `UPDATE` record carries a **single** record (no `old.*` half) holding the PK
+/// columns plus the changed non-PK columns, with unchanged non-PK columns as the
+/// `0x00` omitted marker. `INSERT` records are byte-identical to a changeset's.
+pub(crate) fn serialize_patchset(
+    state: &SessionState,
+    read_row: impl FnMut(&str, &[Value]) -> Option<Vec<Value>>,
+) -> Vec<u8> {
+    serialize_impl(state, true, read_row)
+}
+
+/// Shared body of [`serialize`] and [`serialize_patchset`]: `patchset` selects
+/// the changeset (`false`) or patchset (`true`) record layout.
+fn serialize_impl(
+    state: &SessionState,
+    patchset: bool,
     mut read_row: impl FnMut(&str, &[Value]) -> Option<Vec<Value>>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
@@ -425,9 +450,10 @@ pub(crate) fn serialize(
         if tbl.is_empty() {
             continue;
         }
-        // Table header: 'T', ncol (varint), pk-flag bytes, NUL-terminated name.
+        // Table header: 'T' (changeset) / 'P' (patchset), ncol (varint),
+        // pk-flag bytes, NUL-terminated name.
         let hdr_start = out.len();
-        out.push(b'T');
+        out.push(if patchset { b'P' } else { b'T' });
         append_varint(&mut out, tbl.ncol as u64);
         // The PK-flag bytes are SQLite's `abPK` verbatim: 0 for a non-PK column,
         // else the column's 1-based position within the primary key.
@@ -458,12 +484,12 @@ pub(crate) fn serialize(
                         // INSERT then DELETE → nothing.
                     }
                     (ChangeOp::Update | ChangeOp::Delete, Some(row)) => {
-                        if append_update(&mut out, &change.old, &row, &tbl.pk_flags) {
+                        if append_update(&mut out, &change.old, &row, &tbl.pk_flags, patchset) {
                             wrote_any = true;
                         }
                     }
                     (ChangeOp::Update | ChangeOp::Delete, None) => {
-                        append_delete(&mut out, &change.old);
+                        append_delete(&mut out, &change.old, &tbl.pk_flags, patchset);
                         wrote_any = true;
                     }
                 }
@@ -479,21 +505,42 @@ pub(crate) fn serialize(
     out
 }
 
-/// Append a DELETE change: op byte, indirect byte, then the full old record.
-fn append_delete(out: &mut Vec<u8>, old: &[Value]) {
+/// Append a DELETE change. For a changeset (`patchset == false`): op byte,
+/// indirect byte, then the full old record. For a patchset (`patchset == true`):
+/// op byte, indirect byte, then **only** the primary-key columns (each PK field
+/// verbatim, in column order); non-PK columns are omitted entirely (no `0x00`
+/// placeholder). Mirrors `sessionAppendDelete`.
+fn append_delete(out: &mut Vec<u8>, old: &[Value], pk_flags: &[u8], patchset: bool) {
     out.push(OP_DELETE);
     out.push(0);
-    for v in old {
-        append_value(out, v);
+    for (i, v) in old.iter().enumerate() {
+        let is_pk = pk_flags.get(i).copied().unwrap_or(0) != 0;
+        if patchset {
+            // Patchset: emit only PK columns; skip non-PK columns entirely.
+            if is_pk {
+                append_value(out, v);
+            }
+        } else {
+            append_value(out, v);
+        }
     }
 }
 
-/// Append an UPDATE change: op byte, indirect byte, old record (PK columns and
-/// changed columns present, unchanged non-PK columns as `OMIT`), then new
-/// record (changed columns present, unchanged as `OMIT`). Returns `false`
+/// Append an UPDATE change. For a changeset (`patchset == false`): op byte,
+/// indirect byte, old record (PK columns and changed columns present, unchanged
+/// non-PK columns as `OMIT`), then new record (changed columns present,
+/// unchanged as `OMIT`). For a patchset (`patchset == true`): op byte, indirect
+/// byte, then a **single** record (no old.* half) with PK columns and changed
+/// non-PK columns present, unchanged non-PK columns as `OMIT`. Returns `false`
 /// (writing nothing) if no non-PK column changed — matching SQLite, which
 /// rewinds the buffer for a no-op update.
-fn append_update(out: &mut Vec<u8>, old: &[Value], new: &[Value], pk_flags: &[u8]) -> bool {
+fn append_update(
+    out: &mut Vec<u8>,
+    old: &[Value],
+    new: &[Value],
+    pk_flags: &[u8],
+    patchset: bool,
+) -> bool {
     let start = out.len();
     out.push(OP_UPDATE);
     out.push(0);
@@ -507,14 +554,18 @@ fn append_update(out: &mut Vec<u8>, old: &[Value], new: &[Value], pk_flags: &[u8
         if changed {
             changed_any = true;
         }
-        // old.* record: present if changed or PK, else OMIT.
-        if changed || is_pk {
-            append_value(out, &old[i]);
-        } else {
-            out.push(T_OMIT);
+        // old.* record: only emitted for a changeset. Present if changed or PK,
+        // else OMIT. A patchset omits the old.* record entirely.
+        if !patchset {
+            if changed || is_pk {
+                append_value(out, &old[i]);
+            } else {
+                out.push(T_OMIT);
+            }
         }
-        // new.* record: present if changed, else OMIT.
-        if changed {
+        // new.* record (the only record for a patchset): present if changed, or
+        // (patchset only) if it is a PK column; else OMIT.
+        if changed || (patchset && is_pk) {
             append_value(&mut new_rec, &new[i]);
         } else {
             new_rec.push(T_OMIT);
@@ -663,23 +714,49 @@ impl<'a> Reader<'a> {
         }
         Ok(out)
     }
+
+    /// Read a patchset PK-only record: one value for each column whose `pk_flags`
+    /// byte is non-zero (in column order), returning a full `ncol`-length vector
+    /// with the PK slots filled and every non-PK slot `None`. Non-PK columns are
+    /// **not** present in the byte stream at all (no `0x00` placeholder), so only
+    /// the PK fields are consumed.
+    fn pk_only_record(&mut self, ncol: usize, pk_flags: &[u8]) -> Result<Vec<Option<Value>>> {
+        let mut out = alloc::vec![None; ncol];
+        for (i, slot) in out.iter_mut().enumerate().take(ncol) {
+            if pk_flags.get(i).copied().unwrap_or(0) != 0 {
+                *slot = self.value()?;
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn corrupt(msg: &str) -> crate::error::Error {
     crate::error::Error::Corrupt(alloc::format!("changeset: {msg}"))
 }
 
-/// Parse a changeset blob into per-table change groups. Supports the format
-/// [`serialize`] produces (`'T'` table headers followed by `INSERT`/`UPDATE`/
-/// `DELETE` change records). An empty blob yields an empty vector.
+/// Parse a changeset **or patchset** blob into per-table change groups.
+/// Supports the formats [`serialize`]/[`serialize_patchset`] produce (`'T'` or
+/// `'P'` table headers followed by `INSERT`/`UPDATE`/`DELETE` change records).
+/// An empty blob yields an empty vector.
+///
+/// Patchset records are normalized into the same [`ChangeRecord`] shape a
+/// changeset yields (so [`crate::Connection::changeset_apply`] handles both):
+/// a patchset `DELETE`'s PK-only record and a patchset `UPDATE`'s single record
+/// are expanded to full `ncol`-length vectors, with the missing `old.*` fields
+/// left as `None` (the apply matches the target row by PK, which is exactly the
+/// patchset's "match on PK, ignore old values" semantics).
 pub(crate) fn parse_changeset(data: &[u8]) -> Result<Vec<TableChangeset>> {
     let mut r = Reader::new(data);
     let mut tables: Vec<TableChangeset> = Vec::new();
+    // Whether the table currently being read used a `'P'` (patchset) header.
+    let mut patchset = false;
     while !r.eof() {
         let marker = r.peek()?;
         match marker {
-            b'T' => {
-                r.u8()?; // consume 'T'
+            b'T' | b'P' => {
+                patchset = marker == b'P';
+                r.u8()?; // consume 'T' / 'P'
                 let ncol = r.varint()? as usize;
                 if ncol == 0 {
                     return Err(corrupt("table has zero columns"));
@@ -713,6 +790,7 @@ pub(crate) fn parse_changeset(data: &[u8]) -> Result<Vec<TableChangeset>> {
                     .last_mut()
                     .ok_or_else(|| corrupt("change record before any table header"))?;
                 let ncol = tbl.ncol;
+                let pk_flags = tbl.pk_flags.clone();
                 let op = r.u8()?;
                 let _indirect = r.u8()?;
                 let rec = match op {
@@ -721,13 +799,42 @@ pub(crate) fn parse_changeset(data: &[u8]) -> Result<Vec<TableChangeset>> {
                         old: Vec::new(),
                         new: r.record(ncol)?,
                     },
+                    OP_DELETE if patchset => {
+                        // Patchset DELETE: only PK columns are present, in
+                        // column order. Expand to a full old.* record with the
+                        // PK values filled and non-PK columns left `None`.
+                        let old = r.pk_only_record(ncol, &pk_flags)?;
+                        ChangeRecord {
+                            op: ChangeOp::Delete,
+                            old,
+                            new: Vec::new(),
+                        }
+                    }
                     OP_DELETE => ChangeRecord {
                         op: ChangeOp::Delete,
                         old: r.record(ncol)?,
                         new: Vec::new(),
                     },
+                    _ if patchset => {
+                        // Patchset UPDATE: a single record with PK columns and
+                        // changed non-PK columns present (unchanged as `0x00`).
+                        // Use it as new.*; synthesize old.* holding just the PK
+                        // values (so apply matches the row by PK only).
+                        let new = r.record(ncol)?;
+                        let mut old = alloc::vec![None; ncol];
+                        for (i, flag) in pk_flags.iter().enumerate().take(ncol) {
+                            if *flag != 0 {
+                                old[i] = new[i].clone();
+                            }
+                        }
+                        ChangeRecord {
+                            op: ChangeOp::Update,
+                            old,
+                            new,
+                        }
+                    }
                     _ => {
-                        // UPDATE: old record then new record.
+                        // Changeset UPDATE: old record then new record.
                         let old = r.record(ncol)?;
                         let new = r.record(ncol)?;
                         ChangeRecord {
@@ -1465,5 +1572,172 @@ mod tests {
             "540301020074001200010000000000000001\
              010000000000000002010000000000000003"
         );
+    }
+
+    // --- patchset (byte-verified against the SQLite 3.50.4 oracle) ---------
+
+    /// A patchset INSERT is byte-identical to a changeset INSERT except the
+    /// table-header op byte is `'P'` (0x50) instead of `'T'` (0x54).
+    #[test]
+    fn patchset_insert_matches_oracle() {
+        let mut st = SessionState {
+            enabled: true,
+            tables: Vec::new(),
+        };
+        st.record(
+            "t",
+            2,
+            &[1, 0],
+            ChangeOp::Insert,
+            alloc::vec![Value::Integer(1)],
+            alloc::vec![Value::Integer(1), Value::Null],
+        );
+        let out = serialize_patchset(&st, |_, _| {
+            Some(alloc::vec![Value::Integer(1), Value::Integer(2)])
+        });
+        assert_eq!(
+            hex(&out),
+            "5002010074001200010000000000000001010000000000000002"
+        );
+    }
+
+    /// A patchset UPDATE (single-INTEGER-PK table `t(a pk, b, c)`, setting `b`)
+    /// carries a single record: PK present, changed column present, unchanged
+    /// column `0x00` — no `old.*` record.
+    #[test]
+    fn patchset_update_matches_oracle() {
+        let mut st = SessionState {
+            enabled: true,
+            tables: Vec::new(),
+        };
+        st.record(
+            "t",
+            3,
+            &[1, 0, 0],
+            ChangeOp::Update,
+            alloc::vec![Value::Integer(1)],
+            alloc::vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        );
+        let out = serialize_patchset(&st, |_, _| {
+            Some(alloc::vec![
+                Value::Integer(1),
+                Value::Integer(20),
+                Value::Integer(3)
+            ])
+        });
+        assert_eq!(
+            hex(&out),
+            "50030100007400170001000000000000000101000000000000001400"
+        );
+    }
+
+    /// A patchset DELETE carries only the primary-key columns (non-PK columns
+    /// omitted entirely — no `0x00` placeholder).
+    #[test]
+    fn patchset_delete_matches_oracle() {
+        let mut st = SessionState {
+            enabled: true,
+            tables: Vec::new(),
+        };
+        st.record(
+            "t",
+            3,
+            &[1, 0, 0],
+            ChangeOp::Delete,
+            alloc::vec![Value::Integer(1)],
+            alloc::vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        );
+        // The row is gone at patchset time → DELETE.
+        let out = serialize_patchset(&st, |_, _| None);
+        assert_eq!(hex(&out), "500301000074000900010000000000000001");
+    }
+
+    /// A composite-PK patchset DELETE keeps both PK columns, dropping the non-PK
+    /// column.
+    #[test]
+    fn patchset_composite_delete_matches_oracle() {
+        let mut st = SessionState {
+            enabled: true,
+            tables: Vec::new(),
+        };
+        st.record(
+            "t",
+            3,
+            &[1, 2, 0],
+            ChangeOp::Delete,
+            alloc::vec![Value::Integer(1), Value::Integer(2)],
+            alloc::vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        );
+        let out = serialize_patchset(&st, |_, _| None);
+        assert_eq!(
+            hex(&out),
+            "500301020074000900010000000000000001010000000000000002"
+        );
+    }
+
+    /// A composite-PK patchset UPDATE (`t(a,b,c, PRIMARY KEY(a,b))`, setting
+    /// `c`) keeps both PK columns plus the changed column in the single record.
+    #[test]
+    fn patchset_composite_update_matches_oracle() {
+        let mut st = SessionState {
+            enabled: true,
+            tables: Vec::new(),
+        };
+        st.record(
+            "t",
+            3,
+            &[1, 2, 0],
+            ChangeOp::Update,
+            alloc::vec![Value::Integer(1), Value::Integer(2)],
+            alloc::vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        );
+        let out = serialize_patchset(&st, |_, _| {
+            Some(alloc::vec![
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(30)
+            ])
+        });
+        assert_eq!(
+            hex(&out),
+            "50030102007400170001000000000000000101000000000000000201000000000000001e"
+        );
+    }
+
+    /// Parsing a patchset back yields change records the apply layer consumes:
+    /// a patchset DELETE fills only PK slots (non-PK `None`); a patchset UPDATE's
+    /// single record becomes `new`, with `old` holding just the PK values.
+    #[test]
+    fn parse_patchset_normalizes_records() {
+        // Patchset for `t(a pk,b,c)`: UPDATE set b=20, then a DELETE.
+        let update = "50030100007400170001000000000000000101000000000000001400";
+        let bytes = from_hex(update);
+        let tables = parse_changeset(&bytes).unwrap();
+        assert_eq!(tables.len(), 1);
+        let t = &tables[0];
+        assert_eq!(t.ncol, 3);
+        assert_eq!(t.pk_flags, alloc::vec![1, 0, 0]);
+        let c = &t.changes[0];
+        assert_eq!(c.op, ChangeOp::Update);
+        // new: PK present, changed col present, unchanged col omitted.
+        assert_eq!(
+            c.new,
+            alloc::vec![Some(Value::Integer(1)), Some(Value::Integer(20)), None]
+        );
+        // old: only the PK slot is filled (matches the row by PK on apply).
+        assert_eq!(c.old, alloc::vec![Some(Value::Integer(1)), None, None]);
+
+        let del = "500301000074000900010000000000000001";
+        let tables = parse_changeset(&from_hex(del)).unwrap();
+        let c = &tables[0].changes[0];
+        assert_eq!(c.op, ChangeOp::Delete);
+        assert_eq!(c.old, alloc::vec![Some(Value::Integer(1)), None, None]);
+    }
+
+    fn from_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 }

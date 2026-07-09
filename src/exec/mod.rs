@@ -7228,6 +7228,37 @@ impl Connection {
         Ok(bytes)
     }
 
+    /// Produce the **patchset** blob for `session`, reading the current values of
+    /// changed rows live from the database. Mirrors `sqlite3session_patchset`.
+    ///
+    /// A patchset is the [`session_changeset`](Self::session_changeset) format
+    /// with the old, non-primary-key values omitted: a `DELETE` record carries
+    /// only the primary-key columns, and an `UPDATE` record carries only the
+    /// primary-key columns plus the changed new values (no `old.*` record). The
+    /// blob is byte-compatible with SQLite's session extension for every
+    /// supported table shape (single `INTEGER PRIMARY KEY`, single non-integer
+    /// PK, composite PK, and `WITHOUT ROWID`).
+    ///
+    /// A patchset produced here can be applied with
+    /// [`changeset_apply`](Self::changeset_apply), which accepts both formats.
+    pub fn session_patchset(&self, session: &crate::session::Session) -> Result<Vec<u8>> {
+        let state = session.state.borrow();
+        let mut err: Option<Error> = None;
+        let bytes = crate::session::serialize_patchset(&state, |table, pk| {
+            match self.session_read_row_by_pk(table, pk) {
+                Ok(row) => row,
+                Err(e) => {
+                    err.get_or_insert(e);
+                    None
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(bytes)
+    }
+
     /// Read the current full row (visible columns, declared order) of `table`
     /// whose primary-key columns equal `pk` (the PK column values, in column
     /// order). Returns `None` if no such row exists. Used by
@@ -7337,10 +7368,14 @@ impl Connection {
         Ok(Some((flags, pk_positions)))
     }
 
-    /// Apply a changeset blob (as produced by
-    /// [`session_changeset`](Self::session_changeset) or SQLite's session
+    /// Apply a changeset **or patchset** blob (as produced by
+    /// [`session_changeset`](Self::session_changeset),
+    /// [`session_patchset`](Self::session_patchset), or SQLite's session
     /// extension) to this connection's database, reproducing
-    /// `sqlite3changeset_apply`'s default behaviour (roadmap D5).
+    /// `sqlite3changeset_apply`'s default behaviour (roadmap D5). SQLite's apply
+    /// accepts both formats, and so does this: a patchset's `DELETE`/`UPDATE`
+    /// records (which omit the old, non-PK values) match their target row by
+    /// primary key only.
     ///
     /// Each `INSERT`/`UPDATE`/`DELETE` record is applied to the matching table.
     /// The default conflict dispositions are honoured:
