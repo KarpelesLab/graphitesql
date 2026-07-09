@@ -375,9 +375,15 @@ result or declines to it — never a wrong answer), so this track is
   byte-compatible changeset (verified vs an `SQLITE_ENABLE_SESSION` oracle across
   ~78k fuzzed sequences: all storage classes, coalescing, hash-bucket order,
   `INSERT OR REPLACE`). Records single-`INTEGER PRIMARY KEY` rowid tables only; the
-  write hook is a no-op when no session is active. **Remaining:** `WITHOUT ROWID`/
-  composite/no-PK tables, patchsets, `changeset_apply`/invert, per-table attach,
-  indirect changes, and streaming.
+  write hook is a no-op when no session is active. *Changeset apply done
+  (2026-07-09, 1a84b64):* `Connection::changeset_apply(&[u8])` parses a changeset
+  and replays it as parameterized DML under a `SAVEPOINT`, with sqlite's default
+  conflict dispositions (NOTFOUND/DATA→OMIT; CONFLICT/CONSTRAINT→ABORT+`ROLLBACK
+  TO`) — verified round-trip and differentially vs a `sesapply` oracle (incl.
+  conflicts), and graphite applies sqlite-generated changesets. **Remaining:**
+  `WITHOUT ROWID`/composite/no-PK tables, patchsets, changeset invert/concat/
+  rebase, custom conflict handlers, per-table attach, indirect changes, and
+  streaming.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**
