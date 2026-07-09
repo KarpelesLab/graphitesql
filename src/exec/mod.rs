@@ -41072,10 +41072,10 @@ fn trigger_global_unique_quals(
     // rationale; a genuinely mixed body still bails untouched.
     let (mut quals, bare) = match global_unique_plan(&srcs, table, old, table_cols) {
         Some((q, true)) => (q, true),
-        Some((q, false)) => match scope_bare_old_decision_trigger(&ct, table, old, table_cols) {
-            Some(rb) => (q, rb),
-            None => return None,
-        },
+        Some((q, false)) => (
+            q,
+            scope_bare_old_decision_trigger(&ct, table, old, table_cols)?,
+        ),
         None => return None,
     };
     if ct.table.eq_ignore_ascii_case(table) {

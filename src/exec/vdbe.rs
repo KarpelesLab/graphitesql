@@ -839,10 +839,7 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
         // `DISTINCT` with two arguments is a tree-walker error ("DISTINCT
         // aggregates must have exactly one argument"), so leave it to fall back.
         "group_concat" | "string_agg" if args.len() == 2 && !*distinct => {
-            match const_sep_text(&args[1]) {
-                Some(s) => (AggKind::GroupConcat, Some(s)),
-                None => return None,
-            }
+            (AggKind::GroupConcat, Some(const_sep_text(&args[1])?))
         }
         _ => return None,
     };
