@@ -31279,27 +31279,39 @@ impl Connection {
         let block =
             fts5_index::build_segment_block(&terms, &doc_sizes, 4050, merged_segid, prefixes);
 
+        // Mutate a COPY of the structure and only commit it on success, so a bail
+        // leaves the caller's `structure` untouched (it then rebuilds from
+        // scratch, discarding this attempt).
+        let mut merged = structure.clone();
         // Replace level 0 with an empty level, add the merged segment at level 1,
         // then promote. This mirrors fts5IndexMergeLevel + fts5StructurePromote
         // for the single-crisis case.
-        structure.levels[0].segs.clear();
-        structure.levels[0].n_merge = 0;
-        if structure.levels.len() < 2 {
-            structure.levels.push(crate::fts5_index::StructLevel {
+        merged.levels[0].segs.clear();
+        merged.levels[0].n_merge = 0;
+        if merged.levels.len() < 2 {
+            merged.levels.push(crate::fts5_index::StructLevel {
                 n_merge: 0,
                 segs: Vec::new(),
             });
         }
-        structure.levels[1].segs.push(crate::fts5_index::StructSeg {
-            segid: merged_segid,
-            pgno_first: 1,
-            pgno_last: block.n_leaves,
-        });
-        structure.promote_after_merge(1);
+        // When the merged live corpus is EMPTY (a delete-crisis that deleted the
+        // last live row), the output segment has no leaves. sqlite's
+        // `fts5IndexMergeLevel` writes it, sees `pSeg->pgnoLast==0`, and REMOVES
+        // it (`pLvlOut->nSeg--; pStruct->nSegment--`) — so no phantom segment is
+        // recorded. Match that: only add the merged segment when it has leaves.
+        if block.n_leaves > 0 {
+            merged.levels[1].segs.push(crate::fts5_index::StructSeg {
+                segid: merged_segid,
+                pgno_first: 1,
+                pgno_last: block.n_leaves,
+            });
+            merged.promote_after_merge(1);
+        }
         // If the promote did not clear a subsequent crisis, bail to rebuild.
-        if structure.levels.iter().any(|l| l.segs.len() >= CRISIS) {
+        if merged.levels.iter().any(|l| l.segs.len() >= CRISIS) {
             return Ok(false);
         }
+        *structure = merged;
 
         // Rewrite all segment `%_data`/`%_idx` rows: clear existing leaf/idx rows,
         // write the single merged segment.
@@ -31496,14 +31508,40 @@ impl Connection {
             return Ok(false);
         }
 
-        structure.append_level0(segid, block.n_leaves);
-        // A crisis merge here would have to reconcile tombstones against the older
-        // segments (fts5IndexMerge with delete markers) — not ported. Fall back to
-        // the bulk rebuild whenever appending this segment reaches the threshold.
         const CRISIS: usize = 16;
-        if structure.levels.iter().any(|l| l.segs.len() >= CRISIS) {
+        structure.append_level0(segid, block.n_leaves);
+        // Crisis-merge: while a level holds >= 16 segments, merge it into one
+        // segment at the next level (sqlite's `fts5IndexCrisismerge`). When the
+        // merge collapses the WHOLE index into the single oldest level
+        // (`bOldest`), sqlite's `fts5IndexMergeLevel` ANNIHILATES every DELETE
+        // marker together with the older posting it shadows (the key-annihilation
+        // `if( pSegIter->nPos==0 && (bOldest || pSegIter->bDel==0) ) continue;`) —
+        // so the merged segment is exactly a clean rebuild over the LIVE corpus,
+        // with no tombstone entries and no deleted rowids. `docs` is the
+        // post-mutation live corpus, so the shared `fts5_crisis_merge` (which
+        // rebuilds from `docs`) produces sqlite's byte-exact merged structure. It
+        // rewrites the `%_data`/`%_idx` segment rows itself; when it fires we must
+        // NOT also append this tombstone block (it was consumed by the merge).
+        //
+        // The rebuild-from-live shortcut is only VALID when the crisis is
+        // `bOldest`: the merge must collapse the ENTIRE index into a single
+        // segment, so no tombstone needs to survive to shadow a posting in a
+        // segment that is NOT part of the merge. That holds iff level 0 is the
+        // only populated level as it reaches the threshold (every higher level
+        // empty) — then merging level 0 yields the sole segment at the last level.
+        // If any higher level already holds a segment, a delete-crisis would be
+        // `bOldest=false` (tombstones must be carried, not dropped): bail to the
+        // bulk rebuild, which is always correct.
+        let level0_at_crisis = structure
+            .levels
+            .first()
+            .is_some_and(|l| l.segs.len() >= CRISIS);
+        let higher_populated = structure.levels.iter().skip(1).any(|l| !l.segs.is_empty());
+        if level0_at_crisis && higher_populated {
             return Ok(false);
         }
+        let did_crisis =
+            self.fts5_crisis_merge(name, &mut structure, ncols, tok, &prefixes, &docs)?;
 
         // Global averages over the WHOLE live corpus (nRow + per-column totals).
         let (_all_terms, col_totals, _all_sizes) = self.fts5_tokenize_docs(&docs, ncols, tok);
@@ -31536,26 +31574,30 @@ impl Connection {
                 Value::Blob(structure.encode())
             ]),
         )?;
-        // Append the new segment's leaf `%_data` rows and `%_idx` rows.
-        for (id, block_bytes) in &block.data {
-            self.execute_params(
-                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
-                &pv(alloc::vec![
-                    Value::Integer(*id),
-                    Value::Blob(block_bytes.clone())
-                ]),
-            )?;
-        }
-        let idx_t = q(&format!("{name}_idx"));
-        for IdxRow { segid, term, pgno } in &block.idx {
-            self.execute_params(
-                &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
-                &pv(alloc::vec![
-                    Value::Integer(*segid),
-                    Value::Blob(term.clone()),
-                    Value::Integer(*pgno)
-                ]),
-            )?;
+        // Append the new segment's leaf `%_data` rows and `%_idx` rows — unless a
+        // crisis merge fired, in which case it already rewrote every segment row
+        // and this tombstone block was consumed by (annihilated in) the merge.
+        if !did_crisis {
+            for (id, block_bytes) in &block.data {
+                self.execute_params(
+                    &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                    &pv(alloc::vec![
+                        Value::Integer(*id),
+                        Value::Blob(block_bytes.clone())
+                    ]),
+                )?;
+            }
+            let idx_t = q(&format!("{name}_idx"));
+            for IdxRow { segid, term, pgno } in &block.idx {
+                self.execute_params(
+                    &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                    &pv(alloc::vec![
+                        Value::Integer(*segid),
+                        Value::Blob(term.clone()),
+                        Value::Integer(*pgno)
+                    ]),
+                )?;
+            }
         }
         // `_docsize`: delete each mutated rowid's old row, then (for UPDATEs) write
         // the new one. A pure delete leaves the rowid absent.
