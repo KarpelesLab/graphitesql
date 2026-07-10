@@ -404,8 +404,17 @@ history / `CHANGELOG.md`. Remaining:
     worker) vs a genuinely async `Connection` API; which backend (OPFS sync-access
     handle — itself sync — vs async IndexedDB); wasm target (`wasm32-unknown-unknown`
     + JS glue vs `wasm32-wasi`). This choice drives everything below.
-  - **D6-1 — wasm build + a memory-backed VFS smoke test** in the browser (no
-    persistence yet), to establish the toolchain and glue.
+  - **D6-1 — wasm build (toolchain established, 2026-07-10).** The zero-dependency
+    `no_std`+alloc core — including the always-available in-memory `MemoryVfs` and
+    `Connection::open_memory()` — **compiles cleanly to `wasm32-unknown-unknown`**
+    (`cargo build --no-default-features --target wasm32-unknown-unknown`), so an
+    in-memory graphite database runs in a browser/wasm host today. A CI `wasm` job
+    now guards this against regressions. *Remaining for a full browser smoke test:*
+    a JS entry point — which needs either `wasm-bindgen` (a dependency) or raw wasm
+    exports (`#[unsafe(no_mangle)]`), both of which the default build's zero-dep +
+    `#![forbid(unsafe_code)]` constraints exclude. So the JS glue belongs in a
+    **sibling crate that opts out** of those constraints (the same shape as the D7
+    C-API shim) — part of the D6-0 decision.
   - **D6-2 — the persistent async VFS** implementing the chosen backend behind the
     existing `Vfs`/`File` traits.
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is

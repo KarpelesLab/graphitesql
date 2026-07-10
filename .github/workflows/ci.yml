@@ -109,6 +109,26 @@ jobs:
       - name: cargo build --no-default-features
         run: cargo build --no-default-features
 
+  wasm:
+    name: wasm build (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      # The zero-dependency `no_std`+alloc core (with the always-available in-memory
+      # VFS) compiles to WebAssembly, so graphite can run an in-memory database in a
+      # browser/wasm host today (ROADMAP D6-1). This guards that capability against
+      # regressions; the persistent async VFS (D6-2) is a separate, opt-in step.
+      - name: cargo build --no-default-features --target wasm32-unknown-unknown
+        run: cargo build --no-default-features --target wasm32-unknown-unknown
+
   msrv:
     name: MSRV (1.89)
     runs-on: ubuntu-latest
