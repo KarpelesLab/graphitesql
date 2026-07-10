@@ -389,8 +389,18 @@ history / `CHANGELOG.md`. Remaining:
   - **D2e-2 — incremental writes inside explicit `BEGIN`/`SAVEPOINT`** (autocommit
     is incremental; explicit txns rebuild).
   - **D2e-3 — incremental path for prefix-index and spanning-dlidx segments.**
-- **D4-leftover — window UDFs.** *(Custom collations DONE 2026-07-11.)*
-  Application-registered collating sequences work end-to-end: `Collation::Custom(u32)`
+- **D4-leftover — DONE 2026-07-11 (window UDFs + custom collations).**
+  *Window UDFs:* a user-registered aggregate (`Connection::register_aggregate_function`
+  / C-API `sqlite3_create_function` or `sqlite3_create_window_function`) is now usable
+  as a window function — `myagg(x) OVER (…)`. The window executor drives it by
+  recomputing over each frame with a fresh accumulator (`fill_window_partition`'s
+  aggregate arm falls back to `self.aggregates` when the name isn't a built-in), so no
+  `xValue`/`xInverse` inverse protocol is needed; built-in window aggregates keep
+  precedence. Verified across running / whole-partition / `PARTITION BY` / explicit
+  `ROWS` frames, each matching the built-in `sum` window (`tests/window_udf.rs`, and a
+  C `wsumsq` case in ctest.c).
+  *Custom collations:* application-registered collating sequences work end-to-end:
+  `Collation::Custom(u32)`
   (an id into a process-global, `std`-gated registry, so the public enum keeps
   `Copy`/`Send`/`Sync`/`Eq`), resolved inside `value::cmp_text`/`cmp_values_coll` so
   every comparison site — `ORDER BY`/`GROUP BY`/`DISTINCT`, `WHERE`, `UNIQUE` and
@@ -402,7 +412,7 @@ history / `CHANGELOG.md`. Remaining:
   a `UNIQUE` index that passes `integrity_check`, and re-registration replaces. Limits
   (documented, never wrong): `std`-only; process-global by name; a schema declaring
   `COLLATE <name>` needs it registered before use (SQLite defers to first use — this
-  errors, stricter but not wrong). **Window UDFs** remain (need core `xValue`/`xInverse`).
+  errors, stricter but not wrong).
 - **D5 — `sqlite3_session`. Essentially complete.** Changeset/patchset generation
   + apply (all PK shapes incl. composite/WITHOUT ROWID), `invert`/`concat`, custom
   conflict handlers (`xConflict`), per-table attach, indirect-change flagging

@@ -20601,7 +20601,23 @@ impl Connection {
                         .filter(|&&k| passes[ordered[k]])
                         .map(|&k| &arg_vals[ordered[k]])
                         .collect();
-                    window_aggregate(lname, star, &frame)?
+                    match window_aggregate(lname, star, &frame) {
+                        Ok(v) => v,
+                        // A user-registered aggregate used as a window function:
+                        // drive it over the frame with a fresh accumulator (the
+                        // recompute-per-row path — no xInverse optimization). This
+                        // is what makes `sqlite3_create_window_function`'s common
+                        // case work; built-in names take precedence above.
+                        Err(Error::Unsupported(_)) if self.aggregates.contains_key(lname) => {
+                            let factory = &self.aggregates[lname];
+                            let mut acc = factory();
+                            for &row in &frame {
+                                acc.step(row)?;
+                            }
+                            acc.finalize()?
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             };
             result[idx] = val;
