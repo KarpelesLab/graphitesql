@@ -2487,6 +2487,8 @@ fn pragma_setter_result_query(sql: &str) -> Option<String> {
             | "secure_delete"
             | "soft_heap_limit"
             | "wal_autocheckpoint"
+            | "journal_size_limit"
+            | "analysis_limit"
     ) {
         Some(format!("PRAGMA {target}"))
     } else {

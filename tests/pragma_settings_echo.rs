@@ -66,6 +66,14 @@ fn advisory_setting_pragmas_round_trip() {
         "PRAGMA wal_autocheckpoint=100",
         "PRAGMA wal_autocheckpoint=100; PRAGMA wal_autocheckpoint",
         "PRAGMA wal_autocheckpoint",
+        // journal_size_limit and analysis_limit — already stored, now echo on set.
+        "PRAGMA journal_size_limit=1024",
+        "PRAGMA journal_size_limit=1024; PRAGMA journal_size_limit",
+        "PRAGMA journal_size_limit=-1; PRAGMA journal_size_limit",
+        "PRAGMA analysis_limit=100",
+        "PRAGMA analysis_limit=100; PRAGMA analysis_limit",
+        "PRAGMA analysis_limit=-5; PRAGMA analysis_limit",
+        "PRAGMA analysis_limit",
         // Setting synchronous never affects query results.
         "CREATE TABLE t(a); PRAGMA synchronous=OFF; INSERT INTO t VALUES(1),(2); SELECT * FROM t",
         // Unrelated setters are unaffected.
