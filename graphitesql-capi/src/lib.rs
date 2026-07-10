@@ -1023,20 +1023,24 @@ pub struct sqlite3_value {
     scratch: Option<CString>,
 }
 
-/// The call context of a UDF (`sqlite3_context*`): the pending result / error and
-/// the application pointer registered with the function.
+/// The call context of a UDF (`sqlite3_context*`): the pending result / error, the
+/// application pointer registered with the function, and — for an aggregate — a
+/// back-pointer to the accumulator so `sqlite3_aggregate_context` can reach its
+/// per-group buffer. `agg` is null in a scalar context.
 pub struct sqlite3_context {
     result: Value,
     error: Option<String>,
     user_data: *mut c_void,
+    agg: *mut CAggregate,
 }
 
 type XFunc = Option<unsafe extern "C" fn(*mut sqlite3_context, c_int, *mut *mut sqlite3_value)>;
 type XStep = Option<unsafe extern "C" fn(*mut sqlite3_context, c_int, *mut *mut sqlite3_value)>;
 type XFinal = Option<unsafe extern "C" fn(*mut sqlite3_context)>;
 
-/// Register a **scalar** user-defined function callable from SQL. Aggregates
-/// (`xStep`/`xFinal`) are not yet supported and yield `SQLITE_ERROR`.
+/// Register a user-defined function callable from SQL: **scalar** (`xFunc` set,
+/// `xStep`/`xFinal` NULL) or **aggregate** (`xStep`+`xFinal` set, `xFunc` NULL).
+/// Any other combination yields `SQLITE_ERROR`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_create_function(
     db: *mut sqlite3,
@@ -1072,6 +1076,7 @@ pub unsafe extern "C" fn sqlite3_create_function(
                     result: Value::Null,
                     error: None,
                     user_data: app as *mut c_void,
+                    agg: core::ptr::null_mut(),
                 };
                 unsafe {
                     func(
@@ -1087,9 +1092,106 @@ pub unsafe extern "C" fn sqlite3_create_function(
             });
             SQLITE_OK
         }
-        // Aggregate registration (or a no-op) is unsupported.
+        (None, Some(step), Some(final_)) => {
+            // Aggregate: a fresh accumulator per group wraps the C callbacks.
+            let app = p_app as usize;
+            db.conn.register_aggregate_function(&name, move || {
+                Box::new(CAggregate {
+                    step,
+                    final_,
+                    user_data: app,
+                    agg_buf: Vec::new(),
+                })
+            });
+            SQLITE_OK
+        }
+        // Any other combination (e.g. a no-op, or only one of step/final) is invalid.
         _ => SQLITE_ERROR,
     }
+}
+
+/// A C aggregate accumulator: one per group. Holds the C `xStep`/`xFinal`
+/// callbacks and the persistent per-group buffer handed out by
+/// `sqlite3_aggregate_context`.
+struct CAggregate {
+    step: unsafe extern "C" fn(*mut sqlite3_context, c_int, *mut *mut sqlite3_value),
+    final_: unsafe extern "C" fn(*mut sqlite3_context),
+    user_data: usize,
+    agg_buf: Vec<u8>,
+}
+
+impl graphitesql::AggregateFunction for CAggregate {
+    fn step(&mut self, args: &[Value]) -> graphitesql::Result<()> {
+        let mut vals: Vec<sqlite3_value> = args
+            .iter()
+            .map(|v| sqlite3_value {
+                v: v.clone(),
+                scratch: None,
+            })
+            .collect();
+        let mut ptrs: Vec<*mut sqlite3_value> =
+            vals.iter_mut().map(|p| p as *mut sqlite3_value).collect();
+        // Copy out what we need so `self` isn't borrowed during the callback (the C
+        // side reaches the accumulator only through the raw `agg` pointer).
+        let step_fn = self.step;
+        let ud = self.user_data;
+        let self_ptr = self as *mut CAggregate;
+        let mut ctx = sqlite3_context {
+            result: Value::Null,
+            error: None,
+            user_data: ud as *mut c_void,
+            agg: self_ptr,
+        };
+        unsafe { step_fn(&mut ctx, args.len() as c_int, ptrs.as_mut_ptr()) };
+        match ctx.error {
+            Some(e) => Err(graphitesql::Error::Error(e)),
+            None => Ok(()),
+        }
+    }
+
+    fn finalize(&mut self) -> graphitesql::Result<Value> {
+        let final_fn = self.final_;
+        let ud = self.user_data;
+        let self_ptr = self as *mut CAggregate;
+        let mut ctx = sqlite3_context {
+            result: Value::Null,
+            error: None,
+            user_data: ud as *mut c_void,
+            agg: self_ptr,
+        };
+        unsafe { final_fn(&mut ctx) };
+        match ctx.error {
+            Some(e) => Err(graphitesql::Error::Error(e)),
+            None => Ok(ctx.result),
+        }
+    }
+}
+
+/// Per-group aggregate scratch: returns a stable, zero-initialised buffer of at
+/// least `n_bytes`, persistent across this group's `xStep` calls and `xFinal`.
+/// NULL in a scalar context or when `n_bytes <= 0` before any allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_aggregate_context(
+    ctx: *mut sqlite3_context,
+    n_bytes: c_int,
+) -> *mut c_void {
+    let Some(c) = (unsafe { ctx.as_mut() }) else {
+        return core::ptr::null_mut();
+    };
+    if c.agg.is_null() {
+        return core::ptr::null_mut();
+    }
+    let agg = unsafe { &mut *c.agg };
+    let n = n_bytes.max(0) as usize;
+    if agg.agg_buf.len() < n {
+        // Grow only on first request (n is constant per aggregate) so the pointer
+        // stays stable across the group's steps.
+        agg.agg_buf.resize(n, 0);
+    }
+    if agg.agg_buf.is_empty() {
+        return core::ptr::null_mut();
+    }
+    agg.agg_buf.as_mut_ptr() as *mut c_void
 }
 
 #[unsafe(no_mangle)]

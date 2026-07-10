@@ -20,7 +20,7 @@ shape as the `graphitesql-wasm` sibling.
 | Parameters | `sqlite3_bind_parameter_count`/`name`/`index` (named `:x`/`@x`/`$x` + numbered `?N`) |
 | Columns | `sqlite3_column_count`/`data_count`/`name`/`type`/`int`/`int64`/`double`/`text`/`blob`/`bytes` |
 | Status | `sqlite3_errmsg`, `sqlite3_errcode`, `sqlite3_changes`, `sqlite3_last_insert_rowid` |
-| UDFs | `sqlite3_create_function` (scalar), `sqlite3_user_data`, `sqlite3_value_*`, `sqlite3_result_*` |
+| UDFs | `sqlite3_create_function` (scalar + aggregate), `sqlite3_user_data`, `sqlite3_aggregate_context`, `sqlite3_value_*`, `sqlite3_result_*` |
 | Version | `sqlite3_libversion`, `sqlite3_libversion_number` (reports `3.50.4`) |
 | Memory | `sqlite3_free` |
 
@@ -37,14 +37,14 @@ row-producer, as in SQLite.
 detected structurally via the engine's parser so a "returning" inside a string is
 not mistaken for the clause.
 
-Scalar user-defined functions work: register with `sqlite3_create_function`
-(xFunc set, xStep/xFinal NULL), read arguments with `sqlite3_value_*`, and return
-via `sqlite3_result_*`. The registered function is callable from SQL anywhere,
-including in `WHERE`.
+User-defined functions work, scalar and aggregate. A **scalar** registers with
+`xFunc` set (read args with `sqlite3_value_*`, return via `sqlite3_result_*`); an
+**aggregate** registers with `xStep`+`xFinal`, keeping per-group state in the
+buffer from `sqlite3_aggregate_context` (a fresh accumulator per group). Both are
+callable from SQL anywhere, including `WHERE` and `GROUP BY`.
 
-**Not yet covered:** aggregate/window UDFs (`xStep`/`xFinal` yield `SQLITE_ERROR`),
-the `_v3` prepare flags, incremental BLOB I/O, online backup, hooks/authorizer,
-and the UTF-16 entry points.
+**Not yet covered:** window UDFs, the `_v3` prepare flags, incremental BLOB I/O,
+online backup, hooks/authorizer, and the UTF-16 entry points.
 
 ## Build & test
 

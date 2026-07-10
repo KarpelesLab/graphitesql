@@ -92,6 +92,7 @@ int sqlite3_create_function(sqlite3 *db, const char *zName, int nArg, int eTextR
     void (*xFinal)(sqlite3_context *));
 
 void *sqlite3_user_data(sqlite3_context *ctx);
+void *sqlite3_aggregate_context(sqlite3_context *ctx, int nBytes);
 
 int sqlite3_value_type(sqlite3_value *v);
 int sqlite3_value_int(sqlite3_value *v);

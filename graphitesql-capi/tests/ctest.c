@@ -39,9 +39,22 @@ static void concat2(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
 }
 
-/* Correctly-typed no-op aggregate callbacks (registration is unsupported). */
-static void dummy_step(sqlite3_context *c, int n, sqlite3_value **v) { (void)c; (void)n; (void)v; }
-static void dummy_final(sqlite3_context *c) { (void)c; }
+/* A user-defined aggregate: sum_sq(x) = sum of x*x, accumulated in per-group
+   state obtained from sqlite3_aggregate_context. */
+struct sumsq { long long total; };
+static void sumsq_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc;
+  struct sumsq *st = (struct sumsq *)sqlite3_aggregate_context(ctx, sizeof(struct sumsq));
+  long long x = sqlite3_value_int64(argv[0]);
+  st->total += x * x;
+}
+static void sumsq_final(sqlite3_context *ctx) {
+  struct sumsq *st = (struct sumsq *)sqlite3_aggregate_context(ctx, sizeof(struct sumsq));
+  sqlite3_result_int64(ctx, st ? st->total : 0);
+}
+
+/* A no-op step with a mismatched final signature is an invalid combination. */
+static void lone_step(sqlite3_context *c, int n, sqlite3_value **v) { (void)c; (void)n; (void)v; }
 
 int main(void) {
   sqlite3 *db = NULL;
@@ -193,10 +206,32 @@ int main(void) {
   CHECK("times_k(id)<=20 matches id 1,2", sqlite3_column_int64(ufw, 0) == 2);
   sqlite3_finalize(ufw);
 
-  /* Aggregate registration is not supported yet -> SQLITE_ERROR. */
-  CHECK("aggregate create -> ERROR",
-        sqlite3_create_function(db, "agg", 1, SQLITE_UTF8, NULL, NULL,
-                                dummy_step, dummy_final) == SQLITE_ERROR);
+  /* User-defined aggregate over table rows: sum of id*id. `t` holds ids 1..5
+     (alice/bob/carol, dave via RETURNING, 'returning home'), so 1+4+9+16+25=55.
+     Cross-check against the builtin so the test is robust to earlier inserts. */
+  rc = sqlite3_create_function(db, "sum_sq", 1, SQLITE_UTF8, NULL, NULL,
+                               sumsq_step, sumsq_final);
+  CHECK("create aggregate sum_sq", rc == SQLITE_OK);
+  sqlite3_stmt *ag = NULL;
+  sqlite3_prepare_v2(db, "SELECT sum_sq(id), sum(id*id) FROM t", -1, &ag, NULL);
+  CHECK("aggregate step", sqlite3_step(ag) == SQLITE_ROW);
+  CHECK("sum_sq matches builtin sum(id*id)",
+        sqlite3_column_int64(ag, 0) == sqlite3_column_int64(ag, 1));
+  sqlite3_finalize(ag);
+
+  /* A GROUP BY exercises fresh per-group accumulator state. */
+  sqlite3_exec(db, "CREATE TABLE g(k INT, v INT)", NULL, NULL, NULL);
+  sqlite3_exec(db, "INSERT INTO g VALUES(1,2),(1,3),(2,5)", NULL, NULL, NULL);
+  sqlite3_stmt *ag2 = NULL;
+  sqlite3_prepare_v2(db, "SELECT k, sum_sq(v) FROM g GROUP BY k ORDER BY k", -1, &ag2, NULL);
+  CHECK("group row 1", sqlite3_step(ag2) == SQLITE_ROW && sqlite3_column_int64(ag2, 1) == 13); /* 4+9 */
+  CHECK("group row 2", sqlite3_step(ag2) == SQLITE_ROW && sqlite3_column_int64(ag2, 1) == 25); /* 25 */
+  sqlite3_finalize(ag2);
+
+  /* An invalid callback combination (step without final) -> SQLITE_ERROR. */
+  CHECK("step-without-final -> ERROR",
+        sqlite3_create_function(db, "bad", 1, SQLITE_UTF8, NULL, NULL,
+                                lone_step, NULL) == SQLITE_ERROR);
 
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 
