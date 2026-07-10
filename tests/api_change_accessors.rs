@@ -63,3 +63,34 @@ fn change_and_rowid_accessors() {
     assert_eq!(c.changes(), 1);
     assert_eq!(c.total_changes(), 10);
 }
+
+#[test]
+fn is_autocommit_reflects_transaction_state() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute_batch("CREATE TABLE t(a);").unwrap();
+    // Autocommit on by default.
+    assert!(c.is_autocommit());
+
+    c.execute_batch("BEGIN;").unwrap();
+    assert!(!c.is_autocommit());
+    c.execute_batch("INSERT INTO t VALUES(1);").unwrap();
+    assert!(!c.is_autocommit());
+    c.execute_batch("COMMIT;").unwrap();
+    assert!(c.is_autocommit());
+
+    // ROLLBACK also restores autocommit.
+    c.execute_batch("BEGIN;").unwrap();
+    assert!(!c.is_autocommit());
+    c.execute_batch("ROLLBACK;").unwrap();
+    assert!(c.is_autocommit());
+
+    // An outermost SAVEPOINT turns autocommit off until it is released.
+    c.execute_batch("SAVEPOINT s;").unwrap();
+    assert!(!c.is_autocommit());
+    c.execute_batch("SAVEPOINT s2;").unwrap();
+    assert!(!c.is_autocommit());
+    c.execute_batch("RELEASE s2;").unwrap();
+    assert!(!c.is_autocommit());
+    c.execute_batch("RELEASE s;").unwrap();
+    assert!(c.is_autocommit());
+}

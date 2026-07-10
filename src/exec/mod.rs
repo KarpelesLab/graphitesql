@@ -606,6 +606,14 @@ impl Connection {
         self.total_changes.get()
     }
 
+    /// Whether the connection is in autocommit mode — the equivalent of
+    /// `sqlite3_get_autocommit()`. Autocommit is on by default and is turned off
+    /// by a `BEGIN` (or an outermost `SAVEPOINT`) until the matching
+    /// `COMMIT`/`ROLLBACK` (or `RELEASE`) restores it.
+    pub fn is_autocommit(&self) -> bool {
+        !self.in_tx && self.open_savepoints == 0
+    }
+
     /// Run a single `SELECT` and return all rows.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         self.query_params(sql, &Params::default())
