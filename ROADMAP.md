@@ -500,12 +500,15 @@ UTF-8 pass-through) landed 2026-07-10. `.backup`/`.save` also landed 2026-07-10,
 backed by the new `Connection::serialize()` (`sqlite3_serialize`): every page of
 the committed database (WAL-aware) is concatenated into a standalone file image
 (WAL format-version bytes normalized to rollback), verified valid via `sqlite3`'s
-`integrity_check` + data round-trip. Still not implemented: `.bail` and the CLI
-error-message text (graphite renders `Error:` rather than sqlite's `Parse error
-near line N: … (code)` with the `error here ---^` caret — needs parser token
-offsets threaded into errors), and `.show` (reflects column-mode `--wrap`/
-`--wordwrap` options graphite does not model). Peripheral (the SQL engine, not the
-shell, is the project's purpose), so lower priority.
+`integrity_check` + data round-trip. `.show` also landed 2026-07-10 (all 12 setting lines byte-identical incl. the
+column-family `--wrap 60 --wordwrap off --noquote` suffix and `output_c_string`-
+quoted separators; `eqp`/`explain`/`stats`/`width` shown at SQLite's defaults).
+Still not implemented: `.bail`, the CLI error-message text (graphite renders
+`Error:` rather than sqlite's `Parse error near line N: … (code)` with the
+`error here ---^` caret — needs parser token offsets threaded into errors), and
+`.echo` echoing dot-command input lines (graphite echoes SQL groups, not each raw
+input line). Peripheral (the SQL engine, not the shell, is the project's purpose),
+so lower priority.
 
 ---
 

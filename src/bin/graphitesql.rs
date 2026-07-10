@@ -78,6 +78,7 @@ fn main() {
     };
 
     let mut shell = Shell::new();
+    shell.filename = path.clone();
 
     if !scripts.is_empty() {
         // One-shot mode: run each argument batch, exiting non-zero on the first
@@ -162,6 +163,12 @@ struct Shell {
     /// True while a `.once` redirect is active: the sink reverts to stdout after
     /// the next SQL group that produces output.
     once: bool,
+    /// The SQLite mode name as last set (for `.show`), e.g. `list`, `box`.
+    mode_name: String,
+    /// The current output target's name (for `.show`): `stdout` or a file path.
+    out_name: String,
+    /// The database file path (for `.show`'s `filename` line).
+    filename: String,
 }
 
 impl Shell {
@@ -180,6 +187,9 @@ impl Shell {
             last_changes: 0,
             out: Sink::Stdout,
             once: false,
+            mode_name: String::from("list"),
+            out_name: String::from("stdout"),
+            filename: String::from(":memory:"),
         }
     }
 
@@ -968,6 +978,7 @@ impl Shell {
                 // Echo the arguments, space-separated (SQLite's `.print`).
                 println!("{}", args[1..].join(" "));
             }
+            ".show" => self.show_settings(),
             ".backup" | ".save" => {
                 // `.backup ?DB? FILE` / `.save FILE` — write a serialized copy of
                 // the database to FILE. graphite serializes `main`; a leading DB
@@ -1009,51 +1020,67 @@ impl Shell {
         let matches = |full: &str| !m.is_empty() && full.starts_with(m.as_str());
         if matches("list") {
             self.mode = Mode::List;
+            self.mode_name = String::from("list");
             self.col_sep = String::from("|");
             self.row_sep = String::from("\n");
         } else if matches("csv") {
             self.mode = Mode::Csv;
+            self.mode_name = String::from("csv");
             self.col_sep = String::from(",");
             self.row_sep = String::from("\r\n");
         } else if matches("columns") {
             self.mode = Mode::Column;
+            self.mode_name = String::from("column");
             if !self.header_set {
                 self.headers = true;
             }
             self.row_sep = String::from("\n");
         } else if matches("lines") {
             self.mode = Mode::Line;
+            self.mode_name = String::from("line");
             self.row_sep = String::from("\n");
         } else if matches("tabs") {
+            // `tabs` is list mode with a tab separator; SQLite's `.show` reports
+            // it as `list` (there is no distinct internal tabs mode).
             self.mode = Mode::List;
+            self.mode_name = String::from("list");
             self.col_sep = String::from("\t");
         } else if matches("quote") {
             self.mode = Mode::Quote;
+            self.mode_name = String::from("quote");
             self.col_sep = String::from(",");
             self.row_sep = String::from("\n");
         } else if matches("insert") {
             self.mode = Mode::Insert;
+            self.mode_name = String::from("insert");
             self.insert_table = tabname.cloned().unwrap_or_else(|| String::from("table"));
         } else if matches("json") {
             self.mode = Mode::Json;
+            self.mode_name = String::from("json");
         } else if matches("markdown") {
             self.mode = Mode::Markdown;
+            self.mode_name = String::from("markdown");
             self.row_sep = String::from("\n");
         } else if matches("box") {
             self.mode = Mode::Box;
+            self.mode_name = String::from("box");
             self.row_sep = String::from("\n");
         } else if matches("table") {
             self.mode = Mode::Table;
+            self.mode_name = String::from("table");
             self.row_sep = String::from("\n");
         } else if matches("html") {
             self.mode = Mode::Html;
+            self.mode_name = String::from("html");
         } else if matches("tcl") {
             self.mode = Mode::Tcl;
+            self.mode_name = String::from("tcl");
             self.col_sep = String::from(" ");
             self.row_sep = String::from("\n");
         } else if matches("ascii") {
             // ASCII mode is list mode with the unit/record separators.
             self.mode = Mode::List;
+            self.mode_name = String::from("ascii");
             self.col_sep = String::from("\x1f");
             self.row_sep = String::from("\x1e");
         } else {
@@ -1074,6 +1101,7 @@ impl Shell {
         match target.map(String::as_str) {
             None | Some("stdout") => {
                 self.out = Sink::Stdout;
+                self.out_name = String::from("stdout");
                 self.once = false;
             }
             Some("off") => {
@@ -1082,20 +1110,64 @@ impl Shell {
                     Ok(f) => self.out = Sink::File(f),
                     Err(_) => self.out = Sink::Stdout,
                 }
+                self.out_name = String::from("stdout");
                 self.once = false;
             }
             Some(file) => match File::create(file) {
                 Ok(f) => {
                     self.out = Sink::File(f);
+                    self.out_name = file.to_string();
                     self.once = once;
                 }
                 Err(e) => {
                     eprintln!("Error: cannot open \"{file}\": {e}");
                     self.out = Sink::Stdout;
+                    self.out_name = String::from("stdout");
                     self.once = false;
                 }
             },
         }
+    }
+
+    /// Print the current shell settings, matching SQLite's `.show`. Output goes
+    /// to the current sink (so a `.output` redirect captures it). Settings
+    /// graphite does not model (`eqp`/`explain`/`stats`/`width`) are shown at
+    /// SQLite's defaults.
+    fn show_settings(&mut self) {
+        // The column-family modes append the column wrap options to the name.
+        let modestr = match self.mode_name.as_str() {
+            m @ ("column" | "markdown" | "box" | "table") => {
+                format!("{m} --wrap 60 --wordwrap off --noquote")
+            }
+            m => m.to_string(),
+        };
+        // Quote a separator/NULL value exactly as SQLite does (`output_c_string`).
+        let q = |s: &str| {
+            let mut v = Vec::new();
+            tcl_string(s.as_bytes(), &mut v);
+            String::from_utf8_lossy(&v).into_owned()
+        };
+        let onoff = |b: bool| if b { "on" } else { "off" };
+        let lines = [
+            format!("{:>12}: {}", "echo", onoff(self.echo)),
+            format!("{:>12}: {}", "eqp", "off"),
+            format!("{:>12}: {}", "explain", "auto"),
+            format!("{:>12}: {}", "headers", onoff(self.headers)),
+            format!("{:>12}: {}", "mode", modestr),
+            format!("{:>12}: {}", "nullvalue", q(&self.null_value)),
+            format!("{:>12}: {}", "output", self.out_name),
+            format!("{:>12}: {}", "colseparator", q(&self.col_sep)),
+            format!("{:>12}: {}", "rowseparator", q(&self.row_sep)),
+            format!("{:>12}: {}", "stats", "off"),
+            format!("{:>12}: {}", "width", ""),
+            format!("{:>12}: {}", "filename", self.filename),
+        ];
+        let mut buf = String::new();
+        for l in &lines {
+            buf.push_str(l);
+            buf.push('\n');
+        }
+        let _ = self.out.write_all(buf.as_bytes());
     }
 
     /// Implement `.import FILE TABLE`: read `FILE` field-by-field using the CSV

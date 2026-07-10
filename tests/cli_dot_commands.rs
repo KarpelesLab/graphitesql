@@ -442,3 +442,34 @@ fn tcl_mode_matches_sqlite() {
         assert_same(label, script);
     }
 }
+
+#[test]
+fn show_settings_match_sqlite() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let cases: &[(&str, &str)] = &[
+        ("defaults", ".show\n"),
+        (
+            "headers_nullvalue_box",
+            ".headers on\n.mode box\n.nullvalue NULL\n.show\n",
+        ),
+        ("csv", ".mode csv\n.show\n"),
+        ("ascii_separators", ".mode ascii\n.show\n"),
+        ("tabs_reports_list", ".mode tabs\n.show\n"),
+        (
+            "markdown_custom_sep",
+            ".mode markdown\n.separator ; ROW\n.show\n",
+        ),
+        ("insert_omits_table", ".mode insert foo\n.show\n"),
+        ("column_family_wrap", ".mode column\n.show\n"),
+        (
+            "line_quote_json_tcl_html",
+            ".mode json\n.show\n.mode tcl\n.show\n.mode html\n.show\n",
+        ),
+    ];
+    for (label, script) in cases {
+        assert_same(label, script);
+    }
+}
