@@ -496,13 +496,16 @@ Unicode-width cases), the `ascii` (unit/record-separator) and `html`
 (`<TR>`/`<TD>`, escaping `< > & " '`) `.mode`s, and `.print` — all byte-verified
 against `sqlite3` 3.50.4. The `.mode` family is now complete — the `tcl` mode
 (`output_c_string` byte escaping: `\ooo` octal, C-string NUL truncation, valid
-UTF-8 pass-through) landed 2026-07-10. Still not implemented: `.backup` (needs an
-engine DB-copy/serialize API), `.bail` and the CLI error-message text (graphite
-renders `Error:` rather than sqlite's `Parse error near line N: … (code)` with the
-`error here ---^` caret — needs parser token offsets threaded into errors), and
-`.show` (reflects column-mode `--wrap`/`--wordwrap` options graphite does not
-model). Peripheral (the SQL engine, not the shell, is the project's purpose), so
-lower priority.
+UTF-8 pass-through) landed 2026-07-10. `.backup`/`.save` also landed 2026-07-10,
+backed by the new `Connection::serialize()` (`sqlite3_serialize`): every page of
+the committed database (WAL-aware) is concatenated into a standalone file image
+(WAL format-version bytes normalized to rollback), verified valid via `sqlite3`'s
+`integrity_check` + data round-trip. Still not implemented: `.bail` and the CLI
+error-message text (graphite renders `Error:` rather than sqlite's `Parse error
+near line N: … (code)` with the `error here ---^` caret — needs parser token
+offsets threaded into errors), and `.show` (reflects column-mode `--wrap`/
+`--wordwrap` options graphite does not model). Peripheral (the SQL engine, not the
+shell, is the project's purpose), so lower priority.
 
 ---
 

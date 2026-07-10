@@ -968,6 +968,25 @@ impl Shell {
                 // Echo the arguments, space-separated (SQLite's `.print`).
                 println!("{}", args[1..].join(" "));
             }
+            ".backup" | ".save" => {
+                // `.backup ?DB? FILE` / `.save FILE` — write a serialized copy of
+                // the database to FILE. graphite serializes `main`; a leading DB
+                // argument (always `main` here) is accepted and ignored.
+                match args.get(1..).filter(|a| !a.is_empty()) {
+                    None => eprintln!("Usage: .backup ?DB? FILE"),
+                    Some(rest) => {
+                        let file = rest.last().unwrap();
+                        match conn.serialize() {
+                            Ok(bytes) => {
+                                if let Err(e) = std::fs::write(file, &bytes) {
+                                    eprintln!("Error: cannot write \"{file}\": {e}");
+                                }
+                            }
+                            Err(e) => eprintln!("Error: {e}"),
+                        }
+                    }
+                }
+            }
             other => eprintln!("Unknown command: {other}. Try \".help\"."),
         }
         false

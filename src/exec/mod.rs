@@ -7303,6 +7303,40 @@ impl Connection {
         }
     }
 
+    /// Serialize the entire database into a byte vector holding a complete,
+    /// valid SQLite database file — the equivalent of `sqlite3_serialize()`.
+    ///
+    /// Every page of the current committed database (WAL frames included, since
+    /// the read is WAL-aware) is read in order and concatenated, so the result
+    /// is byte-for-byte a database file that `sqlite3` opens with
+    /// `PRAGMA integrity_check = ok` and identical contents. This backs the
+    /// shell's `.backup`/`.save` commands and lets a caller snapshot a
+    /// `:memory:` database.
+    ///
+    /// The read/write format version bytes on page 1 are normalized to the
+    /// rollback-journal value, so a database currently in WAL mode serializes to
+    /// a self-contained image that needs no companion `-wal` file.
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        let src = self.backend.source();
+        let n = src.page_count();
+        let page_size = src.header().page_size as usize;
+        let mut out = Vec::with_capacity(n as usize * page_size);
+        for i in 1..=n {
+            out.extend_from_slice(src.page(i)?.data());
+        }
+        // Normalize the file-format read/write version bytes (offsets 18/19) to
+        // 1 (rollback journal), so a WAL-mode database yields a standalone image.
+        if out.len() >= 20 {
+            if out[18] == 2 {
+                out[18] = 1;
+            }
+            if out[19] == 2 {
+                out[19] = 1;
+            }
+        }
+        Ok(out)
+    }
+
     /// Create a change-tracking [`Session`](crate::Session) on this connection
     /// (roadmap D5). Call [`Session::attach`](crate::Session::attach) to begin
     /// recording, run some `INSERT`/`UPDATE`/`DELETE`, then
