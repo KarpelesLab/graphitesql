@@ -610,8 +610,13 @@ pub enum ColumnConstraint {
     NotNull(OnConflict),
     /// `UNIQUE [ON CONFLICT <action>]`; the action defaults to `Abort`.
     Unique(OnConflict),
-    /// `DEFAULT <expr>`.
-    Default(Expr),
+    /// `DEFAULT <value>`. The second field is the value's **verbatim source text**
+    /// (the literal as written, or the inner text of a parenthesized
+    /// `DEFAULT ( expr )` with the outer parens stripped), which SQLite reproduces
+    /// byte-for-byte in `PRAGMA table_info`'s `dflt_value` — e.g. `0x1F`, `-1.5e3`,
+    /// `TRUE`, `CURRENT_TIMESTAMP`, `1+1`. `None` for a synthetically constructed
+    /// default (no source span), which falls back to re-printing the expression.
+    Default(Expr, Option<String>),
     /// `COLLATE <name>`.
     Collate(String),
     /// `CHECK (<expr>)`. The second field is the constraint's *label* for error

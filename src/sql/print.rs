@@ -294,7 +294,9 @@ fn column_constraint(c: &ColumnConstraint) -> String {
         }
         ColumnConstraint::NotNull(oc) => format!("NOT NULL{}", conflict_suffix(oc)),
         ColumnConstraint::Unique(oc) => format!("UNIQUE{}", conflict_suffix(oc)),
-        ColumnConstraint::Default(e) => format!("DEFAULT {}", expr(e)),
+        // Re-print from the expression (not the captured inner text, which has its
+        // outer parens stripped and would be invalid for a compound default).
+        ColumnConstraint::Default(e, _) => format!("DEFAULT {}", expr(e)),
         ColumnConstraint::Collate(n) => format!("COLLATE {n}"),
         ColumnConstraint::Check(e, _) => format!("CHECK ({})", expr(e)),
         ColumnConstraint::References(fk) => {

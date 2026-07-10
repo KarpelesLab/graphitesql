@@ -2016,15 +2016,23 @@ impl Parser {
                 let on_conflict = self.eat_conflict_clause();
                 constraints.push(ColumnConstraint::Unique(on_conflict));
             } else if self.eat_kw("default") {
-                let e = if self.check(&Token::LParen) {
+                // Capture the value's verbatim source text (what SQLite reproduces in
+                // `table_info.dflt_value`): the inner text for a parenthesized
+                // `DEFAULT ( expr )` (outer parens stripped), else the literal as
+                // written (`0x1F`, `-1.5e3`, `CURRENT_TIMESTAMP`, …).
+                let (e, text) = if self.check(&Token::LParen) {
                     self.expect(&Token::LParen)?;
+                    let inner_start = self.tokens.get(self.pos).map(|s| s.start);
                     let e = self.expr()?;
+                    let text = self.span_text(inner_start);
                     self.expect(&Token::RParen)?;
-                    e
+                    (e, text)
                 } else {
-                    self.default_literal()?
+                    let start = self.tokens.get(self.pos).map(|s| s.start);
+                    let e = self.default_literal()?;
+                    (e, self.span_text(start))
                 };
-                constraints.push(ColumnConstraint::Default(e));
+                constraints.push(ColumnConstraint::Default(e, text));
             } else if self.eat_kw("collate") {
                 constraints.push(ColumnConstraint::Collate(self.ident()?));
             } else if self.eat_kw("check") {

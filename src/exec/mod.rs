@@ -3874,7 +3874,12 @@ impl Connection {
             // preserves the literal as written — e.g. a string keeps its quotes,
             // `DEFAULT NULL` shows `NULL`), so reprint rather than evaluate it.
             let dflt = col.constraints.iter().find_map(|c| match c {
-                ColumnConstraint::Default(e) => Some(sql::print::expr(e)),
+                // SQLite reproduces the default's verbatim source text here (`0x1F`,
+                // `-1.5e3`, `CURRENT_TIMESTAMP`, `1+1`), captured at parse time; fall
+                // back to re-printing the expression for a synthetic default.
+                ColumnConstraint::Default(e, text) => {
+                    Some(text.clone().unwrap_or_else(|| sql::print::expr(e)))
+                }
                 _ => None,
             });
             let pk = pk_positions
@@ -6148,7 +6153,7 @@ impl Connection {
             if generated == 1 {
                 if c.constraints
                     .iter()
-                    .any(|k| matches!(k, ColumnConstraint::Default(_)))
+                    .any(|k| matches!(k, ColumnConstraint::Default(..)))
                 {
                     return Err(Error::Error(
                         "cannot use DEFAULT on a generated column".into(),
@@ -6308,7 +6313,7 @@ impl Connection {
                 // A column `DEFAULT` must be constant: SQLite allows literals,
                 // `CURRENT_*`, and (deterministic or not) function calls, but not a
                 // reference to any column. Reject at CREATE like sqlite.
-                if let ColumnConstraint::Default(e) = k
+                if let ColumnConstraint::Default(e, _) = k
                     && unknown_column_ref(e, &[], false, None).is_some()
                 {
                     return Err(Error::Error(format!(
@@ -13181,7 +13186,7 @@ impl Connection {
                         }
                         // A column `DEFAULT` must be constant — no column reference —
                         // exactly as on `CREATE TABLE`.
-                        ColumnConstraint::Default(e)
+                        ColumnConstraint::Default(e, _)
                             if unknown_column_ref(e, &[], false, None).is_some() =>
                         {
                             return Err(Error::Error(format!(
@@ -13198,7 +13203,7 @@ impl Connection {
                     .any(|k| matches!(k, ColumnConstraint::NotNull(_)));
                 if not_null {
                     let default = cd.constraints.iter().find_map(|k| match k {
-                        ColumnConstraint::Default(e) => Some(e),
+                        ColumnConstraint::Default(e, _) => Some(e),
                         _ => None,
                     });
                     let no_params = Params::default();
@@ -13379,7 +13384,7 @@ impl Connection {
                 for col in &mut ct.columns {
                     for k in &mut col.constraints {
                         match k {
-                            ColumnConstraint::Check(e, _) | ColumnConstraint::Default(e) => {
+                            ColumnConstraint::Check(e, _) | ColumnConstraint::Default(e, _) => {
                                 rename(e)
                             }
                             ColumnConstraint::Generated { expr, .. } => rename(expr),
@@ -34196,7 +34201,7 @@ impl Connection {
             .iter()
             .map(|c| {
                 c.constraints.iter().find_map(|k| match k {
-                    ColumnConstraint::Default(e) => Some(e.clone()),
+                    ColumnConstraint::Default(e, _) => Some(e.clone()),
                     _ => None,
                 })
             })

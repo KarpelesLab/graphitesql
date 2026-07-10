@@ -91,3 +91,37 @@ fn unparenthesized_default_is_a_literal_term() {
         assert_eq!(s, gr, "error mismatch for {sql}");
     }
 }
+
+#[test]
+fn table_info_reproduces_default_source_text() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    // `PRAGMA table_info`'s `dflt_value` reproduces the default's verbatim source
+    // text, not a re-rendering of the parsed expression — so a hex literal stays
+    // `0x1F` (not `31`), scientific notation stays `-1.5e3` (not `-1500.0`), a
+    // boolean stays `TRUE` (not `1`), `CURRENT_TIMESTAMP` is not rewritten to
+    // `datetime('now')`, and a parenthesized value keeps its inner text with exactly
+    // one outer-paren layer stripped and inner whitespace preserved.
+    let cases = [
+        "CREATE TABLE t(a DEFAULT 0x1F); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT -1.5e3 NOT NULL); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT TRUE); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT FALSE NOT NULL); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT CURRENT_TIMESTAMP); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT current_date); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT (1+1)); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT ( 1  +  1 )); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT (( 1 ))); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT (abs(-5))); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT ('x' || 'y')); PRAGMA table_info(t)",
+        "CREATE TABLE t(a DEFAULT +5); PRAGMA table_info(t)",
+        // The stored schema text is preserved verbatim too.
+        "CREATE TABLE t(a DEFAULT 0x1F, b DEFAULT (1+1)); SELECT sql FROM sqlite_master",
+    ];
+    for sql in cases {
+        assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
+    }
+}
