@@ -79,6 +79,61 @@ impl Backend {
 
 /// A database connection. Supports reading (`query`) and writing (`execute`),
 /// over a file or in memory.
+///
+/// # Threading model (roadmap C9d)
+///
+/// A `Connection` follows a **per-thread ("thread-confined") model**: it is used
+/// by **one thread at a time**, and it is neither `Send` nor `Sync`. To use
+/// graphite from a thread pool, give **each thread its own `Connection`** (open
+/// the same file path from each worker — the built-in `StdVfs` coordinates
+/// cross-`Connection` access to one file through a process-local lock manager and
+/// a shared wal-index). Do not move a live `Connection` between threads or share
+/// one behind a lock.
+///
+/// ## Why `Connection` is not `Send`
+///
+/// Making the *whole* `Connection` type `Send` was investigated for C9d. It is
+/// blocked by state that is fundamentally single-threaded and cannot be converted
+/// without an architectural refactor that is out of proportion to the payoff.
+/// The exact, remaining blockers (as surfaced by `assert_send::<Connection>()`)
+/// are:
+///
+/// 1. **`Box<dyn `[`File`](crate::vfs::File)`>`** in the pager. The default
+///    `StdVfs` file handle ([`StdFile`](crate::vfs::std_file::StdFile)) *is*
+///    `Send` (it is `Mutex`/`Arc`/atomics), but the always-available in-memory
+///    VFS handle ([`MemoryFile`](crate::vfs::memory::MemoryFile)) is deliberately
+///    `Rc`/`RefCell`-based and `!Send` (it backs `:memory:` and must work in
+///    `no_std`/wasm with no atomics). Because a `Connection` stores the file as a
+///    single erased `Box<dyn File>` — the same concrete type for both VFSs — the
+///    type is `Send` only if **every** `File` impl is, which `MemoryFile` is not.
+///    Making only the `StdVfs`-backed connection `Send` would require making
+///    `Connection` generic over the file type (a large, pervasive refactor).
+/// 2. **`Box<dyn `[`PageSource`]`>`** (the read-only
+///    backend) — same erased-trait-object situation as (1).
+/// 3. The **session recorder** (`RefCell<SessionState>`, shared with a
+///    [`Session`](crate::session::Session) via reference counting):
+///    `Send` would need `Arc<Mutex<…>>` (a `std`-only primitive), not the
+///    single-threaded `Rc<RefCell<…>>` the per-thread model calls for.
+/// 4. Registered **user functions/aggregates and virtual-table modules**
+///    (`Box<dyn Fn …>` / `Box<dyn DynVTabModule>`): `Send` would require adding a
+///    `+ Send` bound to those public trait objects, a breaking API change that
+///    would forbid non-`Send` user closures — and that buys nothing while (1)/(2)
+///    keep the type `!Send` regardless.
+///
+/// Net: the payoff (a `Send` `Connection`) is unreachable within a clean,
+/// non-breaking change, so graphite ships the documented per-thread model above.
+/// The page cache and page buffers use `Rc<Vec<u8>>` (single-threaded, cheap);
+/// were the `File`/`PageSource` blocker ever removed (e.g. by making `Connection`
+/// generic over the VFS), those `Rc`s would need to become `Arc` too.
+///
+/// The `!Send`-ness is deliberate and enforced: the following must **not**
+/// compile (if it ever does, the per-thread model above has silently changed and
+/// this decision should be revisited):
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<graphitesql::Connection>();
+/// ```
 pub struct Connection {
     backend: Backend,
     schema: Schema,
