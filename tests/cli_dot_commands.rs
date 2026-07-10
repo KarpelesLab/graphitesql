@@ -321,3 +321,53 @@ fn import_csv_matches_sqlite() {
         let _ = std::fs::remove_file(gdb);
     }
 }
+
+#[test]
+fn markdown_box_table_print_match_sqlite() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let cases: &[(&str, &str)] = &[
+        (
+            "markdown_headers",
+            ".mode markdown\n.headers on\nSELECT 1 AS a, 'hi' AS bee UNION ALL SELECT 22, 'x';\n",
+        ),
+        (
+            "markdown_no_headers_still_shows",
+            ".mode markdown\nSELECT 1 AS a, 2 AS b;\n",
+        ),
+        (
+            "markdown_centered_header",
+            ".mode markdown\nSELECT 100 AS x, 'yz' AS long_col;\n",
+        ),
+        (
+            "markdown_empty",
+            ".mode markdown\n.headers on\nSELECT 1 AS a WHERE 0;\n",
+        ),
+        ("markdown_prefix_abbrev", ".mode mark\nSELECT 5 AS n;\n"),
+        (
+            "box_headers",
+            ".mode box\n.headers on\nSELECT 1 AS a, 'hi' AS bee UNION ALL SELECT 22, 'x';\n",
+        ),
+        ("box_no_headers", ".mode box\nSELECT 1 AS a, 2 AS b;\n"),
+        (
+            "box_null_and_unicode",
+            ".mode box\n.headers on\nSELECT NULL AS a, 'héllo' AS b;\n",
+        ),
+        ("box_empty", ".mode box\nSELECT 1 WHERE 0;\n"),
+        (
+            "table_headers",
+            ".mode table\n.headers on\nSELECT 1 AS id, 'Alice' AS name, 3.5 AS score UNION ALL SELECT 200, 'Bob', 99.25;\n",
+        ),
+        ("table_no_headers", ".mode table\nSELECT 1 AS a, 2 AS b;\n"),
+        ("print_args", ".print hello world\n.print\n.print done\n"),
+        (
+            "print_then_query",
+            ".mode box\n.print --- results ---\nSELECT 42 AS answer;\n",
+        ),
+    ];
+    for (label, script) in cases {
+        assert_same(label, script);
+    }
+}

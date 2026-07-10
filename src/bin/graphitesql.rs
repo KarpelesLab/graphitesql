@@ -43,6 +43,12 @@ enum Mode {
     Insert,
     /// `json` — a JSON array of one object per row.
     Json,
+    /// `markdown` — a GitHub-flavored Markdown table (always with a header).
+    Markdown,
+    /// `box` — a Unicode box-drawing table (always with a header).
+    Box,
+    /// `table` — an ASCII-art table (`+`/`-`/`|`, always with a header).
+    Table,
 }
 
 fn main() {
@@ -384,7 +390,115 @@ impl Shell {
             Mode::Quote => self.print_quote(result),
             Mode::Insert => self.print_insert(result),
             Mode::Json => self.print_json(result),
+            Mode::Markdown => self.print_markdown(result),
+            Mode::Box => self.print_boxed(result, BOX_CHARS),
+            Mode::Table => self.print_boxed(result, TABLE_CHARS),
         }
+    }
+
+    /// Cells (as displayed) and per-column display widths (character counts),
+    /// shared by the `markdown`/`box`/`table` renderers.
+    fn boxed_cells(&self, result: &QueryResult) -> (Vec<Vec<String>>, Vec<usize>) {
+        let ncol = result.columns.len();
+        let cells: Vec<Vec<String>> = result
+            .rows
+            .iter()
+            .map(|row| {
+                (0..ncol)
+                    .map(|i| match row.get(i) {
+                        Some(Value::Null) | None => self.null_value.clone(),
+                        Some(v) => display_cell(v),
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut width: Vec<usize> = result.columns.iter().map(|c| c.chars().count()).collect();
+        for row in &cells {
+            for (i, c) in row.iter().enumerate() {
+                width[i] = width[i].max(c.chars().count());
+            }
+        }
+        (cells, width)
+    }
+
+    /// `markdown` mode: a GitHub-flavored Markdown table. Always includes a
+    /// header row and its `|---|` separator (independent of `.headers`); an
+    /// empty result set prints nothing, matching SQLite.
+    fn print_markdown(&mut self, result: &QueryResult) {
+        if result.rows.is_empty() || result.columns.is_empty() {
+            return;
+        }
+        let (cells, width) = self.boxed_cells(result);
+        let mut out = String::new();
+        let row = |out: &mut String, cols: &[String], center: bool| {
+            out.push('|');
+            for (i, c) in cols.iter().enumerate() {
+                out.push(' ');
+                if center {
+                    pad_center(c, width[i], out);
+                } else {
+                    pad_str(c, width[i], out);
+                }
+                out.push_str(" |");
+            }
+            out.push('\n');
+        };
+        row(&mut out, &result.columns, true);
+        out.push('|');
+        for &w in &width {
+            for _ in 0..w + 2 {
+                out.push('-');
+            }
+            out.push('|');
+        }
+        out.push('\n');
+        for r in &cells {
+            row(&mut out, r, false);
+        }
+        let _ = self.out.write_all(out.as_bytes());
+    }
+
+    /// `box`/`table` mode: a bordered table (Unicode box-drawing or ASCII art).
+    /// Always includes a header (independent of `.headers`); an empty result set
+    /// prints nothing, matching SQLite.
+    fn print_boxed(&mut self, result: &QueryResult, c: BoxChars) {
+        if result.rows.is_empty() || result.columns.is_empty() {
+            return;
+        }
+        let (cells, width) = self.boxed_cells(result);
+        let mut out = String::new();
+        let border = |out: &mut String, l: char, mid: char, r: char| {
+            out.push(l);
+            for (i, &w) in width.iter().enumerate() {
+                for _ in 0..w + 2 {
+                    out.push(c.horiz);
+                }
+                out.push(if i == width.len() - 1 { r } else { mid });
+            }
+            out.push('\n');
+        };
+        let data_row = |out: &mut String, cols: &[String], center: bool| {
+            out.push(c.vert);
+            for (i, cell) in cols.iter().enumerate() {
+                out.push(' ');
+                if center {
+                    pad_center(cell, width[i], out);
+                } else {
+                    pad_str(cell, width[i], out);
+                }
+                out.push(' ');
+                out.push(c.vert);
+            }
+            out.push('\n');
+        };
+        border(&mut out, c.tl, c.tm, c.tr);
+        data_row(&mut out, &result.columns, true);
+        border(&mut out, c.ml, c.mm, c.mr);
+        for row in &cells {
+            data_row(&mut out, row, false);
+        }
+        border(&mut out, c.bl, c.bm, c.br);
+        let _ = self.out.write_all(out.as_bytes());
     }
 
     /// List/tabs mode: header (optional) then one row per line, cells joined by
@@ -766,6 +880,10 @@ impl Shell {
                     },
                 }
             }
+            ".print" => {
+                // Echo the arguments, space-separated (SQLite's `.print`).
+                println!("{}", args[1..].join(" "));
+            }
             other => eprintln!("Unknown command: {other}. Try \".help\"."),
         }
         false
@@ -815,6 +933,15 @@ impl Shell {
             self.insert_table = tabname.cloned().unwrap_or_else(|| String::from("table"));
         } else if matches("json") {
             self.mode = Mode::Json;
+        } else if matches("markdown") {
+            self.mode = Mode::Markdown;
+            self.row_sep = String::from("\n");
+        } else if matches("box") {
+            self.mode = Mode::Box;
+            self.row_sep = String::from("\n");
+        } else if matches("table") {
+            self.mode = Mode::Table;
+            self.row_sep = String::from("\n");
         } else {
             eprintln!(
                 "Error: mode should be one of: ascii box column csv html insert \
@@ -1607,6 +1734,77 @@ fn pad_to(s: &str, width: usize, out: &mut Vec<u8>) {
     let n = s.chars().count();
     out.extend(std::iter::repeat_n(b' ', width.saturating_sub(n)));
 }
+
+/// Left-justify `s` to `width` display characters, appending to a `String`.
+fn pad_str(s: &str, width: usize, out: &mut String) {
+    out.push_str(s);
+    let n = s.chars().count();
+    for _ in 0..width.saturating_sub(n) {
+        out.push(' ');
+    }
+}
+
+/// Center `s` within `width` display characters (left-biased when the padding
+/// is odd), appending to a `String`. Matches the header justification of
+/// SQLite's `markdown`/`box`/`table` output.
+fn pad_center(s: &str, width: usize, out: &mut String) {
+    let n = s.chars().count();
+    let pad = width.saturating_sub(n);
+    let left = pad / 2;
+    for _ in 0..left {
+        out.push(' ');
+    }
+    out.push_str(s);
+    for _ in 0..pad - left {
+        out.push(' ');
+    }
+}
+
+/// The eleven border glyphs of a `box`/`table`-style bordered table.
+#[derive(Clone, Copy)]
+struct BoxChars {
+    tl: char,
+    tm: char,
+    tr: char,
+    ml: char,
+    mm: char,
+    mr: char,
+    bl: char,
+    bm: char,
+    br: char,
+    horiz: char,
+    vert: char,
+}
+
+/// Unicode box-drawing glyphs (`.mode box`).
+const BOX_CHARS: BoxChars = BoxChars {
+    tl: '┌',
+    tm: '┬',
+    tr: '┐',
+    ml: '├',
+    mm: '┼',
+    mr: '┤',
+    bl: '└',
+    bm: '┴',
+    br: '┘',
+    horiz: '─',
+    vert: '│',
+};
+
+/// ASCII-art glyphs (`.mode table`).
+const TABLE_CHARS: BoxChars = BoxChars {
+    tl: '+',
+    tm: '+',
+    tr: '+',
+    ml: '+',
+    mm: '+',
+    mr: '+',
+    bl: '+',
+    bm: '+',
+    br: '+',
+    horiz: '-',
+    vert: '|',
+};
 
 /// Render a value's bytes for a CSV/line/list cell (not the NULL case — the
 /// caller substitutes `.nullvalue`). TEXT/BLOB stop at the first NUL, as the
