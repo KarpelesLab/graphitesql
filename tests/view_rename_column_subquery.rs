@@ -134,17 +134,23 @@ fn view_rename_column_subquery_matches_sqlite() {
         assert_eq!(run("sqlite3", sql), run(g, sql), "for {sql}");
     }
 
-    // Bail: a derived table in main position that projects the renamed column and is
-    // then consumed — SQLite rewrites the body then rejects the whole rename (its
-    // exposed column changed), leaving the stored view unchanged; graphite likewise
-    // leaves it byte-identical (the error is A-alter-2's job). Guards against a wrong
-    // rewrite.
-    let bail = [(
+    // Reject (A-alter-2): a derived table in main position that projects the renamed
+    // column and is then consumed — SQLite rewrites the body then rejects the whole
+    // rename (its exposed column changed) and rolls back, leaving the stored view
+    // unchanged. graphite now does the same (savepoint + post-rename revalidation),
+    // so both engines emit the same rejection and leave the view byte-identical. The
+    // `run` helper strips each CLI's error prefix, so the shared message compares
+    // equal; the trailing schema dump proves the view was rolled back untouched.
+    let reject = [
         "CREATE TABLE t(a,b); CREATE VIEW v AS SELECT a FROM (SELECT a FROM t); \
          ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-        "CREATE VIEW v AS SELECT a FROM (SELECT a FROM t)",
-    )];
-    for (sql, unchanged) in bail {
-        assert_eq!(run(g, sql), unchanged, "bail invariant for {sql}");
+    ];
+    for sql in reject {
+        let s = run("sqlite3", sql);
+        assert!(
+            s.contains("after rename:"),
+            "sqlite should reject {sql}: {s}"
+        );
+        assert_eq!(s, run(g, sql), "reject invariant for {sql}");
     }
 }

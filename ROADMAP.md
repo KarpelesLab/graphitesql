@@ -188,33 +188,26 @@ EXCEPT) incl. `ORDER BY`, and `WITH` CTE bodies incl. output-column provenance
   visibility list (derived tables don't propagate to sibling arms/subqueries, unlike
   CTEs — a subtle bug found and fixed during the sweep). Verified across 48 shapes.
   With this, RENAME COLUMN propagation is complete for every shape sqlite rewrites.
-- **A-alter-2 — ALTER-time rejection of a RENAME that breaks a dependent.**
-  *(attempted 2026-07-10, reverted — see the finding below)* sqlite rejects + rolls
-  back a rename that leaves a dependent view unresolvable (`USING(col)` column
-  vanishes, a derived/CTE that exposes the renamed column and is then consumed);
-  graphite currently mutates and commits. **The machinery works** — a
-  `\0graphite_alter` writer savepoint around the rewrite, `Schema::read` the
-  post-rename overlay, then re-validate each dependent view by probing it
-  (`SELECT * FROM "v" LIMIT 0`) and, on a resolution error, `rollback_to_savepoint`
-  + emit the byte-exact `error in view NAME after rename: <detail>` (graphite's
-  resolver already produces the exact `no such column` / `cannot join using …`
-  details). Verified working on the genuine-reject cases.
-  **Why it was reverted — the blanket re-validation false-rejects.** A `SELECT * FROM
-  v LIMIT 0` probe rejects *any* view that no longer resolves, but graphite still
-  *declines* a handful of niche shapes that **sqlite rewrites and accepts** — so the
-  declined-and-now-broken view gets wrongly rejected. Measured false-reject shapes
-  (all `collect_select_base_sources` bails that sqlite nonetheless rewrites):
-  a **result-column alias equal to `old`** (`SELECT b AS a, a FROM t`), and a
-  **source table named `old`** (`SELECT t.a FROM t, a`). (NATURAL joins, `USING` on
-  a *different* column, and unrelated TVF sources are fine — the declined view still
-  *resolves* after the rename, so the probe doesn't reject it.) **So A-alter-2 needs
-  either:** (a) close those last propagation gaps (alias-collision + source-named-`old`
-  — both doable with the `BareRewrite::At` span machinery, so the renamed occurrences
-  are rewritten while the alias/table token is left) so the blanket probe is clean;
-  **or** (b) a *targeted* reject detector (USING-column-vanishes + consumed-renamed-
-  CTE/derived via the existing provenance `bails=true` signal) instead of the blanket
-  probe. (a) is the cleaner path. Triggers (A-alter-2b) are a further step (probing a
-  trigger without firing it). Central DDL — carry the finding into the redo.
+- **A-alter-2 — ALTER-time rejection of a RENAME that breaks a dependent view.
+  DONE 2026-07-10 (views; triggers = A-alter-2b).** sqlite rejects + rolls back a
+  rename that leaves a dependent view unresolvable (`USING(col)` column vanishes, a
+  derived/CTE that exposes the renamed column and is then consumed); graphite now
+  matches. Took the clean path (a): first **closed the last propagation gaps** with
+  the `BareRewrite::At` span machinery so the blanket probe can't false-reject — a
+  result-column alias equal to `old` (`SELECT b AS a, a FROM t`) and a source table
+  named `old` (`SELECT t.a FROM t, a`) now rewrite the bound occurrences span-precisely
+  while leaving the alias/table token (`scope_bare_old_decision` always returns
+  `At(spans)`, never a blanket `All`; `select_needs_scope_aware` forces the scope pass
+  when a result-alias or source name equals `old`). Then re-applied the machinery: a
+  `\0graphite_alter` writer savepoint around the rewrite, `Schema::read` the post-rename
+  overlay, `first_broken_view_after_rename` probes each dependent view
+  (`SELECT * FROM "v" LIMIT 0`) and, on a resolution error, `rollback_to_savepoint` +
+  the byte-exact `error in view NAME after rename: <detail>`. A sweep of 12+ shapes
+  (aliases, GROUP BY/HAVING/DISTINCT/ORDER BY, self-alias, comma/NATURAL joins) found
+  no shape where graphite leaves a view broken that sqlite rewrites. Tests:
+  `tests/alter_rename_rollback.rs` (reject-and-rollback + accept), and the reject cases
+  folded into the two rename-propagation suites. Triggers (A-alter-2b) are the further
+  step — probe a trigger's body without firing it.
 - **A-misc-1 — structural row-arity error *ordering* vs name resolution.** *(niche;
   cosmetic)* On doubly-malformed input (a row-value misuse *and* a missing column
   in one clause) graphite reports the column error where sqlite sometimes reports
@@ -540,9 +533,9 @@ independently shippable. Recommended next order:
 1. **C9b — cross-process OS file locks** *(newly unblocked; MSRV 1.89 approved)*.
    Start with **C9b-0** (the MSRV bump), then the lock primitive (C9b-1) and the
    two-process differential test (C9b-2). Well-scoped, high value.
-2. **A-alter-1 → A-alter-2 — finish RENAME dependency safety.** Derived-table
-   propagation (small, reuses the CTE-provenance pattern), then the savepoint
-   rollback + resolve-check re-validation (the reverted machinery, now unblocked).
+2. **A-alter-2b — RENAME dependency safety for triggers.** Views are DONE
+   (A-alter-1 + A-alter-2 landed 2026-07-10). Remaining: extend the post-rename
+   re-validation to dependent triggers — probe a trigger body without firing it.
 3. **B5b-2 — live storage cursors on the VDBE** *(in progress)*. The largest VDBE
    piece; next sub-steps are the in-interpreter `OpenRead`/`SeekRowid` opcodes and
    the affinity-blocked secondary-index / `WITHOUT ROWID` seeks. Parity-gated, low

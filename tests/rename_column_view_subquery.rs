@@ -284,55 +284,51 @@ fn rename_column_rewrites_nested_subquery_refs_in_view() {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
     }
 
-    // CTE bail: an outer reference to a CTE's renamed OUTPUT column (`SELECT a FROM
-    // x` where `x`'s body projects the renamed `t.a`) makes the reference
-    // unresolvable — graphite leaves the stored view byte-identical. SQLite rewrites
-    // the CTE body and then rejects the whole rename (the CTE's exposed column
-    // became `aa`, so the outer `a` no longer resolves), so its stored view is *also*
-    // left unchanged; only SQLite additionally errors (that reject is A-alter-
-    // rollback's job). Here the stored SQL matches; the invariant guards against a
-    // wrong rewrite.
-    let cte_bail = [
-        (
-            "CREATE TABLE t(a,b); \
-             CREATE VIEW v AS WITH x AS (SELECT a FROM t) SELECT a FROM x; \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-            "CREATE VIEW v AS WITH x AS (SELECT a FROM t) SELECT a FROM x",
-        ),
-        // A CTE consumed in a compound arm that exposes the renamed column: the
-        // consumer (`SELECT a FROM y`, y = `SELECT a FROM t`) would break, so SQLite
-        // rejects the whole rename. graphite leaves the view byte-identical (its
-        // stored SQL matches SQLite's reject-and-leave; the error itself is
-        // A-alter-rollback's job).
-        (
-            "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
-             CREATE VIEW v AS WITH x AS (SELECT a FROM u), y AS (SELECT a FROM t) \
-               SELECT a FROM x UNION SELECT a FROM y; \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-            "CREATE VIEW v AS WITH x AS (SELECT a FROM u), y AS (SELECT a FROM t) SELECT a FROM x UNION SELECT a FROM y",
-        ),
-        // A derived table in main position that projects the renamed column
-        // unaliased (`SELECT a FROM (SELECT a FROM t)`): the outer `a` would break,
-        // so SQLite rejects; graphite leaves the view byte-identical (stored SQL
-        // matches SQLite's reject-and-leave — A-alter-rollback's job to error).
-        (
-            "CREATE TABLE t(a,b); \
-             CREATE VIEW v AS SELECT a FROM (SELECT a FROM t); \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-            "CREATE VIEW v AS SELECT a FROM (SELECT a FROM t)",
-        ),
-        // Two derived tables in arms, one over the renamed table exposing it
-        // unaliased → its consumer breaks → SQLite rejects; graphite leaves
-        // unchanged (never a wrong partial rewrite of the other arm).
-        (
-            "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
-             CREATE VIEW v AS SELECT a FROM (SELECT a FROM u) UNION SELECT a FROM (SELECT a FROM t); \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-            "CREATE VIEW v AS SELECT a FROM (SELECT a FROM u) UNION SELECT a FROM (SELECT a FROM t)",
-        ),
+    // Rename-rejects (A-alter-2): the rename would leave the view unresolvable — a
+    // CTE/derived table exposing the renamed column unaliased and then consumed, or
+    // a `USING(col)` join whose column vanishes. SQLite and graphite both reject
+    // with `error in view v after rename: …` and roll back, leaving the stored view
+    // unchanged. Only the CLI error-line *prefix* differs (`Error: stepping, ` vs
+    // `Error: error: ` — the CLI-2 residual), so compare after stripping it.
+    let reject = [
+        "CREATE TABLE t(a,b); \
+         CREATE VIEW v AS WITH x AS (SELECT a FROM t) SELECT a FROM x; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS WITH x AS (SELECT a FROM u), y AS (SELECT a FROM t) \
+           SELECT a FROM x UNION SELECT a FROM y; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        "CREATE TABLE t(a,b); \
+         CREATE VIEW v AS SELECT a FROM (SELECT a FROM t); \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT a FROM (SELECT a FROM u) UNION SELECT a FROM (SELECT a FROM t); \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        // A `USING(col)` join whose column vanishes — a distinct error message.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT * FROM t JOIN u USING(a); \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
     ];
-    for (sql, unchanged) in cte_bail {
-        assert_eq!(out(g, sql), unchanged, "cte bail for {sql}");
+    let strip = |s: &str| -> String {
+        s.lines()
+            .map(|l| {
+                l.strip_prefix("Error: stepping, ")
+                    .or_else(|| l.strip_prefix("Error: error: "))
+                    .or_else(|| l.strip_prefix("Runtime error near line 1: "))
+                    .or_else(|| l.strip_prefix("Error: "))
+                    .unwrap_or(l)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for sql in reject {
+        let s = strip(&out("sqlite3", sql));
+        let g2 = strip(&out(g, sql));
+        assert!(
+            s.contains("after rename:"),
+            "sqlite should reject: {sql}\n{s}"
+        );
+        assert_eq!(s, g2, "rename reject mismatch for {sql}");
     }
 
     // Functional check: the mixed-body view stays queryable after the rename (the

@@ -13098,6 +13098,9 @@ impl Connection {
     }
 
     fn exec_alter(&mut self, a: &Alter) -> Result<()> {
+        // Internal savepoint name for the RENAME COLUMN rollback (A-alter-2); the
+        // NUL prefix keeps it out of the user savepoint namespace.
+        const ALTER_SAVEPOINT: &str = "\u{0}graphite_alter";
         self.reject_internal_table_ddl(&a.table, "altered")?;
         // A virtual table can be renamed (sqlite renames its backing tables too),
         // but not otherwise altered — and it isn't a CREATE TABLE, so it must not
@@ -13123,6 +13126,16 @@ impl Connection {
 
         if let AlterAction::DropColumn(name) = &a.action {
             return self.exec_drop_column(a, ct, name);
+        }
+        // A RENAME COLUMN can leave a dependent view unresolvable (a shape neither
+        // graphite nor SQLite can rewrite — e.g. a `USING(col)` join whose column
+        // vanishes, or a derived table that exposes the renamed column and is
+        // consumed). SQLite applies the rename, re-validates every dependent, and
+        // rolls back with `error in view … after rename: …` if any no longer
+        // resolves (ROADMAP A-alter-2). Snapshot the staged schema first.
+        let rename_col = matches!(&a.action, AlterAction::RenameColumn { .. });
+        if rename_col {
+            self.backend.writer()?.savepoint(ALTER_SAVEPOINT);
         }
         match &a.action {
             AlterAction::DropColumn(_) => unreachable!("handled above"),
@@ -13594,7 +13607,56 @@ impl Connection {
             .wrapping_add(1);
         self.backend.writer()?.header_mut().schema_cookie = cookie;
         self.schema = Schema::read(self.backend.source())?;
+        if rename_col {
+            // Re-validate dependents against the post-rename schema; a broken view
+            // rolls the whole rename back, matching SQLite.
+            if let Some(err) = self.first_broken_view_after_rename(&a.table) {
+                self.backend
+                    .writer()?
+                    .rollback_to_savepoint(ALTER_SAVEPOINT)?;
+                self.backend.writer()?.release_savepoint(ALTER_SAVEPOINT)?;
+                self.schema = Schema::read(self.backend.source())?;
+                return Err(err);
+            }
+            self.backend.writer()?.release_savepoint(ALTER_SAVEPOINT)?;
+        }
         Ok(())
+    }
+
+    /// After a RENAME COLUMN, find the first dependent view that no longer resolves
+    /// against the post-rename schema (ROADMAP A-alter-2). Each candidate view — one
+    /// whose stored text mentions `table`, so a pre-existing latent error in an
+    /// unrelated view can never turn a rename into a false rejection — is probed
+    /// minimally (`SELECT * FROM "v" LIMIT 0`); a resolution error means the rename
+    /// broke it. Returns that view's error wrapped as SQLite renders it (`error in
+    /// view NAME after rename: <detail>`), in schema (creation) order, or `None` if
+    /// every dependent still resolves. (Trigger dependents are A-alter-2b.)
+    fn first_broken_view_after_rename(&self, table: &str) -> Option<Error> {
+        let needle = table.to_ascii_lowercase();
+        for obj in self.schema.objects() {
+            if obj.obj_type != crate::schema::ObjectType::View {
+                continue;
+            }
+            let Some(vsql) = &obj.sql else { continue };
+            if !vsql.to_ascii_lowercase().contains(&needle) {
+                continue;
+            }
+            let probe = format!(
+                "SELECT * FROM \"{}\" LIMIT 0",
+                obj.name.replace('"', "\"\"")
+            );
+            if let Err(e) = self.query(&probe) {
+                let detail = match &e {
+                    Error::Error(m) => m.clone(),
+                    other => other.to_string(),
+                };
+                return Some(Error::Error(format!(
+                    "error in view {} after rename: {detail}",
+                    obj.name
+                )));
+            }
+        }
+        None
     }
 
     /// `ALTER TABLE … RENAME TO` for a virtual table: rename its persistent
