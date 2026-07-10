@@ -252,6 +252,74 @@ impl Parser {
         self.syntax_error(self.pos)
     }
 
+    /// Parse the value of an *unparenthesized* column `DEFAULT`.
+    ///
+    /// SQLite restricts this to a single literal term — an optionally-signed
+    /// number, a string, a blob, `NULL`, `TRUE`/`FALSE`, a
+    /// `CURRENT_{DATE,TIME,TIMESTAMP}` keyword, or a bare identifier — and **not** a
+    /// general expression. So `DEFAULT 1+1` and `DEFAULT abs(1)` are syntax errors
+    /// (parentheses are required for anything compound), and a trailing
+    /// `NOT NULL` / `COLLATE …` / `UNIQUE` / … is the *next column constraint*, never
+    /// part of the default. graphite previously parsed a full `expr()` here, which
+    /// greedily swallowed those constraints as postfix operators
+    /// (`DEFAULT 'x' NOT NULL` became `DEFAULT ('x' IS NOT NULL)` with the `NOT NULL`
+    /// constraint lost) and wrongly accepted an unparenthesized compound expression.
+    fn default_literal(&mut self) -> Result<Expr> {
+        // Optional leading sign (SQLite's grammar: `DEFAULT [PLUS|MINUS] term`).
+        let sign = if self.eat(&Token::Minus) {
+            Some(UnaryOp::Negate)
+        } else if self.eat(&Token::Plus) {
+            Some(UnaryOp::Identity)
+        } else {
+            None
+        };
+        // `-9223372036854775808` folds to `i64::MIN`, matching `prefix`.
+        if matches!(sign, Some(UnaryOp::Negate)) && matches!(self.peek(), Some(Token::Int2Pow63)) {
+            self.pos += 1;
+            return Ok(Expr::Literal(Literal::Integer(i64::MIN)));
+        }
+        let bad = self.pos;
+        let term = match self.advance() {
+            Some(Token::Integer(i)) => Expr::Literal(Literal::Integer(i)),
+            Some(Token::Int2Pow63) => Expr::Literal(Literal::Real(9223372036854775808.0)),
+            Some(Token::Float(f)) => Expr::Literal(Literal::Real(f)),
+            Some(Token::Str(s)) => Expr::Literal(Literal::Str(s)),
+            Some(Token::Blob(b)) => Expr::Literal(Literal::Blob(b)),
+            Some(Token::Word(w)) => match w.to_ascii_lowercase().as_str() {
+                "null" => Expr::Literal(Literal::Null),
+                "true" => Expr::Literal(Literal::Boolean(true)),
+                "false" => Expr::Literal(Literal::Boolean(false)),
+                "current_date" => now_datetime_fn("date"),
+                "current_time" => now_datetime_fn("time"),
+                "current_timestamp" => now_datetime_fn("datetime"),
+                // A bare word (`DEFAULT abc`) is a valid literal default in SQLite,
+                // stored as the identifier text.
+                _ => Expr::Column {
+                    schema: None,
+                    table: None,
+                    column: w,
+                    quoted: false,
+                    span: Span::none(),
+                },
+            },
+            Some(Token::Ident(name)) => Expr::Column {
+                schema: None,
+                table: None,
+                column: name,
+                quoted: true,
+                span: Span::none(),
+            },
+            _ => return Err(self.syntax_error(bad)),
+        };
+        Ok(match sign {
+            Some(op) => Expr::Unary {
+                op,
+                expr: Box::new(term),
+            },
+            None => term,
+        })
+    }
+
     /// Is the current token the keyword `kw` (case-insensitive bare word)?
     fn check_kw(&self, kw: &str) -> bool {
         matches!(self.peek(), Some(Token::Word(w)) if w.eq_ignore_ascii_case(kw))
@@ -1954,7 +2022,7 @@ impl Parser {
                     self.expect(&Token::RParen)?;
                     e
                 } else {
-                    self.expr()?
+                    self.default_literal()?
                 };
                 constraints.push(ColumnConstraint::Default(e));
             } else if self.eat_kw("collate") {
