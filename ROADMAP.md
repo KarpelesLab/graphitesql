@@ -355,12 +355,22 @@ history / `CHANGELOG.md`. Remaining:
   — a writer holds OS-exclusive for the whole write txn (from `RESERVED`), so it
   blocks cross-process readers during a write, where SQLite's byte-range `RESERVED`
   lock keeps them. std's whole-file locks cannot express that split. Remaining:
-  - **C9b-3 — autocommit reads take a cross-process shared lock.** An *explicit*
-    read txn takes the persistent shared lock (C9a) and so coordinates
-    cross-process, but a bare autocommit `SELECT` reads without driving the
-    aggregate to `Shared`, so it isn't blocked by a foreign exclusive lock (could
-    read a torn page during another process's write). Make the autocommit read path
-    take (and release) a transient shared lock around the read.
+  - **C9b-3 — autocommit reads take a cross-process shared lock. DONE 2026-07-10.**
+    A bare autocommit `SELECT` now takes a *transient* `Shared` lock for the duration
+    of the read (`WritePager::begin_autocommit_read`/`end_autocommit_read`, wired in
+    `Connection::query_params` for a `Select` with no open txn over a `Write`
+    backend), so a foreign process mid-write (holding the OS-exclusive lock under the
+    pessimistic whole-file model) BUSYs the read instead of letting it see a torn
+    page. Acquired before the `revalidate_read_cache` change-counter read (so that's
+    covered too) and released at statement end; the clean read cache is left intact
+    (the next statement's token revalidation handles a foreign commit). In-process
+    this adds no contention — the OS lock is process-wide, so a sibling connection's
+    write already holds it and a same-process `Shared` acquire is a no-op; only a
+    cross-process exclusive holder BUSYs, and a foreign *shared* lock still coexists.
+    Test: `tests/c9b_cross_process_locks.rs::foreign_exclusive_lock_blocks_an_autocommit_reader`.
+    **With this, Track C's cross-process locking is complete** (the whole-file
+    pessimistic-writer limitation remains documented — std locks can't express
+    SQLite's byte-range `RESERVED` split).
 
 ### Track D — Virtual tables & ecosystem extensions
 

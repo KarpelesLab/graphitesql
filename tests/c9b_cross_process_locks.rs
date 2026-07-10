@@ -103,6 +103,35 @@ fn foreign_shared_lock_blocks_a_writer_but_not_a_reader() {
 }
 
 #[test]
+fn foreign_exclusive_lock_blocks_an_autocommit_reader() {
+    // C9b-3: a bare autocommit SELECT takes a transient shared lock for the read, so
+    // a foreign process mid-write (holding the exclusive lock) can't be read torn.
+    let db = temp_path("acread");
+    cleanup(&db);
+    let (ok, _) = run(&db, "CREATE TABLE t(a); INSERT INTO t VALUES(1)");
+    assert!(ok, "setup failed");
+
+    let lockf = File::options().read(true).write(true).open(&db).unwrap();
+    lockf.lock().unwrap();
+
+    // No BEGIN — a plain autocommit read must still be blocked by the exclusive lock.
+    let (ok, msg) = run(&db, "SELECT count(*) FROM t");
+    assert!(
+        !ok && is_locked(&msg),
+        "an autocommit read must be blocked by a foreign exclusive lock, got ok={ok} msg={msg}"
+    );
+
+    // Once released, the read succeeds.
+    lockf.unlock().unwrap();
+    let (ok, msg) = run(&db, "SELECT count(*) FROM t");
+    assert!(
+        ok && msg.trim() == "1",
+        "read must succeed after unlock: {msg}"
+    );
+    cleanup(&db);
+}
+
+#[test]
 fn foreign_exclusive_lock_blocks_an_explicit_read_transaction() {
     let db = temp_path("exread");
     cleanup(&db);

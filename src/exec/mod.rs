@@ -3254,10 +3254,26 @@ impl Connection {
 
     /// Like [`query`](Self::query) but with bound parameters.
     pub fn query_params(&self, sql: &str, params: &Params) -> Result<QueryResult> {
+        let stmt = sql::parse_one(sql)?;
+        // A bare autocommit `SELECT` takes a transient cross-process `Shared` lock for
+        // the duration of the read (ROADMAP C9b-3), so a foreign process mid-write
+        // can't be read torn. Acquired *before* revalidating the cache so the
+        // change-counter read is itself covered, and released at statement end. A
+        // no-op inside an explicit transaction (which holds its own lock) and for a
+        // read-only / in-memory backend.
+        let took_transient = if matches!(stmt, Statement::Select(_))
+            && !self.in_tx
+            && self.open_savepoints == 0
+            && let Backend::Write(w) = &self.backend
+        {
+            w.begin_autocommit_read()?
+        } else {
+            false
+        };
         // Statement boundary: drop any read cache that a foreign commit has made
         // stale, so this statement sees the newest committed data (ROADMAP C8c-2).
         self.revalidate_read_caches();
-        match sql::parse_one(sql)? {
+        let result = match stmt {
             Statement::Select(sel) => {
                 self.ensure_read_txn_lock()?;
                 self.run_select(&sel, params)
@@ -3273,7 +3289,11 @@ impl Connection {
             _ => Err(Error::Unsupported(
                 "use execute() for non-SELECT statements",
             )),
+        };
+        if took_transient && let Backend::Write(w) = &self.backend {
+            w.end_autocommit_read();
         }
+        result
     }
 
     /// Evaluate the read-only `PRAGMA`s that return a result set.

@@ -128,6 +128,17 @@ pub struct WritePager {
     /// by [`end_read_txn`](Self::end_read_txn). A `Cell` for the same `&self`
     /// reason as [`held`](Self::held).
     read_txn: Cell<bool>,
+    /// Whether this connection is holding a *transient* autocommit read lock
+    /// (ROADMAP C9b-3). A bare autocommit `SELECT` (no open transaction) takes a
+    /// `Shared` lock for the duration of the statement so a foreign *process* mid-
+    /// write (holding the OS-exclusive lock under the pessimistic whole-file model)
+    /// cannot be read torn; it is released the moment the statement finishes. Unlike
+    /// [`read_txn`](Self::read_txn) this does not pin a repeatable-read snapshot —
+    /// it exists only to gate the read against a concurrent foreign writer. Set by
+    /// [`begin_autocommit_read`](Self::begin_autocommit_read), cleared by
+    /// [`end_autocommit_read`](Self::end_autocommit_read). A `Cell` for the same
+    /// `&self` read-path reason as [`held`](Self::held).
+    transient_read: Cell<bool>,
     /// Open savepoints (innermost last); each snapshots the staged state so
     /// `ROLLBACK TO` can restore it.
     savepoints: Vec<Savepoint>,
@@ -275,6 +286,7 @@ impl WritePager {
             wal,
             held: Cell::new(crate::vfs::LockLevel::Unlocked),
             read_txn: Cell::new(false),
+            transient_read: Cell::new(false),
             savepoints: Vec::new(),
             secure_delete: false,
             read_cache: RefCell::new(PageCache::new(pcache::DEFAULT_CACHE_SIZE, page_size)),
@@ -362,6 +374,7 @@ impl WritePager {
             wal: None,
             held: Cell::new(crate::vfs::LockLevel::Unlocked),
             read_txn: Cell::new(false),
+            transient_read: Cell::new(false),
             savepoints: Vec::new(),
             secure_delete: false,
             read_cache: RefCell::new(PageCache::new(
@@ -718,6 +731,56 @@ impl WritePager {
     /// Read-only accessor for tests and the exec layer's txn bookkeeping.
     pub fn in_read_txn(&self) -> bool {
         self.read_txn.get()
+    }
+
+    /// Take a **transient** `Shared` lock around a bare autocommit read (ROADMAP
+    /// C9b-3), returning `true` if it was taken (so the caller knows to release it
+    /// with [`end_autocommit_read`](Self::end_autocommit_read)).
+    ///
+    /// A bare autocommit `SELECT` otherwise reads without holding any lock, which is
+    /// safe in-process (the cache + write locks coordinate) but lets a *foreign
+    /// process* mid-write be read torn: under the pessimistic whole-file model a
+    /// cross-process writer holds the OS-exclusive lock for its whole write txn, and
+    /// without a `Shared` lock this reader never contends with it. Acquiring `Shared`
+    /// makes the read wait for (or [`Error::Busy`] against) that foreign exclusive
+    /// lock, exactly as an explicit read transaction does — but released immediately
+    /// at statement end rather than pinned for a repeatable-read snapshot.
+    ///
+    /// A no-op (returns `false`) when a lock is already held — an explicit read/write
+    /// transaction owns coordination — so it only ever fires for a true autocommit
+    /// read. In-process this never adds contention: the OS lock is process-wide, so a
+    /// sibling connection's write already holds it and `reconcile` is a no-op for a
+    /// same-process `Shared` acquire; only a cross-process exclusive holder BUSYs.
+    pub fn begin_autocommit_read(&self) -> Result<bool> {
+        use crate::vfs::LockLevel;
+        if self.read_txn.get() || self.transient_read.get() || self.held.get() >= LockLevel::Shared
+        {
+            return Ok(false);
+        }
+        self.file.lock(LockLevel::Shared)?;
+        self.held.set(LockLevel::Shared);
+        self.transient_read.set(true);
+        Ok(true)
+    }
+
+    /// Release the transient autocommit read lock taken by
+    /// [`begin_autocommit_read`](Self::begin_autocommit_read). Idempotent; a no-op
+    /// if no transient lock is held (e.g. the statement upgraded to a write, whose
+    /// own commit/rollback path releases the lock instead). The clean read cache is
+    /// left intact — the next statement's `revalidate_read_cache` drops it via the
+    /// change-counter token if a foreign writer committed meanwhile.
+    pub fn end_autocommit_read(&self) {
+        use crate::vfs::LockLevel;
+        if !self.transient_read.get() {
+            return;
+        }
+        self.transient_read.set(false);
+        // Only release if the statement did not escalate to a write lock (which the
+        // write path owns and releases at commit/rollback).
+        if self.held.get() == LockLevel::Shared {
+            let _ = self.file.unlock(LockLevel::Unlocked);
+            self.held.set(LockLevel::Unlocked);
+        }
     }
 
     /// Take the write-intent (`RESERVED`) lock on the main file before staging
