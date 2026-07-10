@@ -609,7 +609,12 @@ content; we document and accept these rather than chase them:
   for a display tag); huge-argument `sin`/`cos` last-ULP (would need reimplementing
   glibc's libm); extreme-exponent (`|exp| ≳ 300`) `quote()` real rendering (a
   compiler-FP parser artifact — graphite's shorter form round-trips in graphite);
-  a fractional-second + `-N month` date-modifier rounding edge.
+  a fractional-second + `-N month` date-modifier rounding edge; and the single
+  pathological hex literal `-0x8000000000000000` (SQLite folds the unary minus
+  into the hex literal and rejects the `INT64_MIN` overflow at parse time;
+  graphite treats `-` as a runtime operator that overflows to a real — exactly
+  as SQLite itself does for `0 - 0x8000000000000000`. Every other hex literal,
+  signed or not, matches).
 
 ---
 
