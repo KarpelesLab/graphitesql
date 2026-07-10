@@ -492,13 +492,14 @@ The shell covers the common introspection/dump commands, the output/import layer
 `.nullvalue`, `.output`/`.once`, `.import` (CSV), `.echo`, `.changes`), and as of
 2026-07-10 the `markdown`/`box`/`table` `.mode`s (bordered tables with a
 center-justified header, byte-identical to sqlite incl. the empty-result and
-Unicode-width cases) and `.print` — all byte-verified against `sqlite3` 3.50.4.
-Still not implemented: `.backup` (needs an engine DB-copy/serialize API), `.bail`
-and the CLI error-message text (graphite renders `Error:` rather than sqlite's
-`Parse error near line N: … (code)` with the `error here ---^` caret — needs
-parser token offsets threaded into errors), `.show`, and the `ascii`/`html`/`tcl`
-`.mode`s. Peripheral (the SQL engine, not the shell, is the project's purpose), so
-lower priority.
+Unicode-width cases), the `ascii` (unit/record-separator) and `html`
+(`<TR>`/`<TD>`, escaping `< > & " '`) `.mode`s, and `.print` — all byte-verified
+against `sqlite3` 3.50.4. Still not implemented: `.backup` (needs an engine
+DB-copy/serialize API), `.bail` and the CLI error-message text (graphite renders
+`Error:` rather than sqlite's `Parse error near line N: … (code)` with the
+`error here ---^` caret — needs parser token offsets threaded into errors),
+`.show`, and the `tcl` `.mode`. Peripheral (the SQL engine, not the shell, is the
+project's purpose), so lower priority.
 
 ---
 

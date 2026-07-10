@@ -49,6 +49,8 @@ enum Mode {
     Box,
     /// `table` — an ASCII-art table (`+`/`-`/`|`, always with a header).
     Table,
+    /// `html` — `<TR>`/`<TD>` table rows (header via `<TH>` when `.headers`).
+    Html,
 }
 
 fn main() {
@@ -393,7 +395,48 @@ impl Shell {
             Mode::Markdown => self.print_markdown(result),
             Mode::Box => self.print_boxed(result, BOX_CHARS),
             Mode::Table => self.print_boxed(result, TABLE_CHARS),
+            Mode::Html => self.print_html(result),
         }
+    }
+
+    /// `html` mode: one `<TR>` per row, cells in `<TD>` (or `<TH>` for the
+    /// header, emitted only when `.headers` is on). HTML-special characters are
+    /// escaped. An empty result set prints nothing, matching SQLite.
+    fn print_html(&mut self, result: &QueryResult) {
+        if result.rows.is_empty() || result.columns.is_empty() {
+            return;
+        }
+        let mut out = String::new();
+        let row = |out: &mut String, cells: &[String], tag: &str| {
+            out.push_str("<TR>");
+            for (i, c) in cells.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push('<');
+                out.push_str(tag);
+                out.push('>');
+                html_escape(c, out);
+                out.push_str("</");
+                out.push_str(tag);
+                out.push('>');
+            }
+            out.push_str("\n</TR>\n");
+        };
+        if self.headers {
+            row(&mut out, &result.columns, "TH");
+        }
+        let ncol = result.columns.len();
+        for r in &result.rows {
+            let cells: Vec<String> = (0..ncol)
+                .map(|i| match r.get(i) {
+                    Some(Value::Null) | None => self.null_value.clone(),
+                    Some(v) => display_cell(v),
+                })
+                .collect();
+            row(&mut out, &cells, "TD");
+        }
+        let _ = self.out.write_all(out.as_bytes());
     }
 
     /// Cells (as displayed) and per-column display widths (character counts),
@@ -942,6 +985,13 @@ impl Shell {
         } else if matches("table") {
             self.mode = Mode::Table;
             self.row_sep = String::from("\n");
+        } else if matches("html") {
+            self.mode = Mode::Html;
+        } else if matches("ascii") {
+            // ASCII mode is list mode with the unit/record separators.
+            self.mode = Mode::List;
+            self.col_sep = String::from("\x1f");
+            self.row_sep = String::from("\x1e");
         } else {
             eprintln!(
                 "Error: mode should be one of: ascii box column csv html insert \
@@ -1757,6 +1807,21 @@ fn pad_center(s: &str, width: usize, out: &mut String) {
     out.push_str(s);
     for _ in 0..pad - left {
         out.push(' ');
+    }
+}
+
+/// Append `s` to `out`, escaping the HTML-special characters SQLite's `html`
+/// mode escapes (`<`, `>`, `&`, `"`, `'`).
+fn html_escape(s: &str, out: &mut String) {
+    for ch in s.chars() {
+        match ch {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
     }
 }
 

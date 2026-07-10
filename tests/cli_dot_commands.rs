@@ -371,3 +371,41 @@ fn markdown_box_table_print_match_sqlite() {
         assert_same(label, script);
     }
 }
+
+#[test]
+fn ascii_html_modes_match_sqlite() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let cases: &[(&str, &str)] = &[
+        (
+            "ascii_headers",
+            ".mode ascii\n.headers on\nSELECT 1 AS a, 'x' AS b UNION ALL SELECT 2,'y';\n",
+        ),
+        (
+            "ascii_no_headers",
+            ".mode ascii\nSELECT 'p' AS a, 'q' AS b;\n",
+        ),
+        (
+            "html_headers_escape",
+            ".mode html\n.headers on\nSELECT 1 AS a, '<b>&' AS b;\n",
+        ),
+        ("html_no_headers", ".mode html\nSELECT 1 AS a, 2 AS b;\n"),
+        (
+            "html_empty",
+            ".mode html\n.headers on\nSELECT 1 AS a WHERE 0;\n",
+        ),
+        (
+            "html_quote_apos_null",
+            ".mode html\nSELECT 'a\"b' AS q, '''x' AS ap, NULL AS n;\n",
+        ),
+        (
+            "html_multi_row",
+            ".mode html\n.headers on\nSELECT 'A&B' AS x, 'C<D>E' AS y UNION ALL SELECT '1','2';\n",
+        ),
+    ];
+    for (label, script) in cases {
+        assert_same(label, script);
+    }
+}
