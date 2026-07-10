@@ -236,6 +236,12 @@ impl Shell {
             let trimmed = line.trim();
             // Dot-commands are only recognized at the start of a fresh buffer.
             if buffer.is_empty() && trimmed.starts_with('.') {
+                // With `.echo on`, SQLite echoes every input line — dot-commands
+                // included — before running it (the command turning echo on is not
+                // itself echoed, since echo was still off when it was read).
+                if self.echo {
+                    let _ = writeln!(io::stdout(), "{trimmed}");
+                }
                 if self.dot_command(conn, trimmed) {
                     break;
                 }
@@ -275,6 +281,9 @@ impl Shell {
             }
             let trimmed = line.trim();
             if buffer.is_empty() && trimmed.starts_with('.') {
+                if self.echo {
+                    let _ = writeln!(io::stdout(), "{trimmed}");
+                }
                 if self.dot_command(conn, trimmed) {
                     return true;
                 }

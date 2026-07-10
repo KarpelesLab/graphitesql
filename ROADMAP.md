@@ -436,8 +436,9 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   with the `error here ---^` caret instead of graphite's bare `Error:`. Needs parser
   token byte-offsets threaded into `Error` — a library-level change, not shell-only.
   (The `Expr::Column` span work is a precedent for carrying offsets.)
-- **CLI-3 — `.echo` per-input-line.** Echo each raw dot-command input line, not
-  just SQL groups.
+- **CLI-3 — `.echo` per-input-line. DONE 2026-07-10.** `.echo on` now echoes
+  dot-command input lines too (the command turning echo on is not itself echoed),
+  byte-identical to sqlite3 (`tests/cli_dot_commands.rs::echo_includes_dot_command_lines`).
 
 ---
 

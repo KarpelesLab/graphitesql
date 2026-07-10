@@ -583,3 +583,20 @@ fn non_interactive_exits_nonzero_on_error() {
     // A clean batch succeeds.
     assert!(status("SELECT 1;\nSELECT 2;\n"));
 }
+
+/// `.echo on` echoes every input line, dot-commands included (the command that
+/// turns echo on is not itself echoed). Byte-identical to sqlite3.
+#[test]
+fn echo_includes_dot_command_lines() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    for script in [
+        ".echo on\nSELECT 1;\n.tables\nSELECT 2;\n",
+        ".echo on\nCREATE TABLE t(a);\n.tables\n.headers on\nSELECT 1 AS x;\n",
+        ".echo on\n.echo off\nSELECT 1;\n",
+    ] {
+        assert_same("echo-dot", script);
+    }
+}
