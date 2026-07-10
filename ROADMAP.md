@@ -442,10 +442,11 @@ history / `CHANGELOG.md`. Remaining:
   32 exported `sqlite3_*` symbols, matching result/type constants. Prepared
   statements are emulated over graphite's materialized query model (a `step` walks
   the computed rows; column metadata is available right after `prepare` for a
-  row-producer, as in SQLite). Verified end-to-end by a C program
-  (`tests/ctest.c`, run in CI's `capi` job) that links the cdylib and drives the
-  full lifecycle. Residuals: `INSERT … RETURNING` via the row path, `_v3` prepare
-  flags, incremental BLOB I/O, backup, hooks/authorizer, UTF-16 entry points.
+  row-producer, as in SQLite). `INSERT/UPDATE/DELETE … RETURNING` drives the row
+  path (classified structurally via the engine's parser). Verified end-to-end by a
+  C program (`tests/ctest.c`, run in CI's `capi` job) that links the cdylib and
+  drives the full lifecycle. Residuals: `_v3` prepare flags, incremental BLOB I/O,
+  backup, hooks/authorizer, UTF-16 entry points.
 
 ### Track E — Cross-database write resolution  *(essentially complete)*
 

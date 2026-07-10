@@ -31,8 +31,11 @@ incremental VDBE stepping for these entry points. Column metadata
 (`column_count`/`column_name`) is available immediately after `prepare` for a
 row-producer, as in SQLite.
 
-**Not yet covered:** `INSERT … RETURNING` via the row path (dispatched as a
-mutation today), the `_v3` prepare flags, incremental BLOB I/O, online backup,
+`INSERT/UPDATE/DELETE … RETURNING` drives the row path (`step` → `SQLITE_ROW`),
+detected structurally via the engine's parser so a "returning" inside a string is
+not mistaken for the clause.
+
+**Not yet covered:** the `_v3` prepare flags, incremental BLOB I/O, online backup,
 hooks/authorizer, and the UTF-16 entry points.
 
 ## Build & test

@@ -112,6 +112,24 @@ int main(void) {
   CHECK("blob bytes match", got && memcmp(got, raw, 4) == 0);
   sqlite3_finalize(bstmt);
 
+  /* INSERT ... RETURNING drives the row path (step -> ROW), not just DONE. */
+  sqlite3_stmt *ret = NULL;
+  rc = sqlite3_prepare_v2(db,
+      "INSERT INTO t(name, score) VALUES('dave', 9.0) RETURNING id, name", -1, &ret, NULL);
+  CHECK("prepare insert-returning", rc == SQLITE_OK);
+  CHECK("returning step -> ROW", sqlite3_step(ret) == SQLITE_ROW);
+  CHECK("returning col count 2", sqlite3_column_count(ret) == 2);
+  CHECK("returning id == 4", sqlite3_column_int64(ret, 0) == 4);
+  CHECK("returning name dave", strcmp((const char *)sqlite3_column_text(ret, 1), "dave") == 0);
+  CHECK("returning then DONE", sqlite3_step(ret) == SQLITE_DONE);
+  CHECK("returning changed 1 row", sqlite3_changes(db) == 1);
+  sqlite3_finalize(ret);
+
+  /* The word "returning" inside a string literal must not trigger the row path
+     (structural detection, not a text scan). */
+  rc = sqlite3_exec(db, "INSERT INTO t(name) VALUES('returning home')", NULL, NULL, NULL);
+  CHECK("'returning' in a string is a plain insert", rc == SQLITE_OK && sqlite3_changes(db) == 1);
+
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 
   sqlite3_close(db);

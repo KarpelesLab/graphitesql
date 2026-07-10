@@ -107,10 +107,9 @@ impl sqlite3_stmt {
     }
 }
 
-/// Does this statement produce a result set (drive `step` → `SQLITE_ROW`), or is
-/// it a mutation/DDL (drive `step` → `SQLITE_DONE`)? Dispatch by leading keyword,
-/// matching how SQLite classifies at prepare time. `RETURNING` is not yet routed
-/// to the row path (a documented residual).
+/// A pure read (`step` → `SQLITE_ROW`), dispatched by leading keyword — matching
+/// how SQLite classifies at prepare time. An `INSERT/UPDATE/DELETE … RETURNING`
+/// also produces rows but is handled separately (see [`has_returning`]).
 fn is_row_producer(sql: &str) -> bool {
     let kw: String = sql
         .trim_start()
@@ -122,6 +121,21 @@ fn is_row_producer(sql: &str) -> bool {
         kw.as_str(),
         "SELECT" | "WITH" | "VALUES" | "PRAGMA" | "EXPLAIN"
     )
+}
+
+/// True if `sql` is an `INSERT/UPDATE/DELETE` with a non-empty `RETURNING` clause.
+/// Determined structurally via the engine's parser (not a text scan), so a column
+/// or literal spelled "returning" is never mistaken for the clause. Anything that
+/// doesn't parse as an IUD returns false (it'll route to the mutation path, which
+/// reports the same parse error).
+fn has_returning(sql: &str) -> bool {
+    use graphitesql::sql::ast::Statement;
+    match graphitesql::sql::parser::parse_one(sql) {
+        Ok(Statement::Insert(i)) => !i.returning.is_empty(),
+        Ok(Statement::Update(u)) => !u.returning.is_empty(),
+        Ok(Statement::Delete(d)) => !d.returning.is_empty(),
+        _ => false,
+    }
 }
 
 // --- helpers ------------------------------------------------------------------
@@ -340,9 +354,30 @@ pub unsafe extern "C" fn sqlite3_exec(
         if stmt.is_empty() {
             continue;
         }
-        if is_row_producer(stmt) {
-            match db.conn.query(stmt) {
-                Ok(qr) => {
+        // Three cases: a pure reader (SELECT/… — rows for the callback, `changes`
+        // untouched), an IUD…RETURNING (rows for the callback AND `changes`), or a
+        // plain mutation (no rows, `changes` only).
+        let is_reader = is_row_producer(stmt);
+        let outcome = if is_reader {
+            db.conn.query(stmt).map(Some)
+        } else if has_returning(stmt) {
+            db.conn
+                .execute_returning(stmt, &Params::default())
+                .map(Some)
+        } else {
+            db.conn.execute(stmt).map(|n| {
+                db.changes = n as c_int;
+                None
+            })
+        };
+        match outcome {
+            Ok(maybe_qr) => {
+                db.last_insert_rowid = db.conn.last_insert_rowid();
+                if let Some(qr) = maybe_qr {
+                    if !is_reader {
+                        // IUD…RETURNING: one row per affected row.
+                        db.changes = qr.rows.len() as c_int;
+                    }
                     if let Some(cb) = callback
                         && invoke_exec_callback(cb, arg, &qr) != SQLITE_OK
                     {
@@ -350,25 +385,12 @@ pub unsafe extern "C" fn sqlite3_exec(
                         return SQLITE_ERROR;
                     }
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    db.set_error(SQLITE_ERROR, &msg);
-                    unsafe { write_errmsg(errmsg, &msg) };
-                    return SQLITE_ERROR;
-                }
             }
-        } else {
-            match db.conn.execute(stmt) {
-                Ok(n) => {
-                    db.changes = n as c_int;
-                    db.last_insert_rowid = db.conn.last_insert_rowid();
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    db.set_error(SQLITE_ERROR, &msg);
-                    unsafe { write_errmsg(errmsg, &msg) };
-                    return SQLITE_ERROR;
-                }
+            Err(e) => {
+                let msg = e.to_string();
+                db.set_error(SQLITE_ERROR, &msg);
+                unsafe { write_errmsg(errmsg, &msg) };
+                return SQLITE_ERROR;
             }
         }
     }
@@ -485,6 +507,7 @@ fn ensure_executed(stmt: &mut sqlite3_stmt) -> c_int {
     stmt.executed = true;
     let db = unsafe { &mut *stmt.db };
     if is_row_producer(&stmt.sql) {
+        // Pure read: SELECT/WITH/VALUES/PRAGMA/EXPLAIN.
         match db.conn.query_params(&stmt.sql, &stmt.params) {
             Ok(qr) => {
                 stmt.result = Some(qr);
@@ -495,7 +518,22 @@ fn ensure_executed(stmt: &mut sqlite3_stmt) -> c_int {
                 SQLITE_ERROR
             }
         }
+    } else if has_returning(&stmt.sql) {
+        // INSERT/UPDATE/DELETE … RETURNING: a mutation that also yields rows.
+        match db.conn.execute_returning(&stmt.sql, &stmt.params) {
+            Ok(qr) => {
+                db.changes = qr.rows.len() as c_int;
+                db.last_insert_rowid = db.conn.last_insert_rowid();
+                stmt.result = Some(qr);
+                SQLITE_OK
+            }
+            Err(e) => {
+                db.set_error(SQLITE_ERROR, &e.to_string());
+                SQLITE_ERROR
+            }
+        }
     } else {
+        // Plain mutation/DDL.
         match db.conn.execute_params(&stmt.sql, &stmt.params) {
             Ok(n) => {
                 db.changes = n as c_int;
