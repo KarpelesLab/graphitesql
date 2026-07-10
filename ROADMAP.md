@@ -205,7 +205,17 @@ its (niche/cosmetic) value:
   pervasive AST/parser refactor (not a localized fix); it also **unblocks
   A-alter-rollback**, whose savepoint-rollback + byte-exact re-validation machinery
   is already proven (see that item). Deferred to a dedicated pass because the
-  regression surface is the entire query grammar.
+  regression surface is the entire query grammar. **Semver constraint (found
+  2026-07-10):** `Expr` is public (`graphitesql::sql::ast::Expr`), so adding a
+  field to the `Column` variant is a **breaking change** the pre-push
+  `cargo semver-checks` gate rejects at `0.1.0` (release-plz owns the version bump
+  post-merge, so the gate and the bump conflict). The clean fix needs a deliberate
+  public-API/version decision, or a span *side-channel* (the lexer already records
+  per-token `start`/`end` and the result-column path already slices verbatim spans,
+  so a rename-only parse mode could emit column spans in traversal order without
+  touching public `Expr` — at the cost of a fragile order-correlation for the very
+  same-name/two-scope case it must fix). Both are deliberate design choices, which
+  is why this is a dedicated-session item.
 - **A-alter-rollback — ALTER-time rejection of a RENAME that breaks a dependent.**
   `DROP COLUMN` already rejects pre-mutation. A `RENAME` whose propagation can't be
   *proven* can leave a dependent view/trigger unresolvable; SQLite rejects and
