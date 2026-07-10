@@ -206,8 +206,32 @@ EXCEPT) incl. `ORDER BY`, and `WITH` CTE bodies incl. output-column provenance
   (aliases, GROUP BY/HAVING/DISTINCT/ORDER BY, self-alias, comma/NATURAL joins) found
   no shape where graphite leaves a view broken that sqlite rewrites. Tests:
   `tests/alter_rename_rollback.rs` (reject-and-rollback + accept), and the reject cases
-  folded into the two rename-propagation suites. Triggers (A-alter-2b) are the further
-  step — probe a trigger's body without firing it.
+  folded into the two rename-propagation suites.
+- **A-alter-2b — RENAME-that-breaks-a-dependent-TRIGGER rejection. PARTIALLY DONE
+  2026-07-10 (INSERT…SELECT + body-SELECT subset).** The trigger analogue of
+  A-alter-2. graphite can't query a trigger, so `first_broken_trigger_after_rename`
+  resolves the trigger's *real* body `SELECT` ASTs — the source of an `INSERT …
+  SELECT` and a body `SELECT` step — against the post-rename schema (via `run_select`),
+  with `NEW`/`OLD`/`RAISE` neutralised (`neutralize_new_old_select`, replacing
+  `NEW.x`/`OLD.x`/`RAISE(…)` with `NULL`), and rejects with the byte-exact
+  `error in trigger NAME after rename: <detail>` when a probe fails with a genuine
+  renamed-column resolution error (`trigger_break_detail`: the message is `no such
+  column` / `cannot join using column` *and* names the old column as a whole
+  identifier). **Key design decision — probe the real AST, never reconstruct.**
+  Reconstructing a probe `SELECT` from `UPDATE`/`DELETE`/`VALUES`/`WHEN` fields
+  resolves in a different order than sqlite (whose *partial* rewrite dangles a
+  different reference than graphite's all-or-nothing), producing a *wrong* rejection
+  message; and a `LIMIT 0` on any probe makes graphite skip the scan so a
+  `WHERE`/projection subquery never resolves (a missed break). So only the real
+  `INSERT…SELECT`/body-`SELECT` ASTs are probed (no `LIMIT`), which graphite resolves
+  identically to sqlite → byte-exact. **Residual (documented, sound):** a break
+  reachable *only* through an `UPDATE`/`DELETE`/`VALUES`/`WHEN` expression subquery is
+  still accepted (as graphite accepted *every* trigger break before this) — a
+  false-accept, never a false-reject; same class the DROP COLUMN dependency check
+  leaves. Closing it needs either graphite's propagation to become partial like
+  sqlite's, or a scope-aware per-subquery probe. Verified 16-shape sweep (6 reject / 10
+  accept, incl. correlated-over-target and NEW/OLD/RAISE). Test:
+  `tests/alter_rename_trigger_rollback.rs`.
 - **A-misc-1 — structural row-arity error *ordering* vs name resolution.** *(niche;
   cosmetic)* On doubly-malformed input (a row-value misuse *and* a missing column
   in one clause) graphite reports the column error where sqlite sometimes reports
@@ -533,9 +557,12 @@ independently shippable. Recommended next order:
 1. **C9b — cross-process OS file locks** *(newly unblocked; MSRV 1.89 approved)*.
    Start with **C9b-0** (the MSRV bump), then the lock primitive (C9b-1) and the
    two-process differential test (C9b-2). Well-scoped, high value.
-2. **A-alter-2b — RENAME dependency safety for triggers.** Views are DONE
-   (A-alter-1 + A-alter-2 landed 2026-07-10). Remaining: extend the post-rename
-   re-validation to dependent triggers — probe a trigger body without firing it.
+2. **A-alter-2b residual — trigger breaks via UPDATE/DELETE/VALUES/WHEN subqueries.**
+   Views (A-alter-2) and the trigger INSERT…SELECT/body-SELECT subset (A-alter-2b)
+   landed 2026-07-10. Remaining: a trigger break reachable only through an
+   `UPDATE`/`DELETE`/`VALUES`/`WHEN` expression subquery is still accepted (a
+   sound false-accept). Needs partial-rewrite propagation or a scope-aware
+   per-subquery probe; low priority (same residual class as DROP COLUMN).
 3. **B5b-2 — live storage cursors on the VDBE** *(in progress)*. The largest VDBE
    piece; next sub-steps are the in-interpreter `OpenRead`/`SeekRowid` opcodes and
    the affinity-blocked secondary-index / `WITHOUT ROWID` seeks. Parity-gated, low

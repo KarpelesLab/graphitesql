@@ -13609,8 +13609,15 @@ impl Connection {
         self.schema = Schema::read(self.backend.source())?;
         if rename_col {
             // Re-validate dependents against the post-rename schema; a broken view
-            // rolls the whole rename back, matching SQLite.
-            if let Some(err) = self.first_broken_view_after_rename(&a.table) {
+            // or trigger rolls the whole rename back, matching SQLite.
+            let renamed_old = match &a.action {
+                AlterAction::RenameColumn { old, .. } => old.as_str(),
+                _ => "",
+            };
+            let broken = self
+                .first_broken_view_after_rename(&a.table)
+                .or_else(|| self.first_broken_trigger_after_rename(&a.table, renamed_old));
+            if let Some(err) = broken {
                 self.backend
                     .writer()?
                     .rollback_to_savepoint(ALTER_SAVEPOINT)?;
@@ -13654,6 +13661,46 @@ impl Connection {
                     "error in view {} after rename: {detail}",
                     obj.name
                 )));
+            }
+        }
+        None
+    }
+
+    /// The trigger counterpart of [`Self::first_broken_view_after_rename`]. A
+    /// `RENAME COLUMN` that graphite's propagation cannot fully rewrite (a derived
+    /// table, `USING`/`NATURAL` join, or CTE in a trigger body reaching the renamed
+    /// column) leaves a dangling reference; SQLite rejects and rolls back such a
+    /// rename with `error in trigger NAME after rename: <detail>`. graphite can't
+    /// query a trigger directly, so it resolves each trigger body statement via a
+    /// static probe `SELECT` (see [`trigger_probe_selects`]) with `NEW`/`OLD`
+    /// neutralised, and rejects only when a probe fails with a genuine
+    /// renamed-column resolution error ([`trigger_break_detail`]).
+    fn first_broken_trigger_after_rename(&self, table: &str, old: &str) -> Option<Error> {
+        let tneedle = table.to_ascii_lowercase();
+        for obj in self.schema.objects() {
+            if obj.obj_type != crate::schema::ObjectType::Trigger {
+                continue;
+            }
+            let Some(tsql) = &obj.sql else { continue };
+            if !tsql.to_ascii_lowercase().contains(&tneedle) {
+                continue;
+            }
+            let Ok(Statement::CreateTrigger(ct)) = sql::parse_one(tsql) else {
+                continue;
+            };
+            for probe in trigger_probe_selects(&ct) {
+                if let Err(e) = self.run_select(&probe, &Params::default()) {
+                    let detail = match &e {
+                        Error::Error(m) => m.clone(),
+                        other => other.to_string(),
+                    };
+                    if trigger_break_detail(&detail, old) {
+                        return Some(Error::Error(format!(
+                            "error in trigger {} after rename: {detail}",
+                            obj.name
+                        )));
+                    }
+                }
             }
         }
         None
@@ -41231,6 +41278,227 @@ fn rename_column_ref(e: &mut Expr, table: &str, old: &str, new: &str) {
             span: Span::none(),
         },
     );
+}
+
+/// Whether a `table.`-qualifier names the trigger pseudo-tables `NEW`/`OLD`.
+fn is_new_old_qualifier(q: &str) -> bool {
+    q.eq_ignore_ascii_case("new") || q.eq_ignore_ascii_case("old")
+}
+
+/// Replace every `NEW.col` / `OLD.col` reference (and `NEW.*`/`OLD.*`) in `e` with
+/// a `NULL` literal, recursing into nested subqueries. Used when probing a
+/// trigger body for post-`RENAME COLUMN` breakage without firing it: the trigger's
+/// `NEW`/`OLD` rows have no value in a static probe, but they always bind to the
+/// trigger's own (renamed) table and are validated by the rename propagation
+/// itself, so neutralising them to `NULL` leaves only the real base-table
+/// references — the ones a broken rename would leave dangling — to resolve.
+fn neutralize_new_old_expr(e: &mut Expr) {
+    match e {
+        Expr::Column { table: Some(t), .. } if is_new_old_qualifier(t) => {
+            *e = Expr::Literal(Literal::Null);
+        }
+        // A body `SELECT RAISE(…)` has an effect (abort/ignore the firing row); a
+        // static probe must never trigger it, so neutralise the call to NULL. Its
+        // arguments are a keyword + a message string, never a base-table column.
+        Expr::Function { name, .. } if name.eq_ignore_ascii_case("raise") => {
+            *e = Expr::Literal(Literal::Null);
+        }
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Column { .. } => {}
+        Expr::Unary { expr, .. } => neutralize_new_old_expr(expr),
+        Expr::Binary { left, right, .. } => {
+            neutralize_new_old_expr(left);
+            neutralize_new_old_expr(right);
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            over,
+            ..
+        } => {
+            for a in args {
+                neutralize_new_old_expr(a);
+            }
+            if let Some(f) = filter {
+                neutralize_new_old_expr(f);
+            }
+            for ot in order_by {
+                neutralize_new_old_expr(&mut ot.expr);
+            }
+            if let Some(w) = over {
+                for p in &mut w.partition_by {
+                    neutralize_new_old_expr(p);
+                }
+                for ot in &mut w.order_by {
+                    neutralize_new_old_expr(&mut ot.expr);
+                }
+            }
+        }
+        Expr::IsNull { expr, .. } => neutralize_new_old_expr(expr),
+        Expr::InList { expr, list, .. } => {
+            neutralize_new_old_expr(expr);
+            for a in list {
+                neutralize_new_old_expr(a);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            neutralize_new_old_expr(expr);
+            neutralize_new_old_expr(low);
+            neutralize_new_old_expr(high);
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                neutralize_new_old_expr(o);
+            }
+            for (w, t) in when_then {
+                neutralize_new_old_expr(w);
+                neutralize_new_old_expr(t);
+            }
+            if let Some(el) = else_result {
+                neutralize_new_old_expr(el);
+            }
+        }
+        Expr::Cast { expr, .. } => neutralize_new_old_expr(expr),
+        Expr::Paren(inner) => neutralize_new_old_expr(inner),
+        Expr::RowValue(items) => {
+            for it in items {
+                neutralize_new_old_expr(it);
+            }
+        }
+        Expr::Collate { expr, .. } => neutralize_new_old_expr(expr),
+        Expr::Subquery(sel) => neutralize_new_old_select(sel),
+        Expr::Exists { select, .. } => neutralize_new_old_select(select),
+        Expr::InSelect { expr, select, .. } => {
+            neutralize_new_old_expr(expr);
+            neutralize_new_old_select(select);
+        }
+    }
+}
+
+/// [`neutralize_new_old_expr`] over every expression a `Select` reaches (columns,
+/// `FROM` subqueries/joins, `WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`, CTE
+/// bodies, and compound arms).
+fn neutralize_new_old_select(sel: &mut Select) {
+    for cte in &mut sel.ctes {
+        neutralize_new_old_select(&mut cte.select);
+    }
+    for (_, arm) in &mut sel.compound {
+        neutralize_new_old_select(arm);
+    }
+    for rc in &mut sel.columns {
+        match rc {
+            ResultColumn::Expr { expr, .. } => neutralize_new_old_expr(expr),
+            ResultColumn::TableWildcard(t) if is_new_old_qualifier(t) => {
+                *rc = ResultColumn::Expr {
+                    expr: Expr::Literal(Literal::Null),
+                    alias: None,
+                    source: None,
+                };
+            }
+            ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => {}
+        }
+    }
+    if let Some(from) = &mut sel.from {
+        neutralize_new_old_ref(&mut from.first);
+        for j in &mut from.joins {
+            neutralize_new_old_ref(&mut j.table);
+            if let Some(on) = &mut j.on {
+                neutralize_new_old_expr(on);
+            }
+        }
+    }
+    for e in sel.where_clause.iter_mut() {
+        neutralize_new_old_expr(e);
+    }
+    for e in &mut sel.group_by {
+        neutralize_new_old_expr(e);
+    }
+    for e in sel.having.iter_mut() {
+        neutralize_new_old_expr(e);
+    }
+    for ot in &mut sel.order_by {
+        neutralize_new_old_expr(&mut ot.expr);
+    }
+    for e in sel.limit.iter_mut() {
+        neutralize_new_old_expr(e);
+    }
+    for e in sel.offset.iter_mut() {
+        neutralize_new_old_expr(e);
+    }
+}
+
+fn neutralize_new_old_ref(tr: &mut TableRef) {
+    if let Some(sq) = &mut tr.subquery {
+        neutralize_new_old_select(sq);
+    }
+    if let Some(args) = &mut tr.tvf_args {
+        for e in args {
+            neutralize_new_old_expr(e);
+        }
+    }
+}
+
+/// Build name-resolution probe `SELECT`s for a trigger body, so a `RENAME COLUMN`
+/// that leaves a dangling base-table reference in the trigger can be detected (and
+/// rejected) without firing it.
+///
+/// Only the trigger body's *real* `SELECT` ASTs are probed — the source of an
+/// `INSERT … SELECT` and a body `SELECT` step — cloned verbatim (with `NEW`/`OLD`/
+/// `RAISE` neutralised) and run through the ordinary resolver. Probing the real AST
+/// is what keeps the error byte-identical to SQLite's: graphite resolves the exact
+/// same select structure SQLite would, so a broken derived/`USING`/CTE source
+/// reports the same `no such column` / `cannot join using` detail. Reconstructing a
+/// probe from `UPDATE`/`DELETE`/`VALUES`/`WHEN` fields instead risks resolving in a
+/// different order than SQLite (whose partial rewrite dangles a different
+/// reference), so those are deliberately left unprobed — a break reached only
+/// through them is a documented residual (the same shape the DROP COLUMN dependency
+/// check also leaves unrejected), never a *wrong* rejection.
+fn trigger_probe_selects(ct: &CreateTrigger) -> Vec<Select> {
+    let mut out: Vec<Select> = Vec::new();
+    for stmt in &ct.body {
+        match stmt {
+            Statement::Insert(ins) => {
+                if let InsertSource::Select(sel) = &ins.source {
+                    let mut s = (**sel).clone();
+                    // The INSERT's own `WITH` CTEs are in scope for its source.
+                    let mut ctes = ins.ctes.clone();
+                    ctes.append(&mut s.ctes);
+                    s.ctes = ctes;
+                    out.push(s);
+                }
+            }
+            Statement::Select(sel) => out.push(sel.clone()),
+            _ => {}
+        }
+    }
+    for s in &mut out {
+        neutralize_new_old_select(s);
+    }
+    out
+}
+
+/// Whether a resolution-probe error detail indicates a genuine `RENAME COLUMN`
+/// breakage that names the renamed column `old`. SQLite reports exactly two
+/// classes for such a break — `no such column: <ref>` and
+/// `cannot join using column <c> - column not present in both tables` — and the
+/// offending identifier is the renamed column. Restricting rejection to these
+/// classes (and requiring `old` to appear as a whole identifier) keeps a
+/// probe-reshaping artifact from ever being mistaken for a real break.
+fn trigger_break_detail(detail: &str, old: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    let is_break = d.starts_with("no such column:") || d.starts_with("cannot join using column");
+    if !is_break {
+        return false;
+    }
+    let o = old.to_ascii_lowercase();
+    d.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|tok| tok == o)
 }
 
 /// Rename every reference to table `old` → `new` throughout a `Select`: its
