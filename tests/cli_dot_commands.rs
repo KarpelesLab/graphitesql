@@ -409,3 +409,36 @@ fn ascii_html_modes_match_sqlite() {
         assert_same(label, script);
     }
 }
+
+#[test]
+fn tcl_mode_matches_sqlite() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let cases: &[(&str, &str)] = &[
+        (
+            "tcl_headers_quote",
+            ".mode tcl\n.headers on\nSELECT 1 AS a, 'x y' AS b UNION ALL SELECT 2,'q\"r';\n",
+        ),
+        (
+            "tcl_backslash_null_empty",
+            ".mode tcl\nSELECT 'a\\b' AS x, NULL AS n, '' AS e;\n",
+        ),
+        ("tcl_no_headers", ".mode tcl\nSELECT 1 AS a, 2 AS b;\n"),
+        ("tcl_empty", ".mode tcl\n.headers on\nSELECT 1 WHERE 0;\n"),
+        (
+            "tcl_types_and_nul_truncation",
+            ".mode tcl\nSELECT 42, 3.5, x'00ab', 'nul'||char(0)||'after';\n",
+        ),
+        ("tcl_unicode_passthrough", ".mode tcl\nSELECT 'héllo €';\n"),
+        (
+            "tcl_control_chars_octal",
+            ".mode tcl\nSELECT char(8), char(11), char(127), char(9);\n",
+        ),
+        ("tcl_blob_octal", ".mode tcl\nSELECT x'deadbeef' AS b;\n"),
+    ];
+    for (label, script) in cases {
+        assert_same(label, script);
+    }
+}

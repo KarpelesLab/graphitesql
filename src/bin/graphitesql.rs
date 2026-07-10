@@ -51,6 +51,9 @@ enum Mode {
     Table,
     /// `html` — `<TR>`/`<TD>` table rows (header via `<TH>` when `.headers`).
     Html,
+    /// `tcl` — each cell a Tcl/C-quoted string, separated by the column
+    /// separator (a space by default); header row only when `.headers` is on.
+    Tcl,
 }
 
 fn main() {
@@ -396,7 +399,45 @@ impl Shell {
             Mode::Box => self.print_boxed(result, BOX_CHARS),
             Mode::Table => self.print_boxed(result, TABLE_CHARS),
             Mode::Html => self.print_html(result),
+            Mode::Tcl => self.print_tcl(result),
         }
+    }
+
+    /// `tcl` mode: each cell rendered as a Tcl/C-quoted string (`output_c_string`),
+    /// cells joined by the column separator, one row per line. The header row is
+    /// emitted only when `.headers` is on; an empty result set prints nothing.
+    fn print_tcl(&mut self, result: &QueryResult) {
+        if result.rows.is_empty() || result.columns.is_empty() {
+            return;
+        }
+        let ncol = result.columns.len();
+        let col_sep = self.col_sep.clone();
+        let row_sep = self.row_sep.clone();
+        let mut out: Vec<u8> = Vec::new();
+        if self.headers {
+            for (i, c) in result.columns.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(col_sep.as_bytes());
+                }
+                tcl_string(c.as_bytes(), &mut out);
+            }
+            out.extend_from_slice(row_sep.as_bytes());
+        }
+        for r in &result.rows {
+            for i in 0..ncol {
+                if i > 0 {
+                    out.extend_from_slice(col_sep.as_bytes());
+                }
+                let mut bytes: Vec<u8> = Vec::new();
+                match r.get(i) {
+                    Some(Value::Null) | None => bytes.extend_from_slice(self.null_value.as_bytes()),
+                    Some(v) => render_text_cell(v, &mut bytes),
+                }
+                tcl_string(&bytes, &mut out);
+            }
+            out.extend_from_slice(row_sep.as_bytes());
+        }
+        let _ = self.out.write_all(&out);
     }
 
     /// `html` mode: one `<TR>` per row, cells in `<TD>` (or `<TH>` for the
@@ -987,6 +1028,10 @@ impl Shell {
             self.row_sep = String::from("\n");
         } else if matches("html") {
             self.mode = Mode::Html;
+        } else if matches("tcl") {
+            self.mode = Mode::Tcl;
+            self.col_sep = String::from(" ");
+            self.row_sep = String::from("\n");
         } else if matches("ascii") {
             // ASCII mode is list mode with the unit/record separators.
             self.mode = Mode::List;
@@ -1808,6 +1853,68 @@ fn pad_center(s: &str, width: usize, out: &mut String) {
     for _ in 0..pad - left {
         out.push(' ');
     }
+}
+
+/// Append `z`'s bytes to `out` as a Tcl/C-quoted string (`"…"`), matching
+/// SQLite's `output_c_string`: `"`/`\` and the `\t\n\r\f` escapes, other control
+/// bytes and lone high bytes as `\ooo` (3-digit octal), and valid UTF-8
+/// multibyte sequences passed through verbatim. (There is deliberately no `\b`
+/// escape — a backspace becomes `\010`.)
+fn tcl_string(z: &[u8], out: &mut Vec<u8>) {
+    out.push(b'"');
+    let mut i = 0;
+    while i < z.len() {
+        let c = z[i];
+        match c {
+            b'"' => {
+                out.extend_from_slice(b"\\\"");
+                i += 1;
+            }
+            b'\\' => {
+                out.extend_from_slice(b"\\\\");
+                i += 1;
+            }
+            b'\t' => {
+                out.extend_from_slice(b"\\t");
+                i += 1;
+            }
+            b'\n' => {
+                out.extend_from_slice(b"\\n");
+                i += 1;
+            }
+            b'\r' => {
+                out.extend_from_slice(b"\\r");
+                i += 1;
+            }
+            0x0c => {
+                out.extend_from_slice(b"\\f");
+                i += 1;
+            }
+            0x20..=0x7e => {
+                out.push(c);
+                i += 1;
+            }
+            0x00..=0x1f => {
+                out.extend_from_slice(format!("\\{c:03o}").as_bytes());
+                i += 1;
+            }
+            _ => {
+                // A byte >= 0x7f: pass a valid UTF-8 sequence through verbatim,
+                // else escape the stray byte as octal.
+                match utf8_seq_len(z, i) {
+                    Some(len) => {
+                        out.extend_from_slice(&z[i..i + len]);
+                        i += len;
+                    }
+                    None => {
+                        out.extend_from_slice(format!("\\{c:03o}").as_bytes());
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+    out.push(b'"');
 }
 
 /// Append `s` to `out`, escaping the HTML-special characters SQLite's `html`

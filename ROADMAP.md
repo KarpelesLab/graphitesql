@@ -494,12 +494,15 @@ The shell covers the common introspection/dump commands, the output/import layer
 center-justified header, byte-identical to sqlite incl. the empty-result and
 Unicode-width cases), the `ascii` (unit/record-separator) and `html`
 (`<TR>`/`<TD>`, escaping `< > & " '`) `.mode`s, and `.print` — all byte-verified
-against `sqlite3` 3.50.4. Still not implemented: `.backup` (needs an engine
-DB-copy/serialize API), `.bail` and the CLI error-message text (graphite renders
-`Error:` rather than sqlite's `Parse error near line N: … (code)` with the
-`error here ---^` caret — needs parser token offsets threaded into errors),
-`.show`, and the `tcl` `.mode`. Peripheral (the SQL engine, not the shell, is the
-project's purpose), so lower priority.
+against `sqlite3` 3.50.4. The `.mode` family is now complete — the `tcl` mode
+(`output_c_string` byte escaping: `\ooo` octal, C-string NUL truncation, valid
+UTF-8 pass-through) landed 2026-07-10. Still not implemented: `.backup` (needs an
+engine DB-copy/serialize API), `.bail` and the CLI error-message text (graphite
+renders `Error:` rather than sqlite's `Parse error near line N: … (code)` with the
+`error here ---^` caret — needs parser token offsets threaded into errors), and
+`.show` (reflects column-mode `--wrap`/`--wordwrap` options graphite does not
+model). Peripheral (the SQL engine, not the shell, is the project's purpose), so
+lower priority.
 
 ---
 
