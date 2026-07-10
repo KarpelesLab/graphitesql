@@ -72,7 +72,7 @@ pub mod vtab;
 
 pub use error::{Error, Result};
 pub use exec::{AggregateFactory, AggregateFunction, Connection, QueryResult, ScalarFunction};
-pub use session::{Changeset, Session};
+pub use session::{Changeset, ConflictAction, ConflictType, Session};
 
 /// The version of the SQLite file format graphitesql targets.
 ///

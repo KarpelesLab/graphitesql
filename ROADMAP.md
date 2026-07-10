@@ -415,8 +415,18 @@ result or declines to it — never a wrong answer), so this track is
   done (2026-07-09, 69bcc71):* `Connection::session_patchset()` emits the `'P'`
   patchset variant (omits old non-PK values; DELETE = PK only; UPDATE = PK +
   changed new) via a shared serializer, byte-verified vs a `sqlite3session_patchset`
-  oracle. **Remaining:** changeset rebase, custom conflict handlers, per-table
-  attach, indirect changes, and streaming — the niche tail of the session API.
+  oracle. *Custom conflict handlers done (2026-07-10):*
+  `Connection::changeset_apply_with(cs, |ConflictType| -> ConflictAction)` drives
+  apply through a caller-supplied handler — the equivalent of
+  `sqlite3changeset_apply`'s `xConflict`. It classifies each failure as
+  `Data`/`NotFound`/`Conflict`/`Constraint` and honours `Omit`/`Replace`/`Abort`
+  (a `Conflict` `Replace` deletes the PK-colliding row then inserts; a `Data`
+  `Replace` re-matches the `UPDATE`/`DELETE` by primary key alone); the built-in
+  `changeset_apply` is now just the default handler (omit DATA/NOTFOUND, abort
+  CONFLICT/CONSTRAINT). Verified vs a policy-parameterised `sesapply` oracle
+  (matching `xConflict`) across OMIT/REPLACE/ABORT on single-integer, composite,
+  and text primary keys. **Remaining:** changeset rebase, per-table attach,
+  indirect changes, and streaming — the niche tail of the session API.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**

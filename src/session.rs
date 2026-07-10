@@ -1443,6 +1443,50 @@ pub(crate) fn concat(a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The kind of conflict encountered while applying a changeset or patchset,
+/// passed to the conflict handler of
+/// [`Connection::changeset_apply_with`](crate::Connection::changeset_apply_with).
+/// Mirrors SQLite's `SQLITE_CHANGESET_*` `eConflict` codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConflictType {
+    /// A `DELETE`/`UPDATE` found a row with the required primary key, but its
+    /// non-primary-key values differ from the `old.*` values in the change
+    /// (`SQLITE_CHANGESET_DATA`). May be resolved with `Omit`, `Replace`, or
+    /// `Abort`.
+    Data,
+    /// A `DELETE`/`UPDATE` found no row with the required primary key
+    /// (`SQLITE_CHANGESET_NOTFOUND`). May be resolved with `Omit` or `Abort`
+    /// (a `Replace` is treated as `Abort`, matching SQLite's misuse handling).
+    NotFound,
+    /// An `INSERT` could not proceed because a row with the same primary key
+    /// already exists (`SQLITE_CHANGESET_CONFLICT`). May be resolved with
+    /// `Omit`, `Replace` (delete the existing row, then insert), or `Abort`.
+    Conflict,
+    /// A change violated another constraint — a secondary `UNIQUE` index,
+    /// `NOT NULL`, or `CHECK` (`SQLITE_CHANGESET_CONSTRAINT`). May be resolved
+    /// with `Omit` or `Abort` (a `Replace` is treated as `Abort`).
+    Constraint,
+}
+
+/// How to resolve a changeset-apply conflict, returned by the conflict handler
+/// of [`Connection::changeset_apply_with`](crate::Connection::changeset_apply_with).
+/// Mirrors SQLite's `SQLITE_CHANGESET_OMIT`/`_REPLACE`/`_ABORT` return codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictAction {
+    /// Skip the conflicting change and continue applying the rest.
+    Omit,
+    /// Force the change through: for [`ConflictType::Conflict`] delete the
+    /// existing row and insert; for [`ConflictType::Data`] apply the
+    /// `UPDATE`/`DELETE` matched by primary key alone. Only valid for `Data`
+    /// and `Conflict`; for `NotFound`/`Constraint` it is treated as `Abort`.
+    Replace,
+    /// Abort the whole apply: every change made so far is rolled back and
+    /// [`changeset_apply_with`](crate::Connection::changeset_apply_with) returns
+    /// an error.
+    Abort,
+}
+
 /// Byte-transform entry points for changesets: [`Changeset::invert`] and
 /// [`Changeset::concat`], mirroring SQLite's `sqlite3changeset_invert` and
 /// `sqlite3changeset_concat`. This is a zero-sized namespace type — the

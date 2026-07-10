@@ -7453,6 +7453,50 @@ impl Connection {
     /// layout is treated as a schema mismatch and its changes are skipped (as
     /// SQLite does). Values of every storage class are supported.
     pub fn changeset_apply(&mut self, changeset: &[u8]) -> Result<()> {
+        // The default conflict handler reproduces sqlite's default xConflict:
+        // omit a DATA/NOTFOUND (missing / mismatched DELETE-UPDATE target),
+        // abort a CONFLICT/CONSTRAINT (a colliding INSERT or a constraint hit).
+        self.changeset_apply_with(changeset, |kind| match kind {
+            crate::session::ConflictType::Data | crate::session::ConflictType::NotFound => {
+                crate::session::ConflictAction::Omit
+            }
+            crate::session::ConflictType::Conflict | crate::session::ConflictType::Constraint => {
+                crate::session::ConflictAction::Abort
+            }
+        })
+    }
+
+    /// Apply a changeset **or patchset** blob like
+    /// [`changeset_apply`](Self::changeset_apply), but drive conflict resolution
+    /// through the caller-supplied handler `on_conflict` — the equivalent of the
+    /// `xConflict` callback of SQLite's `sqlite3changeset_apply`.
+    ///
+    /// For every change that cannot be applied cleanly the handler is called with
+    /// the [`ConflictType`](crate::ConflictType) and returns a
+    /// [`ConflictAction`](crate::ConflictAction):
+    ///
+    /// * [`Omit`](crate::ConflictAction::Omit) — skip this change, keep applying.
+    /// * [`Replace`](crate::ConflictAction::Replace) — force the change through:
+    ///   a [`Conflict`](crate::ConflictType::Conflict) `INSERT` deletes the
+    ///   colliding row then inserts; a [`Data`](crate::ConflictType::Data)
+    ///   `UPDATE`/`DELETE` is re-matched by primary key alone. `Replace` on a
+    ///   [`NotFound`](crate::ConflictType::NotFound) or
+    ///   [`Constraint`](crate::ConflictType::Constraint) conflict (where SQLite
+    ///   does not permit it) is treated as `Abort`.
+    /// * [`Abort`](crate::ConflictAction::Abort) — roll back every change made so
+    ///   far and return an error.
+    ///
+    /// The whole apply runs inside a savepoint, so an abort restores the database
+    /// to its state before the call. Supports the same table shapes as
+    /// [`changeset_apply`](Self::changeset_apply) (any declared primary key). A
+    /// `Replace` on an `INSERT` removes the primary-key-colliding row; a row that
+    /// collides only on a *secondary* `UNIQUE` index surfaces as a separate
+    /// `Constraint` conflict rather than being replaced.
+    pub fn changeset_apply_with(
+        &mut self,
+        changeset: &[u8],
+        mut on_conflict: impl FnMut(crate::session::ConflictType) -> crate::session::ConflictAction,
+    ) -> Result<()> {
         let tables = crate::session::parse_changeset(changeset)?;
         if tables.is_empty() {
             return Ok(());
@@ -7460,11 +7504,11 @@ impl Connection {
 
         const SP: &str = "graphite_changeset_apply";
         // Wrap the whole apply in a savepoint so an abort (a CONFLICT/CONSTRAINT
-        // under the default disposition) rolls back every change applied so far,
-        // exactly like sqlite's ROLLBACK-TO + RELEASE.
+        // under the default disposition, or a handler-requested Abort) rolls back
+        // every change applied so far, exactly like sqlite's ROLLBACK-TO + RELEASE.
         self.execute_params(&alloc::format!("SAVEPOINT \"{SP}\""), &Params::default())?;
 
-        let result = self.changeset_apply_inner(&tables);
+        let result = self.changeset_apply_inner(&tables, &mut on_conflict);
 
         match result {
             Ok(()) => {
@@ -7484,7 +7528,11 @@ impl Connection {
     /// The body of [`changeset_apply`](Self::changeset_apply), run inside the
     /// caller's savepoint. Returns `Err` to signal an abort (the caller rolls
     /// back).
-    fn changeset_apply_inner(&mut self, tables: &[crate::session::TableChangeset]) -> Result<()> {
+    fn changeset_apply_inner(
+        &mut self,
+        tables: &[crate::session::TableChangeset],
+        on_conflict: &mut dyn FnMut(crate::session::ConflictType) -> crate::session::ConflictAction,
+    ) -> Result<()> {
         for tbl in tables {
             // Resolve the target table; a missing table is a schema mismatch
             // (skip the whole table's changes), matching sqlite's xFilter=NULL
@@ -7508,31 +7556,53 @@ impl Connection {
             let col_names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
 
             for change in &tbl.changes {
-                self.apply_one_change(&tbl.name, &col_names, &tbl.pk_flags, change)?;
+                self.apply_one_change(&tbl.name, &col_names, &tbl.pk_flags, change, on_conflict)?;
             }
         }
         Ok(())
     }
 
-    /// Apply one parsed change record. Returns `Err` only when the change must
-    /// abort the apply (a `CONFLICT`/`CONSTRAINT`); `DATA`/`NOTFOUND` conflicts
-    /// are omitted (return `Ok(())` without touching the row).
+    /// Apply one parsed change record, resolving any conflict through
+    /// `on_conflict` (see [`changeset_apply_with`](Self::changeset_apply_with)).
+    /// Returns `Err` only when the change must abort the whole apply.
     fn apply_one_change(
         &mut self,
         table: &str,
         col_names: &[String],
         pk_flags: &[u8],
         change: &crate::session::ChangeRecord,
+        on_conflict: &mut dyn FnMut(crate::session::ConflictType) -> crate::session::ConflictAction,
     ) -> Result<()> {
+        use crate::session::{ChangeOp, ConflictAction as CA, ConflictType as CT};
+
         let quote = |n: &str| alloc::format!("\"{}\"", n.replace('"', "\"\""));
         let qtable = quote(table);
         let ncol = col_names.len();
         let is_pk = |i: usize| pk_flags.get(i).copied().unwrap_or(0) != 0;
+        // The error returned when the handler aborts a conflict that carries no
+        // underlying engine error (a handler-requested Abort, or a Replace where
+        // sqlite does not permit one). Mirrors `sqlite3changeset_apply`'s
+        // `SQLITE_ABORT`.
+        let abort_err = || Error::Constraint(String::from("changeset apply aborted by conflict"));
+
+        // A PK-only WHERE clause built from a change's PK columns, matching the
+        // row by primary key alone (used to detect DATA vs NOTFOUND, and to
+        // force a Replace through).
+        let pk_where = |source: &[Option<Value>]| -> (String, Vec<Value>) {
+            let mut wheres: Vec<String> = Vec::new();
+            let mut positional: Vec<Value> = Vec::new();
+            for (i, name) in col_names.iter().enumerate() {
+                if is_pk(i) {
+                    let v = source.get(i).and_then(|o| o.clone()).unwrap_or(Value::Null);
+                    positional.push(v);
+                    wheres.push(alloc::format!("{} IS ?{}", quote(name), positional.len()));
+                }
+            }
+            (wheres.join(" AND "), positional)
+        };
 
         match change.op {
-            crate::session::ChangeOp::Insert => {
-                // INSERT INTO "t"("c0",...) VALUES(?1,...); a PK collision
-                // surfaces as Error::Constraint → CONFLICT → abort.
+            ChangeOp::Insert => {
                 let cols_sql: Vec<String> = col_names.iter().map(|c| quote(c)).collect();
                 let placeholders: Vec<String> =
                     (1..=ncol).map(|i| alloc::format!("?{i}")).collect();
@@ -7541,22 +7611,67 @@ impl Connection {
                     cols_sql.join(","),
                     placeholders.join(",")
                 );
-                let mut positional = Vec::with_capacity(ncol);
-                for v in &change.new {
-                    positional.push(v.clone().unwrap_or(Value::Null));
-                }
+                let positional: Vec<Value> = change
+                    .new
+                    .iter()
+                    .map(|v| v.clone().unwrap_or(Value::Null))
+                    .collect();
                 let params = Params {
                     positional,
                     named: Vec::new(),
                 };
-                // A constraint violation (PK collision) is a CONFLICT → default
-                // ABORT; the caller rolls back. A clean insert applies the row.
-                self.execute_params(&sql, &params)?;
-                Ok(())
+                match self.execute_params(&sql, &params) {
+                    Ok(_) => Ok(()),
+                    // Only a constraint violation is a changeset conflict; any
+                    // other error propagates unchanged.
+                    Err(e @ Error::Constraint(_)) => {
+                        // Classify: a colliding primary key is CONFLICT, any
+                        // other constraint (secondary UNIQUE / NOT NULL / CHECK)
+                        // is CONSTRAINT.
+                        let pk_exists =
+                            self.session_pk_row_exists(table, col_names, pk_flags, &change.new)?;
+                        let kind = if pk_exists {
+                            CT::Conflict
+                        } else {
+                            CT::Constraint
+                        };
+                        match on_conflict(kind) {
+                            CA::Omit => Ok(()),
+                            CA::Abort => Err(e),
+                            CA::Replace if kind == CT::Conflict => {
+                                // Delete the primary-key-colliding row, then
+                                // retry the insert.
+                                let (w, wp) = pk_where(&change.new);
+                                let _ = self.execute_params(
+                                    &alloc::format!("DELETE FROM {qtable} WHERE {w}"),
+                                    &Params {
+                                        positional: wp,
+                                        named: Vec::new(),
+                                    },
+                                )?;
+                                match self.execute_params(&sql, &params) {
+                                    Ok(_) => Ok(()),
+                                    // A row that also collides on a secondary
+                                    // UNIQUE index is a separate CONSTRAINT.
+                                    Err(e2 @ Error::Constraint(_)) => {
+                                        match on_conflict(CT::Constraint) {
+                                            CA::Omit => Ok(()),
+                                            _ => Err(e2),
+                                        }
+                                    }
+                                    Err(e2) => Err(e2),
+                                }
+                            }
+                            // Replace is not permitted for a CONSTRAINT conflict;
+                            // treat it as Abort (as sqlite does).
+                            CA::Replace => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
             }
-            crate::session::ChangeOp::Delete => {
-                // DELETE FROM "t" WHERE <pk>=?  AND <old non-pk> IS ?  …
-                // 0 rows changed ⇒ NOTFOUND/DATA ⇒ omit.
+            ChangeOp::Delete => {
+                // Full match: primary key + every present old non-PK value.
                 let mut wheres: Vec<String> = Vec::new();
                 let mut positional: Vec<Value> = Vec::new();
                 for (i, name) in col_names.iter().enumerate() {
@@ -7571,18 +7686,42 @@ impl Connection {
                     }
                 }
                 let sql = alloc::format!("DELETE FROM {qtable} WHERE {}", wheres.join(" AND "));
-                let params = Params {
-                    positional,
-                    named: Vec::new(),
+                let n = self.execute_params(
+                    &sql,
+                    &Params {
+                        positional,
+                        named: Vec::new(),
+                    },
+                )?;
+                if n >= 1 {
+                    return Ok(());
+                }
+                // 0 rows changed: DATA (the PK row exists but old.* differ) or
+                // NOTFOUND (no row with that PK).
+                let kind = if self.session_pk_row_exists(table, col_names, pk_flags, &change.old)? {
+                    CT::Data
+                } else {
+                    CT::NotFound
                 };
-                // 0 rows changed ⇒ NOTFOUND/DATA conflict ⇒ omit (the DELETE is
-                // a harmless no-op). A constraint error would abort via `?`.
-                self.execute_params(&sql, &params)?;
-                Ok(())
+                match on_conflict(kind) {
+                    CA::Omit => Ok(()),
+                    CA::Replace if kind == CT::Data => {
+                        // Force the delete through, matched by primary key alone.
+                        let (w, wp) = pk_where(&change.old);
+                        let _ = self.execute_params(
+                            &alloc::format!("DELETE FROM {qtable} WHERE {w}"),
+                            &Params {
+                                positional: wp,
+                                named: Vec::new(),
+                            },
+                        )?;
+                        Ok(())
+                    }
+                    // Abort, or Replace on a NOTFOUND (which sqlite forbids).
+                    _ => Err(abort_err()),
+                }
             }
-            crate::session::ChangeOp::Update => {
-                // UPDATE "t" SET <changed non-pk>=? … WHERE <pk & old-present
-                // non-pk> IS ? …  0 rows changed ⇒ NOTFOUND/DATA ⇒ omit.
+            ChangeOp::Update => {
                 let mut sets: Vec<String> = Vec::new();
                 let mut wheres: Vec<String> = Vec::new();
                 let mut positional: Vec<Value> = Vec::new();
@@ -7615,16 +7754,111 @@ impl Connection {
                     sets.join(","),
                     wheres.join(" AND ")
                 );
-                let params = Params {
-                    positional,
-                    named: Vec::new(),
+                let n = self.execute_params(
+                    &sql,
+                    &Params {
+                        positional,
+                        named: Vec::new(),
+                    },
+                )?;
+                if n >= 1 {
+                    return Ok(());
+                }
+                // 0 rows changed: DATA or NOTFOUND, exactly like DELETE.
+                let kind = if self.session_pk_row_exists(table, col_names, pk_flags, &change.old)? {
+                    CT::Data
+                } else {
+                    CT::NotFound
                 };
-                // 0 rows changed ⇒ NOTFOUND/DATA conflict ⇒ omit. A constraint
-                // error would abort via `?`.
-                self.execute_params(&sql, &params)?;
-                Ok(())
+                match on_conflict(kind) {
+                    CA::Omit => Ok(()),
+                    CA::Replace if kind == CT::Data => {
+                        // Force the update through, matched by primary key alone.
+                        let mut sets: Vec<String> = Vec::new();
+                        let mut positional: Vec<Value> = Vec::new();
+                        for (i, name) in col_names.iter().enumerate() {
+                            if !is_pk(i)
+                                && let Some(v) = &change.new[i]
+                            {
+                                positional.push(v.clone());
+                                sets.push(alloc::format!("{}=?{}", quote(name), positional.len()));
+                            }
+                        }
+                        let (w, wp) = pk_where(&change.old);
+                        positional.extend(wp);
+                        // Renumber the WHERE placeholders to follow the SET ones.
+                        let mut idx = sets.len();
+                        let w = w
+                            .split(" AND ")
+                            .map(|term| {
+                                idx += 1;
+                                // term is `"col" IS ?K`; rewrite the placeholder.
+                                let cut = term.rfind('?').unwrap_or(term.len());
+                                alloc::format!("{}?{}", &term[..cut], idx)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        let sql =
+                            alloc::format!("UPDATE {qtable} SET {} WHERE {}", sets.join(","), w);
+                        match self.execute_params(
+                            &sql,
+                            &Params {
+                                positional,
+                                named: Vec::new(),
+                            },
+                        ) {
+                            Ok(_) => Ok(()),
+                            Err(e @ Error::Constraint(_)) => match on_conflict(CT::Constraint) {
+                                CA::Omit => Ok(()),
+                                _ => Err(e),
+                            },
+                            Err(e) => Err(e),
+                        }
+                    }
+                    _ => Err(abort_err()),
+                }
             }
         }
+    }
+
+    /// Whether a row whose primary-key columns equal `source`'s PK-flagged
+    /// values exists in `table`. Used by [`apply_one_change`](Self::apply_one_change)
+    /// to distinguish a `DATA` conflict (row present, values differ) from a
+    /// `NOTFOUND` conflict, and a primary-key `CONFLICT` from a secondary
+    /// `CONSTRAINT`.
+    fn session_pk_row_exists(
+        &self,
+        table: &str,
+        col_names: &[String],
+        pk_flags: &[u8],
+        source: &[Option<Value>],
+    ) -> Result<bool> {
+        let quote = |n: &str| alloc::format!("\"{}\"", n.replace('"', "\"\""));
+        let mut wheres: Vec<String> = Vec::new();
+        let mut positional: Vec<Value> = Vec::new();
+        for (i, name) in col_names.iter().enumerate() {
+            if pk_flags.get(i).copied().unwrap_or(0) != 0 {
+                let v = source.get(i).and_then(|o| o.clone()).unwrap_or(Value::Null);
+                positional.push(v);
+                wheres.push(alloc::format!("{} IS ?{}", quote(name), positional.len()));
+            }
+        }
+        if wheres.is_empty() {
+            return Ok(false);
+        }
+        let sql = alloc::format!(
+            "SELECT 1 FROM {} WHERE {} LIMIT 1",
+            quote(table),
+            wheres.join(" AND ")
+        );
+        let res = self.query_params(
+            &sql,
+            &Params {
+                positional,
+                named: Vec::new(),
+            },
+        )?;
+        Ok(!res.rows.is_empty())
     }
 
     /// Write-path hook: when a session is active and `table` has a declared
