@@ -1122,3 +1122,118 @@ fn patchset_apply_roundtrip_without_rowid() {
         "INSERT INTO t VALUES(3,30,300); UPDATE t SET c=999 WHERE a=1; DELETE FROM t WHERE a=2;",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-table attach — `Session::attach_table` (sqlite3session_attach(p, "t")).
+// Only the named table's changes are recorded. Verified against the
+// `sesdump_attach` oracle (`GRAPHITE_SESDUMP_ATTACH`).
+// ---------------------------------------------------------------------------
+
+/// Record only `attach` (a single table) while running `sql` over `setup`.
+fn graphite_changeset_attach(setup: &str, sql: &str, attach: &str) -> String {
+    let mut conn = Connection::open_memory().unwrap();
+    conn.execute_batch(setup).unwrap();
+    let session = conn.create_session();
+    session.attach_table(attach);
+    conn.execute_batch(sql).unwrap();
+    hex(&conn.session_changeset(&session).unwrap())
+}
+
+fn oracle_attach(setup: &str, sql: &str, attach: &str) -> Option<String> {
+    let bin = std::env::var("GRAPHITE_SESDUMP_ATTACH").ok()?;
+    let out = Command::new(bin)
+        .arg(":memory:")
+        .arg(sql)
+        .arg(setup)
+        .arg(attach)
+        .output()
+        .expect("run sesdump_attach");
+    assert!(
+        out.status.success(),
+        "sesdump_attach failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Assert graphite records exactly `attach`'s changes, matching the oracle.
+fn check_attach(setup: &str, sql: &str, attach: &str, expect: Option<&str>) {
+    let got = graphite_changeset_attach(setup, sql, attach);
+    if let Some(reference) = oracle_attach(setup, sql, attach) {
+        assert_eq!(
+            got, reference,
+            "vs oracle\n setup={setup}\n sql={sql}\n attach={attach}"
+        );
+    }
+    if let Some(exp) = expect {
+        assert_eq!(
+            got, exp,
+            "vs literal\n setup={setup}\n sql={sql}\n attach={attach}"
+        );
+    }
+}
+
+const TWO: &str =
+    "CREATE TABLE t(a INTEGER PRIMARY KEY, b); CREATE TABLE u(a INTEGER PRIMARY KEY, b);";
+
+#[test]
+fn attach_table_records_only_named() {
+    // Change both t and u, attach only u → only u's INSERT is recorded.
+    check_attach(
+        TWO,
+        "INSERT INTO t VALUES(1,2); INSERT INTO u VALUES(9,8);",
+        "u",
+        None,
+    );
+    // Symmetric: attach only t.
+    check_attach(
+        TWO,
+        "INSERT INTO t VALUES(1,2); INSERT INTO u VALUES(9,8);",
+        "t",
+        None,
+    );
+}
+
+#[test]
+fn attach_table_unwritten_is_empty() {
+    // Attach u but only write t → nothing recorded (empty changeset).
+    let got = graphite_changeset_attach(TWO, "INSERT INTO t VALUES(1,2);", "u");
+    assert_eq!(got, "");
+    if let Some(reference) = oracle_attach(TWO, "INSERT INTO t VALUES(1,2);", "u") {
+        assert_eq!(got, reference);
+    }
+}
+
+#[test]
+fn attach_all_overrides_per_table() {
+    // attach_table(u) then attach() (all) → both tables recorded.
+    let mut conn = Connection::open_memory().unwrap();
+    conn.execute_batch(TWO).unwrap();
+    let session = conn.create_session();
+    session.attach_table("u");
+    session.attach(); // all tables
+    conn.execute_batch("INSERT INTO t VALUES(1,2); INSERT INTO u VALUES(9,8);")
+        .unwrap();
+    let got = hex(&conn.session_changeset(&session).unwrap());
+    if let Some(reference) = oracle(TWO, "INSERT INTO t VALUES(1,2); INSERT INTO u VALUES(9,8);") {
+        assert_eq!(got, reference);
+    }
+    // Both table headers ('T' = 0x54) appear.
+    assert!(got.matches("54").count() >= 2);
+}
+
+#[test]
+fn attach_multiple_tables_accumulate() {
+    // Attach both t and u by name → both recorded (same as attach-all here).
+    let mut conn = Connection::open_memory().unwrap();
+    conn.execute_batch(TWO).unwrap();
+    let session = conn.create_session();
+    session.attach_table("t");
+    session.attach_table("u");
+    conn.execute_batch("INSERT INTO t VALUES(1,2); INSERT INTO u VALUES(9,8);")
+        .unwrap();
+    let got = hex(&conn.session_changeset(&session).unwrap());
+    if let Some(reference) = oracle(TWO, "INSERT INTO t VALUES(1,2); INSERT INTO u VALUES(9,8);") {
+        assert_eq!(got, reference);
+    }
+}

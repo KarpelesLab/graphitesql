@@ -260,9 +260,16 @@ fn pk_eq(a: &[Value], b: &[Value]) -> bool {
 /// can push changes into the session the caller holds.
 #[derive(Debug, Default)]
 pub(crate) struct SessionState {
-    /// `true` between [`Session::attach`] (all tables) and the session being
-    /// dropped/disabled. When `false` the write hook is a no-op.
+    /// `true` once any table is attached (all or by name) and until the session
+    /// is dropped/disabled. When `false` the write hook is a no-op.
     pub(crate) enabled: bool,
+    /// `true` when every table is attached ([`Session::attach`], i.e.
+    /// `sqlite3session_attach(p, NULL)`). When `false`, only the tables named in
+    /// `attached` are recorded.
+    attach_all: bool,
+    /// The specific tables attached by name ([`Session::attach_table`]). Ignored
+    /// when `attach_all` is set.
+    attached: Vec<String>,
     /// Recorded changes, keyed by table name, in first-touch order (which is
     /// the order tables appear in the changeset).
     tables: Vec<TableChanges>,
@@ -287,6 +294,11 @@ impl SessionState {
         old: Vec<Value>,
     ) {
         if !self.enabled {
+            return;
+        }
+        // Per-table attach: when not every table is attached, only record a
+        // table that was explicitly attached by name.
+        if !self.attach_all && !self.attached.iter().any(|t| t == table) {
             return;
         }
         // SQLite skips rows whose primary key contains a NULL value.
@@ -332,9 +344,25 @@ impl Session {
     /// Attach every table in the session's database to the session, so changes
     /// to any of them are recorded. Mirrors `sqlite3session_attach(p, NULL)`.
     ///
-    /// (Per-table attach is not yet exposed; this attaches all tables.)
+    /// Attaching all tables overrides any prior per-table
+    /// [`attach_table`](Self::attach_table) restriction.
     pub fn attach(&self) {
-        self.state.borrow_mut().enabled = true;
+        let mut s = self.state.borrow_mut();
+        s.enabled = true;
+        s.attach_all = true;
+    }
+
+    /// Attach a single table by name, so only changes to that table are
+    /// recorded (unless [`attach`](Self::attach) is also called, which attaches
+    /// all tables). Mirrors `sqlite3session_attach(p, "table")`. Multiple calls
+    /// accumulate; a table may be attached before it exists (it is recorded once
+    /// it is created and written).
+    pub fn attach_table(&self, table: &str) {
+        let mut s = self.state.borrow_mut();
+        s.enabled = true;
+        if !s.attached.iter().any(|t| t == table) {
+            s.attached.push(String::from(table));
+        }
     }
 
     /// Returns `true` if no changes have been recorded (so the changeset would
@@ -1568,6 +1596,8 @@ mod tests {
     fn insert_matches_oracle() {
         let mut st = SessionState {
             enabled: true,
+            attach_all: true,
+            attached: Vec::new(),
             tables: Vec::new(),
         };
         st.record(
@@ -1593,6 +1623,8 @@ mod tests {
     fn composite_insert_matches_oracle() {
         let mut st = SessionState {
             enabled: true,
+            attach_all: true,
+            attached: Vec::new(),
             tables: Vec::new(),
         };
         st.record(
@@ -1626,6 +1658,8 @@ mod tests {
     fn patchset_insert_matches_oracle() {
         let mut st = SessionState {
             enabled: true,
+            attach_all: true,
+            attached: Vec::new(),
             tables: Vec::new(),
         };
         st.record(
@@ -1652,6 +1686,8 @@ mod tests {
     fn patchset_update_matches_oracle() {
         let mut st = SessionState {
             enabled: true,
+            attach_all: true,
+            attached: Vec::new(),
             tables: Vec::new(),
         };
         st.record(
@@ -1681,6 +1717,8 @@ mod tests {
     fn patchset_delete_matches_oracle() {
         let mut st = SessionState {
             enabled: true,
+            attach_all: true,
+            attached: Vec::new(),
             tables: Vec::new(),
         };
         st.record(
@@ -1702,6 +1740,8 @@ mod tests {
     fn patchset_composite_delete_matches_oracle() {
         let mut st = SessionState {
             enabled: true,
+            attach_all: true,
+            attached: Vec::new(),
             tables: Vec::new(),
         };
         st.record(
@@ -1725,6 +1765,8 @@ mod tests {
     fn patchset_composite_update_matches_oracle() {
         let mut st = SessionState {
             enabled: true,
+            attach_all: true,
+            attached: Vec::new(),
             tables: Vec::new(),
         };
         st.record(

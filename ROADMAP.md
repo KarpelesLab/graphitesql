@@ -425,8 +425,12 @@ result or declines to it — never a wrong answer), so this track is
   `changeset_apply` is now just the default handler (omit DATA/NOTFOUND, abort
   CONFLICT/CONSTRAINT). Verified vs a policy-parameterised `sesapply` oracle
   (matching `xConflict`) across OMIT/REPLACE/ABORT on single-integer, composite,
-  and text primary keys. **Remaining:** changeset rebase, per-table attach,
-  indirect changes, and streaming — the niche tail of the session API.
+  and text primary keys. *Per-table attach done (2026-07-10):*
+  `Session::attach_table(name)` records only the named table(s)
+  (`sqlite3session_attach(p, "table")`); `Session::attach()` still attaches all
+  and overrides a per-table restriction. Verified vs a `sesdump` oracle built
+  with a named attach. **Remaining:** changeset rebase, indirect changes, and
+  streaming — the niche tail of the session API.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**
