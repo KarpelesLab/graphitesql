@@ -1237,3 +1237,96 @@ fn attach_multiple_tables_accumulate() {
         assert_eq!(got, reference);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Indirect changes — the changeset record's indirect byte. A change made by a
+// trigger or FK action is flagged indirect automatically (SQLite's preupdate
+// depth); Session::set_indirect(true) flags every change. Verified against the
+// plain `sesdump` oracle (auto-indirect) and `sesdump_indirect`
+// (GRAPHITE_SESDUMP_INDIRECT, which calls sqlite3session_indirect).
+// ---------------------------------------------------------------------------
+
+fn graphite_changeset_indirect(setup: &str, sql: &str) -> String {
+    let mut conn = Connection::open_memory().unwrap();
+    conn.execute_batch(setup).unwrap();
+    let session = conn.create_session();
+    session.attach();
+    assert!(session.set_indirect(true));
+    conn.execute_batch(sql).unwrap();
+    hex(&conn.session_changeset(&session).unwrap())
+}
+
+fn oracle_indirect(setup: &str, sql: &str) -> Option<String> {
+    let bin = std::env::var("GRAPHITE_SESDUMP_INDIRECT").ok()?;
+    let out = Command::new(bin)
+        .arg(":memory:")
+        .arg(sql)
+        .arg(setup)
+        .output()
+        .expect("run sesdump_indirect");
+    assert!(
+        out.status.success(),
+        "sesdump_indirect: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[test]
+fn indirect_mode_flags_every_change() {
+    // set_indirect(true): the plain INSERT carries indirect byte 01.
+    let setup = "CREATE TABLE t(a INTEGER PRIMARY KEY,b);";
+    let got = graphite_changeset_indirect(setup, "INSERT INTO t VALUES(1,2);");
+    // op byte (0x12) then indirect byte (0x01).
+    assert!(got.contains("1201"), "expected indirect insert, got {got}");
+    if let Some(reference) = oracle_indirect(setup, "INSERT INTO t VALUES(1,2);") {
+        assert_eq!(got, reference);
+    }
+}
+
+#[test]
+fn trigger_change_is_indirect() {
+    // An AFTER INSERT trigger inserts into `log`: t's change is direct (0x1200),
+    // log's change is indirect (0x1201). Matches the plain oracle (which
+    // auto-marks trigger changes indirect via the preupdate depth).
+    let setup = "CREATE TABLE t(a INTEGER PRIMARY KEY,b); \
+                 CREATE TABLE log(a INTEGER PRIMARY KEY,m); \
+                 CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES(NEW.a,'ins'); END;";
+    let sql = "INSERT INTO t VALUES(1,2);";
+    let got = graphite_changeset(setup, sql);
+    if let Some(reference) = oracle(setup, sql) {
+        assert_eq!(got, reference, "trigger indirect vs oracle");
+    }
+    // Sanity: the log table header appears and its change is indirect.
+    assert!(got.contains("6c6f67"), "log header present");
+}
+
+#[test]
+fn fk_cascade_change_is_indirect() {
+    // ON DELETE CASCADE: deleting the parent deletes the child; the child DELETE
+    // is an FK action → indirect. Matches the plain oracle.
+    let setup = "CREATE TABLE p(a INTEGER PRIMARY KEY); \
+                 CREATE TABLE c(a INTEGER PRIMARY KEY, p REFERENCES p(a) ON DELETE CASCADE); \
+                 INSERT INTO p VALUES(1); INSERT INTO c VALUES(10,1); \
+                 PRAGMA foreign_keys=ON;";
+    let sql = "DELETE FROM p WHERE a=1;";
+    let got = graphite_changeset(setup, sql);
+    if let Some(reference) = oracle(setup, sql) {
+        assert_eq!(got, reference, "fk cascade indirect vs oracle");
+    }
+}
+
+#[test]
+fn direct_after_trigger_demotes_to_direct() {
+    // A row first changed indirectly (by a trigger) then directly must end up
+    // marked direct (sessionPreupdateOneChange demotion). Here a trigger inserts
+    // into log, then we directly update the same log row.
+    let setup = "CREATE TABLE t(a INTEGER PRIMARY KEY,b); \
+                 CREATE TABLE log(a INTEGER PRIMARY KEY,m); \
+                 CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES(NEW.a,'ins'); END;";
+    let sql = "INSERT INTO t VALUES(1,2); UPDATE log SET m='edited' WHERE a=1;";
+    let got = graphite_changeset(setup, sql);
+    if let Some(reference) = oracle(setup, sql) {
+        assert_eq!(got, reference, "demotion vs oracle");
+    }
+}

@@ -175,6 +175,10 @@ pub struct Connection {
     ignore_check_constraints: bool,
     /// Re-entrancy depth of trigger firing.
     trigger_depth: core::cell::Cell<usize>,
+    /// Nesting depth of foreign-key action application. Non-zero while a
+    /// cascade/set-null/set-default runs, so a session records those writes as
+    /// *indirect* (mirroring SQLite's preupdate-hook depth for FK actions).
+    fk_depth: core::cell::Cell<usize>,
     /// Set by an `OR FAIL` conflict before it raises: tells the statement-level
     /// atomicity wrapper to keep the rows changed before the failure (rather than
     /// rolling the statement back, which is the `OR ABORT` default).
@@ -401,6 +405,7 @@ impl Connection {
             query_only: false,
             ignore_check_constraints: false,
             trigger_depth: core::cell::Cell::new(0),
+            fk_depth: core::cell::Cell::new(0),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
             raise_ignore: core::cell::Cell::new(false),
@@ -448,6 +453,7 @@ impl Connection {
             query_only: false,
             ignore_check_constraints: false,
             trigger_depth: core::cell::Cell::new(0),
+            fk_depth: core::cell::Cell::new(0),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
             raise_ignore: core::cell::Cell::new(false),
@@ -7061,6 +7067,33 @@ impl Connection {
         action: FkAction,
         params: &Params,
     ) -> Result<()> {
+        // Mark writes made by this FK action as indirect for any active session
+        // (SQLite's preupdate depth is non-zero inside FK-action sub-programs).
+        self.fk_depth.set(self.fk_depth.get() + 1);
+        let r = self.apply_fk_action_inner(
+            child_table,
+            fk,
+            old_key,
+            new_parent,
+            parent_pos,
+            action,
+            params,
+        );
+        self.fk_depth.set(self.fk_depth.get() - 1);
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_fk_action_inner(
+        &mut self,
+        child_table: &str,
+        fk: &ForeignKey,
+        old_key: &[Value],
+        new_parent: Option<&[Value]>,
+        parent_pos: &[usize],
+        action: FkAction,
+        params: &Params,
+    ) -> Result<()> {
         let cmeta = self.table_meta(child_table, None)?;
         let cpos = self.column_positions(&cmeta, &fk.columns)?;
         // The parent key columns' affinities — applied to the child value when
@@ -7185,13 +7218,28 @@ impl Connection {
     ) -> Result<()> {
         // Read the row so its own dependents can be enforced.
         let old = self.read_row(meta, rowid)?;
-        if let Some(old) = old {
-            self.enforce_parent_change(table, &old, None, params)?;
+        if let Some(old) = &old {
+            self.enforce_parent_change(table, old, None, params)?;
         }
         delete_table(self.backend.writer()?, meta.root, rowid)?;
         let indexes = self.indexes_of(table)?;
         if !indexes.is_empty() {
             self.rebuild_indexes(meta, &indexes)?;
+        }
+        // Record the FK-action delete for an active session (indirect, since
+        // `fk_depth > 0` here). Skipped for the non-FK caller (INSERT OR
+        // REPLACE), whose conflict-delete is recorded on its own path.
+        if self.fk_depth.get() > 0
+            && let Some(old) = &old
+        {
+            self.record_session_change(
+                table,
+                meta,
+                crate::session::ChangeOp::Delete,
+                rowid,
+                Some(old.as_slice()),
+                None,
+            );
         }
         Ok(())
     }
@@ -7208,6 +7256,12 @@ impl Connection {
         let Some(mut row) = self.read_row(meta, rowid)? else {
             return Ok(());
         };
+        // Snapshot the pre-update row for session recording (FK context only).
+        let old_row = if self.fk_depth.get() > 0 {
+            Some(row.clone())
+        } else {
+            None
+        };
         for (&p, v) in positions.iter().zip(new_vals) {
             row[p] = v.clone();
         }
@@ -7221,6 +7275,18 @@ impl Connection {
         let indexes = self.indexes_of(table)?;
         if !indexes.is_empty() {
             self.rebuild_indexes(meta, &indexes)?;
+        }
+        // Record the FK-action update (SET NULL / SET DEFAULT / cascade key
+        // change) for an active session (indirect, since `fk_depth > 0`).
+        if let Some(old_row) = &old_row {
+            self.record_session_change(
+                table,
+                meta,
+                crate::session::ChangeOp::Update,
+                rowid,
+                Some(old_row.as_slice()),
+                Some(row.as_slice()),
+            );
         }
         Ok(())
     }
@@ -7923,6 +7989,11 @@ impl Connection {
             Some(out)
         };
 
+        // A change made while a trigger or FK action is running is *indirect*
+        // (SQLite's preupdate depth > 0); the session's own indirect mode is
+        // folded in inside `SessionState::record`.
+        let indirect = self.trigger_depth.get() > 0 || self.fk_depth.get() > 0;
+
         match op {
             crate::session::ChangeOp::Insert => {
                 let Some(row) = new_row else { return };
@@ -7935,7 +8006,7 @@ impl Connection {
                     .as_ref()
                     .unwrap()
                     .borrow_mut()
-                    .record(table, ncol, &pk_flags, op, pk, old);
+                    .record(table, ncol, &pk_flags, op, pk, old, indirect);
             }
             crate::session::ChangeOp::Delete => {
                 let Some(row) = old_row else { return };
@@ -7950,6 +8021,7 @@ impl Connection {
                     op,
                     pk,
                     row[..ncol].to_vec(),
+                    indirect,
                 );
             }
             crate::session::ChangeOp::Update => {
@@ -7973,6 +8045,7 @@ impl Connection {
                         crate::session::ChangeOp::Update,
                         old_pk,
                         oldr[..ncol].to_vec(),
+                        indirect,
                     );
                     // Change keyed by the NEW primary key (op = INSERT). If the
                     // PK did not change this coalesces into the UPDATE above.
@@ -7983,6 +8056,7 @@ impl Connection {
                         crate::session::ChangeOp::Insert,
                         new_pk,
                         alloc::vec![Value::Null; ncol],
+                        indirect,
                     );
                 }
             }

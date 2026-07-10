@@ -93,6 +93,10 @@ struct Change {
     op: ChangeOp,
     pk: Vec<Value>,
     old: Vec<Value>,
+    /// `true` if this change was made indirectly — by a trigger or foreign-key
+    /// action, or while the session's indirect mode was on. Emitted as the
+    /// changeset record's indirect byte. Mirrors SQLite's `SessionChange.bIndirect`.
+    indirect: bool,
 }
 
 /// Hash one primary-key value into `h` following SQLite's `sessionPreupdateHash`
@@ -215,19 +219,34 @@ impl TableChanges {
         }
     }
 
-    /// Record one row operation, applying SQLite's coalescing.
-    fn record(&mut self, op: ChangeOp, pk: Vec<Value>, old: Vec<Value>) {
+    /// Record one row operation, applying SQLite's coalescing. `indirect` is
+    /// this operation's effective indirect flag (trigger/FK context or the
+    /// session's indirect mode).
+    fn record(&mut self, op: ChangeOp, pk: Vec<Value>, old: Vec<Value>, indirect: bool) {
         self.maybe_grow();
         let idx = self.bucket(&pk);
-        if self.buckets[idx].iter().any(|c| pk_eq(&c.pk, &pk)) {
+        if let Some(c) = self.buckets[idx].iter_mut().find(|c| pk_eq(&c.pk, &pk)) {
             // A change already exists for this row: SQLite keeps the original
-            // op and original old.* values, folding later edits in at
-            // changeset time via the live row read. Nothing to update here.
+            // op and original old.* values, folding later edits in at changeset
+            // time via the live row read. The one field it does update is the
+            // indirect flag — an indirect change hit by a later *direct* change
+            // becomes direct (`sessionPreupdateOneChange`).
+            if c.indirect && !indirect {
+                c.indirect = false;
+            }
             return;
         }
         self.nentry += 1;
         // Prepend (LIFO), matching SQLite's linked-list insertion.
-        self.buckets[idx].insert(0, Change { op, pk, old });
+        self.buckets[idx].insert(
+            0,
+            Change {
+                op,
+                pk,
+                old,
+                indirect,
+            },
+        );
     }
 
     fn is_empty(&self) -> bool {
@@ -270,6 +289,9 @@ pub(crate) struct SessionState {
     /// The specific tables attached by name ([`Session::attach_table`]). Ignored
     /// when `attach_all` is set.
     attached: Vec<String>,
+    /// When `true` ([`Session::set_indirect`], = `sqlite3session_indirect`),
+    /// every recorded change is flagged indirect regardless of context.
+    indirect_mode: bool,
     /// Recorded changes, keyed by table name, in first-touch order (which is
     /// the order tables appear in the changeset).
     tables: Vec<TableChanges>,
@@ -284,6 +306,7 @@ impl SessionState {
     ///
     /// A row whose primary key contains a `NULL` is ignored, matching SQLite
     /// (which records no change for such a row).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record(
         &mut self,
         table: &str,
@@ -292,10 +315,14 @@ impl SessionState {
         op: ChangeOp,
         pk: Vec<Value>,
         old: Vec<Value>,
+        indirect: bool,
     ) {
         if !self.enabled {
             return;
         }
+        // A change is indirect if made in a trigger/FK context (`indirect`) or
+        // while the session's indirect mode is on.
+        let indirect = indirect || self.indirect_mode;
         // Per-table attach: when not every table is attached, only record a
         // table that was explicitly attached by name.
         if !self.attach_all && !self.attached.iter().any(|t| t == table) {
@@ -316,7 +343,7 @@ impl SessionState {
                 self.tables.last_mut().unwrap()
             }
         };
-        tbl.record(op, pk, old);
+        tbl.record(op, pk, old, indirect);
     }
 }
 
@@ -363,6 +390,20 @@ impl Session {
         if !s.attached.iter().any(|t| t == table) {
             s.attached.push(String::from(table));
         }
+    }
+
+    /// Set or clear the session's *indirect* mode. While set, every change the
+    /// session records is flagged indirect (the changeset record's indirect
+    /// byte), regardless of whether it was made directly or by a trigger/foreign
+    /// key. Mirrors `sqlite3session_indirect(p, 1|0)`. Returns the mode in
+    /// effect after the call.
+    ///
+    /// (Changes made by a trigger or foreign-key action are flagged indirect
+    /// automatically, independent of this mode.)
+    pub fn set_indirect(&self, indirect: bool) -> bool {
+        let mut s = self.state.borrow_mut();
+        s.indirect_mode = indirect;
+        s.indirect_mode
     }
 
     /// Returns `true` if no changes have been recorded (so the changeset would
@@ -502,7 +543,7 @@ fn serialize_impl(
                 match (change.op, current) {
                     (ChangeOp::Insert, Some(row)) => {
                         out.push(OP_INSERT);
-                        out.push(0); // not indirect
+                        out.push(u8::from(change.indirect));
                         for v in &row {
                             append_value(&mut out, v);
                         }
@@ -512,12 +553,25 @@ fn serialize_impl(
                         // INSERT then DELETE → nothing.
                     }
                     (ChangeOp::Update | ChangeOp::Delete, Some(row)) => {
-                        if append_update(&mut out, &change.old, &row, &tbl.pk_flags, patchset) {
+                        if append_update(
+                            &mut out,
+                            &change.old,
+                            &row,
+                            &tbl.pk_flags,
+                            patchset,
+                            change.indirect,
+                        ) {
                             wrote_any = true;
                         }
                     }
                     (ChangeOp::Update | ChangeOp::Delete, None) => {
-                        append_delete(&mut out, &change.old, &tbl.pk_flags, patchset);
+                        append_delete(
+                            &mut out,
+                            &change.old,
+                            &tbl.pk_flags,
+                            patchset,
+                            change.indirect,
+                        );
                         wrote_any = true;
                     }
                 }
@@ -538,9 +592,15 @@ fn serialize_impl(
 /// op byte, indirect byte, then **only** the primary-key columns (each PK field
 /// verbatim, in column order); non-PK columns are omitted entirely (no `0x00`
 /// placeholder). Mirrors `sessionAppendDelete`.
-fn append_delete(out: &mut Vec<u8>, old: &[Value], pk_flags: &[u8], patchset: bool) {
+fn append_delete(
+    out: &mut Vec<u8>,
+    old: &[Value],
+    pk_flags: &[u8],
+    patchset: bool,
+    indirect: bool,
+) {
     out.push(OP_DELETE);
-    out.push(0);
+    out.push(u8::from(indirect));
     for (i, v) in old.iter().enumerate() {
         let is_pk = pk_flags.get(i).copied().unwrap_or(0) != 0;
         if patchset {
@@ -568,10 +628,11 @@ fn append_update(
     new: &[Value],
     pk_flags: &[u8],
     patchset: bool,
+    indirect: bool,
 ) -> bool {
     let start = out.len();
     out.push(OP_UPDATE);
-    out.push(0);
+    out.push(u8::from(indirect));
 
     let ncol = old.len().min(new.len());
     let mut new_rec = Vec::new();
@@ -1598,6 +1659,7 @@ mod tests {
             enabled: true,
             attach_all: true,
             attached: Vec::new(),
+            indirect_mode: false,
             tables: Vec::new(),
         };
         st.record(
@@ -1607,6 +1669,7 @@ mod tests {
             ChangeOp::Insert,
             alloc::vec![Value::Integer(1)],
             alloc::vec![Value::Integer(1), Value::Null],
+            false,
         );
         let out = serialize(&st, |_, pk| {
             assert_eq!(pk, [Value::Integer(1)]);
@@ -1625,6 +1688,7 @@ mod tests {
             enabled: true,
             attach_all: true,
             attached: Vec::new(),
+            indirect_mode: false,
             tables: Vec::new(),
         };
         st.record(
@@ -1634,6 +1698,7 @@ mod tests {
             ChangeOp::Insert,
             alloc::vec![Value::Integer(1), Value::Integer(2)],
             alloc::vec![Value::Integer(1), Value::Integer(2), Value::Null],
+            false,
         );
         let out = serialize(&st, |_, pk| {
             assert_eq!(pk, [Value::Integer(1), Value::Integer(2)]);
@@ -1660,6 +1725,7 @@ mod tests {
             enabled: true,
             attach_all: true,
             attached: Vec::new(),
+            indirect_mode: false,
             tables: Vec::new(),
         };
         st.record(
@@ -1669,6 +1735,7 @@ mod tests {
             ChangeOp::Insert,
             alloc::vec![Value::Integer(1)],
             alloc::vec![Value::Integer(1), Value::Null],
+            false,
         );
         let out = serialize_patchset(&st, |_, _| {
             Some(alloc::vec![Value::Integer(1), Value::Integer(2)])
@@ -1688,6 +1755,7 @@ mod tests {
             enabled: true,
             attach_all: true,
             attached: Vec::new(),
+            indirect_mode: false,
             tables: Vec::new(),
         };
         st.record(
@@ -1697,6 +1765,7 @@ mod tests {
             ChangeOp::Update,
             alloc::vec![Value::Integer(1)],
             alloc::vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+            false,
         );
         let out = serialize_patchset(&st, |_, _| {
             Some(alloc::vec![
@@ -1719,6 +1788,7 @@ mod tests {
             enabled: true,
             attach_all: true,
             attached: Vec::new(),
+            indirect_mode: false,
             tables: Vec::new(),
         };
         st.record(
@@ -1728,6 +1798,7 @@ mod tests {
             ChangeOp::Delete,
             alloc::vec![Value::Integer(1)],
             alloc::vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+            false,
         );
         // The row is gone at patchset time → DELETE.
         let out = serialize_patchset(&st, |_, _| None);
@@ -1742,6 +1813,7 @@ mod tests {
             enabled: true,
             attach_all: true,
             attached: Vec::new(),
+            indirect_mode: false,
             tables: Vec::new(),
         };
         st.record(
@@ -1751,6 +1823,7 @@ mod tests {
             ChangeOp::Delete,
             alloc::vec![Value::Integer(1), Value::Integer(2)],
             alloc::vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+            false,
         );
         let out = serialize_patchset(&st, |_, _| None);
         assert_eq!(
@@ -1767,6 +1840,7 @@ mod tests {
             enabled: true,
             attach_all: true,
             attached: Vec::new(),
+            indirect_mode: false,
             tables: Vec::new(),
         };
         st.record(
@@ -1776,6 +1850,7 @@ mod tests {
             ChangeOp::Update,
             alloc::vec![Value::Integer(1), Value::Integer(2)],
             alloc::vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+            false,
         );
         let out = serialize_patchset(&st, |_, _| {
             Some(alloc::vec![

@@ -429,8 +429,16 @@ result or declines to it — never a wrong answer), so this track is
   `Session::attach_table(name)` records only the named table(s)
   (`sqlite3session_attach(p, "table")`); `Session::attach()` still attaches all
   and overrides a per-table restriction. Verified vs a `sesdump` oracle built
-  with a named attach. **Remaining:** changeset rebase, indirect changes, and
-  streaming — the niche tail of the session API.
+  with a named attach. *Indirect changes done (2026-07-10):* the changeset
+  record's indirect byte is now set — a change made by a trigger or foreign-key
+  action is flagged indirect automatically (via the trigger/FK nesting depth,
+  SQLite's preupdate `xDepth`), and `Session::set_indirect(bool)`
+  (`sqlite3session_indirect`) flags every change; coalescing demotes an indirect
+  change hit by a later direct one. FK-action child writes (cascade/set-null/
+  set-default) are now session-recorded too (previously invisible). Verified vs
+  the plain `sesdump` oracle (auto-indirect for trigger/FK) and a
+  `sqlite3session_indirect` oracle. **Remaining:** changeset rebase and
+  streaming — the last of the session API.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**
