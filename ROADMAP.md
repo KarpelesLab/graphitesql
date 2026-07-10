@@ -240,14 +240,28 @@ its (niche/cosmetic) value:
   the **A-rn3-edge per-occurrence-span propagation must land first**. Once
   graphite propagates as completely as SQLite, any residual breakage is a genuine
   reject and the (working) savepoint-rollback + re-validation can be re-enabled.
-  **Update 2026-07-10:** the A-rn3-edge mixed-scope *view* rewrite now lands
-  (above), so the specific decline that regressed `view_rename_column_subquery` is
-  gone — the view path is ready for re-validation to be re-enabled. The remaining
-  decline set is narrower (derived/TVF/CTE/NATURAL sources + the trigger mixed
-  body); re-validation must still treat those as "graphite can't prove" and not
-  reject, so the check needs to reject only when the resolver proves a genuine
-  break (the `USING(a)` shape) rather than on any decline. Reduced-risk follow-up,
-  no longer blocked.
+  **Update 2026-07-10:** the A-rn3-edge mixed-scope rewrite now lands for views AND
+  triggers (above), removing that class of false-reject. But a decline-set probe
+  shows A-alter-rollback is **still blocked** — the remaining decline set splits
+  two ways, and one half is still a false-reject trap:
+  - **sqlite REWRITES + succeeds, graphite DECLINES (broken):** CTE-body views
+    (`WITH x AS (SELECT a FROM t) SELECT * FROM x`) and compound/UNION views
+    (`SELECT a FROM t UNION SELECT a FROM u`). Here a naive "did the dependent
+    break?" re-validation would **falsely reject** a rename sqlite accepts — the
+    exact bug that forced the revert. So these must be *propagated* (graphite must
+    rewrite them like sqlite) before re-validation is safe.
+  - **sqlite REJECTS, graphite declines (broken):** derived-table views
+    (`SELECT a FROM (SELECT a FROM t)`, `SELECT s.a FROM (SELECT a FROM t) s`) and
+    the `USING(a)` join-column-vanishes shape. Here re-validation rejecting *matches*
+    sqlite — these are the genuine A-alter-rollback targets. (A `NATURAL JOIN`
+    rename is NOT a break — it degrades to a cross-join and both accept.)
+  **Net:** A-alter-rollback needs RENAME-COLUMN propagation extended to CTE and
+  compound view bodies first (which involves CTE output-column-name flow — the CTE
+  has no explicit column list, so renaming the base column renames the CTE's
+  exposed column, which may cascade to outer refs). Once graphite propagates those
+  as completely as sqlite, the only remaining declines are cases sqlite *also*
+  rejects, and the (working, reverted) savepoint-rollback + re-validation can be
+  re-enabled to reject exactly those. Still a real blocker, now precisely scoped.
 
 ### Track B — Query planner, statistics & the VDBE
 
