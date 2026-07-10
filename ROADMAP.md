@@ -311,23 +311,23 @@ In-process multi-connection coordination is done: read-only clean-page cache
 (C9c), and the documented thread-confined `Connection` model (C9d). See git
 history / `CHANGELOG.md`. Remaining:
 
-- **C9b — OS-level cross-process file locks.** *(unblocked 2026-07-10 — MSRV 1.89
-  approved)* Today the `StdVfs` lock manager is **process-local** (a path-keyed
-  in-memory table), so two OS processes over the same file don't see each other's
-  locks. Use `std::fs::File::{lock, try_lock, unlock}` (stabilised in Rust 1.89)
-  behind the std VFS so the `Shared`/`Reserved`/`Pending`/`Exclusive` levels map to
-  real advisory OS locks. Chunks:
-  - **C9b-0 — MSRV bump to 1.89.** Update `Cargo.toml` `rust-version`, the CI
-    toolchain, and CLAUDE.md/README references; confirm the gate is green on 1.89.
-  - **C9b-1 — cross-process lock primitive.** Add an OS-lock path to `StdFile`
-    behind the existing `File::lock`/`unlock` trait (keep the process-local table as
-    the in-memory-VFS impl). Map SQLite's byte-range lock protocol (pending/reserved/
-    shared-range) onto `File::lock_shared`/`lock` as faithfully as the std API
-    allows; document any range the std API can't express.
-  - **C9b-2 — differential test across two processes.** Spawn two `graphitesql`
-    processes over one file and assert writer-excludes-reader / readers-coexist /
-    `SQLITE_BUSY` semantics match sqlite3 (guard the test on `cfg` / platform lock
-    support).
+- **C9b — OS-level cross-process file locks.** *C9b-0/1/2 DONE 2026-07-10.* The
+  `StdVfs` now drives **one process-wide OS advisory lock** (`std::fs::File`'s 1.89
+  `lock`/`try_lock`/`unlock`) off its per-path aggregate `LockState` (`CpLock` in
+  `src/vfs/std_file.rs`): OS *shared* while only readers are active, OS *exclusive*
+  for any write intent. So two OS processes over one file serialize their writes
+  (and explicit read txns coordinate) — the C9b-0 MSRV bump, the C9b-1 primitive,
+  and the C9b-2 two-process test (`tests/c9b_cross_process_locks.rs`, unix-guarded)
+  all landed. **Whole-file limitation (documented):** the mapping is *pessimistic*
+  — a writer holds OS-exclusive for the whole write txn (from `RESERVED`), so it
+  blocks cross-process readers during a write, where SQLite's byte-range `RESERVED`
+  lock keeps them. std's whole-file locks cannot express that split. Remaining:
+  - **C9b-3 — autocommit reads take a cross-process shared lock.** An *explicit*
+    read txn takes the persistent shared lock (C9a) and so coordinates
+    cross-process, but a bare autocommit `SELECT` reads without driving the
+    aggregate to `Shared`, so it isn't blocked by a foreign exclusive lock (could
+    read a torn page during another process's write). Make the autocommit read path
+    take (and release) a transient shared lock around the read.
 
 ### Track D — Virtual tables & ecosystem extensions
 

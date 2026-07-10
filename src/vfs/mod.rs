@@ -138,6 +138,18 @@ impl LockState {
         Ok(())
     }
 
+    /// Whether any write-intent lock (`RESERVED`/`PENDING`/`EXCLUSIVE`) is held by
+    /// some handle in this process. Used by the std VFS to decide when the
+    /// process must hold an OS-level exclusive lock (ROADMAP C9b).
+    pub fn has_write_intent(&self) -> bool {
+        self.reserved || self.pending || self.exclusive
+    }
+
+    /// Number of `SHARED` (read) locks currently held across all handles.
+    pub fn reader_count(&self) -> usize {
+        self.shared
+    }
+
     /// Release a handle from `from` down to `to`, clearing whatever it held above
     /// `to`. Never fails.
     pub fn release(&mut self, from: LockLevel, to: LockLevel) {

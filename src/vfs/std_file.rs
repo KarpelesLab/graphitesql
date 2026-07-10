@@ -40,21 +40,133 @@ impl AtomicLockLevel {
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Process-global registry of per-path lock states. `StdVfs` locking is advisory
-/// and **process-local**: two `Connection`s in the same process serialize
-/// correctly, but cross-process locking would require OS file locks (which need
-/// `unsafe`/`std::fs::File::lock`, above this crate's MSRV and no-`unsafe`
-/// policy). A host that needs multi-process access can supply its own `Vfs`
-/// whose `lock`/`unlock` call the platform primitives.
-fn lock_registry() -> &'static Mutex<HashMap<String, Arc<Mutex<LockState>>>> {
-    static REG: OnceLock<Mutex<HashMap<String, Arc<Mutex<LockState>>>>> = OnceLock::new();
+/// Per-path cross-process lock coordinator: the process-local aggregate
+/// [`LockState`] plus **one** process-wide OS advisory lock (`std::fs::File`'s
+/// 1.89 `lock`/`try_lock`/`unlock`), driven off the aggregate so all in-process
+/// `Connection`s share a single OS lock (no intra-process self-conflict).
+///
+/// The mapping is **pessimistic**: the process holds an OS *exclusive* lock for
+/// the whole duration of any write intent (`RESERVED` and up), and an OS *shared*
+/// lock while only readers are active. This serialises cross-process writers
+/// race-free (a single `try_lock`, never a release-then-reacquire that could drop
+/// a writer's exclusivity), at the cost of blocking cross-process readers during a
+/// write transaction — SQLite's byte-range `RESERVED` lock keeps readers during
+/// writes, but std's whole-file locks cannot express that split (ROADMAP C9b). OS
+/// locking is best-effort: a platform that errors (not `WouldBlock`) degrades to
+/// the process-local behaviour; genuine contention surfaces as [`Error::Busy`].
+struct CpLock {
+    /// Process-local aggregate lock state (the source of truth within a process).
+    state: LockState,
+    /// The file path, for opening the OS-lock handle lazily.
+    path: String,
+    /// The process-wide OS-lock handle (opened on first lock).
+    os: Option<fs::File>,
+    /// The OS lock level the process currently holds (only `Unlocked`/`Shared`/
+    /// `Exclusive` occur).
+    os_level: LockLevel,
+    /// Set once the platform reports the OS lock API is unusable — thereafter the
+    /// coordinator is purely process-local.
+    os_disabled: bool,
+}
+
+impl CpLock {
+    fn new(path: &str) -> Self {
+        CpLock {
+            state: LockState::default(),
+            path: String::from(path),
+            os: None,
+            os_level: LockLevel::Unlocked,
+            os_disabled: false,
+        }
+    }
+
+    /// The OS lock the process should hold given the aggregate `state`.
+    fn desired_os(&self) -> LockLevel {
+        if self.state.has_write_intent() {
+            LockLevel::Exclusive
+        } else if self.state.reader_count() > 0 {
+            LockLevel::Shared
+        } else {
+            LockLevel::Unlocked
+        }
+    }
+
+    /// Reconcile the process-wide OS lock with [`desired_os`](Self::desired_os).
+    /// Returns [`Error::Busy`] only on genuine cross-process contention (the OS
+    /// reports `WouldBlock`); any other OS error disables OS locking and degrades
+    /// to process-local coordination.
+    fn reconcile(&mut self) -> Result<()> {
+        if self.os_disabled {
+            return Ok(());
+        }
+        let want = self.desired_os();
+        if want == self.os_level {
+            return Ok(());
+        }
+        if want != LockLevel::Unlocked && self.os.is_none() {
+            // Open the data file purely for OS locking (it already exists — the
+            // db is open). Fall back to a read-only handle for a read-only db.
+            let opened = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .or_else(|_| fs::OpenOptions::new().read(true).open(&self.path));
+            match opened {
+                Ok(f) => self.os = Some(f),
+                Err(_) => {
+                    self.os_disabled = true;
+                    return Ok(());
+                }
+            }
+        }
+        let Some(f) = self.os.as_ref() else {
+            return Ok(());
+        };
+        let res: core::result::Result<(), std::fs::TryLockError> = match want {
+            LockLevel::Unlocked => {
+                let _ = f.unlock();
+                Ok(())
+            }
+            LockLevel::Shared if self.os_level == LockLevel::Exclusive => {
+                // Downgrade EX → SH (blocking; there are no cross-process holders
+                // to wait on since we hold exclusive).
+                f.lock_shared().map_err(std::fs::TryLockError::Error)
+            }
+            LockLevel::Shared => f.try_lock_shared(),
+            LockLevel::Exclusive => f.try_lock(),
+            _ => Ok(()),
+        };
+        match res {
+            Ok(()) => {
+                self.os_level = want;
+                Ok(())
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Err(Error::Busy),
+            Err(std::fs::TryLockError::Error(_)) => {
+                // The platform can't advisory-lock — degrade to process-local.
+                self.os_disabled = true;
+                self.os = None;
+                self.os_level = LockLevel::Unlocked;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Process-global registry of per-path [`CpLock`] coordinators. Real files are
+/// process-global, so every `StdFile` handle to the same path shares one
+/// coordinator (and thus one process-wide OS lock).
+fn lock_registry() -> &'static Mutex<HashMap<String, Arc<Mutex<CpLock>>>> {
+    static REG: OnceLock<Mutex<HashMap<String, Arc<Mutex<CpLock>>>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The shared lock state for `path`, creating it on first use.
-fn locks_for(path: &str) -> Arc<Mutex<LockState>> {
+/// The shared lock coordinator for `path`, creating it on first use.
+fn locks_for(path: &str) -> Arc<Mutex<CpLock>> {
     let mut reg = lock_registry().lock().expect("lock registry poisoned");
-    reg.entry(path.to_string()).or_default().clone()
+    reg.entry(path.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(CpLock::new(path))))
+        .clone()
 }
 
 /// Process-global registry of per-path wal-indexes (ROADMAP C9c). Real files are
@@ -128,8 +240,8 @@ impl Vfs for StdVfs {
 /// A handle to one real file.
 pub struct StdFile {
     inner: Mutex<fs::File>,
-    /// The process-shared lock state for this file's path.
-    locks: Arc<Mutex<LockState>>,
+    /// The process-shared cross-process lock coordinator for this file's path.
+    locks: Arc<Mutex<CpLock>>,
     /// The process-shared wal-index for this file's path (ROADMAP C9c).
     wal_index: crate::pager::SharedWalIndex,
     /// The lock level this handle currently holds. Atomic so `lock`/`unlock` can
@@ -150,7 +262,8 @@ impl StdFile {
 impl Drop for StdFile {
     fn drop(&mut self) {
         if let Ok(mut s) = self.locks.lock() {
-            s.release(self.level.get(), LockLevel::Unlocked);
+            s.state.release(self.level.get(), LockLevel::Unlocked);
+            let _ = s.reconcile();
         }
     }
 }
@@ -183,26 +296,37 @@ impl File for StdFile {
     }
 
     fn lock(&self, level: LockLevel) -> Result<()> {
+        let from = self.level.get();
         let mut s = self
             .locks
             .lock()
             .map_err(|_| Error::Io("lock state poisoned".into()))?;
-        s.acquire(self.level.get(), level)?;
+        // Process-local first (source of truth within the process), then reconcile
+        // the process-wide OS lock; on cross-process contention roll the local
+        // acquire back so the handle's state stays consistent.
+        s.state.acquire(from, level)?;
+        if let Err(e) = s.reconcile() {
+            s.state.release(level, from);
+            let _ = s.reconcile();
+            return Err(e);
+        }
         drop(s);
-        if level > self.level.get() {
+        if level > from {
             self.level.set(level);
         }
         Ok(())
     }
 
     fn unlock(&self, level: LockLevel) -> Result<()> {
+        let from = self.level.get();
         let mut s = self
             .locks
             .lock()
             .map_err(|_| Error::Io("lock state poisoned".into()))?;
-        s.release(self.level.get(), level);
+        s.state.release(from, level);
+        let _ = s.reconcile();
         drop(s);
-        if level < self.level.get() {
+        if level < from {
             self.level.set(level);
         }
         Ok(())
