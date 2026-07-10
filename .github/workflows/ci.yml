@@ -110,12 +110,12 @@ jobs:
         run: cargo build --no-default-features
 
   msrv:
-    name: MSRV (1.88)
+    name: MSRV (1.89)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89
       - name: Cache
         uses: Swatinem/rust-cache@v2
         with:

@@ -2,7 +2,7 @@
 
 A pure-Rust, `#![forbid(unsafe_code)]`, `#![no_std]`+alloc, zero-dependency
 reimplementation of SQLite, byte-compatible with the SQLite 3 file format.
-MSRV 1.88.
+MSRV 1.89.
 
 ## CHANGELOG.md is owned by release-plz — NEVER edit it by hand
 
