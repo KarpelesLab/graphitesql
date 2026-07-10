@@ -202,6 +202,18 @@ its (niche/cosmetic) value:
   *proven* can leave a dependent view/trigger unresolvable; SQLite rejects and
   rolls back, graphite mutates first. Needs **statement-level DDL rollback** — a
   writer savepoint around `exec_alter`, mirroring `run_dml_atomic`.
+  Concrete reproduction (2026-07-10): `CREATE TABLE t(a,b); CREATE TABLE u(a,c);
+  CREATE VIEW v AS SELECT b,c FROM t JOIN u USING(a); ALTER TABLE t RENAME COLUMN a
+  TO z;` — SQLite rejects with `error in view v after rename: cannot join using
+  column a - column not present in both tables` and leaves the schema unchanged;
+  graphite renames `t.a`→`z` and leaves `v` broken. The fix is tractable and
+  byte-matchable: graphite's resolver already produces the identical detail
+  (`cannot join using column a …`), so after applying the rename the fix is to
+  re-resolve each dependent view/trigger against the new schema and, on failure,
+  roll back and raise `error in <type> <name> after rename: <detail>`. It's
+  deferred only because it touches the central `exec_alter` + schema-vs-b-tree
+  rollback interaction and deserves careful work, not a rushed change that could
+  regress the (currently green) RENAME-propagation suite.
 
 ### Track B — Query planner, statistics & the VDBE
 
