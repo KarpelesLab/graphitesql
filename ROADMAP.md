@@ -256,12 +256,30 @@ its (niche/cosmetic) value:
     sqlite — these are the genuine A-alter-rollback targets. (A `NATURAL JOIN`
     rename is NOT a break — it degrades to a cross-join and both accept.)
   **Net:** A-alter-rollback needs RENAME-COLUMN propagation extended to CTE and
-  compound view bodies first (which involves CTE output-column-name flow — the CTE
-  has no explicit column list, so renaming the base column renames the CTE's
-  exposed column, which may cascade to outer refs). Once graphite propagates those
-  as completely as sqlite, the only remaining declines are cases sqlite *also*
-  rejects, and the (working, reverted) savepoint-rollback + re-validation can be
-  re-enabled to reject exactly those. Still a real blocker, now precisely scoped.
+  compound view bodies first. **Concrete sqlite rewrite rules measured 2026-07-10
+  (the implementation targets):**
+  - *Compound* (`SELECT … UNION/INTERSECT/EXCEPT SELECT …`): each arm is an
+    independent scope — rewrite only the arm(s) whose refs bind to the renamed
+    table (reuses the existing `BareRewrite::At`/span machinery per arm), e.g.
+    `SELECT a FROM t UNION SELECT a FROM u` → `SELECT aa FROM t UNION SELECT a FROM
+    u`. The one extra wrinkle: a compound **`ORDER BY`** term binds to the *first*
+    arm's output column, so `… ORDER BY a` becomes `… ORDER BY aa` when the first
+    arm's renamed column is the ordering key — needs first-arm output-column
+    modeling, not just base-table resolution.
+  - *CTE* (`WITH x AS (SELECT … FROM t) …`): rewrite the CTE body like a subquery
+    scope, but sqlite does **not** cascade to the CTE's output-column consumers —
+    `WITH x AS (SELECT a FROM t) SELECT * FROM x` and `WITH x(k) AS (SELECT a FROM
+    t) SELECT k FROM x` succeed (body rewritten), while `WITH x AS (SELECT a FROM
+    t) SELECT a FROM x` is *rejected* by sqlite (the CTE's exposed column became
+    `aa`, so outer `a` no longer resolves). So graphite must rewrite the CTE body
+    ONLY when the outer scope doesn't reference the renamed CTE output column by
+    its old name (else it would introduce a stored-SQL divergence vs sqlite's
+    reject-and-leave-unchanged). Explicit `WITH x(collist)` fixes the output names,
+    so it's always safe to rewrite the body there.
+  Once graphite propagates those as completely as sqlite, the only remaining
+  declines are cases sqlite *also* rejects, and the (working, reverted)
+  savepoint-rollback + re-validation can be re-enabled to reject exactly those.
+  Still a real blocker, now precisely scoped with concrete targets.
 
 ### Track B — Query planner, statistics & the VDBE
 
