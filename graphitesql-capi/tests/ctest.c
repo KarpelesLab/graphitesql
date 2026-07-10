@@ -339,6 +339,36 @@ int main(void) {
   CHECK("window UDF running sum-of-squares 1,5,14", wok);
   sqlite3_finalize(ws);
 
+  /* UTF-16 path: prepare16 + bind_text16 + column_text16 round-trip. Build
+     UTF-16 (native-endian, ASCII so 1 unit/char) buffers by hand. */
+  {
+    /* "SELECT ?1" */
+    const char *q = "SELECT ?1";
+    unsigned short q16[16];
+    int qi = 0;
+    for (const char *p = q; *p; p++) q16[qi++] = (unsigned char)*p;
+    q16[qi] = 0;
+    /* bind value "wide" */
+    const char *val = "wide";
+    unsigned short v16[8];
+    int vi = 0;
+    for (const char *p = val; *p; p++) v16[vi++] = (unsigned char)*p;
+    v16[vi] = 0;
+
+    sqlite3_stmt *u16 = NULL;
+    rc = sqlite3_prepare16_v2(db, q16, -1, &u16, NULL);
+    CHECK("prepare16_v2 ok", rc == SQLITE_OK && u16 != NULL);
+    sqlite3_bind_text16(u16, 1, v16, -1, SQLITE_TRANSIENT);
+    CHECK("utf16 step -> ROW", sqlite3_step(u16) == SQLITE_ROW);
+    CHECK("column_bytes16 == 8", sqlite3_column_bytes16(u16, 0) == 8); /* 4 chars * 2 */
+    const unsigned short *out = (const unsigned short *)sqlite3_column_text16(u16, 0);
+    int u16ok = out && out[0] == 'w' && out[1] == 'i' && out[2] == 'd' && out[3] == 'e' && out[4] == 0;
+    CHECK("column_text16 round-trips 'wide'", u16ok);
+    /* And the UTF-8 view agrees. */
+    CHECK("utf8 view agrees", strcmp((const char *)sqlite3_column_text(u16, 0), "wide") == 0);
+    sqlite3_finalize(u16);
+  }
+
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 
   sqlite3_close(db);

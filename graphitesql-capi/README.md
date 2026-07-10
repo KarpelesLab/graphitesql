@@ -22,6 +22,7 @@ shape as the `graphitesql-wasm` sibling.
 | Status | `sqlite3_errmsg`, `sqlite3_errcode`/`extended_errcode`, `sqlite3_errstr`, `sqlite3_changes`/`total_changes`, `sqlite3_last_insert_rowid`, `sqlite3_get_autocommit`, `sqlite3_busy_timeout`, `sqlite3_interrupt` |
 | UDFs | `sqlite3_create_function` (scalar + aggregate), `sqlite3_create_window_function`, `sqlite3_user_data`, `sqlite3_aggregate_context`, `sqlite3_value_*`, `sqlite3_result_*` |
 | Collations | `sqlite3_create_collation`/`_v2` (custom `COLLATE` sequences) |
+| UTF-16 | `sqlite3_open16`, `sqlite3_prepare16_v2`, `sqlite3_bind_text16`, `sqlite3_column_text16`/`bytes16`, `sqlite3_errmsg16` |
 | Version | `sqlite3_libversion`, `sqlite3_libversion_number` (reports `3.50.4`) |
 | Memory | `sqlite3_free` |
 
@@ -48,8 +49,10 @@ over each frame, so the `xValue`/`xInverse` inverse protocol is accepted but not
 required). All are callable from SQL anywhere, including `WHERE`, `GROUP BY`, and
 `OVER`.
 
-**Not yet covered:** the `_v3` prepare flags, incremental BLOB I/O, online backup,
-hooks/authorizer, and the UTF-16 entry points.
+UTF-16 entry points (`*16`) convert at the boundary (graphitesql is UTF-8
+internally); `nByte` arguments are in bytes, native byte order.
+
+**Not yet covered:** incremental BLOB I/O, online backup, and hooks/authorizer.
 
 ## Build & test
 

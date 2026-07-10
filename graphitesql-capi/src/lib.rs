@@ -20,8 +20,8 @@
 //! query model (a `step` walks the already-computed rows), which is behaviourally
 //! equivalent to SQLite's incremental VDBE stepping for these entry points.
 //!
-//! Not (yet) covered: the `_v3` prepare variant flags, incremental BLOB I/O,
-//! backup, the authorizer/hooks, and UTF-16 entry points.
+//! Not (yet) covered: incremental BLOB I/O, online backup, and the
+//! authorizer/hooks.
 
 #![allow(unsafe_code)]
 #![allow(non_camel_case_types)]
@@ -62,6 +62,8 @@ const LIBVERSION_NUMBER: c_int = 3_050_004;
 pub struct sqlite3 {
     conn: Connection,
     errmsg: Option<CString>,
+    /// Scratch for `sqlite3_errmsg16`'s returned pointer (UTF-16, NUL-terminated).
+    errmsg16: Option<Vec<u16>>,
     errcode: c_int,
     changes: c_int,
     last_insert_rowid: c_longlong,
@@ -103,6 +105,8 @@ pub struct sqlite3_stmt {
     /// next `step`/`reset`/`finalize`, per SQLite's lifetime contract.
     text_scratch: Vec<Option<CString>>,
     blob_scratch: Vec<Option<Vec<u8>>>,
+    /// Same, for `column_text16` (UTF-16, NUL-terminated).
+    text16_scratch: Vec<Option<Vec<u16>>>,
 }
 
 impl sqlite3_stmt {
@@ -113,6 +117,7 @@ impl sqlite3_stmt {
         self.executed = false;
         self.text_scratch.clear();
         self.blob_scratch.clear();
+        self.text16_scratch.clear();
     }
 }
 
@@ -345,6 +350,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             let db = Box::new(sqlite3 {
                 conn,
                 errmsg: None,
+                errmsg16: None,
                 errcode: SQLITE_OK,
                 changes: 0,
                 last_insert_rowid: 0,
@@ -357,6 +363,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             let mut db = Box::new(sqlite3 {
                 conn: Connection::open_memory().expect("in-memory always opens"),
                 errmsg: None,
+                errmsg16: None,
                 errcode: SQLITE_ERROR,
                 changes: 0,
                 last_insert_rowid: 0,
@@ -652,6 +659,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         sql_cstr: None,
         text_scratch: Vec::new(),
         blob_scratch: Vec::new(),
+        text16_scratch: Vec::new(),
     });
     unsafe { *pp_stmt = Box::into_raw(stmt) };
     SQLITE_OK
@@ -1535,6 +1543,136 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     _x_destroy: Option<unsafe extern "C" fn(*mut c_void)>,
 ) -> c_int {
     unsafe { sqlite3_create_collation(db, z_name, e_text_rep, p_arg, x_compare) }
+}
+
+// --- UTF-16 entry points ------------------------------------------------------
+//
+// SQLite's `*16` API takes/returns UTF-16 in the host's native byte order.
+// graphitesql is UTF-8 internally, so these convert at the boundary. `nByte`
+// arguments are in BYTES (as in SQLite), so the u16 unit count is `nByte / 2`.
+
+/// Decode a native-endian UTF-16 buffer to a `String`. `n_byte < 0` means
+/// NUL-terminated; otherwise it is a byte length.
+unsafe fn utf16_to_string(p: *const c_void, n_byte: c_int) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let p = p as *const u16;
+    let units: &[u16] = if n_byte < 0 {
+        let mut len = 0usize;
+        while unsafe { *p.add(len) } != 0 {
+            len += 1;
+        }
+        unsafe { core::slice::from_raw_parts(p, len) }
+    } else {
+        unsafe { core::slice::from_raw_parts(p, (n_byte as usize) / 2) }
+    };
+    String::from_utf16_lossy(units)
+}
+
+/// Encode `s` as a NUL-terminated native-endian UTF-16 buffer.
+fn str_to_utf16_nul(s: &str) -> Vec<u16> {
+    let mut v: Vec<u16> = s.encode_utf16().collect();
+    v.push(0);
+    v
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_open16(
+    filename: *const c_void,
+    pp_db: *mut *mut sqlite3,
+) -> c_int {
+    let name = unsafe { utf16_to_string(filename, -1) };
+    let c = CString::new(name).unwrap_or_default();
+    unsafe { sqlite3_open(c.as_ptr(), pp_db) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_prepare16_v2(
+    db: *mut sqlite3,
+    sql: *const c_void,
+    n_byte: c_int,
+    pp_stmt: *mut *mut sqlite3_stmt,
+    pz_tail: *mut *const c_void,
+) -> c_int {
+    // The tail (a pointer into the original UTF-16 buffer) is not tracked here;
+    // report "all consumed".
+    if !pz_tail.is_null() {
+        unsafe { *pz_tail = core::ptr::null() };
+    }
+    let s = unsafe { utf16_to_string(sql, n_byte) };
+    let c = CString::new(s).unwrap_or_default();
+    unsafe { sqlite3_prepare_v2(db, c.as_ptr(), -1, pp_stmt, core::ptr::null_mut()) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_text16(
+    stmt: *mut sqlite3_stmt,
+    idx: c_int,
+    text: *const c_void,
+    n_byte: c_int,
+    _destructor: isize,
+) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_ERROR;
+    }
+    let s = unsafe { utf16_to_string(text, n_byte) };
+    bind_at(unsafe { &mut *stmt }, idx, Value::Text(s))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_column_text16(
+    stmt: *mut sqlite3_stmt,
+    col: c_int,
+) -> *const c_void {
+    if stmt.is_null() {
+        return core::ptr::null();
+    }
+    let stmt = unsafe { &mut *stmt };
+    let text = match stmt_cell(stmt, col) {
+        Some(v) => match value_to_text(v) {
+            Some(b) => String::from_utf8_lossy(&b).into_owned(),
+            None => return core::ptr::null(), // NULL column
+        },
+        None => return core::ptr::null(),
+    };
+    let idx = col as usize;
+    if stmt.text16_scratch.len() <= idx {
+        stmt.text16_scratch.resize(idx + 1, None);
+    }
+    let u = str_to_utf16_nul(&text);
+    let p = u.as_ptr() as *const c_void;
+    stmt.text16_scratch[idx] = Some(u);
+    p
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_column_bytes16(stmt: *mut sqlite3_stmt, col: c_int) -> c_int {
+    if stmt.is_null() {
+        return 0;
+    }
+    match stmt_cell(unsafe { &*stmt }, col) {
+        Some(v) => value_to_text(v)
+            .map(|b| String::from_utf8_lossy(&b).encode_utf16().count() as c_int * 2)
+            .unwrap_or(0),
+        None => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_errmsg16(db: *mut sqlite3) -> *const c_void {
+    if db.is_null() {
+        return core::ptr::null();
+    }
+    let db = unsafe { &mut *db };
+    let msg = match &db.errmsg {
+        Some(m) => m.to_str().unwrap_or("").to_string(),
+        None => "not an error".to_string(),
+    };
+    let u = str_to_utf16_nul(&msg);
+    let p = u.as_ptr() as *const c_void;
+    db.errmsg16 = Some(u);
+    p
 }
 
 // --- memory -------------------------------------------------------------------

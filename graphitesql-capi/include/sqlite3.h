@@ -135,6 +135,15 @@ void sqlite3_result_text(sqlite3_context *ctx, const char *text, int nByte, void
 void sqlite3_result_blob(sqlite3_context *ctx, const void *data, int nByte, void(*d)(void*));
 void sqlite3_result_error(sqlite3_context *ctx, const char *msg, int nByte);
 
+/* UTF-16 entry points (native byte order; nByte args are in bytes) */
+int sqlite3_open16(const void *zFilename, sqlite3 **ppDb);
+int sqlite3_prepare16_v2(sqlite3 *db, const void *zSql, int nByte,
+                         sqlite3_stmt **ppStmt, const void **pzTail);
+int sqlite3_bind_text16(sqlite3_stmt *stmt, int idx, const void *text, int nByte, void(*d)(void*));
+const void *sqlite3_column_text16(sqlite3_stmt *stmt, int col);
+int sqlite3_column_bytes16(sqlite3_stmt *stmt, int col);
+const void *sqlite3_errmsg16(sqlite3 *db);
+
 void sqlite3_free(void *p);
 
 #ifdef __cplusplus
