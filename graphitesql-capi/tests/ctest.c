@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 static int failures = 0;
 #define CHECK(name, cond) do { \
@@ -55,6 +56,27 @@ static void sumsq_final(sqlite3_context *ctx) {
 
 /* A no-op step with a mismatched final signature is an invalid combination. */
 static void lone_step(sqlite3_context *c, int n, sqlite3_value **v) { (void)c; (void)n; (void)v; }
+
+/* Custom collation: reverse of BINARY (memcmp negated). */
+static int rev_collation(void *arg, int nx, const void *x, int ny, const void *y) {
+  (void)arg;
+  int n = nx < ny ? nx : ny;
+  int c = memcmp(x, y, (size_t)n);
+  if (c == 0) c = nx - ny;
+  return -c; /* reverse */
+}
+
+/* Custom collation equal to NOCASE (ASCII case-insensitive). */
+static int nocase_collation(void *arg, int nx, const void *x, int ny, const void *y) {
+  (void)arg;
+  const unsigned char *a = x, *b = y;
+  int n = nx < ny ? nx : ny;
+  for (int i = 0; i < n; i++) {
+    int ca = toupper(a[i]), cb = toupper(b[i]);
+    if (ca != cb) return ca - cb;
+  }
+  return nx - ny;
+}
 
 int main(void) {
   sqlite3 *db = NULL;
@@ -250,6 +272,55 @@ int main(void) {
   CHECK("db_handle round-trips", sqlite3_db_handle(v3) == db);
   CHECK("v3 step", sqlite3_step(v3) == SQLITE_ROW && sqlite3_column_int64(v3, 0) == 42);
   sqlite3_finalize(v3);
+
+  /* Custom collating sequences via sqlite3_create_collation. */
+  rc = sqlite3_create_collation(db, "REV", SQLITE_UTF8, NULL, rev_collation);
+  CHECK("create_collation REV", rc == SQLITE_OK);
+  rc = sqlite3_create_collation(db, "MYNOCASE", SQLITE_UTF8, NULL, nocase_collation);
+  CHECK("create_collation MYNOCASE", rc == SQLITE_OK);
+
+  sqlite3_exec(db, "CREATE TABLE c(s TEXT)", NULL, NULL, NULL);
+  sqlite3_exec(db, "INSERT INTO c VALUES('apple'),('Cherry'),('banana')", NULL, NULL, NULL);
+
+  /* ORDER BY ... COLLATE REV: reverse-binary order -> banana, apple, Cherry
+     (lowercase 'a'/'b' > uppercase 'C' in BINARY, reversed). */
+  sqlite3_stmt *cr = NULL;
+  sqlite3_prepare_v2(db, "SELECT s FROM c ORDER BY s COLLATE REV", -1, &cr, NULL);
+  sqlite3_step(cr);
+  CHECK("REV row0 banana", strcmp((const char *)sqlite3_column_text(cr, 0), "banana") == 0);
+  sqlite3_step(cr);
+  CHECK("REV row1 apple", strcmp((const char *)sqlite3_column_text(cr, 0), "apple") == 0);
+  sqlite3_step(cr);
+  CHECK("REV row2 Cherry", strcmp((const char *)sqlite3_column_text(cr, 0), "Cherry") == 0);
+  sqlite3_finalize(cr);
+
+  /* A custom collation defined to equal NOCASE must order like built-in NOCASE:
+     apple, banana, Cherry. */
+  const char *want[] = {"apple", "banana", "Cherry"};
+  sqlite3_stmt *cn = NULL, *bn = NULL;
+  sqlite3_prepare_v2(db, "SELECT s FROM c ORDER BY s COLLATE MYNOCASE", -1, &cn, NULL);
+  sqlite3_prepare_v2(db, "SELECT s FROM c ORDER BY s COLLATE NOCASE", -1, &bn, NULL);
+  int match = 1;
+  for (int i = 0; i < 3; i++) {
+    sqlite3_step(cn); sqlite3_step(bn);
+    const char *a = (const char *)sqlite3_column_text(cn, 0);
+    const char *b = (const char *)sqlite3_column_text(bn, 0);
+    if (strcmp(a, want[i]) != 0 || strcmp(a, b) != 0) match = 0;
+  }
+  CHECK("MYNOCASE matches built-in NOCASE ordering", match);
+  sqlite3_finalize(cn); sqlite3_finalize(bn);
+
+  /* A custom collation works in a UNIQUE index (case-insensitive dedup). */
+  rc = sqlite3_exec(db, "CREATE TABLE ci(k TEXT COLLATE MYNOCASE)", NULL, NULL, NULL);
+  CHECK("create table with custom collation column", rc == SQLITE_OK);
+  sqlite3_exec(db, "CREATE UNIQUE INDEX ci_k ON ci(k)", NULL, NULL, NULL);
+  sqlite3_exec(db, "INSERT INTO ci VALUES('Hello')", NULL, NULL, NULL);
+  rc = sqlite3_exec(db, "INSERT INTO ci VALUES('HELLO')", NULL, NULL, NULL);
+  CHECK("custom-collation UNIQUE rejects case-variant dup", rc != SQLITE_OK);
+
+  /* An unknown collation name still errors. */
+  rc = sqlite3_exec(db, "SELECT 1 FROM c ORDER BY s COLLATE nope", NULL, NULL, NULL);
+  CHECK("unknown collation still errors", rc == SQLITE_ERROR);
 
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 

@@ -1434,6 +1434,67 @@ pub unsafe extern "C" fn sqlite3_result_error(
     }
 }
 
+// --- custom collating sequences -----------------------------------------------
+
+type XCompare = Option<
+    unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int,
+>;
+
+/// Register a custom collating sequence callable as `COLLATE zName` in SQL. The
+/// comparison receives the two operands as byte buffers and returns
+/// negative/zero/positive like `memcmp`. Only UTF-8 (`eTextRep == SQLITE_UTF8`)
+/// is meaningful here. A NULL `xCompare` (deregistration) yields `SQLITE_ERROR`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_create_collation(
+    db: *mut sqlite3,
+    z_name: *const c_char,
+    _e_text_rep: c_int,
+    p_arg: *mut c_void,
+    x_compare: XCompare,
+) -> c_int {
+    if db.is_null() {
+        return SQLITE_ERROR;
+    }
+    let db = unsafe { &mut *db };
+    let name = unsafe { cstr(z_name) }.to_string();
+    match x_compare {
+        Some(cmp) => {
+            // Capture the app pointer as an integer so the closure stays `Send`.
+            let arg = p_arg as usize;
+            db.conn.register_collation(&name, move |x: &str, y: &str| {
+                let xb = x.as_bytes();
+                let yb = y.as_bytes();
+                let r = unsafe {
+                    cmp(
+                        arg as *mut c_void,
+                        xb.len() as c_int,
+                        xb.as_ptr() as *const c_void,
+                        yb.len() as c_int,
+                        yb.as_ptr() as *const c_void,
+                    )
+                };
+                r.cmp(&0)
+            });
+            SQLITE_OK
+        }
+        None => SQLITE_ERROR,
+    }
+}
+
+/// Like `sqlite3_create_collation` with a destructor for the app pointer (which
+/// this shim never invokes, since collations live for the process); delegates.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_create_collation_v2(
+    db: *mut sqlite3,
+    z_name: *const c_char,
+    e_text_rep: c_int,
+    p_arg: *mut c_void,
+    x_compare: XCompare,
+    _x_destroy: Option<unsafe extern "C" fn(*mut c_void)>,
+) -> c_int {
+    unsafe { sqlite3_create_collation(db, z_name, e_text_rep, p_arg, x_compare) }
+}
+
 // --- memory -------------------------------------------------------------------
 
 /// Free memory handed to the caller by this library (`errmsg` from `exec`).

@@ -21,6 +21,7 @@ shape as the `graphitesql-wasm` sibling.
 | Columns | `sqlite3_column_count`/`data_count`/`name`/`type`/`int`/`int64`/`double`/`text`/`blob`/`bytes` |
 | Status | `sqlite3_errmsg`, `sqlite3_errcode`/`extended_errcode`, `sqlite3_errstr`, `sqlite3_changes`/`total_changes`, `sqlite3_last_insert_rowid`, `sqlite3_get_autocommit`, `sqlite3_busy_timeout`, `sqlite3_interrupt` |
 | UDFs | `sqlite3_create_function` (scalar + aggregate), `sqlite3_user_data`, `sqlite3_aggregate_context`, `sqlite3_value_*`, `sqlite3_result_*` |
+| Collations | `sqlite3_create_collation`/`_v2` (custom `COLLATE` sequences) |
 | Version | `sqlite3_libversion`, `sqlite3_libversion_number` (reports `3.50.4`) |
 | Memory | `sqlite3_free` |
 
