@@ -27170,14 +27170,21 @@ impl Connection {
                         if !in_range {
                             break;
                         }
-                        rows.push(alloc::vec![Value::Integer(v)]);
+                        // SQLite's generate_series rowid is the value itself.
+                        rows.push(alloc::vec![Value::Integer(v), Value::Integer(v)]);
                         match v.checked_add(step) {
                             Some(n) => v = n,
                             None => break, // i64 overflow ends the series
                         }
                     }
                 }
-                Ok((alloc::vec![col("value", eval::Affinity::Integer)], rows))
+                Ok((
+                    alloc::vec![
+                        col("value", eval::Affinity::Integer),
+                        hcol("rowid", eval::Affinity::Integer),
+                    ],
+                    rows,
+                ))
             }
             "json_each" | "json_tree" => {
                 let columns = alloc::vec![
@@ -27194,6 +27201,9 @@ impl Connection {
                     // (default `$`). Both are excluded from `*` expansion.
                     hcol("json", eval::Affinity::Blob),
                     hcol("root", eval::Affinity::Text),
+                    // The implicit table-valued-function rowid: a 0-based counter
+                    // over the emitted rows, matching SQLite's json_each/json_tree.
+                    hcol("rowid", eval::Affinity::Integer),
                 ];
                 // SQLite caps these table-valued functions at two arguments —
                 // the JSON document and an optional path — and rejects more as a
@@ -27267,9 +27277,10 @@ impl Connection {
                 // document argument as-is (a JSONB blob stays a blob); `root`
                 // is the path argument text (default `$`).
                 let root_val = Value::Text(root_path);
-                for row in &mut rows {
+                for (i, row) in rows.iter_mut().enumerate() {
                     row.push(doc.clone());
                     row.push(root_val.clone());
+                    row.push(Value::Integer(i as i64)); // rowid: 0-based row counter
                 }
                 Ok((columns, rows))
             }
@@ -27309,6 +27320,9 @@ impl Connection {
                     .collect();
                 columns.push(hcol("schema", eval::Affinity::Text));
                 columns.push(hcol("arg", eval::Affinity::Text));
+                // The implicit rowid of a pragma table-valued function is the
+                // 1-based row number, matching SQLite.
+                columns.push(hcol("rowid", eval::Affinity::Integer));
                 let arg_val = match args.first() {
                     Some(a) => eval::eval(a, &ctx)?,
                     None => Value::Null,
@@ -27320,9 +27334,11 @@ impl Connection {
                 let rows = result
                     .rows
                     .into_iter()
-                    .map(|mut r| {
+                    .enumerate()
+                    .map(|(i, mut r)| {
                         r.push(schema_val.clone());
                         r.push(arg_val.clone());
+                        r.push(Value::Integer(i as i64 + 1));
                         r
                     })
                     .collect();
