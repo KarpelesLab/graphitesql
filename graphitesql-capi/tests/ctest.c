@@ -322,6 +322,23 @@ int main(void) {
   rc = sqlite3_exec(db, "SELECT 1 FROM c ORDER BY s COLLATE nope", NULL, NULL, NULL);
   CHECK("unknown collation still errors", rc == SQLITE_ERROR);
 
+  /* A user-defined aggregate registered as a window function: running sum of
+     squares over an ORDER BY frame. Reuses sumsq_step/sumsq_final. */
+  rc = sqlite3_create_window_function(db, "wsumsq", 1, SQLITE_UTF8, NULL,
+                                      sumsq_step, sumsq_final, NULL, NULL, NULL);
+  CHECK("create_window_function wsumsq", rc == SQLITE_OK);
+  sqlite3_exec(db, "CREATE TABLE w(i INTEGER)", NULL, NULL, NULL);
+  sqlite3_exec(db, "INSERT INTO w VALUES(1),(2),(3)", NULL, NULL, NULL);
+  sqlite3_stmt *ws = NULL;
+  sqlite3_prepare_v2(db, "SELECT wsumsq(i) OVER (ORDER BY i) FROM w ORDER BY i", -1, &ws, NULL);
+  long long wexp[] = {1, 5, 14}; /* 1, 1+4, 1+4+9 */
+  int wok = 1;
+  for (int i = 0; i < 3; i++) {
+    if (sqlite3_step(ws) != SQLITE_ROW || sqlite3_column_int64(ws, 0) != wexp[i]) wok = 0;
+  }
+  CHECK("window UDF running sum-of-squares 1,5,14", wok);
+  sqlite3_finalize(ws);
+
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 
   sqlite3_close(db);

@@ -104,6 +104,14 @@ int sqlite3_create_function(sqlite3 *db, const char *zName, int nArg, int eTextR
 void *sqlite3_user_data(sqlite3_context *ctx);
 void *sqlite3_aggregate_context(sqlite3_context *ctx, int nBytes);
 
+int sqlite3_create_window_function(sqlite3 *db, const char *zName, int nArg, int eTextRep,
+    void *pApp,
+    void (*xStep)(sqlite3_context *, int, sqlite3_value **),
+    void (*xFinal)(sqlite3_context *),
+    void (*xValue)(sqlite3_context *),
+    void (*xInverse)(sqlite3_context *, int, sqlite3_value **),
+    void (*xDestroy)(void *));
+
 /* Custom collating sequences */
 int sqlite3_create_collation(sqlite3 *db, const char *zName, int eTextRep, void *pArg,
     int (*xCompare)(void *, int, const void *, int, const void *));

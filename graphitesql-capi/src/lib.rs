@@ -1201,6 +1201,48 @@ pub unsafe extern "C" fn sqlite3_create_function(
     }
 }
 
+/// Register an aggregate usable as a **window function**. graphitesql drives
+/// window aggregates by recomputing over each frame (`xStep`/`xFinal` with a
+/// fresh accumulator per frame), so the sliding-frame optimization callbacks
+/// `xValue`/`xInverse` are accepted for API compatibility but not required; the
+/// same registration also serves plain `GROUP BY` aggregation. Requires
+/// `xStep`+`xFinal`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn sqlite3_create_window_function(
+    db: *mut sqlite3,
+    name: *const c_char,
+    _n_arg: c_int,
+    _e_text_rep: c_int,
+    p_app: *mut c_void,
+    x_step: XStep,
+    x_final: XFinal,
+    _x_value: XFinal,
+    _x_inverse: XStep,
+    _x_destroy: Option<unsafe extern "C" fn(*mut c_void)>,
+) -> c_int {
+    if db.is_null() {
+        return SQLITE_ERROR;
+    }
+    let db = unsafe { &mut *db };
+    let name = unsafe { cstr(name) }.to_string();
+    match (x_step, x_final) {
+        (Some(step), Some(final_)) => {
+            let app = p_app as usize;
+            db.conn.register_aggregate_function(&name, move || {
+                Box::new(CAggregate {
+                    step,
+                    final_,
+                    user_data: app,
+                    agg_buf: Vec::new(),
+                })
+            });
+            SQLITE_OK
+        }
+        _ => SQLITE_ERROR,
+    }
+}
+
 /// A C aggregate accumulator: one per group. Holds the C `xStep`/`xFinal`
 /// callbacks and the persistent per-group buffer handed out by
 /// `sqlite3_aggregate_context`.
