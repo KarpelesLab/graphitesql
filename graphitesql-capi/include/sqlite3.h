@@ -28,6 +28,9 @@ typedef long long int sqlite3_int64;
 #define SQLITE_BLOB    4
 #define SQLITE_NULL    5
 
+/* Text encodings */
+#define SQLITE_UTF8 1
+
 /* bind_text/blob destructor sentinels */
 #define SQLITE_STATIC      ((void(*)(void*))0)
 #define SQLITE_TRANSIENT   ((void(*)(void*))-1)
@@ -77,6 +80,34 @@ double sqlite3_column_double(sqlite3_stmt *stmt, int col);
 const unsigned char *sqlite3_column_text(sqlite3_stmt *stmt, int col);
 const void *sqlite3_column_blob(sqlite3_stmt *stmt, int col);
 int sqlite3_column_bytes(sqlite3_stmt *stmt, int col);
+
+/* User-defined scalar functions */
+typedef struct sqlite3_context sqlite3_context;
+typedef struct sqlite3_value sqlite3_value;
+
+int sqlite3_create_function(sqlite3 *db, const char *zName, int nArg, int eTextRep,
+    void *pApp,
+    void (*xFunc)(sqlite3_context *, int, sqlite3_value **),
+    void (*xStep)(sqlite3_context *, int, sqlite3_value **),
+    void (*xFinal)(sqlite3_context *));
+
+void *sqlite3_user_data(sqlite3_context *ctx);
+
+int sqlite3_value_type(sqlite3_value *v);
+int sqlite3_value_int(sqlite3_value *v);
+sqlite3_int64 sqlite3_value_int64(sqlite3_value *v);
+double sqlite3_value_double(sqlite3_value *v);
+int sqlite3_value_bytes(sqlite3_value *v);
+const unsigned char *sqlite3_value_text(sqlite3_value *v);
+const void *sqlite3_value_blob(sqlite3_value *v);
+
+void sqlite3_result_null(sqlite3_context *ctx);
+void sqlite3_result_int(sqlite3_context *ctx, int v);
+void sqlite3_result_int64(sqlite3_context *ctx, sqlite3_int64 v);
+void sqlite3_result_double(sqlite3_context *ctx, double v);
+void sqlite3_result_text(sqlite3_context *ctx, const char *text, int nByte, void(*d)(void*));
+void sqlite3_result_blob(sqlite3_context *ctx, const void *data, int nByte, void(*d)(void*));
+void sqlite3_result_error(sqlite3_context *ctx, const char *msg, int nByte);
 
 void sqlite3_free(void *p);
 

@@ -22,6 +22,27 @@ static int count_cb(void *arg, int ncol, char **vals, char **names) {
   return 0;
 }
 
+/* A user-defined scalar: times_k(x) = x * k, where k is the app pointer. */
+static void times_k(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc;
+  long long k = *(long long *)sqlite3_user_data(ctx);
+  sqlite3_result_int64(ctx, sqlite3_value_int64(argv[0]) * k);
+}
+
+/* A UDF that concatenates its two text args. */
+static void concat2(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc;
+  char buf[128];
+  snprintf(buf, sizeof buf, "%s%s",
+           (const char *)sqlite3_value_text(argv[0]),
+           (const char *)sqlite3_value_text(argv[1]));
+  sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+}
+
+/* Correctly-typed no-op aggregate callbacks (registration is unsupported). */
+static void dummy_step(sqlite3_context *c, int n, sqlite3_value **v) { (void)c; (void)n; (void)v; }
+static void dummy_final(sqlite3_context *c) { (void)c; }
+
 int main(void) {
   sqlite3 *db = NULL;
   int rc = sqlite3_open(":memory:", &db);
@@ -150,6 +171,32 @@ int main(void) {
   CHECK("named @n=88", sqlite3_column_int64(np, 2) == 88);
   CHECK("out-of-range bind -> RANGE", sqlite3_bind_int64(np, 4, 0) == SQLITE_RANGE);
   sqlite3_finalize(np);
+
+  /* User-defined scalar functions callable from SQL. */
+  static long long k = 10;
+  rc = sqlite3_create_function(db, "times_k", 1, SQLITE_UTF8, &k, times_k, NULL, NULL);
+  CHECK("create_function times_k", rc == SQLITE_OK);
+  rc = sqlite3_create_function(db, "concat2", 2, SQLITE_UTF8, NULL, concat2, NULL, NULL);
+  CHECK("create_function concat2", rc == SQLITE_OK);
+
+  sqlite3_stmt *ufn = NULL;
+  sqlite3_prepare_v2(db, "SELECT times_k(5), concat2('foo','bar')", -1, &ufn, NULL);
+  CHECK("udf step -> ROW", sqlite3_step(ufn) == SQLITE_ROW);
+  CHECK("times_k(5) == 50", sqlite3_column_int64(ufn, 0) == 50);
+  CHECK("concat2 == foobar", strcmp((const char *)sqlite3_column_text(ufn, 1), "foobar") == 0);
+  sqlite3_finalize(ufn);
+
+  /* A UDF used inside a WHERE clause over table rows. */
+  sqlite3_stmt *ufw = NULL;
+  sqlite3_prepare_v2(db, "SELECT count(*) FROM t WHERE times_k(id) <= 20", -1, &ufw, NULL);
+  CHECK("udf-in-where step", sqlite3_step(ufw) == SQLITE_ROW);
+  CHECK("times_k(id)<=20 matches id 1,2", sqlite3_column_int64(ufw, 0) == 2);
+  sqlite3_finalize(ufw);
+
+  /* Aggregate registration is not supported yet -> SQLITE_ERROR. */
+  CHECK("aggregate create -> ERROR",
+        sqlite3_create_function(db, "agg", 1, SQLITE_UTF8, NULL, NULL,
+                                dummy_step, dummy_final) == SQLITE_ERROR);
 
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 

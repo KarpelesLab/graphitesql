@@ -443,10 +443,15 @@ history / `CHANGELOG.md`. Remaining:
   statements are emulated over graphite's materialized query model (a `step` walks
   the computed rows; column metadata is available right after `prepare` for a
   row-producer, as in SQLite). `INSERT/UPDATE/DELETE … RETURNING` drives the row
-  path (classified structurally via the engine's parser). Verified end-to-end by a
-  C program (`tests/ctest.c`, run in CI's `capi` job) that links the cdylib and
-  drives the full lifecycle. Residuals: `_v3` prepare flags, incremental BLOB I/O,
-  backup, hooks/authorizer, UTF-16 entry points.
+  path (classified structurally via the engine's parser). Named/numbered bind
+  parameters (`sqlite3_bind_parameter_count`/`_name`/`_index`) and **scalar
+  user-defined functions** (`sqlite3_create_function` + the `sqlite3_value_*` /
+  `sqlite3_result_*` families, bridged onto the engine's `register_function`) are
+  supported — 52 exported `sqlite3_*` symbols. Verified end-to-end by a C program
+  (`tests/ctest.c`, run in CI's `capi` job) that links the cdylib and drives the
+  full lifecycle including a UDF used in a `WHERE`. Residuals: aggregate/window
+  UDFs, `_v3` prepare flags, incremental BLOB I/O, backup, hooks/authorizer,
+  UTF-16 entry points.
 
 ### Track E — Cross-database write resolution  *(essentially complete)*
 

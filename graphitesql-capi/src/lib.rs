@@ -1014,6 +1014,233 @@ pub unsafe extern "C" fn sqlite3_column_bytes(stmt: *mut sqlite3_stmt, col: c_in
     }
 }
 
+// --- user-defined scalar functions -------------------------------------------
+
+/// A protected value passed to a UDF (`sqlite3_value*`). Owns its `Value` so
+/// `sqlite3_value_text`/`_blob` can hand back a stable pointer for the call.
+pub struct sqlite3_value {
+    v: Value,
+    scratch: Option<CString>,
+}
+
+/// The call context of a UDF (`sqlite3_context*`): the pending result / error and
+/// the application pointer registered with the function.
+pub struct sqlite3_context {
+    result: Value,
+    error: Option<String>,
+    user_data: *mut c_void,
+}
+
+type XFunc = Option<unsafe extern "C" fn(*mut sqlite3_context, c_int, *mut *mut sqlite3_value)>;
+type XStep = Option<unsafe extern "C" fn(*mut sqlite3_context, c_int, *mut *mut sqlite3_value)>;
+type XFinal = Option<unsafe extern "C" fn(*mut sqlite3_context)>;
+
+/// Register a **scalar** user-defined function callable from SQL. Aggregates
+/// (`xStep`/`xFinal`) are not yet supported and yield `SQLITE_ERROR`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_create_function(
+    db: *mut sqlite3,
+    name: *const c_char,
+    _n_arg: c_int,
+    _e_text_rep: c_int,
+    p_app: *mut c_void,
+    x_func: XFunc,
+    x_step: XStep,
+    x_final: XFinal,
+) -> c_int {
+    if db.is_null() {
+        return SQLITE_ERROR;
+    }
+    let db = unsafe { &mut *db };
+    let name = unsafe { cstr(name) }.to_string();
+    match (x_func, x_step, x_final) {
+        (Some(func), None, None) => {
+            // The closure must be 'static; capture the C fn pointer (Copy) and the
+            // app pointer as an integer so the closure body reconstitutes it.
+            let app = p_app as usize;
+            db.conn.register_function(&name, move |args: &[Value]| {
+                let mut vals: Vec<sqlite3_value> = args
+                    .iter()
+                    .map(|v| sqlite3_value {
+                        v: v.clone(),
+                        scratch: None,
+                    })
+                    .collect();
+                let mut ptrs: Vec<*mut sqlite3_value> =
+                    vals.iter_mut().map(|p| p as *mut sqlite3_value).collect();
+                let mut ctx = sqlite3_context {
+                    result: Value::Null,
+                    error: None,
+                    user_data: app as *mut c_void,
+                };
+                unsafe {
+                    func(
+                        &mut ctx as *mut sqlite3_context,
+                        args.len() as c_int,
+                        ptrs.as_mut_ptr(),
+                    );
+                }
+                match ctx.error {
+                    Some(e) => Err(graphitesql::Error::Error(e)),
+                    None => Ok(ctx.result),
+                }
+            });
+            SQLITE_OK
+        }
+        // Aggregate registration (or a no-op) is unsupported.
+        _ => SQLITE_ERROR,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_user_data(ctx: *mut sqlite3_context) -> *mut c_void {
+    if ctx.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { &*ctx }.user_data
+}
+
+// sqlite3_value_* accessors (argument readout inside a UDF).
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_value_type(v: *mut sqlite3_value) -> c_int {
+    if v.is_null() {
+        return SQLITE_NULL;
+    }
+    value_type(&unsafe { &*v }.v)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_value_int(v: *mut sqlite3_value) -> c_int {
+    unsafe { sqlite3_value_int64(v) as c_int }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_value_int64(v: *mut sqlite3_value) -> c_longlong {
+    if v.is_null() {
+        return 0;
+    }
+    value_to_i64(&unsafe { &*v }.v)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_value_double(v: *mut sqlite3_value) -> c_double {
+    if v.is_null() {
+        return 0.0;
+    }
+    value_to_f64(&unsafe { &*v }.v)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_value_bytes(v: *mut sqlite3_value) -> c_int {
+    if v.is_null() {
+        return 0;
+    }
+    value_to_text(&unsafe { &*v }.v)
+        .map(|b| b.len() as c_int)
+        .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_value_text(v: *mut sqlite3_value) -> *const c_uchar {
+    if v.is_null() {
+        return core::ptr::null();
+    }
+    let v = unsafe { &mut *v };
+    match value_to_text(&v.v) {
+        Some(bytes) => {
+            let c = CString::new(bytes).unwrap_or_default();
+            let p = c.as_ptr() as *const c_uchar;
+            v.scratch = Some(c);
+            p
+        }
+        None => core::ptr::null(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_value_blob(v: *mut sqlite3_value) -> *const c_void {
+    unsafe { sqlite3_value_text(v) as *const c_void }
+}
+
+// sqlite3_result_* setters (a UDF's return value).
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_null(ctx: *mut sqlite3_context) {
+    if let Some(c) = unsafe { ctx.as_mut() } {
+        c.result = Value::Null;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_int(ctx: *mut sqlite3_context, v: c_int) {
+    unsafe { sqlite3_result_int64(ctx, v as c_longlong) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_int64(ctx: *mut sqlite3_context, v: c_longlong) {
+    if let Some(c) = unsafe { ctx.as_mut() } {
+        c.result = Value::Integer(v);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_double(ctx: *mut sqlite3_context, v: c_double) {
+    if let Some(c) = unsafe { ctx.as_mut() } {
+        c.result = Value::Real(v);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_text(
+    ctx: *mut sqlite3_context,
+    text: *const c_char,
+    n_byte: c_int,
+    _destructor: isize,
+) {
+    let Some(c) = (unsafe { ctx.as_mut() }) else {
+        return;
+    };
+    let s = if text.is_null() {
+        String::new()
+    } else if n_byte < 0 {
+        unsafe { cstr(text) }.to_string()
+    } else {
+        let bytes = unsafe { core::slice::from_raw_parts(text as *const u8, n_byte as usize) };
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    c.result = Value::Text(s);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_blob(
+    ctx: *mut sqlite3_context,
+    data: *const c_void,
+    n_byte: c_int,
+    _destructor: isize,
+) {
+    let Some(c) = (unsafe { ctx.as_mut() }) else {
+        return;
+    };
+    let bytes = if data.is_null() || n_byte <= 0 {
+        Vec::new()
+    } else {
+        unsafe { core::slice::from_raw_parts(data as *const u8, n_byte as usize) }.to_vec()
+    };
+    c.result = Value::Blob(bytes);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_error(
+    ctx: *mut sqlite3_context,
+    msg: *const c_char,
+    _n_byte: c_int,
+) {
+    if let Some(c) = unsafe { ctx.as_mut() } {
+        c.error = Some(unsafe { cstr(msg) }.to_string());
+    }
+}
+
 // --- memory -------------------------------------------------------------------
 
 /// Free memory handed to the caller by this library (`errmsg` from `exec`).
