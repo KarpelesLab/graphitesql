@@ -480,11 +480,20 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 1)?;
             match &v[0] {
                 Value::Null => Value::Null,
-                other => eval::to_text(other)
-                    .chars()
-                    .next()
-                    .map(|c| Value::Integer(c as i64))
-                    .unwrap_or(Value::Null),
+                other => {
+                    // SQLite reads the argument as a NUL-terminated C string
+                    // (`sqlite3_value_text`), so an embedded NUL truncates it —
+                    // `unicode(char(0))` / `unicode(char(0)||'A')` see an empty
+                    // string and return NULL, not codepoint 0.
+                    let text = eval::to_text(other);
+                    text.split('\0')
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .next()
+                        .map(|c| Value::Integer(c as i64))
+                        .unwrap_or(Value::Null)
+                }
             }
         }
         // `if` is SQLite's alias for `iif`. The parser desugars the scalar form

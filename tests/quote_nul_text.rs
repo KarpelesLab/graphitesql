@@ -41,3 +41,31 @@ fn quote_truncates_text_at_embedded_nul() {
         assert_eq!(hexout("sqlite3", sql), hexout(g, sql), "for `{sql}`");
     }
 }
+
+/// `unicode(X)` likewise reads its argument as a NUL-terminated C string, so a
+/// value whose first byte is NUL (`char(0)`, `char(0)||'A'`) yields an empty
+/// string and returns NULL — not codepoint 0. Ordinary text is unaffected.
+#[test]
+fn unicode_truncates_argument_at_embedded_nul() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let cases = [
+        // Leading NUL → empty C string → NULL.
+        "SELECT quote(unicode(char(0)));",
+        "SELECT quote(unicode(char(0)||'A'));",
+        "SELECT quote(unicode(CAST(x'00' AS TEXT)));",
+        // A NUL after the first character does not affect the first codepoint.
+        "SELECT unicode(char(97,0,98));",
+        "SELECT unicode('A'||char(0));",
+        // Ordinary and edge cases are unaffected.
+        "SELECT unicode('A'), unicode(''), quote(unicode(''));",
+        "SELECT quote(unicode(NULL));",
+        "SELECT unicode(123), unicode(1.5);",
+    ];
+    for sql in cases {
+        assert_eq!(hexout("sqlite3", sql), hexout(g, sql), "for `{sql}`");
+    }
+}
