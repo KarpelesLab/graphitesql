@@ -200,20 +200,22 @@ its (niche/cosmetic) value:
 - **A-alter-rollback — ALTER-time rejection of a RENAME that breaks a dependent.**
   `DROP COLUMN` already rejects pre-mutation. A `RENAME` whose propagation can't be
   *proven* can leave a dependent view/trigger unresolvable; SQLite rejects and
-  rolls back, graphite mutates first. Needs **statement-level DDL rollback** — a
-  writer savepoint around `exec_alter`, mirroring `run_dml_atomic`.
-  Concrete reproduction (2026-07-10): `CREATE TABLE t(a,b); CREATE TABLE u(a,c);
-  CREATE VIEW v AS SELECT b,c FROM t JOIN u USING(a); ALTER TABLE t RENAME COLUMN a
-  TO z;` — SQLite rejects with `error in view v after rename: cannot join using
-  column a - column not present in both tables` and leaves the schema unchanged;
-  graphite renames `t.a`→`z` and leaves `v` broken. The fix is tractable and
-  byte-matchable: graphite's resolver already produces the identical detail
-  (`cannot join using column a …`), so after applying the rename the fix is to
-  re-resolve each dependent view/trigger against the new schema and, on failure,
-  roll back and raise `error in <type> <name> after rename: <detail>`. It's
-  deferred only because it touches the central `exec_alter` + schema-vs-b-tree
-  rollback interaction and deserves careful work, not a rushed change that could
-  regress the (currently green) RENAME-propagation suite.
+  rolls back, graphite mutates first. **Blocked on A-rn3-edge, not just DDL
+  rollback (learned 2026-07-10).** A post-rename re-validation + writer-savepoint
+  rollback was implemented and reverted: the writer savepoint machinery works and
+  graphite's resolver already byte-matches SQLite's detail (e.g. `error in view v
+  after rename: cannot join using column a - column not present in both tables`),
+  but a simple "did any view break?" check is wrong. When graphite *declines* to
+  rewrite a view (the A-rn3-edge mixed-scope residual — e.g. `SELECT a FROM t WHERE
+  a IN (SELECT a FROM u)` on `ALTER TABLE u RENAME COLUMN a TO aa`), the view
+  breaks **but SQLite rewrites the inner ref and succeeds** — so re-validation
+  wrongly rejects a rename SQLite accepts (it regressed
+  `view_rename_column_subquery`). Correctly rejecting the genuine breakage (the
+  `USING(a)` case, where SQLite *also* fails) while allowing the decline cases
+  requires distinguishing "SQLite could rewrite this" from "SQLite can't" — i.e.
+  the **A-rn3-edge per-occurrence-span propagation must land first**. Once
+  graphite propagates as completely as SQLite, any residual breakage is a genuine
+  reject and the (working) savepoint-rollback + re-validation can be re-enabled.
 
 ### Track B — Query planner, statistics & the VDBE
 
