@@ -125,9 +125,18 @@ jobs:
       # The zero-dependency `no_std`+alloc core (with the always-available in-memory
       # VFS) compiles to WebAssembly, so graphite can run an in-memory database in a
       # browser/wasm host today (ROADMAP D6-1). This guards that capability against
-      # regressions; the persistent async VFS (D6-2) is a separate, opt-in step.
+      # regressions.
       - name: cargo build --no-default-features --target wasm32-unknown-unknown
         run: cargo build --no-default-features --target wasm32-unknown-unknown
+      # The `graphitesql-wasm` sibling crate (wasm-bindgen JS bindings + OPFS VFS,
+      # ROADMAP D6) is its own workspace, so build & clippy it explicitly. It opts
+      # out of the core's zero-dep / forbid-unsafe rules on purpose.
+      - name: graphitesql-wasm build + clippy
+        working-directory: graphitesql-wasm
+        run: |
+          rustup component add clippy
+          cargo build --target wasm32-unknown-unknown --release
+          cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
 
   msrv:
     name: MSRV (1.89)

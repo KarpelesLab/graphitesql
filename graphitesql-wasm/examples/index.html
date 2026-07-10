@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>graphitesql — OPFS persistence demo</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 44rem; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; height: 5rem; font-family: ui-monospace, monospace; }
+  button { padding: .4rem .8rem; }
+  pre { background: #f4f4f4; padding: .8rem; overflow: auto; border-radius: 6px; }
+  .muted { color: #666; }
+</style>
+</head>
+<body>
+<h1>graphitesql over OPFS</h1>
+<p class="muted">
+  A persistent SQLite-compatible database running entirely in your browser.
+  Insert a row, then <b>reload the page</b> — the data survives because it is stored
+  in the Origin-Private File System. Requires a browser with OPFS sync-access
+  handles (Chrome/Edge 108+, Safari 17+). Must be served over http(s), not file://.
+</p>
+
+<p>
+  <button id="add">Insert a row</button>
+  <button id="refresh">Show rows</button>
+  <button id="clear">Delete all</button>
+</p>
+
+<textarea id="sql">SELECT id, note, ts FROM notes ORDER BY id;</textarea>
+<p><button id="run">Run SQL</button></p>
+
+<pre id="out">starting…</pre>
+
+<script type="module">
+const out = document.getElementById("out");
+const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+
+let seq = 0;
+const pending = new Map();
+worker.onmessage = (ev) => {
+  const { id, ...rest } = ev.data;
+  const resolve = pending.get(id);
+  if (resolve) { pending.delete(id); resolve(rest); }
+};
+function call(msg) {
+  return new Promise((resolve) => { const id = ++seq; pending.set(id, resolve); worker.postMessage({ id, ...msg }); });
+}
+
+function show(x) { out.textContent = typeof x === "string" ? x : JSON.stringify(x, (k, v) => typeof v === "bigint" ? String(v) : v, 2); }
+
+async function main() {
+  const opened = await call({ type: "open", name: "demo.db" });
+  if (!opened.ok) return show("open failed: " + opened.error);
+  await call({ type: "exec", sql: "CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, note TEXT, ts TEXT DEFAULT (datetime('now')))" });
+  show((opened.created ? "created a fresh database\n\n" : "opened existing database\n\n") + "ready.");
+}
+
+document.getElementById("add").onclick = async () => {
+  const r = await call({ type: "exec", sql: `INSERT INTO notes(note) VALUES('hello #' || (SELECT count(*)+1 FROM notes))` });
+  show(r.ok ? `inserted (changes=${r.changes})` : "error: " + r.error);
+};
+document.getElementById("refresh").onclick = async () => {
+  const r = await call({ type: "query", sql: "SELECT id, note, ts FROM notes ORDER BY id" });
+  show(r.ok ? r.result : "error: " + r.error);
+};
+document.getElementById("clear").onclick = async () => {
+  const r = await call({ type: "exec", sql: "DELETE FROM notes" });
+  show(r.ok ? `deleted (changes=${r.changes})` : "error: " + r.error);
+};
+document.getElementById("run").onclick = async () => {
+  const sql = document.getElementById("sql").value;
+  const r = await call({ type: "query", sql });
+  show(r.ok ? r.result : "error: " + r.error);
+};
+
+main();
+</script>
+</body>
+</html>

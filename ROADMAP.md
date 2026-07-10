@@ -398,25 +398,30 @@ history / `CHANGELOG.md`. Remaining:
   the `SQLITE_ENABLE_SESSION` oracles (git history / `CHANGELOG.md`). Only
   **streaming** (`xInput`/`xOutput`) is unimplemented — an API-shape variant with
   no benefit over the `Vec` API in Rust; effectively won't-do.
-- **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O). *Needs a user
-  decision on target/architecture before implementation.* Chunks (pending that):
-  - **D6-0 — decide the async model.** Blocking sync-over-async (Atomics.wait in a
-    worker) vs a genuinely async `Connection` API; which backend (OPFS sync-access
-    handle — itself sync — vs async IndexedDB); wasm target (`wasm32-unknown-unknown`
-    + JS glue vs `wasm32-wasi`). This choice drives everything below.
-  - **D6-1 — wasm build (toolchain established, 2026-07-10).** The zero-dependency
-    `no_std`+alloc core — including the always-available in-memory `MemoryVfs` and
-    `Connection::open_memory()` — **compiles cleanly to `wasm32-unknown-unknown`**
-    (`cargo build --no-default-features --target wasm32-unknown-unknown`), so an
-    in-memory graphite database runs in a browser/wasm host today. A CI `wasm` job
-    now guards this against regressions. *Remaining for a full browser smoke test:*
-    a JS entry point — which needs either `wasm-bindgen` (a dependency) or raw wasm
-    exports (`#[unsafe(no_mangle)]`), both of which the default build's zero-dep +
-    `#![forbid(unsafe_code)]` constraints exclude. So the JS glue belongs in a
-    **sibling crate that opts out** of those constraints (the same shape as the D7
-    C-API shim) — part of the D6-0 decision.
-  - **D6-2 — the persistent async VFS** implementing the chosen backend behind the
-    existing `Vfs`/`File` traits.
+- **D6 — wasm / browser bindings — DONE 2026-07-11.** Shipped as the
+  **`graphitesql-wasm`** sibling crate (its own workspace, so the core stays
+  zero-dep + `#![forbid(unsafe_code)]`; the bindings opt out via `wasm-bindgen` /
+  `js-sys` / `web-sys`). Chosen model (per the user): **OPFS sync-access handles**
+  for persistence + **wasm-bindgen** for the JS surface — no async `Connection`
+  rework needed, because OPFS sync handles satisfy graphite's existing synchronous
+  `Vfs`/`File` traits directly.
+  - **D6-0 — model decided.** OPFS sync-access-handle backend (synchronous, so the
+    engine's sync VFS is reused as-is), wasm-bindgen glue in a sibling crate,
+    `wasm32-unknown-unknown` target. Persistence lives in a Web Worker (the only
+    place OPFS sync handles are available).
+  - **D6-1 — wasm build + in-memory bindings (DONE).** The core compiles to
+    `wasm32-unknown-unknown`; the sibling exposes `Database` (`new()` in-memory,
+    `exec`, `query` → `{columns, rows}`, `serialize`/`deserialize`). Value marshaling
+    covers NULL/int(→number or BigInt past 2^53)/real/text/blob(→Uint8Array).
+    Verified end-to-end under Node (`tests/node_smoke.mjs`), including a
+    serialize→deserialize round-trip and sqlite-exact error propagation.
+  - **D6-2 — persistent OPFS VFS (DONE).** An `OpfsVfs`/`OpfsFile` implementing the
+    existing `Vfs`/`File` traits over pre-acquired `FileSystemSyncAccessHandle`s
+    (`Database.openOpfs(files, path, create)`); the worker acquires a handle per
+    file (`name`, `-journal`, `-wal`) up front. Complete runnable browser demo in
+    `graphitesql-wasm/examples/` (persists across reloads). OPFS is browser-only,
+    so the persistent path is browser-tested rather than in CI; CI builds + clippies
+    the crate.
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**
   form is not: writing a page *beyond* EOF (`INSERT(count+1, …)`) grows the file
