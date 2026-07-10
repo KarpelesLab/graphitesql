@@ -433,10 +433,19 @@ history / `CHANGELOG.md`. Remaining:
   architectural boundary, not a blocker. (The read-side `WHERE schema='aux'`
   redirect is likewise still open.)
 
-**Blocked by design:**
-- **D7 — C-API shim** (`libsqlite3`-compatible surface). Needs `extern "C"` + raw
-  pointers, incompatible with `#![forbid(unsafe_code)]`; would live in a sibling
-  crate that opts out.
+- **D7 — C-API shim — DONE 2026-07-11.** Shipped as the **`graphitesql-capi`**
+  sibling crate (its own workspace; opts out of zero-dep + `#![forbid(unsafe_code)]`
+  for the `extern "C"` + raw-pointer surface, same shape as `graphitesql-wasm`). A
+  `libsqlite3`-compatible C ABI: `open`/`open_v2`/`close`, `exec` (row callback),
+  `prepare_v2`/`step`/`reset`/`clear_bindings`/`finalize`, `bind_*`, `column_*`,
+  `errmsg`/`errcode`/`changes`/`last_insert_rowid`, `libversion` (reports 3.50.4) —
+  32 exported `sqlite3_*` symbols, matching result/type constants. Prepared
+  statements are emulated over graphite's materialized query model (a `step` walks
+  the computed rows; column metadata is available right after `prepare` for a
+  row-producer, as in SQLite). Verified end-to-end by a C program
+  (`tests/ctest.c`, run in CI's `capi` job) that links the cdylib and drives the
+  full lifecycle. Residuals: `INSERT … RETURNING` via the row path, `_v3` prepare
+  flags, incremental BLOB I/O, backup, hooks/authorizer, UTF-16 entry points.
 
 ### Track E — Cross-database write resolution  *(essentially complete)*
 

@@ -1,0 +1,23 @@
+# A standalone workspace (empty `[workspace]`) so it is NOT pulled into the main
+# graphitesql crate's build/test/CI — the core stays zero-dependency and
+# `#![forbid(unsafe_code)]`. This C-ABI shim (ROADMAP D7) deliberately opts out of
+# both: an `extern "C"` `libsqlite3`-compatible surface needs raw pointers and
+# `unsafe`. Same shape as the graphitesql-wasm sibling.
+[workspace]
+
+[package]
+name = "graphitesql-capi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A libsqlite3-compatible C ABI (subset) over graphitesql"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/KarpelesLab/graphitesql"
+
+[lib]
+# `cdylib` for `libgraphitesql_capi.so` (link like libsqlite3); `staticlib` for `.a`.
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# Native shim → use the default (std) build of the core: file databases, OS VFS.
+graphitesql = { path = ".." }

@@ -1,0 +1,121 @@
+/*
+** End-to-end C test for graphitesql-capi: drives the library exactly as a real
+** libsqlite3 consumer would (open, exec, prepare/bind/step/column, finalize,
+** close) and checks results. Compiled and run by tests/run.sh against both this
+** shim and (when present) the real libsqlite3 to confirm behavioural parity.
+*/
+#include "sqlite3.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+static int failures = 0;
+#define CHECK(name, cond) do { \
+  if (cond) { printf("  ok   %s\n", name); } \
+  else { printf("  FAIL %s\n", name); failures++; } \
+} while (0)
+
+static int count_cb(void *arg, int ncol, char **vals, char **names) {
+  (void)ncol; (void)names;
+  int *sum = (int *)arg;
+  *sum += atoi(vals[0]);
+  return 0;
+}
+
+int main(void) {
+  sqlite3 *db = NULL;
+  int rc = sqlite3_open(":memory:", &db);
+  CHECK("open :memory:", rc == SQLITE_OK && db != NULL);
+
+  rc = sqlite3_exec(db,
+      "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, score REAL, data BLOB)",
+      NULL, NULL, NULL);
+  CHECK("create table", rc == SQLITE_OK);
+
+  /* Parameterized inserts via prepare/bind/step. */
+  sqlite3_stmt *ins = NULL;
+  rc = sqlite3_prepare_v2(db, "INSERT INTO t(name, score) VALUES(?1, ?2)", -1, &ins, NULL);
+  CHECK("prepare insert", rc == SQLITE_OK && ins != NULL);
+
+  const char *names[] = {"alice", "bob", "carol"};
+  double scores[]     = {1.5,     2.25,  3.0};
+  for (int i = 0; i < 3; i++) {
+    sqlite3_reset(ins);
+    sqlite3_clear_bindings(ins);
+    sqlite3_bind_text(ins, 1, names[i], -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(ins, 2, scores[i]);
+    rc = sqlite3_step(ins);
+    CHECK("insert step -> DONE", rc == SQLITE_DONE);
+  }
+  CHECK("last_insert_rowid == 3", sqlite3_last_insert_rowid(db) == 3);
+  sqlite3_finalize(ins);
+
+  /* Query back with a bound filter. */
+  sqlite3_stmt *sel = NULL;
+  rc = sqlite3_prepare_v2(db,
+      "SELECT id, name, score FROM t WHERE score >= ?1 ORDER BY id", -1, &sel, NULL);
+  CHECK("prepare select", rc == SQLITE_OK);
+  sqlite3_bind_double(sel, 1, 2.0);
+
+  CHECK("column_count == 3", sqlite3_column_count(sel) == 3);
+
+  int rows = 0;
+  long long ids = 0;
+  char last_name[64] = {0};
+  double last_score = 0;
+  while ((rc = sqlite3_step(sel)) == SQLITE_ROW) {
+    ids += sqlite3_column_int64(sel, 0);
+    strncpy(last_name, (const char *)sqlite3_column_text(sel, 1), sizeof last_name - 1);
+    last_score = sqlite3_column_double(sel, 2);
+    CHECK("col0 type INTEGER", sqlite3_column_type(sel, 0) == SQLITE_INTEGER);
+    CHECK("col1 type TEXT", sqlite3_column_type(sel, 1) == SQLITE_TEXT);
+    CHECK("col2 type FLOAT", sqlite3_column_type(sel, 2) == SQLITE_FLOAT);
+    rows++;
+  }
+  CHECK("select returned DONE", rc == SQLITE_DONE);
+  CHECK("two rows matched (bob, carol)", rows == 2);
+  CHECK("id sum 2+3", ids == 5);
+  CHECK("last row name carol", strcmp(last_name, "carol") == 0);
+  CHECK("last row score 3.0", last_score == 3.0);
+
+  /* Column name introspection. */
+  CHECK("column_name(1) == name", strcmp(sqlite3_column_name(sel, 1), "name") == 0);
+  sqlite3_finalize(sel);
+
+  /* UPDATE reports changes. */
+  rc = sqlite3_exec(db, "UPDATE t SET score = score + 1", NULL, NULL, NULL);
+  CHECK("update ok", rc == SQLITE_OK);
+  CHECK("changes == 3", sqlite3_changes(db) == 3);
+
+  /* exec + callback aggregation. */
+  int total = 0;
+  rc = sqlite3_exec(db, "SELECT count(*) FROM t", count_cb, &total, NULL);
+  CHECK("exec callback ok", rc == SQLITE_OK);
+  CHECK("callback saw count 3", total == 3);
+
+  /* Error reporting. */
+  char *emsg = NULL;
+  rc = sqlite3_exec(db, "SELECT * FROM nope", NULL, NULL, &emsg);
+  CHECK("bad query -> error", rc == SQLITE_ERROR);
+  CHECK("errmsg mentions table", emsg && strstr(emsg, "no such table: nope"));
+  sqlite3_free(emsg);
+
+  /* Blob round-trip. */
+  sqlite3_stmt *bstmt = NULL;
+  sqlite3_prepare_v2(db, "SELECT ?1", -1, &bstmt, NULL);
+  unsigned char raw[] = {0x00, 0x01, 0xff, 0x7f};
+  sqlite3_bind_blob(bstmt, 1, raw, sizeof raw, SQLITE_TRANSIENT);
+  CHECK("blob step -> ROW", sqlite3_step(bstmt) == SQLITE_ROW);
+  CHECK("blob type", sqlite3_column_type(bstmt, 0) == SQLITE_BLOB);
+  CHECK("blob length 4", sqlite3_column_bytes(bstmt, 0) == 4);
+  const unsigned char *got = (const unsigned char *)sqlite3_column_blob(bstmt, 0);
+  CHECK("blob bytes match", got && memcmp(got, raw, 4) == 0);
+  sqlite3_finalize(bstmt);
+
+  CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
+
+  sqlite3_close(db);
+
+  printf(failures ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", failures);
+  return failures ? 1 : 0;
+}

@@ -138,6 +138,29 @@ jobs:
           cargo build --target wasm32-unknown-unknown --release
           cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
 
+  capi:
+    name: C-API shim (D7)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: capi
+      # The `graphitesql-capi` sibling crate (a libsqlite3-compatible C ABI over the
+      # engine, ROADMAP D7) is its own workspace. Build + clippy it, then compile the
+      # C consumer test against the cdylib and run it (end-to-end C-ABI parity). It
+      # opts out of the core's zero-dep / forbid-unsafe rules on purpose.
+      - name: graphitesql-capi build + clippy + C test
+        working-directory: graphitesql-capi
+        run: |
+          cargo clippy --release --all-targets -- -D warnings
+          bash tests/run.sh
+
   msrv:
     name: MSRV (1.89)
     runs-on: ubuntu-latest
