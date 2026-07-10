@@ -590,10 +590,13 @@ impl Parser {
 
     fn pragma(&mut self) -> Result<Pragma> {
         // `PRAGMA [schema.]name` — a `schema.` qualifier selects the database the
-        // pragma applies to. Our pragmas are connection-scoped, so the qualifier
-        // is accepted and the bare name kept (as for ANALYZE/REINDEX).
+        // pragma applies to (the introspection pragmas honour it; the
+        // connection-scoped setting pragmas accept but ignore it, as for
+        // ANALYZE/REINDEX).
+        let mut schema = None;
         let mut name = self.ident()?;
         if self.eat(&Token::Dot) {
+            schema = Some(name);
             name = self.ident()?;
         }
         let value = if self.eat(&Token::Eq) {
@@ -605,7 +608,11 @@ impl Parser {
         } else {
             None
         };
-        Ok(Pragma { name, value })
+        Ok(Pragma {
+            schema,
+            name,
+            value,
+        })
     }
 
     /// A PRAGMA argument: a normal expression, but also a bare keyword like

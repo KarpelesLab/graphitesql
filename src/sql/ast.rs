@@ -825,6 +825,10 @@ pub enum AlterAction {
 /// A `PRAGMA` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pragma {
+    /// A `schema.` (database) qualifier — `PRAGMA aux.table_info(t)` — selecting
+    /// which attached database an introspection pragma targets. `None` for the
+    /// unqualified form (the `main`/active database).
+    pub schema: Option<String>,
     /// Pragma name.
     pub name: String,
     /// `PRAGMA name = value` or `PRAGMA name(value)`.

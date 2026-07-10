@@ -3684,9 +3684,32 @@ impl Connection {
         }
     }
 
+    /// The schema catalog an introspection `PRAGMA` targets: `p.schema` selects
+    /// `main` (the default), `temp`, or an attached database, matching SQLite's
+    /// `PRAGMA <db>.table_info(…)` form. An unknown database name errors
+    /// `unknown database <name>` (as SQLite does at prepare time).
+    fn pragma_db_schema(&self, p: &Pragma) -> Result<&Schema> {
+        match p.schema.as_deref() {
+            None => Ok(&self.schema),
+            Some(s) if s.eq_ignore_ascii_case("main") => Ok(&self.schema),
+            Some(s) if s.eq_ignore_ascii_case("temp") => self
+                .temp_db
+                .as_ref()
+                .map(|t| &t.schema)
+                .ok_or_else(|| Error::Error(alloc::format!("unknown database {s}"))),
+            Some(s) => self
+                .attached
+                .iter()
+                .find(|d| d.name.eq_ignore_ascii_case(s))
+                .map(|d| &d.schema)
+                .ok_or_else(|| Error::Error(alloc::format!("unknown database {s}"))),
+        }
+    }
+
     /// `PRAGMA table_info(name)` → one row per column
     /// `(cid, name, type, notnull, dflt_value, pk)`.
     fn pragma_table_info(&self, p: &Pragma, extended: bool) -> Result<QueryResult> {
+        let sch = self.pragma_db_schema(p)?;
         let table = match &p.value {
             Some(Expr::Column { column, .. }) => column.clone(),
             Some(Expr::Literal(Literal::Str(s))) => s.clone(),
@@ -3734,7 +3757,7 @@ impl Connection {
         // name shadows them. Each entry is `(name, type, pk, hidden)`:
         // `sqlite_dbpage.pgno` is PRIMARY KEY, and both carry trailing hidden
         // columns that only `table_xinfo` (the extended form) reports.
-        if self.schema.table(&table).is_none() {
+        if sch.table(&table).is_none() {
             let lower = table.to_ascii_lowercase();
             let fixed: &[(&str, &str, i64, bool)] = match lower.as_str() {
                 "sqlite_dbpage" => &[
@@ -3789,7 +3812,7 @@ impl Connection {
         }
         // A VIEW also answers table_info: its columns with their resolved types
         // (notnull/dflt/pk are always 0/empty for a view).
-        if let Some(vobj) = self.schema.objects().iter().find(|o| {
+        if let Some(vobj) = sch.objects().iter().find(|o| {
             o.obj_type == crate::schema::ObjectType::View && o.name.eq_ignore_ascii_case(&table)
         }) && let Some(sql) = &vobj.sql
             && let Statement::CreateView(cv) = sql::parse_one(sql)?
@@ -3829,7 +3852,7 @@ impl Connection {
         // `table_info` / `table_xinfo` of a non-existent table yields no rows (not
         // an error), matching sqlite — both the `PRAGMA` form and the
         // `pragma_table_info('x')` table-valued function.
-        let Some(obj) = self.schema.table(&table) else {
+        let Some(obj) = sch.table(&table) else {
             return Ok(QueryResult {
                 columns: table_info_columns(extended),
                 rows: Vec::new(),
@@ -4099,17 +4122,17 @@ impl Connection {
     /// `PRAGMA index_list(table)` → `(seq, name, unique, origin, partial)`, newest
     /// index first (as SQLite lists them).
     fn pragma_index_list(&self, p: &Pragma) -> Result<QueryResult> {
+        let sch = self.pragma_db_schema(p)?;
         // A bare / non-name argument names no table → empty result (SQLite parity).
         let table = Self::pragma_arg_name(p).unwrap_or_default();
-        let objs: Vec<_> = self.schema.indexes_on(&table).collect();
+        let objs: Vec<_> = sch.indexes_on(&table).collect();
 
         // To label an automatic index's origin `pk` vs `u`, find the PRIMARY KEY's
         // column set. An INTEGER PRIMARY KEY is the rowid (no auto-index), so only
         // a non-integer / composite PK yields a `pk`-origin auto-index. The set
         // matches one of `collect_unique_sets`, which mirrors SQLite's auto-index
         // numbering.
-        let pk_set: Vec<usize> = self
-            .schema
+        let pk_set: Vec<usize> = sch
             .table(&table)
             .and_then(|o| o.sql.as_deref())
             .and_then(|sql| sql::parse_one(sql).ok())
@@ -4128,7 +4151,7 @@ impl Connection {
                 _ => None,
             })
             .unwrap_or_default();
-        let tmeta = self.table_meta(&table, None).ok();
+        let tmeta = self.table_meta_in(sch, &table, None).ok();
 
         let mut rows = Vec::new();
         for obj in objs.iter().rev() {
@@ -4199,13 +4222,14 @@ impl Connection {
                 .map(|s| String::from(*s))
                 .collect()
         };
+        let sch = self.pragma_db_schema(p)?;
         // SQLite reports an unknown index name as an empty result, not an error.
-        let Some(obj) = self.schema.index(&index) else {
+        let Some(obj) = sch.index(&index) else {
             // A WITHOUT ROWID table's PRIMARY KEY is the table b-tree itself,
             // reported as `sqlite_autoindex_<t>_1` with no separate index object; its
             // columns are the PK (key) columns, plus — for xinfo — the remaining
             // table columns as trailing auxiliary (non-key) columns.
-            if let Some(result) = self.wr_pk_autoindex_info(&index, extended, &columns)? {
+            if let Some(result) = self.wr_pk_autoindex_info(sch, &index, extended, &columns)? {
                 return Ok(result);
             }
             return Ok(QueryResult {
@@ -4213,7 +4237,7 @@ impl Connection {
                 rows: Vec::new(),
             });
         };
-        let tmeta = self.table_meta(&obj.tbl_name, None)?;
+        let tmeta = self.table_meta_in(sch, &obj.tbl_name, None)?;
         // Per key column: (cid, name, descending, collation). A bare column takes
         // its position + name; an EXPRESSION column is `cid = -2` with a NULL name,
         // as SQLite reports (its collation defaults to BINARY unless COLLATE-d).
@@ -4344,17 +4368,18 @@ impl Connection {
     /// Returns `None` when `index` is not such an auto-index.
     fn wr_pk_autoindex_info(
         &self,
+        sch: &Schema,
         index: &str,
         extended: bool,
         columns: &[String],
     ) -> Result<Option<QueryResult>> {
-        let Some(obj) = self.schema.objects().iter().find(|o| {
+        let Some(obj) = sch.objects().iter().find(|o| {
             o.obj_type == crate::schema::ObjectType::Table
                 && index.eq_ignore_ascii_case(&alloc::format!("sqlite_autoindex_{}_1", o.name))
         }) else {
             return Ok(None);
         };
-        let m = self.table_meta(&obj.name, None)?;
+        let m = self.table_meta_in(sch, &obj.name, None)?;
         if !m.without_rowid || m.pk_len == 0 {
             return Ok(None);
         }
@@ -4405,6 +4430,7 @@ impl Connection {
     /// `PRAGMA foreign_key_list(table)` →
     /// `(id, seq, table, from, to, on_update, on_delete, match)`.
     fn pragma_foreign_key_list(&self, p: &Pragma) -> Result<QueryResult> {
+        let sch = self.pragma_db_schema(p)?;
         // A bare / non-name argument names no table → empty result (SQLite parity).
         let table = Self::pragma_arg_name(p).unwrap_or_default();
         let columns: Vec<String> = [
@@ -4422,7 +4448,7 @@ impl Connection {
         .collect();
         // An unknown table — like a virtual table — yields an empty list, not an
         // error, matching SQLite.
-        let Some(obj) = self.schema.table(&table) else {
+        let Some(obj) = sch.table(&table) else {
             return Ok(QueryResult {
                 columns,
                 rows: Vec::new(),
@@ -27258,7 +27284,14 @@ impl Connection {
                 if !pragma_has_tvf(bare) {
                     return Err(Error::Error(format!("no such table: {}", tref.name)));
                 }
+                // A pragma TVF's 2nd argument is the schema/database qualifier
+                // (`pragma_table_info(arg, schema)`), mirroring `PRAGMA <db>.name`.
+                let schema = match args.get(1) {
+                    Some(Expr::Literal(Literal::Str(s))) if !s.is_empty() => Some(s.clone()),
+                    _ => None,
+                };
                 let p = Pragma {
+                    schema,
                     name: String::from(bare),
                     value: args.first().cloned(),
                 };
