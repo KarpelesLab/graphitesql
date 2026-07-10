@@ -555,3 +555,31 @@ fn bail_on_stops_after_error() {
         "without .bail the batch continues past the error: {out2:?}"
     );
 }
+
+/// In non-interactive (piped) mode the shell exits non-zero if any statement
+/// errored, even without `.bail` — matching sqlite3, so scripts can detect a
+/// failure. A clean run exits zero.
+#[test]
+fn non_interactive_exits_nonzero_on_error() {
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let status = |input: &str| -> bool {
+        let mut child = Command::new(g)
+            .arg(":memory:")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap().status.success()
+    };
+    // An error mid-batch (with .bail off) still fails the process.
+    assert!(!status("SELECT 1;\nSELECT no_such_col;\nSELECT 2;\n"));
+    // A clean batch succeeds.
+    assert!(status("SELECT 1;\nSELECT 2;\n"));
+}

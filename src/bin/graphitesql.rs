@@ -157,6 +157,9 @@ struct Shell {
     /// Stop (exit non-zero) after the first error (`.bail on`). Off by default,
     /// matching SQLite: errors are reported and execution continues.
     bail: bool,
+    /// Whether any statement error has occurred. In non-interactive (piped) mode
+    /// SQLite exits non-zero if any error happened, even with `.bail off`.
+    had_error: bool,
     /// Running total of rows changed by DML, for `.changes` `total_changes`.
     total_changes: u64,
     /// Rows changed by the most recent DML statement, for `.changes` `changes`.
@@ -187,6 +190,7 @@ impl Shell {
             echo: false,
             count_changes: false,
             bail: false,
+            had_error: false,
             total_changes: 0,
             last_changes: 0,
             out: Sink::Stdout,
@@ -245,6 +249,12 @@ impl Shell {
                 self.run_group(conn, &sql);
             }
         }
+        // Non-interactive (piped) input: exit non-zero if any error occurred,
+        // matching SQLite — even with `.bail off`, a failed statement makes the
+        // shell exit with a failure code so scripts can detect it.
+        if !interactive && self.had_error {
+            std::process::exit(1);
+        }
     }
 
     /// Process lines from `reader` exactly as the interactive loop does (minus the
@@ -290,6 +300,7 @@ impl Shell {
         }
         if let Err(e) = self.run_sql_batch(conn, sql) {
             eprintln!("Error: {e}");
+            self.had_error = true;
             if self.bail {
                 std::process::exit(1);
             }
