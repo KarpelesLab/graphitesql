@@ -42428,19 +42428,33 @@ fn collect_select_base_sources(
     old: &str,
     srcs: &mut Vec<(String, Option<String>)>,
 ) -> bool {
+    collect_select_base_sources_ctx(sel, old, srcs, &[])
+}
+
+/// Inner form of [`collect_select_base_sources`] that also carries the CTE names
+/// visible from enclosing selects (`outer_ctes`), so a reference to an outer CTE
+/// in a nested compound arm or subquery `FROM` is recognised as a CTE (skipped)
+/// rather than mistaken for an unknown base table.
+fn collect_select_base_sources_ctx(
+    sel: &Select,
+    old: &str,
+    srcs: &mut Vec<(String, Option<String>)>,
+    outer_ctes: &[String],
+) -> bool {
     // CTEs: each `WITH` body is an independent source scope (recurse it); a
-    // reference to a CTE *name* in this select's `FROM` is not a base table, so it
-    // is skipped below. A CTE named exactly `old` would confuse the token rewrite,
-    // so bail. (A later fast-path gate forces scope-aware resolution whenever a CTE
-    // is present, so an outer reference to a CTE's renamed output column stays
+    // reference to a visible CTE *name* in a `FROM` is not a base table, so it is
+    // skipped below. A CTE named exactly `old` would confuse the token rewrite, so
+    // bail. (A later fast-path gate forces scope-aware resolution whenever a CTE is
+    // present, so an outer reference to a CTE's renamed output column stays
     // unresolvable and the whole object bails — matching SQLite's reject-and-leave-
     // unchanged rather than a stored-SQL divergence.)
-    let cte_names: Vec<String> = sel.ctes.iter().map(|c| c.name.clone()).collect();
+    let mut cte_names: Vec<String> = outer_ctes.to_vec();
+    cte_names.extend(sel.ctes.iter().map(|c| c.name.clone()));
     for cte in &sel.ctes {
         if cte.name.eq_ignore_ascii_case(old) {
             return false;
         }
-        if !collect_select_base_sources(&cte.select, old, srcs) {
+        if !collect_select_base_sources_ctx(&cte.select, old, srcs, &cte_names) {
             return false;
         }
     }
@@ -42457,7 +42471,7 @@ fn collect_select_base_sources(
         return false;
     }
     for (_, arm) in &sel.compound {
-        if !collect_select_base_sources(arm, old, srcs) {
+        if !collect_select_base_sources_ctx(arm, old, srcs, &cte_names) {
             return false;
         }
     }
@@ -42504,7 +42518,7 @@ fn collect_select_base_sources(
         collect_immediate_subselects(e, &mut subs);
     }
     subs.into_iter()
-        .all(|s| collect_select_base_sources(s, old, srcs))
+        .all(|s| collect_select_base_sources_ctx(s, old, srcs, &cte_names))
 }
 
 /// Build the column-rename plan from every base-table source `(name, alias)`
@@ -42602,7 +42616,7 @@ fn scope_bare_old_decision(
 ) -> Option<BareRewrite> {
     let mut owners: Vec<(String, Span)> = Vec::new();
     let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
-    if !collect_bare_old_owners(sel, old, table_cols, &mut scopes, &mut owners) {
+    if !collect_bare_old_owners(sel, old, table, table_cols, &mut scopes, &mut owners, &[]) {
         return None;
     }
     let renamed = owners.iter().any(|(o, _)| o.eq_ignore_ascii_case(table));
@@ -42718,16 +42732,114 @@ fn walk_own_scope_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, &str, Span)
     }
 }
 
+/// The single base source of a CTE body that owns a column named `old`, if
+/// exactly one does (used to resolve an unaliased `SELECT old FROM …` projection's
+/// provenance). Only plain base-table sources are considered.
+fn cte_body_single_owner(
+    body: &Select,
+    old: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<String> {
+    let from = body.from.as_ref()?;
+    let mut owner: Option<String> = None;
+    for tr in core::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.table)) {
+        if tr.subquery.is_some() || tr.tvf_args.is_some() {
+            continue;
+        }
+        let owns = table_cols
+            .iter()
+            .find(|(t, _)| t.eq_ignore_ascii_case(&tr.name))
+            .is_some_and(|(_, cols)| cols.iter().any(|c| c.eq_ignore_ascii_case(old)));
+        if owns {
+            if owner.is_some() {
+                return None;
+            }
+            owner = Some(tr.name.clone());
+        }
+    }
+    owner
+}
+
+/// How a bare column named `old` referencing a CTE `cte` should be treated when
+/// `renamed`'s `old` column is renamed:
+/// - `None` — the CTE does not expose an output column named `old` (not the owner);
+/// - `Some(true)` — it exposes `old` as an *unaliased* projection of the renamed
+///   table's `old` column (or a `*`/`tbl.*` that might), so the rename changes the
+///   CTE's exposed name and a consumer reference breaks → the object must bail
+///   (matching SQLite, which rejects such a rename);
+/// - `Some(false)` — it exposes `old` but from a different column/table or via a
+///   fixed name (explicit column list, alias), so the reference is unaffected and
+///   left as-is.
+fn cte_old_owner(
+    cte: &crate::sql::ast::Cte,
+    old: &str,
+    renamed: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<bool> {
+    if !cte.columns.is_empty() {
+        // An explicit column list fixes the exposed names, so a base rename never
+        // changes them.
+        return cte
+            .columns
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(old))
+            .then_some(false);
+    }
+    let body = &cte.select;
+    for rc in &body.columns {
+        match rc {
+            // `*` / `tbl.*` may expose the renamed column under its own name — be
+            // conservative and bail (safe: the object is left byte-unchanged).
+            ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => return Some(true),
+            ResultColumn::Expr { expr, alias, .. } => {
+                let out_name = match alias {
+                    Some(a) => Some(a.as_str()),
+                    None => match expr {
+                        Expr::Column { column, .. } => Some(column.as_str()),
+                        _ => None,
+                    },
+                };
+                if out_name.is_some_and(|n| n.eq_ignore_ascii_case(old)) {
+                    if alias.is_none()
+                        && let Expr::Column {
+                            table: ct, column, ..
+                        } = expr
+                        && column.eq_ignore_ascii_case(old)
+                    {
+                        let from_renamed = match ct {
+                            Some(t) => t.eq_ignore_ascii_case(renamed),
+                            None => cte_body_single_owner(body, old, table_cols)
+                                .is_some_and(|t| t.eq_ignore_ascii_case(renamed)),
+                        };
+                        return Some(from_renamed);
+                    }
+                    // Exposed under a fixed alias or via an expression → unaffected.
+                    return Some(false);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve a bare column named `old` against the scope stack (outermost first,
 /// innermost last), returning the base table that owns it. The innermost scope
 /// with a source owning a column `old` wins (SQLite's binding rule, including
-/// correlation into an outer query). Returns `None` if a single scope has two
-/// sources owning `old` (ambiguous — SQLite errors) or no scope owns it.
+/// correlation into an outer query). A scope source that is a visible CTE
+/// (`exposed_ctes`, name → "bails") is handled specially: if it exposes `old` from
+/// the renamed table unaliased the whole resolution bails (`None`); otherwise the
+/// reference is to an unaffected CTE column and resolves to a synthetic non-renamed
+/// owner (left as-is). Returns `None` if a single scope has two sources owning
+/// `old` (ambiguous — SQLite errors) or no scope owns it.
 fn resolve_bare_owner(
     old: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
     scopes: &[Vec<(String, Option<String>)>],
+    exposed_ctes: &[(String, bool)],
 ) -> Option<String> {
+    // A synthetic owner name that can never equal a real (renamed) table — marks a
+    // reference to an unaffected CTE output column, which must be left as-is.
+    const CTE_LEAVE: &str = "\u{1}cte-leave";
     let owns = |name: &str| -> bool {
         table_cols
             .iter()
@@ -42735,17 +42847,33 @@ fn resolve_bare_owner(
             .is_some_and(|(_, cols)| cols.iter().any(|c| c.eq_ignore_ascii_case(old)))
     };
     for scope in scopes.iter().rev() {
-        let mut owner: Option<&str> = None;
+        let mut owner: Option<String> = None;
         for (name, _alias) in scope {
-            if owns(name) {
+            // A visible CTE shadows a same-named base table (SQLite's rule). A CTE
+            // that exposes `old` from the renamed table unaliased bails; otherwise
+            // the reference is to an unaffected CTE column (left as-is).
+            let this: Option<String> = if let Some((_, bails)) = exposed_ctes
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            {
+                if *bails {
+                    return None;
+                }
+                Some(String::from(CTE_LEAVE))
+            } else if owns(name) {
+                Some(name.clone())
+            } else {
+                None
+            };
+            if let Some(o) = this {
                 if owner.is_some() {
                     return None; // two sources own `old` in one scope → ambiguous
                 }
-                owner = Some(name);
+                owner = Some(o);
             }
         }
         if let Some(o) = owner {
-            return Some(o.to_string());
+            return Some(o);
         }
     }
     None
@@ -42760,15 +42888,17 @@ fn resolve_bare_owner(
 fn resolve_exprs_bare_owners(
     exprs: &[&Expr],
     old: &str,
+    renamed: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
     scopes: &mut Vec<Vec<(String, Option<String>)>>,
     owners: &mut Vec<(String, Span)>,
+    exposed_ctes: &[(String, bool)],
 ) -> bool {
     let mut ok = true;
     for e in exprs {
         walk_own_scope_columns(e, &mut |tbl, col, span| {
             if ok && tbl.is_none() && col.eq_ignore_ascii_case(old) {
-                match resolve_bare_owner(old, table_cols, scopes) {
+                match resolve_bare_owner(old, table_cols, scopes, exposed_ctes) {
                     Some(owner) => owners.push((owner, span)),
                     None => ok = false,
                 }
@@ -42783,7 +42913,7 @@ fn resolve_exprs_bare_owners(
         collect_immediate_subselects(e, &mut subs);
     }
     for s in subs {
-        if !collect_bare_old_owners(s, old, table_cols, scopes, owners) {
+        if !collect_bare_old_owners(s, old, renamed, table_cols, scopes, owners, exposed_ctes) {
             return false;
         }
     }
@@ -42800,16 +42930,33 @@ fn resolve_exprs_bare_owners(
 fn collect_bare_old_owners(
     sel: &Select,
     old: &str,
+    renamed: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
     scopes: &mut Vec<Vec<(String, Option<String>)>>,
     owners: &mut Vec<(String, Span)>,
+    exposed_ctes: &[(String, bool)],
 ) -> bool {
-    // CTE bodies are independent scopes defined before this select's own `FROM`:
-    // resolve each against the enclosing `scopes` only. A reference in the outer
-    // query to a CTE's column is *not* to a base table, so it stays unresolved and
-    // bails the whole object (matching SQLite, which rejects such a rename).
+    // Make this select's CTEs visible (name → "exposes the renamed column's `old`
+    // unaliased", which must bail) for resolving its own FROM refs, body, compound
+    // arms, and nested subqueries — plus any enclosing CTEs already in scope.
+    let mut visible = exposed_ctes.to_vec();
     for cte in &sel.ctes {
-        if !collect_bare_old_owners(&cte.select, old, table_cols, scopes, owners) {
+        if let Some(bails) = cte_old_owner(cte, old, renamed, table_cols) {
+            visible.push((cte.name.clone(), bails));
+        }
+    }
+    // CTE bodies are independent scopes defined before this select's own `FROM`:
+    // resolve each against the enclosing `scopes` only.
+    for cte in &sel.ctes {
+        if !collect_bare_old_owners(
+            &cte.select,
+            old,
+            renamed,
+            table_cols,
+            scopes,
+            owners,
+            &visible,
+        ) {
             return false;
         }
     }
@@ -42821,7 +42968,15 @@ fn collect_bare_old_owners(
         }
     }
     scopes.push(scope);
-    let ok = resolve_exprs_bare_owners(&view_select_exprs(sel), old, table_cols, scopes, owners);
+    let ok = resolve_exprs_bare_owners(
+        &view_select_exprs(sel),
+        old,
+        renamed,
+        table_cols,
+        scopes,
+        owners,
+        &visible,
+    );
     scopes.pop();
     if !ok {
         return false;
@@ -42829,10 +42984,9 @@ fn collect_bare_old_owners(
     // Each compound arm is an independent scope: recurse it (its own `FROM` is
     // pushed for the duration, and any outer `scopes` stay available for a
     // correlated arm). The compound `ORDER BY` is handled in the main select's
-    // scope above; `collect_select_base_sources` has already bailed a compound that
-    // carries one.
+    // scope above.
     for (_, arm) in &sel.compound {
-        if !collect_bare_old_owners(arm, old, table_cols, scopes, owners) {
+        if !collect_bare_old_owners(arm, old, renamed, table_cols, scopes, owners, &visible) {
             return false;
         }
     }
@@ -42858,12 +43012,12 @@ fn scope_bare_old_decision_trigger(
     // in the guard has no table scope and would bail — conservative).
     if let Some(w) = &ct.when {
         let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
-        if !resolve_exprs_bare_owners(&[w], old, table_cols, &mut scopes, &mut owners) {
+        if !resolve_exprs_bare_owners(&[w], old, table, table_cols, &mut scopes, &mut owners, &[]) {
             return None;
         }
     }
     for stmt in &ct.body {
-        if !collect_trigger_stmt_bare_owners(stmt, old, table_cols, &mut owners) {
+        if !collect_trigger_stmt_bare_owners(stmt, old, table, table_cols, &mut owners) {
             return None;
         }
     }
@@ -42901,6 +43055,7 @@ fn scope_bare_old_decision_trigger(
 fn collect_trigger_stmt_bare_owners(
     stmt: &Statement,
     old: &str,
+    renamed: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
     owners: &mut Vec<(String, Span)>,
 ) -> bool {
@@ -42908,18 +43063,26 @@ fn collect_trigger_stmt_bare_owners(
     match stmt {
         Statement::Select(sel) => {
             let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
-            collect_bare_old_owners(sel, old, table_cols, &mut scopes, owners)
+            collect_bare_old_owners(sel, old, renamed, table_cols, &mut scopes, owners, &[])
         }
         Statement::Insert(i) => match &i.source {
             InsertSource::DefaultValues => true,
             InsertSource::Values(rows) => {
                 let exprs: Vec<&Expr> = rows.iter().flatten().collect();
                 let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
-                resolve_exprs_bare_owners(&exprs, old, table_cols, &mut scopes, owners)
+                resolve_exprs_bare_owners(
+                    &exprs,
+                    old,
+                    renamed,
+                    table_cols,
+                    &mut scopes,
+                    owners,
+                    &[],
+                )
             }
             InsertSource::Select(sel) => {
                 let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
-                collect_bare_old_owners(sel, old, table_cols, &mut scopes, owners)
+                collect_bare_old_owners(sel, old, renamed, table_cols, &mut scopes, owners, &[])
             }
         },
         Statement::Update(u) => {
@@ -42933,7 +43096,7 @@ fn collect_trigger_stmt_bare_owners(
             exprs.extend(u.order_by.iter().map(|t| &t.expr));
             exprs.extend(u.limit.as_ref());
             exprs.extend(u.offset.as_ref());
-            resolve_exprs_bare_owners(&exprs, old, table_cols, &mut scopes, owners)
+            resolve_exprs_bare_owners(&exprs, old, renamed, table_cols, &mut scopes, owners, &[])
         }
         Statement::Delete(d) => {
             let mut scopes: Vec<Vec<(String, Option<String>)>> =
@@ -42943,7 +43106,7 @@ fn collect_trigger_stmt_bare_owners(
             exprs.extend(d.order_by.iter().map(|t| &t.expr));
             exprs.extend(d.limit.as_ref());
             exprs.extend(d.offset.as_ref());
-            resolve_exprs_bare_owners(&exprs, old, table_cols, &mut scopes, owners)
+            resolve_exprs_bare_owners(&exprs, old, renamed, table_cols, &mut scopes, owners, &[])
         }
         _ => false,
     }

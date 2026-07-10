@@ -263,23 +263,32 @@ its (niche/cosmetic) value:
     (matching sqlite's reject-and-leave-unchanged) instead of being blindly
     rewritten. Byte-exact vs sqlite for `SELECT *`, explicit `WITH x(collist)`,
     join bodies, multi-CTE, nested-mixed, and recursive CTEs — for both views and
-    trigger bodies. The one CTE sub-case still declining is a CTE *consumed inside a
-    compound arm* (`… UNION SELECT a FROM x`), which needs CTE output-column
-    provenance; it bails untouched (safe, never wrong).
+    trigger bodies. **CTE output-column provenance now DONE too (2026-07-10):** a
+    reference to a CTE column resolves via `cte_old_owner` — it bails only if the
+    CTE exposes the renamed table's `old` column *unaliased* (sqlite rejects), and
+    otherwise resolves to a synthetic non-renamed owner (left as-is). This clears
+    the CTE-*consumed-in-a-compound-arm* case (`WITH x AS (SELECT a FROM u) SELECT a
+    FROM t UNION SELECT a FROM x` → only the base arm rewrites), byte-exact vs
+    sqlite. The scope resolution (`resolve_bare_owner`/`collect_bare_old_owners`)
+    and the flat collector (`collect_select_base_sources_ctx`) now thread the
+    renamed table and visible CTE names.
   - **sqlite REJECTS, graphite declines (broken):** derived-table views
     (`SELECT a FROM (SELECT a FROM t)`, `SELECT s.a FROM (SELECT a FROM t) s`) and
     the `USING(a)` join-column-vanishes shape. Here re-validation rejecting *matches*
     sqlite — these are the genuine A-alter-rollback targets. (A `NATURAL JOIN`
     rename is NOT a break — it degrades to a cross-join and both accept.)
-  **Net (updated 2026-07-10):** compound AND CTE propagation are now DONE, so the
-  common false-reject cases are gone. The remaining false-reject residuals are
-  narrow — a compound `ORDER BY` and a CTE consumed inside a compound arm (both
-  bail, both need output-column modeling). A-alter-rollback's re-validation can now
-  be re-approached: reject only when graphite *successfully propagated* the
-  dependent and it *still* fails to resolve (the genuine `USING(a)`/derived breaks
-  sqlite also rejects), and never on a decline (those narrow residuals stay
-  allowed-but-unchanged, matching graphite's prior conservative behavior). **The
-  original concrete sqlite rewrite rules (now implemented) for reference:**
+  **Net (updated 2026-07-10):** compound, compound-`ORDER BY`, AND CTE propagation
+  (incl. CTE output-column provenance) are now DONE. The remaining
+  graphite-declines-but-sqlite-rewrites residual is a *derived-table* (or TVF)
+  subquery consumed in a compound arm — rare, and it bails safely (never a wrong
+  rewrite). Everything else graphite declines (derived table in main position,
+  `USING(a)`) is a case sqlite *also* rejects, so a re-validation would match.
+  **A-alter-rollback** is now close to unblocked: implement the resolve-check +
+  savepoint rollback (the reverted machinery), rejecting a dependent that fails to
+  resolve after propagation; the only false-reject risk left is the rare
+  derived-in-compound-arm case, which would need derived-table output-column
+  provenance (the same pattern as the CTE fix, applied to `FROM (subquery)`).
+  **The original concrete sqlite rewrite rules (now implemented) for reference:**
   - *Compound* (`SELECT … UNION/INTERSECT/EXCEPT SELECT …`): each arm is an
     independent scope — rewrite only the arm(s) whose refs bind to the renamed
     table (reuses the existing `BareRewrite::At`/span machinery per arm), e.g.
