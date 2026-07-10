@@ -15,7 +15,7 @@
 
 use crate::error::{Error, Result};
 use crate::exec::eval::Affinity;
-use crate::sql::ast::{BinaryOp, Expr, JoinKind, Literal, OrderTerm, ResultColumn, Select};
+use crate::sql::ast::{BinaryOp, Expr, JoinKind, Literal, OrderTerm, ResultColumn, Select, Span};
 use crate::value::{Collation, Value};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -1618,6 +1618,7 @@ fn compile_group_select(
                 table: None,
                 column: columns[ci].clone(),
                 quoted: false,
+                span: Span::none(),
             },
             gkey_start + k,
         ));
@@ -1628,6 +1629,7 @@ fn compile_group_select(
                     table: Some(t.clone()),
                     column: columns[ci].clone(),
                     quoted: false,
+                    span: Span::none(),
                 },
                 gkey_start + k,
             ));
@@ -1652,6 +1654,7 @@ fn compile_group_select(
                 table: None,
                 column: columns[ci].clone(),
                 quoted: false,
+                span: Span::none(),
             },
             grepr_start + r,
         ));
@@ -1662,6 +1665,7 @@ fn compile_group_select(
                     table: Some(t.clone()),
                     column: columns[ci].clone(),
                     quoted: false,
+                    span: Span::none(),
                 },
                 grepr_start + r,
             ));
@@ -1803,6 +1807,7 @@ fn compile_group_select(
                     table: None,
                     column: label.clone(),
                     quoted: false,
+                    span: Span::none(),
                 },
                 out_start + i,
             ));
@@ -2385,6 +2390,7 @@ fn expand_projections(
                             table,
                             column: name.clone(),
                             quoted: false,
+                            span: Span::none(),
                         },
                         name.clone(),
                     ));
@@ -2408,6 +2414,7 @@ fn expand_projections(
                                 table: Some(q.clone()),
                                 column: name.clone(),
                                 quoted: false,
+                                span: Span::none(),
                             },
                             name.clone(),
                         ));

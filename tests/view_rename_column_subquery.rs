@@ -7,11 +7,14 @@
 //!
 //! graphite now rewrites a single-source view whose subqueries reference only
 //! the renamed table — at every nesting level, bare and `<alias>.`-qualified
-//! references alike. It still conservatively leaves the view untouched (a known
-//! gap, not a regression) when a token rewrite can't be proven safe: a subquery
-//! touching another table, a derived table in a `FROM`, or a result-column alias
-//! that collides with the renamed column name. Those bail cases are asserted to
-//! leave the stored view SQL byte-identical (no *wrong* rewrite).
+//! references alike — and, via per-occurrence source spans on `Expr::Column`,
+//! the genuinely *mixed* body where the same bare name binds to the renamed
+//! table in one scope and another table in a different scope (A-rn3-edge). It
+//! still conservatively leaves the view untouched (a known gap, not a
+//! regression) when a token rewrite can't be proven safe: a derived table in a
+//! `FROM`, or a result-column alias that collides with the renamed column name.
+//! Those bail cases are asserted to leave the stored view SQL byte-identical
+//! (no *wrong* rewrite).
 //!
 //! Verified against the sqlite3 3.50.4 CLI.
 
@@ -108,6 +111,14 @@ fn view_rename_column_subquery_matches_sqlite() {
         "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
          CREATE VIEW v AS SELECT a, (SELECT c FROM u WHERE u.a=t.a) FROM t; \
          ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Mixed scope (A-rn3-edge, now handled): the same bare `a` name binds to
+        // two different tables in one body — the outer `a` to `t`, the inner `a`
+        // to `u`. Per-occurrence source spans on `Expr::Column` let the rewrite
+        // rename only the occurrences that scope-resolve to the renamed table, so
+        // renaming `u.a` touches just the inner `a`, byte-matching SQLite.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT a FROM u); \
+         ALTER TABLE u RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
     ];
     for sql in matching {
         assert_eq!(run("sqlite3", sql), run(g, sql), "for {sql}");
@@ -130,16 +141,6 @@ fn view_rename_column_subquery_matches_sqlite() {
             "CREATE TABLE t(a,b); CREATE VIEW v AS SELECT a FROM (SELECT a FROM t); \
              ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
             "CREATE VIEW v AS SELECT a FROM (SELECT a FROM t)",
-        ),
-        // Mixed scope (A-rn3-edge residual): the same bare `a` name binds to two
-        // different tables in one body — the outer `a` to `t`, the inner `a` to
-        // `u` — so a whole-text rewrite can't disambiguate without per-occurrence
-        // spans. graphite declines; SQLite rewrites just the inner one.
-        (
-            "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
-             CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT a FROM u); \
-             ALTER TABLE u RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-            "CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT a FROM u)",
         ),
     ];
     for (sql, unchanged) in bail {

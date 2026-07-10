@@ -13416,7 +13416,7 @@ impl Connection {
                                 core::slice::from_ref(&table),
                                 &old,
                                 &new_text,
-                                true,
+                                BareRewrite::All,
                             ),
                             _ => reprint.clone(),
                         });
@@ -13431,7 +13431,7 @@ impl Connection {
                                 core::slice::from_ref(&table),
                                 &old,
                                 &new_text,
-                                true,
+                                BareRewrite::All,
                             );
                             if rewritten != isql {
                                 cols[4] = Value::Text(rewritten);
@@ -13463,17 +13463,35 @@ impl Connection {
                                 let rewritten = if let Some(quals) =
                                     view_single_source_column_quals(&vsql, &table, &old)
                                 {
-                                    rewrite_column_tokens(&vsql, &quals, &old, &new_text, true)
+                                    rewrite_column_tokens(
+                                        &vsql,
+                                        &quals,
+                                        &old,
+                                        &new_text,
+                                        BareRewrite::All,
+                                    )
                                 } else if let Some(quals) =
                                     view_only_table_quals(&vsql, &table, &old)
                                 {
                                     // Single-source view whose body nests expression
                                     // subqueries that reference only the renamed table.
-                                    rewrite_column_tokens(&vsql, &quals, &old, &new_text, true)
+                                    rewrite_column_tokens(
+                                        &vsql,
+                                        &quals,
+                                        &old,
+                                        &new_text,
+                                        BareRewrite::All,
+                                    )
                                 } else if let Some((quals, bare)) =
                                     view_multi_source_quals(&vsql, &table, &old, &table_cols)
                                 {
-                                    rewrite_column_tokens(&vsql, &quals, &old, &new_text, bare)
+                                    rewrite_column_tokens(
+                                        &vsql,
+                                        &quals,
+                                        &old,
+                                        &new_text,
+                                        BareRewrite::from_bool(bare),
+                                    )
                                 } else if let Some((quals, bare)) =
                                     view_global_unique_quals(&vsql, &table, &old, &table_cols)
                                 {
@@ -13507,7 +13525,13 @@ impl Connection {
                                 let rewritten = if let Some(quals) =
                                     trigger_single_source_quals(&tsql, &table, &old)
                                 {
-                                    rewrite_column_tokens(&tsql, &quals, &old, &new_text, true)
+                                    rewrite_column_tokens(
+                                        &tsql,
+                                        &quals,
+                                        &old,
+                                        &new_text,
+                                        BareRewrite::All,
+                                    )
                                 } else if let Some((quals, bare)) =
                                     trigger_global_unique_quals(&tsql, &table, &old, &table_cols)
                                 {
@@ -13519,14 +13543,20 @@ impl Connection {
                                     // `NEW`/`OLD`-only branch below, which would
                                     // otherwise short-circuit a trigger ON the
                                     // renamed table and miss the bare refs.
-                                    rewrite_column_tokens(&tsql, &quals, &old, &new_text, bare)
+                                    rewrite_column_tokens(
+                                        &tsql,
+                                        &quals,
+                                        &old,
+                                        &new_text,
+                                        BareRewrite::from_bool(bare),
+                                    )
                                 } else if trigger_on_renamed_table(&tsql, &table, &old) {
                                     rewrite_column_tokens(
                                         &tsql,
                                         &[String::from("NEW"), String::from("OLD")],
                                         &old,
                                         &new_text,
-                                        false,
+                                        BareRewrite::None,
                                     )
                                 } else if trigger_body_single_source_over(&tsql, &table, &old) {
                                     // A trigger on ANOTHER table whose body reads/
@@ -13539,7 +13569,7 @@ impl Connection {
                                         core::slice::from_ref(&table),
                                         &old,
                                         &new_text,
-                                        true,
+                                        BareRewrite::All,
                                     )
                                 } else {
                                     tsql.clone()
@@ -19883,6 +19913,7 @@ impl Connection {
                 table: None,
                 column: col_name,
                 quoted: false,
+                span: Span::none(),
             };
             window::replace_window_expr(&mut new_sel, wexpr, &repl);
         }
@@ -24943,6 +24974,7 @@ impl Connection {
                         table: None,
                         column: "rowid".into(),
                         quoted: false,
+                        span: Span::none(),
                     },
                     alias: Some("__winrowid__".into()),
                     source: None,
@@ -28353,6 +28385,7 @@ impl Connection {
                         table: table.map(|t| t.to_string()),
                         column: column.to_string(),
                         quoted,
+                        span: Span::none(),
                     };
                     match col_index(&cref, &declared_cols) {
                         Some(g) => {
@@ -33008,6 +33041,7 @@ impl Connection {
                 table: None,
                 column: alloc::format!("__agg{idx}"),
                 quoted: false,
+                span: Span::none(),
             };
         }
         match e {
@@ -34364,6 +34398,7 @@ fn expand_agg_wildcards(sel: &Select, columns: &[ColumnInfo]) -> Select {
             table: Some(c.table.clone()),
             column: c.name.clone(),
             quoted: false,
+            span: Span::none(),
         },
         alias: None,
         source: None,
@@ -34443,6 +34478,7 @@ fn alias_substituted(sel: &Select, columns: &[ColumnInfo]) -> Option<Select> {
                 table: None,
                 column: name.clone(),
                 quoted: false,
+                span: Span::none(),
             };
             window::replace_expr(e, &target, repl);
         }
@@ -35058,6 +35094,7 @@ fn walk_shallow_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, Option<&str>,
             table,
             column,
             quoted,
+            ..
         } => f(schema.as_deref(), table.as_deref(), column, *quoted),
         Expr::Unary { expr, .. } => walk_shallow_columns(expr, f),
         Expr::Binary { left, right, .. } => {
@@ -40528,6 +40565,7 @@ fn order_projection<'a>(
             table: None,
             column: c.name.clone(),
             quoted: false,
+            span: Span::none(),
         },
         alias: None,
         source: None,
@@ -41107,12 +41145,14 @@ fn rename_column_ref(e: &mut Expr, table: &str, old: &str, new: &str) {
             table: None,
             column: String::from(old),
             quoted: false,
+            span: Span::none(),
         },
         &Expr::Column {
             schema: None,
             table: None,
             column: String::from(new),
             quoted: false,
+            span: Span::none(),
         },
     );
     window::replace_expr(
@@ -41122,12 +41162,14 @@ fn rename_column_ref(e: &mut Expr, table: &str, old: &str, new: &str) {
             table: Some(String::from(table)),
             column: String::from(old),
             quoted: false,
+            span: Span::none(),
         },
         &Expr::Column {
             schema: None,
             table: Some(String::from(table)),
             column: String::from(new),
             quoted: false,
+            span: Span::none(),
         },
     );
 }
@@ -41347,6 +41389,7 @@ fn rewrite_target_alias_expr(
             table: Some(t),
             column,
             quoted,
+            ..
         } => {
             if t.eq_ignore_ascii_case(alias) {
                 if alias_col_resolvable(cols, column) {
@@ -42302,7 +42345,7 @@ fn view_global_unique_quals(
     table: &str,
     old: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
-) -> Option<(Vec<String>, bool)> {
+) -> Option<(Vec<String>, BareRewrite)> {
     let Ok(Statement::CreateView(cv)) = sql::parse_one(view_sql) else {
         return None;
     };
@@ -42326,7 +42369,7 @@ fn view_global_unique_quals(
     // genuinely *mixed* body (some bare `old` binding to the renamed table and
     // some to another) still needs per-ref spans, so that one bails. (A-rn3-edge.)
     match global_unique_plan(&srcs, table, old, table_cols) {
-        Some((quals, true)) => Some((quals, true)),
+        Some((quals, true)) => Some((quals, BareRewrite::All)),
         Some((quals, false)) => {
             scope_bare_old_decision(&cv.select, table, old, table_cols).map(|rb| (quals, rb))
         }
@@ -42450,23 +42493,67 @@ fn global_unique_plan(
 /// so the caller bails and leaves the object untouched. `None` is also returned
 /// for any reference that can't be resolved unambiguously (e.g. two sources in a
 /// single scope own `old`, which SQLite itself rejects as ambiguous).
+/// Which *bare* (unqualified) `old` occurrences a token rewrite should rename.
+/// Qualified `qual.old` refs are always handled separately via the `quals` list;
+/// this only governs the bare tokens.
+#[derive(Debug, Clone, PartialEq)]
+enum BareRewrite {
+    /// Rewrite no bare occurrence (they belong to another scope's table).
+    None,
+    /// Rewrite every bare occurrence (globally unambiguous, or the whole body's
+    /// bare `old` binds to the renamed table).
+    All,
+    /// Rewrite only the bare occurrences beginning at these source byte offsets —
+    /// the A-rn3-edge *mixed* case, where some bare `old` bind to the renamed
+    /// table and some to another, disambiguated per-occurrence by span.
+    At(Vec<u32>),
+}
+
+impl BareRewrite {
+    /// The whole-body decision the older provers express as a bool: `true` →
+    /// rewrite every bare `old`, `false` → rewrite none.
+    fn from_bool(b: bool) -> Self {
+        if b {
+            BareRewrite::All
+        } else {
+            BareRewrite::None
+        }
+    }
+}
+
 fn scope_bare_old_decision(
     sel: &Select,
     table: &str,
     old: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
-) -> Option<bool> {
-    let mut owners: Vec<String> = Vec::new();
+) -> Option<BareRewrite> {
+    let mut owners: Vec<(String, Span)> = Vec::new();
     let mut scopes: Vec<Vec<(String, Option<String>)>> = Vec::new();
     if !collect_bare_old_owners(sel, old, table_cols, &mut scopes, &mut owners) {
         return None;
     }
-    let renamed = owners.iter().any(|o| o.eq_ignore_ascii_case(table));
-    let other = owners.iter().any(|o| !o.eq_ignore_ascii_case(table));
+    let renamed = owners.iter().any(|(o, _)| o.eq_ignore_ascii_case(table));
+    let other = owners.iter().any(|(o, _)| !o.eq_ignore_ascii_case(table));
     if renamed && other {
-        None // mixed — needs per-ref spans
+        // Mixed body: rewrite exactly the bare occurrences that bind to the
+        // renamed table, located by their parsed source span. Every such
+        // occurrence must carry a real span (view bodies are always parsed from
+        // stored text, so they do); if any is synthetic we cannot target it
+        // precisely, so bail and leave the object untouched.
+        let mut spans: Vec<u32> = Vec::new();
+        for (owner, span) in &owners {
+            if owner.eq_ignore_ascii_case(table) {
+                match span.0 {
+                    Some((start, _)) => spans.push(start),
+                    None => return None,
+                }
+            }
+        }
+        Some(BareRewrite::At(spans))
+    } else if renamed {
+        Some(BareRewrite::All) // all bind to the renamed table
     } else {
-        Some(renamed) // true = all bind to renamed; false = none reference it
+        Some(BareRewrite::None) // none reference it — qualified refs only
     }
 }
 
@@ -42478,9 +42565,14 @@ fn scope_bare_old_decision(
 /// subquery's own scope and are resolved separately. The `match` is exhaustive on
 /// purpose (no `_` arm) so a newly added [`Expr`] variant that could hide a bare
 /// column forces this to be revisited rather than silently under-counted.
-fn walk_own_scope_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, &str)) {
+fn walk_own_scope_columns(e: &Expr, f: &mut impl FnMut(Option<&str>, &str, Span)) {
     match e {
-        Expr::Column { table, column, .. } => f(table.as_deref(), column),
+        Expr::Column {
+            table,
+            column,
+            span,
+            ..
+        } => f(table.as_deref(), column, *span),
         Expr::Unary { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
@@ -42597,14 +42689,14 @@ fn resolve_exprs_bare_owners(
     old: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
     scopes: &mut Vec<Vec<(String, Option<String>)>>,
-    owners: &mut Vec<String>,
+    owners: &mut Vec<(String, Span)>,
 ) -> bool {
     let mut ok = true;
     for e in exprs {
-        walk_own_scope_columns(e, &mut |tbl, col| {
+        walk_own_scope_columns(e, &mut |tbl, col, span| {
             if ok && tbl.is_none() && col.eq_ignore_ascii_case(old) {
                 match resolve_bare_owner(old, table_cols, scopes) {
-                    Some(owner) => owners.push(owner),
+                    Some(owner) => owners.push((owner, span)),
                     None => ok = false,
                 }
             }
@@ -42637,7 +42729,7 @@ fn collect_bare_old_owners(
     old: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
     scopes: &mut Vec<Vec<(String, Option<String>)>>,
-    owners: &mut Vec<String>,
+    owners: &mut Vec<(String, Span)>,
 ) -> bool {
     let mut scope: Vec<(String, Option<String>)> = Vec::new();
     if let Some(from) = &sel.from {
@@ -42664,7 +42756,7 @@ fn scope_bare_old_decision_trigger(
     old: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
 ) -> Option<bool> {
-    let mut owners: Vec<String> = Vec::new();
+    let mut owners: Vec<(String, Span)> = Vec::new();
     // WHEN guard: its subqueries have their own FROM scopes (a bare `old` directly
     // in the guard has no table scope and would bail — conservative).
     if let Some(w) = &ct.when {
@@ -42678,8 +42770,10 @@ fn scope_bare_old_decision_trigger(
             return None;
         }
     }
-    let renamed = owners.iter().any(|o| o.eq_ignore_ascii_case(table));
-    let other = owners.iter().any(|o| !o.eq_ignore_ascii_case(table));
+    // The trigger mixed-scope case still bails (per-occurrence span rewriting is
+    // wired for views only for now); a uniform body rewrites as before.
+    let renamed = owners.iter().any(|(o, _)| o.eq_ignore_ascii_case(table));
+    let other = owners.iter().any(|(o, _)| !o.eq_ignore_ascii_case(table));
     if renamed && other {
         None
     } else {
@@ -42697,7 +42791,7 @@ fn collect_trigger_stmt_bare_owners(
     stmt: &Statement,
     old: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
-    owners: &mut Vec<String>,
+    owners: &mut Vec<(String, Span)>,
 ) -> bool {
     use crate::sql::ast::InsertSource;
     match stmt {
@@ -43296,7 +43390,11 @@ fn view_drop_break_ref(
     } else if let Some(p) = view_multi_source_quals(vsql, table, col, table_cols) {
         p
     } else {
-        view_global_unique_quals(vsql, table, col, table_cols)?
+        // Any bare occurrence that would be rewritten (whole-body `All` or a
+        // per-occurrence `At`) means a bare ref binds to the dropped column, so
+        // the drop breaks the view.
+        let (q, br) = view_global_unique_quals(vsql, table, col, table_cols)?;
+        (q, !matches!(br, BareRewrite::None))
     };
     first_bound_column_ref(vsql, &quals, col, bare, false)
 }
@@ -43340,7 +43438,7 @@ fn rewrite_column_tokens(
     quals: &[String],
     old: &str,
     rendered: &str,
-    rewrite_bare: bool,
+    bare: BareRewrite,
 ) -> String {
     use sql::token::Token;
     let toks = match sql::token::tokenize(sql) {
@@ -43414,10 +43512,20 @@ fn rewrite_column_tokens(
             if !qual_ok {
                 continue;
             }
-        } else if !rewrite_bare {
-            // A bare reference is only provably the renamed column in a
-            // single-source context; skip it otherwise.
-            continue;
+        } else {
+            // A bare reference: rewrite per the caller's policy. `None` skips all
+            // (another scope owns them); `All` rewrites every one (single-source
+            // or globally unambiguous); `At` rewrites only the occurrences whose
+            // source offset was proven to bind to the renamed table (mixed scope).
+            match &bare {
+                BareRewrite::None => continue,
+                BareRewrite::All => {}
+                BareRewrite::At(offsets) => {
+                    if !offsets.contains(&(sp.start as u32)) {
+                        continue;
+                    }
+                }
+            }
         }
         out.push_str(&sql[cursor..sp.start]);
         // SQLite preserves each occurrence's own quoting: a token written

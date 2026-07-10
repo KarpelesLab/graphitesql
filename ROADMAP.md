@@ -190,41 +190,34 @@ its (niche/cosmetic) value:
   *materialises* every TVF source, so it can't represent the lazy unbounded stream
   without hanging. Belongs on the VDBE lazy-cursor track (Track B), not the
   materialise path.
-- **A-rn3-edge — RENAME COLUMN in a genuinely *mixed* view/trigger body.** The
-  scope-aware rewrite handles single-source, nested-subquery, and cross-object
-  bodies. The residual is the *same* bare column name binding to *different* tables
-  in one statement (`SELECT a FROM t WHERE a IN (SELECT a FROM u)` renaming `u.a`),
-  where only the inner `a` should change — needs per-occurrence source spans on
-  `Expr::Column`. The pass declines it, leaving the object byte-identical (never a
-  half-rename). **Scope (measured 2026-07-10):** `Expr::Column` (`src/sql/ast.rs`)
-  carries no byte span; adding one means threading a position through ~42 struct-
-  literal construction sites across 6 files (`sql/parser.rs`, `sql/print.rs`,
-  `exec/{mod,eval,func,vdbe}.rs`) — the parser sets a real span, synthetic
-  desugarings set `None` — then having the rename rewrite use the spans to edit
-  only the occurrence(s) that scope-resolve to the renamed table. A large,
-  pervasive AST/parser refactor (not a localized fix); it also **unblocks
-  A-alter-rollback**, whose savepoint-rollback + byte-exact re-validation machinery
-  is already proven (see that item). Deferred to a dedicated pass because the
-  regression surface is the entire query grammar. **Semver constraint (found
-  2026-07-10):** `Expr` is public (`graphitesql::sql::ast::Expr`), so adding a
-  field to the `Column` variant is a **breaking change** the pre-push
-  `cargo semver-checks` gate rejects at `0.1.0` (release-plz owns the version bump
-  post-merge, so the gate and the bump conflict). The clean fix needs a deliberate
-  public-API/version decision, or a span *side-channel* (the lexer already records
-  per-token `start`/`end` and the result-column path already slices verbatim spans,
-  so a rename-only parse mode could emit column spans in traversal order without
-  touching public `Expr` — at the cost of a fragile order-correlation for the very
-  same-name/two-scope case it must fix). Both are deliberate design choices, which
-  is why this is a dedicated-session item. **The side-channel is worse than
-  fragile — it is unreliable (found 2026-07-10):** the recursive-descent parser
-  *backtracks* (e.g. the `table.*` speculative lookahead at `parser.rs:921`/`928`,
-  and any speculative `expr()`), so a spans-in-construction-order list would
-  desync from the final AST whenever a speculatively-parsed `Expr::Column` is
-  discarded. Spans that travel *inside* the node survive backtracking, so the
-  robust fix is the span field on `Expr::Column` — i.e. the public-API/semver
-  break is effectively required, and with it the version-bump decision (currently
-  owned by release-plz). Net: A-rn3-edge is blocked on a deliberate API/version
-  decision, and it in turn gates A-alter-rollback.
+- **A-rn3-edge — RENAME COLUMN in a genuinely *mixed* view body. DONE for views
+  2026-07-10.** The same bare column name binding to *different* tables in one
+  statement (`SELECT a FROM t WHERE a IN (SELECT a FROM u)` renaming `u.a`, where
+  only the inner `a` should change) now rewrites per-occurrence and byte-matches
+  SQLite. **How it landed:** `Expr::Column` (`src/sql/ast.rs`) gained a `span:
+  Span` field — `Span` is an always-`PartialEq`-equal newtype over
+  `Option<(u32,u32)>`, so expression equality (the planner's `isDupColumn` dedup)
+  is unperturbed. The parser sets the real byte span (`prev_span()` off the
+  consumed name token, captured before any speculative `eat`); all synthetic
+  desugarings pass `Span::none()`. The rename decision (`scope_bare_old_decision`)
+  now returns a `BareRewrite` enum — `None`/`All`/`At(offsets)` — and for the mixed
+  case collects the source offsets of exactly the bare occurrences that
+  scope-resolve (innermost-first) to the renamed table; `rewrite_column_tokens`
+  renames a bare token only when its `start` offset is in that set. ~24 struct-
+  literal construction sites across `sql/parser.rs` + `exec/{mod,vdbe}.rs` were
+  updated (most `Expr::Column` uses are `..` patterns and needed no change).
+  Verified against sqlite3 3.50.4 over correlated / multi-occurrence /
+  qualified-plus-bare / double-nested mixed bodies (`tests/view_rename_column_subquery.rs`,
+  `tests/rename_column_view_subquery.rs`). **Semver:** adding the field to public
+  `Expr::Column` is a breaking change (`cargo semver-checks` flags it) — but
+  semver-checks is *not* in the pre-push gate (it runs only in the release-plz
+  workflow), and release-plz owns the version bump, so the breaking-change commit
+  (`feat!:`) drives the `0.1.0 → 0.2.0` bump automatically; there was no
+  gate/bump conflict after all. **Residual:** the *trigger* mixed-body case still
+  declines (its NEW/OLD + multi-statement rewrite is higher-risk; the span
+  infrastructure is already shared, so it is a localized follow-up), and non-base
+  sources (derived subquery/TVF, CTE, NATURAL/USING) still bail the whole object
+  untouched. This **unblocks A-alter-rollback** for the view path (see that item).
 - **A-alter-rollback — ALTER-time rejection of a RENAME that breaks a dependent.**
   `DROP COLUMN` already rejects pre-mutation. A `RENAME` whose propagation can't be
   *proven* can leave a dependent view/trigger unresolvable; SQLite rejects and
@@ -244,6 +237,14 @@ its (niche/cosmetic) value:
   the **A-rn3-edge per-occurrence-span propagation must land first**. Once
   graphite propagates as completely as SQLite, any residual breakage is a genuine
   reject and the (working) savepoint-rollback + re-validation can be re-enabled.
+  **Update 2026-07-10:** the A-rn3-edge mixed-scope *view* rewrite now lands
+  (above), so the specific decline that regressed `view_rename_column_subquery` is
+  gone — the view path is ready for re-validation to be re-enabled. The remaining
+  decline set is narrower (derived/TVF/CTE/NATURAL sources + the trigger mixed
+  body); re-validation must still treat those as "graphite can't prove" and not
+  reject, so the check needs to reject only when the resolver proves a genuine
+  break (the `USING(a)` shape) rather than on any decline. Reduced-risk follow-up,
+  no longer blocked.
 
 ### Track B — Query planner, statistics & the VDBE
 

@@ -187,6 +187,15 @@ impl Parser {
         t
     }
 
+    /// Byte span of the most recently consumed token (`pos-1`), for attaching a
+    /// source position to a parsed [`Expr::Column`] (used by `RENAME COLUMN`).
+    fn prev_span(&self) -> Span {
+        match self.pos.checked_sub(1).and_then(|i| self.tokens.get(i)) {
+            Some(s) => Span::new(s.start as u32, s.end as u32),
+            None => Span::none(),
+        }
+    }
+
     fn check(&self, t: &Token) -> bool {
         self.peek() == Some(t)
     }
@@ -544,6 +553,7 @@ impl Parser {
                     table: None,
                     column: w,
                     quoted: false,
+                    span: Span::none(),
                 });
             }
         }
@@ -2477,6 +2487,10 @@ impl Parser {
     /// *double-quote* form specifically, which is the only one SQLite flags as a
     /// possible string-literal typo when the bare name fails to resolve.
     fn after_name(&mut self, name: String, quoted: bool, dq: bool) -> Result<Expr> {
+        // Span of the bare name token (already consumed, at `pos-1`), captured
+        // before any further tokens are eaten so a bare column reference keeps
+        // its exact source position for `RENAME COLUMN`.
+        let name_span = self.prev_span();
         if !quoted && self.eat(&Token::LParen) {
             return self.function_call(name);
         }
@@ -2494,11 +2508,13 @@ impl Parser {
                 column = self.ident()?;
             }
             // A table-qualified reference never gets the string-literal hint.
+            // The column name was the last token consumed, so `pos-1` spans it.
             return Ok(Expr::Column {
                 schema,
                 table: Some(table),
                 column,
                 quoted: false,
+                span: self.prev_span(),
             });
         }
         Ok(Expr::Column {
@@ -2506,6 +2522,7 @@ impl Parser {
             table: None,
             column: name,
             quoted: dq,
+            span: name_span,
         })
     }
 

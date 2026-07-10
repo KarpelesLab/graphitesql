@@ -635,6 +635,7 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             table,
             column,
             quoted,
+            ..
         } => ctx.resolve_column(schema.as_deref(), table.as_deref(), column, *quoted),
         Expr::Paren(e) => eval(e, ctx),
         Expr::Unary { op, expr } => eval_unary(*op, eval(expr, ctx)?),

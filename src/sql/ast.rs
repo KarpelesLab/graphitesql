@@ -826,6 +826,40 @@ pub struct Pragma {
     pub value: Option<Expr>,
 }
 
+/// Source byte span `(start, end)` of a parsed node.
+///
+/// Carried on [`Expr::Column`] so `ALTER TABLE … RENAME COLUMN` can rewrite the
+/// *exact* occurrence of a bare column name when the same name binds to two
+/// different tables in one statement (the A-rn3-edge mixed-scope case) — a
+/// spans-in-construction-order side-channel is unreliable because the parser
+/// backtracks. Synthetic (desugared) columns have no source position and carry
+/// `Span(None)`.
+///
+/// Compares **always-equal** so it does not perturb [`Expr`] equality: the
+/// planner dedups column references by identity (SQLite's `isDupColumn`), which
+/// must stay position-insensitive.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Span(pub Option<(u32, u32)>);
+
+impl Span {
+    /// A synthetic node with no source position.
+    pub const fn none() -> Self {
+        Span(None)
+    }
+
+    /// A node spanning source bytes `[start, end)`.
+    pub const fn new(start: u32, end: u32) -> Self {
+        Span(Some((start, end)))
+    }
+}
+
+impl PartialEq for Span {
+    /// Spans never affect expression equality.
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 /// A scalar expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -852,6 +886,10 @@ pub enum Expr {
         /// single-quotes?`. Bare words, `[bracketed]`, `` `backtick` ``, and any
         /// table-qualified reference set this to `false`.
         quoted: bool,
+        /// Source byte span of this reference, when parsed from SQL text; used
+        /// to rewrite the exact occurrence during `RENAME COLUMN`. Synthetic
+        /// (desugared) references carry [`Span::none`]. Does not affect equality.
+        span: Span,
     },
     /// A unary operation.
     Unary {
