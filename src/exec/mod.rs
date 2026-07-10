@@ -4201,6 +4201,13 @@ impl Connection {
         };
         // SQLite reports an unknown index name as an empty result, not an error.
         let Some(obj) = self.schema.index(&index) else {
+            // A WITHOUT ROWID table's PRIMARY KEY is the table b-tree itself,
+            // reported as `sqlite_autoindex_<t>_1` with no separate index object; its
+            // columns are the PK (key) columns, plus — for xinfo — the remaining
+            // table columns as trailing auxiliary (non-key) columns.
+            if let Some(result) = self.wr_pk_autoindex_info(&index, extended, &columns)? {
+                return Ok(result);
+            }
             return Ok(QueryResult {
                 columns,
                 rows: Vec::new(),
@@ -4327,6 +4334,72 @@ impl Connection {
             }
         }
         Ok(QueryResult { columns, rows })
+    }
+
+    /// Synthesize `PRAGMA index_info` / `index_xinfo` for a `WITHOUT ROWID` table's
+    /// implicit PRIMARY KEY index (`sqlite_autoindex_<t>_1`), which has no separate
+    /// schema object because the table b-tree *is* that index. The key columns are
+    /// the PRIMARY KEY columns (in key order, honouring each `DESC`); for xinfo the
+    /// remaining table columns follow as trailing auxiliary (non-key) columns.
+    /// Returns `None` when `index` is not such an auto-index.
+    fn wr_pk_autoindex_info(
+        &self,
+        index: &str,
+        extended: bool,
+        columns: &[String],
+    ) -> Result<Option<QueryResult>> {
+        let Some(obj) = self.schema.objects().iter().find(|o| {
+            o.obj_type == crate::schema::ObjectType::Table
+                && index.eq_ignore_ascii_case(&alloc::format!("sqlite_autoindex_{}_1", o.name))
+        }) else {
+            return Ok(None);
+        };
+        let m = self.table_meta(&obj.name, None)?;
+        if !m.without_rowid || m.pk_len == 0 {
+            return Ok(None);
+        }
+        let coll_name = |c: crate::value::Collation| match c {
+            crate::value::Collation::NoCase => "NOCASE",
+            crate::value::Collation::RTrim => "RTRIM",
+            crate::value::Collation::Binary => "BINARY",
+        };
+        let mut rows = Vec::new();
+        for (seqno, &cid) in m.storage_order[..m.pk_len].iter().enumerate() {
+            let desc = m.pk_descending.get(seqno).copied().unwrap_or(false);
+            if extended {
+                rows.push(alloc::vec![
+                    Value::Integer(seqno as i64),
+                    Value::Integer(cid as i64),
+                    Value::Text(m.columns[cid].name.clone()),
+                    Value::Integer(desc as i64),
+                    Value::Text(coll_name(m.columns[cid].collation).into()),
+                    Value::Integer(1), // key column
+                ]);
+            } else {
+                rows.push(alloc::vec![
+                    Value::Integer(seqno as i64),
+                    Value::Integer(cid as i64),
+                    Value::Text(m.columns[cid].name.clone()),
+                ]);
+            }
+        }
+        // xinfo appends the non-PK columns as trailing auxiliary (non-key) columns.
+        if extended {
+            for (k, &cid) in m.storage_order[m.pk_len..].iter().enumerate() {
+                rows.push(alloc::vec![
+                    Value::Integer((m.pk_len + k) as i64),
+                    Value::Integer(cid as i64),
+                    Value::Text(m.columns[cid].name.clone()),
+                    Value::Integer(0),
+                    Value::Text(coll_name(m.columns[cid].collation).into()),
+                    Value::Integer(0), // auxiliary, non-key
+                ]);
+            }
+        }
+        Ok(Some(QueryResult {
+            columns: columns.to_vec(),
+            rows,
+        }))
     }
 
     /// `PRAGMA foreign_key_list(table)` →
