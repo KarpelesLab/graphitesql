@@ -26786,6 +26786,23 @@ impl Connection {
         with_rowid: bool,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         for join in &from.joins {
+            // A LATERAL / correlated table-valued function inner (`FROM t,
+            // json_each(t.data)`): the TVF's arguments reference an outer FROM
+            // column, so it must be re-materialized per outer row with that row
+            // bound. (A non-correlated TVF — constant arguments — is materialized
+            // once by the normal path below.) NATURAL/USING coalescing over a TVF is
+            // not handled here and falls through.
+            if !join.natural
+                && join.using.is_empty()
+                && self.is_correlated_tvf(&join.table, &columns)
+            {
+                let (new_columns, joined) =
+                    self.exec_lateral_tvf_join(join, &columns, &rows, params)?;
+                columns = new_columns;
+                rows = joined;
+                continue;
+            }
+
             // Roadmap B1a: when the inner table's join column is its rowid IPK,
             // seek the one inner row by rowid per outer row instead of
             // materializing and nested-looping it. Identical results to the
@@ -29313,6 +29330,119 @@ impl Connection {
                 joined.push(combined);
             }
         }
+        Ok((new_columns, joined))
+    }
+
+    /// Whether `tref` is a table-valued function whose argument list references a
+    /// column of the already-materialised outer sources (`columns`) — a LATERAL /
+    /// correlated TVF that must be re-evaluated per outer row.
+    fn is_correlated_tvf(&self, tref: &TableRef, columns: &[ColumnInfo]) -> bool {
+        let Some(args) = &tref.tvf_args else {
+            return false;
+        };
+        let mut correlated = false;
+        for a in args {
+            window::visit(a, &mut |e| {
+                if let Expr::Column { table, column, .. } = e
+                    && columns.iter().any(|c| {
+                        !c.hidden
+                            && c.name.eq_ignore_ascii_case(column)
+                            && table
+                                .as_deref()
+                                .is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+                    })
+                {
+                    correlated = true;
+                }
+            });
+        }
+        correlated
+    }
+
+    /// Fold a LATERAL / correlated table-valued function inner source onto the
+    /// materialised outer rows: for each outer row, evaluate the TVF's arguments
+    /// (which reference the outer columns) into constants and materialise the
+    /// function with them, cross-joining its rows onto that outer row. An `ON`
+    /// predicate gates each pair; a `LEFT JOIN` null-pads an outer row that
+    /// produced no inner rows (or none satisfying `ON`). The TVF's hidden columns
+    /// (`json`/`root`/`arg`/`schema`/`rowid`) are dropped from the join output, as
+    /// for a non-correlated TVF source. Returns the widened columns and joined rows.
+    fn exec_lateral_tvf_join(
+        &self,
+        join: &Join,
+        columns: &[ColumnInfo],
+        rows: &[Vec<Value>],
+        params: &Params,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        let on = join.on.as_ref();
+        let is_left = matches!(join.kind, JoinKind::Left);
+        let mut new_columns: Option<Vec<ColumnInfo>> = None;
+        let mut inner_width = 0usize;
+        let mut joined: Vec<Vec<Value>> = Vec::new();
+        for left in rows {
+            // Evaluate the correlated arguments against this outer row, then
+            // materialise the TVF with those now-constant arguments.
+            let sub = {
+                let ctx = row_ctx(left, columns, None, params).with_subqueries(self);
+                let mut t = join.table.clone();
+                if let Some(args) = &mut t.tvf_args {
+                    for a in args.iter_mut() {
+                        *a = value_to_literal_expr(eval::eval(a, &ctx)?);
+                    }
+                }
+                t
+            };
+            let (cinfos, tvf_out) = self.tvf_rows(&sub, params)?;
+            if new_columns.is_none() {
+                // Keep the TVF's hidden columns (`rowid`/`json`/`root`/…): they are
+                // resolvable by name (e.g. `j.rowid`) but excluded from `*`, exactly
+                // as a non-correlated TVF source contributes them.
+                inner_width = cinfos.len();
+                let mut nc = columns.to_vec();
+                nc.extend(cinfos.iter().cloned());
+                new_columns = Some(nc);
+            }
+            let nc = new_columns.as_ref().unwrap();
+            let mut matched = false;
+            for inner in &tvf_out {
+                let mut combined = left.clone();
+                combined.extend(inner.iter().cloned());
+                let keep = match on {
+                    Some(on) => {
+                        let ctx = row_ctx(&combined, nc, None, params).with_subqueries(self);
+                        eval::truth(&eval::eval(on, &ctx)?) == Some(true)
+                    }
+                    None => true,
+                };
+                if keep {
+                    joined.push(combined);
+                    matched = true;
+                }
+            }
+            if !matched && is_left {
+                let mut combined = left.clone();
+                combined.extend(core::iter::repeat_n(Value::Null, inner_width));
+                joined.push(combined);
+            }
+        }
+        // With no outer rows the loop never established the column layout; derive it
+        // from a NULL-substituted materialisation so the outer query still resolves
+        // the inner columns over zero rows.
+        let new_columns = match new_columns {
+            Some(nc) => nc,
+            None => {
+                let mut t = join.table.clone();
+                if let Some(args) = &mut t.tvf_args {
+                    for a in args.iter_mut() {
+                        *a = Expr::Literal(Literal::Null);
+                    }
+                }
+                let (cinfos, _) = self.tvf_rows(&t, params)?;
+                let mut nc = columns.to_vec();
+                nc.extend(cinfos);
+                nc
+            }
+        };
         Ok((new_columns, joined))
     }
 
