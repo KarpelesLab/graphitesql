@@ -468,10 +468,19 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   The related non-interactive exit-code part is also DONE: a piped batch now exits
   non-zero if any statement errored even under `.bail off`, matching sqlite
   (`tests/cli_dot_commands.rs::non_interactive_exits_nonzero_on_error`).
-- **CLI-2 — sqlite-style error *text*.** Render `Parse error near line N: … (code)`
-  with the `error here ---^` caret instead of graphite's bare `Error:`. Needs parser
-  token byte-offsets threaded into `Error` — a library-level change, not shell-only.
-  (The `Expr::Column` span work is a precedent for carrying offsets.)
+- **CLI-2 — sqlite-style error *text*. DONE 2026-07-10.** The one-shot (`-arg`)
+  path now renders `Error: in prepare, <msg>` with a `^--- error here` source-line
+  caret for compile-time errors and `Error: stepping, <msg> [(<code>)]` for run-time
+  errors, byte-exact with the sqlite3 shell across a 34-case corpus
+  (`tests/cli_error_format.rs`). Done CLI-only (no library offset threading) via
+  `render_cli_error` in `src/bin/graphitesql.rs`: the caret token is located by a
+  string/comment-skipping text search of the failed statement, and prepare-vs-step
+  is decided by an *inverted* classification (a small stable set of step errors;
+  everything else is prepare). Interactive/piped mode keeps the plain one-line form
+  (SQLite uses a different `Parse error near line N:` format there). *Residuals
+  (rare; the differential corpus strips carets):* a repeated-operator token (`===`)
+  whose exact offset only the parser knows, and the long-line source *windowing* the
+  sqlite shell applies past ~column 53.
 - **CLI-3 — `.echo` per-input-line. DONE 2026-07-10.** `.echo on` now echoes
   dot-command input lines too (the command turning echo on is not itself echoed),
   byte-identical to sqlite3 (`tests/cli_dot_commands.rs::echo_includes_dot_command_lines`).

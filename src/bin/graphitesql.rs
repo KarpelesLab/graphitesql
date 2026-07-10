@@ -84,8 +84,8 @@ fn main() {
         // One-shot mode: run each argument batch, exiting non-zero on the first
         // error (like the `sqlite3` shell).
         for sql in scripts {
-            if let Err(e) = shell.run_sql_batch(&mut conn, sql) {
-                eprintln!("Error: {e}");
+            if let Err((e, stmt)) = shell.run_sql_batch(&mut conn, sql) {
+                eprintln!("{}", render_cli_error(&stmt, &e));
                 std::process::exit(1);
             }
         }
@@ -307,7 +307,10 @@ impl Shell {
             let mut out = io::stdout();
             let _ = writeln!(out, "{}", sql.trim_end_matches('\n'));
         }
-        if let Err(e) = self.run_sql_batch(conn, sql) {
+        if let Err((e, _stmt)) = self.run_sql_batch(conn, sql) {
+            // Interactive / piped mode keeps the plain one-line form; the SQLite
+            // `in prepare,`/`stepping,` + caret rendering is applied on the one-shot
+            // `-arg` path (see `main`), which is where it is matched byte-for-byte.
             eprintln!("Error: {e}");
             self.had_error = true;
             if self.bail {
@@ -331,13 +334,22 @@ impl Shell {
     }
 
     /// Run one or more `;`-separated statements.
-    fn run_sql_batch(&mut self, conn: &mut Connection, sql: &str) -> graphitesql::Result<()> {
+    #[allow(clippy::result_large_err)]
+    fn run_sql_batch(
+        &mut self,
+        conn: &mut Connection,
+        sql: &str,
+    ) -> Result<(), (graphitesql::Error, String)> {
         for stmt in split_statements(sql) {
             let stmt = stmt.trim();
             if stmt.is_empty() {
                 continue;
             }
-            self.run_one(conn, stmt)?;
+            // On error, carry the failing statement text so the caller can render
+            // SQLite's `in prepare` / `stepping` message with a source-line caret.
+            if let Err(e) = self.run_one(conn, stmt) {
+                return Err((e, stmt.to_string()));
+            }
         }
         Ok(())
     }
@@ -2435,6 +2447,248 @@ fn has_returning(sql: &str) -> bool {
 /// as `PRAGMA table_info(foo)`). Those `=arg` forms are getters, not setters, so
 /// they must route to `query` and print their rows — never be mistaken for a
 /// state-mutating setter just because they contain `=`.
+/// The raw error message SQLite would report (without graphite's `Display`
+/// prefix). Matches the text SQLite puts after `Error: in prepare, ` /
+/// `Error: stepping, `.
+fn raw_error_message(e: &graphitesql::Error) -> String {
+    use graphitesql::Error as E;
+    match e {
+        E::Error(m)
+        | E::Corrupt(m)
+        | E::Io(m)
+        | E::CantOpen(m)
+        | E::Constraint(m)
+        | E::Parse(m) => m.clone(),
+        E::Busy => String::from("database is locked"),
+        E::Unsupported(m) => String::from(*m),
+        // `Error` is non-exhaustive; fall back to Display for any future variant.
+        other => format!("{other}"),
+    }
+}
+
+/// Whether an error occurs at *prepare* time (SQLite renders `in prepare,` and,
+/// when it has a source position, a caret) rather than at *step* time
+/// (`stepping,`, no caret). Syntax errors and every name/type-resolution / DDL
+/// validation error are prepare-time; constraint violations and the handful of
+/// run-time faults are step-time. The step set is enumerated (it is small and
+/// stable) and everything else defaults to prepare, so a not-yet-listed prepare
+/// error is classified correctly rather than mislabelled `stepping`.
+fn is_prepare_error(e: &graphitesql::Error, msg: &str) -> bool {
+    use graphitesql::Error as E;
+    match e {
+        E::Parse(_) => true,
+        // A constraint violation, a lock/busy, a corrupt/IO/open failure is a
+        // run-time (step) error.
+        E::Constraint(_) | E::Busy | E::Corrupt(_) | E::Io(_) | E::CantOpen(_) => false,
+        // A generic error is prepare-time only when it is one of SQLite's finite
+        // name-resolution / schema / DDL-validation diagnostics. Everything else —
+        // vtab/FTS5 faults, the ALTER re-validation `error in …`, `SQL logic error`,
+        // and other run-time messages — defaults to step (they are open-ended, so
+        // enumerating the prepare set is the reliable direction).
+        E::Error(_) => {
+            const PREPARE_PREFIXES: &[&str] = &[
+                "no such column",
+                "no such table",
+                "no such function",
+                "no such collation sequence",
+                "no such index",
+                "no such view",
+                "no such trigger",
+                "no such module",
+                "ambiguous column name",
+                "misuse of aggregate function",
+                "misuse of window function",
+                "wrong number of arguments to function",
+                "too many arguments on",
+                "duplicate column name",
+                "row value misused",
+                "aggregate functions are not allowed",
+                "sub-select returns",
+                "table ", // "table X has N columns…" / "table X already exists"
+                "there is already ",
+                "unknown table option",
+                "unknown database",
+                "1st ORDER BY term",
+                "ORDER BY term out of range",
+                "default value of column",
+                "object name reserved for internal use",
+                "foreign key on ",
+                "number of columns in foreign key",
+                "parameters prohibited",
+                "second argument to nth_value",
+                "no query solution",
+                "missing datatype for",
+                "AUTOINCREMENT is only allowed",
+                "cannot use DEFAULT on a generated column",
+                "cannot use window functions in recursive",
+                "generated columns cannot",
+                "must have at least one non-generated column",
+                "Cannot add a UNIQUE",
+                "Cannot add a PRIMARY KEY",
+                "unsupported frame specification",
+                "cannot create",
+                "conflicting ON CONFLICT",
+                "the NATURAL keyword",
+                "a JOIN clause is required",
+                "USING clause",
+                "cannot have more than one primary key",
+                "has more than one primary key",
+                "PRIMARY KEY missing on table",
+                "the \".\" operator prohibited",
+                "cannot modify ",
+                "ON CONFLICT clause does not match",
+                "RANGE with offset",
+                "GROUPS with offset",
+            ];
+            // Patterns that carry a leading ordinal / function name, so a prefix
+            // match won't do (`2nd ORDER BY term out of range`, `abs() may not be
+            // used as a window function`).
+            const PREPARE_CONTAINS: &[&str] = &[
+                "ORDER BY term out of range",
+                "GROUP BY term out of range",
+                "may not be used as a window function",
+            ];
+            PREPARE_PREFIXES.iter().any(|p| msg.starts_with(p))
+                || PREPARE_CONTAINS.iter().any(|p| msg.contains(p))
+                || msg.ends_with(" already exists")
+        }
+        _ => false,
+    }
+}
+
+/// The offending identifier a prepare-error message names, whose first source
+/// occurrence SQLite's caret points at — but only for the specific error classes
+/// SQLite actually renders a caret for. Many prepare errors (`no such table`,
+/// `no such collation sequence`, `no such index/view/trigger`, the column-count and
+/// row-value errors, …) carry no source position and show no caret, so they return
+/// `None` here.
+fn error_offending_token(msg: &str) -> Option<&str> {
+    if let Some(rest) = msg
+        .strip_prefix("near \"")
+        .or_else(|| msg.strip_prefix("unrecognized token: \""))
+    {
+        return rest.split('"').next().filter(|t| !t.is_empty());
+    }
+    for pre in [
+        "misuse of aggregate function ",
+        "misuse of window function ",
+        "wrong number of arguments to function ",
+    ] {
+        if let Some(rest) = msg.strip_prefix(pre) {
+            return rest.split('(').next().filter(|t| !t.is_empty());
+        }
+    }
+    // Among the colon-delimited resolution errors, SQLite carets only these three
+    // (the identifier is in the current statement's scope). The `no such column`
+    // form may carry a trailing ` - should this be a string literal…` hint.
+    for pre in [
+        "no such column: ",
+        "no such function: ",
+        "ambiguous column name: ",
+    ] {
+        if let Some(rest) = msg.strip_prefix(pre) {
+            let tok = rest.split(" - ").next().unwrap_or(rest);
+            return (!tok.is_empty() && !tok.contains(' ')).then_some(tok);
+        }
+    }
+    // `<kind> <name> already exists` carets the object name — but only for a table,
+    // view, or trigger; the `index` form and the `there is already …` variant carry
+    // no source position (no caret).
+    for kind in ["table ", "view ", "trigger "] {
+        if let Some(rest) = msg.strip_prefix(kind)
+            && let Some(name) = rest.strip_suffix(" already exists")
+        {
+            return (!name.is_empty() && !name.contains(' ')).then_some(name);
+        }
+    }
+    None
+}
+
+/// Byte offset of `token`'s first occurrence in `sql` that is not inside a
+/// single-quoted string literal or a comment (SQLite's caret points at the code
+/// occurrence, never one inside a string). A double-quoted `"ident"` is *not*
+/// skipped — it is a valid identifier the token may itself be.
+fn locate_token(sql: &str, token: &str) -> Option<usize> {
+    // A token that itself begins with `'` is an unterminated / malformed string
+    // literal (`unrecognized token: "'abc"`); the string-skipping below would hide
+    // it, so search plainly.
+    if token.starts_with('\'') {
+        return sql.find(token);
+    }
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                // Skip a single-quoted string (doubled '' is an escaped quote).
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if i + 1 < b.len() && b[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            _ => {
+                if sql[i..].starts_with(token) {
+                    return Some(i);
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Render an error the way the SQLite CLI does for the failed statement `sql`:
+/// `Error: in prepare, <msg>` (with a source line and `^--- error here` caret when
+/// the message names a locatable token) for a prepare-time error, or
+/// `Error: stepping, <msg>[ (<code>)]` for a step-time error (the extended result
+/// code is shown when it is not the generic `SQLITE_ERROR`).
+fn render_cli_error(sql: &str, e: &graphitesql::Error) -> String {
+    let msg = raw_error_message(e);
+    if is_prepare_error(e, &msg) {
+        if let Some(off) = error_offending_token(&msg).and_then(|t| locate_token(sql, t)) {
+            // The caret sits at column `2 + off` (the source line is indented two
+            // spaces). SQLite decorates it on the right (`^--- error here`) near the
+            // start of the line, but flips to the left (`error here ---^`) once the
+            // caret column reaches 27, matching its shell.
+            let caret_col = 2 + off;
+            let caret_line = if caret_col >= 27 {
+                format!("{}error here ---^", " ".repeat(caret_col - 14))
+            } else {
+                format!("{}^--- error here", " ".repeat(caret_col))
+            };
+            return format!("Error: in prepare, {msg}\n  {sql}\n{caret_line}");
+        }
+        return format!("Error: in prepare, {msg}");
+    }
+    // Step-time: append the extended result code unless it is SQLITE_ERROR (1).
+    let code = e.code();
+    if code != 1 {
+        format!("Error: stepping, {msg} ({code})")
+    } else {
+        format!("Error: stepping, {msg}")
+    }
+}
+
 fn is_pragma_setter(sql: &str) -> bool {
     let rest = sql.trim_start();
     let mut words = rest.split(|c: char| !c.is_ascii_alphabetic());
