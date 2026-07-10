@@ -119,30 +119,31 @@ fn view_rename_column_subquery_matches_sqlite() {
         "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
          CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT a FROM u); \
          ALTER TABLE u RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Result-column alias collides with the renamed column name
+        // (`SELECT b AS a, a FROM t`): span-precise rewriting renames only the bound
+        // projection `a` (→`aa`) and leaves the alias token, byte-matching SQLite.
+        "CREATE TABLE t(a,b); CREATE VIEW v AS SELECT b AS a, a FROM t; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        // A source table named the same as the renamed column (`FROM t, a`): only the
+        // qualified `t.a` rewrites, the `FROM` token `a` is left.
+        "CREATE TABLE t(a,b); CREATE TABLE a(x); \
+         CREATE VIEW v AS SELECT t.a FROM t, a; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
     ];
     for sql in matching {
         assert_eq!(run("sqlite3", sql), run(g, sql), "for {sql}");
     }
 
-    // Bail cases: a token rewrite can't be proven safe, so graphite leaves the
-    // stored view SQL byte-identical. (SQLite does more here — rewriting through
-    // the other table, or aborting on a derived table — so these stay known gaps
-    // rather than differential equalities. The invariant guards against a *wrong*
-    // rewrite creeping in.)
-    let bail = [
-        // Result-column alias collides with the renamed column name.
-        (
-            "CREATE TABLE t(a,b); CREATE VIEW v AS SELECT b AS a, a FROM t; \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-            "CREATE VIEW v AS SELECT b AS a, a FROM t",
-        ),
-        // Derived table in the FROM.
-        (
-            "CREATE TABLE t(a,b); CREATE VIEW v AS SELECT a FROM (SELECT a FROM t); \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-            "CREATE VIEW v AS SELECT a FROM (SELECT a FROM t)",
-        ),
-    ];
+    // Bail: a derived table in main position that projects the renamed column and is
+    // then consumed — SQLite rewrites the body then rejects the whole rename (its
+    // exposed column changed), leaving the stored view unchanged; graphite likewise
+    // leaves it byte-identical (the error is A-alter-2's job). Guards against a wrong
+    // rewrite.
+    let bail = [(
+        "CREATE TABLE t(a,b); CREATE VIEW v AS SELECT a FROM (SELECT a FROM t); \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        "CREATE VIEW v AS SELECT a FROM (SELECT a FROM t)",
+    )];
     for (sql, unchanged) in bail {
         assert_eq!(run(g, sql), unchanged, "bail invariant for {sql}");
     }

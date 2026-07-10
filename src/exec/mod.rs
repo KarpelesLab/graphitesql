@@ -42253,6 +42253,17 @@ fn view_multi_source_quals(
         if tr.subquery.is_some() || tr.tvf_args.is_some() || tr.schema.is_some() {
             return false;
         }
+        // A source table named or aliased `old` would have its FROM token wrongly
+        // renamed by this prover's whole-text `All` rewrite; bail to the span-precise
+        // scope-aware path (`view_global_unique_quals`).
+        if tr.name.eq_ignore_ascii_case(old)
+            || tr
+                .alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(old))
+        {
+            return false;
+        }
         srcs.push((tr.name.clone(), tr.alias.clone()));
         true
     };
@@ -42369,7 +42380,7 @@ fn view_global_unique_quals(
     // says "globally unique": the fast path would rewrite an outer reference to a
     // CTE's renamed output column, but SQLite rejects that (the CTE's exposed name
     // changed), so it must stay unresolved and bail rather than be blindly renamed.
-    let cte = select_needs_scope_aware(&cv.select);
+    let cte = select_needs_scope_aware(&cv.select, old);
     match global_unique_plan(&srcs, table, old, table_cols) {
         Some((quals, true)) if !cte => Some((quals, BareRewrite::All)),
         Some((quals, _)) => {
@@ -42393,29 +42404,48 @@ fn view_global_unique_quals(
 /// reference to a CTE's or derived table's renamed output column must be resolved
 /// per-scope (bailed, or left, per its provenance) rather than blindly rewritten —
 /// so the caller forces the scope-aware decision instead.
-fn select_needs_scope_aware(sel: &Select) -> bool {
+fn select_needs_scope_aware(sel: &Select, old: &str) -> bool {
     if !sel.ctes.is_empty() {
         return true;
     }
-    if sel
-        .compound
-        .iter()
-        .any(|(_, arm)| select_needs_scope_aware(arm))
-    {
+    // A result-column alias equal to `old` (or a source table named/aliased `old`)
+    // means a token that spells `old` is NOT a bound column reference — the whole-
+    // text `All` fast path would wrongly rewrite it, so force the span-precise
+    // scope-aware decision.
+    if sel.columns.iter().any(
+        |rc| matches!(rc, ResultColumn::Expr { alias: Some(a), .. } if a.eq_ignore_ascii_case(old)),
+    ) {
         return true;
     }
     if let Some(from) = &sel.from {
+        let src_named_old = |tr: &crate::sql::ast::TableRef| {
+            tr.name.eq_ignore_ascii_case(old)
+                || tr
+                    .alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(old))
+        };
+        if src_named_old(&from.first) || from.joins.iter().any(|j| src_named_old(&j.table)) {
+            return true;
+        }
         // A derived-table source (subquery in FROM) needs scope-aware resolution:
         // an outer reference to its output column must be classified by provenance.
         if from.first.subquery.is_some() || from.joins.iter().any(|j| j.table.subquery.is_some()) {
             return true;
         }
     }
+    if sel
+        .compound
+        .iter()
+        .any(|(_, arm)| select_needs_scope_aware(arm, old))
+    {
+        return true;
+    }
     let mut subs: Vec<&Select> = Vec::new();
     for e in view_select_exprs(sel) {
         collect_immediate_subselects(e, &mut subs);
     }
-    subs.iter().any(|s| select_needs_scope_aware(s))
+    subs.iter().any(|s| select_needs_scope_aware(s, old))
 }
 
 fn collect_select_base_sources(
@@ -42503,24 +42533,18 @@ fn collect_select_base_sources_ctx(
             if cte_names.iter().any(|c| c.eq_ignore_ascii_case(&tr.name)) {
                 continue;
             }
-            if tr.name.eq_ignore_ascii_case(old)
-                || tr
-                    .alias
-                    .as_deref()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(old))
-            {
-                return false;
-            }
+            // A source table named or aliased `old` is still a real base source. The
+            // scope-aware path (forced by `select_needs_scope_aware` when a source is
+            // named `old`) is span-precise: it rewrites only bound column-ref
+            // occurrences, never this `FROM` token, so it no longer needs to bail.
             srcs.push((tr.name.clone(), tr.alias.clone()));
         }
     }
-    for rc in &sel.columns {
-        if let ResultColumn::Expr { alias: Some(a), .. } = rc
-            && a.eq_ignore_ascii_case(old)
-        {
-            return false;
-        }
-    }
+    // A result-column alias equal to `old` (`SELECT b AS a, …`) used to bail here
+    // because the whole-text `All` rewrite would wrongly rename the alias token. The
+    // scope-aware decision is now span-precise (rewrites only bound column-ref
+    // occurrences, never the alias), and `select_needs_scope_aware` forces that path
+    // when an alias equals `old`, so this no longer needs to bail.
     let mut subs: Vec<&Select> = Vec::new();
     for e in view_select_exprs(sel) {
         collect_immediate_subselects(e, &mut subs);
@@ -42627,29 +42651,26 @@ fn scope_bare_old_decision(
     if !collect_bare_old_owners(sel, old, table, table_cols, &mut scopes, &mut owners, &[]) {
         return None;
     }
-    let renamed = owners.iter().any(|(o, _)| o.eq_ignore_ascii_case(table));
-    let other = owners.iter().any(|(o, _)| !o.eq_ignore_ascii_case(table));
-    if renamed && other {
-        // Mixed body: rewrite exactly the bare occurrences that bind to the
-        // renamed table, located by their parsed source span. Every such
-        // occurrence must carry a real span (view bodies are always parsed from
-        // stored text, so they do); if any is synthetic we cannot target it
-        // precisely, so bail and leave the object untouched.
-        let mut spans: Vec<u32> = Vec::new();
-        for (owner, span) in &owners {
-            if owner.eq_ignore_ascii_case(table) {
-                match span.0 {
-                    Some((start, _)) => spans.push(start),
-                    None => return None,
-                }
+    if !owners.iter().any(|(o, _)| o.eq_ignore_ascii_case(table)) {
+        return Some(BareRewrite::None); // no bare ref binds to the renamed table
+    }
+    // Rewrite exactly the bare occurrences that bind to the renamed table, located
+    // by their parsed source span — never a whole-text `All`. Span precision means a
+    // token that merely *spells* `old` but is not a bound column reference — a
+    // result-column alias (`SELECT b AS a`), or a source table named `old` — is left
+    // untouched, matching sqlite. Every renamed-binding occurrence must carry a real
+    // span (view bodies are parsed from stored text, so they do); a synthetic one
+    // can't be targeted, so bail.
+    let mut spans: Vec<u32> = Vec::new();
+    for (owner, span) in &owners {
+        if owner.eq_ignore_ascii_case(table) {
+            match span.0 {
+                Some((start, _)) => spans.push(start),
+                None => return None,
             }
         }
-        Some(BareRewrite::At(spans))
-    } else if renamed {
-        Some(BareRewrite::All) // all bind to the renamed table
-    } else {
-        Some(BareRewrite::None) // none reference it — qualified refs only
     }
+    Some(BareRewrite::At(spans))
 }
 
 /// Walk every column reference that belongs to `e`'s *own* scope: descend through
@@ -43267,21 +43288,21 @@ fn collect_trigger_stmt_base_sources(
 /// Whether a trigger's `WHEN` guard or any body statement uses a `WITH` CTE (in a
 /// statement's own select or a nested subquery). Mirrors [`select_needs_scope_aware`]
 /// for the trigger shape; used to force scope-aware RENAME COLUMN resolution.
-fn trigger_contains_cte(ct: &crate::sql::ast::CreateTrigger) -> bool {
+fn trigger_contains_cte(ct: &crate::sql::ast::CreateTrigger, old: &str) -> bool {
     use crate::sql::ast::InsertSource;
     let expr_has_cte = |e: &Expr| -> bool {
         let mut subs: Vec<&Select> = Vec::new();
         collect_immediate_subselects(e, &mut subs);
-        subs.iter().any(|s| select_needs_scope_aware(s))
+        subs.iter().any(|s| select_needs_scope_aware(s, old))
     };
     if ct.when.as_ref().is_some_and(&expr_has_cte) {
         return true;
     }
     for stmt in &ct.body {
         let has = match stmt {
-            Statement::Select(s) => select_needs_scope_aware(s),
+            Statement::Select(s) => select_needs_scope_aware(s, old),
             Statement::Insert(i) => match &i.source {
-                InsertSource::Select(s) => select_needs_scope_aware(s),
+                InsertSource::Select(s) => select_needs_scope_aware(s, old),
                 InsertSource::Values(rows) => rows.iter().flatten().any(&expr_has_cte),
                 InsertSource::DefaultValues => false,
             },
@@ -43356,7 +43377,7 @@ fn trigger_global_unique_quals(
     // rationale; a genuinely mixed body still bails untouched. As for views, a CTE
     // anywhere forces scope-aware so an outer reference to a CTE's renamed output
     // column stays unresolved and bails rather than being blindly rewritten.
-    let cte = trigger_contains_cte(&ct);
+    let cte = trigger_contains_cte(&ct, old);
     let (mut quals, bare) = match global_unique_plan(&srcs, table, old, table_cols) {
         Some((q, true)) if !cte => (q, BareRewrite::All),
         Some((q, _)) => (
