@@ -473,3 +473,36 @@ fn show_settings_match_sqlite() {
         assert_same(label, script);
     }
 }
+
+#[test]
+fn control_char_escaping_in_display_modes() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    // The width-aligned display modes caret-escape control chars *before*
+    // computing column widths, so the borders line up as sqlite's do.
+    let cases: &[(&str, &str)] = &[
+        ("box", ".mode box\n.headers on\nSELECT x'024142' AS c;\n"),
+        (
+            "table",
+            ".mode table\n.headers on\nSELECT x'024142' AS c;\n",
+        ),
+        (
+            "markdown",
+            ".mode markdown\n.headers on\nSELECT x'0102' AS c;\n",
+        ),
+        (
+            "column",
+            ".mode column\n.headers on\nSELECT x'024142' AS c, 'plain' AS d;\n",
+        ),
+        ("line", ".mode line\nSELECT x'024142' AS c;\n"),
+        (
+            "box_multirow",
+            ".mode box\n.headers on\nSELECT x'1b' AS a, 'wide value' AS b UNION ALL SELECT x'02','x';\n",
+        ),
+    ];
+    for (label, script) in cases {
+        assert_same(label, script);
+    }
+}

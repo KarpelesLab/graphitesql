@@ -501,7 +501,7 @@ impl Shell {
                 (0..ncol)
                     .map(|i| match row.get(i) {
                         Some(Value::Null) | None => self.null_value.clone(),
-                        Some(v) => display_cell(v),
+                        Some(v) => escape_display_str(&display_cell(v)),
                     })
                     .collect()
             })
@@ -677,7 +677,8 @@ impl Shell {
         if ncol == 0 {
             return;
         }
-        // Cell text for every column of every row (as displayed).
+        // Cell text for every column of every row (as displayed, with control
+        // characters caret-escaped so widths account for the expansion).
         let cells: Vec<Vec<String>> = result
             .rows
             .iter()
@@ -685,7 +686,7 @@ impl Shell {
                 (0..ncol)
                     .map(|i| match row.get(i) {
                         Some(Value::Null) | None => self.null_value.clone(),
-                        Some(v) => display_cell(v),
+                        Some(v) => escape_display_str(&display_cell(v)),
                     })
                     .collect()
             })
@@ -742,8 +743,14 @@ impl Shell {
                 out.extend_from_slice(name.as_bytes());
                 out.extend_from_slice(b" = ");
                 match row.get(i) {
-                    Some(Value::Null) | None => out.extend_from_slice(self.null_value.as_bytes()),
-                    Some(v) => render_text_cell(v, &mut out),
+                    Some(Value::Null) | None => {
+                        push_display_escaped(self.null_value.as_bytes(), &mut out)
+                    }
+                    Some(v) => {
+                        let mut cell = Vec::new();
+                        render_text_cell(v, &mut cell);
+                        push_display_escaped(&cell, &mut out);
+                    }
                 }
                 out.push(b'\n');
             }
@@ -1955,6 +1962,16 @@ fn push_display_escaped(bytes: &[u8], out: &mut Vec<u8>) {
         }
         i += 1;
     }
+}
+
+/// Apply [`push_display_escaped`] to `s` and return the result as a `String`
+/// (the escaping only emits ASCII `^X` and passes other bytes through, so the
+/// result stays valid UTF-8). Used by the width-aligned display modes, which
+/// must escape *before* computing column widths.
+fn escape_display_str(s: &str) -> String {
+    let mut out = Vec::new();
+    push_display_escaped(s.as_bytes(), &mut out);
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Left-justify `s` to `width` display characters, appending to a `String`.
