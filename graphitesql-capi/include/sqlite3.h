@@ -63,7 +63,12 @@ int sqlite3_bind_null(sqlite3_stmt *stmt, int idx);
 int sqlite3_bind_text(sqlite3_stmt *stmt, int idx, const char *text, int nByte, void(*d)(void*));
 int sqlite3_bind_blob(sqlite3_stmt *stmt, int idx, const void *data, int nByte, void(*d)(void*));
 
+int sqlite3_bind_parameter_count(sqlite3_stmt *stmt);
+const char *sqlite3_bind_parameter_name(sqlite3_stmt *stmt, int idx);
+int sqlite3_bind_parameter_index(sqlite3_stmt *stmt, const char *name);
+
 int sqlite3_column_count(sqlite3_stmt *stmt);
+int sqlite3_data_count(sqlite3_stmt *stmt);
 const char *sqlite3_column_name(sqlite3_stmt *stmt, int col);
 int sqlite3_column_type(sqlite3_stmt *stmt, int col);
 int sqlite3_column_int(sqlite3_stmt *stmt, int col);

@@ -17,7 +17,8 @@ shape as the `graphitesql-wasm` sibling.
 | One-shot | `sqlite3_exec` (with row callback) |
 | Prepared | `sqlite3_prepare_v2`, `sqlite3_step`, `sqlite3_reset`, `sqlite3_clear_bindings`, `sqlite3_finalize` |
 | Bind | `sqlite3_bind_int`/`int64`/`double`/`null`/`text`/`blob` |
-| Columns | `sqlite3_column_count`/`name`/`type`/`int`/`int64`/`double`/`text`/`blob`/`bytes` |
+| Parameters | `sqlite3_bind_parameter_count`/`name`/`index` (named `:x`/`@x`/`$x` + numbered `?N`) |
+| Columns | `sqlite3_column_count`/`data_count`/`name`/`type`/`int`/`int64`/`double`/`text`/`blob`/`bytes` |
 | Status | `sqlite3_errmsg`, `sqlite3_errcode`, `sqlite3_changes`, `sqlite3_last_insert_rowid` |
 | Version | `sqlite3_libversion`, `sqlite3_libversion_number` (reports `3.50.4`) |
 | Memory | `sqlite3_free` |

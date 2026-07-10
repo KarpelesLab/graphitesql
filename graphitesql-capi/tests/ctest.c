@@ -130,6 +130,27 @@ int main(void) {
   rc = sqlite3_exec(db, "INSERT INTO t(name) VALUES('returning home')", NULL, NULL, NULL);
   CHECK("'returning' in a string is a plain insert", rc == SQLITE_OK && sqlite3_changes(db) == 1);
 
+  /* Named parameters: count, name<->index, and value binding by looked-up index. */
+  sqlite3_stmt *np = NULL;
+  sqlite3_prepare_v2(db, "SELECT :who, ?2, @n", -1, &np, NULL);
+  CHECK("param count 3", sqlite3_bind_parameter_count(np) == 3);
+  CHECK("param 1 name :who", strcmp(sqlite3_bind_parameter_name(np, 1), ":who") == 0);
+  CHECK("param 2 anonymous", sqlite3_bind_parameter_name(np, 2) == NULL);
+  CHECK("param 3 name @n", strcmp(sqlite3_bind_parameter_name(np, 3), "@n") == 0);
+  CHECK("index of :who is 1", sqlite3_bind_parameter_index(np, ":who") == 1);
+  CHECK("index of @n is 3", sqlite3_bind_parameter_index(np, "@n") == 3);
+  CHECK("index of missing is 0", sqlite3_bind_parameter_index(np, ":nope") == 0);
+  sqlite3_bind_text(np, sqlite3_bind_parameter_index(np, ":who"), "eve", -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(np, 2, 77);
+  sqlite3_bind_int64(np, sqlite3_bind_parameter_index(np, "@n"), 88);
+  CHECK("named step -> ROW", sqlite3_step(np) == SQLITE_ROW);
+  CHECK("data_count 3", sqlite3_data_count(np) == 3);
+  CHECK("named who=eve", strcmp((const char *)sqlite3_column_text(np, 0), "eve") == 0);
+  CHECK("named ?2=77", sqlite3_column_int64(np, 1) == 77);
+  CHECK("named @n=88", sqlite3_column_int64(np, 2) == 88);
+  CHECK("out-of-range bind -> RANGE", sqlite3_bind_int64(np, 4, 0) == SQLITE_RANGE);
+  sqlite3_finalize(np);
+
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 
   sqlite3_close(db);

@@ -90,6 +90,13 @@ pub struct sqlite3_stmt {
     /// Next row `step` will return.
     next: usize,
     executed: bool,
+    /// Per-parameter slot metadata by SQLite numbering (index 0 = parameter 1):
+    /// `Some(":name")` for a named parameter (bind routes to `params.named`),
+    /// `None` for an anonymous `?` or numbered `?N` (routes to `params.positional`).
+    /// Length is `sqlite3_bind_parameter_count`.
+    param_names: Vec<Option<String>>,
+    /// Scratch for `sqlite3_bind_parameter_name`'s returned pointer.
+    param_name_scratch: Option<CString>,
     /// Backing storage keeping `column_text`/`column_blob` pointers valid until the
     /// next `step`/`reset`/`finalize`, per SQLite's lifetime contract.
     text_scratch: Vec<Option<CString>>,
@@ -136,6 +143,88 @@ fn has_returning(sql: &str) -> bool {
         Ok(Statement::Delete(d)) => !d.returning.is_empty(),
         _ => false,
     }
+}
+
+/// Scan a statement for bind parameters, assigning SQLite's numbering, and return
+/// the slot table (index 0 = parameter 1): `Some(":name")` for a named parameter,
+/// `None` for an anonymous `?` or a numbered `?N`. The length is the parameter
+/// count (the highest number reached). Quoting and comments are skipped.
+fn scan_params(sql: &str) -> Vec<Option<String>> {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    let mut next_auto = 1usize;
+    let mut slots: Vec<Option<String>> = Vec::new();
+    let ensure = |slots: &mut Vec<Option<String>>, num: usize| {
+        if num > slots.len() {
+            slots.resize(num, None);
+        }
+    };
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'?' => {
+                i += 1;
+                let start = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i > start {
+                    if let Ok(num) = sql[start..i].parse::<usize>()
+                        && num > 0
+                    {
+                        ensure(&mut slots, num);
+                        next_auto = next_auto.max(num + 1);
+                    }
+                } else {
+                    ensure(&mut slots, next_auto);
+                    next_auto += 1;
+                }
+            }
+            b':' | b'@' | b'$' => {
+                let start = i;
+                i += 1;
+                let nstart = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if i > nstart {
+                    let name = &sql[start..i]; // includes the sigil
+                    if !slots.iter().any(|s| s.as_deref() == Some(name)) {
+                        ensure(&mut slots, next_auto);
+                        slots[next_auto - 1] = Some(name.to_string());
+                        next_auto += 1;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    slots
 }
 
 // --- helpers ------------------------------------------------------------------
@@ -484,12 +573,14 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
 
     let stmt = Box::new(sqlite3_stmt {
         db,
+        param_names: scan_params(head),
         sql: head.to_string(),
         params: Params::default(),
         result: None,
         cur: None,
         next: 0,
         executed: false,
+        param_name_scratch: None,
         text_scratch: Vec::new(),
         blob_scratch: Vec::new(),
     });
@@ -600,16 +691,29 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> c_int {
 
 // --- bind ---------------------------------------------------------------------
 
-/// Set positional parameter `idx` (1-based), growing with NULLs as needed.
+/// Bind parameter `idx` (1-based). Routes to `params.named` when that slot is a
+/// named parameter (`:x`/`@x`/`$x`), else to `params.positional`. Out-of-range
+/// against the statement's known parameter count yields `SQLITE_RANGE`.
 fn bind_at(stmt: &mut sqlite3_stmt, idx: c_int, v: Value) -> c_int {
-    if idx < 1 {
+    if idx < 1 || idx as usize > stmt.param_names.len() {
         return SQLITE_RANGE;
     }
     let i = (idx - 1) as usize;
-    if stmt.params.positional.len() <= i {
-        stmt.params.positional.resize(i + 1, Value::Null);
+    match &stmt.param_names[i] {
+        Some(name) => {
+            let name = name.clone();
+            match stmt.params.named.iter_mut().find(|(k, _)| *k == name) {
+                Some(slot) => slot.1 = v,
+                None => stmt.params.named.push((name, v)),
+            }
+        }
+        None => {
+            if stmt.params.positional.len() <= i {
+                stmt.params.positional.resize(i + 1, Value::Null);
+            }
+            stmt.params.positional[i] = v;
+        }
     }
-    stmt.params.positional[i] = v;
     SQLITE_OK
 }
 
@@ -689,6 +793,72 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
         unsafe { core::slice::from_raw_parts(data as *const u8, n_byte as usize) }.to_vec()
     };
     bind_at(unsafe { &mut *stmt }, idx, Value::Blob(bytes))
+}
+
+// --- parameter introspection --------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_parameter_count(stmt: *mut sqlite3_stmt) -> c_int {
+    if stmt.is_null() {
+        return 0;
+    }
+    unsafe { &*stmt }.param_names.len() as c_int
+}
+
+/// Name (with sigil) of parameter `idx` (1-based), or NULL for an anonymous `?`
+/// / numbered `?N` / out-of-range index.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_parameter_name(
+    stmt: *mut sqlite3_stmt,
+    idx: c_int,
+) -> *const c_char {
+    if stmt.is_null() || idx < 1 {
+        return core::ptr::null();
+    }
+    let stmt = unsafe { &mut *stmt };
+    match stmt.param_names.get((idx - 1) as usize) {
+        Some(Some(name)) => {
+            let c = CString::new(name.as_str()).unwrap_or_default();
+            let p = c.as_ptr();
+            stmt.param_name_scratch = Some(c);
+            p
+        }
+        _ => core::ptr::null(),
+    }
+}
+
+/// 1-based index of the named parameter `name` (given with its sigil, e.g. `:id`),
+/// or 0 if there is no such parameter.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_parameter_index(
+    stmt: *mut sqlite3_stmt,
+    name: *const c_char,
+) -> c_int {
+    if stmt.is_null() || name.is_null() {
+        return 0;
+    }
+    let want = unsafe { cstr(name) };
+    let stmt = unsafe { &*stmt };
+    for (i, slot) in stmt.param_names.iter().enumerate() {
+        if slot.as_deref() == Some(want) {
+            return (i + 1) as c_int;
+        }
+    }
+    0
+}
+
+/// Number of columns in the current result row: `column_count` while a row is
+/// available (after `step` → `SQLITE_ROW`), else 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_data_count(stmt: *mut sqlite3_stmt) -> c_int {
+    if stmt.is_null() {
+        return 0;
+    }
+    let stmt = unsafe { &*stmt };
+    match (&stmt.result, stmt.cur) {
+        (Some(qr), Some(_)) => qr.columns.len() as c_int,
+        _ => 0,
+    }
 }
 
 // --- column accessors ---------------------------------------------------------
