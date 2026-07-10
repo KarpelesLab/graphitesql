@@ -196,7 +196,16 @@ its (niche/cosmetic) value:
   in one statement (`SELECT a FROM t WHERE a IN (SELECT a FROM u)` renaming `u.a`),
   where only the inner `a` should change — needs per-occurrence source spans on
   `Expr::Column`. The pass declines it, leaving the object byte-identical (never a
-  half-rename).
+  half-rename). **Scope (measured 2026-07-10):** `Expr::Column` (`src/sql/ast.rs`)
+  carries no byte span; adding one means threading a position through ~42 struct-
+  literal construction sites across 6 files (`sql/parser.rs`, `sql/print.rs`,
+  `exec/{mod,eval,func,vdbe}.rs`) — the parser sets a real span, synthetic
+  desugarings set `None` — then having the rename rewrite use the spans to edit
+  only the occurrence(s) that scope-resolve to the renamed table. A large,
+  pervasive AST/parser refactor (not a localized fix); it also **unblocks
+  A-alter-rollback**, whose savepoint-rollback + byte-exact re-validation machinery
+  is already proven (see that item). Deferred to a dedicated pass because the
+  regression surface is the entire query grammar.
 - **A-alter-rollback — ALTER-time rejection of a RENAME that breaks a dependent.**
   `DROP COLUMN` already rejects pre-mutation. A `RENAME` whose propagation can't be
   *proven* can leave a dependent view/trigger unresolvable; SQLite rejects and
