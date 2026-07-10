@@ -53,6 +53,19 @@ fn advisory_setting_pragmas_round_trip() {
         "PRAGMA busy_timeout=5000",
         "PRAGMA busy_timeout=5000; PRAGMA busy_timeout",
         "PRAGMA busy_timeout",
+        // secure_delete (0/1/2=fast) — echoes on set, and its behaviour is preserved.
+        "PRAGMA secure_delete=1",
+        "PRAGMA secure_delete=1; PRAGMA secure_delete",
+        "PRAGMA secure_delete=FAST; PRAGMA secure_delete",
+        "PRAGMA secure_delete=0; PRAGMA secure_delete",
+        // soft_heap_limit and wal_autocheckpoint — advisory, echo on set.
+        "PRAGMA soft_heap_limit=1000",
+        "PRAGMA soft_heap_limit=1000; PRAGMA soft_heap_limit",
+        "PRAGMA soft_heap_limit=-5; PRAGMA soft_heap_limit",
+        "PRAGMA soft_heap_limit",
+        "PRAGMA wal_autocheckpoint=100",
+        "PRAGMA wal_autocheckpoint=100; PRAGMA wal_autocheckpoint",
+        "PRAGMA wal_autocheckpoint",
         // Setting synchronous never affects query results.
         "CREATE TABLE t(a); PRAGMA synchronous=OFF; INSERT INTO t VALUES(1),(2); SELECT * FROM t",
         // Unrelated setters are unaffected.

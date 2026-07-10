@@ -2481,7 +2481,12 @@ fn pragma_setter_result_query(sql: &str) -> Option<String> {
     // stores the value, so re-querying the getter reproduces the echoed line.
     if matches!(
         name.to_ascii_lowercase().as_str(),
-        "journal_mode" | "busy_timeout" | "threads"
+        "journal_mode"
+            | "busy_timeout"
+            | "threads"
+            | "secure_delete"
+            | "soft_heap_limit"
+            | "wal_autocheckpoint"
     ) {
         Some(format!("PRAGMA {target}"))
     } else {

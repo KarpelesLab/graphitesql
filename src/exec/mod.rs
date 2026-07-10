@@ -278,6 +278,15 @@ pub struct Connection {
     /// `PRAGMA threads` — the max auxiliary sort threads. graphite is
     /// single-threaded, so this is advisory; stored and reported back like sqlite.
     threads: core::cell::Cell<i64>,
+    /// `PRAGMA soft_heap_limit` — an advisory memory cap (bytes, 0 = unlimited).
+    /// graphite does not bound its heap, so it is stored and reported back like
+    /// sqlite (which echoes the value on set). (`hard_heap_limit` is deliberately
+    /// left inert: sqlite *enforces* it — a small value OOMs — which graphite can't
+    /// replicate, so echoing it would diverge; it stays a reported-0 no-op.)
+    soft_heap_limit: core::cell::Cell<i64>,
+    /// `PRAGMA wal_autocheckpoint` — the WAL frame threshold that triggers an
+    /// automatic checkpoint (default 1000). Advisory here; stored and reported back.
+    wal_autocheckpoint: core::cell::Cell<i64>,
     /// User-defined scalar functions registered via
     /// [`register_function`](Self::register_function), keyed by lowercased name.
     /// Built-in functions take precedence; these fill otherwise-unknown names.
@@ -440,6 +449,8 @@ impl Connection {
             synchronous: core::cell::Cell::new(2),
             temp_store: core::cell::Cell::new(0),
             threads: core::cell::Cell::new(0),
+            soft_heap_limit: core::cell::Cell::new(0),
+            wal_autocheckpoint: core::cell::Cell::new(1000),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
@@ -491,6 +502,8 @@ impl Connection {
             synchronous: core::cell::Cell::new(2),
             temp_store: core::cell::Cell::new(0),
             threads: core::cell::Cell::new(0),
+            soft_heap_limit: core::cell::Cell::new(0),
+            wal_autocheckpoint: core::cell::Cell::new(1000),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
@@ -3466,7 +3479,14 @@ impl Connection {
                     Value::Integer(-1),
                 ]],
             }),
-            "wal_autocheckpoint" => Ok(single("wal_autocheckpoint", Value::Integer(1000))),
+            "wal_autocheckpoint" => Ok(single(
+                "wal_autocheckpoint",
+                Value::Integer(self.wal_autocheckpoint.get()),
+            )),
+            "soft_heap_limit" => Ok(single(
+                "soft_heap_limit",
+                Value::Integer(self.soft_heap_limit.get()),
+            )),
             // `journal_size_limit` stores/reports the journal-shrink cap. The set
             // form clamps any negative value to -1 (the "no limit" sentinel) and
             // echoes the result; the plain form reads it back — exactly like sqlite.
@@ -3536,9 +3556,8 @@ impl Connection {
             | "empty_result_callbacks"
             | "defer_foreign_keys"
             | "reverse_unordered_selects"
-            | "writable_schema"
-            | "soft_heap_limit"
-            | "hard_heap_limit" => Ok(single(&name, Value::Integer(0))),
+            | "hard_heap_limit"
+            | "writable_schema" => Ok(single(&name, Value::Integer(0))),
             // `incremental_vacuum` (bare or `(N)`) performs a write, so it cannot
             // run on the read-only query path. Signal the caller to re-run it via
             // execute() (the CLI retries on this message); the `= N` form already
@@ -6889,6 +6908,19 @@ impl Connection {
             if let Some(e) = &p.value {
                 let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
                 self.threads.set(v.max(0));
+            }
+        } else if p.name.eq_ignore_ascii_case("soft_heap_limit") {
+            // Advisory (graphite does not bound its heap); store so a later
+            // `PRAGMA soft_heap_limit` reads it back. A negative value clamps to 0.
+            if let Some(e) = &p.value {
+                let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                self.soft_heap_limit.set(v.max(0));
+            }
+        } else if p.name.eq_ignore_ascii_case("wal_autocheckpoint") {
+            // Advisory (graphite has no WAL auto-checkpointer); store the threshold.
+            if let Some(e) = &p.value {
+                let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                self.wal_autocheckpoint.set(v.max(0));
             }
         } else if p.name.eq_ignore_ascii_case("secure_delete") {
             // sqlite maps the argument to 0 (off), 2 (the `fast` keyword only), or
