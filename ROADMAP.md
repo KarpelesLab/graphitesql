@@ -215,7 +215,16 @@ its (niche/cosmetic) value:
   so a rename-only parse mode could emit column spans in traversal order without
   touching public `Expr` — at the cost of a fragile order-correlation for the very
   same-name/two-scope case it must fix). Both are deliberate design choices, which
-  is why this is a dedicated-session item.
+  is why this is a dedicated-session item. **The side-channel is worse than
+  fragile — it is unreliable (found 2026-07-10):** the recursive-descent parser
+  *backtracks* (e.g. the `table.*` speculative lookahead at `parser.rs:921`/`928`,
+  and any speculative `expr()`), so a spans-in-construction-order list would
+  desync from the final AST whenever a speculatively-parsed `Expr::Column` is
+  discarded. Spans that travel *inside* the node survive backtracking, so the
+  robust fix is the span field on `Expr::Column` — i.e. the public-API/semver
+  break is effectively required, and with it the version-bump decision (currently
+  owned by release-plz). Net: A-rn3-edge is blocked on a deliberate API/version
+  decision, and it in turn gates A-alter-rollback.
 - **A-alter-rollback — ALTER-time rejection of a RENAME that breaks a dependent.**
   `DROP COLUMN` already rejects pre-mutation. A `RENAME` whose propagation can't be
   *proven* can leave a dependent view/trigger unresolvable; SQLite rejects and
