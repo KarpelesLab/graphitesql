@@ -333,8 +333,18 @@ result or declines to it — never a wrong answer), so this track is
   `PRAGMA integrity_check` stays clean. Exposed via an additive `File::wal_index()`
   trait method. Process-local only (no cross-process `-shm`, consistent with the
   existing lock model) — a host needing multi-process WAL supplies its own VFS.
-- **C9d — a thread-safe `Connection`** (`Send`/`Sync`, or a documented per-thread
-  model).
+- **C9d — a thread-safe `Connection`. DONE via the documented per-thread model
+  (2026-07-09, 0c51128).** Full `Connection: Send` is fundamentally blocked: it
+  stores its file as one erased `Box<dyn File>`, and while `StdFile` is `Send`, the
+  always-available in-memory `MemoryFile` (backs `:memory:`, must work no_std/wasm)
+  is intentionally `Rc`/`RefCell`/`!Send` — so one concrete `Connection` is `Send`
+  only if every `File` impl is (an in-scope `Rc`→`Arc` swap was trialed and yields
+  zero `Send` progress). `Connection` is documented as **thread-confined** (neither
+  `Send` nor `Sync`; one per thread — `StdVfs` coordinates a shared file across
+  connections via the process-local lock manager + wal-index, C9a/C9c), enforced by
+  a `compile_fail` doctest and a multi-thread test. The path to real `Send` (a
+  `Connection` generic over the VFS, or a `Send`-only in-memory VFS + `Arc` page
+  data) is documented as the future direction.
 
 ### Track D — Virtual tables & ecosystem extensions
 
