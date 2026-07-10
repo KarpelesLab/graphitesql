@@ -437,8 +437,17 @@ result or declines to it — never a wrong answer), so this track is
   change hit by a later direct one. FK-action child writes (cascade/set-null/
   set-default) are now session-recorded too (previously invisible). Verified vs
   the plain `sesdump` oracle (auto-indirect for trigger/FK) and a
-  `sqlite3session_indirect` oracle. **Remaining:** changeset rebase and
-  streaming — the last of the session API.
+  `sqlite3session_indirect` oracle. *Changeset rebase done (2026-07-10):*
+  `Connection::changeset_apply_rebase(cs, on_conflict) -> Vec<u8>` applies a
+  remote changeset and captures a rebase blob (SQLite's `sqlite3changeset_apply_v2`
+  rebase output), and `Rebaser::new()/configure(blob)/rebase(changeset)`
+  (`sqlite3_rebaser`) rebases a local changeset onto the applied remote changes —
+  all 5 documented rebase rules (INSERT/UPDATE/DELETE × OMIT/REPLACE, per-field
+  partial-update merging). Verified byte-for-byte vs a `sqlite3rebaser` oracle
+  across the rule set, all storage classes, multi-row/-column, text PK, and a
+  fuzz sweep. **Remaining:** streaming (`xInput`/`xOutput`) — an API-shape variant
+  with no benefit over the `Vec` API in Rust; the session API is otherwise
+  complete.
 - **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**

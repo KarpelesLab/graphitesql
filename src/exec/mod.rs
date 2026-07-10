@@ -7574,12 +7574,54 @@ impl Connection {
         // every change applied so far, exactly like sqlite's ROLLBACK-TO + RELEASE.
         self.execute_params(&alloc::format!("SAVEPOINT \"{SP}\""), &Params::default())?;
 
-        let result = self.changeset_apply_inner(&tables, &mut on_conflict);
+        let mut rebase = None;
+        let result = self.changeset_apply_inner(&tables, &mut on_conflict, &mut rebase);
 
         match result {
             Ok(()) => {
                 self.execute_params(&alloc::format!("RELEASE \"{SP}\""), &Params::default())?;
                 Ok(())
+            }
+            Err(e) => {
+                let _ = self
+                    .execute_params(&alloc::format!("ROLLBACK TO \"{SP}\""), &Params::default());
+                let _ =
+                    self.execute_params(&alloc::format!("RELEASE \"{SP}\""), &Params::default());
+                Err(e)
+            }
+        }
+    }
+
+    /// Apply a changeset like [`changeset_apply_with`](Self::changeset_apply_with)
+    /// and, in addition, capture and return a **rebase** blob describing how each
+    /// conflict was resolved. The blob configures a [`Rebaser`](crate::Rebaser)
+    /// so a *local* changeset can be rebased onto these just-applied (remote)
+    /// changes. Mirrors `sqlite3changeset_apply_v2`'s rebase output (roadmap D5).
+    ///
+    /// On a handler-requested `Abort` (or a constraint the handler aborts on) the
+    /// apply rolls back and returns the error, and no rebase blob is produced.
+    ///
+    /// # Errors
+    /// As [`changeset_apply_with`](Self::changeset_apply_with).
+    pub fn changeset_apply_rebase(
+        &mut self,
+        changeset: &[u8],
+        mut on_conflict: impl FnMut(crate::session::ConflictType) -> crate::session::ConflictAction,
+    ) -> Result<Vec<u8>> {
+        let tables = crate::session::parse_changeset(changeset)?;
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        const SP: &str = "graphite_changeset_apply";
+        self.execute_params(&alloc::format!("SAVEPOINT \"{SP}\""), &Params::default())?;
+        let mut rebase = Some(Vec::new());
+        let result = self.changeset_apply_inner(&tables, &mut on_conflict, &mut rebase);
+        match result {
+            Ok(()) => {
+                self.execute_params(&alloc::format!("RELEASE \"{SP}\""), &Params::default())?;
+                Ok(crate::session::serialize_rebase(
+                    &rebase.unwrap_or_default(),
+                ))
             }
             Err(e) => {
                 let _ = self
@@ -7598,6 +7640,7 @@ impl Connection {
         &mut self,
         tables: &[crate::session::TableChangeset],
         on_conflict: &mut dyn FnMut(crate::session::ConflictType) -> crate::session::ConflictAction,
+        rebase: &mut Option<Vec<crate::session::RebaseEntry>>,
     ) -> Result<()> {
         for tbl in tables {
             // Resolve the target table; a missing table is a schema mismatch
@@ -7622,7 +7665,14 @@ impl Connection {
             let col_names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
 
             for change in &tbl.changes {
-                self.apply_one_change(&tbl.name, &col_names, &tbl.pk_flags, change, on_conflict)?;
+                self.apply_one_change(
+                    &tbl.name,
+                    &col_names,
+                    &tbl.pk_flags,
+                    change,
+                    on_conflict,
+                    rebase,
+                )?;
             }
         }
         Ok(())
@@ -7631,6 +7681,7 @@ impl Connection {
     /// Apply one parsed change record, resolving any conflict through
     /// `on_conflict` (see [`changeset_apply_with`](Self::changeset_apply_with)).
     /// Returns `Err` only when the change must abort the whole apply.
+    #[allow(clippy::too_many_arguments)]
     fn apply_one_change(
         &mut self,
         table: &str,
@@ -7638,6 +7689,7 @@ impl Connection {
         pk_flags: &[u8],
         change: &crate::session::ChangeRecord,
         on_conflict: &mut dyn FnMut(crate::session::ConflictType) -> crate::session::ConflictAction,
+        rebase: &mut Option<Vec<crate::session::RebaseEntry>>,
     ) -> Result<()> {
         use crate::session::{ChangeOp, ConflictAction as CA, ConflictType as CT};
 
@@ -7645,6 +7697,32 @@ impl Connection {
         let qtable = quote(table);
         let ncol = col_names.len();
         let is_pk = |i: usize| pk_flags.get(i).copied().unwrap_or(0) != 0;
+        // Capture a rebase record for a conflict resolved OMIT/REPLACE (a no-op
+        // unless `changeset_apply_rebase` is collecting). Values follow SQLite's
+        // `sessionRebaseAdd`: old for a DELETE or an UPDATE's PK columns, else new.
+        let mut capture = |action: CA| {
+            let Some(entries) = rebase.as_mut() else {
+                return;
+            };
+            if !matches!(action, CA::Omit | CA::Replace) {
+                return;
+            }
+            let mut values = Vec::with_capacity(ncol);
+            for i in 0..ncol {
+                let use_old =
+                    change.op == ChangeOp::Delete || (change.op == ChangeOp::Update && is_pk(i));
+                let src = if use_old { &change.old } else { &change.new };
+                values.push(src.get(i).cloned().flatten());
+            }
+            entries.push(crate::session::RebaseEntry {
+                table: table.to_string(),
+                ncol,
+                pk_flags: pk_flags.to_vec(),
+                op: change.op,
+                replace: matches!(action, CA::Replace),
+                values,
+            });
+        };
         // The error returned when the handler aborts a conflict that carries no
         // underlying engine error (a handler-requested Abort, or a Replace where
         // sqlite does not permit one). Mirrors `sqlite3changeset_apply`'s
@@ -7701,7 +7779,9 @@ impl Connection {
                         } else {
                             CT::Constraint
                         };
-                        match on_conflict(kind) {
+                        let action = on_conflict(kind);
+                        capture(action);
+                        match action {
                             CA::Omit => Ok(()),
                             CA::Abort => Err(e),
                             CA::Replace if kind == CT::Conflict => {
@@ -7720,7 +7800,9 @@ impl Connection {
                                     // A row that also collides on a secondary
                                     // UNIQUE index is a separate CONSTRAINT.
                                     Err(e2 @ Error::Constraint(_)) => {
-                                        match on_conflict(CT::Constraint) {
+                                        let a2 = on_conflict(CT::Constraint);
+                                        capture(a2);
+                                        match a2 {
                                             CA::Omit => Ok(()),
                                             _ => Err(e2),
                                         }
@@ -7769,7 +7851,9 @@ impl Connection {
                 } else {
                     CT::NotFound
                 };
-                match on_conflict(kind) {
+                let action = on_conflict(kind);
+                capture(action);
+                match action {
                     CA::Omit => Ok(()),
                     CA::Replace if kind == CT::Data => {
                         // Force the delete through, matched by primary key alone.
@@ -7836,7 +7920,9 @@ impl Connection {
                 } else {
                     CT::NotFound
                 };
-                match on_conflict(kind) {
+                let action = on_conflict(kind);
+                capture(action);
+                match action {
                     CA::Omit => Ok(()),
                     CA::Replace if kind == CT::Data => {
                         // Force the update through, matched by primary key alone.
@@ -7874,10 +7960,14 @@ impl Connection {
                             },
                         ) {
                             Ok(_) => Ok(()),
-                            Err(e @ Error::Constraint(_)) => match on_conflict(CT::Constraint) {
-                                CA::Omit => Ok(()),
-                                _ => Err(e),
-                            },
+                            Err(e @ Error::Constraint(_)) => {
+                                let a2 = on_conflict(CT::Constraint);
+                                capture(a2);
+                                match a2 {
+                                    CA::Omit => Ok(()),
+                                    _ => Err(e),
+                                }
+                            }
                             Err(e) => Err(e),
                         }
                     }

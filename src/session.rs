@@ -1607,6 +1607,495 @@ impl Changeset {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Changeset rebase (ROADMAP D5). Mirrors sqlite's sqlite3_rebaser: after a
+// remote changeset is applied with a conflict handler (capturing a "rebase"
+// blob, see `Connection::changeset_apply_rebase`), a local changeset is
+// rebased so it can be applied cleanly on top of the remote changes.
+// ---------------------------------------------------------------------------
+
+/// A conflict-resolution record captured while applying a changeset with
+/// [`crate::Connection::changeset_apply_rebase`]. One is produced per conflict
+/// resolved `OMIT`/`REPLACE`. Serialized into the rebase blob by
+/// [`serialize_rebase`].
+pub(crate) struct RebaseEntry {
+    pub(crate) table: String,
+    pub(crate) ncol: usize,
+    pub(crate) pk_flags: Vec<u8>,
+    /// The remote change's op (drives the value selection below).
+    pub(crate) op: ChangeOp,
+    /// Whether the conflict was resolved `REPLACE` (`true`) or `OMIT`.
+    pub(crate) replace: bool,
+    /// The captured record: for each column, `old` if the op is `DELETE` or the
+    /// column is a primary key of an `UPDATE`, else `new` (SQLite's
+    /// `sessionRebaseAdd`).
+    pub(crate) values: Vec<Option<Value>>,
+}
+
+/// Serialize captured [`RebaseEntry`]s into a rebase blob (SQLite-compatible:
+/// `'T'` table headers, then per record an op byte — `INSERT` for a remote
+/// `INSERT`/`UPDATE`, `DELETE` for a remote `DELETE` — a replace flag byte, and
+/// the record's values). Tables appear in first-touch order.
+pub(crate) fn serialize_rebase(entries: &[RebaseEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for e in entries {
+        if !seen.iter().any(|t| *t == e.table) {
+            seen.push(&e.table);
+            out.push(b'T');
+            append_varint(&mut out, e.ncol as u64);
+            out.extend_from_slice(&e.pk_flags);
+            out.extend_from_slice(e.table.as_bytes());
+            out.push(0);
+        }
+        out.push(if e.op == ChangeOp::Delete {
+            OP_DELETE
+        } else {
+            OP_INSERT
+        });
+        out.push(u8::from(e.replace));
+        for v in &e.values {
+            match v {
+                Some(v) => append_value(&mut out, v),
+                None => out.push(T_OMIT),
+            }
+        }
+    }
+    out
+}
+
+/// One field of a rebase-hash record: a concrete value, "undefined" (`0x00` in
+/// SQLite), or "replaced" (`0xFF` — a field a REPLACE resolution overrode).
+#[derive(Clone, Debug, PartialEq)]
+enum RField {
+    Undefined,
+    Replaced,
+    Val(Value),
+}
+
+/// One row's conflict resolution in the rebaser hash.
+#[derive(Clone)]
+struct RebaseChange {
+    /// `Insert` (remote INSERT/UPDATE) or `Delete` (remote DELETE).
+    op: ChangeOp,
+    /// Whether the resolution was REPLACE.
+    replace: bool,
+    fields: Vec<RField>,
+}
+
+struct RebaseHashTable {
+    name: String,
+    ncol: usize,
+    pk_flags: Vec<u8>,
+    /// (PK values, change) pairs.
+    rows: Vec<(Vec<Value>, RebaseChange)>,
+}
+
+/// A changeset rebaser. Configure it with one or more rebase blobs (from
+/// [`crate::Connection::changeset_apply_rebase`], in apply order), then
+/// [`rebase`](Self::rebase) local changesets. Mirrors SQLite's `sqlite3_rebaser`.
+#[derive(Default)]
+pub struct Rebaser {
+    tables: Vec<RebaseHashTable>,
+}
+
+impl Rebaser {
+    /// Create an empty rebaser.
+    pub fn new() -> Rebaser {
+        Rebaser { tables: Vec::new() }
+    }
+
+    /// Add a rebase blob to this rebaser's configuration. Call once per remote
+    /// changeset that was applied, in the same order the changesets were applied
+    /// (mirrors `sqlite3rebaser_configure`).
+    ///
+    /// # Errors
+    /// [`crate::error::Error::Corrupt`] if `rebase` is malformed.
+    pub fn configure(&mut self, rebase: &[u8]) -> Result<()> {
+        let mut r = Reader::new(rebase);
+        let mut cur: Option<usize> = None;
+        while !r.eof() {
+            let marker = r.peek()?;
+            match marker {
+                b'T' => {
+                    r.u8()?;
+                    let ncol = r.varint()? as usize;
+                    if ncol == 0 {
+                        return Err(corrupt("rebase table has zero columns"));
+                    }
+                    let mut pk_flags = Vec::with_capacity(ncol);
+                    for _ in 0..ncol {
+                        pk_flags.push(r.u8()?);
+                    }
+                    let start = r.pos;
+                    loop {
+                        if r.u8()? == 0 {
+                            break;
+                        }
+                    }
+                    let name = String::from(
+                        core::str::from_utf8(&r.data[start..r.pos - 1])
+                            .map_err(|_| corrupt("non-UTF-8 table name"))?,
+                    );
+                    cur = Some(match self.tables.iter().position(|t| t.name == name) {
+                        Some(i) => i,
+                        None => {
+                            self.tables.push(RebaseHashTable {
+                                name,
+                                ncol,
+                                pk_flags,
+                                rows: Vec::new(),
+                            });
+                            self.tables.len() - 1
+                        }
+                    });
+                }
+                OP_INSERT | OP_DELETE => {
+                    let op = if marker == OP_DELETE {
+                        ChangeOp::Delete
+                    } else {
+                        ChangeOp::Insert
+                    };
+                    r.u8()?;
+                    let replace = r.u8()? != 0;
+                    let ti = cur.ok_or_else(|| corrupt("rebase record before table header"))?;
+                    let (ncol, pk_flags) = {
+                        let t = &self.tables[ti];
+                        (t.ncol, t.pk_flags.clone())
+                    };
+                    let raw = r.record(ncol)?;
+                    // PK values (column order) for hashing.
+                    let mut pk = Vec::new();
+                    for (i, v) in raw.iter().enumerate() {
+                        if pk_flags.get(i).copied().unwrap_or(0) != 0 {
+                            pk.push(v.clone().unwrap_or(Value::Null));
+                        }
+                    }
+                    // Transform the raw record into rebase fields (SQLite's
+                    // sessionChangeMerge new-entry path): undefined stays
+                    // undefined; for a REPLACE, non-PK fields become "replaced".
+                    let fields: Vec<RField> = raw
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| match v {
+                            None => RField::Undefined,
+                            Some(val) => {
+                                if replace && pk_flags.get(i).copied().unwrap_or(0) == 0 {
+                                    RField::Replaced
+                                } else {
+                                    RField::Val(val)
+                                }
+                            }
+                        })
+                        .collect();
+                    let newc = RebaseChange {
+                        op,
+                        replace,
+                        fields,
+                    };
+                    self.merge_into(ti, pk, newc);
+                }
+                other => {
+                    return Err(corrupt(&alloc::format!("bad rebase op byte {other}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge a new rebase change for `pk` into table `ti`'s hash, combining with
+    /// any existing entry per SQLite's `sessionChangeMerge` (rebase path).
+    fn merge_into(&mut self, ti: usize, pk: Vec<Value>, newc: RebaseChange) {
+        let pk_flags = self.tables[ti].pk_flags.clone();
+        let t = &mut self.tables[ti];
+        let Some(slot) = t.rows.iter_mut().find(|(k, _)| pk_eq(k, &pk)) else {
+            t.rows.push((pk, newc));
+            return;
+        };
+        let existing = &slot.1;
+        // A replaced DELETE is sticky.
+        if existing.op == ChangeOp::Delete && existing.replace {
+            return;
+        }
+        let mut fields = Vec::with_capacity(existing.fields.len());
+        for (i, ef) in existing.fields.iter().enumerate() {
+            let non_pk = pk_flags.get(i).copied().unwrap_or(0) == 0;
+            let nf = newc.fields.get(i).cloned().unwrap_or(RField::Undefined);
+            let f = if *ef == RField::Replaced || (non_pk && newc.replace) {
+                RField::Replaced
+            } else if nf == RField::Undefined {
+                ef.clone()
+            } else {
+                nf
+            };
+            fields.push(f);
+        }
+        slot.1 = RebaseChange {
+            op: newc.op,
+            replace: newc.replace || existing.replace,
+            fields,
+        };
+    }
+
+    /// Rebase the changeset `changeset` against this rebaser's configuration and
+    /// return the rebased changeset. Mirrors `sqlite3rebaser_rebase`.
+    ///
+    /// # Errors
+    /// [`crate::error::Error::Corrupt`] if `changeset` is malformed, or
+    /// [`crate::error::Error::Unsupported`] for a patchset (which may not be
+    /// rebased, matching SQLite).
+    pub fn rebase(&self, changeset: &[u8]) -> Result<Vec<u8>> {
+        let tables = parse_changeset(changeset)?;
+        let mut out = Vec::new();
+        for tbl in &tables {
+            // SQLite writes a table header on the first change of each input
+            // table, before deciding whether the change survives — so a table
+            // whose changes all drop still contributes a bare header.
+            if tbl.changes.is_empty() {
+                continue;
+            }
+            out.push(b'T');
+            append_varint(&mut out, tbl.ncol as u64);
+            out.extend_from_slice(&tbl.pk_flags);
+            out.extend_from_slice(tbl.name.as_bytes());
+            out.push(0);
+
+            let rt = self.tables.iter().find(|t| t.name == tbl.name);
+            for change in &tbl.changes {
+                if let Some(bytes) = self.rebase_one(tbl, rt, change) {
+                    out.extend_from_slice(&bytes);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Rebase a single local change. Returns the serialized rebased record(s), or
+    /// `None` if the change is dropped.
+    fn rebase_one(
+        &self,
+        tbl: &TableChangeset,
+        rt: Option<&RebaseHashTable>,
+        change: &ChangeRecord,
+    ) -> Option<Vec<u8>> {
+        // The local change's PK values.
+        let key_src = match change.op {
+            ChangeOp::Insert => &change.new,
+            _ => &change.old,
+        };
+        let mut pk = Vec::new();
+        for (i, v) in key_src.iter().enumerate() {
+            if tbl.pk_flags.get(i).copied().unwrap_or(0) != 0 {
+                pk.push(v.clone().unwrap_or(Value::Null));
+            }
+        }
+        // Find the matching rebase change, if any.
+        let matched = rt
+            .and_then(|t| t.rows.iter().find(|(k, _)| pk_eq(k, &pk)))
+            .map(|(_, c)| c);
+
+        let Some(c) = matched else {
+            return Some(self.emit_unchanged(tbl, change));
+        };
+
+        match change.op {
+            ChangeOp::Insert => {
+                if c.op == ChangeOp::Insert {
+                    if c.replace {
+                        None // REPLACE: the local INSERT is overridden — drop it.
+                    } else {
+                        // OMIT: emit UPDATE with the full rebase record as old.*
+                        // and the full local insert record as new.* (SQLite
+                        // appends both records verbatim — no omit layout).
+                        let old = fields_to_record(&c.fields);
+                        Some(emit_update_raw(&old, &change.new))
+                    }
+                } else {
+                    Some(self.emit_unchanged(tbl, change))
+                }
+            }
+            ChangeOp::Update => {
+                if c.op == ChangeOp::Delete {
+                    if c.replace {
+                        None
+                    } else {
+                        // OMIT: UPDATE→INSERT; fill undefined new.* from the
+                        // rebase record.
+                        let merged = record_merge_fields(&change.new, &c.fields);
+                        Some(emit_insert(&merged))
+                    }
+                } else {
+                    // Remote UPDATE: partial-update rebase.
+                    emit_partial_update(&tbl.pk_flags, &change.old, &change.new, &c.fields)
+                }
+            }
+            ChangeOp::Delete => {
+                if c.op == ChangeOp::Insert {
+                    // DELETE with old.* = merge(rebase record, local old).
+                    let merged = record_merge_local(&c.fields, &change.old);
+                    Some(emit_delete(&merged))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Re-serialize a local change unchanged (no matching rebase record).
+    fn emit_unchanged(&self, tbl: &TableChangeset, change: &ChangeRecord) -> Vec<u8> {
+        match change.op {
+            ChangeOp::Insert => emit_insert(&change.new),
+            ChangeOp::Delete => emit_delete(&change.old),
+            ChangeOp::Update => emit_update(&tbl.pk_flags, &change.old, &change.new),
+        }
+    }
+}
+
+/// Convert rebase fields to an owned record (Replaced/Undefined → `None`).
+fn fields_to_record(fields: &[RField]) -> Vec<Option<Value>> {
+    fields
+        .iter()
+        .map(|f| match f {
+            RField::Val(v) => Some(v.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Merge a local `new.*` record with rebase `fields`: for each column, keep the
+/// local value unless it is undefined, in which case take the rebase field's
+/// value (SQLite's `sessionAppendRecordMerge`, a1 = local, a2 = rebase).
+fn record_merge_fields(local: &[Option<Value>], fields: &[RField]) -> Vec<Option<Value>> {
+    (0..local.len().max(fields.len()))
+        .map(|i| {
+            let l = local.get(i).cloned().flatten();
+            match l {
+                Some(v) => Some(v),
+                None => match fields.get(i) {
+                    Some(RField::Val(v)) => Some(v.clone()),
+                    _ => None,
+                },
+            }
+        })
+        .collect()
+}
+
+/// Merge rebase `fields` (a1) with a local `old.*` record (a2): keep the rebase
+/// value unless it is undefined/replaced, then take the local value.
+fn record_merge_local(fields: &[RField], local: &[Option<Value>]) -> Vec<Option<Value>> {
+    (0..fields.len().max(local.len()))
+        .map(|i| match fields.get(i) {
+            Some(RField::Val(v)) => Some(v.clone()),
+            _ => local.get(i).cloned().flatten(),
+        })
+        .collect()
+}
+
+/// Rebase a local UPDATE against a remote UPDATE (SQLite's
+/// `sessionAppendPartialUpdate`). Returns `None` if no column would be updated.
+fn emit_partial_update(
+    pk_flags: &[u8],
+    old: &[Option<Value>],
+    new: &[Option<Value>],
+    fields: &[RField],
+) -> Option<Vec<u8>> {
+    let ncol = pk_flags.len();
+    let mut rebased_old: Vec<Option<Value>> = Vec::with_capacity(ncol);
+    let mut b_data = false;
+    for i in 0..ncol {
+        let is_pk = pk_flags.get(i).copied().unwrap_or(0) != 0;
+        let f = fields.get(i).unwrap_or(&RField::Undefined);
+        let o = old.get(i).cloned().flatten();
+        if is_pk || matches!(f, RField::Undefined) {
+            if !is_pk && o.is_some() {
+                b_data = true;
+            }
+            rebased_old.push(o);
+        } else if let RField::Val(v) = f {
+            if o.is_some() {
+                b_data = true;
+                rebased_old.push(Some(v.clone()));
+            } else {
+                rebased_old.push(None);
+            }
+        } else {
+            // Replaced, or old undefined → undefined.
+            rebased_old.push(None);
+        }
+    }
+    if !b_data {
+        return None;
+    }
+    // new.* half: drop updates to replaced columns.
+    let mut rebased_new: Vec<Option<Value>> = Vec::with_capacity(ncol);
+    for i in 0..ncol {
+        let is_pk = pk_flags.get(i).copied().unwrap_or(0) != 0;
+        let replaced = matches!(fields.get(i), Some(RField::Replaced));
+        if is_pk || !replaced {
+            rebased_new.push(new.get(i).cloned().flatten());
+        } else {
+            rebased_new.push(None);
+        }
+    }
+    Some(emit_update_raw(&rebased_old, &rebased_new))
+}
+
+/// Write a full record (each field a value or the `0x00` omit marker).
+fn write_record(out: &mut Vec<u8>, rec: &[Option<Value>]) {
+    for v in rec {
+        match v {
+            Some(v) => append_value(out, v),
+            None => out.push(T_OMIT),
+        }
+    }
+}
+
+fn emit_insert(new: &[Option<Value>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(OP_INSERT);
+    out.push(0);
+    write_record(&mut out, new);
+    out
+}
+
+fn emit_delete(old: &[Option<Value>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(OP_DELETE);
+    out.push(0);
+    write_record(&mut out, old);
+    out
+}
+
+/// Emit an UPDATE record from full old/new vectors, applying the changeset
+/// UPDATE layout (unchanged non-PK columns become the `0x00` omit marker).
+fn emit_update(pk_flags: &[u8], old: &[Option<Value>], new: &[Option<Value>]) -> Vec<u8> {
+    let ncol = old.len().min(new.len());
+    let mut o = Vec::with_capacity(ncol);
+    let mut n = Vec::with_capacity(ncol);
+    for i in 0..ncol {
+        let is_pk = pk_flags.get(i).copied().unwrap_or(0) != 0;
+        let changed = old[i] != new[i];
+        o.push(if changed || is_pk {
+            old[i].clone()
+        } else {
+            None
+        });
+        n.push(if changed { new[i].clone() } else { None });
+    }
+    emit_update_raw(&o, &n)
+}
+
+/// Emit an UPDATE record from already-laid-out old/new records (each field a
+/// value or omit marker, verbatim).
+fn emit_update_raw(old: &[Option<Value>], new: &[Option<Value>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(OP_UPDATE);
+    out.push(0);
+    write_record(&mut out, old);
+    write_record(&mut out, new);
+    out
+}
+
 /// Compile-time check on the public [`Session`] type's auto-traits.
 ///
 /// [`Session`] shares its recorder with the connection through `Rc<RefCell<…>>`,
