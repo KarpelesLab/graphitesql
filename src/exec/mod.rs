@@ -3889,7 +3889,9 @@ impl Connection {
             let mut row = alloc::vec![
                 Value::Integer(i as i64),
                 Value::Text(col.name.clone()),
-                Value::Text(col.type_name.clone().unwrap_or_default()),
+                Value::Text(canonical_type_name(
+                    col.type_name.as_deref().unwrap_or_default()
+                )),
                 Value::Integer(notnull as i64),
                 dflt.map(Value::Text).unwrap_or(Value::Null),
                 Value::Integer(pk),
@@ -37439,6 +37441,24 @@ impl eval::Subqueries for Connection {
 /// Whether a value is the given text (used to match `sqlite_schema` columns).
 fn is_text(v: &Value, s: &str) -> bool {
     matches!(v, Value::Text(t) if t == s)
+}
+
+/// The declared column type as `PRAGMA table_info` reports it. SQLite stores one
+/// of its *standard* type names (`sqlite3StdType`: `ANY`, `BLOB`, `INT`,
+/// `INTEGER`, `REAL`, `TEXT`) by a shared uppercase spelling, so a column declared
+/// `InTeGeR` (or `integer`, or bare `  int  `, whose token span excludes the
+/// surrounding whitespace) is reported as the canonical uppercase form. Any other
+/// type text is preserved verbatim: a length spec (`VARCHAR(5)`, `INT(3)`), a
+/// multi-word or non-standard name (`mediumint`, `numeric`), or — matching SQLite,
+/// which compares the *stored* string without trimming — a quoted type whose
+/// content carries interior whitespace (`"integer "` stays `integer `).
+fn canonical_type_name(decl: &str) -> alloc::string::String {
+    for std in ["ANY", "BLOB", "INT", "INTEGER", "REAL", "TEXT"] {
+        if decl.eq_ignore_ascii_case(std) {
+            return alloc::string::String::from(std);
+        }
+    }
+    alloc::string::String::from(decl)
 }
 
 /// Collect `column = constant` equalities from the top-level `AND` conjuncts of a
