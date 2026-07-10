@@ -126,30 +126,16 @@ fn rename_column_rewrites_cross_object_trigger_refs() {
          CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
            UPDATE u SET c=1 WHERE a IN (SELECT a FROM t); END; \
          ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // A CTE inside a body subquery: the CTE body is rewritten like any scope
+        // (its `a` binds to `t`), the outer `count(*)` is unaffected — byte-matching
+        // SQLite. (The CTE body's output column isn't referenced by the outer under
+        // its old name, so the rewrite is safe.)
+        "CREATE TABLE t(a,b); CREATE TABLE u(c); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET c=(WITH x AS (SELECT a FROM t) SELECT count(*) FROM x); END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
-    }
-
-    // Bail invariant: the remaining A-rn3-edge residual and the non-base-source
-    // shapes. graphite leaves the stored trigger byte-identical — never a
-    // half-renamed body. SQLite does more here (it resolves each ref by scope, or
-    // reaches through the CTE), so these stay known gaps rather than differential
-    // equalities; the invariant only guards against a *wrong* (partial/corrupting)
-    // rewrite creeping in.
-    let bail = [
-        // A CTE inside a body subquery is a non-base source the rewrite can't
-        // reason about.
-        (
-            "CREATE TABLE t(a,b); CREATE TABLE u(c); \
-             CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
-               UPDATE u SET c=(WITH x AS (SELECT a FROM t) SELECT count(*) FROM x); END; \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
-            "CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
-               UPDATE u SET c=(WITH x AS (SELECT a FROM t) SELECT count(*) FROM x); END",
-        ),
-    ];
-    for (sql, unchanged) in bail {
-        assert_eq!(out(g, sql), unchanged, "bail invariant for {sql}");
     }
 }

@@ -42365,9 +42365,14 @@ fn view_global_unique_quals(
     // safely; if none does, only the qualified `renamed.old` refs rewrite; only a
     // genuinely *mixed* body (some bare `old` binding to the renamed table and
     // some to another) still needs per-ref spans, so that one bails. (A-rn3-edge.)
+    // With a CTE present, force the scope-aware decision even when the flat check
+    // says "globally unique": the fast path would rewrite an outer reference to a
+    // CTE's renamed output column, but SQLite rejects that (the CTE's exposed name
+    // changed), so it must stay unresolved and bail rather than be blindly renamed.
+    let cte = select_contains_cte(&cv.select);
     match global_unique_plan(&srcs, table, old, table_cols) {
-        Some((quals, true)) => Some((quals, BareRewrite::All)),
-        Some((quals, false)) => {
+        Some((quals, true)) if !cte => Some((quals, BareRewrite::All)),
+        Some((quals, _)) => {
             scope_bare_old_decision(&cv.select, table, old, table_cols).map(|rb| (quals, rb))
         }
         None => None,
@@ -42381,13 +42386,63 @@ fn view_global_unique_quals(
 /// derived subquery / TVF / schema-qualified source in a `FROM`, a NATURAL/USING
 /// join (column coalescing), a source named or aliased exactly `old` (its token
 /// would be wrongly rewritten), or a result-column alias equal to `old`.
+/// Whether `sel` uses a `WITH` common table expression anywhere the RENAME COLUMN
+/// rewrite would traverse (this select, a compound arm, a `FROM` subquery, an
+/// expression subquery, or a CTE body). When true, the whole-text
+/// `BareRewrite::All` fast path is unsafe — an outer reference to a CTE's renamed
+/// output column must be resolved per-scope (and bailed) rather than blindly
+/// rewritten — so the caller forces the scope-aware decision instead.
+fn select_contains_cte(sel: &Select) -> bool {
+    if !sel.ctes.is_empty() {
+        return true;
+    }
+    if sel.compound.iter().any(|(_, arm)| select_contains_cte(arm)) {
+        return true;
+    }
+    if let Some(from) = &sel.from {
+        if from
+            .first
+            .subquery
+            .as_deref()
+            .is_some_and(select_contains_cte)
+        {
+            return true;
+        }
+        if from
+            .joins
+            .iter()
+            .any(|j| j.table.subquery.as_deref().is_some_and(select_contains_cte))
+        {
+            return true;
+        }
+    }
+    let mut subs: Vec<&Select> = Vec::new();
+    for e in view_select_exprs(sel) {
+        collect_immediate_subselects(e, &mut subs);
+    }
+    subs.iter().any(|s| select_contains_cte(s))
+}
+
 fn collect_select_base_sources(
     sel: &Select,
     old: &str,
     srcs: &mut Vec<(String, Option<String>)>,
 ) -> bool {
-    if !sel.ctes.is_empty() {
-        return false;
+    // CTEs: each `WITH` body is an independent source scope (recurse it); a
+    // reference to a CTE *name* in this select's `FROM` is not a base table, so it
+    // is skipped below. A CTE named exactly `old` would confuse the token rewrite,
+    // so bail. (A later fast-path gate forces scope-aware resolution whenever a CTE
+    // is present, so an outer reference to a CTE's renamed output column stays
+    // unresolvable and the whole object bails — matching SQLite's reject-and-leave-
+    // unchanged rather than a stored-SQL divergence.)
+    let cte_names: Vec<String> = sel.ctes.iter().map(|c| c.name.clone()).collect();
+    for cte in &sel.ctes {
+        if cte.name.eq_ignore_ascii_case(old) {
+            return false;
+        }
+        if !collect_select_base_sources(&cte.select, old, srcs) {
+            return false;
+        }
     }
     // Compound (`UNION`/`INTERSECT`/`EXCEPT`): each arm is an independent scope, so
     // recurse them (the scope-aware pass then resolves each arm's bare `old` to its
@@ -42406,6 +42461,10 @@ fn collect_select_base_sources(
         let mut take = |tr: &crate::sql::ast::TableRef| -> bool {
             if tr.subquery.is_some() || tr.tvf_args.is_some() || tr.schema.is_some() {
                 return false;
+            }
+            // A reference to one of this select's CTE names is not a base source.
+            if cte_names.iter().any(|c| c.eq_ignore_ascii_case(&tr.name)) {
+                return true;
             }
             if tr.name.eq_ignore_ascii_case(old) {
                 return false;
@@ -42741,6 +42800,15 @@ fn collect_bare_old_owners(
     scopes: &mut Vec<Vec<(String, Option<String>)>>,
     owners: &mut Vec<(String, Span)>,
 ) -> bool {
+    // CTE bodies are independent scopes defined before this select's own `FROM`:
+    // resolve each against the enclosing `scopes` only. A reference in the outer
+    // query to a CTE's column is *not* to a base table, so it stays unresolved and
+    // bails the whole object (matching SQLite, which rejects such a rename).
+    for cte in &sel.ctes {
+        if !collect_bare_old_owners(&cte.select, old, table_cols, scopes, owners) {
+            return false;
+        }
+    }
     let mut scope: Vec<(String, Option<String>)> = Vec::new();
     if let Some(from) = &sel.from {
         scope.push((from.first.name.clone(), from.first.alias.clone()));
@@ -42977,6 +43045,49 @@ fn collect_trigger_stmt_base_sources(
     }
 }
 
+/// Whether a trigger's `WHEN` guard or any body statement uses a `WITH` CTE (in a
+/// statement's own select or a nested subquery). Mirrors [`select_contains_cte`]
+/// for the trigger shape; used to force scope-aware RENAME COLUMN resolution.
+fn trigger_contains_cte(ct: &crate::sql::ast::CreateTrigger) -> bool {
+    use crate::sql::ast::InsertSource;
+    let expr_has_cte = |e: &Expr| -> bool {
+        let mut subs: Vec<&Select> = Vec::new();
+        collect_immediate_subselects(e, &mut subs);
+        subs.iter().any(|s| select_contains_cte(s))
+    };
+    if ct.when.as_ref().is_some_and(&expr_has_cte) {
+        return true;
+    }
+    for stmt in &ct.body {
+        let has = match stmt {
+            Statement::Select(s) => select_contains_cte(s),
+            Statement::Insert(i) => match &i.source {
+                InsertSource::Select(s) => select_contains_cte(s),
+                InsertSource::Values(rows) => rows.iter().flatten().any(&expr_has_cte),
+                InsertSource::DefaultValues => false,
+            },
+            Statement::Update(u) => {
+                u.assignments.iter().any(|(_, e)| expr_has_cte(e))
+                    || u.where_clause.as_ref().is_some_and(&expr_has_cte)
+                    || u.order_by.iter().any(|t| expr_has_cte(&t.expr))
+                    || u.limit.as_ref().is_some_and(&expr_has_cte)
+                    || u.offset.as_ref().is_some_and(&expr_has_cte)
+            }
+            Statement::Delete(d) => {
+                d.where_clause.as_ref().is_some_and(&expr_has_cte)
+                    || d.order_by.iter().any(|t| expr_has_cte(&t.expr))
+                    || d.limit.as_ref().is_some_and(&expr_has_cte)
+                    || d.offset.as_ref().is_some_and(&expr_has_cte)
+            }
+            _ => false,
+        };
+        if has {
+            return true;
+        }
+    }
+    false
+}
+
 /// The trigger counterpart of [`view_global_unique_quals`]: a `CREATE TRIGGER`
 /// whose `WHEN` guard and body reach the renamed `table` only through base-table
 /// sources (its own target tables and nested-subquery `FROM`s), with the renamed
@@ -43023,10 +43134,13 @@ fn trigger_global_unique_quals(
     }
     // Globally-unique fast path, else the scope-aware fallback (A-rn3-edge) — see
     // [`view_global_unique_quals`] / [`scope_bare_old_decision_trigger`] for the
-    // rationale; a genuinely mixed body still bails untouched.
+    // rationale; a genuinely mixed body still bails untouched. As for views, a CTE
+    // anywhere forces scope-aware so an outer reference to a CTE's renamed output
+    // column stays unresolved and bails rather than being blindly rewritten.
+    let cte = trigger_contains_cte(&ct);
     let (mut quals, bare) = match global_unique_plan(&srcs, table, old, table_cols) {
-        Some((q, true)) => (q, BareRewrite::All),
-        Some((q, false)) => (
+        Some((q, true)) if !cte => (q, BareRewrite::All),
+        Some((q, _)) => (
             q,
             scope_bare_old_decision_trigger(&ct, table, old, table_cols)?,
         ),

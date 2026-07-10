@@ -28,9 +28,13 @@
 //! table in a different scope of the same statement — is now handled too: each
 //! bare `Expr::Column` carries its source byte span, so the rewrite renames
 //! exactly the occurrences that bind to the renamed table and leaves the rest
-//! (A-rn3-edge closed for views). Any non-base source (a derived subquery/TVF,
-//! CTE, NATURAL/USING join) still bails the whole view untouched — the remaining
-//! residual.
+//! (A-rn3-edge closed for views). Compound (UNION/INTERSECT/EXCEPT) and `WITH` CTE
+//! bodies are handled too: each compound arm and each CTE body is an independent
+//! scope, so only the refs that bind to the renamed base table rewrite; an outer
+//! reference to a CTE's renamed output column stays unresolved and bails the whole
+//! view (matching SQLite, which rejects such a rename). The remaining residual is
+//! a derived-table/TVF/NATURAL-USING source, a compound `ORDER BY`, or a CTE
+//! consumed inside a compound arm — those bail the whole view untouched.
 //!
 //! Verified against the sqlite3 3.50.4 CLI.
 
@@ -183,9 +187,62 @@ fn rename_column_rewrites_nested_subquery_refs_in_view() {
          CREATE VIEW v AS SELECT c FROM u WHERE c IN (SELECT a FROM t UNION SELECT a FROM t); \
          ALTER TABLE t RENAME COLUMN a TO aa; \
          SELECT sql FROM sqlite_schema WHERE name='v'",
+        // CTE body over the renamed table, consumed by `SELECT *`: the body rewrites
+        // (`a`→`aa`), the outer `*` is unaffected. The CTE's exposed column changes,
+        // but no consumer references it by the old name, so SQLite (and graphite)
+        // succeed.
+        "CREATE TABLE t(a,b); \
+         CREATE VIEW v AS WITH x AS (SELECT a FROM t) SELECT * FROM x; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // CTE with an explicit column list fixes the exposed name, so the body
+        // rewrites and the outer `SELECT k` is unaffected.
+        "CREATE TABLE t(a,b); \
+         CREATE VIEW v AS WITH x(k) AS (SELECT a FROM t) SELECT k FROM x; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // CTE body with a join.
+        "CREATE TABLE t(a,b); CREATE TABLE u(c,d); \
+         CREATE VIEW v AS WITH x AS (SELECT a FROM t JOIN u ON t.b=u.c) SELECT * FROM x; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Two CTE bodies, both over the renamed table.
+        "CREATE TABLE t(a,b); \
+         CREATE VIEW v AS WITH x AS (SELECT a FROM t), y AS (SELECT a FROM t) SELECT * FROM x,y; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // CTE body nesting a mixed subquery (renamed `t.a` inside, another `u.a`
+        // stays).
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS WITH x AS (SELECT a FROM t WHERE a IN (SELECT a FROM u)) SELECT * FROM x; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Renaming a column the CTE view never references leaves it byte-unchanged.
+        "CREATE TABLE t(a,b); \
+         CREATE VIEW v AS WITH x AS (SELECT a FROM t) SELECT * FROM x; \
+         ALTER TABLE t RENAME COLUMN b TO bb; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
+    }
+
+    // CTE bail: an outer reference to a CTE's renamed OUTPUT column (`SELECT a FROM
+    // x` where `x`'s body projects the renamed `t.a`) makes the reference
+    // unresolvable — graphite leaves the stored view byte-identical. SQLite rewrites
+    // the CTE body and then rejects the whole rename (the CTE's exposed column
+    // became `aa`, so the outer `a` no longer resolves), so its stored view is *also*
+    // left unchanged; only SQLite additionally errors (that reject is A-alter-
+    // rollback's job). Here the stored SQL matches; the invariant guards against a
+    // wrong rewrite.
+    let cte_bail = [(
+        "CREATE TABLE t(a,b); \
+         CREATE VIEW v AS WITH x AS (SELECT a FROM t) SELECT a FROM x; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        "CREATE VIEW v AS WITH x AS (SELECT a FROM t) SELECT a FROM x",
+    )];
+    for (sql, unchanged) in cte_bail {
+        assert_eq!(out(g, sql), unchanged, "cte bail for {sql}");
     }
 
     // Compound bail: a compound-level `ORDER BY` binds to the FIRST arm's OUTPUT

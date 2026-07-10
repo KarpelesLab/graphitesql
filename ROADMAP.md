@@ -255,16 +255,31 @@ its (niche/cosmetic) value:
     EXCEPT, N arms, per-arm joins, and nested mixed subqueries. The one compound
     sub-case still declining is a compound-level **`ORDER BY`** (it binds to the
     first arm's OUTPUT column — needs output-column modeling); it bails untouched
-    (never a wrong rewrite). **CTE bodies still decline** and remain the false-reject
-    blocker (see the CTE rule below).
+    (never a wrong rewrite). **CTE bodies are now DONE too (2026-07-10):**
+    `collect_select_base_sources`/`collect_bare_old_owners` recurse each `WITH`
+    body as a scope and skip CTE names as base sources; a fast-path gate
+    (`select_contains_cte`/`trigger_contains_cte`) forces scope-aware resolution so
+    an outer reference to a CTE's renamed output column stays unresolved and bails
+    (matching sqlite's reject-and-leave-unchanged) instead of being blindly
+    rewritten. Byte-exact vs sqlite for `SELECT *`, explicit `WITH x(collist)`,
+    join bodies, multi-CTE, nested-mixed, and recursive CTEs — for both views and
+    trigger bodies. The one CTE sub-case still declining is a CTE *consumed inside a
+    compound arm* (`… UNION SELECT a FROM x`), which needs CTE output-column
+    provenance; it bails untouched (safe, never wrong).
   - **sqlite REJECTS, graphite declines (broken):** derived-table views
     (`SELECT a FROM (SELECT a FROM t)`, `SELECT s.a FROM (SELECT a FROM t) s`) and
     the `USING(a)` join-column-vanishes shape. Here re-validation rejecting *matches*
     sqlite — these are the genuine A-alter-rollback targets. (A `NATURAL JOIN`
     rename is NOT a break — it degrades to a cross-join and both accept.)
-  **Net:** A-alter-rollback needs RENAME-COLUMN propagation extended to CTE and
-  compound view bodies first. **Concrete sqlite rewrite rules measured 2026-07-10
-  (the implementation targets):**
+  **Net (updated 2026-07-10):** compound AND CTE propagation are now DONE, so the
+  common false-reject cases are gone. The remaining false-reject residuals are
+  narrow — a compound `ORDER BY` and a CTE consumed inside a compound arm (both
+  bail, both need output-column modeling). A-alter-rollback's re-validation can now
+  be re-approached: reject only when graphite *successfully propagated* the
+  dependent and it *still* fails to resolve (the genuine `USING(a)`/derived breaks
+  sqlite also rejects), and never on a decline (those narrow residuals stay
+  allowed-but-unchanged, matching graphite's prior conservative behavior). **The
+  original concrete sqlite rewrite rules (now implemented) for reference:**
   - *Compound* (`SELECT … UNION/INTERSECT/EXCEPT SELECT …`): each arm is an
     independent scope — rewrite only the arm(s) whose refs bind to the renamed
     table (reuses the existing `BareRewrite::At`/span machinery per arm), e.g.
