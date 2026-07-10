@@ -411,11 +411,15 @@ import layer (`.separator`/`.nullvalue`/`.output`/`.once`/`.import`/`.echo`/
 `.changes`/`.print`/`.show`), and `.backup`/`.save` (backed by
 `Connection::serialize()`). See git history / `CHANGELOG.md`. **Remaining (all
 peripheral — the SQL engine, not the shell, is the project's purpose):**
-- **CLI-1 — `.bail`** (stop on first error).
+- **CLI-1 — `.bail`. DONE 2026-07-10.** `.bail on` stops the batch at the first
+  error and exits non-zero (`tests/cli_dot_commands.rs::bail_on_stops_after_error`).
+  (Related follow-up, part of CLI-2: SQLite also exits non-zero on *any* error in
+  non-interactive mode even under `.bail off` — graphite currently exits 0.)
 - **CLI-2 — sqlite-style error text.** Render `Parse error near line N: … (code)`
-  with the `error here ---^` caret instead of graphite's bare `Error:`. Needs
-  parser token byte-offsets threaded into `Error` — a library-level change, not
-  shell-only. (The `Expr::Column` span work is a precedent for carrying offsets.)
+  with the `error here ---^` caret instead of graphite's bare `Error:`, and exit
+  non-zero on any error in a non-interactive batch. Needs parser token
+  byte-offsets threaded into `Error` — a library-level change, not shell-only. (The
+  `Expr::Column` span work is a precedent for carrying offsets.)
 - **CLI-3 — `.echo` per-input-line.** Echo each raw dot-command input line, not
   just SQL groups.
 

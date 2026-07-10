@@ -154,6 +154,9 @@ struct Shell {
     /// Print a `changes: N   total_changes: M` line after each SQL group
     /// (`.changes on`).
     count_changes: bool,
+    /// Stop (exit non-zero) after the first error (`.bail on`). Off by default,
+    /// matching SQLite: errors are reported and execution continues.
+    bail: bool,
     /// Running total of rows changed by DML, for `.changes` `total_changes`.
     total_changes: u64,
     /// Rows changed by the most recent DML statement, for `.changes` `changes`.
@@ -183,6 +186,7 @@ impl Shell {
             insert_table: String::from("table"),
             echo: false,
             count_changes: false,
+            bail: false,
             total_changes: 0,
             last_changes: 0,
             out: Sink::Stdout,
@@ -286,6 +290,9 @@ impl Shell {
         }
         if let Err(e) = self.run_sql_batch(conn, sql) {
             eprintln!("Error: {e}");
+            if self.bail {
+                std::process::exit(1);
+            }
         }
         if self.count_changes {
             let mut out = io::stdout();
@@ -956,6 +963,10 @@ impl Shell {
             ".changes" => match arg {
                 Some(a) => self.count_changes = boolean_value(a),
                 None => eprintln!("Usage: .changes on|off"),
+            },
+            ".bail" => match arg {
+                Some(a) => self.bail = boolean_value(a),
+                None => eprintln!("Usage: .bail on|off"),
             },
             ".output" | ".once" => self.set_output(cmd, &args),
             ".databases" => {

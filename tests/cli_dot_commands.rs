@@ -506,3 +506,52 @@ fn control_char_escaping_in_display_modes() {
         assert_same(label, script);
     }
 }
+
+/// `.bail on` stops the batch at the first error (SQLite's `.bail`): the statement
+/// after the error does not run and the process exits non-zero. Default (`.bail
+/// off`) reports the error and continues. Compared against graphite's own
+/// behaviour (the error *text* differs from sqlite — a separate CLI residual — so
+/// this is not a byte-diff).
+#[test]
+fn bail_on_stops_after_error() {
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let run_status = |input: &str| -> (String, bool) {
+        let mut child = Command::new(g)
+            .arg(":memory:")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.success(),
+        )
+    };
+
+    // .bail on: the statement after the error must not run; exit non-zero.
+    let (out, ok) = run_status(".bail on\nSELECT 1;\nSELECT no_such_col;\nSELECT 2 AS after;\n");
+    assert!(
+        out.split_whitespace().any(|w| w == "1"),
+        "first ran: {out:?}"
+    );
+    assert!(
+        !out.split_whitespace().any(|w| w == "2"),
+        "no statement after the error should run under .bail on: {out:?}"
+    );
+    assert!(!ok, ".bail on must exit non-zero after an error");
+
+    // Default (.bail off): the batch continues past the error.
+    let (out2, _) = run_status("SELECT 1;\nSELECT no_such_col;\nSELECT 2 AS after;\n");
+    assert!(
+        out2.split_whitespace().any(|w| w == "2"),
+        "without .bail the batch continues past the error: {out2:?}"
+    );
+}
