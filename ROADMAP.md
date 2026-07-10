@@ -517,12 +517,17 @@ the committed database (WAL-aware) is concatenated into a standalone file image
 `integrity_check` + data round-trip. `.show` also landed 2026-07-10 (all 12 setting lines byte-identical incl. the
 column-family `--wrap 60 --wordwrap off --noquote` suffix and `output_c_string`-
 quoted separators; `eqp`/`explain`/`stats`/`width` shown at SQLite's defaults).
-Still not implemented: `.bail`, the CLI error-message text (graphite renders
-`Error:` rather than sqlite's `Parse error near line N: … (code)` with the
-`error here ---^` caret — needs parser token offsets threaded into errors), and
-`.echo` echoing dot-command input lines (graphite echoes SQL groups, not each raw
-input line). Peripheral (the SQL engine, not the shell, is the project's purpose),
-so lower priority.
+`list`/`tabs` mode now also applies SQLite's default control-character display
+escaping (`SHELL_ESC_ASCII`: a control byte ≤ 0x1f other than tab/newline/CRLF-CR
+renders as `^`+`c+0x40`, e.g. `x'02'`→`^B`; `ascii` mode stays verbatim), byte-
+verified (2026-07-10). Still not implemented: the same `^X` escaping in the
+*width-aligned* display modes (`column`/`box`/`table`/`markdown`/`line`) — those
+need the escape applied before column-width computation; `.bail`; the CLI
+error-message text (graphite renders `Error:` rather than sqlite's `Parse error
+near line N: … (code)` with the `error here ---^` caret — needs parser token
+offsets threaded into errors); and `.echo` echoing dot-command input lines
+(graphite echoes SQL groups, not each raw input line). Peripheral (the SQL engine,
+not the shell, is the project's purpose), so lower priority.
 
 ---
 

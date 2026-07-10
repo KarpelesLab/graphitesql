@@ -600,13 +600,24 @@ impl Shell {
     /// the `.nullvalue` string; TEXT/BLOB stop at the first NUL (C-string
     /// semantics), matching the `sqlite3` CLI.
     fn print_list(&mut self, result: &QueryResult) {
+        // `list`/`tabs` apply SQLite's default control-character display escaping
+        // (`^X`); `ascii` mode (same `Mode::List`, distinguished by its name) is
+        // for machine parsing and sends bytes verbatim.
+        let escape = self.mode_name != "ascii";
         let mut line: Vec<u8> = Vec::new();
+        let emit = |line: &mut Vec<u8>, raw: &[u8]| {
+            if escape {
+                push_display_escaped(raw, line);
+            } else {
+                line.extend_from_slice(raw);
+            }
+        };
         if self.headers {
             for (i, c) in result.columns.iter().enumerate() {
                 if i > 0 {
                     line.extend_from_slice(self.col_sep.as_bytes());
                 }
-                line.extend_from_slice(c.as_bytes());
+                emit(&mut line, c.as_bytes());
             }
             line.extend_from_slice(self.row_sep.as_bytes());
         }
@@ -615,7 +626,9 @@ impl Shell {
                 if i > 0 {
                     line.extend_from_slice(self.col_sep.as_bytes());
                 }
-                render_list_cell(v, &self.null_value, &mut line);
+                let mut cell = Vec::new();
+                render_list_cell(v, &self.null_value, &mut cell);
+                emit(&mut line, &cell);
             }
             line.extend_from_slice(self.row_sep.as_bytes());
         }
@@ -1919,6 +1932,29 @@ fn pad_to(s: &str, width: usize, out: &mut Vec<u8>) {
     out.extend_from_slice(s.as_bytes());
     let n = s.chars().count();
     out.extend(std::iter::repeat_n(b' ', width.saturating_sub(n)));
+}
+
+/// Append `bytes` to `out`, applying SQLite's default control-character display
+/// escaping (`SHELL_ESC_ASCII`): a control byte `c ≤ 0x1f` other than tab,
+/// newline, or the `\r` of a `\r\n` is rendered as `^` followed by `c + 0x40`
+/// (so `\x02` → `^B`); a NUL ends the (C-string) value. All other bytes,
+/// including valid UTF-8 and `\x7f`, pass through verbatim.
+fn push_display_escaped(bytes: &[u8], out: &mut Vec<u8>) {
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == 0 {
+            break;
+        }
+        let is_crlf_cr = c == 0x0d && bytes.get(i + 1) == Some(&0x0a);
+        if c <= 0x1f && c != b'\t' && c != b'\n' && !is_crlf_cr {
+            out.push(b'^');
+            out.push(0x40 + c);
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
 }
 
 /// Left-justify `s` to `width` display characters, appending to a `String`.
