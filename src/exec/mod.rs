@@ -42386,8 +42386,21 @@ fn collect_select_base_sources(
     old: &str,
     srcs: &mut Vec<(String, Option<String>)>,
 ) -> bool {
-    if !sel.ctes.is_empty() || !sel.compound.is_empty() {
+    if !sel.ctes.is_empty() {
         return false;
+    }
+    // Compound (`UNION`/`INTERSECT`/`EXCEPT`): each arm is an independent scope, so
+    // recurse them (the scope-aware pass then resolves each arm's bare `old` to its
+    // own table). Bail if the compound carries an `ORDER BY` — it binds to the
+    // FIRST arm's OUTPUT column, which a base-table token rewrite can't model — or
+    // if this is a desugared multi-row `VALUES` clause (no real base sources).
+    if !sel.compound.is_empty() && (!sel.order_by.is_empty() || sel.values_rows != 0) {
+        return false;
+    }
+    for (_, arm) in &sel.compound {
+        if !collect_select_base_sources(arm, old, srcs) {
+            return false;
+        }
     }
     if let Some(from) = &sel.from {
         let mut take = |tr: &crate::sql::ast::TableRef| -> bool {
@@ -42738,7 +42751,20 @@ fn collect_bare_old_owners(
     scopes.push(scope);
     let ok = resolve_exprs_bare_owners(&view_select_exprs(sel), old, table_cols, scopes, owners);
     scopes.pop();
-    ok
+    if !ok {
+        return false;
+    }
+    // Each compound arm is an independent scope: recurse it (its own `FROM` is
+    // pushed for the duration, and any outer `scopes` stay available for a
+    // correlated arm). The compound `ORDER BY` is handled in the main select's
+    // scope above; `collect_select_base_sources` has already bailed a compound that
+    // carries one.
+    for (_, arm) in &sel.compound {
+        if !collect_bare_old_owners(arm, old, table_cols, scopes, owners) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Trigger counterpart of [`scope_bare_old_decision`]: decides, across a whole

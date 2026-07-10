@@ -153,9 +153,54 @@ fn rename_column_rewrites_nested_subquery_refs_in_view() {
          CREATE VIEW v AS SELECT a FROM t WHERE a IN (SELECT a FROM u); \
          ALTER TABLE t RENAME COLUMN b TO bb; \
          SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Compound (UNION/INTERSECT/EXCEPT): each arm is an independent scope, so
+        // only the arm bound to the renamed table rewrites. Here `a` in the first
+        // arm binds to `t`, the second to `u` — renaming `t.a` rewrites just the
+        // first arm's `a`.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Compound, three arms, only the bound arm rewrites.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); CREATE TABLE w(a,d); \
+         CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u UNION ALL SELECT a FROM w; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Compound whose arm nests a mixed subquery: the first arm's outer `a`
+        // (bound to `u`) stays, its subquery `a` (bound to `t`) and the second
+        // arm's `a` (bound to `t`) rewrite. Renaming `t.a`.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT c FROM u WHERE c IN (SELECT a FROM t) UNION SELECT a FROM t; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Compound with a qualified ref in each arm.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT t.a FROM t UNION SELECT u.a FROM u; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Compound nested inside a scalar subquery.
+        "CREATE TABLE t(a,b); CREATE TABLE u(c); \
+         CREATE VIEW v AS SELECT c FROM u WHERE c IN (SELECT a FROM t UNION SELECT a FROM t); \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
+    }
+
+    // Compound bail: a compound-level `ORDER BY` binds to the FIRST arm's OUTPUT
+    // column, which a base-table token rewrite can't model, so graphite declines
+    // and leaves the view byte-identical (SQLite rewrites both the arm and the
+    // matching `ORDER BY` term — a known gap, not a wrong rewrite). Guards against
+    // a corrupting partial rewrite.
+    let compound_bail = [(
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u ORDER BY a; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+        "CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u ORDER BY a",
+    )];
+    for (sql, unchanged) in compound_bail {
+        assert_eq!(out(g, sql), unchanged, "compound ORDER BY bail for {sql}");
     }
 
     // Functional check: the mixed-body view stays queryable after the rename (the

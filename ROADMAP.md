@@ -244,12 +244,19 @@ its (niche/cosmetic) value:
   triggers (above), removing that class of false-reject. But a decline-set probe
   shows A-alter-rollback is **still blocked** — the remaining decline set splits
   two ways, and one half is still a false-reject trap:
-  - **sqlite REWRITES + succeeds, graphite DECLINES (broken):** CTE-body views
+  - **sqlite REWRITES + succeeds, graphite DECLINES (broken):** was CTE-body views
     (`WITH x AS (SELECT a FROM t) SELECT * FROM x`) and compound/UNION views
     (`SELECT a FROM t UNION SELECT a FROM u`). Here a naive "did the dependent
     break?" re-validation would **falsely reject** a rename sqlite accepts — the
-    exact bug that forced the revert. So these must be *propagated* (graphite must
-    rewrite them like sqlite) before re-validation is safe.
+    exact bug that forced the revert. **Compound is now DONE (2026-07-10):**
+    `collect_select_base_sources` + `collect_bare_old_owners` recurse each compound
+    arm as an independent scope, so only the bound arm rewrites (reusing the
+    `BareRewrite::At` span machinery), byte-exact vs sqlite across UNION/INTERSECT/
+    EXCEPT, N arms, per-arm joins, and nested mixed subqueries. The one compound
+    sub-case still declining is a compound-level **`ORDER BY`** (it binds to the
+    first arm's OUTPUT column — needs output-column modeling); it bails untouched
+    (never a wrong rewrite). **CTE bodies still decline** and remain the false-reject
+    blocker (see the CTE rule below).
   - **sqlite REJECTS, graphite declines (broken):** derived-table views
     (`SELECT a FROM (SELECT a FROM t)`, `SELECT s.a FROM (SELECT a FROM t) s`) and
     the `USING(a)` join-column-vanishes shape. Here re-validation rejecting *matches*
