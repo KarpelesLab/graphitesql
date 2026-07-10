@@ -189,18 +189,32 @@ EXCEPT) incl. `ORDER BY`, and `WITH` CTE bodies incl. output-column provenance
   CTEs — a subtle bug found and fixed during the sweep). Verified across 48 shapes.
   With this, RENAME COLUMN propagation is complete for every shape sqlite rewrites.
 - **A-alter-2 — ALTER-time rejection of a RENAME that breaks a dependent.**
-  *(now fully unblocked — every propagation residual is cleared)* sqlite rejects +
-  rolls back a rename that leaves a dependent view/trigger unresolvable (`USING(a)`
-  column vanishes, or a derived-table-in-main-position); graphite currently mutates
-  and commits. The writer-savepoint machinery was built and reverted once — the
-  false-reject bug it hit is now gone (comprehensive propagation: any dependent
-  graphite still *declines* is one sqlite *also* rejects, so a resolve-check matches
-  either way). Redo: wrap the rename in a `\0graphite_alter` writer savepoint,
-  `Schema::read` the *uncommitted* overlay (`rewrite_schema_rows` writes the
-  sqlite_master b-tree but not `self.schema`), resolve-check each dependent, and on
-  failure `ROLLBACK TO` + emit the byte-exact `error in {view|trigger} NAME after
-  rename: …` (graphite's resolver already matches sqlite's detail). Pre-mutation
-  `DROP COLUMN` rejection is the existing template.
+  *(attempted 2026-07-10, reverted — see the finding below)* sqlite rejects + rolls
+  back a rename that leaves a dependent view unresolvable (`USING(col)` column
+  vanishes, a derived/CTE that exposes the renamed column and is then consumed);
+  graphite currently mutates and commits. **The machinery works** — a
+  `\0graphite_alter` writer savepoint around the rewrite, `Schema::read` the
+  post-rename overlay, then re-validate each dependent view by probing it
+  (`SELECT * FROM "v" LIMIT 0`) and, on a resolution error, `rollback_to_savepoint`
+  + emit the byte-exact `error in view NAME after rename: <detail>` (graphite's
+  resolver already produces the exact `no such column` / `cannot join using …`
+  details). Verified working on the genuine-reject cases.
+  **Why it was reverted — the blanket re-validation false-rejects.** A `SELECT * FROM
+  v LIMIT 0` probe rejects *any* view that no longer resolves, but graphite still
+  *declines* a handful of niche shapes that **sqlite rewrites and accepts** — so the
+  declined-and-now-broken view gets wrongly rejected. Measured false-reject shapes
+  (all `collect_select_base_sources` bails that sqlite nonetheless rewrites):
+  a **result-column alias equal to `old`** (`SELECT b AS a, a FROM t`), and a
+  **source table named `old`** (`SELECT t.a FROM t, a`). (NATURAL joins, `USING` on
+  a *different* column, and unrelated TVF sources are fine — the declined view still
+  *resolves* after the rename, so the probe doesn't reject it.) **So A-alter-2 needs
+  either:** (a) close those last propagation gaps (alias-collision + source-named-`old`
+  — both doable with the `BareRewrite::At` span machinery, so the renamed occurrences
+  are rewritten while the alias/table token is left) so the blanket probe is clean;
+  **or** (b) a *targeted* reject detector (USING-column-vanishes + consumed-renamed-
+  CTE/derived via the existing provenance `bails=true` signal) instead of the blanket
+  probe. (a) is the cleaner path. Triggers (A-alter-2b) are a further step (probing a
+  trigger without firing it). Central DDL — carry the finding into the redo.
 - **A-misc-1 — structural row-arity error *ordering* vs name resolution.** *(niche;
   cosmetic)* On doubly-malformed input (a row-value misuse *and* a missing column
   in one clause) graphite reports the column error where sqlite sometimes reports
