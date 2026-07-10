@@ -176,24 +176,26 @@ views+triggers (per-occurrence `Expr::Column` spans), compound (UNION/INTERSECT/
 EXCEPT) incl. `ORDER BY`, and `WITH` CTE bodies incl. output-column provenance
 (details in git history / `CHANGELOG.md`). What remains:
 
-- **A-alter-1 — derived-table propagation for RENAME COLUMN.** *(small; unblocks
-  A-alter-2)* The last propagation gap: a derived-table/TVF subquery consumed in a
-  compound arm (`SELECT a FROM t UNION SELECT a FROM (SELECT a FROM u)`) still bails
-  (safe — never a wrong rewrite) where sqlite rewrites the sibling base arm. Apply
-  the CTE-provenance pattern to `FROM (subquery)`: in `collect_select_base_sources_ctx`
-  recurse the derived body (skip its alias as a base source); in
-  `collect_bare_old_owners` compute the body's provenance via a `body_exposes_old`
-  helper (factor it out of `cte_old_owner`), key the derived source by its alias
-  (synthetic key when unaliased), and resolve a ref to its output column the same
-  way (bail if it exposes the renamed `old` unaliased, else leave). Verify vs sqlite
-  incl. aliased/unaliased/nested and the reject case.
+- **A-alter-1 — derived-table propagation for RENAME COLUMN. DONE 2026-07-10.** A
+  derived-table subquery consumed in a compound arm (`SELECT a FROM t UNION SELECT a
+  FROM (SELECT a FROM u)`) now rewrites the base arm and leaves the derived arm,
+  byte-exact vs sqlite; a derived table that exposes the renamed column unaliased
+  and is consumed (`SELECT a FROM (SELECT a FROM t)`) bails unchanged (sqlite
+  rejects). Applied the CTE-provenance pattern to `FROM (subquery)`: a
+  `body_exposes_old` helper (factored out of `cte_old_owner`), derived sources
+  recursed + skipped as base sources in `collect_select_base_sources_ctx`, keyed by
+  alias (synthetic when unaliased) with their provenance in a *select-local*
+  visibility list (derived tables don't propagate to sibling arms/subqueries, unlike
+  CTEs — a subtle bug found and fixed during the sweep). Verified across 48 shapes.
+  With this, RENAME COLUMN propagation is complete for every shape sqlite rewrites.
 - **A-alter-2 — ALTER-time rejection of a RENAME that breaks a dependent.**
-  *(depends on A-alter-1)* sqlite rejects + rolls back a rename that leaves a
-  dependent view/trigger unresolvable (`USING(a)` column vanishes, or a
-  derived-table-in-main-position); graphite currently mutates and commits. The
-  writer-savepoint machinery was built and reverted once — the false-reject bug it
-  hit is now fixed by comprehensive propagation (only the A-alter-1 case remains, so
-  do that first). Redo: wrap the rename in a `\0graphite_alter` writer savepoint,
+  *(now fully unblocked — every propagation residual is cleared)* sqlite rejects +
+  rolls back a rename that leaves a dependent view/trigger unresolvable (`USING(a)`
+  column vanishes, or a derived-table-in-main-position); graphite currently mutates
+  and commits. The writer-savepoint machinery was built and reverted once — the
+  false-reject bug it hit is now gone (comprehensive propagation: any dependent
+  graphite still *declines* is one sqlite *also* rejects, so a resolve-check matches
+  either way). Redo: wrap the rename in a `\0graphite_alter` writer savepoint,
   `Schema::read` the *uncommitted* overlay (`rewrite_schema_rows` writes the
   sqlite_master b-tree but not `self.schema`), resolve-check each dependent, and on
   failure `ROLLBACK TO` + emit the byte-exact `error in {view|trigger} NAME after

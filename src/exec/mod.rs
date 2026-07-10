@@ -42369,7 +42369,7 @@ fn view_global_unique_quals(
     // says "globally unique": the fast path would rewrite an outer reference to a
     // CTE's renamed output column, but SQLite rejects that (the CTE's exposed name
     // changed), so it must stay unresolved and bail rather than be blindly renamed.
-    let cte = select_contains_cte(&cv.select);
+    let cte = select_needs_scope_aware(&cv.select);
     match global_unique_plan(&srcs, table, old, table_cols) {
         Some((quals, true)) if !cte => Some((quals, BareRewrite::All)),
         Some((quals, _)) => {
@@ -42386,33 +42386,28 @@ fn view_global_unique_quals(
 /// derived subquery / TVF / schema-qualified source in a `FROM`, a NATURAL/USING
 /// join (column coalescing), a source named or aliased exactly `old` (its token
 /// would be wrongly rewritten), or a result-column alias equal to `old`.
-/// Whether `sel` uses a `WITH` common table expression anywhere the RENAME COLUMN
-/// rewrite would traverse (this select, a compound arm, a `FROM` subquery, an
-/// expression subquery, or a CTE body). When true, the whole-text
-/// `BareRewrite::All` fast path is unsafe — an outer reference to a CTE's renamed
-/// output column must be resolved per-scope (and bailed) rather than blindly
-/// rewritten — so the caller forces the scope-aware decision instead.
-fn select_contains_cte(sel: &Select) -> bool {
+/// Whether `sel` uses a `WITH` CTE **or** a derived-table (`FROM (SELECT …)`)
+/// source anywhere the RENAME COLUMN rewrite would traverse (this select, a
+/// compound arm, a `FROM` subquery, an expression subquery, or a CTE body). When
+/// true, the whole-text `BareRewrite::All` fast path is unsafe — an outer
+/// reference to a CTE's or derived table's renamed output column must be resolved
+/// per-scope (bailed, or left, per its provenance) rather than blindly rewritten —
+/// so the caller forces the scope-aware decision instead.
+fn select_needs_scope_aware(sel: &Select) -> bool {
     if !sel.ctes.is_empty() {
         return true;
     }
-    if sel.compound.iter().any(|(_, arm)| select_contains_cte(arm)) {
+    if sel
+        .compound
+        .iter()
+        .any(|(_, arm)| select_needs_scope_aware(arm))
+    {
         return true;
     }
     if let Some(from) = &sel.from {
-        if from
-            .first
-            .subquery
-            .as_deref()
-            .is_some_and(select_contains_cte)
-        {
-            return true;
-        }
-        if from
-            .joins
-            .iter()
-            .any(|j| j.table.subquery.as_deref().is_some_and(select_contains_cte))
-        {
+        // A derived-table source (subquery in FROM) needs scope-aware resolution:
+        // an outer reference to its output column must be classified by provenance.
+        if from.first.subquery.is_some() || from.joins.iter().any(|j| j.table.subquery.is_some()) {
             return true;
         }
     }
@@ -42420,7 +42415,7 @@ fn select_contains_cte(sel: &Select) -> bool {
     for e in view_select_exprs(sel) {
         collect_immediate_subselects(e, &mut subs);
     }
-    subs.iter().any(|s| select_contains_cte(s))
+    subs.iter().any(|s| select_needs_scope_aware(s))
 }
 
 fn collect_select_base_sources(
@@ -42476,34 +42471,47 @@ fn collect_select_base_sources_ctx(
         }
     }
     if let Some(from) = &sel.from {
-        let mut take = |tr: &crate::sql::ast::TableRef| -> bool {
-            if tr.subquery.is_some() || tr.tvf_args.is_some() || tr.schema.is_some() {
+        let mut sources: Vec<(&crate::sql::ast::TableRef, bool, bool)> =
+            alloc::vec![(&from.first, false, false)];
+        for j in &from.joins {
+            sources.push((&j.table, j.natural, !j.using.is_empty()));
+        }
+        for (tr, natural, using) in sources {
+            // NATURAL / USING joins coalesce columns — a token rewrite can't reason
+            // about them.
+            if natural || using || tr.tvf_args.is_some() || tr.schema.is_some() {
                 return false;
+            }
+            if let Some(subq) = &tr.subquery {
+                // A derived table (`FROM (SELECT …) alias`): recurse its body for
+                // base sources; the alias is an *output* name, not a base source
+                // (like a CTE). A derived source aliased exactly `old` would confuse
+                // the token rewrite, so bail.
+                if tr
+                    .alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(old))
+                {
+                    return false;
+                }
+                if !collect_select_base_sources_ctx(subq, old, srcs, &cte_names) {
+                    return false;
+                }
+                continue;
             }
             // A reference to one of this select's CTE names is not a base source.
             if cte_names.iter().any(|c| c.eq_ignore_ascii_case(&tr.name)) {
-                return true;
+                continue;
             }
-            if tr.name.eq_ignore_ascii_case(old) {
-                return false;
-            }
-            if tr
-                .alias
-                .as_deref()
-                .is_some_and(|a| a.eq_ignore_ascii_case(old))
+            if tr.name.eq_ignore_ascii_case(old)
+                || tr
+                    .alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(old))
             {
                 return false;
             }
             srcs.push((tr.name.clone(), tr.alias.clone()));
-            true
-        };
-        if !take(&from.first) {
-            return false;
-        }
-        for j in &from.joins {
-            if j.natural || !j.using.is_empty() || !take(&j.table) {
-                return false;
-            }
         }
     }
     for rc in &sel.columns {
@@ -42785,7 +42793,19 @@ fn cte_old_owner(
             .any(|c| c.eq_ignore_ascii_case(old))
             .then_some(false);
     }
-    let body = &cte.select;
+    body_exposes_old(&cte.select, old, renamed, table_cols)
+}
+
+/// The same output-column-provenance decision as [`cte_old_owner`], but for a
+/// query `body` referenced with no explicit column list — used for a *derived
+/// table* (`FROM (SELECT …) alias`), which SQLite treats like an anonymous CTE.
+/// See [`cte_old_owner`] for the `None`/`Some(true)`/`Some(false)` meanings.
+fn body_exposes_old(
+    body: &Select,
+    old: &str,
+    renamed: &str,
+    table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
+) -> Option<bool> {
     for rc in &body.columns {
         match rc {
             // `*` / `tbl.*` may expose the renamed column under its own name — be
@@ -42924,9 +42944,10 @@ fn resolve_exprs_bare_owners(
 /// each bare `old` reference into `owners`. `scopes` is the active scope stack;
 /// this select's `FROM` sources are pushed while its own expressions and their
 /// nested subqueries are visited, then popped. Returns `false` (bail) on any bare
-/// `old` that can't be resolved unambiguously. The body's shape has already been
-/// validated by [`collect_select_base_sources`], so every source here is a plain
-/// base table (no derived/TVF/NATURAL/USING/CTE/compound).
+/// `old` that can't be resolved unambiguously. CTE, compound-arm, and
+/// derived-table sources are handled here (via [`cte_old_owner`]/[`body_exposes_old`]
+/// provenance); the shape has already been vetted by [`collect_select_base_sources`]
+/// (which bails TVF/NATURAL/USING).
 fn collect_bare_old_owners(
     sel: &Select,
     old: &str,
@@ -42960,11 +42981,42 @@ fn collect_bare_old_owners(
             return false;
         }
     }
+    // Derived-table sources are visible only within *this* select (unlike CTEs,
+    // which propagate to nested scopes). Keep their provenance entries in a
+    // select-local list used only for this select's own reference resolution; the
+    // propagated `visible` carries CTEs alone, so a sibling compound arm or a
+    // nested subquery never sees (and never mis-resolves against) this select's
+    // derived tables.
+    let mut local = visible.clone();
     let mut scope: Vec<(String, Option<String>)> = Vec::new();
     if let Some(from) = &sel.from {
-        scope.push((from.first.name.clone(), from.first.alias.clone()));
-        for j in &from.joins {
-            scope.push((j.table.name.clone(), j.table.alias.clone()));
+        let mut refs: Vec<&crate::sql::ast::TableRef> = alloc::vec![&from.first];
+        refs.extend(from.joins.iter().map(|j| &j.table));
+        for (i, tr) in refs.iter().enumerate() {
+            if let Some(subq) = &tr.subquery {
+                // A derived table (`FROM (SELECT …) alias`): resolve refs *inside*
+                // its body against the enclosing scopes (it is not correlated to
+                // this select's own FROM), then record it — keyed by its alias (a
+                // synthetic key when unaliased) with its output-column provenance —
+                // so an outer reference to its column is classified like a CTE's
+                // (bail if it exposes the renamed `old` unaliased, else left as an
+                // unaffected non-renamed owner).
+                if !collect_bare_old_owners(
+                    subq, old, renamed, table_cols, scopes, owners, &visible,
+                ) {
+                    return false;
+                }
+                let key = tr
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| alloc::format!("\u{2}d{i}"));
+                if let Some(bails) = body_exposes_old(subq, old, renamed, table_cols) {
+                    local.push((key.clone(), bails));
+                }
+                scope.push((key, tr.alias.clone()));
+            } else {
+                scope.push((tr.name.clone(), tr.alias.clone()));
+            }
         }
     }
     scopes.push(scope);
@@ -42975,7 +43027,7 @@ fn collect_bare_old_owners(
         table_cols,
         scopes,
         owners,
-        &visible,
+        &local,
     );
     scopes.pop();
     if !ok {
@@ -43213,23 +43265,23 @@ fn collect_trigger_stmt_base_sources(
 }
 
 /// Whether a trigger's `WHEN` guard or any body statement uses a `WITH` CTE (in a
-/// statement's own select or a nested subquery). Mirrors [`select_contains_cte`]
+/// statement's own select or a nested subquery). Mirrors [`select_needs_scope_aware`]
 /// for the trigger shape; used to force scope-aware RENAME COLUMN resolution.
 fn trigger_contains_cte(ct: &crate::sql::ast::CreateTrigger) -> bool {
     use crate::sql::ast::InsertSource;
     let expr_has_cte = |e: &Expr| -> bool {
         let mut subs: Vec<&Select> = Vec::new();
         collect_immediate_subselects(e, &mut subs);
-        subs.iter().any(|s| select_contains_cte(s))
+        subs.iter().any(|s| select_needs_scope_aware(s))
     };
     if ct.when.as_ref().is_some_and(&expr_has_cte) {
         return true;
     }
     for stmt in &ct.body {
         let has = match stmt {
-            Statement::Select(s) => select_contains_cte(s),
+            Statement::Select(s) => select_needs_scope_aware(s),
             Statement::Insert(i) => match &i.source {
-                InsertSource::Select(s) => select_contains_cte(s),
+                InsertSource::Select(s) => select_needs_scope_aware(s),
                 InsertSource::Values(rows) => rows.iter().flatten().any(&expr_has_cte),
                 InsertSource::DefaultValues => false,
             },

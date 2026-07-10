@@ -261,6 +261,24 @@ fn rename_column_rewrites_nested_subquery_refs_in_view() {
          CREATE VIEW v AS WITH x(k) AS (SELECT c FROM u) SELECT a FROM t UNION SELECT k FROM x; \
          ALTER TABLE t RENAME COLUMN a TO aa; \
          SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Derived table (A-alter-1) consumed in a compound arm: the arm reading the
+        // derived table over `u` is unaffected (its `a` comes from `u`), so only the
+        // base arm rewrites — like the CTE case but for `FROM (subquery)`.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM (SELECT a FROM u); \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Aliased derived table in an arm.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT a FROM t UNION SELECT s.a FROM (SELECT a FROM u) s; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Derived table over the renamed table, but renaming an unrelated column
+        // leaves the whole view unchanged.
+        "CREATE TABLE t(a,b); \
+         CREATE VIEW v AS SELECT a FROM (SELECT a FROM t) s WHERE s.a>0; \
+         ALTER TABLE t RENAME COLUMN b TO bb; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
@@ -292,6 +310,25 @@ fn rename_column_rewrites_nested_subquery_refs_in_view() {
                SELECT a FROM x UNION SELECT a FROM y; \
              ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
             "CREATE VIEW v AS WITH x AS (SELECT a FROM u), y AS (SELECT a FROM t) SELECT a FROM x UNION SELECT a FROM y",
+        ),
+        // A derived table in main position that projects the renamed column
+        // unaliased (`SELECT a FROM (SELECT a FROM t)`): the outer `a` would break,
+        // so SQLite rejects; graphite leaves the view byte-identical (stored SQL
+        // matches SQLite's reject-and-leave — A-alter-rollback's job to error).
+        (
+            "CREATE TABLE t(a,b); \
+             CREATE VIEW v AS SELECT a FROM (SELECT a FROM t); \
+             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+            "CREATE VIEW v AS SELECT a FROM (SELECT a FROM t)",
+        ),
+        // Two derived tables in arms, one over the renamed table exposing it
+        // unaliased → its consumer breaks → SQLite rejects; graphite leaves
+        // unchanged (never a wrong partial rewrite of the other arm).
+        (
+            "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+             CREATE VIEW v AS SELECT a FROM (SELECT a FROM u) UNION SELECT a FROM (SELECT a FROM t); \
+             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
+            "CREATE VIEW v AS SELECT a FROM (SELECT a FROM u) UNION SELECT a FROM (SELECT a FROM t)",
         ),
     ];
     for (sql, unchanged) in cte_bail {
