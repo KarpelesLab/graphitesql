@@ -21,11 +21,12 @@
 //! them, a bare `old` can only bind to the renamed table, so every reference
 //! (bare, `<table>.old`/`<alias>.old`, and — when the trigger is on the renamed
 //! table — `NEW.old`/`OLD.old`) is rewritten. When the name is *not* globally
-//! unique — a bare ref might belong to another scope's table, which a token
-//! rewrite can't disambiguate without per-ref spans — the prover declines
-//! entirely and leaves the trigger byte-identical (never a half-renamed body).
-//! Any non-base source (a derived subquery/TVF, CTE, `UPDATE … FROM`) likewise
-//! bails the whole trigger untouched. Those remain the scope-aware A-rn3-edge
+//! unique a scope-aware pass resolves each bare `old` innermost-scope-first; and
+//! a genuinely *mixed* body — the same bare name binding to the renamed table in
+//! one scope and another table in a different scope — is handled via
+//! per-occurrence source spans on `Expr::Column`, rewriting exactly the bound
+//! occurrences (A-rn3-edge). Any non-base source (a derived subquery/TVF, CTE,
+//! `UPDATE … FROM`) still bails the whole trigger untouched — the remaining
 //! residual.
 //!
 //! Verified against the sqlite3 3.50.4 CLI.
@@ -116,6 +117,15 @@ fn rename_column_rewrites_cross_object_trigger_refs() {
          CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
            UPDATE u SET c=1 WHERE c IN (SELECT a FROM t); END; \
          ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // Mixed scope (A-rn3-edge, now handled for triggers): the same bare `a`
+        // binds to the `UPDATE u` target in the `WHERE` and to `t` in the subquery
+        // of one statement. Renaming `t.a` rewrites only the inner `a`; the outer
+        // `a` (bound to `u`) stays — per-occurrence source spans disambiguate them,
+        // byte-matching SQLite.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET c=1 WHERE a IN (SELECT a FROM t); END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
@@ -128,17 +138,6 @@ fn rename_column_rewrites_cross_object_trigger_refs() {
     // equalities; the invariant only guards against a *wrong* (partial/corrupting)
     // rewrite creeping in.
     let bail = [
-        // Mixed scope: the same bare `a` name binds to two different tables in one
-        // statement — the `UPDATE u` target's `a` in the `WHERE`, and the inner
-        // `t.a` in the subquery. Disambiguating them needs per-occurrence spans.
-        (
-            "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
-             CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
-               UPDATE u SET c=1 WHERE a IN (SELECT a FROM t); END; \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
-            "CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
-               UPDATE u SET c=1 WHERE a IN (SELECT a FROM t); END",
-        ),
         // A CTE inside a body subquery is a non-base source the rewrite can't
         // reason about.
         (

@@ -13535,21 +13535,18 @@ impl Connection {
                                 } else if let Some((quals, bare)) =
                                     trigger_global_unique_quals(&tsql, &table, &old, &table_cols)
                                 {
-                                    // The renamed table is reached across objects
-                                    // (the trigger is on another table, or its body
-                                    // touches more than one table) but the column
-                                    // name is globally unique, so every bare/
-                                    // qualified ref binds to it. Must precede the
-                                    // `NEW`/`OLD`-only branch below, which would
-                                    // otherwise short-circuit a trigger ON the
+                                    // `bare` is a `BareRewrite` (None/All/At-spans):
+                                    // a mixed trigger body rewrites only the bare
+                                    // occurrences that scope-resolve to the renamed
+                                    // table, like the view path. The renamed table is
+                                    // reached across objects (the trigger is on
+                                    // another table, or its body touches more than
+                                    // one) — globally unique → every ref binds to it
+                                    // (`All`); scope-resolved → `None`/`At`. Must
+                                    // precede the `NEW`/`OLD`-only branch below, which
+                                    // would otherwise short-circuit a trigger ON the
                                     // renamed table and miss the bare refs.
-                                    rewrite_column_tokens(
-                                        &tsql,
-                                        &quals,
-                                        &old,
-                                        &new_text,
-                                        BareRewrite::from_bool(bare),
-                                    )
+                                    rewrite_column_tokens(&tsql, &quals, &old, &new_text, bare)
                                 } else if trigger_on_renamed_table(&tsql, &table, &old) {
                                     rewrite_column_tokens(
                                         &tsql,
@@ -42745,17 +42742,19 @@ fn collect_bare_old_owners(
 }
 
 /// Trigger counterpart of [`scope_bare_old_decision`]: decides, across a whole
-/// `CREATE TRIGGER` (its `WHEN` guard and every body statement), whether every
-/// bare `old` binds to the renamed `table` (`Some(true)` → rewrite bare),
-/// binds only elsewhere (`Some(false)` → qualified-only), or is *mixed* / can't be
-/// resolved (`None` → bail, leaving the trigger byte-identical). The body's shape
-/// has already been vetted by [`collect_trigger_stmt_base_sources`].
+/// `CREATE TRIGGER` (its `WHEN` guard and every body statement), which bare `old`
+/// references bind to the renamed `table` — `BareRewrite::All` (every bare one),
+/// `BareRewrite::None` (only qualified refs), or `BareRewrite::At(offsets)` (the
+/// mixed body: exactly the occurrences at those source offsets). Returns `None`
+/// only when a reference can't be resolved (leaving the trigger byte-identical).
+/// The body's shape has already been vetted by
+/// [`collect_trigger_stmt_base_sources`].
 fn scope_bare_old_decision_trigger(
     ct: &crate::sql::ast::CreateTrigger,
     table: &str,
     old: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
-) -> Option<bool> {
+) -> Option<BareRewrite> {
     let mut owners: Vec<(String, Span)> = Vec::new();
     // WHEN guard: its subqueries have their own FROM scopes (a bare `old` directly
     // in the guard has no table scope and would bail — conservative).
@@ -42770,14 +42769,28 @@ fn scope_bare_old_decision_trigger(
             return None;
         }
     }
-    // The trigger mixed-scope case still bails (per-occurrence span rewriting is
-    // wired for views only for now); a uniform body rewrites as before.
+    // Same per-occurrence-span resolution as the view path
+    // ([`scope_bare_old_decision`]): a uniform body rewrites all-or-none; a mixed
+    // body rewrites exactly the bare occurrences (located by source offset) that
+    // bind to the renamed table. The offsets index the stored trigger SQL, which
+    // is what `rewrite_column_tokens` re-tokenizes.
     let renamed = owners.iter().any(|(o, _)| o.eq_ignore_ascii_case(table));
     let other = owners.iter().any(|(o, _)| !o.eq_ignore_ascii_case(table));
     if renamed && other {
-        None
+        let mut spans: Vec<u32> = Vec::new();
+        for (owner, span) in &owners {
+            if owner.eq_ignore_ascii_case(table) {
+                match span.0 {
+                    Some((start, _)) => spans.push(start),
+                    None => return None,
+                }
+            }
+        }
+        Some(BareRewrite::At(spans))
+    } else if renamed {
+        Some(BareRewrite::All)
     } else {
-        Some(renamed)
+        Some(BareRewrite::None)
     }
 }
 
@@ -42952,7 +42965,7 @@ fn trigger_global_unique_quals(
     table: &str,
     old: &str,
     table_cols: &alloc::collections::BTreeMap<String, Vec<String>>,
-) -> Option<(Vec<String>, bool)> {
+) -> Option<(Vec<String>, BareRewrite)> {
     let Ok(Statement::CreateTrigger(ct)) = sql::parse_one(trigger_sql) else {
         return None;
     };
@@ -42986,7 +42999,7 @@ fn trigger_global_unique_quals(
     // [`view_global_unique_quals`] / [`scope_bare_old_decision_trigger`] for the
     // rationale; a genuinely mixed body still bails untouched.
     let (mut quals, bare) = match global_unique_plan(&srcs, table, old, table_cols) {
-        Some((q, true)) => (q, true),
+        Some((q, true)) => (q, BareRewrite::All),
         Some((q, false)) => (
             q,
             scope_bare_old_decision_trigger(&ct, table, old, table_cols)?,
@@ -43412,8 +43425,10 @@ fn trigger_drop_break_ref(
 ) -> Option<String> {
     let (quals, bare) = if let Some(q) = trigger_single_source_quals(tsql, table, col) {
         (q, true)
-    } else if let Some(p) = trigger_global_unique_quals(tsql, table, col, table_cols) {
-        p
+    } else if let Some((q, br)) = trigger_global_unique_quals(tsql, table, col, table_cols) {
+        // Any bare occurrence that would be rewritten (whole-body `All` or a
+        // per-occurrence `At`) means a bare ref binds to the dropped column.
+        (q, !matches!(br, BareRewrite::None))
     } else if trigger_on_renamed_table(tsql, table, col) {
         (alloc::vec![String::from("NEW"), String::from("OLD")], false)
     } else if trigger_body_single_source_over(tsql, table, col) {

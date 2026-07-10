@@ -9,12 +9,13 @@
 //! graphite now rewrites a trigger attached to the renamed table whose body and
 //! `WHEN` target only that table — every body statement targets it and every
 //! nested subquery references only it — at every nesting level, bare and
-//! `<alias>.`/`NEW.`/`OLD.`-qualified references alike. It still conservatively
-//! leaves the trigger untouched (a known gap, not a regression) when a token
-//! rewrite can't be proven safe: a body statement writing another table, a
-//! subquery touching another table, or a derived table in a `FROM`. Those bail
-//! cases are asserted to leave the stored trigger SQL byte-identical (no *wrong*
-//! rewrite).
+//! `<alias>.`/`NEW.`/`OLD.`-qualified references alike — and, via per-occurrence
+//! source spans on `Expr::Column`, the genuinely *mixed* body where the same bare
+//! name binds to the renamed table in one scope and another table in a different
+//! scope (A-rn3-edge). It still conservatively leaves the trigger untouched (a
+//! known gap, not a regression) when a token rewrite can't be proven safe: a
+//! derived table in a subquery `FROM`. That bail case is asserted to leave the
+//! stored trigger SQL byte-identical (no *wrong* rewrite).
 //!
 //! Verified against the sqlite3 3.50.4 CLI.
 
@@ -106,27 +107,35 @@ fn trigger_rename_column_subquery_matches_sqlite() {
          CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
          INSERT INTO log SELECT a FROM t WHERE a=(SELECT max(a) FROM t t2); END; \
          ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // Mixed scope (A-rn3-edge, now handled for triggers too): the trigger body
+        // `UPDATE t SET b=b+1 WHERE a IN (SELECT a FROM u)` has the outer `a` bound
+        // to the UPDATE target `t` and the inner `a` bound to `u`. Renaming `t.a`
+        // rewrites only the outer `a` (byte-matching SQLite); the subquery's `a`
+        // stays. Per-occurrence source spans on `Expr::Column` disambiguate them.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+         UPDATE t SET b=b+1 WHERE a IN (SELECT a FROM u); END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // Mixed, other direction: renaming `u.a` rewrites only the inner `a`.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+         UPDATE t SET b=b+1 WHERE a IN (SELECT a FROM u); END; \
+         ALTER TABLE u RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // Mixed inside an INSERT … SELECT body over a log table.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); CREATE TABLE log(x); \
+         CREATE TRIGGER tr AFTER INSERT ON log BEGIN \
+         INSERT INTO log SELECT a FROM t WHERE a IN (SELECT a FROM u); END; \
+         ALTER TABLE u RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
     ];
     for sql in matching {
         assert_eq!(run("sqlite3", sql), run(g, sql), "for {sql}");
     }
 
     // Bail cases: a token rewrite can't be proven safe, so graphite leaves the
-    // stored trigger SQL byte-identical. (SQLite does more here — rewriting
-    // through the other table — so these stay known gaps rather than differential
-    // equalities. The invariant guards against a *wrong* rewrite creeping in.)
+    // stored trigger SQL byte-identical. (SQLite does more here — aborting on a
+    // derived table — so this stays a known gap rather than a differential
+    // equality. The invariant guards against a *wrong* rewrite creeping in.)
     let bail = [
-        // Nested subquery references another table that *also* owns an `a`, so a
-        // bare `a` is ambiguous (it could bind to either) — the global-uniqueness
-        // prover declines rather than guess.
-        (
-            "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
-             CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
-             UPDATE t SET b=b+1 WHERE a IN (SELECT a FROM u); END; \
-             ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
-            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
-             UPDATE t SET b=b+1 WHERE a IN (SELECT a FROM u); END",
-        ),
         // Derived table in a nested subquery's FROM.
         (
             "CREATE TABLE t(a,b); CREATE TRIGGER tr AFTER INSERT ON t BEGIN \

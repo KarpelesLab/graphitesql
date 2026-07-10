@@ -190,8 +190,8 @@ its (niche/cosmetic) value:
   *materialises* every TVF source, so it can't represent the lazy unbounded stream
   without hanging. Belongs on the VDBE lazy-cursor track (Track B), not the
   materialise path.
-- **A-rn3-edge — RENAME COLUMN in a genuinely *mixed* view body. DONE for views
-  2026-07-10.** The same bare column name binding to *different* tables in one
+- **A-rn3-edge — RENAME COLUMN in a genuinely *mixed* view/trigger body. DONE
+  2026-07-10 (views + triggers).** The same bare column name binding to *different* tables in one
   statement (`SELECT a FROM t WHERE a IN (SELECT a FROM u)` renaming `u.a`, where
   only the inner `a` should change) now rewrites per-occurrence and byte-matches
   SQLite. **How it landed:** `Expr::Column` (`src/sql/ast.rs`) gained a `span:
@@ -213,11 +213,14 @@ its (niche/cosmetic) value:
   semver-checks is *not* in the pre-push gate (it runs only in the release-plz
   workflow), and release-plz owns the version bump, so the breaking-change commit
   (`feat!:`) drives the `0.1.0 → 0.2.0` bump automatically; there was no
-  gate/bump conflict after all. **Residual:** the *trigger* mixed-body case still
-  declines (its NEW/OLD + multi-statement rewrite is higher-risk; the span
-  infrastructure is already shared, so it is a localized follow-up), and non-base
-  sources (derived subquery/TVF, CTE, NATURAL/USING) still bail the whole object
-  untouched. This **unblocks A-alter-rollback** for the view path (see that item).
+  gate/bump conflict after all. **Triggers too:** the same `BareRewrite` /
+  span-collection path was extended to `scope_bare_old_decision_trigger` +
+  `trigger_global_unique_quals`, so a mixed trigger body (`UPDATE t SET … WHERE a
+  IN (SELECT a FROM u)`) rewrites per-occurrence and byte-matches sqlite across
+  INSERT…SELECT / UPDATE / DELETE bodies. **Residual:** only non-base sources
+  (derived subquery/TVF, CTE, NATURAL/USING) still bail the whole object
+  untouched. This **unblocks A-alter-rollback** for both the view and trigger
+  paths (see that item).
 - **A-alter-rollback — ALTER-time rejection of a RENAME that breaks a dependent.**
   `DROP COLUMN` already rejects pre-mutation. A `RENAME` whose propagation can't be
   *proven* can leave a dependent view/trigger unresolvable; SQLite rejects and
