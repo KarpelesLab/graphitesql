@@ -171,146 +171,44 @@ surface — are in git history and `CHANGELOG.md`.)
 
 ### Track A — SQL language & functions  *(substantially complete)*
 
-The differential sweep has exhausted the bounded, single-fix work; what remains is
-a handful of residuals, each needing an architectural change disproportionate to
-its (niche/cosmetic) value:
+RENAME COLUMN dependency propagation is now comprehensive — mixed-scope
+views+triggers (per-occurrence `Expr::Column` spans), compound (UNION/INTERSECT/
+EXCEPT) incl. `ORDER BY`, and `WITH` CTE bodies incl. output-column provenance
+(details in git history / `CHANGELOG.md`). What remains:
 
-- **A-misc-1 — structural row-arity error *ordering* vs name resolution.** When a
-  clause holds both a row-value misuse (`(nope,a) IN ((1,2,3))`) and a missing
-  column, graphite resolves all columns up front then runs the structural checks,
-  so it reports the column error where SQLite — a single name-resolution walk in
-  clause order (`result-set → HAVING → WHERE → GROUP BY/ORDER BY`, pre-order within
-  each tree, first-fault-wins) — sometimes reports the structural one. The message
-  *bodies* are identical; only which of two errors fires first differs on
-  doubly-malformed input. Fix = interleave the arity check with column resolution
-  clause-by-clause; deferred as fragile-for-cosmetic-gain.
-- **A-tvf-bare-series — bare `generate_series` (no parens).** `FROM json_each`,
-  `FROM pragma_*` (bare, `WHERE arg=…`-driven) are done; `generate_series` is the
-  hard one — its default `stop` is unbounded, and graphite's tree-walker
-  *materialises* every TVF source, so it can't represent the lazy unbounded stream
-  without hanging. Belongs on the VDBE lazy-cursor track (Track B), not the
-  materialise path.
-- **A-rn3-edge — RENAME COLUMN in a genuinely *mixed* view/trigger body. DONE
-  2026-07-10 (views + triggers).** The same bare column name binding to *different* tables in one
-  statement (`SELECT a FROM t WHERE a IN (SELECT a FROM u)` renaming `u.a`, where
-  only the inner `a` should change) now rewrites per-occurrence and byte-matches
-  SQLite. **How it landed:** `Expr::Column` (`src/sql/ast.rs`) gained a `span:
-  Span` field — `Span` is an always-`PartialEq`-equal newtype over
-  `Option<(u32,u32)>`, so expression equality (the planner's `isDupColumn` dedup)
-  is unperturbed. The parser sets the real byte span (`prev_span()` off the
-  consumed name token, captured before any speculative `eat`); all synthetic
-  desugarings pass `Span::none()`. The rename decision (`scope_bare_old_decision`)
-  now returns a `BareRewrite` enum — `None`/`All`/`At(offsets)` — and for the mixed
-  case collects the source offsets of exactly the bare occurrences that
-  scope-resolve (innermost-first) to the renamed table; `rewrite_column_tokens`
-  renames a bare token only when its `start` offset is in that set. ~24 struct-
-  literal construction sites across `sql/parser.rs` + `exec/{mod,vdbe}.rs` were
-  updated (most `Expr::Column` uses are `..` patterns and needed no change).
-  Verified against sqlite3 3.50.4 over correlated / multi-occurrence /
-  qualified-plus-bare / double-nested mixed bodies (`tests/view_rename_column_subquery.rs`,
-  `tests/rename_column_view_subquery.rs`). **Semver:** adding the field to public
-  `Expr::Column` is a breaking change (`cargo semver-checks` flags it) — but
-  semver-checks is *not* in the pre-push gate (it runs only in the release-plz
-  workflow), and release-plz owns the version bump, so the breaking-change commit
-  (`feat!:`) drives the `0.1.0 → 0.2.0` bump automatically; there was no
-  gate/bump conflict after all. **Triggers too:** the same `BareRewrite` /
-  span-collection path was extended to `scope_bare_old_decision_trigger` +
-  `trigger_global_unique_quals`, so a mixed trigger body (`UPDATE t SET … WHERE a
-  IN (SELECT a FROM u)`) rewrites per-occurrence and byte-matches sqlite across
-  INSERT…SELECT / UPDATE / DELETE bodies. **Residual:** only non-base sources
-  (derived subquery/TVF, CTE, NATURAL/USING) still bail the whole object
-  untouched. This **unblocks A-alter-rollback** for both the view and trigger
-  paths (see that item).
-- **A-alter-rollback — ALTER-time rejection of a RENAME that breaks a dependent.**
-  `DROP COLUMN` already rejects pre-mutation. A `RENAME` whose propagation can't be
-  *proven* can leave a dependent view/trigger unresolvable; SQLite rejects and
-  rolls back, graphite mutates first. **Blocked on A-rn3-edge, not just DDL
-  rollback (learned 2026-07-10).** A post-rename re-validation + writer-savepoint
-  rollback was implemented and reverted: the writer savepoint machinery works and
-  graphite's resolver already byte-matches SQLite's detail (e.g. `error in view v
-  after rename: cannot join using column a - column not present in both tables`),
-  but a simple "did any view break?" check is wrong. When graphite *declines* to
-  rewrite a view (the A-rn3-edge mixed-scope residual — e.g. `SELECT a FROM t WHERE
-  a IN (SELECT a FROM u)` on `ALTER TABLE u RENAME COLUMN a TO aa`), the view
-  breaks **but SQLite rewrites the inner ref and succeeds** — so re-validation
-  wrongly rejects a rename SQLite accepts (it regressed
-  `view_rename_column_subquery`). Correctly rejecting the genuine breakage (the
-  `USING(a)` case, where SQLite *also* fails) while allowing the decline cases
-  requires distinguishing "SQLite could rewrite this" from "SQLite can't" — i.e.
-  the **A-rn3-edge per-occurrence-span propagation must land first**. Once
-  graphite propagates as completely as SQLite, any residual breakage is a genuine
-  reject and the (working) savepoint-rollback + re-validation can be re-enabled.
-  **Update 2026-07-10:** the A-rn3-edge mixed-scope rewrite now lands for views AND
-  triggers (above), removing that class of false-reject. But a decline-set probe
-  shows A-alter-rollback is **still blocked** — the remaining decline set splits
-  two ways, and one half is still a false-reject trap:
-  - **sqlite REWRITES + succeeds, graphite DECLINES (broken):** was CTE-body views
-    (`WITH x AS (SELECT a FROM t) SELECT * FROM x`) and compound/UNION views
-    (`SELECT a FROM t UNION SELECT a FROM u`). Here a naive "did the dependent
-    break?" re-validation would **falsely reject** a rename sqlite accepts — the
-    exact bug that forced the revert. **Compound is now DONE (2026-07-10):**
-    `collect_select_base_sources` + `collect_bare_old_owners` recurse each compound
-    arm as an independent scope, so only the bound arm rewrites (reusing the
-    `BareRewrite::At` span machinery), byte-exact vs sqlite across UNION/INTERSECT/
-    EXCEPT, N arms, per-arm joins, and nested mixed subqueries. The one compound
-    sub-case still declining is a compound-level **`ORDER BY`** (it binds to the
-    first arm's OUTPUT column — needs output-column modeling); it bails untouched
-    (never a wrong rewrite). **CTE bodies are now DONE too (2026-07-10):**
-    `collect_select_base_sources`/`collect_bare_old_owners` recurse each `WITH`
-    body as a scope and skip CTE names as base sources; a fast-path gate
-    (`select_contains_cte`/`trigger_contains_cte`) forces scope-aware resolution so
-    an outer reference to a CTE's renamed output column stays unresolved and bails
-    (matching sqlite's reject-and-leave-unchanged) instead of being blindly
-    rewritten. Byte-exact vs sqlite for `SELECT *`, explicit `WITH x(collist)`,
-    join bodies, multi-CTE, nested-mixed, and recursive CTEs — for both views and
-    trigger bodies. **CTE output-column provenance now DONE too (2026-07-10):** a
-    reference to a CTE column resolves via `cte_old_owner` — it bails only if the
-    CTE exposes the renamed table's `old` column *unaliased* (sqlite rejects), and
-    otherwise resolves to a synthetic non-renamed owner (left as-is). This clears
-    the CTE-*consumed-in-a-compound-arm* case (`WITH x AS (SELECT a FROM u) SELECT a
-    FROM t UNION SELECT a FROM x` → only the base arm rewrites), byte-exact vs
-    sqlite. The scope resolution (`resolve_bare_owner`/`collect_bare_old_owners`)
-    and the flat collector (`collect_select_base_sources_ctx`) now thread the
-    renamed table and visible CTE names.
-  - **sqlite REJECTS, graphite declines (broken):** derived-table views
-    (`SELECT a FROM (SELECT a FROM t)`, `SELECT s.a FROM (SELECT a FROM t) s`) and
-    the `USING(a)` join-column-vanishes shape. Here re-validation rejecting *matches*
-    sqlite — these are the genuine A-alter-rollback targets. (A `NATURAL JOIN`
-    rename is NOT a break — it degrades to a cross-join and both accept.)
-  **Net (updated 2026-07-10):** compound, compound-`ORDER BY`, AND CTE propagation
-  (incl. CTE output-column provenance) are now DONE. The remaining
-  graphite-declines-but-sqlite-rewrites residual is a *derived-table* (or TVF)
-  subquery consumed in a compound arm — rare, and it bails safely (never a wrong
-  rewrite). Everything else graphite declines (derived table in main position,
-  `USING(a)`) is a case sqlite *also* rejects, so a re-validation would match.
-  **A-alter-rollback** is now close to unblocked: implement the resolve-check +
-  savepoint rollback (the reverted machinery), rejecting a dependent that fails to
-  resolve after propagation; the only false-reject risk left is the rare
-  derived-in-compound-arm case, which would need derived-table output-column
-  provenance (the same pattern as the CTE fix, applied to `FROM (subquery)`).
-  **The original concrete sqlite rewrite rules (now implemented) for reference:**
-  - *Compound* (`SELECT … UNION/INTERSECT/EXCEPT SELECT …`): each arm is an
-    independent scope — rewrite only the arm(s) whose refs bind to the renamed
-    table (reuses the existing `BareRewrite::At`/span machinery per arm), e.g.
-    `SELECT a FROM t UNION SELECT a FROM u` → `SELECT aa FROM t UNION SELECT a FROM
-    u`. The one extra wrinkle: a compound **`ORDER BY`** term binds to the *first*
-    arm's output column, so `… ORDER BY a` becomes `… ORDER BY aa` when the first
-    arm's renamed column is the ordering key — needs first-arm output-column
-    modeling, not just base-table resolution.
-  - *CTE* (`WITH x AS (SELECT … FROM t) …`): rewrite the CTE body like a subquery
-    scope, but sqlite does **not** cascade to the CTE's output-column consumers —
-    `WITH x AS (SELECT a FROM t) SELECT * FROM x` and `WITH x(k) AS (SELECT a FROM
-    t) SELECT k FROM x` succeed (body rewritten), while `WITH x AS (SELECT a FROM
-    t) SELECT a FROM x` is *rejected* by sqlite (the CTE's exposed column became
-    `aa`, so outer `a` no longer resolves). So graphite must rewrite the CTE body
-    ONLY when the outer scope doesn't reference the renamed CTE output column by
-    its old name (else it would introduce a stored-SQL divergence vs sqlite's
-    reject-and-leave-unchanged). Explicit `WITH x(collist)` fixes the output names,
-    so it's always safe to rewrite the body there.
-  Once graphite propagates those as completely as sqlite, the only remaining
-  declines are cases sqlite *also* rejects, and the (working, reverted)
-  savepoint-rollback + re-validation can be re-enabled to reject exactly those.
-  Still a real blocker, now precisely scoped with concrete targets.
+- **A-alter-1 — derived-table propagation for RENAME COLUMN.** *(small; unblocks
+  A-alter-2)* The last propagation gap: a derived-table/TVF subquery consumed in a
+  compound arm (`SELECT a FROM t UNION SELECT a FROM (SELECT a FROM u)`) still bails
+  (safe — never a wrong rewrite) where sqlite rewrites the sibling base arm. Apply
+  the CTE-provenance pattern to `FROM (subquery)`: in `collect_select_base_sources_ctx`
+  recurse the derived body (skip its alias as a base source); in
+  `collect_bare_old_owners` compute the body's provenance via a `body_exposes_old`
+  helper (factor it out of `cte_old_owner`), key the derived source by its alias
+  (synthetic key when unaliased), and resolve a ref to its output column the same
+  way (bail if it exposes the renamed `old` unaliased, else leave). Verify vs sqlite
+  incl. aliased/unaliased/nested and the reject case.
+- **A-alter-2 — ALTER-time rejection of a RENAME that breaks a dependent.**
+  *(depends on A-alter-1)* sqlite rejects + rolls back a rename that leaves a
+  dependent view/trigger unresolvable (`USING(a)` column vanishes, or a
+  derived-table-in-main-position); graphite currently mutates and commits. The
+  writer-savepoint machinery was built and reverted once — the false-reject bug it
+  hit is now fixed by comprehensive propagation (only the A-alter-1 case remains, so
+  do that first). Redo: wrap the rename in a `\0graphite_alter` writer savepoint,
+  `Schema::read` the *uncommitted* overlay (`rewrite_schema_rows` writes the
+  sqlite_master b-tree but not `self.schema`), resolve-check each dependent, and on
+  failure `ROLLBACK TO` + emit the byte-exact `error in {view|trigger} NAME after
+  rename: …` (graphite's resolver already matches sqlite's detail). Pre-mutation
+  `DROP COLUMN` rejection is the existing template.
+- **A-misc-1 — structural row-arity error *ordering* vs name resolution.** *(niche;
+  cosmetic)* On doubly-malformed input (a row-value misuse *and* a missing column
+  in one clause) graphite reports the column error where sqlite sometimes reports
+  the structural one — message bodies identical, only first-fault order differs.
+  Fix = interleave the arity check with column resolution clause-by-clause
+  (`result-set → HAVING → WHERE → GROUP BY/ORDER BY`, first-fault-wins). Fragile for
+  cosmetic gain; low priority.
+- **A-tvf-bare-series — bare `generate_series` (no parens).** *(belongs to Track B)*
+  Its default `stop` is unbounded and the tree-walker materialises every TVF source,
+  so it needs the VDBE lazy-cursor path — tracked under Track B, not here.
 
 ### Track B — Query planner, statistics & the VDBE
 
@@ -408,52 +306,28 @@ result or declines to it — never a wrong answer), so this track is
 
 ### Track C — Storage engine, transactions, concurrency
 
-- **C8c — read-cache for read-only connections. DONE (2026-07-09).** The
-  `WritePager` clean-page cache now serves the read-only path too, gated by a
-  change-counter validity token: `read_cache_token` records the page-1 change
-  counter the cached pages were read under, and `revalidate_read_cache()` (called
-  at the `query_params` read-statement boundary via `revalidate_read_caches`)
-  re-reads the on-disk counter directly and drops the cache if a foreign in-process
-  `Connection` committed (sqlite bumps the counter per commit) — no-op under a
-  write lock and in WAL mode. Additive (results byte-identical); verified with two
-  in-process connections (`tests/c8c_readonly_cache.rs`: sees a foreign commit on
-  the next statement, repeat reads served from cache). Orthogonal residual: a
-  foreign commit that *grows* the file still errors "page N out of range" on the
-  read-only path (`page_count` frozen at open) — unrelated to the cache.
-- **C9a — persistent read locks. DONE (2026-07-09).** `WritePager::begin_read_txn`/
-  `end_read_txn` hold a persistent `Shared` lock for an open read transaction, and
-  `Connection::ensure_read_txn_lock` acquires it at the **first read within** an
-  explicit transaction (matching sqlite's *deferred* `BEGIN` — not eagerly at
-  `BEGIN`, so two bare `BEGIN`s don't wrongly block each other's later write).
-  Readers coexist via the counted `Shared`; a writer's commit-time `Exclusive`
-  upgrade `BUSY`s until readers drain. To let the `&self` read path take the lock,
-  `File::lock`/`unlock` became `&self` with a `Cell<LockLevel>` per handle (no
-  `unsafe`); the write-path `Shared→Reserved→Exclusive` upgrade is unchanged.
-  Verified with two in-process `Connection`s (`tests/c9a_connection_locks.rs`),
-  including the deferred guard and autocommit-never-blocks.
-- **C9b — OS-level cross-process file locks** (`std::fs::File::lock`, wants MSRV
-  1.89) behind the std VFS.
-- **C9c — the WAL wal-index for multi-connection WAL readers. DONE (2026-07-09,
-  3560126).** A process-local, coherent `SharedWalIndex` (append log + `mx_frame`
-  high-water + pinned-reader marks, path-keyed like `locks_for`) shared by all
-  connections over one file: connection B sees A's committed WAL frames on its next
-  statement, an open read txn keeps its snapshot (repeatable read), checkpoint
-  folds the log and only resets the WAL when no sibling reader is pinned, and
-  `PRAGMA integrity_check` stays clean. Exposed via an additive `File::wal_index()`
-  trait method. Process-local only (no cross-process `-shm`, consistent with the
-  existing lock model) — a host needing multi-process WAL supplies its own VFS.
-- **C9d — a thread-safe `Connection`. DONE via the documented per-thread model
-  (2026-07-09, 0c51128).** Full `Connection: Send` is fundamentally blocked: it
-  stores its file as one erased `Box<dyn File>`, and while `StdFile` is `Send`, the
-  always-available in-memory `MemoryFile` (backs `:memory:`, must work no_std/wasm)
-  is intentionally `Rc`/`RefCell`/`!Send` — so one concrete `Connection` is `Send`
-  only if every `File` impl is (an in-scope `Rc`→`Arc` swap was trialed and yields
-  zero `Send` progress). `Connection` is documented as **thread-confined** (neither
-  `Send` nor `Sync`; one per thread — `StdVfs` coordinates a shared file across
-  connections via the process-local lock manager + wal-index, C9a/C9c), enforced by
-  a `compile_fail` doctest and a multi-thread test. The path to real `Send` (a
-  `Connection` generic over the VFS, or a `Send`-only in-memory VFS + `Arc` page
-  data) is documented as the future direction.
+In-process multi-connection coordination is done: read-only clean-page cache
+(C8c), persistent deferred read locks (C9a), the process-local WAL wal-index
+(C9c), and the documented thread-confined `Connection` model (C9d). See git
+history / `CHANGELOG.md`. Remaining:
+
+- **C9b — OS-level cross-process file locks.** *(unblocked 2026-07-10 — MSRV 1.89
+  approved)* Today the `StdVfs` lock manager is **process-local** (a path-keyed
+  in-memory table), so two OS processes over the same file don't see each other's
+  locks. Use `std::fs::File::{lock, try_lock, unlock}` (stabilised in Rust 1.89)
+  behind the std VFS so the `Shared`/`Reserved`/`Pending`/`Exclusive` levels map to
+  real advisory OS locks. Chunks:
+  - **C9b-0 — MSRV bump to 1.89.** Update `Cargo.toml` `rust-version`, the CI
+    toolchain, and CLAUDE.md/README references; confirm the gate is green on 1.89.
+  - **C9b-1 — cross-process lock primitive.** Add an OS-lock path to `StdFile`
+    behind the existing `File::lock`/`unlock` trait (keep the process-local table as
+    the in-memory-VFS impl). Map SQLite's byte-range lock protocol (pending/reserved/
+    shared-range) onto `File::lock_shared`/`lock` as faithfully as the std API
+    allows; document any range the std API can't express.
+  - **C9b-2 — differential test across two processes.** Spawn two `graphitesql`
+    processes over one file and assert writer-excludes-reader / readers-coexist /
+    `SQLITE_BUSY` semantics match sqlite3 (guard the test on `cfg` / platform lock
+    support).
 
 ### Track D — Virtual tables & ecosystem extensions
 
@@ -461,103 +335,36 @@ result or declines to it — never a wrong answer), so this track is
   `_content` scan (results correct). The high-frequency-term case is **no longer a
   fallback** — a spanning term's doclist-index segment is served via the index
   route (pinned by `high_frequency_spanning_term_takes_index_route`).
-- **D2e-encoder — byte-identical FTS5 at large scale.** *Doclist-index done
-  (2026-07-09):* ported sqlite's `fts5WriteDlidxAppend`, so a term whose doclist
-  spills onto ≥ `FTS5_MIN_DLIDX_SIZE` continuation leaves now emits byte-identical
-  `dlidx` pages and sets the term's `%_idx` dlidx bit — graphite's file is
-  integrity-clean and sqlite-readable at scale (was rejected as "malformed" at
-  ~8000 docs before). *Multi-term leaf-fill done (2026-07-09):* ported sqlite's
-  `fts5WriteAppendTerm` split rule (`4 + body + pgidx + nTerm + 2 >= pgsz`, full
-  uncompressed term length), so multi-term segments are now byte-identical up to
-  ~37 leaves incl. variable-length terms. *Prefix indexes done (2026-07-09):*
-  the rebuild now emits a prefix-index segment per configured `prefix=` length
-  (keyed `FTS5_MAIN_PREFIX + i + 1`), byte-identical for `'1'`/`'2 3'`/`'1 2 3'`/…
-  incl. unicode/multi-column/contentless. *Doclist spill fixed (2026-07-09):* the
-  spill onto term-less continuation leaves now keeps position varints whole
-  (sqlite never splits a varint) and writes absolute first-rowids — a spanning
-  corpus went from 62 leaves divergent to byte-identical. (Note: FTS5 3.50.4 has
-  **no** `height>0` interior `%_data` pages — that form was removed; a
-  high-frequency term's "interior" structure is its doclist-index, and the
-  per-segment term index is the plain `%_idx` table.) *Incremental multi-segment
-  writes + automerge done (2026-07-09, 633c8f1):* each autocommit INSERT now
-  appends a level-0 segment (updating the STRUCTURE + averages record) instead of
-  rebuilding, and crossing the 16-segment crisis threshold merges the level into
-  the next with sqlite's promote-down cascade — byte-identical `%_data`/`%_idx`/
-  `%_docsize`/STRUCTURE vs sqlite across insert sequences through recurring crises,
-  fixing both the O(rows²) bulk-load and the multi-segment byte-parity residual.
-  *Incremental DELETE/UPDATE via tombstones done (2026-07-09, 35d5ec8):* a
-  self-content DELETE/UPDATE in autocommit appends one level-0 tombstone segment
-  (`nPos = content_len*2 + bDel`) — byte-identical vs sqlite for delete-one/many,
-  delete-then-insert, UPDATE (incl. the shared-term `size2` case), multi-column,
-  interleaved, and delete-all. *Delete-crisis merge done (2026-07-09, 0fe4691):* a
-  delete/update that pushes a level to the 16-segment crisis threshold now merges
-  incrementally (reusing the rebuild-from-live-corpus, valid because sqlite's
-  `fts5IndexMergeLevel` annihilates DELETE markers with the postings they shadow
-  when collapsing to the oldest level) — 250/250 fuzzed threshold-crossing
-  sequences byte-identical to sqlite, integrity-clean. **Remaining:** a
-  delete-crisis when a *higher* level is already populated (needs tombstones
-  carried into the merge), explicit `BEGIN`/`SAVEPOINT` transactions, prefix
-  indexes, and spanning-dlidx segments still fall back to the correct bulk rebuild
-  (never wrong, just not incremental) — the last thin FTS5 tails.
+- **D2e-encoder — byte-identical FTS5 at large scale.** The writer is byte-identical
+  vs sqlite for the mainline: doclist-index, multi-term leaf-fill, prefix indexes,
+  doclist spill, incremental multi-segment writes + automerge, and incremental
+  DELETE/UPDATE tombstones incl. delete-crisis merge (git history / `CHANGELOG.md`).
+  **Remaining (thin tails — all fall back to the *correct* bulk rebuild, never
+  wrong, just not incremental):**
+  - **D2e-1 — delete-crisis with a populated higher level** (needs tombstones
+    carried into the merge).
+  - **D2e-2 — incremental writes inside explicit `BEGIN`/`SAVEPOINT`** (autocommit
+    is incremental; explicit txns rebuild).
+  - **D2e-3 — incremental path for prefix-index and spanning-dlidx segments.**
 - **D4-leftover — window UDFs + custom collations.** The latter needs a user
   variant on the `Collation` enum (invasive).
-- **D5 — `sqlite3_session`** changesets/patchsets for replication. *Changeset
-  generation done (2026-07-09, 80a5281):* `Connection::create_session()` /
-  `Session::attach()`/`is_empty()` / `Connection::session_changeset()` produce a
-  byte-compatible changeset (verified vs an `SQLITE_ENABLE_SESSION` oracle across
-  ~78k fuzzed sequences: all storage classes, coalescing, hash-bucket order,
-  `INSERT OR REPLACE`). Records single-`INTEGER PRIMARY KEY` rowid tables only; the
-  write hook is a no-op when no session is active. *Changeset apply done
-  (2026-07-09, 1a84b64):* `Connection::changeset_apply(&[u8])` parses a changeset
-  and replays it as parameterized DML under a `SAVEPOINT`, with sqlite's default
-  conflict dispositions (NOTFOUND/DATA→OMIT; CONFLICT/CONSTRAINT→ABORT+`ROLLBACK
-  TO`) — verified round-trip and differentially vs a `sesapply` oracle (incl.
-  conflicts), and graphite applies sqlite-generated changesets. *PK shapes
-  broadened (2026-07-09, ad4e196):* gen + apply now byte-verified for non-integer
-  single PKs (TEXT/BLOB/REAL), composite PKs (incl. reordered — the header carries
-  sqlite's 1-based PK ordinal per column), and `WITHOUT ROWID` tables (12.4k
-  fuzzed oracle checks, 0 diffs); a no-declared-PK table stays unrecorded → empty
-  changeset, matching sqlite's default. *invert + concat done (2026-07-09,
-  c754e28):* `graphitesql::Changeset::invert`/`concat` are pure byte transforms
-  matching `sqlite3changeset_invert`/`_concat` (34.6k fuzzed oracle checks, 0
-  diffs, incl. concat's 256-bucket coalescing hash and all PK shapes). *Patchsets
-  done (2026-07-09, 69bcc71):* `Connection::session_patchset()` emits the `'P'`
-  patchset variant (omits old non-PK values; DELETE = PK only; UPDATE = PK +
-  changed new) via a shared serializer, byte-verified vs a `sqlite3session_patchset`
-  oracle. *Custom conflict handlers done (2026-07-10):*
-  `Connection::changeset_apply_with(cs, |ConflictType| -> ConflictAction)` drives
-  apply through a caller-supplied handler — the equivalent of
-  `sqlite3changeset_apply`'s `xConflict`. It classifies each failure as
-  `Data`/`NotFound`/`Conflict`/`Constraint` and honours `Omit`/`Replace`/`Abort`
-  (a `Conflict` `Replace` deletes the PK-colliding row then inserts; a `Data`
-  `Replace` re-matches the `UPDATE`/`DELETE` by primary key alone); the built-in
-  `changeset_apply` is now just the default handler (omit DATA/NOTFOUND, abort
-  CONFLICT/CONSTRAINT). Verified vs a policy-parameterised `sesapply` oracle
-  (matching `xConflict`) across OMIT/REPLACE/ABORT on single-integer, composite,
-  and text primary keys. *Per-table attach done (2026-07-10):*
-  `Session::attach_table(name)` records only the named table(s)
-  (`sqlite3session_attach(p, "table")`); `Session::attach()` still attaches all
-  and overrides a per-table restriction. Verified vs a `sesdump` oracle built
-  with a named attach. *Indirect changes done (2026-07-10):* the changeset
-  record's indirect byte is now set — a change made by a trigger or foreign-key
-  action is flagged indirect automatically (via the trigger/FK nesting depth,
-  SQLite's preupdate `xDepth`), and `Session::set_indirect(bool)`
-  (`sqlite3session_indirect`) flags every change; coalescing demotes an indirect
-  change hit by a later direct one. FK-action child writes (cascade/set-null/
-  set-default) are now session-recorded too (previously invisible). Verified vs
-  the plain `sesdump` oracle (auto-indirect for trigger/FK) and a
-  `sqlite3session_indirect` oracle. *Changeset rebase done (2026-07-10):*
-  `Connection::changeset_apply_rebase(cs, on_conflict) -> Vec<u8>` applies a
-  remote changeset and captures a rebase blob (SQLite's `sqlite3changeset_apply_v2`
-  rebase output), and `Rebaser::new()/configure(blob)/rebase(changeset)`
-  (`sqlite3_rebaser`) rebases a local changeset onto the applied remote changes —
-  all 5 documented rebase rules (INSERT/UPDATE/DELETE × OMIT/REPLACE, per-field
-  partial-update merging). Verified byte-for-byte vs a `sqlite3rebaser` oracle
-  across the rule set, all storage classes, multi-row/-column, text PK, and a
-  fuzz sweep. **Remaining:** streaming (`xInput`/`xOutput`) — an API-shape variant
-  with no benefit over the `Vec` API in Rust; the session API is otherwise
-  complete.
-- **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O).
+- **D5 — `sqlite3_session`. Essentially complete.** Changeset/patchset generation
+  + apply (all PK shapes incl. composite/WITHOUT ROWID), `invert`/`concat`, custom
+  conflict handlers (`xConflict`), per-table attach, indirect-change flagging
+  (trigger/FK), and changeset rebase (`sqlite3_rebaser`) are all byte-verified vs
+  the `SQLITE_ENABLE_SESSION` oracles (git history / `CHANGELOG.md`). Only
+  **streaming** (`xInput`/`xOutput`) is unimplemented — an API-shape variant with
+  no benefit over the `Vec` API in Rust; effectively won't-do.
+- **D6 — async VFS for wasm** (non-blocking IndexedDB/OPFS I/O). *Needs a user
+  decision on target/architecture before implementation.* Chunks (pending that):
+  - **D6-0 — decide the async model.** Blocking sync-over-async (Atomics.wait in a
+    worker) vs a genuinely async `Connection` API; which backend (OPFS sync-access
+    handle — itself sync — vs async IndexedDB); wasm target (`wasm32-unknown-unknown`
+    + JS glue vs `wasm32-wasi`). This choice drives everything below.
+  - **D6-1 — wasm build + a memory-backed VFS smoke test** in the browser (no
+    persistence yet), to establish the toolchain and glue.
+  - **D6-2 — the persistent async VFS** implementing the chosen backend behind the
+    existing `Vfs`/`File` traits.
 - **dbpage-2 INSERT leftover.** The writable `sqlite_dbpage` **UPDATE** path is
   done (patch a page's raw bytes; byte-identical to the oracle). The **INSERT**
   form is not: writing a page *beyond* EOF (`INSERT(count+1, …)`) grows the file
@@ -596,40 +403,29 @@ the write target by qualifier, reads by the global `main → temp → attached` 
 
 ### CLI shell (`graphitesql`)
 
-The shell covers the common introspection/dump commands, the output/import layer
-(`.mode` `list`/`csv`/`column`/`line`/`tabs`/`quote`/`insert`/`json`, `.separator`,
-`.nullvalue`, `.output`/`.once`, `.import` (CSV), `.echo`, `.changes`), and as of
-2026-07-10 the `markdown`/`box`/`table` `.mode`s (bordered tables with a
-center-justified header, byte-identical to sqlite incl. the empty-result and
-Unicode-width cases), the `ascii` (unit/record-separator) and `html`
-(`<TR>`/`<TD>`, escaping `< > & " '`) `.mode`s, and `.print` — all byte-verified
-against `sqlite3` 3.50.4. The `.mode` family is now complete — the `tcl` mode
-(`output_c_string` byte escaping: `\ooo` octal, C-string NUL truncation, valid
-UTF-8 pass-through) landed 2026-07-10. `.backup`/`.save` also landed 2026-07-10,
-backed by the new `Connection::serialize()` (`sqlite3_serialize`): every page of
-the committed database (WAL-aware) is concatenated into a standalone file image
-(WAL format-version bytes normalized to rollback), verified valid via `sqlite3`'s
-`integrity_check` + data round-trip. `.show` also landed 2026-07-10 (all 12 setting lines byte-identical incl. the
-column-family `--wrap 60 --wordwrap off --noquote` suffix and `output_c_string`-
-quoted separators; `eqp`/`explain`/`stats`/`width` shown at SQLite's defaults).
-All display modes (`list`/`tabs`/`column`/`box`/`table`/`markdown`/`line`) now
-apply SQLite's default control-character display escaping (`SHELL_ESC_ASCII`: a
-control byte ≤ 0x1f other than tab/newline/CRLF-CR renders as `^`+`c+0x40`, e.g.
-`x'02'`→`^B`; the width-aligned modes escape before computing column widths;
-`ascii`/`csv`/`quote`/`insert`/`json`/`tcl`/`html` keep their own encoding),
-byte-verified (2026-07-10). Still not implemented: `.bail`; the CLI
-error-message text (graphite renders `Error:` rather than sqlite's `Parse error
-near line N: … (code)` with the `error here ---^` caret — needs parser token
-offsets threaded into errors); and `.echo` echoing dot-command input lines
-(graphite echoes SQL groups, not each raw input line). Peripheral (the SQL engine,
-not the shell, is the project's purpose), so lower priority.
+The shell covers the common introspection/dump commands, the full `.mode` family
+(`list`/`csv`/`column`/`line`/`tabs`/`quote`/`insert`/`json`/`ascii`/`html`/`tcl`/
+`markdown`/`box`/`table` — all byte-verified vs `sqlite3` 3.50.4, incl. the
+`SHELL_ESC_ASCII` control-char escaping across every display mode), the output/
+import layer (`.separator`/`.nullvalue`/`.output`/`.once`/`.import`/`.echo`/
+`.changes`/`.print`/`.show`), and `.backup`/`.save` (backed by
+`Connection::serialize()`). See git history / `CHANGELOG.md`. **Remaining (all
+peripheral — the SQL engine, not the shell, is the project's purpose):**
+- **CLI-1 — `.bail`** (stop on first error).
+- **CLI-2 — sqlite-style error text.** Render `Parse error near line N: … (code)`
+  with the `error here ---^` caret instead of graphite's bare `Error:`. Needs
+  parser token byte-offsets threaded into `Error` — a library-level change, not
+  shell-only. (The `Expr::Column` span work is a precedent for carrying offsets.)
+- **CLI-3 — `.echo` per-input-line.** Echo each raw dot-command input line, not
+  just SQL groups.
 
 ---
 
 ## 5. Cross-cutting concerns
 
-- **Edition** is **Rust 2024** (`let`-chains adopted); **MSRV** is pinned at
-  **1.88** (`Cargo.toml`) — revisit before 1.0 (C9b wants 1.89 for `File::lock`).
+- **Edition** is **Rust 2024** (`let`-chains adopted); **MSRV** moving to **1.89**
+  (approved 2026-07-10) to use `std::fs::File::lock` for C9b cross-process locks
+  (tracked as C9b-0).
 - **Numeric model** — reals are `f64` to match SQLite; no extended decimal/bignum.
 - **Text is UTF-8.** `Value::Text` is a Rust `String`, so an operation that would
   produce *non-UTF-8* "text" (e.g. `zeroblob(2)||x'ff'`) falls back to `Value::Blob`
@@ -715,32 +511,29 @@ content; we document and accept these rather than chase them:
 
 ## 7. Suggested order
 
-The headline features are done (§3), Tracks A & E are essentially complete, and the
-EQP-fidelity thread is largely closed. What remains (§4) is bigger, multi-session
-work, each track independently shippable:
+The headline features are done (§3); Tracks A, C, D & E are essentially complete
+(RENAME COLUMN propagation, in-process concurrency, FTS5 mainline, `sqlite3_session`
+all landed). What remains (§4) is smaller chunks plus a few bigger threads, each
+independently shippable. Recommended next order:
 
-1. **B5b-2 — live storage cursors on the VDBE** *(in progress)*. The largest
-   remaining VDBE piece; rowid seeks landed, the next sub-steps are the
-   in-interpreter `OpenRead`/`SeekRowid` opcodes and the affinity-blocked
-   secondary-index / `WITHOUT ROWID` seeks. Perf/coverage, parity-gated, low risk.
-2. **B5c-2 — correlated subqueries on the VDBE**, once B5b-2 lands the live-cursor
-   machinery. This also unblocks bare `generate_series` (A-tvf-bare-series) via
-   lazy row production.
-3. **C9a → C9d — the concurrency story** — persistent read locks in `src/pager/`,
-   then OS file locks (MSRV 1.89), the WAL `-shm` index, and a thread-safe
-   `Connection`.
-4. **Ecosystem surfaces** — D2e-encoder (needs the fts5 writer source), D5
-   (`sqlite3_session`), D6 (async wasm VFS); dbpage-2 UPDATE is done, its INSERT-grow an architectural boundary (see Track D).
-5. **Cost model (Track B)** — the selectivity-driven join order and remaining B9h
-   index-choice items; B9b window EQP unblocks once B9h lands. **B4** stat4 needs a
-   stat4-enabled oracle first.
-6. **Track A leftovers** — an `Expr::Column` source-span enrichment for the
-   A-rn3-edge *mixed*-body rewrite; statement-level DDL rollback for A-alter-rollback;
-   the A-misc-1 error-ordering interleave (all low-value, deferred by design).
+1. **C9b — cross-process OS file locks** *(newly unblocked; MSRV 1.89 approved)*.
+   Start with **C9b-0** (the MSRV bump), then the lock primitive (C9b-1) and the
+   two-process differential test (C9b-2). Well-scoped, high value.
+2. **A-alter-1 → A-alter-2 — finish RENAME dependency safety.** Derived-table
+   propagation (small, reuses the CTE-provenance pattern), then the savepoint
+   rollback + resolve-check re-validation (the reverted machinery, now unblocked).
+3. **B5b-2 — live storage cursors on the VDBE** *(in progress)*. The largest VDBE
+   piece; next sub-steps are the in-interpreter `OpenRead`/`SeekRowid` opcodes and
+   the affinity-blocked secondary-index / `WITHOUT ROWID` seeks. Parity-gated, low
+   risk. Then **B5c-2** correlated subqueries (compile-time-validated), which also
+   unblocks bare `generate_series` (A-tvf-bare-series).
+4. **Cost model (Track B)** — B9h index-choice sub-items, then B9b window EQP
+   (blocked on B9h); B1b selectivity-driven join order.
+5. **D2e FTS5 tails** (D2e-1/2/3) and **D6 wasm** (pending the D6-0 architecture
+   decision).
 
-**Deferred / blocked** (documented in §4/§6): **B1b** selectivity-driven join
-reordering and **B4** `sqlite_stat4` (unverifiable against the stat1-only oracle);
-**B9j** collation-aware index selection; **B1c** RIGHT/FULL inner seeks (correct via
-materialization); **D7** the C-API shim (needs `unsafe`; a sibling crate);
-the Track E cross-db qualified-subquery resolution;
-and the FTS5 large-scale encoder sub-cases (need the fts5 writer source).
+**Blocked by project constraints** (not effort): **D7** C-API shim (needs `unsafe`;
+a sibling crate that opts out); **dbpage-2 INSERT-grow** (would write a deliberately
+malformed file, breaking the pager consistency invariant); **B9j** collation-aware
+index selection and **B1c** RIGHT/FULL inner seeks (correct via materialization —
+plan/perf only); the Track E unqualified cross-db name residual.
