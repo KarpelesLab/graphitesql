@@ -150,3 +150,66 @@ fn cli_backup_writes_valid_file() {
     assert_eq!(sqlite3(&out, "SELECT count(*) FROM t;"), "3");
     let _ = std::fs::remove_file(&out);
 }
+
+/// `Connection::deserialize` opens a database from a serialized image and sees
+/// the same data — the round-trip with `serialize`.
+#[test]
+fn deserialize_round_trip() {
+    let mut conn = Connection::open_memory().unwrap();
+    conn.execute_batch(SETUP).unwrap();
+    let bytes = conn.serialize().unwrap();
+
+    let mut re = Connection::deserialize(&bytes).unwrap();
+    assert_eq!(
+        re.query("SELECT count(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(3)
+    );
+    assert_eq!(
+        re.query("SELECT b FROM t WHERE a=1").unwrap().rows[0][0],
+        Value::Text("hello".into())
+    );
+    assert_eq!(
+        re.query("SELECT y FROM u WHERE x='r'").unwrap().rows[0][0],
+        Value::Text("s".into())
+    );
+    // It is writable: a further INSERT works and the count updates.
+    re.execute_batch("INSERT INTO t(a,b) VALUES(4,'four');")
+        .unwrap();
+    assert_eq!(
+        re.query("SELECT count(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(4)
+    );
+    // The original is unaffected (the image was copied).
+    assert_eq!(
+        conn.query("SELECT count(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(3)
+    );
+}
+
+/// deserialize accepts an image written by the sqlite3 CLI.
+#[test]
+fn deserialize_sqlite3_written_image() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let path = tmp_path("s3-written");
+    let _ = std::fs::remove_file(&path);
+    sqlite3(
+        &path,
+        "CREATE TABLE q(n); INSERT INTO q VALUES(10),(20),(30);",
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    let re = Connection::deserialize(&bytes).unwrap();
+    assert_eq!(
+        re.query("SELECT sum(n) FROM q").unwrap().rows[0][0],
+        Value::Integer(60)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// deserialize rejects a malformed image.
+#[test]
+fn deserialize_rejects_garbage() {
+    assert!(Connection::deserialize(b"not a database").is_err());
+}

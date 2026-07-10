@@ -555,6 +555,27 @@ impl Connection {
         Connection::from_pager(db)
     }
 
+    /// Open a read-write in-memory database from a serialized database image —
+    /// the equivalent of `sqlite3_deserialize()`. `bytes` must be a complete
+    /// SQLite database file (such as one produced by
+    /// [`serialize`](Self::serialize) or written by `sqlite3`); the image is
+    /// copied into a private in-memory VFS and opened.
+    ///
+    /// Always available (`no_std` too), so a database can be loaded from a byte
+    /// buffer without any filesystem.
+    ///
+    /// # Errors
+    /// [`crate::error::Error`] if `bytes` is not a valid database image.
+    pub fn deserialize(bytes: &[u8]) -> Result<Connection> {
+        let vfs = crate::vfs::memory::MemoryVfs::new();
+        {
+            let mut main = vfs.open("main", OpenFlags::READ_WRITE_CREATE)?;
+            main.write_all_at(bytes, 0)?;
+            main.sync()?;
+        }
+        Connection::open_vfs(&vfs, "main")
+    }
+
     /// The schema catalog.
     pub fn schema(&self) -> &Schema {
         &self.schema
