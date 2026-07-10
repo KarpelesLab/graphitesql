@@ -370,11 +370,16 @@ result or declines to it — never a wrong answer), so this track is
   self-content DELETE/UPDATE in autocommit appends one level-0 tombstone segment
   (`nPos = content_len*2 + bDel`) — byte-identical vs sqlite for delete-one/many,
   delete-then-insert, UPDATE (incl. the shared-term `size2` case), multi-column,
-  interleaved, and delete-all. **Remaining:** deletes that cross the 16-segment
-  crisis threshold (tombstone-reconciling crisis merge not ported), explicit
-  `BEGIN`/`SAVEPOINT` transactions, prefix indexes, and spanning-dlidx segments
-  still fall back to the single-segment bulk rebuild (never wrong, just not
-  incremental) — those are the remaining follow-ups.
+  interleaved, and delete-all. *Delete-crisis merge done (2026-07-09, 0fe4691):* a
+  delete/update that pushes a level to the 16-segment crisis threshold now merges
+  incrementally (reusing the rebuild-from-live-corpus, valid because sqlite's
+  `fts5IndexMergeLevel` annihilates DELETE markers with the postings they shadow
+  when collapsing to the oldest level) — 250/250 fuzzed threshold-crossing
+  sequences byte-identical to sqlite, integrity-clean. **Remaining:** a
+  delete-crisis when a *higher* level is already populated (needs tombstones
+  carried into the merge), explicit `BEGIN`/`SAVEPOINT` transactions, prefix
+  indexes, and spanning-dlidx segments still fall back to the correct bulk rebuild
+  (never wrong, just not incremental) — the last thin FTS5 tails.
 - **D4-leftover — window UDFs + custom collations.** The latter needs a user
   variant on the `Collation` enum (invasive).
 - **D5 — `sqlite3_session`** changesets/patchsets for replication. *Changeset
