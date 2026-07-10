@@ -448,7 +448,7 @@ history / `CHANGELOG.md`. Remaining:
   functions — scalar and aggregate** (`sqlite3_create_function` + the
   `sqlite3_value_*` / `sqlite3_result_*` families + `sqlite3_aggregate_context`,
   bridged onto the engine's `register_function`/`register_aggregate_function`) are
-  supported — 53 exported `sqlite3_*` symbols. Verified end-to-end by a C program
+  supported — 62 exported `sqlite3_*` symbols (incl. prepare_v3, db_handle, sql, total_changes, get_autocommit, errstr, busy_timeout no-op). Verified end-to-end by a C program
   (`tests/ctest.c`, run in CI's `capi` job) that links the cdylib and drives the
   full lifecycle including a scalar UDF in a `WHERE` and an aggregate UDF over a
   `GROUP BY`. Residuals: window UDFs, `_v3` prepare flags, incremental BLOB I/O,

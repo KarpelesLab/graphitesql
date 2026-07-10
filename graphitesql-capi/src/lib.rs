@@ -97,6 +97,8 @@ pub struct sqlite3_stmt {
     param_names: Vec<Option<String>>,
     /// Scratch for `sqlite3_bind_parameter_name`'s returned pointer.
     param_name_scratch: Option<CString>,
+    /// Scratch for `sqlite3_sql`'s returned pointer.
+    sql_cstr: Option<CString>,
     /// Backing storage keeping `column_text`/`column_blob` pointers valid until the
     /// next `step`/`reset`/`finalize`, per SQLite's lifetime contract.
     text_scratch: Vec<Option<CString>>,
@@ -417,6 +419,57 @@ pub unsafe extern "C" fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> c_longlo
     unsafe { &*db }.last_insert_rowid
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_total_changes(db: *mut sqlite3) -> c_int {
+    if db.is_null() {
+        return 0;
+    }
+    unsafe { &*db }.conn.total_changes() as c_int
+}
+
+/// 1 in autocommit mode, 0 inside an explicit `BEGIN`…`COMMIT` transaction.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_get_autocommit(db: *mut sqlite3) -> c_int {
+    if db.is_null() {
+        return 1;
+    }
+    unsafe { &*db }.conn.is_autocommit() as c_int
+}
+
+/// This shim does not model SQLite's extended result codes, so this returns the
+/// primary code (identical to `sqlite3_errcode`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut sqlite3) -> c_int {
+    unsafe { sqlite3_errcode(db) }
+}
+
+/// No-op: locking is process-local, so a connection never sees a busy file lock
+/// held by another OS process to wait on. Accepted for API compatibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_busy_timeout(_db: *mut sqlite3, _ms: c_int) -> c_int {
+    SQLITE_OK
+}
+
+/// No-op: this shim runs statements to completion synchronously, so there is no
+/// in-flight step to interrupt.
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_interrupt(_db: *mut sqlite3) {}
+
+/// English text for a primary result code (like `sqlite3_errstr`).
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_errstr(rc: c_int) -> *const c_char {
+    let s: &CStr = match rc {
+        SQLITE_OK => c"not an error",
+        SQLITE_ERROR => c"SQL logic error",
+        SQLITE_NOMEM => c"out of memory",
+        SQLITE_RANGE => c"column index out of range",
+        SQLITE_ROW => c"another row available",
+        SQLITE_DONE => c"no more rows available",
+        _ => c"unknown error",
+    };
+    s.as_ptr()
+}
+
 // --- exec ---------------------------------------------------------------------
 
 type ExecCallback =
@@ -536,6 +589,21 @@ unsafe fn write_errmsg(errmsg: *mut *mut c_char, msg: &str) {
 
 // --- prepare / step / finalize ------------------------------------------------
 
+/// Like `sqlite3_prepare_v2` with a `prepFlags` argument; the flags (persistent,
+/// no-vtab, normalize) don't affect this shim's materialized model, so it simply
+/// delegates.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_prepare_v3(
+    db: *mut sqlite3,
+    sql: *const c_char,
+    n_byte: c_int,
+    _prep_flags: core::ffi::c_uint,
+    pp_stmt: *mut *mut sqlite3_stmt,
+    pz_tail: *mut *const c_char,
+) -> c_int {
+    unsafe { sqlite3_prepare_v2(db, sql, n_byte, pp_stmt, pz_tail) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_prepare_v2(
     db: *mut sqlite3,
@@ -581,6 +649,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         next: 0,
         executed: false,
         param_name_scratch: None,
+        sql_cstr: None,
         text_scratch: Vec::new(),
         blob_scratch: Vec::new(),
     });
@@ -687,6 +756,28 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> c_int {
         drop(unsafe { Box::from_raw(stmt) });
     }
     SQLITE_OK
+}
+
+/// The connection that prepared this statement (`sqlite3_db_handle`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqlite3 {
+    if stmt.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { &*stmt }.db
+}
+
+/// The original SQL text of the prepared statement (`sqlite3_sql`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_sql(stmt: *mut sqlite3_stmt) -> *const c_char {
+    if stmt.is_null() {
+        return core::ptr::null();
+    }
+    let stmt = unsafe { &mut *stmt };
+    let c = CString::new(stmt.sql.as_str()).unwrap_or_default();
+    let p = c.as_ptr();
+    stmt.sql_cstr = Some(c);
+    p
 }
 
 // --- bind ---------------------------------------------------------------------

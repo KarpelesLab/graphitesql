@@ -49,11 +49,21 @@ int sqlite3_exec(sqlite3 *db, const char *sql,
 
 const char *sqlite3_errmsg(sqlite3 *db);
 int sqlite3_errcode(sqlite3 *db);
+int sqlite3_extended_errcode(sqlite3 *db);
+const char *sqlite3_errstr(int rc);
 int sqlite3_changes(sqlite3 *db);
+int sqlite3_total_changes(sqlite3 *db);
 sqlite3_int64 sqlite3_last_insert_rowid(sqlite3 *db);
+int sqlite3_get_autocommit(sqlite3 *db);
+int sqlite3_busy_timeout(sqlite3 *db, int ms);
+void sqlite3_interrupt(sqlite3 *db);
 
 int sqlite3_prepare_v2(sqlite3 *db, const char *sql, int nByte,
                        sqlite3_stmt **ppStmt, const char **pzTail);
+int sqlite3_prepare_v3(sqlite3 *db, const char *sql, int nByte, unsigned int prepFlags,
+                       sqlite3_stmt **ppStmt, const char **pzTail);
+sqlite3 *sqlite3_db_handle(sqlite3_stmt *stmt);
+const char *sqlite3_sql(sqlite3_stmt *stmt);
 int sqlite3_step(sqlite3_stmt *stmt);
 int sqlite3_reset(sqlite3_stmt *stmt);
 int sqlite3_clear_bindings(sqlite3_stmt *stmt);

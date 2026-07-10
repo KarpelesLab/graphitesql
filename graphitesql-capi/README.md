@@ -15,11 +15,11 @@ shape as the `graphitesql-wasm` sibling.
 |------|-----------|
 | Lifecycle | `sqlite3_open`, `sqlite3_open_v2`, `sqlite3_close`, `sqlite3_close_v2` |
 | One-shot | `sqlite3_exec` (with row callback) |
-| Prepared | `sqlite3_prepare_v2`, `sqlite3_step`, `sqlite3_reset`, `sqlite3_clear_bindings`, `sqlite3_finalize` |
+| Prepared | `sqlite3_prepare_v2`/`v3`, `sqlite3_step`, `sqlite3_reset`, `sqlite3_clear_bindings`, `sqlite3_finalize`, `sqlite3_sql`, `sqlite3_db_handle` |
 | Bind | `sqlite3_bind_int`/`int64`/`double`/`null`/`text`/`blob` |
 | Parameters | `sqlite3_bind_parameter_count`/`name`/`index` (named `:x`/`@x`/`$x` + numbered `?N`) |
 | Columns | `sqlite3_column_count`/`data_count`/`name`/`type`/`int`/`int64`/`double`/`text`/`blob`/`bytes` |
-| Status | `sqlite3_errmsg`, `sqlite3_errcode`, `sqlite3_changes`, `sqlite3_last_insert_rowid` |
+| Status | `sqlite3_errmsg`, `sqlite3_errcode`/`extended_errcode`, `sqlite3_errstr`, `sqlite3_changes`/`total_changes`, `sqlite3_last_insert_rowid`, `sqlite3_get_autocommit`, `sqlite3_busy_timeout`, `sqlite3_interrupt` |
 | UDFs | `sqlite3_create_function` (scalar + aggregate), `sqlite3_user_data`, `sqlite3_aggregate_context`, `sqlite3_value_*`, `sqlite3_result_*` |
 | Version | `sqlite3_libversion`, `sqlite3_libversion_number` (reports `3.50.4`) |
 | Memory | `sqlite3_free` |

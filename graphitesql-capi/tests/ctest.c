@@ -233,6 +233,24 @@ int main(void) {
         sqlite3_create_function(db, "bad", 1, SQLITE_UTF8, NULL, NULL,
                                 lone_step, NULL) == SQLITE_ERROR);
 
+  /* Connection/statement introspection + prepare_v3. */
+  CHECK("errstr(SQLITE_RANGE)", strcmp(sqlite3_errstr(SQLITE_RANGE), "column index out of range") == 0);
+  CHECK("busy_timeout no-op OK", sqlite3_busy_timeout(db, 1000) == SQLITE_OK);
+  CHECK("autocommit on by default", sqlite3_get_autocommit(db) == 1);
+  sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+  CHECK("autocommit off in transaction", sqlite3_get_autocommit(db) == 0);
+  sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+  CHECK("autocommit on after commit", sqlite3_get_autocommit(db) == 1);
+  CHECK("total_changes accumulates", sqlite3_total_changes(db) > 0);
+
+  sqlite3_stmt *v3 = NULL;
+  int prc = sqlite3_prepare_v3(db, "SELECT 42", -1, 0, &v3, NULL);
+  CHECK("prepare_v3 ok", prc == SQLITE_OK);
+  CHECK("sql() echoes text", strcmp(sqlite3_sql(v3), "SELECT 42") == 0);
+  CHECK("db_handle round-trips", sqlite3_db_handle(v3) == db);
+  CHECK("v3 step", sqlite3_step(v3) == SQLITE_ROW && sqlite3_column_int64(v3, 0) == 42);
+  sqlite3_finalize(v3);
+
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 
   sqlite3_close(db);
