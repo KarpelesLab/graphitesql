@@ -581,6 +581,31 @@ impl Connection {
         &self.schema
     }
 
+    /// The rowid of the most recently inserted row on this connection, the
+    /// equivalent of `sqlite3_last_insert_rowid()` (and of the SQL
+    /// `last_insert_rowid()` function). Returns 0 if no row has ever been
+    /// inserted. A successful `INSERT` into a rowid table updates it; other
+    /// statements leave it unchanged.
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.last_insert_rowid.get()
+    }
+
+    /// The number of rows modified, inserted, or deleted by the most recently
+    /// completed `INSERT`/`UPDATE`/`DELETE` statement — the equivalent of
+    /// `sqlite3_changes()` (and the SQL `changes()` function). Statements that
+    /// are not `INSERT`/`UPDATE`/`DELETE` leave it unchanged.
+    pub fn changes(&self) -> i64 {
+        self.changes.get()
+    }
+
+    /// The total number of rows modified, inserted, or deleted by
+    /// `INSERT`/`UPDATE`/`DELETE` statements since this connection was opened —
+    /// the equivalent of `sqlite3_total_changes()` (and the SQL
+    /// `total_changes()` function).
+    pub fn total_changes(&self) -> i64 {
+        self.total_changes.get()
+    }
+
     /// Run a single `SELECT` and return all rows.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         self.query_params(sql, &Params::default())
