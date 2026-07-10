@@ -268,6 +268,16 @@ pub struct Connection {
     /// cells on every read, so the flag is inert; it is stored and reported back
     /// like sqlite for drop-in compatibility.
     cell_size_check: core::cell::Cell<bool>,
+    /// `PRAGMA synchronous` (0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA; default FULL).
+    /// graphite has no fsync-policy knob, so this is advisory; it is stored and
+    /// reported back like sqlite.
+    synchronous: core::cell::Cell<i64>,
+    /// `PRAGMA temp_store` (0=DEFAULT, 1=FILE, 2=MEMORY). graphite holds temp data
+    /// in the pager regardless, so this is advisory; stored and reported back.
+    temp_store: core::cell::Cell<i64>,
+    /// `PRAGMA threads` — the max auxiliary sort threads. graphite is
+    /// single-threaded, so this is advisory; stored and reported back like sqlite.
+    threads: core::cell::Cell<i64>,
     /// User-defined scalar functions registered via
     /// [`register_function`](Self::register_function), keyed by lowercased name.
     /// Built-in functions take precedence; these fill otherwise-unknown names.
@@ -427,6 +437,9 @@ impl Connection {
             secure_delete: core::cell::Cell::new(0),
             automatic_index: core::cell::Cell::new(true),
             cell_size_check: core::cell::Cell::new(false),
+            synchronous: core::cell::Cell::new(2),
+            temp_store: core::cell::Cell::new(0),
+            threads: core::cell::Cell::new(0),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
@@ -475,6 +488,9 @@ impl Connection {
             secure_delete: core::cell::Cell::new(0),
             automatic_index: core::cell::Cell::new(true),
             cell_size_check: core::cell::Cell::new(false),
+            synchronous: core::cell::Cell::new(2),
+            temp_store: core::cell::Cell::new(0),
+            threads: core::cell::Cell::new(0),
             functions: alloc::collections::BTreeMap::new(),
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
@@ -3398,8 +3414,12 @@ impl Connection {
                 columns: alloc::vec![String::from("mmap_size")],
                 rows: Vec::new(),
             }),
-            "synchronous" => Ok(single("synchronous", Value::Integer(2))),
-            "temp_store" => Ok(single("temp_store", Value::Integer(0))),
+            "synchronous" => Ok(single(
+                "synchronous",
+                Value::Integer(self.synchronous.get()),
+            )),
+            "temp_store" => Ok(single("temp_store", Value::Integer(self.temp_store.get()))),
+            "threads" => Ok(single("threads", Value::Integer(self.threads.get()))),
             "secure_delete" => Ok(single(
                 "secure_delete",
                 Value::Integer(self.secure_delete.get()),
@@ -3517,7 +3537,6 @@ impl Connection {
             | "defer_foreign_keys"
             | "reverse_unordered_selects"
             | "writable_schema"
-            | "threads"
             | "soft_heap_limit"
             | "hard_heap_limit" => Ok(single(&name, Value::Integer(0))),
             // `incremental_vacuum` (bare or `(N)`) performs a write, so it cannot
@@ -6837,6 +6856,39 @@ impl Connection {
             if let Some(e) = &p.value {
                 let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
                 self.journal_size_limit.set(if v < 0 { -1 } else { v });
+            }
+        } else if p.name.eq_ignore_ascii_case("synchronous") {
+            // Advisory (graphite has no fsync-policy knob); store the level so a
+            // later `PRAGMA synchronous` reads it back. Accepts the keyword form
+            // (OFF/NORMAL/FULL/EXTRA) or a number 0..3, like sqlite.
+            if let Some(e) = &p.value {
+                let v = match pragma_text(e).to_ascii_lowercase().as_str() {
+                    "off" => 0,
+                    "normal" => 1,
+                    "full" => 2,
+                    "extra" => 3,
+                    _ => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?),
+                };
+                self.synchronous.set(v);
+            }
+        } else if p.name.eq_ignore_ascii_case("temp_store") {
+            // Advisory (graphite keeps temp data in the pager); store the mode.
+            // Accepts DEFAULT/FILE/MEMORY or a number 0..2, like sqlite.
+            if let Some(e) = &p.value {
+                let v = match pragma_text(e).to_ascii_lowercase().as_str() {
+                    "default" => 0,
+                    "file" => 1,
+                    "memory" => 2,
+                    _ => eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?),
+                };
+                self.temp_store.set(v);
+            }
+        } else if p.name.eq_ignore_ascii_case("threads") {
+            // Advisory (graphite is single-threaded); store the value so a later
+            // `PRAGMA threads` reads it back, clamping a negative value to 0.
+            if let Some(e) = &p.value {
+                let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(params))?);
+                self.threads.set(v.max(0));
             }
         } else if p.name.eq_ignore_ascii_case("secure_delete") {
             // sqlite maps the argument to 0 (off), 2 (the `fast` keyword only), or

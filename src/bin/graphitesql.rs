@@ -2476,7 +2476,13 @@ fn pragma_setter_result_query(sql: &str) -> Option<String> {
     // The target (possibly `schema.name`) is everything between PRAGMA and `=`.
     let target = rest[6..].split('=').next()?.trim();
     let name = target.rsplit('.').next().unwrap_or(target).trim();
-    if name.eq_ignore_ascii_case("journal_mode") {
+    // Setters whose `= value` form itself echoes the resulting value (SQLite prints
+    // it), as opposed to the silent setters (`synchronous`, `temp_store`, …). Each
+    // stores the value, so re-querying the getter reproduces the echoed line.
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "journal_mode" | "busy_timeout" | "threads"
+    ) {
         Some(format!("PRAGMA {target}"))
     } else {
         None
