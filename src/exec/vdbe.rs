@@ -872,7 +872,7 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
 fn explicit_non_binary_collation(expr: &Expr) -> bool {
     match unparen(expr) {
         Expr::Collate { collation, .. } => {
-            Collation::parse(collation).is_some_and(|c| c != Collation::Binary)
+            crate::value::resolve_collation_name(collation).is_some_and(|c| c != Collation::Binary)
         }
         _ => false,
     }
@@ -891,7 +891,8 @@ fn projections_have_explicit_collation(projections: &[(Expr, String)]) -> bool {
     for (e, _) in projections {
         crate::exec::window::visit(e, &mut |node| {
             if let Expr::Collate { collation, .. } = node
-                && Collation::parse(collation).is_some_and(|c| c != Collation::Binary)
+                && crate::value::resolve_collation_name(collation)
+                    .is_some_and(|c| c != Collation::Binary)
             {
                 found = true;
             }
@@ -4193,9 +4194,8 @@ impl Compiler {
     fn explicit_collation(&self, expr: &Expr) -> Option<Collation> {
         match expr {
             Expr::Paren(e) => self.explicit_collation(e),
-            Expr::Collate { expr, collation } => {
-                Collation::parse(collation).or_else(|| self.explicit_collation(expr))
-            }
+            Expr::Collate { expr, collation } => crate::value::resolve_collation_name(collation)
+                .or_else(|| self.explicit_collation(expr)),
             _ => None,
         }
     }

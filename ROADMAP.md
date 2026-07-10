@@ -389,8 +389,20 @@ history / `CHANGELOG.md`. Remaining:
   - **D2e-2 — incremental writes inside explicit `BEGIN`/`SAVEPOINT`** (autocommit
     is incremental; explicit txns rebuild).
   - **D2e-3 — incremental path for prefix-index and spanning-dlidx segments.**
-- **D4-leftover — window UDFs + custom collations.** The latter needs a user
-  variant on the `Collation` enum (invasive).
+- **D4-leftover — window UDFs.** *(Custom collations DONE 2026-07-11.)*
+  Application-registered collating sequences work end-to-end: `Collation::Custom(u32)`
+  (an id into a process-global, `std`-gated registry, so the public enum keeps
+  `Copy`/`Send`/`Sync`/`Eq`), resolved inside `value::cmp_text`/`cmp_values_coll` so
+  every comparison site — `ORDER BY`/`GROUP BY`/`DISTINCT`, `WHERE`, `UNIQUE` and
+  b-tree **index** keys — uses them without threading a registry through the btree
+  layer. `Connection::register_collation` (core) and `sqlite3_create_collation`(`_v2`)
+  (C-API) register them; `COLLATE <name>` resolves via `resolve_collation_name` at the
+  name sites. Verified: a custom collation drives ORDER BY, matches built-in `NOCASE`
+  ordering (the indirect differential, since the CLI oracle can't register one), backs
+  a `UNIQUE` index that passes `integrity_check`, and re-registration replaces. Limits
+  (documented, never wrong): `std`-only; process-global by name; a schema declaring
+  `COLLATE <name>` needs it registered before use (SQLite defers to first use — this
+  errors, stricter but not wrong). **Window UDFs** remain (need core `xValue`/`xInverse`).
 - **D5 — `sqlite3_session`. Essentially complete.** Changeset/patchset generation
   + apply (all PK shapes incl. composite/WITHOUT ROWID), `invert`/`concat`, custom
   conflict handlers (`xConflict`), per-table attach, indirect-change flagging

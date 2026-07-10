@@ -62,8 +62,11 @@ impl ValueRef<'_> {
 }
 
 /// A text collating sequence. `BINARY` (the default) compares bytes; `NOCASE`
-/// folds ASCII letters; `RTRIM` ignores trailing spaces. Collations only affect
-/// text-vs-text comparison; storage-class ordering is unchanged.
+/// folds ASCII letters; `RTRIM` ignores trailing spaces. `Custom` is an
+/// application-registered sequence (see [`Connection::register_collation`](crate::Connection::register_collation)), identified by a
+/// small id into a process-global registry so this enum stays `Copy`/`Send`/`Sync`.
+/// Collations only affect text-vs-text comparison; storage-class ordering is
+/// unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Collation {
     /// `BINARY` — `memcmp` on the UTF-8 bytes.
@@ -73,16 +76,147 @@ pub enum Collation {
     NoCase,
     /// `RTRIM` — like `BINARY` but trailing spaces are ignored.
     RTrim,
+    /// A user-registered collating sequence, by registry id. Only ever
+    /// constructed on `std` builds (via [`Connection::register_collation`](crate::Connection::register_collation)).
+    Custom(u32),
 }
 
 impl Collation {
-    /// Parse a collation name (`BINARY`/`NOCASE`/`RTRIM`, case-insensitive).
+    /// Parse a *built-in* collation name (`BINARY`/`NOCASE`/`RTRIM`,
+    /// case-insensitive). Does not resolve custom collations — use the
+    /// crate-internal `resolve_collation_name` for that.
     pub fn parse(name: &str) -> Option<Collation> {
         match name.to_ascii_lowercase().as_str() {
             "binary" => Some(Collation::Binary),
             "nocase" => Some(Collation::NoCase),
             "rtrim" => Some(Collation::RTrim),
             _ => None,
+        }
+    }
+}
+
+/// Resolve a collation name to a [`Collation`], including application-registered
+/// custom collations. Returns `None` for an unknown name (the caller reports the
+/// usual `no such collation sequence` error). Built-ins resolve on every build;
+/// custom names resolve only on `std` builds.
+pub fn resolve_collation_name(name: &str) -> Option<Collation> {
+    if let Some(c) = Collation::parse(name) {
+        return Some(c);
+    }
+    #[cfg(feature = "std")]
+    {
+        registry::resolve_name(name).map(Collation::Custom)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        None
+    }
+}
+
+/// The name of a collation for schema/EXPLAIN reprinting (`BINARY`/`NOCASE`/
+/// `RTRIM`, or a custom sequence's registered name).
+pub fn collation_name(coll: Collation) -> alloc::string::String {
+    use alloc::string::ToString;
+    match coll {
+        Collation::Binary => "BINARY".to_string(),
+        Collation::NoCase => "NOCASE".to_string(),
+        Collation::RTrim => "RTRIM".to_string(),
+        Collation::Custom(id) => {
+            #[cfg(feature = "std")]
+            {
+                registry::name_of(id).unwrap_or_else(|| "BINARY".to_string())
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                let _ = id;
+                "BINARY".to_string()
+            }
+        }
+    }
+}
+
+/// Register (or replace) a custom collating sequence `name`, callable as
+/// `COLLATE <name>` in SQL. `cmp` compares two text values. Requires `std`.
+///
+/// Re-registering an existing name replaces its comparison function. The
+/// registry is process-global and its entries are never reclaimed, so register
+/// each collation once at startup.
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub fn register_collation<F>(name: &str, cmp: F) -> u32
+where
+    F: Fn(&str, &str) -> Ordering + Send + 'static,
+{
+    registry::register(name, alloc::boxed::Box::new(cmp))
+}
+
+/// The process-global custom-collation registry. `std`-only (needs a global
+/// `Mutex`). Ids index `fns`; `by_name` maps a name to its id.
+#[cfg(feature = "std")]
+mod registry {
+    use super::Ordering;
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+    use std::sync::{Mutex, OnceLock};
+
+    type CollFn = Box<dyn Fn(&str, &str) -> Ordering + Send>;
+
+    struct Registry {
+        /// Lowercased name → id (collation names are case-insensitive).
+        by_name: BTreeMap<String, u32>,
+        /// id → original-case name (for schema/EXPLAIN reprinting).
+        names: Vec<String>,
+        /// id → comparison function.
+        fns: Vec<CollFn>,
+    }
+
+    fn registry() -> &'static Mutex<Registry> {
+        static REG: OnceLock<Mutex<Registry>> = OnceLock::new();
+        REG.get_or_init(|| {
+            Mutex::new(Registry {
+                by_name: BTreeMap::new(),
+                names: Vec::new(),
+                fns: Vec::new(),
+            })
+        })
+    }
+
+    pub(super) fn register(name: &str, f: CollFn) -> u32 {
+        let mut reg = registry().lock().unwrap();
+        let key = name.to_ascii_lowercase();
+        if let Some(&id) = reg.by_name.get(&key) {
+            reg.fns[id as usize] = f;
+            reg.names[id as usize] = name.to_string();
+            return id;
+        }
+        let id = reg.fns.len() as u32;
+        reg.fns.push(f);
+        reg.names.push(name.to_string());
+        reg.by_name.insert(key, id);
+        id
+    }
+
+    pub(super) fn resolve_name(name: &str) -> Option<u32> {
+        registry()
+            .lock()
+            .unwrap()
+            .by_name
+            .get(&name.to_ascii_lowercase())
+            .copied()
+    }
+
+    pub(super) fn name_of(id: u32) -> Option<String> {
+        registry().lock().unwrap().names.get(id as usize).cloned()
+    }
+
+    pub(super) fn compare(id: u32, x: &str, y: &str) -> Ordering {
+        let reg = registry().lock().unwrap();
+        match reg.fns.get(id as usize) {
+            Some(f) => f(x, y),
+            // Unregistered id (cannot happen via the public API): fall back to BINARY.
+            None => x.as_bytes().cmp(y.as_bytes()),
         }
     }
 }
@@ -99,6 +233,19 @@ pub fn cmp_text(x: &str, y: &str, coll: Collation) -> Ordering {
             .trim_end_matches(' ')
             .as_bytes()
             .cmp(y.trim_end_matches(' ').as_bytes()),
+        Collation::Custom(_id) => {
+            #[cfg(feature = "std")]
+            {
+                registry::compare(_id, x, y)
+            }
+            // In `no_std` builds a `Custom` collation can never be constructed
+            // (there is no registry), so this arm is unreachable; fall back to
+            // BINARY to keep the match exhaustive.
+            #[cfg(not(feature = "std"))]
+            {
+                x.as_bytes().cmp(y.as_bytes())
+            }
+        }
     }
 }
 

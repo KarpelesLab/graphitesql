@@ -4287,9 +4287,10 @@ impl Connection {
                     .iter()
                     .map(|term| {
                         let (inner, explicit) = match &term.expr {
-                            Expr::Collate { expr, collation } => {
-                                (expr.as_ref(), crate::value::Collation::parse(collation))
-                            }
+                            Expr::Collate { expr, collation } => (
+                                expr.as_ref(),
+                                crate::value::resolve_collation_name(collation),
+                            ),
                             e => (e, None),
                         };
                         match inner {
@@ -4331,11 +4332,7 @@ impl Connection {
                 })
                 .collect(),
         };
-        let coll_name = |c: crate::value::Collation| match c {
-            crate::value::Collation::NoCase => "NOCASE",
-            crate::value::Collation::RTrim => "RTRIM",
-            crate::value::Collation::Binary => "BINARY",
-        };
+        let coll_name = crate::value::collation_name;
         let mut rows = Vec::new();
         for (seqno, (cid, name, desc, coll)) in keys.iter().enumerate() {
             let name_val = name.clone().map_or(Value::Null, Value::Text);
@@ -4345,7 +4342,7 @@ impl Connection {
                     Value::Integer(*cid),
                     name_val,
                     Value::Integer(*desc as i64),
-                    Value::Text(coll_name(*coll).into()),
+                    Value::Text(coll_name(*coll)),
                     Value::Integer(1), // key column
                 ]);
             } else {
@@ -4379,7 +4376,7 @@ impl Connection {
                         Value::Integer(pcid as i64),
                         Value::Text(tmeta.columns[pcid].name.clone()),
                         Value::Integer(0),
-                        Value::Text(coll_name(tmeta.columns[pcid].collation).into()),
+                        Value::Text(coll_name(tmeta.columns[pcid].collation)),
                         Value::Integer(0), // auxiliary, non-key
                     ]);
                     seqno += 1;
@@ -4421,11 +4418,7 @@ impl Connection {
         if !m.without_rowid || m.pk_len == 0 {
             return Ok(None);
         }
-        let coll_name = |c: crate::value::Collation| match c {
-            crate::value::Collation::NoCase => "NOCASE",
-            crate::value::Collation::RTrim => "RTRIM",
-            crate::value::Collation::Binary => "BINARY",
-        };
+        let coll_name = crate::value::collation_name;
         let mut rows = Vec::new();
         for (seqno, &cid) in m.storage_order[..m.pk_len].iter().enumerate() {
             let desc = m.pk_descending.get(seqno).copied().unwrap_or(false);
@@ -4435,7 +4428,7 @@ impl Connection {
                     Value::Integer(cid as i64),
                     Value::Text(m.columns[cid].name.clone()),
                     Value::Integer(desc as i64),
-                    Value::Text(coll_name(m.columns[cid].collation).into()),
+                    Value::Text(coll_name(m.columns[cid].collation)),
                     Value::Integer(1), // key column
                 ]);
             } else {
@@ -4454,7 +4447,7 @@ impl Connection {
                     Value::Integer(cid as i64),
                     Value::Text(m.columns[cid].name.clone()),
                     Value::Integer(0),
-                    Value::Text(coll_name(m.columns[cid].collation).into()),
+                    Value::Text(coll_name(m.columns[cid].collation)),
                     Value::Integer(0), // auxiliary, non-key
                 ]);
             }
@@ -4739,6 +4732,23 @@ impl Connection {
     ) {
         self.aggregates
             .insert(name.to_ascii_lowercase(), Box::new(factory));
+    }
+
+    /// Register (or replace) a custom collating sequence callable as
+    /// `COLLATE <name>` in SQL — the equivalent of `sqlite3_create_collation`.
+    /// `cmp` compares two text values. Requires `std`.
+    ///
+    /// The registry is process-global (shared across connections), so a name
+    /// registered here resolves in any connection; re-registering a name replaces
+    /// its function. A database whose schema declares a column/index
+    /// `COLLATE <name>` needs `<name>` registered before that schema is used.
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    pub fn register_collation<F>(&mut self, name: &str, cmp: F)
+    where
+        F: Fn(&str, &str) -> core::cmp::Ordering + Send + 'static,
+    {
+        crate::value::register_collation(name, cmp);
     }
 
     /// Execute a `;`-separated script of one or more statements, like SQLite's
@@ -5210,7 +5220,7 @@ impl Connection {
                     // A bare target may name a collation; a `schema.`-qualified one
                     // may only be a table or index (a collation is not per-database).
                     let known = (schema.is_none()
-                        && crate::value::Collation::parse(name).is_some())
+                        && crate::value::resolve_collation_name(name).is_some())
                         || self.schema.table(name).is_some()
                         || self.schema.index(name).is_some();
                     if !known {
@@ -6313,7 +6323,7 @@ impl Connection {
             }
             for k in &c.constraints {
                 if let ColumnConstraint::Collate(name) = k
-                    && crate::value::Collation::parse(name).is_none()
+                    && crate::value::resolve_collation_name(name).is_none()
                 {
                     return Err(Error::Error(format!("no such collation sequence: {name}")));
                 }
@@ -19631,9 +19641,10 @@ impl Connection {
         for term in &ci.columns {
             // Peel an explicit COLLATE off the index column expression.
             let (inner, explicit) = match &term.expr {
-                Expr::Collate { expr, collation } => {
-                    (expr.as_ref(), crate::value::Collation::parse(collation))
-                }
+                Expr::Collate { expr, collation } => (
+                    expr.as_ref(),
+                    crate::value::resolve_collation_name(collation),
+                ),
                 e => (e, None),
             };
             let Expr::Column { column, .. } = inner else {
@@ -19667,9 +19678,10 @@ impl Connection {
         let mut is_expr = false;
         for term in &ci.columns {
             let (inner, explicit) = match &term.expr {
-                Expr::Collate { expr, collation } => {
-                    (expr.as_ref(), crate::value::Collation::parse(collation))
-                }
+                Expr::Collate { expr, collation } => (
+                    expr.as_ref(),
+                    crate::value::resolve_collation_name(collation),
+                ),
                 e => (e, None),
             };
             exprs.push(inner.clone());
@@ -27615,7 +27627,7 @@ impl Connection {
                     let (aff, base_coll) = origin(expr, base);
                     (
                         aff,
-                        crate::value::Collation::parse(collation).unwrap_or(base_coll),
+                        crate::value::resolve_collation_name(collation).unwrap_or(base_coll),
                     )
                 }
                 _ => (eval::Affinity::Blob, crate::value::Collation::default()),
@@ -35929,7 +35941,7 @@ fn first_ambiguous_in_scopes(sel: &Select, scopes: &[Option<Vec<ColumnInfo>>]) -
 fn top_collation(e: &Expr) -> Result<()> {
     match e {
         Expr::Collate { collation, expr } => {
-            if crate::value::Collation::parse(collation).is_none() {
+            if crate::value::resolve_collation_name(collation).is_none() {
                 return Err(Error::Error(format!(
                     "no such collation sequence: {collation}"
                 )));
@@ -36043,7 +36055,7 @@ fn consumed_collations(e: &Expr) -> Result<()> {
 fn unknown_collation(e: &Expr) -> Option<&str> {
     match e {
         Expr::Collate { expr, collation } => {
-            if crate::value::Collation::parse(collation).is_none() {
+            if crate::value::resolve_collation_name(collation).is_none() {
                 Some(collation)
             } else {
                 unknown_collation(expr)
@@ -40542,7 +40554,7 @@ fn ntable_edge_local(
 /// explicit `COLLATE` (so the comparison uses the column's own collation).
 fn explicit_collation(e: &Expr) -> Option<crate::value::Collation> {
     match e {
-        Expr::Collate { collation, .. } => crate::value::Collation::parse(collation),
+        Expr::Collate { collation, .. } => crate::value::resolve_collation_name(collation),
         Expr::Paren(inner) => explicit_collation(inner),
         _ => None,
     }
@@ -44910,7 +44922,7 @@ fn column_collation(col: &ColumnDef) -> crate::value::Collation {
     col.constraints
         .iter()
         .find_map(|c| match c {
-            ColumnConstraint::Collate(name) => crate::value::Collation::parse(name),
+            ColumnConstraint::Collate(name) => crate::value::resolve_collation_name(name),
             _ => None,
         })
         .unwrap_or_default()

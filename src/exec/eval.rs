@@ -597,7 +597,7 @@ pub(crate) fn resolve_collation(left: &Expr, right: &Expr, ctx: &EvalCtx) -> Col
 
 fn explicit_collation(e: &Expr) -> Option<Collation> {
     match e {
-        Expr::Collate { collation, .. } => Collation::parse(collation),
+        Expr::Collate { collation, .. } => crate::value::resolve_collation_name(collation),
         Expr::Paren(inner) => explicit_collation(inner),
         _ => None,
     }
