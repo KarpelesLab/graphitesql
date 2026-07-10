@@ -32,9 +32,11 @@
 //! bodies are handled too: each compound arm and each CTE body is an independent
 //! scope, so only the refs that bind to the renamed base table rewrite; an outer
 //! reference to a CTE's renamed output column stays unresolved and bails the whole
-//! view (matching SQLite, which rejects such a rename). The remaining residual is
-//! a derived-table/TVF/NATURAL-USING source, a compound `ORDER BY`, or a CTE
-//! consumed inside a compound arm — those bail the whole view untouched.
+//! view (matching SQLite, which rejects such a rename). A compound `ORDER BY` is
+//! handled too — the ordering key binds to the first arm's output column and
+//! rewrites with it. The remaining residual is a derived-table/TVF/NATURAL-USING
+//! source or a CTE consumed inside a compound arm — those bail the whole view
+//! untouched.
 //!
 //! Verified against the sqlite3 3.50.4 CLI.
 
@@ -222,6 +224,29 @@ fn rename_column_rewrites_nested_subquery_refs_in_view() {
          CREATE VIEW v AS WITH x AS (SELECT a FROM t) SELECT * FROM x; \
          ALTER TABLE t RENAME COLUMN b TO bb; \
          SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Compound with an ORDER BY: the ordering key binds to the FIRST arm's
+        // output column, so it rewrites together with that arm's ref
+        // (`… ORDER BY a` → `… ORDER BY aa`), matching SQLite.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u ORDER BY a; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // ORDER BY binding to a non-renamed first arm stays put; the renamed
+        // second arm rewrites.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT a FROM u UNION SELECT a FROM t ORDER BY a; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // ORDER BY an output alias (unaffected) while the arm's base ref rewrites.
+        "CREATE TABLE t(a,b); CREATE TABLE u(c,d); \
+         CREATE VIEW v AS SELECT a AS m FROM t UNION SELECT c FROM u ORDER BY m; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
+        // Positional ORDER BY (a literal, never a column) is left as-is.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
+         CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u ORDER BY 1; \
+         ALTER TABLE t RENAME COLUMN a TO aa; \
+         SELECT sql FROM sqlite_schema WHERE name='v'",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
@@ -243,21 +268,6 @@ fn rename_column_rewrites_nested_subquery_refs_in_view() {
     )];
     for (sql, unchanged) in cte_bail {
         assert_eq!(out(g, sql), unchanged, "cte bail for {sql}");
-    }
-
-    // Compound bail: a compound-level `ORDER BY` binds to the FIRST arm's OUTPUT
-    // column, which a base-table token rewrite can't model, so graphite declines
-    // and leaves the view byte-identical (SQLite rewrites both the arm and the
-    // matching `ORDER BY` term — a known gap, not a wrong rewrite). Guards against
-    // a corrupting partial rewrite.
-    let compound_bail = [(
-        "CREATE TABLE t(a,b); CREATE TABLE u(a,c); \
-         CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u ORDER BY a; \
-         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='v'",
-        "CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u ORDER BY a",
-    )];
-    for (sql, unchanged) in compound_bail {
-        assert_eq!(out(g, sql), unchanged, "compound ORDER BY bail for {sql}");
     }
 
     // Functional check: the mixed-body view stays queryable after the rename (the

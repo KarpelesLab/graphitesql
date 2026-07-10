@@ -42446,10 +42446,14 @@ fn collect_select_base_sources(
     }
     // Compound (`UNION`/`INTERSECT`/`EXCEPT`): each arm is an independent scope, so
     // recurse them (the scope-aware pass then resolves each arm's bare `old` to its
-    // own table). Bail if the compound carries an `ORDER BY` — it binds to the
-    // FIRST arm's OUTPUT column, which a base-table token rewrite can't model — or
-    // if this is a desugared multi-row `VALUES` clause (no real base sources).
-    if !sel.compound.is_empty() && (!sel.order_by.is_empty() || sel.values_rows != 0) {
+    // own table). A compound-level `ORDER BY` binds to the FIRST arm's OUTPUT
+    // column; since the first arm IS this (main) select and the `ORDER BY` is
+    // resolved in its `FROM` scope, a bare `old` ordering key that is a projected
+    // column of the renamed table rewrites correctly alongside the arm's own ref
+    // (an alias or another table's column is left, and a term matching no output
+    // column can't be a valid stored compound). Only a desugared multi-row `VALUES`
+    // clause (no real base sources) bails here.
+    if !sel.compound.is_empty() && sel.values_rows != 0 {
         return false;
     }
     for (_, arm) in &sel.compound {
