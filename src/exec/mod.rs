@@ -2839,23 +2839,54 @@ impl Connection {
             // *right* table is preserved and the *left* is null-padded. Rewriting
             // `a RIGHT JOIN b` to `b LEFT JOIN a` (same ON) lets the seek path
             // drive the now-inner left table by rowid / unique index instead of
-            // materializing it, and is row-for-row identical. Only taken for an
-            // explicit (non-wildcard) projection, where each output column resolves
-            // by name regardless of FROM order so no column reordering is needed; a
-            // bare `SELECT *` keeps the existing materialized order below. If the
-            // swapped LEFT join cannot run on the VDBE it falls through to the
-            // materialized RIGHT path, so this only ever *adds* seek coverage.
-            if is_right_2
-                && sel
+            // materializing it, and is row-for-row identical. If the swapped LEFT
+            // join cannot run on the VDBE it falls through to the materialized RIGHT
+            // path, so this only ever *adds* seek coverage.
+            if is_right_2 {
+                let all_expr = sel
                     .columns
                     .iter()
-                    .all(|c| matches!(c, sql::ast::ResultColumn::Expr { .. }))
-            {
-                let swapped = Self::swap_right_join_to_left(sel);
-                match self.run_select_vdbe(&swapped) {
-                    Ok(r) => return Ok(r),
-                    Err(Error::Unsupported(_)) => {}
-                    Err(e) => return Err(e),
+                    .all(|c| matches!(c, sql::ast::ResultColumn::Expr { .. }));
+                // An explicit projection resolves output columns by name, so no
+                // reorder is needed. A bare `SELECT *` needs the combined
+                // `(right, left)` columns rotated back to `(left, right)` — the
+                // number of left columns comes from the schema (no materialization),
+                // and both sides must be base tables for the swap.
+                let bare_star =
+                    matches!(sel.columns.as_slice(), [sql::ast::ResultColumn::Wildcard]);
+                let left_cols = if bare_star {
+                    match (
+                        self.table_meta(&from.first.name, from.first.alias.as_deref()),
+                        self.table_meta(
+                            &from.joins[0].table.name,
+                            from.joins[0].table.alias.as_deref(),
+                        ),
+                    ) {
+                        (Ok(a_meta), Ok(_)) => Some(a_meta.columns.len()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if all_expr || left_cols.is_some() {
+                    let swapped = Self::swap_right_join_to_left(sel);
+                    match self.run_select_vdbe(&swapped) {
+                        Ok(mut r) => {
+                            // Rotate `(right ++ left)` back to `(left ++ right)`.
+                            if let Some(n_a) = left_cols
+                                && r.columns.len() >= n_a
+                            {
+                                let n_b = r.columns.len() - n_a;
+                                r.columns.rotate_left(n_b);
+                                for row in &mut r.rows {
+                                    row.rotate_left(n_b);
+                                }
+                            }
+                            return Ok(r);
+                        }
+                        Err(Error::Unsupported(_)) => {}
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             // A left-deep chain of ≥ 2 LEFT/INNER joins (at least one LEFT, no

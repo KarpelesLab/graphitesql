@@ -342,12 +342,14 @@ result or declines to it — never a wrong answer), so this track is
   a `LEFT JOIN` (the *right* table is preserved), so `a RIGHT JOIN b ON …` is
   rewritten to the identity `b LEFT JOIN a ON …` (`Connection::swap_right_join_to_left`),
   which routes through the existing seek path and drives the now-inner left table by
-  rowid / unique index instead of materializing it. Taken only for an explicit
-  projection (columns resolve by name, so no reorder); a bare `SELECT *` and any
-  non-seekable shape fall through to the existing — correct — materialized RIGHT
-  path, so this only *adds* seek coverage. Byte-identical to sqlite incl. left-side
-  null-padding (`tests/vdbe_right_join_seek.rs`). FULL join still materializes (its
-  unmatched-right anti-join pass has no single-scan seek form).
+  rowid / unique index instead of materializing it. An explicit projection resolves
+  columns by name (no reorder); a bare `SELECT *` rotates the swapped `(right, left)`
+  combined columns back to `(left, right)` (the left column count comes from the
+  schema, no materialization). Any non-seekable shape falls through to the existing —
+  correct — materialized RIGHT path, so this only *adds* seek coverage. Byte-identical
+  to sqlite incl. left-side null-padding and `SELECT *` column order
+  (`tests/vdbe_right_join_seek.rs`). FULL join still materializes (its unmatched-right
+  anti-join pass has no single-scan seek form).
 - **VDBE aggregate coverage — `json_group_array` / `jsonb_group_array`. DONE 2026-07-11.**
   Added `AggKind::JsonGroupArray { jsonb }`: the fold keeps NULL arguments for this
   kind (SQLite includes them as JSON `null`) and the finalizer serializes the

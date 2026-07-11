@@ -74,26 +74,24 @@ fn right_join_seek_matches_expected() {
 }
 
 #[test]
-fn right_join_wildcard_still_correct_via_fallback() {
-    // A bare `SELECT *` is not rewritten (its column order would differ); it takes
-    // the existing materialized RIGHT path and remains correct.
+fn right_join_wildcard_runs_on_vdbe_with_correct_order() {
+    // A bare `SELECT *` also runs on the VDBE: the swapped `(right, left)` columns
+    // are rotated back to `(left, right)`, so the output order matches sqlite's
+    // `(a.k, a.x, b.p, b.y)` exactly.
     let c = setup();
+    let q = "SELECT * FROM a RIGHT JOIN b ON a.k = b.p ORDER BY b.p";
+    let v = c
+        .query_vdbe(q)
+        .expect("SELECT * RIGHT join runs on the VDBE");
+    assert_eq!(v.columns, vec!["k", "x", "p", "y"]);
+    let expected = vec![
+        vec![i(1), t("a1"), i(1), t("b1")],
+        vec![i(2), t("a2"), i(2), t("b2")],
+        vec![Value::Null, Value::Null, i(9), t("b9")],
+    ];
+    assert_eq!(v.rows, expected, "VDBE mismatch");
     c.set_use_vdbe(false);
-    let tw = c
-        .query("SELECT * FROM a RIGHT JOIN b ON a.k = b.p ORDER BY b.p")
-        .unwrap();
+    let tw = c.query(q).unwrap();
     c.set_use_vdbe(true);
-    let got = c
-        .query("SELECT * FROM a RIGHT JOIN b ON a.k = b.p ORDER BY b.p")
-        .unwrap();
-    assert_eq!(got.rows, tw.rows);
-    // sqlite's column order is (a.k, a.x, b.p, b.y).
-    assert_eq!(
-        got.rows,
-        vec![
-            vec![i(1), t("a1"), i(1), t("b1")],
-            vec![i(2), t("a2"), i(2), t("b2")],
-            vec![Value::Null, Value::Null, i(9), t("b9")],
-        ],
-    );
+    assert_eq!(tw.rows, expected, "tree-walker mismatch");
 }
