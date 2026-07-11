@@ -206,19 +206,23 @@ fn distinct_aggregate_over_join_runs_on_vdbe() {
     );
 }
 
-/// A `DISTINCT` aggregate over a non-BINARY column collation must defer to the
-/// tree-walker (the VDBE aggregate path dedups under BINARY only). The
-/// tree-walker still produces the correct answer.
+/// A `DISTINCT` aggregate (and `min`/`max`) over a column with a non-BINARY
+/// *declared* collation now runs on the VDBE, folding under that collation
+/// (`AggStep.collation`): `'a'=='A'` under NOCASE, so `count(DISTINCT x)` is 2.
 #[test]
-fn distinct_aggregate_over_nocase_defers_but_is_correct() {
+fn distinct_aggregate_over_nocase_runs_on_vdbe() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE u(x TEXT COLLATE NOCASE)").unwrap();
     c.execute("INSERT INTO u VALUES ('a'),('A'),('b')").unwrap();
-    // The VDBE bails (non-BINARY collation), so query_vdbe errors …
-    assert!(c.query_vdbe("SELECT count(DISTINCT x) FROM u").is_err());
-    // … but the default path (tree-walker fallback) matches sqlite: 'a'=='A'.
-    let r = c.query("SELECT count(DISTINCT x) FROM u").unwrap();
+    // The declared-collation aggregate runs on the VDBE and dedups under NOCASE.
+    let r = c.query_vdbe("SELECT count(DISTINCT x) FROM u").unwrap();
     assert_eq!(r.rows, vec![vec![Value::Integer(2)]]);
+    // min/max fold under NOCASE too.
+    let r = c.query_vdbe("SELECT min(x), max(x) FROM u").unwrap();
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Text("a".into()), Value::Text("b".into())]]
+    );
 }
 
 /// An *explicit* `COLLATE` on a `DISTINCT` aggregate argument

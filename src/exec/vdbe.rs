@@ -223,6 +223,9 @@ pub enum Op {
         order: Vec<AggOrderKey>,
         /// Constant `group_concat`/`string_agg` separator (`None` = default `,`).
         sep: Option<String>,
+        /// The argument's collating sequence (declared column collation, else
+        /// BINARY), driving the `DISTINCT` dedup and the `min`/`max` reduction.
+        collation: Collation,
     },
     /// Finalize aggregate `slot` into `dest`.
     AggFinal {
@@ -1193,13 +1196,10 @@ fn compile_aggregate_select(
     {
         return Err(Error::Unsupported("VDBE: bare aggregate only"));
     }
-    // Aggregate reduction (min/max) compares under BINARY; a non-BINARY column
-    // collation would diverge, so defer the whole query to the tree-walker.
-    if collations.iter().any(|c| *c != Collation::Binary) {
-        return Err(Error::Unsupported(
-            "VDBE: non-BINARY collation in aggregate",
-        ));
-    }
+    // The aggregate min/max reduction and DISTINCT dedup now fold under the
+    // argument's collation (`AggStep.collation` → `AggAcc.collation`), so a
+    // non-BINARY declared column collation runs on the VDBE. An explicit `COLLATE`
+    // argument still defers via `agg_kind_distinct` below.
     // Every projection must be exactly one supported aggregate call. DISTINCT is
     // supported here (the collected values are deduped at fold time), as is
     // `FILTER (WHERE …)` (a non-passing row is skipped for that aggregate).
@@ -1255,6 +1255,10 @@ fn compile_aggregate_select(
             None => None,
         };
         let order_keys = compile_order_keys(&mut c, order)?;
+        let collation = arg
+            .as_ref()
+            .and_then(|e| c.explicit_collation(e).or_else(|| c.col_collation(e)))
+            .unwrap_or_default();
         c.ops.push(Op::AggStep {
             slot,
             kind: *kind,
@@ -1264,6 +1268,7 @@ fn compile_aggregate_select(
             filter: filter_reg,
             order: order_keys,
             sep: sep.clone(),
+            collation,
         });
     }
     let next = c.ops.len();
@@ -3400,12 +3405,9 @@ pub fn compile_aggregate_join(
     {
         return Err(Error::Unsupported("VDBE: bare aggregate join only"));
     }
-    // min/max reduce under BINARY; a non-BINARY column collation would diverge.
-    if collations.iter().any(|cl| *cl != Collation::Binary) {
-        return Err(Error::Unsupported(
-            "VDBE: non-BINARY collation in aggregate",
-        ));
-    }
+    // The aggregate min/max reduction and DISTINCT dedup fold under the argument's
+    // collation (`AggStep.collation`), so a non-BINARY declared column collation runs
+    // on the VDBE; an explicit `COLLATE` argument still defers via `agg_kind_distinct`.
     let projections = expand_projections(sel, columns, tables)?;
     // A row-level DISTINCT dedups under each output column's collation; the VDBE's
     // DistinctCheck compares under BINARY, so an explicit `COLLATE` on a projection
@@ -3477,6 +3479,10 @@ pub fn compile_aggregate_join(
             None => None,
         };
         let order_keys = compile_order_keys(&mut c, order)?;
+        let collation = arg
+            .as_ref()
+            .and_then(|e| c.explicit_collation(e).or_else(|| c.col_collation(e)))
+            .unwrap_or_default();
         c.ops.push(Op::AggStep {
             slot,
             kind: *kind,
@@ -3486,6 +3492,7 @@ pub fn compile_aggregate_join(
             filter: filter_reg,
             order: order_keys,
             sep: sep.clone(),
+            collation,
         });
     }
     // `NextC` chain, innermost-first (as in `compile_join2`).
@@ -6133,10 +6140,12 @@ fn run_rows_multi_impl(
                 filter,
                 order,
                 sep,
+                collation,
             } => {
                 if *slot >= agg.len() {
                     agg.resize(*slot + 1, AggAcc::default());
                 }
+                agg[*slot].collation = *collation;
                 if sep.is_some() && agg[*slot].sep.is_none() {
                     agg[*slot].sep = sep.clone();
                 }
@@ -6159,11 +6168,15 @@ fn run_rows_multi_impl(
                         || !matches!(regs[*r], Value::Null))
                 {
                     let v = regs[*r].clone();
-                    // A DISTINCT aggregate folds each distinct argument value
-                    // once: skip a value already collected for this slot
-                    // (BINARY equality — the non-BINARY case bails to the
-                    // tree-walker before compilation).
-                    if !*distinct || !agg[*slot].vals.iter().any(|p| distinct_eq(p, &v)) {
+                    // A DISTINCT aggregate folds each distinct argument value once,
+                    // under the argument's collation (BINARY reproduces the old
+                    // behaviour exactly).
+                    if !*distinct
+                        || !agg[*slot]
+                            .vals
+                            .iter()
+                            .any(|p| distinct_eq_coll(p, &v, *collation))
+                    {
                         agg[*slot].vals.push(v);
                         push_order_key(&mut agg[*slot], order, &regs);
                     }
@@ -6652,12 +6665,6 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
             }
         }
     })
-}
-
-/// Equality used by `DISTINCT`: two NULLs are equal (unlike `=`), otherwise the
-/// usual binary-collation value comparison decides.
-fn distinct_eq(a: &Value, b: &Value) -> bool {
-    distinct_eq_coll(a, b, crate::value::Collation::Binary)
 }
 
 /// `DISTINCT`/`GROUP BY` equality under a collating sequence: two `NULL`s are
