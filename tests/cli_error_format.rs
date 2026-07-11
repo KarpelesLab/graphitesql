@@ -107,6 +107,7 @@ fn one_shot_error_rendering_matches_sqlite() {
         "CREATE TABLE t(a CHECK(a>0)); INSERT INTO t VALUES(-1)",
         "CREATE TABLE t(a INT) STRICT; INSERT INTO t VALUES('x')",
         "SELECT json_extract('bad','$')",
+        "CREATE VIRTUAL TABLE v USING nomod", // no such module: step (module looked up on construction)
         "CREATE TABLE t(a); CREATE TRIGGER x BEFORE INSERT ON t BEGIN SELECT RAISE(ABORT,'no'); END; \
          INSERT INTO t VALUES(1)",
         "PRAGMA foreign_keys=ON; CREATE TABLE p(i PRIMARY KEY); CREATE TABLE c(x REFERENCES p); \

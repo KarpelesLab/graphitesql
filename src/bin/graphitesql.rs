@@ -2504,7 +2504,7 @@ fn raw_error_message(e: &graphitesql::Error) -> String {
 /// run-time faults are step-time. The step set is enumerated (it is small and
 /// stable) and everything else defaults to prepare, so a not-yet-listed prepare
 /// error is classified correctly rather than mislabelled `stepping`.
-fn is_prepare_error(e: &graphitesql::Error, msg: &str) -> bool {
+fn is_prepare_error(e: &graphitesql::Error, msg: &str, sql: &str) -> bool {
     use graphitesql::Error as E;
     match e {
         E::Parse(_) | E::ParseAt(..) => true,
@@ -2517,6 +2517,14 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str) -> bool {
         // and other run-time messages — defaults to step (they are open-ended, so
         // enumerating the prepare set is the reliable direction).
         E::Error(_) | E::ErrorAt(..) => {
+            // `no such module` is context-dependent: a query that references a
+            // virtual table whose module is missing fails at prepare, but
+            // `CREATE VIRTUAL TABLE … USING <module>` looks the module up when it
+            // constructs the table, so sqlite reports that at step. The failing
+            // statement is available, so distinguish on whether it is the CREATE.
+            if msg.starts_with("no such module") {
+                return !sql.to_ascii_uppercase().contains("VIRTUAL TABLE");
+            }
             const PREPARE_PREFIXES: &[&str] = &[
                 "no such column",
                 "no such table",
@@ -2525,7 +2533,7 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str) -> bool {
                 "no such index",
                 "no such view",
                 "no such trigger",
-                "no such module",
+                // "no such module" is handled above (context-dependent).
                 "ambiguous column name",
                 "misuse of aggregate function",
                 "misuse of window function",
@@ -2733,7 +2741,7 @@ fn caret_block(src: &str, off: usize) -> String {
 
 fn render_cli_error(sql: &str, e: &graphitesql::Error) -> String {
     let msg = raw_error_message(e);
-    if is_prepare_error(e, &msg) {
+    if is_prepare_error(e, &msg, sql) {
         // Prefer the parser's exact byte offset (a syntax error carries it, like
         // `sqlite3_error_offset`) so the caret is right even for a repeated token
         // (`===`); fall back to locating the message's token by text for errors
@@ -2786,7 +2794,7 @@ fn collapse_ws(s: &str) -> String {
 fn render_script_error(sql: &str, e: &graphitesql::Error, line: usize) -> String {
     let msg = raw_error_message(e);
     let flat = collapse_ws(sql);
-    if is_prepare_error(e, &msg) {
+    if is_prepare_error(e, &msg, sql) {
         // The parser's byte offset is into the original `sql`; it aligns with the
         // whitespace-collapsed `flat` only when no collapse happened (a single-line
         // statement, which the shell trims). Use it then (exact even for a repeated
