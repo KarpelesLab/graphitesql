@@ -182,6 +182,24 @@ int main(void) {
   CHECK("errmsg mentions table", emsg && strstr(emsg, "no such table: nope"));
   sqlite3_free(emsg);
 
+  /* sqlite3_error_offset: a syntax error reports the offending token's byte
+   * offset (the repeated `=` in `===`); a resolution error reports -1. The shim
+   * parses lazily, so the error surfaces at step. */
+  const char *serr_sql = "SELECT 1 FROM t WHERE score === 1";
+  sqlite3_stmt *serr = NULL;
+  rc = sqlite3_prepare_v2(db, serr_sql, -1, &serr, NULL);
+  CHECK("syntax error prepares (lazy)", rc == SQLITE_OK && serr != NULL);
+  CHECK("syntax error -> ERROR at step", sqlite3_step(serr) == SQLITE_ERROR);
+  int erroff = sqlite3_error_offset(db);
+  CHECK("error_offset points at a '=' token", erroff >= 0 && serr_sql[erroff] == '=');
+  sqlite3_finalize(serr);
+  sqlite3_stmt *rerr = NULL;
+  rc = sqlite3_prepare_v2(db, "SELECT nope FROM t", -1, &rerr, NULL);
+  CHECK("resolution error prepares (lazy)", rc == SQLITE_OK && rerr != NULL);
+  CHECK("no-such-column -> ERROR at step", sqlite3_step(rerr) == SQLITE_ERROR);
+  CHECK("error_offset -1 for a resolution error", sqlite3_error_offset(db) == -1);
+  sqlite3_finalize(rerr);
+
   /* Blob round-trip. */
   sqlite3_stmt *bstmt = NULL;
   sqlite3_prepare_v2(db, "SELECT ?1", -1, &bstmt, NULL);

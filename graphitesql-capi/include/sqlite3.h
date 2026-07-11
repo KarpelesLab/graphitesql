@@ -50,6 +50,7 @@ int sqlite3_exec(sqlite3 *db, const char *sql,
 const char *sqlite3_errmsg(sqlite3 *db);
 int sqlite3_errcode(sqlite3 *db);
 int sqlite3_extended_errcode(sqlite3 *db);
+int sqlite3_error_offset(sqlite3 *db);
 const char *sqlite3_errstr(int rc);
 int sqlite3_changes(sqlite3 *db);
 int sqlite3_total_changes(sqlite3 *db);

@@ -67,16 +67,27 @@ pub struct sqlite3 {
     errcode: c_int,
     changes: c_int,
     last_insert_rowid: c_longlong,
+    /// Byte offset of the most recent error's offending token in the SQL, or -1
+    /// when unknown — surfaced by `sqlite3_error_offset`.
+    error_offset: c_int,
 }
 
 impl sqlite3 {
     fn set_error(&mut self, code: c_int, msg: &str) {
         self.errcode = code;
         self.errmsg = Some(CString::new(msg).unwrap_or_default());
+        self.error_offset = -1;
+    }
+    /// Record an engine error, capturing its token byte offset (a syntax error
+    /// carries one, like `sqlite3_error_offset`) when present.
+    fn set_error_e(&mut self, e: &graphitesql::Error) {
+        self.set_error(SQLITE_ERROR, &e.to_string());
+        self.error_offset = e.parse_offset().map_or(-1, |o| o as c_int);
     }
     fn clear_error(&mut self) {
         self.errcode = SQLITE_OK;
         self.errmsg = None;
+        self.error_offset = -1;
     }
 }
 
@@ -354,6 +365,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
                 errcode: SQLITE_OK,
                 changes: 0,
                 last_insert_rowid: 0,
+                error_offset: -1,
             });
             unsafe { *pp_db = Box::into_raw(db) };
             SQLITE_OK
@@ -367,6 +379,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
                 errcode: SQLITE_ERROR,
                 changes: 0,
                 last_insert_rowid: 0,
+                error_offset: -1,
             });
             db.set_error(SQLITE_ERROR, &msg);
             unsafe { *pp_db = Box::into_raw(db) };
@@ -408,6 +421,17 @@ pub unsafe extern "C" fn sqlite3_errcode(db: *mut sqlite3) -> c_int {
         return SQLITE_ERROR;
     }
     unsafe { &*db }.errcode
+}
+
+/// The byte offset of the most recent error's offending token within the SQL, or
+/// -1 when the error had no location (or there was no error) — mirrors SQLite's
+/// `sqlite3_error_offset` (available for a syntax error via [`Error::parse_offset`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_error_offset(db: *mut sqlite3) -> c_int {
+    if db.is_null() {
+        return -1;
+    }
+    unsafe { &*db }.error_offset
 }
 
 #[unsafe(no_mangle)]
@@ -682,7 +706,7 @@ fn ensure_executed(stmt: &mut sqlite3_stmt) -> c_int {
                 SQLITE_OK
             }
             Err(e) => {
-                db.set_error(SQLITE_ERROR, &e.to_string());
+                db.set_error_e(&e);
                 SQLITE_ERROR
             }
         }
@@ -696,7 +720,7 @@ fn ensure_executed(stmt: &mut sqlite3_stmt) -> c_int {
                 SQLITE_OK
             }
             Err(e) => {
-                db.set_error(SQLITE_ERROR, &e.to_string());
+                db.set_error_e(&e);
                 SQLITE_ERROR
             }
         }
@@ -709,7 +733,7 @@ fn ensure_executed(stmt: &mut sqlite3_stmt) -> c_int {
                 SQLITE_OK
             }
             Err(e) => {
-                db.set_error(SQLITE_ERROR, &e.to_string());
+                db.set_error_e(&e);
                 SQLITE_ERROR
             }
         }
@@ -1988,7 +2012,7 @@ fn blob_fetch(db: &mut sqlite3, table: &str, column: &str, rowid: c_longlong) ->
         }
         Ok(_) => None,
         Err(e) => {
-            db.set_error(SQLITE_ERROR, &e.to_string());
+            db.set_error_e(&e);
             None
         }
     }
@@ -2132,7 +2156,7 @@ unsafe fn blob_flush(blob: *mut sqlite3_blob) -> c_int {
             SQLITE_OK
         }
         Err(e) => {
-            db.set_error(SQLITE_ERROR, &e.to_string());
+            db.set_error_e(&e);
             SQLITE_ERROR
         }
     }
