@@ -54,8 +54,8 @@ const QUERIES: &[&str] = &[
     // Computed key with LIMIT.
     "SELECT g*10, count(*) FROM t GROUP BY g*10 ORDER BY g*10 LIMIT 2",
     // Function-folded text key: `upper(a)` loses the column collation, so BINARY
-    // grouping of the uppercased result is correct (an explicit `COLLATE` would
-    // not be — see `non_binary_collation_key_falls_back`).
+    // grouping of the uppercased result is correct. An explicit `COLLATE` key is a
+    // separate case that also runs on the VDBE — see `explicit_collate_key_runs_on_vdbe`.
     "SELECT upper(a), count(*) FROM t GROUP BY upper(a) ORDER BY 1",
     // GROUP BY an OUTPUT ALIAS of a computed column: SQLite resolves the bare name
     // to the SELECT-list label (no source column `d`), and the VDBE rewrites it to
@@ -146,13 +146,34 @@ fn constant_group_key_falls_back() {
 }
 
 #[test]
-fn non_binary_collation_key_falls_back() {
+fn explicit_collate_key_runs_on_vdbe() {
     let c = conn();
-    // An explicit `COLLATE NOCASE` on the key changes group matching away from the
-    // VDBE's BINARY `GroupStep`, so it must defer to the tree-walker.
+    // An explicit `COLLATE NOCASE` on the key groups under that collation via
+    // `group_key_collations`, so it now runs on the VDBE (no longer defers).
     let q = "SELECT a COLLATE NOCASE, count(*) FROM t GROUP BY a COLLATE NOCASE ORDER BY 1";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    let r = c
+        .query_vdbe(q)
+        .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
+    if Command::new("sqlite3").arg("--version").output().is_ok() {
+        let vdbe: Vec<Vec<String>> = r
+            .rows
+            .iter()
+            .map(|r| r.iter().map(render).collect())
+            .collect();
+        let out = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg("-ascii")
+            .arg(format!("{SETUP}{q};"))
+            .output()
+            .unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let expected: Vec<Vec<String>> = text
+            .split('\u{1e}')
+            .filter(|r| !r.is_empty())
+            .map(|r| r.split('\u{1f}').map(|f| f.to_string()).collect())
+            .collect();
+        assert_eq!(vdbe, expected, "diverged on {q}");
+    }
 }
 
 #[test]

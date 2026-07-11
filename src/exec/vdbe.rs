@@ -1766,18 +1766,9 @@ fn compile_group_select(
                 if refs.is_empty() {
                     return Err(Error::Unsupported("VDBE: constant GROUP BY key"));
                 }
-                // Group matching is BINARY (`GroupStep`); a key carrying a non-BINARY
-                // collation — an explicit `COLLATE NOCASE` or a non-BINARY declared
-                // column collation — would group differently, so defer. (An all-BINARY
-                // column set otherwise passes the table-wide collation guard below,
-                // which would miss an explicit override on the key expression.)
-                if c.col_collation(other)
-                    .is_some_and(|co| co != Collation::Binary)
-                {
-                    return Err(Error::Unsupported(
-                        "VDBE: non-BINARY collation in GROUP BY key",
-                    ));
-                }
+                // A computed key groups under its resolved collation — an explicit
+                // `COLLATE`, else the underlying column's — via `group_key_collations`,
+                // so an explicit `COLLATE NOCASE` on the key runs on the VDBE too.
                 group_keys.push(GroupKeySpec::Expr(alloc::boxed::Box::new(other.clone())));
             }
         }

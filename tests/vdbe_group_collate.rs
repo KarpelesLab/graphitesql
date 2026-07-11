@@ -74,6 +74,10 @@ fn grouped_over_collation_key_runs_on_vdbe() {
         "SELECT a, max(x) FROM t GROUP BY a ORDER BY a",
         "SELECT a, max(c), min(c) FROM t GROUP BY a ORDER BY a",
         "SELECT a, count(DISTINCT c) FROM t GROUP BY a ORDER BY a",
+        // An explicit `COLLATE` on the group key (over a differently-collated column)
+        // now runs on the VDBE — `group_key_collations` resolves the override.
+        "SELECT c COLLATE NOCASE, count(*) FROM t GROUP BY c COLLATE NOCASE ORDER BY 1",
+        "SELECT a COLLATE BINARY, count(*) FROM t GROUP BY a COLLATE BINARY ORDER BY 1",
     ] {
         let r = c
             .query_vdbe(q)
@@ -89,10 +93,9 @@ fn collation_sensitive_grouped_shapes_defer() {
     let c = conn();
     // Still deferred: a `SELECT DISTINCT … GROUP BY` — its post-grouping dedup
     // compares the output rows under BINARY (the grouped `DistinctCheck` carries no
-    // collations) — and an explicit `COLLATE` group key.
+    // collations).
     for q in [
         "SELECT DISTINCT a FROM t GROUP BY a, x", // DISTINCT over grouped output
-        "SELECT a COLLATE NOCASE, count(*) FROM t GROUP BY a COLLATE NOCASE", // explicit key COLLATE
     ] {
         assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
         // The deferred result (tree-walker, unchanged by this feature) still runs.
