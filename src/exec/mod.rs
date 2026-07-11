@@ -23080,6 +23080,99 @@ impl Connection {
         Some((label, cols))
     }
 
+    /// Whether *every* `ORDER BY` term of a two-table INNER join is pinned to a
+    /// constant — so the sort can be skipped entirely (the rows are valid in any
+    /// order). This holds when the driver (`from.first`) is a single-row `rowid =
+    /// <const>` seek ([`join_first_rowid_seek`]): then every driver column is that
+    /// one row's value, and every inner column equated to a driver column by a
+    /// top-level `ON` equality (`driver.a = inner.b`) is likewise constant. sqlite
+    /// emits no `USE TEMP B-TREE FOR ORDER BY` for these. Conservative: only the
+    /// all-constant case (it needs no assumption about the inner's scan order, unlike
+    /// an `ORDER BY` on the inner's own rowid, left as a follow-up); a non-constant
+    /// term, an outer join (inner columns may be NULL, not constant), or an
+    /// unresolvable/`COLLATE`d term returns `false`.
+    fn join_order_all_constant(&self, sel: &Select, from: &FromClause, params: &Params) -> bool {
+        if from.joins.len() != 1 || sel.order_by.is_empty() {
+            return false;
+        }
+        if self.join_first_rowid_seek(sel, from, params).is_none() {
+            return false;
+        }
+        let join = &from.joins[0];
+        if !matches!(join.kind, JoinKind::Inner) || join.natural || !join.using.is_empty() {
+            return false;
+        }
+        let (Ok(dmeta), Ok(imeta)) = (
+            self.table_meta(&from.first.name, from.first.alias.as_deref()),
+            self.table_meta(&join.table.name, join.table.alias.as_deref()),
+        ) else {
+            return false;
+        };
+        let dlabel = from.first.alias.as_deref().unwrap_or(&from.first.name);
+        let ilabel = join.table.alias.as_deref().unwrap_or(&join.table.name);
+        // Inner columns equated to a driver column by a top-level ON equality are
+        // constant (the driver is a single row).
+        let mut inner_const: Vec<String> = Vec::new();
+        if let Some(on) = &join.on {
+            let mut conj: Vec<&Expr> = Vec::new();
+            and_conjuncts(on, &mut conj);
+            let is_col = |e: &Expr, label: &str, meta: &TableMeta| -> Option<String> {
+                let mut base = e;
+                while let Expr::Paren(inner) = base {
+                    base = inner;
+                }
+                match base {
+                    Expr::Column { table, column, .. }
+                        if table
+                            .as_deref()
+                            .is_none_or(|t| t.eq_ignore_ascii_case(label))
+                            && meta
+                                .columns
+                                .iter()
+                                .any(|c| c.name.eq_ignore_ascii_case(column)) =>
+                    {
+                        Some(column.clone())
+                    }
+                    _ => None,
+                }
+            };
+            for c in conj {
+                let mut base = c;
+                while let Expr::Paren(inner) = base {
+                    base = inner;
+                }
+                if let Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left,
+                    right,
+                } = base
+                {
+                    for (a, b) in [(left, right), (right, left)] {
+                        if is_col(a, dlabel, &dmeta).is_some()
+                            && let Some(icol) = is_col(b, ilabel, &imeta)
+                        {
+                            inner_const.push(icol);
+                        }
+                    }
+                }
+            }
+        }
+        sel.order_by.iter().all(
+            |term| match self.join_key_column_identity(sel, from, &term.expr) {
+                Some((tbl, col)) => {
+                    (tbl.eq_ignore_ascii_case(dlabel)
+                        && dmeta
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&col)))
+                        || (tbl.eq_ignore_ascii_case(ilabel)
+                            && inner_const.iter().any(|c| c.eq_ignore_ascii_case(&col)))
+                }
+                None => false,
+            },
+        )
+    }
+
     /// Resolve one `ORDER BY` / `GROUP BY` / `DISTINCT` key expression to a
     /// `(table_label, colname)` identity against a two-table join, using the same
     /// output-alias / positional resolution as the single-table paths. Returns
@@ -23888,6 +23981,15 @@ impl Connection {
         // and this must not claim satisfaction (that would perturb no-ORDER-BY plans
         // like a `count(*)` covering-index scan).
         if !sel.order_by.is_empty() && self.order_const_lead(sel, params) == sel.order_by.len() {
+            return Some(false);
+        }
+        // A two-table INNER join driven by a single-row `rowid = <const>` seek whose
+        // every ORDER BY term is constant (a driver column, or an inner column equated
+        // to a driver column by the ON) needs no sort — the rows are valid in any
+        // order, exactly as sqlite plans it.
+        if let Some(from) = sel.from.as_ref()
+            && self.join_order_all_constant(sel, from, params)
+        {
             return Some(false);
         }
         match self.seek_order_prefix(sel, params) {
