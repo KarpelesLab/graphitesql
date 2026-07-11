@@ -250,6 +250,13 @@ pub enum Op {
         repr_count: usize,
         companion: Option<(usize, bool)>,
         aggs: Vec<AggSpec>,
+        /// Collating sequence for each group key (`key_collations[i]` for key `i`;
+        /// empty => all BINARY). A `NOCASE`/`RTRIM`/custom-collation `GROUP BY` key
+        /// groups under its collation.
+        key_collations: alloc::vec::Vec<Collation>,
+        /// Collation of the min()/max() companion's argument (BINARY when there is
+        /// no companion), so the extreme-row tracking compares text under it.
+        companion_collation: Collation,
     },
     /// Emit one row per group, ordered by the GROUP BY keys (the first
     /// `key_count` slots of each group vector, BINARY ascending, NULLs first —
@@ -258,6 +265,10 @@ pub enum Op {
     GroupEmit {
         outputs: Vec<GroupOut>,
         key_count: usize,
+        /// Group-key collations (parallel to the first `key_count` slots; empty =>
+        /// all BINARY), so the group emit order matches SQLite's collation-sorted
+        /// grouping.
+        key_collations: alloc::vec::Vec<Collation>,
         agg_kinds: Vec<AggKind>,
         /// Source-column index of each group key (parallel to the first
         /// `key_count` slots of every group's key vector), used to place the
@@ -281,6 +292,9 @@ pub enum Op {
         agg_kinds: Vec<AggKind>,
         key_count: usize,
         target: usize,
+        /// Group-key collations (parallel to the first `key_count` slots; empty =>
+        /// all BINARY), for the collation-sorted group emit order.
+        key_collations: alloc::vec::Vec<Collation>,
     },
     /// Load group-key value at index `key` of the current group into `dest`.
     GroupKey { key: usize, dest: usize },
@@ -1388,6 +1402,67 @@ enum GroupKeySpec {
 /// All scan/exit edges are backpatched so control falls through to whatever emit
 /// phase the caller appends next. Shared by the single-table and nested-loop-join
 /// grouped compilers, so a `GROUP BY` join inherits the full grouped grammar.
+/// Whether the query contains an aggregate that folds its argument under a
+/// collation the grouped VDBE path performs under BINARY: a `DISTINCT` aggregate
+/// (`count(DISTINCT x)`), an ordered aggregate (`group_concat(x ORDER BY y)`), or
+/// a single-argument `min`/`max`. When such an aggregate is present *and* a
+/// non-BINARY collation is in play, the grouped compiler defers to the tree-walker
+/// (which honors the collation) — an explicit `COLLATE` on the argument already
+/// defers via `agg_kind_distinct`, but a column's *declared* collation would not.
+/// A window call (`over` set) is not an aggregate here.
+fn has_collation_sensitive_aggregate(sel: &Select) -> bool {
+    let mut found = false;
+    let mut check = |e: &Expr| {
+        if let Expr::Function {
+            name,
+            distinct,
+            args,
+            star,
+            over,
+            order_by,
+            ..
+        } = e
+            && over.is_none()
+        {
+            let is_minmax = args.len() == 1
+                && !*star
+                && matches!(name.to_ascii_lowercase().as_str(), "min" | "max");
+            if *distinct || !order_by.is_empty() || is_minmax {
+                found = true;
+            }
+        }
+    };
+    for rc in &sel.columns {
+        if let ResultColumn::Expr { expr, .. } = rc {
+            crate::exec::window::visit(expr, &mut check);
+        }
+    }
+    if let Some(h) = &sel.having {
+        crate::exec::window::visit(h, &mut check);
+    }
+    for t in &sel.order_by {
+        crate::exec::window::visit(&t.expr, &mut check);
+    }
+    found
+}
+
+/// The collating sequence each group key is compared/ordered under: a bare
+/// column's declared collation (from the source-indexed `c.collations`), else a
+/// computed key's resolved collation (explicit `COLLATE`, else its column's, else
+/// BINARY). All-BINARY output reproduces the previous BINARY-only grouping.
+fn group_key_collations(c: &Compiler, group_keys: &[GroupKeySpec]) -> Vec<Collation> {
+    group_keys
+        .iter()
+        .map(|k| match k {
+            GroupKeySpec::Col(ci) => c.collations.get(*ci).copied().unwrap_or_default(),
+            GroupKeySpec::Expr(e) => c
+                .explicit_collation(e)
+                .or_else(|| c.col_collation(e))
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
 fn emit_group_fold(
     c: &mut Compiler,
     sel: &Select,
@@ -1532,12 +1607,35 @@ fn emit_group_fold(
             _ => None,
         }
     };
+    let key_collations = group_key_collations(c, group_keys);
+    // Collation of the single min()/max() companion's argument (BINARY otherwise),
+    // so the extreme-row comparison matches under a collated text argument.
+    let companion_collation = if companion.is_none() {
+        Collation::Binary
+    } else {
+        let mm: Vec<usize> = aggs
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| matches!(a.kind, AggKind::Min | AggKind::Max))
+            .map(|(i, _)| i)
+            .collect();
+        match mm.as_slice() {
+            [j] => agg_specs[*j]
+                .1
+                .as_ref()
+                .and_then(|e| c.explicit_collation(e).or_else(|| c.col_collation(e)))
+                .unwrap_or_default(),
+            _ => Collation::Binary,
+        }
+    };
     c.ops.push(Op::GroupStep {
         key_start,
         key_count: group_keys.len(),
         repr_count: repr_cols.len(),
         companion,
         aggs,
+        key_collations,
+        companion_collation,
     });
     // Epilogue: advance the loop(s) and backpatch the empty/exit edges so an empty
     // source lands at `end` (no groups → the caller emits no rows).
@@ -1601,11 +1699,14 @@ fn compile_group_select(
     boundaries: Option<&[usize]>,
     allow_correlated: bool,
 ) -> Result<Program> {
-    // Group-key matching and min/max reduction compare under BINARY; a non-BINARY
-    // column collation would diverge, so defer to the tree-walker. This guard also
-    // covers a `SELECT DISTINCT … GROUP BY` (handled on the general path below):
-    // its post-grouping dedup likewise compares output rows under BINARY.
-    if collations.iter().any(|c| *c != Collation::Binary) {
+    // Group-key matching, ordering and the min()/max() companion reduction are now
+    // collation-aware (`GroupStep`/`sort_groups_by_key` carry per-key collations).
+    // The comparisons still done under BINARY are a `SELECT DISTINCT … GROUP BY`'s
+    // post-grouping dedup and a DISTINCT/ordered *aggregate*'s internal argument
+    // comparison, so defer only when a non-BINARY collation could reach one of those.
+    if collations.iter().any(|c| *c != Collation::Binary)
+        && (sel.distinct || has_collation_sensitive_aggregate(sel))
+    {
         return Err(Error::Unsupported("VDBE: non-BINARY collation in GROUP BY"));
     }
     let has_having = sel.having.is_some();
@@ -2007,10 +2108,12 @@ fn compile_group_select(
 
     // Finalize groups and position the group cursor; the emit loop body follows.
     let gfin = c.ops.len();
+    let gfin_key_colls = group_key_collations(&c, &group_keys);
     c.ops.push(Op::GroupFinalize {
         agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _, _)| *k).collect(),
         key_count: group_keys.len(),
         target: 0,
+        key_collations: gfin_key_colls,
     });
     let gbody = c.ops.len();
     // Load this group's keys and aggregate finals into their registers.
@@ -2533,9 +2636,11 @@ fn compile_group_emit(
     let needs_sub = outputs
         .iter()
         .any(|o| matches!(o, GroupOut::Sub(_) | GroupOut::SubExists(..)));
+    let emit_key_colls = group_key_collations(&c, &group_keys);
     c.ops.push(Op::GroupEmit {
         outputs,
         key_count: group_cols.len(),
+        key_collations: emit_key_colls,
         agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _, _)| *k).collect(),
         group_cols: if needs_sub {
             group_cols.to_vec()
@@ -6106,18 +6211,25 @@ fn run_rows_multi_impl(
                 repr_count,
                 companion,
                 aggs,
+                key_collations,
+                companion_collation,
             } => {
                 // The stored vector is the grouping keys followed by any bare-column
                 // representatives; group identity compares only the first `key_count`
-                // entries. Without a companion the representatives keep the first-seen
-                // row's values; with one, a hidden trailing slot holds the running
-                // extreme and the representatives track the extreme row.
+                // entries, each under its collation (`key_collations`). Without a
+                // companion the representatives keep the first-seen row's values; with
+                // one, a hidden trailing slot holds the running extreme and the
+                // representatives track the extreme row.
                 let total = *key_count + *repr_count;
                 let gi = match groups.iter().position(|(k, _)| {
                     k.iter()
                         .zip(regs[*key_start..].iter())
                         .take(*key_count)
-                        .all(|(a, b)| distinct_eq(a, b))
+                        .enumerate()
+                        .all(|(i, (a, b))| {
+                            let coll = key_collations.get(i).copied().unwrap_or(Collation::Binary);
+                            distinct_eq_coll(a, b, coll)
+                        })
                 }) {
                     Some(i) => {
                         if let Some((arg, is_max)) = companion {
@@ -6125,7 +6237,11 @@ fn run_rows_multi_impl(
                             if !matches!(gv, Value::Null) {
                                 let best = &groups[i].0[total];
                                 let beats = matches!(best, Value::Null) || {
-                                    let o = crate::exec::eval::compare(gv, best);
+                                    let o = crate::value::cmp_values_coll(
+                                        gv,
+                                        best,
+                                        *companion_collation,
+                                    );
                                     if *is_max {
                                         o == core::cmp::Ordering::Greater
                                     } else {
@@ -6193,11 +6309,12 @@ fn run_rows_multi_impl(
             Op::GroupEmit {
                 outputs,
                 key_count,
+                key_collations,
                 agg_kinds,
                 group_cols,
                 n_cols,
             } => {
-                sort_groups_by_key(&mut groups, *key_count);
+                sort_groups_by_key(&mut groups, *key_count, key_collations);
                 for (key, accs) in groups.drain(..) {
                     let finals: Vec<Value> = agg_kinds
                         .iter()
@@ -6247,11 +6364,12 @@ fn run_rows_multi_impl(
                 agg_kinds,
                 key_count,
                 target,
+                key_collations,
             } => {
                 // Finalize each group's aggregates once, into `emit_groups`,
                 // ordered by the GROUP BY keys; position the group cursor at the
                 // first. (An explicit ORDER BY re-sorts the output downstream.)
-                sort_groups_by_key(&mut groups, *key_count);
+                sort_groups_by_key(&mut groups, *key_count, key_collations);
                 emit_groups.clear();
                 for (key, accs) in groups.drain(..) {
                     let finals: Vec<Value> = agg_kinds
@@ -6387,15 +6505,20 @@ fn group_emit_synthetic_row(
 /// rows), `min`/`max` reduce by value comparison (NULL over no rows), and
 /// `group_concat` joins with `,` (NULL over no rows).
 /// Order accumulated groups by their GROUP BY keys — the first `key_count` slots
-/// of each group vector — under BINARY collation, ascending with NULLs first.
-/// SQLite emits grouped output in this order (its grouping is done via a sort);
-/// the grouped VDBE path bails on a non-BINARY group key, so a plain BINARY value
-/// comparison reproduces it. An explicit `ORDER BY` re-sorts downstream, so this
-/// pre-order is harmless then.
-fn sort_groups_by_key(groups: &mut [(Vec<Value>, Vec<AggAcc>)], key_count: usize) {
+/// of each group vector — under each key's collation (`collations[k]`, BINARY when
+/// absent), ascending with NULLs first. SQLite emits grouped output in this order
+/// (its grouping is done via a sort). An explicit `ORDER BY` re-sorts downstream,
+/// so this pre-order is harmless then. With all-BINARY keys this is byte-identical
+/// to the previous `cmp_values` comparison.
+fn sort_groups_by_key(
+    groups: &mut [(Vec<Value>, Vec<AggAcc>)],
+    key_count: usize,
+    collations: &[Collation],
+) {
     groups.sort_by(|a, b| {
         for k in 0..key_count {
-            let ord = crate::value::cmp_values(&a.0[k], &b.0[k]);
+            let coll = collations.get(k).copied().unwrap_or(Collation::Binary);
+            let ord = crate::value::cmp_values_coll(&a.0[k], &b.0[k], coll);
             if ord != core::cmp::Ordering::Equal {
                 return ord;
             }
