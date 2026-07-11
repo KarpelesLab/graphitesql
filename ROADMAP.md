@@ -751,10 +751,18 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   `sqlite3_error_offset`, exposed as `Error::parse_offset()`. `syntax_error` builds it
   from the token `Span`, and both CLI renderers prefer it over the text search, so
   `===` / a column-alias list `AS v(x,y)` / a doubled function name now caret exactly.
-  *Residual:* a **resolution** error (`no such column`, `wrong number of arguments`)
-  still text-searches — those come from the executor, which does not yet thread an
-  offset (the parser-offset infra is now in place to extend to them); and the script
-  path uses the offset only for a single-line (collapse-free) statement.
+  **Function-call resolution carets DONE 2026-07-12:** `wrong number of arguments to
+  function NAME()` and `no such function: NAME` now thread the call's exact byte
+  offset via a new `Expr::Function.span` (always-equal, like `Expr::Column`) →
+  `Error::ErrorAt(String, usize)` (a located `Error::Error` — identical `Display`/code,
+  `parse_offset()` returns the offset), tagged in `reject_unresolved_functions` (prepare)
+  and the per-row `eval` function arm. Fixes the repeated-name case `SELECT abs(a),
+  abs(a,a)` where the text search caret the first (valid) call
+  (`tests/cli_error_format.rs`). *Residual:* a `no such column` resolution error still
+  text-searches (already byte-exact for every probed single/repeated/qualified/
+  string-shadowed case — `Expr::Column` carries a span, so it can be threaded the same
+  way if a divergent case is ever found); and the script path uses the offset only for a
+  single-line (collapse-free) statement.
 - **CLI-2b — script/piped error *text*. DONE 2026-07-11.** The piped/`.read`/
   interactive path now renders the sqlite shell's *script* wording — `Parse error
   near line N: <msg>` (with the whitespace-collapsed statement and a `^--- error
