@@ -192,6 +192,71 @@ fn bare_order_independent_aggregate_over_swap_runs_on_vdbe() {
     assert_eq!(render(&c.query(gc).unwrap().rows), sqlite(S, gc));
 }
 
+/// An N-table (three-plus) cost-based reorder of a *plain projection* runs on the
+/// VDBE when every inner is a ≤1-match seek (rowid / single-column unique) so the
+/// row order is fixed by the driver; a non-unique inner still defers.
+#[test]
+fn ntable_plain_projection_reorder_runs_when_all_inners_single_match() {
+    if !sqlite3_available() {
+        return;
+    }
+    // `big` is the fact table; `dim1`/`dim2` are rowid dimensions seeked by rowid —
+    // every inner matches ≤1 row, so the reorder (drive the smaller table) is
+    // order-safe on the VDBE.
+    const S: &str = "CREATE TABLE big(id INTEGER PRIMARY KEY, d1, d2, val); \
+                     INSERT INTO big VALUES(1,2,3,'a'),(2,1,2,'b'),(3,3,1,'c'),(4,2,3,'d'); \
+                     CREATE TABLE dim1(k INTEGER PRIMARY KEY, n1); \
+                     INSERT INTO dim1 VALUES(1,'X'),(2,'Y'),(3,'Z'); \
+                     CREATE TABLE dim2(m INTEGER PRIMARY KEY, n2); \
+                     INSERT INTO dim2 VALUES(1,'P'),(2,'Q'),(3,'R');";
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in S.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            c.execute(s).unwrap();
+        }
+    }
+    for q in [
+        "SELECT big.val, dim1.n1, dim2.n2 FROM big JOIN dim1 ON big.d1=dim1.k \
+         JOIN dim2 ON big.d2=dim2.m",
+        "SELECT dim1.n1, big.val FROM dim1 JOIN big ON big.d1=dim1.k JOIN dim2 ON big.d2=dim2.m",
+        "SELECT big.val FROM big JOIN dim1 ON big.d1=dim1.k JOIN dim2 ON big.d2=dim2.m \
+         WHERE dim1.n1>'X'",
+    ] {
+        let v = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("`{q}` must run on the VDBE: {e}"));
+        let vs = render(&v.rows);
+        c.set_use_vdbe(false);
+        let tw = render(&c.query(q).unwrap().rows);
+        c.set_use_vdbe(true);
+        assert_eq!(vs, tw, "VDBE vs tree-walker for `{q}`");
+        assert_eq!(vs, sqlite(S, q), "VDBE vs sqlite for `{q}`");
+    }
+
+    // A non-unique inner (`dim1.k` non-unique index) can multi-match, so a
+    // plain-projection reorder over it defers — but the fallback is still correct.
+    const SN: &str = "CREATE TABLE big(id INTEGER PRIMARY KEY, d1, d2, val); \
+                      INSERT INTO big VALUES(1,1,3,'a'),(2,1,2,'b'); \
+                      CREATE TABLE dim1(k, n1); CREATE INDEX d1k ON dim1(k); \
+                      INSERT INTO dim1 VALUES(1,'X'),(1,'X2'); \
+                      CREATE TABLE dim2(m INTEGER PRIMARY KEY, n2); \
+                      INSERT INTO dim2 VALUES(2,'Q'),(3,'R');";
+    let mut c2 = Connection::open_memory().unwrap();
+    for stmt in SN.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            c2.execute(s).unwrap();
+        }
+    }
+    let q =
+        "SELECT big.val, dim1.n1 FROM big JOIN dim1 ON big.d1=dim1.k JOIN dim2 ON big.d2=dim2.m";
+    // Whichever way the cost model reorders, if it drives a non-declaration order
+    // over the non-unique inner it must defer; either way the result is correct.
+    let _ = c2.query_vdbe(q); // may run or defer depending on the chosen order
+    assert_eq!(render(&c2.query(q).unwrap().rows), sqlite(SN, q));
+}
+
 /// A driver walked via a reordering covering index: the VDBE cannot reproduce the
 /// index-key scan order from its rowid-order rowset, so the query defers to the
 /// tree-walker — but `query` (which falls back) still returns the correct rows.

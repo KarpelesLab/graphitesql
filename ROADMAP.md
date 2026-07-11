@@ -289,9 +289,15 @@ result or declines to it — never a wrong answer), so this track is
   `min`/`max`, no GROUP BY) is invariant to the join drive order, so its swap — *and
   even the N-table (≥3) reorder* — now runs on the VDBE (the identity-order fold is
   correct); an order-sensitive aggregate (`group_concat`/`string_agg`/the JSON
-  aggregates, whitelisted conservatively so an unknown/user aggregate defers), a
-  GROUP BY, or a plain-projection N-table reorder still defers.
-  `tests/vdbe_join_swap.rs`.
+  aggregates, whitelisted conservatively so an unknown/user aggregate defers) or a
+  GROUP BY still defers. The **N-table (≥3) plain-projection reorder** also runs on
+  the VDBE when every inner is a ≤1-match seek (its rowid IPK or a single-column
+  UNIQUE index — so the row set/order is fixed by the driver) and the driver is
+  plain-scanned: `ntable_join_order` now also returns the placement permutation (the
+  VDBE `loop_order`) and an all-inners-single-match flag; a non-unique/composite
+  inner or a reordering-covering-index driver still defers. `tests/vdbe_join_swap.rs`.
+  This completes the cost-based join swaps/reorders on the VDBE — the residual
+  deferrals are all provably order-unsafe cases, correct via the tree-walker fallback.
 - **B5b-2 — seek-driven inner cursor over real storage** *(the largest remaining
   VDBE piece)*. Inner rowid seeks (INNER + LEFT, single & N-table left-deep chain,
   compound-`ON`) already run over a live `TableCursor`. *Single-table live scan

@@ -1970,13 +1970,34 @@ impl Connection {
                     }
                 }
             } else if let Some(pf) = &check_sel.from
-                && self.ntable_join_order(check_sel, pf).is_some()
+                && let Some((reordered, _, perm, all_inners_single_match)) =
+                    self.ntable_join_order(check_sel, pf)
             {
-                // Cost-based N-table (≥3) reorder: the VDBE join compiler scans
-                // sources in declaration order, so a reordered drive produces a
-                // different (observable, unordered) row order — defer to the
-                // tree-walker, which owns the reorder (`ntable_join_order`).
-                return Err(Error::Unsupported("VDBE: N-table cost-based join order"));
+                // Cost-based N-table (≥3) reorder. The VDBE reproduces it by nesting
+                // the cursors in the placement permutation (`perm`), but only when
+                // every inner is a ≤1-match seek (its rowid IPK or a single-column
+                // UNIQUE index — so the combined row set and order are fixed by the
+                // driver's scan alone), the driver is scanned in rowid/declaration
+                // order (not a reordering covering index the materialized rowset can't
+                // reproduce), and the shape is a plain projection. Otherwise defer to
+                // the tree-walker, which owns the reorder.
+                let driver_reordered = self
+                    .table_meta(&reordered.first.name, reordered.first.alias.as_deref())
+                    .ok()
+                    .is_some_and(|m| {
+                        self.join_scan_covering_index(check_sel, pf, &reordered.first, &m)
+                            .is_some()
+                    });
+                if all_inners_single_match
+                    && !driver_reordered
+                    && sel.group_by.is_empty()
+                    && sel.having.is_none()
+                    && !self.has_aggregate(sel)
+                {
+                    join_loop_order = perm;
+                } else {
+                    return Err(Error::Unsupported("VDBE: N-table cost-based join order"));
+                }
             }
         }
         // `PRAGMA case_sensitive_like = ON` makes the `LIKE` operator ASCII
@@ -18322,7 +18343,7 @@ impl Connection {
         // (else the declared one) and route every multi-table join-EQP branch through
         // it, so both paths stay in lockstep. `ntable_join_order` fires only for
         // `from.joins.len() >= 2`, so the single-table rendering is untouched.
-        let ntable_reordered = self.ntable_join_order(sel, from).map(|(f, _)| f);
+        let ntable_reordered = self.ntable_join_order(sel, from).map(|(f, _, _, _)| f);
         let join_from: &FromClause = ntable_reordered.as_ref().unwrap_or(from);
         // A virtual table scans through its module, not a b-tree — render sqlite's
         // `VIRTUAL TABLE INDEX <n>:<str>` node and skip the regular-table planning
@@ -27765,7 +27786,7 @@ impl Connection {
             // lockstep with how the EQP emitter renders it), then the columns and every
             // row are remapped to declared order — so `SELECT *` / `t.*` and the
             // projection see the unchanged declared layout; only the row ORDER changes.
-            if let Some((reordered, remap)) = self.ntable_join_order(sel, from) {
+            if let Some((reordered, remap, _, _)) = self.ntable_join_order(sel, from) {
                 let (drv_columns, drv_rows) = self.resolve_join_scan_source_rowid(
                     sel,
                     &reordered,
@@ -29674,12 +29695,18 @@ impl Connection {
     /// - every `ON` is a single top-level `=` equating a column of one table with a
     ///   column of another (a self-equality or a non-column side declines);
     /// - the join graph is connected from the chosen driver (no cross-product step).
+    ///
+    /// Returns four values: the reordered clause, the declared-to-execution column
+    /// remap, the table permutation (placement position to declared table index), and
+    /// whether every inner is a single-match seek. The last two serve the VDBE swap
+    /// path (the permutation is its `loop_order`; the flag gates whether the reorder
+    /// is order-safe there); the tree-walker exec / EQP callers use only the first two.
     #[allow(clippy::type_complexity)]
     fn ntable_join_order(
         &self,
         sel: &Select,
         from: &FromClause,
-    ) -> Option<(FromClause, Vec<usize>)> {
+    ) -> Option<(FromClause, Vec<usize>, Vec<usize>, bool)> {
         if from.joins.len() < 2 {
             return None;
         }
@@ -29980,7 +30007,28 @@ impl Connection {
                 remap.push(exec_block_start[t] + local);
             }
         }
-        Some((reordered, remap))
+        // The table permutation (placement position → DECLARED table index) — this is
+        // exactly the nested-loop `loop_order` the VDBE compiler needs to reproduce
+        // the reorder. Plus whether EVERY inner (non-driver) is joined via a ≤1-match
+        // seek on ITS side — its rowid IPK or a single-column UNIQUE index — so the
+        // combined row count and order are fixed by the driver's scan alone (letting
+        // the VDBE's scan+filter reproduce the tree-walker's seek order). Any inner
+        // that can multi-match (a non-unique / composite index) makes this `false`, so
+        // the VDBE path stays deferred while the tree-walker still owns the reorder.
+        let perm: Vec<usize> = order.iter().map(|&(t, _)| t).collect();
+        let all_inners_single_match = order[1..].iter().all(|&(t, ji)| {
+            let Some(ji) = ji else { return false };
+            let Some(local) = ntable_edge_local(&from.joins[ji], t, &block_start, &declared_cols)
+            else {
+                return false;
+            };
+            metas[t].ipk == Some(local)
+                || self.indexes_of(&trefs[t].name).is_ok_and(|ixs| {
+                    ixs.iter()
+                        .any(|ix| ix.unique && ix.cols.len() == 1 && ix.cols[0] == local)
+                })
+        });
+        Some((reordered, remap, perm, all_inners_single_match))
     }
 
     /// Whether the chosen secondary index on `from.first` COVERS the query — every
