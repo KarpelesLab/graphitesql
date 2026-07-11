@@ -2215,7 +2215,9 @@ impl Connection {
             // the column metadata and every row are projected through the visible-
             // column mask. (A multi-source query containing a TVF defers earlier.)
             if tr.tvf_args.is_some() || self.is_bare_tvf(tr) {
-                let (cinfos, rows) = self.tvf_rows(tr, &eval::Params::default())?;
+                let series_cap = self.generate_series_scan_cap(sel);
+                let (cinfos, rows) =
+                    self.tvf_rows_capped(tr, &eval::Params::default(), series_cap)?;
                 let visible: Vec<usize> = cinfos
                     .iter()
                     .enumerate()
@@ -26644,7 +26646,9 @@ impl Connection {
                         "VDBE window: TVF source references rowid",
                     ));
                 }
-                let (cinfos, _rows) = self.tvf_rows(tref, &Params::default())?;
+                // Columns only — a cap of 0 avoids materialising an unbounded
+                // `generate_series` just to read its column metadata.
+                let (cinfos, _rows) = self.tvf_rows_capped(tref, &Params::default(), Some(0))?;
                 cinfos.into_iter().filter(|ci| !ci.hidden).collect()
             } else if tref.tvf_args.is_none()
                 && tref.index_hint.is_none()
@@ -26878,7 +26882,8 @@ impl Connection {
             .iter()
             .any(|b| b.name.eq_ignore_ascii_case(&tref.name));
         if tref.tvf_args.is_some() || self.is_bare_tvf(tref) {
-            let (cinfos, _rows) = self.tvf_rows(tref, &Params::default())?;
+            // Columns only — cap at 0 (see the sibling call in the row path).
+            let (cinfos, _rows) = self.tvf_rows_capped(tref, &Params::default(), Some(0))?;
             Ok(cinfos.into_iter().filter(|ci| !ci.hidden).collect())
         } else if !shadows_cte && self.is_view(&tref.name) {
             let (cinfos, _rows) = self
@@ -27769,6 +27774,39 @@ impl Connection {
     }
 
     /// Scan the `FROM` source into column metadata and decoded input rows.
+    /// Row bound for a sole-source `generate_series` scan; `Some(OFFSET+LIMIT)`
+    /// only when the query consumes exactly the first rows of its single source in
+    /// order (one unfiltered source, no aggregation / window / DISTINCT / ORDER BY
+    /// / compound, constant non-negative integer LIMIT + optional OFFSET). Else
+    /// `None` (materialise fully) — never a wrong result.
+    fn generate_series_scan_cap(&self, sel: &Select) -> Option<usize> {
+        let f = sel.from.as_ref()?;
+        if !f.joins.is_empty()
+            || sel.where_clause.is_some()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || !sel.order_by.is_empty()
+            || !sel.compound.is_empty()
+            || self.has_aggregate(sel)
+            || window::has_window(sel)
+        {
+            return None;
+        }
+        let lit_uint = |e: &Expr| -> Option<usize> {
+            match e {
+                Expr::Literal(sql::ast::Literal::Integer(n)) if *n >= 0 => usize::try_from(*n).ok(),
+                _ => None,
+            }
+        };
+        let limit = lit_uint(sel.limit.as_ref()?)?;
+        let offset = match sel.offset.as_ref() {
+            Some(o) => lit_uint(o)?,
+            None => 0,
+        };
+        limit.checked_add(offset)
+    }
+
     fn scan_source(
         &self,
         sel: &Select,
@@ -27897,7 +27935,8 @@ impl Connection {
             } else {
                 &from.first
             };
-            let (columns, rows) = self.tvf_rows(source, params)?;
+            let cap = self.generate_series_scan_cap(sel);
+            let (columns, rows) = self.tvf_rows_capped(source, params, cap)?;
             let input = rows
                 .into_iter()
                 .map(|values| InputRow {
@@ -28659,6 +28698,17 @@ impl Connection {
         tref: &TableRef,
         params: &Params,
     ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        self.tvf_rows_capped(tref, params, None)
+    }
+
+    /// [`tvf_rows`](Self::tvf_rows) with an optional upper bound on the number of
+    /// `generate_series` rows produced (see `generate_series_scan_cap`).
+    fn tvf_rows_capped(
+        &self,
+        tref: &TableRef,
+        params: &Params,
+        series_cap: Option<usize>,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
         let args = tref.tvf_args.as_deref().unwrap_or(&[]);
         let lname = tref.name.to_ascii_lowercase();
         let label = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
@@ -28705,6 +28755,12 @@ impl Connection {
                 if step != 0 {
                     let mut v = start;
                     loop {
+                        // Stop once the caller's row bound is met — checked before
+                        // generating, so a cap of 0 (a columns-only probe) produces
+                        // no rows and an unbounded default series can't run away.
+                        if series_cap.is_some_and(|c| rows.len() >= c) {
+                            break;
+                        }
                         let in_range = if step > 0 { v <= stop } else { v >= stop };
                         if !in_range {
                             break;
