@@ -271,9 +271,10 @@ result or declines to it — never a wrong answer), so this track is
   `c.collations`, which is indexed by the source columns and misaligns under a
   reordered/narrowed projection. So a `NOCASE`/`RTRIM`/custom-collation column, and an
   explicit `COLLATE BINARY`, run on the VDBE; an explicit *non-BINARY* projection
-  `COLLATE` still defers via `projections_have_explicit_collation`, and the
-  group/join/aggregate DISTINCT paths keep their own non-BINARY bails (empty
-  `collations`). Parity-gated; differential vs sqlite3 3.50.4
+  `COLLATE` still defers via `projections_have_explicit_collation`. The **nested-loop
+  join** DISTINCT path (ad95097) does the same (`col_collation` resolves a join
+  column from either source); the grouped/aggregate DISTINCT paths keep their own
+  non-BINARY bails (empty `collations`). Parity-gated; differential vs sqlite3 3.50.4
   (`tests/vdbe_distinct_collate.rs`).
 - **B-limit-fold — constant-expression `LIMIT`/`OFFSET` on the VDBE. DONE
   2026-07-11.** `fold_const_int` now folds a `LIMIT`/`OFFSET` built from
