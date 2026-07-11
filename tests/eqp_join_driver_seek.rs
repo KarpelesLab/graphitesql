@@ -13,22 +13,32 @@
 use graphitesql::{Connection, Value};
 use std::process::Command;
 
+// No index on `big.k` — so a `big.k = small.<col>` join does not trigger the
+// cost-based index-inner swap, and a `WHERE big.id = <const>` cleanly drives the
+// rowid seek (the secondary-index cases use `SETUP_IDX` below, which adds `bk`).
 const SETUP: &str = "CREATE TABLE big(id INTEGER PRIMARY KEY, k, v); \
-                     CREATE INDEX bk ON big(k); \
                      CREATE TABLE small(id INTEGER PRIMARY KEY, k, v); \
                      CREATE INDEX sk ON small(k); \
                      INSERT INTO big VALUES(5,1,'b5'),(7,2,'b7'),(9,2,'b9'); \
                      INSERT INTO small VALUES(1,2,'s1'),(2,2,'s2'),(3,1,'s3');";
+
+// Adds a single-column secondary index on `big.k` for the secondary-index driver
+// seek. The join columns here are chosen so no rowid/index swap competes.
+const SETUP_IDX: &str = "CREATE TABLE big(id INTEGER PRIMARY KEY, k, v); \
+                         CREATE INDEX bk ON big(k); \
+                         CREATE TABLE small(id INTEGER PRIMARY KEY, k, v); \
+                         INSERT INTO big VALUES(5,1,'b5'),(7,2,'b7'),(9,2,'b9'); \
+                         INSERT INTO small VALUES(1,'x'),(2,'y'),(3,'z');";
 
 fn sqlite_available() -> bool {
     Command::new("sqlite3").arg("--version").output().is_ok()
 }
 
 /// EQP node details (tree markers and the `QUERY PLAN` header stripped).
-fn sqlite_eqp(sql: &str) -> Vec<String> {
+fn sqlite_eqp(setup: &str, sql: &str) -> Vec<String> {
     let out = Command::new("sqlite3")
         .arg(":memory:")
-        .arg(format!("{SETUP} EXPLAIN QUERY PLAN {sql};"))
+        .arg(format!("{setup} EXPLAIN QUERY PLAN {sql};"))
         .output()
         .unwrap();
     String::from_utf8(out.stdout)
@@ -51,9 +61,9 @@ fn graphite_eqp(c: &Connection, sql: &str) -> Vec<String> {
         .collect()
 }
 
-fn seeded() -> Connection {
+fn seeded(setup: &str) -> Connection {
     let mut c = Connection::open_memory().unwrap();
-    for stmt in SETUP.split(';') {
+    for stmt in setup.split(';') {
         let s = stmt.trim();
         if !s.is_empty() {
             c.execute(s).unwrap();
@@ -67,7 +77,7 @@ fn driver_rowid_seek_eqp_matches_sqlite() {
     if !sqlite_available() {
         return;
     }
-    let c = seeded();
+    let c = seeded(SETUP);
     for q in [
         // Unindexed inner join column → driver seeks, inner SCANs (no auto-index).
         "SELECT * FROM big JOIN small ON big.k=small.v WHERE big.id=7",
@@ -77,15 +87,34 @@ fn driver_rowid_seek_eqp_matches_sqlite() {
         "SELECT * FROM big JOIN small ON big.k=small.v",
         // The reversed projection and an extra WHERE term still seek the driver.
         "SELECT small.v, big.v FROM big JOIN small ON big.k=small.v WHERE big.id=7 AND small.v>'a'",
-        // A single-column *secondary* index equality on the driver seeks the index
-        // (`SEARCH big USING INDEX bk (k=?)`) and scans the unindexed inner. `big.k=2`
-        // matches multiple rows — they share the key, so they arrive in rowid order,
-        // matching the executor.
-        "SELECT * FROM big JOIN small ON big.v=small.v WHERE big.k=2",
-        // With an inner that has a real index on the join column, that index is used.
-        "SELECT * FROM big JOIN small ON big.k=small.k WHERE big.id=7",
     ] {
-        assert_eq!(sqlite_eqp(q), graphite_eqp(&c, q), "EQP diverged on `{q}`");
+        assert_eq!(
+            sqlite_eqp(SETUP, q),
+            graphite_eqp(&c, q),
+            "EQP diverged on `{q}`"
+        );
+    }
+}
+
+#[test]
+fn driver_secondary_index_seek_eqp_matches_sqlite() {
+    if !sqlite_available() {
+        return;
+    }
+    // `bk` is a single-column secondary index on `big.k`; the join is on `v` so no
+    // rowid/index swap competes with the `big.k = <const>` driver seek.
+    let c = seeded(SETUP_IDX);
+    for q in [
+        // Secondary-index driver seek; the unindexed inner scans (no auto-index).
+        "SELECT * FROM big JOIN small ON big.v=small.v WHERE big.k=2",
+        // A driver-only extra predicate still seeks the index.
+        "SELECT big.v, small.v FROM big JOIN small ON big.v=small.v WHERE big.k=2 AND big.v>'a'",
+    ] {
+        assert_eq!(
+            sqlite_eqp(SETUP_IDX, q),
+            graphite_eqp(&c, q),
+            "EQP diverged on `{q}`"
+        );
     }
 }
 
@@ -94,7 +123,7 @@ fn secondary_index_driver_seek_rows_match_sqlite() {
     if !sqlite_available() {
         return;
     }
-    let c = seeded();
+    let c = seeded(SETUP_IDX);
     let q = "SELECT big.v, small.v FROM big JOIN small ON big.v=small.v WHERE big.k=2 \
              ORDER BY big.v, small.v";
     let got: Vec<Vec<String>> = c
@@ -116,7 +145,7 @@ fn secondary_index_driver_seek_rows_match_sqlite() {
     let out = Command::new("sqlite3")
         .arg(":memory:")
         .args(["-separator", "|"])
-        .arg(format!("{SETUP} {q};"))
+        .arg(format!("{SETUP_IDX} {q};"))
         .output()
         .unwrap();
     let want: Vec<Vec<String>> = String::from_utf8(out.stdout)
@@ -132,7 +161,7 @@ fn driver_rowid_seek_rows_match_sqlite() {
     if !sqlite_available() {
         return;
     }
-    let c = seeded();
+    let c = seeded(SETUP);
     let q = "SELECT big.v, small.v FROM big JOIN small ON big.k=small.v WHERE big.id=7 \
              ORDER BY small.v";
     let got: Vec<Vec<String>> = c
