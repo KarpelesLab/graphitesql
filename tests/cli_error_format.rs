@@ -73,6 +73,9 @@ fn one_shot_error_rendering_matches_sqlite() {
         "SELECT 'abc",
         "CREATE TABLE t(a); CREATE TABLE t(a)",
         "CREATE INDEX i ON t2(a); CREATE TABLE t2(a); CREATE INDEX i ON t2(a)",
+        // `ALTER TABLE … RENAME COLUMN <missing>` carets the bare identifier even
+        // though the message quotes it (`no such column: "nope"`).
+        "CREATE TABLE t(a); ALTER TABLE t RENAME COLUMN nope TO x",
         // Prepare-time errors without a caret (no source position).
         "SELECT * FROM nope",
         "INSERT INTO nope VALUES(1)",

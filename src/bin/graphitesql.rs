@@ -2648,6 +2648,14 @@ fn error_offending_token(msg: &str) -> Option<&str> {
     ] {
         if let Some(rest) = msg.strip_prefix(pre) {
             let tok = rest.split(" - ").next().unwrap_or(rest);
+            // The ALTER-rename form quotes the name (`no such column: "nope"`)
+            // while the SELECT-resolution form does not (`no such column: froed`);
+            // the caret is located at the bare identifier in the source either way,
+            // so strip a surrounding pair of double quotes before searching.
+            let tok = tok
+                .strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .unwrap_or(tok);
             return (!tok.is_empty() && !tok.contains(' ')).then_some(tok);
         }
     }
