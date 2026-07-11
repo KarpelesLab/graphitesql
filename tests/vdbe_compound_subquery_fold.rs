@@ -9,7 +9,9 @@
 //! column: the whole compound's result column then carries NONE affinity, exactly
 //! like an ordinary literal list, so folding the candidate set to literals is
 //! affinity-exact. A *bare-column* arm would carry that column's affinity (which a
-//! literal list lacks) and still defers — see `bare_column_compound_arm_falls_back`.
+//! literal list lacks), so the router does not fold it to a literal list; instead
+//! it runs on the VDBE through B5c-2's correlated-`IN (SELECT)` path, which
+//! preserves the affinity exactly — see `bare_column_compound_arm_runs_via_correlated_in`.
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE folded
 //! the subquery. Checked against the tree-walker and sqlite3 3.50.4.
@@ -91,7 +93,10 @@ fn bare_column_compound_arm_runs_via_correlated_in() {
     // correct result (byte-identical to the tree-walker, verified against sqlite in
     // `compound_subquery_matches_sqlite3`'s sibling checks).
     let q = "SELECT g, n FROM t WHERE a IN (SELECT 'x' UNION SELECT a FROM t) ORDER BY g, n";
-    let got = c.query_vdbe(q).expect("runs on the VDBE via correlated IN").rows;
+    let got = c
+        .query_vdbe(q)
+        .expect("runs on the VDBE via correlated IN")
+        .rows;
     let want = c.query(q).unwrap().rows;
     assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
 }
