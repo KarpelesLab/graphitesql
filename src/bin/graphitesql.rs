@@ -2535,6 +2535,8 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str) -> bool {
                 "row value misused",
                 "aggregate functions are not allowed",
                 "HAVING clause on a non-aggregate query",
+                "SELECTs to the left and right of", // UNION/INTERSECT/EXCEPT arity
+                "all VALUES must have the same number of terms",
                 "sub-select returns",
                 "table ", // "table X has N columns…" / "table X already exists"
                 "there is already ",

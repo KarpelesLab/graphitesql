@@ -85,6 +85,9 @@ fn one_shot_error_rendering_matches_sqlite() {
         "SELECT (SELECT 1,2)",
         "CREATE TABLE t(a); SELECT a FROM t GROUP BY count(*)",
         "CREATE TABLE t(a); SELECT a FROM t HAVING a>1", // HAVING on a non-aggregate query
+        "SELECT 1 UNION SELECT 1,2",                     // compound arity mismatch
+        "SELECT 1 INTERSECT SELECT 1,2",
+        "VALUES(1),(1,2)", // VALUES term-count mismatch
         "CREATE TABLE t(a PRIMARY KEY, b PRIMARY KEY)",
         "SELECT count(*) OVER ()",
         "SELECT",
