@@ -261,6 +261,20 @@ result or declines to it — never a wrong answer), so this track is
 
 **Move the last shapes onto the VDBE:**
 
+- **B-distinct-collate — collation-aware single-table `DISTINCT` on the VDBE. DONE
+  2026-07-12.** A `SELECT DISTINCT` over a single-table scan whose projected columns
+  carry a non-BINARY collation used to defer (the VDBE's `DistinctCheck` compared
+  under BINARY). `Op::DistinctCheck` now carries a per-column `collations` vector and
+  dedups column `i` under `distinct_eq_coll(a, b, collations[i])` (NULLs still equal);
+  the scan path resolves each projected column's collation with the same
+  `explicit_collation().or(col_collation())` logic as an ORDER BY key — *not*
+  `c.collations`, which is indexed by the source columns and misaligns under a
+  reordered/narrowed projection. So a `NOCASE`/`RTRIM`/custom-collation column, and an
+  explicit `COLLATE BINARY`, run on the VDBE; an explicit *non-BINARY* projection
+  `COLLATE` still defers via `projections_have_explicit_collation`, and the
+  group/join/aggregate DISTINCT paths keep their own non-BINARY bails (empty
+  `collations`). Parity-gated; differential vs sqlite3 3.50.4
+  (`tests/vdbe_distinct_collate.rs`).
 - **B-limit-fold — constant-expression `LIMIT`/`OFFSET` on the VDBE. DONE
   2026-07-11.** `fold_const_int` now folds a `LIMIT`/`OFFSET` built from
   deterministic, stateless scalar functions (`abs`/`round`/`length`/`coalesce`/…,
