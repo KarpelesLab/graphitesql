@@ -28,7 +28,7 @@ const SETUP_IDX: &str = "CREATE TABLE big(id INTEGER PRIMARY KEY, k, v); \
                          CREATE INDEX bk ON big(k); \
                          CREATE TABLE small(id INTEGER PRIMARY KEY, k, v); \
                          INSERT INTO big VALUES(5,1,'b5'),(7,2,'b7'),(9,2,'b9'); \
-                         INSERT INTO small VALUES(1,'x'),(2,'y'),(3,'z');";
+                         INSERT INTO small VALUES(1,0,'b7'),(2,0,'b9'),(3,0,'zz');";
 
 fn sqlite_available() -> bool {
     Command::new("sqlite3").arg("--version").output().is_ok()
