@@ -138,10 +138,13 @@ fn single_row_driver_join_all_constant_order_by() {
     // `big.id=7` is a single-row rowid seek, so `big.*` is constant and `small.v`
     // (equated to `big.k` by the ON) is constant too — an ORDER BY on any of those
     // needs no sort. A non-constant inner column (`small.k`) still sorts.
+    // `small.v` is numeric so `big.k = small.v` actually joins (big.id=7 → k=2 →
+    // matches small rows 1 and 2, whose v=2); `small.k` varies so it is genuinely
+    // non-constant.
     const S: &str = "CREATE TABLE big(id INTEGER PRIMARY KEY, k, v); \
                      CREATE TABLE small(id INTEGER PRIMARY KEY, k, v); \
                      INSERT INTO big VALUES(5,1,'b5'),(7,2,'b7'),(9,2,'b9'); \
-                     INSERT INTO small VALUES(1,2,'s1'),(2,2,'s2'),(3,1,'s3');";
+                     INSERT INTO small VALUES(1,8,2),(2,7,2),(3,6,1);";
     let mut c = Connection::open_memory().unwrap();
     for stmt in S.split(';') {
         let s = stmt.trim();
