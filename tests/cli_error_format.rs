@@ -89,8 +89,9 @@ fn one_shot_error_rendering_matches_sqlite() {
         "CREATE TABLE t(a); ALTER TABLE t ADD COLUMN a",
         "SELECT (SELECT 1,2)",
         "CREATE TABLE t(a); SELECT a FROM t GROUP BY count(*)",
+        "SELECT * FROM generate_series()", // TVF required first arg missing (prepare)
         "CREATE TABLE t(a); SELECT a FROM t HAVING a>1", // HAVING on a non-aggregate query
-        "SELECT 1 UNION SELECT 1,2",                     // compound arity mismatch
+        "SELECT 1 UNION SELECT 1,2",       // compound arity mismatch
         "SELECT 1 INTERSECT SELECT 1,2",
         "VALUES(1),(1,2)",             // VALUES term-count mismatch
         "REINDEX nope",                // unable to identify the object to be reindexed
@@ -126,6 +127,9 @@ fn one_shot_error_rendering_matches_sqlite() {
         "CREATE TABLE t(a CHECK(a>0)); INSERT INTO t VALUES(-1)",
         "CREATE TABLE t(a INT) STRICT; INSERT INTO t VALUES('x')",
         "SELECT json_extract('bad','$')",
+        // `nth_value`'s second-argument value check is a run-time (step) error,
+        // unlike its wrong-argument-*count* which is prepare-time.
+        "SELECT nth_value(a, 0) OVER () FROM (SELECT 1 a)",
         "CREATE VIRTUAL TABLE v USING nomod", // no such module: step (module looked up on construction)
         "CREATE TABLE t(a); CREATE TRIGGER x BEFORE INSERT ON t BEGIN SELECT RAISE(ABORT,'no'); END; \
          INSERT INTO t VALUES(1)",

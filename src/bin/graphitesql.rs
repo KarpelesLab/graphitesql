@@ -2574,8 +2574,10 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str, sql: &str) -> bool {
                 "foreign key on ",
                 "number of columns in foreign key",
                 "parameters prohibited",
-                "second argument to nth_value",
                 "no query solution",
+                // A TVF whose required first argument is missing/unusable is a
+                // prepare-time error (`SELECT * FROM generate_series()`).
+                "first argument to \"generate_series()\"",
                 "missing datatype for",
                 "unknown datatype for", // STRICT table column with an invalid type name
                 "AUTOINCREMENT", // "… is only allowed on …" / "… not allowed on WITHOUT ROWID …"
