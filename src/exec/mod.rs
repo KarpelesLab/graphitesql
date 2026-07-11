@@ -19180,6 +19180,14 @@ impl Connection {
                     &from.joins[0].table,
                     &eqp_label(&from.joins[0].table),
                 )
+            } else if self.join_first_rowid_seek(sel, from, params).is_some() {
+                // The driver carries its own `rowid = <const>` equality — sqlite (and
+                // now the executor, in lockstep) seeks that one row instead of
+                // scanning: `SEARCH <driver> USING INTEGER PRIMARY KEY (rowid=?)`.
+                alloc::format!(
+                    "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                    eqp_label(&from.first)
+                )
             } else {
                 // Joins run as nested-loop scans in `join_from` order — declaration
                 // order, or the cost-based N-table permutation. The driver may read a
@@ -19444,6 +19452,16 @@ impl Connection {
                     let auto_col = if join.natural
                         || !join.using.is_empty()
                         || !matches!(join.kind, JoinKind::Inner | JoinKind::Left)
+                        // When the driver is a single-row rowid seek, sqlite does not
+                        // build a transient auto-index for one probe — it scans the
+                        // inner. Suppress the AUTOMATIC-COVERING-INDEX label to match
+                        // (graphite nested-loops either way, so this is EQP-only). A
+                        // real index on the inner still takes the `index_join_seek`
+                        // branch above and renders `SEARCH … USING INDEX`.
+                        || sel
+                            .from
+                            .as_ref()
+                            .is_some_and(|f| self.join_first_rowid_seek(sel, f, params).is_some())
                     {
                         None
                     } else {
@@ -27708,8 +27726,14 @@ impl Connection {
         // (matching sqlite's row order). When a swap below fires instead, the second
         // table drives and these rows are discarded — only `columns` (metadata) is
         // reused, which the covering reorder leaves unchanged.
-        let (columns, rows) =
-            self.resolve_join_scan_source_rowid(sel, from, &from.first, params, with_rowid)?;
+        let (columns, rows) = if let Some(rid) = self.join_first_rowid_seek(sel, from, params) {
+            // The driver carries its own `rowid = <const>` — seek that one row rather
+            // than scanning the whole table (in lockstep with the `SEARCH … (rowid=?)`
+            // EQP). The fold re-applies the full WHERE, so the result is unchanged.
+            self.resolve_join_driver_rowid_seek(&from.first, rid, with_rowid)?
+        } else {
+            self.resolve_join_scan_source_rowid(sel, from, &from.first, params, with_rowid)?
+        };
 
         {
             // Cost-based join-order (two-table rowid-inner swap): when driving from
@@ -30733,6 +30757,94 @@ impl Connection {
             return Ok((columns, rows));
         }
         self.resolve_join_source_rowid(tref, params, with_rowid)
+    }
+
+    /// When the driver (`from.first`) of an INNER join carries a single `rowid = <int
+    /// const>` equality on its own INTEGER PRIMARY KEY in the `WHERE`, sqlite drives
+    /// the join by seeking that one row — `SEARCH <driver> USING INTEGER PRIMARY KEY
+    /// (rowid=?)` — instead of scanning the whole table. Returns that rowid value so
+    /// the executor and the EQP emitter stay in lockstep. Scoped tightly: a plain
+    /// `main` rowid base-table driver, no cost-based swap / N-table reorder (those own
+    /// the driver choice), no covering index on the driver (rendered as a covering
+    /// SCAN), no `INDEXED BY` hint. The driver's own rowid predicate references only
+    /// the driver, so seeking it is safe — the join's re-applied `WHERE` is a superset.
+    fn join_first_rowid_seek(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        params: &Params,
+    ) -> Option<i64> {
+        if from.joins.is_empty()
+            || self.two_table_rowid_inner_swap(from).is_some()
+            || self.two_table_index_inner_swap(from).is_some()
+            || self.ntable_join_order(sel, from).is_some()
+        {
+            return None;
+        }
+        let tref = &from.first;
+        if tref.subquery.is_some()
+            || tref.tvf_args.is_some()
+            || self.is_bare_tvf(tref)
+            || tref.schema.is_some()
+            || tref.index_hint.is_some()
+            || self.lookup_cte(&tref.name, tref.alias.as_deref()).is_some()
+            || self.is_view(&tref.name)
+            || self.unqualified_db(&tref.name) != DbRef::Main
+        {
+            return None;
+        }
+        let meta = self.table_meta(&tref.name, tref.alias.as_deref()).ok()?;
+        if meta.without_rowid {
+            return None;
+        }
+        let ipk = meta.ipk?;
+        if self
+            .join_scan_covering_index(sel, from, tref, &meta)
+            .is_some()
+        {
+            return None;
+        }
+        let where_expr = sel.where_clause.as_ref()?;
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        eqs.iter().find_map(|(c, v)| match v {
+            Value::Integer(rid) if *c == ipk => Some(*rid),
+            _ => None,
+        })
+    }
+
+    /// Produce the join driver's rows by seeking the single `rowid` — the executor
+    /// half of [`join_first_rowid_seek`]. Zero or one row, stamped and (optionally)
+    /// rowid-carrying exactly like [`resolve_join_source_rowid`](Self::resolve_join_source_rowid),
+    /// so the fold that consumes it is unchanged.
+    fn resolve_join_driver_rowid_seek(
+        &self,
+        tref: &TableRef,
+        rid: i64,
+        with_rowid: bool,
+    ) -> Result<(Vec<ColumnInfo>, Vec<Vec<Value>>)> {
+        let mut meta = self.table_meta(&tref.name, tref.alias.as_deref())?;
+        let db_label = self.db_label(DbRef::Main);
+        for col in &mut meta.columns {
+            col.schema = Some(db_label.clone());
+        }
+        let mut columns = meta.columns.clone();
+        let label = tref.alias.as_deref().unwrap_or(&tref.name);
+        if with_rowid {
+            columns.push(hidden_rowid_col(label, Some(db_label.clone())));
+        }
+        let encoding = self.backend.source().header().text_encoding;
+        let mut cur = TableCursor::new(self.backend.source(), meta.root);
+        cur.seek(rid)?;
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        if cur.is_valid() && cur.rowid()? == rid {
+            let mut row = self.decode_full_row(&meta, rid, &cur.payload()?, encoding)?;
+            if with_rowid {
+                row.push(Value::Integer(rid));
+            }
+            rows.push(row);
+        }
+        Ok((columns, rows))
     }
 
     /// Scan a `WITHOUT ROWID` table's clustered index b-tree, decoding each entry

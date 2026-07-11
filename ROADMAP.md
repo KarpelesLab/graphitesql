@@ -454,17 +454,19 @@ result or declines to it — never a wrong answer), so this track is
   single-table WHERE restriction picking the driver) and projection-sensitive
   equal-cost driver ties — the full `whereLoopAddBtree`/`wherePathSolver` formula.
   Divergent EQP where graphite's per-cursor access paths are often cheaper than
-  sqlite's cost-reordered scans is *by design* (results correct). *Probed
-  2026-07-11 — a concrete sub-case:* when the join **driver** carries its own
-  selective WHERE equality (`… JOIN small ON big.v=small.v WHERE big.k=7`, or a
-  rowid `WHERE big.id=7`), sqlite renders the driver as a `SEARCH` seeking that
-  constraint (`SEARCH big USING INDEX bk (k=?)`) while graphite `SCAN`s it and
-  builds an automatic index on the inner. The *rows are identical* (the driver's
-  WHERE is re-applied) — this is EQP/perf only. Closing it needs the driver's
-  access path to become a seek (an EQP **and** join-executor change, since the
-  driver is currently always scanned), which ripples through the whole join EQP
-  corpus; deferred as a genuine `whereLoopAddBtree` driver-cost slice, not a quick
-  structural one.
+  sqlite's cost-reordered scans is *by design* (results correct). **Driver rowid-seek
+  DONE 2026-07-11:** when the join **driver** (`from.first`) carries its own single
+  `rowid = <int const>` equality in the `WHERE` (`… JOIN small ON … WHERE big.id=7`),
+  graphite now seeks that one row — `SEARCH big USING INTEGER PRIMARY KEY (rowid=?)` —
+  in lockstep EQP + executor (`join_first_rowid_seek` / `resolve_join_driver_rowid_seek`),
+  and, since there is then a single driver row, suppresses the inner's transient
+  `AUTOMATIC COVERING INDEX` label to a plain `SCAN` (a real index on the inner still
+  renders `SEARCH … USING INDEX`). Byte-exact vs sqlite (`tests/eqp_join_driver_seek.rs`),
+  full corpus green. Tightly scoped (plain `main` rowid driver, no swap/N-table
+  reorder, no covering index, no `INDEXED BY`). Still open: the **secondary-index**
+  driver seek (`WHERE big.k=7` on an indexed non-rowid column → `SEARCH big USING
+  INDEX bk (k=?)`) — the same shape one level up, needs the collation-aware index
+  pick threaded into the driver path.
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   An index carrying a non-default collation (`CREATE INDEX ib ON t(b COLLATE
   NOCASE)`) is mis-selected (rows still correct via the WHERE re-apply). The model —
