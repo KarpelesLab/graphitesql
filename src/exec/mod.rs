@@ -1901,7 +1901,19 @@ impl Connection {
         // identity, leftmost source outermost). A cost-based swap sets a non-identity
         // permutation so the VDBE reproduces the tree-walker's driven row order.
         let mut join_loop_order: Vec<usize> = Vec::new();
-        if sel.order_by.is_empty()
+        // A bare aggregate whose every aggregate is order-INDEPENDENT (count / sum /
+        // total / avg / min / max) yields the same value for *any* join drive order,
+        // so the VDBE's identity-order fold (`compile_aggregate_join`) is correct
+        // regardless of a cost-based swap or N-table reorder — the bails below need
+        // not fire (2-table *and* N-table). An order-sensitive or user-registered
+        // aggregate, or a GROUP BY (whose group emission order the reorder perturbs),
+        // is excluded and still defers.
+        let bare_order_indep_agg = self.has_aggregate(sel)
+            && sel.group_by.is_empty()
+            && sel.having.is_none()
+            && !self.select_has_order_sensitive_aggregate(sel);
+        if !bare_order_indep_agg
+            && sel.order_by.is_empty()
             && let Some(from) = &sel.from
         {
             let promo_tables = self.comma_join_table_columns(from);
@@ -35423,6 +35435,31 @@ impl Connection {
         sel.having
             .as_ref()
             .is_some_and(|h| expr_contains_agg(h, &is_agg))
+    }
+
+    /// Whether any result-column aggregate is *order-sensitive* — its value depends
+    /// on the order rows are folded in (`group_concat` / `string_agg` and the JSON
+    /// aggregates preserve element order) — or is a user-registered aggregate of
+    /// unknown order-dependence. Uses a whitelist of the definitively
+    /// order-*independent* aggregates (`count`/`sum`/`total`/`avg`/`min`/`max`), so
+    /// anything else is treated conservatively as order-sensitive. Used to decide
+    /// whether a cost-based join swap/reorder is irrelevant to a bare aggregate (an
+    /// order-independent one is invariant to the join drive order, so the VDBE's
+    /// identity-order fold is correct without modelling the reorder).
+    fn select_has_order_sensitive_aggregate(&self, sel: &Select) -> bool {
+        let bad = |name: &str, n: usize, star: bool| -> bool {
+            let is_agg = func::is_aggregate_call(name, n, star)
+                || self.aggregates.contains_key(&name.to_ascii_lowercase());
+            is_agg
+                && !matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "count" | "sum" | "total" | "avg" | "min" | "max"
+                )
+        };
+        sel.columns.iter().any(|rc| match rc {
+            ResultColumn::Expr { expr, .. } => expr_contains_agg(expr, &bad),
+            _ => false,
+        })
     }
 
     /// An aggregate appearing inside a result-column window function's `OVER`

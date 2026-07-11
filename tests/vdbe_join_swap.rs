@@ -144,6 +144,54 @@ fn unique_index_inner_swap_runs_but_nonunique_defers() {
     assert_eq!(render(&c2.query(q).unwrap().rows), sqlite(SN, q));
 }
 
+/// A *bare order-independent* aggregate (count/sum/min/max/avg/total) is invariant
+/// to the join drive order, so a swap — and even an N-table reorder — needs no
+/// modelling: the VDBE's identity-order fold is correct. An order-sensitive
+/// aggregate (`group_concat`) still defers.
+#[test]
+fn bare_order_independent_aggregate_over_swap_runs_on_vdbe() {
+    if !sqlite3_available() {
+        return;
+    }
+    const S: &str = "CREATE TABLE t(a INTEGER PRIMARY KEY, b); \
+                     INSERT INTO t VALUES(1,'t1'),(2,'t2'),(3,'t3'); \
+                     CREATE TABLE u(k, v); \
+                     INSERT INTO u VALUES(2,'q'),(1,'p'),(2,'r'),(9,'z'); \
+                     CREATE TABLE w(m INTEGER PRIMARY KEY, n); \
+                     INSERT INTO w VALUES(1,'A'),(2,'B'),(3,'C');";
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in S.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            c.execute(s).unwrap();
+        }
+    }
+    for q in [
+        "SELECT count(*) FROM t JOIN u ON t.a=u.k",
+        "SELECT sum(t.a), max(u.v), min(u.v) FROM t JOIN u ON t.a=u.k",
+        // Order-independent aggregate over a three-table join (N-table reorder).
+        "SELECT count(*) FROM t JOIN u ON t.a=u.k JOIN w ON t.a=w.m",
+    ] {
+        let v = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("`{q}` must run on the VDBE: {e}"));
+        let vs = render(&v.rows);
+        c.set_use_vdbe(false);
+        let tw = render(&c.query(q).unwrap().rows);
+        c.set_use_vdbe(true);
+        assert_eq!(vs, tw, "VDBE vs tree-walker for `{q}`");
+        assert_eq!(vs, sqlite(S, q), "VDBE vs sqlite for `{q}`");
+    }
+    // An order-sensitive aggregate over the swap-join still defers (its fold order
+    // would differ) — but the fallback returns sqlite's value.
+    let gc = "SELECT group_concat(u.v) FROM t JOIN u ON t.a=u.k";
+    assert!(
+        c.query_vdbe(gc).is_err(),
+        "group_concat over a swap-join must defer"
+    );
+    assert_eq!(render(&c.query(gc).unwrap().rows), sqlite(S, gc));
+}
+
 /// A driver walked via a reordering covering index: the VDBE cannot reproduce the
 /// index-key scan order from its rowid-order rowset, so the query defers to the
 /// tree-walker — but `query` (which falls back) still returns the correct rows.

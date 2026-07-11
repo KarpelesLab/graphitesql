@@ -285,7 +285,13 @@ result or declines to it — never a wrong answer), so this track is
   defer. The **single-column-UNIQUE index-inner swap** runs on the VDBE too (same
   `[1, 0]` permutation — a unique index also matches ≤1 inner row); a *composite* or
   *non-unique* index-inner swap can match several inner rows in index-key order and
-  still defers, as does the N-table (≥3) reorder. `tests/vdbe_join_swap.rs`.
+  still defers. A **bare order-independent aggregate** (`count`/`sum`/`total`/`avg`/
+  `min`/`max`, no GROUP BY) is invariant to the join drive order, so its swap — *and
+  even the N-table (≥3) reorder* — now runs on the VDBE (the identity-order fold is
+  correct); an order-sensitive aggregate (`group_concat`/`string_agg`/the JSON
+  aggregates, whitelisted conservatively so an unknown/user aggregate defers), a
+  GROUP BY, or a plain-projection N-table reorder still defers.
+  `tests/vdbe_join_swap.rs`.
 - **B5b-2 — seek-driven inner cursor over real storage** *(the largest remaining
   VDBE piece)*. Inner rowid seeks (INNER + LEFT, single & N-table left-deep chain,
   compound-`ON`) already run over a live `TableCursor`. *Single-table live scan
