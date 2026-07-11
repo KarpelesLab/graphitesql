@@ -184,6 +184,65 @@ fn correlated_subquery_over_outer_join() {
 }
 
 #[test]
+fn grouped_correlated_scalar_in_projection() {
+    let c = setup();
+    // A correlated scalar subquery in a GROUP BY projection, correlated ONLY on the
+    // group key (`a.k`): its value is well-defined per group, and the VDBE grouped
+    // emit evaluates it against a synthetic row of the group's key values.
+    both(
+        &c,
+        "SELECT k, (SELECT count(*) FROM b WHERE b.p = a.k) FROM a GROUP BY k",
+        vec![vec![i(10), i(1)], vec![i(20), i(2)], vec![i(30), i(0)]],
+    );
+    // Alongside a real aggregate (each distinct key is its own single-row group).
+    both(
+        &c,
+        "SELECT k, count(*), (SELECT count(*) FROM b WHERE b.p = a.k) FROM a GROUP BY k",
+        vec![
+            vec![i(10), i(1), i(1)],
+            vec![i(20), i(1), i(2)],
+            vec![i(30), i(1), i(0)],
+        ],
+    );
+    // A correlated EXISTS in the projection.
+    both(
+        &c,
+        "SELECT k, EXISTS(SELECT 1 FROM b WHERE b.p = a.k) FROM a GROUP BY k",
+        vec![vec![i(10), i(1)], vec![i(20), i(1)], vec![i(30), i(0)]],
+    );
+    // A correlated scalar returning the first matching value (NULL when none).
+    both(
+        &c,
+        "SELECT k, (SELECT v FROM b WHERE b.p = a.k) FROM a GROUP BY k",
+        vec![
+            vec![i(10), t("ten")],
+            vec![i(20), t("twenty")],
+            vec![i(30), Value::Null],
+        ],
+    );
+}
+
+#[test]
+fn grouped_correlated_nonkey_ref_falls_back() {
+    let c = setup();
+    // A correlated subquery in a GROUP BY projection that references a NON-key
+    // outer column (`a.x`) has no well-defined per-group value (the group's
+    // representative row is unspecified), so the VDBE grouped emit must decline and
+    // defer to the tree-walker — `query_vdbe` therefore errors, while the ordinary
+    // `query` path still produces sqlite's result.
+    let q = "SELECT k, (SELECT count(*) FROM b WHERE b.p = a.x) FROM a GROUP BY k";
+    assert!(
+        c.query_vdbe(q).is_err(),
+        "a non-key correlated ref must not run on the VDBE grouped path"
+    );
+    // The tree-walker (via the auto-fallback `query`) still answers correctly.
+    assert_eq!(
+        c.query(q).unwrap().rows,
+        vec![vec![i(10), i(0)], vec![i(20), i(0)], vec![i(30), i(0)],],
+    );
+}
+
+#[test]
 fn noncorrelated_subqueries_unregressed() {
     let c = setup();
     // A non-correlated scalar subquery still folds and runs on the VDBE.

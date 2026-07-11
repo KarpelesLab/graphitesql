@@ -297,7 +297,18 @@ result or declines to it — never a wrong answer), so this track is
   cursor count (`< 2` ⇒ cursor 0, else the assembled row). The post-success validation adds
   `validate_nested_ambiguity` so an ambiguous outer reference inside a subquery is still
   rejected. Byte-identical to the tree-walker across all join kinds
-  (`tests/vdbe_correlated_subquery.rs`). (`GROUP BY`-join correlated still defers.)
+  (`tests/vdbe_correlated_subquery.rs`).
+  *Extended to grouped projections (2026-07-11):* a correlated scalar/`EXISTS` subquery
+  in a plain `GROUP BY` projection now runs on the VDBE when it is correlated **only on
+  the group key(s)** — its value is then well-defined per group. `compile_group_emit`
+  admits it via `group_correlated_output` (a conservative walker: any non-key outer
+  reference, three-part reference, or shape it cannot fully account for declines), emitting
+  `GroupOut::Sub`/`SubExists`; the `GroupEmit` interpreter builds a synthetic per-group row
+  (the group's key values at their source-column positions, all else NULL) and evaluates the
+  subquery against it through the same `SubqueryEval` callback. A reference to a non-key
+  column, or a `HAVING`/`ORDER BY`/`DISTINCT` grouped shape (the general path), still defers
+  to the tree-walker. Byte-identical to sqlite (`tests/vdbe_correlated_subquery.rs`).
+  (`GROUP BY`-**join** correlated, and non-key grouped references, still defer.)
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).
 

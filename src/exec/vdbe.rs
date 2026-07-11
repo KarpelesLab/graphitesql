@@ -253,6 +253,15 @@ pub enum Op {
         outputs: Vec<GroupOut>,
         key_count: usize,
         agg_kinds: Vec<AggKind>,
+        /// Source-column index of each group key (parallel to the first
+        /// `key_count` slots of every group's key vector), used to place the
+        /// group's key values into the synthetic row a [`GroupOut::Sub`] /
+        /// [`GroupOut::SubExists`] correlated subquery is evaluated against.
+        /// Empty unless the projection holds such a subquery.
+        group_cols: Vec<usize>,
+        /// Width of that synthetic row (the number of source columns), so an
+        /// outer reference resolves to the same index the compiler assigned.
+        n_cols: usize,
     },
     /// Finalize the accumulated groups (computing each slot's value per group)
     /// into an emit list ordered by the GROUP BY keys (the first `key_count`
@@ -332,6 +341,15 @@ pub enum GroupOut {
     Key(usize),
     /// The finalized aggregate at this slot.
     Agg(usize),
+    /// A correlated scalar subquery (by index into [`Program::subqueries`]),
+    /// evaluated against a synthetic row carrying this group's key values at
+    /// their source-column positions (B5c-2 over a grouped projection; only the
+    /// group keys are well-defined per group, so the guard admits it solely when
+    /// every outer reference is a group key).
+    Sub(usize),
+    /// A correlated `EXISTS`/`NOT EXISTS` subquery (subquery index, `negated`),
+    /// evaluated like [`GroupOut::Sub`].
+    SubExists(usize, bool),
 }
 
 /// The aggregate functions the VDBE can fold over a single-table scan.
@@ -1467,6 +1485,7 @@ fn emit_group_fold(
 /// aggregates (first-seen group order); a second pass then walks the groups,
 /// applies `HAVING`, projects, and (optionally) feeds a sorter for `ORDER BY`.
 /// `DISTINCT` and non-grouped output columns still fall back.
+#[allow(clippy::too_many_arguments)] // cohesive: the column space + boundaries + correlated gate
 fn compile_group_select(
     sel: &Select,
     columns: &[String],
@@ -1475,6 +1494,7 @@ fn compile_group_select(
     collations: &[Collation],
     projections: &[(Expr, String)],
     boundaries: Option<&[usize]>,
+    allow_correlated: bool,
 ) -> Result<Program> {
     // Group-key matching and min/max reduction compare under BINARY; a non-BINARY
     // column collation would diverge, so defer to the tree-walker. This guard also
@@ -1619,6 +1639,7 @@ fn compile_group_select(
             projections,
             &key_col_indices,
             boundaries,
+            allow_correlated,
         );
     }
 
@@ -2084,9 +2105,182 @@ fn compile_group_select(
     })
 }
 
-/// The compact plain-GROUP-BY path: every output column is a grouping key or a
-/// bare aggregate, with no HAVING/ORDER BY/LIMIT. Folds the scan and emits one
-/// row per group via [`Op::GroupEmit`].
+/// Collect every column reference in `e` (recursing into nested subqueries) into
+/// `out` as `(schema, table, name)`. Exhaustive over [`Expr`]; returns `Err` on a
+/// windowed function (its `OVER` partition/order columns are not walked) so the
+/// caller conservatively declines rather than silently missing a reference.
+fn collect_all_columns(
+    e: &Expr,
+    out: &mut Vec<(Option<String>, Option<String>, String)>,
+) -> core::result::Result<(), ()> {
+    match e {
+        Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::Column {
+            schema,
+            table,
+            column,
+            ..
+        } => out.push((schema.clone(), table.clone(), column.clone())),
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Paren(expr)
+        | Expr::Collate { expr, .. } => collect_all_columns(expr, out)?,
+        Expr::Binary { left, right, .. } => {
+            collect_all_columns(left, out)?;
+            collect_all_columns(right, out)?;
+        }
+        Expr::Function {
+            args,
+            filter,
+            order_by,
+            over,
+            ..
+        } => {
+            if over.is_some() {
+                return Err(());
+            }
+            for a in args {
+                collect_all_columns(a, out)?;
+            }
+            if let Some(f) = filter {
+                collect_all_columns(f, out)?;
+            }
+            for o in order_by {
+                collect_all_columns(&o.expr, out)?;
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_all_columns(expr, out)?;
+            for x in list {
+                collect_all_columns(x, out)?;
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_all_columns(expr, out)?;
+            collect_all_columns(low, out)?;
+            collect_all_columns(high, out)?;
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_all_columns(o, out)?;
+            }
+            for (w, t) in when_then {
+                collect_all_columns(w, out)?;
+                collect_all_columns(t, out)?;
+            }
+            if let Some(x) = else_result {
+                collect_all_columns(x, out)?;
+            }
+        }
+        Expr::RowValue(xs) => {
+            for x in xs {
+                collect_all_columns(x, out)?;
+            }
+        }
+        Expr::Subquery(s) => collect_select_columns(s, out)?,
+        Expr::Exists { select, .. } => collect_select_columns(select, out)?,
+        Expr::InSelect { expr, select, .. } => {
+            collect_all_columns(expr, out)?;
+            collect_select_columns(select, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Collect every column reference in a (sub)query `sel` into `out`. Returns `Err`
+/// on a compound/CTE/window-carrying/`FROM`-subquery shape the walker does not
+/// fully account for, so the caller conservatively declines.
+fn collect_select_columns(
+    sel: &Select,
+    out: &mut Vec<(Option<String>, Option<String>, String)>,
+) -> core::result::Result<(), ()> {
+    if !sel.compound.is_empty() || !sel.ctes.is_empty() || !sel.window_defs.is_empty() {
+        return Err(());
+    }
+    for rc in &sel.columns {
+        match rc {
+            ResultColumn::Expr { expr, .. } => collect_all_columns(expr, out)?,
+            ResultColumn::Wildcard | ResultColumn::TableWildcard(_) => {}
+        }
+    }
+    if let Some(f) = &sel.from {
+        // A subquery/TVF FROM source introduces its own scope the walker does not
+        // model; decline. A plain table reference contributes no columns here.
+        if f.first.subquery.is_some() {
+            return Err(());
+        }
+        for j in &f.joins {
+            if j.table.subquery.is_some() {
+                return Err(());
+            }
+            if let Some(on) = &j.on {
+                collect_all_columns(on, out)?;
+            }
+        }
+    }
+    if let Some(w) = &sel.where_clause {
+        collect_all_columns(w, out)?;
+    }
+    for g in &sel.group_by {
+        collect_all_columns(g, out)?;
+    }
+    if let Some(h) = &sel.having {
+        collect_all_columns(h, out)?;
+    }
+    for o in &sel.order_by {
+        collect_all_columns(&o.expr, out)?;
+    }
+    Ok(())
+}
+
+/// If `e` is a correlated scalar / `EXISTS` subquery whose every outer reference
+/// resolves to a group-key column, return the matching [`GroupOut`] (the subquery
+/// is to be stored at index `sub_index`); otherwise `None`, deferring to the
+/// tree-walker. Conservative on every axis: any structure
+/// [`collect_select_columns`] cannot fully account for, a three-part reference, or
+/// any outer reference to a non-key column yields `None`. An inner column (bound
+/// to the subquery's own `FROM`) does not resolve against the outer scope, so it
+/// is correctly ignored; a name that also collides with a non-key outer column
+/// resolves outward and conservatively declines.
+fn group_correlated_output(
+    c: &Compiler,
+    e: &Expr,
+    group_cols: &[usize],
+    sub_index: usize,
+) -> Option<GroupOut> {
+    let (sel, out) = match e {
+        Expr::Subquery(s) => (s.as_ref(), GroupOut::Sub(sub_index)),
+        Expr::Exists { select, negated } => {
+            (select.as_ref(), GroupOut::SubExists(sub_index, *negated))
+        }
+        _ => return None,
+    };
+    let mut cols = Vec::new();
+    collect_select_columns(sel, &mut cols).ok()?;
+    for (schema, table, name) in &cols {
+        if schema.is_some() {
+            return None;
+        }
+        if let Ok(idx) = c.resolve_column(table.as_deref(), name)
+            && !group_cols.contains(&idx)
+        {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// The compact plain-GROUP-BY path: every output column is a grouping key, a bare
+/// aggregate, or a group-key-only correlated subquery (via
+/// [`group_correlated_output`]), with no HAVING/ORDER BY/LIMIT. Folds the scan and
+/// emits one row per group via [`Op::GroupEmit`].
 #[allow(clippy::too_many_arguments)] // cohesive: the combined column space + boundaries
 fn compile_group_emit(
     sel: &Select,
@@ -2097,6 +2291,7 @@ fn compile_group_emit(
     projections: &[(Expr, String)],
     group_cols: &[usize],
     boundaries: Option<&[usize]>,
+    allow_correlated: bool,
 ) -> Result<Program> {
     let mut c = Compiler {
         ops: Vec::new(),
@@ -2109,7 +2304,7 @@ fn compile_group_emit(
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: boundaries.map(|b| b.to_vec()),
-        correlated_subqueries: false,
+        correlated_subqueries: allow_correlated,
         subqueries: Vec::new(),
     };
     // Classify each output column as a grouping-key reference or an aggregate.
@@ -2158,6 +2353,24 @@ fn compile_group_emit(
                     outputs.push(GroupOut::Key(group_cols.len() + r));
                 }
             }
+        } else if allow_correlated
+            && let Some(out) = group_correlated_output(&c, e, group_cols, c.subqueries.len())
+        {
+            // A correlated scalar / EXISTS subquery in the projection, admitted
+            // only when every outer reference is a group key (see
+            // `group_correlated_output`): its value is then well-defined per group
+            // (the group holds one value for each key), and the interpreter
+            // evaluates it against a synthetic row of the group's keys.
+            match e {
+                Expr::Subquery(sel) => c.subqueries.push(CorrelatedSub {
+                    select: (**sel).clone(),
+                }),
+                Expr::Exists { select, .. } => c.subqueries.push(CorrelatedSub {
+                    select: (**select).clone(),
+                }),
+                _ => unreachable!("group_correlated_output only matches subquery/exists"),
+            }
+            outputs.push(out);
         } else {
             return Err(Error::Unsupported(
                 "VDBE: GROUP BY output must be key or aggregate",
@@ -2186,10 +2399,19 @@ fn compile_group_emit(
     let group_keys: Vec<GroupKeySpec> = group_cols.iter().map(|&i| GroupKeySpec::Col(i)).collect();
     emit_group_fold(&mut c, sel, &group_keys, &repr_cols, &agg_specs)?;
 
+    let needs_sub = outputs
+        .iter()
+        .any(|o| matches!(o, GroupOut::Sub(_) | GroupOut::SubExists(..)));
     c.ops.push(Op::GroupEmit {
         outputs,
         key_count: group_cols.len(),
         agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _)| *k).collect(),
+        group_cols: if needs_sub {
+            group_cols.to_vec()
+        } else {
+            Vec::new()
+        },
+        n_cols: if needs_sub { columns.len() } else { 0 },
     });
     c.ops.push(Op::Halt);
     Ok(Program {
@@ -2262,6 +2484,7 @@ pub fn compile_table_select_opts(
             collations,
             &projections,
             None,
+            allow_correlated,
         );
     }
     // An all-aggregate projection (no GROUP BY) folds the scan into one row.
@@ -3105,6 +3328,10 @@ pub fn compile_group_join(
         collations,
         &projections,
         Some(boundaries),
+        // A grouped correlated subquery over a *join* is out of scope (the
+        // synthetic per-group row is single-source); the join grouped path never
+        // admits one.
+        false,
     )
 }
 
@@ -5676,6 +5903,8 @@ fn run_rows_multi_impl(
                 outputs,
                 key_count,
                 agg_kinds,
+                group_cols,
+                n_cols,
             } => {
                 sort_groups_by_key(&mut groups, *key_count);
                 for (key, accs) in groups.drain(..) {
@@ -5684,13 +5913,42 @@ fn run_rows_multi_impl(
                         .zip(accs)
                         .map(|(k, acc)| finalize_agg(*k, acc))
                         .collect::<Result<_>>()?;
-                    let row: Vec<Value> = outputs
-                        .iter()
-                        .map(|o| match o {
+                    // Lazily build the synthetic per-group outer row a correlated
+                    // subquery output evaluates against: the group's key values at
+                    // their source-column positions, every other column NULL (only
+                    // group keys are admitted as outer references, so no non-key
+                    // column is ever read). Built once per group, reused by each
+                    // subquery output.
+                    let mut group_row: Option<Vec<Value>> = None;
+                    let mut row: Vec<Value> = Vec::with_capacity(outputs.len());
+                    for o in outputs {
+                        let v = match o {
                             GroupOut::Key(i) => key[*i].clone(),
                             GroupOut::Agg(j) => finals[*j].clone(),
-                        })
-                        .collect();
+                            GroupOut::Sub(sub) | GroupOut::SubExists(sub, _) => {
+                                let eval = subquery_eval.ok_or(Error::Unsupported(
+                                    "VDBE: correlated subquery without evaluator",
+                                ))?;
+                                let gr = group_row.get_or_insert_with(|| {
+                                    let mut r = alloc::vec![Value::Null; *n_cols];
+                                    for (j, &sc) in group_cols.iter().enumerate() {
+                                        r[sc] = key[j].clone();
+                                    }
+                                    r
+                                });
+                                let cur = MaterializedCursor0::new(core::slice::from_ref(gr));
+                                let sel = &program.subqueries[*sub].select;
+                                match o {
+                                    GroupOut::SubExists(_, negated) => {
+                                        let found = eval.exists(sel, &cur)?;
+                                        Value::Integer((found ^ *negated) as i64)
+                                    }
+                                    _ => eval.scalar(sel, &cur)?,
+                                }
+                            }
+                        };
+                        row.push(v);
+                    }
                     out.push(row);
                 }
             }
