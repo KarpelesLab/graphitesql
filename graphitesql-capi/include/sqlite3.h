@@ -154,6 +154,26 @@ void *sqlite3_update_hook(sqlite3 *db,
 void *sqlite3_commit_hook(sqlite3 *db, int (*xCallback)(void *), void *pArg);
 void *sqlite3_rollback_hook(sqlite3 *db, void (*xCallback)(void *), void *pArg);
 
+/* Authorizer (statement-level) */
+#define SQLITE_DENY   1
+#define SQLITE_IGNORE 2
+#define SQLITE_CREATE_INDEX        1
+#define SQLITE_CREATE_TABLE        2
+#define SQLITE_CREATE_TRIGGER      7
+#define SQLITE_CREATE_VIEW         8
+#define SQLITE_DROP_INDEX         10
+#define SQLITE_DROP_TABLE         11
+#define SQLITE_DROP_TRIGGER       16
+#define SQLITE_DROP_VIEW          17
+#define SQLITE_PRAGMA             19
+#define SQLITE_READ_ACTION        20
+#define SQLITE_SELECT_ACTION      21
+#define SQLITE_TRANSACTION        22
+#define SQLITE_ALTER_TABLE        26
+int sqlite3_set_authorizer(sqlite3 *db,
+    int (*xAuth)(void *, int, const char *, const char *, const char *, const char *),
+    void *pUserData);
+
 /* Online backup (whole-image copy) */
 typedef struct sqlite3_backup sqlite3_backup;
 sqlite3_backup *sqlite3_backup_init(sqlite3 *pDest, const char *zDestName,

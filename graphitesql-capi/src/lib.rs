@@ -1778,6 +1778,56 @@ pub unsafe extern "C" fn sqlite3_rollback_hook(
     core::ptr::null_mut()
 }
 
+/// The C `sqlite3_set_authorizer` callback: `(pArg, action, arg1, arg2, dbName,
+/// triggerName) -> SQLITE_OK | SQLITE_DENY | SQLITE_IGNORE`. NULL string args are
+/// passed for absent values.
+type AuthorizerCb = Option<
+    unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+    ) -> c_int,
+>;
+
+/// Register an authorizer (`sqlite3_set_authorizer`): consulted while preparing a
+/// statement with an action code and up to two action-specific strings; returning
+/// `SQLITE_DENY` rejects the statement. A NULL callback removes the authorizer.
+/// Always returns `SQLITE_OK`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_set_authorizer(
+    db: *mut sqlite3,
+    cb: AuthorizerCb,
+    arg: *mut c_void,
+) -> c_int {
+    if db.is_null() {
+        return SQLITE_ERROR;
+    }
+    let db = unsafe { &mut *db };
+    match cb {
+        Some(f) => {
+            let a = arg as usize;
+            db.conn
+                .set_authorizer(move |action, a1, a2, dbn, trig| {
+                    // Convert each Option<&str> to a NUL-terminated C string kept
+                    // alive across the call; None → a null pointer.
+                    let c1 = a1.map(|s| CString::new(s).unwrap_or_default());
+                    let c2 = a2.map(|s| CString::new(s).unwrap_or_default());
+                    let c3 = dbn.map(|s| CString::new(s).unwrap_or_default());
+                    let c4 = trig.map(|s| CString::new(s).unwrap_or_default());
+                    let p = |c: &Option<CString>| {
+                        c.as_ref().map_or(core::ptr::null(), |s| s.as_ptr())
+                    };
+                    unsafe { f(a as *mut c_void, action, p(&c1), p(&c2), p(&c3), p(&c4)) }
+                });
+        }
+        None => db.conn.clear_authorizer(),
+    }
+    SQLITE_OK
+}
+
 // --- online backup ------------------------------------------------------------
 //
 // SQLite's backup API streams pages from a source database to a destination a

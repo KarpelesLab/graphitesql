@@ -93,6 +93,17 @@ static int ch_commits = 0, rh_rollbacks = 0, ch_veto = 0;
 static int commit_cb(void *arg) { (void)arg; ch_commits++; return ch_veto; }
 static void rollback_cb(void *arg) { (void)arg; rh_rollbacks++; }
 
+/* Authorizer: deny every write action (a read-only sandbox). */
+static int deny_writes_cb(void *arg, int action, const char *a1, const char *a2,
+                          const char *db, const char *trig) {
+  (void)arg; (void)a1; (void)a2; (void)db; (void)trig;
+  if (action == SQLITE_INSERT || action == SQLITE_UPDATE ||
+      action == SQLITE_DELETE || action == SQLITE_DROP_TABLE ||
+      action == SQLITE_CREATE_TABLE)
+    return SQLITE_DENY;
+  return SQLITE_OK;
+}
+
 int main(void) {
   sqlite3 *db = NULL;
   int rc = sqlite3_open(":memory:", &db);
@@ -446,6 +457,30 @@ int main(void) {
     sqlite3_finalize(bs);
     sqlite3_close(src);
     sqlite3_close(dst);
+  }
+
+  /* Authorizer: a read-only sandbox denies writes but allows reads. */
+  {
+    sqlite3 *az = NULL;
+    sqlite3_open(":memory:", &az);
+    sqlite3_exec(az, "CREATE TABLE s(a); INSERT INTO s VALUES(1),(2)", NULL, NULL, NULL);
+    sqlite3_set_authorizer(az, deny_writes_cb, NULL);
+    int rd = sqlite3_exec(az, "SELECT * FROM s", NULL, NULL, NULL);
+    CHECK("authorizer allows SELECT", rd == SQLITE_OK);
+    int wr = sqlite3_exec(az, "INSERT INTO s VALUES(3)", NULL, NULL, NULL);
+    CHECK("authorizer denies INSERT", wr != SQLITE_OK);
+    int dr = sqlite3_exec(az, "DROP TABLE s", NULL, NULL, NULL);
+    CHECK("authorizer denies DROP", dr != SQLITE_OK);
+    /* Clearing the authorizer re-allows writes. */
+    sqlite3_set_authorizer(az, NULL, NULL);
+    int wr2 = sqlite3_exec(az, "INSERT INTO s VALUES(3)", NULL, NULL, NULL);
+    CHECK("cleared authorizer allows INSERT", wr2 == SQLITE_OK);
+    sqlite3_stmt *cs = NULL;
+    sqlite3_prepare_v2(az, "SELECT count(*) FROM s", -1, &cs, NULL);
+    sqlite3_step(cs);
+    CHECK("only the allowed insert landed (3 rows)", sqlite3_column_int(cs, 0) == 3);
+    sqlite3_finalize(cs);
+    sqlite3_close(az);
   }
 
   /* Incremental BLOB I/O: open a cell, read it, overwrite a byte, verify. */

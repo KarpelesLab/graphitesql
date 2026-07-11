@@ -336,6 +336,64 @@ pub struct Connection {
     /// by the [`commit_hook`](Self::commit_hook)). `None` when unset.
     #[allow(clippy::type_complexity)]
     rollback_hook: core::cell::RefCell<Option<Box<dyn FnMut()>>>,
+    /// The authorizer callback, the equivalent of `sqlite3_set_authorizer`:
+    /// consulted while preparing a statement with the action code and up to two
+    /// action-specific string arguments (e.g. table and column). Returning
+    /// [`SQLITE_DENY`](AuthResult::Deny) rejects the statement; `SQLITE_OK` allows
+    /// it. `None` when unset.
+    #[allow(clippy::type_complexity)]
+    authorizer: core::cell::RefCell<
+        Option<Box<dyn FnMut(i32, Option<&str>, Option<&str>, Option<&str>, Option<&str>) -> i32>>,
+    >,
+}
+
+/// SQLite authorizer action codes (a subset covering the statement-level
+/// operations graphitesql authorizes). Passed to the callback registered with
+/// [`Connection::set_authorizer`].
+#[allow(missing_docs)]
+pub mod auth_action {
+    pub const CREATE_INDEX: i32 = 1;
+    pub const CREATE_TABLE: i32 = 2;
+    pub const CREATE_TEMP_INDEX: i32 = 3;
+    pub const CREATE_TEMP_TABLE: i32 = 4;
+    pub const CREATE_TEMP_TRIGGER: i32 = 5;
+    pub const CREATE_TEMP_VIEW: i32 = 6;
+    pub const CREATE_TRIGGER: i32 = 7;
+    pub const CREATE_VIEW: i32 = 8;
+    pub const DELETE: i32 = 9;
+    pub const DROP_INDEX: i32 = 10;
+    pub const DROP_TABLE: i32 = 11;
+    pub const DROP_TRIGGER: i32 = 16;
+    pub const DROP_VIEW: i32 = 17;
+    pub const INSERT: i32 = 18;
+    pub const PRAGMA: i32 = 19;
+    pub const READ: i32 = 20;
+    pub const SELECT: i32 = 21;
+    pub const TRANSACTION: i32 = 22;
+    pub const UPDATE: i32 = 23;
+    pub const ATTACH: i32 = 24;
+    pub const DETACH: i32 = 25;
+    pub const ALTER_TABLE: i32 = 26;
+    pub const REINDEX: i32 = 27;
+    pub const ANALYZE: i32 = 28;
+    pub const CREATE_VTABLE: i32 = 29;
+    pub const DROP_VTABLE: i32 = 30;
+    pub const FUNCTION: i32 = 31;
+    pub const SAVEPOINT: i32 = 32;
+}
+
+/// The result of an authorizer callback (`SQLITE_OK` / `SQLITE_DENY` /
+/// `SQLITE_IGNORE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthResult {
+    /// Allow the action (`SQLITE_OK`, 0).
+    Ok = 0,
+    /// Reject the whole statement with an authorization error (`SQLITE_DENY`, 1).
+    Deny = 1,
+    /// Disallow this action without failing the statement (`SQLITE_IGNORE`, 2).
+    /// graphitesql treats it like `Deny` for the statement-level actions it
+    /// authorizes (the read-column NULL substitution is not modeled).
+    Ignore = 2,
 }
 
 /// The kind of row change reported to an [update hook](Connection::register_update_hook).
@@ -489,6 +547,7 @@ impl Connection {
             update_hook: core::cell::RefCell::new(None),
             commit_hook: core::cell::RefCell::new(None),
             rollback_hook: core::cell::RefCell::new(None),
+            authorizer: core::cell::RefCell::new(None),
         })
     }
 
@@ -545,6 +604,7 @@ impl Connection {
             update_hook: core::cell::RefCell::new(None),
             commit_hook: core::cell::RefCell::new(None),
             rollback_hook: core::cell::RefCell::new(None),
+            authorizer: core::cell::RefCell::new(None),
         })
     }
 
@@ -3437,6 +3497,7 @@ impl Connection {
     /// Like [`query`](Self::query) but with bound parameters.
     pub fn query_params(&self, sql: &str, params: &Params) -> Result<QueryResult> {
         let stmt = sql::parse_one(sql)?;
+        self.run_authorizer(&stmt)?;
         // A bare autocommit `SELECT` takes a transient cross-process `Shared` lock for
         // the duration of the read (ROADMAP C9b-3), so a foreign process mid-write
         // can't be read torn. Acquired *before* revalidating the cache so the
@@ -4995,6 +5056,135 @@ impl Connection {
         }
     }
 
+    /// Register an authorizer callback — the equivalent of
+    /// `sqlite3_set_authorizer`. While preparing each statement the callback is
+    /// consulted with an [action code](auth_action) and up to two action-specific
+    /// string arguments (e.g. a table and column, or a pragma name and value),
+    /// plus the database name and the triggering trigger name (currently always
+    /// `Some("main")` and `None`). Returning `SQLITE_DENY` (1) rejects the whole
+    /// statement with an authorization error; `SQLITE_OK` (0) allows it.
+    /// `SQLITE_IGNORE` (2) is treated like `SQLITE_DENY` for the statement-level
+    /// actions authorized here.
+    ///
+    /// graphitesql authorizes the *statement-level* action of each statement
+    /// (`SELECT` / `INSERT` / `UPDATE` / `DELETE`, the `CREATE`/`DROP` family,
+    /// `ALTER`, `TRANSACTION`, `SAVEPOINT`, `PRAGMA`, `ATTACH`/`DETACH`,
+    /// `ANALYZE`, `REINDEX`) with its primary object name, plus a `READ` action
+    /// naming the table of a single-table `SELECT`. Per-column `READ` granularity
+    /// (and the `FUNCTION` code) is not modeled — enough to build a read-only or
+    /// per-table/operation sandbox, which is the common use.
+    ///
+    /// The callback is detached while it runs so it cannot recurse.
+    pub fn set_authorizer<F>(&self, cb: F)
+    where
+        F: FnMut(i32, Option<&str>, Option<&str>, Option<&str>, Option<&str>) -> i32 + 'static,
+    {
+        *self.authorizer.borrow_mut() = Some(Box::new(cb));
+    }
+
+    /// Remove any callback set by [`set_authorizer`](Self::set_authorizer).
+    pub fn clear_authorizer(&self) {
+        *self.authorizer.borrow_mut() = None;
+    }
+
+    /// Consult the authorizer for one action; `Err` (not authorized) when it
+    /// returns a non-zero code (`DENY`/`IGNORE`). A no-op returning `Ok` when no
+    /// authorizer is set. Detaches the callback while it runs so it cannot recurse.
+    fn authorize(&self, action: i32, arg1: Option<&str>, arg2: Option<&str>) -> Result<()> {
+        let taken = self.authorizer.borrow_mut().take();
+        let Some(mut cb) = taken else { return Ok(()) };
+        let rc = cb(action, arg1, arg2, Some("main"), None);
+        let mut slot = self.authorizer.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(cb);
+        }
+        drop(slot);
+        if rc == AuthResult::Ok as i32 {
+            Ok(())
+        } else {
+            Err(Error::Error("not authorized".into()))
+        }
+    }
+
+    /// Whether an authorizer is currently registered (a cheap pre-check so the
+    /// classification walk is skipped entirely on the common no-authorizer path).
+    fn has_authorizer(&self) -> bool {
+        self.authorizer.borrow().is_some()
+    }
+
+    /// Authorize a parsed statement before it runs, firing the authorizer for its
+    /// statement-level action(s). Returns the authorization error on a denial.
+    fn run_authorizer(&self, stmt: &Statement) -> Result<()> {
+        use auth_action as a;
+        if !self.has_authorizer() {
+            return Ok(());
+        }
+        match stmt {
+            Statement::Select(sel) => {
+                self.authorize(a::SELECT, None, None)?;
+                // A single-table SELECT also emits a `READ` for the table it reads
+                // (arg2 left empty — per-column granularity for joins/subqueries is
+                // not modeled), so a sandbox can deny reads of a specific table.
+                if let Some(from) = &sel.from
+                    && from.joins.is_empty()
+                    && from.first.subquery.is_none()
+                    && from.first.tvf_args.is_none()
+                    && !from.first.name.is_empty()
+                {
+                    self.authorize(a::READ, Some(&from.first.name), Some(""))?;
+                }
+            }
+            Statement::Insert(ins) => self.authorize(a::INSERT, Some(&ins.table), None)?,
+            Statement::Delete(del) => self.authorize(a::DELETE, Some(&del.table), None)?,
+            Statement::Update(upd) => {
+                for (col, _) in &upd.assignments {
+                    self.authorize(a::UPDATE, Some(&upd.table), Some(col))?;
+                }
+            }
+            Statement::CreateTable(ct) => self.authorize(a::CREATE_TABLE, Some(&ct.name), None)?,
+            Statement::CreateIndex(ci) => {
+                self.authorize(a::CREATE_INDEX, Some(&ci.name), Some(&ci.table))?
+            }
+            Statement::CreateView(cv) => self.authorize(a::CREATE_VIEW, Some(&cv.name), None)?,
+            Statement::CreateTrigger(ctr) => {
+                self.authorize(a::CREATE_TRIGGER, Some(&ctr.name), Some(&ctr.table))?
+            }
+            Statement::CreateVirtualTable(cvt) => {
+                self.authorize(a::CREATE_VTABLE, Some(&cvt.name), None)?
+            }
+            Statement::Drop(d) => {
+                let code = match d.kind {
+                    sql::ast::DropKind::Table => a::DROP_TABLE,
+                    sql::ast::DropKind::Index => a::DROP_INDEX,
+                    sql::ast::DropKind::View => a::DROP_VIEW,
+                    sql::ast::DropKind::Trigger => a::DROP_TRIGGER,
+                };
+                self.authorize(code, Some(&d.name), None)?;
+            }
+            Statement::Alter(al) => self.authorize(a::ALTER_TABLE, Some(&al.table), None)?,
+            Statement::Pragma(p) => self.authorize(a::PRAGMA, Some(&p.name), None)?,
+            Statement::Begin => self.authorize(a::TRANSACTION, Some("BEGIN"), None)?,
+            Statement::Commit => self.authorize(a::TRANSACTION, Some("COMMIT"), None)?,
+            Statement::Rollback => self.authorize(a::TRANSACTION, Some("ROLLBACK"), None)?,
+            Statement::Savepoint(name) => {
+                self.authorize(a::SAVEPOINT, Some("BEGIN"), Some(name))?
+            }
+            Statement::Release(name) => {
+                self.authorize(a::SAVEPOINT, Some("RELEASE"), Some(name))?
+            }
+            Statement::RollbackTo(name) => {
+                self.authorize(a::SAVEPOINT, Some("ROLLBACK"), Some(name))?
+            }
+            Statement::Attach { .. } => self.authorize(a::ATTACH, None, None)?,
+            Statement::Detach(name) => self.authorize(a::DETACH, Some(name), None)?,
+            Statement::Analyze(_) => self.authorize(a::ANALYZE, None, None)?,
+            Statement::Reindex { .. } => self.authorize(a::REINDEX, None, None)?,
+            // EXPLAIN / VACUUM and any other statement are not separately authorized.
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Fire the update hook (if any) for one row change. Takes the callback out
     /// for the duration of the call so a reentrant change does not double-borrow
     /// or recurse; restores it afterward unless the callback replaced it.
@@ -5031,6 +5221,7 @@ impl Connection {
     /// Like [`execute`](Self::execute) but with bound parameters.
     pub fn execute_params(&mut self, sql: &str, params: &Params) -> Result<usize> {
         let stmt = sql::parse_one(sql)?;
+        self.run_authorizer(&stmt)?;
         // Transaction control is handled directly (no autocommit around it).
         match &stmt {
             Statement::Begin => {
@@ -5694,6 +5885,7 @@ impl Connection {
     /// [`execute`](Self::execute) for those.
     pub fn execute_returning(&mut self, sql: &str, params: &Params) -> Result<QueryResult> {
         let stmt = sql::parse_one(sql)?;
+        self.run_authorizer(&stmt)?;
         let returning: &[ResultColumn] = match &stmt {
             Statement::Insert(i) => &i.returning,
             Statement::Update(u) => &u.returning,
