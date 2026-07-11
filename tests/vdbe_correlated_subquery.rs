@@ -286,3 +286,58 @@ fn correlated_subquery_over_derived_and_cte_source() {
         vec![vec![i(1)], vec![i(2)]],
     );
 }
+
+#[test]
+fn correlated_in_select_on_vdbe() {
+    let c = setup();
+    // A correlated `IN (SELECT …)` in WHERE runs on the VDBE (wrapped in a FROM-less
+    // scalar select and evaluated per outer row through the callback, so the exact
+    // NULL-aware IN semantics apply). The inner predicate correlates on `a.k`.
+    both(
+        &c,
+        "SELECT x FROM a WHERE 'twenty' IN (SELECT v FROM b WHERE b.p = a.k) ORDER BY x",
+        vec![vec![i(2)]],
+    );
+    // A correlated `IN (SELECT …)` in the projection.
+    both(
+        &c,
+        "SELECT x, k IN (SELECT p FROM b WHERE b.p = a.k) FROM a ORDER BY x",
+        vec![vec![i(1), i(1)], vec![i(2), i(1)], vec![i(3), i(0)]],
+    );
+    // `NOT IN`, correlated inner filter.
+    both(
+        &c,
+        "SELECT x FROM a WHERE k NOT IN (SELECT p FROM b WHERE b.v = 'twenty') ORDER BY x",
+        vec![vec![i(1)], vec![i(3)]],
+    );
+}
+
+#[test]
+fn correlated_in_select_null_semantics() {
+    // A NULL candidate makes `NOT IN` yield NULL (row excluded) and an unmatched
+    // `IN` yield NULL — the wrapper-through-scalar path must reproduce SQLite's
+    // three-valued IN exactly.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE a(x, k)").unwrap();
+    c.execute("INSERT INTO a VALUES(1,10),(2,20),(3,30)")
+        .unwrap();
+    c.execute("CREATE TABLE b(p, v)").unwrap();
+    c.execute("INSERT INTO b VALUES(10,'ten'),(NULL,'nullp')")
+        .unwrap();
+    // A NULL in the candidate set kills every `NOT IN` → empty result.
+    both(
+        &c,
+        "SELECT x FROM a WHERE k NOT IN (SELECT p FROM b) ORDER BY x",
+        vec![],
+    );
+    // `IN` is 1 on a match, NULL (not 0) when unmatched but a NULL candidate exists.
+    both(
+        &c,
+        "SELECT x, k IN (SELECT p FROM b) FROM a ORDER BY x",
+        vec![
+            vec![i(1), i(1)],
+            vec![i(2), Value::Null],
+            vec![i(3), Value::Null],
+        ],
+    );
+}

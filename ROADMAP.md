@@ -314,6 +314,14 @@ result or declines to it — never a wrong answer), so this track is
   carries a subquery, runs it through a `LiveSubqueryEval` over the source's columns — so a
   correlated scalar/`EXISTS` (per row) or a group-key correlated `GROUP BY` projection (per
   group) over a derived/CTE source runs on the VDBE instead of deferring.
+  *Correlated `IN (SELECT …)` (2026-07-11):* a correlated `expr [NOT] IN (SELECT …)` (the
+  non-correlated bare-column form is pre-folded to an `IN (list)` by the router) now runs on
+  the VDBE — `compile_expr` wraps the whole predicate in a FROM-less scalar `SELECT` routed
+  through the existing `CorrelatedScalar` op, so the tree-walker applies the exact NULL-aware
+  three-valued `IN` semantics against the outer frame (no new op/trait method). This also
+  lifts the former fallback for an unfolded compound-arm `IN (SELECT 'x' UNION SELECT a …)`:
+  wrapping preserves the candidate column's comparison affinity (the reason the router
+  declined to fold it), so it now runs correctly rather than deferring.
   (`GROUP BY`-**join** correlated, and non-key grouped references, still defer.)
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).

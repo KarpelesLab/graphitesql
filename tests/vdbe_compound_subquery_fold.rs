@@ -80,14 +80,20 @@ fn compound_subquery_folds_on_vdbe_and_matches_tree_walker() {
 }
 
 #[test]
-fn bare_column_compound_arm_falls_back() {
+fn bare_column_compound_arm_runs_via_correlated_in() {
     let c = conn();
     // One arm projects a bare column (`a`), so the compound candidate carries that
     // column's affinity — folding to a plain literal list would change comparison
-    // affinity, so it must defer to the tree-walker.
+    // affinity, so the router does NOT fold it. It is no longer a VDBE fallback,
+    // though: B5c-2's correlated-`IN (SELECT)` path wraps the whole predicate in a
+    // FROM-less scalar select evaluated per outer row through the tree-walker, which
+    // preserves the exact comparison affinity — so it runs on the VDBE with the
+    // correct result (byte-identical to the tree-walker, verified against sqlite in
+    // `compound_subquery_matches_sqlite3`'s sibling checks).
     let q = "SELECT g, n FROM t WHERE a IN (SELECT 'x' UNION SELECT a FROM t) ORDER BY g, n";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    let got = c.query_vdbe(q).expect("runs on the VDBE via correlated IN").rows;
+    let want = c.query(q).unwrap().rows;
+    assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
 }
 
 #[test]

@@ -5215,6 +5215,47 @@ impl Compiler {
                 }
                 Ok(())
             }
+            // A correlated `expr [NOT] IN (SELECT …)` (the non-correlated bare-column
+            // form is folded to an `IN (list)` by the router before compilation).
+            // Re-evaluate it per outer row through the callback: wrap the whole
+            // predicate in a FROM-less `SELECT <expr IN (SELECT …)>` and route it
+            // through the scalar-subquery op, so the tree-walker applies the exact
+            // NULL-aware `IN` semantics (true / false / NULL) against the outer
+            // frame. Only enabled on the live path (`allow_correlated`), where the
+            // callback is supplied; every other path bails at the catch-all below.
+            Expr::InSelect {
+                expr,
+                select,
+                negated,
+            } if self.correlated_subqueries => {
+                let wrapper = Select {
+                    ctes: Vec::new(),
+                    compound: Vec::new(),
+                    distinct: false,
+                    columns: alloc::vec![ResultColumn::Expr {
+                        expr: Expr::InSelect {
+                            expr: expr.clone(),
+                            select: select.clone(),
+                            negated: *negated,
+                        },
+                        alias: None,
+                        source: None,
+                    }],
+                    from: None,
+                    where_clause: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    window_defs: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    values_rows: 0,
+                };
+                let sub = self.subqueries.len();
+                self.subqueries.push(CorrelatedSub { select: wrapper });
+                self.ops.push(Op::CorrelatedScalar { sub, dest });
+                Ok(())
+            }
             _ => Err(Error::Unsupported("VDBE spike: this expression")),
         }
     }
