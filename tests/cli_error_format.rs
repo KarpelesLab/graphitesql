@@ -87,9 +87,12 @@ fn one_shot_error_rendering_matches_sqlite() {
         "CREATE TABLE t(a); SELECT a FROM t HAVING a>1", // HAVING on a non-aggregate query
         "SELECT 1 UNION SELECT 1,2",                     // compound arity mismatch
         "SELECT 1 INTERSECT SELECT 1,2",
-        "VALUES(1),(1,2)", // VALUES term-count mismatch
-        "REINDEX nope",    // unable to identify the object to be reindexed
-        "SELECT ?0",       // variable number must be between ?1 and ?32766
+        "VALUES(1),(1,2)",             // VALUES term-count mismatch
+        "REINDEX nope",                // unable to identify the object to be reindexed
+        "CREATE TEMP TABLE main.t(a)", // temporary table name must be unqualified
+        "CREATE TEMP VIEW main.v AS SELECT 1",
+        "CREATE TABLE x(a); CREATE TEMP TRIGGER main.tr AFTER INSERT ON x BEGIN SELECT 1; END", // trigger variant
+        "SELECT ?0", // variable number must be between ?1 and ?32766
         "SELECT ?40000",
         "SELECT ?9999999999999", // too large for u32, same range message
         "CREATE TABLE a(x); CREATE TABLE b(y); SELECT * FROM a JOIN b USING(x)", // USING col not in both

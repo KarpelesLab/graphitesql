@@ -60,6 +60,21 @@ pub fn parse_one(sql: &str) -> Result<Statement> {
 /// the string a virtual-table module receives. Module arguments are not SQL
 /// expressions — SQLite hands them over verbatim — so this reproduces the
 /// literal's value (e.g. `Integer(5)` → `"5"`, `Str("a")` → `"a"`).
+/// Resolve the schema qualifier of a `CREATE TEMP <object>`: an absent qualifier
+/// becomes the implicit `temp` database, an explicit `temp` is kept, and `main`
+/// (always a real, non-temp database) is rejected — sqlite requires a temporary
+/// object's name to be unqualified. An unknown attached-database qualifier is left
+/// as-is: the executor reports `unknown database <x>` for it, which sqlite also
+/// checks before the temp-qualification rule.
+fn temp_object_schema(schema: Option<String>, unqualified_msg: &str) -> Result<Option<String>> {
+    match schema.as_deref() {
+        None => Ok(Some("temp".into())),
+        Some(s) if s.eq_ignore_ascii_case("temp") => Ok(schema),
+        Some(s) if s.eq_ignore_ascii_case("main") => Err(Error::Parse(unqualified_msg.into())),
+        Some(_) => Ok(schema),
+    }
+}
+
 fn token_arg_text(tok: &Token) -> String {
     match tok {
         Token::Word(w) => w.clone(),
@@ -1629,8 +1644,11 @@ impl Parser {
                 return Err(self.err("UNIQUE is not valid for CREATE TABLE"));
             }
             let mut ct = self.create_table()?;
-            if temp && ct.schema.is_none() {
-                ct.schema = Some("temp".into());
+            if temp {
+                ct.schema = temp_object_schema(
+                    ct.schema.take(),
+                    "temporary table name must be unqualified",
+                )?;
             }
             return Ok(Statement::CreateTable(ct));
         }
@@ -1646,15 +1664,21 @@ impl Parser {
         }
         if self.eat_kw("view") {
             let mut cv = self.create_view()?;
-            if temp && cv.schema.is_none() {
-                cv.schema = Some("temp".into());
+            if temp {
+                cv.schema = temp_object_schema(
+                    cv.schema.take(),
+                    "temporary table name must be unqualified",
+                )?;
             }
             return Ok(Statement::CreateView(cv));
         }
         if self.eat_kw("trigger") {
             let mut ct = self.create_trigger()?;
-            if temp && ct.schema.is_none() {
-                ct.schema = Some("temp".into());
+            if temp {
+                ct.schema = temp_object_schema(
+                    ct.schema.take(),
+                    "temporary trigger may not have qualified name",
+                )?;
             }
             return Ok(Statement::CreateTrigger(ct));
         }
