@@ -165,6 +165,25 @@ fn correlated_subquery_over_inner_join() {
 }
 
 #[test]
+fn correlated_subquery_over_outer_join() {
+    let c = setup();
+    // A correlated scalar subquery over a LEFT join runs on the VDBE (the join is
+    // materialized, then the subquery re-evaluates per combined row; an unmatched
+    // left row still resolves its correlated outer column, e.g. a.k = 30 → 0).
+    both(
+        &c,
+        "SELECT a.x, (SELECT count(*) FROM b c WHERE c.p = a.k) \
+         FROM a LEFT JOIN b ON a.k = b.p ORDER BY a.x, b.v",
+        vec![
+            vec![i(1), i(1)],
+            vec![i(2), i(2)],
+            vec![i(2), i(2)],
+            vec![i(3), i(0)],
+        ],
+    );
+}
+
+#[test]
 fn noncorrelated_subqueries_unregressed() {
     let c = setup();
     // A non-correlated scalar subquery still folds and runs on the VDBE.

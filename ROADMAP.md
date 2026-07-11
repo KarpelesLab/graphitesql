@@ -288,13 +288,16 @@ result or declines to it — never a wrong answer), so this track is
   — so `a > (SELECT 1,2)` and `(SELECT u.a)` over a zero-row/filtered scan error
   exactly as SQLite, not silently accepted. `row_value_misuse` + `subquery_body_columns`
   green again; results byte-identical to the tree-walker (`tests/vdbe_correlated_subquery.rs`).
-  *Extended to inner joins (same day):* a correlated scalar/`EXISTS` subquery over an
-  `INNER`/comma join now runs on the VDBE too — the interpreter assembles the combined
-  multi-cursor row for the callback (`combined_join_row` +
-  `run_rows_multi_with_subqueries`); `compile_join2` opts in via `allow_correlated`, and
-  the post-success validation adds `validate_nested_ambiguity` so an ambiguous outer
-  reference inside a subquery is still rejected. LEFT/RIGHT/FULL-join and GROUP-BY-join
-  correlated subqueries still defer to the tree-walker (correct).
+  *Extended to ALL joins (same day):* a correlated scalar/`EXISTS` subquery now runs on
+  the VDBE over any join. An `INNER`/comma join uses the nested-loop path
+  (`compile_join2` + `allow_correlated`), assembling the combined multi-cursor row for
+  the callback (`combined_join_row`). A `LEFT`/`RIGHT`/`FULL`/`NATURAL`/`USING` join uses
+  the *materialized* path (`compile_table_select_opts(allow_correlated)` over the already-
+  combined rows), where cursor 0 is the combined row — the interpreter picks the source by
+  cursor count (`< 2` ⇒ cursor 0, else the assembled row). The post-success validation adds
+  `validate_nested_ambiguity` so an ambiguous outer reference inside a subquery is still
+  rejected. Byte-identical to the tree-walker across all join kinds
+  (`tests/vdbe_correlated_subquery.rs`). (`GROUP BY`-join correlated still defers.)
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).
 

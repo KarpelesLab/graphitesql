@@ -5747,11 +5747,14 @@ fn run_rows_multi_impl(
                     "VDBE: correlated subquery without evaluator",
                 ))?;
                 let sel = &program.subqueries[*sub].select;
-                // Single-cursor scan (`rowsets` empty): cursor 0 IS the outer row.
-                // A join (`rowsets` non-empty): the outer row is the combined
-                // multi-cursor row assembled from each cursor's current position
-                // (a null-padded cursor contributes NULLs).
-                regs[*dest] = if rowsets.is_empty() {
+                // A SINGLE-cursor program (`rowsets` empty for a live scan, or one
+                // materialized row-set — including a *materialized* join whose
+                // combined columns are cursor 0) advances only cursor 0, so `c0` IS
+                // the current outer row. A MULTI-cursor nested-loop join (≥ 2
+                // row-sets) advances the per-cursor `positions`, so the outer row is
+                // the combined row assembled from them (a null-padded cursor
+                // contributes NULLs).
+                regs[*dest] = if rowsets.len() < 2 {
                     eval.scalar(sel, c0)?
                 } else {
                     let combined = combined_join_row(rowsets, &positions, &null_flags);
@@ -5764,7 +5767,7 @@ fn run_rows_multi_impl(
                     "VDBE: correlated subquery without evaluator",
                 ))?;
                 let sel = &program.subqueries[*sub].select;
-                let found = if rowsets.is_empty() {
+                let found = if rowsets.len() < 2 {
                     eval.exists(sel, c0)?
                 } else {
                     let combined = combined_join_row(rowsets, &positions, &null_flags);

@@ -2305,8 +2305,19 @@ impl Connection {
             if validate_unambiguous_columns(sel, &join_cols, &|t| t.into()).is_err() {
                 return Err(Error::Unsupported("VDBE: ambiguous column name"));
             }
-            let prog = vdbe::compile_table_select(sel, &names, &tabs, &affs, &colls, false)?;
-            let result = vdbe::run_rows(&prog, &rows)?;
+            // The join is materialized into `rows` (a single cursor 0 over the
+            // combined columns), so a correlated scalar/EXISTS subquery can be
+            // re-evaluated per combined row through the callback (B5c-2 over any
+            // materialized join — inner/outer/NATURAL/USING alike); the combined
+            // schema is its outer scope.
+            let prog =
+                vdbe::compile_table_select_opts(sel, &names, &tabs, &affs, &colls, false, true)?;
+            let eval = LiveSubqueryEval {
+                conn: self,
+                columns: &join_cols,
+                rowid_index: None,
+            };
+            let result = vdbe::run_rows_multi_with_subqueries(&prog, &[&rows], &eval)?;
             return Ok(QueryResult {
                 columns: prog.columns,
                 rows: result,
