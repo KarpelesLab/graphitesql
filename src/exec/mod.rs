@@ -3909,7 +3909,9 @@ impl Connection {
             // registers no custom collations).
             "collation_list" => Ok(QueryResult {
                 columns: alloc::vec!["seq".into(), "name".into()],
-                rows: ["RTRIM", "NOCASE", "BINARY"]
+                // SQLite lists the built-in collations `BINARY`, `NOCASE`, `RTRIM`
+                // in that order (seq 0..); graphite implements exactly these three.
+                rows: ["BINARY", "NOCASE", "RTRIM"]
                     .iter()
                     .enumerate()
                     .map(|(i, n)| alloc::vec![Value::Integer(i as i64), Value::Text((*n).into())])

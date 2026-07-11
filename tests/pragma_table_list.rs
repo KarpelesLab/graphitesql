@@ -99,10 +99,20 @@ fn collation_list_reports_builtins() {
             other => format!("{other:?}"),
         })
         .collect();
-    // graphite implements exactly the three built-in collating sequences.
-    let mut sorted = names.clone();
-    sorted.sort();
-    assert_eq!(sorted, vec!["BINARY", "NOCASE", "RTRIM"]);
+    // graphite implements exactly the three built-in collating sequences, listed
+    // in sqlite's order (`BINARY`, `NOCASE`, `RTRIM`) with sequential ids.
+    assert_eq!(names, vec!["BINARY", "NOCASE", "RTRIM"]);
+    let seqs: Vec<i64> = c
+        .query("PRAGMA collation_list")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| match r[0] {
+            Value::Integer(n) => n,
+            ref other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(seqs, vec![0, 1, 2]);
 }
 
 #[test]
