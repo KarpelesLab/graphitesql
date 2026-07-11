@@ -88,6 +88,8 @@ fn one_shot_error_rendering_matches_sqlite() {
         "SELECT 1 UNION SELECT 1,2",                     // compound arity mismatch
         "SELECT 1 INTERSECT SELECT 1,2",
         "VALUES(1),(1,2)", // VALUES term-count mismatch
+        "REINDEX nope",    // unable to identify the object to be reindexed
+        "CREATE TABLE a(x); CREATE TABLE b(y); SELECT * FROM a JOIN b USING(x)", // USING col not in both
         "CREATE TABLE t(a PRIMARY KEY, b PRIMARY KEY)",
         "SELECT count(*) OVER ()",
         "SELECT",
