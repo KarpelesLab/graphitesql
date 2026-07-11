@@ -328,6 +328,15 @@ result or declines to it — never a wrong answer), so this track is
   `GroupEmit` machinery apply; `compile_group_join` threads `allow_correlated` and the caller
   supplies a `LiveSubqueryEval` over the combined columns. Non-key grouped references (whose
   per-group value is unspecified) still defer to the tree-walker.
+  *Extended to the general grouped path — HAVING / ORDER BY (2026-07-11):* a group-key-correlated
+  scalar/`EXISTS` subquery in `HAVING`, in an `ORDER BY` key, or in a projection on the *general*
+  grouped path (the second pass over finalized groups: `HAVING`/`ORDER BY`/`LIMIT`/`DISTINCT`)
+  now runs on the VDBE. New `Op::GroupCorrelatedScalar` / `GroupCorrelatedExists` build the
+  synthetic per-group row from the current group's key vector (`emit_groups[gcursor]`) placed at
+  their source-column positions; the compiler sets `group_emit_keys` before the emit body (gated
+  on all-bare-column keys and no single-min/max representative rule), and `compile_expr`'s
+  subquery arms emit the group op after the same group-key-only guard. Non-key references bail.
+  Byte-identical to sqlite (`grouped_correlated_in_having_and_order_by`).
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).
 

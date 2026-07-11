@@ -298,6 +298,29 @@ pub enum Op {
         negated: bool,
         dest: usize,
     },
+    /// Like [`Op::CorrelatedScalar`], but emitted in the *general* grouped path's
+    /// second-pass body (over finalized groups, no scan row). The interpreter
+    /// builds a synthetic outer row from the current group's key values — placed at
+    /// their source-column positions (`Compiler::group_emit_keys`, captured in the
+    /// op), all else NULL — and evaluates the subquery against it. Admitted only
+    /// when every outer reference is a group key, so that synthetic row is complete.
+    GroupCorrelatedScalar {
+        sub: usize,
+        dest: usize,
+        /// Source-column index of each group key (parallel to the group's key
+        /// vector); the key value is placed here in the synthetic row.
+        group_cols: Vec<usize>,
+        /// Width of the synthetic row (the source column count).
+        n_cols: usize,
+    },
+    /// The `[NOT] EXISTS` analogue of [`Op::GroupCorrelatedScalar`].
+    GroupCorrelatedExists {
+        sub: usize,
+        negated: bool,
+        dest: usize,
+        group_cols: Vec<usize>,
+        n_cols: usize,
+    },
     /// Stop execution.
     Halt,
 }
@@ -583,6 +606,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         cursor_boundaries: None,
         correlated_subqueries: false,
         subqueries: Vec::new(),
+        group_emit_keys: Vec::new(),
     };
     // A FROM-less `SELECT … WHERE <pred>` evaluates the predicate once over the
     // single (rowless) row and emits the projection only when it is true; a NULL
@@ -1109,6 +1133,7 @@ fn compile_aggregate_select(
         cursor_boundaries: None,
         correlated_subqueries: false,
         subqueries: Vec::new(),
+        group_emit_keys: Vec::new(),
     };
     let rewind = c.ops.len();
     c.ops.push(Op::Rewind { target: 0 });
@@ -1524,6 +1549,7 @@ fn compile_group_select(
         cursor_boundaries: boundaries.map(|b| b.to_vec()),
         correlated_subqueries: false,
         subqueries: Vec::new(),
+        group_emit_keys: Vec::new(),
     };
     // Resolve each grouping key. A bare column becomes a (combined) column index;
     // any other expression is kept and evaluated per row in the fold (its value
@@ -1933,6 +1959,16 @@ fn compile_group_select(
     // bare non-grouped column the collector did not pre-bind cannot be read here —
     // forbid raw column reads so it bails and the tree-walker handles it.
     c.forbid_raw_columns = true;
+    // Admit a group-key-only correlated scalar/`EXISTS` subquery in the
+    // projection / HAVING / ORDER BY, evaluated against a synthetic row of the
+    // group's key values (`Op::GroupCorrelatedScalar` / `…Exists`). Requires every
+    // group key to be a bare source column (so a key position maps to a source
+    // column) and the single-min/max representative rule to be inactive (so the
+    // stored key vector holds each group's true key values); otherwise the
+    // subquery arm bails and the tree-walker handles it.
+    if allow_correlated && all_col_keys && !single_minmax {
+        c.group_emit_keys = key_col_indices.clone();
+    }
     // Project the output row into the contiguous output block first, so HAVING
     // (and ORDER BY) can reference output aliases — matching the tree-walker,
     // where a HAVING/ORDER-BY name that isn't a table column resolves to the
@@ -2262,19 +2298,32 @@ fn group_correlated_output(
         }
         _ => return None,
     };
+    subquery_refs_only_group_keys(c, sel, group_cols).then_some(out)
+}
+
+/// Whether every column reference in subquery `sel` either stays inside the
+/// subquery's own scope (does not resolve against the outer `c.columns`) or
+/// resolves to one of the `group_cols` group-key columns — the condition under
+/// which the subquery's value is well-defined for each group (evaluable against a
+/// synthetic row of the group's keys). Conservative: a shape
+/// [`collect_select_columns`] cannot fully account for, a three-part reference, or
+/// any outer reference to a non-key column returns `false`.
+fn subquery_refs_only_group_keys(c: &Compiler, sel: &Select, group_cols: &[usize]) -> bool {
     let mut cols = Vec::new();
-    collect_select_columns(sel, &mut cols).ok()?;
+    if collect_select_columns(sel, &mut cols).is_err() {
+        return false;
+    }
     for (schema, table, name) in &cols {
         if schema.is_some() {
-            return None;
+            return false;
         }
         if let Ok(idx) = c.resolve_column(table.as_deref(), name)
             && !group_cols.contains(&idx)
         {
-            return None;
+            return false;
         }
     }
-    Some(out)
+    true
 }
 
 /// The compact plain-GROUP-BY path: every output column is a grouping key, a bare
@@ -2306,6 +2355,7 @@ fn compile_group_emit(
         cursor_boundaries: boundaries.map(|b| b.to_vec()),
         correlated_subqueries: allow_correlated,
         subqueries: Vec::new(),
+        group_emit_keys: Vec::new(),
     };
     // Classify each output column as a grouping-key reference or an aggregate.
     // Column refs resolve through `resolve_column` (qualifier-aware) so a join's
@@ -2530,6 +2580,7 @@ pub fn compile_table_select_opts(
         cursor_boundaries: None,
         correlated_subqueries: allow_correlated,
         subqueries: Vec::new(),
+        group_emit_keys: Vec::new(),
     };
     // Optional LIMIT (constant integer only): a counter register decremented
     // after each emitted row, halting the loop at zero.
@@ -2930,6 +2981,7 @@ pub fn compile_join2(
         cursor_boundaries: Some(boundaries.to_vec()),
         correlated_subqueries: allow_correlated,
         subqueries: Vec::new(),
+        group_emit_keys: Vec::new(),
     };
     // LIMIT / OFFSET counters (constant integer only; negative LIMIT = unlimited,
     // non-positive OFFSET = none).
@@ -3200,6 +3252,7 @@ pub fn compile_aggregate_join(
         cursor_boundaries: Some(boundaries.to_vec()),
         correlated_subqueries: false,
         subqueries: Vec::new(),
+        group_emit_keys: Vec::new(),
     };
     // N-deep nested loop (cursor 0 outermost), as in `compile_join2`.
     let mut rewind_at = alloc::vec![0usize; n];
@@ -3409,6 +3462,7 @@ pub fn compile_left_join2(
         cursor_boundaries: Some(alloc::vec![n_left, columns.len()]),
         correlated_subqueries: false,
         subqueries: Vec::new(),
+        group_emit_keys: Vec::new(),
     };
     let limit_reg = match &sel.limit {
         None => None,
@@ -3825,6 +3879,7 @@ pub fn compile_full_join2(
         cursor_boundaries: Some(alloc::vec![n_left, columns.len()]),
         correlated_subqueries: false,
         subqueries: Vec::new(),
+        group_emit_keys: Vec::new(),
     };
     let limit_reg = match &sel.limit {
         None => None,
@@ -4333,6 +4388,7 @@ pub fn compile_left_join_n(
         cursor_boundaries: Some(boundaries.to_vec()),
         correlated_subqueries: false,
         subqueries: Vec::new(),
+        group_emit_keys: Vec::new(),
     };
     let limit_reg = match &sel.limit {
         None => None,
@@ -4507,6 +4563,15 @@ struct Compiler {
     /// Correlated subqueries registered by the compiler (parallel to the `sub`
     /// index in the emitted ops); moved into [`Program::subqueries`].
     subqueries: Vec<CorrelatedSub>,
+    /// When non-empty, the compiler is emitting the *general* grouped path's
+    /// second-pass body (over finalized groups, no scan row), and these are the
+    /// source-column indices of the group keys (all bare columns). A correlated
+    /// scalar/`EXISTS` subquery referencing only those keys then compiles to a
+    /// [`Op::GroupCorrelatedScalar`] / [`Op::GroupCorrelatedExists`] callback op,
+    /// which the interpreter evaluates against a synthetic row built from the
+    /// current group's key values. Empty everywhere else, so the ordinary
+    /// [`Op::CorrelatedScalar`] path (or a bail) applies.
+    group_emit_keys: Vec<usize>,
 }
 
 impl Compiler {
@@ -5079,6 +5144,27 @@ impl Compiler {
                 // to the tree-walker. Only enabled on the live path (`allow_correlated`),
                 // where the callback is supplied; every other path keeps the inline
                 // const grammar below.
+                // General grouped path second-pass body: evaluate against a
+                // synthetic row of the current group's keys, admitted only when
+                // every outer reference is a group key (see `group_emit_keys`).
+                if !self.group_emit_keys.is_empty() {
+                    if !subquery_refs_only_group_keys(self, sel, &self.group_emit_keys) {
+                        return Err(Error::Unsupported(
+                            "VDBE: grouped correlated subquery references a non-key column",
+                        ));
+                    }
+                    let sub = self.subqueries.len();
+                    self.subqueries.push(CorrelatedSub {
+                        select: (**sel).clone(),
+                    });
+                    self.ops.push(Op::GroupCorrelatedScalar {
+                        sub,
+                        dest,
+                        group_cols: self.group_emit_keys.clone(),
+                        n_cols: self.columns.len(),
+                    });
+                    return Ok(());
+                }
                 if self.correlated_subqueries {
                     let sub = self.subqueries.len();
                     self.subqueries.push(CorrelatedSub {
@@ -5147,6 +5233,27 @@ impl Compiler {
                 select: sel,
                 negated,
             } => {
+                // General grouped path second-pass body (see the `Expr::Subquery`
+                // arm): a group-key-only correlated EXISTS over a synthetic group row.
+                if !self.group_emit_keys.is_empty() {
+                    if !subquery_refs_only_group_keys(self, sel, &self.group_emit_keys) {
+                        return Err(Error::Unsupported(
+                            "VDBE: grouped correlated subquery references a non-key column",
+                        ));
+                    }
+                    let sub = self.subqueries.len();
+                    self.subqueries.push(CorrelatedSub {
+                        select: (**sel).clone(),
+                    });
+                    self.ops.push(Op::GroupCorrelatedExists {
+                        sub,
+                        negated: *negated,
+                        dest,
+                        group_cols: self.group_emit_keys.clone(),
+                        n_cols: self.columns.len(),
+                    });
+                    return Ok(());
+                }
                 // Live single-table scan (B5c-2): re-evaluate per outer row through
                 // the callback, so a correlated `EXISTS`/`NOT EXISTS` resolves its
                 // outer reference (see the `Expr::Subquery` arm above).
@@ -6079,10 +6186,60 @@ fn run_rows_multi_impl(
                 };
                 regs[*dest] = Value::Integer((found ^ *negated) as i64);
             }
+            Op::GroupCorrelatedScalar {
+                sub,
+                dest,
+                group_cols,
+                n_cols,
+            } => {
+                let eval = subquery_eval.ok_or(Error::Unsupported(
+                    "VDBE: correlated subquery without evaluator",
+                ))?;
+                let row = group_emit_synthetic_row(&emit_groups, gcursor, group_cols, *n_cols);
+                let cur = MaterializedCursor0::new(core::slice::from_ref(&row));
+                regs[*dest] = eval.scalar(&program.subqueries[*sub].select, &cur)?;
+            }
+            Op::GroupCorrelatedExists {
+                sub,
+                negated,
+                dest,
+                group_cols,
+                n_cols,
+            } => {
+                let eval = subquery_eval.ok_or(Error::Unsupported(
+                    "VDBE: correlated subquery without evaluator",
+                ))?;
+                let row = group_emit_synthetic_row(&emit_groups, gcursor, group_cols, *n_cols);
+                let cur = MaterializedCursor0::new(core::slice::from_ref(&row));
+                let found = eval.exists(&program.subqueries[*sub].select, &cur)?;
+                regs[*dest] = Value::Integer((found ^ *negated) as i64);
+            }
             Op::Halt => break,
         }
     }
     Ok(out)
+}
+
+/// Build the synthetic outer row a general-grouped-path correlated subquery is
+/// evaluated against: the current group's key values (`emit_groups[gcursor].0`)
+/// placed at their source-column positions (`group_cols`), every other column
+/// NULL. Width `n_cols` (the source column count). Only group keys are admitted as
+/// outer references, so no NULL column is ever read.
+fn group_emit_synthetic_row(
+    emit_groups: &[(Vec<Value>, Vec<Value>)],
+    gcursor: usize,
+    group_cols: &[usize],
+    n_cols: usize,
+) -> Vec<Value> {
+    let mut row = alloc::vec![Value::Null; n_cols];
+    if let Some((key, _)) = emit_groups.get(gcursor) {
+        for (k, &sc) in group_cols.iter().enumerate() {
+            if let (Some(v), true) = (key.get(k), sc < n_cols) {
+                row[sc] = v.clone();
+            }
+        }
+    }
+    row
 }
 
 /// Finalize an aggregate slot, matching the tree-walker's semantics exactly:

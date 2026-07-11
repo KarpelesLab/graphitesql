@@ -251,6 +251,42 @@ fn grouped_correlated_scalar_in_projection() {
 }
 
 #[test]
+fn grouped_correlated_in_having_and_order_by() {
+    // The general grouped path (HAVING / ORDER BY / LIMIT / DISTINCT) also runs a
+    // group-key-correlated subquery — via the second-pass `GroupCorrelatedScalar` /
+    // `GroupCorrelatedExists` ops, evaluated against a synthetic row of the group's
+    // keys. `a` has two rows with k=20, so that group's count(*) is 2.
+    let mut c = setup();
+    c.execute("INSERT INTO a VALUES(4,20)").unwrap();
+    // A correlated scalar subquery in HAVING.
+    both(
+        &c,
+        "SELECT k, count(*) FROM a GROUP BY k HAVING (SELECT count(*) FROM b WHERE b.p = a.k) > 0",
+        vec![vec![i(10), i(1)], vec![i(20), i(2)]],
+    );
+    // A correlated EXISTS in HAVING.
+    both(
+        &c,
+        "SELECT k FROM a GROUP BY k HAVING EXISTS (SELECT 1 FROM b WHERE b.p = a.k)",
+        vec![vec![i(10)], vec![i(20)]],
+    );
+    // A correlated subquery as an ORDER BY key (general path via `has_order`).
+    both(
+        &c,
+        "SELECT k, count(*) FROM a GROUP BY k \
+         ORDER BY (SELECT count(*) FROM b WHERE b.p = a.k), k",
+        vec![vec![i(30), i(1)], vec![i(10), i(1)], vec![i(20), i(2)]],
+    );
+    // A non-key correlated reference in HAVING still declines to the tree-walker.
+    let q = "SELECT k FROM a GROUP BY k HAVING (SELECT count(*) FROM b WHERE b.p = a.x) > 0";
+    assert!(
+        c.query_vdbe(q).is_err(),
+        "non-key HAVING ref must fall back"
+    );
+    assert_eq!(c.query(q).unwrap().rows, Vec::<Vec<Value>>::new());
+}
+
+#[test]
 fn grouped_correlated_nonkey_ref_falls_back() {
     let c = setup();
     // A correlated subquery in a GROUP BY projection that references a NON-key
