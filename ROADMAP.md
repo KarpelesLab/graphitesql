@@ -261,6 +261,19 @@ result or declines to it — never a wrong answer), so this track is
 
 **Move the last shapes onto the VDBE:**
 
+- **B-groupby-collate — collation-aware `GROUP BY` on the VDBE. DONE 2026-07-12.**
+  `GROUP BY` over a non-BINARY declared-collation key (`NOCASE`/`RTRIM`/custom) now
+  runs on the VDBE: `GroupStep` matches group identity and tracks the min/max
+  companion under per-key collations, and `sort_groups_by_key` emits the groups in
+  collation-sorted order (`cmp_values_coll`). Safe by construction — all-BINARY keys
+  are byte-identical (`distinct_eq_coll(_,Binary)==distinct_eq`,
+  `cmp_values_coll(_,Binary)==cmp_values`), so only previously-deferring queries
+  change. The blanket bail is narrowed to defer only what still folds under BINARY:
+  a `SELECT DISTINCT … GROUP BY` post-group dedup, or a `has_collation_sensitive_
+  aggregate` (`DISTINCT`/ordered aggregate, single-arg `min`/`max`); a
+  computed/explicit-`COLLATE` group key still defers. Differential vs sqlite3 3.50.4
+  across multi-key/NULL-group/HAVING/WHERE/DESC/join grouping
+  (`tests/vdbe_group_collate.rs`).
 - **B-distinct-collate — collation-aware single-table `DISTINCT` on the VDBE. DONE
   2026-07-12.** A `SELECT DISTINCT` over a single-table scan whose projected columns
   carry a non-BINARY collation used to defer (the VDBE's `DistinctCheck` compared
