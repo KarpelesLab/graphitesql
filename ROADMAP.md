@@ -693,11 +693,24 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   `render_cli_error` in `src/bin/graphitesql.rs`: the caret token is located by a
   string/comment-skipping text search of the failed statement, and prepare-vs-step
   is decided by an *inverted* classification (a small stable set of step errors;
-  everything else is prepare). Interactive/piped mode keeps the plain one-line form
-  (SQLite uses a different `Parse error near line N:` format there). *Residuals
+  everything else is prepare). *Residuals
   (rare; the differential corpus strips carets):* a repeated-operator token (`===`)
   whose exact offset only the parser knows, and the long-line source *windowing* the
   sqlite shell applies past ~column 53.
+- **CLI-2b — script/piped error *text*. DONE 2026-07-11.** The piped/`.read`/
+  interactive path now renders the sqlite shell's *script* wording — `Parse error
+  near line N: <msg>` (with the whitespace-collapsed statement and a `^--- error
+  here` caret) for a prepare error, and `Runtime error near line N: <msg> (<code>)`
+  for a step error — instead of the old plain `Error: error: <msg>`. `N` is the
+  1-based input line the failing statement begins on: the REPL/`feed_reader` loops
+  count input lines and record each group's start, and `run_sql_batch` maps the
+  failing statement back to its line by locating it within the group. Reuses the
+  same prepare-vs-step classification and caret geometry as CLI-2 (`render_script_
+  error` beside `render_cli_error`). Byte-exact vs sqlite3 3.50.4 on stdout *and*
+  stderr (compared separately — buffered stdout and unbuffered stderr interleave
+  differently when merged) across an 8-script corpus incl. mid-script errors,
+  multi-line-statement carets, and the (19)-coded runtime error
+  (`tests/cli_error_format.rs::script_mode_error_rendering_matches_sqlite`).
 - **CLI-3 — `.echo` per-input-line. DONE 2026-07-10.** `.echo on` now echoes
   dot-command input lines too (the command turning echo on is not itself echoed),
   byte-identical to sqlite3 (`tests/cli_dot_commands.rs::echo_includes_dot_command_lines`).

@@ -13,10 +13,36 @@
 
 #![cfg(feature = "std")]
 
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 fn sqlite3_available() -> bool {
     Command::new("sqlite3").arg("--version").output().is_ok()
+}
+
+/// Run `script` on stdin (piped, non-interactive), returning `(stdout, stderr)`
+/// captured separately — the two streams must be compared independently because a
+/// buffered-stdout result and an unbuffered-stderr error interleave differently
+/// across shells when merged.
+fn piped(bin: &str, script: &str) -> (String, String) {
+    let mut child = Command::new(bin)
+        .arg(":memory:")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&o.stdout).trim_end().to_string(),
+        String::from_utf8_lossy(&o.stderr).trim_end().to_string(),
+    )
 }
 
 fn out(bin: &str, sql: &str) -> String {
@@ -79,5 +105,41 @@ fn one_shot_error_rendering_matches_sqlite() {
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
+    }
+}
+
+#[test]
+fn script_mode_error_rendering_matches_sqlite() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    // Piped/script mode uses a different wording from the one-shot path: `Parse
+    // error near line N: <msg>` (+ caret) for a prepare error, `Runtime error near
+    // line N: <msg> (<code>)` for a step error. `N` is the input line the failing
+    // statement begins on; a multi-line statement is whitespace-collapsed under the
+    // caret. Both stdout and stderr must match (compared separately — see `piped`).
+    let scripts = [
+        // Prepare error mid-script; execution continues afterwards.
+        "SELECT 1;\nSELECT 2;\nSELET bad;\nSELECT 3;\n",
+        // Prepare error without a caret (no source position).
+        "SELECT 1;\nSELECT * FROM nope;\n",
+        // A blank leading line shifts the reported line number.
+        "\nSELECT * FROM nope;\n",
+        // Runtime (constraint) error carries the (19) code.
+        "CREATE TABLE t(a UNIQUE);\nINSERT INTO t VALUES(1);\nINSERT INTO t VALUES(1);\n",
+        // A multi-line statement is collapsed to one line under the caret, and the
+        // line number is where the statement *begins*.
+        "SELECT\n1\n,\nnope.bad;\n",
+        // Two statements on one line: the second's error still reports that line.
+        "CREATE TABLE t(a);\nSELECT 1; SELECT bad.col;\n",
+        // A long statement uses the right-anchored `error here ---^` caret form.
+        "SELECT aaaaaaaaaaaaaaaaaaaaaaaaaaaa FROM x SELET;\n",
+        // No error → identical (regression guard on the happy path).
+        "CREATE TABLE t(a,b);\nINSERT INTO t VALUES(1,'x');\nSELECT * FROM t;\n",
+    ];
+    for s in scripts {
+        assert_eq!(piped("sqlite3", s), piped(g, s), "for script {s:?}");
     }
 }

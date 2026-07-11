@@ -84,7 +84,7 @@ fn main() {
         // One-shot mode: run each argument batch, exiting non-zero on the first
         // error (like the `sqlite3` shell).
         for sql in scripts {
-            if let Err((e, stmt)) = shell.run_sql_batch(&mut conn, sql) {
+            if let Err((e, stmt, _line)) = shell.run_sql_batch(&mut conn, sql, 1) {
                 eprintln!("{}", render_cli_error(&stmt, &e));
                 std::process::exit(1);
             }
@@ -211,6 +211,10 @@ impl Shell {
         }
         let stdin = io::stdin();
         let mut buffer = String::new();
+        // 1-based input line counter, and the line at which the current buffer began
+        // — used to render `… near line N …` errors like the SQLite shell.
+        let mut input_line = 0usize;
+        let mut group_start_line = 1usize;
 
         loop {
             if interactive {
@@ -232,6 +236,7 @@ impl Shell {
                     break;
                 }
             }
+            input_line += 1;
 
             let trimmed = line.trim();
             // Dot-commands are only recognized at the start of a fresh buffer.
@@ -248,11 +253,15 @@ impl Shell {
                 continue;
             }
 
+            // Remember the line the current statement group begins on.
+            if buffer.is_empty() {
+                group_start_line = input_line;
+            }
             buffer.push_str(&line);
             // Execute once the accumulated input contains a complete statement.
             if buffer.trim_end().ends_with(';') {
                 let sql = std::mem::take(&mut buffer);
-                self.run_group(conn, &sql);
+                self.run_group(conn, &sql, group_start_line);
             }
         }
         // Non-interactive (piped) input: exit non-zero if any error occurred,
@@ -269,6 +278,8 @@ impl Shell {
     /// the `.read` command. Returns `true` if a `.quit`/`.exit` was reached.
     fn feed_reader(&mut self, conn: &mut Connection, reader: &mut impl BufRead) -> bool {
         let mut buffer = String::new();
+        let mut input_line = 0usize;
+        let mut group_start_line = 1usize;
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
@@ -279,6 +290,7 @@ impl Shell {
                     break;
                 }
             }
+            input_line += 1;
             let trimmed = line.trim();
             if buffer.is_empty() && trimmed.starts_with('.') {
                 if self.echo {
@@ -289,10 +301,13 @@ impl Shell {
                 }
                 continue;
             }
+            if buffer.is_empty() {
+                group_start_line = input_line;
+            }
             buffer.push_str(&line);
             if buffer.trim_end().ends_with(';') {
                 let sql = std::mem::take(&mut buffer);
-                self.run_group(conn, &sql);
+                self.run_group(conn, &sql, group_start_line);
             }
         }
         false
@@ -301,17 +316,19 @@ impl Shell {
     /// Run one accumulated input group (which may hold several `;`-separated
     /// statements): echo it if `.echo on`, execute it, then honor `.changes` and
     /// the pending `.once` redirect exactly as SQLite's per-line handling does.
-    fn run_group(&mut self, conn: &mut Connection, sql: &str) {
+    fn run_group(&mut self, conn: &mut Connection, sql: &str, start_line: usize) {
         if self.echo {
             // SQLite echoes the input group verbatim (trailing newline trimmed).
             let mut out = io::stdout();
             let _ = writeln!(out, "{}", sql.trim_end_matches('\n'));
         }
-        if let Err((e, _stmt)) = self.run_sql_batch(conn, sql) {
-            // Interactive / piped mode keeps the plain one-line form; the SQLite
-            // `in prepare,`/`stepping,` + caret rendering is applied on the one-shot
-            // `-arg` path (see `main`), which is where it is matched byte-for-byte.
-            eprintln!("Error: {e}");
+        if let Err((e, stmt, line)) = self.run_sql_batch(conn, sql, start_line) {
+            // Match the SQLite shell's script/piped rendering: `Parse error near
+            // line N: <msg>` (with a source line + caret for a locatable token) for a
+            // prepare-time error, or `Runtime error near line N: <msg> (<code>)` for a
+            // step-time one. (The one-shot `-arg` path uses the different
+            // `Error: in prepare,`/`stepping,` wording; see `render_cli_error`.)
+            eprintln!("{}", render_script_error(&stmt, &e, line));
             self.had_error = true;
             if self.bail {
                 std::process::exit(1);
@@ -339,16 +356,28 @@ impl Shell {
         &mut self,
         conn: &mut Connection,
         sql: &str,
-    ) -> Result<(), (graphitesql::Error, String)> {
-        for stmt in split_statements(sql) {
-            let stmt = stmt.trim();
+        start_line: usize,
+    ) -> Result<(), (graphitesql::Error, String, usize)> {
+        // Track where each statement begins within the group so an error can name
+        // the input line (`… near line N …`), like the SQLite shell. Statements are
+        // located sequentially so a repeated statement text still maps to its own
+        // occurrence; the line is the group's start plus the newlines that precede it.
+        let mut search_from = 0usize;
+        for stmt_raw in split_statements(sql) {
+            let stmt = stmt_raw.trim();
             if stmt.is_empty() {
                 continue;
             }
-            // On error, carry the failing statement text so the caller can render
-            // SQLite's `in prepare` / `stepping` message with a source-line caret.
+            let off = sql[search_from..]
+                .find(stmt)
+                .map(|p| search_from + p)
+                .unwrap_or(search_from);
+            search_from = off + stmt.len();
+            let line = start_line + sql[..off].bytes().filter(|&b| b == b'\n').count();
+            // On error, carry the failing statement text and its line so the caller
+            // can render SQLite's `Parse`/`Runtime error near line N` message.
             if let Err(e) = self.run_one(conn, stmt) {
-                return Err((e, stmt.to_string()));
+                return Err((e, stmt.to_string(), line));
             }
         }
         Ok(())
@@ -2686,6 +2715,58 @@ fn render_cli_error(sql: &str, e: &graphitesql::Error) -> String {
         format!("Error: stepping, {msg} ({code})")
     } else {
         format!("Error: stepping, {msg}")
+    }
+}
+
+/// Collapse every run of whitespace (including newlines) in `s` to a single space,
+/// trimming the ends — the SQLite shell renders a multi-line offending statement as
+/// one space-joined line under the error caret.
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_ws = false;
+    for c in s.trim().chars() {
+        if c.is_whitespace() {
+            if !prev_ws {
+                out.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            out.push(c);
+            prev_ws = false;
+        }
+    }
+    out
+}
+
+/// Render an error the way the SQLite CLI does when running a *script* (piped stdin,
+/// `.read`, or interactive): `Parse error near line N: <msg>` — with the offending
+/// statement (whitespace-collapsed) and a `^--- error here` caret when the message
+/// names a locatable token — for a prepare-time error, or `Runtime error near line
+/// N: <msg>[ (<code>)]` for a step-time error. `line` is the 1-based input line the
+/// failing statement begins on. This is the script analogue of [`render_cli_error`]
+/// (which uses the one-shot `-arg` wording).
+fn render_script_error(sql: &str, e: &graphitesql::Error, line: usize) -> String {
+    let msg = raw_error_message(e);
+    let flat = collapse_ws(sql);
+    if is_prepare_error(e, &msg) {
+        if let Some(off) = error_offending_token(&msg).and_then(|t| locate_token(&flat, t)) {
+            // Same caret geometry as the one-shot path: the source line is indented
+            // two spaces, and the decoration flips from right to left at column 27.
+            let caret_col = 2 + off;
+            let caret_line = if caret_col >= 27 {
+                format!("{}error here ---^", " ".repeat(caret_col - 14))
+            } else {
+                format!("{}^--- error here", " ".repeat(caret_col))
+            };
+            return format!("Parse error near line {line}: {msg}\n  {flat}\n{caret_line}");
+        }
+        return format!("Parse error near line {line}: {msg}");
+    }
+    let code = e.code();
+    if code != 1 {
+        format!("Runtime error near line {line}: {msg} ({code})")
+    } else {
+        format!("Runtime error near line {line}: {msg}")
     }
 }
 
