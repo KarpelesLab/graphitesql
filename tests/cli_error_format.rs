@@ -84,6 +84,7 @@ fn one_shot_error_rendering_matches_sqlite() {
         "CREATE TABLE t(a); ALTER TABLE t ADD COLUMN a",
         "SELECT (SELECT 1,2)",
         "CREATE TABLE t(a); SELECT a FROM t GROUP BY count(*)",
+        "CREATE TABLE t(a); SELECT a FROM t HAVING a>1", // HAVING on a non-aggregate query
         "CREATE TABLE t(a PRIMARY KEY, b PRIMARY KEY)",
         "SELECT count(*) OVER ()",
         "SELECT",
