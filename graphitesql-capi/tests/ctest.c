@@ -424,6 +424,30 @@ int main(void) {
   sqlite3_commit_hook(db, NULL, NULL);
   sqlite3_rollback_hook(db, NULL, NULL);
 
+  /* Online backup: copy a populated source into a fresh destination. */
+  {
+    sqlite3 *src = NULL, *dst = NULL;
+    sqlite3_open(":memory:", &src);
+    sqlite3_exec(src, "CREATE TABLE bak(a); INSERT INTO bak VALUES(10),(20),(30)", NULL, NULL, NULL);
+    sqlite3_open(":memory:", &dst);
+    sqlite3_backup *bk = sqlite3_backup_init(dst, "main", src, "main");
+    CHECK("backup_init non-NULL", bk != NULL);
+    CHECK("backup_pagecount positive", sqlite3_backup_pagecount(bk) > 0);
+    int rc = sqlite3_backup_step(bk, -1);
+    CHECK("backup_step -> DONE", rc == SQLITE_DONE);
+    CHECK("backup_remaining 0 when done", sqlite3_backup_remaining(bk) == 0);
+    CHECK("backup_finish OK", sqlite3_backup_finish(bk) == SQLITE_OK);
+    /* The destination now holds the source's table. */
+    sqlite3_stmt *bs = NULL;
+    sqlite3_prepare_v2(dst, "SELECT count(*), sum(a) FROM bak", -1, &bs, NULL);
+    sqlite3_step(bs);
+    CHECK("backup copied 3 rows", sqlite3_column_int(bs, 0) == 3);
+    CHECK("backup copied values (sum 60)", sqlite3_column_int(bs, 1) == 60);
+    sqlite3_finalize(bs);
+    sqlite3_close(src);
+    sqlite3_close(dst);
+  }
+
   /* Incremental BLOB I/O: open a cell, read it, overwrite a byte, verify. */
   sqlite3_exec(db, "CREATE TABLE blobs(id INTEGER PRIMARY KEY, data BLOB)", NULL, NULL, NULL);
   {

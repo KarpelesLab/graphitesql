@@ -154,6 +154,15 @@ void *sqlite3_update_hook(sqlite3 *db,
 void *sqlite3_commit_hook(sqlite3 *db, int (*xCallback)(void *), void *pArg);
 void *sqlite3_rollback_hook(sqlite3 *db, void (*xCallback)(void *), void *pArg);
 
+/* Online backup (whole-image copy) */
+typedef struct sqlite3_backup sqlite3_backup;
+sqlite3_backup *sqlite3_backup_init(sqlite3 *pDest, const char *zDestName,
+                                    sqlite3 *pSource, const char *zSourceName);
+int sqlite3_backup_step(sqlite3_backup *p, int nPage);
+int sqlite3_backup_finish(sqlite3_backup *p);
+int sqlite3_backup_remaining(sqlite3_backup *p);
+int sqlite3_backup_pagecount(sqlite3_backup *p);
+
 /* Incremental BLOB I/O (buffered) */
 typedef struct sqlite3_blob sqlite3_blob;
 int sqlite3_blob_open(sqlite3 *db, const char *zDb, const char *zTable, const char *zColumn,

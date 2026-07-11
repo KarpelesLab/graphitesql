@@ -1778,6 +1778,113 @@ pub unsafe extern "C" fn sqlite3_rollback_hook(
     core::ptr::null_mut()
 }
 
+// --- online backup ------------------------------------------------------------
+//
+// SQLite's backup API streams pages from a source database to a destination a
+// chunk at a time. graphitesql materializes the whole database image, so this
+// copies the source's serialized image into the destination in one step (any
+// positive `nPage` — or -1 for "all" — completes it). API-compatible and correct
+// for a whole-database backup; the destination holds the copy in memory (persist
+// it with a subsequent write if the destination is file-backed). Only the `main`
+// database of each side is supported (the schema-name arguments are ignored).
+
+/// An in-progress backup. Mirrors the opaque `sqlite3_backup`.
+pub struct sqlite3_backup {
+    dest: *mut sqlite3,
+    image: Vec<u8>,
+    page_count: c_int,
+    done: bool,
+}
+
+/// Start a backup from `source`'s `main` database to `dest`'s. Snapshots the
+/// source image now; returns NULL on a NULL handle or a serialization failure.
+/// The schema-name arguments are accepted but only `main` is copied.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_backup_init(
+    dest: *mut sqlite3,
+    _dest_name: *const c_char,
+    source: *mut sqlite3,
+    _source_name: *const c_char,
+) -> *mut sqlite3_backup {
+    if dest.is_null() || source.is_null() {
+        return core::ptr::null_mut();
+    }
+    let src = unsafe { &*source };
+    let image = match src.conn.serialize() {
+        Ok(b) => b,
+        Err(_) => return core::ptr::null_mut(),
+    };
+    // The page size is a big-endian u16 at offset 16 (the value 1 means 65536).
+    let page_size = match image.get(16..18) {
+        Some(&[hi, lo]) => match u32::from(u16::from_be_bytes([hi, lo])) {
+            1 => 65536,
+            n => n.max(512) as usize,
+        },
+        _ => 4096,
+    };
+    let page_count = (image.len() / page_size) as c_int;
+    Box::into_raw(Box::new(sqlite3_backup {
+        dest,
+        image,
+        page_count,
+        done: false,
+    }))
+}
+
+/// Copy the (remaining) database. `n_page` is honored loosely: any positive value
+/// or -1 copies the whole image and returns `SQLITE_DONE`; a further call also
+/// returns `SQLITE_DONE`. Returns `SQLITE_ERROR` if the destination cannot be
+/// restored (e.g. it has an open transaction).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_backup_step(p: *mut sqlite3_backup, _n_page: c_int) -> c_int {
+    if p.is_null() {
+        return SQLITE_ERROR;
+    }
+    let p = unsafe { &mut *p };
+    if p.done {
+        return SQLITE_DONE;
+    }
+    if p.dest.is_null() {
+        return SQLITE_ERROR;
+    }
+    let dest = unsafe { &mut *p.dest };
+    match dest.conn.restore_from(&p.image) {
+        Ok(()) => {
+            p.done = true;
+            SQLITE_DONE
+        }
+        Err(_) => SQLITE_ERROR,
+    }
+}
+
+/// Finish a backup, freeing the handle. Returns `SQLITE_OK`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_backup_finish(p: *mut sqlite3_backup) -> c_int {
+    if !p.is_null() {
+        drop(unsafe { Box::from_raw(p) });
+    }
+    SQLITE_OK
+}
+
+/// The number of pages still to be backed up (0 once complete).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_backup_remaining(p: *mut sqlite3_backup) -> c_int {
+    if p.is_null() {
+        return 0;
+    }
+    let p = unsafe { &*p };
+    if p.done { 0 } else { p.page_count }
+}
+
+/// The total number of pages in the source database.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_backup_pagecount(p: *mut sqlite3_backup) -> c_int {
+    if p.is_null() {
+        return 0;
+    }
+    unsafe { &*p }.page_count
+}
+
 // --- incremental BLOB I/O -----------------------------------------------------
 //
 // SQLite streams a single cell's bytes from disk; graphitesql's value model

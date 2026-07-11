@@ -640,6 +640,28 @@ impl Connection {
         Connection::open_vfs(&vfs, "main")
     }
 
+    /// Replace this connection's `main` database with the database image `bytes`
+    /// (a complete SQLite file, as produced by [`serialize`](Self::serialize) or
+    /// written by `sqlite3`), the primitive behind an online backup's destination
+    /// side. Registered callbacks (update / commit / rollback hooks), functions,
+    /// collations, and PRAGMA settings are preserved — only the stored data and its
+    /// schema change. The connection must not be inside an open transaction. The
+    /// restored image is held in memory (as with [`deserialize`](Self::deserialize));
+    /// persist it to a file afterward with [`serialize`](Self::serialize) if needed.
+    pub fn restore_from(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.in_tx || self.open_savepoints > 0 {
+            return Err(Error::Error(
+                "cannot restore into a connection with an active transaction".into(),
+            ));
+        }
+        let fresh = Connection::deserialize(bytes)?;
+        self.backend = fresh.backend;
+        self.schema = fresh.schema;
+        self.last_insert_rowid.set(0);
+        self.changes.set(0);
+        Ok(())
+    }
+
     /// The schema catalog.
     pub fn schema(&self) -> &Schema {
         &self.schema

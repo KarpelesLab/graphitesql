@@ -548,13 +548,16 @@ history / `CHANGELOG.md`. Remaining:
   supported — plus `sqlite3_create_window_function`, custom collations
   (`sqlite3_create_collation`), the UTF-16 entry points (`*16`), and the
   `sqlite3_update_hook` data-change notification, and the `sqlite3_commit_hook` /
-  `sqlite3_rollback_hook` transaction callbacks — **74 exported `sqlite3_*`
-  symbols**. Verified end-to-end by a C program (`tests/ctest.c`, run in CI's `capi`
-  job) that links the cdylib and drives the full lifecycle including a scalar UDF in
-  a `WHERE`, an aggregate UDF over a `GROUP BY`, a window UDF, a custom collation, a
-  UTF-16 round-trip, update-hook accounting, commit/rollback-hook accounting with a
-  commit veto, and buffered incremental BLOB I/O (`sqlite3_blob_*`). Residuals:
-  online backup and the authorizer.
+  `sqlite3_rollback_hook` transaction callbacks, and the online backup API
+  (`sqlite3_backup_init`/`_step`/`_finish`/`_remaining`/`_pagecount`) — **79 exported
+  `sqlite3_*` symbols**. Verified end-to-end by a C program (`tests/ctest.c`, run in
+  CI's `capi` job) that links the cdylib and drives the full lifecycle including a
+  scalar UDF in a `WHERE`, an aggregate UDF over a `GROUP BY`, a window UDF, a custom
+  collation, a UTF-16 round-trip, update-hook accounting, commit/rollback-hook
+  accounting with a commit veto, a whole-database online backup, and buffered
+  incremental BLOB I/O (`sqlite3_blob_*`). The backup is a whole-image copy (built on
+  `Connection::restore_from`, the destination-side of `serialize`/`deserialize`),
+  non-streaming like the buffered BLOB I/O. Residual: the authorizer.
 
 ### Track E — Cross-database write resolution  *(essentially complete)*
 
