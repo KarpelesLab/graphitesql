@@ -61,6 +61,11 @@ impl Error {
     /// equivalent concept.
     pub fn code(&self) -> i32 {
         match self {
+            // A "datatype mismatch" is SQLite's `SQLITE_MISMATCH` (20) — e.g. a
+            // non-integer `LIMIT`/`OFFSET`, or an incompatible INTEGER PRIMARY KEY
+            // value. Its message is a fixed SQLite string, so key the code off it
+            // rather than adding a dedicated variant.
+            Error::Error(m) | Error::ErrorAt(m, _) if m == "datatype mismatch" => 20,
             Error::Error(_)
             | Error::ErrorAt(..)
             | Error::Parse(_)

@@ -95,7 +95,10 @@ fn one_shot_error_rendering_matches_sqlite() {
         "CREATE TABLE t(a PRIMARY KEY, b PRIMARY KEY)",
         "SELECT count(*) OVER ()",
         "SELECT",
-        // Step-time errors (constraints carry the (19) code; a plain error does not).
+        // Step-time errors (constraints carry the (19) code, a datatype mismatch
+        // the (20) SQLITE_MISMATCH code; a plain error carries none).
+        "CREATE TABLE t(a); SELECT a FROM t LIMIT 'x'", // datatype mismatch (20)
+        "CREATE TABLE t(a INTEGER PRIMARY KEY); INSERT INTO t VALUES('x')",
         "CREATE TABLE t(a UNIQUE); INSERT INTO t VALUES(1),(1)",
         "CREATE TABLE t(a NOT NULL); INSERT INTO t VALUES(NULL)",
         "CREATE TABLE t(a CHECK(a>0)); INSERT INTO t VALUES(-1)",
