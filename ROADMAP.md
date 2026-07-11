@@ -187,7 +187,26 @@ EXCEPT) incl. `ORDER BY`, and `WITH` CTE bodies incl. output-column provenance
   alias (synthetic when unaliased) with their provenance in a *select-local*
   visibility list (derived tables don't propagate to sibling arms/subqueries, unlike
   CTEs — a subtle bug found and fixed during the sweep). Verified across 48 shapes.
-  With this, RENAME COLUMN propagation is complete for every shape sqlite rewrites.
+- **A-alter-3 — trigger multi-source body propagation for RENAME/DROP COLUMN. DONE
+  2026-07-12.** A trigger body's *multi-source* write statements were the last
+  propagation gap: `collect_trigger_stmt_base_sources` bailed on an `UPDATE … SET …
+  FROM <sources>` (SQLite extension), a row-assignment `SET (c1,c2) = (SELECT … FROM
+  other)`, and an `ON CONFLICT … DO UPDATE SET c = (SELECT … FROM other)` upsert —
+  collecting no base sources for them. So a renamed column reached only through one
+  (`UPDATE u SET z = t.c FROM t`) was left stale, and the matching DROP COLUMN was
+  wrongly accepted, silently breaking the trigger. Now the `FROM` clause's tables
+  (`collect_fromclause_base_sources`, a plain-table/derived-source subset — a
+  `NATURAL`/`USING` join or table-valued function still bails), the row-assignment
+  subqueries, and the upsert `DO UPDATE`/target `WHERE` subqueries are all collected,
+  so a `<src>.old` or globally-unique bare `old` rewrites on RENAME and is reported
+  on DROP, byte-matching sqlite3 3.50.4 (incl. CTE-bearing subqueries, mixed bodies,
+  and end-to-end trigger firing). Tests: `tests/rename_column_trigger_subquery.rs`,
+  `tests/drop_column_dependents.rs`. **Residual (documented, conservative — a missed
+  rewrite, never a wrong one):** a *qualified* `t.old` inside a `NATURAL`/`USING`
+  join or alongside a TVF in an `UPDATE … FROM` (sqlite rewrites it since the
+  qualifier disambiguates; graphite bails the whole trigger). With this and A-alter-1,
+  RENAME COLUMN propagation covers every non-`NATURAL`/`USING`/TVF shape sqlite
+  rewrites.
 - **A-alter-2 — ALTER-time rejection of a RENAME that breaks a dependent view.
   DONE 2026-07-10 (views; triggers = A-alter-2b).** sqlite rejects + rolls back a
   rename that leaves a dependent view unresolvable (`USING(col)` column vanishes, a
@@ -928,10 +947,13 @@ independently shippable. Recommended next order:
    two-process differential test (C9b-2). Well-scoped, high value.
 2. **A-alter-2b residual — trigger breaks via UPDATE/DELETE/VALUES/WHEN subqueries.**
    Views (A-alter-2) and the trigger INSERT…SELECT/body-SELECT subset (A-alter-2b)
-   landed 2026-07-10. Remaining: a trigger break reachable only through an
-   `UPDATE`/`DELETE`/`VALUES`/`WHEN` expression subquery is still accepted (a
-   sound false-accept). Needs partial-rewrite propagation or a scope-aware
-   per-subquery probe; low priority (same residual class as DROP COLUMN).
+   landed 2026-07-10; A-alter-3 (2026-07-12) then closed *propagation* into the
+   multi-source body shapes (`UPDATE … FROM`, row-assignment and upsert subqueries),
+   so most such renames now rewrite cleanly instead of needing rejection. Remaining:
+   a break that genuinely *can't* propagate (a `NATURAL`/`USING`/TVF `UPDATE … FROM`,
+   or a break reachable only through a `DELETE`/`VALUES`/`WHEN` expression subquery)
+   is still accepted (a sound false-accept). Needs partial-rewrite propagation or a
+   scope-aware per-subquery probe; low priority (same residual class as DROP COLUMN).
 3. **B5b-2 — live storage cursors on the VDBE** *(in progress)*. The largest VDBE
    piece; next sub-steps are the in-interpreter `OpenRead`/`SeekRowid` opcodes and
    the affinity-blocked secondary-index / `WITHOUT ROWID` seeks. Parity-gated, low
