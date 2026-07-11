@@ -131,6 +131,57 @@ fn constant_terms_dropped_on_a_plain_scan_too() {
 }
 
 #[test]
+fn single_row_driver_join_inner_rowid_with_unrelated_index() {
+    if !sqlite_available() {
+        return;
+    }
+    // `small` has an index on `k`, but the join is on `v` (unindexed) — so `small` is
+    // still scanned in rowid order, and `ORDER BY small.id` needs no sort. The index
+    // being unrelated to the join must not defeat the credit.
+    const S: &str = "CREATE TABLE big(id INTEGER PRIMARY KEY, k, v); \
+                     CREATE TABLE small(id INTEGER PRIMARY KEY, k, v); \
+                     CREATE INDEX sk ON small(k); \
+                     INSERT INTO big VALUES(7,2,'b7'); \
+                     INSERT INTO small VALUES(1,8,2),(2,7,2),(3,6,1);";
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in S.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            c.execute(s).unwrap();
+        }
+    }
+    let eqp = |sql: &str| -> Vec<String> {
+        let out = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg(format!("{S} EXPLAIN QUERY PLAN {sql};"))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim_start_matches(['`', '|', '-', ' ']).to_string())
+            .filter(|s| !s.is_empty() && s != "QUERY PLAN")
+            .collect()
+    };
+    let q = "SELECT * FROM big JOIN small ON big.k=small.v WHERE big.id=7 ORDER BY small.id";
+    assert_eq!(eqp(q), graphite_eqp(&c, q), "EQP diverged on `{q}`");
+    // Rows come out ascending by small.id despite the skipped sort.
+    let ids: Vec<i64> = c
+        .query(
+            "SELECT small.id FROM big JOIN small ON big.k=small.v WHERE big.id=7 ORDER BY small.id",
+        )
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
+}
+
+#[test]
 fn single_row_driver_join_all_constant_order_by() {
     if !sqlite_available() {
         return;
