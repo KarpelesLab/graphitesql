@@ -1704,6 +1704,154 @@ impl Connection {
         s
     }
 
+    /// B1c: run a two-table `FULL JOIN` on the VDBE by rewriting it to the
+    /// equivalent compound `(a LEFT JOIN b) UNION ALL (b WHERE NOT EXISTS a)` —
+    /// verified row-for-row (including order) against sqlite. The second arm scans
+    /// the right table with a correlated `NOT EXISTS` (which B5c-2 seek-drives) and
+    /// projects the left columns as NULL. Returns `Unsupported` for a shape that
+    /// can't be safely rewritten (a wildcard or non-null-rewritable projection, a
+    /// grouped/windowed/DISTINCT query, a non-base table, or a missing `ON`), so
+    /// the caller falls through to the materialized FULL path.
+    fn try_full_join_seek(&self, sel: &Select) -> Result<QueryResult> {
+        use sql::ast::{Expr, Join, JoinKind, ResultColumn};
+        let unsup = |m: &'static str| Error::Unsupported(m);
+        let from = sel.from.as_ref().ok_or(unsup("VDBE: full join seek"))?;
+        if from.joins.len() != 1
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || !sel.window_defs.is_empty()
+            || sel.distinct
+            || !sel.compound.is_empty()
+        {
+            return Err(unsup("VDBE: full join seek shape"));
+        }
+        let join = &from.joins[0];
+        if join.natural || !join.using.is_empty() {
+            return Err(unsup("VDBE: full join natural/using"));
+        }
+        let on = join.on.as_ref().ok_or(unsup("VDBE: full join needs ON"))?;
+        // Both sides must be base tables — needed to split a/b columns.
+        let a_meta = self
+            .table_meta(&from.first.name, from.first.alias.as_deref())
+            .map_err(|_| unsup("VDBE: full join non-base left"))?;
+        self.table_meta(&join.table.name, join.table.alias.as_deref())
+            .map_err(|_| unsup("VDBE: full join non-base right"))?;
+        let b_meta = self
+            .table_meta(&join.table.name, join.table.alias.as_deref())
+            .map_err(|_| unsup("VDBE: full join non-base right"))?;
+        let _ = &a_meta;
+        // The names by which the left table's columns can be qualified.
+        let mut a_quals = alloc::vec![from.first.name.clone()];
+        if let Some(al) = &from.first.alias {
+            a_quals.push(al.clone());
+        }
+        let b_cols: Vec<String> = b_meta.columns.iter().map(|c| c.name.clone()).collect();
+        // Arm 2 projects the left columns as NULL (unmatched right rows have no
+        // left side); a wildcard or a shape the rewriter can't handle defers.
+        let mut arm2_cols = Vec::with_capacity(sel.columns.len());
+        for rc in &sel.columns {
+            let ResultColumn::Expr {
+                expr,
+                alias,
+                source,
+            } = rc
+            else {
+                return Err(unsup("VDBE: full join wildcard projection"));
+            };
+            let e = null_out_a_columns(expr, &a_quals, &b_cols)
+                .ok_or(unsup("VDBE: full join projection not null-rewritable"))?;
+            arm2_cols.push(ResultColumn::Expr {
+                expr: e,
+                alias: alias.clone(),
+                source: source.clone(),
+            });
+        }
+        // Arm 2 keeps only right rows with no matching left row: `NOT EXISTS
+        // (SELECT 1 FROM a WHERE <on>)`, plus the (null-rewritten) original WHERE.
+        let exists_body = Select {
+            ctes: Vec::new(),
+            compound: Vec::new(),
+            distinct: false,
+            columns: alloc::vec![ResultColumn::Expr {
+                expr: Expr::Literal(sql::ast::Literal::Integer(1)),
+                alias: None,
+                source: None,
+            }],
+            from: Some(sql::ast::FromClause {
+                first: from.first.clone(),
+                joins: Vec::new(),
+            }),
+            where_clause: Some(on.clone()),
+            group_by: Vec::new(),
+            having: None,
+            window_defs: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            values_rows: 0,
+        };
+        let not_exists = Expr::Exists {
+            select: Box::new(exists_body),
+            negated: true,
+        };
+        let arm2_where = match &sel.where_clause {
+            Some(w) => {
+                let w2 = null_out_a_columns(w, &a_quals, &b_cols)
+                    .ok_or(unsup("VDBE: full join where not null-rewritable"))?;
+                Expr::Binary {
+                    op: sql::ast::BinaryOp::And,
+                    left: Box::new(not_exists),
+                    right: Box::new(w2),
+                }
+            }
+            None => not_exists,
+        };
+        let arm2 = Select {
+            ctes: Vec::new(),
+            compound: Vec::new(),
+            distinct: false,
+            columns: arm2_cols,
+            from: Some(sql::ast::FromClause {
+                first: join.table.clone(),
+                joins: Vec::new(),
+            }),
+            where_clause: Some(arm2_where),
+            group_by: Vec::new(),
+            having: None,
+            window_defs: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            values_rows: 0,
+        };
+        // Arm 1 is `a LEFT JOIN b` with the original projection and WHERE; the
+        // whole-query ORDER BY / LIMIT / OFFSET apply to the compound.
+        let mut arm1_from = from.clone();
+        arm1_from.joins[0] = Join {
+            kind: JoinKind::Left,
+            table: join.table.clone(),
+            on: Some(on.clone()),
+            natural: false,
+            using: Vec::new(),
+        };
+        let compound = Select {
+            ctes: Vec::new(),
+            compound: alloc::vec![(sql::ast::CompoundOp::UnionAll, arm2)],
+            distinct: false,
+            columns: sel.columns.clone(),
+            from: Some(arm1_from),
+            where_clause: sel.where_clause.clone(),
+            group_by: Vec::new(),
+            having: None,
+            window_defs: Vec::new(),
+            order_by: sel.order_by.clone(),
+            limit: sel.limit.clone(),
+            offset: sel.offset.clone(),
+            values_rows: 0,
+        };
+        self.run_select_vdbe(&compound)
+    }
+
     /// Compile and run a parsed `SELECT` through the VDBE engine, or `Unsupported`
     /// when its shape is outside the spike's grammar (so callers fall back).
     fn run_select_vdbe(&self, sel: &Select) -> Result<QueryResult> {
@@ -2835,6 +2983,21 @@ impl Connection {
             let is_left_2 = single && from.joins[0].kind == sql::ast::JoinKind::Left;
             let is_right_2 = single && from.joins[0].kind == sql::ast::JoinKind::Right;
             let is_full_2 = single && from.joins[0].kind == sql::ast::JoinKind::Full;
+            // B1c: a two-table FULL join equals `(a LEFT JOIN b) UNION ALL (rows of
+            // b with no matching a, a-null-padded)` — verified row-for-row including
+            // order against sqlite. Both arms can seek (arm 1 via the LEFT seek
+            // path; arm 2 is a single-table scan of b with a correlated `NOT EXISTS`
+            // that B5c-2 runs on the VDBE), so the compound avoids materializing
+            // either table. Falls through to the materialized FULL path when the
+            // projection/predicate can't be safely null-rewritten or the compound
+            // can't run on the VDBE — this only *adds* seek coverage.
+            if is_full_2 {
+                match self.try_full_join_seek(sel) {
+                    Ok(r) => return Ok(r),
+                    Err(Error::Unsupported(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
             // B1c: a two-table RIGHT join is the mirror of a LEFT join — the
             // *right* table is preserved and the *left* is null-padded. Rewriting
             // `a RIGHT JOIN b` to `b LEFT JOIN a` (same ON) lets the seek path
@@ -35568,6 +35731,129 @@ struct TableMeta {
 /// explicit table-qualified column references drawn from `columns`. Used by the
 /// aggregate path so bare wildcards follow the same representative-row rule as
 /// named bare columns.
+/// Rewrite `e`, replacing every reference to a *left*-table column with `NULL`
+/// (used to build the anti-join arm of a FULL-join seek, where the left side is
+/// null-padded). A column is a left column when it is qualified with one of
+/// `a_quals`, or is unqualified and not one of the right table's `b_cols`.
+/// Returns `None` for a shape the rewriter does not handle (a subquery, row
+/// value, windowed/filtered/ordered aggregate, …), so the caller defers.
+fn null_out_a_columns(e: &Expr, a_quals: &[String], b_cols: &[String]) -> Option<Expr> {
+    use sql::ast::Expr as E;
+    let null = || E::Literal(sql::ast::Literal::Null);
+    let rw = |x: &Expr| null_out_a_columns(x, a_quals, b_cols);
+    Some(match e {
+        E::Literal(_) | E::Parameter(_) => e.clone(),
+        E::Column { table, column, .. } => {
+            let is_left = match table {
+                Some(t) => a_quals.iter().any(|q| q.eq_ignore_ascii_case(t)),
+                None => !b_cols.iter().any(|c| c.eq_ignore_ascii_case(column)),
+            };
+            if is_left { null() } else { e.clone() }
+        }
+        E::Unary { op, expr } => E::Unary {
+            op: *op,
+            expr: Box::new(rw(expr)?),
+        },
+        E::Binary { op, left, right } => E::Binary {
+            op: *op,
+            left: Box::new(rw(left)?),
+            right: Box::new(rw(right)?),
+        },
+        E::Paren(i) => E::Paren(Box::new(rw(i)?)),
+        E::Cast { expr, type_name } => E::Cast {
+            expr: Box::new(rw(expr)?),
+            type_name: type_name.clone(),
+        },
+        E::Collate { expr, collation } => E::Collate {
+            expr: Box::new(rw(expr)?),
+            collation: collation.clone(),
+        },
+        E::IsNull { expr, negated } => E::IsNull {
+            expr: Box::new(rw(expr)?),
+            negated: *negated,
+        },
+        E::Function {
+            name,
+            distinct,
+            args,
+            star,
+            filter,
+            order_by,
+            over,
+        } => {
+            if over.is_some() || filter.is_some() || !order_by.is_empty() {
+                return None;
+            }
+            let mut new_args = Vec::with_capacity(args.len());
+            for a in args {
+                new_args.push(rw(a)?);
+            }
+            E::Function {
+                name: name.clone(),
+                distinct: *distinct,
+                args: new_args,
+                star: *star,
+                filter: None,
+                order_by: Vec::new(),
+                over: None,
+            }
+        }
+        E::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => E::Between {
+            expr: Box::new(rw(expr)?),
+            low: Box::new(rw(low)?),
+            high: Box::new(rw(high)?),
+            negated: *negated,
+        },
+        E::InList {
+            expr,
+            list,
+            negated,
+            candidate_affinity,
+        } => {
+            let mut new_list = Vec::with_capacity(list.len());
+            for x in list {
+                new_list.push(rw(x)?);
+            }
+            E::InList {
+                expr: Box::new(rw(expr)?),
+                list: new_list,
+                negated: *negated,
+                candidate_affinity: candidate_affinity.clone(),
+            }
+        }
+        E::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            let operand = match operand {
+                Some(o) => Some(Box::new(rw(o)?)),
+                None => None,
+            };
+            let mut wt = Vec::with_capacity(when_then.len());
+            for (w, t) in when_then {
+                wt.push((rw(w)?, rw(t)?));
+            }
+            let else_result = match else_result {
+                Some(x) => Some(Box::new(rw(x)?)),
+                None => None,
+            };
+            E::Case {
+                operand,
+                when_then: wt,
+                else_result,
+            }
+        }
+        // Subqueries, row values, and anything else are not rewritten.
+        _ => return None,
+    })
+}
+
 fn expand_agg_wildcards(sel: &Select, columns: &[ColumnInfo]) -> Select {
     let col_ref = |c: &ColumnInfo| ResultColumn::Expr {
         expr: Expr::Column {

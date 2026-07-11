@@ -95,3 +95,78 @@ fn right_join_wildcard_runs_on_vdbe_with_correct_order() {
     c.set_use_vdbe(true);
     assert_eq!(tw.rows, expected, "tree-walker mismatch");
 }
+
+#[test]
+fn full_join_seek_matches_expected() {
+    // A two-table FULL join runs on the VDBE as the compound
+    // `(a LEFT JOIN b) UNION ALL (b WHERE NOT EXISTS a)` — both arms seek. The
+    // rows, including the no-ORDER-BY order, are byte-identical to sqlite: the
+    // left-join rows first (a3 unmatched → NULL b), then the unmatched right row
+    // (b9 → NULL a).
+    let c = setup();
+    both(
+        &c,
+        "SELECT a.x, b.y FROM a FULL JOIN b ON a.k = b.p",
+        vec![
+            vec![t("a1"), t("b1")],
+            vec![t("a2"), t("b2")],
+            vec![t("a3"), Value::Null],
+            vec![Value::Null, t("b9")],
+        ],
+    );
+    // Full explicit projection with ORDER BY.
+    both(
+        &c,
+        "SELECT a.k, a.x, b.p, b.y FROM a FULL JOIN b ON a.k = b.p ORDER BY b.p, a.k",
+        vec![
+            vec![i(3), t("a3"), Value::Null, Value::Null],
+            vec![i(1), t("a1"), i(1), t("b1")],
+            vec![i(2), t("a2"), i(2), t("b2")],
+            vec![Value::Null, Value::Null, i(9), t("b9")],
+        ],
+    );
+    // A function over a left column is null-rewritten in the anti-join arm:
+    // `coalesce(a.x,'none')` is 'none' for the unmatched right row.
+    both(
+        &c,
+        "SELECT coalesce(a.x,'none'), b.y FROM a FULL JOIN b ON a.k = b.p ORDER BY b.p",
+        vec![
+            vec![t("a3"), Value::Null],
+            vec![t("a1"), t("b1")],
+            vec![t("a2"), t("b2")],
+            vec![t("none"), t("b9")],
+        ],
+    );
+    // A WHERE over the joined row filters both arms.
+    both(
+        &c,
+        "SELECT a.x, b.y FROM a FULL JOIN b ON a.k = b.p WHERE b.y IS NOT NULL ORDER BY b.p",
+        vec![
+            vec![t("a1"), t("b1")],
+            vec![t("a2"), t("b2")],
+            vec![Value::Null, t("b9")],
+        ],
+    );
+}
+
+#[test]
+fn full_join_wildcard_falls_back_correctly() {
+    // A bare `SELECT *` FULL join is not rewritten (defers to the materialized
+    // path) but still returns the correct result.
+    let c = setup();
+    let q = "SELECT * FROM a FULL JOIN b ON a.k = b.p ORDER BY b.p, a.k";
+    c.set_use_vdbe(false);
+    let tw = c.query(q).unwrap();
+    c.set_use_vdbe(true);
+    let got = c.query(q).unwrap();
+    assert_eq!(got.rows, tw.rows);
+    assert_eq!(
+        got.rows,
+        vec![
+            vec![i(3), t("a3"), Value::Null, Value::Null],
+            vec![i(1), t("a1"), i(1), t("b1")],
+            vec![i(2), t("a2"), i(2), t("b2")],
+            vec![Value::Null, Value::Null, i(9), t("b9")],
+        ],
+    );
+}

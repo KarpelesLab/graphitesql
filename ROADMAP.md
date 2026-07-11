@@ -337,8 +337,19 @@ result or declines to it — never a wrong answer), so this track is
   on all-bare-column keys and no single-min/max representative rule), and `compile_expr`'s
   subquery arms emit the group op after the same group-key-only guard. Non-key references bail.
   Byte-identical to sqlite (`grouped_correlated_in_having_and_order_by`).
-- **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek. **RIGHT (two-table,
-  explicit projection) now seeks too (2026-07-11):** a `RIGHT JOIN` is the mirror of
+- **B1c — RIGHT/FULL join inner seeks. DONE 2026-07-11 (all four join kinds now
+  seek-drive).** **FULL (two-table, explicit projection):** a `FULL JOIN` equals the
+  compound `(a LEFT JOIN b) UNION ALL (rows of b with no matching a, a-null-padded)`
+  — verified row-for-row *including the no-`ORDER BY` order* against sqlite.
+  `Connection::try_full_join_seek` builds that compound: arm 1 is `a LEFT JOIN b`
+  (seeks b via the LEFT seek path), arm 2 scans b with a correlated
+  `NOT EXISTS (SELECT 1 FROM a WHERE on)` (B5c-2 seek-drives the left lookup) and
+  projects the left columns as NULL (`null_out_a_columns` rewrites left-column refs,
+  incl. inside functions like `coalesce(a.x,…)`, to NULL). So neither table is
+  materialized. Deferred (→ materialized FULL path) for a wildcard/non-rewritable
+  projection, a grouped/windowed/DISTINCT query, or a non-base table — only *adds*
+  seek coverage. Byte-identical to sqlite (`tests/vdbe_right_join_seek.rs`).
+  **RIGHT (two-table):** a `RIGHT JOIN` is the mirror of
   a `LEFT JOIN` (the *right* table is preserved), so `a RIGHT JOIN b ON …` is
   rewritten to the identity `b LEFT JOIN a ON …` (`Connection::swap_right_join_to_left`),
   which routes through the existing seek path and drives the now-inner left table by
@@ -348,8 +359,8 @@ result or declines to it — never a wrong answer), so this track is
   schema, no materialization). Any non-seekable shape falls through to the existing —
   correct — materialized RIGHT path, so this only *adds* seek coverage. Byte-identical
   to sqlite incl. left-side null-padding and `SELECT *` column order
-  (`tests/vdbe_right_join_seek.rs`). FULL join still materializes (its unmatched-right
-  anti-join pass has no single-scan seek form).
+  (`tests/vdbe_right_join_seek.rs`). A `SELECT *` FULL join and any non-rewritable
+  shape still take the (correct) materialized path.
 - **VDBE aggregate coverage — `json_group_array` / `jsonb_group_array`. DONE 2026-07-11.**
   Added `AggKind::JsonGroupArray { jsonb }`: the fold keeps NULL arguments for this
   kind (SQLite includes them as JSON `null`) and the finalizer serializes the
