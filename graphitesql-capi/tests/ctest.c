@@ -78,6 +78,17 @@ static int nocase_collation(void *arg, int nx, const void *x, int ny, const void
   return nx - ny;
 }
 
+/* Update-hook accounting for the test below. */
+static int uh_inserts = 0, uh_updates = 0, uh_deletes = 0;
+static long long uh_last_rowid = 0;
+static void update_cb(void *arg, int op, const char *db, const char *tbl, long long rowid) {
+  (void)arg; (void)db; (void)tbl;
+  if (op == SQLITE_INSERT) uh_inserts++;
+  else if (op == SQLITE_UPDATE) uh_updates++;
+  else if (op == SQLITE_DELETE) uh_deletes++;
+  uh_last_rowid = rowid;
+}
+
 int main(void) {
   sqlite3 *db = NULL;
   int rc = sqlite3_open(":memory:", &db);
@@ -368,6 +379,21 @@ int main(void) {
     CHECK("utf8 view agrees", strcmp((const char *)sqlite3_column_text(u16, 0), "wide") == 0);
     sqlite3_finalize(u16);
   }
+
+  /* Data-change notification via sqlite3_update_hook. */
+  sqlite3_update_hook(db, update_cb, NULL);
+  sqlite3_exec(db, "CREATE TABLE h(a)", NULL, NULL, NULL);
+  sqlite3_exec(db, "INSERT INTO h VALUES (1),(2),(3)", NULL, NULL, NULL);
+  sqlite3_exec(db, "UPDATE h SET a=a+1 WHERE a=1", NULL, NULL, NULL);
+  sqlite3_exec(db, "DELETE FROM h WHERE a=3", NULL, NULL, NULL);
+  CHECK("update hook saw 3 inserts", uh_inserts == 3);
+  CHECK("update hook saw 1 update", uh_updates == 1);
+  CHECK("update hook saw 1 delete", uh_deletes == 1);
+  CHECK("update hook last rowid (delete of rowid 3)", uh_last_rowid == 3);
+  /* Removing the hook stops notifications. */
+  sqlite3_update_hook(db, NULL, NULL);
+  sqlite3_exec(db, "INSERT INTO h VALUES (9)", NULL, NULL, NULL);
+  CHECK("removed hook: still 3 inserts", uh_inserts == 3);
 
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 

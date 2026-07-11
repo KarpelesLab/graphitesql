@@ -30,7 +30,7 @@
 
 use core::ffi::{c_char, c_double, c_int, c_longlong, c_uchar, c_void};
 use graphitesql::exec::eval::Params;
-use graphitesql::{Connection, QueryResult, Value};
+use graphitesql::{Connection, QueryResult, UpdateOp, Value};
 use std::ffi::{CStr, CString};
 
 // --- Result codes (subset of sqlite3.h) ---------------------------------------
@@ -1673,6 +1673,54 @@ pub unsafe extern "C" fn sqlite3_errmsg16(db: *mut sqlite3) -> *const c_void {
     let p = u.as_ptr() as *const c_void;
     db.errmsg16 = Some(u);
     p
+}
+
+// --- data-change hook ---------------------------------------------------------
+
+// SQLite update-hook op codes.
+const SQLITE_DELETE: c_int = 9;
+const SQLITE_INSERT: c_int = 18;
+const SQLITE_UPDATE: c_int = 23;
+
+type UpdateHookCb = Option<
+    unsafe extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char, c_longlong),
+>;
+
+/// Register a data-change notification callback (`sqlite3_update_hook`): invoked
+/// once per inserted/updated/deleted row with the op code
+/// (`SQLITE_INSERT`/`_UPDATE`/`_DELETE`), the database and table names, and the
+/// rowid. A NULL callback removes the hook. Returns the previous `pArg` — not
+/// tracked here, so always NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_update_hook(
+    db: *mut sqlite3,
+    cb: UpdateHookCb,
+    arg: *mut c_void,
+) -> *mut c_void {
+    if db.is_null() {
+        return core::ptr::null_mut();
+    }
+    let db = unsafe { &mut *db };
+    match cb {
+        Some(f) => {
+            let a = arg as usize;
+            db.conn
+                .register_update_hook(move |op, dbname, table, rowid| {
+                    let code = match op {
+                        UpdateOp::Insert => SQLITE_INSERT,
+                        UpdateOp::Update => SQLITE_UPDATE,
+                        UpdateOp::Delete => SQLITE_DELETE,
+                    };
+                    let db_c = CString::new(dbname).unwrap_or_default();
+                    let tb_c = CString::new(table).unwrap_or_default();
+                    unsafe {
+                        f(a as *mut c_void, code, db_c.as_ptr(), tb_c.as_ptr(), rowid);
+                    }
+                });
+        }
+        None => db.conn.remove_update_hook(),
+    }
+    core::ptr::null_mut()
 }
 
 // --- memory -------------------------------------------------------------------

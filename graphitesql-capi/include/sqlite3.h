@@ -144,6 +144,14 @@ const void *sqlite3_column_text16(sqlite3_stmt *stmt, int col);
 int sqlite3_column_bytes16(sqlite3_stmt *stmt, int col);
 const void *sqlite3_errmsg16(sqlite3 *db);
 
+/* Data-change notification hook */
+#define SQLITE_DELETE 9
+#define SQLITE_INSERT 18
+#define SQLITE_UPDATE 23
+void *sqlite3_update_hook(sqlite3 *db,
+    void (*xCallback)(void *, int op, char const *zDb, char const *zTable, sqlite3_int64 rowid),
+    void *pArg);
+
 void sqlite3_free(void *p);
 
 #ifdef __cplusplus
