@@ -31,8 +31,14 @@ fn ints(c: &Connection, sql: &str) -> Vec<i64> {
 fn unbounded_series_with_limit_terminates() {
     let c = Connection::open_memory().unwrap();
     // The core case: an unbounded single-argument series bounded by LIMIT.
-    assert_eq!(ints(&c, "SELECT value FROM generate_series(5) LIMIT 3"), [5, 6, 7]);
-    assert_eq!(ints(&c, "SELECT value FROM generate_series(100) LIMIT 1"), [100]);
+    assert_eq!(
+        ints(&c, "SELECT value FROM generate_series(5) LIMIT 3"),
+        [5, 6, 7]
+    );
+    assert_eq!(
+        ints(&c, "SELECT value FROM generate_series(100) LIMIT 1"),
+        [100]
+    );
     // OFFSET is part of the bound.
     assert_eq!(
         ints(&c, "SELECT value FROM generate_series(5) LIMIT 3 OFFSET 2"),
@@ -44,7 +50,10 @@ fn unbounded_series_with_limit_terminates() {
         [10, 12, 14]
     );
     // A non-integer first argument coerces to 0 and is still bounded.
-    assert_eq!(ints(&c, "SELECT value FROM generate_series('x') LIMIT 4"), [0, 1, 2, 3]);
+    assert_eq!(
+        ints(&c, "SELECT value FROM generate_series('x') LIMIT 4"),
+        [0, 1, 2, 3]
+    );
     // Nested inside a subquery the inner LIMIT still bounds it.
     assert_eq!(
         ints(
@@ -58,11 +67,26 @@ fn unbounded_series_with_limit_terminates() {
 #[test]
 fn bounded_series_and_star_are_unaffected() {
     let c = Connection::open_memory().unwrap();
-    assert_eq!(ints(&c, "SELECT value FROM generate_series(1, 5)"), [1, 2, 3, 4, 5]);
-    assert_eq!(ints(&c, "SELECT value FROM generate_series(1, 10) LIMIT 3"), [1, 2, 3]);
-    assert_eq!(ints(&c, "SELECT value FROM generate_series(2, 10, 2)"), [2, 4, 6, 8, 10]);
+    assert_eq!(
+        ints(&c, "SELECT value FROM generate_series(1, 5)"),
+        [1, 2, 3, 4, 5]
+    );
+    assert_eq!(
+        ints(&c, "SELECT value FROM generate_series(1, 10) LIMIT 3"),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        ints(&c, "SELECT value FROM generate_series(2, 10, 2)"),
+        [2, 4, 6, 8, 10]
+    );
     // `SELECT *` over a bounded series still works (column metadata intact).
-    assert_eq!(c.query("SELECT * FROM generate_series(1, 3)").unwrap().rows.len(), 3);
+    assert_eq!(
+        c.query("SELECT * FROM generate_series(1, 3)")
+            .unwrap()
+            .rows
+            .len(),
+        3
+    );
     // A window/subquery scope over an unbounded series (its column metadata is
     // probed with a zero-row cap) no longer hangs.
     assert_eq!(
