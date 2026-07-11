@@ -2539,6 +2539,7 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str) -> bool {
                 "all VALUES must have the same number of terms",
                 "cannot join using column",
                 "unable to identify the object to be reindexed",
+                "cannot drop ", // DROP COLUMN validation (last/PK/indexed column)
                 "sub-select returns",
                 "table ", // "table X has N columns…" / "table X already exists"
                 "there is already ",
