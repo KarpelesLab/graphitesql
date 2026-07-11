@@ -21,6 +21,7 @@ shape as the `graphitesql-wasm` sibling.
 | Columns | `sqlite3_column_count`/`data_count`/`name`/`type`/`int`/`int64`/`double`/`text`/`blob`/`bytes` |
 | Status | `sqlite3_errmsg`, `sqlite3_errcode`/`extended_errcode`, `sqlite3_errstr`, `sqlite3_changes`/`total_changes`, `sqlite3_last_insert_rowid`, `sqlite3_get_autocommit`, `sqlite3_busy_timeout`, `sqlite3_interrupt` |
 | Hooks | `sqlite3_update_hook` (row-change notification) |
+| BLOB I/O | `sqlite3_blob_open`/`bytes`/`read`/`write`/`reopen`/`close` (buffered) |
 | UDFs | `sqlite3_create_function` (scalar + aggregate), `sqlite3_create_window_function`, `sqlite3_user_data`, `sqlite3_aggregate_context`, `sqlite3_value_*`, `sqlite3_result_*` |
 | Collations | `sqlite3_create_collation`/`_v2` (custom `COLLATE` sequences) |
 | UTF-16 | `sqlite3_open16`, `sqlite3_prepare16_v2`, `sqlite3_bind_text16`, `sqlite3_column_text16`/`bytes16`, `sqlite3_errmsg16` |
@@ -56,8 +57,12 @@ internally); `nByte` arguments are in bytes, native byte order.
 `sqlite3_update_hook` fires per inserted/updated/deleted row (op code, db/table
 names, rowid).
 
-**Not yet covered:** incremental BLOB I/O, online backup, the commit/rollback
-hooks, and the authorizer.
+`sqlite3_blob_*` provides incremental BLOB access — buffered rather than
+streaming (graphitesql materializes whole cells): the cell is fetched on open and
+a writable handle is flushed on close. Size-changing writes are rejected, as in
+SQLite.
+
+**Not yet covered:** online backup, the commit/rollback hooks, and the authorizer.
 
 ## Build & test
 

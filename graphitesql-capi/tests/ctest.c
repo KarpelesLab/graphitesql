@@ -395,6 +395,40 @@ int main(void) {
   sqlite3_exec(db, "INSERT INTO h VALUES (9)", NULL, NULL, NULL);
   CHECK("removed hook: still 3 inserts", uh_inserts == 3);
 
+  /* Incremental BLOB I/O: open a cell, read it, overwrite a byte, verify. */
+  sqlite3_exec(db, "CREATE TABLE blobs(id INTEGER PRIMARY KEY, data BLOB)", NULL, NULL, NULL);
+  {
+    sqlite3_stmt *bi = NULL;
+    sqlite3_prepare_v2(db, "INSERT INTO blobs(id,data) VALUES(1, ?1)", -1, &bi, NULL);
+    unsigned char init[] = {0xaa, 0xbb, 0xcc, 0xdd};
+    sqlite3_bind_blob(bi, 1, init, 4, SQLITE_TRANSIENT);
+    sqlite3_step(bi);
+    sqlite3_finalize(bi);
+  }
+  sqlite3_blob *blob = NULL;
+  rc = sqlite3_blob_open(db, "main", "blobs", "data", 1, 1 /* rw */, &blob);
+  CHECK("blob_open ok", rc == SQLITE_OK && blob != NULL);
+  CHECK("blob_bytes == 4", sqlite3_blob_bytes(blob) == 4);
+  unsigned char rb[4] = {0};
+  CHECK("blob_read ok", sqlite3_blob_read(blob, rb, 4, 0) == SQLITE_OK);
+  CHECK("blob_read bytes", rb[0] == 0xaa && rb[3] == 0xdd);
+  /* out-of-range read fails */
+  CHECK("blob_read oob -> ERROR", sqlite3_blob_read(blob, rb, 4, 2) == SQLITE_ERROR);
+  /* overwrite byte 1 */
+  unsigned char nb = 0x55;
+  CHECK("blob_write ok", sqlite3_blob_write(blob, &nb, 1, 1) == SQLITE_OK);
+  sqlite3_blob_close(blob); /* flushes */
+
+  /* Read back via SQL to confirm the write persisted. */
+  {
+    sqlite3_stmt *chk = NULL;
+    sqlite3_prepare_v2(db, "SELECT data FROM blobs WHERE id=1", -1, &chk, NULL);
+    sqlite3_step(chk);
+    const unsigned char *got = (const unsigned char *)sqlite3_column_blob(chk, 0);
+    CHECK("blob write persisted", sqlite3_column_bytes(chk, 0) == 4 && got[1] == 0x55 && got[0] == 0xaa);
+    sqlite3_finalize(chk);
+  }
+
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 
   sqlite3_close(db);

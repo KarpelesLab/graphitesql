@@ -152,6 +152,16 @@ void *sqlite3_update_hook(sqlite3 *db,
     void (*xCallback)(void *, int op, char const *zDb, char const *zTable, sqlite3_int64 rowid),
     void *pArg);
 
+/* Incremental BLOB I/O (buffered) */
+typedef struct sqlite3_blob sqlite3_blob;
+int sqlite3_blob_open(sqlite3 *db, const char *zDb, const char *zTable, const char *zColumn,
+                      sqlite3_int64 iRow, int flags, sqlite3_blob **ppBlob);
+int sqlite3_blob_bytes(sqlite3_blob *blob);
+int sqlite3_blob_read(sqlite3_blob *blob, void *z, int n, int iOffset);
+int sqlite3_blob_write(sqlite3_blob *blob, const void *z, int n, int iOffset);
+int sqlite3_blob_reopen(sqlite3_blob *blob, sqlite3_int64 iRow);
+int sqlite3_blob_close(sqlite3_blob *blob);
+
 void sqlite3_free(void *p);
 
 #ifdef __cplusplus

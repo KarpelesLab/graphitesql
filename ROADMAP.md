@@ -476,8 +476,9 @@ history / `CHANGELOG.md`. Remaining:
   symbols**. Verified end-to-end by a C program (`tests/ctest.c`, run in CI's `capi`
   job) that links the cdylib and drives the full lifecycle including a scalar UDF in
   a `WHERE`, an aggregate UDF over a `GROUP BY`, a window UDF, a custom collation, a
-  UTF-16 round-trip, and update-hook accounting. Residuals: incremental BLOB I/O,
-  online backup, the commit/rollback hooks, and the authorizer.
+  UTF-16 round-trip, update-hook accounting, and buffered incremental BLOB I/O
+  (`sqlite3_blob_*`). Residuals: online backup, the commit/rollback hooks, and the
+  authorizer.
 
 ### Track E — Cross-database write resolution  *(essentially complete)*
 

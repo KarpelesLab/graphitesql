@@ -1723,6 +1723,219 @@ pub unsafe extern "C" fn sqlite3_update_hook(
     core::ptr::null_mut()
 }
 
+// --- incremental BLOB I/O -----------------------------------------------------
+//
+// SQLite streams a single cell's bytes from disk; graphitesql's value model
+// materializes whole cells, so this handle buffers the cell (fetched on open,
+// flushed on close for a writable handle). API-compatible and correct, but
+// buffered rather than truly streaming.
+
+/// An open BLOB handle. Mirrors the opaque `sqlite3_blob`.
+pub struct sqlite3_blob {
+    db: *mut sqlite3,
+    table: String,
+    column: String,
+    rowid: c_longlong,
+    buf: Vec<u8>,
+    /// True if the source cell held text (write-back preserves the class).
+    was_text: bool,
+    dirty: bool,
+    readonly: bool,
+}
+
+/// Quote an identifier for interpolation (`"` doubled), like SQLite.
+fn quote_ident(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// Fetch the target cell's bytes and text-ness, or `None` if the row is absent.
+fn blob_fetch(db: &mut sqlite3, table: &str, column: &str, rowid: c_longlong) -> Option<(Vec<u8>, bool)> {
+    let sql = format!(
+        "SELECT {} FROM {} WHERE rowid = ?1",
+        quote_ident(column),
+        quote_ident(table)
+    );
+    let params = Params {
+        positional: vec![Value::Integer(rowid)],
+        named: Vec::new(),
+    };
+    match db.conn.query_params(&sql, &params) {
+        Ok(qr) if !qr.rows.is_empty() => {
+            let v = &qr.rows[0][0];
+            let was_text = matches!(v, Value::Text(_));
+            Some((value_to_text(v).unwrap_or_default(), was_text))
+        }
+        Ok(_) => None,
+        Err(e) => {
+            db.set_error(SQLITE_ERROR, &e.to_string());
+            None
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_blob_open(
+    db: *mut sqlite3,
+    _z_db: *const c_char,
+    z_table: *const c_char,
+    z_column: *const c_char,
+    i_row: c_longlong,
+    flags: c_int,
+    pp_blob: *mut *mut sqlite3_blob,
+) -> c_int {
+    if db.is_null() || pp_blob.is_null() {
+        return SQLITE_ERROR;
+    }
+    unsafe { *pp_blob = core::ptr::null_mut() };
+    let db_ref = unsafe { &mut *db };
+    let table = unsafe { cstr(z_table) }.to_string();
+    let column = unsafe { cstr(z_column) }.to_string();
+    let (buf, was_text) = match blob_fetch(db_ref, &table, &column, i_row) {
+        Some(x) => x,
+        None => {
+            db_ref.set_error(SQLITE_ERROR, "no such rowid");
+            return SQLITE_ERROR;
+        }
+    };
+    let blob = Box::new(sqlite3_blob {
+        db,
+        table,
+        column,
+        rowid: i_row,
+        buf,
+        was_text,
+        dirty: false,
+        readonly: flags == 0,
+    });
+    unsafe { *pp_blob = Box::into_raw(blob) };
+    SQLITE_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_blob_bytes(blob: *mut sqlite3_blob) -> c_int {
+    if blob.is_null() {
+        return 0;
+    }
+    unsafe { &*blob }.buf.len() as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_blob_read(
+    blob: *mut sqlite3_blob,
+    z: *mut c_void,
+    n: c_int,
+    offset: c_int,
+) -> c_int {
+    if blob.is_null() || z.is_null() || n < 0 || offset < 0 {
+        return SQLITE_ERROR;
+    }
+    let blob = unsafe { &*blob };
+    let (off, n) = (offset as usize, n as usize);
+    if off + n > blob.buf.len() {
+        return SQLITE_ERROR;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(blob.buf[off..].as_ptr(), z as *mut u8, n) };
+    SQLITE_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_blob_write(
+    blob: *mut sqlite3_blob,
+    z: *const c_void,
+    n: c_int,
+    offset: c_int,
+) -> c_int {
+    if blob.is_null() || z.is_null() || n < 0 || offset < 0 {
+        return SQLITE_ERROR;
+    }
+    let blob = unsafe { &mut *blob };
+    if blob.readonly {
+        return SQLITE_ERROR;
+    }
+    let (off, n) = (offset as usize, n as usize);
+    // A BLOB handle cannot change the cell's size.
+    if off + n > blob.buf.len() {
+        return SQLITE_ERROR;
+    }
+    let src = unsafe { core::slice::from_raw_parts(z as *const u8, n) };
+    blob.buf[off..off + n].copy_from_slice(src);
+    blob.dirty = true;
+    SQLITE_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_blob_reopen(blob: *mut sqlite3_blob, i_row: c_longlong) -> c_int {
+    if blob.is_null() {
+        return SQLITE_ERROR;
+    }
+    // Flush any pending write for the current row, then re-fetch the new one.
+    let _ = unsafe { blob_flush(blob) };
+    let blob = unsafe { &mut *blob };
+    let db = unsafe { &mut *blob.db };
+    match blob_fetch(db, &blob.table, &blob.column, i_row) {
+        Some((buf, was_text)) => {
+            blob.rowid = i_row;
+            blob.buf = buf;
+            blob.was_text = was_text;
+            blob.dirty = false;
+            SQLITE_OK
+        }
+        None => SQLITE_ERROR,
+    }
+}
+
+/// Write a dirty writable blob back to its cell, preserving the storage class.
+unsafe fn blob_flush(blob: *mut sqlite3_blob) -> c_int {
+    let blob = unsafe { &mut *blob };
+    if !blob.dirty || blob.readonly {
+        return SQLITE_OK;
+    }
+    let value = if blob.was_text {
+        Value::Text(String::from_utf8_lossy(&blob.buf).into_owned())
+    } else {
+        Value::Blob(blob.buf.clone())
+    };
+    let sql = format!(
+        "UPDATE {} SET {} = ?1 WHERE rowid = ?2",
+        quote_ident(&blob.table),
+        quote_ident(&blob.column)
+    );
+    let params = Params {
+        positional: vec![value, Value::Integer(blob.rowid)],
+        named: Vec::new(),
+    };
+    let db = unsafe { &mut *blob.db };
+    match db.conn.execute_params(&sql, &params) {
+        Ok(_) => {
+            blob.dirty = false;
+            SQLITE_OK
+        }
+        Err(e) => {
+            db.set_error(SQLITE_ERROR, &e.to_string());
+            SQLITE_ERROR
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_blob_close(blob: *mut sqlite3_blob) -> c_int {
+    if blob.is_null() {
+        return SQLITE_OK;
+    }
+    let rc = unsafe { blob_flush(blob) };
+    drop(unsafe { Box::from_raw(blob) });
+    rc
+}
+
 // --- memory -------------------------------------------------------------------
 
 /// Free memory handed to the caller by this library (`errmsg` from `exec`).
