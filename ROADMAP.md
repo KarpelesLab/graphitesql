@@ -251,6 +251,16 @@ result or declines to it — never a wrong answer), so this track is
 
 **Move the last shapes onto the VDBE:**
 
+- **B-limit-fold — constant-expression `LIMIT`/`OFFSET` on the VDBE. DONE
+  2026-07-11.** `fold_const_int` now folds a `LIMIT`/`OFFSET` built from
+  deterministic, stateless scalar functions (`abs`/`round`/`length`/`coalesce`/…,
+  combined with arithmetic), not just an integer literal — so e.g.
+  `LIMIT abs(-3)` and `LIMIT (2*2)+coalesce(NULL,1)` run on the VDBE instead of
+  bailing. The allowlist deliberately excludes clock (`datetime`/`strftime`),
+  random, and connection-state functions, which are folded at *run* time by the
+  tree-walker (folding them at *compile* time would diverge); those, and any
+  column/subquery/aggregate/window/filtered argument, bail — so the result is
+  always identical to the tree-walker (`tests/vdbe_limit_fold.rs`).
 - **B5b-2 — seek-driven inner cursor over real storage** *(the largest remaining
   VDBE piece)*. Inner rowid seeks (INNER + LEFT, single & N-table left-deep chain,
   compound-`ON`) already run over a live `TableCursor`. *Single-table live scan

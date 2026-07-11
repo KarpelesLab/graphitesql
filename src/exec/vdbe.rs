@@ -661,6 +661,70 @@ fn unparen(e: &Expr) -> &Expr {
 /// references row/connection state (a column, parameter, subquery, or function)
 /// so the tree-walker must handle it. Only literal/paren/cast/unary/binary trees
 /// are folded; the rowless tree-walker `eval` evaluates those deterministically.
+/// Scalar functions safe to evaluate at **compile time** for constant folding:
+/// deterministic, side-effect-free, and independent of the wall clock and
+/// connection state. This is deliberately STRICTER than the VDBE's run-time
+/// function allowlist — which includes `date`/`time`/`datetime`/`strftime`
+/// because those read the clock identically on both paths *at run time*. Folding
+/// a clock/random/state function here (at compile time) could diverge from the
+/// tree-walker, so they are excluded and left to bail.
+fn is_const_pure_fn(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "abs"
+            | "coalesce"
+            | "ifnull"
+            | "iif"
+            | "nullif"
+            | "sign"
+            | "round"
+            | "length"
+            | "lower"
+            | "upper"
+            | "hex"
+            | "unhex"
+            | "quote"
+            | "char"
+            | "unicode"
+            | "trim"
+            | "ltrim"
+            | "rtrim"
+            | "replace"
+            | "substr"
+            | "substring"
+            | "instr"
+            | "typeof"
+            | "printf"
+            | "format"
+            | "sqrt"
+            | "pow"
+            | "power"
+            | "mod"
+            | "exp"
+            | "ln"
+            | "log"
+            | "log10"
+            | "log2"
+            | "ceil"
+            | "ceiling"
+            | "floor"
+            | "trunc"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "atan2"
+            | "sinh"
+            | "cosh"
+            | "tanh"
+            | "radians"
+            | "degrees"
+            | "pi"
+    )
+}
+
 fn fold_const_int(e: &Expr) -> Option<i64> {
     fn pure(e: &Expr) -> bool {
         match e {
@@ -668,6 +732,26 @@ fn fold_const_int(e: &Expr) -> Option<i64> {
             Expr::Paren(x) | Expr::Cast { expr: x, .. } => pure(x),
             Expr::Unary { expr, .. } => pure(expr),
             Expr::Binary { left, right, .. } => pure(left) && pure(right),
+            // A deterministic, stateless scalar function of pure arguments — folds
+            // at compile time. Aggregates/`*`/`DISTINCT`, clock/random/state
+            // functions, and anything with a column/subquery argument are excluded
+            // (they bail to the tree-walker, which is never wrong).
+            Expr::Function {
+                name,
+                args,
+                distinct,
+                star,
+                filter,
+                over,
+                ..
+            } => {
+                !*distinct
+                    && !*star
+                    && filter.is_none()
+                    && over.is_none()
+                    && is_const_pure_fn(name)
+                    && args.iter().all(pure)
+            }
             _ => false,
         }
     }
