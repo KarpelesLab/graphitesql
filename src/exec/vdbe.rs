@@ -387,6 +387,14 @@ pub enum AggKind {
     Min,
     Max,
     GroupConcat,
+    /// `json_group_array(x)` / `jsonb_group_array(x)` — collect every value
+    /// (including NULLs, as JSON `null`) into a JSON array; `jsonb` selects the
+    /// binary JSONB encoding. Only admitted when the argument does not statically
+    /// carry the JSON subtype (see `func::produces_json`), so `value_to_json`
+    /// reproduces the tree-walker's `arg_to_json` exactly.
+    JsonGroupArray {
+        jsonb: bool,
+    },
 }
 
 /// One `ORDER BY` key for [`Op::SorterSort`]: direction, NULL placement, and the
@@ -1000,6 +1008,21 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
         // aggregates must have exactly one argument"), so leave it to fall back.
         "group_concat" | "string_agg" if args.len() == 2 && !*distinct => {
             (AggKind::GroupConcat, Some(const_sep_text(&args[1])?))
+        }
+        // `json_group_array(x)` collects every value (NULLs included) into a JSON
+        // array. Admitted only when the argument does not statically carry the JSON
+        // subtype: then the tree-walker's `arg_to_json` reduces to `value_to_json`,
+        // which the finalizer uses — so a `json(x)`/`->` argument (whose text must
+        // be spliced in unquoted) defers to the tree-walker.
+        "json_group_array" | "jsonb_group_array"
+            if args.len() == 1 && !args.first().is_some_and(super::func::produces_json) =>
+        {
+            (
+                AggKind::JsonGroupArray {
+                    jsonb: name.eq_ignore_ascii_case("jsonb_group_array"),
+                },
+                None,
+            )
         }
         _ => return None,
     };
@@ -5948,7 +5971,8 @@ fn run_rows_multi_impl(
                 } else if *kind == AggKind::CountStar {
                     agg[*slot].count += 1;
                 } else if let Some(r) = arg
-                    && !matches!(regs[*r], Value::Null)
+                    && (matches!(*kind, AggKind::JsonGroupArray { .. })
+                        || !matches!(regs[*r], Value::Null))
                 {
                     let v = regs[*r].clone();
                     // A DISTINCT aggregate folds each distinct argument value
@@ -6036,7 +6060,8 @@ fn run_rows_multi_impl(
                     if spec.kind == AggKind::CountStar {
                         groups[gi].1[j].count += 1;
                     } else if let Some(r) = spec.arg
-                        && !matches!(regs[r], Value::Null)
+                        && (matches!(spec.kind, AggKind::JsonGroupArray { .. })
+                            || !matches!(regs[r], Value::Null))
                     {
                         let v = regs[r].clone();
                         // A DISTINCT aggregate folds each distinct argument
@@ -6379,6 +6404,20 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
                 idx.sort_by(|&i, &j| cmp_key_rows(&keys[i], &keys[j], &dirs));
                 let parts: Vec<String> = idx.iter().map(|&i| eval::to_text(&vals[i])).collect();
                 Value::Text(parts.join(sep))
+            }
+        }
+        AggKind::JsonGroupArray { jsonb } => {
+            // Every collected value (NULLs included — the fold keeps them for this
+            // kind) becomes a JSON element via the same `value_to_json` the
+            // tree-walker's `arg_to_json` uses for a non-subtype argument, so the
+            // serialized array is byte-identical. An empty group yields `[]` (not
+            // NULL). `ORDER BY` inside the call already bailed at compile time.
+            let items: Vec<_> = vals.iter().map(crate::exec::json::value_to_json).collect();
+            let arr = crate::exec::json::Json::Array(items);
+            if jsonb {
+                Value::Blob(arr.to_jsonb())
+            } else {
+                Value::Text(arr.serialize())
             }
         }
     })

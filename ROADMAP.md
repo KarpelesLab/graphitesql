@@ -339,6 +339,15 @@ result or declines to it — never a wrong answer), so this track is
   Byte-identical to sqlite (`grouped_correlated_in_having_and_order_by`).
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).
+- **VDBE aggregate coverage — `json_group_array` / `jsonb_group_array`. DONE 2026-07-11.**
+  Added `AggKind::JsonGroupArray { jsonb }`: the fold keeps NULL arguments for this
+  kind (SQLite includes them as JSON `null`) and the finalizer serializes the
+  collected values via the same `json::value_to_json` the tree-walker's `arg_to_json`
+  uses, so an empty group yields `[]` (not NULL) and the array is byte-identical.
+  Admitted only when the argument does not statically carry the JSON subtype
+  (`func::produces_json` — a `json(x)` / `->` argument defers, since its text must be
+  spliced in unquoted). `DISTINCT` dedups via the existing per-group path. Verified vs
+  sqlite3 (`tests/vdbe_json_group_array.rs`).
 
 **Cost model & EQP fidelity** *(rows already correct — plan/perf only)*:
 

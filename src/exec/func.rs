@@ -1646,7 +1646,7 @@ pub(crate) fn arg_to_json(val: &Value, expr: Option<&Expr>) -> super::json::Json
 /// only with two or more paths (then its result is always a JSON array — a
 /// single path's subtype is value-dependent and needs the runtime subtype, not
 /// modelled here); the `->` operator always carries the subtype (`->>` does not).
-fn produces_json(e: &Expr) -> bool {
+pub(crate) fn produces_json(e: &Expr) -> bool {
     match e {
         Expr::Function { name, args, .. } => {
             let lname = name.to_ascii_lowercase();
