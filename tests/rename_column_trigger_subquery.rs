@@ -25,9 +25,12 @@
 //! a genuinely *mixed* body — the same bare name binding to the renamed table in
 //! one scope and another table in a different scope — is handled via
 //! per-occurrence source spans on `Expr::Column`, rewriting exactly the bound
-//! occurrences (A-rn3-edge). Any non-base source (a derived subquery/TVF, CTE,
-//! `UPDATE … FROM`) still bails the whole trigger untouched — the remaining
-//! residual.
+//! occurrences (A-rn3-edge). An `UPDATE … SET … FROM <sources>` body statement is
+//! now handled too: the joined `FROM` tables are collected as additional base
+//! sources, so a `<src>.old` or globally-unique bare `old` in the `SET`/`WHERE`
+//! rewrites (and the matching DROP COLUMN break is rejected). A derived
+//! subquery/TVF source in that `FROM`, or one named exactly the renamed column,
+//! still bails the trigger untouched — the remaining residual.
 //!
 //! Verified against the sqlite3 3.50.4 CLI.
 
@@ -133,6 +136,32 @@ fn rename_column_rewrites_cross_object_trigger_refs() {
         "CREATE TABLE t(a,b); CREATE TABLE u(c); \
          CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
            UPDATE u SET c=(WITH x AS (SELECT a FROM t) SELECT count(*) FROM x); END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // `UPDATE … SET … FROM <table>` in the body: the joined `FROM t` is a base
+        // source, so the renamed `t.a` — read via a qualifier — is rewritten. The
+        // old code bailed on any `UPDATE … FROM`, leaving the ref stale.
+        "CREATE TABLE t(a,b); CREATE TABLE u(y,z); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET z=t.a FROM t WHERE u.y=t.b; END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // Same, reached by a globally-unique *bare* `a` in the `SET` value (only
+        // `t` has an `a`, so it binds there and is rewritten).
+        "CREATE TABLE t(a,b); CREATE TABLE u(y,z); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET z=a FROM t WHERE u.y=t.b; END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // The `FROM` source is aliased: `x.a` (x = t) rewrites via the alias qual.
+        "CREATE TABLE t(a,b); CREATE TABLE u(y,z); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET z=x.a FROM t AS x WHERE u.y=x.b; END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // `UPDATE … FROM` where the renamed name also exists in the target table:
+        // not globally unique, so only the qualified `t.a` rewrites; the target's
+        // own `a` (in the `WHERE`) is left — scope-aware per-occurrence, matching
+        // SQLite.
+        "CREATE TABLE t(a,b); CREATE TABLE u(a,z); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET z=t.a FROM t WHERE u.a=t.b; END; \
          ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
     ];
     for sql in cases {

@@ -45928,6 +45928,53 @@ fn collect_trigger_stmt_bare_owners(
 /// schema-qualified / RETURNING / upsert / CTE / `UPDATE … FROM` / row-value
 /// assignment statement, a target named or aliased exactly `old`, or any
 /// unprovable nested `SELECT` (handled by [`collect_select_base_sources`]).
+/// Collect the base sources of an `UPDATE … SET … FROM <sources>` clause into
+/// `srcs`, the same treatment [`collect_select_base_sources_ctx`] gives a
+/// `SELECT`'s `FROM`: each plain table pushes `(name, alias)` and a derived
+/// `(SELECT …)` source recurses. A `NATURAL`/`USING` join, table-valued function,
+/// schema-qualified source, or any source named/aliased exactly `old` bails
+/// (returns `false`) — leave the trigger byte-identical rather than risk a wrong
+/// token rewrite, consistent with the target-table `push_target` collision guard.
+fn collect_fromclause_base_sources(
+    from: &crate::sql::ast::FromClause,
+    old: &str,
+    srcs: &mut Vec<(String, Option<String>)>,
+) -> bool {
+    let mut sources: Vec<(&crate::sql::ast::TableRef, bool, bool)> =
+        alloc::vec![(&from.first, false, false)];
+    for j in &from.joins {
+        sources.push((&j.table, j.natural, !j.using.is_empty()));
+    }
+    for (tr, natural, using) in sources {
+        if natural || using || tr.tvf_args.is_some() || tr.schema.is_some() {
+            return false;
+        }
+        if let Some(subq) = &tr.subquery {
+            if tr
+                .alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(old))
+            {
+                return false;
+            }
+            if !collect_select_base_sources(subq, old, srcs) {
+                return false;
+            }
+            continue;
+        }
+        if tr.name.eq_ignore_ascii_case(old)
+            || tr
+                .alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(old))
+        {
+            return false;
+        }
+        srcs.push((tr.name.clone(), tr.alias.clone()));
+    }
+    true
+}
+
 fn collect_trigger_stmt_base_sources(
     stmt: &Statement,
     old: &str,
@@ -45982,11 +46029,21 @@ fn collect_trigger_stmt_base_sources(
         }
         Statement::Update(u) => {
             if u.schema.is_some()
-                || u.from.is_some()
                 || !u.returning.is_empty()
                 || !u.row_assignments.is_empty()
                 || !u.ctes.is_empty()
                 || !push_target(&u.table, u.alias.as_deref(), old, srcs)
+            {
+                return false;
+            }
+            // `UPDATE … SET … FROM <sources>` (SQLite extension): the joined tables
+            // are additional readable sources, so a qualified `<src>.old` or a
+            // globally-unique bare `old` in the `SET`/`WHERE` binds to one of them.
+            // Collect them (a wrong-shape `FROM` bails), fixing a false-accept where
+            // a trigger-body `UPDATE u SET z = t.c FROM t` referenced a since-dropped
+            // `t.c`, and the matching missed RENAME COLUMN rewrite.
+            if let Some(from) = &u.from
+                && !collect_fromclause_base_sources(from, old, srcs)
             {
                 return false;
             }

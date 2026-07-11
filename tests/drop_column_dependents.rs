@@ -92,6 +92,19 @@ fn a_trigger_referencing_the_dropped_column_names_the_trigger_and_ref() {
             "CREATE TRIGGER tr AFTER INSERT ON s BEGIN INSERT INTO log SELECT c FROM t; END",
             "error in trigger tr after drop column: no such column: c",
         ),
+        // `UPDATE … SET … FROM t`: the joined `FROM t` is a readable source, so a
+        // qualified `t.c` value in the `SET` binds to the dropped column and breaks
+        // the trigger. graphite used to bail on any `UPDATE … FROM` and accept the
+        // drop, leaving the trigger silently broken.
+        (
+            "CREATE TRIGGER tr AFTER INSERT ON s BEGIN UPDATE s SET z = t.c FROM t WHERE s.z = t.a; END",
+            "error in trigger tr after drop column: no such column: t.c",
+        ),
+        // The same reached by a globally-unique bare `c` (only `t` has a `c`).
+        (
+            "CREATE TRIGGER tr AFTER INSERT ON s BEGIN UPDATE s SET z = c FROM t WHERE s.z = t.a; END",
+            "error in trigger tr after drop column: no such column: c",
+        ),
     ];
     for (setup, msg) in cases {
         let mut c = Connection::open_memory().unwrap();
