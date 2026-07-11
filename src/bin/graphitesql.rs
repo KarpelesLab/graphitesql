@@ -264,6 +264,12 @@ impl Shell {
                 self.run_group(conn, &sql, group_start_line);
             }
         }
+        // At EOF, run any statement left unterminated by a `;` — SQLite completes
+        // the buffer at end-of-input (so `SELECT 1` with no trailing `;` still
+        // runs). A comment-/whitespace-only remainder is discarded, not run.
+        if has_sql_content(&buffer) {
+            self.run_group(conn, &buffer, group_start_line);
+        }
         // Non-interactive (piped) input: exit non-zero if any error occurred,
         // matching SQLite — even with `.bail off`, a failed statement makes the
         // shell exit with a failure code so scripts can detect it.
@@ -309,6 +315,10 @@ impl Shell {
                 let sql = std::mem::take(&mut buffer);
                 self.run_group(conn, &sql, group_start_line);
             }
+        }
+        // Run a final statement left unterminated by `;` at EOF (see `repl`).
+        if has_sql_content(&buffer) {
+            self.run_group(conn, &buffer, group_start_line);
         }
         false
     }
@@ -365,7 +375,10 @@ impl Shell {
         let mut search_from = 0usize;
         for stmt_raw in split_statements(sql) {
             let stmt = stmt_raw.trim();
-            if stmt.is_empty() {
+            // Skip a chunk with no SQL (blank, or only comments) — SQLite runs the
+            // statements around it and ignores it, rather than raising an `empty
+            // statement` error (e.g. `SELECT 1; /* c */; SELECT 2`).
+            if !has_sql_content(stmt) {
                 continue;
             }
             let off = sql[search_from..]
@@ -2884,6 +2897,42 @@ fn pragma_setter_result_query(sql: &str) -> Option<String> {
 /// Split a batch into statements on `;`, respecting single-quoted strings so a
 /// `;` inside a literal does not split it. (Good enough for a shell; the engine
 /// re-parses each piece.)
+/// Whether `s` holds anything other than whitespace and SQL comments — the
+/// shell's `_all_whitespace()` test. At end-of-input the trailing (unterminated
+/// by `;`) buffer is executed only when this is true, so a complete statement
+/// missing its final `;` runs (matching SQLite, which completes the buffer at
+/// EOF) while a trailing comment or blank line is silently discarded rather than
+/// raising an `empty statement` error. Line (`--`) and block (`/* */`) comments
+/// are skipped; an unterminated block comment counts as all-whitespace (as in
+/// SQLite), so it too is discarded.
+fn has_sql_content(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            // Whitespace and bare statement separators carry no SQL — a chunk of
+            // only comments/`;` (e.g. `split_statements` re-attaches the `;` to a
+            // `/* c */` between statements) is an empty statement, not content.
+            b' ' | b'\t' | b'\r' | b'\n' | 0x0c | b';' => i += 1,
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
 fn split_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
