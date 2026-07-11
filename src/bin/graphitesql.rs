@@ -2578,6 +2578,9 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str, sql: &str) -> bool {
                 // A TVF whose required first argument is missing/unusable is a
                 // prepare-time error (`SELECT * FROM generate_series()`).
                 "first argument to \"generate_series()\"",
+                // `likelihood(x, p)` with an out-of-range constant probability is a
+                // prepare-time constant check (`nth_value`'s value check is step).
+                "second argument to likelihood()",
                 "missing datatype for",
                 "unknown datatype for", // STRICT table column with an invalid type name
                 "AUTOINCREMENT", // "… is only allowed on …" / "… not allowed on WITHOUT ROWID …"
@@ -2640,6 +2643,14 @@ fn error_offending_token(msg: &str) -> Option<&str> {
             return rest.split('(').next().filter(|t| !t.is_empty());
         }
     }
+    // `second argument to likelihood() must be a constant …` carets the function
+    // name (the parenthesised `NAME()` form; the un-parenthesised `second argument
+    // to nth_value …` variant is a run-time error that never reaches this caret
+    // path, and its space-bearing remainder is rejected below anyway).
+    if let Some(rest) = msg.strip_prefix("second argument to ") {
+        let name = rest.split('(').next().unwrap_or(rest);
+        return (!name.is_empty() && !name.contains(' ')).then_some(name);
+    }
     // Among the colon-delimited resolution errors, SQLite carets only these three
     // (the identifier is in the current statement's scope). The `no such column`
     // form may carry a trailing ` - should this be a string literal…` hint.
@@ -2650,15 +2661,13 @@ fn error_offending_token(msg: &str) -> Option<&str> {
     ] {
         if let Some(rest) = msg.strip_prefix(pre) {
             let tok = rest.split(" - ").next().unwrap_or(rest);
-            // The ALTER-rename form quotes the name (`no such column: "nope"`)
-            // while the SELECT-resolution form does not (`no such column: froed`);
-            // the caret is located at the bare identifier in the source either way,
-            // so strip a surrounding pair of double quotes before searching.
-            let tok = tok
-                .strip_prefix('"')
-                .and_then(|t| t.strip_suffix('"'))
-                .unwrap_or(tok);
-            return (!tok.is_empty() && !tok.contains(' ')).then_some(tok);
+            // Keep any surrounding double quotes: `SELECT "x"` carets the opening
+            // quote (source is quoted), while `RENAME COLUMN nope` carets the bare
+            // identifier (source is bare, message quotes it). `locate_offending`
+            // tries the quoted form first, then the dequoted form, so each lands
+            // where SQLite's does. A quoted name with an inner space is still valid.
+            let ok = !tok.is_empty() && (tok.starts_with('"') || !tok.contains(' '));
+            return ok.then_some(tok);
         }
     }
     // `<kind> <name> already exists` carets the object name — but only for a table,
@@ -2678,6 +2687,20 @@ fn error_offending_token(msg: &str) -> Option<&str> {
 /// single-quoted string literal or a comment (SQLite's caret points at the code
 /// occurrence, never one inside a string). A double-quoted `"ident"` is *not*
 /// skipped — it is a valid identifier the token may itself be.
+/// Locate the offending token for a caret, trying it verbatim first — a quoted
+/// `"x"` in the source carets the opening quote — then, if the token was quoted
+/// and no verbatim match was found, its dequoted inner form: a `no such column:
+/// "nope"` message whose source spells the column bare (`RENAME COLUMN nope`)
+/// carets the bare identifier. Each lands exactly where SQLite's caret does.
+fn locate_offending(sql: &str, tok: &str) -> Option<usize> {
+    locate_token(sql, tok).or_else(|| {
+        tok.strip_prefix('"')
+            .and_then(|t| t.strip_suffix('"'))
+            .filter(|t| !t.is_empty())
+            .and_then(|inner| locate_token(sql, inner))
+    })
+}
+
 fn locate_token(sql: &str, token: &str) -> Option<usize> {
     // A token that itself begins with `'` is an unterminated / malformed string
     // literal (`unrecognized token: "'abc"`); the string-skipping below would hide
@@ -2774,7 +2797,7 @@ fn render_cli_error(sql: &str, e: &graphitesql::Error) -> String {
         let off = e
             .parse_offset()
             .filter(|&o| o <= sql.len())
-            .or_else(|| error_offending_token(&msg).and_then(|t| locate_token(sql, t)));
+            .or_else(|| error_offending_token(&msg).and_then(|t| locate_offending(sql, t)));
         if let Some(off) = off {
             return format!("Error: in prepare, {msg}\n{}", caret_block(sql, off));
         }
@@ -2827,7 +2850,7 @@ fn render_script_error(sql: &str, e: &graphitesql::Error, line: usize) -> String
         let off = e
             .parse_offset()
             .filter(|_| flat == sql)
-            .or_else(|| error_offending_token(&msg).and_then(|t| locate_token(&flat, t)));
+            .or_else(|| error_offending_token(&msg).and_then(|t| locate_offending(&flat, t)));
         if let Some(off) = off {
             return format!(
                 "Parse error near line {line}: {msg}\n{}",

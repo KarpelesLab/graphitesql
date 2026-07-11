@@ -90,8 +90,9 @@ fn one_shot_error_rendering_matches_sqlite() {
         "SELECT (SELECT 1,2)",
         "CREATE TABLE t(a); SELECT a FROM t GROUP BY count(*)",
         "SELECT * FROM generate_series()", // TVF required first arg missing (prepare)
+        "SELECT likelihood(1, 2.0)", // out-of-range constant probability (prepare, carets the fn)
         "CREATE TABLE t(a); SELECT a FROM t HAVING a>1", // HAVING on a non-aggregate query
-        "SELECT 1 UNION SELECT 1,2",       // compound arity mismatch
+        "SELECT 1 UNION SELECT 1,2", // compound arity mismatch
         "SELECT 1 INTERSECT SELECT 1,2",
         "VALUES(1),(1,2)",             // VALUES term-count mismatch
         "REINDEX nope",                // unable to identify the object to be reindexed
