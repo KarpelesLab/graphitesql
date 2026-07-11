@@ -3042,14 +3042,6 @@ pub fn compile_join2(
         return Err(Error::Unsupported("VDBE: join shape not nested-loopable"));
     }
     reject_aggregate_or_window_in_predicates(sel)?;
-    // DISTINCT compares output rows under BINARY; a non-BINARY column collation
-    // would diverge, so defer those to the tree-walker (as the single-table path
-    // does).
-    if sel.distinct && collations.iter().any(|cl| *cl != Collation::Binary) {
-        return Err(Error::Unsupported(
-            "VDBE: non-BINARY collation with DISTINCT",
-        ));
-    }
     let projections = expand_projections(sel, columns, tables)?;
     // A row-level DISTINCT dedups under each output column's collation; the VDBE's
     // DistinctCheck compares under BINARY, so an explicit `COLLATE` on a projection
@@ -3153,14 +3145,25 @@ pub fn compile_join2(
         c.compile_expr_into(expr, i)?;
     }
     // DISTINCT gates on the projected row and runs before OFFSET/LIMIT/sorter (a
-    // duplicate must not consume the budget nor enter the sorter).
+    // duplicate must not consume the budget nor enter the sorter). Each projected
+    // column dedups under its resolved collation (declared column collation or an
+    // explicit `COLLATE BINARY`; a non-BINARY explicit `COLLATE` deferred above),
+    // exactly like the single-table scan path.
     let distinct_skip = if sel.distinct {
+        let colls: Vec<Collation> = projections
+            .iter()
+            .map(|(e, _)| {
+                c.explicit_collation(e)
+                    .or_else(|| c.col_collation(e))
+                    .unwrap_or_default()
+            })
+            .collect();
         let at = c.ops.len();
         c.ops.push(Op::DistinctCheck {
             start: 0,
             count,
             target: 0,
-            collations: alloc::vec::Vec::new(),
+            collations: colls,
         });
         Some(at)
     } else {
