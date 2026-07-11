@@ -235,6 +235,14 @@ fn matches_sqlite_cli() {
         "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET c=1 WHERE a=1; END; ALTER TABLE t DROP COLUMN c; SELECT 'ok';",
         "CREATE TRIGGER tr AFTER INSERT ON s BEGIN INSERT INTO t(c) VALUES(1); END; ALTER TABLE t DROP COLUMN c; SELECT 'ok';",
         "CREATE TRIGGER tr AFTER UPDATE OF c ON t BEGIN INSERT INTO log VALUES(1); END; ALTER TABLE t DROP COLUMN c; SELECT 'ok';",
+        // triggers reaching c only through a multi-source body statement (reject):
+        // an `UPDATE … FROM t`, a `SET (…) = (SELECT … FROM t)` row-assignment,
+        // and an `ON CONFLICT … DO UPDATE SET … = (SELECT … FROM t)` upsert.
+        "CREATE TRIGGER tr AFTER INSERT ON s BEGIN UPDATE s SET z=t.c FROM t WHERE s.z=t.a; END; ALTER TABLE t DROP COLUMN c;",
+        "CREATE TRIGGER tr AFTER INSERT ON s BEGIN UPDATE s SET (z)=(SELECT c FROM t LIMIT 1); END; ALTER TABLE t DROP COLUMN c;",
+        "CREATE TABLE p(k PRIMARY KEY,w); CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO p VALUES(1,2) ON CONFLICT(k) DO UPDATE SET w=(SELECT c FROM t LIMIT 1); END; ALTER TABLE t DROP COLUMN c;",
+        // …but the same shapes referencing only a *surviving* column drop cleanly.
+        "CREATE TRIGGER tr AFTER INSERT ON s BEGIN UPDATE s SET z=t.a FROM t WHERE s.z=t.b; END; ALTER TABLE t DROP COLUMN c; SELECT 'ok';",
         // schema-order precedence
         "CREATE VIEW v AS SELECT c FROM t; CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES(NEW.c); END; ALTER TABLE t DROP COLUMN c;",
         "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES(NEW.c); END; CREATE VIEW v AS SELECT c FROM t; ALTER TABLE t DROP COLUMN c;",

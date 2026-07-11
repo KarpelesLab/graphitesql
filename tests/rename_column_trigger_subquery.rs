@@ -25,12 +25,15 @@
 //! a genuinely *mixed* body — the same bare name binding to the renamed table in
 //! one scope and another table in a different scope — is handled via
 //! per-occurrence source spans on `Expr::Column`, rewriting exactly the bound
-//! occurrences (A-rn3-edge). An `UPDATE … SET … FROM <sources>` body statement is
-//! now handled too: the joined `FROM` tables are collected as additional base
-//! sources, so a `<src>.old` or globally-unique bare `old` in the `SET`/`WHERE`
-//! rewrites (and the matching DROP COLUMN break is rejected). A derived
-//! subquery/TVF source in that `FROM`, or one named exactly the renamed column,
-//! still bails the trigger untouched — the remaining residual.
+//! occurrences (A-rn3-edge). The multi-source body statements are handled too: an
+//! `UPDATE … SET … FROM <sources>` collects its joined `FROM` tables as base
+//! sources; a row-assignment `SET (…) = (SELECT … FROM other)` and an
+//! `ON CONFLICT … DO UPDATE SET … = (SELECT … FROM other)` upsert collect their
+//! nested subqueries' sources. So a `<src>.old` or globally-unique bare `old`
+//! reached through any of them rewrites (and the matching DROP COLUMN break is
+//! rejected). A `NATURAL`/`USING` join, table-valued-function or derived source in
+//! an `UPDATE … FROM`, or a row-assignment target-list that names the renamed
+//! column, still bails the trigger untouched — the remaining residual.
 //!
 //! Verified against the sqlite3 3.50.4 CLI.
 
@@ -162,6 +165,21 @@ fn rename_column_rewrites_cross_object_trigger_refs() {
         "CREATE TABLE t(a,b); CREATE TABLE u(a,z); \
          CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
            UPDATE u SET z=t.a FROM t WHERE u.a=t.b; END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // A row-assignment subquery `SET (…) = (SELECT … FROM t)`: the subquery is
+        // a base source, so its `a` (bound to `t`) is rewritten while the target
+        // column-list `(z)` is left. The old code bailed on any row-assignment.
+        "CREATE TABLE t(a,b); CREATE TABLE u(y,z); \
+         CREATE TRIGGER tr AFTER INSERT ON u BEGIN \
+           UPDATE u SET (z)=(SELECT a FROM t LIMIT 1); END; \
+         ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
+        // An `ON CONFLICT … DO UPDATE SET … = (SELECT … FROM t)` upsert reached by
+        // a body `INSERT`: both the inserted `VALUES` subquery and the DO-UPDATE
+        // subquery read `t.a` and are rewritten. The old code bailed on any upsert.
+        "CREATE TABLE t(a,b); CREATE TABLE u(y PRIMARY KEY,z); \
+         CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+           INSERT INTO u VALUES(1,(SELECT a FROM t LIMIT 1)) \
+           ON CONFLICT(y) DO UPDATE SET z=(SELECT a FROM t LIMIT 1); END; \
          ALTER TABLE t RENAME COLUMN a TO aa; SELECT sql FROM sqlite_schema WHERE name='tr'",
     ];
     for sql in cases {

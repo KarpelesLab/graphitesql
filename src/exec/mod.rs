@@ -46012,11 +46012,32 @@ fn collect_trigger_stmt_base_sources(
         Statement::Insert(i) => {
             if i.schema.is_some()
                 || !i.returning.is_empty()
-                || !i.upsert.is_empty()
                 || !i.ctes.is_empty()
                 || !push_target(&i.table, None, old, srcs)
             {
                 return false;
+            }
+            // `ON CONFLICT … DO UPDATE SET … [WHERE …]` (and a partial-index target
+            // `WHERE`) may nest subqueries reading other tables; collect their base
+            // sources so a renamed/dropped column reached only through the upsert
+            // clause is rewritten / reported. The conflict-target and DO-UPDATE `SET`
+            // targets are write targets (skipped for DROP detection downstream).
+            for up in &i.upsert {
+                let mut up_exprs: Vec<&Expr> = Vec::new();
+                up_exprs.extend(up.target_where.as_ref());
+                if let crate::sql::ast::UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                } = &up.action
+                {
+                    for (_, e) in assignments {
+                        up_exprs.push(e);
+                    }
+                    up_exprs.extend(where_clause.as_ref());
+                }
+                if !collect_expr_subs(&up_exprs, old, srcs) {
+                    return false;
+                }
             }
             match &i.source {
                 InsertSource::DefaultValues => true,
@@ -46030,11 +46051,22 @@ fn collect_trigger_stmt_base_sources(
         Statement::Update(u) => {
             if u.schema.is_some()
                 || !u.returning.is_empty()
-                || !u.row_assignments.is_empty()
                 || !u.ctes.is_empty()
                 || !push_target(&u.table, u.alias.as_deref(), old, srcs)
             {
                 return false;
+            }
+            // Row-assignment subqueries `SET (c1,c2,…) = (SELECT … FROM other)`: the
+            // subquery is a readable source, so collect its base tables. Bail if a
+            // target column-list names `old` — its bare token inside the `(…)` group
+            // is not a skippable `col=` write target, so leaving the trigger
+            // untouched is safer than misjudging the drop/rename there.
+            for (targets, sub) in &u.row_assignments {
+                if targets.iter().any(|t| t.eq_ignore_ascii_case(old))
+                    || !collect_select_base_sources(sub, old, srcs)
+                {
+                    return false;
+                }
             }
             // `UPDATE … SET … FROM <sources>` (SQLite extension): the joined tables
             // are additional readable sources, so a qualified `<src>.old` or a
