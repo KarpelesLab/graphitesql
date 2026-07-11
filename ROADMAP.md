@@ -266,12 +266,16 @@ result or declines to it — never a wrong answer), so this track is
   non-BINARY declared-collation column, with no `GROUP BY`, now run on the VDBE:
   `Op::AggStep` carries the argument collation, the fold dedups with
   `distinct_eq_coll` and reduces `min`/`max` with `cmp_values_coll`. Both
-  bare-aggregate bails (single-table + join) are removed. With this, **collation on
-  the VDBE is complete** — DISTINCT (single-table + join), `GROUP BY` key/order/
-  companion, and the grouped and bare aggregate folds all honor collations; only an
-  explicit-`COLLATE` group key or aggregate argument still defers (conservative, via
-  `agg_kind_distinct` / the computed-key bail). Safe by construction (BINARY
-  arguments are byte-identical). `tests/vdbe_distinct_agg.rs`.
+  bare-aggregate bails (single-table + join) are removed. Explicit-`COLLATE` group
+  keys (62a9ce1) and explicit-`COLLATE` aggregate arguments (4bac6b5) run too — the
+  computed-key bail and `agg_kind_distinct`'s collation check are removed since the
+  fold resolves the collation. With this, **collation on the VDBE is complete**:
+  DISTINCT (single-table + join), `GROUP BY` (declared + explicit-`COLLATE` keys,
+  order, companion), and the grouped and bare aggregate folds (declared + explicit-
+  `COLLATE` arguments) all honor collations. Safe by construction (BINARY is
+  byte-identical). The only remaining collation defer is an explicit-`COLLATE` on a
+  row-level `SELECT DISTINCT` projection (niche; 5 of 7 DISTINCT paths still dedup
+  under BINARY). `tests/vdbe_distinct_agg.rs`, `tests/vdbe_group_collate.rs`.
 - **B-groupby-collate — collation-aware `GROUP BY` on the VDBE. DONE 2026-07-12.**
   `GROUP BY` over a non-BINARY declared-collation key (`NOCASE`/`RTRIM`/custom) now
   runs on the VDBE: `GroupStep` matches group identity and tracks the min/max
