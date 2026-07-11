@@ -429,6 +429,24 @@ int main(void) {
     sqlite3_finalize(chk);
   }
 
+  /* sqlite3_complete: statement-completeness for REPL-style consumers. */
+  CHECK("complete: 'SELECT 1;'", sqlite3_complete("SELECT 1;") == 1);
+  CHECK("complete: trailing ws/comment", sqlite3_complete("SELECT 1;  -- done\n") == 1);
+  CHECK("incomplete: no semicolon", sqlite3_complete("SELECT 1") == 0);
+  CHECK("incomplete: semicolon in string only", sqlite3_complete("SELECT ';'") == 0);
+  CHECK("complete: two statements", sqlite3_complete("SELECT 1; SELECT 2;") == 1);
+
+  /* sqlite3_stmt_readonly. */
+  {
+    sqlite3_stmt *ro = NULL, *rw = NULL;
+    sqlite3_prepare_v2(db, "SELECT 1", -1, &ro, NULL);
+    sqlite3_prepare_v2(db, "INSERT INTO t(name) VALUES('x')", -1, &rw, NULL);
+    CHECK("SELECT is readonly", sqlite3_stmt_readonly(ro) != 0);
+    CHECK("INSERT is not readonly", sqlite3_stmt_readonly(rw) == 0);
+    sqlite3_finalize(ro);
+    sqlite3_finalize(rw);
+  }
+
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 
   sqlite3_close(db);

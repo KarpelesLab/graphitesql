@@ -162,6 +162,9 @@ int sqlite3_blob_write(sqlite3_blob *blob, const void *z, int n, int iOffset);
 int sqlite3_blob_reopen(sqlite3_blob *blob, sqlite3_int64 iRow);
 int sqlite3_blob_close(sqlite3_blob *blob);
 
+int sqlite3_complete(const char *sql);
+int sqlite3_stmt_readonly(sqlite3_stmt *stmt);
+
 void sqlite3_free(void *p);
 
 #ifdef __cplusplus

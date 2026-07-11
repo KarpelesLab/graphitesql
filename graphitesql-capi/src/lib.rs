@@ -2021,3 +2021,56 @@ fn statement_end(sql: &str) -> Option<usize> {
     }
     None
 }
+
+/// Strip leading whitespace and `--` / `/* */` comments, returning the remainder.
+fn strip_ws_comments(s: &str) -> &str {
+    let b = s.as_bytes();
+    let mut i = 0;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < b.len() && b[i] == b'-' && b[i + 1] == b'-' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+        } else {
+            break;
+        }
+    }
+    &s[i.min(s.len())..]
+}
+
+/// `sqlite3_complete`: true if `sql` is one or more complete statements — i.e. it
+/// contains a top-level `;` and only whitespace/comments follow the last one.
+/// (The `CREATE TRIGGER … BEGIN … END;` nuance, where inner `;` don't terminate,
+/// is not modelled — an inner `;` is treated as a terminator.)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_complete(sql: *const c_char) -> c_int {
+    let s = unsafe { cstr(sql) };
+    let mut rest = s;
+    let mut saw_semi = false;
+    while let Some(end) = statement_end(rest) {
+        saw_semi = true;
+        rest = &rest[end..];
+    }
+    (saw_semi && strip_ws_comments(rest).is_empty()) as c_int
+}
+
+/// `sqlite3_stmt_readonly`: true if the statement makes no direct changes to the
+/// database (a `SELECT`/`WITH`/`VALUES`/`EXPLAIN`/read-only `PRAGMA`), false for a
+/// mutation or an `INSERT/UPDATE/DELETE … RETURNING`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_stmt_readonly(stmt: *mut sqlite3_stmt) -> c_int {
+    if stmt.is_null() {
+        return 1;
+    }
+    let stmt = unsafe { &*stmt };
+    (is_row_producer(&stmt.sql) && !has_returning(&stmt.sql)) as c_int
+}
