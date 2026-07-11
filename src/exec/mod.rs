@@ -318,6 +318,23 @@ pub struct Connection {
     session: core::cell::RefCell<
         Option<alloc::rc::Rc<core::cell::RefCell<crate::session::SessionState>>>,
     >,
+    /// The data-change notification callback, the equivalent of
+    /// `sqlite3_update_hook`: invoked once per inserted/updated/deleted row with
+    /// the operation, the (schema, table) it belongs to, and the rowid. `None`
+    /// when no hook is registered.
+    #[allow(clippy::type_complexity)]
+    update_hook: core::cell::RefCell<Option<Box<dyn FnMut(UpdateOp, &str, &str, i64)>>>,
+}
+
+/// The kind of row change reported to an [update hook](Connection::register_update_hook).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOp {
+    /// A row was inserted.
+    Insert,
+    /// A row was updated.
+    Update,
+    /// A row was deleted.
+    Delete,
 }
 
 /// A user-defined scalar function: it receives its evaluated argument values and
@@ -457,6 +474,7 @@ impl Connection {
             fts5_rank: core::cell::RefCell::new(None),
             use_vdbe: core::cell::Cell::new(true),
             session: core::cell::RefCell::new(None),
+            update_hook: core::cell::RefCell::new(None),
         })
     }
 
@@ -510,6 +528,7 @@ impl Connection {
             fts5_rank: core::cell::RefCell::new(None),
             use_vdbe: core::cell::Cell::new(true),
             session: core::cell::RefCell::new(None),
+            update_hook: core::cell::RefCell::new(None),
         })
     }
 
@@ -4751,6 +4770,41 @@ impl Connection {
         crate::value::register_collation(name, cmp);
     }
 
+    /// Register a data-change notification callback — the equivalent of
+    /// `sqlite3_update_hook`. `hook` is called once per row inserted, updated, or
+    /// deleted by a subsequent statement, with the operation, the schema name
+    /// (currently always `"main"`), the table name, and the rowid. Registering a
+    /// new hook replaces any previous one.
+    ///
+    /// The callback must not modify the database (SQLite's rule); to keep this
+    /// safe, the hook is temporarily removed while it runs, so a change it
+    /// nonetheless triggers is not reported recursively.
+    pub fn register_update_hook<F>(&self, hook: F)
+    where
+        F: FnMut(UpdateOp, &str, &str, i64) + 'static,
+    {
+        *self.update_hook.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Remove any callback set by [`register_update_hook`](Self::register_update_hook).
+    pub fn remove_update_hook(&self) {
+        *self.update_hook.borrow_mut() = None;
+    }
+
+    /// Fire the update hook (if any) for one row change. Takes the callback out
+    /// for the duration of the call so a reentrant change does not double-borrow
+    /// or recurse; restores it afterward unless the callback replaced it.
+    fn fire_update_hook(&self, op: UpdateOp, table: &str, rowid: i64) {
+        let taken = self.update_hook.borrow_mut().take();
+        if let Some(mut cb) = taken {
+            cb(op, "main", table, rowid);
+            let mut slot = self.update_hook.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(cb);
+            }
+        }
+    }
+
     /// Execute a `;`-separated script of one or more statements, like SQLite's
     /// `sqlite3_exec`. Each statement runs in order through the normal
     /// single-statement path (so per-statement `CREATE` text is preserved and
@@ -8354,6 +8408,17 @@ impl Connection {
         old_row: Option<&[Value]>,
         new_row: Option<&[Value]>,
     ) {
+        // The update hook fires for every row change, independent of whether a
+        // session is recording. (record_session_change is called at every DML
+        // row-change site, so it is the natural universal notification point.)
+        if self.update_hook.borrow().is_some() {
+            let uop = match op {
+                crate::session::ChangeOp::Insert => UpdateOp::Insert,
+                crate::session::ChangeOp::Update => UpdateOp::Update,
+                crate::session::ChangeOp::Delete => UpdateOp::Delete,
+            };
+            self.fire_update_hook(uop, table, rowid);
+        }
         if self.session.borrow().is_none() {
             return;
         }

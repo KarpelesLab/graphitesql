@@ -470,11 +470,14 @@ history / `CHANGELOG.md`. Remaining:
   functions — scalar and aggregate** (`sqlite3_create_function` + the
   `sqlite3_value_*` / `sqlite3_result_*` families + `sqlite3_aggregate_context`,
   bridged onto the engine's `register_function`/`register_aggregate_function`) are
-  supported — 62 exported `sqlite3_*` symbols (incl. prepare_v3, db_handle, sql, total_changes, get_autocommit, errstr, busy_timeout no-op). Verified end-to-end by a C program
-  (`tests/ctest.c`, run in CI's `capi` job) that links the cdylib and drives the
-  full lifecycle including a scalar UDF in a `WHERE` and an aggregate UDF over a
-  `GROUP BY`. Residuals: window UDFs, `_v3` prepare flags, incremental BLOB I/O,
-  backup, hooks/authorizer, UTF-16 entry points.
+  supported — plus `sqlite3_create_window_function`, custom collations
+  (`sqlite3_create_collation`), the UTF-16 entry points (`*16`), and the
+  `sqlite3_update_hook` data-change notification — **72 exported `sqlite3_*`
+  symbols**. Verified end-to-end by a C program (`tests/ctest.c`, run in CI's `capi`
+  job) that links the cdylib and drives the full lifecycle including a scalar UDF in
+  a `WHERE`, an aggregate UDF over a `GROUP BY`, a window UDF, a custom collation, a
+  UTF-16 round-trip, and update-hook accounting. Residuals: incremental BLOB I/O,
+  online backup, the commit/rollback hooks, and the authorizer.
 
 ### Track E — Cross-database write resolution  *(essentially complete)*
 
