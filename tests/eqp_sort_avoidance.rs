@@ -48,9 +48,7 @@ fn sqlite_eqp(sql: &str) -> Option<Vec<String>> {
             // sqlite renders EQP as a tree; strip the leading `|--` / `` `-- `` /
             // indentation markers to leave just each node's detail, and drop the
             // `QUERY PLAN` header (graphite's `query()` returns the bare details).
-            .map(|l| {
-                l.trim_start_matches(['`', '|', '-', ' ']).to_string()
-            })
+            .map(|l| l.trim_start_matches(['`', '|', '-', ' ']).to_string())
             .filter(|s| !s.is_empty() && s != "QUERY PLAN")
             .collect(),
     )
@@ -79,6 +77,77 @@ fn order_by_index_avoids_sort_matching_sqlite() {
         let got = graphite_eqp(q);
         assert_eq!(got, want, "EQP diverged from sqlite on `{q}`");
     }
+}
+
+#[test]
+fn order_by_collate_uses_matching_collation_index() {
+    if sqlite_eqp("SELECT 1").is_none() {
+        return;
+    }
+    // `ORDER BY b COLLATE NOCASE` walks the NOCASE index (`ib`), while a plain
+    // `ORDER BY b` uses the BINARY index (`ib2`) — an index serves the term only
+    // when its stored collation equals the term's effective collation (B9j).
+    const S: &str = "CREATE TABLE t(a, b TEXT); \
+                     CREATE INDEX ib ON t(b COLLATE NOCASE); CREATE INDEX ib2 ON t(b); \
+                     INSERT INTO t VALUES(1,'Apple'),(2,'banana'),(3,'CHERRY');";
+    let eqp = |sql: &str| -> Vec<String> {
+        let out = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg(format!("{S} EXPLAIN QUERY PLAN {sql};"))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim_start_matches(['`', '|', '-', ' ']).to_string())
+            .filter(|s| !s.is_empty() && s != "QUERY PLAN")
+            .collect()
+    };
+    let graphite = |sql: &str| -> Vec<String> {
+        let mut c = Connection::open_memory().unwrap();
+        for stmt in S.split(';') {
+            let s = stmt.trim();
+            if !s.is_empty() {
+                c.execute(s).unwrap();
+            }
+        }
+        c.query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.last() {
+                Some(graphitesql::Value::Text(t)) => t.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    };
+    for q in [
+        "SELECT * FROM t ORDER BY b COLLATE NOCASE",
+        "SELECT * FROM t ORDER BY b",
+        "SELECT * FROM t ORDER BY b COLLATE NOCASE DESC",
+    ] {
+        assert_eq!(graphite(q), eqp(q), "EQP diverged on `{q}`");
+    }
+    // And the NOCASE-ordered rows come out case-insensitively sorted.
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in S.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            c.execute(s).unwrap();
+        }
+    }
+    let rows = c
+        .query("SELECT b FROM t ORDER BY b COLLATE NOCASE")
+        .unwrap()
+        .rows;
+    let bs: Vec<String> = rows
+        .iter()
+        .map(|r| match &r[0] {
+            graphitesql::Value::Text(t) => t.clone(),
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert_eq!(bs, vec!["Apple", "banana", "CHERRY"]);
 }
 
 #[test]

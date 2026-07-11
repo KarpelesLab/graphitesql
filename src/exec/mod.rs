@@ -22029,13 +22029,24 @@ impl Connection {
         let order_cols = order_projection(&sel.columns, &meta.columns);
         let descending = sel.order_by[0].descending;
         let mut cols: Vec<usize> = Vec::with_capacity(sel.order_by.len());
+        // Each term's *effective* collation (an explicit `COLLATE`, else the
+        // column's declared collation) — an index serves the term only when its
+        // stored collation for that column equals this (B9j).
+        let mut term_colls: Vec<crate::value::Collation> = Vec::with_capacity(sel.order_by.len());
         let mut uniform_prefix = 0usize;
         let mut prefix_open = true;
         for term in &sel.order_by {
             if !redundant_nulls(term) {
                 return None;
             }
-            let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
+            let resolved = order_key_expr(&order_cols, &term.expr);
+            let explicit = explicit_collation(resolved);
+            // Peel an explicit `COLLATE` / parens down to the underlying column.
+            let mut base = resolved;
+            while let Expr::Collate { expr, .. } | Expr::Paren(expr) = base {
+                base = expr;
+            }
+            let (tbl, col_name) = match base {
                 Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => return None,
             };
@@ -22046,6 +22057,7 @@ impl Connection {
                 .columns
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case(col_name))?;
+            term_colls.push(explicit.unwrap_or(meta.columns[col].collation));
             cols.push(col);
             if prefix_open && term.descending == descending {
                 uniform_prefix += 1;
@@ -22108,8 +22120,10 @@ impl Connection {
                 continue;
             }
             let descending = reverse.unwrap_or(false);
-            let coll_ok =
-                (0..ordered).all(|i| idx.collations[i] == meta.columns[cols[i]].collation);
+            // The index serves each ordered term only when its stored collation
+            // matches that term's *effective* collation (an explicit `COLLATE` or
+            // the column's declared collation) — B9j.
+            let coll_ok = (0..ordered).all(|i| idx.collations[i] == term_colls[i]);
             if !coll_ok {
                 continue;
             }

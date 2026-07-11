@@ -407,11 +407,17 @@ result or declines to it — never a wrong answer), so this track is
   sqlite's cost-reordered scans is *by design* (results correct).
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   An index carrying a non-default collation (`CREATE INDEX ib ON t(b COLLATE
-  NOCASE)`) is mis-selected both ways (rows still correct via the WHERE re-apply).
-  The correct model — an index serves a comparison iff its per-column collation
-  equals the comparison's *effective* collation — must be threaded into selection
-  at ~9 `collect_eq_constraints` sites in lockstep; a careful cross-cutting
-  refactor.
+  NOCASE)`) is mis-selected (rows still correct via the WHERE re-apply). The model —
+  an index serves a term iff its per-column collation equals the term's *effective*
+  collation. **ORDER BY slice DONE 2026-07-11:** `order_index_scan` now resolves each
+  `ORDER BY` term's effective collation (an explicit `COLLATE`, else the column's
+  declared collation) and matches it against the index's stored collation, so
+  `ORDER BY b COLLATE NOCASE` walks the NOCASE index while `ORDER BY b` uses the
+  BINARY one — byte-identical to sqlite (`tests/eqp_sort_avoidance.rs`). **Still open:
+  the WHERE slice** — `choose_seek_index`/`choose_range_index` ignore the comparison's
+  effective collation, so `WHERE b = 'x' COLLATE NOCASE` does not pick the NOCASE
+  index (threading it through the ~9 `collect_eq_constraints` selection sites in
+  lockstep remains a careful cross-cutting change).
 - **B9b — window-function EQP.** The co-routine *body* is exactly the B9h index
   choice (SQLite picks the index that covers the input **and** serves the
   `PARTITION BY`/window-`ORDER BY`), so this is **blocked on B9h** (plus a
