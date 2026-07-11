@@ -2658,6 +2658,7 @@ pub fn compile_join2(
     affinities: &[Affinity],
     collations: &[Collation],
     boundaries: &[usize],
+    allow_correlated: bool,
 ) -> Result<Program> {
     let n = boundaries.len();
     debug_assert!(n >= 2 && boundaries[n - 1] == columns.len());
@@ -2704,7 +2705,7 @@ pub fn compile_join2(
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: Some(boundaries.to_vec()),
-        correlated_subqueries: false,
+        correlated_subqueries: allow_correlated,
         subqueries: Vec::new(),
     };
     // LIMIT / OFFSET counters (constant integer only; negative LIMIT = unlimited,
@@ -5130,6 +5131,38 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
     run_rows_multi(program, &[table_rows])
 }
 
+/// Assemble the current combined multi-cursor row for a correlated subquery in a
+/// join: each cursor contributes its row at `positions[i]` (NULLs when the cursor
+/// is null-padded for an outer join, or its position is past the end).
+fn combined_join_row(
+    rowsets: &[&[Vec<Value>]],
+    positions: &[usize],
+    null_flags: &[bool],
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (i, rs) in rowsets.iter().enumerate() {
+        let width = rs.first().map(|r| r.len()).unwrap_or(0);
+        let nulled = null_flags.get(i).copied().unwrap_or(false);
+        match (nulled, rs.get(positions.get(i).copied().unwrap_or(0))) {
+            (false, Some(r)) => out.extend(r.iter().cloned()),
+            _ => out.extend(core::iter::repeat_n(Value::Null, width)),
+        }
+    }
+    out
+}
+
+/// Like [`run_rows_multi`] but with a [`SubqueryEval`] so a join program may emit
+/// [`Op::CorrelatedScalar`] / [`Op::CorrelatedExists`], evaluated against the
+/// current combined multi-cursor row (B5c-2 over joins).
+pub fn run_rows_multi_with_subqueries(
+    program: &Program,
+    rowsets: &[&[Vec<Value>]],
+    eval: &dyn SubqueryEval,
+) -> Result<Vec<Vec<Value>>> {
+    let mut c0 = MaterializedCursor0::new(rowsets.first().copied().unwrap_or(&[]));
+    run_rows_multi_impl(program, rowsets, &mut c0, Some(eval))
+}
+
 /// Run a compiled single-cursor program driving cursor 0 from a live row source
 /// (a b-tree cursor, B5b-2 / B8) instead of a materialized row-set. Only the
 /// single-cursor `Rewind` / `Column` / `Next` ops read from `src`; a program that
@@ -5713,13 +5746,31 @@ fn run_rows_multi_impl(
                 let eval = subquery_eval.ok_or(Error::Unsupported(
                     "VDBE: correlated subquery without evaluator",
                 ))?;
-                regs[*dest] = eval.scalar(&program.subqueries[*sub].select, c0)?;
+                let sel = &program.subqueries[*sub].select;
+                // Single-cursor scan (`rowsets` empty): cursor 0 IS the outer row.
+                // A join (`rowsets` non-empty): the outer row is the combined
+                // multi-cursor row assembled from each cursor's current position
+                // (a null-padded cursor contributes NULLs).
+                regs[*dest] = if rowsets.is_empty() {
+                    eval.scalar(sel, c0)?
+                } else {
+                    let combined = combined_join_row(rowsets, &positions, &null_flags);
+                    let cur = MaterializedCursor0::new(core::slice::from_ref(&combined));
+                    eval.scalar(sel, &cur)?
+                };
             }
             Op::CorrelatedExists { sub, negated, dest } => {
                 let eval = subquery_eval.ok_or(Error::Unsupported(
                     "VDBE: correlated subquery without evaluator",
                 ))?;
-                let found = eval.exists(&program.subqueries[*sub].select, c0)?;
+                let sel = &program.subqueries[*sub].select;
+                let found = if rowsets.is_empty() {
+                    eval.exists(sel, c0)?
+                } else {
+                    let combined = combined_join_row(rowsets, &positions, &null_flags);
+                    let cur = MaterializedCursor0::new(core::slice::from_ref(&combined));
+                    eval.exists(sel, &cur)?
+                };
                 regs[*dest] = Value::Integer((found ^ *negated) as i64);
             }
             Op::Halt => break,
@@ -5969,7 +6020,7 @@ mod tests {
         ];
         let aff = vec![Affinity::Blob; 4];
         let coll = vec![Collation::Binary; 4];
-        let prog = compile_join2(&sel, &columns, &tables, &aff, &coll, &[2, 4]).unwrap();
+        let prog = compile_join2(&sel, &columns, &tables, &aff, &coll, &[2, 4], false).unwrap();
         let left: Vec<Vec<Value>> = vec![
             vec![Value::Integer(1), Value::Text("a".into())],
             vec![Value::Integer(2), Value::Text("b".into())],
@@ -6106,7 +6157,7 @@ mod tests {
                 panic!()
             };
             assert!(
-                compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_err(),
+                compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2], false).is_err(),
                 "{sql} should bail to the cross-product path"
             );
         }
@@ -6120,7 +6171,7 @@ mod tests {
                 panic!()
             };
             assert!(
-                compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_ok(),
+                compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2], false).is_ok(),
                 "{sql} should compile on the VDBE"
             );
         }

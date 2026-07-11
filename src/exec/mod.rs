@@ -2954,10 +2954,30 @@ impl Connection {
                     &combined_aff,
                     &combined_coll,
                     &boundaries,
+                    true,
                 ) {
                     let rowsets: Vec<&[Vec<Value>]> =
                         sources.iter().map(|s| s.4.as_slice()).collect();
-                    let result = vdbe::run_rows_multi(&prog, &rowsets)?;
+                    // A correlated scalar/EXISTS subquery inside the join (B5c-2
+                    // over joins) compiles to a callback op re-evaluated per outer
+                    // row against the *combined* join row; the combined schema is
+                    // its outer scope. Non-correlated joins never invoke the eval.
+                    let join_cols: Vec<ColumnInfo> = (0..combined.len())
+                        .map(|i| ColumnInfo {
+                            name: combined[i].clone(),
+                            table: combined_tables[i].clone(),
+                            affinity: combined_aff[i],
+                            collation: combined_coll[i],
+                            schema: None,
+                            hidden: false,
+                        })
+                        .collect();
+                    let eval = LiveSubqueryEval {
+                        conn: self,
+                        columns: &join_cols,
+                        rowid_index: None,
+                    };
+                    let result = vdbe::run_rows_multi_with_subqueries(&prog, &rowsets, &eval)?;
                     return Ok(QueryResult {
                         columns: prog.columns,
                         rows: result,
@@ -24638,6 +24658,11 @@ impl Connection {
                         Some(_) => self.window_join_source_columns(sel).unwrap_or_default(),
                         None => Vec::new(),
                     };
+                    // A bare reference inside a subquery that binds to an enclosing
+                    // FROM carrying that name on two sources is ambiguous — rejected
+                    // statically, before the body-column resolution below (the
+                    // tree-walker's order at the outermost level).
+                    self.validate_nested_ambiguity(sel, &scope)?;
                     self.validate_subquery_body_columns(sel, &scope)?;
                     self.reject_invalid_in_subquery_arity(sel, &scope)?;
                     self.reject_invalid_scalar_subquery_arity(sel, &scope)?;

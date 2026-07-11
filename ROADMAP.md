@@ -288,6 +288,13 @@ result or declines to it — never a wrong answer), so this track is
   — so `a > (SELECT 1,2)` and `(SELECT u.a)` over a zero-row/filtered scan error
   exactly as SQLite, not silently accepted. `row_value_misuse` + `subquery_body_columns`
   green again; results byte-identical to the tree-walker (`tests/vdbe_correlated_subquery.rs`).
+  *Extended to inner joins (same day):* a correlated scalar/`EXISTS` subquery over an
+  `INNER`/comma join now runs on the VDBE too — the interpreter assembles the combined
+  multi-cursor row for the callback (`combined_join_row` +
+  `run_rows_multi_with_subqueries`); `compile_join2` opts in via `allow_correlated`, and
+  the post-success validation adds `validate_nested_ambiguity` so an ambiguous outer
+  reference inside a subquery is still rejected. LEFT/RIGHT/FULL-join and GROUP-BY-join
+  correlated subqueries still defer to the tree-walker (correct).
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).
 

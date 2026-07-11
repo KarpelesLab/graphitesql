@@ -144,6 +144,27 @@ fn correlated_null_and_empty_inner() {
 }
 
 #[test]
+fn correlated_subquery_over_inner_join() {
+    let c = setup();
+    // A correlated scalar subquery over an INNER join runs on the VDBE join path:
+    // the interpreter assembles the combined multi-cursor row for the callback.
+    both(
+        &c,
+        "SELECT a.x, (SELECT count(*) FROM b c WHERE c.p = a.k) \
+         FROM a JOIN b ON a.k = b.p ORDER BY a.x, b.v",
+        vec![vec![i(1), i(1)], vec![i(2), i(2)], vec![i(2), i(2)]],
+    );
+    // A correlated EXISTS in the WHERE of a join, referencing BOTH outer sources
+    // (a.k and b.v) — exercises the full combined join row.
+    both(
+        &c,
+        "SELECT a.x FROM a JOIN b ON a.k = b.p \
+         WHERE EXISTS (SELECT 1 FROM b d WHERE d.p = a.k AND d.v <> b.v) ORDER BY a.x, b.v",
+        vec![vec![i(2)], vec![i(2)]],
+    );
+}
+
+#[test]
 fn noncorrelated_subqueries_unregressed() {
     let c = setup();
     // A non-correlated scalar subquery still folds and runs on the VDBE.
