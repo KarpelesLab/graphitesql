@@ -933,6 +933,11 @@ pub enum Expr {
         order_by: Vec<OrderTerm>,
         /// `OVER (…)` window specification, making this a window-function call.
         over: Option<WindowSpec>,
+        /// Source byte span of the function name, when parsed from SQL text; used
+        /// to place the shell's error caret on the exact call (e.g. an arity error
+        /// on a repeated function name). Synthetic calls carry [`Span::none`]. Does
+        /// not affect equality.
+        span: Span,
     },
     /// `expr IS [NOT] NULL`.
     IsNull {

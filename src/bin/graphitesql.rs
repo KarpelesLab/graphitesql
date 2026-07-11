@@ -2483,6 +2483,7 @@ fn raw_error_message(e: &graphitesql::Error) -> String {
     use graphitesql::Error as E;
     match e {
         E::Error(m)
+        | E::ErrorAt(m, _)
         | E::Corrupt(m)
         | E::Io(m)
         | E::CantOpen(m)
@@ -2515,7 +2516,7 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str) -> bool {
         // vtab/FTS5 faults, the ALTER re-validation `error in …`, `SQL logic error`,
         // and other run-time messages — defaults to step (they are open-ended, so
         // enumerating the prepare set is the reliable direction).
-        E::Error(_) => {
+        E::Error(_) | E::ErrorAt(..) => {
             const PREPARE_PREFIXES: &[&str] = &[
                 "no such column",
                 "no such table",

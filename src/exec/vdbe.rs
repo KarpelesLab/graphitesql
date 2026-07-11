@@ -993,6 +993,7 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
         filter,
         order_by,
         over,
+        ..
     } = expr
     else {
         return None;
@@ -1372,7 +1373,8 @@ fn collect_bare_columns(expr: &Expr, out: &mut Vec<(Option<String>, String)>) {
 /// projection resolves the same expression through the binding table.
 enum GroupKeySpec {
     Col(usize),
-    Expr(Expr),
+    // Boxed to keep the enum small — `Expr` is a large variant.
+    Expr(alloc::boxed::Box<Expr>),
 }
 
 /// Emit the GROUP-BY fold loop into `c`: allocate the contiguous group-key
@@ -1696,7 +1698,7 @@ fn compile_group_select(
                         "VDBE: non-BINARY collation in GROUP BY key",
                     ));
                 }
-                group_keys.push(GroupKeySpec::Expr(other.clone()));
+                group_keys.push(GroupKeySpec::Expr(alloc::boxed::Box::new(other.clone())));
             }
         }
     }
@@ -1846,7 +1848,7 @@ fn compile_group_select(
     for (k, key) in group_keys.iter().enumerate() {
         let ci = match key {
             GroupKeySpec::Expr(e) => {
-                c.bindings.push((e.clone(), gkey_start + k));
+                c.bindings.push(((**e).clone(), gkey_start + k));
                 continue;
             }
             GroupKeySpec::Col(ci) => *ci,
@@ -5186,6 +5188,7 @@ impl Compiler {
                 filter,
                 order_by,
                 over,
+                ..
             } if !*distinct
                 && !*star
                 && filter.is_none()

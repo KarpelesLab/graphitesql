@@ -113,6 +113,15 @@ fn one_shot_error_rendering_matches_sqlite() {
         // `AS v(x,y)`, and a doubled function-name arity error).
         "CREATE TABLE t(a); SELECT 1 FROM t WHERE a === 1",
         "SELECT * FROM (SELECT 1 a) AS v(x,y)",
+        // A repeated *function* name where the first call is valid and a later one
+        // has the wrong arity (or is unknown): the caret must land on the erroring
+        // call, not the first text match. The `Error::ErrorAt` byte offset (carried
+        // from the parsed call's span through `reject_unresolved_functions`) places
+        // it exactly, mirroring `sqlite3_error_offset`.
+        "CREATE TABLE t(a); SELECT abs(a), abs(a,a) FROM t",
+        "CREATE TABLE t(a); SELECT length(a), length() FROM t",
+        "CREATE TABLE t(a); SELECT abs(a,a), abs(a) FROM t",
+        "CREATE TABLE t(a); SELECT foo(a), foo(a) FROM t",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");

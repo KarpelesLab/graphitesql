@@ -1009,6 +1009,7 @@ impl Connection {
                 filter,
                 order_by,
                 over,
+                ..
             } if over.is_none() => E::Function {
                 name: name.clone(),
                 distinct: *distinct,
@@ -1022,6 +1023,7 @@ impl Connection {
                     .map(|f| alloc::boxed::Box::new(self.fold_subquery_expr(f, changed))),
                 order_by: order_by.clone(),
                 over: None,
+                span: Span::none(),
             },
             // `IN (SELECT …)`: fold to an `IN (list)` of the materialized candidate
             // values when the subquery is self-contained (non-correlated). A
@@ -6956,6 +6958,7 @@ impl Connection {
                 args,
                 star,
                 over,
+                span,
                 ..
             } = n
             {
@@ -6987,7 +6990,14 @@ impl Connection {
                     && (m.starts_with("no such function: ")
                         || m.starts_with("wrong number of arguments to function "))
                 {
-                    err = Some(Error::Error(m));
+                    // Carry the call's byte offset so the shell carets the exact
+                    // function even when the same name appears earlier in a valid
+                    // call (`abs(a), abs(a,a)`); synthetic calls (`Span::none()`)
+                    // have none and fall back to the message-text search.
+                    err = Some(match span.0 {
+                        Some((start, _)) => Error::ErrorAt(m, start as usize),
+                        None => Error::Error(m),
+                    });
                 }
             }
         });
@@ -23684,6 +23694,7 @@ impl Connection {
                     filter,
                     order_by,
                     over,
+                    ..
                 } => {
                     if !func::is_aggregate_call(name, args.len(), *star) {
                         return;
@@ -23907,6 +23918,7 @@ impl Connection {
                     filter,
                     order_by,
                     over,
+                    ..
                 } => {
                     if over.is_some() || filter.is_some() || !order_by.is_empty() {
                         disqualified = true;
@@ -35147,6 +35159,7 @@ impl Connection {
                 filter,
                 order_by,
                 over,
+                ..
             } => {
                 let new_args = args
                     .iter()
@@ -35184,6 +35197,7 @@ impl Connection {
                     filter: new_filter,
                     order_by: order_by.clone(),
                     over: new_over,
+                    span: Span::none(),
                 }
             }
             Expr::Binary { op, left, right } => Expr::Binary {
@@ -35550,6 +35564,7 @@ impl Connection {
                 filter,
                 order_by,
                 over: None,
+                ..
             } if func::is_aggregate_call(name, args.len(), *star)
                 || self.aggregates.contains_key(&name.to_ascii_lowercase()) =>
             {
@@ -35583,6 +35598,7 @@ impl Connection {
                         filter: None,
                         order_by: Vec::new(),
                         over: None,
+                        span: Span::none(),
                     }
                 } else {
                     lit
@@ -35596,6 +35612,7 @@ impl Connection {
                 filter,
                 order_by,
                 over,
+                ..
             } => {
                 let mut new_args = Vec::with_capacity(args.len());
                 for a in args {
@@ -35609,6 +35626,7 @@ impl Connection {
                     filter: filter.clone(),
                     order_by: order_by.clone(),
                     over: over.clone(),
+                    span: Span::none(),
                 }
             }
             Expr::Binary { op, left, right } => Expr::Binary {
@@ -36630,6 +36648,7 @@ fn null_out_a_columns(e: &Expr, a_quals: &[String], b_cols: &[String]) -> Option
             filter,
             order_by,
             over,
+            ..
         } => {
             if over.is_some() || filter.is_some() || !order_by.is_empty() {
                 return None;
@@ -36646,6 +36665,7 @@ fn null_out_a_columns(e: &Expr, a_quals: &[String], b_cols: &[String]) -> Option
                 filter: None,
                 order_by: Vec::new(),
                 over: None,
+                span: Span::none(),
             }
         }
         E::Between {
@@ -40166,6 +40186,7 @@ fn resolve_window_ref(wexpr: &Expr, defs: &[(String, WindowSpec)]) -> Result<Exp
         filter,
         order_by,
         over: Some(spec),
+        ..
     } = wexpr
     else {
         return Ok(wexpr.clone());
@@ -40221,6 +40242,7 @@ fn resolve_window_ref(wexpr: &Expr, defs: &[(String, WindowSpec)]) -> Result<Exp
         filter: filter.clone(),
         order_by: order_by.clone(),
         over: Some(effective),
+        span: Span::none(),
     })
 }
 
@@ -43307,6 +43329,7 @@ fn coroutine_outer_minmax(sel: &Select) -> Option<bool> {
                 filter,
                 order_by,
                 over,
+                ..
             } = node
             {
                 if over.is_some() || filter.is_some() || !order_by.is_empty() {

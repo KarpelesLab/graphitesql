@@ -824,6 +824,7 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             args,
             star,
             over,
+            span,
             ..
         } => {
             // A window function — any call carrying an `OVER` clause, including an
@@ -839,7 +840,24 @@ pub fn eval(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     name.to_ascii_lowercase()
                 )));
             }
-            super::func::eval_scalar(name, args, *star, ctx)
+            // Tag a bare arity error with this call's source offset, so the shell
+            // carets the exact function even when the same name appears earlier in a
+            // valid call (`abs(a), abs(a,a)`). The arity message is about the call
+            // itself (not an argument), and a nested call's own arity error already
+            // arrives as `ErrorAt` — so matching a raw `Error::Error` here never
+            // re-tags it. Synthetic calls (`Span::none()`) carry no offset.
+            match super::func::eval_scalar(name, args, *star, ctx) {
+                Err(Error::Error(m))
+                    if span.0.is_some()
+                        && m.starts_with("wrong number of arguments to function ") =>
+                {
+                    Err(Error::ErrorAt(
+                        m,
+                        span.0.expect("checked is_some").0 as usize,
+                    ))
+                }
+                other => other,
+            }
         }
         Expr::Subquery(select) => match ctx.subqueries {
             Some(s) => s.scalar(select, ctx),

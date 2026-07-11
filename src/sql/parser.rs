@@ -2578,7 +2578,7 @@ impl Parser {
         // its exact source position for `RENAME COLUMN`.
         let name_span = self.prev_span();
         if !quoted && self.eat(&Token::LParen) {
-            return self.function_call(name);
+            return self.function_call(name, name_span);
         }
         if self.eat(&Token::Dot) {
             let mut schema = None;
@@ -2612,7 +2612,7 @@ impl Parser {
         })
     }
 
-    fn function_call(&mut self, name: String) -> Result<Expr> {
+    fn function_call(&mut self, name: String, name_span: Span) -> Result<Expr> {
         if self.eat(&Token::Star) {
             self.expect(&Token::RParen)?;
             let filter = self.filter_clause()?;
@@ -2625,6 +2625,7 @@ impl Parser {
                 filter,
                 order_by: Vec::new(),
                 over,
+                span: name_span,
             });
         }
         let distinct = self.eat_kw("distinct");
@@ -2692,6 +2693,7 @@ impl Parser {
             args,
             star: false,
             filter,
+            span: name_span,
             order_by,
             over,
         })
@@ -2950,6 +2952,7 @@ impl Parser {
             filter: None,
             order_by: Vec::new(),
             over: None,
+            span: Span::none(),
         })
     }
 
@@ -3122,6 +3125,7 @@ impl Parser {
             filter: None,
             order_by: Vec::new(),
             over: None,
+            span: Span::none(),
         };
         Ok(if negated {
             Expr::Unary {
@@ -3157,6 +3161,7 @@ impl Parser {
                 filter: None,
                 order_by: Vec::new(),
                 over: None,
+                span: Span::none(),
             },
         };
         if negated {
@@ -3251,6 +3256,7 @@ fn now_datetime_fn(func: &str) -> Expr {
         filter: None,
         order_by: alloc::vec![],
         over: None,
+        span: Span::none(),
     }
 }
 

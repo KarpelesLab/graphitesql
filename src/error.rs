@@ -20,6 +20,13 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub enum Error {
     /// Generic error (`SQLITE_ERROR`), with a human-readable message.
     Error(String),
+    /// Like [`Error`](Error::Error) — same `SQLITE_ERROR` code and the *identical*
+    /// human-readable message — but carrying the byte offset of the offending token
+    /// within the parsed SQL (e.g. the position of a function call whose argument
+    /// count is wrong), so the shell can place its `^--- error here` caret exactly
+    /// even when the token text repeats. The `Display` is byte-for-byte the same as
+    /// `Error`; only [`Error::parse_offset`] differs.
+    ErrorAt(String, usize),
     /// The database file is malformed (`SQLITE_CORRUPT`).
     Corrupt(String),
     /// A disk I/O error occurred in the VFS (`SQLITE_IOERR`).
@@ -54,7 +61,11 @@ impl Error {
     /// equivalent concept.
     pub fn code(&self) -> i32 {
         match self {
-            Error::Error(_) | Error::Parse(_) | Error::ParseAt(..) | Error::Unsupported(_) => 1, // SQLITE_ERROR
+            Error::Error(_)
+            | Error::ErrorAt(..)
+            | Error::Parse(_)
+            | Error::ParseAt(..)
+            | Error::Unsupported(_) => 1, // SQLITE_ERROR
             Error::Corrupt(_) => 11,    // SQLITE_CORRUPT
             Error::Io(_) => 10,         // SQLITE_IOERR
             Error::Busy => 5,           // SQLITE_BUSY
@@ -64,12 +75,13 @@ impl Error {
     }
 
     /// The byte offset of the offending token within the parsed SQL, when known (a
-    /// [`ParseAt`](Error::ParseAt) syntax error) — the equivalent of SQLite's
+    /// [`ParseAt`](Error::ParseAt) syntax error or an [`ErrorAt`](Error::ErrorAt)
+    /// located resolution error) — the equivalent of SQLite's
     /// `sqlite3_error_offset`. `None` for every other error, including a `Parse`
     /// without a locatable token (`incomplete input`).
     pub fn parse_offset(&self) -> Option<usize> {
         match self {
-            Error::ParseAt(_, off) => Some(*off),
+            Error::ParseAt(_, off) | Error::ErrorAt(_, off) => Some(*off),
             _ => None,
         }
     }
@@ -78,7 +90,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Error(m) => write!(f, "error: {m}"),
+            Error::Error(m) | Error::ErrorAt(m, _) => write!(f, "error: {m}"),
             Error::Corrupt(m) => write!(f, "database disk image is malformed: {m}"),
             Error::Io(m) => write!(f, "disk I/O error: {m}"),
             Error::Busy => write!(f, "database is locked"),
