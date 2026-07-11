@@ -97,6 +97,37 @@ fn driver_rowid_seek_eqp_matches_sqlite() {
 }
 
 #[test]
+fn rowid_seek_beats_index_inner_swap() {
+    if !sqlite_available() {
+        return;
+    }
+    // `bk` on `big.k` makes `big.k = small.v` index-inner-swappable (drive small,
+    // seek big by `bk`), but the driver's own `big.id = 7` is a single-row rowid
+    // seek — the more selective plan — so sqlite (and now graphite) drives that
+    // instead: `SEARCH big USING INTEGER PRIMARY KEY (rowid=?)` + `SCAN small`.
+    let c = seeded(SETUP_IDX);
+    for q in [
+        "SELECT * FROM big JOIN small ON big.k=small.v WHERE big.id=7",
+        // `ORDER BY` on the driver's rowid is still satisfied without a temp b-tree.
+        "SELECT * FROM big JOIN small ON big.k=small.v WHERE big.id=7 ORDER BY big.id",
+    ] {
+        assert_eq!(
+            sqlite_eqp(SETUP_IDX, q),
+            graphite_eqp(&c, q),
+            "EQP diverged on `{q}`"
+        );
+    }
+    // Rows are correct regardless of the chosen plan.
+    let rows = c
+        .query("SELECT big.id FROM big JOIN small ON big.k=small.v WHERE big.id=7")
+        .unwrap()
+        .rows;
+    for r in &rows {
+        assert_eq!(r[0], Value::Integer(7));
+    }
+}
+
+#[test]
 fn driver_secondary_index_seek_eqp_matches_sqlite() {
     if !sqlite_available() {
         return;

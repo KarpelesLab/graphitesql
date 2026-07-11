@@ -19168,12 +19168,15 @@ impl Connection {
                     &from.joins[0].table,
                     &eqp_label(&from.joins[0].table),
                 )
-            } else if self.two_table_index_inner_swap(from).is_some() {
+            } else if self.join_first_rowid_seek(sel, from, params).is_none()
+                && self.two_table_index_inner_swap(from).is_some()
+            {
                 // Cost-based two-table secondary-index-inner swap: same as the rowid
                 // swap but `from.first` is sought by a secondary index instead — the
                 // SECOND table still drives (scanned), so the outer SCAN node names
                 // it and the block below renders `SEARCH <first> USING [COVERING]
-                // INDEX <idx> (<col>=?)`.
+                // INDEX <idx> (<col>=?)`. Deferred to the rowid seek when `from.first`
+                // also has a `rowid = <const>` equality (the more selective plan).
                 self.eqp_join_scan_detail(
                     sel,
                     from,
@@ -19360,7 +19363,9 @@ impl Connection {
         // is the index-sought inner — `SEARCH <first> USING [COVERING] INDEX <idx>
         // (<col>=?)`. `COVERING` iff every `from.first` column the query needs is in
         // the index (matching sqlite's cost-model label).
-        else if let Some((_, first_meta, idx)) = self.two_table_index_inner_swap(from) {
+        else if self.join_first_rowid_seek(sel, from, params).is_none()
+            && let Some((_, first_meta, idx)) = self.two_table_index_inner_swap(from)
+        {
             let col = &first_meta.columns[idx.cols[0]].name;
             let second_meta = self
                 .table_meta(
@@ -23018,9 +23023,14 @@ impl Connection {
             return None;
         }
         // The driver is the second table under either cost-based swap, else the
-        // first source.
-        let driver: &TableRef = if self.two_table_rowid_inner_swap(from).is_some()
-            || self.two_table_index_inner_swap(from).is_some()
+        // first source — but a `rowid = <const>` seek on `from.first` takes
+        // precedence over the index-inner swap (as in the executor/EQP), so
+        // `from.first` drives then.
+        let driver: &TableRef = if self
+            .join_first_rowid_seek(sel, from, &Params::default())
+            .is_none()
+            && (self.two_table_rowid_inner_swap(from).is_some()
+                || self.two_table_index_inner_swap(from).is_some())
         {
             &join.table
         } else {
@@ -27786,8 +27796,9 @@ impl Connection {
             // rowid swap (which requires `from.first`'s column to BE its rowid IPK).
             // EXECUTION-only: user columns/rows stay in DECLARED order; the hidden
             // per-table rowid columns (if `with_rowid`) trail them.
-            if let Some((driver_join_local, first_meta, idx)) =
-                self.two_table_index_inner_swap(from)
+            if self.join_first_rowid_seek(sel, from, params).is_none()
+                && let Some((driver_join_local, first_meta, idx)) =
+                    self.two_table_index_inner_swap(from)
             {
                 let (out_columns, out_rows) = self.exec_two_table_index_inner_swap(
                     sel,
@@ -30783,9 +30794,14 @@ impl Connection {
         from: &FromClause,
         params: &Params,
     ) -> Option<i64> {
+        // A `rowid = <const>` seek on `from.first` is a single-row access — the most
+        // selective plan — so it takes PRECEDENCE over the cost-based index-inner
+        // swap (sqlite drives the rowid seek there, not the swap). The swap's
+        // executor and EQP defer to this when it fires, so it is deliberately NOT
+        // gated out by `two_table_index_inner_swap`. The rowid-*inner*-swap and the
+        // N-table reorder still own the driver, so those still gate it out.
         if from.joins.is_empty()
             || self.two_table_rowid_inner_swap(from).is_some()
-            || self.two_table_index_inner_swap(from).is_some()
             || self.ntable_join_order(sel, from).is_some()
         {
             return None;
