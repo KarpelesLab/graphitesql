@@ -413,11 +413,16 @@ result or declines to it — never a wrong answer), so this track is
   `ORDER BY` term's effective collation (an explicit `COLLATE`, else the column's
   declared collation) and matches it against the index's stored collation, so
   `ORDER BY b COLLATE NOCASE` walks the NOCASE index while `ORDER BY b` uses the
-  BINARY one — byte-identical to sqlite (`tests/eqp_sort_avoidance.rs`). **Still open:
-  the WHERE slice** — `choose_seek_index`/`choose_range_index` ignore the comparison's
-  effective collation, so `WHERE b = 'x' COLLATE NOCASE` does not pick the NOCASE
-  index (threading it through the ~9 `collect_eq_constraints` selection sites in
-  lockstep remains a careful cross-cutting change).
+  BINARY one — byte-identical to sqlite (`tests/eqp_sort_avoidance.rs`). **WHERE
+  equality slice DONE 2026-07-11:** `collect_eq_constraints_coll` records each
+  equality's effective collation (un-gated), and `choose_seek_index` matches an
+  equality to an index only when their collations agree — so `WHERE b = 'x' COLLATE
+  NOCASE` seeks the NOCASE index (`ib`) while a plain `= 'x'` uses the BINARY one.
+  Threaded through `choose_seek_index` (+ `stat4_equal_est`), `try_index_lookup`'s
+  seek-key build (which keeps the gated `eqs` for the rowid fast path), `eqp_access`,
+  and `seek_order_prefix` — all in lockstep, full corpus green. **Still open: the
+  range slice** — `choose_range_index` ignores the comparison collation, so
+  `WHERE b > 'x' COLLATE NOCASE` does not yet pick the NOCASE index.
 - **B9b — window-function EQP.** The co-routine *body* is exactly the B9h index
   choice (SQLite picks the index that covers the input **and** serves the
   `PARTITION BY`/window-`ORDER BY`), so this is **blocked on B9h** (plus a

@@ -15509,7 +15509,7 @@ impl Connection {
         meta: &TableMeta,
         table_name: &str,
         where_expr: &Expr,
-        eqs: &[(usize, Value)],
+        eqs: &[(usize, Value, crate::value::Collation)],
         is_null_cols: &[usize],
         hint: Option<&IndexHint>,
     ) -> Result<Option<(IndexMeta, usize)>> {
@@ -15550,8 +15550,18 @@ impl Connection {
                 continue;
             }
             let mut matched = 0usize;
-            for &c in &idx.cols {
-                if eqs.iter().any(|(col, _)| *col == c) || is_null_cols.contains(&c) {
+            for (i, &c) in idx.cols.iter().enumerate() {
+                // An equality serves this index column only when its effective
+                // collation equals the index's stored collation for the column
+                // (B9j) — so a `NOCASE` index serves `= 'x' COLLATE NOCASE` while a
+                // `BINARY` index does not. `col IS NULL` is a collation-independent
+                // NULL-key seek.
+                let idx_coll = idx.collations.get(i).copied().unwrap_or_default();
+                if eqs
+                    .iter()
+                    .any(|(col, _, coll)| *col == c && *coll == idx_coll)
+                    || is_null_cols.contains(&c)
+                {
                     matched += 1;
                 } else {
                     break;
@@ -15795,7 +15805,7 @@ impl Connection {
         &self,
         idx: &IndexMeta,
         matched: usize,
-        eqs: &[(usize, Value)],
+        eqs: &[(usize, Value, crate::value::Collation)],
         is_null_cols: &[usize],
         ai_row_est: &[u64],
     ) -> Option<u64> {
@@ -15804,7 +15814,7 @@ impl Connection {
         // probes with NULL; otherwise the `col = value` constant.
         let mut rec: Vec<Value> = Vec::with_capacity(matched);
         for &c in idx.cols.iter().take(matched) {
-            if let Some((_, v)) = eqs.iter().find(|(col, _)| *col == c) {
+            if let Some((_, v, _)) = eqs.iter().find(|(col, _, _)| *col == c) {
                 rec.push(v.clone());
             } else if is_null_cols.contains(&c) {
                 rec.push(Value::Null);
@@ -16149,12 +16159,18 @@ impl Connection {
         // index whose eligibility we can prove from the `WHERE` structure (see
         // `partial_expr_seek`) — this keeps plain-index behavior byte-identical
         // while extending seeks to the new index kinds.
+        // Collation-aware equalities (un-gated, tagged with each comparison's
+        // effective collation) drive the index choice and the seek key, so a
+        // `NOCASE` index can serve `= 'x' COLLATE NOCASE` (B9j). The rowid/IPK fast
+        // path above deliberately keeps the column-collation-gated `eqs`.
+        let mut eqs_coll = Vec::new();
+        collect_eq_constraints_coll(where_expr, &meta.columns, params, &mut eqs_coll);
         let Some((idx, matched)) = self.choose_seek_index(
             Some(sel),
             meta,
             table_name,
             where_expr,
-            &eqs,
+            &eqs_coll,
             &is_null_cols,
             hint,
         )?
@@ -16165,7 +16181,7 @@ impl Connection {
         // for the chosen index's matched leading prefix.
         let mut key = Vec::with_capacity(matched);
         for &c in &idx.cols[..matched] {
-            if let Some((_, v)) = eqs.iter().find(|(col, _)| *col == c) {
+            if let Some((_, v, _)) = eqs_coll.iter().find(|(col, _, _)| *col == c) {
                 key.push(meta.columns[c].affinity.coerce(v.clone()));
             } else {
                 // `col IS NULL`: a NULL index key, which the prefix seek matches
@@ -20022,12 +20038,16 @@ impl Connection {
             .and_then(|s| s.from.as_ref())
             .and_then(|f| f.first.index_hint.as_ref())
             .filter(|h| matches!(h, IndexHint::IndexedBy(_)));
+        // Collation-aware equalities so the EQP names the same index the executor
+        // seeks, including a `NOCASE` index for `= 'x' COLLATE NOCASE` (B9j).
+        let mut eqs_coll = Vec::new();
+        collect_eq_constraints_coll(where_expr, &meta.columns, params, &mut eqs_coll);
         let chosen = self.choose_seek_index(
             sel,
             meta,
             table,
             where_expr,
-            &eqs,
+            &eqs_coll,
             &is_null_cols,
             indexed_by,
         )?;
@@ -23881,13 +23901,15 @@ impl Connection {
             // Pick the exact index the executor's equality/`IS NULL`-prefix seek
             // walks (via the shared `choose_seek_index`), with its pinned-prefix
             // length, so the order credit is for the index that actually runs.
+            let mut eqs_coll = Vec::new();
+            collect_eq_constraints_coll(where_expr, &meta.columns, params, &mut eqs_coll);
             let (chosen, prefix) = self
                 .choose_seek_index(
                     Some(sel),
                     &meta,
                     &t.name,
                     where_expr,
-                    &eqs,
+                    &eqs_coll,
                     &is_null_cols,
                     None,
                 )
@@ -40439,6 +40461,65 @@ fn order_vtab_argv(plan: &IndexPlan, values: &[Value]) -> Vec<Value> {
         .collect();
     slots.sort_by_key(|(pos, _)| *pos);
     slots.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Like [`collect_eq_constraints`] but recording each equality's *effective*
+/// collation (an explicit `COLLATE`, else the column's declared collation) and
+/// WITHOUT the column-collation gate, so a `b = 'x' COLLATE NOCASE` is emitted even
+/// when `b` is `BINARY`. Used by collation-aware index selection
+/// ([`Connection::choose_seek_index`]), which matches an equality to an index only
+/// when their collations agree — letting a `NOCASE` index serve a `NOCASE`
+/// comparison (B9j). The `IS` arm mirrors `collect_eq_constraints` (column
+/// collation; `IS` takes no `COLLATE`).
+fn collect_eq_constraints_coll(
+    e: &Expr,
+    columns: &[ColumnInfo],
+    params: &Params,
+    out: &mut Vec<(usize, Value, crate::value::Collation)>,
+) {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            collect_eq_constraints_coll(left, columns, params, out);
+            collect_eq_constraints_coll(right, columns, params, out);
+        }
+        Expr::Paren(inner) => collect_eq_constraints_coll(inner, columns, params, out),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            let eff =
+                |ci: usize, val: &Expr| explicit_collation(val).unwrap_or(columns[ci].collation);
+            if let (Some(ci), Some(v)) = (col_index(left, columns), const_value(right, params)) {
+                out.push((ci, v, eff(ci, right)));
+            } else if let (Some(ci), Some(v)) =
+                (col_index(right, columns), const_value(left, params))
+            {
+                out.push((ci, v, eff(ci, left)));
+            }
+        }
+        Expr::Binary {
+            op: BinaryOp::Is,
+            left,
+            right,
+        } => {
+            if let (Some(ci), Some(v)) = (col_index(left, columns), const_value(right, params)) {
+                if !matches!(v, Value::Null) {
+                    out.push((ci, v, columns[ci].collation));
+                }
+            } else if let (Some(ci), Some(v)) =
+                (col_index(right, columns), const_value(left, params))
+                && !matches!(v, Value::Null)
+            {
+                out.push((ci, v, columns[ci].collation));
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_eq_constraints(

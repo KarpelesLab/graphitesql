@@ -125,9 +125,28 @@ fn order_by_collate_uses_matching_collation_index() {
         "SELECT * FROM t ORDER BY b COLLATE NOCASE",
         "SELECT * FROM t ORDER BY b",
         "SELECT * FROM t ORDER BY b COLLATE NOCASE DESC",
+        // WHERE-comparison collation: `= 'x' COLLATE NOCASE` seeks the NOCASE
+        // index (`ib`); a plain `= 'x'` uses the BINARY one (B9j WHERE slice).
+        "SELECT * FROM t WHERE b = 'apple' COLLATE NOCASE",
+        "SELECT * FROM t WHERE b = 'apple'",
+        "SELECT * FROM t WHERE b = 'Apple'",
     ] {
         assert_eq!(graphite(q), eqp(q), "EQP diverged on `{q}`");
     }
+    // The NOCASE seek returns the case-insensitive match.
+    let mut cc = Connection::open_memory().unwrap();
+    for stmt in S.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            cc.execute(s).unwrap();
+        }
+    }
+    assert_eq!(
+        cc.query("SELECT a FROM t WHERE b = 'apple' COLLATE NOCASE")
+            .unwrap()
+            .rows,
+        vec![vec![graphitesql::Value::Integer(1)]],
+    );
     // And the NOCASE-ordered rows come out case-insensitively sorted.
     let mut c = Connection::open_memory().unwrap();
     for stmt in S.split(';') {
