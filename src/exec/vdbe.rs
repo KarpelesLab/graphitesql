@@ -1099,37 +1099,16 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
     if !order.is_empty() && (*distinct || kind != AggKind::GroupConcat) {
         return None;
     }
-    // A non-BINARY argument collation drives two folds the VDBE performs under
-    // BINARY: a `DISTINCT` dedup (see `AggSpec::distinct`) and a `min`/`max`
-    // comparison. An explicit `COLLATE` on the argument — `count(DISTINCT a
-    // COLLATE NOCASE)`, `min(a COLLATE NOCASE)` — must drive that fold, so defer
-    // the whole query to the tree-walker, which honors it via
-    // `eval::key_collation`. (A column's *declared* collation is already caught by
-    // the caller's non-BINARY-collation bail.) The other aggregates
-    // (`count`/`sum`/`avg`/`total`, and non-DISTINCT `group_concat`) ignore the
-    // argument collation, so they stay on the VDBE.
-    let collation_sensitive = *distinct || matches!(kind, AggKind::Min | AggKind::Max);
-    if collation_sensitive && arg.as_ref().is_some_and(explicit_non_binary_collation) {
-        return None;
-    }
+    // A non-BINARY argument collation — an explicit `COLLATE` (`min(a COLLATE
+    // NOCASE)`, `count(DISTINCT a COLLATE NOCASE)`) or a column's declared collation
+    // — drives the VDBE's `DISTINCT` dedup and `min`/`max` fold: the compile paths
+    // resolve it into `AggStep.collation`/`AggSpec.collation`, so no deferral is
+    // needed here.
     // `json_group_object`'s value argument (the key is `arg`).
     let arg2 = matches!(kind, AggKind::JsonGroupObject { .. })
         .then(|| args.get(1).cloned())
         .flatten();
     Some((kind, arg, *distinct, filter, order, sep, arg2))
-}
-
-/// True when `expr` carries an explicit `COLLATE` that is not BINARY (peeling
-/// parentheses). Mirrors the explicit-collation arm of `eval::key_collation`,
-/// used to defer a `DISTINCT` aggregate whose dedup would otherwise fold under
-/// the wrong (BINARY) collation.
-fn explicit_non_binary_collation(expr: &Expr) -> bool {
-    match unparen(expr) {
-        Expr::Collate { collation, .. } => {
-            crate::value::resolve_collation_name(collation).is_some_and(|c| c != Collation::Binary)
-        }
-        _ => false,
-    }
 }
 
 /// True if any `DISTINCT` output projection carries an explicit non-BINARY

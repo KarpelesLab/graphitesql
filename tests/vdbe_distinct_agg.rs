@@ -226,43 +226,30 @@ fn distinct_aggregate_over_nocase_runs_on_vdbe() {
 }
 
 /// An *explicit* `COLLATE` on a `DISTINCT` aggregate argument
-/// (`count(DISTINCT a COLLATE NOCASE)`) must drive the dedup. The VDBE folds
-/// under BINARY, so it has to defer to the tree-walker — which honors the
-/// collation and matches sqlite. An explicit `COLLATE BINARY`, by contrast,
-/// is BINARY already and stays on the VDBE.
+/// (`count(DISTINCT a COLLATE NOCASE)`) drives the dedup, and now folds under that
+/// collation on the VDBE (`AggStep.collation`/`AggSpec.collation`): `'a'=='A'`
+/// under NOCASE, so `count(DISTINCT)` is 2 and `group_concat(DISTINCT)` is `'a,b'`.
+/// An explicit `COLLATE BINARY` keeps `'a'` and `'A'` distinct.
 #[test]
-fn distinct_aggregate_with_explicit_collate_arg_defers_but_is_correct() {
+fn distinct_aggregate_with_explicit_collate_arg_runs_on_vdbe() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a TEXT)").unwrap();
     c.execute("INSERT INTO t VALUES ('a'),('A'),('b')").unwrap();
 
-    // Non-BINARY explicit collation: VDBE bails, tree-walker collapses 'a'=='A'.
-    for q in [
-        "SELECT count(DISTINCT a COLLATE NOCASE) FROM t",
-        "SELECT group_concat(DISTINCT a COLLATE NOCASE) FROM t",
-        "SELECT count(DISTINCT (a COLLATE NOCASE)) FROM t",
+    for (q, want) in [
+        ("SELECT count(DISTINCT a COLLATE NOCASE) FROM t", 2),
+        ("SELECT count(DISTINCT (a COLLATE NOCASE)) FROM t", 2),
+        ("SELECT count(DISTINCT a COLLATE BINARY) FROM t", 3),
     ] {
-        assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
+        let r = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
+        assert_eq!(r.rows, vec![vec![Value::Integer(want)]], "on {q}");
     }
-    assert_eq!(
-        c.query("SELECT count(DISTINCT a COLLATE NOCASE) FROM t")
-            .unwrap()
-            .rows,
-        vec![vec![Value::Integer(2)]],
-    );
-    assert_eq!(
-        c.query("SELECT group_concat(DISTINCT a COLLATE NOCASE) FROM t")
-            .unwrap()
-            .rows,
-        vec![vec![Value::Text("a,b".into())]],
-    );
-
-    // Explicit COLLATE BINARY is the default fold, so it stays on the VDBE and
-    // keeps 'a' and 'A' distinct.
     let r = c
-        .query_vdbe("SELECT count(DISTINCT a COLLATE BINARY) FROM t")
+        .query_vdbe("SELECT group_concat(DISTINCT a COLLATE NOCASE) FROM t")
         .unwrap();
-    assert_eq!(r.rows, vec![vec![Value::Integer(3)]]);
+    assert_eq!(r.rows, vec![vec![Value::Text("a,b".into())]]);
 }
 
 /// The same explicit-`COLLATE` deferral over `GROUP BY`: the tree-walker dedups
@@ -302,33 +289,25 @@ fn distinct_aggregate_with_explicit_collate_over_group_by_matches_sqlite3() {
     assert_eq!(got, expected);
 }
 
-/// `min`/`max` compare under the argument collation, not BINARY. An explicit
-/// `COLLATE` on a `min`/`max` argument (even without DISTINCT) must therefore
-/// defer to the tree-walker; an explicit `COLLATE BINARY` stays on the VDBE.
+/// `min`/`max` compare under the argument collation. An explicit `COLLATE` on a
+/// `min`/`max` argument now folds under that collation on the VDBE; an explicit
+/// `COLLATE BINARY` uses the default comparison.
 #[test]
-fn min_max_with_explicit_collate_arg_defers_but_is_correct() {
+fn min_max_with_explicit_collate_arg_runs_on_vdbe() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a TEXT)").unwrap();
     c.execute("INSERT INTO t VALUES ('B'),('a'),('C')").unwrap();
 
-    // Non-BINARY explicit collation: VDBE bails (it folds min/max under BINARY).
-    for q in [
-        "SELECT min(a COLLATE NOCASE) FROM t",
-        "SELECT max(a COLLATE NOCASE) FROM t",
-        "SELECT min(a COLLATE NOCASE), max(a COLLATE NOCASE) FROM t",
-    ] {
-        assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
-    }
-    // The tree-walker honors NOCASE: min='a', max='C'.
+    // NOCASE order is a < B < C, so min='a', max='C' — now on the VDBE.
+    let r = c
+        .query_vdbe("SELECT min(a COLLATE NOCASE), max(a COLLATE NOCASE) FROM t")
+        .unwrap();
     assert_eq!(
-        c.query("SELECT min(a COLLATE NOCASE), max(a COLLATE NOCASE) FROM t")
-            .unwrap()
-            .rows,
+        r.rows,
         vec![vec![Value::Text("a".into()), Value::Text("C".into())]],
     );
 
-    // Explicit COLLATE BINARY is the default comparison, so it stays on the VDBE:
-    // BINARY orders uppercase before lowercase, so min='B'.
+    // Explicit COLLATE BINARY orders uppercase before lowercase, so min='B'.
     let r = c.query_vdbe("SELECT min(a COLLATE BINARY) FROM t").unwrap();
     assert_eq!(r.rows, vec![vec![Value::Text("B".into())]]);
 

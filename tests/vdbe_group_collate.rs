@@ -94,11 +94,8 @@ fn collation_sensitive_grouped_shapes_defer() {
     // Still deferred: a `SELECT DISTINCT … GROUP BY` — its post-grouping dedup
     // compares the output rows under BINARY (the grouped `DistinctCheck` carries no
     // collations).
-    for q in [
-        "SELECT DISTINCT a FROM t GROUP BY a, x", // DISTINCT over grouped output
-    ] {
-        assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
-        // The deferred result (tree-walker, unchanged by this feature) still runs.
-        assert!(c.query(q).is_ok(), "tree-walker failed on {q}");
-    }
+    let q = "SELECT DISTINCT a FROM t GROUP BY a, x";
+    assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
+    // The deferred result (tree-walker, unchanged by this feature) still runs.
+    assert!(c.query(q).is_ok(), "tree-walker failed on {q}");
 }
