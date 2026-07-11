@@ -24046,6 +24046,11 @@ impl Connection {
         if self.rowid_eq_single_row(sel, params) {
             return Some(false);
         }
+        // A full `UNIQUE`-index equality likewise matches at most one row (the
+        // secondary-index analogue), so any ORDER BY is trivially satisfied.
+        if self.unique_eq_single_row(sel, params) {
+            return Some(false);
+        }
         // Every ORDER BY term pinned to a constant by a `col = <const>` WHERE
         // equality (even on a plain SCAN, so `seek_order_prefix` does not apply): the
         // whole ORDER BY is then vacuously satisfied, so no sort is needed. Guarded on
@@ -24198,6 +24203,83 @@ impl Connection {
             rowid_seek_constraint(where_expr, &meta.columns, meta.ipk, params),
             Some(v) if v.len() == 1
         )
+    }
+
+    /// A `WHERE` whose top-level equalities pin *every* column of some non-partial,
+    /// plain-column `UNIQUE` index to a non-NULL constant matches at most one row —
+    /// the index enforces uniqueness over that column set — so *any* `ORDER BY` over
+    /// the single base table is trivially satisfied and needs no temp b-tree, exactly
+    /// as sqlite plans it (the secondary-index analogue of [`Self::rowid_eq_single_row`]).
+    ///
+    /// Soundness rests on the seek collation matching the index collation: an
+    /// equality is only counted when its comparison collation is the column's default
+    /// ([`collect_eq_constraints`] enforces that), and the index is only accepted when
+    /// each of its columns is indexed under that same default collation — otherwise a
+    /// (say) `NOCASE` column under a `BINARY`-unique index could match two rows
+    /// (`'x'`/`'X'`) that the index treats as distinct. `IS NULL` / `= NULL` never
+    /// count (NULLs are not unique). Conservative on any mismatch: returns `false`,
+    /// the sort stays, and the ORDER-BY differential corpus catches over-claims.
+    fn unique_eq_single_row(&self, sel: &Select, params: &Params) -> bool {
+        let Some(from) = sel.from.as_ref() else {
+            return false;
+        };
+        if !from.joins.is_empty() {
+            return false;
+        }
+        let t = &from.first;
+        if t.subquery.is_some()
+            || t.tvf_args.is_some()
+            || t.schema.is_some()
+            || t.index_hint.is_some()
+        {
+            return false;
+        }
+        let Some(where_expr) = sel.where_clause.as_ref() else {
+            return false;
+        };
+        if sel.order_by.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || self.has_aggregate(sel)
+            || window::has_window(sel)
+        {
+            return false;
+        }
+        if self.lookup_cte(&t.name, None).is_some() || self.is_view(&t.name) {
+            return false;
+        }
+        let Ok(meta) = self.table_meta(&t.name, t.alias.as_deref()) else {
+            return false;
+        };
+        // Columns pinned to a NON-NULL constant by a top-level `=` / `IS` equality
+        // whose comparison collation is the column's default.
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        let pinned: alloc::collections::BTreeSet<usize> = eqs
+            .iter()
+            .filter(|(_, v)| !matches!(v, Value::Null))
+            .map(|(i, _)| *i)
+            .collect();
+        if pinned.is_empty() {
+            return false;
+        }
+        // Some non-partial, plain-column UNIQUE index — indexed entirely under the
+        // columns' default collations — has all its columns pinned → at most one row.
+        self.indexes_of(&t.name)
+            .map(|ixs| {
+                ixs.iter().any(|ix| {
+                    ix.unique
+                        && ix.partial.is_none()
+                        && ix.key_exprs.is_none()
+                        && !ix.cols.is_empty()
+                        && ix.cols.len() == ix.collations.len()
+                        && ix.cols.iter().zip(&ix.collations).all(|(&c, coll)| {
+                            pinned.contains(&c) && *coll == meta.columns[c].collation
+                        })
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// How many leading `ORDER BY` terms a `WHERE` seek already produces in order,

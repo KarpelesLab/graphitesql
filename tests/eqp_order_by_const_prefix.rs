@@ -336,6 +336,72 @@ fn single_row_driver_join_on_indexed_inner_column() {
 }
 
 #[test]
+fn full_unique_index_equality_matches_one_row_no_sort() {
+    if !sqlite_available() {
+        return;
+    }
+    // A `WHERE` equality covering *every* column of a non-partial UNIQUE index (or
+    // the full composite key) matches at most one row, so ANY `ORDER BY` is vacuous
+    // and sqlite drops the temp b-tree. A non-unique index, a partial composite key,
+    // or `IS NULL` (NULLs are not unique) all still sort.
+    const S: &str = "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c, d); \
+                     CREATE UNIQUE INDEX tb ON t(b); \
+                     CREATE INDEX tc ON t(c); \
+                     CREATE UNIQUE INDEX tcd ON t(c,d); \
+                     INSERT INTO t VALUES(1,10,'x',5),(2,20,'y',6),(3,30,'z',7);";
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in S.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            c.execute(s).unwrap();
+        }
+    }
+    // Compare only the sort (`USE TEMP B-TREE`) lines — this feature controls the
+    // sort, not which index the seek picks (index choice is an orthogonal, separately
+    // tested cost-model concern that can legitimately differ here).
+    let sort_lines = |eqp: &[String]| -> Vec<String> {
+        eqp.iter()
+            .filter(|l| l.contains("TEMP B-TREE"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for q in [
+        // Full single-column UNIQUE key pinned → one row → no sort (asc, desc, multi-term).
+        "SELECT * FROM t WHERE b=20 ORDER BY c",
+        "SELECT * FROM t WHERE b=20 ORDER BY c DESC",
+        "SELECT * FROM t WHERE b=20 ORDER BY c, a, d",
+        // A UNIQUE column pinned alongside extra constraints → still one row.
+        "SELECT * FROM t WHERE b=20 AND c='y' ORDER BY d",
+        // Full composite UNIQUE key (c,d) pinned → one row.
+        "SELECT * FROM t WHERE c='y' AND d=6 ORDER BY b",
+        // Regression guards that must STILL sort:
+        //  * a non-unique / partial-key equality (only the leading `tcd` column
+        //    pinned, and `tc` is non-unique) → many rows possible,
+        "SELECT * FROM t WHERE c='y' ORDER BY b",
+        //  * `IS NULL` on the UNIQUE column (NULLs are not unique).
+        "SELECT * FROM t WHERE b IS NULL ORDER BY c",
+    ] {
+        assert_eq!(
+            sort_lines(&sqlite_eqp_setup(S, q)),
+            sort_lines(&graphite_eqp(&c, q)),
+            "sort node diverged on `{q}`"
+        );
+    }
+    // The single matched row is returned correctly with the sort skipped.
+    let row: Vec<String> = c
+        .query("SELECT c FROM t WHERE b=20 ORDER BY c, a, d")
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(t) => t.clone(),
+            v => format!("{v:?}"),
+        })
+        .collect();
+    assert_eq!(row, vec!["y".to_string()]);
+}
+
+#[test]
 fn dropped_constant_term_still_returns_correct_rows() {
     if !sqlite_available() {
         return;
