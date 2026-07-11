@@ -177,10 +177,13 @@ pub enum Op {
     ResultRow { start: usize, count: usize },
     /// `DISTINCT` gate: if the row in `[start, start+count)` was already seen,
     /// jump to `target` (skip it); otherwise record it and fall through.
+    /// `collations[i]` is the collating sequence for output column `i` (empty =>
+    /// all `BINARY`); a `NOCASE`/`RTRIM`/custom column dedups under its collation.
     DistinctCheck {
         start: usize,
         count: usize,
         target: usize,
+        collations: alloc::vec::Vec<Collation>,
     },
     /// Append a row to the sorter: the output values in `[row_start, row_start+
     /// row_count)` keyed by `[key_start, key_start+key_count)`.
@@ -2094,6 +2097,7 @@ fn compile_group_select(
             start: out_start,
             count,
             target: 0,
+            collations: alloc::vec::Vec::new(),
         });
         Some(at)
     } else {
@@ -2736,20 +2740,27 @@ pub fn compile_table_select_opts(
         c.compile_expr_into(expr, i)?;
     }
     // Optional DISTINCT: skip the row (jump to Next) when an equal one was emitted.
-    // DISTINCT compares rows under BINARY, so a non-BINARY column collation would
-    // diverge — defer to the tree-walker. (An explicit `COLLATE` in a projection
-    // is caught by the post-`expand_projections` guard above.)
-    if sel.distinct && c.collations.iter().any(|cl| *cl != Collation::Binary) {
-        return Err(Error::Unsupported(
-            "VDBE: non-BINARY collation with DISTINCT",
-        ));
-    }
+    // Each projected column dedups under its *resolved* collation — an explicit
+    // `COLLATE` if present, else the underlying column's declared collation, else
+    // BINARY — exactly as `build_sort_keys` resolves an ORDER BY term's collation.
+    // (`c.collations` is indexed by the *source* columns, not the projected output,
+    // so it cannot be used directly here.) This lets a `NOCASE`/`RTRIM`/custom-
+    // collation column — and an explicit projection `COLLATE` — run on the VDBE.
     let distinct_skip = if sel.distinct {
+        let colls: Vec<Collation> = projections
+            .iter()
+            .map(|(e, _)| {
+                c.explicit_collation(e)
+                    .or_else(|| c.col_collation(e))
+                    .unwrap_or_default()
+            })
+            .collect();
         let at = c.ops.len();
         c.ops.push(Op::DistinctCheck {
             start: 0,
             count,
             target: 0,
+            collations: colls,
         });
         Some(at)
     } else {
@@ -3149,6 +3160,7 @@ pub fn compile_join2(
             start: 0,
             count,
             target: 0,
+            collations: alloc::vec::Vec::new(),
         });
         Some(at)
     } else {
@@ -3658,6 +3670,7 @@ pub fn compile_left_join2(
             start: 0,
             count,
             target: 0,
+            collations: alloc::vec::Vec::new(),
         });
         Some(at)
     } else {
@@ -3725,6 +3738,7 @@ pub fn compile_left_join2(
             start: 0,
             count,
             target: 0,
+            collations: alloc::vec::Vec::new(),
         });
         Some(at)
     } else {
@@ -3881,6 +3895,7 @@ fn emit_output_row(
             start: 0,
             count,
             target: 0,
+            collations: alloc::vec::Vec::new(),
         });
         Some(at)
     } else {
@@ -5968,10 +5983,15 @@ fn run_rows_multi_impl(
                 start,
                 count,
                 target,
+                collations,
             } => {
                 let row = &regs[*start..*start + *count];
                 let dup = seen.iter().any(|prev| {
-                    prev.len() == row.len() && prev.iter().zip(row).all(|(a, b)| distinct_eq(a, b))
+                    prev.len() == row.len()
+                        && prev.iter().zip(row).enumerate().all(|(i, (a, b))| {
+                            let coll = collations.get(i).copied().unwrap_or(Collation::Binary);
+                            distinct_eq_coll(a, b, coll)
+                        })
                 });
                 if dup {
                     pc = *target;
@@ -6535,13 +6555,18 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
 /// Equality used by `DISTINCT`: two NULLs are equal (unlike `=`), otherwise the
 /// usual binary-collation value comparison decides.
 fn distinct_eq(a: &Value, b: &Value) -> bool {
+    distinct_eq_coll(a, b, crate::value::Collation::Binary)
+}
+
+/// `DISTINCT`/`GROUP BY` equality under a collating sequence: two `NULL`s are
+/// equal (unlike `=`), a `NULL` differs from any value, and two non-NULL values
+/// compare via `cmp_values_coll` (so `TEXT` under `NOCASE`/`RTRIM`/a custom
+/// collation dedups case/space-insensitively).
+fn distinct_eq_coll(a: &Value, b: &Value, coll: Collation) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Null, _) | (_, Value::Null) => false,
-        _ => {
-            crate::value::cmp_values_coll(a, b, crate::value::Collation::Binary)
-                == core::cmp::Ordering::Equal
-        }
+        _ => crate::value::cmp_values_coll(a, b, coll) == core::cmp::Ordering::Equal,
     }
 }
 
