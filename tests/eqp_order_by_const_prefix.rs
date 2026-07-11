@@ -173,6 +173,10 @@ fn single_row_driver_join_all_constant_order_by() {
         "SELECT * FROM big JOIN small ON big.k=small.v WHERE big.id=7 ORDER BY big.v, small.v",
         // A non-constant inner column still needs the sort.
         "SELECT * FROM big JOIN small ON big.k=small.v WHERE big.id=7 ORDER BY small.k",
+        // The inner's own rowid (ascending) is satisfied by the inner's plain
+        // rowid-order scan (small has no secondary index) — no sort.
+        "SELECT * FROM big JOIN small ON big.k=small.v WHERE big.id=7 ORDER BY small.id",
+        "SELECT * FROM big JOIN small ON big.k=small.v WHERE big.id=7 ORDER BY small.v, small.id",
     ] {
         assert_eq!(eqp(q), graphite_eqp(&c, q), "EQP diverged on `{q}`");
     }
@@ -189,6 +193,22 @@ fn single_row_driver_join_all_constant_order_by() {
         .collect();
     got.sort_unstable();
     assert_eq!(got, vec![1, 2]);
+
+    // The inner-rowid ORDER BY skips the sort, but the inner's plain rowid scan
+    // already yields ascending small.id — so the rows come out ordered.
+    let ordered: Vec<i64> = c
+        .query(
+            "SELECT small.id FROM big JOIN small ON big.k=small.v WHERE big.id=7 ORDER BY small.id",
+        )
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert_eq!(ordered, vec![1, 2]);
 }
 
 #[test]

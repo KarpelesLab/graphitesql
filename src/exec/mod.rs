@@ -23080,17 +23080,19 @@ impl Connection {
         Some((label, cols))
     }
 
-    /// Whether *every* `ORDER BY` term of a two-table INNER join is pinned to a
-    /// constant — so the sort can be skipped entirely (the rows are valid in any
-    /// order). This holds when the driver (`from.first`) is a single-row `rowid =
-    /// <const>` seek ([`join_first_rowid_seek`]): then every driver column is that
-    /// one row's value, and every inner column equated to a driver column by a
-    /// top-level `ON` equality (`driver.a = inner.b`) is likewise constant. sqlite
-    /// emits no `USE TEMP B-TREE FOR ORDER BY` for these. Conservative: only the
-    /// all-constant case (it needs no assumption about the inner's scan order, unlike
-    /// an `ORDER BY` on the inner's own rowid, left as a follow-up); a non-constant
-    /// term, an outer join (inner columns may be NULL, not constant), or an
-    /// unresolvable/`COLLATE`d term returns `false`.
+    /// Whether the `ORDER BY` of a two-table INNER join needs no sort because the
+    /// driver (`from.first`) is a single-row `rowid = <const>` seek
+    /// ([`join_first_rowid_seek`]). With one driver row, every driver column is
+    /// constant, and every inner column equated to a driver column by a top-level
+    /// `ON` equality (`driver.a = inner.b`) is likewise constant — an `ORDER BY` over
+    /// those is valid in any order. Additionally, when the inner is a plain
+    /// rowid-order scan (a rowid table with an IPK and *no* secondary indexes, so it
+    /// cannot be seeked or covering-scanned into another order), the whole output
+    /// arrives in inner-rowid order, so a trailing `ORDER BY` on the inner's rowid is
+    /// satisfied too (the rowid is unique, so every later term is then vacuous).
+    /// sqlite emits no `USE TEMP B-TREE FOR ORDER BY` for these. Conservative: an
+    /// outer join (inner columns may be NULL, not constant), or any non-constant /
+    /// non-inner-rowid / unresolvable / `COLLATE`d term, returns `false`.
     fn join_order_all_constant(&self, sel: &Select, from: &FromClause, params: &Params) -> bool {
         if from.joins.len() != 1 || sel.order_by.is_empty() {
             return false;
@@ -23157,20 +23159,51 @@ impl Connection {
                 }
             }
         }
-        sel.order_by.iter().all(
-            |term| match self.join_key_column_identity(sel, from, &term.expr) {
-                Some((tbl, col)) => {
-                    (tbl.eq_ignore_ascii_case(dlabel)
-                        && dmeta
-                            .columns
-                            .iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(&col)))
-                        || (tbl.eq_ignore_ascii_case(ilabel)
-                            && inner_const.iter().any(|c| c.eq_ignore_ascii_case(&col)))
-                }
-                None => false,
-            },
-        )
+        // The inner's own rowid is also satisfied WITHOUT a sort when the inner is a
+        // plain rowid-order scan — which, for the single driver row, means the whole
+        // output arrives in inner-rowid order. Gated *very* conservatively: a rowid
+        // table with an IPK and NO secondary indexes at all (so it cannot be
+        // index-seeked or covering-scanned into a different order). The rowid is
+        // unique, so once an ORDER BY term is the inner rowid (ascending), every later
+        // term is satisfied too.
+        let inner_plain_rowid_scan = imeta.ipk.is_some()
+            && !imeta.without_rowid
+            && self
+                .indexes_of(&join.table.name)
+                .map(|ixs| ixs.is_empty())
+                .unwrap_or(false);
+        let inner_rowid = imeta.ipk.map(|i| imeta.columns[i].name.clone());
+        let mut rowid_seen = false;
+        for term in &sel.order_by {
+            if rowid_seen {
+                continue; // a unique rowid already fixed the order of everything after
+            }
+            let Some((tbl, col)) = self.join_key_column_identity(sel, from, &term.expr) else {
+                return false;
+            };
+            let is_driver = tbl.eq_ignore_ascii_case(dlabel)
+                && dmeta
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&col));
+            let is_inner_const = tbl.eq_ignore_ascii_case(ilabel)
+                && inner_const.iter().any(|c| c.eq_ignore_ascii_case(&col));
+            let is_inner_rowid = inner_plain_rowid_scan
+                && !term.descending
+                && tbl.eq_ignore_ascii_case(ilabel)
+                && inner_rowid
+                    .as_deref()
+                    .is_some_and(|r| r.eq_ignore_ascii_case(&col));
+            if is_driver || is_inner_const {
+                continue;
+            }
+            if is_inner_rowid {
+                rowid_seen = true;
+                continue;
+            }
+            return false;
+        }
+        true
     }
 
     /// Resolve one `ORDER BY` / `GROUP BY` / `DISTINCT` key expression to a
