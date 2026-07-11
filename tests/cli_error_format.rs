@@ -102,6 +102,9 @@ fn one_shot_error_rendering_matches_sqlite() {
         "CREATE TABLE t(a PRIMARY KEY, b); ALTER TABLE t DROP COLUMN a", // cannot drop PK column
         "CREATE TABLE t(a PRIMARY KEY, b PRIMARY KEY)",
         "SELECT count(*) OVER ()",
+        // A STRICT table with an invalid column type is a prepare-time schema
+        // error (`unknown datatype for …`), like the `missing datatype` case.
+        "CREATE TABLE t(a ANYTHING) STRICT",
         "SELECT",
         // Step-time errors (constraints carry the (19) code, a datatype mismatch
         // the (20) SQLITE_MISMATCH code; a plain error carries none).
