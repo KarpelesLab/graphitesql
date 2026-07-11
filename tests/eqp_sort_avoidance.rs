@@ -138,6 +138,10 @@ fn order_by_collate_uses_matching_collation_index() {
         "SELECT * FROM t WHERE b <= 'c' COLLATE NOCASE",
         "SELECT * FROM t WHERE b BETWEEN 'a' AND 'd' COLLATE NOCASE",
         "SELECT * FROM t WHERE b BETWEEN 'a' AND 'd'",
+        // A NOCASE range seek also earns the ORDER-BY-collation credit, so no temp
+        // b-tree is emitted (matching sqlite).
+        "SELECT * FROM t WHERE b > 'a' COLLATE NOCASE ORDER BY b COLLATE NOCASE",
+        "SELECT * FROM t WHERE b >= 'a' COLLATE NOCASE ORDER BY b COLLATE NOCASE DESC",
     ] {
         assert_eq!(graphite(q), eqp(q), "EQP diverged on `{q}`");
     }

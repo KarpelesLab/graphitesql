@@ -23975,7 +23975,16 @@ impl Connection {
                 Some(r) if r != this_reverse => break,
                 Some(_) => {}
             }
-            let (tbl, col_name) = match order_key_expr(&order_cols, &term.expr) {
+            // Peel an explicit `COLLATE` (setting the term's effective collation)
+            // down to the underlying column, so `ORDER BY b COLLATE NOCASE` is
+            // credited against a NOCASE index walk (B9j).
+            let resolved = order_key_expr(&order_cols, &term.expr);
+            let explicit = explicit_collation(resolved);
+            let mut base = resolved;
+            while let Expr::Collate { expr, .. } | Expr::Paren(expr) = base {
+                base = expr;
+            }
+            let (tbl, col_name) = match base {
                 Expr::Column { table, column, .. } => (table.as_deref(), column.as_str()),
                 _ => break,
             };
@@ -23989,7 +23998,8 @@ impl Connection {
             else {
                 break;
             };
-            if walk_cols[k] != oc || walk_colls[k] != meta.columns[oc].collation {
+            let eff_coll = explicit.unwrap_or(meta.columns[oc].collation);
+            if walk_cols[k] != oc || walk_colls[k] != eff_coll {
                 break;
             }
             k += 1;

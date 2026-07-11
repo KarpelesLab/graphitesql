@@ -426,10 +426,13 @@ result or declines to it — never a wrong answer), so this track is
   recovers the bound collation; `choose_range_index` matches it to the index's
   leading-column collation). `BETWEEN`/`GLOB` keep the gated per-bound behaviour (a
   mixed-collation `BETWEEN 'a' AND 'd' COLLATE NOCASE` still uses the BINARY index,
-  matching sqlite). **B9j WHERE is now complete for equality + range.** Residual (not
-  a regression): a range seek does not yet get ORDER-BY-collation credit
-  (`b > 'x' COLLATE NOCASE ORDER BY b COLLATE NOCASE` still shows a temp b-tree — a
-  separate order-credit path).
+  matching sqlite). **Seek ORDER-BY-collation credit DONE 2026-07-11:**
+  `seek_order_prefix` peels an explicit `COLLATE` from each `ORDER BY` term and
+  compares the index walk against the term's *effective* collation, so a NOCASE
+  equality/range seek walking the NOCASE index earns the order credit —
+  `b > 'x' COLLATE NOCASE ORDER BY b COLLATE NOCASE` runs with no temp b-tree,
+  matching sqlite. **B9j is now complete** (ORDER-BY, WHERE equality, WHERE range,
+  seek order-credit).
 - **B9b — window-function EQP.** The co-routine *body* is exactly the B9h index
   choice (SQLite picks the index that covers the input **and** serves the
   `PARTITION BY`/window-`ORDER BY`), so this is **blocked on B9h** (plus a
