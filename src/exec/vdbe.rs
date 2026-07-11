@@ -3000,6 +3000,7 @@ fn build_sort_keys(
 /// (or tree-walker) path. Without ORDER BY the row order (innermost cursor
 /// advancing fastest, cursor 0 outermost) matches the cross-product and SQLite's
 /// nested-loop order.
+#[allow(clippy::too_many_arguments)]
 pub fn compile_join2(
     sel: &Select,
     columns: &[String],
@@ -3008,9 +3009,22 @@ pub fn compile_join2(
     collations: &[Collation],
     boundaries: &[usize],
     allow_correlated: bool,
+    loop_order: &[usize],
 ) -> Result<Program> {
     let n = boundaries.len();
     debug_assert!(n >= 2 && boundaries[n - 1] == columns.len());
+    // `loop_order[p]` is the cursor nested at loop position `p` (0 = outermost).
+    // Empty means the identity `[0, 1, …, n-1]` (leftmost source outermost). A
+    // non-identity permutation drives from a different table — used for the
+    // cost-based two-table rowid-inner swap (drive the second table, the first
+    // becomes the inner) — which only reorders row *emission*; the cursor→column
+    // mapping (via `boundaries`) is unchanged, so projections/WHERE are unaffected.
+    let order: Vec<usize> = if loop_order.is_empty() {
+        (0..n).collect()
+    } else {
+        debug_assert_eq!(loop_order.len(), n);
+        loop_order.to_vec()
+    };
     if !sel.compound.is_empty() || !sel.group_by.is_empty() || sel.having.is_some() {
         return Err(Error::Unsupported("VDBE: join shape not nested-loopable"));
     }
@@ -3097,14 +3111,14 @@ pub fn compile_join2(
     for _ in &key_specs {
         c.alloc();
     }
-    // N-deep nested loop: `RewindC 0 [ RewindC 1 [ … [ RewindC n-1 <body>
-    // NextC n-1 ] … NextC 1 ] NextC 0` — cursor 0 outermost, matching the
-    // cross-product's leftmost-outermost row order.
+    // N-deep nested loop: `RewindC [ RewindC [ … [ RewindC <body> NextC ] …
+    // NextC ] NextC` — position 0 outermost. The cursor at each position is
+    // `order[p]` (identity `[0,1,…]` unless a swap drives a different table).
     let mut rewind_at = alloc::vec![0usize; n];
-    for (i, slot) in rewind_at.iter_mut().enumerate() {
+    for (p, slot) in rewind_at.iter_mut().enumerate() {
         *slot = c.ops.len();
         c.ops.push(Op::RewindC {
-            cursor: i,
+            cursor: order[p],
             target: 0,
         });
     }
@@ -3165,14 +3179,17 @@ pub fn compile_join2(
         });
         (offset_skip, limit_done)
     };
-    // Emit the `NextC`s innermost-first; `next_at[i]` is the address of cursor
-    // `i`'s advance. The innermost re-runs the body; an outer one re-runs the
-    // next-inner cursor's `RewindC`.
+    // Emit the `NextC`s innermost-first; `next_at[p]` is the address of the
+    // position-`p` cursor's advance. The innermost re-runs the body; an outer one
+    // re-runs the next-inner position's `RewindC`.
     let mut next_at = alloc::vec![0usize; n];
-    for i in (0..n).rev() {
-        next_at[i] = c.ops.len();
-        let target = if i == n - 1 { body } else { rewind_at[i + 1] };
-        c.ops.push(Op::NextC { cursor: i, target });
+    for p in (0..n).rev() {
+        next_at[p] = c.ops.len();
+        let target = if p == n - 1 { body } else { rewind_at[p + 1] };
+        c.ops.push(Op::NextC {
+            cursor: order[p],
+            target,
+        });
     }
     // Sorted emit loop (ORDER BY): sort, then walk the sorter applying OFFSET then
     // LIMIT to the ordered output.
@@ -6611,7 +6628,8 @@ mod tests {
         ];
         let aff = vec![Affinity::Blob; 4];
         let coll = vec![Collation::Binary; 4];
-        let prog = compile_join2(&sel, &columns, &tables, &aff, &coll, &[2, 4], false).unwrap();
+        let prog =
+            compile_join2(&sel, &columns, &tables, &aff, &coll, &[2, 4], false, &[]).unwrap();
         let left: Vec<Vec<Value>> = vec![
             vec![Value::Integer(1), Value::Text("a".into())],
             vec![Value::Integer(2), Value::Text("b".into())],
@@ -6748,7 +6766,7 @@ mod tests {
                 panic!()
             };
             assert!(
-                compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2], false).is_err(),
+                compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2], false, &[]).is_err(),
                 "{sql} should bail to the cross-product path"
             );
         }
@@ -6762,7 +6780,7 @@ mod tests {
                 panic!()
             };
             assert!(
-                compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2], false).is_ok(),
+                compile_join2(&sel, &cols, &tabs, &aff, &coll, &[1, 2], false, &[]).is_ok(),
                 "{sql} should compile on the VDBE"
             );
         }

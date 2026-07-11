@@ -271,6 +271,20 @@ result or declines to it — never a wrong answer), so this track is
   tree-walker (folding them at *compile* time would diverge); those, and any
   column/subquery/aggregate/window/filtered argument, bail — so the result is
   always identical to the tree-walker (`tests/vdbe_limit_fold.rs`).
+- **B-vdbe-swap — two-table rowid-inner swap on the VDBE. DONE 2026-07-11.** A
+  two-table inner join the cost model reorders to drive from the *second* table
+  (seeking `from.first` by its cheaper rowid) previously *deferred* to the
+  tree-walker; it now runs on the VDBE. `compile_join2` gained a `loop_order`
+  permutation (empty = identity) that nests the driver cursor outermost (`[1, 0]`),
+  which — because a rowid join matches ≤1 inner row — reproduces the tree-walker's
+  driven, unordered emission order exactly (verified for multi-driver-row, DISTINCT,
+  WHERE, LIMIT, and the comma form). The swap is applied only to the plain-projection
+  path and only when the driver is scanned in rowid/declaration order; a driver
+  walked via a *reordering covering index* (`SCAN v USING COVERING INDEX iv`, which
+  the materialized rowset scan can't reproduce) and aggregate/GROUP BY joins still
+  defer. `tests/vdbe_join_swap.rs`. (The index-inner and N-table swaps still defer —
+  index seeks return key-order for multi-matches, which a scan+filter would not
+  reproduce.)
 - **B5b-2 — seek-driven inner cursor over real storage** *(the largest remaining
   VDBE piece)*. Inner rowid seeks (INNER + LEFT, single & N-table left-deep chain,
   compound-`ON`) already run over a live `TableCursor`. *Single-table live scan
