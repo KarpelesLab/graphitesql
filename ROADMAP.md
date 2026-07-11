@@ -337,8 +337,17 @@ result or declines to it — never a wrong answer), so this track is
   on all-bare-column keys and no single-min/max representative rule), and `compile_expr`'s
   subquery arms emit the group op after the same group-key-only guard. Non-key references bail.
   Byte-identical to sqlite (`grouped_correlated_in_having_and_order_by`).
-- **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
-  materialize the inner table (correct, just not seek-driven).
+- **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek. **RIGHT (two-table,
+  explicit projection) now seeks too (2026-07-11):** a `RIGHT JOIN` is the mirror of
+  a `LEFT JOIN` (the *right* table is preserved), so `a RIGHT JOIN b ON …` is
+  rewritten to the identity `b LEFT JOIN a ON …` (`Connection::swap_right_join_to_left`),
+  which routes through the existing seek path and drives the now-inner left table by
+  rowid / unique index instead of materializing it. Taken only for an explicit
+  projection (columns resolve by name, so no reorder); a bare `SELECT *` and any
+  non-seekable shape fall through to the existing — correct — materialized RIGHT
+  path, so this only *adds* seek coverage. Byte-identical to sqlite incl. left-side
+  null-padding (`tests/vdbe_right_join_seek.rs`). FULL join still materializes (its
+  unmatched-right anti-join pass has no single-scan seek form).
 - **VDBE aggregate coverage — `json_group_array` / `jsonb_group_array`. DONE 2026-07-11.**
   Added `AggKind::JsonGroupArray { jsonb }`: the fold keeps NULL arguments for this
   kind (SQLite includes them as JSON `null`) and the finalizer serializes the

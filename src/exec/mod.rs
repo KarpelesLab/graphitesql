@@ -1686,6 +1686,24 @@ impl Connection {
         Ok(false)
     }
 
+    /// Rewrite a two-table `a RIGHT JOIN b ON …` into the equivalent
+    /// `b LEFT JOIN a ON …` (swap the first table with the joined one, flip the
+    /// kind to `LEFT`). The `ON` predicate references both tables by name, so it is
+    /// unchanged; the projection is unchanged (columns resolve by name). Used by
+    /// B1c to seek-drive the now-inner left table.
+    fn swap_right_join_to_left(sel: &Select) -> Select {
+        let mut s = sel.clone();
+        if let Some(from) = s.from.as_mut()
+            && from.joins.len() == 1
+        {
+            let mut joined = from.joins.remove(0);
+            core::mem::swap(&mut from.first, &mut joined.table);
+            joined.kind = sql::ast::JoinKind::Left;
+            from.joins.push(joined);
+        }
+        s
+    }
+
     /// Compile and run a parsed `SELECT` through the VDBE engine, or `Unsupported`
     /// when its shape is outside the spike's grammar (so callers fall back).
     fn run_select_vdbe(&self, sel: &Select) -> Result<QueryResult> {
@@ -2817,6 +2835,29 @@ impl Connection {
             let is_left_2 = single && from.joins[0].kind == sql::ast::JoinKind::Left;
             let is_right_2 = single && from.joins[0].kind == sql::ast::JoinKind::Right;
             let is_full_2 = single && from.joins[0].kind == sql::ast::JoinKind::Full;
+            // B1c: a two-table RIGHT join is the mirror of a LEFT join — the
+            // *right* table is preserved and the *left* is null-padded. Rewriting
+            // `a RIGHT JOIN b` to `b LEFT JOIN a` (same ON) lets the seek path
+            // drive the now-inner left table by rowid / unique index instead of
+            // materializing it, and is row-for-row identical. Only taken for an
+            // explicit (non-wildcard) projection, where each output column resolves
+            // by name regardless of FROM order so no column reordering is needed; a
+            // bare `SELECT *` keeps the existing materialized order below. If the
+            // swapped LEFT join cannot run on the VDBE it falls through to the
+            // materialized RIGHT path, so this only ever *adds* seek coverage.
+            if is_right_2
+                && sel
+                    .columns
+                    .iter()
+                    .all(|c| matches!(c, sql::ast::ResultColumn::Expr { .. }))
+            {
+                let swapped = Self::swap_right_join_to_left(sel);
+                match self.run_select_vdbe(&swapped) {
+                    Ok(r) => return Ok(r),
+                    Err(Error::Unsupported(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
             // A left-deep chain of ≥ 2 LEFT/INNER joins (at least one LEFT, no
             // NATURAL/USING, bounded depth) runs as one N-table null-padding nested
             // loop (`compile_left_join_n`). A pure-INNER chain stays on the inner
