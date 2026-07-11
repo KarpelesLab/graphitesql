@@ -15,8 +15,27 @@ const SETUP: &str = "CREATE TABLE t(a INTEGER PRIMARY KEY, x, y, z); \
                      CREATE INDEX tx ON t(x); \
                      INSERT INTO t VALUES(1,5,3,'a'),(2,5,4,'b'),(3,7,1,'c');";
 
+// Same data but NO index on `x` — the equality `WHERE x = <const>` runs as a plain
+// SCAN, exercising the scan-path constant credit (`order_const_lead`).
+const SETUP_SCAN: &str = "CREATE TABLE t(a INTEGER PRIMARY KEY, x, y, z); \
+                          INSERT INTO t VALUES(1,5,3,'a'),(2,5,4,'b'),(3,7,1,'c');";
+
 fn sqlite_available() -> bool {
     Command::new("sqlite3").arg("--version").output().is_ok()
+}
+
+fn sqlite_eqp_setup(setup: &str, sql: &str) -> Vec<String> {
+    let out = Command::new("sqlite3")
+        .arg(":memory:")
+        .arg(format!("{setup} EXPLAIN QUERY PLAN {sql};"))
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim_start_matches(['`', '|', '-', ' ']).to_string())
+        .filter(|s| !s.is_empty() && s != "QUERY PLAN")
+        .collect()
 }
 
 fn sqlite_eqp(sql: &str) -> Vec<String> {
@@ -77,6 +96,37 @@ fn constant_leading_order_by_terms_are_dropped_like_sqlite() {
         "SELECT * FROM t WHERE x=5 ORDER BY y",
     ] {
         assert_eq!(sqlite_eqp(q), graphite_eqp(&c, q), "EQP diverged on `{q}`");
+    }
+}
+
+#[test]
+fn constant_terms_dropped_on_a_plain_scan_too() {
+    if !sqlite_available() {
+        return;
+    }
+    // No index on `x`, so `WHERE x = <const>` runs as a plain SCAN — the constant
+    // credit must still drop the leading `x`.
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in SETUP_SCAN.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            c.execute(s).unwrap();
+        }
+    }
+    for q in [
+        "SELECT * FROM t WHERE x=5 ORDER BY x, y",
+        "SELECT * FROM t WHERE x=5 AND y=3 ORDER BY x, y, z",
+        "SELECT * FROM t WHERE x=5 ORDER BY x",
+        // A non-constant leading term still sorts the whole clause.
+        "SELECT * FROM t WHERE x=5 ORDER BY y, x",
+        "SELECT * FROM t WHERE x=5 ORDER BY y",
+        "SELECT * FROM t ORDER BY x, y",
+    ] {
+        assert_eq!(
+            sqlite_eqp_setup(SETUP_SCAN, q),
+            graphite_eqp(&c, q),
+            "EQP diverged on `{q}`"
+        );
     }
 }
 

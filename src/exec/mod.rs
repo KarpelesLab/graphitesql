@@ -19727,7 +19727,18 @@ impl Connection {
             } else if let Some((k, _)) = self.seek_order_prefix(sel, params) {
                 n - k.min(n)
             } else {
-                n - self.scan_order_prefix(sel, params).min(n)
+                // A plain SCAN supplies no order; but a leading `col = <const>` WHERE
+                // equality still pins that term to a constant, so sqlite drops it
+                // (`order_const_lead`). A covering scan (`scan_order_prefix > 0`) keeps
+                // its index-order credit (constant/covered interleaving is rare and
+                // left to the full sort).
+                let sp = self.scan_order_prefix(sel, params);
+                let credited = if sp == 0 {
+                    self.order_const_lead(sel, params)
+                } else {
+                    sp
+                };
+                n - credited.min(n)
             };
             // `sorted == 0` means the access path already yields every ORDER BY term
             // in order, so no sort is needed — emit nothing (a `LAST 0 TERMS` node is
@@ -23870,6 +23881,12 @@ impl Connection {
         if self.rowid_eq_single_row(sel, params) {
             return Some(false);
         }
+        // Every ORDER BY term pinned to a constant by a `col = <const>` WHERE
+        // equality (even on a plain SCAN, so `seek_order_prefix` does not apply): the
+        // whole ORDER BY is then vacuously satisfied, so no sort is needed.
+        if self.order_const_lead(sel, params) == sel.order_by.len() {
+            return Some(false);
+        }
         match self.seek_order_prefix(sel, params) {
             Some((k, descending)) if k == sel.order_by.len() => Some(descending),
             _ => None,
@@ -24299,6 +24316,81 @@ impl Connection {
             return Some((k.max(lead), descending));
         }
         Some((k, descending))
+    }
+
+    /// The number of leading `ORDER BY` terms that are pinned to a constant by a
+    /// `col = <const>` (or `col IS NULL`) WHERE equality on a *single* base table.
+    /// sqlite drops such leading terms from the sort regardless of the access path
+    /// (even a plain `SCAN`, where [`seek_order_prefix`] does not apply because
+    /// nothing is seeked). Single-table, non-grouped, non-aggregate, no window — the
+    /// same shapes `seek_order_prefix` handles; returns 0 otherwise. The pinned
+    /// column need not be indexed (a plain-scan `WHERE y = 5 ORDER BY y, z` still
+    /// drops `y`).
+    fn order_const_lead(&self, sel: &Select, params: &Params) -> usize {
+        let Some(from) = sel.from.as_ref() else {
+            return 0;
+        };
+        if !from.joins.is_empty() {
+            return 0;
+        }
+        let t = &from.first;
+        if t.subquery.is_some() || t.tvf_args.is_some() || self.is_bare_tvf(t) || t.schema.is_some()
+        {
+            return 0;
+        }
+        if sel.order_by.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || self.has_aggregate(sel)
+            || window::has_window(sel)
+        {
+            return 0;
+        }
+        let Some(where_expr) = sel.where_clause.as_ref() else {
+            return 0;
+        };
+        let Ok(meta) = self.table_meta(&t.name, t.alias.as_deref()) else {
+            return 0;
+        };
+        let label = t.alias.as_deref().unwrap_or(&t.name);
+        let mut eqs: Vec<(usize, Value)> = Vec::new();
+        collect_eq_constraints(where_expr, &meta.columns, params, &mut eqs);
+        eqs.retain(|(_, v)| !matches!(v, Value::Null));
+        let mut is_null_cols: Vec<usize> = Vec::new();
+        collect_isnull_cols(where_expr, &meta.columns, &mut is_null_cols);
+        if eqs.is_empty() && is_null_cols.is_empty() {
+            return 0;
+        }
+        let order_cols = order_projection(&sel.columns, &meta.columns);
+        let mut lead = 0usize;
+        for term in &sel.order_by {
+            if !redundant_nulls(term) {
+                break;
+            }
+            let Expr::Column { table, column, .. } = order_key_expr(&order_cols, &term.expr) else {
+                break;
+            };
+            if table
+                .as_deref()
+                .is_some_and(|tn| !tn.eq_ignore_ascii_case(label))
+            {
+                break;
+            }
+            let Some(pos) = meta
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(column))
+            else {
+                break;
+            };
+            if eqs.iter().any(|(c, _)| *c == pos) || is_null_cols.contains(&pos) {
+                lead += 1;
+            } else {
+                break;
+            }
+        }
+        lead
     }
 
     /// The first `match(query, operand)` call in a WHERE clause's `AND`/`OR` tree,
